@@ -270,7 +270,7 @@ public final class AppLauncher {
         // Force the app's activity to the front. On DiLink 3 (Android 10), AMS moves the 
         // background task to the split stack silently without triggering a focus transition.
         // A direct start command wakes the activity and forces the system to render it on top.
-        runShell("am start --user 0 -n " + shellQuote(component));
+        //runShell("am start --user 0 -n " + shellQuote(component));
 
         logger.info("openApp: re-docked task " + task + " into split stack " + ghostStack);
         return true;
