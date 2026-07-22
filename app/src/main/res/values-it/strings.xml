@@ -206,6 +206,10 @@
     <string name="onboarding_authorize_retry_title">Ancora non connesso</string>
     <string name="onboarding_authorize_retry_body">L\'helper non è ancora in esecuzione. Il permesso Android potrebbe essere stato respinto. Riprova e ricorda di controllare <b>Consenti sempre</b>.</string>
     <string name="onboarding_authorize_retry_button">Riprova</string>
+    <string name="onboarding_mode_title">Quando dovrebbe funzionare Overdrive?</string>
+    <string name="onboarding_mode_body">Scegli come si comporta Overdrive dopo che spegni l\'auto.\n\n<b>Acceso &amp; spento</b> continua a sorvegliare durante il parcheggio — la sorveglianza e il monitoraggio in background restano attivi, quindi l\'auto consuma un po\' di energia durante la notte.\n\n<b>Solo acceso</b> arresta completamente Overdrive quando esci. Dashcam, viaggi e ricarica funzionano comunque durante la guida, e tutto si riavvia automaticamente quando accendi l\'auto. Puoi cambiare questa impostazione in qualsiasi momento nelle Impostazioni.</string>
+    <string name="onboarding_mode_on_off_button">Acceso &amp; spento</string>
+    <string name="onboarding_mode_on_only_button">Solo acceso</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Camera · passo %1$d di %2$d</string>
     <string name="onboarding_camera_intro_title">Imposta le tue telecamere</string>
@@ -734,6 +738,7 @@ Questa azione non puo essere annullata.</string>
     <string name="rail_live">Live</string>
     <string name="rail_recordings">Registrazioni</string>
     <string name="rail_vehicle">Veicolo</string>
+    <string name="rail_projection">Proiezione</string>
     <string name="rail_trips">Viaggi</string>
     <string name="rail_charging">Ricarica</string>
     <string name="rail_automations">Automazioni</string>
@@ -1322,4 +1327,34 @@ Questa azione non puo essere annullata.</string>
     <string name="toast_cloudflared_token_cannot_be_empty">Se si imposta la versione a pagamento, il token non può essere vuoto</string>
     <string name="toast_cloudflared_token_invalid">Token non valido: usa solo lettere, numeri e . _ - = caratteri</string>
     <string name="toast_cloudflared_saved_settings">Impostazioni Cloudflared salvate</string>
+    <!-- Projection feature -->
+    <string name="projection_hero_title">Proiezione</string>
+    <string name="projection_hero_subtitle">Trasmetti un\'app sul quadro strumenti del conducente e rispecchiala qui.</string>
+    <string name="projection_pick_app">Scegli un\'app da proiettare</string>
+    <string name="projection_cast">Trasmetti al quadro strumenti</string>
+    <string name="projection_stop">Ferma</string>
+    <string name="projection_cast_failed">Impossibile trasmettere quell\'app al quadro strumenti.</string>
+    <string name="projection_status_idle">Nessuna proiezione in corso.</string>
+    <string name="projection_status_live">Mirroring in tempo reale — tocca e scorri per controllare.</string>
+    <string name="projection_status_preview">Modalità anteprima (frequenza fotogrammi ridotta su questo veicolo).</string>
+    <string name="projection_status_none">Non è ancora proiettato nulla — scegli un\'app e trasmettila.</string>
+    <string name="projection_status_unsupported">Il mirroring in tempo reale non è supportato su questo veicolo. L\'app viene comunque proiettata sul quadro strumenti.</string>
+    <string name="projection_note_single_app">È possibile proiettare una sola app sul quadro strumenti alla volta.</string>
+    <string name="projection_adjust_bounds">Regola area</string>
+    <string name="projection_done_adjusting">Fine</string>
+    <string name="projection_bounds_hint_idle">Area di mirroring</string>
+    <string name="projection_status_adjust">Trascina per spostare · trascina un angolo per ridimensionare.</string>
+    <string name="projection_scale_title">Ridimensionamento</string>
+    <string name="projection_scale_desc">Come il quadro strumenti riempie l\'area dello specchio.</string>
+    <string name="projection_scale_fit">Adatta</string>
+    <string name="projection_scale_fill">Allunga</string>
+    <string name="projection_scale_zoom">Zoom</string>
+    <string name="projection_autostart_title">Avvio automatico all\'accensione</string>
+    <string name="projection_autostart_desc">Trasmette automaticamente l\'ultima app usata al quadro strumenti a ogni accensione dell\'auto. (Lo specchio si apre quando apri questa schermata.)</string>
+    <string name="projection_autostart_need_app">Trasmetti prima un\'app, poi attiva questa opzione.</string>
+    <string name="projection_autostart_conflict_title">RoadSense sta usando il quadro strumenti</string>
+    <string name="projection_autostart_conflict_body">RoadSense è impostato per proiettare automaticamente la mappa sul quadro strumenti del conducente all\'accensione dell\'auto. Il quadro strumenti può mostrare una sola cosa alla volta. Disattivarlo e avviare automaticamente questa app?</string>
+    <string name="projection_autostart_conflict_confirm">Usa questa app</string>
+    <string name="projection_app_uninstalled">Quell\'app non è più installata.</string>
+    <string name="projection_status_service_down">Il servizio di mirroring non è pronto — riavvia l\'app (o il daemon della fotocamera) e riprova.</string>
 </resources>

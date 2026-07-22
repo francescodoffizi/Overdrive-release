@@ -1525,6 +1525,7 @@
     <string name="projection_status_preview">Preview mode (reduced frame rate on this vehicle).</string>
     <string name="projection_status_none">Nothing is projected yet — choose an app and cast.</string>
     <string name="projection_status_unsupported">Live mirror isn\'t supported on this vehicle. The app is still projected on the cluster.</string>
+    <string name="projection_status_service_down">Mirror service isn\'t ready — restart the app (or the camera daemon) and try again.</string>
     <string name="projection_note_single_app">One app can be projected on the cluster at a time.</string>
     <string name="projection_adjust_bounds">Adjust bounds</string>
     <string name="projection_done_adjusting">Done</string>

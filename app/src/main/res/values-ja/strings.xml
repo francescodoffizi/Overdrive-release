@@ -206,6 +206,10 @@
     <string name="onboarding_authorize_retry_title">まだ接続されていません</string>
     <string name="onboarding_authorize_retry_body">The helper isn\'t running yet. The Android permission may have been dismissed. Try again and remember to check <b>Always allow</b>.</string>
     <string name="onboarding_authorize_retry_button">もう一度やり直してください</string>
+    <string name="onboarding_mode_title">Overdrive はいつ動作しますか？</string>
+    <string name="onboarding_mode_body">車の電源を切った後の Overdrive の動作を選択します。\n\n<b>オン &amp; オフ</b>は駐車中も監視を続けます — 監視とバックグラウンド監視が有効なままになるため、夜間に車がわずかに電力を消費します。\n\n<b>オンのみ</b>は、降車すると Overdrive を完全にシャットダウンします。走行中はドライブレコーダー、走行履歴、充電は引き続き動作し、車の電源を入れたときにすべて自動的に再起動します。これは設定でいつでも変更できます。</string>
+    <string name="onboarding_mode_on_off_button">オン &amp; オフ</string>
+    <string name="onboarding_mode_on_only_button">オンのみ</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Camera · step %1$d of %2$d</string>
     <string name="onboarding_camera_intro_title">カメラの設定</string>
@@ -729,6 +733,7 @@
     <string name="rail_live">生きている</string>
     <string name="rail_recordings">録画</string>
     <string name="rail_vehicle">車両</string>
+    <string name="rail_projection">プロジェクション</string>
     <string name="rail_trips">走行履歴</string>
     <string name="rail_charging">充電中</string>
     <string name="rail_automations">オートメーション</string>
@@ -1310,4 +1315,34 @@
     <string name="toast_cloudflared_token_cannot_be_empty">有料版に設定した場合、トークンは空にできません</string>
     <string name="toast_cloudflared_token_invalid">無効なトークン: 使用する文字、数字、および . _ - = 文字</string>
     <string name="toast_cloudflared_saved_settings">Cloudflared settings saved</string>
+    <!-- Projection feature -->
+    <string name="projection_hero_title">プロジェクション</string>
+    <string name="projection_hero_subtitle">アプリをドライバーのメータークラスターにキャストし、ここにミラーリングします。</string>
+    <string name="projection_pick_app">投影するアプリを選択</string>
+    <string name="projection_cast">メータークラスターにキャスト</string>
+    <string name="projection_stop">停止</string>
+    <string name="projection_cast_failed">そのアプリをメータークラスターにキャストできませんでした。</string>
+    <string name="projection_status_idle">投影していません。</string>
+    <string name="projection_status_live">ライブミラー — タップとスワイプで操作します。</string>
+    <string name="projection_status_preview">プレビューモード（この車両ではフレームレートが低下します）。</string>
+    <string name="projection_status_none">まだ何も投影されていません — アプリを選択してキャストしてください。</string>
+    <string name="projection_status_unsupported">この車両ではライブミラーはサポートされていません。アプリはメータークラスターに引き続き投影されます。</string>
+    <string name="projection_note_single_app">メータークラスターには一度に1つのアプリのみ投影できます。</string>
+    <string name="projection_adjust_bounds">範囲を調整</string>
+    <string name="projection_done_adjusting">完了</string>
+    <string name="projection_bounds_hint_idle">ミラー範囲</string>
+    <string name="projection_status_adjust">ドラッグして移動 · 角をドラッグしてサイズ変更。</string>
+    <string name="projection_scale_title">スケーリング</string>
+    <string name="projection_scale_desc">クラスターがミラー領域をどのように満たすか。</string>
+    <string name="projection_scale_fit">フィット</string>
+    <string name="projection_scale_fill">引き伸ばし</string>
+    <string name="projection_scale_zoom">ズーム</string>
+    <string name="projection_autostart_title">電源オン時に自動開始</string>
+    <string name="projection_autostart_desc">車の電源が入るたびに、最後に使用したアプリをクラスターに自動でキャストします。（ミラーはこの画面を開いたときに表示されます。）</string>
+    <string name="projection_autostart_need_app">先にアプリをキャストしてから、これをオンにしてください。</string>
+    <string name="projection_autostart_conflict_title">RoadSense がクラスターを使用中です</string>
+    <string name="projection_autostart_conflict_body">RoadSense は、車の電源が入るとドライバークラスターに地図を自動投影するよう設定されています。クラスターには一度に1つしか表示できません。それをオフにして、代わりにこのアプリを自動開始しますか？</string>
+    <string name="projection_autostart_conflict_confirm">このアプリを使用</string>
+    <string name="projection_app_uninstalled">そのアプリはインストールされていません。</string>
+    <string name="projection_status_service_down">ミラーサービスの準備ができていません。アプリ（またはカメラデーモン）を再起動してもう一度お試しください。</string>
 </resources>

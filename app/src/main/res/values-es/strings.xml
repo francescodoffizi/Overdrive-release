@@ -206,6 +206,10 @@
     <string name="onboarding_authorize_retry_title">Aún no conectado</string>
     <string name="onboarding_authorize_retry_body">El ayudante aún no se está ejecutando. El permiso de Android puede haber sido descartado. Inténtalo de nuevo y recuerda marcar <b>Permitir siempre</b>.</string>
     <string name="onboarding_authorize_retry_button">Inténtalo de nuevo</string>
+    <string name="onboarding_mode_title">¿Cuándo debe ejecutarse Overdrive?</string>
+    <string name="onboarding_mode_body">Elige cómo se comporta Overdrive después de apagar el coche.\n\n<b>Encendido &amp; apagado</b> sigue vigilando mientras está estacionado — la vigilancia y la supervisión en segundo plano permanecen activas, por lo que el coche consume un poco de energía durante la noche.\n\n<b>Solo encendido</b> apaga Overdrive por completo en cuanto te vas. La dashcam, los viajes y la carga siguen funcionando mientras conduces, y todo se vuelve a iniciar automáticamente cuando enciendes el coche. Puedes cambiar esto en cualquier momento en Ajustes.</string>
+    <string name="onboarding_mode_on_off_button">Encendido &amp; apagado</string>
+    <string name="onboarding_mode_on_only_button">Solo encendido</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Cámara · paso %1$d de %2$d</string>
     <string name="onboarding_camera_intro_title">Configura tus cámaras</string>
@@ -732,6 +736,7 @@
     <string name="rail_live">En vivo</string>
     <string name="rail_recordings">Grabaciones</string>
     <string name="rail_vehicle">Vehículo</string>
+    <string name="rail_projection">Proyección</string>
     <string name="rail_trips">Viajes</string>
     <string name="rail_charging">Cargando</string>
     <string name="rail_automations">Automatizaciones</string>
@@ -1320,4 +1325,34 @@
     <string name="toast_cloudflared_token_cannot_be_empty">Si estableces una versión de pago, el token no puede estar vacío</string>
     <string name="toast_cloudflared_token_invalid">Token no válido: utilice sólo letras, números y . _ - = caracteres</string>
     <string name="toast_cloudflared_saved_settings">Configuración de Cloudflared guardada</string>
+    <!-- Projection feature -->
+    <string name="projection_hero_title">Proyección</string>
+    <string name="projection_hero_subtitle">Proyecta una app en el cuadro de instrumentos del conductor y refléjala aquí.</string>
+    <string name="projection_pick_app">Elige una app para proyectar</string>
+    <string name="projection_cast">Proyectar al cuadro de instrumentos</string>
+    <string name="projection_stop">Detener</string>
+    <string name="projection_cast_failed">No se pudo proyectar esa app en el cuadro de instrumentos.</string>
+    <string name="projection_status_idle">No se está proyectando.</string>
+    <string name="projection_status_live">Reflejo en vivo — toca y desliza para controlar.</string>
+    <string name="projection_status_preview">Modo de vista previa (frecuencia de fotogramas reducida en este vehículo).</string>
+    <string name="projection_status_none">Aún no se proyecta nada — elige una app y proyéctala.</string>
+    <string name="projection_status_unsupported">El reflejo en vivo no es compatible con este vehículo. La app sigue proyectándose en el cuadro de instrumentos.</string>
+    <string name="projection_note_single_app">Solo se puede proyectar una app en el cuadro de instrumentos a la vez.</string>
+    <string name="projection_adjust_bounds">Ajustar área</string>
+    <string name="projection_done_adjusting">Listo</string>
+    <string name="projection_bounds_hint_idle">Área de reflejo</string>
+    <string name="projection_status_adjust">Arrastra para mover · arrastra una esquina para cambiar el tamaño.</string>
+    <string name="projection_scale_title">Escalado</string>
+    <string name="projection_scale_desc">Cómo llena el clúster el área del reflejo.</string>
+    <string name="projection_scale_fit">Ajustar</string>
+    <string name="projection_scale_fill">Estirar</string>
+    <string name="projection_scale_zoom">Zoom</string>
+    <string name="projection_autostart_title">Iniciar automáticamente al encender</string>
+    <string name="projection_autostart_desc">Proyecta la última app usada en el clúster automáticamente cada vez que el coche se enciende. (El reflejo se abre al entrar en esta pantalla.)</string>
+    <string name="projection_autostart_need_app">Primero proyecta una app y luego activa esto.</string>
+    <string name="projection_autostart_conflict_title">RoadSense está usando el clúster</string>
+    <string name="projection_autostart_conflict_body">RoadSense está configurado para proyectar el mapa en el clúster del conductor al encender el coche. El clúster solo puede mostrar una cosa a la vez. ¿Desactivar eso e iniciar automáticamente esta app en su lugar?</string>
+    <string name="projection_autostart_conflict_confirm">Usar esta app</string>
+    <string name="projection_app_uninstalled">Esa app ya no está instalada.</string>
+    <string name="projection_status_service_down">El servicio de reflejo no está listo: reinicia la app (o el daemon de la cámara) e inténtalo de nuevo.</string>
 </resources>

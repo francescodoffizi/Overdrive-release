@@ -620,6 +620,7 @@
     <string name="rail_live">जीवित</string>
     <string name="rail_recordings">रिकॉर्डिंग</string>
     <string name="rail_vehicle">वाहन</string>
+    <string name="rail_projection">प्रोजेक्शन</string>
     <string name="rail_trips">यात्राएँ</string>
     <string name="rail_integrations">एकीकरण</string>
     <string name="rail_diagnostics">निदान</string>
@@ -1294,6 +1295,10 @@
     <string name="settings_backup_daemon_down">बैकअप या रिस्टोर के लिए कैमरा सेवा चालू होनी चाहिए। इसे Daemons से शुरू करें, फिर दोबारा कोशिश करें।</string>
     <string name="onboarding_expert_menu_title">गाइडेड टूर</string>
     <string name="onboarding_authorize_retry_button">दोबारा कोशिश करें</string>
+    <string name="onboarding_mode_title">Overdrive कब चले?</string>
+    <string name="onboarding_mode_body">कार बंद करने के बाद Overdrive कैसे व्यवहार करे, यह चुनें।\n\n<b>ऑन &amp; ऑफ</b> पार्क रहते समय देखता रहता है — निगरानी और बैकग्राउंड मॉनिटरिंग सक्रिय रहती हैं, इसलिए रातभर में कार थोड़ी बिजली खींचती है।\n\n<b>केवल ऑन</b> आपके जाते ही Overdrive को पूरी तरह बंद कर देता है। ड्राइविंग के दौरान डैशकैम, यात्राएँ और चार्जिंग फिर भी काम करती हैं, और कार चालू करते ही सब कुछ अपने-आप फिर से शुरू हो जाता है। आप इसे Settings में कभी भी बदल सकते हैं।</string>
+    <string name="onboarding_mode_on_off_button">ऑन &amp; ऑफ</string>
+    <string name="onboarding_mode_on_only_button">केवल ऑन</string>
     <string name="onboarding_expert_trips_title">ट्रिप इतिहास</string>
     <string name="onboarding_expert_maps_body">पूर्ण टर्न-बाय-टर्न नेविगेशन के लिए Map खोलें — कोई गंतव्य खोजें, रूटिंग और लाइव गाइडेंस पाएँ, साथ ही आस-पास के रुचि-स्थल और रास्ते में RoadSense द्वारा लॉग किए गए कोई भी सड़क ख़तरे। आप ड्राइविंग शुरू करते ही इसे इंस्ट्रुमेंट क्लस्टर पर अपने आप प्रोजेक्ट भी कर सकते हैं — वह टॉगल RoadSense के Map टैब में है।</string>
     <string name="settings_backup_read_failed">फ़ाइल पढ़ी नहीं जा सकी</string>
@@ -1305,4 +1310,34 @@
     <string name="onboarding_camera_windshield_body">OEM डैशकैम लेआउट के लिए — आपकी रिकॉर्डिंग के ऊपर एक पट्टी के रूप में विंडशील्ड कैमरा — रोल मेनू में Windshield चुनें, सामने का कैमरा चुनें, और Save करें। ज़्यादातर मालिक इसे छोड़ सकते हैं।</string>
     <string name="onboarding_camera_windshield_skip">नहीं, धन्यवाद</string>
     <string name="onboarding_expert_integrations_title">इंटीग्रेशन</string>
+    <!-- Projection feature -->
+    <string name="projection_hero_title">प्रोजेक्शन</string>
+    <string name="projection_hero_subtitle">किसी ऐप को ड्राइवर इंस्ट्रूमेंट क्लस्टर पर कास्ट करें और उसे यहाँ मिरर करें।</string>
+    <string name="projection_pick_app">प्रोजेक्ट करने के लिए एक ऐप चुनें</string>
+    <string name="projection_cast">क्लस्टर पर कास्ट करें</string>
+    <string name="projection_stop">रोकें</string>
+    <string name="projection_cast_failed">उस ऐप को क्लस्टर पर कास्ट नहीं किया जा सका।</string>
+    <string name="projection_status_idle">प्रोजेक्ट नहीं हो रहा है।</string>
+    <string name="projection_status_live">लाइव मिरर — नियंत्रित करने के लिए टैप करें और स्वाइप करें।</string>
+    <string name="projection_status_preview">पूर्वावलोकन मोड (इस वाहन पर घटी हुई फ्रेम दर)।</string>
+    <string name="projection_status_none">अभी तक कुछ भी प्रोजेक्ट नहीं हुआ — एक ऐप चुनें और कास्ट करें।</string>
+    <string name="projection_status_unsupported">इस वाहन पर लाइव मिरर समर्थित नहीं है। ऐप अब भी क्लस्टर पर प्रोजेक्ट हो रहा है।</string>
+    <string name="projection_note_single_app">एक समय में क्लस्टर पर केवल एक ऐप प्रोजेक्ट किया जा सकता है।</string>
+    <string name="projection_adjust_bounds">सीमा समायोजित करें</string>
+    <string name="projection_done_adjusting">पूर्ण</string>
+    <string name="projection_bounds_hint_idle">मिरर क्षेत्र</string>
+    <string name="projection_status_adjust">ले जाने के लिए खींचें · आकार बदलने के लिए कोना खींचें।</string>
+    <string name="projection_scale_title">स्केलिंग</string>
+    <string name="projection_scale_desc">क्लस्टर मिरर क्षेत्र को कैसे भरता है।</string>
+    <string name="projection_scale_fit">फ़िट</string>
+    <string name="projection_scale_fill">खींचें</string>
+    <string name="projection_scale_zoom">ज़ूम</string>
+    <string name="projection_autostart_title">पावर-ऑन पर स्वतः शुरू करें</string>
+    <string name="projection_autostart_desc">हर बार कार चालू होने पर अंतिम उपयोग किए गए ऐप को क्लस्टर पर स्वतः कास्ट करता है। (इस स्क्रीन पर जाने पर मिरर खुलता है।)</string>
+    <string name="projection_autostart_need_app">पहले कोई ऐप कास्ट करें, फिर इसे चालू करें।</string>
+    <string name="projection_autostart_conflict_title">RoadSense क्लस्टर का उपयोग कर रहा है</string>
+    <string name="projection_autostart_conflict_body">RoadSense को कार चालू होने पर ड्राइवर क्लस्टर पर मानचित्र स्वतः प्रोजेक्ट करने के लिए सेट किया गया है। क्लस्टर एक बार में केवल एक चीज़ दिखा सकता है। उसे बंद करके इसके बजाय इस ऐप को स्वतः शुरू करें?</string>
+    <string name="projection_autostart_conflict_confirm">इस ऐप का उपयोग करें</string>
+    <string name="projection_app_uninstalled">वह ऐप अब इंस्टॉल नहीं है।</string>
+    <string name="projection_status_service_down">मिरर सेवा तैयार नहीं है — ऐप (या कैमरा डेमन) पुनः आरंभ करें और फिर से प्रयास करें।</string>
 </resources>

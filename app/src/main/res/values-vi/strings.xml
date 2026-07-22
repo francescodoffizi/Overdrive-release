@@ -617,6 +617,7 @@
     <string name="rail_live">Đời sống</string>
     <string name="rail_recordings">Bản ghi</string>
     <string name="rail_vehicle">Chiếc xe</string>
+    <string name="rail_projection">Chiếu hình</string>
     <string name="rail_trips">Chuyến đi</string>
     <string name="rail_integrations">Kết hợp</string>
     <string name="rail_diagnostics">Chẩn đoán</string>
@@ -1284,6 +1285,10 @@
     <string name="settings_backup_daemon_down">Dịch vụ camera phải đang chạy để sao lưu hoặc khôi phục. Hãy khởi động nó từ Daemon, rồi thử lại.</string>
     <string name="onboarding_expert_menu_title">Hướng dẫn có dẫn dắt</string>
     <string name="onboarding_authorize_retry_button">Thử lại</string>
+    <string name="onboarding_mode_title">Overdrive nên chạy khi nào?</string>
+    <string name="onboarding_mode_body">Chọn cách Overdrive hoạt động sau khi bạn tắt máy xe.\n\n<b>Bật &amp; Tắt</b> vẫn tiếp tục theo dõi khi đỗ xe — giám sát và theo dõi nền luôn hoạt động, nên xe tiêu thụ một chút điện qua đêm.\n\n<b>Chỉ bật</b> sẽ tắt hoàn toàn Overdrive khi bạn rời đi. Dashcam, hành trình và sạc vẫn hoạt động khi bạn đang lái, và mọi thứ sẽ tự động khởi động lại khi bạn bật máy xe. Bạn có thể thay đổi điều này bất cứ lúc nào trong Cài đặt.</string>
+    <string name="onboarding_mode_on_off_button">Bật &amp; Tắt</string>
+    <string name="onboarding_mode_on_only_button">Chỉ bật</string>
     <string name="onboarding_expert_trips_title">Lịch sử hành trình</string>
     <string name="onboarding_expert_maps_body">Mở Bản đồ để có chỉ đường từng chặng đầy đủ — tìm điểm đến, nhận định tuyến và dẫn đường trực tiếp, cùng các điểm tham quan lân cận và bất kỳ mối nguy trên đường nào mà RoadSense đã ghi lại dọc đường. Bạn cũng có thể tự động chiếu nó lên cụm đồng hồ khi bắt đầu lái — công tắc đó nằm trong tab Bản đồ của RoadSense.</string>
     <string name="settings_backup_read_failed">Không thể đọc tệp</string>
@@ -1295,4 +1300,34 @@
     <string name="onboarding_camera_windshield_body">Đối với bố cục dashcam OEM — camera kính chắn gió dạng dải nằm trên đầu bản ghi của bạn — chọn Kính chắn gió trong menu vai trò, chọn camera phía trước, và Lưu. Hầu hết chủ xe có thể bỏ qua bước này.</string>
     <string name="onboarding_camera_windshield_skip">Không, cảm ơn</string>
     <string name="onboarding_expert_integrations_title">Tích hợp</string>
+    <!-- Projection screen -->
+    <string name="projection_hero_title">Chiếu hình</string>
+    <string name="projection_hero_subtitle">Truyền một ứng dụng lên bảng đồng hồ sau vô lăng và phản chiếu tại đây.</string>
+    <string name="projection_pick_app">Chọn một ứng dụng để chiếu</string>
+    <string name="projection_cast">Truyền lên bảng đồng hồ</string>
+    <string name="projection_stop">Dừng</string>
+    <string name="projection_cast_failed">Không thể truyền ứng dụng đó lên bảng đồng hồ.</string>
+    <string name="projection_status_idle">Chưa chiếu hình.</string>
+    <string name="projection_status_live">Phản chiếu trực tiếp — chạm và vuốt để điều khiển.</string>
+    <string name="projection_status_preview">Chế độ xem trước (tốc độ khung hình giảm trên xe này).</string>
+    <string name="projection_status_none">Chưa có gì được chiếu — hãy chọn một ứng dụng và truyền.</string>
+    <string name="projection_status_unsupported">Xe này không hỗ trợ phản chiếu trực tiếp. Ứng dụng vẫn được chiếu trên bảng đồng hồ.</string>
+    <string name="projection_note_single_app">Chỉ có thể chiếu một ứng dụng lên bảng đồng hồ tại một thời điểm.</string>
+    <string name="projection_adjust_bounds">Điều chỉnh vùng</string>
+    <string name="projection_done_adjusting">Xong</string>
+    <string name="projection_bounds_hint_idle">Vùng phản chiếu</string>
+    <string name="projection_status_adjust">Kéo để di chuyển · kéo một góc để đổi kích thước.</string>
+    <string name="projection_scale_title">Tỷ lệ</string>
+    <string name="projection_scale_desc">Cách cụm đồng hồ lấp đầy vùng phản chiếu.</string>
+    <string name="projection_scale_fit">Vừa khít</string>
+    <string name="projection_scale_fill">Kéo giãn</string>
+    <string name="projection_scale_zoom">Thu phóng</string>
+    <string name="projection_autostart_title">Tự động khởi động khi bật nguồn</string>
+    <string name="projection_autostart_desc">Tự động truyền ứng dụng dùng gần nhất lên cụm đồng hồ mỗi khi xe bật nguồn. (Phản chiếu mở ra khi bạn vào màn hình này.)</string>
+    <string name="projection_autostart_need_app">Hãy truyền một ứng dụng trước, rồi bật tùy chọn này.</string>
+    <string name="projection_autostart_conflict_title">RoadSense đang dùng cụm đồng hồ</string>
+    <string name="projection_autostart_conflict_body">RoadSense được đặt để tự động chiếu bản đồ lên cụm đồng hồ của người lái khi xe bật nguồn. Cụm đồng hồ chỉ hiển thị được một thứ tại một thời điểm. Tắt tùy chọn đó và tự động khởi động ứng dụng này thay thế?</string>
+    <string name="projection_autostart_conflict_confirm">Dùng ứng dụng này</string>
+    <string name="projection_app_uninstalled">Ứng dụng đó không còn được cài đặt.</string>
+    <string name="projection_status_service_down">Dịch vụ phản chiếu chưa sẵn sàng — hãy khởi động lại ứng dụng (hoặc daemon máy ảnh) rồi thử lại.</string>
 </resources>

@@ -620,6 +620,7 @@
     <string name="rail_live">Canlı</string>
     <string name="rail_recordings">Kayıtlar</string>
     <string name="rail_vehicle">Araç</string>
+    <string name="rail_projection">Yansıtma</string>
     <string name="rail_trips">Seyahatler</string>
     <string name="rail_integrations">Entegreler</string>
     <string name="rail_diagnostics">Teşhisler</string>
@@ -1294,6 +1295,10 @@
     <string name="settings_backup_daemon_down">Yedekleme veya geri yükleme için kamera hizmetinin çalışıyor olması gerekir. Arka Plan Hizmetleri\'nden başlatın, ardından tekrar deneyin.</string>
     <string name="onboarding_expert_menu_title">Rehberli tur</string>
     <string name="onboarding_authorize_retry_button">Tekrar dene</string>
+    <string name="onboarding_mode_title">Overdrive ne zaman çalışsın?</string>
+    <string name="onboarding_mode_body">Aracı kapattıktan sonra Overdrive\'ın nasıl davranacağını seçin.\n\n<b>Açık &amp; Kapalı</b> park halindeyken izlemeye devam eder — gözetim ve arka plan izleme etkin kalır, böylece araç gece boyunca biraz güç çeker.\n\n<b>Yalnızca açık</b>, siz ayrıldığınızda Overdrive\'ı tamamen kapatır. Dashcam, yolculuklar ve şarj siz sürerken çalışmaya devam eder ve aracı çalıştırdığınızda her şey otomatik olarak yeniden başlar. Bunu istediğiniz zaman Ayarlar\'dan değiştirebilirsiniz.</string>
+    <string name="onboarding_mode_on_off_button">Açık &amp; Kapalı</string>
+    <string name="onboarding_mode_on_only_button">Yalnızca açık</string>
     <string name="onboarding_expert_trips_title">Yolculuk geçmişi</string>
     <string name="onboarding_expert_maps_body">Tam adım adım navigasyon için Haritayı açın — bir hedef arayın, rota ve canlı yönlendirme alın, ayrıca yakındaki ilgi noktaları ve RoadSense\'in yol boyunca kaydettiği tüm yol tehlikeleri. Sürüşe başladığınızda bunu gösterge paneline otomatik olarak da yansıtabilirsiniz — bu anahtar RoadSense\'in Harita sekmesinde bulunur.</string>
     <string name="settings_backup_read_failed">Dosya okunamadı</string>
@@ -1305,4 +1310,34 @@
     <string name="onboarding_camera_windshield_body">OEM dashcam düzeni için — ön cam kamerası kaydınızın üstünde bir şerit olarak — rol menüsünden Ön Cam\'i seçin, ileri kamerayı belirleyin ve Kaydedin. Çoğu kullanıcı bunu atlayabilir.</string>
     <string name="onboarding_camera_windshield_skip">Hayır, teşekkürler</string>
     <string name="onboarding_expert_integrations_title">Entegrasyonlar</string>
+    <!-- Projection screen -->
+    <string name="projection_hero_title">Yansıtma</string>
+    <string name="projection_hero_subtitle">Bir uygulamayı gösterge paneline aktarın ve burada yansıtın.</string>
+    <string name="projection_pick_app">Yansıtılacak bir uygulama seçin</string>
+    <string name="projection_cast">Gösterge paneline aktar</string>
+    <string name="projection_stop">Durdur</string>
+    <string name="projection_cast_failed">Bu uygulama gösterge paneline aktarılamadı.</string>
+    <string name="projection_status_idle">Yansıtma yapılmıyor.</string>
+    <string name="projection_status_live">Canlı yansıma — kontrol etmek için dokunun ve kaydırın.</string>
+    <string name="projection_status_preview">Önizleme modu (bu araçta kare hızı düşürülür).</string>
+    <string name="projection_status_none">Henüz hiçbir şey yansıtılmıyor — bir uygulama seçin ve aktarın.</string>
+    <string name="projection_status_unsupported">Canlı yansıma bu araçta desteklenmiyor. Uygulama yine de gösterge paneline yansıtılıyor.</string>
+    <string name="projection_note_single_app">Gösterge paneline aynı anda tek bir uygulama yansıtılabilir.</string>
+    <string name="projection_adjust_bounds">Alanı ayarla</string>
+    <string name="projection_done_adjusting">Bitti</string>
+    <string name="projection_bounds_hint_idle">Yansıma alanı</string>
+    <string name="projection_status_adjust">Taşımak için sürükleyin · yeniden boyutlandırmak için bir köşeyi sürükleyin.</string>
+    <string name="projection_scale_title">Ölçekleme</string>
+    <string name="projection_scale_desc">Gösterge panelinin ayna alanını nasıl doldurduğu.</string>
+    <string name="projection_scale_fit">Sığdır</string>
+    <string name="projection_scale_fill">Uzat</string>
+    <string name="projection_scale_zoom">Yakınlaştır</string>
+    <string name="projection_autostart_title">Açılışta otomatik başlat</string>
+    <string name="projection_autostart_desc">Araç her çalıştığında son kullanılan uygulamayı gösterge paneline otomatik olarak yayınlar. (Ayna, bu ekrana girdiğinizde açılır.)</string>
+    <string name="projection_autostart_need_app">Önce bir uygulama yayınlayın, sonra bunu açın.</string>
+    <string name="projection_autostart_conflict_title">RoadSense gösterge panelini kullanıyor</string>
+    <string name="projection_autostart_conflict_body">RoadSense, araç çalıştığında haritayı sürücü gösterge paneline otomatik yansıtacak şekilde ayarlı. Gösterge paneli aynı anda yalnızca bir şey gösterebilir. Bunu kapatıp bunun yerine bu uygulamayı otomatik başlatmak ister misiniz?</string>
+    <string name="projection_autostart_conflict_confirm">Bu uygulamayı kullan</string>
+    <string name="projection_app_uninstalled">O uygulama artık yüklü değil.</string>
+    <string name="projection_status_service_down">Ayna hizmeti hazır değil — uygulamayı (veya kamera arka plan hizmetini) yeniden başlatıp tekrar deneyin.</string>
 </resources>

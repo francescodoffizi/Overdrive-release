@@ -617,6 +617,7 @@
     <string name="rail_live">ภาพสด</string>
     <string name="rail_recordings">วิดีโอ</string>
     <string name="rail_vehicle">สถานะรถ</string>
+    <string name="rail_projection">การฉายภาพ</string>
     <string name="rail_trips">ทริป</string>
     <string name="rail_integrations">ส่วนเสริม</string>
     <string name="rail_diagnostics">วิเคราะห์ระบบ</string>
@@ -1284,6 +1285,10 @@
     <string name="settings_backup_daemon_down">บริการกล้องต้องทำงานเพื่อสำรองหรือกู้คืน เริ่มจาก Daemons แล้วลองอีกครั้ง</string>
     <string name="onboarding_expert_menu_title">ทัวร์แนะนำ</string>
     <string name="onboarding_authorize_retry_button">ลองอีกครั้ง</string>
+    <string name="onboarding_mode_title">Overdrive ควรทำงานเมื่อใด?</string>
+    <string name="onboarding_mode_body">เลือกวิธีที่ Overdrive ทำงานหลังจากคุณดับเครื่องยนต์\n\n<b>เปิด &amp; ปิด</b> จะเฝ้าดูต่อขณะจอด — การเฝ้าระวังและการตรวจสอบเบื้องหลังยังคงทำงานอยู่ รถจึงใช้ไฟเล็กน้อยตลอดคืน\n\n<b>เปิดเท่านั้น</b> จะปิด Overdrive ทั้งหมดทันทีที่คุณลงจากรถ กล้องหน้ารถ ทริป และการชาร์จยังคงทำงานขณะที่คุณขับขี่ และทุกอย่างจะเริ่มทำงานใหม่โดยอัตโนมัติเมื่อคุณสตาร์ทรถ คุณเปลี่ยนค่านี้ได้ทุกเมื่อในการตั้งค่า</string>
+    <string name="onboarding_mode_on_off_button">เปิด &amp; ปิด</string>
+    <string name="onboarding_mode_on_only_button">เปิดเท่านั้น</string>
     <string name="onboarding_expert_trips_title">ประวัติการเดินทาง</string>
     <string name="onboarding_expert_maps_body">เปิดแผนที่เพื่อการนำทางแบบบอกทุกเลี้ยวเต็มรูปแบบ — ค้นหาจุดหมาย รับการนำทางและคำแนะนำสด พร้อมจุดสนใจใกล้เคียงและอันตรายบนถนนที่ RoadSense บันทึกไว้ตลอดทาง คุณยังสามารถฉายภาพไปยังหน้าปัดวัดอัตโนมัติเมื่อเริ่มขับขี่ — ปุ่มสลับนั้นอยู่ในแท็บแผนที่ของ RoadSense</string>
     <string name="settings_backup_read_failed">ไม่สามารถอ่านไฟล์ได้</string>
@@ -1295,4 +1300,34 @@
     <string name="onboarding_camera_windshield_body">สำหรับเลย์เอาต์ดashcam แบบ OEM — กล้องกระจกหน้าเป็นแถบบนการบันทึกของคุณ — เลือกกระจกหน้าในเมนูบทบาท เลือกกล้องด้านหน้า แล้วบันทึก เจ้าของส่วนใหญ่ข้ามได้</string>
     <string name="onboarding_camera_windshield_skip">ไม่ ขอบคุณ</string>
     <string name="onboarding_expert_integrations_title">การเชื่อมต่อ</string>
+    <!-- Projection screen -->
+    <string name="projection_hero_title">การฉายภาพ</string>
+    <string name="projection_hero_subtitle">ส่งภาพแอปไปยังหน้าปัดหลังพวงมาลัยและแสดงภาพเดียวกันที่นี่</string>
+    <string name="projection_pick_app">เลือกแอปเพื่อฉายภาพ</string>
+    <string name="projection_cast">ส่งภาพไปยังหน้าปัด</string>
+    <string name="projection_stop">หยุด</string>
+    <string name="projection_cast_failed">ไม่สามารถส่งภาพแอปนั้นไปยังหน้าปัดได้</string>
+    <string name="projection_status_idle">ยังไม่ได้ฉายภาพ</string>
+    <string name="projection_status_live">ภาพสะท้อนสด — แตะและปัดเพื่อควบคุม</string>
+    <string name="projection_status_preview">โหมดแสดงตัวอย่าง (อัตราเฟรมลดลงในรถคันนี้)</string>
+    <string name="projection_status_none">ยังไม่มีการฉายภาพใด ๆ — เลือกแอปแล้วส่งภาพ</string>
+    <string name="projection_status_unsupported">รถคันนี้ไม่รองรับภาพสะท้อนสด แอปยังคงถูกฉายบนหน้าปัด</string>
+    <string name="projection_note_single_app">สามารถฉายภาพแอปบนหน้าปัดได้ครั้งละหนึ่งแอปเท่านั้น</string>
+    <string name="projection_adjust_bounds">ปรับพื้นที่</string>
+    <string name="projection_done_adjusting">เสร็จ</string>
+    <string name="projection_bounds_hint_idle">พื้นที่มิเรอร์</string>
+    <string name="projection_status_adjust">ลากเพื่อย้าย · ลากมุมเพื่อปรับขนาด</string>
+    <string name="projection_scale_title">การปรับขนาด</string>
+    <string name="projection_scale_desc">วิธีที่คลัสเตอร์เติมเต็มพื้นที่มิเรอร์</string>
+    <string name="projection_scale_fit">พอดี</string>
+    <string name="projection_scale_fill">ยืด</string>
+    <string name="projection_scale_zoom">ซูม</string>
+    <string name="projection_autostart_title">เริ่มอัตโนมัติเมื่อเปิดเครื่อง</string>
+    <string name="projection_autostart_desc">แคสต์แอปที่ใช้ล่าสุดไปยังคลัสเตอร์โดยอัตโนมัติทุกครั้งที่รถเปิดเครื่อง (มิเรอร์จะเปิดขึ้นเมื่อคุณเข้าหน้าจอนี้)</string>
+    <string name="projection_autostart_need_app">แคสต์แอปก่อน แล้วจึงเปิดใช้งานสิ่งนี้</string>
+    <string name="projection_autostart_conflict_title">RoadSense กำลังใช้คลัสเตอร์อยู่</string>
+    <string name="projection_autostart_conflict_body">RoadSense ถูกตั้งค่าให้ฉายแผนที่ไปยังคลัสเตอร์ของผู้ขับโดยอัตโนมัติเมื่อรถเปิดเครื่อง คลัสเตอร์แสดงได้ครั้งละหนึ่งอย่างเท่านั้น ต้องการปิดใช้งานสิ่งนั้นและเริ่มแอปนี้โดยอัตโนมัติแทนหรือไม่?</string>
+    <string name="projection_autostart_conflict_confirm">ใช้แอปนี้</string>
+    <string name="projection_app_uninstalled">แอปนั้นไม่ได้ติดตั้งอยู่แล้ว</string>
+    <string name="projection_status_service_down">บริการมิเรอร์ยังไม่พร้อม — โปรดรีสตาร์ตแอป (หรือเดมอนกล้อง) แล้วลองอีกครั้ง</string>
 </resources>

@@ -206,6 +206,10 @@
     <string name="onboarding_authorize_retry_title">Toujours non connecté</string>
     <string name="onboarding_authorize_retry_body">L\'aide n\'est pas encore en cours d\'exécution. La permission Android a peut-être été rejetée. Essayez à nouveau et n\'oubliez pas de cocher <b>Toujours autoriser</b>.</string>
     <string name="onboarding_authorize_retry_button">Réessayez</string>
+    <string name="onboarding_mode_title">Quand Overdrive doit-il fonctionner ?</string>
+    <string name="onboarding_mode_body">Choisissez le comportement d\'Overdrive après l\'arrêt de la voiture.\n\n<b>Allumée &amp; éteinte</b> continue de surveiller pendant le stationnement — la surveillance et le suivi en arrière-plan restent actifs, la voiture consomme donc un peu d\'énergie pendant la nuit.\n\n<b>Allumée uniquement</b> arrête complètement Overdrive dès que vous partez. La dashcam, les trajets et la recharge fonctionnent toujours pendant que vous conduisez, et tout redémarre automatiquement lorsque vous allumez la voiture. Vous pouvez modifier ceci à tout moment dans les Paramètres.</string>
+    <string name="onboarding_mode_on_off_button">Allumée &amp; éteinte</string>
+    <string name="onboarding_mode_on_only_button">Allumée uniquement</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Caméra · Etape %1$d de %2$d</string>
     <string name="onboarding_camera_intro_title">Configurez vos caméras</string>
@@ -732,6 +736,7 @@
     <string name="rail_live">En direct</string>
     <string name="rail_recordings">Enregistrements</string>
     <string name="rail_vehicle">Véhicule</string>
+    <string name="rail_projection">Projection</string>
     <string name="rail_trips">Trajets</string>
     <string name="rail_charging">Recharge en cours</string>
     <string name="rail_automations">Automatisations</string>
@@ -1320,4 +1325,34 @@
     <string name="toast_cloudflared_token_cannot_be_empty">Si vous définissez une version payante, le jeton ne peut pas être vide</string>
     <string name="toast_cloudflared_token_invalid">Token invalide : utilisez uniquement des lettres, des chiffres et . _ - = des caractères</string>
     <string name="toast_cloudflared_saved_settings">Paramètres Cloudflared enregistrés</string>
+    <!-- Projection feature -->
+    <string name="projection_hero_title">Projection</string>
+    <string name="projection_hero_subtitle">Diffusez une application sur le combiné d\'instruments du conducteur et reflétez-la ici.</string>
+    <string name="projection_pick_app">Choisissez une application à projeter</string>
+    <string name="projection_cast">Diffuser sur le combiné d\'instruments</string>
+    <string name="projection_stop">Arrêter</string>
+    <string name="projection_cast_failed">Impossible de diffuser cette application sur le combiné d\'instruments.</string>
+    <string name="projection_status_idle">Aucune projection en cours.</string>
+    <string name="projection_status_live">Miroir en direct — touchez et balayez pour contrôler.</string>
+    <string name="projection_status_preview">Mode aperçu (fréquence d\'images réduite sur ce véhicule).</string>
+    <string name="projection_status_none">Rien n\'est encore projeté — choisissez une application et diffusez-la.</string>
+    <string name="projection_status_unsupported">Le miroir en direct n\'est pas pris en charge sur ce véhicule. L\'application est toujours projetée sur le combiné d\'instruments.</string>
+    <string name="projection_note_single_app">Une seule application peut être projetée sur le combiné d\'instruments à la fois.</string>
+    <string name="projection_adjust_bounds">Ajuster la zone</string>
+    <string name="projection_done_adjusting">Terminé</string>
+    <string name="projection_bounds_hint_idle">Zone du miroir</string>
+    <string name="projection_status_adjust">Faites glisser pour déplacer · faites glisser un coin pour redimensionner.</string>
+    <string name="projection_scale_title">Mise à l\'échelle</string>
+    <string name="projection_scale_desc">Comment le combiné remplit la zone du miroir.</string>
+    <string name="projection_scale_fit">Ajuster</string>
+    <string name="projection_scale_fill">Étirer</string>
+    <string name="projection_scale_zoom">Zoom</string>
+    <string name="projection_autostart_title">Démarrage automatique à l\'allumage</string>
+    <string name="projection_autostart_desc">Diffuse automatiquement la dernière application utilisée sur le combiné à chaque démarrage de la voiture. (Le miroir s\'ouvre lorsque vous accédez à cet écran.)</string>
+    <string name="projection_autostart_need_app">Diffusez d\'abord une application, puis activez ceci.</string>
+    <string name="projection_autostart_conflict_title">RoadSense utilise le combiné</string>
+    <string name="projection_autostart_conflict_body">RoadSense est configuré pour projeter automatiquement la carte sur le combiné du conducteur au démarrage de la voiture. Le combiné ne peut afficher qu\'une seule chose à la fois. Désactiver cela et démarrer automatiquement cette application à la place ?</string>
+    <string name="projection_autostart_conflict_confirm">Utiliser cette application</string>
+    <string name="projection_app_uninstalled">Cette application n\'est plus installée.</string>
+    <string name="projection_status_service_down">Le service de miroir n\'est pas prêt — redémarrez l\'application (ou le démon de la caméra) et réessayez.</string>
 </resources>

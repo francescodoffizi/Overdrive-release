@@ -617,6 +617,7 @@
     <string name="rail_live">活下去</string>
     <string name="rail_recordings">錄影</string>
     <string name="rail_vehicle">汽車</string>
+    <string name="rail_projection">投影</string>
     <string name="rail_trips">行程</string>
     <string name="rail_integrations">集成</string>
     <string name="rail_diagnostics">診斷結果</string>
@@ -1284,6 +1285,10 @@
     <string name="settings_backup_daemon_down">相機服務必須正在運作才能備份或還原。請從服務中啟動它，然後再試一次。</string>
     <string name="onboarding_expert_menu_title">導覽說明</string>
     <string name="onboarding_authorize_retry_button">再試一次</string>
+    <string name="onboarding_mode_title">Overdrive 何時該運作？</string>
+    <string name="onboarding_mode_body">選擇 Overdrive 在您熄火後的行為。\n\n<b>開機與熄火</b>會在停車時持續監看 — 監控與背景監測維持運作，因此車輛整夜會消耗少許電力。\n\n<b>僅開機</b>會在您離開後讓 Overdrive 完全關閉。行車記錄器、行程與充電在您行車時仍會運作，而啟動車輛時一切都會自動重新啟動。您可以隨時在設定中變更此選項。</string>
+    <string name="onboarding_mode_on_off_button">開機與熄火</string>
+    <string name="onboarding_mode_on_only_button">僅開機</string>
     <string name="onboarding_expert_trips_title">行程歷史紀錄</string>
     <string name="onboarding_expert_maps_body">開啟地圖以使用完整的逐向導航 — 搜尋目的地、取得路線規劃與即時導引，以及附近的興趣點與 RoadSense 沿途記錄的任何路面危險。您也可以在開始行駛時自動投影到儀表板上 — 該切換鈕位於 RoadSense 的地圖分頁。</string>
     <string name="settings_backup_read_failed">無法讀取檔案</string>
@@ -1295,4 +1300,34 @@
     <string name="onboarding_camera_windshield_body">若要使用原廠行車記錄器版面 — 擋風玻璃相機顯示為錄影上方的條帶 — 請在角色選單中選擇「擋風玻璃」，選取前方相機，然後儲存。多數車主可略過此項。</string>
     <string name="onboarding_camera_windshield_skip">不用了，謝謝</string>
     <string name="onboarding_expert_integrations_title">整合</string>
+    <!-- Projection screen -->
+    <string name="projection_hero_title">投影</string>
+    <string name="projection_hero_subtitle">將應用程式投放到儀表板，並在此處鏡像顯示。</string>
+    <string name="projection_pick_app">選擇要投影的應用程式</string>
+    <string name="projection_cast">投放到儀表板</string>
+    <string name="projection_stop">停止</string>
+    <string name="projection_cast_failed">無法將該應用程式投放到儀表板。</string>
+    <string name="projection_status_idle">未在投影。</string>
+    <string name="projection_status_live">即時鏡像 — 輕觸並滑動以控制。</string>
+    <string name="projection_status_preview">預覽模式（此車輛的畫面更新率降低）。</string>
+    <string name="projection_status_none">尚未投影任何內容 — 請選擇應用程式並投放。</string>
+    <string name="projection_status_unsupported">此車輛不支援即時鏡像。應用程式仍會投影到儀表板。</string>
+    <string name="projection_note_single_app">儀表板一次只能投影一個應用程式。</string>
+    <string name="projection_adjust_bounds">調整區域</string>
+    <string name="projection_done_adjusting">完成</string>
+    <string name="projection_bounds_hint_idle">鏡像區域</string>
+    <string name="projection_status_adjust">拖曳以移動 · 拖曳一角以調整大小。</string>
+    <string name="projection_scale_title">縮放</string>
+    <string name="projection_scale_desc">儀表板鏡像如何填滿鏡像區域。</string>
+    <string name="projection_scale_fit">符合</string>
+    <string name="projection_scale_fill">拉伸</string>
+    <string name="projection_scale_zoom">縮放填滿</string>
+    <string name="projection_autostart_title">開機時自動啟動</string>
+    <string name="projection_autostart_desc">每次車輛通電時，自動將上次使用的應用程式投射到儀表板。（進入此畫面時鏡像才會顯示。）</string>
+    <string name="projection_autostart_need_app">請先投射一個應用程式，然後再開啟此項。</string>
+    <string name="projection_autostart_conflict_title">RoadSense 正在使用儀表板</string>
+    <string name="projection_autostart_conflict_body">RoadSense 已設定為車輛通電時自動將地圖投射到駕駛座儀表板。儀表板一次只能顯示一項內容。是否關閉該設定並改為自動啟動此應用程式？</string>
+    <string name="projection_autostart_conflict_confirm">使用此應用程式</string>
+    <string name="projection_app_uninstalled">該應用程式已被解除安裝。</string>
+    <string name="projection_status_service_down">鏡像服務尚未就緒 — 請重新啟動應用程式（或攝影機守護程序）後再試一次。</string>
 </resources>

@@ -75,6 +75,7 @@
     "streaming_start_failed_with_detail": "Failed to start pipeline: {0}",
     "streaming_enable_failed_with_detail": "Failed to enable streaming: {0}",
     "streaming_invalid_view_mode": "Invalid view mode. Use 0=Mosaic, 1=Front, 2=Right, 3=Rear, 4=Left, 5=OEM Dashcam",
+    "surveillance_all_classes_off": "This save would disable all object classes, turning AI detection off entirely. Confirm to proceed.",
     "surveillance_invalid_quadrant_id": "Invalid quadrant ID",
     "surveillance_invalid_quadrant_with_id": "Invalid quadrant: {0}",
     "surveillance_event_frame_failed_with_detail": "Failed to process event frame: {0}",
@@ -461,6 +462,7 @@
     }
   },
   "vehicle_control": {
+    "blocked_driving": "This action isn't available while the vehicle is moving",
     "cloud_required": "Connect a BYD account in Settings to use this control",
     "cloud_sent": "Sent via cloud",
     "cloud_unavailable_used_local": "Cloud unavailable — used direct connection",
@@ -661,6 +663,10 @@
     "set_fan_only_description": "Turn fan-only ventilation (no compressor) on or off. This control does not work while the vehicle is powered off.",
     "set_steering_heat": "Steering Wheel Heater",
     "set_steering_heat_description": "Turn the heated steering wheel on or off. This control does not work while the vehicle is powered off.",
+    "set_front_defrost": "Front Defrost",
+    "set_front_defrost_description": "Turn the front windscreen defrost/demister on or off. This control does not work while the vehicle is powered off.",
+    "set_rear_defrost": "Rear Defrost",
+    "set_rear_defrost_description": "Turn the rear windscreen defrost/demister on or off. This control does not work while the vehicle is powered off.",
     "set_recirculation": "Air Recirculation",
     "set_recirculation_description": "Switch the air intake between recirculating cabin air and drawing in fresh outside air.",
     "air_intake": "Air Intake",

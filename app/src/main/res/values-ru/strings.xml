@@ -206,6 +206,10 @@
     <string name="onboarding_authorize_retry_title">Все еще не подключен</string>
     <string name="onboarding_authorize_retry_body">Помощник еще не запущен. Возможно, разрешение Android было отклонено. Попробуйте еще раз и не забудьте проверить <b>всегда разрешить</b>.</string>
     <string name="onboarding_authorize_retry_button">Попробовать еще раз</string>
+    <string name="onboarding_mode_title">Когда должен работать Overdrive?</string>
+    <string name="onboarding_mode_body">Выберите, как Overdrive ведёт себя после выключения автомобиля.\n\n<b>Вкл. &amp; выкл.</b> продолжает наблюдать во время стоянки — наблюдение и фоновый мониторинг остаются активными, поэтому за ночь автомобиль расходует немного заряда.\n\n<b>Только вкл.</b> полностью выключает Overdrive, как только вы уходите. Видеорегистратор, поездки и зарядка по-прежнему работают во время движения, а при включении автомобиля всё запускается автоматически. Вы можете изменить это в любой момент в Настройках.</string>
+    <string name="onboarding_mode_on_off_button">Вкл. &amp; выкл.</string>
+    <string name="onboarding_mode_on_only_button">Только вкл.</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Камера · шаг %1$d из %2$d</string>
     <string name="onboarding_camera_intro_title">Настройка камер</string>
@@ -738,6 +742,7 @@
     <string name="rail_live">Жизнь</string>
     <string name="rail_recordings">Записи</string>
     <string name="rail_vehicle">Автомобиль</string>
+    <string name="rail_projection">Проекция</string>
     <string name="rail_trips">Поездки</string>
     <string name="rail_charging">Зарядка</string>
     <string name="rail_automations">Автоматизации</string>
@@ -1340,4 +1345,34 @@
     <string name="toast_cloudflared_token_cannot_be_empty">Если вы установили платную версию, токен не может быть пустым</string>
     <string name="toast_cloudflared_token_invalid">Неверный токен: используйте только буквы, цифры и . _ - = символы</string>
     <string name="toast_cloudflared_saved_settings">Настройки Cloudflared сохранены</string>
+    <!-- Projection screen -->
+    <string name="projection_hero_title">Проекция</string>
+    <string name="projection_hero_subtitle">Транслируйте приложение на приборную панель и отображайте его здесь.</string>
+    <string name="projection_pick_app">Выберите приложение для проекции</string>
+    <string name="projection_cast">Транслировать на панель</string>
+    <string name="projection_stop">Остановить</string>
+    <string name="projection_cast_failed">Не удалось транслировать это приложение на приборную панель.</string>
+    <string name="projection_status_idle">Проекция не выполняется.</string>
+    <string name="projection_status_live">Живое зеркало — нажимайте и проводите для управления.</string>
+    <string name="projection_status_preview">Режим предпросмотра (сниженная частота кадров на этом автомобиле).</string>
+    <string name="projection_status_none">Пока ничего не проецируется — выберите приложение и транслируйте.</string>
+    <string name="projection_status_unsupported">Живое зеркало не поддерживается на этом автомобиле. Приложение всё равно проецируется на приборную панель.</string>
+    <string name="projection_note_single_app">На приборную панель одновременно можно проецировать только одно приложение.</string>
+    <string name="projection_adjust_bounds">Настроить область</string>
+    <string name="projection_done_adjusting">Готово</string>
+    <string name="projection_bounds_hint_idle">Область зеркала</string>
+    <string name="projection_status_adjust">Перетащите, чтобы переместить · перетащите угол, чтобы изменить размер.</string>
+    <string name="projection_scale_title">Масштабирование</string>
+    <string name="projection_scale_desc">Как приборная панель заполняет область зеркала.</string>
+    <string name="projection_scale_fit">Вписать</string>
+    <string name="projection_scale_fill">Растянуть</string>
+    <string name="projection_scale_zoom">Масштаб</string>
+    <string name="projection_autostart_title">Автозапуск при включении</string>
+    <string name="projection_autostart_desc">Автоматически транслирует последнее использованное приложение на приборную панель при каждом включении автомобиля. (Зеркало открывается при переходе на этот экран.)</string>
+    <string name="projection_autostart_need_app">Сначала транслируйте приложение, затем включите это.</string>
+    <string name="projection_autostart_conflict_title">RoadSense использует приборную панель</string>
+    <string name="projection_autostart_conflict_body">RoadSense настроен на автоматическую проекцию карты на приборную панель водителя при включении автомобиля. Панель может показывать только одно за раз. Отключить это и вместо этого автоматически запускать это приложение?</string>
+    <string name="projection_autostart_conflict_confirm">Использовать это приложение</string>
+    <string name="projection_app_uninstalled">Это приложение больше не установлено.</string>
+    <string name="projection_status_service_down">Служба зеркала не готова — перезапустите приложение (или демон камеры) и повторите попытку.</string>
 </resources>

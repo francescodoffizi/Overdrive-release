@@ -445,6 +445,7 @@
     <string name="rail_live">Leve</string>
     <string name="rail_recordings">Opptak</string>
     <string name="rail_vehicle">Køretøy</string>
+    <string name="rail_projection">Projeksjon</string>
     <string name="rail_trips">Turer</string>
     <string name="rail_automations">Automatiseringer</string>
     <string name="rail_integrations">Integrasjoner</string>
@@ -753,4 +754,34 @@
     <string name="toast_cloudflared_token_invalid">Ugyldig token: bruk kun bokstaver, tall og tegnene . _ - =</string>
     <string name="toast_cloudflared_saved_settings">Cloudflared-innstillinger lagret</string>
     <string name="roadsense_map_search_network">Kunne ikke nå søketjenesten. Sjekk tilkoblingen eller proxyen din og prøv igjen.</string>
+    <!-- Projection feature -->
+    <string name="projection_hero_title">Projeksjon</string>
+    <string name="projection_hero_subtitle">Kast en app til førerens instrumentpanel og speil den her.</string>
+    <string name="projection_pick_app">Velg en app å projisere</string>
+    <string name="projection_cast">Kast til instrumentpanelet</string>
+    <string name="projection_stop">Stopp</string>
+    <string name="projection_cast_failed">Kunne ikke kaste den appen til instrumentpanelet.</string>
+    <string name="projection_status_idle">Projiserer ikke.</string>
+    <string name="projection_status_live">Sanntidsspeiling — trykk og sveip for å styre.</string>
+    <string name="projection_status_preview">Forhåndsvisningsmodus (redusert bildefrekvens på dette kjøretøyet).</string>
+    <string name="projection_status_none">Ingenting er projisert ennå — velg en app og kast den.</string>
+    <string name="projection_status_unsupported">Sanntidsspeiling støttes ikke på dette kjøretøyet. Appen projiseres fortsatt på instrumentpanelet.</string>
+    <string name="projection_note_single_app">Bare én app kan projiseres på instrumentpanelet om gangen.</string>
+    <string name="projection_adjust_bounds">Juster området</string>
+    <string name="projection_done_adjusting">Ferdig</string>
+    <string name="projection_bounds_hint_idle">Speilområde</string>
+    <string name="projection_status_adjust">Dra for å flytte · dra i et hjørne for å endre størrelse.</string>
+    <string name="projection_scale_title">Skalering</string>
+    <string name="projection_scale_desc">Hvordan instrumentpanelet fyller speilområdet.</string>
+    <string name="projection_scale_fit">Tilpass</string>
+    <string name="projection_scale_fill">Strekk</string>
+    <string name="projection_scale_zoom">Zoom</string>
+    <string name="projection_autostart_title">Start automatisk ved påslag</string>
+    <string name="projection_autostart_desc">Caster den sist brukte appen til instrumentpanelet automatisk hver gang bilen slås på. (Speilet åpnes når du besøker denne skjermen.)</string>
+    <string name="projection_autostart_need_app">Cast en app først, og slå deretter på dette.</string>
+    <string name="projection_autostart_conflict_title">RoadSense bruker instrumentpanelet</string>
+    <string name="projection_autostart_conflict_body">RoadSense er satt til å projisere kartet til førerens instrumentpanel automatisk når bilen slås på. Instrumentpanelet kan bare vise én ting om gangen. Slå av det og start denne appen automatisk i stedet?</string>
+    <string name="projection_autostart_conflict_confirm">Bruk denne appen</string>
+    <string name="projection_app_uninstalled">Den appen er ikke lenger installert.</string>
+    <string name="projection_status_service_down">Speiltjenesten er ikke klar – start appen (eller kamera-daemonen) på nytt og prøv igjen.</string>
 </resources>

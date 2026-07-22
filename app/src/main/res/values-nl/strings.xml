@@ -206,6 +206,10 @@
     <string name="onboarding_authorize_retry_title">Nog steeds niet verbonden</string>
     <string name="onboarding_authorize_retry_body">The helper isn\'t running yet. The Android permission may have been dismissed. Try again and remember to check <b>Always allow</b>.</string>
     <string name="onboarding_authorize_retry_button">Opnieuw proberen</string>
+    <string name="onboarding_mode_title">Wanneer moet Overdrive draaien?</string>
+    <string name="onboarding_mode_body">Kies hoe Overdrive zich gedraagt nadat u de auto uitschakelt.\n\n<b>Aan &amp; uit</b> blijft kijken terwijl geparkeerd — bewaking en achtergrondmonitoring blijven actief, dus de auto verbruikt \'s nachts een beetje stroom.\n\n<b>Alleen aan</b> sluit Overdrive volledig af zodra u weggaat. Dashcam, ritten en opladen werken nog steeds terwijl u rijdt, en alles start automatisch weer op zodra u de auto inschakelt. U kunt dit op elk moment wijzigen in Instellingen.</string>
+    <string name="onboarding_mode_on_off_button">Aan &amp; uit</string>
+    <string name="onboarding_mode_on_only_button">Alleen aan</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Camera · stap %1$d van %2$d</string>
     <string name="onboarding_camera_intro_title">Instellen van je camera\'s</string>
@@ -732,6 +736,7 @@
     <string name="rail_live">Leven</string>
     <string name="rail_recordings">Opnames</string>
     <string name="rail_vehicle">Voertuig</string>
+    <string name="rail_projection">Projectie</string>
     <string name="rail_trips">Ritten</string>
     <string name="rail_charging">Opladen</string>
     <string name="rail_automations">Automatiseringen</string>
@@ -1320,4 +1325,34 @@
     <string name="toast_cloudflared_token_cannot_be_empty">Als je op de betaalde versie hebt gezet, mag de token niet leeg zijn</string>
     <string name="toast_cloudflared_token_invalid">Ongeldige sleutel: gebruik alleen letters, cijfers en . _ - = tekens</string>
     <string name="toast_cloudflared_saved_settings">Cloudflared instellingen opgeslagen</string>
+    <!-- Projection screen -->
+    <string name="projection_hero_title">Projectie</string>
+    <string name="projection_hero_subtitle">Cast een app naar het instrumentencluster en spiegel het hier.</string>
+    <string name="projection_pick_app">Kies een app om te projecteren</string>
+    <string name="projection_cast">Casten naar cluster</string>
+    <string name="projection_stop">Stoppen</string>
+    <string name="projection_cast_failed">Kon die app niet naar het cluster casten.</string>
+    <string name="projection_status_idle">Niet aan het projecteren.</string>
+    <string name="projection_status_live">Live spiegel — tik en veeg om te bedienen.</string>
+    <string name="projection_status_preview">Voorbeeldmodus (verlaagde framerate op dit voertuig).</string>
+    <string name="projection_status_none">Er wordt nog niets geprojecteerd — kies een app en cast.</string>
+    <string name="projection_status_unsupported">Live spiegelen wordt niet ondersteund op dit voertuig. De app wordt nog steeds op het cluster geprojecteerd.</string>
+    <string name="projection_note_single_app">Er kan één app tegelijk op het cluster worden geprojecteerd.</string>
+    <string name="projection_adjust_bounds">Gebied aanpassen</string>
+    <string name="projection_done_adjusting">Klaar</string>
+    <string name="projection_bounds_hint_idle">Spiegelgebied</string>
+    <string name="projection_status_adjust">Sleep om te verplaatsen · sleep een hoek om het formaat te wijzigen.</string>
+    <string name="projection_scale_title">Schalen</string>
+    <string name="projection_scale_desc">Hoe het instrumentenpaneel het spiegelgebied vult.</string>
+    <string name="projection_scale_fit">Passend</string>
+    <string name="projection_scale_fill">Uitrekken</string>
+    <string name="projection_scale_zoom">Zoom</string>
+    <string name="projection_autostart_title">Automatisch starten bij inschakelen</string>
+    <string name="projection_autostart_desc">Cast de laatst gebruikte app automatisch naar het instrumentenpaneel telkens wanneer de auto wordt ingeschakeld. (De spiegel opent wanneer je dit scherm bezoekt.)</string>
+    <string name="projection_autostart_need_app">Cast eerst een app en schakel dit daarna in.</string>
+    <string name="projection_autostart_conflict_title">RoadSense gebruikt het instrumentenpaneel</string>
+    <string name="projection_autostart_conflict_body">RoadSense is ingesteld om de kaart automatisch naar het instrumentenpaneel van de bestuurder te projecteren wanneer de auto wordt ingeschakeld. Het instrumentenpaneel kan maar één ding tegelijk tonen. Dat uitschakelen en in plaats daarvan deze app automatisch starten?</string>
+    <string name="projection_autostart_conflict_confirm">Deze app gebruiken</string>
+    <string name="projection_app_uninstalled">Die app is niet meer geïnstalleerd.</string>
+    <string name="projection_status_service_down">De spiegelservice is niet gereed — herstart de app (of de camera-daemon) en probeer het opnieuw.</string>
 </resources>
