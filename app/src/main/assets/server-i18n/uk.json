@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "Завантаження журналу недоступне в цій збірці",
     "logs_unknown_daemon": "Невідомий демон. Наприклад: {0}",
     "update_progress_unreadable": "Файл прогресу неможливо прочитати",
+    "vehicle_blocked_in_motion": "Ця дія недоступна, поки автомобіль рухається",
     "vehicle_data_unavailable": "Дані про ТЗ недоступні",
     "vehicle_trunk_unlock_failed": "Не вдалося відкрити чан: розблокування не виконано. Автомобіль все ще заблоковано.",
     "vehicle_window_target_requires_area": "для досягнення цільового відсотків потрібна певна область (1-6)",
@@ -135,6 +136,7 @@
     "proximity_alert": "🚨 Proximity Alert\nTime: {0}\nTrigger: {1} ({2})\nRecording started..."
   },
   "vehicle_control": {
+    "blocked_driving": "Ця дія недоступна, поки автомобіль рухається",
     "cloud_required": "Під'єднайте обліковий запис BYD в налаштуваннях, щоб використовувати це управління",
     "cloud_sent": "Надіслано у хмарі",
     "cloud_unavailable_used_local": "Хмара недоступна — використовується пряме підключення",

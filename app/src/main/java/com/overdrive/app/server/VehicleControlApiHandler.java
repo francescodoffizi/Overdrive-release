@@ -4,6 +4,7 @@ import com.overdrive.app.byd.BydDataCollector;
 import com.overdrive.app.byd.BydVehicleData;
 import com.overdrive.app.byd.cloud.BydCloudConfig;
 import com.overdrive.app.byd.light.LightConstants;
+import com.overdrive.app.byd.routing.DrivingSafetyGuard;
 import com.overdrive.app.byd.routing.VehicleCommandRouter;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.CommandResult;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.VehicleCommand;
@@ -1175,6 +1176,18 @@ public class VehicleControlApiHandler {
                 HttpResponse.sendJson(out, response.toString());
                 return;
             }
+            // Every screen/brightness target (infotainment, cluster, HUD, screen
+            // power) removes or dims safety-relevant display information — gate
+            // them all the same way. Volume is excluded: a separate, lower-severity
+            // issue (no ceiling on remote volume changes), not a driving-state gate.
+            boolean screenTarget = !isVolume;
+            if (screenTarget && DrivingSafetyGuard.isMovementBlocked()) {
+                response.put("success", false);
+                response.put("outcome", "blocked_driving");
+                response.put("error", Messages.get("errors.vehicle_blocked_in_motion"));
+                HttpResponse.sendJson(out, 409, response.toString());
+                return;
+            }
             boolean ok;
             if (isMediaKey) {
                 // Transport control via AudioManager.dispatchMediaKeyEvent — a Binder
@@ -1429,6 +1442,13 @@ public class VehicleControlApiHandler {
             // "display": "screen" shows an MP4's picture on the head-unit SurfaceControl
             // lane; anything else (default) is audio-only (speakers). Audio files ignore it.
             boolean onScreen = "screen".equalsIgnoreCase(req.optString("display", "speakers"));
+            if (onScreen && DrivingSafetyGuard.isMovementBlocked()) {
+                response.put("success", false);
+                response.put("outcome", "blocked_driving");
+                response.put("error", Messages.get("errors.vehicle_blocked_in_motion"));
+                HttpResponse.sendJson(out, 409, response.toString());
+                return;
+            }
             // Prefer a library "name"; fall back to an explicit "path".
             String name = req.optString("name", null);
             String path = req.optString("path", null);

@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "Lokin lataus ei ole käytettävissä tässä versiossa",
     "logs_unknown_daemon": "Tuntematon taustaprosessi. Try: {0}",
     "update_progress_unreadable": "Edistymistiedostoa ei voi lukea",
+    "vehicle_blocked_in_motion": "Tämä toiminto ei ole käytettävissä ajoneuvon liikkuessa",
     "vehicle_data_unavailable": "Ajoneuvon tiedot eivät ole saatavilla",
     "vehicle_trunk_unlock_failed": "Ei voida avata: lukituksen poisto epäonnistui. Auto voidaan silti lukita",
     "vehicle_window_target_requires_area": "kohdeProsentti vaatii tietyn alueen (1-6)",
@@ -135,6 +136,7 @@
     "proximity_alert": "🚨 Lähivarmennus\nAika: {0}\nLaukaisu: {1} ({2})\nNauhoitus aloitettu..."
   },
   "vehicle_control": {
+    "blocked_driving": "Tämä toiminto ei ole käytettävissä ajoneuvon liikkuessa",
     "cloud_required": "Yhdistä BYD tili Asetuksiin käyttääksesi tätä ohjausta",
     "cloud_sent": "Lähetetty pilven kautta",
     "cloud_unavailable_used_local": "Pilvi ei ole käytettävissä — käytetty suora yhteys",

@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "تحميل السجل غير متوفر في هذا البناء",
     "logs_unknown_daemon": "مجهول. جرب: {0}",
     "update_progress_unreadable": "ملف التقدم غير مقروء",
+    "vehicle_blocked_in_motion": "هذا الإجراء غير متاح أثناء تحرك السيارة",
     "vehicle_data_unavailable": "بيانات السيارة غير متوفرة",
     "vehicle_trunk_unlock_failed": "لا يمكن فتح الهاوية: فشل الفتح. قد تظل السيارة مقفلة.",
     "vehicle_window_target_requires_area": "الهدف يتطلب مساحة محددة (1-6)",

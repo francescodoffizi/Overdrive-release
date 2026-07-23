@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "O envio de logs não está disponível nesta compilação",
     "logs_unknown_daemon": "Daemon desconhecido. Tente: {0}",
     "update_progress_unreadable": "Arquivo de progressão não legível",
+    "vehicle_blocked_in_motion": "Esta ação não está disponível enquanto o veículo está em movimento",
     "vehicle_data_unavailable": "Dados do veículo não disponíveis",
     "vehicle_trunk_unlock_failed": "Não posso abrir o porta-bagagens, o desbloqueio falhou, o carro pode ainda estar trancado.",
     "vehicle_window_target_requires_area": "ObjectivoPercentual requer uma área específica (1-6)",

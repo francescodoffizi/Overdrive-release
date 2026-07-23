@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "Loggopplasting er ikke tilgjengelig i denne versjonen",
     "logs_unknown_daemon": "Ukjent demon. Try: {0}",
     "update_progress_unreadable": "Fremdriftsfil er uleselig",
+    "vehicle_blocked_in_motion": "Denne handlingen er ikke tilgjengelig mens kjøretøyet er i bevegelse",
     "vehicle_data_unavailable": "Kjøretøyets data er ikke tilgjengelig",
     "vehicle_trunk_unlock_failed": "Kan ikke åpne trunk: opplåsing mislyktes. Bilen kan fortsatt låses.",
     "vehicle_window_target_requires_area": "Målprosent krever et spesifikt område (1-6)",
@@ -137,6 +138,7 @@
     "proximity_alert": "🚨 Nærhetsvarsel\nTid: {0}\nTrigger: {1} ({2})\nOpptak startet..."
   },
   "vehicle_control": {
+    "blocked_driving": "Denne handlingen er ikke tilgjengelig mens kjøretøyet er i bevegelse",
     "cloud_required": "Koble til en BYD-konto i Innstillinger for å bruke denne kontrollen",
     "cloud_sent": "Sendt via sky",
     "cloud_unavailable_used_local": "Sky utilgjengelig – brukt direkte tilkobling",

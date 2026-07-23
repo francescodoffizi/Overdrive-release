@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "このビルドではログのアップロードはできません",
     "logs_unknown_daemon": "不明なデーモンです。 {0} を試してください",
     "update_progress_unreadable": "進行ファイルは読み取れない",
+    "vehicle_blocked_in_motion": "この操作は車両走行中は利用できません",
     "vehicle_data_unavailable": "車両データは利用できない",
     "vehicle_trunk_unlock_failed": "箱を開けられない 解錠失敗 車はまだロックされているかもしれない",
     "vehicle_window_target_requires_area": "目標 パーセントは特定の領域を必要とする (1-6)",

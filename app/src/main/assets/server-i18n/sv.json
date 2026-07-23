@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "Logguppladdning är inte tillgänglig i denna version",
     "logs_unknown_daemon": "Okänd daemon. Prova: {0}",
     "update_progress_unreadable": "Oläsbar framstegsfil",
+    "vehicle_blocked_in_motion": "Den här åtgärden är inte tillgänglig medan fordonet är i rörelse",
     "vehicle_data_unavailable": "Fordonsuppgifter är inte tillgängliga",
     "vehicle_trunk_unlock_failed": "Kan inte öppna stammen: upplåsning misslyckades. Bilen kan fortfarande vara låst.",
     "vehicle_window_target_requires_area": "MålProcent kräver ett specifikt område (1-6)",
@@ -135,6 +136,7 @@
     "proximity_alert": "🚨 Närhetsvarning\nTid: {0}\nUtlösare: {1} ({2})\nInspelning startad..."
   },
   "vehicle_control": {
+    "blocked_driving": "Den här åtgärden är inte tillgänglig medan fordonet är i rörelse",
     "cloud_required": "Anslut ett BYD-konto i Inställningar för att använda denna kontroll",
     "cloud_sent": "Skickat via moln",
     "cloud_unavailable_used_local": "Molnet ej tillgängligt — använd direkt anslutning",

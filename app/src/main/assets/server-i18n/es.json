@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "La carga de registros no está disponible en esta versión",
     "logs_unknown_daemon": "Daemón desconocido. Intentar: {0}",
     "update_progress_unreadable": "Ficha de progreso no se puede leer",
+    "vehicle_blocked_in_motion": "Esta acción no está disponible mientras el vehículo está en movimiento",
     "vehicle_data_unavailable": "Datos del vehículo no disponibles",
     "vehicle_trunk_unlock_failed": "No se puede abrir el maletero, el desbloqueo no funcionó.",
     "vehicle_window_target_requires_area": "objetivoEl porcentaje requiere un área específica (1-6)",

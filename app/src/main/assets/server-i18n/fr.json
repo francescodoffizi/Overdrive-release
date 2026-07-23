@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "L'upload de logs n'est pas disponible dans cette version",
     "logs_unknown_daemon": "Démon inconnu. Essayer : {0}",
     "update_progress_unreadable": "Fichier de progression illisible",
+    "vehicle_blocked_in_motion": "Cette action n'est pas disponible pendant que le véhicule est en mouvement",
     "vehicle_data_unavailable": "Données du véhicule non disponibles",
     "vehicle_trunk_unlock_failed": "Impossible d'ouvrir le coffre: échec du déverrouillage. La voiture est peut-être encore verrouillée.",
     "vehicle_window_target_requires_area": "Le pourcentage cible nécessite une zone spécifique (1-6)",

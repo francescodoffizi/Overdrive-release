@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "이 빌드에서는 로그 업로드를 사용할 수 없습니다.",
     "logs_unknown_daemon": "알 수 없는 데몬입니다. 시도해 보세요: {0}",
     "update_progress_unreadable": "진행 파일 읽기 불가능",
+    "vehicle_blocked_in_motion": "차량이 주행 중일 때는 이 작업을 사용할 수 없습니다",
     "vehicle_data_unavailable": "차량 데이터가 없습니다",
     "vehicle_trunk_unlock_failed": "가방 열 수 없으니 잠금을 풀지 못했고 차는 여전히 잠겨 있을 수도 있습니다.",
     "vehicle_window_target_requires_area": "목표율은 특정 영역을 필요로 한다 (1-6)",

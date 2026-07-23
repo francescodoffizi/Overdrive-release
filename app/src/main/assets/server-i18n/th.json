@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "การอัปโหลดบันทึกไม่สามารถใช้งานได้ในบิลด์นี้",
     "logs_unknown_daemon": "เดมอนไม่รู้จัก ลอง: {0}",
     "update_progress_unreadable": "อ่านสถานะอัปเดตไม่ได้",
+    "vehicle_blocked_in_motion": "การดำเนินการนี้ไม่สามารถใช้งานได้ขณะรถกำลังเคลื่อนที่",
     "vehicle_data_unavailable": "ไม่มีข้อมูลรถ",
     "vehicle_trunk_unlock_failed": "เปิดฝากระโปรงท้ายไม่ได้ รถอาจจะล็อกอยู่",
     "vehicle_window_target_requires_area": "คุมกระจกต้องระบุบานที่ต้องการ (1-6)",

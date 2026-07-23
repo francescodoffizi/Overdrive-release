@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "Nahrávání protokolu není v tomto sestavení k dispozici",
     "logs_unknown_daemon": "Neznámý daemon. Try: {0}",
     "update_progress_unreadable": "Soubor průběhu nelze přečíst",
+    "vehicle_blocked_in_motion": "Tato akce není k dispozici, když je vozidlo v pohybu",
     "vehicle_data_unavailable": "Údaje o vozidle nejsou k dispozici",
     "vehicle_trunk_unlock_failed": "Nelze otevřít kmen: odemknutí se nezdařilo. Vozidlo může být stále uzamčeno.",
     "vehicle_window_target_requires_area": "targetPProcent vyžaduje konkrétní oblast (1-6)",
@@ -135,6 +136,7 @@
     "proximity_alert": "🚨 Upozornění na blízkost\nČas: {0}\nTrigger: {1} ({2})\nNahrávání..."
   },
   "vehicle_control": {
+    "blocked_driving": "Tato akce není k dispozici, když je vozidlo v pohybu",
     "cloud_required": "Pro použití tohoto ovládání připojte BYD účet v nastavení",
     "cloud_sent": "Odesláno přes cloud",
     "cloud_unavailable_used_local": "Cloud není k dispozici – použité přímé připojení",

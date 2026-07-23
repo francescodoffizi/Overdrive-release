@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "Log upload is not available in this build",
     "logs_unknown_daemon": "Unknown daemon. Try: {0}",
     "update_progress_unreadable": "Progress file unreadable",
+    "vehicle_blocked_in_motion": "This action isn't available while the vehicle is moving",
     "vehicle_data_unavailable": "Vehicle data not available",
     "vehicle_trunk_unlock_failed": "Cannot open trunk: unlock failed. Car may still be locked.",
     "vehicle_window_target_requires_area": "targetPercent requires a specific area (1-6)",
@@ -135,6 +136,7 @@
     "proximity_alert": "🚨 Proximity Alert\nTime: {0}\nTrigger: {1} ({2})\nRecording started..."
   },
   "vehicle_control": {
+    "blocked_driving": "This action isn't available while the vehicle is moving",
     "cloud_required": "Connecteu un compte de BYD a Configuració per utilitzar aquest control",
     "cloud_sent": "Enviat mitjançant el núvol",
     "cloud_unavailable_used_local": "Núvol no disponible; s'ha utilitzat la connexió directa",

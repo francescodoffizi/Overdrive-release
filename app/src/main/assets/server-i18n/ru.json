@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "Загрузка журнала недоступна в этой сборке",
     "logs_unknown_daemon": "Неизвестный демон. Попробовать: {0}",
     "update_progress_unreadable": "Прогресс файл нечитаемый",
+    "vehicle_blocked_in_motion": "Это действие недоступно, пока автомобиль движется",
     "vehicle_data_unavailable": "Данные о транспортном средстве отсутствуют",
     "vehicle_trunk_unlock_failed": "Я не могу открыть багажник, не удалось разблокировать.",
     "vehicle_window_target_requires_area": "ЦельПроцент требует определенной области (1-6)",

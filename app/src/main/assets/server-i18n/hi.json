@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "इस बिल्ड में लॉग अपलोड उपलब्ध नहीं है",
     "logs_unknown_daemon": "अज्ञात डीमन। प्रयास करें: {0}",
     "update_progress_unreadable": "प्रगति फ़ाइल अपठनीय",
+    "vehicle_blocked_in_motion": "वाहन चलते समय यह क्रिया उपलब्ध नहीं है",
     "vehicle_data_unavailable": "वाहन डेटा उपलब्ध नहीं",
     "vehicle_trunk_unlock_failed": "ट्रंक नहीं खोल सकता, अनलॉक विफल रहा। कार अभी भी लॉक हो सकता है।",
     "vehicle_window_target_requires_area": "लक्ष्य प्रतिशत के लिए एक विशिष्ट क्षेत्र की आवश्यकता होती है (1-6)",

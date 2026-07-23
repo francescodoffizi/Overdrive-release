@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "Incarcarea jurnalului nu este disponibila in aceasta versiune",
     "logs_unknown_daemon": "daemon necunoscut. Încearcă: {0}",
     "update_progress_unreadable": "Fișier de progres ilizibil",
+    "vehicle_blocked_in_motion": "Această acțiune nu este disponibilă în timp ce vehiculul este în mișcare",
     "vehicle_data_unavailable": "Datele vehiculului nu sunt disponibile",
     "vehicle_trunk_unlock_failed": "Nu se poate deschide trunkul: deblocarea a eșuat. Mașina poate fi încă blocată.",
     "vehicle_window_target_requires_area": "Procentul țintă necesită o anumită zonă (1-6)",
@@ -135,6 +136,7 @@
     "proximity_alert": "🚨 Alerta de proximitate\nTimp: {0}\nTrigger: {1} ({2})\nÎnregistrare începută..."
   },
   "vehicle_control": {
+    "blocked_driving": "Această acțiune nu este disponibilă în timp ce vehiculul este în mișcare",
     "cloud_required": "Conectați un cont BYD în Setări pentru a utiliza acest control",
     "cloud_sent": "Trimis prin nor",
     "cloud_unavailable_used_local": "Cloud indisponibil — conexiune directă utilizată",

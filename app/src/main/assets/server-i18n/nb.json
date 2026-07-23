@@ -87,6 +87,7 @@
     "update_pre_install_failed_with_detail": "Forinstalleringskontroll mislyktes: {0}",
     "update_no_update_available": "Ingen oppdatering tilgjengelig",
     "update_progress_unreadable": "Progressfil ulæsbart",
+    "vehicle_blocked_in_motion": "Denne handlingen er ikke tilgjengelig mens kjøretøyet er i bevegelse",
     "vehicle_data_unavailable": "Ikke tilgjengelige kjøretøydata",
     "vehicle_trunk_unlock_failed": "Jeg kan ikke åpne kofferten, låset er ikke lukket.",
     "vehicle_window_target_requires_area": "målProsent krever et bestemt område (1-6)",

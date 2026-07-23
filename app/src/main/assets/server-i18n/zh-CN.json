@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "此版本不提供記錄檔上傳功能",
     "logs_unknown_daemon": "未知的守護程式。請嘗試：{0}",
     "update_progress_unreadable": "進行檔案無法閱讀",
+    "vehicle_blocked_in_motion": "車輛行駛中無法使用此操作",
     "vehicle_data_unavailable": "沒有車輛資料",
     "vehicle_trunk_unlock_failed": "難以打開行李箱, 開鎖失敗.",
     "vehicle_window_target_requires_area": "目標百分比需要特定的區域 (1-6)",

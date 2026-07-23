@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "Tải nhật ký lên không khả dụng trong bản dựng này",
     "logs_unknown_daemon": "Daemon không xác định. Thử: {0}",
     "update_progress_unreadable": "Dữ liệu tiến bộ không thể đọc được",
+    "vehicle_blocked_in_motion": "Thao tác này không khả dụng khi xe đang di chuyển",
     "vehicle_data_unavailable": "Dữ liệu xe không có sẵn",
     "vehicle_trunk_unlock_failed": "Tôi không thể mở thùng, khóa đã thất bại, có thể xe vẫn bị khóa.",
     "vehicle_window_target_requires_area": "mục tiêuPhần trăm yêu cầu một khu vực cụ thể (1-6)",

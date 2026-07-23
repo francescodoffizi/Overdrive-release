@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "Log-upload er ikke tilgængelig i denne build",
     "logs_unknown_daemon": "Ukendt dæmon. Try: {0}",
     "update_progress_unreadable": "Fremdriftsfil ulæselig",
+    "vehicle_blocked_in_motion": "Denne handling er ikke tilgængelig, mens køretøjet kører",
     "vehicle_data_unavailable": "Køretøjsdata er ikke tilgængelige",
     "vehicle_trunk_unlock_failed": "Kan ikke åbne trunk: oplåsning mislykkedes. Bilen kan stadig låses.",
     "vehicle_window_target_requires_area": "targetProcent kræver et specifikt område (1-6)",
@@ -135,6 +136,7 @@
     "proximity_alert": "🚨 Proximity Alert\nTid: {0}\nTrigger: {1} ({2})\nOptagelse startet..."
   },
   "vehicle_control": {
+    "blocked_driving": "Denne handling er ikke tilgængelig, mens køretøjet kører",
     "cloud_required": "Tilslut en BYD-konto i Indstillinger for at bruge denne kontrol",
     "cloud_sent": "Sendt via sky",
     "cloud_unavailable_used_local": "Cloud utilgængelig — brugt direkte forbindelse",

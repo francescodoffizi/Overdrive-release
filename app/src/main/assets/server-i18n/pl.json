@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "Wgrywanie dziennika nie jest dostępne w tej kompilacji",
     "logs_unknown_daemon": "Nieznany demon. Wypróbuj: {0}",
     "update_progress_unreadable": "Nieczytelny plik postępu",
+    "vehicle_blocked_in_motion": "Ta czynność nie jest dostępna, gdy pojazd jest w ruchu",
     "vehicle_data_unavailable": "Dane pojazdu niedostępne",
     "vehicle_trunk_unlock_failed": "Nie można otworzyć tułowia: odblokowanie nie powiodło się. Samochód może być nadal zablokowany.",
     "vehicle_window_target_requires_area": "docelowy procent wymaga określonego obszaru (1-6)",
@@ -135,6 +136,7 @@
     "proximity_alert": "🚨 Powiadomienie o zbliżeniu\nCzas: {0}\nWyzwalacz: {1} ({2})\nNagrywanie rozpoczęte..."
   },
   "vehicle_control": {
+    "blocked_driving": "Ta czynność nie jest dostępna, gdy pojazd jest w ruchu",
     "cloud_required": "Połącz konto BYD w Ustawieniach, aby użyć tej kontroli",
     "cloud_sent": "Wysłane przez chmurę",
     "cloud_unavailable_used_local": "Chmura niedostępna — używane połączenie bezpośrednie",

@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "Log-Upload ist in diesem Build nicht verfügbar",
     "logs_unknown_daemon": "Unbekannter Daemon. Versuch: {0}",
     "update_progress_unreadable": "Fortschrittsdatei nicht lesbar",
+    "vehicle_blocked_in_motion": "Diese Aktion ist nicht verfügbar, während sich das Fahrzeug bewegt",
     "vehicle_data_unavailable": "Fahrzeugdaten nicht verfügbar",
     "vehicle_trunk_unlock_failed": "Ich kann den Kofferraum nicht öffnen.",
     "vehicle_window_target_requires_area": "ZielProzent erfordert einen bestimmten Bereich (1-6)",

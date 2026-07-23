@@ -90,6 +90,7 @@
     "logs_upload_unavailable": "O envio de logs não está disponível nesta compilação",
     "logs_unknown_daemon": "daemon desconhecido. Tente: {0}",
     "update_progress_unreadable": "Arquivo de progresso ilegível",
+    "vehicle_blocked_in_motion": "Esta ação não está disponível enquanto o veículo está em movimento",
     "vehicle_data_unavailable": "Dados do veículo não disponíveis",
     "vehicle_trunk_unlock_failed": "Não é possível abrir o tronco: desbloqueio falhou. O carro ainda pode estar trancado.",
     "vehicle_window_target_requires_area": "targetPercent requer uma área específica (1-6)",
@@ -135,6 +136,7 @@
     "proximity_alert": "🚨 Alerta de Proximidade\nTempo: {0}\nDisparador: {1} ({2})\nGravação iniciada..."
   },
   "vehicle_control": {
+    "blocked_driving": "Esta ação não está disponível enquanto o veículo está em movimento",
     "cloud_required": "Conecte uma conta BYD em Configurações para usar este controle",
     "cloud_sent": "Enviado por nuvem",
     "cloud_unavailable_used_local": "Cloud indisponível - conexão direta usada",
