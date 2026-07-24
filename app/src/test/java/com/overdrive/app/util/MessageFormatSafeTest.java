@@ -23,15 +23,16 @@ public class MessageFormatSafeTest {
     private static final Locale UK = Locale.forLanguageTag("uk");
     private static final Locale NL = Locale.forLanguageTag("nl");
 
-    // ── The severe case: apostrophe BEFORE a placeholder swallows it ──────
+    // ── The severe case: an ODD apostrophe count before a placeholder ─────
+    // The unclosed quote run swallows the substitution entirely; without the
+    // escape these render the literal "{0}".
 
     @Test
-    public void apostropheBeforePlaceholderStillSubstitutes() {
-        // fr errors.recordings_not_found_with_filename — without escaping this
-        // renders the literal "{0}" and the user never sees the filename.
-        assertEquals("L'enregistrement n'a pas été trouvé: clip.mp4",
-                MessageFormatSafe.format(
-                        "L'enregistrement n'a pas été trouvé: {0}", FR, "clip.mp4"));
+    public void oddApostropheRunNoLongerSwallowsThePlaceholder() {
+        // uk errors.connection_not_found — one lone apostrophe, so the raw
+        // quote run extends to end-of-string and {0} is inside it.
+        assertEquals("З'єднання не знайдено: conn-4",
+                MessageFormatSafe.format("З'єднання не знайдено: {0}", UK, "conn-4"));
     }
 
     @Test
@@ -42,13 +43,46 @@ public class MessageFormatSafeTest {
                         "Максимальна кількість з'єднань досягнута ({0})", UK, 8));
     }
 
-    // ── The mild case: apostrophe AFTER the placeholder is merely dropped ─
+    // ── The mild case: an EVEN count closes its run before the placeholder ─
+    // Raw MessageFormat drops the apostrophes but still substitutes; the fix
+    // must keep the substitution AND restore the apostrophes.
+
+    @Test
+    public void evenApostropheRunKeepsBothApostrophesAndTheSubstitution() {
+        // fr errors.recordings_not_found_with_filename — two lone apostrophes
+        // (L', n'a), so raw MessageFormat renders "Lenregistrement na pas été
+        // trouvé: clip.mp4": placeholder fine, prose mangled.
+        assertEquals("L'enregistrement n'a pas été trouvé: clip.mp4",
+                MessageFormatSafe.format(
+                        "L'enregistrement n'a pas été trouvé: {0}", FR, "clip.mp4"));
+    }
 
     @Test
     public void dutchPossessiveApostropheIsPreserved() {
         // nl telegram.recording_caption_no_label
         assertEquals(" Opname - 14:32's",
                 MessageFormatSafe.format(" Opname - {0}'s", NL, "14:32"));
+    }
+
+    @Test
+    public void nullLocaleStillEscapesAndSubstitutes() {
+        // SrtWriter passes null to keep the old MessageFormat.format(template,
+        // args) default-locale semantics — the escaping must apply there too.
+        assertEquals(" Opname - 14:32's",
+                MessageFormatSafe.format(" Opname - {0}'s", null, "14:32"));
+        assertEquals("З'єднання не знайдено: conn-4",
+                MessageFormatSafe.format("З'єднання не знайдено: {0}", null, "conn-4"));
+    }
+
+    // ── The safety-net contract: broken translations must not throw ───────
+    // This catch path is the sole crash guard for every Messages.get call
+    // site; a refactor that narrows the try block must fail here.
+
+    @Test
+    public void malformedTemplateReturnsTheRawTemplateInsteadOfThrowing() {
+        // Unbalanced brace — MessageFormat.applyPattern throws internally.
+        assertEquals("Enregistrements supprimés: {0 fichiers",
+                MessageFormatSafe.format("Enregistrements supprimés: {0 fichiers", FR, 3));
     }
 
     // ── Escaping rules ───────────────────────────────────────────────────

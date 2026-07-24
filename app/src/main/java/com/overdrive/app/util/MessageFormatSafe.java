@@ -15,18 +15,34 @@ import java.util.Locale;
  * of the languages we ship: French {@code l'}, {@code d'}, {@code n'};
  * Ukrainian {@code з'}; Dutch {@code {0}'s}; Turkish {@code {0}'de}. Translators
  * write these naturally and cannot reasonably be asked to type {@code ''}, so
- * the catalogs accumulate templates that silently drop an apostrophe — or, when
- * it precedes a placeholder, drop the substitution:
+ * the catalogs accumulate templates that silently drop apostrophes. Whether a
+ * placeholder is also lost depends on where it falls relative to the quote
+ * runs, i.e. on the PARITY of the apostrophes before it — which is exactly why
+ * this class of bug is treacherous to reason about per-string:
  *
  * <pre>
+ *   // ODD count: the run never closes, the placeholder is inside it — LOST:
+ *   "З'єднання не знайдено: {0}"
+ *      → "Зєднання не знайдено: {0}"                 // connection never shown
+ *
+ *   // EVEN count: both apostrophes drop but the run closes before {0} — kept:
  *   "L'enregistrement n'a pas été trouvé: {0}"
- *      → "Lenregistrement na pas été trouvé: {0}"   // filename never shown
+ *      → "Lenregistrement na pas été trouvé: clip.mp4"
  * </pre>
  *
  * <p>This helper escapes lone apostrophes immediately before formatting, so the
  * catalog can hold ordinary prose and the placeholders still resolve. Existing
  * {@code ''} pairs are left alone, making the transform safe to apply to a
  * template that was already escaped by hand.
+ *
+ * <p><b>Known limitation — typed subformats.</b> The escape runs once, at the
+ * top level. {@code {0,choice,...}} branches are re-parsed recursively by
+ * {@code MessageFormat.subformat} after {@code ChoiceFormat} has collapsed
+ * {@code ''} back to {@code '}, so an apostrophe inside a choice branch that
+ * also nests a placeholder is NOT protected. No shipped catalog uses typed
+ * subformats ({@code {0,number}}, {@code {0,choice}}, ...), and
+ * {@code ServerI18nPlaceholderRenderingTest} enforces that they stay out of the
+ * catalogs until this class handles them.
  */
 public final class MessageFormatSafe {
 
