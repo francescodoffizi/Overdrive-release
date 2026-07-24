@@ -71,6 +71,30 @@ public class PermissionGranterTest {
     }
 
     @Test
+    public void deniedAnywhereWinsOverGrantedElsewhere() {
+        // dumpsys emits one runtime block per Android user; pm grant (no
+        // --user) only fixes user 0. A permission revoked in one block but
+        // granted in another must be re-granted, not skipped — regardless of
+        // which line the parser encounters first.
+        String multiUser = String.join("\n",
+                "      runtime permissions:",
+                "        android.permission.ACCESS_FINE_LOCATION: granted=false, flags=[ USER_SET]",
+                "    User 10: ceDataInode=456 installed=true hidden=false",
+                "      runtime permissions:",
+                "        android.permission.ACCESS_FINE_LOCATION: granted=true",
+                "");
+        assertFalse(PermissionGranter.parseGrantedPermissions(multiUser)
+                .contains("android.permission.ACCESS_FINE_LOCATION"));
+
+        String reversedOrder = String.join("\n",
+                "        android.permission.ACCESS_FINE_LOCATION: granted=true",
+                "        android.permission.ACCESS_FINE_LOCATION: granted=false, flags=[ USER_SET]",
+                "");
+        assertFalse(PermissionGranter.parseGrantedPermissions(reversedOrder)
+                .contains("android.permission.ACCESS_FINE_LOCATION"));
+    }
+
+    @Test
     public void excludesMerelyRequestedPermissions() {
         // The "requested permissions:" block lists bare names with no
         // granted= marker. Treating those as granted would skip the very

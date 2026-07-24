@@ -227,19 +227,30 @@ public final class PermissionGranter {
             int alreadyHeld = 0;
             List<String> failures = new ArrayList<>();
 
-            // One dumpsys read instead of 145 speculative grants. Every grant we
-            // can skip is a `sh` fork, a `cmd package` fork, a PMS binder call
-            // and a GRANT_THROTTLE_MS sleep that no longer lands on top of the
-            // camera HAL's first-frame window during daemon start.
+            // One dumpsys read instead of speculative grants for permissions
+            // the app already holds. Every grant we can skip is a `sh` fork, a
+            // `cmd package` fork, a PMS binder call and a GRANT_THROTTLE_MS
+            // sleep that no longer lands on top of the camera HAL's
+            // first-frame window during daemon start.
             //
-            // On a settled device this empties the loop almost completely; after
-            // a fresh install it is one extra call before the same full pass.
-            // Reading the live state (rather than persisting a "done" marker)
-            // keeps it self-correcting if a permission is ever revoked.
+            // Scope honestly stated: on the measured settled device this skips
+            // the ~33 grantable permissions dumpsys reports as held (19.1s ->
+            // 15.1s). The ~112 signature-level entries are never reported
+            // granted, so they still pay fork + binder + throttle every start;
+            // eliminating those would need a device-fingerprint-keyed cache
+            // whose stale-skip failure mode is worse than the waste (see
+            // issue #178). Reading live state (rather than persisting a
+            // "done" marker) keeps this self-correcting if a permission is
+            // ever revoked.
             Set<String> alreadyGranted = readGrantedPermissions(packageName);
+            // Intersect with our grant list before logging so the count here
+            // matches the "already held" counter in the Done line — dumpsys
+            // also reports grants we never attempt (auto-granted install-time
+            // and vendor permissions outside ALL_PERMISSIONS).
+            alreadyGranted.retainAll(java.util.Arrays.asList(ALL_PERMISSIONS));
             if (!alreadyGranted.isEmpty()) {
-                log("dumpsys reports " + alreadyGranted.size()
-                    + " permissions already held — those will be skipped");
+                log("dumpsys: " + alreadyGranted.size() + " of " + ALL_PERMISSIONS.length
+                    + " grant-list permissions already held — skipping those");
             }
 
             for (String permission : ALL_PERMISSIONS) {
@@ -270,10 +281,12 @@ public final class PermissionGranter {
                 }
                 
                 // Throttle: yield between grants to avoid flooding PMS.
-                // 50ms per grant ISSUED — permissions we already hold skip the
-                // loop body above, so a settled device now sleeps ~0s here
-                // instead of the full 145 × 50ms ≈ 7s. Unthrottled, this was
-                // observed at 199s when PMS was overloaded by rapid restarts.
+                // 50ms per grant ISSUED — already-held permissions skip the
+                // loop body above. Measured on a settled device: ~112
+                // signature-level entries still reach here (dumpsys never
+                // reports them granted), so this sleeps ~5.6s per start, down
+                // from ~7.25s. Unthrottled, this was observed at 199s when PMS
+                // was overloaded by rapid restarts.
                 try { Thread.sleep(GRANT_THROTTLE_MS); } catch (InterruptedException e) {
                     log("Interrupted during throttle — aborting remaining grants");
                     break;
@@ -353,6 +366,14 @@ public final class PermissionGranter {
      * bare names with no grant marker, and treating those as granted would skip
      * exactly the grants we still need to issue.
      *
+     * <p>A permission reported {@code granted=false} ANYWHERE in the dump is
+     * excluded even if another line reports it {@code granted=true}. DiLink
+     * head units are single-user, but dumpsys emits one runtime block per
+     * Android user and {@code pm grant} (no {@code --user}) only fixes user 0 —
+     * so if a multi-user image ever appears, a permission revoked for user 0
+     * but held by another user must be re-granted, not skipped. Denied-wins is
+     * the safe direction: under-collecting merely re-issues a no-op grant.
+     *
      * <p>Returns an empty set for null / empty / unrecognised output. That is
      * the safe direction: an unreadable dumpsys degrades to "grant everything"
      * (the old behaviour), never to "skip everything".
@@ -361,20 +382,27 @@ public final class PermissionGranter {
         Set<String> granted = new HashSet<>();
         if (dumpsysOutput == null || dumpsysOutput.isEmpty()) return granted;
 
+        Set<String> denied = new HashSet<>();
         for (String rawLine : dumpsysOutput.split("\n")) {
             String line = rawLine.trim();
             int marker = line.indexOf(": granted=");
             if (marker <= 0) continue;
 
+            String name = line.substring(0, marker).trim();
+            if (name.isEmpty()) continue;
+
             // Value runs to the next comma (runtime entries append flags=[...]).
             String value = line.substring(marker + ": granted=".length());
             int comma = value.indexOf(',');
             if (comma >= 0) value = value.substring(0, comma);
-            if (!"true".equals(value.trim())) continue;
 
-            String name = line.substring(0, marker).trim();
-            if (!name.isEmpty()) granted.add(name);
+            if ("true".equals(value.trim())) {
+                granted.add(name);
+            } else {
+                denied.add(name);
+            }
         }
+        granted.removeAll(denied);
         return granted;
     }
 
@@ -384,9 +412,20 @@ public final class PermissionGranter {
      * attempting every grant — the pre-existing behaviour.
      */
     private static Set<String> readGrantedPermissions(String packageName) {
+        // The old code's first observable action was its interrupt check; keep
+        // that ordering — don't spawn a probe the shutdown path can't unblock
+        // (a parked pipe read does not respond to Thread.interrupt()).
+        if (Thread.currentThread().isInterrupted()) {
+            return new HashSet<>();
+        }
         try {
+            // -t 5: bound the dump at 5s (supported since Android 8.1; on an
+            // exotic build that rejects the flag, dumpsys errors out, we parse
+            // nothing, and the loop safely falls back to attempting every
+            // grant). Android's dumpsys also self-bounds per service (~10s),
+            // so this is belt and suspenders, not the only limit.
             Process process = Runtime.getRuntime().exec(
-                new String[]{"sh", "-c", "dumpsys package " + packageName + " 2>/dev/null"});
+                new String[]{"sh", "-c", "dumpsys -t 5 package " + packageName + " 2>/dev/null"});
 
             StringBuilder output = new StringBuilder(16384);
             try (BufferedReader reader =
@@ -396,8 +435,15 @@ public final class PermissionGranter {
                     output.append(line).append('\n');
                 }
             }
-            process.waitFor();
-            return parseGrantedPermissions(output.toString());
+            int exitCode = process.waitFor();
+            Set<String> parsed = parseGrantedPermissions(output.toString());
+            // A silent zero-result probe would be indistinguishable from a
+            // fresh install in the Done line; name the cause for field logs.
+            if (exitCode != 0 || parsed.isEmpty()) {
+                log("dumpsys probe yielded nothing (exit=" + exitCode
+                    + ", bytes=" + output.length() + ") — will attempt every grant");
+            }
+            return parsed;
         } catch (InterruptedException e) {
             // Preserve the interrupt so the grant loop's own check still fires.
             Thread.currentThread().interrupt();
@@ -432,6 +478,13 @@ public final class PermissionGranter {
     }
 
     private static void log(String msg) {
-        System.out.println(TAG + ": " + msg);
+        // DaemonLogger, not a bare System.out.println: proguard-rules.pro
+        // applies -assumenosideeffects to java.io.PrintStream in EVERY release
+        // build, so raw println calls are stripped and the field would see
+        // nothing from this class. DaemonLogger's file channel writes via
+        // PrintWriter (not PrintStream), survives that rule, and is gated by
+        // DaemonLogConfig — the supported field-diagnostics path. Its stdout
+        // channel also covers debug daemon runs (with timestamps).
+        com.overdrive.app.logging.DaemonLogger.getInstance(TAG).info(msg);
     }
 }
