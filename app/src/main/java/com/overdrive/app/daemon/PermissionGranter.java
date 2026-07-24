@@ -3,7 +3,9 @@ package com.overdrive.app.daemon;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Shell-based permission granter for daemon processes.
@@ -222,7 +224,23 @@ public final class PermissionGranter {
             int granted = 0;
             int failed = 0;
             int skipped = 0;
+            int alreadyHeld = 0;
             List<String> failures = new ArrayList<>();
+
+            // One dumpsys read instead of 145 speculative grants. Every grant we
+            // can skip is a `sh` fork, a `cmd package` fork, a PMS binder call
+            // and a GRANT_THROTTLE_MS sleep that no longer lands on top of the
+            // camera HAL's first-frame window during daemon start.
+            //
+            // On a settled device this empties the loop almost completely; after
+            // a fresh install it is one extra call before the same full pass.
+            // Reading the live state (rather than persisting a "done" marker)
+            // keeps it self-correcting if a permission is ever revoked.
+            Set<String> alreadyGranted = readGrantedPermissions(packageName);
+            if (!alreadyGranted.isEmpty()) {
+                log("dumpsys reports " + alreadyGranted.size()
+                    + " permissions already held — those will be skipped");
+            }
 
             for (String permission : ALL_PERMISSIONS) {
                 // Check if daemon is shutting down — stop spawning new processes
@@ -230,7 +248,12 @@ public final class PermissionGranter {
                     log("Interrupted — aborting remaining grants");
                     break;
                 }
-                
+
+                if (alreadyGranted.contains(permission)) {
+                    alreadyHeld++;
+                    continue;   // no fork, no binder call, no throttle sleep
+                }
+
                 try {
                     int result = execGrant(packageName, permission);
                     if (result == 0) {
@@ -247,8 +270,10 @@ public final class PermissionGranter {
                 }
                 
                 // Throttle: yield between grants to avoid flooding PMS.
-                // 50ms × 141 permissions = ~7s total, vs the unthrottled 199s
-                // observed in logs when PMS was overloaded from rapid restarts.
+                // 50ms per grant ISSUED — permissions we already hold skip the
+                // loop body above, so a settled device now sleeps ~0s here
+                // instead of the full 145 × 50ms ≈ 7s. Unthrottled, this was
+                // observed at 199s when PMS was overloaded by rapid restarts.
                 try { Thread.sleep(GRANT_THROTTLE_MS); } catch (InterruptedException e) {
                     log("Interrupted during throttle — aborting remaining grants");
                     break;
@@ -256,8 +281,8 @@ public final class PermissionGranter {
             }
 
             long elapsed = System.currentTimeMillis() - start;
-            log("Done in " + elapsed + "ms: " + granted + " granted, " 
-                + skipped + " skipped, " + failed + " failed");
+            log("Done in " + elapsed + "ms: " + alreadyHeld + " already held, "
+                + granted + " granted, " + skipped + " skipped, " + failed + " failed");
             if (!failures.isEmpty() && failures.size() <= 15) {
                 log("Failed: " + String.join(", ", failures));
             } else if (!failures.isEmpty()) {
@@ -315,6 +340,71 @@ public final class PermissionGranter {
             return -1;
         } catch (Exception e) {
             return -1;
+        }
+    }
+
+    /**
+     * Permissions {@code dumpsys package <pkg>} reports as already granted.
+     *
+     * <p>Parses both blocks the platform emits — {@code install permissions:}
+     * (bare {@code name: granted=true}) and the per-user
+     * {@code runtime permissions:} (which appends {@code , flags=[...]}). The
+     * {@code requested permissions:} block is deliberately NOT counted: it lists
+     * bare names with no grant marker, and treating those as granted would skip
+     * exactly the grants we still need to issue.
+     *
+     * <p>Returns an empty set for null / empty / unrecognised output. That is
+     * the safe direction: an unreadable dumpsys degrades to "grant everything"
+     * (the old behaviour), never to "skip everything".
+     */
+    static Set<String> parseGrantedPermissions(String dumpsysOutput) {
+        Set<String> granted = new HashSet<>();
+        if (dumpsysOutput == null || dumpsysOutput.isEmpty()) return granted;
+
+        for (String rawLine : dumpsysOutput.split("\n")) {
+            String line = rawLine.trim();
+            int marker = line.indexOf(": granted=");
+            if (marker <= 0) continue;
+
+            // Value runs to the next comma (runtime entries append flags=[...]).
+            String value = line.substring(marker + ": granted=".length());
+            int comma = value.indexOf(',');
+            if (comma >= 0) value = value.substring(0, comma);
+            if (!"true".equals(value.trim())) continue;
+
+            String name = line.substring(0, marker).trim();
+            if (!name.isEmpty()) granted.add(name);
+        }
+        return granted;
+    }
+
+    /**
+     * Run {@code dumpsys package <pkg>} and return the permissions it reports as
+     * granted. Returns an empty set on any failure so the caller falls back to
+     * attempting every grant — the pre-existing behaviour.
+     */
+    private static Set<String> readGrantedPermissions(String packageName) {
+        try {
+            Process process = Runtime.getRuntime().exec(
+                new String[]{"sh", "-c", "dumpsys package " + packageName + " 2>/dev/null"});
+
+            StringBuilder output = new StringBuilder(16384);
+            try (BufferedReader reader =
+                         new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append('\n');
+                }
+            }
+            process.waitFor();
+            return parseGrantedPermissions(output.toString());
+        } catch (InterruptedException e) {
+            // Preserve the interrupt so the grant loop's own check still fires.
+            Thread.currentThread().interrupt();
+            return new HashSet<>();
+        } catch (Exception e) {
+            log("dumpsys probe failed (" + e.getMessage() + ") — will attempt every grant");
+            return new HashSet<>();
         }
     }
 
