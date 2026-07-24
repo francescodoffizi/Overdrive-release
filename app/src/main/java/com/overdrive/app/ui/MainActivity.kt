@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.View
 import android.widget.ImageButton
@@ -3392,6 +3393,14 @@ class MainActivity : AppCompatActivity() {
      * Enable or disable the BYD Traffic Monitor package via ADB shell.
      */
     private fun setTrafficMonitorEnabled(enable: Boolean) {
+
+        try {
+            packageManager.getPackageInfo("com.byd.trafficmonitor", 0)
+        } catch (e: PackageManager.NameNotFoundException) {
+            android.util.Log.w("TrafficMonitor", "Pacote com.byd.trafficmonitor não encontrado. Operação cancelada.")
+            return
+        }
+
         val cmd = if (enable) {
             "pm enable com.byd.trafficmonitor 2>&1"
         } else {
@@ -3491,6 +3500,12 @@ class MainActivity : AppCompatActivity() {
     fun invokeReconfigureCameraAction() = onReconfigureCameraClicked()
     fun invokeTrafficMonitorAction() {
         // Match drawer-open behavior: refresh status before showing dialog.
+        try {
+            packageManager.getPackageInfo("com.byd.trafficmonitor", 0)
+        } catch (e: PackageManager.NameNotFoundException) {
+            android.util.Log.w("TrafficMonitor", "Pacote com.byd.trafficmonitor não encontrado. Operação cancelada.")
+            return
+        }
         checkTrafficMonitorStatus()
         onTrafficMonitorClicked()
     }
