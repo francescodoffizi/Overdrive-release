@@ -460,8 +460,19 @@ public class PanoramicCameraGpu {
     // are deliberately patient. This only ever fires for a camera that has not
     // produced a single frame; once one arrives, the existing machinery owns
     // recovery and this path is permanently disarmed for the session.
+    //
+    // Legacy (addPreviewSurface) path ONLY. On dilink4 the esco-parity posture
+    // deliberately performs no stall-driven close/reopen at all (see
+    // dilink4SkipStallRestart below): that HAL routinely pauses frame emission
+    // on parked cars, so "open but no frames for 25s" is a NORMAL state there,
+    // not a dead slot — walking would churn the HAL and could persist a wrong
+    // id. Issue #170's hardware is exclusively the legacy path.
     private static final long FIRST_FRAME_DEAD_SLOT_MS = 25000;
-    // Camera IDs opened this session, so the walk never retries a dead slot.
+    // Camera IDs opened OR attempted this session, so the walk never revisits
+    // a candidate. startCamera records every successful open; the walk records
+    // each candidate at switch time — an attempt that fails to open counts as
+    // tried too, otherwise a candidate whose open throws would be retried on
+    // every watchdog tick, forever.
     // CopyOnWriteArraySet, not a synchronized wrapper: startCamera adds from the
     // camera-open worker thread that restartCameraAfterError spawns, while the
     // GL thread reads it (and concatenates it into log lines). COW gives both
@@ -470,9 +481,12 @@ public class PanoramicCameraGpu {
     // a couple of entries, so the copy cost is irrelevant.
     private final java.util.Set<Integer> deadSlotTriedCameraIds =
         new java.util.concurrent.CopyOnWriteArraySet<>();
-    // Set when a dead-slot fallback switched IDs; the first frame that arrives
-    // afterwards persists the winning ID so the next boot goes straight to it.
-    private volatile boolean deadSlotFallbackPendingPersist = false;
+    // True once the walk has switched ids at least once. Two consumers: it
+    // relaxes the watchdog's cameraObj gate (a candidate whose open FAILED
+    // leaves cameraObj null mid-walk — the walk must still advance past it),
+    // and it makes the switch re-enable frame validation so the frame-15/50
+    // path can validate-and-persist the recovered id (see advance...()).
+    private volatile boolean deadSlotWalkActive = false;
     // Latched once the candidate list is exhausted so we log once, not per tick.
     private volatile boolean deadSlotWalkExhausted = false;
     // BmmCameraInfo panoramic tag mapping, resolved lazily on first use so the
@@ -1784,7 +1798,11 @@ public class PanoramicCameraGpu {
 
         // Remember every slot we've opened so the dead-slot walk (issue #170)
         // can't loop back onto one that already failed to deliver a frame.
-        deadSlotTriedCameraIds.add(cameraId);
+        // Recomputed rather than reusing the local: the static-factory branch
+        // inside startCameraViaAvmReflection can probe ids 0-5 and open a
+        // DIFFERENT slot (it updates cameraIdOverride when it does) — record
+        // the id that actually opened, not the one we asked for.
+        deadSlotTriedCameraIds.add(cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID);
 
         cameraYielded = false;
         lastCameraStartTime = System.currentTimeMillis();
@@ -2675,23 +2693,18 @@ public class PanoramicCameraGpu {
             consecutiveContentionStalls = 0;  // Frames flowing — clear stall counter
             consecutiveZeroFrameRestarts = 0; // Real frame arrived — reopen succeeded; clear escalation counter
 
-            // Dead-slot fallback (issue #170) paid off: this camera id is the
-            // one that actually streams on this vehicle. Persist it so the next
-            // boot opens it directly instead of spending another 25s wedged on
-            // the profile default. Fires once per successful fallback — the
-            // flag is cleared before the callback so a throw can't re-arm it.
-            if (deadSlotFallbackPendingPersist) {
-                deadSlotFallbackPendingPersist = false;
-                int recoveredId = cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID;
-                logger.info("Dead-slot fallback CONFIRMED: camera id " + recoveredId
-                    + " is streaming — persisting as the validated panoramic id");
-                if (probeCallback != null) {
-                    try {
-                        probeCallback.onCameraFound(recoveredId, cameraSurfaceMode);
-                    } catch (Throwable t) {
-                        logger.warn("Dead-slot persist callback failed: " + t.getMessage());
-                    }
-                }
+            // Dead-slot fallback (issue #170): deliberately NO persist here.
+            // A first frame proves delivery, not content — every other persist
+            // site demands pixel evidence first. The switch re-enabled frame
+            // validation (advanceToNextCandidateCameraId sets
+            // skipFrameValidation=false), so the frame-15/50 blocks below own
+            // validating AND persisting the recovered id — including their
+            // non-black readback and the frame-50 manual-override guard.
+            if (deadSlotWalkActive && frameCounter == 1) {
+                logger.info("Dead-slot fallback: camera id "
+                    + (cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID)
+                    + " delivered its first frame — frame-15/50 validation will"
+                    + " confirm content before anything is persisted");
             }
 
             // SOTA: Full-matrix auto-probe at frame 15 (~2 sec).
@@ -3454,25 +3467,36 @@ public class PanoramicCameraGpu {
                     
                     // DEAD-SLOT ESCAPE (issue #170) — must be checked BEFORE the
                     // frame-health monitor below, whose `lastFrameTime > 0` gate a
-                    // never-streamed camera can by definition never satisfy.
+                    // never-streamed camera cannot satisfy (restarts triggered
+                    // before the first frame deliberately leave it 0 — see
+                    // restartCameraAfterError).
                     //
                     // Conditions, all required:
+                    //   - legacy path only: on dilink4 the HAL routinely pauses
+                    //     frame emission on parked cars, so 25s of silence is a
+                    //     normal state there, not a dead slot — mirrors the
+                    //     dilink4SkipStallRestart esco-parity carve-out below.
                     //   - firstFrameReceived == false: this camera has produced
                     //     nothing since the pipeline started. Once any frame has
                     //     arrived the normal stall/restart machinery is armed and
                     //     owns recovery, so we stay out of its way for good.
-                    //   - !cameraYielded: a native app (reverse cam, AVM parking
-                    //     view) holding the HAL is a legitimate reason to see no
-                    //     frames. Switching IDs would not help and could steal a
-                    //     slot from the OEM app.
-                    //   - cameraObj != null: we actually hold an open camera, so
-                    //     "no frames" means the stream is dead rather than that we
-                    //     simply never opened anything.
-                    //   - no restart or HAL-recovery already in flight, so we never
-                    //     race a close/open we don't own.
-                    if (!firstFrameReceived
+                    //   - !cameraYielded AND no native app active: an OEM app
+                    //     (reverse cam, AVM parking view) holding or contending
+                    //     the HAL legitimately starves frames without a yield
+                    //     event — the stall monitor below makes the same
+                    //     allowance via its contention threshold.
+                    //   - cameraObj != null, EXCEPT mid-walk: a candidate whose
+                    //     open failed leaves cameraObj null, and the walk must
+                    //     still advance past it rather than freeze forever.
+                    //   - no restart or HAL-recovery already in flight, so we
+                    //     never race a close/open we don't own.
+                    boolean nativeAppHoldsHal = cameraCoordinator != null
+                            && cameraCoordinator.isNativeAppActive();
+                    if (!USE_ESCO_SURFACE_TEXTURE_PATH
+                            && !firstFrameReceived
                             && !cameraYielded
-                            && cameraObj != null
+                            && !nativeAppHoldsHal
+                            && (cameraObj != null || deadSlotWalkActive)
                             && !restartInProgress.get()
                             && !halRecoveryEscalated
                             && !deadSlotWalkExhausted
@@ -3482,10 +3506,13 @@ public class PanoramicCameraGpu {
                         long deadFor = now - lastCameraStartTime;
                         logger.warn("DEAD SLOT: camera id "
                             + (cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID)
-                            + " opened but delivered ZERO frames in " + deadFor
-                            + "ms — the HAL accepted the open but cannot stream this slot"
-                            + " (BYD 2602/pano_h reports a 0x0 preview here). Trying next"
-                            + " panoramic candidate.");
+                            + (cameraObj != null
+                                ? " opened but delivered ZERO frames in " + deadFor
+                                    + "ms — the HAL accepted the open but cannot stream"
+                                    + " this slot (BYD 2602/pano_h reports a 0x0 preview"
+                                    + " here)."
+                                : " failed to reopen during the fallback walk.")
+                            + " Trying next panoramic candidate.");
                         glHandler.post(this::advanceToNextCandidateCameraId);
                     }
 
@@ -3621,9 +3648,34 @@ public class PanoramicCameraGpu {
         // ago, and a first frame (or someone else's restart) may have landed in
         // between. Cheap insurance against tearing down a camera that just
         // started working.
-        if (firstFrameReceived || cameraYielded || cameraObj == null
+        if (firstFrameReceived || cameraYielded
                 || restartInProgress.get() || halRecoveryEscalated
                 || deadSlotWalkExhausted) {
+            return;
+        }
+        if (cameraCoordinator != null && cameraCoordinator.isNativeAppActive()) {
+            return;
+        }
+        // Mid-walk a failed candidate open leaves cameraObj null and the walk
+        // must still move past it; outside the walk, null means we never held
+        // a camera at all — no slot evidence, nothing to escape from.
+        if (cameraObj == null && !deadSlotWalkActive) {
+            return;
+        }
+        // Re-check the trigger itself, not just the flags. The watchdog posts
+        // this once per 1s tick while the condition holds, so a GL-thread
+        // stall of >1s at the boundary queues DUPLICATE posts; the first one
+        // switches ids and reopens (refreshing lastCameraStartTime), and
+        // without this check the stale second post would advance again with
+        // zero warmup — burning the new candidate's 25s window, or falsely
+        // latching exhaustion while it is still warming up. Every reopen
+        // refreshes lastCameraStartTime, so this single predicate makes
+        // stale and duplicate posts self-neutralizing. (Exception: after a
+        // FAILED candidate open, startCamera never reached the refresh, the
+        // window is stale by construction, and advancing immediately is
+        // exactly right — no point waiting 25s for a camera that is not open.)
+        if (lastCameraStartTime <= 0
+                || (System.currentTimeMillis() - lastCameraStartTime) <= FIRST_FRAME_DEAD_SLOT_MS) {
             return;
         }
 
@@ -3633,10 +3685,17 @@ public class PanoramicCameraGpu {
 
         if (nextId == PanoCameraFallbackOrder.NO_CANDIDATE) {
             // Latch so this logs once rather than every watchdog tick. Leaving
-            // the camera on its current ID is deliberate: the normal restart /
-            // HAL-recovery path stays armed, and a user can always pin a slot
-            // explicitly via POST /api/surveillance/config {"manualCameraId":N}.
+            // the camera on its current ID is deliberate: a user can always pin
+            // a slot explicitly via POST /api/surveillance/config
+            // {"manualCameraId":N}.
             deadSlotWalkExhausted = true;
+            // Hand recovery back to the pre-existing machinery. Walk restarts
+            // deliberately keep lastFrameTime at 0 so each candidate gets its
+            // full first-frame window (see restartCameraAfterError); with the
+            // walk over, arm the frame-stall monitor so the bare-restart +
+            // zero-frame-escalation path owns the slot again — post-exhaustion
+            // behaviour is then identical to pre-walk behaviour.
+            lastFrameTime = System.currentTimeMillis();
             logger.error("Dead-slot walk exhausted — tried camera ids "
                 + deadSlotTriedCameraIds + " and none delivered a frame. Leaving"
                 + " camera on id " + currentId + " for the normal restart path."
@@ -3649,6 +3708,10 @@ public class PanoramicCameraGpu {
             + currentId + " -> " + nextId + " (tried so far: "
             + deadSlotTriedCameraIds + ")");
 
+        // An attempted candidate counts as tried even if its open fails —
+        // otherwise a candidate that throws at open would be retried on every
+        // watchdog pass, forever, with the escalation path suppressed.
+        deadSlotTriedCameraIds.add(nextId);
         cameraIdOverride = nextId;
         // The zero-frame reopen evidence was gathered against a DIFFERENT
         // physical slot, so it says nothing about this one. Without this reset
@@ -3656,7 +3719,13 @@ public class PanoramicCameraGpu {
         // off to the warmup-routed full restart, which reopens the same dead
         // slot — exactly the loop this method exists to break.
         consecutiveZeroFrameRestarts = 0;
-        deadSlotFallbackPendingPersist = true;
+        deadSlotWalkActive = true;
+        // The saved config's validated/manual privilege belongs to the id it
+        // was saved FOR — a different slot must earn persistence through the
+        // frame-15/50 pixel checks (which also carry the manual-override
+        // guard). Re-enabling validation here is what lets the recovered id be
+        // confirmed and written back on configs that skip validation.
+        skipFrameValidation = false;
 
         restartCameraAfterError();
     }
@@ -4399,7 +4468,18 @@ public class PanoramicCameraGpu {
             // (FRAME_STALL_WARMUP_GRACE_MS) gives the BYD HAL its full 5-8s
             // first-frame latency before any stall can fire again. startCamera
             // already set lastCameraStartTime; align lastFrameTime to it.
-            lastFrameTime = System.currentTimeMillis();
+            //
+            // EXCEPT before the very first frame (issue #170): arming the stall
+            // monitor for a camera that has never streamed would let it seize
+            // ownership of a dead slot at ~9s and churn same-id bare restarts —
+            // each one refreshing lastCameraStartTime and starving the
+            // dead-slot walk's 25s window, so later fallback candidates would
+            // never be tried. Leaving it 0 keeps the never-streamed state's
+            // recovery with the walk (which re-arms the stall monitor when it
+            // exhausts); it also keeps the dead-slot field comment's invariant
+            // — "the stall monitor's lastFrameTime > 0 gate a never-streamed
+            // camera cannot satisfy" — actually true across restarts.
+            lastFrameTime = firstFrameReceived ? System.currentTimeMillis() : 0;
 
             // Restart encoder drainer now that camera is open again
             if (encoder != null) {
@@ -4622,7 +4702,12 @@ public class PanoramicCameraGpu {
             // torn down before its 5-8s first-frame warmup can complete
             // (the recording-blackout reopen loop). startCamera set
             // lastCameraStartTime; align lastFrameTime to it.
-            lastFrameTime = System.currentTimeMillis();
+            //
+            // Pre-first-frame, leave it 0 for the same reason as
+            // restartCameraAfterError: the dead-slot walk owns the
+            // never-streamed state, and arming the stall monitor here would
+            // let its same-id churn starve the walk's 25s window.
+            lastFrameTime = firstFrameReceived ? System.currentTimeMillis() : 0;
             logger.info("Camera reopened successfully");
 
         } catch (Exception e) {
