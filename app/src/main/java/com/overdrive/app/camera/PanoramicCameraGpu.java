@@ -441,6 +441,45 @@ public class PanoramicCameraGpu {
     // (and resets it via notePipelineRestarted()).
     private volatile boolean halRecoveryEscalated = false;
     
+    // DEAD-SLOT ESCAPE (issue #170). Every self-healing path above needs proof
+    // that the camera produced at least one frame: the frame-15/50 revalidation
+    // is driven by frameCounter, and the frame-stall monitor is gated on
+    // `lastFrameTime > 0`. A slot that opens but can NEVER stream therefore arms
+    // none of them and the pipeline waits forever — Diagnostics stays on
+    // "Probing…", frameCount stays 0, nothing is ever recorded.
+    //
+    // That is exactly what BYD's 2602-generation firmware does on legacy pano_h
+    // boards: AVMCamera.open(1) succeeds, but the HAL reports a 0x0 preview so
+    // addPreviewSurface fails (err 423) and startPreview fails (err 279) — both
+    // inside the HAL, neither raising a Java exception we could catch at open.
+    //
+    // So: if NO frame has arrived within this window of the camera opening, the
+    // slot is presumed dead and we walk PanoCameraFallbackOrder. The window must
+    // clear the documented 5-8s BYD first-frame latency and the 9s stall grace
+    // with room to spare — a false trigger costs a HAL close/open cycle, so we
+    // are deliberately patient. This only ever fires for a camera that has not
+    // produced a single frame; once one arrives, the existing machinery owns
+    // recovery and this path is permanently disarmed for the session.
+    private static final long FIRST_FRAME_DEAD_SLOT_MS = 25000;
+    // Camera IDs opened this session, so the walk never retries a dead slot.
+    // CopyOnWriteArraySet, not a synchronized wrapper: startCamera adds from the
+    // camera-open worker thread that restartCameraAfterError spawns, while the
+    // GL thread reads it (and concatenates it into log lines). COW gives both
+    // contains() and toString() snapshot semantics with no lock and no risk of
+    // ConcurrentModificationException. Writes are rare and the set holds at most
+    // a couple of entries, so the copy cost is irrelevant.
+    private final java.util.Set<Integer> deadSlotTriedCameraIds =
+        new java.util.concurrent.CopyOnWriteArraySet<>();
+    // Set when a dead-slot fallback switched IDs; the first frame that arrives
+    // afterwards persists the winning ID so the next boot goes straight to it.
+    private volatile boolean deadSlotFallbackPendingPersist = false;
+    // Latched once the candidate list is exhausted so we log once, not per tick.
+    private volatile boolean deadSlotWalkExhausted = false;
+    // BmmCameraInfo panoramic tag mapping, resolved lazily on first use so the
+    // reflection + logging cost is paid only on boards that actually wedge.
+    // MIN_VALUE = not yet resolved; -1 = resolved, API absent (DiLink 3.0).
+    private volatile int halPanoCameraIdHint = Integer.MIN_VALUE;
+
     // Flag to indicate camera restart is in progress — watchdog uses extended timeout.
     // P1 #11: AtomicBoolean so concurrent restartCameraAfterError + reopenCamera
     // calls can't both enter the restart path. Loser observes
@@ -1743,6 +1782,10 @@ public class PanoramicCameraGpu {
 
         startCameraViaAvmReflection(cameraId);
 
+        // Remember every slot we've opened so the dead-slot walk (issue #170)
+        // can't loop back onto one that already failed to deliver a frame.
+        deadSlotTriedCameraIds.add(cameraId);
+
         cameraYielded = false;
         lastCameraStartTime = System.currentTimeMillis();
         // Snapshot the frame counter at this open so the next restart can tell
@@ -2631,7 +2674,26 @@ public class PanoramicCameraGpu {
             firstFrameReceived = true;
             consecutiveContentionStalls = 0;  // Frames flowing — clear stall counter
             consecutiveZeroFrameRestarts = 0; // Real frame arrived — reopen succeeded; clear escalation counter
-            
+
+            // Dead-slot fallback (issue #170) paid off: this camera id is the
+            // one that actually streams on this vehicle. Persist it so the next
+            // boot opens it directly instead of spending another 25s wedged on
+            // the profile default. Fires once per successful fallback — the
+            // flag is cleared before the callback so a throw can't re-arm it.
+            if (deadSlotFallbackPendingPersist) {
+                deadSlotFallbackPendingPersist = false;
+                int recoveredId = cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID;
+                logger.info("Dead-slot fallback CONFIRMED: camera id " + recoveredId
+                    + " is streaming — persisting as the validated panoramic id");
+                if (probeCallback != null) {
+                    try {
+                        probeCallback.onCameraFound(recoveredId, cameraSurfaceMode);
+                    } catch (Throwable t) {
+                        logger.warn("Dead-slot persist callback failed: " + t.getMessage());
+                    }
+                }
+            }
+
             // SOTA: Full-matrix auto-probe at frame 15 (~2 sec).
             // Sweeps camera IDs 0-5 × surface modes 0-5 to find the first
             // combination that produces panoramic image data. Each combo gets
@@ -3390,6 +3452,43 @@ public class PanoramicCameraGpu {
                         System.exit(0);
                     }
                     
+                    // DEAD-SLOT ESCAPE (issue #170) — must be checked BEFORE the
+                    // frame-health monitor below, whose `lastFrameTime > 0` gate a
+                    // never-streamed camera can by definition never satisfy.
+                    //
+                    // Conditions, all required:
+                    //   - firstFrameReceived == false: this camera has produced
+                    //     nothing since the pipeline started. Once any frame has
+                    //     arrived the normal stall/restart machinery is armed and
+                    //     owns recovery, so we stay out of its way for good.
+                    //   - !cameraYielded: a native app (reverse cam, AVM parking
+                    //     view) holding the HAL is a legitimate reason to see no
+                    //     frames. Switching IDs would not help and could steal a
+                    //     slot from the OEM app.
+                    //   - cameraObj != null: we actually hold an open camera, so
+                    //     "no frames" means the stream is dead rather than that we
+                    //     simply never opened anything.
+                    //   - no restart or HAL-recovery already in flight, so we never
+                    //     race a close/open we don't own.
+                    if (!firstFrameReceived
+                            && !cameraYielded
+                            && cameraObj != null
+                            && !restartInProgress.get()
+                            && !halRecoveryEscalated
+                            && !deadSlotWalkExhausted
+                            && lastCameraStartTime > 0
+                            && (now - lastCameraStartTime) > FIRST_FRAME_DEAD_SLOT_MS
+                            && glHandler != null) {
+                        long deadFor = now - lastCameraStartTime;
+                        logger.warn("DEAD SLOT: camera id "
+                            + (cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID)
+                            + " opened but delivered ZERO frames in " + deadFor
+                            + "ms — the HAL accepted the open but cannot stream this slot"
+                            + " (BYD 2602/pano_h reports a 0x0 preview here). Trying next"
+                            + " panoramic candidate.");
+                        glHandler.post(this::advanceToNextCandidateCameraId);
+                    }
+
                     // SOTA: Frame health monitor — detect stalled camera feed
                     // If GL thread is alive but no new frames for FRAME_STALL_THRESHOLD_MS,
                     // the camera HAL may be starved or dead.
@@ -3506,7 +3605,86 @@ public class PanoramicCameraGpu {
             "cameraId=" + (cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID) + ", " +
             "probe=" + (autoProbeCameras ? "ACTIVE" : "OFF") + ")");
     }
-    
+
+    /**
+     * Dead-slot escape (issue #170): move to the next panoramic camera candidate
+     * after the current one opened but never produced a frame.
+     *
+     * <p>MUST run on the GL thread — it mutates {@code cameraIdOverride} and
+     * hands off to {@link #restartCameraAfterError()}, which owns the
+     * close/reopen sequence (including the encoder drainer, event-callback
+     * re-registration and {@code onPostReacquire}). Reusing that path rather
+     * than open-coding a second close/open keeps the two in lockstep.
+     */
+    private void advanceToNextCandidateCameraId() {
+        // Re-validate on the GL thread: the watchdog observed this up to a tick
+        // ago, and a first frame (or someone else's restart) may have landed in
+        // between. Cheap insurance against tearing down a camera that just
+        // started working.
+        if (firstFrameReceived || cameraYielded || cameraObj == null
+                || restartInProgress.get() || halRecoveryEscalated
+                || deadSlotWalkExhausted) {
+            return;
+        }
+
+        int currentId = cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID;
+        int nextId = PanoCameraFallbackOrder.next(
+            resolveHalPanoCameraIdHint(), deadSlotTriedCameraIds);
+
+        if (nextId == PanoCameraFallbackOrder.NO_CANDIDATE) {
+            // Latch so this logs once rather than every watchdog tick. Leaving
+            // the camera on its current ID is deliberate: the normal restart /
+            // HAL-recovery path stays armed, and a user can always pin a slot
+            // explicitly via POST /api/surveillance/config {"manualCameraId":N}.
+            deadSlotWalkExhausted = true;
+            logger.error("Dead-slot walk exhausted — tried camera ids "
+                + deadSlotTriedCameraIds + " and none delivered a frame. Leaving"
+                + " camera on id " + currentId + " for the normal restart path."
+                + " If this vehicle streams on another slot, pin it with"
+                + " POST /api/surveillance/config {\"manualCameraId\": N}.");
+            return;
+        }
+
+        logger.warn("Dead-slot fallback: switching panoramic camera id "
+            + currentId + " -> " + nextId + " (tried so far: "
+            + deadSlotTriedCameraIds + ")");
+
+        cameraIdOverride = nextId;
+        // The zero-frame reopen evidence was gathered against a DIFFERENT
+        // physical slot, so it says nothing about this one. Without this reset
+        // the escalation counter would reach its threshold mid-walk and hand
+        // off to the warmup-routed full restart, which reopens the same dead
+        // slot — exactly the loop this method exists to break.
+        consecutiveZeroFrameRestarts = 0;
+        deadSlotFallbackPendingPersist = true;
+
+        restartCameraAfterError();
+    }
+
+    /**
+     * Panoramic camera ID from the HAL's own tag map, resolved once and cached.
+     *
+     * <p>Returns -1 when {@code BmmCameraInfo} is unavailable — the norm on
+     * DiLink 3.0, where only the native {@code BMMCamProp} holds the mapping and
+     * no Java API exposes it. {@link PanoCameraFallbackOrder} handles that by
+     * falling through to the raw-strip slot.
+     */
+    private int resolveHalPanoCameraIdHint() {
+        if (halPanoCameraIdHint == Integer.MIN_VALUE) {
+            int discovered;
+            try {
+                discovered = AvmCameraHelper.discoverPanoCameraId();
+            } catch (Throwable t) {
+                logger.warn("BmmCameraInfo pano-id lookup failed: " + t.getMessage());
+                discovered = -1;
+            }
+            halPanoCameraIdHint = discovered;
+            logger.info("Dead-slot fallback: BmmCameraInfo panoramic hint = "
+                + (discovered >= 0 ? String.valueOf(discovered) : "unavailable"));
+        }
+        return halPanoCameraIdHint;
+    }
+
     /**
      * SOTA: Yields the camera to the native BYD AVM app.
      * 
