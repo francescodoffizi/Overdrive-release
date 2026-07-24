@@ -1,11 +1,11 @@
 package com.overdrive.app.server;
 
 import com.overdrive.app.daemon.CameraDaemon;
+import com.overdrive.app.util.MessageFormatSafe;
 import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileInputStream;
-import java.text.MessageFormat;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -34,11 +34,11 @@ public final class Messages {
         if (raw == null && !lang.equals("en")) raw = lookup("en", key);
         if (raw == null) return key; // dev-visible miss
         if (args == null || args.length == 0) return raw;
-        try {
-            return new MessageFormat(raw, Locale.forLanguageTag(lang)).format(args);
-        } catch (Exception e) {
-            return raw;
-        }
+        // Escapes lone apostrophes before formatting. Crowdin translators write
+        // natural elision (fr "l'", uk "з'", nl "{0}'s"), which raw MessageFormat
+        // reads as a quoted literal — dropping the apostrophe and, when it comes
+        // before a placeholder, suppressing the substitution entirely.
+        return MessageFormatSafe.format(raw, Locale.forLanguageTag(lang), args);
     }
 
     private static synchronized String lookup(String lang, String key) {

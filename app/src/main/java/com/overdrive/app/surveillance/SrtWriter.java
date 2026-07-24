@@ -1,6 +1,7 @@
 package com.overdrive.app.surveillance;
 
 import com.overdrive.app.logging.DaemonLogger;
+import com.overdrive.app.util.MessageFormatSafe;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -224,13 +225,15 @@ public final class SrtWriter {
             template = key;
         }
         if (args == null || args.length == 0) return template;
-        try {
-            return MessageFormat.format(template, args);
-        } catch (Exception e) {
-            // Bad placeholder in the template — emit the raw template so the
-            // operator at least sees what fired.
-            return template;
-        }
+        // Escapes lone apostrophes first — see MessageFormatSafe. Without it a
+        // translated template like fr srt.charging_stopped ("La charge s'est
+        // arrêtée à {0}%") emits a literal {0} and the percentage is lost.
+        //
+        // A null locale keeps the previous MessageFormat.format(template, args)
+        // semantics exactly (JVM default locale). Whether this should instead
+        // use this writer's own `locale` field is a separate question from the
+        // apostrophe bug, so it is deliberately left alone here.
+        return MessageFormatSafe.format(template, null, args);
     }
 
     /** Reflectively call {@code Messages.get(locale, key)} or {@code Messages.get(key)}. */

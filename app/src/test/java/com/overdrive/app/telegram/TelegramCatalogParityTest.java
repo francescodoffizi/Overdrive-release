@@ -70,11 +70,20 @@ public class TelegramCatalogParityTest {
         }
     }
 
-    @Test
-    public void placeholderTemplatesHaveNoUnescapedSingleApostrophes() {
-        assertApostropheSafety("en", english);
-        assertApostropheSafety("pt-BR", portuguese);
-    }
+    // The former placeholderTemplatesHaveNoUnescapedSingleApostrophes lived
+    // here. It required raw catalog strings to carry MessageFormat's '' escape,
+    // which is an invariant a Crowdin-fed catalog cannot hold: translators write
+    // ordinary elision (fr "l'", uk "з'", nl "{0}'s"), so the rule went red on
+    // every translation sync — and it only ever covered the telegram.* subtree,
+    // missing the errors.*, notifications.* and srt.* templates that were losing
+    // placeholders in fr, uk, tr and pt-BR.
+    //
+    // Production now escapes lone apostrophes at format time
+    // (com.overdrive.app.util.MessageFormatSafe), so the shape of the raw string
+    // no longer matters. The contract that does matter — every shipped template
+    // still substitutes its placeholders — is asserted against rendered output,
+    // across all locales and all subtrees, by
+    // com.overdrive.app.util.ServerI18nPlaceholderRenderingTest.
 
     @Test
     public void portugueseHelpHeadingIsLocalized() {
@@ -160,24 +169,4 @@ public class TelegramCatalogParityTest {
         return positions;
     }
 
-    private static void assertApostropheSafety(String locale, Map<String, Object> catalog) {
-        for (Map.Entry<String, Object> entry : catalog.entrySet()) {
-            String template = requireString(locale, entry.getKey(), entry.getValue());
-            if (!placeholders(template).isEmpty()) {
-                assertFalse(locale + " telegram." + entry.getKey()
-                                + " contains an unescaped apostrophe in a MessageFormat template",
-                        hasOddApostropheRun(template));
-            }
-        }
-    }
-
-    private static boolean hasOddApostropheRun(String template) {
-        for (int i = 0; i < template.length(); i++) {
-            if (template.charAt(i) != '\'') continue;
-            int start = i;
-            while (i + 1 < template.length() && template.charAt(i + 1) == '\'') i++;
-            if ((i - start + 1) % 2 != 0) return true;
-        }
-        return false;
-    }
 }
