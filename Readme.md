@@ -336,6 +336,410 @@ If you've contributed substantial translations for a language, open an issue or 
 
 ## Changelog
 
+Condensed highlights below. Full release notes for every version live in [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+### v35.0 — July 2026: Blind-Spot Camera Fixes & Pick-Your-Overlay
+
+**✨ New Features**
+- **Blind-spot side/rear views** — Correct single-camera feed with per-side rotation, per-side screen position, and a fisheye-correction slider
+- **Choose your overlay fields** — The burned-in overlay is now a checklist: keep the usual speed, gear, pedals, seatbelts, turn signals and timestamp, or add **battery %, 12V voltage, low/high beam, and GPS location**. Pick per recording type — trips/manual, surveillance, and OEM dashcam each have their own list
+- **Overlay on surveillance too** — Sentry event clips can now carry the overlay (off by default), with its own separate field selection
+
+**⚡ Optimizations & Fixes**
+- **Blind-spot reliability** — Single-camera passthrough (sliders only affect the merged view), stripped release logs, and arming that a disable can't undo
+- **HUD On/Off** *(speculative — please confirm on your car)* — The HUD on/off action now toggles the dedicated head-up-display power switch instead of just dropping brightness to zero, so "off" actually turns the HUD off
+- **Bluetooth connect/disconnect triggers** *(speculative)* — Bluetooth connection state is now watched from the app and relayed to automations, so "when Bluetooth connects / disconnects" rules should fire
+- **Bluetooth device-name condition** *(speculative)* — The connected phone's name is now populated alongside the connection state, so a "only while &lt;my phone&gt; is connected" condition can match
+- **Play Video** *(speculative)* — Reworked how the video player is launched (and how the video button/key-mapping fires) to fix uploaded MP4s not starting on screen
+
+---
+
+### v34.0 — July 2026: Projection, Smarter Automations & Reliability Fixes
+
+**✨ New Features**
+- **Choose when Overdrive runs** — Pick "On & Off" (keeps watching while parked, the default) or "On Only" (fully shuts down when you park and starts back up when you switch the car on — no overnight battery use)
+- **Low-power mode while parked** — Optional setting that drops the cameras to a low idle frame rate when nothing's happening and instantly ramps back to full quality on motion
+- **Projection** — Cast an app to the driver cluster and see a live, draggable, resizable mirror of it on the main screen — tap and swipe the mirror to control it
+- **On-screen messages** — New "Show Toast" and "Show Dialog" actions put a message on the screen from any automation or button, floating over whatever's on screen without taking over the car
+- **Compare against a variable or another signal** — If / Else, Loop, and Wait-Until can now compare a value against one of your variables or against another live signal
+- **Set a variable from the car's live state** — A "Set Variable" action can capture the current value of a signal into a variable to use later
+- **Air recirculation control** — Switch the air intake between recirculate and fresh air from an automation or a mapped button
+
+**⚡ Optimizations & Fixes**
+- **Play Video works now** — Uploaded MP4 videos wouldn't start (from either an automation or a button); they now play correctly on screen
+- **Seatbelt automations fire** — The driver/passenger belt state was read the wrong way and never updated. Fixed, with a de-glitch so a never-fastened passenger seat reads correctly
+- **Cabin-temperature automations fire** — "Cabin temp" was reading the climate dial (your setpoint) instead of the measured cabin temperature. It now reads the real sensor
+- **Double-tap bindings no longer trigger the single action** — More forgiving detection window, plus a new **Double-tap speed** slider on the Key Mapping page
+- **Fold/unfold mirrors reliability** — Aligned the mirror-fold command with the reference behaviour so it reports success correctly
+- **Ambient-light colour picker redesign** — Tap-to-pick swatch grid matching the Vehicle Control page, instead of a fiddly slider
+
+---
+
+### v33.1 — July 2026: Cast to the Cluster, More Automation Signals & Reliability Fixes
+
+**✨ New Features**
+- **Cast any app to the driver cluster** — A "Move app to display" automation/button can now send an app to the instrument cluster behind the wheel
+- **Save reusable action groups from the app** — Build a named set of actions once, then run it from any automation or button, with a proper Groups tab
+- **Lock and regen as triggers & conditions** — React to the car locking/unlocking, and to the energy-recuperation level (Standard / High / Max)
+- **Block a button's single-click** — Optional per-binding setting so a double-press action isn't preceded by the button's normal single-click
+
+**⚡ Optimizations & Fixes**
+- **More triggers & conditions fire reliably** — Gear (incl. Park), seatbelt, drive/EV mode, hazards, high/low beam, auto-lights, incline and parking-radar were reading a stale value; they now update live
+- **If / Else automations save correctly** — The "Otherwise" branch was being dropped on save; both branches now persist
+- **Action groups save reliably** — Fixed a wiring bug that made every group save fail
+- **Automation editor polish** — Consistent field widths, tidier action-group cards, cleaner condition value picker
+- **Lower parked power use** — Fast pedal/steering polling now stops when the car is off
+
+---
+
+### v33.0 — July 2026: Programmable Automations, Full ADAS Control & More Ways to React
+
+**✨ New Features**
+- **Automations that can think** — Loops, an inline If / Else branch, number variables, and reusable action groups
+- **Smarter conditions** — Nested AND / OR groups, and compare one live value against another (cabin vs outside temp)
+- **One automation controls another** — enable/disable/toggle a rule from another. Name them, see how often each runs, and fire any from a mapped button
+- **Full ADAS control** — blind-spot, traffic-sign, cross-traffic alert & brake, traffic-light, door-open & rear-collision warning, speed-limit, lane-keeping, forward-collision, hazards. Emergency Braking is re-arm-only, never off
+- **More to control** — WiFi / Bluetooth / data, AC auto & fan-only, heated wheel, welcome & reading lights, ambient music, headlight level, media, volume, brightness, speak-aloud and app navigation
+- **More to react to** — drive & EV/HEV mode, sunrise/sunset, date, rain-soon, an incoming call, and what the **parked camera** sees (person, vehicle or animal)
+- **Home Assistant, both ways** — publish an MQTT message from a rule, and trigger a rule from an incoming one
+- **Edit shared automations** — update a community automation you published in place, keeping its ratings and downloads
+
+**⚡ Optimizations & Fixes**
+- **Sounds and videos play now** — the Play Audio / Video actions were silent on many cars
+- **Driver seat heating no longer also turns on the passenger seat**
+- **Double-press-only buttons work again** — a single tap now passes through to the car's own function. **"Close all windows"** from a button works too
+- **Door open/close automations work while parked** — no longer need the car on
+- **Stability Control & wireless charging toggles fixed**; key mapping recovers faster after a dropped button-capture service
+
+---
+
+### v32.0 — July 2026: Camera Views, Your Own Sounds & Smarter Automations
+
+**✨ New Features**
+- **Show any camera on screen — on demand** — Front, rear, left, right or all-four, on the main infotainment screen or the instrument cluster, at the size and corner you pick. Fire it from an automation ("show rear on reverse") or a mapped button, with optional auto-hide
+- **Play your own sounds and videos** — Upload MP3/WAV/MP4 to the new Audio Library, then play from an automation or button
+- **Many more things your car can react to** — New triggers for accelerator/brake pressure, steering angle, indicators, the emergency alarm, tyre pressure/leak warnings, and your phone connecting over Bluetooth by name
+- **Rules that know where you are** — A location trigger fires when you enter or leave a mapped Safe-Location zone. Zones now go as small as 15 m (was 50)
+- **More you can control** — Cluster and head-up-display brightness, volume per channel, and brake pedal feel (Comfort/Sport)
+- **Pause and wait in a routine** — Pause for a set time, or wait until a value is reached ("wait until stopped, then close windows")
+- **Toggle with one button** — Mapped buttons can flip a setting on, then off on the next press
+
+**⚡ Optimizations & Fixes**
+- **Edit a key mapping in place** — Edit an existing binding instead of deleting and re-adding
+- **Steering & pedal rules fire reliably** — Fixed the steering reading sticking at start-up, and stopped a momentary "unavailable" reading from firing a rule by mistake
+- **Turn-signal rules don't flicker** while you wait to turn
+- **EV / HEV switching hardened** — a guard ensures the powertrain only ever selects a valid mode
+- **Fully translated** across all shipped languages
+
+---
+
+### v31.0 — July 2026: Community Automations, Ambient Automation, App Launcher & Live Deterrents
+
+**✨ New Features**
+- **Community Automations — browse, share and rate** — A new Community tab to discover automations other drivers built and add them with one tap (switched off, so you can review them first). Publish your own, rate the ones you like, and sort or filter by rating, adds or recency
+- **Ambient light automation — and more ways to trigger** — Set the interior ambient light colour as an automation action, or straight from the Vehicle Control page. New triggers react to current speed, the time of day, and the day of the week — plus a copy button to duplicate an existing automation
+- **Open any app — from an automation or a button** — Launch any installed app automatically when an automation fires, or bind it to a steering-wheel/dashboard button with Key Mapping
+- **Horn and Flash on the live camera view** — Dedicated Horn and Flash buttons right on the live camera feed to deter anyone near your car
+- **Separate MQTT heartbeat for parked, charging and normal** — Independent heartbeat sliders let you slow telemetry publishing right down when the car is parked or charging
+
+---
+
+### v30.2 — July 2026: Custom Key Mapping
+
+**✨ New Features**
+- **Key Mapping — make the car's buttons do what you want** — Rebind your steering-wheel and dashboard buttons. Capture a button (or type its code), pick single, double or long press, and choose what it does — lock or unlock, open the windows, tailgate, sunroof or sunshade, toggle climate, seat heating or cooling, daytime lights, flash the lights or find your car. Find it under **Vehicle → Key Mapping**
+- **One button, a whole routine** — Chain several actions into a single press. One button can close the windows, lock the doors and switch to ECO — in order, every time
+- **Switch drive and energy modes anywhere** — Change drive mode (ECO / Sport / Normal / Snow), powertrain (EV / HEV), energy recuperation and steering feel — as button mappings, automation actions, and from Home Assistant / MQTT
+- **Run scripts and open apps automatically** — Bind a shell command to a button or fire one from an automation. Off by default behind a separate permission, with a clear warning before you turn them on
+
+**⚡ Optimizations & Fixes**
+- **Instant settings** — Key-mapping changes now take effect the moment you save
+- **Fully translated** — Every new screen and label is available in all supported languages
+
+---
+
+### v30.0 — July 2026: Automation Support
+
+**✨ New Features**
+- **Automations — your car reacts on its own** — Build your own "when this, do that" rules. Pick a trigger from a vehicle event (power state, gear, battery level, windows and more), add conditions, and choose what happens — open or close the sunroof, sunshade or windows, switch lights or seat heating and cooling on, set the speed-limit warning, or send yourself a notification
+- **Animals show up on the event timeline** — When the camera spots an animal, it now appears on the recording's timeline and subtitles alongside people and vehicles
+
+**⚡ Optimizations & Fixes**
+- **Smoother MQTT** — Optimizations so your car's data flows more reliably to Home Assistant and other tools
+- **Better Brazilian Portuguese** — Cleaned up the Brazilian Portuguese (PT-BR) translations
+
+---
+
+### v29.0 — July 2026: Tune Each Camera, Catch Every Alert
+
+**✨ New Features**
+- **Separate quality for driving and surveillance** — Recording frame rate and video quality can now be set independently for the two modes
+- **A history of every notification** — Notifications now have their own Log tab. Filter by date, category or severity, and tap an event alert to jump straight to its recording
+
+**⚡ Optimizations & Fixes**
+- **Correct charging power for plug-in hybrids** — Fixed the charging power reading on PHEVs
+- **Turn-by-turn banner alignment** — Sorted out the alignment of the turn-by-turn navigation banner
+- **Sharper surveillance detection** — Improved detection accuracy so the camera flags what matters and misses less
+- **Live MQTT power draw** — Fixed MQTT power draw so it now updates live
+- **Time to full charge no longer sticks** — Fixed the time-to-full-charge figure getting stuck on the dashboard
+
+---
+
+### v28.0 — June 2026: Charging History & Longer Clips
+
+**✨ New Features**
+- **Charging history and a dashboard card** — Overdrive now logs your charging sessions and shows a card with time to full charge and more
+- **Longer event clips** — Recordings were fixed at 2 minutes; you can now choose 5 or 10 minutes too
+- **Save places straight from the map** — Press and hold anywhere on the map to add that spot as a favourite
+
+**⚡ Optimizations & Fixes**
+- **More accurate trip distance** — Trips now use the car's own distance reading, falling back to GPS only when it isn't available
+- **Fixed Driving DNA consistency** — Corrected the consistency score calculation
+- **Fixed turn-by-turn on the cluster** — The navigation banner now shows correctly on the instrument cluster projection
+- **Map settings without RoadSense** — You can open map settings without enabling RoadSense first
+- **Correct update tags and version info**
+- **Improved Surveillance recording and hero thumbnail generation accuracy**
+
+---
+
+### v27.0 — June 2026: Easier Recordings, Settings You Can Carry Over
+
+**✨ New Features**
+- **Find your clips faster, wherever they're saved** — Your recordings now show as simple chips so you can see at a glance where things are stored, and a filter lets you look through clips across all your storage in one place
+- **Back up your settings and trips, your way** — Save all your Overdrive settings to one file and load them back whenever you need. Your trip info is there too, accessible from the car, the web app, or Telegram
+- **Dial in how sensitive RoadSense is** — A new slider lets you turn speed breaker and pothole detection up or down to match your roads
+- **Bring your trips back if your storage gets wiped** — Added a Trip Restore button so you can recover past trips instead of losing them
+
+**⚡ Optimizations & Fixes**
+- **Surveillance stays on with USB power off** — Fixed an issue where surveillance would quietly stop after a while when the USB power toggle was off
+- **Telegram notifications work properly again**
+- **Cleaner trip numbers for plug-in hybrids** — Two decimal places, and for PHEVs the start and end battery percentage
+- **Correct battery health and energy for plug-in hybrids**
+- **The map tells you why a search didn't work** — Clear reason instead of just "couldn't find a route"
+- **Your location is up to date when you come back to the map**
+- **Smoother position marker on the driver cluster** — The dot now glides along instead of hopping every second, following your car's own speed and braking
+- **Sharper map on the driver cluster** — Now fills the whole cluster screen and reads clearly
+
+---
+
+### v26.0 — June 2026: Choose Your Updates — Alpha or Braveheart
+
+**✨ New Features**
+- **Two update channels — pick how new you like it** — Choose how updates reach your car from **Settings → About → Update channel**. Switch any time
+  - **Alpha** — the stable release, recommended for everyday driving. Every version is kept here, so you can install any one you like
+  - **Braveheart** — the latest and greatest, the moment it's ready. New features first, with the occasional rough edge
+- **Send us a log when something goes wrong** — The app bundles up a diagnostic log (with personal info automatically removed) and gives you a short code to share on Discord, GitHub, or WhatsApp
+- **Light or dark map, your call** — Switch the map between light and dark, or leave it on **Auto** to follow your app theme
+- **Save your Home, Work, and favourite places** — Pin the places you drive to most and reach them in one tap
+- **Pick up your trip where you left off** — Your destination and stops are still set when you come back to the map
+
+**⚡ Optimizations & Fixes**
+- **Lower CPU and GPU usage with Proximity Guard and Blind Spot on** — Cameras run at a low frame rate when nothing is happening, switching to full quality the moment there's an event
+- **Live view runs at full quality only while open**
+- **Cameras start only when the mode needs them**
+- **Recording storage limit is now properly enforced** — Older recordings clear correctly once the storage limit is reached, including dashcam drive clips
+- **Smooth location tracking on the map**
+- **Re-routing keeps your stops**
+- **Smoother, more reliable updating** — Installs and channel switches are dependable, and settings carry over cleanly
+- **More accurate battery health on plug-in hybrids**
+- **Fuel and total range now shown for plug-in hybrids**
+
+---
+
+### v25.0 — June 2026: Turn-by-Turn Navigation with RoadSense Hazards
+
+**✨ New Features**
+- **Turn-by-turn navigation, right on your dash** — Search for a place, pick your route, and follow clear guidance as you drive. You can send the map to your driver cluster so the road ahead stays in your line of sight
+- **See road hazards along your route** — The map plots the speed breakers and potholes RoadSense knows about — yours and ones shared by other drivers. Tap any hazard to confirm or remove it
+- **Chinese BYD cloud accounts now supported**
+
+**⚡ Optimizations & Fixes**
+- **Recording starts right away** — Fixed an uncommon case where recording could take a couple of minutes to kick in
+- **Smoother, snappier screen** — Menus and animations on the head unit feel noticeably more fluid
+
+---
+
+### v24.0 — June 2026: Blind Spot View, Recording Layouts, Redesigned Dashboard
+
+**✨ New Features**
+- **Blind Spot — see alongside the car when you signal** — Flip on a turn signal and a floating window pops up with an intelligently blended view of that side of the car, merging the side and rear cameras into one wide, natural picture. Size it, pin it to any corner, and fine-tune it from **RoadSense → Blind Spot**
+- **Choose what your recordings show** — A new recording layout option captures the forward dashcam view together with the full 360° camera feed
+- **Redesigned web app dashboard** — Fresh, cleaner look that's easier to read at a glance
+
+**⚡ Optimizations & Fixes**
+- **Sharper road hazard detection** — RoadSense is better at spotting speed breakers and potholes
+- **Accurate battery health for plug-in hybrids**
+- **Web app fits your phone properly** — Pages adapt to portrait or landscape with nothing cut off
+
+---
+
+### v23.0 — June 2026: RoadSense, App Lock, Recording Modes from the Overlay
+
+**✨ New Features**
+- **RoadSense — get a heads-up before the bumps** — Your car learns the speed breakers and potholes on the roads you drive and warns you as you approach. Everything stays on your device by default; optionally share hazards with other drivers
+- **App Lock with a PIN** — Set a PIN and the app asks for it before opening. Cameras, surveillance, and recordings keep running in the background as normal
+- **Switch recording modes right from the overlay** — Change recording mode and start recording with a single tap
+
+**⚡ Optimizations & Fixes**
+- **More resilient recording** — No longer stops by itself in certain rare timing situations
+- **Smoother telemetry overlay** — The speed/gear/GPS stamp burned into recordings is lighter on the system
+- **Recordings now move in the right direction** — **Next** takes you to the newer recording and **Previous** to the older one
+- **No more false charging alerts** — Fixed a bug that sent charging notifications every couple of hours
+
+---
+
+### v22.0 — June 2026: Fisheye Correction, Per-Camera Zoom, Location Search
+
+**✨ New Features**
+- **Fisheye correction for the cameras** — Straightens out the curve on the wide-angle cameras. Set independently for **Vehicle On** (driving) and **Vehicle Off** (parked) recordings
+- **Zoom into a single camera** — Tap any camera to zoom in while the others stay where they are. Zoom level is remembered per camera
+- **Search recordings by place** — Type a city, area, or landmark and the list filters as you type
+
+**⚡ Optimizations & Fixes**
+- **OEM Dashcam streaming fix** — Fixed the live stream not starting or freezing shortly after opening
+- **Faster Recordings and Trips pages** — Both open noticeably quicker, especially on slower head units
+
+---
+
+### v21.0 — June 2026: OEM Dashcam Recording & Streaming
+
+**✨ New Features**
+- **OEM Dashcam recording — vehicle on** — The factory forward camera writes its own `dvr_*.mp4` clips alongside the panoramic dashcam. Pick **Continuous** or **Smart** from **Settings → Recording → Dashcam**
+- **OEM Dashcam recording — vehicle off** — The same two modes apply to parked surveillance, with identical Safe Locations / Schedule / per-camera filters
+- **OEM Dashcam streaming** — Stream the forward camera in real time over the web app, with streaming quality controlled separately from recording quality
+
+**⚡ Optimizations & Fixes**
+- **Place filter chips on landscape Recordings page** — The landscape head unit now gets the same chip-based filtering as portrait
+- **Apply button drives all OEM and quality changes** — Codec, FPS, recording quality, and OEM mode pickers now wait for the Apply pill instead of saving on selection
+
+---
+
+### v20.0 — May 2026: In-Cabin Audio, Continuous Surveillance Recording
+
+> **Important** — after installing this update, do a hard reboot by holding the Volume button for 5 seconds.
+
+**✨ New Features**
+- **In-cabin audio recording on every camera clip** — The cabin microphone is captured alongside video on Continuous, Drive, and Proximity Guard recordings. Off by default; toggle from **Settings → Recording → Cabin Audio**
+- **Continuous Surveillance recording** — Keep recording the whole time the car is parked, not just when motion fires, with oldest segments rolling off automatically
+
+**⚡ Optimizations & Fixes**
+- **Zrok tunnel reachability fix** — Resolved a case where the tunnel could go silently unreachable after a network handover
+- **Lower CPU + memory across ACC ON/OFF transitions**
+- **Accurate SOH and kWh for PHEVs**
+- **SD card detection edge cases** — Fixed mounts where the card was visible to the OS but the daemon reported "no card"
+- **BYD Cloud account: country picker replaces region picker** — Korea now uses the right `-kr` host, and the Middle East / Africa node is exposed for the first time. **EU users — re-save your BYD Cloud settings**
+- **"Bad magic: expected BGTB" sign-in error fixed**
+
+---
+
+### v19.0 — May 2026: Stutter-Free AI Recording, Richer MQTT, Dashboard Upgrades
+
+**✨ New Features**
+- **New optimized AI detection pipeline — zero stutters in recordings** — The encoder pipeline is now fully decoupled from AI inference, so freeze-and-skip frames are gone
+- **MQTT payload now carries 60+ fields** — Automatically filtered by validity so consumers never see stale or sentinel values
+- **Open / Close Trunk button on the Dashboard**
+- **Mini map view on the Dashboard**
+- **Draggable floating camera / location button** — Position is remembered between sessions
+
+---
+
+### v18.0 — May 2026: Screen Deterrent, Web Dashboard & USB Storage
+
+**✨ New Features**
+- **Screen Deterrent without cloud setup** — A visual deterrent that runs entirely on-device, no BYD Cloud account required. Set your own message, image, or animated GIF
+- **Dashboard page in the web app** — Live position, lock / unlock / flash / find-car commands, and at-a-glance battery, range, 12V, ACC, network and lock-state metrics
+- **USB Flash Drive as a storage option** — Auto-detects mounted volumes and falls back gracefully when the drive is unplugged
+
+---
+
+### v17.0 — May 2026: New FPS Controls, New Logo, Fullscreen Player
+
+**✨ New Features**
+- **Configurable recording frame rate (10 / 15 / 20 / 30 FPS)** — For both Normal and Surveillance recording, with dynamic quality scaling
+- **Live streaming up to 30 FPS** — Streaming presets now reach the HAL ceiling (1280×960 @ 30 fps)
+- **Brand-new OverDrive logo**
+- **Fullscreen video player in Recordings**
+
+**⚡ Optimizations & Fixes**
+- **Better Thai (ไทย) translations**
+- **THB added as a Trips currency**
+
+---
+
+### v15.0 — May 2026: A Whole New OverDrive
+
+Android app + web companion rebuilt around how you actually use the car. Material 3.
+
+**✨ New Features**
+- **Hand-curated translations** — Every screen, button, alert, and the new theme picker / Telegram tier filter polished by hand
+- **Real home screen** — Car at a glance, charging, last trip, surveillance, quick actions
+- **Five sections, one tap each** — Dashboard · Recordings · Diagnostics · Integrations · Settings
+- **Settings hub** — Recording, Surveillance, ABRP, MQTT, Telegram, Tailscale, Themes under one roof
+- **Light · Dark · Auto themes** — "Auto" follows the head unit's day/night mode
+- **Web companion redesign** — Themed Live View, redesigned Vehicle Control with a 3D viewport, and its own theme picker
+- **Telegram severity filter** — Notice / Alert / Critical, with a clear "bot not paired" hint
+- **Recordings, reimagined** — Grouped by date, count pills, share-on-tile, refined player
+
+**⚡ Optimizations & Fixes**
+- **First-load tunnel fix** — Shows last-known values and a "Stale / Disconnected" pill instead of going to "—"
+- **Sharper surveillance thumbnails** — Static parked vehicles can no longer hijack a recording's hero thumbnail
+- **Every event has a preview image**
+- **"Check for updates" reliability** — Caps at 12s
+- **Rotation-ready** — Layouts respond properly to portrait/landscape on the 15.6" display
+
+---
+
+### v14.2 — May 2026: Speak Your Language & More Vehicle Controls
+
+**✨ New Features**
+- **Multi-language support** — Every screen, button, alert, popup, push notification, and recording subtitle translated. Out of the box, OverDrive matches your car's language
+- **More Vehicle Controls** — Seat Memory Positions (1 / 2 / 3), Daytime Running Lights (DRL), and Speed Limit Warning (SLW), alongside the existing lock, trunk, windows, AC, and seats
+
+**⚡ Optimizations & Fixes**
+- **Resolved install failures across several languages** — Character-encoding issues that broke the build on specific locales
+- **Refreshed setup-wizard icons**
+- **Map markers translated** — Tile labels stay in their local script
+- **Sidebar layout robust to long translations**
+- **Cleaner short-status words across locales**
+
+---
+
+### v14.0 — May 2026: Surveillance Revamp & Native Push
+
+**✨ New Features**
+- **Native Push Notifications** — Alerts straight from the car to your phone, no bot, no chat. Needs a Zrok reserved tunnel; open the URL on your phone, Add to Home Screen, hit **Enable**. Per-device, per-tier muting
+- **Surveillance Overhaul** — Rebuilt around persistent **Actors** tracked across frames and cameras with class, peak severity, and proximity
+  - **Three-tier severity** (Notice / Alert / Critical) on separate push channels
+  - **Hero thumbnail per recording** at the peak-threat moment
+  - **Per-segment heroes** for long events
+  - **Cleaner copy** — proper plurals
+  - **Two-stage banners** — quick text at start, rich banner at close
+  - **Static-aware gate** — parked cars cap at NOTICE, still persons stay CRITICAL
+- **Recording Library Redesign** — 2-col grid of 16:10 tiles with severity badges + actor pills, week-strip calendar
+- **Web Events Filtering** — Three chip rows (What / Severity / Distance)
+- **Sunshade Controls** on the Vehicle Control page
+
+**⚡ Optimizations & Fixes**
+- **Fixed Duplicate Recordings**
+- **Fixed Broken Recordings** — Reliable across rapid ACC/gear transitions and SD card hiccups
+- **Fixed Charging** — Indicator updates during active charging; kW reads true value
+
+---
+
+### v13.0 — May 2026: Tailscale Tunnel, More Vehicle Models & Window Levels
+
+**✨ New Features**
+- **Tailscale Tunnel Support** — A new remote-access option alongside Zrok and Cloudflared
+- **New Vehicle 3D Models** — BYD Seal, Seal U, Seal U DM-i, Dolphin, Atto 3, Han, Tang, M6, Seagull, and Destroyer 05
+- **Partial Window Controls** — Open or close each window to a chosen level (¼, ½, ¾, full)
+
+**⚡ Optimizations & Fixes**
+- **Fixed ACC Off / ACC On Recording**
+- **3D Surround View Polished**
+- **Lock/Unlock Status Reliability** — Now updates correctly even when the car is asleep, using BYD Cloud as a fallback
+
+---
+
 ### v12 — May 2026: Vehicle Control, ROI Scheduling & Cloud Sync
 
 **✨ New Features**
