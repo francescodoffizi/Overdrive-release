@@ -1527,13 +1527,22 @@
     <string name="projection_status_unsupported">Live mirror isn\'t supported on this vehicle. The app is still projected on the cluster.</string>
     <string name="projection_status_service_down">Mirror service isn\'t ready — restart the app (or the camera daemon) and try again.</string>
     <string name="projection_note_single_app">One app can be projected on the cluster at a time.</string>
-    <string name="projection_adjust_bounds">Adjust bounds</string>
+    <string name="projection_adjust_bounds">Resize</string>
     <string name="projection_done_adjusting">Done</string>
-    <string name="projection_bounds_hint_idle">Mirror area</string>
-    <string name="projection_status_adjust">Drag to move · drag a corner to resize.</string>
+    <string name="projection_bounds_hint_idle">Mirror preview</string>
+    <string name="projection_status_adjust">Drag the frame to move · drag a handle to resize the preview.</string>
+    <!-- Cluster window layout: presets + aspect lock. The box positions the cast app ON the
+         driver cluster; the head-unit view is a live mirror of the whole cluster. -->
+    <string name="projection_window_title">Cluster window</string>
+    <string name="projection_window_desc">Position the cast app on the driver cluster. Presets snap it to common layouts; Resize window lets you drag it freely.</string>
+    <string name="projection_preset_full">Full</string>
+    <string name="projection_preset_left">Left half</string>
+    <string name="projection_preset_right">Right half</string>
+    <string name="projection_preset_center">Center</string>
+    <string name="projection_lock_aspect">Keep cluster aspect</string>
     <!-- Scaling mode picker -->
-    <string name="projection_scale_title">Scaling</string>
-    <string name="projection_scale_desc">How the cluster fills the mirror area.</string>
+    <string name="projection_scale_title">Mirror scaling</string>
+    <string name="projection_scale_desc">How the cluster mirror fills the preview on this screen.</string>
     <string name="projection_scale_fit">Fit</string>
     <string name="projection_scale_fill">Stretch</string>
     <string name="projection_scale_zoom">Zoom</string>
