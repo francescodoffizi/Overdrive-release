@@ -38,6 +38,11 @@ public class MqttPublisherService implements MqttCallback {
     private static final int BACKOFF_BASE_SECONDS = 5;
     private static final int BACKOFF_CAP_SECONDS = 300;
 
+    // How long to wait for an enabled-but-not-yet-up Tailscale proxy before falling back to a
+    // direct dial. Covers the boot window (tailscaled still binding) without permanently refusing
+    // a directly-reachable broker if the proxy is genuinely dead.
+    private static final long PROXY_WARMUP_GRACE_MS = 60_000L;
+
     // Connection config
     private final MqttConnectionConfig config;
     private final String deviceId;
@@ -53,6 +58,10 @@ public class MqttPublisherService implements MqttCallback {
     private volatile long lastPublishTime = 0;
     private volatile int consecutiveFailures = 0;
     private volatile String lastError = null;
+    // Proxy warm-up tracking (issue #182): when the first defer started, and whether we've already
+    // logged this warm-up so the health loop doesn't spam an identical warning every cycle.
+    private volatile long proxyWaitStartMs = 0L;
+    private volatile boolean loggedProxyWait = false;
 
     // Change detection (report-by-exception) + Home Assistant discovery state.
     // TelemetryDiffer is documented single-thread-owned: ALL access to it must
@@ -101,6 +110,44 @@ public class MqttPublisherService implements MqttCallback {
             logger.error(lastError);
             return false;
         }
+
+        // Mark the connection active as soon as it has a broker to attempt, independent of whether
+        // this first connect succeeds. Otherwise a failed OR deferred initial connect leaves
+        // running=false, and MqttConnectionManager's health loop bails on !isRunning() and never
+        // reschedules — the connection stays dead until a daemon restart. That gate (not the direct
+        // dial alone) is the real "never recovers" root cause behind #182, and the reason the
+        // "will retry on first publish" contract at the call site never actually held.
+        running = true;
+
+        // issue #182: when the Tailscale SOCKS proxy is ENABLED the broker is normally reachable
+        // ONLY through it (e.g. a LAN broker behind a subnet router while the car is on cellular).
+        // A DIRECT dial in that state can never succeed off Wi-Fi and strands the connection, so
+        // hold off while the proxy is warming up (tailscaled still binding at boot / after a link
+        // change) instead of falling through to the direct-socket path below. We do NOT bump
+        // consecutiveFailures — the health loop re-probes at the min-interval floor and connects the
+        // instant the proxy binds. Bounded by PROXY_WARMUP_GRACE_MS so a genuinely dead proxy can't
+        // permanently refuse a directly-reachable broker: after the grace window we fall through and
+        // try a direct dial as a last resort.
+        if (ProxyHelper.isProxyExpected() && !ProxyHelper.isProxyAvailable()) {
+            long now = System.currentTimeMillis();
+            if (proxyWaitStartMs == 0L) proxyWaitStartMs = now;
+            long waitedMs = now - proxyWaitStartMs;
+            if (waitedMs < PROXY_WARMUP_GRACE_MS) {
+                connected = false;
+                lastError = "Tailscale proxy enabled but not reachable yet (127.0.0.1:"
+                        + ProxyHelper.getTailscaleProxyPort() + ") — deferring connect until proxy is up";
+                if (!loggedProxyWait) {
+                    logger.warn(lastError);
+                    loggedProxyWait = true;
+                }
+                return false;
+            }
+            logger.warn("Tailscale proxy still unreachable after " + (waitedMs / 1000)
+                    + "s — attempting a direct connect as a fallback");
+        }
+        // Proxy is up (or the grace window elapsed) — clear the warm-up state and proceed to connect.
+        proxyWaitStartMs = 0L;
+        loggedProxyWait = false;
 
         String effectiveClientId = config.getEffectiveClientId(deviceId);
 
