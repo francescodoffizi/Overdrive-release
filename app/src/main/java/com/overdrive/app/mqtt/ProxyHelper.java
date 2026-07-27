@@ -2,6 +2,8 @@ package com.overdrive.app.mqtt;
 
 import com.overdrive.app.logging.DaemonLogger;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -39,6 +41,7 @@ public class ProxyHelper {
     private static final String PROXY_HOST = "127.0.0.1";
     private static final int PROXY_PORT = 8119;
     private static final int TAILSCALE_PROXY_PORT = 8539;
+    private static final String PROXY_ENABLED_FILE = "/data/local/tmp/.tailscale/proxy_enabled";
     // Loopback TCP connect budget. 200ms was too tight: a cold/loaded sing-box (or a
     // probe issued while the proxy is still binding) could miss, and a SINGLE miss
     // poisoned a whole minute (see the asymmetric cache below) → every map search /
@@ -82,23 +85,33 @@ public class ProxyHelper {
         proxyChecked = true;
         lastProbeTime = now;
 
-        try (Socket probe = new Socket()) {
-            try {
-                probe.connect(new InetSocketAddress(PROXY_HOST, TAILSCALE_PROXY_PORT), PROBE_TIMEOUT_MS);
-                proxyAvailable = true;
-                proxyPort = TAILSCALE_PROXY_PORT;
-                logger.info("Proxy probe: Tailscale proxy available on port " + TAILSCALE_PROXY_PORT);
-            } catch (Exception e) {
-                probe.connect(new InetSocketAddress(PROXY_HOST, PROXY_PORT), PROBE_TIMEOUT_MS);
-                proxyAvailable = true;
-                proxyPort = PROXY_PORT;
-                logger.info("Proxy probe: sing-box available on port " + PROXY_PORT);
-            }
-        } catch (Exception e) {
+        // Probe each candidate port on its OWN socket. A Socket cannot be reconnected after a
+        // failed connect(), so the previous single-socket form made the sing-box fallback throw
+        // "Socket closed" whenever the Tailscale probe missed — reporting "no proxy" even when a
+        // proxy was actually up (and, during the boot window, stranding MQTT on a direct dial).
+        if (probePort(TAILSCALE_PROXY_PORT)) {
+            proxyAvailable = true;
+            proxyPort = TAILSCALE_PROXY_PORT;
+            logger.info("Proxy probe: Tailscale proxy available on port " + TAILSCALE_PROXY_PORT);
+        } else if (probePort(PROXY_PORT)) {
+            proxyAvailable = true;
+            proxyPort = PROXY_PORT;
+            logger.info("Proxy probe: sing-box available on port " + PROXY_PORT);
+        } else {
             proxyAvailable = false;
         }
 
         return proxyAvailable;
+    }
+
+    /** Loopback TCP probe of a single port on a FRESH socket (see caller for why per-port). */
+    private static boolean probePort(int port) {
+        try (Socket probe = new Socket()) {
+            probe.connect(new InetSocketAddress(PROXY_HOST, port), PROBE_TIMEOUT_MS);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**
@@ -110,12 +123,42 @@ public class ProxyHelper {
     }
 
     /**
+     * The Tailscale SOCKS port we expect when the proxy is enabled. Unlike {@link #getProxyPort()}
+     * (which stays at the sing-box default until a successful probe updates it), this is stable, so
+     * callers can name the right port in "proxy warming up" diagnostics.
+     */
+    public static int getTailscaleProxyPort() {
+        return TAILSCALE_PROXY_PORT;
+    }
+
+    /**
      * Invalidate the proxy cache.
      * Call this on connection failures so the next attempt re-probes.
      */
     public static void invalidateCache() {
         proxyAvailable = false;
         proxyChecked = false;
+    }
+
+    /**
+     * Whether the user has ENABLED the Tailscale SOCKS proxy (persisted flag written by the
+     * Daemons screen to {@code .tailscale/proxy_enabled}). When true, outbound traffic is
+     * expected to go through the proxy ONLY, so callers must not fall back to a direct dial
+     * that cannot reach a proxy-only (e.g. subnet-routed LAN) broker off Wi-Fi.
+     */
+    public static boolean isProxyExpected() {
+        try (BufferedReader r = new BufferedReader(new FileReader(PROXY_ENABLED_FILE))) {
+            return isProxyEnabledValue(r.readLine());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Parse a persisted {@code proxy_enabled} value: true iff "true" (any case) or "1", trimmed. */
+    static boolean isProxyEnabledValue(String raw) {
+        if (raw == null) return false;
+        String v = raw.trim();
+        return "true".equalsIgnoreCase(v) || "1".equals(v);
     }
 
     /**
