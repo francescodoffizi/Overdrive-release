@@ -15,7 +15,7 @@ import java.util.EnumMap;
  * Per-role mappings (windshield / cabin / 360-front/right/rear/left) are stored
  * under {@code unified.camera.roleMappings} keyed by role; the resolver merges
  * profile defaults with persisted overrides at runtime. Profile selection
- * ({@code cameraProfile}) tracks vehicle-class geometry (Seal/Atto vs Tang),
+ * ({@code cameraProfile}) tracks vehicle-class geometry,
  * and probe results ({@code probedCameraId}, {@code probedSurfaceMode},
  * {@code probedWidth}, {@code probedHeight}) record the actual stream the GL
  * pipeline locked onto.
@@ -35,8 +35,10 @@ public final class CameraConfigResolver {
         String selectedProfileId = camera.optString("cameraProfile", CameraProfiles.PROFILE_AUTO);
         boolean autoProfile = selectedProfileId.isEmpty()
                 || CameraProfiles.PROFILE_AUTO.equalsIgnoreCase(selectedProfileId);
+        String vehicleModelHint = preferSelectedVehicleModel(
+                readSelectedVehicleModel(), vehicleModel);
         CameraProfile profile = autoProfile
-                ? CameraProfiles.infer(vehicleModel)
+                ? CameraProfiles.infer(vehicleModelHint)
                 : CameraProfiles.get(selectedProfileId);
 
         int panoCameraId = optNonNegative(camera, "probedCameraId", profile.getPanoCameraId());
@@ -256,6 +258,30 @@ public final class CameraConfigResolver {
             object.put(key, value);
         } catch (JSONException e) {
             throw new IllegalStateException("Failed to write JSON field '" + key + "'", e);
+        }
+    }
+
+    /**
+     * Prefer the model explicitly selected in OverDrive over the often-generic
+     * Android product string ("BYD AUTO"). A non-auto camera profile and any
+     * persisted probe/manual camera ID still take precedence later in resolve().
+     */
+    static String preferSelectedVehicleModel(String selectedModelId, String systemModel) {
+        if (selectedModelId != null && !selectedModelId.trim().isEmpty()) {
+            return selectedModelId.trim();
+        }
+        if (systemModel != null && !systemModel.trim().isEmpty()) {
+            return systemModel.trim();
+        }
+        return "unknown";
+    }
+
+    private static String readSelectedVehicleModel() {
+        try {
+            String selected = UnifiedConfigManager.getSelectedVehicleModelId();
+            return selected != null ? selected : "";
+        } catch (Exception e) {
+            return "";
         }
     }
 

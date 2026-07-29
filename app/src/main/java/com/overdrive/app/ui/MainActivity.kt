@@ -3535,13 +3535,18 @@ class MainActivity : AppCompatActivity() {
      */
     fun restartCameraDaemonForOnboarding() = restartCameraDaemonForCameraSettings()
 
-    /** Open the real vehicle capacity/model dialog for the vehicle chapter. */
-    fun openVehicleProfileForOnboarding() {
+    /**
+     * Open the real vehicle capacity/model dialog for the vehicle chapter.
+     * Completion waits for the user's save/reset/cancel action so the camera
+     * chapter cannot resolve against the old renderer fallback model.
+     */
+    fun openVehicleProfileForOnboarding(onFinished: () -> Unit): Boolean {
         val nav = supportFragmentManager.findFragmentById(R.id.navHostFragment)
                 as? androidx.navigation.fragment.NavHostFragment
         val dash = nav?.childFragmentManager?.primaryNavigationFragment
                 as? com.overdrive.app.ui.fragment.DashboardFragment
-        dash?.showVehicleCapacityDialog()
+                ?: return false
+        return dash.showVehicleCapacityDialog(onFinished)
     }
 
     /** Live DashboardFragment root for the orientation tour anchors (null if not current). */

@@ -1862,9 +1862,8 @@ public class SohEstimator {
 
             // Read fresh — model can change without touching SOH state.
             try {
-                JSONObject vehicle = UnifiedConfigManager.getVehicle();
-                String modelId = vehicle.optString("modelId", "");
-                if (!modelId.isEmpty()) {
+                String modelId = UnifiedConfigManager.getSelectedVehicleModelId();
+                if (modelId != null && !modelId.isEmpty()) {
                     status.put("modelId", modelId);
                 } else {
                     status.put("modelId", JSONObject.NULL);

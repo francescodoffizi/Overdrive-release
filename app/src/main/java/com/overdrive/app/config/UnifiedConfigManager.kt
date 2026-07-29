@@ -817,10 +817,26 @@ object UnifiedConfigManager {
         // Stored unified so AVN and remote (phone-over-tunnel) clients show the
         // same vehicle. modelId must match an entry in models/manifest.json; the
         // bundled default 'seal' is always available offline.
-        val vehicle = config.optJSONObject("vehicle") ?: JSONObject().also {
+        val storedVehicle = config.optJSONObject("vehicle")
+        val hadPersistedModel = storedVehicle?.has("modelId") == true
+        val vehicle = storedVehicle ?: JSONObject().also {
             config.put("vehicle", it)
         }
+        // Keep Seal as the offline 3D-renderer fallback, but do not present it
+        // to camera/SOH logic as a selected physical model on fresh installs.
+        // Existing configs predate provenance, so preserve their prior model
+        // behavior with the legacy source.
         if (!vehicle.has("modelId")) vehicle.put("modelId", "seal")
+        if (!vehicle.has("modelSource")) {
+            vehicle.put(
+                "modelSource",
+                if (hadPersistedModel) {
+                    VehicleModelSelection.SOURCE_LEGACY
+                } else {
+                    VehicleModelSelection.SOURCE_UNSET
+                }
+            )
+        }
         if (!vehicle.has("color")) vehicle.put("color", "#E8E8EC")  // Aurora White
 
         // Geocoding (place-name tagging) defaults — opt-in, fully offline by
@@ -922,9 +938,12 @@ object UnifiedConfigManager {
                     // nested keys wouldn't exist.
                     //
                     // Detect "needs migration" cheaply (legacy key at the
-                    // top of geocoding, or missing new sections).
+                    // top of geocoding, or missing new sections/selection
+                    // provenance).
                     val migrationNeeded = run {
                         if (!config.has("cloudflared")) return@run true
+                        val vehicle = config.optJSONObject("vehicle") ?: return@run true
+                        if (!vehicle.has("modelSource")) return@run true
                         val geo = config.optJSONObject("geocoding") ?: return@run true
                         geo.has("enabled") || geo.has("allowOnline")
                             || geo.has("customNominatimBase")
@@ -2206,13 +2225,35 @@ object UnifiedConfigManager {
             // Backfill driveSide on configs written before this field existed
             // so call sites can read it unconditionally without a default.
             if (!stored.has("driveSide")) stored.put("driveSide", "rhd")
+            if (!stored.has("modelSource")) {
+                stored.put(
+                    "modelSource",
+                    VehicleModelSelection.normalizeSource(
+                        null, stored.optString("modelId", "")
+                    )
+                )
+            }
             return stored
         }
         return JSONObject().apply {
             put("modelId", "seal")
+            put("modelSource", VehicleModelSelection.SOURCE_UNSET)
             put("color", "#E8E8EC")
             put("driveSide", "rhd")
         }
+    }
+
+    /**
+     * Physical vehicle model selected by the user or a future verified
+     * detector. Returns null when modelId is only the renderer fallback.
+     */
+    @JvmStatic
+    fun getSelectedVehicleModelId(): String? {
+        val vehicle = getVehicle()
+        return VehicleModelSelection.resolvedModelId(
+            vehicle.optString("modelId", ""),
+            vehicle.optString("modelSource", "")
+        )
     }
 
     /**

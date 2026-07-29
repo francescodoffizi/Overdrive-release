@@ -1,6 +1,7 @@
 package com.overdrive.app.server;
 
 import com.overdrive.app.config.UnifiedConfigManager;
+import com.overdrive.app.config.VehicleModelSelection;
 import com.overdrive.app.daemon.CameraDaemon;
 import com.overdrive.app.logging.DaemonLogger;
 
@@ -263,12 +264,23 @@ public class ModelsApiHandler {
         // returning a dead id that will fail at load time.
         JSONObject manifest = readManifest();
         String defaultId = manifest != null ? manifest.optString("default", "seal") : "seal";
-        String modelId = vehicle.optString("modelId", defaultId);
-        if (manifest != null && findModel(manifest, modelId) == null) {
-            modelId = defaultId;
+        String rawModelId = vehicle.optString("modelId", "");
+        String modelSource = VehicleModelSelection.normalizeSource(
+                vehicle.optString("modelSource", ""), rawModelId);
+        String selectedModelId = VehicleModelSelection.resolvedModelId(
+                rawModelId, modelSource);
+        if (selectedModelId != null
+                && manifest != null
+                && findModel(manifest, selectedModelId) == null) {
+            selectedModelId = null;
+            modelSource = VehicleModelSelection.SOURCE_UNSET;
         }
+        String modelId = selectedModelId != null ? selectedModelId : defaultId;
         JSONObject response = new JSONObject();
         response.put("modelId", modelId);
+        response.put("selectedModelId",
+                selectedModelId != null ? selectedModelId : JSONObject.NULL);
+        response.put("modelSource", modelSource);
         response.put("color", vehicle.optString("color", "#E8E8EC"));
         // driveSide controls which front-axis door each BYD HAL area code
         // labels as "Front-left" vs "Front-right" in notifications. The
@@ -290,6 +302,7 @@ public class ModelsApiHandler {
             return;
         }
         JSONObject patch = new JSONObject();
+        boolean modelSelectionChanged = false;
         if (incoming.has("modelId")) {
             String id = incoming.optString("modelId");
             // Validate against manifest so a typo or stale client can't poison the config.
@@ -299,6 +312,16 @@ public class ModelsApiHandler {
                 return;
             }
             patch.put("modelId", id);
+            patch.put("modelSource", VehicleModelSelection.SOURCE_USER);
+            modelSelectionChanged = true;
+        } else if (incoming.optBoolean("clearModelSelection", false)) {
+            JSONObject manifest = readManifest();
+            String defaultId = manifest != null
+                    ? manifest.optString("default", "seal")
+                    : "seal";
+            patch.put("modelId", defaultId);
+            patch.put("modelSource", VehicleModelSelection.SOURCE_UNSET);
+            modelSelectionChanged = true;
         }
         if (incoming.has("color")) {
             String color = incoming.optString("color", "");
@@ -334,7 +357,7 @@ public class ModelsApiHandler {
         // SOH so the displayed health value reflects the new pack rather
         // than carrying stale calibration from the previous selection.
         // Skipped when only color changed — that has no SOH bearing.
-        if (incoming.has("modelId")) {
+        if (modelSelectionChanged) {
             try {
                 com.overdrive.app.monitor.SocHistoryDatabase socDb =
                     com.overdrive.app.monitor.SocHistoryDatabase.getInstance();
@@ -379,8 +402,8 @@ public class ModelsApiHandler {
      */
     public static double nominalKwhForSelectedModel() {
         try {
-            String modelId = UnifiedConfigManager.getVehicle().optString("modelId", "");
-            if (modelId.isEmpty()) return 0;
+            String modelId = UnifiedConfigManager.getSelectedVehicleModelId();
+            if (modelId == null || modelId.isEmpty()) return 0;
             JSONObject manifest = readManifest();
             if (manifest == null) return 0;
             JSONObject m = findModel(manifest, modelId);
@@ -400,8 +423,8 @@ public class ModelsApiHandler {
      */
     public static double grossNameplateKwhForSelectedModel() {
         try {
-            String modelId = UnifiedConfigManager.getVehicle().optString("modelId", "");
-            if (modelId.isEmpty()) return 0;
+            String modelId = UnifiedConfigManager.getSelectedVehicleModelId();
+            if (modelId == null || modelId.isEmpty()) return 0;
             JSONObject manifest = readManifest();
             if (manifest == null) return 0;
             JSONObject m = findModel(manifest, modelId);

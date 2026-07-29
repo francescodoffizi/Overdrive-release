@@ -904,7 +904,15 @@ class DashboardFragment : Fragment() {
                 if (conn.responseCode == 200) {
                     val body = conn.inputStream.bufferedReader().use { it.readText() }
                     val json = org.json.JSONObject(body)
-                    val m = json.optString("modelId", "")
+                    val m = when {
+                        json.has("selectedModelId") && !json.isNull("selectedModelId") ->
+                            json.optString("selectedModelId", "")
+                        json.has("modelSource")
+                                && json.optString("modelSource", "unset") == "unset" -> ""
+                        // Backward compatibility with an older daemon that does
+                        // not expose selection provenance yet.
+                        else -> json.optString("modelId", "")
+                    }
                     if (m.isNotEmpty()) modelId = m
                 }
                 conn.disconnect()
@@ -932,8 +940,8 @@ class DashboardFragment : Fragment() {
      * `internal` so the onboarding vehicle chapter can launch the real dialog via
      * MainActivity.openVehicleProfileForOnboarding() rather than reimplementing it.
      */
-    internal fun showVehicleCapacityDialog() {
-        val ctx = context ?: return
+    internal fun showVehicleCapacityDialog(onFinished: (() -> Unit)? = null): Boolean {
+        val ctx = context ?: return false
 
         // Inflate the M3 layout (outlined inputs + ExposedDropdownMenu).
         val dialogView = layoutInflater.inflate(
@@ -1068,7 +1076,13 @@ class DashboardFragment : Fragment() {
                 if (conn.responseCode == 200) {
                     val body = conn.inputStream.bufferedReader().use { it.readText() }
                     val json = org.json.JSONObject(body)
-                    val m = json.optString("modelId", "")
+                    val m = when {
+                        json.has("selectedModelId") && !json.isNull("selectedModelId") ->
+                            json.optString("selectedModelId", "")
+                        json.has("modelSource")
+                                && json.optString("modelSource", "unset") == "unset" -> ""
+                        else -> json.optString("modelId", "")
+                    }
                     if (m.isNotEmpty()) initialModelId = m
                 }
                 conn.disconnect()
@@ -1157,26 +1171,64 @@ class DashboardFragment : Fragment() {
             }
         }
 
-        com.google.android.material.dialog.MaterialAlertDialogBuilder(ctx, R.style.Theme_Overdrive_M3_Dialog)
+        var completionDeferred = false
+        var completionSent = false
+        fun finishOnce() {
+            if (!completionSent) {
+                completionSent = true
+                onFinished?.invoke()
+            }
+        }
+
+        val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(
+            ctx, R.style.Theme_Overdrive_M3_Dialog)
             .setTitle(getString(R.string.vehicle_dialog_title))
             .setView(dialogView)
-            .setPositiveButton(getString(R.string.vehicle_dialog_save)) { _, _ ->
+            // Install button listeners after show so invalid capacity does not
+            // trigger AlertDialog's default auto-dismiss behavior.
+            .setPositiveButton(getString(R.string.vehicle_dialog_save), null)
+            .setNeutralButton(getString(R.string.vehicle_dialog_reset), null)
+            .setNegativeButton(getString(R.string.action_cancel), null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener {
                 val raw = capInput.text?.toString()?.trim().orEmpty()
                 val kwh = raw.toDoubleOrNull()
                 if (kwh == null || kwh < 15.0 || kwh > 120.0) {
                     Toast.makeText(ctx, getString(R.string.vehicle_dialog_invalid_capacity), Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
+                    return@setOnClickListener
                 }
-                postNominalAndModel(kwh, selectedModelId)
+                completionDeferred = true
+                postNominalAndModel(kwh, selectedModelId) { finishOnce() }
+                dialog.dismiss()
             }
-            .setNeutralButton(getString(R.string.vehicle_dialog_reset)) { _, _ ->
-                postNominal(null)
+            dialog.getButton(android.content.DialogInterface.BUTTON_NEUTRAL).setOnClickListener {
+                completionDeferred = true
+                postNominal(
+                    kwh = null,
+                    clearModelSelection = true,
+                    onComplete = { finishOnce() },
+                )
+                dialog.dismiss()
             }
-            .setNegativeButton(getString(R.string.action_cancel), null)
-            .show()
+            dialog.getButton(android.content.DialogInterface.BUTTON_NEGATIVE).setOnClickListener {
+                dialog.dismiss()
+            }
+        }
+        dialog.setOnDismissListener {
+            // Save/reset wait for both daemon writes. Cancel, back, and
+            // outside-tap complete the optional onboarding chapter immediately.
+            if (!completionDeferred) finishOnce()
+        }
+        dialog.show()
+        return true
     }
 
-    private fun postNominal(kwh: Double?) {
+    private fun postNominal(
+        kwh: Double?,
+        clearModelSelection: Boolean = false,
+        onComplete: (() -> Unit)? = null,
+    ) {
         val executor = metricsExecutor ?: Executors.newSingleThreadExecutor()
             .also { metricsExecutor = it }
         executor.execute {
@@ -1190,11 +1242,33 @@ class DashboardFragment : Fragment() {
                 conn.responseCode
                 conn.disconnect()
             } catch (_: Throwable) {}
-            mainHandler.post { refreshVehicleTile() }
+
+            if (clearModelSelection) {
+                try {
+                    val conn = com.overdrive.app.util.DaemonHttpClient.open(
+                        "/api/models/selected", "POST", 3000, 5000)
+                    conn.doOutput = true
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.outputStream.use {
+                        it.write("{\"clearModelSelection\":true}".toByteArray())
+                    }
+                    conn.responseCode
+                    conn.disconnect()
+                } catch (_: Throwable) {}
+            }
+
+            mainHandler.post {
+                refreshVehicleTile()
+                onComplete?.invoke()
+            }
         }
     }
 
-    private fun postNominalAndModel(kwh: Double, modelId: String?) {
+    private fun postNominalAndModel(
+        kwh: Double,
+        modelId: String?,
+        onComplete: (() -> Unit)? = null,
+    ) {
         val executor = metricsExecutor ?: Executors.newSingleThreadExecutor()
             .also { metricsExecutor = it }
         executor.execute {
@@ -1220,7 +1294,10 @@ class DashboardFragment : Fragment() {
                 } catch (_: Throwable) {}
             }
 
-            mainHandler.post { refreshVehicleTile() }
+            mainHandler.post {
+                refreshVehicleTile()
+                onComplete?.invoke()
+            }
         }
     }
 

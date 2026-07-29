@@ -12,13 +12,15 @@ import java.util.Map;
 /**
  * Registry of known camera profiles.
  *
- * Add new vehicle variants here. {@link #infer(String)} matches lowercase
- * substrings of {@code ro.product.model}; that property's content varies
- * across BYD firmwares so verify on real hardware before relying on auto.
+ * Add new vehicle variants here. {@link #infer(String)} accepts either the
+ * user-selected vehicle model ID or a system model string. BYD head units
+ * often expose only a generic {@code ro.product.model} such as "BYD AUTO",
+ * so field-verified selected-model mappings are preferred by the resolver.
  */
 public final class CameraProfiles {
     public static final String PROFILE_AUTO = "auto";
     public static final String PROFILE_LEGACY_SEAL_ATTO = "legacy_seal_atto";
+    public static final String PROFILE_ATTO_3 = "atto3";
     public static final String PROFILE_TANG_2022 = "tang_2022";
 
     private static final LinkedHashMap<String, CameraProfile> PROFILES = new LinkedHashMap<>();
@@ -48,8 +50,25 @@ public final class CameraProfiles {
 
         register(new CameraProfile(
                 PROFILE_LEGACY_SEAL_ATTO,
-                "Legacy panoramic (Seal / Atto)",
+                "Legacy panoramic (camera 1)",
                 1,
+                5120,
+                960,
+                0,
+                1280,
+                960,
+                legacyMappings,
+                FOV_DEG_DEFAULT));
+
+        // Field-verified on a DiLink 3.0 Atto 3 (Android 10): the BMM HAL
+        // advertises pano_h -> camera 0 at 5120x960. Camera 1 is invalid on
+        // this unit and even crashes the vendor bmmcameraserver during the
+        // failed close path, so Atto 3 must not inherit the camera-1 legacy
+        // default.
+        register(new CameraProfile(
+                PROFILE_ATTO_3,
+                "BYD Atto 3 (field verified)",
+                0,
                 5120,
                 960,
                 0,
@@ -90,10 +109,19 @@ public final class CameraProfiles {
     }
 
     public static CameraProfile infer(String vehicleModel) {
-        // Tang profile split disabled — every vehicle gets legacy Seal/Atto
-        // 5120x960 / cameraId=1 / surfaceMode=0. Tang's actual panoramic
-        // strip turned out to behave the same on this firmware, and the
-        // separate profile was causing daemon hangs.
+        if (vehicleModel != null) {
+            String normalized = vehicleModel.toLowerCase(Locale.US)
+                    .replace("-", "")
+                    .replace("_", "")
+                    .replace(" ", "");
+            if (normalized.contains("atto3") || normalized.contains("yuanplus")) {
+                return get(PROFILE_ATTO_3);
+            }
+        }
+
+        // Tang profile split remains disabled. Its separate profile caused
+        // daemon hangs on the tested firmware, so unknown/Tang models retain
+        // the camera-1 legacy fallback until a field-verified mapping exists.
         // if (vehicleModel != null) {
         //     String normalized = vehicleModel.toLowerCase(Locale.US);
         //     if (normalized.contains("tang")) {
