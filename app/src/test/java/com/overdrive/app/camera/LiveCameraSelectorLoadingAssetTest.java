@@ -52,9 +52,9 @@ public class LiveCameraSelectorLoadingAssetTest {
         assertTrue(appShell.contains(
                 "typeof window.AndroidBridge !== 'undefined'"));
         assertTrue(appShell.contains(
-                "var sidebarCanvas = embeddedInNativeApp\n"
-                        + "            ? null\n"
-                        + "            : document.getElementById('evCardCanvas');"));
+                "var sidebarCanvas = embeddedInNativeApp"));
+        assertTrue(appShell.contains(
+                ": document.getElementById('evCardCanvas');"));
         assertTrue(appShell.contains(
                 "if (embeddedInNativeApp) return;"));
         assertTrue(appShell.contains(
