@@ -45,6 +45,22 @@ public class LiveCameraSelectorLoadingAssetTest {
                 eagerLoaderBlock.contains("ensureEv3d();"));
     }
 
+    @Test
+    public void embeddedAppDoesNotRenderTheHiddenWebSidebarVehicle() throws Exception {
+        String appShell = readWebAsset("shared/app-shell.js");
+
+        assertTrue(appShell.contains(
+                "typeof window.AndroidBridge !== 'undefined'"));
+        assertTrue(appShell.contains(
+                "var sidebarCanvas = embeddedInNativeApp\n"
+                        + "            ? null\n"
+                        + "            : document.getElementById('evCardCanvas');"));
+        assertTrue(appShell.contains(
+                "if (embeddedInNativeApp) return;"));
+        assertTrue(appShell.contains(
+                "} else if (!embeddedInNativeApp) {"));
+    }
+
     private static String readWebAsset(String relativePath) throws IOException {
         Path current = Paths.get("").toAbsolutePath();
         Path fromModule = current.resolve("src/main/assets/web").resolve(relativePath);

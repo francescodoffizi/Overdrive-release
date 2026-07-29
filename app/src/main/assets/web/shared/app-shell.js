@@ -25,6 +25,14 @@
 (function () {
     'use strict';
 
+    // The Android app supplies its own navigation rail and injects
+    // AndroidBridge before the page starts loading. Its post-load CSS hides
+    // this web sidebar, so rendering the sidebar's 3D vehicle there wastes a
+    // full GLB parse and can race the visible aux canvas. Standalone/tunnel
+    // pages have no bridge and keep the normal sidebar renderer.
+    var embeddedInNativeApp =
+        typeof window.AndroidBridge !== 'undefined';
+
     /*
      * Sidebar nav layout MIRRORS rail_menu.xml exactly:
      *   Dashboard → Live → Recordings → Vehicle → Trips → Integrations cluster →
@@ -523,6 +531,10 @@
         function instantiate() {
             if (ev3dInstance) return;
             if (typeof window.OverdriveEvCard3D !== 'function') return;
+            // The native shell hides #sidebar after page load. The script may
+            // still be needed by a visible aux canvas, but never bind WebGL
+            // to the hidden sidebar canvas in that environment.
+            if (embeddedInNativeApp) return;
             try {
                 ev3dInstance = new window.OverdriveEvCard3D(canvas);
                 // Replay the most recent (model, colour) pair. SOC +
@@ -633,7 +645,9 @@
         // injects the 3D pipeline on a miss, so subsequent page loads
         // paint the EV card from a ~30KB webp instead of a 600KB
         // three.js + 1.6MB GLB cold parse.
-        var sidebarCanvas = document.getElementById('evCardCanvas');
+        var sidebarCanvas = embeddedInNativeApp
+            ? null
+            : document.getElementById('evCardCanvas');
         if (sidebarCanvas && modelId && hexColor) {
             tryPaintFromSpriteCache(sidebarCanvas, modelId, hexColor, 'side', function (hit) {
                 if (hit) {
@@ -684,7 +698,7 @@
                     pendingSidebarSnapshot = { modelId: modelId, color: hexColor };
                 }
             });
-        } else {
+        } else if (!embeddedInNativeApp) {
             // Fallback for callers that don't have the canvas or only
             // have one of (model, colour) — preserve the original
             // behaviour so login.html and friends still work.
