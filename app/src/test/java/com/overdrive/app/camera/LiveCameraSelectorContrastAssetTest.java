@@ -52,6 +52,25 @@ public class LiveCameraSelectorContrastAssetTest {
         assertTrue(liveView.contains("color: var(--lv-hotspot-active-text)"));
     }
 
+    @Test
+    public void appShellKeepsReadableSizeAndOpposingSideAnchors() throws IOException {
+        String fragment = readRepositoryFile(
+            "app/src/main/java/com/overdrive/app/ui/fragment/WebViewFragment.kt");
+
+        assertTrue(fragment.contains(
+            "max-width: 74px; white-space: nowrap; overflow: hidden;"));
+        assertTrue(fragment.contains(
+            "text-overflow: ellipsis; padding: 4px 6px; font-size: 11px;"));
+        assertTrue(fragment.contains(
+            "left: auto !important; right: calc(100% + 4px) !important;"));
+        assertTrue(fragment.contains(
+            "right: auto !important; left: calc(100% + 4px) !important;"));
+        assertFalse(fragment.contains(
+            ".cam-hotspot[data-cam=\"4\"] .hotspot-label { left: -34px"));
+        assertFalse(fragment.contains(
+            ".cam-hotspot[data-cam=\"2\"] .hotspot-label { right: -34px"));
+    }
+
     private static String between(String value, String start, String end) {
         int startIndex = value.indexOf(start);
         int endIndex = value.indexOf(end, startIndex + start.length());

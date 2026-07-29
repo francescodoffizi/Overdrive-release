@@ -234,14 +234,18 @@ class WebViewFragment : Fragment() {
         '[data-app-shell="1"] #panelMap .map-overlay-actions { top: 14px !important; right: 14px !important; gap: 10px !important; }',
         '[data-app-shell="1"] .btn-map-float { width: 44px !important; height: 44px !important; }',
         '[data-app-shell="1"] .btn-map-float svg { width: 20px !important; height: 20px !important; }',
-        // Camera hotspot labels — clamp width and slightly shrink the
-        // negative offsets so labels don't clip the .seamless-camera-view
-        // when the WebView is in landscape windowed mode.
+        // Camera hotspot labels — keep a generous translated-label clamp,
+        // but preserve the page's paint-independent pill size and opposing
+        // left/right anchors. The former negative-offset rules set both
+        // horizontal edges after the page moved to right:/left: anchoring,
+        // squeezing LEFT/RIGHT down to an ellipsis on the head unit.
         '[data-app-shell="1"] .cam-hotspot .hotspot-label {',
-        '   max-width: 64px; white-space: nowrap; overflow: hidden;',
-        '   text-overflow: ellipsis; padding: 3px 7px; font-size: 9px; }',
-        '[data-app-shell="1"] .cam-hotspot[data-cam="4"] .hotspot-label { left: -34px !important; }',
-        '[data-app-shell="1"] .cam-hotspot[data-cam="2"] .hotspot-label { right: -34px !important; }',
+        '   max-width: 74px; white-space: nowrap; overflow: hidden;',
+        '   text-overflow: ellipsis; padding: 4px 6px; font-size: 11px; }',
+        '[data-app-shell="1"] .cam-hotspot[data-cam="4"] .hotspot-label {',
+        '   left: auto !important; right: calc(100% + 4px) !important; }',
+        '[data-app-shell="1"] .cam-hotspot[data-cam="2"] .hotspot-label {',
+        '   right: auto !important; left: calc(100% + 4px) !important; }',
 
         // === Page-specific carry-overs (kept from previous behaviour) ===
         '#safeLocMap { z-index: 1 !important; position: relative !important; overflow: hidden !important; }',
