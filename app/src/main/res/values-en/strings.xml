@@ -632,11 +632,13 @@
     <string name="settings_section_privacy">Privacy &amp; data</string>
     <string name="settings_section_overlay">Status overlay</string>
     <string name="settings_section_security">Security</string>
-    <string name="settings_overlay_subtitle">Choose which segments of the floating status pill stay visible.</string>
+    <string name="settings_overlay_subtitle">Choose which floating status indicators stay visible.</string>
     <string name="settings_overlay_camera_title">Camera indicator</string>
     <string name="settings_overlay_camera_subtitle">Show the REC / PROX badge while recording is active.</string>
     <string name="settings_overlay_trip_title">Trip indicator</string>
     <string name="settings_overlay_trip_subtitle">Show the TRIP badge while trip detection is running.</string>
+    <string name="settings_overlay_roadsense_title">RoadSense overlay</string>
+    <string name="settings_overlay_roadsense_subtitle">Show the floating RoadSense pill and hazard card while RoadSense is enabled.</string>
     <!-- Was "About & updates" — Check for Updates row was removed from
          the About page, so the menu / rail label is now just "About". -->
     <string name="settings_section_about">About</string>
