@@ -40,6 +40,11 @@ BYD.stream = {
     latencyCheckInterval: null,
     streamStarted: false,
     selectedQuality: 'MEDIUM',
+    // A stream paused because the app was backgrounded should resume the
+    // same camera. Manual stops intentionally clear this state.
+    _backgroundResumeMode: null,
+    _backgroundResumeTimer: null,
+    _backgroundResumeInFlight: false,
     
     // WebSocket connects to /ws on same port as HTTP server (optimized endpoint)
     // Old raw stream port 8887 is deprecated - bypasses SOTA optimizations
@@ -682,7 +687,16 @@ BYD.stream = {
     /**
      * Stop streaming
      */
-    stopStream() {
+    stopStream(options) {
+        const preserveBackgroundResume = options && options.preserveBackgroundResume === true;
+        if (!preserveBackgroundResume) {
+            this._backgroundResumeMode = null;
+            if (this._backgroundResumeTimer) {
+                clearTimeout(this._backgroundResumeTimer);
+                this._backgroundResumeTimer = null;
+            }
+        }
+
         this.streamStarted = false;
         
         if (this.reconnectTimer) {
@@ -726,6 +740,68 @@ BYD.stream = {
         
         this.decoderMode = null;
         console.log('[Stream] Stopped');
+    },
+
+    /**
+     * Pause an active stream while preserving enough intent to restore the
+     * same camera when Android brings the WebView back to the foreground.
+     */
+    pauseForBackground() {
+        if (!this.streamStarted || this.currentViewMode < 0) return;
+
+        const mode = this.currentViewMode;
+        console.log('[Stream] Backgrounded - pausing camera:', mode);
+        this.stopStream({ preserveBackgroundResume: true });
+        this._backgroundResumeMode = mode;
+
+        // Do not leave a stale "Live" badge over the blank decoder while the
+        // WebView is being restored.
+        this.updateStreamStatus(BYD.i18n.t('stream.connecting'), false);
+    },
+
+    /**
+     * Resume a lifecycle-paused stream. Android onResume and the Page
+     * Visibility API can both signal the foreground transition, so the short
+     * timer and in-flight guard ensure only one decoder/socket is created.
+     */
+    resumeAfterBackground(forceForeground) {
+        const foregroundIsAuthoritative = forceForeground === true;
+        if (foregroundIsAuthoritative && this._backgroundResumeTimer) {
+            clearTimeout(this._backgroundResumeTimer);
+            this._backgroundResumeTimer = null;
+        }
+        if (this._backgroundResumeMode === null ||
+            this._backgroundResumeMode < 0 ||
+            this.streamStarted ||
+            this._backgroundResumeInFlight ||
+            this._backgroundResumeTimer) {
+            return;
+        }
+
+        this._backgroundResumeTimer = setTimeout(async () => {
+            this._backgroundResumeTimer = null;
+            if ((!foregroundIsAuthoritative && document.hidden) ||
+                this._backgroundResumeMode === null ||
+                this.streamStarted ||
+                this._backgroundResumeInFlight) {
+                return;
+            }
+
+            const mode = this._backgroundResumeMode;
+            this._backgroundResumeMode = null;
+            this._backgroundResumeInFlight = true;
+            console.log('[Stream] Foregrounded - resuming camera:', mode);
+            try {
+                await this.selectCamera(mode);
+            } catch (e) {
+                console.error('[Stream] Resume failed:', e);
+                if (!document.hidden && !this.streamStarted) {
+                    this._backgroundResumeMode = mode;
+                }
+            } finally {
+                this._backgroundResumeInFlight = false;
+            }
+        }, 250);
     },
     
     /**
@@ -869,11 +945,13 @@ BYD.stream = {
         
         // Status polling is handled by core.js - no duplicate polling here
         
-        // Page Visibility API
+        // Pause expensive decoding in the background and restore the same
+        // selection when the page becomes visible again.
         document.addEventListener("visibilitychange", () => {
-            if (document.hidden && this.streamStarted) {
-                console.log("[Stream] Backgrounded - pausing");
-                this.stopStream();
+            if (document.hidden) {
+                this.pauseForBackground();
+            } else {
+                this.resumeAfterBackground();
             }
         });
         
