@@ -37,12 +37,12 @@ public class VehicleControlAssetTest {
     }
 
     @Test
-    public void modelCorrectionIsManifestDrivenRatherThanVehicleBranched() throws IOException {
+    public void modelFitIsGenericRatherThanVehicleBranched() throws IOException {
         String script = readRepositoryFile("app/src/main/assets/web/shared/vehicle-control.js");
         String manifest = readRepositoryFile(
                 "app/src/main/assets/web/shared/models/manifest.json");
 
-        assertTrue(manifest.contains("\"displayScale\": [0.9, 1.0, 1.0]"));
+        assertFalse(manifest.contains("\"displayScale\""));
         assertTrue(script.contains("entry.displayScale"));
         assertTrue(script.contains("_fitLoadedCarModel"));
         assertFalse(script.contains("activeModelId === 'atto3'"));
@@ -50,13 +50,26 @@ public class VehicleControlAssetTest {
     }
 
     @Test
-    public void explicitNormalTpmsStateWinsOverGenericPressureFallback() throws IOException {
+    public void rawLimitsStillCatchLowPressureWhenSdkSaysNormal() throws IOException {
         String script = readRepositoryFile("app/src/main/assets/web/shared/vehicle-control.js");
 
         assertTrue(script.contains("typeof corner.pressureState === 'number'"));
-        assertTrue(script.contains("if (corner.pressureState >= 1) return 'warn'"));
-        assertTrue(script.contains("return 'normal';"));
+        assertTrue(script.contains("&& corner.pressureState >= 1) return 'warn'"));
+        assertTrue(script.contains("corner.psi < 28 || corner.psi > 50"));
+        assertFalse(script.contains(
+                "corner.pressureState >= 1) return 'warn';\n            return 'normal'"));
         assertFalse(script.contains("corner.psi < 34"));
+    }
+
+    @Test
+    public void inCarRendererResizesAndUsesBoundedGpuWork() throws IOException {
+        String script = readRepositoryFile("app/src/main/assets/web/shared/vehicle-control.js");
+
+        assertTrue(script.contains("_watchCanvasSize"));
+        assertTrue(script.contains("new ResizeObserver(sync)"));
+        assertTrue(script.contains("this.renderer.setPixelRatio(window.AndroidBridge"));
+        assertTrue(script.contains("type: typeof WebAssembly === 'object' ? 'wasm' : 'js'"));
+        assertTrue(script.contains("now - this._lastRenderFrame < 32"));
     }
 
     private static int count(String text, String needle) {

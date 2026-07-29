@@ -1,5 +1,5 @@
 {
-  "version": 8,
+  "version": 7,
   "default": "seal",
   "baseUrl": "https://github.com/yash-srivastava/Overdrive-release/releases/download/models-v1/",
   "paintPresets": [
@@ -73,7 +73,6 @@
       "sizeBytes": 1642648,
       "sha256": "6e08a0223fb2a4c229a8ed323b6d748930491b583cb595b38a0e372314c028a1",
       "bundled": false,
-      "displayScale": [0.9, 1.0, 1.0],
       "nominalKwh": 60.48
     },
     {

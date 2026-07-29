@@ -234,10 +234,22 @@ var VC = {
         this.renderer = new THREE.WebGLRenderer({
             canvas: canvasEl,
             antialias: true,
-            alpha: true
+            alpha: true,
+            powerPreference: 'high-performance'
         });
+        // The AVN stretches the native WebView to the physical display after
+        // page layout. Rendering at its reported devicePixelRatio wastes GPU
+        // fill-rate without adding visible detail; phones retain high DPI.
+        this.renderer.setPixelRatio(window.AndroidBridge
+            ? 1
+            : Math.min(window.devicePixelRatio, 2));
         this.renderer.setSize(renderW, renderH, false);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 3));
+        if (window.AndroidBridge && window.console) {
+            console.log('[VC perf] canvas css=' + renderW + 'x' + renderH
+                + ' buffer=' + canvasEl.width + 'x' + canvasEl.height
+                + ' dpr=' + window.devicePixelRatio
+                + ' cameraAspect=' + this.camera.aspect.toFixed(4));
+        }
         // Read the clear colour from the active theme so the 3D viewport
         // matches the surrounding chrome under both light and dark themes.
         // Was previously hardcoded #0F0F12 which left the car silhouette
@@ -268,6 +280,7 @@ var VC = {
         this.addGroundGrid();
 
         window.addEventListener('resize', function() { self.onResize(); });
+        this._watchCanvasSize();
 
         // React to theme changes so the renderer's clear colour stays in
         // sync with the rest of the UI. The Android shell sets data-theme
@@ -311,6 +324,53 @@ var VC = {
             }
         } catch (e) { /* fall through */ }
         return 0x0F0F12;
+    },
+
+    /**
+     * The native shell hides the web sidebar after onPageFinished, after this
+     * page has already initialised Three.js. That expands the canvas without a
+     * window resize, so the old backing buffer was stretched across the new
+     * box. Observe the real content box and keep renderer + camera in sync.
+     * A short poll covers WebViews older than ResizeObserver.
+     */
+    _watchCanvasSize: function() {
+        var self = this;
+        var canvas = this.renderer && this.renderer.domElement;
+        if (!canvas) return;
+
+        var sync = function() {
+            if (!self.renderer || !self.camera) return;
+            var rect = canvas.getBoundingClientRect();
+            var w = Math.round(rect.width);
+            var h = Math.round(rect.height);
+            if (w < 1 || h < 1) return;
+            if (w !== self._canvasCssW || h !== self._canvasCssH) {
+                self._canvasCssW = w;
+                self._canvasCssH = h;
+                self.onResize();
+                if (window.AndroidBridge && window.console) {
+                    console.log('[VC perf] resized css=' + w + 'x' + h
+                        + ' buffer=' + canvas.width + 'x' + canvas.height
+                        + ' cameraAspect=' + self.camera.aspect.toFixed(4));
+                }
+            }
+        };
+
+        this._canvasCssW = Math.round(canvas.getBoundingClientRect().width);
+        this._canvasCssH = Math.round(canvas.getBoundingClientRect().height);
+
+        if (window.ResizeObserver) {
+            this._canvasResizeObserver = new ResizeObserver(sync);
+            this._canvasResizeObserver.observe(canvas);
+        }
+
+        var checksLeft = 30;
+        var poll = function() {
+            sync();
+            checksLeft--;
+            if (checksLeft > 0) setTimeout(poll, 100);
+        };
+        setTimeout(poll, 0);
     },
 
     addLighting: function() {
@@ -393,6 +453,7 @@ var VC = {
         var self = this;
         modelId = modelId || this.activeModelId || 'seal';
         this.activeModelId = modelId;
+        this._modelLoadStartedAt = Date.now();
         var gen = ++this._loadGen;
 
         // Sanity check — if Three.js failed to load (e.g. local extraction failed),
@@ -546,11 +607,14 @@ var VC = {
 
         // Draco decoder — the GLB uses Draco mesh compression.
         // Local path: assets/web/shared/vendor/draco/ (extracted to /data/local/tmp/web/shared/vendor/draco/).
-        // We force the JS decoder (no WASM) for Chrome 58 compatibility and to avoid the
-        // wasm MIME quirks on some BYD WebViews.
+        // WebAssembly is materially faster on the head unit and the local
+        // server serves .wasm as application/wasm. Keep JS as a fallback for
+        // WebViews without WebAssembly.
         var dracoLoader = new THREE.DRACOLoader();
         dracoLoader.setDecoderPath('../shared/vendor/draco/');
-        dracoLoader.setDecoderConfig({ type: 'js' });
+        dracoLoader.setDecoderConfig({
+            type: typeof WebAssembly === 'object' ? 'wasm' : 'js'
+        });
         loader.setDRACOLoader(dracoLoader);
 
         loader.load(
@@ -607,6 +671,10 @@ var VC = {
 
                 self._modelSourceScale = self.carModel.scale.clone();
                 self._fitLoadedCarModel();
+                if (window.AndroidBridge && window.console) {
+                    console.log('[VC perf] model=' + self.activeModelId
+                        + ' readyMs=' + (Date.now() - self._modelLoadStartedAt));
+                }
 
                 self.scene.add(self.carModel);
 
@@ -684,9 +752,20 @@ var VC = {
         this._tyreLastW = 0; this._tyreLastH = 0;
     },
 
-    animate: function() {
+    animate: function(frameTime) {
         var self = this;
-        requestAnimationFrame(function() { self.animate(); });
+        requestAnimationFrame(function(nextFrameTime) { self.animate(nextFrameTime); });
+        // 30fps is smooth for this fixed automotive display. Together with
+        // the 1x backing buffer it removes most continuous AVN GPU load;
+        // standalone phone/browser clients retain their native refresh rate.
+        if (window.AndroidBridge) {
+            var now = typeof frameTime === 'number'
+                ? frameTime
+                : (window.performance && performance.now ? performance.now() : Date.now());
+            if (this._lastRenderFrame
+                    && now - this._lastRenderFrame < 32) return;
+            this._lastRenderFrame = now;
+        }
         if (this.controls) this.controls.update();
         // Update canvas texture each frame when 3D view is active
         if (this._3dViewActive && this._videoTexture) {
@@ -4348,21 +4427,18 @@ var VC = {
     /** Map raw BYD enums + raw PSI to a 3-tier visual-state scale:
      *    'alert'  → red     leak (airLeakState>=1) or fallback PSI < 22
      *    'warn'   → orange  pressureState UNDER/OVER, or fallback PSI < 28 / > 50
-     *    'normal' → teal    explicit SDK normal state, or plausible fallback PSI
+     *    'normal' → teal    plausible PSI with no SDK warning
      *    'muted'  → grey    no signal / no data
-     *  An explicit SDK state is authoritative. Raw PSI is only a conservative
-     *  fallback for vehicles that do not expose pressureState; this avoids
-     *  painting manufacturer-normal pressures (for example 31.9 PSI) as a
-     *  warning while the same card says OK.
+     *  SDK warnings are authoritative, while conservative raw limits catch a
+     *  genuinely low/high reading even when a vehicle reports state=normal.
+     *  Manufacturer-normal pressures such as 31.9 PSI remain teal.
      */
     _tyreStateToken: function(corner) {
         if (!corner || corner.available === false) return 'muted';
         if (corner.signalState === 1) return 'muted';
         if (corner.airLeakState && corner.airLeakState >= 1) return 'alert';
-        if (typeof corner.pressureState === 'number') {
-            if (corner.pressureState >= 1) return 'warn';
-            return 'normal';
-        }
+        if (typeof corner.pressureState === 'number'
+                && corner.pressureState >= 1) return 'warn';
         if (typeof corner.psi === 'number') {
             if (corner.psi < 22) return 'alert';
             if (corner.psi < 28 || corner.psi > 50) return 'warn';
