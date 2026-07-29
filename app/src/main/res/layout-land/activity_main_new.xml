@@ -182,10 +182,11 @@
                     app:titleTextAppearance="@style/TextAppearance.Material3.TitleMedium">
 
                     <!--
-                      Status pill (landscape variant). Same DOM shape as the
+                      Status pill (landscape variant). Same view shape as the
                       portrait toolbar so MainActivity bindings (urlBar,
                       statusIndicator, urlStatusDot, tvCurrentUrl, btnCopyUrl)
-                      all resolve identically. The bottom URL strip is gone.
+                      all resolve identically. It starts hidden until a tunnel
+                      is genuinely starting or running.
                     -->
                     <LinearLayout
                         android:id="@+id/urlBar"
@@ -206,7 +207,8 @@
                             android:gravity="center_vertical"
                             android:orientation="horizontal"
                             android:paddingHorizontal="14dp"
-                            android:paddingVertical="6dp">
+                            android:paddingVertical="6dp"
+                            android:visibility="gone">
 
                             <View
                                 android:id="@+id/urlStatusDot"
@@ -229,7 +231,7 @@
                                 android:fontFamily="monospace"
                                 android:maxWidth="320dp"
                                 android:singleLine="true"
-                                android:text="@string/url_connecting"
+                                android:text="@string/dashboard_no_tunnel"
                                 android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
                                 android:textColor="?attr/colorPrimary"
                                 android:textIsSelectable="true" />

@@ -186,9 +186,10 @@
                       `btnCopyUrl`, `urlBar` IDs are preserved here even though
                       the bottom URL strip is gone — MainActivity reads them
                       to update tunnel state. `urlStatusDot` is the dot inside
-                      the pill (same drawable swap logic). `urlBar` is now the
-                      pill's outer LinearLayout so the same visibility toggling
-                      keeps working.
+                      the pill (same drawable swap logic). The status pill
+                      starts hidden and appears only for a genuinely starting
+                      or running tunnel; the surrounding `urlBar` stays visible
+                      so the language affordance remains reachable.
                     -->
                     <LinearLayout
                         android:id="@+id/urlBar"
@@ -209,7 +210,8 @@
                             android:gravity="center_vertical"
                             android:orientation="horizontal"
                             android:paddingHorizontal="14dp"
-                            android:paddingVertical="8dp">
+                            android:paddingVertical="8dp"
+                            android:visibility="gone">
 
                             <View
                                 android:id="@+id/urlStatusDot"
@@ -232,7 +234,7 @@
                                 android:fontFamily="monospace"
                                 android:maxWidth="280dp"
                                 android:singleLine="true"
-                                android:text="@string/url_connecting"
+                                android:text="@string/dashboard_no_tunnel"
                                 android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
                                 android:textColor="?attr/colorPrimary"
                                 android:textIsSelectable="true" />
