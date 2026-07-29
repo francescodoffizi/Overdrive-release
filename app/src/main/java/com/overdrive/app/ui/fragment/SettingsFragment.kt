@@ -19,6 +19,8 @@ import com.google.android.material.switchmaterial.SwitchMaterial
 import com.overdrive.app.BuildConfig
 import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
+import com.overdrive.app.roadsense.config.RoadSenseConfig
+import com.overdrive.app.roadsense.overlay.RoadSenseOverlayService
 import com.overdrive.app.ui.MainActivity
 import org.json.JSONObject
 import com.overdrive.app.updater.AppUpdater
@@ -52,6 +54,8 @@ import java.util.Locale
  * set of views — the union of IDs would not exist in any single layout.
  */
 class SettingsFragment : Fragment() {
+    private var portraitRoadSenseSwitch: SwitchMaterial? = null
+    private var applyingPortraitRoadSenseConfig = false
 
     /**
      * Sub-rail sections. The order here is the visual order in the rail
@@ -136,6 +140,16 @@ class SettingsFragment : Fragment() {
             setupResetRow(view)
             setupFooter(view)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshPortraitRoadSenseSwitch(forceReload = true)
+    }
+
+    override fun onDestroyView() {
+        portraitRoadSenseSwitch = null
+        super.onDestroyView()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -335,15 +349,23 @@ class SettingsFragment : Fragment() {
     private fun setupOverlayToggles(view: View) {
         val swCamera = view.findViewById<SwitchMaterial>(R.id.swOverlayCamera) ?: return
         val swTrip = view.findViewById<SwitchMaterial>(R.id.swOverlayTrip) ?: return
+        val swRoadSense =
+            view.findViewById<SwitchMaterial>(R.id.swOverlayRoadSense) ?: return
+        portraitRoadSenseSwitch = swRoadSense
         val rowCamera = view.findViewById<View>(R.id.rowOverlayCamera)
         val rowTrip = view.findViewById<View>(R.id.rowOverlayTrip)
+        val rowRoadSense = view.findViewById<View>(R.id.rowOverlayRoadSense)
 
         val cfg = UnifiedConfigManager.getStatusOverlay()
         swCamera.isChecked = cfg.optBoolean("cameraVisible", true)
         swTrip.isChecked = cfg.optBoolean("tripVisible", true)
+        refreshPortraitRoadSenseSwitch(forceReload = true)
 
         rowCamera?.setOnClickListener { swCamera.isChecked = !swCamera.isChecked }
         rowTrip?.setOnClickListener { swTrip.isChecked = !swTrip.isChecked }
+        rowRoadSense?.setOnClickListener {
+            swRoadSense.isChecked = !swRoadSense.isChecked
+        }
 
         swCamera.setOnCheckedChangeListener { _, checked ->
             UnifiedConfigManager.setStatusOverlay(JSONObject().put("cameraVisible", checked))
@@ -353,6 +375,28 @@ class SettingsFragment : Fragment() {
             UnifiedConfigManager.setStatusOverlay(JSONObject().put("tripVisible", checked))
             kickOverlayRefresh()
         }
+        swRoadSense.setOnCheckedChangeListener { button, checked ->
+            if (applyingPortraitRoadSenseConfig) return@setOnCheckedChangeListener
+            if (RoadSenseConfig.setOverlayVisible(checked)) {
+                context?.let { RoadSenseOverlayService.syncWithConfig(it) }
+            } else {
+                applyingPortraitRoadSenseConfig = true
+                button.isChecked = !checked
+                applyingPortraitRoadSenseConfig = false
+            }
+        }
+    }
+
+    private fun refreshPortraitRoadSenseSwitch(forceReload: Boolean) {
+        val toggle = portraitRoadSenseSwitch ?: return
+        val visible = try {
+            RoadSenseConfig.snapshot(forceReload).overlayVisible
+        } catch (_: Throwable) {
+            return
+        }
+        applyingPortraitRoadSenseConfig = true
+        toggle.isChecked = visible
+        applyingPortraitRoadSenseConfig = false
     }
 
     /**

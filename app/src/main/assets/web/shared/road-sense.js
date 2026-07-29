@@ -471,6 +471,13 @@ BYD.roadSense = {
             // Live-update the dependent-card gate so toggling the master on/off
             // immediately enables/dims Warnings/Crowdsource/Data.
             this._applyMasterGate(on);
+            // The floating overlay is a separate app-process service. Reconcile it
+            // after either master transition, not only when the overlay preference
+            // itself changes, so master OFF removes the pill immediately.
+            if (typeof window.AndroidBridge !== 'undefined'
+                    && typeof AndroidBridge.syncRoadSenseOverlay === 'function') {
+                try { AndroidBridge.syncRoadSenseOverlay(); } catch (e) { /* best-effort */ }
+            }
             this._toastSaved();
         } else {
             el.checked = !on;

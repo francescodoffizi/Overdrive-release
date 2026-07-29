@@ -1156,15 +1156,10 @@ class WebViewFragment : Fragment() {
         fun syncRoadSenseOverlay(): String {
             return try {
                 val ctx = context ?: return "no_context"
-                val shouldShow = com.overdrive.app.roadsense.config.RoadSenseConfig
-                    .snapshot(forceReload = true).overlayShouldShow()
                 ctx.mainExecutor.execute {
                     try {
-                        if (shouldShow) {
-                            com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.startIfPermitted(ctx)
-                        } else {
-                            com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.stop(ctx)
-                        }
+                        com.overdrive.app.roadsense.overlay.RoadSenseOverlayService
+                            .syncWithConfig(ctx)
                     } catch (e: Exception) {
                         android.util.Log.w("WebViewFragment", "syncRoadSenseOverlay apply failed: ${e.message}")
                     }
