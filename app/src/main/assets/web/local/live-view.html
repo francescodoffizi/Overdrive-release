@@ -42,38 +42,12 @@
 
             <div class="live-tabs-view" id="tabsView">
                 <div class="tab-content">
-                    <!-- Map Panel -->
-                    <div class="tab-panel active" id="panelMap">
-                        <div class="map-container" id="mapContainer"></div>
-                        <div class="map-overlay-actions">
-                            <button class="btn-map-float btn-my-location" onclick="BYD.map.showMyLocation()">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/>
-                                </svg>
-                            </button>
-                            <button class="btn-map-float btn-directions" onclick="BYD.map.openDirections()">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11l19-9-9 19-2-8-8-2z"/></svg>
-                            </button>
-                        </div>
-                        <div class="map-info-bar">
-                            <span class="map-info-item">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>
-                                </svg>
-                                <span id="distanceToCar">--</span>
-                            </span>
-                            <span class="map-info-item">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
-                                </svg>
-                                <span id="lastGpsUpdate">--</span>
-                            </span>
-                        </div>
-                    </div>
-
-                    <!-- SOTA Cameras Panel -->
-                    <div class="tab-panel" id="panelCameras">
+                    <!-- Camera-first Live dashboard. In landscape the camera
+                         stage keeps most of the canvas while the selector and
+                         location preview share a utility rail on the right. -->
+                    <div class="tab-panel active" id="panelCameras">
                         <div class="seamless-camera-view">
+                            <div class="camera-stage">
                             <!-- Top Bar -->
                             <div class="camera-top-bar">
                                 <div class="top-bar-left">
@@ -150,8 +124,11 @@
                                     </button>
                                 </div>
                             </div>
+                            </div>
 
-                            <!-- Bottom Car Image Selector — flips to a right-rail in landscape -->
+                            <aside class="live-utility-rail" id="liveUtilityRail">
+                            <section class="camera-selector-card" aria-label="Camera selector">
+                            <!-- Camera selector — first card in the landscape utility rail. -->
                             <div class="car-selector-bottom">
                                 <div class="car-image-container">
                                     <canvas id="liveCarCanvas" class="car-image" aria-hidden="true"></canvas>
@@ -196,13 +173,67 @@
                                     </div>
                                 </div>
                             </div>
+                            </section>
+
+                            <section class="live-location-card" id="locationCard">
+                                <div class="location-card-header">
+                                    <div>
+                                        <h2 data-i18n="dashboard.card_location">Vehicle location</h2>
+                                        <div class="location-freshness">
+                                            <span class="location-freshness-dot"></span>
+                                            <span id="lastGpsUpdate">--</span>
+                                        </div>
+                                    </div>
+                                    <button type="button" class="location-close-button"
+                                            onclick="BYD.liveLayout.setMapExpanded(false)"
+                                            data-i18n-attr="aria-label:liveview.back_to_cameras"
+                                            aria-label="Back to cameras">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="m15 18-6-6 6-6"/>
+                                        </svg>
+                                    </button>
+                                </div>
+
+                                <div class="location-map-frame">
+                                    <div class="map-container" id="mapContainer"></div>
+                                    <div class="map-overlay-actions">
+                                        <button class="btn-map-float btn-my-location"
+                                                onclick="BYD.map.showMyLocation()"
+                                                data-i18n-attr="aria-label:liveview.my_location"
+                                                aria-label="Show my location">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/>
+                                            </svg>
+                                        </button>
+                                        <button class="btn-map-float btn-directions"
+                                                onclick="BYD.map.openDirections()"
+                                                data-i18n-attr="aria-label:liveview.directions"
+                                                aria-label="Directions to vehicle">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11l19-9-9 19-2-8-8-2z"/></svg>
+                                        </button>
+                                    </div>
+                                    <div class="location-distance-chip">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>
+                                        </svg>
+                                        <span id="distanceToCar">--</span>
+                                    </div>
+                                </div>
+
+                                <button type="button" class="location-expand-button"
+                                        id="locationExpandButton"
+                                        onclick="BYD.liveLayout.toggleMap()"
+                                        aria-expanded="false">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/>
+                                        <path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
+                                    </svg>
+                                    <span id="locationExpandLabel" data-i18n="liveview.expand_map">Expand map</span>
+                                </button>
+                            </section>
+                            </aside>
                         </div>
                     </div>
-                </div>
-
-                <div class="mini-preview" id="miniPreview" onclick="BYD.tabs.switchTo(BYD.tabs.activeTab === 'map' ? 'cameras' : 'map')">
-                    <div class="mini-preview-content" id="miniPreviewContent"></div>
-                    <div class="mini-preview-label" id="miniPreviewLabel" data-i18n="stream.mini_cameras">Cameras</div>
                 </div>
             </div>
         </main>
@@ -694,11 +725,250 @@
             0%, 100% { box-shadow: 0 0 20px rgba(0,212,170,0.4); }
             50% { box-shadow: 0 0 35px rgba(0,212,170,0.7); }
         }
+
+        /* Camera-first Live dashboard */
+        .camera-stage {
+            position: relative;
+            display: flex;
+            flex: 1 1 auto;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        .live-utility-rail {
+            display: flex;
+            flex: 0 0 auto;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 0;
+            padding: 12px;
+            background: var(--lv-panel-bg);
+        }
+
+        .camera-selector-card,
+        .live-location-card {
+            border: 1px solid var(--lv-pill-border-soft);
+            border-radius: 14px;
+            background: var(--lv-pill-bg);
+            overflow: hidden;
+        }
+
+        .camera-selector-card {
+            display: flex;
+            flex: 1 1 54%;
+            min-height: 210px;
+        }
+
+        .camera-selector-card .car-selector-bottom {
+            flex: 1 1 auto;
+            width: 100%;
+            padding: 12px;
+            background: transparent;
+            align-items: center;
+        }
+
+        .live-location-card {
+            position: relative;
+            display: flex;
+            flex: 1 1 46%;
+            flex-direction: column;
+            min-height: 210px;
+            margin-top: 12px;
+            transition: border-radius 180ms ease, margin 180ms ease;
+        }
+
+        .location-card-header {
+            display: flex;
+            flex: 0 0 auto;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 14px 10px;
+        }
+
+        .location-card-header h2 {
+            margin: 0;
+            color: var(--text-primary);
+            font-size: 15px;
+            font-weight: 700;
+            line-height: 1.2;
+        }
+
+        .location-freshness {
+            display: flex;
+            align-items: center;
+            margin-top: 5px;
+            color: var(--text-muted);
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .location-freshness-dot {
+            width: 7px;
+            height: 7px;
+            margin-right: 6px;
+            border-radius: 50%;
+            background: #22c55e;
+            box-shadow: 0 0 8px rgba(34,197,94,0.55);
+        }
+
+        .location-map-frame {
+            position: relative;
+            flex: 1 1 auto;
+            min-height: 100px;
+            margin: 0 12px;
+            overflow: hidden;
+            border: 1px solid var(--lv-pill-border-soft);
+            border-radius: 10px;
+            background: #0a0f0f;
+        }
+
+        .location-map-frame .map-container,
+        .location-map-frame .leaflet-container {
+            width: 100%;
+            height: 100%;
+        }
+
+        .location-distance-chip {
+            position: absolute;
+            left: 8px;
+            bottom: 8px;
+            z-index: 20;
+            display: flex;
+            align-items: center;
+            padding: 6px 9px;
+            border: 1px solid rgba(0,212,170,0.22);
+            border-radius: 14px;
+            background: rgba(8,16,16,0.82);
+            color: rgba(255,255,255,0.88);
+            font-size: 10px;
+            font-weight: 600;
+            -webkit-backdrop-filter: blur(10px);
+            backdrop-filter: blur(10px);
+        }
+
+        .location-distance-chip svg {
+            width: 13px;
+            height: 13px;
+            margin-right: 5px;
+            color: var(--brand-primary);
+        }
+
+        .location-expand-button {
+            display: flex;
+            flex: 0 0 44px;
+            align-items: center;
+            justify-content: center;
+            margin: 10px 12px 12px;
+            border: 1px solid var(--brand-primary);
+            border-radius: 10px;
+            background: transparent;
+            color: var(--brand-primary);
+            font-size: 12px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .location-expand-button svg {
+            width: 16px;
+            height: 16px;
+            margin-right: 8px;
+        }
+
+        .location-close-button {
+            display: none;
+            width: 44px;
+            height: 44px;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--lv-pill-border);
+            border-radius: 12px;
+            background: var(--lv-pill-bg);
+            color: var(--text-primary);
+            cursor: pointer;
+        }
+
+        .location-close-button svg {
+            width: 22px;
+            height: 22px;
+        }
+
+        /* Compact preview is deliberately passive: map controls and the
+           Leaflet chrome appear only after the user explicitly expands it. */
+        #panelCameras:not(.map-expanded) .map-overlay-actions,
+        #panelCameras:not(.map-expanded) .location-map-frame .leaflet-control-container {
+            display: none;
+        }
+
+        /* Expanding location promotes the existing map card over the camera
+           dashboard, preserving the stream and selected view underneath. */
+        #panelCameras.map-expanded .live-location-card {
+            position: absolute;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            left: 0;
+            z-index: 100;
+            min-height: 0;
+            margin: 0;
+            border: 0;
+            border-radius: 0;
+            background: var(--bg-base);
+        }
+
+        #panelCameras.map-expanded .location-card-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-subtle);
+            background: var(--bg-surface);
+        }
+
+        #panelCameras.map-expanded .location-card-header h2 {
+            font-size: 18px;
+        }
+
+        #panelCameras.map-expanded .location-close-button {
+            display: flex;
+        }
+
+        #panelCameras.map-expanded .location-map-frame {
+            min-height: 0;
+            margin: 0;
+            border: 0;
+            border-radius: 0;
+        }
+
+        #panelCameras.map-expanded .map-overlay-actions {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #panelCameras.map-expanded .map-overlay-actions .btn-map-float + .btn-map-float {
+            margin-top: 8px;
+        }
+
+        #panelCameras.map-expanded .location-distance-chip {
+            left: 16px;
+            bottom: 16px;
+            padding: 8px 12px;
+            font-size: 12px;
+        }
+
+        #panelCameras.map-expanded .location-expand-button {
+            display: none;
+        }
         
         /* Fullscreen */
         .seamless-camera-view.fullscreen {
             position: fixed;
-            inset: 0;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            left: 0;
             z-index: 1000;
         }
         
@@ -737,60 +1007,70 @@
             .deterrent-btn { min-width: 96px; padding: 9px 12px; font-size: 12px; border-radius: 12px; }
             .deterrent-btn svg { width: 16px; height: 16px; flex: 0 0 16px; margin-right: 6px; }
             .deterrent-controls .deterrent-btn + .deterrent-btn { margin-top: 8px; }
+
+            /* On narrow/portrait screens keep the same information
+               architecture but stack the utility cards below the cameras. */
+            #panelCameras .seamless-camera-view {
+                overflow-y: auto;
+            }
+            #panelCameras .camera-stage {
+                flex: 0 0 58%;
+                min-height: 340px;
+            }
+            #panelCameras .live-utility-rail {
+                flex: 0 0 auto;
+                flex-direction: row;
+                min-height: 220px;
+                padding: 10px;
+                border-top: 1px solid var(--lv-pill-border-soft);
+            }
+            #panelCameras .camera-selector-card,
+            #panelCameras .live-location-card {
+                flex: 1 1 50%;
+                min-width: 0;
+                min-height: 200px;
+            }
+            #panelCameras .live-location-card {
+                margin-top: 0;
+                margin-left: 10px;
+            }
+            #panelCameras .camera-selector-card .car-selector-bottom {
+                padding: 8px;
+                padding-bottom: 8px;
+            }
         }
         
         /* Mini preview position handled by .cameras-mode class */
 
-        /* ===========================================================
-           LANDSCAPE LAYOUT (e.g. BYD Seal head unit, 1920x1080)
-           Default vertical layout puts the car selector below the video,
-           which works in portrait but wastes 30%+ of the canvas in
-           landscape. We flip the cameras panel to side-by-side so the
-           video grows horizontally (75%) and the car-image selector
-           stays as a fixed-width 25% rail on the right.
-           A small toggle near the top-bar collapses the rail to a
-           thin handle, so a single tap can give the video the full
-           canvas. Toggle is purely CSS-driven via a class on the
-           panelCameras element.
-           =========================================================== */
-        /* Landscape trigger is `orientation: landscape` only — no min-width.
-           In the BYD in-app WebView the device is 1920x1080 in landscape but
-           the WebView viewport is narrower than the device width because the
-           Android shell's NavigationRailView claims a fixed pixel column on
-           the left. A `min-width: 900px` gate fails for that effective
-           viewport even though the screen is clearly landscape, so the
-           selector falls back to the portrait below-video stack which the
-           user reads as "selector is taking 50% height". Orientation alone
-           is the right signal — if the device is landscape, side-rail wins.
-           Outside the in-app shell (zrok tunnel on a phone in landscape with
-           a tiny browser window) this could activate at narrow widths, but
-           the rail's `min-width: 200px` keeps the video area still usable. */
+        /* Landscape camera-first dashboard: video receives roughly 72% of
+           the canvas; selector + location share a 28% utility rail. */
         @media (orientation: landscape) {
             #panelCameras .seamless-camera-view {
                 flex-direction: row;
             }
-            #panelCameras .video-display-area {
-                flex: 1 1 75%;
+            #panelCameras .camera-stage {
+                flex: 1 1 72%;
+                min-width: 0;
                 min-height: 0;
             }
-            #panelCameras .car-selector-bottom {
-                flex: 0 0 25%;
-                max-width: 280px;
-                min-width: 200px;
-                padding: 16px 12px;
-                padding-bottom: 24px;
-                border-left: 1px solid var(--lv-pill-border-soft, rgba(255,255,255,0.08));
-                background: var(--lv-car-bg);
-                align-items: center;
-                position: relative;
-                transition: max-width 0.25s ease, min-width 0.25s ease,
-                            flex-basis 0.25s ease, padding 0.25s ease;
+            #panelCameras .video-display-area {
+                min-height: 0;
             }
-            /* Move the car upward so labels above/below stay clear of
-               the panel edges. The portrait extra-margin assumed a wide
-               flex container; we tighten that here. */
-            #panelCameras .car-image-container {
-                margin: 22px auto;
+            #panelCameras .live-utility-rail {
+                flex: 0 0 28%;
+                max-width: 380px;
+                min-width: 270px;
+                border-left: 1px solid var(--lv-pill-border-soft, rgba(255,255,255,0.08));
+            }
+            #panelCameras .camera-selector-card .car-selector-bottom {
+                padding: 10px 12px;
+                padding-bottom: 10px;
+            }
+            #panelCameras .camera-selector-card .car-image-container {
+                margin: 18px auto;
+            }
+            #panelCameras.map-expanded .live-utility-rail {
+                border-left: 0;
             }
         }
     </style>
@@ -808,47 +1088,49 @@
             document.getElementById('sidebarOverlay').classList.toggle('show');
         }
         
-        BYD.tabs = {
-            activeTab: 'map',
-            switchTo(tab) {
-                if (tab === this.activeTab) return;
-                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-                document.getElementById(tab === 'map' ? 'panelMap' : 'panelCameras').classList.add('active');
-                // Flip a body class so CSS can float the mobile header over
-                // the map and let the map paint edge-to-edge to the top.
-                if (tab === 'map') document.body.classList.add('live-map-active');
-                else document.body.classList.remove('live-map-active');
-                const label = document.getElementById('miniPreviewLabel');
-                const content = document.getElementById('miniPreviewContent');
-                if (tab === 'map') {
-                    label.textContent = BYD.i18n.t('liveview.cameras');
-                    content.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2"/></svg>';
-                    setTimeout(() => { if (BYD.map.map) BYD.map.map.invalidateSize(); }, 100);
-                } else {
-                    label.textContent = BYD.i18n.t('liveview.location');
-                    content.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>';
+        BYD.liveLayout = {
+            mapExpanded: false,
+            setMapExpanded: function (expanded) {
+                expanded = !!expanded;
+                var panel = document.getElementById('panelCameras');
+                var button = document.getElementById('locationExpandButton');
+                var label = document.getElementById('locationExpandLabel');
+                if (!panel) return;
+
+                this.mapExpanded = expanded;
+                panel.classList.toggle('map-expanded', expanded);
+                document.body.classList.toggle('live-map-active', expanded);
+                if (button) button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+                if (label) {
+                    label.textContent = expanded
+                        ? BYD.i18n.t('liveview.back_to_cameras')
+                        : BYD.i18n.t('liveview.expand_map');
                 }
-                this.activeTab = tab;
-                // Reapply the chip's corner against the new tab's safe
-                // zone. The map tab has no top-bar / car-selector
-                // overlays; the camera tab has both. Without this, a chip
-                // snapped to bl/br on the map tab ends up behind the
-                // camera tab's car-selector after switching, and the
-                // chip visually "shifts down" relative to the new layout.
-                var miniChip = document.getElementById('miniPreview');
-                if (miniChip && typeof miniChip._reapplyCorner === 'function') {
-                    // setTimeout 0 lets the active-class change propagate so
-                    // computeSafeZone() measures the new tab's children.
-                    setTimeout(function () { miniChip._reapplyCorner(); }, 0);
-                }
+
+                // Leaflet keeps the preview's old dimensions until explicitly
+                // invalidated after the expansion transition.
+                setTimeout(function () {
+                    if (BYD.map && BYD.map.map) BYD.map.map.invalidateSize();
+                }, 220);
+            },
+            toggleMap: function () {
+                this.setMapExpanded(!this.mapExpanded);
             }
         };
-        // Initial state — the page lands on the map tab, so flip the class
-        // immediately to avoid a one-frame flash with the opaque header.
-        document.body.classList.add('live-map-active');
-        
-        // Override stream for seamless UI - NO default camera selected
-        BYD.stream.currentViewMode = -1; // -1 = none selected
+
+        // Compatibility for any existing callers while the page moves away
+        // from ambiguous tab swapping. Cameras remain the default and map is
+        // promoted only by the explicitly labelled Expand map action.
+        BYD.tabs = {
+            activeTab: 'cameras',
+            switchTo: function (tab) {
+                BYD.liveLayout.setMapExpanded(tab === 'map');
+                this.activeTab = tab === 'map' ? 'map' : 'cameras';
+            }
+        };
+
+        // Camera-first entry: ALL is selected before the stream starts.
+        BYD.stream.currentViewMode = 0;
         
         BYD.stream.selectCamera = async function(mode) {
             // Capture the prior view mode + label BEFORE we mutate UI so the
@@ -1202,18 +1484,7 @@
             }
         };
         
-        // i18n must load before the rest of init so first paint doesn't
-        // flash English to a non-English user. All other inits are
-        // synchronous and don't depend on the catalog being present.
-        BYD.i18n.init().then(function () {
-            BYD.core.init();
-            BYD.stream.init();
-            BYD.map.init();
-            SurvSettings.initHeatmapOnly();
-        });
-        
-        // Load saved quality from backend and pre-select
-        (async function() {
+        async function loadSavedStreamQuality() {
             try {
                 const res = await fetch('/api/stream/quality');
                 const data = await res.json();
@@ -1227,7 +1498,22 @@
             } catch (e) {
                 console.log('[Init] Using default quality');
             }
-        })();
+        }
+
+        // i18n must load before first paint. Once the shared modules and the
+        // saved quality are ready, start the useful view immediately instead
+        // of presenting an empty "select camera" state.
+        BYD.i18n.init().then(async function () {
+            BYD.core.init();
+            BYD.stream.init();
+            BYD.map.init();
+            SurvSettings.initHeatmapOnly();
+            await loadSavedStreamQuality();
+            if (!BYD.stream.autoStartRequested) {
+                BYD.stream.autoStartRequested = true;
+                await BYD.stream.selectCamera(0);
+            }
+        });
 
         // Gate the OEM Dashcam (data-cam=6) hotspot on whether the
         // backend has a configured OEM dashcam camera id for this
@@ -1282,8 +1568,6 @@
                 console.log('[Init] Deterrent controls gating skipped:', e && e.message);
             }
         })();
-
-        document.getElementById('miniPreviewContent').innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2"/></svg>';
 
         // Draggable mini-preview chip with snap-to-corner.
         //
