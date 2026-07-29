@@ -11,7 +11,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=3"></script>
     <link rel="stylesheet" href="../shared/styles.css?v=18">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
@@ -154,6 +154,10 @@
                             <!-- Bottom Car Image Selector — flips to a right-rail in landscape -->
                             <div class="car-selector-bottom">
                                 <div class="car-image-container">
+                                    <img class="car-image-fallback"
+                                         src="../shared/car-icon.webp"
+                                         alt=""
+                                         aria-hidden="true">
                                     <canvas id="liveCarCanvas" class="car-image" aria-hidden="true"></canvas>
                                     
                                     <!-- Camera Hotspots with Pulse Animation -->
@@ -573,14 +577,39 @@
             pointer-events: none;
         }
         
+        .car-image-fallback,
         .car-image {
             width: 72px;
             height: 150px;
             display: block;
-            position: relative;
+        }
+
+        .car-image-fallback {
+            position: absolute;
+            inset: 0;
             z-index: 2;
+            object-fit: contain;
+            opacity: 0.72;
             filter: drop-shadow(0 8px 16px var(--lv-shadow-soft));
-            transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+            transition: opacity 0.18s ease;
+        }
+
+        .car-image {
+            position: relative;
+            z-index: 3;
+            opacity: 0;
+            filter: drop-shadow(0 8px 16px var(--lv-shadow-soft));
+            transition:
+                opacity 0.18s ease,
+                transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+        }
+
+        .car-image-container.vehicle-render-ready .car-image-fallback {
+            opacity: 0;
+        }
+
+        .car-image-container.vehicle-render-ready .car-image {
+            opacity: 1;
         }
         
         /* Camera Hotspots */
@@ -721,7 +750,7 @@
             .top-bar-btn { width: 34px; height: 34px; }
             .car-selector-bottom { padding: 10px; padding-bottom: calc(14px + 60px + var(--safe-bottom)); }
             .car-image-container { width: 60px; height: 125px; margin: 20px auto 30px auto; }
-            .car-image { width: 60px; height: 125px; }
+            .car-image-fallback, .car-image { width: 60px; height: 125px; }
             .cam-hotspot { width: 32px; height: 32px; }
             .hotspot-ring { width: 18px; height: 18px; }
             .hotspot-pulse { width: 18px; height: 18px; }
@@ -1654,7 +1683,13 @@
             if (!canvas) return;
             const shell = window.OverdriveAppShell;
             if (!shell || typeof shell.mountVehicleCanvas !== 'function') return;
-            shell.mountVehicleCanvas(canvas, { view: 'top' });
+            const container = canvas.parentElement;
+            shell.mountVehicleCanvas(canvas, {
+                view: 'top',
+                onReady: function () {
+                    if (container) container.classList.add('vehicle-render-ready');
+                }
+            });
         }
         // app-shell.js exposes mountVehicleCanvas after it renders the
         // sidebar and dispatches `app-shell:ready`. Listen for that
