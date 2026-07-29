@@ -946,7 +946,7 @@
             // UI state on rejection — leaving the user staring at "select
             // camera" while frames continue from the previous view is the
             // exact UX glitch the Round 3 audit flagged.
-            if (this.sotaPlayer && this.sotaPlayer.isRunning()) {
+            if (sotaLive || legacyLive) {
                 console.log("[Stream] Switching view to:", mode);
                 const ok = await applyView(mode);
                 if (!ok) {
@@ -957,6 +957,12 @@
                     }
                     this.currentViewMode = priorMode;
                     if (labelEl) labelEl.textContent = priorLabelText;
+                } else {
+                    // The BYD WebView fallback reuses its open WebSocket, so
+                    // switching cameras does not emit another onopen event.
+                    // Mark this transition pending; the first frame from the
+                    // newly-selected view promotes the badge back to Live.
+                    this.markStreamConnecting();
                 }
                 return;
             }
@@ -971,7 +977,7 @@
             const idleState = document.getElementById('videoIdleState');
             if (idleState) idleState.classList.add('hidden');
             
-            this.updateConnectionStatus('connecting');
+            this.markStreamConnecting();
             
             // 1. Set quality
             var _qSel = document.getElementById('qualitySelector');
@@ -1065,9 +1071,10 @@
                 this.sotaPlayer = new SotaPlayer(canvas, url);
                 this.sotaPlayer.onConnected = () => {
                     console.log("[Stream] Connected, view mode:", targetViewMode);
-                    this.updateConnectionStatus('live');
+                    this.markStreamConnecting();
                 };
-                this.sotaPlayer.onDisconnected = () => this.updateConnectionStatus('connecting');
+                this.sotaPlayer.onDisconnected = () => this.markStreamConnecting();
+                this.sotaPlayer.onFrame = (count) => this.noteFrameReceived(count);
                 this.sotaPlayer.start();
                 
             } else {
