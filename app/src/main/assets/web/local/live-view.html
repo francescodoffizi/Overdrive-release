@@ -268,8 +268,16 @@
             --lv-quality-option-color: #ffffff;
             --lv-idle-icon-bg: rgba(255,255,255,0.03);
             --lv-idle-icon-border: rgba(255,255,255,0.06);
-            --lv-hotspot-ring-border: rgba(255,255,255,0.4);
-            --lv-hotspot-ring-bg: rgba(255,255,255,0.08);
+            /* Camera controls sit over user-selected vehicle paint, so their
+               contrast must not depend on either paint colour or app theme.
+               A light edge + dark halo remains visible on white and black. */
+            --lv-hotspot-ring-border: rgba(255,255,255,0.96);
+            --lv-hotspot-ring-bg: rgba(5,10,12,0.82);
+            --lv-hotspot-ring-halo: rgba(0,0,0,0.88);
+            --lv-hotspot-label-bg: rgba(5,9,12,0.92);
+            --lv-hotspot-label-border: rgba(255,255,255,0.24);
+            --lv-hotspot-label-text: #ffffff;
+            --lv-hotspot-active-text: #72f4d9;
             --lv-floor-spotlight: rgba(255,255,255,0.12);
             --lv-shadow-strong: rgba(0,0,0,0.6);
             --lv-shadow-soft: rgba(0,0,0,0.7);
@@ -300,8 +308,6 @@
             --lv-quality-option-color: #181C1A;
             --lv-idle-icon-bg: rgba(0,0,0,0.04);
             --lv-idle-icon-border: rgba(0,0,0,0.08);
-            --lv-hotspot-ring-border: rgba(24,28,26,0.45);
-            --lv-hotspot-ring-bg: rgba(24,28,26,0.06);
             --lv-floor-spotlight: rgba(0,0,0,0.10);
             --lv-shadow-strong: rgba(0,0,0,0.18);
             --lv-shadow-soft: rgba(0,0,0,0.22);
@@ -672,16 +678,20 @@
         .cam-hotspot[data-cam="6"] { top: 18px; left: 62%; transform: translateX(-50%); }
         
         .hotspot-ring {
-            width: 20px; height: 20px;
+            width: 22px; height: 22px;
+            box-sizing: border-box;
             border: 2px solid var(--lv-hotspot-ring-border);
             border-radius: 50%;
             background: var(--lv-hotspot-ring-bg);
+            box-shadow:
+                0 0 0 2px var(--lv-hotspot-ring-halo),
+                0 2px 6px rgba(0,0,0,0.72);
             transition: all 0.3s;
         }
         
         .hotspot-pulse {
             position: absolute;
-            width: 20px; height: 20px;
+            width: 22px; height: 22px;
             border-radius: 50%;
             background: transparent;
             pointer-events: none;
@@ -690,25 +700,31 @@
         /* Labels positioned outside hotspots */
         .hotspot-label {
             position: absolute;
-            font-size: 10px;
-            font-weight: 700;
+            font-size: 11px;
+            line-height: 1;
+            font-weight: 800;
             letter-spacing: 0.08em;
-            color: var(--lv-overlay-text);
-            text-shadow: var(--lv-overlay-shadow);
+            color: var(--lv-hotspot-label-text);
+            background: var(--lv-hotspot-label-bg);
+            border: 1px solid var(--lv-hotspot-label-border);
+            border-radius: 999px;
+            padding: 4px 6px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.62);
+            text-shadow: none;
             white-space: nowrap;
             transition: all 0.3s;
         }
         
         /* Front label - above */
-        .cam-hotspot[data-cam="1"] .hotspot-label { top: -20px; left: 50%; transform: translateX(-50%); bottom: auto; }
+        .cam-hotspot[data-cam="1"] .hotspot-label { bottom: calc(100% + 2px); left: 50%; transform: translateX(-50%); top: auto; }
         /* Rear label - below with more clearance */
-        .cam-hotspot[data-cam="3"] .hotspot-label { bottom: -22px; left: 50%; transform: translateX(-50%); top: auto; }
+        .cam-hotspot[data-cam="3"] .hotspot-label { top: calc(100% + 2px); left: 50%; transform: translateX(-50%); bottom: auto; }
         /* Left label - to the left */
-        .cam-hotspot[data-cam="4"] .hotspot-label { left: -36px; top: 50%; transform: translateY(-50%); bottom: auto; }
+        .cam-hotspot[data-cam="4"] .hotspot-label { right: calc(100% + 4px); left: auto; top: 50%; transform: translateY(-50%); bottom: auto; }
         /* Right label - to the right */
-        .cam-hotspot[data-cam="2"] .hotspot-label { right: -40px; left: auto; top: 50%; transform: translateY(-50%); bottom: auto; }
+        .cam-hotspot[data-cam="2"] .hotspot-label { left: calc(100% + 4px); right: auto; top: 50%; transform: translateY(-50%); bottom: auto; }
         /* All label - below center */
-        .cam-hotspot.cam-all .hotspot-label { bottom: -20px; left: 50%; transform: translateX(-50%); top: auto; }
+        .cam-hotspot.cam-all .hotspot-label { top: calc(50% + 14px); left: 50%; transform: translateX(-50%); bottom: auto; }
         /* OEM Dashcam label — anchored to the right of the ring so it
            floats outside the car silhouette and never overlaps the FRONT
            label that sits directly above the centre column. */
@@ -721,17 +737,22 @@
         
         .cam-hotspot:hover .hotspot-ring {
             border-color: var(--brand-primary);
-            background: rgba(0,212,170,0.15);
-            box-shadow: 0 0 20px rgba(0,212,170,0.3);
+            background: rgba(0,42,36,0.9);
+            box-shadow:
+                0 0 0 2px var(--lv-hotspot-ring-halo),
+                0 0 0 4px rgba(0,212,170,0.2),
+                0 0 16px rgba(0,212,170,0.42);
         }
         
-        .cam-hotspot:hover .hotspot-label { color: var(--brand-primary); }
+        .cam-hotspot:hover .hotspot-label {
+            color: var(--lv-hotspot-active-text);
+            border-color: rgba(0,212,170,0.62);
+        }
         
         /* Active State with Animation */
         .cam-hotspot.active .hotspot-ring {
             border-color: var(--brand-primary);
-            background: rgba(0,212,170,0.25);
-            box-shadow: 0 0 25px rgba(0,212,170,0.5);
+            background: rgba(0,48,40,0.94);
             animation: ringPulse 2s ease-in-out infinite;
         }
         
@@ -741,8 +762,12 @@
         }
         
         .cam-hotspot.active .hotspot-label {
-            color: var(--brand-primary);
-            text-shadow: 0 0 10px rgba(0,212,170,0.5);
+            color: var(--lv-hotspot-active-text);
+            background: rgba(0,35,31,0.96);
+            border-color: rgba(0,212,170,0.72);
+            box-shadow:
+                0 2px 6px rgba(0,0,0,0.68),
+                0 0 8px rgba(0,212,170,0.28);
         }
         
         @keyframes hotspotPulse {
@@ -751,8 +776,18 @@
         }
         
         @keyframes ringPulse {
-            0%, 100% { box-shadow: 0 0 20px rgba(0,212,170,0.4); }
-            50% { box-shadow: 0 0 35px rgba(0,212,170,0.7); }
+            0%, 100% {
+                box-shadow:
+                    0 0 0 2px var(--lv-hotspot-ring-halo),
+                    0 0 0 4px rgba(0,212,170,0.2),
+                    0 0 12px rgba(0,212,170,0.42);
+            }
+            50% {
+                box-shadow:
+                    0 0 0 2px var(--lv-hotspot-ring-halo),
+                    0 0 0 5px rgba(0,212,170,0.28),
+                    0 0 20px rgba(0,212,170,0.68);
+            }
         }
 
         /* Camera-first Live dashboard */
@@ -1022,9 +1057,9 @@
             .car-image-container { width: 60px; height: 125px; margin: 20px auto 30px auto; }
             .car-image-fallback, .car-image { width: 60px; height: 125px; }
             .cam-hotspot { width: 32px; height: 32px; }
-            .hotspot-ring { width: 18px; height: 18px; }
-            .hotspot-pulse { width: 18px; height: 18px; }
-            .hotspot-label { font-size: 9px; }
+            .hotspot-ring { width: 20px; height: 20px; }
+            .hotspot-pulse { width: 20px; height: 20px; }
+            .hotspot-label { font-size: 9px; padding: 3px 5px; }
             /* DVR sits a touch closer to FRONT on the smaller silhouette. */
             .cam-hotspot[data-cam="6"] { top: 14px; left: 62%; }
             .idle-icon { width: 48px; height: 48px; }
