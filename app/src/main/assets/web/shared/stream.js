@@ -36,6 +36,11 @@ BYD.stream = {
     reconnectTimer: null,
     frameCount: 0,
     lastFrameTime: 0,
+    // True only after the current connection/view has produced a frame.
+    // Socket-open alone is not enough: the BYD WebView reuses an existing
+    // WebSocket when switching cameras, so no second onopen event fires.
+    _frameStatusLive: false,
+    _pendingConnectedToast: null,
     decoderMode: null,     // 'webcodecs', 'jmuxer', or 'broadway'
     latencyCheckInterval: null,
     streamStarted: false,
@@ -213,6 +218,32 @@ BYD.stream = {
             return false;
         }
     },
+
+    /**
+     * Record actual frame delivery and converge every live-view status surface.
+     * This is intentionally idempotent so legacy WebSocket onmessage can call it
+     * for every packet without repainting the status DOM at camera frame rate.
+     */
+    noteFrameReceived(count) {
+        this.frameCount = Number.isFinite(count) ? count : this.frameCount + 1;
+        this.lastFrameTime = Date.now();
+        if (!this._frameStatusLive) {
+            this._frameStatusLive = true;
+            this.updateStreamStatus(BYD.i18n.t('stream.live'), true);
+            if (this._pendingConnectedToast && BYD.utils && BYD.utils.toast) {
+                BYD.utils.toast(BYD.i18n.t(this._pendingConnectedToast), 'success');
+            }
+            this._pendingConnectedToast = null;
+        }
+    },
+
+    /**
+     * Reset frame-backed live state for a fresh connection or camera switch.
+     */
+    markStreamConnecting() {
+        this._frameStatusLive = false;
+        this.updateStreamStatus(BYD.i18n.t('stream.connecting'), false);
+    },
     
     /**
      * Initialize decoder based on device capabilities
@@ -278,18 +309,19 @@ BYD.stream = {
             // Set up callbacks
             this.sotaPlayer.onConnected = () => {
                 console.log('[Stream] WebCodecs connected');
-                this.updateStreamStatus(BYD.i18n.t('stream.live'), true);
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('stream.connected_webcodecs'), 'success');
+                // Wait for a decoded frame before claiming the camera is live.
+                this._pendingConnectedToast = 'stream.connected_webcodecs';
+                this.markStreamConnecting();
             };
 
             this.sotaPlayer.onDisconnected = (code) => {
                 console.log('[Stream] WebCodecs disconnected:', code);
-                this.updateStreamStatus(BYD.i18n.t('stream.disconnected'), false);
+                this._pendingConnectedToast = null;
+                this.markStreamConnecting();
             };
             
             this.sotaPlayer.onFrame = (count) => {
-                this.frameCount = count;
-                this.lastFrameTime = Date.now();
+                this.noteFrameReceived(count);
             };
             
             this.sotaPlayer.onError = (e) => {
@@ -492,8 +524,10 @@ BYD.stream = {
             this.ws.onopen = () => {
                 console.log('[Stream] Connected');
                 this.frameCount = 0;
-                this.updateStreamStatus(BYD.i18n.t('stream.live'), true);
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('stream.connected'), 'success');
+                // A connected socket can still have no camera frames. The
+                // first onmessage below promotes the UI to Live.
+                this._pendingConnectedToast = 'stream.connected';
+                this.markStreamConnecting();
             };
             
             this.ws.onmessage = (event) => {
@@ -506,14 +540,14 @@ BYD.stream = {
                     this.jmuxer.feed({ video: data });
                 }
                 
-                this.frameCount++;
-                this.lastFrameTime = Date.now();
+                this.noteFrameReceived();
             };
             
             this.ws.onclose = (event) => {
                 console.log('[Stream] Closed:', event.code);
                 this.ws = null;
-                this.updateStreamStatus(BYD.i18n.t('stream.disconnected'), false);
+                this._pendingConnectedToast = null;
+                this.markStreamConnecting();
                 
                 if (!this.reconnectTimer && this.streamStarted) {
                     this.reconnectTimer = setTimeout(() => {
@@ -581,7 +615,7 @@ BYD.stream = {
         if (overlay) overlay.style.display = 'flex';
 
         // Show connecting state immediately
-        this.updateStreamStatus(BYD.i18n.t('stream.connecting'), false);
+        this.markStreamConnecting();
 
         // Update view label
         const viewLabel = document.getElementById('viewLabel');
@@ -684,6 +718,8 @@ BYD.stream = {
      */
     stopStream() {
         this.streamStarted = false;
+        this._frameStatusLive = false;
+        this._pendingConnectedToast = null;
         
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
