@@ -25,6 +25,14 @@
 (function () {
     'use strict';
 
+    // The Android app supplies its own navigation rail and injects
+    // AndroidBridge before the page starts loading. Its post-load CSS hides
+    // this web sidebar, so rendering the sidebar's 3D vehicle there wastes a
+    // full GLB parse and can race the visible aux canvas. Standalone/tunnel
+    // pages have no bridge and keep the normal sidebar renderer.
+    var embeddedInNativeApp =
+        typeof window.AndroidBridge !== 'undefined';
+
     /*
      * Sidebar nav layout MIRRORS rail_menu.xml exactly:
      *   Dashboard → Live → Recordings → Vehicle → Trips → Integrations cluster →
@@ -523,6 +531,10 @@
         function instantiate() {
             if (ev3dInstance) return;
             if (typeof window.OverdriveEvCard3D !== 'function') return;
+            // The native shell hides #sidebar after page load. The script may
+            // still be needed by a visible aux canvas, but never bind WebGL
+            // to the hidden sidebar canvas in that environment.
+            if (embeddedInNativeApp) return;
             try {
                 ev3dInstance = new window.OverdriveEvCard3D(canvas);
                 // Replay the most recent (model, colour) pair. SOC +
@@ -610,6 +622,13 @@
     // share the same model/colour as the sidebar card and stay in sync
     // when the user changes their selection on vehicle-control.html.
     var auxEv3dInstances = [];
+    // Aux canvases can mount as soon as app-shell:ready fires, while the
+    // selected vehicle is still being fetched asynchronously. Treating
+    // that short "unknown selection" window as a sprite-cache miss forces
+    // every page visit through three.js + the full GLB, even when a cached
+    // sprite exists. Hold those mounts until setEvCardAppearance resolves
+    // either the saved selection or the normal fallback.
+    var vehicleSelectionWaiters = [];
     var FALLBACK_MODEL_ID = 'seal';
     var FALLBACK_MODEL_COLOR = '#E8E8EC';
 
@@ -626,7 +645,9 @@
         // injects the 3D pipeline on a miss, so subsequent page loads
         // paint the EV card from a ~30KB webp instead of a 600KB
         // three.js + 1.6MB GLB cold parse.
-        var sidebarCanvas = document.getElementById('evCardCanvas');
+        var sidebarCanvas = embeddedInNativeApp
+            ? null
+            : document.getElementById('evCardCanvas');
         if (sidebarCanvas && modelId && hexColor) {
             tryPaintFromSpriteCache(sidebarCanvas, modelId, hexColor, 'side', function (hit) {
                 if (hit) {
@@ -677,7 +698,7 @@
                     pendingSidebarSnapshot = { modelId: modelId, color: hexColor };
                 }
             });
-        } else {
+        } else if (!embeddedInNativeApp) {
             // Fallback for callers that don't have the canvas or only
             // have one of (model, colour) — preserve the original
             // behaviour so login.html and friends still work.
@@ -701,6 +722,20 @@
                 continue;
             }
             applyToAux(aux, modelId, hexColor);
+        }
+
+        // Drain deferred aux mounts only after the existing aux iteration.
+        // A callback can add a sprite-only/live entry to auxEv3dInstances;
+        // deferring the drain avoids applying the same selection twice in
+        // this pass and issuing duplicate cache lookups.
+        if (modelId && hexColor && vehicleSelectionWaiters.length) {
+            var waiters = vehicleSelectionWaiters.slice();
+            vehicleSelectionWaiters = [];
+            for (var w = 0; w < waiters.length; w++) {
+                try { waiters[w](); } catch (e) {
+                    if (window.console) console.warn('[app-shell] deferred vehicle canvas mount failed:', e);
+                }
+            }
         }
 
         // If the user actually changed their selection (vehicle-control
@@ -957,6 +992,20 @@
         var view = 'side';
         if (opts && opts.view === 'top') view = 'top';
         else if (opts && opts.view === 'three-quarter') view = 'three-quarter';
+        var readyNotified = false;
+
+        // Surfaces may keep an inexpensive placeholder visible until this
+        // callback fires. A cache hit and the first complete WebGL render
+        // both count as ready; notify at most once for the initial mount.
+        function notifyReady(source) {
+            if (readyNotified) return;
+            readyNotified = true;
+            if (opts && typeof opts.onReady === 'function') {
+                try { opts.onReady({ source: source }); } catch (e) {
+                    if (window.console) console.warn('[app-shell] vehicle canvas onReady failed:', e);
+                }
+            }
+        }
 
         // Sprite-cache fast path. If we have a webp for this
         // (model, colour, view), paint the canvas in 2D and stop.
@@ -972,14 +1021,6 @@
             tryPaintFromSpriteCache(canvasEl, lastEv3dModel, lastEv3dColor, view, cb);
         }
 
-        // ensureEv3d() is the existing loader for the sidebar canvas; it
-        // injects ../shared/ev-card-3d.js on first call and is idempotent
-        // for subsequent ones. Calling it here guarantees the script tag
-        // is in flight even if the sidebar's #evCardCanvas isn't on this
-        // page (defensive — index.html does mount the sidebar so this
-        // path runs anyway, but keep the contract honest).
-        ensureEv3d();
-
         var instance = null;
         function instantiate() {
             if (instance) return instance;
@@ -990,6 +1031,7 @@
                 if (lastEv3dColor) instance.setColor(lastEv3dColor);
                 if (lastEv3dModel) instance.setModel(lastEv3dModel);
                 if (lastEv3dModel && lastEv3dColor) {
+                    instance.onceAfterRender(function () { notifyReady('render'); });
                     scheduleSpriteSnapshot(instance, canvasEl,
                                            lastEv3dModel, lastEv3dColor, view);
                 }
@@ -1051,29 +1093,40 @@
             instantiate();
         }
 
-        // Try cache first; on miss go straight to the live 3D mount.
-        tryCache(function (hit) {
-            if (hit) {
-                makeSpriteOnlyAux();
-                return;
-            }
-            if (typeof window.OverdriveEvCard3D === 'function') {
-                instantiate();
-                return;
-            }
-            // Vendor still in flight — poll for the global the same way
-            // ensureEv3d() does for its own canvas.
-            var tries = 0;
-            var iv = setInterval(function () {
-                tries++;
-                if (typeof window.OverdriveEvCard3D === 'function') {
-                    clearInterval(iv);
-                    instantiate();
-                } else if (tries > 80) {
-                    clearInterval(iv);
+        // Wait for vehicle selection, then try the cache before loading
+        // the renderer. This makes warm navigations a sprite-only path.
+        function mountResolvedSelection() {
+            tryCache(function (hit) {
+                if (hit) {
+                    makeSpriteOnlyAux();
+                    notifyReady('cache');
+                    return;
                 }
-            }, 100);
-        });
+                ensureEv3d();
+                if (typeof window.OverdriveEvCard3D === 'function') {
+                    instantiate();
+                    return;
+                }
+                // Vendor still in flight — poll for the global the same way
+                // ensureEv3d() does for its own canvas.
+                var tries = 0;
+                var iv = setInterval(function () {
+                    tries++;
+                    if (typeof window.OverdriveEvCard3D === 'function') {
+                        clearInterval(iv);
+                        instantiate();
+                    } else if (tries > 80) {
+                        clearInterval(iv);
+                    }
+                }, 100);
+            });
+        }
+
+        if (lastEv3dModel && lastEv3dColor) {
+            mountResolvedSelection();
+        } else {
+            vehicleSelectionWaiters.push(mountResolvedSelection);
+        }
 
         return null;
     };
