@@ -1450,6 +1450,15 @@ class WebViewFragment : Fragment() {
         // Re-apply theme on resume so a user toggle while the page was
         // backgrounded is reflected without requiring a full reload.
         webView?.let { it.evaluateJavascript(buildThemeInjectJs(), null) }
+        // Android WebView versions used by older BYD head units do not always
+        // deliver a reliable visible-side Page Visibility event. Give pages an
+        // explicit lifecycle signal as well; stream.js deduplicates this with
+        // visibilitychange so only one decoder/socket is created.
+        webView?.evaluateJavascript(
+            "(function(){if(window.BYD&&BYD.stream&&BYD.stream.resumeAfterBackground){" +
+                "BYD.stream.resumeAfterBackground(true);}})();",
+            null
+        )
     }
 
     /**
