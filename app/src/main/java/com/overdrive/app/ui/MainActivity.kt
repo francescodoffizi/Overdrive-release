@@ -641,17 +641,10 @@ class MainActivity : AppCompatActivity() {
      */
     private fun syncRoadSenseOverlay() {
         try {
-            // overlayShouldShow() = feature ENABLED and the user hasn't hidden the overlay
-            // (roadSense.overlayVisible, default ON). Hiding it is an on-screen-only opt-out
-            // — detection/audio/crowdsource keep running daemon-side — so we just stop the
-            // app-side window without touching the master enable.
-            val shouldShow = com.overdrive.app.roadsense.config.RoadSenseConfig
-                .snapshot(forceReload = true).overlayShouldShow()
-            if (shouldShow) {
-                com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.startIfPermitted(this)
-            } else {
-                com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.stop(this)
-            }
+            // One policy owns both the RoadSense master gate and the user's
+            // display-only overlay preference.
+            com.overdrive.app.roadsense.overlay.RoadSenseOverlayService
+                .syncWithConfig(this)
         } catch (t: Throwable) {
             android.util.Log.w("MainActivity", "syncRoadSenseOverlay failed: ${t.message}")
         }

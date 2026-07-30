@@ -108,12 +108,23 @@ class RoadSenseOverlayService : Service() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         ioThread = android.os.HandlerThread("roadsense-overlay-io").also { it.start() }
         ioHandler = Handler(ioThread!!.looper)
-        createOverlay()
-        startPolling()
-        instance = this
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // The daemon can launch us via `am`, and START_STICKY can recreate us later.
+        // Check the complete lifecycle policy before creating the window so a stale
+        // overlay cannot flash between onCreate and onStartCommand.
+        val shouldShow = try {
+            RoadSenseConfig.snapshot(forceReload = true).overlayShouldShow()
+        } catch (t: Throwable) {
+            Log.w(TAG, "visibility config unavailable - stopping: ${t.message}")
+            false
+        }
+        if (!shouldShow) {
+            Log.i(TAG, "RoadSense disabled or overlay hidden - stopping")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         // Self-guard the overlay permission here too (not only at the app-side
         // startIfPermitted call site): the daemon launches us via `am` (startFromDaemon)
         // on ACC-on + feature-on, which bypasses the app-side canDrawOverlays gate. If
@@ -123,6 +134,11 @@ class RoadSenseOverlayService : Service() {
             Log.w(TAG, "overlay permission not granted — stopping")
             stopSelf()
             return START_NOT_STICKY
+        }
+        if (overlayView == null) {
+            createOverlay()
+            startPolling()
+            instance = this
         }
         return START_STICKY
     }
@@ -426,16 +442,10 @@ class RoadSenseOverlayService : Service() {
         // off the UI looper (audit UI #3).
         val r = object : Runnable {
             override fun run() {
-                // Visibility self-guard: the user can hide the overlay (roadSense.
-                // overlayVisible=false) while we're already running — e.g. the daemon
-                // launched us on ACC-on and the user then flips the toggle, or a remote
-                // (tunnel/browser) write lands. The app-side onResume/keepalive gate only
-                // runs when the Activity is touched, so without this a daemon-launched
-                // overlay would linger on screen after being hidden. readState() already
-                // refreshed the UCM cache this tick, so this is a cache-fresh read (no
-                // extra disk hit). Stop cleanly — startFromDaemon/startIfPermitted will
-                // bring us back if the user re-enables.
-                if (!RoadSenseConfig.snapshot().overlayVisible) {
+                // Lifecycle self-guard: either the RoadSense master switch or the
+                // overlay preference can turn this window off while it is running.
+                // This also covers remote/tunnel writes when no Activity callback runs.
+                if (!RoadSenseConfig.snapshot().overlayShouldShow()) {
                     handler.post { stopSelf() }
                     return
                 }
@@ -861,9 +871,19 @@ class RoadSenseOverlayService : Service() {
         // day/night theme via themeColor()/colorDim() (R.color.status_*), matching
         // StatusOverlayService so the overlay tracks the active theme.
 
-        /** Start only if overlay permission is granted (StatusOverlayService gate).
+        /** Start only if RoadSense wants the overlay and permission is granted.
          *  This is the APP-process path (MainActivity / DaemonKeepaliveService). */
         fun startIfPermitted(context: Context): Boolean {
+            val shouldShow = try {
+                RoadSenseConfig.snapshot(forceReload = true).overlayShouldShow()
+            } catch (t: Throwable) {
+                Log.w(TAG, "visibility config unavailable - not starting: ${t.message}")
+                false
+            }
+            if (!shouldShow) {
+                Log.i(TAG, "RoadSense disabled or overlay hidden - not starting")
+                return false
+            }
             if (!Settings.canDrawOverlays(context)) {
                 Log.w(TAG, "no overlay permission — not starting")
                 return false
@@ -874,6 +894,25 @@ class RoadSenseOverlayService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, RoadSenseOverlayService::class.java))
+        }
+
+        /**
+         * Reconcile the app-side service with the persisted master + visibility flags.
+         * Native UI entry points use this so they cannot disagree about lifecycle.
+         */
+        fun syncWithConfig(context: Context): Boolean {
+            val shouldShow = try {
+                RoadSenseConfig.snapshot(forceReload = true).overlayShouldShow()
+            } catch (t: Throwable) {
+                Log.w(TAG, "visibility config unavailable - stopping: ${t.message}")
+                false
+            }
+            return if (shouldShow) {
+                startIfPermitted(context)
+            } else {
+                stop(context)
+                false
+            }
         }
 
         /** Fully-qualified component for the daemon's `am` launch. */

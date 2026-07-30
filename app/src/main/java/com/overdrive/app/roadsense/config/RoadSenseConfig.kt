@@ -128,7 +128,11 @@ object RoadSenseConfig {
          *  master feature ON (nothing to render otherwise) AND the user not to have hidden
          *  it. The single gate every start site + the service's own poll consult, so the
          *  start/keep-warm/regime-edge paths can't disagree about visibility. */
-        fun overlayShouldShow(): Boolean = enabled && overlayVisible
+        fun overlayShouldShow(): Boolean =
+            com.overdrive.app.roadsense.overlay.RoadSenseOverlayPolicy.shouldShow(
+                enabled,
+                overlayVisible
+            )
         /** Should a hazard of [severityLevel] (1=minor,2=moderate,3=severe) with
          *  [confidence] produce a warning at all, per the gates? (Distance is the
          *  WarningCoordinator's separate job.) */
@@ -209,7 +213,18 @@ object RoadSenseConfig {
         )
     }
 
-    // NOTE: writes to the roadSense section go through UnifiedConfigManager.updateSection
-    // directly (web settings page via RoadSenseApiHandler, daemon via RoadSenseController).
-    // The old typed update()/setX() writers here had no callers and were removed.
+    /**
+     * Persist the user's display-only overlay preference. Both the RoadSense page and
+     * Settings -> Status overlay write this same key, so the two controls cannot drift.
+     * This does not change the RoadSense master switch.
+     */
+    fun setOverlayVisible(visible: Boolean): Boolean =
+        UnifiedConfigManager.updateSection(
+            SECTION,
+            JSONObject().put(K_OVERLAY_VISIBLE, visible)
+        )
+
+    // Other writes to the roadSense section go through
+    // UnifiedConfigManager.updateSection directly (web settings page via
+    // RoadSenseApiHandler, daemon via RoadSenseController).
 }

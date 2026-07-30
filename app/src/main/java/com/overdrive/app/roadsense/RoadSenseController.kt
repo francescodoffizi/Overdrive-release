@@ -491,6 +491,14 @@ class RoadSenseController @JvmOverloads constructor(
     fun stop() {
         if (!started) return
         started = false
+        featureEnabled = false
+        // The overlay is an app-process service, independent of this daemon-side
+        // detector. The master-disable reconcile stops the ticker immediately, so no
+        // later vehicle-state edge exists to tear the overlay down for us.
+        com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.stopFromDaemon()
+        // A later re-enable must begin from a real OFF edge. Leaving this at DRIVING
+        // made the first poll after restart return early and skip sidecar/overlay start.
+        regime = VehicleStateGate.Regime.OFF
         ticker?.shutdownNow()
         ticker = null
         // Tear down the sync executor too. shutdownNow() interrupts any in-flight
