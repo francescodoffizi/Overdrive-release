@@ -282,6 +282,7 @@ class DashboardFragment : Fragment() {
             // moment a daemon is being launched, without waiting for RUNNING.
             updateHeroSubtitle(running, total, computeCoreHealth(states))
             rebuildTunnelChips()
+            updateTunnelTile()
             refreshHeroChips()
         }
 
@@ -598,30 +599,29 @@ class DashboardFragment : Fragment() {
     }
 
     private fun updateTunnelTile() {
-        val anyUrl = listOf(
-            daemonsViewModel.cloudflaredController.tunnelUrl.value,
-            daemonsViewModel.zrokController.tunnelUrl.value,
-            daemonsViewModel.tailscaleController.tunnelUrl.value
-        ).any { !it.isNullOrEmpty() }
-
         val states = daemonsViewModel.daemonStates.value
-        val anyStarting = states?.values?.any {
-            (it.type == DaemonType.CLOUDFLARED_TUNNEL ||
-                it.type == DaemonType.ZROK_TUNNEL ||
-                it.type == DaemonType.TAILSCALE_TUNNEL) &&
-                it.status == DaemonStatus.STARTING
-        } == true
+        val display = com.overdrive.app.ui.model.TunnelDisplayPolicy.resolve(
+            daemonsViewModel.zrokController.tunnelUrl.value,
+            daemonsViewModel.cloudflaredController.tunnelUrl.value,
+            daemonsViewModel.tailscaleController.tunnelUrl.value,
+            states?.get(DaemonType.ZROK_TUNNEL)?.status,
+            states?.get(DaemonType.CLOUDFLARED_TUNNEL)?.status,
+            states?.get(DaemonType.TAILSCALE_TUNNEL)?.status,
+        )
 
-        when {
-            anyUrl -> {
+        when (display.kind) {
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.ONLINE -> {
                 metricTunnelValue.text = getString(R.string.dashboard_tunnel_online)
                 tunnelStateDot.setBackgroundResource(R.drawable.status_dot_online)
             }
-            anyStarting -> {
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.STARTING_ZROK,
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.STARTING_CLOUDFLARED,
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.STARTING_TAILSCALE,
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.WAITING_FOR_URL -> {
                 metricTunnelValue.text = getString(R.string.dashboard_tunnel_connecting)
                 tunnelStateDot.setBackgroundResource(R.drawable.status_dot_offline)
             }
-            else -> {
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.HIDDEN -> {
                 metricTunnelValue.text = getString(R.string.dashboard_tunnel_offline)
                 tunnelStateDot.setBackgroundResource(R.drawable.status_dot_offline)
             }
@@ -683,14 +683,24 @@ class DashboardFragment : Fragment() {
 
     private fun collectAvailableTunnels(): List<Pair<DaemonType, String>> {
         val list = mutableListOf<Pair<DaemonType, String>>()
+        val states = daemonsViewModel.daemonStates.value
         daemonsViewModel.cloudflaredController.tunnelUrl.value
-            ?.takeIf { it.isNotEmpty() }
+            ?.takeIf {
+                com.overdrive.app.ui.model.TunnelDisplayPolicy.isActiveUrl(
+                    it, states?.get(DaemonType.CLOUDFLARED_TUNNEL)?.status)
+            }
             ?.let { list.add(DaemonType.CLOUDFLARED_TUNNEL to it) }
         daemonsViewModel.zrokController.tunnelUrl.value
-            ?.takeIf { it.isNotEmpty() }
+            ?.takeIf {
+                com.overdrive.app.ui.model.TunnelDisplayPolicy.isActiveUrl(
+                    it, states?.get(DaemonType.ZROK_TUNNEL)?.status)
+            }
             ?.let { list.add(DaemonType.ZROK_TUNNEL to it) }
         daemonsViewModel.tailscaleController.tunnelUrl.value
-            ?.takeIf { it.isNotEmpty() }
+            ?.takeIf {
+                com.overdrive.app.ui.model.TunnelDisplayPolicy.isActiveUrl(
+                    it, states?.get(DaemonType.TAILSCALE_TUNNEL)?.status)
+            }
             ?.let { list.add(DaemonType.TAILSCALE_TUNNEL to it) }
         return list
     }

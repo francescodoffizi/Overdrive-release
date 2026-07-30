@@ -24,6 +24,7 @@ import com.overdrive.app.storage.StorageSetup
 import com.overdrive.app.ui.daemon.DaemonStartupManager
 import com.overdrive.app.ui.model.DaemonStatus
 import com.overdrive.app.ui.model.DaemonType
+import com.overdrive.app.ui.model.TunnelDisplayPolicy
 import com.overdrive.app.ui.viewmodel.DaemonsViewModel
 import com.overdrive.app.ui.viewmodel.LogsViewModel
 import com.overdrive.app.ui.viewmodel.MainViewModel
@@ -80,6 +81,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var navigationRail: LinearLayout
     private lateinit var tvCurrentUrl: TextView
     private lateinit var urlBar: View
+    private lateinit var statusPill: View
     private lateinit var statusIndicator: View
     private lateinit var urlStatusDot: View
     private lateinit var btnCopyUrl: ImageButton
@@ -1301,6 +1303,7 @@ class MainActivity : AppCompatActivity() {
         navigationRail = findViewById(R.id.navigationRail)
         tvCurrentUrl = findViewById(R.id.tvCurrentUrl)
         urlBar = findViewById(R.id.urlBar)
+        statusPill = findViewById(R.id.statusPill)
         statusIndicator = findViewById(R.id.statusIndicator)
         urlStatusDot = findViewById(R.id.urlStatusDot)
         btnCopyUrl = findViewById(R.id.btnCopyUrl)
@@ -1484,13 +1487,11 @@ class MainActivity : AppCompatActivity() {
     
     private fun setupCopyButton() {
         btnCopyUrl.setOnClickListener {
-            val url = tvCurrentUrl.text.toString()
-            if (url.isNotEmpty() && !url.startsWith("No tunnel") && !url.startsWith("Waiting") && !url.startsWith("Starting") && url != "Connecting...") {
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                val clip = ClipData.newPlainText(getString(R.string.clip_label_url), url)
-                clipboard.setPrimaryClip(clip)
-                Toast.makeText(this, getString(R.string.toast_url_copied_short), Toast.LENGTH_SHORT).show()
-            }
+            val url = mainViewModel.currentUrl.value ?: return@setOnClickListener
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText(getString(R.string.clip_label_url), url)
+            clipboard.setPrimaryClip(clip)
+            Toast.makeText(this, getString(R.string.toast_url_copied_short), Toast.LENGTH_SHORT).show()
         }
     }
     
@@ -1539,70 +1540,53 @@ class MainActivity : AppCompatActivity() {
         
         // Observe daemon states for tunnel status (cloudflared, zrok or tailscale)
         daemonsViewModel.daemonStates.observe(this) { states ->
-            val cloudflaredState = states[DaemonType.CLOUDFLARED_TUNNEL]
-            val zrokState = states[DaemonType.ZROK_TUNNEL]
-            val tailscaleState = states[DaemonType.TAILSCALE_TUNNEL]
-            // Show online if either tunnel is running
-            val tunnelStatus = when {
-                zrokState?.status == DaemonStatus.RUNNING -> DaemonStatus.RUNNING
-                cloudflaredState?.status == DaemonStatus.RUNNING -> DaemonStatus.RUNNING
-                tailscaleState?.status == DaemonStatus.RUNNING -> DaemonStatus.RUNNING
-                zrokState?.status == DaemonStatus.STARTING -> DaemonStatus.STARTING
-                cloudflaredState?.status == DaemonStatus.STARTING -> DaemonStatus.STARTING
-                tailscaleState?.status == DaemonStatus.STARTING -> DaemonStatus.STARTING
-                else -> DaemonStatus.STOPPED
-            }
-            updateStatusIndicator(tunnelStatus)
+            // A daemon transition must update the label as well as the dot.
+            // Previously STOPPED initial state changed only the dot, leaving
+            // the XML placeholder "Connecting..." visible indefinitely.
+            updateUrlDisplay()
         }
+        updateUrlDisplay()
     }
     
     private fun updateUrlDisplay() {
-        // Check both tunnel URLs - prefer zrok if available
         val zrokUrl = daemonsViewModel.zrokController.tunnelUrl.value
         val cloudflaredUrl = daemonsViewModel.cloudflaredController.tunnelUrl.value
         val tailscaleUrl = daemonsViewModel.tailscaleController.tunnelUrl.value
-        val tunnelUrl = zrokUrl?.takeIf { it.isNotEmpty() } ?: cloudflaredUrl?.takeIf { it.isNotEmpty() } ?: tailscaleUrl
-        
-        // Both modes now use tunnel URL
-        if (tunnelUrl.isNullOrEmpty()) {
-            // Show context-aware message based on tunnel state
-            val states = daemonsViewModel.daemonStates.value
-            val cfState = states?.get(DaemonType.CLOUDFLARED_TUNNEL)
-            val zrokState = states?.get(DaemonType.ZROK_TUNNEL)
-            val tailscaleState = states?.get(DaemonType.TAILSCALE_TUNNEL)
-            val message = when {
-                zrokState?.status == DaemonStatus.STARTING -> "Starting Zrok tunnel..."
-                cfState?.status == DaemonStatus.STARTING -> "Starting Cloudflared tunnel..."
-                tailscaleState?.status == DaemonStatus.STARTING -> "Starting Tailscale tunnel..."
-                zrokState?.status == DaemonStatus.RUNNING -> "Waiting for tunnel URL..."
-                cfState?.status == DaemonStatus.RUNNING -> "Waiting for tunnel URL..."
-                tailscaleState?.status == DaemonStatus.RUNNING -> "Waiting for tailscale URL..."
-                else -> "No tunnel running"
-            }
-            tvCurrentUrl.text = message
-            urlStatusDot.setBackgroundResource(R.drawable.status_dot_offline)
-            mainViewModel.setCurrentUrl(null)
-        } else {
-            tvCurrentUrl.text = tunnelUrl
-            urlStatusDot.setBackgroundResource(R.drawable.status_dot_online)
-            mainViewModel.setCurrentUrl(tunnelUrl)
+        val states = daemonsViewModel.daemonStates.value
+        val display = TunnelDisplayPolicy.resolve(
+            zrokUrl,
+            cloudflaredUrl,
+            tailscaleUrl,
+            states?.get(DaemonType.ZROK_TUNNEL)?.status,
+            states?.get(DaemonType.CLOUDFLARED_TUNNEL)?.status,
+            states?.get(DaemonType.TAILSCALE_TUNNEL)?.status,
+        )
+
+        statusPill.visibility = if (display.isVisible) View.VISIBLE else View.GONE
+        btnCopyUrl.visibility = if (display.isOnline) View.VISIBLE else View.GONE
+        tvCurrentUrl.text = when (display.kind) {
+            TunnelDisplayPolicy.Kind.STARTING_ZROK ->
+                getString(R.string.dashboard_starting_zrok)
+            TunnelDisplayPolicy.Kind.STARTING_CLOUDFLARED ->
+                getString(R.string.dashboard_starting_cloudflared)
+            TunnelDisplayPolicy.Kind.STARTING_TAILSCALE ->
+                getString(R.string.dashboard_starting_tailscale)
+            TunnelDisplayPolicy.Kind.WAITING_FOR_URL ->
+                getString(R.string.dashboard_waiting_url)
+            TunnelDisplayPolicy.Kind.ONLINE -> display.url
+            TunnelDisplayPolicy.Kind.HIDDEN -> getString(R.string.dashboard_no_tunnel)
         }
-    }
-    
-    private fun updateStatusIndicator(status: DaemonStatus?) {
-        // Single status pill replaced the standalone toolbar dot. Both the
-        // legacy `statusIndicator` and the in-pill `urlStatusDot` IDs are
-        // updated for safety: the legacy dot is now a 0×0 invisible View
-        // (so updates are no-ops visually) and the pill dot is what users
-        // actually see. Keeping both write paths means future layout swaps
-        // don't need MainActivity edits.
-        val drawableRes = when (status) {
-            DaemonStatus.RUNNING -> R.drawable.status_dot_online
-            DaemonStatus.STARTING, DaemonStatus.STOPPING -> R.drawable.status_dot_starting
-            else -> R.drawable.status_dot_offline
+        val drawableRes = when (display.kind) {
+            TunnelDisplayPolicy.Kind.ONLINE -> R.drawable.status_dot_online
+            TunnelDisplayPolicy.Kind.STARTING_ZROK,
+            TunnelDisplayPolicy.Kind.STARTING_CLOUDFLARED,
+            TunnelDisplayPolicy.Kind.STARTING_TAILSCALE,
+            TunnelDisplayPolicy.Kind.WAITING_FOR_URL -> R.drawable.status_dot_starting
+            TunnelDisplayPolicy.Kind.HIDDEN -> R.drawable.status_dot_offline
         }
         statusIndicator.setBackgroundResource(drawableRes)
         urlStatusDot.setBackgroundResource(drawableRes)
+        mainViewModel.setCurrentUrl(display.url)
     }
     
     override fun onSupportNavigateUp(): Boolean {
