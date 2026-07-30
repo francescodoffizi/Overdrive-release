@@ -9,6 +9,8 @@ import android.view.ViewGroup
 import com.overdrive.app.R
 import com.overdrive.app.launcher.AdbDaemonLauncher
 
+private typealias SetupStep = OnboardingConfigPolicy.Step
+
 /**
  * Drives the two-track onboarding guide: owns the [OnboardingOverlayView] lifecycle, the
  * parked-only [OnboardingGate], a cached encoder-busy signal, and the ordered novice
@@ -122,7 +124,7 @@ class OnboardingHost(
     /** Called from MainActivity.onAuthGranted — advances Step 0 if we're waiting on it. */
     fun onDaemonAuthGranted() {
         state.daemonAuthorized = true
-        if (started && currentStep == Step.AUTHORIZE) {
+        if (started && currentStep == SetupStep.AUTHORIZE) {
             mainHandler.post { advanceFromAuthorize() }
         }
     }
@@ -140,8 +142,7 @@ class OnboardingHost(
 
     // ---- step machine ----------------------------------------------------------------
 
-    private enum class Step { AUTHORIZE, MODE, CAMERA, VEHICLE, DASHBOARD, DONE }
-    private var currentStep = Step.AUTHORIZE
+    private var currentStep = SetupStep.AUTHORIZE
 
     private fun routeFirstStep() {
         // If the daemon is ALREADY running (already-installed device / auth granted on a
@@ -152,14 +153,14 @@ class OnboardingHost(
             mainHandler.post {
                 if (!started) return@post
                 if (running) state.daemonAuthorized = true
-                currentStep = when {
-                    !state.daemonAuthorized -> Step.AUTHORIZE
-                    !state.modeChosen -> Step.MODE
-                    state.cameraStep != OnboardingState.CameraStep.SAVED_OK -> Step.CAMERA
-                    !state.vehicleStepDone -> Step.VEHICLE
-                    !state.dashboardTourDone -> Step.DASHBOARD
-                    else -> Step.DONE
-                }
+                reconcilePersistedSetupState()
+                currentStep = OnboardingConfigPolicy.nextStep(
+                    state.daemonAuthorized,
+                    state.modeChosen,
+                    state.vehicleStepDone,
+                    state.cameraStep == OnboardingState.CameraStep.SAVED_OK,
+                    state.dashboardTourDone,
+                )
                 renderCurrent()
             }
         }
@@ -168,12 +169,44 @@ class OnboardingHost(
     private fun renderCurrent() {
         val ov = overlay ?: return
         when (currentStep) {
-            Step.AUTHORIZE -> renderAuthorize(ov)
-            Step.MODE -> renderModeChoice(ov)
-            Step.CAMERA -> launchCameraChapter()
-            Step.VEHICLE -> launchVehicleChapter()
-            Step.DASHBOARD -> launchDashboardChapter()
-            Step.DONE -> renderDone(ov)
+            SetupStep.AUTHORIZE -> renderAuthorize(ov)
+            SetupStep.MODE -> renderModeChoice(ov)
+            SetupStep.VEHICLE -> launchVehicleChapter()
+            SetupStep.CAMERA -> launchCameraChapter()
+            SetupStep.DASHBOARD -> launchDashboardChapter()
+            SetupStep.DONE -> renderDone(ov)
+        }
+    }
+
+    /**
+     * App-private onboarding flags are not part of config backups. Reconcile
+     * them with durable setup state so reinstall+restore does not ask the
+     * owner to reconfigure a validated camera or re-select a known vehicle.
+     */
+    private fun reconcilePersistedSetupState() {
+        try {
+            val vehicle = com.overdrive.app.config.UnifiedConfigManager.getVehicle()
+            if (OnboardingConfigPolicy.hasConfiguredVehicle(
+                    vehicle.optString("modelId", ""),
+                    vehicle.optString("modelSource", ""),
+                )) {
+                state.vehicleStepDone = true
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "vehicle setup reconciliation failed: ${t.message}")
+        }
+
+        try {
+            val camera = com.overdrive.app.camera.CameraConfigResolver.getCameraSection()
+            if (OnboardingConfigPolicy.hasConfiguredCamera(
+                    camera.optInt("probedCameraId", -1),
+                    camera.optBoolean("manualOverride", false),
+                    camera.optBoolean("probedAndValidated", false),
+                )) {
+                state.cameraStep = OnboardingState.CameraStep.SAVED_OK
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "camera setup reconciliation failed: ${t.message}")
         }
     }
 
@@ -203,7 +236,7 @@ class OnboardingHost(
                 // Failsafe: if the grant never arrives (popup dismissed / already authed),
                 // re-offer with a Try-again + Dismiss instead of hanging.
                 mainHandler.postDelayed({
-                    if (started && currentStep == Step.AUTHORIZE && !state.daemonAuthorized) {
+                    if (started && currentStep == SetupStep.AUTHORIZE && !state.daemonAuthorized) {
                         renderAuthorizeRetry(ov)
                     }
                 }, AUTH_WAIT_MS)
@@ -226,7 +259,8 @@ class OnboardingHost(
     }
 
     private fun advanceFromAuthorize() {
-        currentStep = Step.MODE
+        reconcilePersistedSetupState()
+        currentStep = SetupStep.MODE
         renderCurrent()
     }
 
@@ -270,7 +304,14 @@ class OnboardingHost(
             state.pendingOperatingMode = mode
         }
         persistOperatingMode(mode)
-        currentStep = Step.CAMERA
+        reconcilePersistedSetupState()
+        currentStep = OnboardingConfigPolicy.nextStep(
+            true,
+            true,
+            state.vehicleStepDone,
+            state.cameraStep == OnboardingState.CameraStep.SAVED_OK,
+            state.dashboardTourDone,
+        )
         renderCurrent()
     }
 
@@ -307,11 +348,11 @@ class OnboardingHost(
 
     private fun launchCameraChapter() {
         val ov = overlay ?: return
-        val coach = CameraWizardCoach(activity, ov, state, adbLauncher) { outcome ->
-            // Camera chapter always advances to vehicle whether saved or deferred —
-            // it is strongly encouraged, not a hard gate (Auto-detect is a valid baseline).
+        val coach = CameraWizardCoach(activity, ov, state, adbLauncher) { _ ->
+            // Vehicle selection has already run (or was restored), so camera
+            // completion now advances directly to the dashboard tour.
             activeCameraCoach = null
-            currentStep = Step.VEHICLE
+            currentStep = SetupStep.DASHBOARD
             renderCurrent()
         }
         activeCameraCoach = coach
@@ -321,7 +362,12 @@ class OnboardingHost(
     private fun launchVehicleChapter() {
         val ov = overlay ?: return
         VehicleWizardCoach(activity, ov, state) {
-            currentStep = Step.DASHBOARD
+            reconcilePersistedSetupState()
+            currentStep = if (state.cameraStep == OnboardingState.CameraStep.SAVED_OK) {
+                SetupStep.DASHBOARD
+            } else {
+                SetupStep.CAMERA
+            }
             renderCurrent()
         }.begin()
     }
@@ -329,7 +375,7 @@ class OnboardingHost(
     private fun launchDashboardChapter() {
         val ov = overlay ?: return
         DashboardTourCoach(activity, ov, state) {
-            currentStep = Step.DONE
+            currentStep = SetupStep.DONE
             renderCurrent()
         }.begin()
     }

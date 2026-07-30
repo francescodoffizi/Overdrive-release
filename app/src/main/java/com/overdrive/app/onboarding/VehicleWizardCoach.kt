@@ -25,13 +25,21 @@ class VehicleWizardCoach(
             body = activity.getString(R.string.onboarding_vehicle_body),
             primaryText = activity.getString(R.string.onboarding_vehicle_primary),
             onPrimary = {
-                state.vehicleStepDone = true
                 try {
-                    (activity as? com.overdrive.app.ui.MainActivity)?.openVehicleProfileForOnboarding()
+                    val opened = (activity as? com.overdrive.app.ui.MainActivity)
+                        ?.openVehicleProfileForOnboarding {
+                            state.vehicleStepDone = true
+                            onFinished()
+                        } == true
+                    if (!opened) {
+                        state.vehicleStepDone = true
+                        onFinished()
+                    }
                 } catch (t: Throwable) {
                     Log.w("VehicleWizardCoach", "open vehicle dialog failed: ${t.message}")
+                    state.vehicleStepDone = true
+                    onFinished()
                 }
-                onFinished()
             },
             secondaryText = activity.getString(R.string.onboarding_skip),
             onSecondary = { state.vehicleStepDone = true; onFinished() },
