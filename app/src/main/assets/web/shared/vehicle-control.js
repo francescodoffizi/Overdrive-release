@@ -206,13 +206,13 @@ var VC = {
 
         this.scene = new THREE.Scene();
 
-        // Pull camera further back on narrow screens so the car renders
-        // smaller — leaves headroom on the canvas for the four tyre
-        // callouts (and future engine/coolant/oil overlays) without them
-        // colliding with the rendered body. Wider FOV on mobile too, so
-        // the same body fits in less screen height.
+        // Compact screens keep a wider lens so the car leaves room for
+        // overlays. Wide in-car displays use a calmer showroom perspective.
         var isMobile = window.innerWidth < 768;
-        var fov = isMobile ? 50 : 50;
+        var isCompact = isMobile && !window.AndroidBridge;
+        // A slightly narrower showroom lens on wide in-car displays makes
+        // three-quarter views easier to read and reduces near-side distortion.
+        var fov = isCompact ? 50 : 45;
         // Size the renderer to the CANVAS box, not the full window — the
         // sidebar (260px on desktop) eats the left edge, and rendering at
         // window-width pushes the car's visual centre off to the left of
@@ -225,15 +225,31 @@ var VC = {
         this.camera = new THREE.PerspectiveCamera(
             fov, renderW / renderH, 0.1, 1000
         );
-        this.camera.position.set(isMobile ? 5.0 : 4, isMobile ? 3.0 : 2.5, isMobile ? 6.5 : 5);
+        if (window.AndroidBridge) {
+            this.camera.position.set(4.6, 2.8, 6.0);
+        } else {
+            this.camera.position.set(isCompact ? 5.0 : 4, isCompact ? 3.0 : 2.5, isCompact ? 6.5 : 5);
+        }
 
         this.renderer = new THREE.WebGLRenderer({
             canvas: canvasEl,
             antialias: true,
-            alpha: true
+            alpha: true,
+            powerPreference: 'high-performance'
         });
+        // The AVN stretches the native WebView to the physical display after
+        // page layout. Rendering at its reported devicePixelRatio wastes GPU
+        // fill-rate without adding visible detail; phones retain high DPI.
+        this.renderer.setPixelRatio(window.AndroidBridge
+            ? 1
+            : Math.min(window.devicePixelRatio, 2));
         this.renderer.setSize(renderW, renderH, false);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 3));
+        if (window.AndroidBridge && window.console) {
+            console.log('[VC perf] canvas css=' + renderW + 'x' + renderH
+                + ' buffer=' + canvasEl.width + 'x' + canvasEl.height
+                + ' dpr=' + window.devicePixelRatio
+                + ' cameraAspect=' + this.camera.aspect.toFixed(4));
+        }
         // Read the clear colour from the active theme so the 3D viewport
         // matches the surrounding chrome under both light and dark themes.
         // Was previously hardcoded #0F0F12 which left the car silhouette
@@ -264,6 +280,7 @@ var VC = {
         this.addGroundGrid();
 
         window.addEventListener('resize', function() { self.onResize(); });
+        this._watchCanvasSize();
 
         // React to theme changes so the renderer's clear colour stays in
         // sync with the rest of the UI. The Android shell sets data-theme
@@ -307,6 +324,53 @@ var VC = {
             }
         } catch (e) { /* fall through */ }
         return 0x0F0F12;
+    },
+
+    /**
+     * The native shell hides the web sidebar after onPageFinished, after this
+     * page has already initialised Three.js. That expands the canvas without a
+     * window resize, so the old backing buffer was stretched across the new
+     * box. Observe the real content box and keep renderer + camera in sync.
+     * A short poll covers WebViews older than ResizeObserver.
+     */
+    _watchCanvasSize: function() {
+        var self = this;
+        var canvas = this.renderer && this.renderer.domElement;
+        if (!canvas) return;
+
+        var sync = function() {
+            if (!self.renderer || !self.camera) return;
+            var rect = canvas.getBoundingClientRect();
+            var w = Math.round(rect.width);
+            var h = Math.round(rect.height);
+            if (w < 1 || h < 1) return;
+            if (w !== self._canvasCssW || h !== self._canvasCssH) {
+                self._canvasCssW = w;
+                self._canvasCssH = h;
+                self.onResize();
+                if (window.AndroidBridge && window.console) {
+                    console.log('[VC perf] resized css=' + w + 'x' + h
+                        + ' buffer=' + canvas.width + 'x' + canvas.height
+                        + ' cameraAspect=' + self.camera.aspect.toFixed(4));
+                }
+            }
+        };
+
+        this._canvasCssW = Math.round(canvas.getBoundingClientRect().width);
+        this._canvasCssH = Math.round(canvas.getBoundingClientRect().height);
+
+        if (window.ResizeObserver) {
+            this._canvasResizeObserver = new ResizeObserver(sync);
+            this._canvasResizeObserver.observe(canvas);
+        }
+
+        var checksLeft = 30;
+        var poll = function() {
+            sync();
+            checksLeft--;
+            if (checksLeft > 0) setTimeout(poll, 100);
+        };
+        setTimeout(poll, 0);
     },
 
     addLighting: function() {
@@ -389,6 +453,7 @@ var VC = {
         var self = this;
         modelId = modelId || this.activeModelId || 'seal';
         this.activeModelId = modelId;
+        this._modelLoadStartedAt = Date.now();
         var gen = ++this._loadGen;
 
         // Sanity check — if Three.js failed to load (e.g. local extraction failed),
@@ -481,7 +546,59 @@ var VC = {
         });
         if (this.scene) this.scene.remove(this.carModel);
         this.carModel = null;
+        this._modelSourceScale = null;
         this.bodyPaintMeshes = [];
+    },
+
+    /**
+     * Prepare any manifest model for the shared Vehicle stage.
+     *
+     * `displayScale` is optional per-asset calibration metadata. The renderer
+     * does not special-case vehicle ids: a source mesh with a distorted axis
+     * can declare [x,y,z], while every other model falls back to [1,1,1].
+     * A final uniform fit keeps different vehicles similarly readable.
+     */
+    _fitLoadedCarModel: function() {
+        if (!this.carModel || typeof THREE === 'undefined') return;
+
+        var entry = this.ModelStore.findEntry(this.manifest, this.activeModelId);
+        var correction = [1, 1, 1];
+        if (entry && entry.displayScale && entry.displayScale.length === 3) {
+            for (var i = 0; i < 3; i++) {
+                var value = parseFloat(entry.displayScale[i]);
+                if (isFinite(value) && value > 0) correction[i] = value;
+            }
+        }
+
+        var source = this._modelSourceScale || new THREE.Vector3(1, 1, 1);
+        this.carModel.scale.set(
+            source.x * correction[0],
+            source.y * correction[1],
+            source.z * correction[2]
+        );
+        this.carModel.position.set(0, 0, 0);
+
+        var box = new THREE.Box3().setFromObject(this.carModel);
+        var size = box.getSize(new THREE.Vector3());
+        var longestFootprint = Math.max(size.x, size.z);
+        var rect = this.renderer && this.renderer.domElement
+            ? this.renderer.domElement.getBoundingClientRect()
+            : { width: window.innerWidth };
+        var compactViewport = rect.width < 768 && !window.AndroidBridge;
+        var targetLength = compactViewport ? 4.65 : 5.25;
+
+        if (longestFootprint > 0.0001) {
+            this.carModel.scale.multiplyScalar(targetLength / longestFootprint);
+        }
+
+        // Centre only after applying both correction and fit. Scaling an
+        // already-centred group can reintroduce an offset when its source
+        // origin is asymmetric.
+        this.carModel.position.set(0, 0, 0);
+        box.setFromObject(this.carModel);
+        var center = box.getCenter(new THREE.Vector3());
+        this.carModel.position.sub(center);
+        this.carModel.position.y += 0.1;
     },
 
     _loadModelFromPath: function(modelPath, gen) {
@@ -490,11 +607,14 @@ var VC = {
 
         // Draco decoder — the GLB uses Draco mesh compression.
         // Local path: assets/web/shared/vendor/draco/ (extracted to /data/local/tmp/web/shared/vendor/draco/).
-        // We force the JS decoder (no WASM) for Chrome 58 compatibility and to avoid the
-        // wasm MIME quirks on some BYD WebViews.
+        // WebAssembly is materially faster on the head unit and the local
+        // server serves .wasm as application/wasm. Keep JS as a fallback for
+        // WebViews without WebAssembly.
         var dracoLoader = new THREE.DRACOLoader();
         dracoLoader.setDecoderPath('../shared/vendor/draco/');
-        dracoLoader.setDecoderConfig({ type: 'js' });
+        dracoLoader.setDecoderConfig({
+            type: typeof WebAssembly === 'object' ? 'wasm' : 'js'
+        });
         loader.setDRACOLoader(dracoLoader);
 
         loader.load(
@@ -549,18 +669,11 @@ var VC = {
                     }
                 });
 
-                var box = new THREE.Box3().setFromObject(self.carModel);
-                var center = box.getCenter(new THREE.Vector3());
-                self.carModel.position.sub(center);
-                self.carModel.position.y += 0.1;
-
-                // Slight bump on the Android WebView (BYD head unit) since
-                // its effective canvas is smaller than mobile browsers.
-                // Kept conservative (1.10) so the four tyre callouts and
-                // the planned engine/coolant/oil overlays have room around
-                // the rendered car without overlapping the body.
-                if (window.AndroidBridge) {
-                    self.carModel.scale.multiplyScalar(1.10);
+                self._modelSourceScale = self.carModel.scale.clone();
+                self._fitLoadedCarModel();
+                if (window.AndroidBridge && window.console) {
+                    console.log('[VC perf] model=' + self.activeModelId
+                        + ' readyMs=' + (Date.now() - self._modelLoadStartedAt));
                 }
 
                 self.scene.add(self.carModel);
@@ -622,11 +735,8 @@ var VC = {
     },
 
     onResize: function() {
-        // Match the FOV used at init() — we don't shrink the FOV on mobile
-        // anymore (the car was rendering too big and clipping into the
-        // tyre callouts). 50° is a comfortable garage-floor look at all
-        // screen widths.
-        this.camera.fov = 50;
+        // Match the responsive lens used at initialisation.
+        this.camera.fov = window.innerWidth < 768 && !window.AndroidBridge ? 50 : 45;
         // Re-measure the canvas's CSS box, not the window — the sidebar
         // takes 260px on desktop. Without this, the car visually shifts
         // off-centre toward the right edge of the visible area.
@@ -642,9 +752,20 @@ var VC = {
         this._tyreLastW = 0; this._tyreLastH = 0;
     },
 
-    animate: function() {
+    animate: function(frameTime) {
         var self = this;
-        requestAnimationFrame(function() { self.animate(); });
+        requestAnimationFrame(function(nextFrameTime) { self.animate(nextFrameTime); });
+        // 30fps is smooth for this fixed automotive display. Together with
+        // the 1x backing buffer it removes most continuous AVN GPU load;
+        // standalone phone/browser clients retain their native refresh rate.
+        if (window.AndroidBridge) {
+            var now = typeof frameTime === 'number'
+                ? frameTime
+                : (window.performance && performance.now ? performance.now() : Date.now());
+            if (this._lastRenderFrame
+                    && now - this._lastRenderFrame < 32) return;
+            this._lastRenderFrame = now;
+        }
         if (this.controls) this.controls.update();
         // Update canvas texture each frame when 3D view is active
         if (this._3dViewActive && this._videoTexture) {
@@ -4304,21 +4425,23 @@ var VC = {
     _updateTyreCalloutPositions: function() { /* no-op — CSS handles it */ },
 
     /** Map raw BYD enums + raw PSI to a 3-tier visual-state scale:
-     *    'alert'  → red     leak (airLeakState>=1) or PSI < 22 (deflated)
-     *    'warn'   → orange  pressureState UNDER/OVER, or PSI < 34, or PSI > 45
-     *    'normal' → green   34-45 PSI, no leak, signal OK
+     *    'alert'  → red     leak (airLeakState>=1) or fallback PSI < 22
+     *    'warn'   → orange  pressureState UNDER/OVER, or fallback PSI < 28 / > 50
+     *    'normal' → teal    plausible PSI with no SDK warning
      *    'muted'  → grey    no signal / no data
-     *  SDK enums are checked first so we still flag alert/warn when the
-     *  TPMS itself has detected a problem even if the raw PSI looks fine.
+     *  SDK warnings are authoritative, while conservative raw limits catch a
+     *  genuinely low/high reading even when a vehicle reports state=normal.
+     *  Manufacturer-normal pressures such as 31.9 PSI remain teal.
      */
     _tyreStateToken: function(corner) {
         if (!corner || corner.available === false) return 'muted';
         if (corner.signalState === 1) return 'muted';
         if (corner.airLeakState && corner.airLeakState >= 1) return 'alert';
-        if (corner.pressureState && corner.pressureState >= 1) return 'warn';
+        if (typeof corner.pressureState === 'number'
+                && corner.pressureState >= 1) return 'warn';
         if (typeof corner.psi === 'number') {
             if (corner.psi < 22) return 'alert';
-            if (corner.psi < 34 || corner.psi > 45) return 'warn';
+            if (corner.psi < 28 || corner.psi > 50) return 'warn';
         }
         return 'normal';
     },

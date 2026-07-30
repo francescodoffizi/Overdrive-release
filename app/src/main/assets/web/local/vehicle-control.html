@@ -12,8 +12,8 @@
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
     <script src="../shared/app-shell.js?v=2"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
-    <link rel="stylesheet" href="../shared/vehicle-control.css?v=15">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
+    <link rel="stylesheet" href="../shared/vehicle-control.css?v=16">
     <!-- Web fonts loaded async + non-blocking. WebView falls back to system sans-serif if offline. -->
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" media="print" onload="this.media='all'">
 </head>
@@ -70,25 +70,25 @@
 
                     <div class="vc-tyre-overlay" id="vcTyreOverlay">
                         <div class="vc-tyre-callout" data-corner="fl" id="tyreFL">
-                            <div class="vc-tyre-head"><span class="vc-tyre-dot"></span><span class="vc-tyre-label">FL</span><span class="vc-tyre-state">--</span></div>
+                            <div class="vc-tyre-head compact-status-pill"><span class="vc-tyre-dot compact-status-pill__dot"></span><span class="vc-tyre-label">FL</span><span class="vc-tyre-state">--</span></div>
                             <div class="vc-tyre-psi"><span class="vc-tyre-psi-val">--</span><span class="vc-tyre-psi-unit">PSI</span></div>
                             <div class="vc-tyre-sub"><span class="vc-tyre-kpa">-- kPa</span></div>
                             <div class="vc-tyre-temp"><span class="vc-tyre-temp-val">--</span><span class="vc-tyre-temp-unit">°C</span></div>
                         </div>
                         <div class="vc-tyre-callout" data-corner="fr" id="tyreFR">
-                            <div class="vc-tyre-head"><span class="vc-tyre-dot"></span><span class="vc-tyre-label">FR</span><span class="vc-tyre-state">--</span></div>
+                            <div class="vc-tyre-head compact-status-pill"><span class="vc-tyre-dot compact-status-pill__dot"></span><span class="vc-tyre-label">FR</span><span class="vc-tyre-state">--</span></div>
                             <div class="vc-tyre-psi"><span class="vc-tyre-psi-val">--</span><span class="vc-tyre-psi-unit">PSI</span></div>
                             <div class="vc-tyre-sub"><span class="vc-tyre-kpa">-- kPa</span></div>
                             <div class="vc-tyre-temp"><span class="vc-tyre-temp-val">--</span><span class="vc-tyre-temp-unit">°C</span></div>
                         </div>
                         <div class="vc-tyre-callout" data-corner="rl" id="tyreRL">
-                            <div class="vc-tyre-head"><span class="vc-tyre-dot"></span><span class="vc-tyre-label">RL</span><span class="vc-tyre-state">--</span></div>
+                            <div class="vc-tyre-head compact-status-pill"><span class="vc-tyre-dot compact-status-pill__dot"></span><span class="vc-tyre-label">RL</span><span class="vc-tyre-state">--</span></div>
                             <div class="vc-tyre-psi"><span class="vc-tyre-psi-val">--</span><span class="vc-tyre-psi-unit">PSI</span></div>
                             <div class="vc-tyre-sub"><span class="vc-tyre-kpa">-- kPa</span></div>
                             <div class="vc-tyre-temp"><span class="vc-tyre-temp-val">--</span><span class="vc-tyre-temp-unit">°C</span></div>
                         </div>
                         <div class="vc-tyre-callout" data-corner="rr" id="tyreRR">
-                            <div class="vc-tyre-head"><span class="vc-tyre-dot"></span><span class="vc-tyre-label">RR</span><span class="vc-tyre-state">--</span></div>
+                            <div class="vc-tyre-head compact-status-pill"><span class="vc-tyre-dot compact-status-pill__dot"></span><span class="vc-tyre-label">RR</span><span class="vc-tyre-state">--</span></div>
                             <div class="vc-tyre-psi"><span class="vc-tyre-psi-val">--</span><span class="vc-tyre-psi-unit">PSI</span></div>
                             <div class="vc-tyre-sub"><span class="vc-tyre-kpa">-- kPa</span></div>
                             <div class="vc-tyre-temp"><span class="vc-tyre-temp-val">--</span><span class="vc-tyre-temp-unit">°C</span></div>
@@ -531,7 +531,7 @@
     <script src="../shared/vendor/GLTFLoader.js?v=12"></script>
     <script src="../shared/vendor/OrbitControls.js?v=12"></script>
     <script src="../shared/vendor/gsap.min.js?v=12"></script>
-    <script src="../shared/vehicle-control.js?v=19"></script>
+    <script src="../shared/vehicle-control.js?v=23"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

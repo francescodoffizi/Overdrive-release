@@ -122,10 +122,17 @@
     -webkit-align-items: center; align-items: center;
     -webkit-flex-wrap: wrap; flex-wrap: wrap;
     -webkit-justify-content: flex-start; justify-content: flex-start;
-    gap: 6px;
     z-index: 10; pointer-events: none;
 }
-.vc-status-bar-secondary > * { pointer-events: auto; }
+.vc-status-bar-secondary > * {
+    pointer-events: auto;
+    margin-right: 6px;
+    margin-bottom: 6px;
+}
+[dir="rtl"] .vc-status-bar-secondary > * {
+    margin-right: 0;
+    margin-left: 6px;
+}
 .vc-pill {
     display: -webkit-inline-flex; display: inline-flex;
     -webkit-align-items: center; align-items: center;
@@ -256,12 +263,15 @@
    of canvas backing-buffer size. FRONT pair on the bottom, REAR on top. */
 .vc-tyre-callout {
     position: absolute;
-    min-width: 92px;
-    padding: 7px 10px 8px;
-    background: var(--vc-pill-bg);
-    -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+    box-sizing: border-box;
+    width: 168px;
+    min-width: 168px;
+    padding: 11px 13px 12px;
+    background: var(--vc-pill-bg-strong);
+    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
     border: 1px solid var(--vc-border);
-    border-radius: 10px;
+    border-radius: 14px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.14);
     color: var(--vc-text-strong);
     font-family: 'JetBrains Mono', ui-monospace, monospace;
     pointer-events: auto;
@@ -286,96 +296,106 @@
 .vc-tyre-callout[data-corner="rl"] { right: 22px; }
 @media (min-width: 1200px) {
     .vc-tyre-callout[data-corner="fr"],
-    .vc-tyre-callout[data-corner="rr"] { left: 80px; }
+    .vc-tyre-callout[data-corner="rr"] { left: 6%; }
     .vc-tyre-callout[data-corner="fl"],
-    .vc-tyre-callout[data-corner="rl"] { right: 80px; }
+    .vc-tyre-callout[data-corner="rl"] { right: 6%; }
 }
 /* No accent strip — the box itself carries the state colour via the
    border + dot + state label. Cleaner read with no leader lines. */
 
 .vc-tyre-head {
+    --compact-status-pill-dot-gap: 8px;
     display: -webkit-flex; display: flex;
     -webkit-align-items: center; align-items: center;
-    gap: 5px;
-    font-size: 9px;
+    width: 100%;
+    font-size: 11px;
     font-weight: 700;
-    letter-spacing: .8px;
+    letter-spacing: .7px;
     text-transform: uppercase;
     color: var(--vc-text-secondary);
 }
 .vc-tyre-dot {
-    width: 6px; height: 6px;
+    width: 8px; height: 8px;
     border-radius: 50%;
-    background: #22C55E;
-    box-shadow: 0 0 5px #22C55E;
+    background: #00D4AA;
+    box-shadow: 0 0 7px rgba(0,212,170,0.82);
     -webkit-flex-shrink: 0; flex-shrink: 0;
     -webkit-transition: background .2s, box-shadow .2s;
     transition: background .2s, box-shadow .2s;
 }
-.vc-tyre-label { color: var(--vc-text-soft); }
+.vc-tyre-label { color: var(--vc-text-strong); }
 .vc-tyre-state {
     margin-left: auto;
-    font-size: 8px;
+    font-size: 10px;
     font-weight: 700;
     letter-spacing: .6px;
-    color: #22C55E;
+    color: #00D4AA;
     -webkit-transition: color .2s; transition: color .2s;
 }
 .vc-tyre-psi {
     display: -webkit-flex; display: flex;
     -webkit-align-items: baseline; align-items: baseline;
-    gap: 4px;
-    margin-top: 2px;
+    margin-top: 7px;
 }
 .vc-tyre-psi-val {
-    font-size: 18px;
+    font-size: 28px;
     font-weight: 700;
     color: var(--vc-text-primary);
     line-height: 1;
 }
 .vc-tyre-psi-unit {
-    font-size: 9px;
+    margin-left: 7px;
+    font-size: 11px;
     font-weight: 600;
     color: var(--vc-text-muted);
     letter-spacing: .8px;
+}
+[dir="rtl"] .vc-tyre-psi-unit {
+    margin-left: 0;
+    margin-right: 7px;
 }
 .vc-tyre-sub {
     display: -webkit-flex; display: flex;
     -webkit-justify-content: space-between; justify-content: space-between;
     -webkit-align-items: center; align-items: center;
-    margin-top: 4px;
-    font-size: 9px;
+    margin-top: 7px;
+    font-size: 11px;
     color: var(--vc-text-muted);
 }
 .vc-tyre-kpa { letter-spacing: .3px; }
 .vc-tyre-temp {
     display: -webkit-flex; display: flex;
     -webkit-align-items: baseline; align-items: baseline;
-    gap: 3px;
-    margin-top: 3px;
-    font-size: 10px;
+    margin-top: 6px;
+    font-size: 12px;
     color: var(--vc-text-secondary);
 }
 .vc-tyre-temp-val {
-    font-size: 12px;
+    font-size: 16px;
     font-weight: 600;
     color: var(--vc-text-strong);
     line-height: 1;
 }
 .vc-tyre-temp-unit {
-    font-size: 9px;
+    margin-left: 3px;
+    font-size: 11px;
     font-weight: 600;
     color: var(--vc-text-muted);
     letter-spacing: .6px;
 }
+[dir="rtl"] .vc-tyre-temp-unit {
+    margin-left: 0;
+    margin-right: 3px;
+}
 
-/* State colour scale — same 4 tiers as the engine chips so the page
-   reads as one consistent system. Both the dot AND the PSI value
+/* State colour scale — healthy values use the OverDrive teal while
+   attention states retain the familiar amber/red escalation. Both dot and PSI
    colour shift so a low-pressure tyre is unmistakable from across
    the cabin without reading the state label. */
-.vc-tyre-callout[data-state="normal"]  .vc-tyre-dot     { background: #22C55E; box-shadow: 0 0 5px #22C55E; }
-.vc-tyre-callout[data-state="normal"]  .vc-tyre-state   { color: #22C55E; }
-.vc-tyre-callout[data-state="normal"]  .vc-tyre-psi-val { color: #22C55E; }
+.vc-tyre-callout[data-state="normal"]                   { border-color: rgba(0, 212, 170, 0.28); }
+.vc-tyre-callout[data-state="normal"]  .vc-tyre-dot     { background: #00D4AA; box-shadow: 0 0 7px rgba(0,212,170,0.82); }
+.vc-tyre-callout[data-state="normal"]  .vc-tyre-state   { color: #00D4AA; }
+.vc-tyre-callout[data-state="normal"]  .vc-tyre-psi-val { color: #00D4AA; }
 
 .vc-tyre-callout[data-state="caution"] .vc-tyre-dot     { background: #FBBF24; box-shadow: 0 0 6px #FBBF24; }
 .vc-tyre-callout[data-state="caution"] .vc-tyre-state   { color: #FBBF24; }
@@ -410,12 +430,16 @@
 /* Compact on small screens — same min-width tightening pattern as the rest
    of the floating UI. */
 @media (max-width: 768px) {
-    .vc-tyre-callout { min-width: 80px; padding: 5px 8px 6px; }
-    .vc-tyre-psi-val { font-size: 16px; }
-    .vc-tyre-head { font-size: 8px; gap: 4px; }
-    .vc-tyre-sub { font-size: 8px; }
-    .vc-tyre-temp { font-size: 9px; margin-top: 2px; }
-    .vc-tyre-temp-val { font-size: 11px; }
+    .vc-tyre-callout { width: 156px; min-width: 156px; padding: 10px 12px 11px; border-radius: 13px; }
+    .vc-tyre-dot { width: 8px; height: 8px; }
+    .vc-tyre-psi-val { font-size: 26px; }
+    .vc-tyre-psi-unit { margin-left: 6px; font-size: 10px; }
+    .vc-tyre-head { font-size: 10px; }
+    .vc-tyre-state { font-size: 9px; }
+    .vc-tyre-sub { margin-top: 6px; font-size: 10px; }
+    .vc-tyre-temp { font-size: 11px; margin-top: 5px; }
+    .vc-tyre-temp-val { font-size: 15px; }
+    .vc-tyre-temp-unit { font-size: 10px; }
     /* Rear pair on top (below the mobile engine row at top:102),
        front pair on the bottom. Mirror: car-left → screen-right. */
     .vc-tyre-callout[data-corner="rl"],
@@ -428,12 +452,12 @@
     .vc-tyre-callout[data-corner="fr"] { bottom: 120px; top: auto; }
 }
 @media (max-width: 480px) {
-    .vc-tyre-callout { min-width: 72px; padding: 4px 7px 5px; border-radius: 8px; }
-    .vc-tyre-psi-val { font-size: 14px; }
-    .vc-tyre-head { font-size: 7px; }
-    .vc-tyre-sub { font-size: 7px; }
-    .vc-tyre-temp { font-size: 8px; margin-top: 2px; }
-    .vc-tyre-temp-val { font-size: 10px; }
+    .vc-tyre-callout { width: 104px; min-width: 104px; padding: 7px 8px 8px; border-radius: 9px; }
+    .vc-tyre-psi-val { font-size: 19px; }
+    .vc-tyre-head { font-size: 8px; }
+    .vc-tyre-sub { font-size: 8px; }
+    .vc-tyre-temp { font-size: 9px; margin-top: 3px; }
+    .vc-tyre-temp-val { font-size: 12px; }
     .vc-tyre-callout[data-corner="rl"],
     .vc-tyre-callout[data-corner="rr"] { top: 152px; bottom: auto; }
     .vc-tyre-callout[data-corner="fr"],
