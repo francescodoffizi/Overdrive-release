@@ -3,6 +3,7 @@ package com.overdrive.app.config
 import android.content.Context
 import android.content.SharedPreferences
 import com.overdrive.app.logging.LogConfig
+import com.overdrive.app.logging.LogLevel
 import org.json.JSONObject
 
 /**
@@ -33,6 +34,7 @@ class ConfigManager private constructor(private val context: Context) {
         private const val KEY_LOG_CLEANUP_INTERVAL = "log_cleanup_interval_hours"
         private const val KEY_LOG_MAX_SIZE = "log_max_size_mb"
         private const val KEY_LOG_ROTATION_COUNT = "log_rotation_count"
+        private const val KEY_LOG_MIN_LEVEL = "log_min_level"
     }
     
     private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -90,6 +92,7 @@ class ConfigManager private constructor(private val context: Context) {
             putInt(KEY_LOG_CLEANUP_INTERVAL, config.cleanupIntervalHours)
             putInt(KEY_LOG_MAX_SIZE, config.maxFileSizeMB)
             putInt(KEY_LOG_ROTATION_COUNT, config.rotationCount)
+            putString(KEY_LOG_MIN_LEVEL, config.minLevel.name)
             apply()
         }
         
@@ -192,6 +195,7 @@ class ConfigManager private constructor(private val context: Context) {
             put("cleanupIntervalHours", logging.cleanupIntervalHours)
             put("maxFileSizeMB", logging.maxFileSizeMB)
             put("rotationCount", logging.rotationCount)
+            put("minLevel", logging.minLevel.name)
         })
         return json.toString(2)
     }
@@ -223,7 +227,11 @@ class ConfigManager private constructor(private val context: Context) {
                     retentionHours = logging.optInt("retentionHours", 24),
                     cleanupIntervalHours = logging.optInt("cleanupIntervalHours", 4),
                     maxFileSizeMB = logging.optInt("maxFileSizeMB", 5),
-                    rotationCount = logging.optInt("rotationCount", 3)
+                    rotationCount = logging.optInt("rotationCount", 3),
+                    // "minLevel": "DEBUG" is how a field debug session is switched on
+                    // without a rebuild — the only lever that makes the verbose ADB
+                    // command tracing visible. Omitted or misspelled ⇒ INFO.
+                    minLevel = parseMinLevel(logging.optString("minLevel").takeIf { it.isNotEmpty() })
                 )
                 if (config.isValid()) {
                     updateLoggingConfig(config)
@@ -256,9 +264,21 @@ class ConfigManager private constructor(private val context: Context) {
             retentionHours = prefs.getInt(KEY_LOG_RETENTION, 24),
             cleanupIntervalHours = prefs.getInt(KEY_LOG_CLEANUP_INTERVAL, 4),
             maxFileSizeMB = prefs.getInt(KEY_LOG_MAX_SIZE, 5),
-            rotationCount = prefs.getInt(KEY_LOG_ROTATION_COUNT, 3)
+            rotationCount = prefs.getInt(KEY_LOG_ROTATION_COUNT, 3),
+            minLevel = parseMinLevel(prefs.getString(KEY_LOG_MIN_LEVEL, null))
         )
     }
+
+    /**
+     * Read a persisted/imported [LogLevel] name, falling back to INFO.
+     *
+     * Unrecognised input must NOT throw: this is the one setting a user is likely to
+     * hand-edit or push in over ADB while chasing a bug, and a typo that bricks config
+     * load would take the whole app's logging with it. An unparseable value simply
+     * leaves verbose logging off, which is the safe direction.
+     */
+    private fun parseMinLevel(name: String?): LogLevel =
+        name?.let { runCatching { LogLevel.valueOf(it.uppercase()) }.getOrNull() } ?: LogLevel.INFO
     
     private fun notifyListeners(key: String, oldValue: Any?, newValue: Any?) {
         synchronized(listeners) {

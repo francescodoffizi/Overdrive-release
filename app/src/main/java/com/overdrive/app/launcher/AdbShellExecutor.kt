@@ -139,10 +139,18 @@ class AdbShellExecutor(private val context: Context) {
 
     fun execute(command: String, callback: ShellCallback) {
         val seq = cmdSeq.incrementAndGet()
-        // INFO, not DEBUG: "submitted but never ran" is invisible if the only evidence is a debug
-        // line inside the runnable. Pairing SUBMIT/RUN/DONE with a correlation id makes queue
-        // starvation and lock stalls directly observable instead of inferred from absent logs.
-        logger.info(TAG, "adb#$seq SUBMIT [${Thread.currentThread().name}]: $command")
+        // DEBUG, and therefore off unless LogConfig.minLevel is lowered. The trio is a
+        // diagnostic instrument, not an operational signal: it exists so that "submitted
+        // but never ran" stops being indistinguishable from "ran fine" (both present as
+        // no log line), which is what made queue starvation and lock stalls inferable
+        // only from absent logs. But it fires three times per command on a path that runs
+        // continuously — the 30s daemon status refresh alone is one `ps -A | grep` per
+        // daemon — so leaving it on at INFO would churn the rotation window and evict the
+        // history it was added to preserve. Turn it on for a debug session, not for good.
+        // The failure paths stay at their own levels: those are rare and load-bearing —
+        // in particular REROUTED/REJECTED in submit() remain WARN, so an executor handoff
+        // is still visible with verbose logging off.
+        logger.debug(TAG, "adb#$seq SUBMIT [${Thread.currentThread().name}]: $command")
         // Return value deliberately ignored: on a double rejection we log and stop, we do NOT
         // call callback.onError. ServiceLauncher chains the next command from inside onError,
         // so an error callback raised on the CALLER's thread would re-enter execute(), be
@@ -151,11 +159,11 @@ class AdbShellExecutor(private val context: Context) {
         submit(seq, command) {
             val t0 = System.currentTimeMillis()
             try {
-                logger.info(TAG, "adb#$seq RUN [${Thread.currentThread().name}]")
+                logger.debug(TAG, "adb#$seq RUN [${Thread.currentThread().name}]")
                 val dadb = getOrCreateConnection()
                 val tConn = System.currentTimeMillis() - t0
                 val result = dadb.shell(command)
-                logger.info(TAG, "adb#$seq DONE conn=${tConn}ms total=${System.currentTimeMillis() - t0}ms exit=${result.exitCode}")
+                logger.debug(TAG, "adb#$seq DONE conn=${tConn}ms total=${System.currentTimeMillis() - t0}ms exit=${result.exitCode}")
 
                 if (result.exitCode == 0) {
                     callback.onSuccess(result.allOutput)

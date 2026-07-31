@@ -71,11 +71,15 @@ class OverdriveApplication : Application() {
         val base = LogConfig.default()  // carries the resolved app log dir + enable flags
         val persisted = ConfigManager.getInstance(this).getLoggingConfig()
 
+        // NOTE: every user-owned field must be listed here. base is LogConfig.default(),
+        // so anything omitted silently reverts to the compiled-in default and the
+        // persisted value is inert — which is what this merge exists to prevent.
         fun merged(policy: LogConfig): LogConfig = base.copy(
             retentionHours = policy.retentionHours,
             cleanupIntervalHours = policy.cleanupIntervalHours,
             maxFileSizeMB = policy.maxFileSizeMB,
-            rotationCount = policy.rotationCount
+            rotationCount = policy.rotationCount,
+            minLevel = policy.minLevel
         )
 
         // Seed the singleton with the persisted policy.

@@ -7,10 +7,16 @@ import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.fragment.app.Fragment
 import com.google.android.material.button.MaterialButton
 import com.overdrive.app.R
+import com.overdrive.app.config.ConfigManager
+import com.overdrive.app.logging.LogLevel
+import com.overdrive.app.logging.LogManager
 import com.overdrive.app.ui.MainActivity
 import com.overdrive.app.ui.util.RecordingScanner
 import com.overdrive.app.ui.util.RecordingsApiClient
@@ -22,7 +28,13 @@ import java.util.concurrent.Executors
  * Settings → Privacy & data pane.
  *
  * Hosts the on-device privacy stance, a live local-storage summary
- * (clip count + total size), and the destructive reset action.
+ * (clip count + total size), the log-verbosity picker, and the
+ * destructive reset action.
+ *
+ * Log verbosity lives here because logs are on-device data and this is
+ * the control that decides how much of it gets written. Lowering the gate
+ * to Debug turns on per-ADB-command tracing, which fills the rotation
+ * window fast — hence the inline warning while it is active.
  *
  * The reset button delegates to [MainActivity.invokeResetDataDialog],
  * preserving the exact behaviour of the legacy portrait "Reset data"
@@ -56,6 +68,7 @@ class SettingsPrivacyFragment : Fragment() {
         view.findViewById<MaterialButton>(R.id.btnResetData).setOnClickListener {
             (activity as? MainActivity)?.invokeResetDataDialog()
         }
+        setupLogLevel(view)
         populateStorage(view)
     }
 
@@ -71,6 +84,60 @@ class SettingsPrivacyFragment : Fragment() {
         super.onDestroyView()
         scanExecutor?.shutdownNow()
         scanExecutor = null
+    }
+
+    /**
+     * Wire the log-verbosity picker.
+     *
+     * Writes through [ConfigManager.updateLoggingConfig], which notifies the listener
+     * OverdriveApplication registered — that pushes the new config into the running
+     * LogManager, so the change takes effect immediately with no app restart.
+     *
+     * Spinner position maps to [LogLevel] by ordinal, matching the declaration order of
+     * R.array.settings_log_level_entries. The array carries a comment saying so; if the
+     * enum is ever reordered, both must move together.
+     */
+    private fun setupLogLevel(root: View) {
+        val spinner = root.findViewById<Spinner>(R.id.spinnerLogLevel) ?: return
+        val warning = root.findViewById<TextView>(R.id.tvLogLevelVerboseWarning)
+        val ctx = context?.applicationContext ?: return
+
+        val adapter = ArrayAdapter.createFromResource(
+            requireContext(),
+            R.array.settings_log_level_entries,
+            android.R.layout.simple_spinner_item
+        )
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinner.adapter = adapter
+
+        val current = ConfigManager.getInstance(ctx).getLoggingConfig().minLevel
+        spinner.setSelection(current.ordinal, false)
+        warning?.visibility = if (current == LogLevel.DEBUG) View.VISIBLE else View.GONE
+
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, v: View?, position: Int, id: Long) {
+                val chosen = LogLevel.values().getOrNull(position) ?: return
+                val cfg = ConfigManager.getInstance(ctx)
+                val existing = cfg.getLoggingConfig()
+                // setSelection(false) above still fires this once on attach. Comparing
+                // before writing keeps that from spuriously persisting + notifying every
+                // listener (which re-schedules the LogCleaner worker) on a mere page visit.
+                if (existing.minLevel == chosen) {
+                    warning?.visibility = if (chosen == LogLevel.DEBUG) View.VISIBLE else View.GONE
+                    return
+                }
+                // Logged BEFORE the write, at WARN, so the transition is recorded under the
+                // OLD gate. Logging afterwards would lose exactly the interesting case —
+                // "why did the logs go quiet?" — because the new stricter gate would drop
+                // its own audit line. The one transition this can't record is a move away
+                // from ERROR-only, where the user has already asked for near-silence.
+                LogManager.getInstance().warn(TAG, "Log level changed: ${existing.minLevel} → $chosen")
+                cfg.updateLoggingConfig(existing.copy(minLevel = chosen))
+                warning?.visibility = if (chosen == LogLevel.DEBUG) View.VISIBLE else View.GONE
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
     }
 
     private fun populateStorage(root: View) {
