@@ -40,11 +40,6 @@ class DaemonStopGateTest {
         assertFalse(DaemonStopGate.isStartBlocked(SENTINEL, present(MARKER)))
     }
 
-    @Test
-    fun startup_nullSentinelNeverBlocks() {
-        assertFalse(DaemonStopGate.isStartBlocked(null, present(SENTINEL, MARKER)))
-    }
-
     // ---- health-check policy: sentinel OR parked marker ----
 
     @Test

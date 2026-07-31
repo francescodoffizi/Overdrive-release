@@ -31,6 +31,12 @@ package com.overdrive.app.ui.daemon
  * The original symptom turned out to be a measurement artifact in the diagnosis harness. This change
  * therefore removes a genuine fragility and is NOT a fix for that bug — do not cite it as one.
  *
+ * SCOPE — this gate covers the DECISION only. The ACTION it guards (`startTailscaleOnBoot`, and the
+ * `vm.startDaemon` paths) still runs over the per-manager ADB executor, so a handoff that lands
+ * mid-chain can still lose the start. That half is addressed separately, by
+ * `AdbShellExecutor.submit()` rerouting a rejected command to a process-wide executor rather than
+ * dropping it. Neither change alone closes the window; read them together.
+ *
  * ## What makes the local check valid — and its one blind spot
  *
  * `File.exists()` needs **search (`x`) permission on every parent directory**, not read permission
@@ -62,8 +68,8 @@ object DaemonStopGate {
      * `BootReceiver.startDaemons` refuses to reach `startOnBoot` while the marker is present unless
      * the trigger is a recovery trigger.
      */
-    fun isStartBlocked(sentinelPath: String?, exists: (String) -> Boolean): Boolean =
-        sentinelPath != null && exists(sentinelPath)
+    fun isStartBlocked(sentinelPath: String, exists: (String) -> Boolean): Boolean =
+        exists(sentinelPath)
 
     /** Machine-stop markers in a content-aware sentinel's first line: the ACC-off sweep and the
      *  update sweep's write-if-absent `stopAllDaemons`. Neither is a user stop. */
@@ -102,10 +108,8 @@ object DaemonStopGate {
      * deliberately tore down on park, so it must see the marker.
      */
     fun isRelaunchBlocked(
-        sentinelPath: String?,
-        markerPath: String?,
+        sentinelPath: String,
+        markerPath: String,
         exists: (String) -> Boolean
-    ): Boolean =
-        (sentinelPath != null && exists(sentinelPath)) ||
-            (markerPath != null && exists(markerPath))
+    ): Boolean = exists(sentinelPath) || exists(markerPath)
 }
