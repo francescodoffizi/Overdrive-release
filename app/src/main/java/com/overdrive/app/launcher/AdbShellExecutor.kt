@@ -78,6 +78,8 @@ class AdbShellExecutor(private val context: Context) {
         val output: String
     )
     
+    private val cmdSeq = java.util.concurrent.atomic.AtomicInteger(0)
+
     fun execute(command: String, callback: ShellCallback) {
         // Guard against RejectedExecutionException: if the executor is already
         // shutting down (the owning launcher / app is tearing down), execute()
@@ -87,12 +89,20 @@ class AdbShellExecutor(private val context: Context) {
         // KILLS THE PROCESS (observed: app crash on startup when the Activity
         // finished mid-sequence). Swallow it — a dead executor means we're shutting
         // down and the remaining commands are moot.
+        val seq = cmdSeq.incrementAndGet()
+        // INFO, not DEBUG: "submitted but never ran" is invisible if the only evidence is a debug
+        // line inside the runnable. Pairing SUBMIT/RUN/DONE with a correlation id makes queue
+        // starvation and lock stalls directly observable instead of inferred from absent logs.
+        logger.info(TAG, "adb#$seq SUBMIT [${Thread.currentThread().name}]: $command")
         try {
             executor.execute {
+                val t0 = System.currentTimeMillis()
                 try {
-                    logger.debug(TAG, "Executing async: $command")
+                    logger.info(TAG, "adb#$seq RUN [${Thread.currentThread().name}]")
                     val dadb = getOrCreateConnection()
+                    val tConn = System.currentTimeMillis() - t0
                     val result = dadb.shell(command)
+                    logger.info(TAG, "adb#$seq DONE conn=${tConn}ms total=${System.currentTimeMillis() - t0}ms exit=${result.exitCode}")
 
                     if (result.exitCode == 0) {
                         callback.onSuccess(result.allOutput)
@@ -100,13 +110,13 @@ class AdbShellExecutor(private val context: Context) {
                         callback.onError("Exit code ${result.exitCode}: ${result.allOutput}")
                     }
                 } catch (e: Exception) {
-                    logger.error(TAG, "Command execution failed: $command", e)
+                    logger.error(TAG, "adb#$seq FAILED after ${System.currentTimeMillis() - t0}ms: $command", e)
                     callback.onError("Execution failed: ${e.message}")
                 }
             }
         } catch (e: java.util.concurrent.RejectedExecutionException) {
             // Executor shut down — drop the command silently (app is tearing down).
-            logger.warn(TAG, "execute() rejected (executor shutting down): $command")
+            logger.warn(TAG, "adb#$seq REJECTED (executor shut down): $command")
         }
     }
     
@@ -233,11 +243,21 @@ class AdbShellExecutor(private val context: Context) {
     }
     
     fun getOrCreateConnection(): Dadb {
+        // sharedDadbLock is PROCESS-WIDE and the liveness probe below is an un-timed blocking
+        // round-trip. If that probe hangs on a half-dead connection every AdbShellExecutor in the
+        // process stalls behind this monitor — and a thread blocked on a monitor reports as
+        // S (sleeping), which is indistinguishable from idle in /proc. Time it explicitly.
+        val tWait = System.currentTimeMillis()
         synchronized(sharedDadbLock) {
+            val waited = System.currentTimeMillis() - tWait
+            if (waited > 1000) logger.warn(TAG, "getOrCreateConnection: waited ${waited}ms for sharedDadbLock")
             var dadb = sharedDadb
             if (dadb != null) {
                 try {
+                    val tProbe = System.currentTimeMillis()
                     val result = dadb.shell("echo ok")
+                    val probeMs = System.currentTimeMillis() - tProbe
+                    if (probeMs > 1000) logger.warn(TAG, "getOrCreateConnection: liveness probe took ${probeMs}ms (holding the shared lock)")
                     if (result.exitCode == 0) {
                         if (isAuthPending.getAndSet(false)) {
                             wasAuthGranted.set(true)
