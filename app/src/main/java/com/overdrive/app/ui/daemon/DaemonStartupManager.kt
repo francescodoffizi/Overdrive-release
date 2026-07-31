@@ -18,6 +18,9 @@ class DaemonStartupManager(
     private val daemonsViewModel: DaemonsViewModel? = null
 ) {
     private val log = LogManager.getInstance()
+    // Last supervised-optional-daemon set logged by this manager's health check, so the line is
+    // emitted on change rather than every 30s tick. Main-looper only; no @Volatile needed.
+    private var lastLoggedOptional: List<String>? = null
     private val handler = Handler(Looper.getMainLooper())
 
     // Dedicated looper for the 30s daemon health check. That tick does blocking
@@ -283,12 +286,67 @@ class DaemonStartupManager(
         // post-update path; missing from the cold-start launch flow.)
         clearStaleSentinels()
 
+        // Same Tailscale lead as the boot path. This path matters MORE in practice: BYD's
+        // broadcast suppression means the app is normally started by hand (`am start`) rather
+        // than by BOOT_COMPLETED, so initializeOnAppLaunch — not initializeOnBoot — is what
+        // actually runs. Hardware test 2026-07-31 with only the boot path fixed measured
+        // byd_cam_daemon at +50s and tailscaled at +65s, i.e. MQTT still came up 15s before
+        // its proxy existed.
+        scheduleTailscaleLead("App launch")
+
         // Wait 45 seconds for system to fully stabilize before starting any daemons
-        handler.postDelayed({ startCoreDaemons() }, 45000)
-        handler.postDelayed({ startOptionalDaemonsFromPreferences() }, 60000)
+        handler.postDelayed({ startCoreDaemons() }, DaemonBootSchedule.CORE_DELAY_MS)
+        handler.postDelayed({ startOptionalDaemonsFromPreferences() }, DaemonBootSchedule.OPTIONAL_DELAY_MS)
 
         // Start periodic health check after initial daemons have had time to start
-        handler.postDelayed({ startDaemonHealthCheck() }, 90000)
+        handler.postDelayed({ startDaemonHealthCheck() }, DaemonBootSchedule.HEALTH_CHECK_DELAY_MS)
+    }
+
+    /**
+     * Give tailscaled a head start over the core daemons when the tunnel is enabled.
+     *
+     * The camera daemon owns the MQTT publisher, and with the tunnel enabled the broker is
+     * normally reachable ONLY through tailscaled's SOCKS listener. Starting the camera daemon
+     * first makes the publisher defer (issue #182). That deferral is cheap — the #182 fix does
+     * not bump `consecutiveFailures` while waiting, so the publish loop re-probes every 5s and
+     * connects as soon as the listener binds — but it is bounded by `PROXY_WARMUP_GRACE_MS`
+     * (60s), and past that the publisher falls through to a direct dial that can never reach a
+     * LAN address off Wi-Fi. The lead exists to keep the proxy inside that window, not to save
+     * the few seconds of telemetry a good boot would lose anyway. See [DaemonBootSchedule].
+     *
+     * The preference is read INSIDE the callback, not at schedule time: these initializers run
+     * at t=0, when PreferencesManager may not be initialized yet. The later optional-daemon
+     * pass still starts Tailscale too; that call is idempotent (TailscaleLauncher.launchTailscale
+     * probes isTunnelRunning and no-ops), so it doubles as a retry if this early start failed.
+     */
+    private fun scheduleTailscaleLead(phase: String) {
+        handler.postDelayed({
+            // Log the decision either way. An optional daemon that isn't "enabled" is skipped
+            // by BOTH the startup pass and runHealthCheck with NO log line at all, so a
+            // preference that reads back false is invisible — the daemon simply never starts
+            // and nothing says why. That silence cost a full hardware debug cycle on
+            // 2026-07-31; make it observable.
+            val enabled = try {
+                PreferencesManager.getEnabledDaemons().map { it.name }
+            } catch (e: Exception) {
+                log.warn(TAG, "$phase: could not read enabled daemons (${e.message}) — skipping Tailscale lead")
+                return@postDelayed
+            }
+            if (DaemonType.TAILSCALE_TUNNEL.name !in enabled) {
+                log.info(TAG, "$phase: Tailscale not enabled in preferences (enabled=$enabled) — no lead scheduled")
+                return@postDelayed
+            }
+
+            // ifNotUserStopped now checks the sentinel locally (see DaemonStopGate), so it can no
+            // longer be silently disarmed by a shut-down executor — which is what stopped this
+            // lead from ever firing on hardware before that fix.
+            ifNotUserStopped(DaemonType.TAILSCALE_TUNNEL) {
+                log.info(TAG, "$phase: starting Tailscale ${DaemonBootSchedule.proxyLeadMs() / 1000}s " +
+                    "ahead of the core daemons (if the SOCKS proxy toggle is on, this is what lets " +
+                    "MQTT start into a live proxy instead of deferring)")
+                startTailscaleOnBoot()
+            }
+        }, DaemonBootSchedule.TAILSCALE_LEAD_DELAY_MS)
     }
 
     /**
@@ -340,12 +398,14 @@ class DaemonStartupManager(
         // immediately. See initializeOnAppLaunch for the full rationale.
         clearStaleSentinels()
 
+        scheduleTailscaleLead("Boot")
+
         // Wait 45 seconds for system to fully stabilize before starting any daemons
-        handler.postDelayed({ startCoreDaemonsViaAdb() }, 45000)
-        handler.postDelayed({ startOptionalDaemonsViaAdb() }, 60000)
+        handler.postDelayed({ startCoreDaemonsViaAdb() }, DaemonBootSchedule.CORE_DELAY_MS)
+        handler.postDelayed({ startOptionalDaemonsViaAdb() }, DaemonBootSchedule.OPTIONAL_DELAY_MS)
 
         // Start periodic health check after initial daemons have had time to start
-        handler.postDelayed({ startDaemonHealthCheck() }, 90000)
+        handler.postDelayed({ startDaemonHealthCheck() }, DaemonBootSchedule.HEALTH_CHECK_DELAY_MS)
     }
 
 
@@ -446,61 +506,41 @@ class DaemonStartupManager(
      * Core daemons don't need this gate — clearStaleSentinels intentionally
      * re-arms them — so this is only wired into the optional starts.
      *
-     * Probe runs as the app's shared launcher (UID lets it stat
-     * /data/local/tmp). On probe error we bias toward starting (same
-     * availability bias as relaunchDaemon): a missed start is recoverable by
-     * the user, and the daemon is already pref-enabled here.
+     * The sentinel is stat'd LOCALLY, from the app process. This was an ADB round-trip whose reply
+     * callback carried the actual start, so the decision depended on a reply that is not guaranteed
+     * to arrive (see [DaemonStopGate], including why `false` means "absent OR invisible"). Removing
+     * that dependency is hardening — it was NOT shown to be the cause of any observed failure.
+     *
+     * Delivery of [onAllowed] is unchanged: still posted to the main looper, because four of the
+     * call sites invoke this from an ADB worker thread inside a `*Controller.isRunning { }`
+     * callback and their bodies touch DaemonsViewModel.
      */
     private fun ifNotUserStopped(type: DaemonType, onAllowed: () -> Unit) {
-        // The sentinel is present for MACHINE stops too, not just user stops, and
-        // the machine ones are not cleared post-update for optional daemons. So
-        // existence alone keeps a pref-enabled daemon down after any app update
-        // until something else revives it — for Telegram, the next ACC-off edge,
-        // which reads the same file's TEXT and correctly restarts. Read the text
-        // here too so both gates agree about the same file.
-        //
-        // TELEGRAM ONLY, deliberately. Its sentinel is the one whose text is an
-        // authoritative discriminator: the update sweep writes it write-if-absent
-        // (AppUpdater.stopAllDaemons), so "stopAllDaemons" can only appear when no
-        // user stop was already recorded. zrok's sentinel carries the same text but
-        // is still written with a clobbering `>`, and additionally encodes
-        // mutual-exclusion and killDaemon stops — so trusting its text would read a
-        // clobbered user stop as a machine stop. Those daemons keep the
-        // existence-only gate until their writers are made write-if-absent too.
-        val contentAware = type == DaemonType.TELEGRAM_DAEMON
-        val probe = if (contentAware) {
-            "if [ -f ${type.sentinelPath} ]; then " +
-                "if head -1 ${type.sentinelPath} 2>/dev/null | " +
-                "grep -qE 'ACC-on|stopAllDaemons'; then echo MACHINE; " +
-                "else echo STOPPED; fi; " +
-            "else echo OK; fi"
+        // Decide stop-intent LOCALLY (no ADB round-trip — see [DaemonStopGate]), while preserving
+        // upstream's content-aware discrimination for Telegram: its sentinel's TEXT distinguishes a
+        // MACHINE stop (ACC-off sweep / the update sweep's write-if-absent "stopAllDaemons") from a
+        // real user stop, and only a user stop must suppress a pref-enabled start. Ported from the
+        // former `head -1 | grep -qE 'ACC-on|stopAllDaemons'` ADB probe to a local first-line read.
+        val blocked = if (type == DaemonType.TELEGRAM_DAEMON) {
+            DaemonStopGate.isStartBlockedContentAware(type.sentinelPath, fileExists, firstLineOf)
         } else {
-            "test -f ${type.sentinelPath} && echo STOPPED || echo OK"
+            DaemonStopGate.isStartBlocked(type.sentinelPath, fileExists)
         }
-        adbLauncher.executeShellCommand(
-            probe,
-            object : AdbDaemonLauncher.LaunchCallback {
-                override fun onLog(message: String) {
-                    val out = message.trim()
-                    if (out.contains("STOPPED")) {
-                        log.info(TAG, "Optional startup: ${type.displayName} has a user-stop " +
-                            "sentinel — not auto-starting")
-                    } else {
-                        if (out.contains("MACHINE")) {
-                            log.info(TAG, "Optional startup: ${type.displayName} sentinel is a " +
-                                "machine stop, not a user stop — starting")
-                        }
-                        handler.post { onAllowed() }
-                    }
-                }
-                override fun onLaunched() {}
-                override fun onError(error: String) {
-                    log.warn(TAG, "Optional startup sentinel probe failed for " +
-                        "${type.displayName} ($error) — starting (pref-enabled)")
-                    handler.post { onAllowed() }
-                }
-            }
-        )
+        if (blocked) {
+            log.info(TAG, "Optional startup: ${type.displayName} has a user-stop " +
+                "sentinel — not auto-starting")
+            return
+        }
+        handler.post { onAllowed() }
+    }
+
+    /** Injected so the gate's policy stays unit-testable and the call sites stay honest. */
+    private val fileExists: (String) -> Boolean = { java.io.File(it).exists() }
+
+    /** Reads a sentinel's first line locally for the content-aware Telegram gate; null on any
+     *  read failure (caller treats null as "present but unreadable" — a user stop). */
+    private val firstLineOf: (String) -> String? = { path ->
+        try { java.io.File(path).bufferedReader().use { it.readLine() } } catch (_: Exception) { null }
     }
 
     private fun startOptionalDaemonsFromPreferences() {
@@ -910,12 +950,23 @@ class DaemonStartupManager(
         }
 
         // Optional daemons: only restart if user had them enabled in preferences.
-        // Guard ORDER matters for cost (the conjunction is unchanged):
-        // isDaemonEnabled is an in-memory SharedPreferences set lookup, while
-        // isDaemonStoppedViaTelegram opens + Properties.load()s a file. Checking
-        // the cheap in-memory gate FIRST means a disabled optional daemon no
-        // longer pays a disk read every 30s tick, forever. Same decisions, same
-        // relaunch behaviour — pure short-circuit reordering.
+        // #197: log the supervised optional set on CHANGE — the observability that would have
+        // surfaced the 2026-07-29 dead-tailscaled outage. Grafted onto upstream's batched check.
+        val enabledOptional = try {
+            PreferencesManager.getEnabledDaemons().filter { it in OPTIONAL_DAEMONS }.map { it.name }
+        } catch (e: Exception) {
+            log.warn(TAG, "Health check: cannot read enabled daemons: ${e.message}")
+            emptyList()
+        }
+        if (enabledOptional != lastLoggedOptional) {
+            lastLoggedOptional = enabledOptional
+            log.info(TAG, "Health check: supervising optional daemons $enabledOptional " +
+                "(others are skipped silently by design)")
+        }
+
+        // Guard ORDER matters for cost (upstream v36.6): the cheap in-memory isDaemonEnabled check
+        // runs before the file-reading isDaemonStoppedViaTelegram, so a disabled optional daemon no
+        // longer pays a disk read every tick.
         for (type in OPTIONAL_DAEMONS) {
             if (type in userStoppedDaemons) continue
             if (!PreferencesManager.isDaemonEnabled(type)) continue
@@ -925,10 +976,8 @@ class DaemonStartupManager(
 
         if (candidates.isEmpty()) return
 
-        // ZROK keeps its bespoke two-layer check (process-alive AND edge-stale
-        // HTTP probe) — a `ps` snapshot cannot detect a stale zrok edge, so
-        // routing it through the snapshot would silently lose the 8-9h 502
-        // recovery. Dispatch it on its own path exactly as before.
+        // ZROK keeps its bespoke two-layer check (process-alive AND edge-stale HTTP probe) — a `ps`
+        // snapshot cannot detect a stale zrok edge, so route it on its own path exactly as before.
         val zrokCandidate = candidates.remove(DaemonType.ZROK_TUNNEL)
         if (zrokCandidate) checkAndRelaunchDaemon(DaemonType.ZROK_TUNNEL)
 
@@ -936,12 +985,6 @@ class DaemonStartupManager(
 
         adbLauncher.snapshotProcessTable { snapshot ->
             if (snapshot == null) {
-                // Probe failed (adb transport hiccup). Treat as UNKNOWN, not
-                // dead: the old per-daemon path also reported false-on-error but
-                // then funnelled through relaunchDaemon's sentinel probe, which
-                // biases to relaunch. Skipping this tick entirely is the
-                // conservative choice — the next tick is only 30s away, and the
-                // shell-side watchdogs cover a genuinely dead daemon meanwhile.
                 log.warn(TAG, "Health check: ps snapshot unavailable — skipping this tick")
                 return@snapshotProcessTable
             }
@@ -1066,8 +1109,9 @@ class DaemonStartupManager(
         // the health-check) OR a user-initiated stop from the Daemons UI or
         // Telegram (sentinel present → leave it down). This probe is the only
         // check that works regardless of which UID wrote the stop: the
-        // sentinel is `chmod 666` in /data/local/tmp, readable by both the app
-        // and the UID-2000 daemon family. The in-memory userStoppedDaemons set
+        // stop files live in /data/local/tmp, which the app process can stat directly
+        // (search permission on the directory — the files' 0666 mode is irrelevant to
+        // exists(); see DaemonStopGate). The in-memory userStoppedDaemons set
         // is wiped on app relaunch, and the legacy Telegram .properties file is
         // unreadable across the UID boundary — so without this probe a
         // Telegram or post-restart stop gets resurrected within 30s.
@@ -1075,34 +1119,21 @@ class DaemonStartupManager(
         // Every relaunch path (generic dead-process, zrok PROCESS_DEAD, zrok
         // EDGE_STALE, boot-path ADB fallback) funnels through here, so gating
         // once at this chokepoint covers them all.
-        adbLauncher.executeShellCommand(
-            "test -f ${type.sentinelPath} -o -f ${com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH} && echo STOPPED || echo OK",
-            object : com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback {
-                override fun onLog(message: String) {
-                    if (message.trim().contains("STOPPED")) {
-                        // STOPPED = user disable sentinel present, OR the "Vehicle ON only"
-                        // parked-shutdown marker present. In onOnly the whole stack is
-                        // terminated on park and MUST NOT be revived by the 30s health-check
-                        // until the ACC-on edge clears the marker.
-                        log.info(TAG, "Health check: ${type.displayName} is stopped " +
-                            "(disable sentinel or parked-shutdown marker present) — NOT relaunching")
-                    } else {
-                        doRelaunchDaemon(type)
-                    }
-                }
-                override fun onLaunched() {}
-                override fun onError(error: String) {
-                    // Probe failed (transport hiccup). Bias toward availability:
-                    // relaunch rather than leave a crashed daemon dead on a
-                    // false negative. A user-stopped daemon whose sentinel we
-                    // couldn't read will be re-killed on the user's next stop;
-                    // a crashed safety daemon left dead is the worse outcome.
-                    log.warn(TAG, "Health check: sentinel probe failed for " +
-                        "${type.displayName} ($error) — relaunching defensively")
-                    doRelaunchDaemon(type)
-                }
-            }
-        )
+        // Checked LOCALLY (see DaemonStopGate). Previously an ADB round-trip whose reply callback
+        // carried the relaunch, so a shut-down executor could disarm the health check — the one
+        // thing standing between a crashed daemon and an indefinitely dead stack.
+        // STOPPED = user disable sentinel present, OR the "Vehicle ON only" parked-shutdown marker
+        // present. In onOnly the whole stack is terminated on park and MUST NOT be revived by the
+        // 30s health-check until the ACC-on edge clears the marker.
+        if (DaemonStopGate.isRelaunchBlocked(
+                sentinelPath = type.sentinelPath,
+                markerPath = com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH,
+                exists = fileExists)) {
+            log.info(TAG, "Health check: ${type.displayName} is stopped " +
+                "(disable sentinel or parked-shutdown marker present) — NOT relaunching")
+            return
+        }
+        doRelaunchDaemon(type)
     }
 
     private fun doRelaunchDaemon(type: DaemonType) {
