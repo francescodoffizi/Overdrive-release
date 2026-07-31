@@ -9,8 +9,9 @@
     STORAGE     : overline + 2-row card (Clips on disk / Total size).
                   Populated at runtime by SettingsPrivacyFragment via
                   RecordingScanner.
-    DIAGNOSTICS : overline + card with the log-level picker, its cost
-                  caption, and a warning shown only while verbose.
+    DIAGNOSTICS : overline + card with the log-level segmented picker, a
+                  description of the selected level, and an advisory shown
+                  at either extreme (verbose / near-silent).
     RESET CARD  : destructive action — colorErrorContainer background,
                   outlined error MaterialButton.
 
@@ -19,7 +20,7 @@
 
   Preserved IDs:
     btnResetData — outlined destructive button (Kotlin click handler)
-    spinnerLogLevel / tvLogLevelVerboseWarning — log verbosity control
+    toggleLogLevel / tvLogLevelDesc / tvLogLevelNote — log verbosity control
 -->
 <androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -224,7 +225,7 @@
                 android:orientation="vertical"
                 android:padding="@dimen/card_padding_standard">
 
-                <!-- Row: Log detail + level picker -->
+                <!-- Title row -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -243,37 +244,80 @@
                         android:layout_height="wrap_content"
                         android:layout_marginStart="14dp"
                         android:layout_weight="1"
-                        android:labelFor="@+id/spinnerLogLevel"
                         android:text="@string/settings_privacy_log_level_label"
-                        android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
-                        android:textColor="?attr/colorOnSurfaceVariant" />
-
-                    <Spinner
-                        android:id="@+id/spinnerLogLevel"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:minWidth="180dp"
-                        android:contentDescription="@string/settings_privacy_log_level_label" />
+                        android:textAppearance="@style/TextAppearance.Material3.TitleMedium"
+                        android:textColor="?attr/colorOnSurface" />
                 </LinearLayout>
 
-                <TextView
+                <!-- Segmented control, matching the update-channel picker in Settings →
+                     About. A dropdown was the wrong idiom here: it needs a second precise
+                     tap on a ~48dp floating row, which is poor on a head unit. Four
+                     weighted segments give full-width touch targets in one tap. Selection
+                     maps by explicit button id (see SettingsPrivacyFragment), NOT by
+                     index, so reordering the buttons cannot silently change the meaning. -->
+                <com.google.android.material.button.MaterialButtonToggleGroup
+                    android:id="@+id/toggleLogLevel"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:text="@string/settings_privacy_log_level_caption"
-                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:layout_marginTop="12dp"
+                    app:selectionRequired="true"
+                    app:singleSelection="true">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnLogLevelDebug"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/settings_privacy_log_level_debug" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnLogLevelInfo"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/settings_privacy_log_level_info" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnLogLevelWarn"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/settings_privacy_log_level_warn" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnLogLevelError"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/settings_privacy_log_level_error" />
+                </com.google.android.material.button.MaterialButtonToggleGroup>
+
+                <!-- Description of the SELECTED level; swapped by the fragment. BodyMedium
+                     to match the pane's other explanatory copy (the stance card) — BodySmall
+                     is too small to read at head-unit distance. -->
+                <TextView
+                    android:id="@+id/tvLogLevelDesc"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="@string/settings_privacy_log_level_info_desc"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
                     android:textColor="?attr/colorOnSurfaceVariant" />
 
-                <!-- Shown only while the gate is below INFO. Kept inside the card so the
-                     warning travels with the control that caused it. -->
+                <!-- Advisory for either extreme. colorTertiary, not colorError: choosing a
+                     log level is a deliberate setting, not a fault, and red here would cry
+                     wolf next to the genuinely destructive reset card below. -->
                 <TextView
-                    android:id="@+id/tvLogLevelVerboseWarning"
+                    android:id="@+id/tvLogLevelNote"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:text="@string/settings_privacy_log_level_verbose_warning"
-                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
-                    android:textColor="?attr/colorError"
+                    android:layout_marginTop="8dp"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textColor="?attr/colorTertiary"
                     android:textStyle="bold"
                     android:visibility="gone" />
             </LinearLayout>
