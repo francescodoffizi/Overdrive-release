@@ -105,8 +105,38 @@ target_compile_options(surveillance PRIVATE
     -fdata-sections              # Put each data item in its own section
 )
 
+# Force NDEBUG in release configs (same rationale as the od target below):
+# don't rely on the toolchain's implicit default to strip debug-only paths.
+target_compile_definitions(surveillance PRIVATE
+    $<$<CONFIG:Release>:NDEBUG>
+    $<$<CONFIG:RelWithDebInfo>:NDEBUG>
+)
+
 # Strip symbols and remove unused sections in release
 set_target_properties(surveillance PROPERTIES
+    LINK_FLAGS "-Wl,--gc-sections,--strip-all,--exclude-libs,ALL"
+)
+
+# ==================== od library ====================
+# Standalone utility library with host-authorization gate. Same hardening as surveillance:
+# all symbols hidden, fully stripped, sections GC'd — only the two JNI entry points remain.
+add_library(od SHARED od/od.cpp)
+target_include_directories(od PRIVATE ${CMAKE_SOURCE_DIR}/od)
+target_link_libraries(od android log m)
+target_compile_options(od PRIVATE
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+    -ffunction-sections
+    -fdata-sections
+    -O3 -ffast-math
+)
+# Force NDEBUG in release configs so the #ifndef NDEBUG host-auth bypass in
+# od.cpp is preprocessed out (don't rely on the toolchain's implicit default).
+target_compile_definitions(od PRIVATE
+    $<$<CONFIG:Release>:NDEBUG>
+    $<$<CONFIG:RelWithDebInfo>:NDEBUG>
+)
+set_target_properties(od PROPERTIES
     LINK_FLAGS "-Wl,--gc-sections,--strip-all,--exclude-libs,ALL"
 )
 

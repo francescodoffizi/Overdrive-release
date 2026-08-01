@@ -6,8 +6,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.graphics.Color;
-import android.media.AudioAttributes;
-import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Bundle;
 import android.util.Log;
@@ -123,19 +121,19 @@ public final class VideoPlaybackActivity extends Activity {
 
         try {
             videoView.setOnPreparedListener(mp -> {
-                try {
-                    mp.setLooping(loop);
-                    // Route the audio to the chosen channel. ZoomableVideoView otherwise
-                    // uses MediaPlayer defaults (USAGE_MEDIA); overriding here after prepare
-                    // keeps the picture path (which the TextureView owns) untouched. The OEM
-                    // routes by legacy stream, so setLegacyStreamType is the lever (nav/voice
-                    // are approximated to media for the picture-carrying video path).
-                    mp.setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(usageForChannel(channel))
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                            .setLegacyStreamType(streamForChannel(channel))
-                            .build());
-                } catch (Throwable ignored) {}
+                // Do NOT call setAudioAttributes()/setAudioStreamType() here. Reassigning
+                // the audio stream on the MediaPlayer in its PREPARED state stalls the
+                // codec on this BYD/DiLink stack — "reassignAudioAttributes streamType=3
+                // → streamType=1" — so the audio system registers but NO video frames are
+                // ever delivered (audio plays, screen stays black). ZoomableVideoView.
+                // startPreparing() documents this exact failure, and the working recordings
+                // player (VideoPlayerFragment) never touches audio attributes for the same
+                // reason — it relies on the view's default USAGE_MEDIA + CONTENT_TYPE_MOVIE.
+                // The "Play Video" keymap/automation only ever sends channel=media anyway, so
+                // the default routing is already correct; per-channel video-audio routing, if
+                // ever needed, must be applied BEFORE prepareAsync (in startPreparing), not
+                // in this Prepared-state callback.
+                try { mp.setLooping(loop); } catch (Throwable ignored) {}
                 videoView.start();
             });
             // One-shot finishes when the clip ends; a looping clip never completes.
@@ -151,35 +149,6 @@ public final class VideoPlaybackActivity extends Activity {
         } catch (Throwable t) {
             Log.w(TAG, "setup failed: " + t.getMessage());
             finish();
-        }
-    }
-
-    private static int usageForChannel(String channel) {
-        if (channel == null) return AudioAttributes.USAGE_MEDIA;
-        switch (channel.trim().toLowerCase()) {
-            case "navigation": return AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE;
-            case "voice":      return AudioAttributes.USAGE_ASSISTANT;
-            case "alarm":      return AudioAttributes.USAGE_ALARM;
-            case "media":
-            default:           return AudioAttributes.USAGE_MEDIA;
-        }
-    }
-
-    /** Legacy stream type for a channel — this head unit routes audio by stream, not by
-     *  usage (see MediaPlaybackService). Public streams only; nav/voice ride STREAM_MUSIC
-     *  (STREAM_NOTIFICATION is not an audible path on this HU — matches MediaPlaybackService). */
-    private static int streamForChannel(String channel) {
-        if (channel == null) return android.media.AudioManager.STREAM_MUSIC;
-        switch (channel.trim().toLowerCase()) {
-            case "phone":
-            case "call":       return android.media.AudioManager.STREAM_VOICE_CALL;
-            case "alarm":      return android.media.AudioManager.STREAM_ALARM;
-            case "system":     return android.media.AudioManager.STREAM_SYSTEM;
-            case "ring":       return android.media.AudioManager.STREAM_RING;
-            case "navigation":
-            case "voice":
-            case "assistant":  return android.media.AudioManager.STREAM_MUSIC;
-            default:           return android.media.AudioManager.STREAM_MUSIC;
         }
     }
 

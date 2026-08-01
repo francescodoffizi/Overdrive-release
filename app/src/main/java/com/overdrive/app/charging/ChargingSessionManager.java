@@ -61,6 +61,16 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
         config = new ChargingConfig();
         config.load();
 
+        // Load the location-aware tariffs BEFORE anything can price a session.
+        // finalizeStaleOpenSessions() below closes (and therefore prices) any
+        // session left open by a restart, and priceSession() would otherwise
+        // lazy-load on the SoC thread mid-close.
+        try {
+            TariffManager.getInstance().load();
+        } catch (Throwable t) {
+            logger.warn("Tariff load skipped: " + t.getMessage());
+        }
+
         socDb = SocHistoryDatabase.getInstance();
         // Push the opt-in flag so SocHistoryDatabase.trackChargingSession (which
         // runs on the always-on SoC tick) records nothing when disabled.
@@ -105,6 +115,10 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
 
     public void shutdown() {
         logger.info("Shutting down ChargingSessionManager");
+        // Persist any debounced tariff usage counters before we go: markUsed()
+        // coalesces writes (see TariffManager.MARK_USED_FLUSH_MS), so a pending
+        // bump would otherwise be lost on a clean daemon stop.
+        try { TariffManager.getInstance().flushPendingUsage(); } catch (Throwable ignored) {}
         try { ChargingDetector.getInstance().removeFusedStateListener(this); } catch (Exception ignored) {}
         stopSampling();
         if (sampler != null) {
@@ -196,6 +210,17 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
     public void onConfigChanged() {
         if (config == null) return;
         config.load();
+        // Tariffs live in the same chargingAnalytics section, so re-read them on
+        // every config change — otherwise the daemon keeps pricing with a stale
+        // list after the UI edits one.
+        try {
+            // Flush any debounced usage counters BEFORE reloading, or the reload
+            // would drop them (markUsed coalesces writes; see TariffManager).
+            TariffManager.getInstance().flushPendingUsage();
+            TariffManager.getInstance().load();
+        } catch (Throwable t) {
+            logger.warn("Tariff reload skipped: " + t.getMessage());
+        }
         // Propagate the opt-in flag to the always-on session recorder.
         if (socDb != null) socDb.setChargingAnalyticsEnabled(config.isEnabled());
         // Restart the sampler to pick up a new interval / enabled flag.

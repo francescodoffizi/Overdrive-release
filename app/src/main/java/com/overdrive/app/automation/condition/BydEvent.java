@@ -30,6 +30,11 @@ public class BydEvent {
     public static final EventData LIGHTS_HIGH_BEAM = new EventData("lights", Map.of("area", "highBeam"));
     public static final EventData LIGHTS_HAZARD = new EventData("lights", Map.of("area", "hazard"));
     public static final EventData LIGHTS_DRL = new EventData("lights", Map.of("area", "drl"));
+    // Interior ambient (atmosphere) light main switch. A separate event rather than another
+    // "lights" area because it is the only one of that group with a tri-state source: it is
+    // published ONLY when the vehicle really reports the switch, so a trim that cannot read it
+    // never fires either edge (instead of a permanent, wrong "off").
+    public static final EventData AMBIENT_STATE = new EventData("ambient", Map.of());
     public static final EventData SLW = new EventData("slw");
     public static final EventData CPD = new EventData("cpd");
     // Drive mode (normal/eco/sport/snow) on the SETTING drive-config axis, and the
@@ -54,13 +59,18 @@ public class BydEvent {
     public static final EventData SEAT_COOL_DRIVER = new EventData("seatClimate", Map.of("type", "cool", "area", "driver"));
     public static final EventData SEAT_COOL_PASSENGER = new EventData("seatClimate", Map.of("type", "cool", "area", "passenger"));
     public static final EventData AC = new EventData("ac");
+    // CABIN temperature, parked as well as driving (ambient only as a stopped-sensor fallback).
     public static final EventData TEMPERATURE = new EventData("temperature");
-    // Outside/ambient temperature as a first-class event, distinct from TEMPERATURE.
-    // TEMPERATURE is a smart cabin-first (car on) → outside → weather fallback; this
-    // OUTSIDE_TEMPERATURE is always the ambient reading (outside cluster sensor, then
-    // weather by GPS) so an automation can key off "how cold is it outside" regardless
-    // of power state without the cabin sensor ever leaking in.
+    // Outside/ambient temperature as a first-class event, distinct from TEMPERATURE. This one is
+    // ALWAYS the ambient reading (outside cluster sensor, then weather by GPS) so an automation can
+    // key off "how cold is it outside" without the cabin sensor ever leaking in.
     public static final EventData OUTSIDE_TEMPERATURE = new EventData("outsideTemp");
+    // The AC dial SETPOINT (what was asked for) — a third, distinct axis from the two measured
+    // temperatures above. Lets a rule read the dial (${signal:acSetpoint}) or gate on it ("only
+    // warm up if the dial is below 20"). Published in CELSIUS like every other temperature event
+    // here: a rule written as "setpoint > 20" must not silently mean 20 °F on a Fahrenheit car,
+    // and an automation is portable between vehicles in a way a display unit is not.
+    public static final EventData AC_SETPOINT = new EventData("acSetpoint");
     // Mean precipitation probability (%) over the next few hours, from Open-Meteo by
     // GPS (same fetch as the weather temperature). Drives "rain likely soon" automations
     // — distinct from the reactive autoWiper "raining now" proxy. Only published with a
@@ -92,6 +102,12 @@ public class BydEvent {
     // firmware. Published on/off per side (see updateTurnSignals).
     public static final EventData TURN_LEFT = new EventData("turnSignal", Map.of("side", "left"));
     public static final EventData TURN_RIGHT = new EventData("turnSignal", Map.of("side", "right"));
+    // Radar blind-spot / lane-change / cross-traffic ALERT, per side. Distinct
+    // from the blind-spot camera overlay: this is the OEM radar warning. Driven by
+    // BlindSpotEvent (instant ADAS event + fast poll), with an alert hold so a
+    // momentary pulse becomes a stable on/off edge.
+    public static final EventData BLIND_SPOT_LEFT = new EventData("blindSpot", Map.of("side", "left"));
+    public static final EventData BLIND_SPOT_RIGHT = new EventData("blindSpot", Map.of("side", "right"));
     // Pushed once a minute by TimeEvent (not from a vehicle-data snapshot).
     public static final EventData TIME = new EventData("time");
     public static final EventData DAY = new EventData("day");
@@ -107,10 +123,11 @@ public class BydEvent {
     // "bluetooth-by-name"-style condition can match a specific WiFi SSID.
     public static final EventData WIFI_STATE = new EventData("wifiState");
     public static final EventData WIFI_SSID = new EventData("wifiSsid");
-    // Pushed by BluetoothEvent on the same low-cadence poll as WiFi (not from a
-    // vehicle-data snapshot). btState is connected/disconnected; btDeviceName is the
-    // connected device's friendly name (or "" when disconnected) so a "connect to
-    // <name>" condition can match a specific phone — the BT analogue of WIFI_SSID.
+    // Relayed from the app-process BluetoothStateMonitor via Automations.publishExternalEvent
+    // (the daemon can't reliably read BT from UID 2000 — see that class). btState is
+    // connected/disconnected; btDeviceName is the connected device's friendly name (or ""
+    // when disconnected) so a "connect to <name>" condition can match a specific phone —
+    // the BT analogue of WIFI_SSID.
     public static final EventData BT_STATE = new EventData("btState");
     public static final EventData BT_DEVICE_NAME = new EventData("btDeviceName");
     // Published by SafeLocationManager on a geofence transition: the name of the
@@ -194,9 +211,14 @@ public class BydEvent {
     // Auto-headlights engaged (the light sensor turned the lamps on) — the usable
     // "it's dark" proxy; there is no lux value on this platform.
     public static final EventData AUTO_LIGHTS = new EventData("autoLights");
-    // Seat occupancy (someone sitting) per seat.
-    public static final EventData OCCUPANT_DRIVER = new EventData("occupant", Map.of("seat", "driver"));
+    // Seat occupancy (someone sitting). The PASSENGER seat has a real occupancy sensor
+    // (getPassengerStatus area 1) and publishes both occupied and empty.
     public static final EventData OCCUPANT_PASSENGER = new EventData("occupant", Map.of("seat", "passenger"));
+    // The DRIVER seat has NO occupancy sensor, so its presence is INFERRED from the
+    // seatbelt-reminder mask (bit 0) and the driver belt — see
+    // BydDataCollector.readDriverOccupancyNow. POSITIVE-ONLY: publishes "occupied" and never
+    // "empty", because an unbuckled-but-present driver is indistinguishable from an empty seat.
+    public static final EventData OCCUPANT_DRIVER = new EventData("occupant", Map.of("seat", "driver"));
     // User variables / flags (see SetVariableAction + VariableCondition). Not a vehicle
     // signal — a named marker the user sets and reads to coordinate automations (mutex,
     // mode flags). The state key is EventData("variable", {name}); this is just the
@@ -276,6 +298,11 @@ public class BydEvent {
         Automations.update(LIGHTS_HIGH_BEAM, data.highBeam ? "on" : "off");
         Automations.update(LIGHTS_HAZARD, data.hazard ? "on" : "off");
         Automations.update(LIGHTS_DRL, data.dayTimeLight ? "on" : "off");
+        // Ambient main switch — only on a real reading (UNAVAILABLE → publish nothing, so an
+        // unreadable switch cannot fire a spurious "off" trigger on every poll).
+        if (data.ambientEnabled != BydVehicleData.UNAVAILABLE) {
+            Automations.update(AMBIENT_STATE, data.ambientEnabled == 1 ? "on" : "off");
+        }
         Automations.update(SLW, data.speedLimitWarning ? "on" : "off");
         Automations.update(CPD, cpdToString(data.childPresenceDetection));
         if (data.seatHeat != null) {
@@ -288,12 +315,12 @@ public class BydEvent {
         }
         boolean poweredOn = data.powerLevel >= 2;
         Automations.update(AC, (poweredOn && data.acStartState == 1) ? "on" : "off");
-        // Temperature: prefer the cabin sensor (car on), fall back to the outside
-        // cluster sensor, then to the Open-Meteo weather API by last-known GPS so a
-        // parked/powered-off car (cabin sensor unavailable) still reports a
-        // temperature. The weather read is CACHED + refreshed on a background
-        // thread — never a network call on this telemetry-poll thread. See
-        // WeatherTemperature for the ACC-off-blackout-tolerant fetch model.
+        // Temperature: the CABIN sensor, parked as well as driving (the outside cluster
+        // sensor, then the Open-Meteo weather API by last-known GPS, are used only if the
+        // cabin sensor stops answering). The weather read is CACHED + refreshed on a
+        // background thread — never a network call on this telemetry-poll thread. See
+        // WeatherTemperature for the ACC-off-blackout-tolerant fetch model, and
+        // updateTemperature for the freshness/hold rules.
         updateTemperature(data);
         // speedKmh is canonical km/h (already scaled by distanceToKmFactor at ingestion),
         // so the mph value is a straight km→mi conversion. Guard NaN (unreadable speed).
@@ -389,10 +416,21 @@ public class BydEvent {
             Automations.update(AUTO_LIGHTS, data.lightAutoStatus == 1 ? "on" : "off");
         }
         // Seat occupancy per seat: 1=someone, 0=nobody, UNAVAILABLE→skip.
+        // passengerDetection is a 1-slot front-passenger array (see readOccupantsNow) —
+        // its shape is frozen at one slot because it is serialized positionally to MQTT/JSON.
         int[] occ = data.passengerDetection;
-        if (occ != null) {
-            if (occ.length > 0) publishOccupant(OCCUPANT_DRIVER, occ[0]);
-            if (occ.length > 1) publishOccupant(OCCUPANT_PASSENGER, occ[1]);
+        if (occ != null && occ.length > 0) {
+            publishOccupant(OCCUPANT_PASSENGER, occ[0]);
+        }
+        // Inferred DRIVER presence from the snapshot's already-sanitized driver belt (slot 0):
+        // buckled ⇒ someone is there. Deliberately NO HAL read here — this runs inside every
+        // build(), so the reminder-mask tier stays on the fast poller (pollDriverOccupant).
+        // That asymmetry is safe BECAUSE the event is positive-only and monotonic: both paths
+        // can only ever publish "occupied", so a subset of tiers here can never contradict the
+        // poller — it only means presence may be established a tick later on this path.
+        int[] belts = data.seatbeltStatus;
+        if (belts != null && belts.length > 0 && belts[0] == 1) {
+            publishOccupant(OCCUPANT_DRIVER, 1);
         }
         // Drive mode on the config axis (1=normal..4=snow); only publish an in-band
         // value so a trim without the drive-config getter (which can only see eco/sport
@@ -471,6 +509,74 @@ public class BydEvent {
     }
 
     /**
+     * Sample + publish per-seat seatbelt state NOW (called by the fast {@link
+     * com.overdrive.app.automation.condition.SeatbeltEvent} poll). Reads the live
+     * {@code getSafetyBeltStatus(area)} getter directly and publishes each seat via the
+     * same {@link #publishSeatbelt} (→ Automations.update fires On Change on a change).
+     * This is the belt equivalent of {@link #pollTurnSignals}: without it the belt state
+     * was sampled only on the 5s telemetry poll, so a buckle took up to ~5s (avg 2-3s) to
+     * fire its automation. Automations.update itself dedups, so this is a true no-op when
+     * the value hasn't changed since the last sample.
+     */
+    public static void pollSeatbelts() {
+        if (Automations.isDisabled()) return;
+        int[] belts;
+        try {
+            belts = com.overdrive.app.byd.BydDataCollector.getInstance().readSeatbeltsNow();
+        } catch (Throwable t) {
+            return; // instrument device unreachable this tick — leave the events untouched
+        }
+        if (belts == null) return; // no real reading → unseeded (no false publish)
+        if (belts.length > 0) publishSeatbelt(SEATBELT_DRIVER, belts[0]);
+        if (belts.length > 1) publishSeatbelt(SEATBELT_PASSENGER, belts[1]);
+    }
+
+    /**
+     * Sample + publish per-seat OCCUPANCY now (called by the fast {@link SeatbeltEvent} poll).
+     * Reads the live {@code getPassengerStatus(area)} getter via the same collector helper the
+     * 5s snapshot uses and publishes through the same {@link #publishOccupant} path, so the
+     * edge/dedup semantics are identical — just sampled faster. Without this, occupancy rode
+     * only the telemetry snapshot (~5s driving, 90s parked), and getting in/out of a parked car
+     * is exactly the parked case — so the trigger lagged by up to 90s.
+     */
+    public static void pollOccupants() {
+        if (Automations.isDisabled()) return;
+        int[] occ;
+        try {
+            occ = com.overdrive.app.byd.BydDataCollector.getInstance().readOccupantsNow();
+        } catch (Throwable t) {
+            return; // safety-belt device unreachable this tick — leave the events untouched
+        }
+        if (occ == null || occ.length < 1) return; // no real reading → unseeded (no false publish)
+        publishOccupant(OCCUPANT_PASSENGER, occ[0]);
+    }
+
+    /**
+     * Sample + publish inferred DRIVER presence now (called by the fast {@link SeatbeltEvent}
+     * poll, separately gated so a driver rule doesn't pay for the passenger reads or vice versa).
+     *
+     * <p>Publishes ONLY "occupied" — {@link com.overdrive.app.byd.BydDataCollector#readDriverOccupancyNow}
+     * returns UNAVAILABLE rather than 0 when there is no positive evidence, and
+     * {@link #publishOccupant} skips UNAVAILABLE. So this event goes {@code unseeded → occupied}
+     * and then stays there for the rest of the process; it never reports "empty".
+     *
+     * <p><b>Consequence, by design:</b> a rule triggered on {@code occupant{seat:driver}} fires
+     * once when presence is first established, not on every entry/exit. Use
+     * {@code seatbelt{seat:driver}} for buckle/unbuckle edges. Withholding the "empty" edge is
+     * deliberate — see readDriverOccupancyNow for why a 0 would be a fabricated reading.
+     */
+    public static void pollDriverOccupant() {
+        if (Automations.isDisabled()) return;
+        int occ;
+        try {
+            occ = com.overdrive.app.byd.BydDataCollector.getInstance().readDriverOccupancyNow();
+        } catch (Throwable t) {
+            return; // instrument/safety-belt device unreachable this tick — leave the event untouched
+        }
+        publishOccupant(OCCUPANT_DRIVER, occ);
+    }
+
+    /**
      * Sample + publish the turn indicators NOW (called by the fast {@link
      * com.overdrive.app.automation.condition.TurnSignalEvent} poll). Reads the live
      * combined lamp getter and applies the same debounce as the old snapshot path —
@@ -482,6 +588,95 @@ public class BydEvent {
         // (mirrors Automations.update's own guard; keeps this a true no-op when off).
         if (Automations.isDisabled()) return;
         updateTurnSignals();
+    }
+
+    /**
+     * Publish the current drive mode from a LIVE read, for the fast {@link DriveModeEvent}
+     * poller — so a "when drive mode → sport" trigger fires within the fast cadence instead
+     * of lagging up to the ~5s (driving) / longer (parked) telemetry-snapshot interval it
+     * was previously sampled on (via {@code bydEvent}'s collectEnergy path). Reads the same
+     * config axis ({@link com.overdrive.app.byd.BydDataCollector#getDriveConfigMode()}) and
+     * publishes through the same {@link #DRIVE_MODE} + {@link #driveModeToString} path, so the
+     * edge/dedup semantics are identical — just sampled faster. Only an in-band 1..4 reading
+     * publishes; -1/unset is skipped so a trim without the getter never manufactures a
+     * spurious edge (Automations.update is transition-gated, so a repeat is a no-op).
+     */
+    public static void pollDriveMode() {
+        if (Automations.isDisabled()) return;
+        int mode = com.overdrive.app.byd.BydDataCollector.getInstance().getDriveConfigMode();
+        String word = driveModeToString(mode);
+        if (word != null) Automations.update(DRIVE_MODE, word);
+    }
+
+    /**
+     * Publish the current GEAR from a LIVE read, for the fast {@link GearEvent} poller — so a
+     * "when gear → R" / "only while in P" trigger fires promptly instead of lagging up to the
+     * ~5s telemetry snapshot (gear rides {@code bydEvent}'s collectGearbox, which runs only on
+     * the periodic poll and only while ACC is on). Reads the SAME getter the 5s poll uses
+     * ({@link com.overdrive.app.byd.BydDataCollector#readGearNow()} → getGearboxAutoModeType)
+     * — NOT the crashing learningEPB() listener path that forced the gearbox HAL listener to
+     * be disabled — and publishes through the same {@link #GEAR} + {@link
+     * com.overdrive.app.monitor.GearMonitor#gearToString} path, so the edge/dedup semantics
+     * are identical to the snapshot path, just sampled faster. UNAVAILABLE is skipped so a
+     * trim without the getter never manufactures a spurious edge.
+     */
+    public static void pollGear() {
+        if (Automations.isDisabled()) return;
+        int gear = com.overdrive.app.byd.BydDataCollector.getInstance().readGearNow();
+        if (gear == BydVehicleData.UNAVAILABLE) return;
+        Automations.update(GEAR, GearMonitor.gearToString(gear).toLowerCase());
+    }
+
+    /**
+     * Publish per-seat seat-heat / seat-cool AND high/low beam from LIVE reads, for the fast
+     * {@link ClimateEvent} poller — so a "when driver seat cooling turns off" (the reported
+     * seat-cooling ELSE) or "when high beam on" trigger fires promptly instead of riding the
+     * ~5s telemetry snapshot ({@code bydEvent}'s collectSettings / collectLight path). Each
+     * signal is read via its dedicated collector getter and published through the SAME
+     * {@link #SEAT_HEAT_DRIVER}/{@link #SEAT_COOL_DRIVER}/… + {@link #seatClimateToString} and
+     * {@link #LIGHTS_HIGH_BEAM}/{@link #LIGHTS_LOW_BEAM} paths, so edge/dedup semantics match
+     * the snapshot path exactly. UNAVAILABLE reads are skipped (no spurious edge). Each seat /
+     * beam is gated on its OWN {@link Automations#isEventReferenced} so a rule using only one
+     * of them never reads the others' SDK getters.
+     */
+    public static void pollClimate() {
+        if (Automations.isDisabled()) return;
+        com.overdrive.app.byd.BydDataCollector collector =
+                com.overdrive.app.byd.BydDataCollector.getInstance();
+        // Seat cooling (ventilation) — driver + passenger.
+        if (Automations.isEventReferenced(SEAT_COOL_DRIVER)) {
+            int v = collector.readSeatClimateNow(false, 1);
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(SEAT_COOL_DRIVER, seatClimateToString(v));
+        }
+        if (Automations.isEventReferenced(SEAT_COOL_PASSENGER)) {
+            int v = collector.readSeatClimateNow(false, 2);
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(SEAT_COOL_PASSENGER, seatClimateToString(v));
+        }
+        // Seat heating — driver + passenger.
+        if (Automations.isEventReferenced(SEAT_HEAT_DRIVER)) {
+            int v = collector.readSeatClimateNow(true, 1);
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(SEAT_HEAT_DRIVER, seatClimateToString(v));
+        }
+        if (Automations.isEventReferenced(SEAT_HEAT_PASSENGER)) {
+            int v = collector.readSeatClimateNow(true, 2);
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(SEAT_HEAT_PASSENGER, seatClimateToString(v));
+        }
+        // AC dial setpoint — only read when a rule actually references it (same gate as every
+        // other entry here), so a car whose dial is unreadable pays nothing.
+        if (Automations.isEventReferenced(AC_SETPOINT)) {
+            int v = collector.readAcSetpointNow(
+                    com.overdrive.app.byd.BydDataCollector.AC_TEMP_AREA_DRIVER);
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(AC_SETPOINT, setpointCelsius(v));
+        }
+        // High / low beam.
+        if (Automations.isEventReferenced(LIGHTS_HIGH_BEAM)) {
+            int v = collector.readBeamNow(true);
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(LIGHTS_HIGH_BEAM, v == 1 ? "on" : "off");
+        }
+        if (Automations.isEventReferenced(LIGHTS_LOW_BEAM)) {
+            int v = collector.readBeamNow(false);
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(LIGHTS_LOW_BEAM, v == 1 ? "on" : "off");
+        }
     }
 
     /**
@@ -593,36 +788,52 @@ public class BydEvent {
     }
 
     /**
-     * Publish the temperature event, choosing the source by power state so a
-     * powered-off car reports AMBIENT (outside/weather) rather than a stale cabin
-     * reading, which is what "temperature while parked" means to a user.
+     * Publish the two temperature events, which are now cleanly separated by WHAT they measure
+     * rather than by the car's power state:
      *
-     * <p>Powered ON (powerLevel &gt;= ON): the live cabin sensor (insideTempC) is the
-     * primary source — cabin climate is what an occupant-facing automation wants —
-     * with outside/weather as fallback if the cabin sensor is unavailable.
+     * <ul>
+     *   <li>{@link #TEMPERATURE} ("Temperature") — the CABIN sensor, parked as well as driving.
+     *       Ambient is used only as a last resort, when the cabin sensor has stopped answering
+     *       (see {@code isCabinTempFresh}).</li>
+     *   <li>{@link #OUTSIDE_TEMPERATURE} ("Outside Temperature") — always ambient: the exterior
+     *       cluster sensor, then the Open-Meteo weather API by last-known GPS. Never the cabin.</li>
+     * </ul>
      *
-     * <p>Powered OFF: prefer the outside cluster sensor (outsideTempC), then the
-     * Open-Meteo weather API by last-known GPS. The cabin sensor is intentionally
-     * SKIPPED here: {@code insideTempC} is carried forward on every snapshot build
-     * (BydVehicleData.toBuilder) and never reset to NaN, so a drove-then-parked
-     * value would otherwise pin the event to a stale cabin reading and starve the
-     * weather fallback the user asked for.
+     * <p>Previously TEMPERATURE switched to ambient whenever the car was powered off, which made a
+     * parked cabin rule (the pet/child heat alert people actually want this for) compare against
+     * outside air. That gate existed to avoid a STALE cabin value, not because the sensor was
+     * unreadable — {@code collectAc} polls the AC device with ACC off too. Freshness is now
+     * decided directly via {@code insideTempReadAt}, so the power state no longer matters.
      *
-     * <p>The weather value is served from cache and refreshed on a background
-     * thread (WeatherTemperature), so this never blocks the telemetry poll. When
-     * no source yields a value we publish nothing — the event keeps its last value
-     * (no spurious "dropped to 0" transition). All sources use Math.round for a
-     * consistent integer so a source switch never adds a phantom 1° step.
+     * <p>The weather value is served from cache and refreshed on a background thread
+     * (WeatherTemperature), so this never blocks the telemetry poll. When no source yields a value
+     * we publish nothing — the event keeps its last value (no spurious "dropped to 0" transition).
+     * All sources use Math.round for a consistent integer so a source switch never adds a phantom
+     * 1° step.
      */
-    private static void updateTemperature(BydVehicleData data) {
-        boolean poweredOn = data.powerLevel >= BodyworkConstants.POWER_LEVEL_ON;
+    /** A dial setpoint in display units → whole Celsius (the disjoint bands identify the scale). */
+    private static int setpointCelsius(int setpoint) {
+        if (setpoint >= com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_F
+                && setpoint <= com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_F) {
+            return (int) Math.round((setpoint - 32) * 5.0 / 9.0);
+        }
+        return setpoint;
+    }
 
+    private static void updateTemperature(BydVehicleData data) {
         // Compute the ambient (outside) temperature once: outside cluster sensor first,
         // then weather by last-known GPS. Reused for both the ambient-only
         // OUTSIDE_TEMPERATURE event and as the fallback tail of the smart TEMPERATURE event.
         double ambient = ambientTemperature(data);
         if (!Double.isNaN(ambient)) {
             Automations.update(OUTSIDE_TEMPERATURE, (int) Math.round(ambient));
+        }
+
+        // AC dial setpoint — published only when the dial actually answered (UNAVAILABLE on a
+        // miss), so a trim that doesn't expose getTemprature leaves the event unseeded rather
+        // than fabricating a value a comparison would silently match against.
+        if (data.acSetpointDriver != BydVehicleData.UNAVAILABLE) {
+            Automations.update(AC_SETPOINT, setpointCelsius(data.acSetpointDriver));
         }
 
         // Rain-likely probability rides the SAME Open-Meteo fetch ambientTemperature()
@@ -633,15 +844,88 @@ public class BydEvent {
             Automations.update(RAIN_PROBABILITY, rain);
         }
 
-        // Smart TEMPERATURE: cabin (car on) preferred, else fall back to the ambient value.
-        if (poweredOn && !Double.isNaN(data.insideTempC)) {
+        // TEMPERATURE is the CABIN temperature — parked as well as driving. It used to switch to
+        // ambient whenever the car was powered off, which made the one case users actually want it
+        // for impossible: a "cabin above 40 → alert" rule for a pet or child evaluated against
+        // OUTSIDE air precisely when the car was parked in the sun.
+        //
+        // The reason it was power-gated was staleness, not power: insideTempC is carried forward by
+        // toBuilder() and never reset to NaN, so a drove-then-parked value would pin this event to
+        // a frozen cabin reading forever. That is now decided properly — collectAc polls the AC
+        // device on the always-alive loop (ACC on AND off, explicitly for parked temperature
+        // alerts), and insideTempReadAt records when the sensor last actually answered. So we use
+        // the cabin value whenever it is FRESH, whatever the power state, and fall back to ambient
+        // only when the sensor has genuinely stopped answering.
+        if (isCabinTempFresh(data)) {
+            cabinTempSourceActive = true;
             Automations.update(TEMPERATURE, (int) Math.round(data.insideTempC));
             return;
         }
+        // Cabin read has aged out. Do NOT switch straight to ambient: this method runs on every
+        // snapshot build, and the ~40 LISTENER-driven rebuilds (charging power, SOC, speed, …) call
+        // build() → bydEvent() while carrying the previous cabin stamp forward unrefreshed. So a
+        // rebuild landing after the freshness window but before the next poll would publish ambient,
+        // and the next poll would publish cabin again — flapping the event between two very
+        // different numbers (a sun-baked cabin at 55 vs 35 outside). Every flip is a real edge to
+        // Automations.update, so a "cabin above 40 → notify" rule would re-fire on every cycle: a
+        // notification loop, in exactly the pet/child scenario this event exists for.
+        //
+        // Only hand the event over to ambient once the cabin sensor is confirmed gone, using a
+        // GIVE-UP threshold well beyond one poll cycle rather than a poll/listener flag (there is
+        // one bydEvent entry point, shared by both, so no such flag exists to test). Between the
+        // freshness window and the give-up threshold the event simply holds its last cabin value —
+        // no publish, so no edge, so no flapping. Past the threshold the sensor has missed many
+        // consecutive polls and ambient is genuinely the better answer.
+        if (cabinTempSourceActive && cabinTempAge(data) < CABIN_TEMP_GIVE_UP_MS) {
+            return;
+        }
+        cabinTempSourceActive = false;
         if (!Double.isNaN(ambient)) {
             Automations.update(TEMPERATURE, (int) Math.round(ambient));
         }
     }
+
+    /**
+     * Whether the TEMPERATURE event is currently sourced from the cabin sensor. Used to keep a
+     * listener-driven rebuild from flipping the source mid-cycle (see updateTemperature). Written
+     * only from the telemetry/listener publish path, which is effectively single-threaded per
+     * snapshot build; volatile so a read from another publisher thread sees the latest value.
+     */
+    private static volatile boolean cabinTempSourceActive = false;
+
+    /**
+     * Whether {@code insideTempC} came from a recent AC-device read rather than being carried
+     * forward from an older snapshot.
+     *
+     * <p>The window MUST be sized against the PARKED poll cadence, not the driving one: the
+     * collector polls every 5s with ACC on but only every 90s with ACC off
+     * ({@code BydDataCollector.POLL_INTERVAL_PARKED_MS}). A window shorter than that would make a
+     * parked cabin reading look stale on essentially every evaluation, so the event would fall back
+     * to ambient permanently — silently reintroducing the very bug this replaced. 4 missed parked
+     * polls (6 min) tolerates a busy HAL or a couple of transient device errors while still ageing
+     * out a sensor that has genuinely stopped answering.
+     */
+    private static boolean isCabinTempFresh(BydVehicleData data) {
+        if (Double.isNaN(data.insideTempC)) return false;
+        if (data.insideTempReadAt <= 0L) return false;   // never read
+        return cabinTempAge(data) <= CABIN_TEMP_MAX_AGE_MS;
+    }
+
+    /** Age of the last cabin read in ms, or Long.MAX_VALUE if there has never been one. A clock jump
+     *  backwards yields a negative age, which every caller treats as fresh — better than spuriously
+     *  falling back to ambient. */
+    private static long cabinTempAge(BydVehicleData data) {
+        if (data.insideTempReadAt <= 0L) return Long.MAX_VALUE;
+        return System.currentTimeMillis() - data.insideTempReadAt;
+    }
+
+    /** How old a cabin read may be and still drive the TEMPERATURE event. Derived from the PARKED
+     *  poll interval (90s) — see isCabinTempFresh for why the driving interval is the wrong basis. */
+    private static final long CABIN_TEMP_MAX_AGE_MS = 6 * 60_000L;   // 6 min ≈ 4 parked polls
+
+    /** Age at which the cabin sensor is declared gone and TEMPERATURE reverts to ambient. Beyond
+     *  CABIN_TEMP_MAX_AGE_MS so the gap between them is a quiet hold rather than a flap. */
+    private static final long CABIN_TEMP_GIVE_UP_MS = 30 * 60_000L;   // 30 min ≈ 20 parked polls
 
     /**
      * Best-effort ambient (outside) temperature: the outside cluster sensor when

@@ -153,7 +153,14 @@ public class SohEstimator {
 
     public void setNominalCapacityKwh(double capacityKwh) {
         synchronized (autoDetectLock) {
-            if (capacityKwh >= MIN_PLAUSIBLE_KWH && capacityKwh <= MAX_PLAUSIBLE_KWH) {
+            // Drivetrain-aware floor. The flat BEV floor (15 kWh) made it IMPOSSIBLE for
+            // auto-detect to land a real PHEV pack: this is the setter every auto path
+            // funnels through (model table, pack-voltage estimate, BMS exact capacity), so a
+            // legitimate DM-i value below 15 was rejected and a stale/wrong nominal stayed
+            // in place. PHEV packs start at ~8 kWh, hence MIN_PLAUSIBLE_KWH_PHEV. On BEV the
+            // strict floor is retained — there it genuinely means "this detect is junk".
+            double floor = isPhevForCapacityFloor() ? MIN_PLAUSIBLE_KWH_PHEV : MIN_PLAUSIBLE_KWH;
+            if (capacityKwh >= floor && capacityKwh <= MAX_PLAUSIBLE_KWH) {
                 this.nominalCapacityKwh = capacityKwh;
                 // Only mark "auto" if a user override isn't currently active. The
                 // auto-detect path otherwise overwrites a user pick when it runs
@@ -166,8 +173,28 @@ public class SohEstimator {
                 persistEstimate();
             } else {
                 logger.warn("Rejecting implausible nominal capacity: " + capacityKwh
-                    + " kWh (valid range: " + MIN_PLAUSIBLE_KWH + "-" + MAX_PLAUSIBLE_KWH + ")");
+                    + " kWh (valid range: " + floor + "-" + MAX_PLAUSIBLE_KWH + ")");
             }
+        }
+    }
+
+    /**
+     * Drivetrain probe for the nominal-capacity floor only. PHEV packs are far smaller than
+     * any BEV pack, so the plausibility floor has to differ or a valid DM-i capacity looks
+     * like junk. Best-effort: an unknown drivetrain falls back to the STRICTER BEV floor, so
+     * a failed probe can never widen the accepted range.
+     *
+     * <p>Deliberately NOT called while holding a collector lock — {@code isPhevPublic()} can
+     * reach back into other subsystems (same reasoning as {@link #getDisplaySoh()}). It is
+     * called under {@code autoDetectLock}, which the collector never acquires.
+     */
+    private static boolean isPhevForCapacityFloor() {
+        try {
+            com.overdrive.app.byd.BydDataCollector col =
+                com.overdrive.app.byd.BydDataCollector.getInstance();
+            return col != null && col.isInitialized() && col.isPhevPublic();
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
@@ -1199,10 +1226,18 @@ public class SohEstimator {
                 String capStr = props.getProperty(PROP_NOMINAL_CAPACITY);
                 if (capStr != null) {
                     double savedCap = Double.parseDouble(capStr);
-                    // Auto-detected nominal keeps the strict BEV floor — only
-                    // user-entered values are allowed below MIN_PLAUSIBLE_KWH
-                    // (gated separately in setNominalCapacityKwhFromUser).
-                    if (savedCap >= MIN_PLAUSIBLE_KWH && savedCap <= MAX_PLAUSIBLE_KWH) {
+                    // Floor must match whatever gate ACCEPTED this value in the first place,
+                    // or a legitimately-stored nominal is destroyed on the next boot. A
+                    // user-entered PHEV pack (e.g. 12.9 kWh) passes the PHEV floor at entry
+                    // (setNominalCapacityKwhFromUser) but was then discarded here by the
+                    // stricter BEV floor — so the setting silently reverted on every restart
+                    // and every capacity-derived number went wrong again. Use the PHEV floor
+                    // for a persisted "user" value; keep the strict BEV floor for "auto",
+                    // which is what actually guards against a bad auto-detect.
+                    String savedSrcForFloor = props.getProperty(PROP_NOMINAL_SOURCE);
+                    double restoreFloor = "user".equals(savedSrcForFloor)
+                            ? MIN_PLAUSIBLE_KWH_PHEV : MIN_PLAUSIBLE_KWH;
+                    if (savedCap >= restoreFloor && savedCap <= MAX_PLAUSIBLE_KWH) {
                         nominalCapacityKwh = savedCap;
                         String savedSrc = props.getProperty(PROP_NOMINAL_SOURCE);
                         nominalSource = (savedSrc != null && !savedSrc.isEmpty()) ? savedSrc : "auto";
@@ -1647,17 +1682,59 @@ public class SohEstimator {
         }
 
         // Keep this chain in sync with the displaySoh logic in getStatus().
-        // PHEV: frame_anchor (retained but currently never fed) > calibration
-        //   > 100% default (currentSoh). A real charge-session calibration is
-        //   the ONLY PHEV signal below 100% — the capacity-Ah anchor is retired
-        //   (getBatteryCapacity is a static nameplate on DM-i, not a coulomb
-        //   count, and reported phantom degradation on healthy packs).
+        // PHEV: OEM index > frame_anchor (never fed) > calibration > 100% default.
         // BEV: live (currentSoh) > calibration > unavailable — unchanged.
+        //
+        // OEM FIRST ON PHEV. Everything else on the PHEV chain is unusable in practice:
+        // the live energy formula is deliberately gated OFF for PHEV (the DM-i BMS
+        // remainKwh is half/stale/frame-ambiguous — see the seed path), the frame anchor
+        // is never fed, and calibration needs a ≥25% charge session at 15-35°C. So PHEV
+        // SOH sat pinned at the 100% seed forever: a healthy pack and a badly degraded
+        // one both read exactly 100.0%, which is worse than a rough number because it
+        // looks like a measurement. The vehicle's OWN health index
+        // (STATISTIC_BATTERY_HEALTHY_INDEX, already a 0..100 percent and already
+        // validated at the collector) is a real reading and needs no capacity/frame
+        // assumptions at all, so on PHEV it outranks the computed chain.
+        //
+        // NOTE: this signal was historically unobservable — the collector read it through
+        // a wrapper Class the HAL doesn't match, so the feature-ID path returned nothing
+        // (see BydDeviceHelper.callGet). With that fixed the value should now arrive; it
+        // is used only when actually present and in range, so a trim that never reports
+        // it degrades to exactly the previous behaviour.
+        double oemSoh = readOemSohPercent();
+        if (phev && oemSoh > 0) return oemSoh;
         if (phev && frameSoh > 0) return frameSoh;
         if (phev && calSoh > 0) return calSoh;
         if (curSoh > 0) return curSoh;
         if (calSoh > 0) return calSoh;
         return -1;
+    }
+
+    /**
+     * The vehicle's OWN state-of-health index, as reported by the OEM
+     * ({@code STATISTIC_BATTERY_HEALTHY_INDEX}) and surfaced on the snapshot as
+     * {@code sohPercent}. Already a plain 0..100 percent — the collector validates the
+     * range before publishing — so it needs no scaling, no nominal capacity, and no
+     * usable-vs-gross frame assumption. That is exactly why it is preferable on PHEV,
+     * where every capacity-derived route is untrustworthy.
+     *
+     * @return the OEM percent in (0,100], or -1 when the trim doesn't report it.
+     */
+    private double readOemSohPercent() {
+        try {
+            com.overdrive.app.byd.BydDataCollector col =
+                com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (col == null || !col.isInitialized()) return -1;
+            com.overdrive.app.byd.BydVehicleData vd = col.getData();
+            if (vd == null) return -1;
+            double soh = vd.sohPercent;
+            // Reject the unset sentinel, junk, and the meaningless 0 — a real pack is
+            // never 0% healthy, so 0 means "not reported" on this HAL.
+            if (Double.isNaN(soh) || soh <= 0 || soh > 100) return -1;
+            return soh;
+        } catch (Throwable ignored) {
+            return -1;
+        }
     }
 
     /**
@@ -1759,6 +1836,12 @@ public class SohEstimator {
 
     public org.json.JSONObject getStatus() {
         org.json.JSONObject status = new org.json.JSONObject();
+        // Read the OEM health index BEFORE taking autoDetectLock below. It reaches into
+        // BydDataCollector, which has its own locking and can call back into other
+        // subsystems — doing that while holding autoDetectLock is the deadlock pattern this
+        // class warns about in getDisplaySoh(). Hoisted here so the value is just a local by
+        // the time the locked section needs it.
+        final double oemSohSnapshot = readOemSohPercent();
         try {
             status.put("soh", currentSoh > 0 ? Math.round(currentSoh * 10) / 10.0 : -1);
             status.put("nominalCapacityKwh", nominalCapacityKwh);
@@ -1839,9 +1922,18 @@ public class SohEstimator {
             // BEV: live > calibration > unavailable — unchanged.
             double displaySoh;
             String displaySource;
+            // OEM index first on PHEV — kept in sync with getDisplaySoh(). See that method
+            // for why: every capacity-derived PHEV route is gated off or unreachable, so the
+            // chain otherwise pins at the 100% seed and a degraded pack reads as healthy.
+            // Snapshot taken before the lock (see top of method).
+            double oemSoh = oemSohSnapshot;
+            boolean preferOem = phev && oemSoh > 0;
             boolean preferFrameAnchor = phev && frameSoh > 0;
             boolean preferCalibration = phev && calibrationSoh > 0;
-            if (preferFrameAnchor) {
+            if (preferOem) {
+                displaySoh = oemSoh;
+                displaySource = "oem";
+            } else if (preferFrameAnchor) {
                 displaySoh = frameSoh;
                 displaySource = "frame_anchor";
             } else if (preferCalibration) {
@@ -1859,6 +1951,10 @@ public class SohEstimator {
             }
             status.put("displaySoh", displaySoh > 0 ? Math.round(displaySoh * 10) / 10.0 : -1);
             status.put("displaySource", displaySource);
+            // Surface the OEM index itself (-1 when the trim doesn't report it) so
+            // /api/performance/soh answers "is there a real vehicle-reported SOH here?"
+            // without needing a logcat capture. This is the value the PHEV chain prefers.
+            status.put("oemSoh", oemSoh > 0 ? Math.round(oemSoh * 10) / 10.0 : -1);
 
             // Read fresh — model can change without touching SOH state.
             try {
@@ -2156,7 +2252,10 @@ public class SohEstimator {
         return 0;
     }
 
-    private static double mapCarTypeToCapacity(String carType) {
+    // Package-visible (not private) purely so SohModelCapacityTest can pin the branch
+    // ORDERING: the DM-i branches must precede their BEV namesakes, and adding one must not
+    // change any BEV outcome. That is an ordering invariant no caller can express.
+    static double mapCarTypeToCapacity(String carType) {
         String ct = carType.toUpperCase();
         // PHEV / DM-i marketing strings FIRST — otherwise "Seal U DM-i" falls into
         // the BEV "SEAL U" branch (71.8) and "Destroyer 05" matches nothing. These
@@ -2169,11 +2268,38 @@ public class SohEstimator {
         boolean isDmiString = ct.contains("DM-I") || ct.contains("DMI") || ct.contains("DM-P");
         if (ct.contains("DESTROYER")) return 18.3;
         if (isDmiString && (ct.contains("SEAL U") || ct.contains("SEALU") || ct.contains("SEAL-U"))) return 18.3;
+        // TANG DM-i — MUST precede the bare "TANG" BEV branch below. Without this a Tang
+        // DM-i was auto-detected as the 108.8 kWh BEV pack: a ~5x nominal overstatement
+        // that poisons every capacity-derived number (SOH, remaining kWh, trip energy,
+        // range). 21.5 kWh gross is the DM-i pack; the SOH formula wants gross because
+        // PHEV remainKwh is corrected to the gross frame at the HAL boundary.
+        if (isDmiString && ct.contains("TANG")) return 21.5;
+        // Song / Qin / Frigate DM-i share the ~18.3 kWh DM-i pack class. Listed before the
+        // BEV name branches for the same reason as above; a DM-i string must never fall
+        // through to a BEV capacity.
+        if (isDmiString && (ct.contains("SONG") || ct.contains("QIN") || ct.contains("FRIGATE"))) return 18.3;
+        // Han DM-i / DM-p — MUST precede the bare "HAN" branch for the same reason the Tang
+        // branch exists: without it a Han PHEV is auto-detected as the 85.44 kWh BEV pack, a
+        // ~4.7x overstatement that poisons SOH, remaining kWh, trip energy and range.
+        //
+        // Returns 0 = "not detected" rather than a number, deliberately. Unlike Tang/Song/Qin
+        // (one pack class each) the Han PHEV pack varies far too widely across trims and model
+        // years to name a single value, and a confidently-wrong constant here would be
+        // indistinguishable from a real detection to every downstream consumer. 0 falls the
+        // caller through to the measurement-based tiers (BMS fuzzy capacity, then pack
+        // voltage), and failing those it logs "SOH estimation disabled until capacity is
+        // identified" — an honest unknown. A user who knows their trim can still pin it exactly
+        // via the user-nominal override.
+        if (isDmiString && ct.contains("HAN")) return 0;
         if (ct.contains("SEALION 6") || ct.contains("SEALION6") || ct.contains("SEA LION 6")) return 26.6;
         if (ct.contains("SEALION") || ct.contains("SEA LION")) return 91.3;
         if (ct.contains("SEAL U") || ct.contains("SEALU") || ct.contains("SEAL-U") || ct.contains("S7")) return 71.8;
         if (ct.contains("SEAL")) return 82.56;
-        if (ct.contains("HAN") || ct.contains("DM-P")) return 85.44;
+        // Han BEV. The bare `|| ct.contains("DM-P")` that used to be on this line is gone: it
+        // assigned an 85 kWh BEV pack to ANY DM-p (i.e. PHEV) model that reached here, which is
+        // the precise bug the branches above fix — a PHEV inheriting a BEV capacity. Named DM-p
+        // models are handled above; an unnamed one now falls through to 0 (not detected).
+        if (ct.contains("HAN")) return 85.44;
         if (ct.contains("TANG")) return 108.8;
         if (ct.contains("ATTO 3") || ct.contains("ATTO3") || ct.contains("YUAN PLUS")) return 60.48;
         if (ct.contains("ATTO 2") || ct.contains("ATTO2")) return 44.9;

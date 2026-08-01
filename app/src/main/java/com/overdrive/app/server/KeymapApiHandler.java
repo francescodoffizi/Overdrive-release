@@ -1048,6 +1048,11 @@ public final class KeymapApiHandler {
                 + "' -> " + action.command.name() + " " + r.outcome + " (" + r.latencyMs + "ms, "
                 + (needsCloud ? "full" : "sdk-only") + ")");
 
+        // Record what we commanded for a blind-toggle entity (mirror fold) — but only once the
+        // command actually reached the vehicle, so a press refused by the motion-safety gate
+        // can't silently swap what the NEXT press does. See ControlAction.commitIfAttempted.
+        action.commitIfAttempted(r.outcome);
+
         response.put("success", r.outcome == VehicleCommandRouter.Outcome.SUCCESS);
         response.put("outcome", r.outcome.toString());
         response.put("message", r.displayMessage);

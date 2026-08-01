@@ -36,6 +36,11 @@ public class TripTelemetryRecorder {
 
     private static final long SAMPLE_INTERVAL_MS = 200;       // 5Hz
     private static final long FLUSH_INTERVAL_MS = 60_000;     // 60s
+    /** Delay before the FIRST flush. Short on purpose — see startRecording:
+     *  until a flush lands there is no on-disk trace of the trip, so a process
+     *  death before it is unrecoverable. 5s ≈ 25 samples: cheap, and it closes
+     *  a 60s data-loss window at the start of every trip. */
+    private static final long FIRST_FLUSH_DELAY_MS = 5_000;
     private static final long MAX_BUFFER_BYTES = 10 * 1024 * 1024; // 10MB
 
     // Distance fusion tunables.
@@ -102,6 +107,14 @@ public class TripTelemetryRecorder {
     private boolean hasLastGps = false;
     private long lastSampleMs = 0;
 
+    // True once the CAN/wheel speed channel has produced ANY non-zero reading in
+    // this trip — i.e. proof the channel is actually wired, as opposed to a fresh
+    // snapshot whose speedKmh is simply the int 0 initialiser because the
+    // BYDAutoSpeedDevice bind failed. Distance integration trusts the speed
+    // channel only after that proof; until then GPS carries the distance. Reset
+    // per trip in startRecording so one bad trip can't poison the next.
+    private boolean speedChannelEverLive = false;
+
     // GPS coverage tracking — how many samples landed valid lat/lon. Logged
     // at trip end so the daemon log alone tells us why a trip's map is blank
     // (no GPS during recording vs. file write failure vs. UI bug).
@@ -147,6 +160,7 @@ public class TripTelemetryRecorder {
         this.lastSampleMs = 0;
         this.sampleCountTotal = 0;
         this.sampleCountWithGps = 0;
+        this.speedChannelEverLive = false;
 
         synchronized (bufferLock) {
             buffer.clear();
@@ -176,9 +190,20 @@ public class TripTelemetryRecorder {
         sampleFuture = executor.scheduleAtFixedRate(
                 this::sample, 0, SAMPLE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
-        // Periodic flush every 60s
+        // Periodic flush every 60s, but with a SHORT first flush.
+        //
+        // The DB row for a trip is written only at trip end, so until the first
+        // telemetry flush lands there is NO artifact on disk and a process death
+        // loses the drive outright — next-boot recovery reconstructs rows from
+        // these .jsonl.gz files, and cannot recover what was never written.
+        // With initialDelay == FLUSH_INTERVAL_MS that blind window was a full
+        // 60s at the start of EVERY trip; on units that restart often (watchdog
+        // kills, settings-change restarts) a large share of drives died inside
+        // it. FIRST_FLUSH_DELAY_MS makes the trip recoverable within seconds.
+        // Steady-state cadence is unchanged, so there is no extra I/O on a
+        // long drive beyond one early small write.
         flushFuture = executor.scheduleAtFixedRate(
-                this::flushBuffer, FLUSH_INTERVAL_MS, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
+                this::flushBuffer, FIRST_FLUSH_DELAY_MS, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
         logger.info("Started recording trip " + tripId + " → " + outputFile.getAbsolutePath());
     }
@@ -362,7 +387,37 @@ public class TripTelemetryRecorder {
             boolean haveGps = lat != 0 && lon != 0;
             if (haveGps) sampleCountWithGps++;
 
-            if (!dynamicsStale && dtMs > 0) {
+            // Does the CAN/wheel speed channel look USABLE, not merely fresh?
+            //
+            // `dynamicsStale` only tests snapshot AGE. On a trim where the
+            // BYDAutoSpeedDevice bind failed, TelemetryDataCollector still
+            // publishes a heartbeat snapshot every 750ms with speedKmh left at its
+            // 0 initialiser — so the snapshot is FRESH and the primary branch adds
+            // `0 * dt` forever. Because the GPS haversine used to be an `else if`,
+            // it was then structurally unreachable, distanceKm stayed 0.0, every
+            // trip failed MIN_TRIP_DISTANCE_KM (0.2), and handleTripDiscarded
+            // DELETED the telemetry file — so nothing survived for recovery either.
+            // That is a permanent "no trips ever recorded" on such a unit, and it
+            // is independent of the enable flag.
+            //
+            // Fix: treat a fresh-but-flat speed channel as unusable for THIS tick
+            // and let GPS carry the distance.
+            //
+            // CRITICAL: the test is "has this channel EVER produced a non-zero
+            // reading in this trip", NOT "is it non-zero right now". `speedKmh` is
+            // an int, so a genuinely stopped car also reads 0 — gating on the
+            // instantaneous value would route EVERY standstill tick into the GPS
+            // haversine on every unit, healthy or not. Parked jitter (~3 m/fix,
+            // over the 2 m MIN_GPS_SEGMENT_KM floor, with a loose 50 m accuracy
+            // gate) then integrates at ~0.18 km/min, so ~2 minutes of idling in
+            // gear — or the 120s park debounce alone, which is inside the
+            // recording window — would clear MIN_TRIP_DISTANCE_KM and fabricate a
+            // phantom trip with a garbage score, folded into the rollups. The old
+            // `!dynamicsStale` test prevented that by accident; this preserves the
+            // protection deliberately while still rescuing a dead speed channel.
+            if (!dynamicsStale && speedKmh > 0) speedChannelEverLive = true;
+            boolean speedUsable = !dynamicsStale && speedChannelEverLive;
+            if (speedUsable && dtMs > 0) {
                 // PRIMARY: integrate wheel/CAN speed. Reads ~0 km/h when stopped,
                 // so idle dwell adds nothing and GPS jitter is irrelevant. Robust
                 // through tunnels/garages where GPS drops out entirely.
@@ -380,7 +435,25 @@ public class TripTelemetryRecorder {
                 boolean accuracyOk = gpsAccuracy > 0 && gpsAccuracy <= GPS_ACCURACY_GATE_M;
                 double dist = haversineKm(lastLat, lastLon, lat, lon);
                 // Reject impossible jumps (>500m/tick) and sub-jitter wiggle.
-                if (accuracyOk && dist >= MIN_GPS_SEGMENT_KM && dist < 0.5) {
+                //
+                // ALSO reject when a speed channel we TRUST says we are stopped.
+                //
+                // Both halves matter. `speedChannelEverLive` means the channel has
+                // produced a non-zero reading at some point this trip, so a 0 now
+                // genuinely means stopped — reject the jitter. Without that half we
+                // would reject on a DEAD channel too (which also reads a fresh 0
+                // while the car is moving), re-breaking the very defect this fix
+                // exists for. Without the freshness half, a stale snapshot's
+                // synthetic 0 would suppress real GPS distance.
+                //
+                // Net effect per case:
+                //   healthy + moving      -> primary branch, never here
+                //   healthy + stopped     -> here, rejected (no phantom distance)
+                //   dead channel + moving -> here, ACCEPTED (GPS carries the trip)
+                //   stale snapshot        -> here, accepted (pre-existing behaviour)
+                boolean trustedStop = !dynamicsStale && speedChannelEverLive && speedKmh == 0;
+                if (accuracyOk && !trustedStop
+                        && dist >= MIN_GPS_SEGMENT_KM && dist < 0.5) {
                     totalDistanceKm += dist;
                 }
             }
@@ -442,6 +515,19 @@ public class TripTelemetryRecorder {
      * 3. Serialize each 1Hz sample as JSON line using TelemetrySample.toJson()
      * 4. Write gzipped chunk and append to the output file
      */
+    /**
+     * Flush buffered samples to disk WITHOUT stopping the recording.
+     *
+     * <p>For use immediately before a process kill that is not a trip end (the
+     * UI's prepare-restart + {@code killall -9}). Guarantees the on-disk
+     * {@code .jsonl.gz} covers everything sampled so far, so next-boot recovery
+     * can reconstruct the trip — while leaving the trip OPEN, so no discard
+     * threshold is applied and the telemetry file is not deleted.
+     */
+    public void flushNow() {
+        flushBuffer();
+    }
+
     private void flushBuffer() {
         List<TelemetrySample> toFlush;
         synchronized (bufferLock) {

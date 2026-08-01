@@ -145,6 +145,28 @@ public class OemDashcamApiHandler {
     private static volatile Thread selfHealThread;
     private static volatile boolean selfHealRunning;
 
+    // How long startPipeline() waits for pano's EGLCore before giving up and starting
+    // OEM on an independent context. Must comfortably exceed a full pano cold start,
+    // because we now REQUEST that start ourselves: GpuSurveillancePipeline.start()
+    // includes a 1500ms encoder-warmup sleep plus AVMCamera open + EGL init (~2-4s
+    // observed). The old 3s budget expired mid-start on a cold boot, which is how OEM
+    // ended up unshared and DVR showed the AVM mosaic. 8s covers the slow case with
+    // margin while still bounding the wait so a genuinely dead pano can never wedge
+    // OEM recording (it proceeds on an independent context, which records fine).
+    // This runs on the dedicated OEM lifecycle executor, never on an HTTP thread.
+    private static final long PANO_EGL_WAIT_MS = 8_000L;
+
+    // One-shot latch for the independent-EGL-context heal restart (view-6 streaming).
+    // The restart is only useful when EGLCore.createShared then SUCCEEDS. If a driver
+    // refuses share groups outright, the rebuilt pipeline comes back unshared too and
+    // the condition (unshared + pano available + streaming wanted) stays true forever —
+    // which would make the 30s self-heal ticker rebuild the camera + encoder every 30s
+    // indefinitely. Latch so we attempt the heal AT MOST ONCE per daemon run; if it
+    // didn't take, we leave the pipeline alone (recording keeps working) and view 6
+    // reports not-ready instead of thrashing. Reset on a successful share so a later
+    // legitimate restart can heal again.
+    private static volatile boolean eglHealAttempted = false;
+
     /**
      * Start the periodic self-heal ticker. Idempotent — a second call while
      * the thread is alive is a no-op. Call once at daemon boot.
@@ -222,6 +244,52 @@ public class OemDashcamApiHandler {
                     if (existing == null || !existing.isRunning()) {
                         existing = startPipeline();
                         if (existing == null) return;
+                    } else if (streamingDesired
+                            && !existing.isEglSharedWithPano()
+                            && !existing.isRecording()
+                            && !eglHealAttempted
+                            && isPanoEglAvailable()) {
+                        // SELF-HEAL (view-6 mosaic/black bug): this pipeline is warm but
+                        // its GL context is INDEPENDENT of pano's — it lost the 3s race in
+                        // startPipeline() and fell through to `new EGLCore()`. Recording is
+                        // fine that way, but pano's stream scaler cannot sample our texture
+                        // across contexts, so view 6 rendered the AVM mosaic / black. Pano
+                        // is up NOW, so restart the pipeline to re-create its context in
+                        // pano's share group — this is the case the old code explicitly
+                        // skipped, leaving the manual OEM off/on as the only recovery.
+                        //
+                        // STRICTLY GUARDED so recording can never be harmed:
+                        //   - streamingDesired: only when a view-6 viewer actually needs it.
+                        //   - !isRecording(): never interrupt an open dvr_*.mp4 / event clip
+                        //     (a recording session keeps its independent context and keeps
+                        //     working; the heal happens on the next recalc once it closes).
+                        //   - isPanoEglAvailable(): pointless to restart if pano still has
+                        //     no EGLCore to parent us — we'd just get another independent
+                        //     context and thrash.
+                        com.overdrive.app.daemon.CameraDaemon.log(
+                            "OemDashcam: warm pipeline is on an INDEPENDENT EGL context and "
+                            + "view-6 streaming is requested — restarting to join pano's "
+                            + "share group (recording idle, safe to restart)");
+                        // Latch BEFORE the restart so a failure can't re-enter here every
+                        // 30s (see eglHealAttempted). Cleared on success below so a future
+                        // unshared bring-up can still be healed once.
+                        eglHealAttempted = true;
+                        try { existing.stop(); } catch (Throwable ignored) {}
+                        com.overdrive.app.daemon.CameraDaemon.setOemDashcamPipeline(null);
+                        existing = startPipeline();
+                        if (existing == null) return;
+                        if (existing.isEglSharedWithPano()) {
+                            eglHealAttempted = false;   // heal worked; re-arm for next time
+                            com.overdrive.app.daemon.CameraDaemon.log(
+                                "OemDashcam: EGL heal OK — now sharing pano's context, "
+                                + "view-6 streaming can render");
+                        } else {
+                            com.overdrive.app.daemon.CameraDaemon.log(
+                                "OemDashcam: EGL heal did NOT take (driver refused share "
+                                + "group) — recording unaffected; view 6 stays unavailable. "
+                                + "Not retrying this daemon run.");
+                        }
+                        // needFormatWait is computed for every shouldRun path below.
                     } else {
                         // Pipeline is ALREADY warm — start() (and its
                         // applyRecordingConfigFromUcm axis resolve) will NOT
@@ -444,16 +512,29 @@ public class OemDashcamApiHandler {
         } catch (Throwable t) { return false; }
     }
 
-    /** True iff the pano pipeline currently has streaming enabled AND its
-     *  scaler view-mode is 6 (OEM Dashcam). When the user navigates away
-     *  from DVR view, this flips false and the pipeline can shut down if
-     *  no other trigger is active. */
+    /** True iff the pano pipeline currently has streaming enabled AND view 6 (OEM
+     *  Dashcam) is the active or REQUESTED view. When the user navigates away from
+     *  DVR view, this flips false and the pipeline can shut down if no other trigger
+     *  is active.
+     *
+     *  <p>Two signals are accepted, and BOTH are needed:
+     *  <ul>
+     *    <li>the live scaler view-mode (6) — the steady state once the route landed;</li>
+     *    <li>the persisted DESIRED view-mode (6) — the user's pick during the OEM
+     *        warmup window. The scaler is deliberately NOT switched to 6 until the
+     *        OEM bind succeeds (a view-6 scaler with uOemActive=0 falls through the
+     *        shader's OEM gate and paints the 4-cam AVM mosaic). Without this second
+     *        signal, streamingDesired would read false for the whole warmup and the
+     *        lifecycle recalc would never bring the OEM pipeline up at all —
+     *        deadlocking DVR permanently.</li>
+     *  </ul> */
     public static boolean isAnyStreamingViewerActive() {
         try {
             com.overdrive.app.surveillance.GpuSurveillancePipeline pano =
                 com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
             if (pano == null || !pano.isStreamingEnabled()) return false;
-            return pano.getStreamViewMode() == 6;
+            if (pano.getStreamViewMode() == 6) return true;
+            return com.overdrive.app.server.StreamingApiHandler.getLastDesiredViewMode() == 6;
         } catch (Throwable t) {
             return false;
         }
@@ -465,6 +546,22 @@ public class OemDashcamApiHandler {
      * a trigger demands it. Returns null on failure (UCM gets a
      * lastStartError).
      */
+    /** True when pano is running AND already owns a live EGLCore we can parent the OEM
+     *  context to. Used to gate the independent-context self-heal restart: without a
+     *  parent to share with, a restart would just produce another independent context
+     *  (thrash). Cheap, non-blocking — unlike startPipeline's 3s wait. */
+    private static boolean isPanoEglAvailable() {
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline pano =
+                com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            if (pano == null || !pano.isRunning()) return false;
+            com.overdrive.app.camera.PanoramicCameraGpu panoCam = pano.getCamera();
+            return panoCam != null && panoCam.getEglCore() != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private static com.overdrive.app.camera.OemDashcamPipeline startPipeline() {
         int oemId = com.overdrive.app.config.UnifiedConfigManager.resolveOemDashcamId();
         if (oemId < 0) {
@@ -501,36 +598,104 @@ public class OemDashcamApiHandler {
         boolean oemOverlay = com.overdrive.app.config.UnifiedConfigManager
             .isTelemetryOverlayEnabledFor("oemDashcam");
         p.setOverlayEnabled(oemOverlay);
-        // Parent-EGL wiring with bounded poll. Pano may still be in
-        // its own start() call (~2-4s for AVMCamera open + EGL setup) when
-        // we get here from a /api/stream/view/6 fast-path; without the
-        // poll, the bare isRunning() check returns false and OEM falls
-        // through to an INDEPENDENT EGL context, breaking the texture-
-        // sharing path. Cap the wait at 3s so a pano that's genuinely
-        // not coming up doesn't hold OEM forever.
+        // Apply the OEM dashcam's own field selection (independent of pano /
+        // surveillance). Absent list resolves to the legacy default.
+        p.setOverlayFields(com.overdrive.app.telemetry.TelemetryFields.fromJsonArray(
+            com.overdrive.app.config.UnifiedConfigManager
+                .getTelemetryOverlayFields("oemDashcam")));
+        // ── Parent-EGL wiring ────────────────────────────────────────────────
+        // OEM's GL context MUST be created in pano's EGL SHARE GROUP, otherwise
+        // pano's stream scaler cannot sample our camera texture and view-6 (DVR)
+        // streaming renders the 4-cam AVM mosaic / black while recording looks fine.
+        // Getting this right at START is the only clean fix: the context is immutable
+        // after start(), so the alternative is a restart — which is unacceptable once
+        // a dvr_*.mp4 is open.
+        //
+        // Two defects in the previous bounded poll are fixed here:
+        //  1) It waited on `pano.isRunning()` but needed the CAMERA's EGLCore. Wait on
+        //     the ACTUAL precondition (a non-null EGLCore) so we can't exit the wait
+        //     and then silently skip the parent because the handle wasn't published.
+        //  2) It only WAITED for pano — it never asked pano to come up. When nothing
+        //     else was starting pano (recording-trigger bring-up, ACC edge, boot race)
+        //     it burned the timeout and fell through to an independent context. We now
+        //     ACTIVELY ensure pano is starting before waiting, so the wait has a
+        //     reason to succeed instead of being a coin flip on scheduling order.
+        // The wait is capped so a genuinely broken pano can never wedge OEM: recording
+        // still comes up (independent context records perfectly), only DVR preview is
+        // deferred to the self-heal restart.
         try {
             com.overdrive.app.surveillance.GpuSurveillancePipeline pano =
                 com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
-            if (pano != null) {
-                long deadline = System.currentTimeMillis() + 3000;
-                while (!pano.isRunning() && System.currentTimeMillis() < deadline) {
+            // Only PAY for the share group when DVR preview is actually wanted. On a
+            // recording-only bring-up (parked sentry / dvr triggers, no view-6 client)
+            // an independent context is perfectly fine, and starting pano here would
+            // boot the whole 360 camera for nothing — real battery cost while parked.
+            // So: request/await pano ONLY when a view-6 viewer is asking. Recording-only
+            // keeps exactly the previous behaviour (no pano start, no wait).
+            boolean dvrPreviewWanted = isAnyStreamingViewerActive();
+            if (pano != null && dvrPreviewWanted) {
+                // (2) Actively bring pano up if it isn't already — without this the wait
+                // below is purely passive and loses the boot race. Failure is non-fatal:
+                // we fall through to the capped wait and, worst case, an independent
+                // context that the self-heal restart repairs later.
+                if (!pano.isRunning()) {
+                    try {
+                        com.overdrive.app.daemon.CameraDaemon.log(
+                            "OemDashcam: pano not up yet — requesting pano start so OEM can "
+                            + "join its EGL share group (required for DVR preview)");
+                        // start(false) = bring the pipeline up WITHOUT auto-recording —
+                        // the same call enableStreaming() uses for a view-only client, so
+                        // this cannot start an unwanted pano recording. It is idempotent
+                        // (no-ops on running/starting, refuses while stopping), so a
+                        // concurrent bring-up is harmless.
+                        pano.start(false);
+                    } catch (Throwable t) {
+                        com.overdrive.app.daemon.CameraDaemon.log(
+                            "OemDashcam: pano start request failed: " + t.getMessage());
+                    }
+                }
+                // (1) Wait on the REAL precondition: pano running AND its EGLCore
+                // published. PanoramicCameraGpu publishes eglCore (initializeGl) before
+                // its own running flag, and GpuSurveillancePipeline gates running on
+                // camera.isRunning(), so in practice this resolves as soon as pano is
+                // up — but polling the handle itself removes the ordering assumption.
+                long deadline = System.currentTimeMillis() + PANO_EGL_WAIT_MS;
+                com.overdrive.app.camera.EGLCore parentEgl = null;
+                while (System.currentTimeMillis() < deadline) {
+                    if (pano.isRunning()) {
+                        com.overdrive.app.camera.PanoramicCameraGpu panoCam = pano.getCamera();
+                        if (panoCam != null && panoCam.getEglCore() != null) {
+                            parentEgl = panoCam.getEglCore();
+                            break;
+                        }
+                    }
                     try { Thread.sleep(50); }
                     catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         break;
                     }
                 }
-                if (pano.isRunning()) {
+                if (parentEgl != null) {
+                    p.setParentEglCore(parentEgl);
+                } else {
+                    com.overdrive.app.daemon.CameraDaemon.log(
+                        "OemDashcam: pano EGL unavailable within " + (PANO_EGL_WAIT_MS / 1000)
+                        + "s — starting on an independent context. RECORDING is unaffected; "
+                        + "DVR preview will self-heal (restart into the share group) once "
+                        + "pano is up and no recording is open.");
+                }
+            } else if (pano != null && pano.isRunning()) {
+                // Recording-only bring-up, but pano happens to ALREADY be up (typical
+                // mid-drive). Joining its share group is then FREE — no start, no wait —
+                // so take it: if the user opens DVR later, the route just works instead
+                // of needing a self-heal restart. Purely opportunistic; a null EGLCore
+                // simply leaves us independent as before.
+                try {
                     com.overdrive.app.camera.PanoramicCameraGpu panoCam = pano.getCamera();
                     if (panoCam != null && panoCam.getEglCore() != null) {
                         p.setParentEglCore(panoCam.getEglCore());
                     }
-                } else {
-                    com.overdrive.app.daemon.CameraDaemon.log(
-                        "OemDashcam: pano not ready within 3s — falling through to "
-                        + "independent EGL context (view-6 streaming will require an "
-                        + "OEM restart once pano comes up)");
-                }
+                } catch (Throwable ignored) {}
             }
         } catch (Throwable ignored) {}
         try {

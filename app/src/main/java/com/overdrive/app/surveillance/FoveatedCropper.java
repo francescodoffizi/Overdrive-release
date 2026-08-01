@@ -281,9 +281,23 @@ public class FoveatedCropper {
         /** True iff a real foveated→block-grid affine was populated. A zero
          *  X-scale (mapAx==0) can never be a legitimate crop mapping (the
          *  window always covers non-zero width), so it doubles as the
-         *  "no rect data" sentinel the consumer fail-safes on. */
+         *  "no rect data" sentinel the consumer fail-safes on.
+         *
+         *  <p>NaN must be rejected explicitly: in IEEE-754 {@code NaN != 0f} is
+         *  TRUE, so a NaN-poisoned affine would report VALID and send the
+         *  consumer down the strict branch — where every comparison against a
+         *  NaN-derived bbox corner is false, no block ever matches, and the
+         *  detection is DROPPED. That is the exact failure this sentinel exists
+         *  to prevent, reached via NaN instead of zero. NaN is reachable from a
+         *  malformed apaCenterInset in JSON config, because
+         *  {@code Math.max(0, Math.min(0.20, NaN))} returns NaN in Java and the
+         *  poison then propagates through xScale → cropWidthNorm → mX → mapAx.
+         *  All four coefficients are checked: the consumer uses every one, and a
+         *  NaN in any of them corrupts the mapping identically. */
         public boolean hasAffine() {
-            return mapAx != 0f;
+            return mapAx != 0f
+                    && !Float.isNaN(mapAx) && !Float.isNaN(mapBx)
+                    && !Float.isNaN(mapAy) && !Float.isNaN(mapBy);
         }
     }
 
@@ -525,11 +539,24 @@ public class FoveatedCropper {
             mapAy =  240.0f * mY;
             mapBy =  240.0f * cY;
         }
-        // Guard against a degenerate zero X-scale (would collide with the
-        // Result.hasAffine() sentinel and make the consumer fail-safe). mX is
-        // cropWidthNorm/(640*qWidth) which is structurally > 0 for any real
-        // window, so this only trips on corrupt inputs — keep a tiny epsilon.
-        if (mapAx == 0f) mapAx = 1e-6f;
+        // A degenerate zero X-scale means the window geometry is corrupt
+        // (cropWidthNorm collapsed, or a NaN propagated out of stripWidth /
+        // apaCenterInset). mX is cropWidthNorm/(640*qWidth), structurally > 0
+        // for any real window, so reaching here means the coefficients cannot
+        // be trusted.
+        //
+        // Leave mapAx AT ZERO so Result.hasAffine() reports false and the
+        // consumer FAILS SAFE (keeps the detection). The previous code nudged
+        // it to 1e-6f specifically to dodge that sentinel — which inverted the
+        // intent: a 1e-6f scale collapses every bbox in the crop onto block
+        // column 0, so the motion-overlap filter tested the wrong blocks,
+        // found no overlap, and DROPPED the detection. Reporting "no affine"
+        // is the whole point of the sentinel; a missed person is worse than an
+        // over-inclusive recording.
+        if (mapAx == 0f && logger != null) {
+            logger.warn("Foveated affine degenerate (mapAx=0, q=" + quadrant
+                    + ") — publishing without affine so the consumer fails safe");
+        }
 
         int[] savedViewport = new int[4];
         GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, savedViewport, 0);
@@ -719,6 +746,16 @@ public class FoveatedCropper {
     /** APA center inset (esco APACropFilter parity). See {@link
      *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
     public void setApaCenterInset(float inset) {
+        // Reject NaN explicitly: the clamp does NOT filter it
+        // (Math.max(0, Math.min(0.20, NaN)) == NaN in Java), and a NaN inset
+        // propagates through xScale → cropWidthNorm → mX → the whole
+        // foveated→block-grid affine, where it silently drops every detection
+        // in the crop. A malformed config double must leave the last good
+        // value in place rather than poison the mapping.
+        if (Float.isNaN(inset)) {
+            if (logger != null) logger.warn("Ignoring NaN apaCenterInset");
+            return;
+        }
         this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));
     }
 

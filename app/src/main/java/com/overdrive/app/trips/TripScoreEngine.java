@@ -661,7 +661,12 @@ public class TripScoreEngine {
         //    SoC-estimated fallback (trip.energyPerKm) stays consumption-only
         //    because 1%-resolution SoC can't reliably tell regen from jitter.
         double signedBmsKwh = trip.getSignedEnergyKwh();
-        boolean haveBmsKwh = signedBmsKwh != 0; // kwhStart>0 && kwhEnd>0 upstream
+        // Non-zero means a MEASURED energy figure is available. Signed (regen can
+        // make it negative) when it came from the remaining-energy pair; when it
+        // came from the metered consumption counter it is gross, so non-negative.
+        // Either way the branch below divides by distance, which is what this
+        // needs — it is not an assertion that the remaining-kWh pair exists.
+        boolean haveBmsKwh = signedBmsKwh != 0;
         double kwhPerKm;
         boolean efficiencyMeasured;
         if (trip.distanceKm >= MIN_EFFICIENCY_DISTANCE && haveBmsKwh) {

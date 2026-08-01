@@ -539,9 +539,11 @@ class VideoPlayerFragment : Fragment() {
                 videoView.pause()
                 btnPlayPause.setImageResource(android.R.drawable.ic_media_play)
                 handler.removeCallbacks(hideOverlayRunnable)
+                handler.removeCallbacks(updateRunnable)
             } else {
                 videoView.start()
                 btnPlayPause.setImageResource(android.R.drawable.ic_media_pause)
+                handler.removeCallbacks(updateRunnable)
                 handler.post(updateRunnable)
                 scheduleOverlayHide()
             }

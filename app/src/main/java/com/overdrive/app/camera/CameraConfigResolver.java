@@ -178,13 +178,53 @@ public final class CameraConfigResolver {
         return UnifiedConfigManager.updateSection("camera", update);
     }
 
+    /**
+     * Persist the outcome of a panoramic camera probe.
+     *
+     * <p><b>This method no longer writes {@code probedWidth}/{@code probedHeight}
+     * at all.</b> Two reasons, and the second is why the obvious "write the
+     * observed dims instead" fix was rejected:
+     *
+     * <p>1. Every caller used to pass the CONFIGURED {@code width, height}
+     * straight through, which made these keys a laundered copy of the profile
+     * default — {@link #resolve} reads them back in preference to the profile, so
+     * the values re-confirmed themselves forever and a car whose HAL emits
+     * something else could never be detected. Writing a value that is guaranteed
+     * to equal the default is pure noise.
+     *
+     * <p>2. Writing the OBSERVED dims instead would silently change geometry for
+     * the LEGACY fleet. On a non-DiLink4 car the frame-50 validation runs on first
+     * boot, and a unit whose HAL overrides the ImageReader geometry (exactly the
+     * case the "HAL emitted WxH but pipeline configured WxH" warning exists for,
+     * e.g. a Tang trim emitting 5120x720 into a 960-tall reader) would persist
+     * 720 and come up NEXT boot with encoderHeight 1440 instead of 1920, a
+     * differently-sized ImageReader, and every mosaic/foveated offset shifted.
+     * Today such a car records at the configured geometry forever. Changing that
+     * on the strength of a first-boot observation is not a safe trade for a
+     * diagnostic gain.
+     *
+     * <p>Omitting the keys is exactly equivalent to writing the profile default:
+     * {@code optNonNegative(camera, "probedWidth", profile.getPanoWidth())}
+     * returns the profile value when the key is absent, and both registered
+     * profiles have positive dims. So the resolved config is byte-identical to
+     * before while the self-confirming write is gone. The genuinely observed
+     * producer size is still available for diagnostics via
+     * {@code PanoramicCameraGpu.getObservedProducerWidth/Height()} and is
+     * surfaced in the logs; it just no longer feeds pipeline geometry.
+     *
+     * <p>The {@code width}/{@code height} parameters are retained for call-site
+     * compatibility and logging only.
+     */
     public static boolean persistPanoramicProbe(int cameraId, int surfaceMode, int width, int height,
                                                 boolean validated, boolean fallback) {
         JSONObject update = new JSONObject();
         putSafely(update, "probedCameraId", cameraId);
         putSafely(update, "probedSurfaceMode", surfaceMode);
-        putSafely(update, "probedWidth", width);
-        putSafely(update, "probedHeight", height);
+        // Deliberately NOT writing probedWidth/probedHeight — see javadoc.
+        if (width > 0 && height > 0) {
+            logger.info("persistPanoramicProbe: observed producer " + width + "x" + height
+                + " (diagnostic only — pipeline geometry stays profile-driven)");
+        }
         putSafely(update, "probedAndValidated", validated);
         putSafely(update, "fallbackFromProbe", fallback);
         return UnifiedConfigManager.updateSection("camera", update);

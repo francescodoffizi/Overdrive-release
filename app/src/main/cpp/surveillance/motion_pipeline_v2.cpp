@@ -482,7 +482,8 @@ static int stage4_connectedComponents(
     int componentLabels[V2_TOTAL_BLOCKS],
     float* largestCentroidX,
     float* largestCentroidY,
-    int* outLargestLabel)
+    int* outLargestLabel,
+    int* outComponentCount)
 {
     // Initialize labels to -1 (unvisited)
     for (int i = 0; i < V2_TOTAL_BLOCKS; i++) {
@@ -544,6 +545,8 @@ static int stage4_connectedComponents(
     }
 
     if (outLargestLabel) *outLargestLabel = largestLabel;
+    // currentLabel advanced once per discovered component, so it IS the count.
+    if (outComponentCount) *outComponentCount = currentLabel;
     return largestSize;
 }
 
@@ -995,8 +998,17 @@ static void processQuadrant(
     // --- Global flash filter: if >25% of blocks active, it's likely a light change ---
     // Real motion from a person is typically 2-8 blocks out of 70 (3-11%).
     // Anything activating >25% of blocks is almost certainly a lighting event.
+    //
+    // ...EXCEPT that block mass also grows with object SIZE and CLOSENESS: a
+    // person at ~1.5m is ~18/70 blocks and a van fills far more, so the closest,
+    // largest subjects are the ones this filter is most likely to erase. With
+    // salienceEnabled we PROBE such a frame (stages 3/4/4b below) and suppress it
+    // only if the mass is diffuse or non-translating; a failed probe restores the
+    // pre-probe state and takes this exact path, so it stays byte-identical.
     float activeRatio = (float)activeCount / V2_TOTAL_BLOCKS;
-    if (activeRatio > 0.25f) {
+    bool highMass = (activeRatio > 0.25f);
+    bool salienceProbe = highMass && config->salienceEnabled != 0;
+    if (highMass && !salienceProbe) {
         LOGD_V2("Q%d: Global flash (%.0f%% blocks) — suppressed", quadrantIdx, activeRatio * 100);
         // Decay all blocks
         bool noBlocks[V2_TOTAL_BLOCKS] = {};
@@ -1005,7 +1017,21 @@ static void processQuadrant(
         memcpy(result->blockConfidence, qs->blockConfidence, sizeof(float) * V2_TOTAL_BLOCKS);
         return;
     }
-    
+
+    // Snapshot every field stages 3 and 4b mutate, so a rejected probe can leave
+    // the quadrant exactly as the suppression path above would have.
+    float savedConfidence[V2_TOTAL_BLOCKS];
+    float savedFlowCoherence = qs->lastFlowCoherence;
+    float savedNetRingX[V2_FLOW_NET_WINDOW];
+    float savedNetRingY[V2_FLOW_NET_WINDOW];
+    int   savedNetRingIndex = qs->netRingIndex;
+    int   savedNetRingCount = qs->netRingCount;
+    if (salienceProbe) {
+        memcpy(savedConfidence, qs->blockConfidence, sizeof(savedConfidence));
+        memcpy(savedNetRingX, qs->netRingX, sizeof(savedNetRingX));
+        memcpy(savedNetRingY, qs->netRingY, sizeof(savedNetRingY));
+    }
+
     // --- Stage 3: Temporal decay ---
     bool confirmedBlocks[V2_TOTAL_BLOCKS];
     int confirmedCount = stage3_temporalDecay(qs, activeBlocks, config, confirmedBlocks);
@@ -1018,8 +1044,10 @@ static void processQuadrant(
     int componentLabels[V2_TOTAL_BLOCKS];
     float centroidX = 0, centroidY = 0;
     int largestLabel = -1;
-    int largestComponent = stage4_connectedComponents(confirmedBlocks, componentLabels, &centroidX, &centroidY, &largestLabel);
+    int componentCount = 0;
+    int largestComponent = stage4_connectedComponents(confirmedBlocks, componentLabels, &centroidX, &centroidY, &largestLabel, &componentCount);
     result->componentSize = largestComponent;
+    result->componentCount = componentCount;
     result->centroidX = centroidX;
     result->centroidY = centroidY;
 
@@ -1059,7 +1087,92 @@ static void processQuadrant(
             result->netDriftBlocks = netDrift;
         }
     }
-    
+
+    // --- Salience probe verdict (only on a high-mass frame, salience enabled) ---
+    // Decide whether this high-mass frame is ONE OBJECT or an illumination event.
+    // Requires ALL of: a component big enough to be an object, that component
+    // dominating the confirmed mass (a flash scatters across the frame), and
+    // rigid translation (flowCoherence / netDrift — a flash has no consistent
+    // flow direction). Coherence UNAVAILABLE (-1) fails the probe: unlike the
+    // Java trust gate, this path can only ADD signal, so absent evidence must
+    // fall back to the original suppression rather than fail open (invariant I3 —
+    // suppression is evidence-scoped, and here the "evidence" is the object's).
+    if (salienceProbe) {
+        bool bigEnough  = (largestComponent >= config->salienceMinBlocks);
+        bool dominant   = (confirmedCount > 0)
+                && ((float)largestComponent / (float)confirmedCount) >= config->salienceDominanceFrac;
+        bool translating = (result->flowCoherence >= 0.0f)
+                && (result->flowCoherence >= config->coherenceRatioMin
+                    || result->netDriftBlocks >= config->coherenceNetMin);
+        if (bigEnough && dominant && translating) {
+            result->salienceState = 2;  // RESCUED
+            // Throttled like every other sustained LOGI in this file: the rescue
+            // condition holds for the WHOLE approach, so an unthrottled line would
+            // emit ~35/s across 4 quadrants and evict the surrounding motion/YOLO
+            // lines from logd during the exact event you need to diagnose.
+            if (frameCount % 50 == 0) {
+                LOGI_V2("Q%d: Salience RESCUE of high-mass frame (%.0f%% blocks): component=%d/%d "
+                        "dominance=%.2f coherence=%.2f netDrift=%.1f — large close object, not a flash",
+                        quadrantIdx, activeRatio * 100, largestComponent, confirmedCount,
+                        confirmedCount > 0 ? (float)largestComponent / confirmedCount : 0.0f,
+                        result->flowCoherence, result->netDriftBlocks);
+            }
+        } else {
+            // Probe FAILED → this really does look like a lighting event. Restore
+            // every field stages 3/4b touched, then take the original suppression
+            // path verbatim so the outcome is identical to salienceEnabled==0.
+            memcpy(qs->blockConfidence, savedConfidence, sizeof(savedConfidence));
+            memcpy(qs->netRingX, savedNetRingX, sizeof(savedNetRingX));
+            memcpy(qs->netRingY, savedNetRingY, sizeof(savedNetRingY));
+            qs->netRingIndex = savedNetRingIndex;
+            qs->netRingCount = savedNetRingCount;
+            qs->lastFlowCoherence = savedFlowCoherence;
+            // LOGI, not LOGD: LOGD_V2 compiles to ((void)0) under NDEBUG, which is
+            // forced for release builds — and this is a SIGNAL-KILL site, so it must
+            // stay attributable on a shipped build (invariant I7). Rate-limited to
+            // once per 50 frames so a sustained flash can't flood the log.
+            if (frameCount % 50 == 0) {
+                LOGI_V2("Q%d: Global flash (%.0f%% blocks) — suppressed (salience probe failed: "
+                        "component=%d/%d big=%d dominant=%d translating=%d)",
+                        quadrantIdx, activeRatio * 100, largestComponent, confirmedCount,
+                        bigEnough, dominant, translating);
+            }
+            bool noBlocks[V2_TOTAL_BLOCKS] = {};
+            bool dummy[V2_TOTAL_BLOCKS];
+            stage3_temporalDecay(qs, noBlocks, config, dummy);
+            // Clear ONLY what the probe published. Do NOT memset the struct or
+            // set brightnessSuppressed: the original flash path leaves meanLuma /
+            // activeBlocks / shadowFiltered intact and brightnessSuppressed FALSE
+            // (stage 1 already returned false to get here). Setting it true would
+            // latch suppressionWasActive[q] in Java, which disables the close-zone
+            // fast paths and the 2s AI-confirm timeout for BASELINE_STABILIZATION_
+            // FRAMES — turning an FP guard into a scene-wide deafness (invariant I2).
+            // confirmedBlocks MUST be zeroed. Stage 3 set it from the PRE-restore
+            // (incremented) confidences, while the mask published below holds the
+            // POST-restore (decayed) ones — so leaking it publishes a positive
+            // count next to a mask that cannot satisfy it. Java's S4 detection
+            // filter arms on `snapshotConfirmedBlocks > 0` and then requires a
+            // block >= BLOCK_MOTION_MIN_CONF(0.5) near the bbox; in the reachable
+            // band (a block on its 2nd active frame: 0.4 counted, 0.3 published)
+            // it arms and then matches nothing, dropping EVERY detection — no
+            // Actor, no hero, eventEverSawPerson never latches. The original path
+            // returned before Stage 3, leaving the memset 0 which takes the
+            // fail-open "no motion data → keep all detections" branch instead.
+            result->confirmedBlocks = 0;
+            result->componentSize = 0;
+            result->componentCount = 0;
+            result->centroidX = 0.0f;
+            result->centroidY = 0.0f;
+            result->threatLevel = THREAT_NONE;
+            result->motionDetected = false;
+            result->flowCoherence = -1.0f;
+            result->netDriftBlocks = -1.0f;
+            result->salienceState = 1;  // probed and suppressed
+            memcpy(result->blockConfidence, qs->blockConfidence, sizeof(float) * V2_TOTAL_BLOCKS);
+            return;
+        }
+    }
+
     // Check minimum component size
     if (largestComponent < config->minComponentSize) {
         if (largestComponent > 0 && frameCount % 50 == 0) {

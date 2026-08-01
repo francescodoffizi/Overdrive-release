@@ -1084,6 +1084,184 @@ public class AppUpdater {
         });
     }
 
+    // ==================== COMPANION APK INSTALL (OverDrive Launcher, WP-H) ====================
+    //
+    // Silent install of a SEPARATE companion package (com.overdrive.launcher)
+    // from its OWN GitHub release track. This is fully ADDITIVE and REUSES the
+    // download + `pm install` primitives of the core self-update path
+    // ({@link #firstApkAsset}, {@link #buildClient}, {@link #downloadApkOkHttp} /
+    // {@link #buildDownloadCommand}, {@link #runShell}), but deliberately does
+    // NOT touch ANY of core's self-update bookkeeping:
+    //   - no {@link #stopAllDaemons()} / kill cascade (we are NOT replacing
+    //     OURSELVES, so no core process needs to die),
+    //   - no per-channel baseline / VERSION_FILE / PREF_JUST_UPDATED writes
+    //     (those track CORE's version, not the companion's),
+    //   - no `am start` relaunch of MainActivity.
+    // `pm install -r` of a DIFFERENT package never kills core's process, so the
+    // simple synchronous flow the pre-daemon app-process path used is sufficient
+    // and safe from either UID (runShell tunnels through the ADB daemon launcher
+    // when the app UID can't write /data/local/tmp). The core self-update
+    // methods ({@link #downloadAndInstall} / {@link #runDetachedInstall}) are
+    // left BYTE-IDENTICAL by this addition.
+    private static final String COMPANION_APK_PATH =
+            "/data/local/tmp/overdrive_companion.apk";
+
+    /** No-op shell callback for fire-and-forget cleanup commands. */
+    private static final com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback NOOP_SHELL =
+            new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                @Override public void onLog(String m) {}
+                @Override public void onLaunched() {}
+                @Override public void onError(String e) {}
+            };
+
+    /**
+     * Resolve, download, and silently install a companion APK from a GitHub
+     * release track that is INDEPENDENT of core's update channels. Runs on the
+     * shared {@link #executor}. The companion (e.g. {@code com.overdrive.launcher})
+     * is a fully optional add-on: this method has no side effect on core's own
+     * version/state, and core behaves identically whether or not it is ever
+     * called.
+     *
+     * <p>Serializes against the core self-update via the SAME process-wide
+     * {@link #tryBeginInstall()} gate so a companion install and a core update
+     * can't race the shared {@code /data/local/tmp} staging + {@code pm install}.
+     *
+     * @param repo     {@code "owner/name"} GitHub repo of the companion release
+     *                 track (parameterized — the companion ships separately from
+     *                 core, so its repo/tag are supplied by the caller)
+     * @param tag      release tag to install (e.g. {@code "prod"})
+     * @param callback progress / success / error surface — SAME contract as the
+     *                 core install ({@link InstallCallback})
+     */
+    public void installCompanionApk(String repo, String tag, InstallCallback callback) {
+        cancelled = false;
+        executor.execute(() -> {
+            boolean gateHeld = false;
+            try {
+                if (repo == null || repo.isEmpty() || tag == null || tag.isEmpty()) {
+                    postInstallError(callback, "No companion release configured");
+                    return;
+                }
+                if (!tryBeginInstall()) {
+                    postInstallError(callback, "Another install is already in progress");
+                    return;
+                }
+                gateHeld = true;
+
+                // Step 1: resolve the first APK asset on the companion release.
+                // Reuses the exact GitHub-release asset resolution the core path
+                // uses (firstApkAsset), just against the companion repo/tag.
+                postProgress(callback, "Resolving launcher release...");
+                String apiUrl = "https://api.github.com/repos/" + repo
+                        + "/releases/tags/" + tag;
+                OkHttpClient client = buildClient(15, 15);
+                Request request = new Request.Builder()
+                        .url(apiUrl)
+                        .header("Accept", "application/vnd.github.v3+json")
+                        .build();
+                String downloadUrl;
+                try (Response response = client.newCall(request).execute()) {
+                    if (!response.isSuccessful()) {
+                        postInstallError(callback, "GitHub API error: HTTP " + response.code());
+                        return;
+                    }
+                    JSONObject release = new JSONObject(response.body().string());
+                    String[] apk = firstApkAsset(release.optJSONArray("assets"));
+                    if (apk == null) {
+                        postInstallError(callback, "No APK found in launcher release");
+                        return;
+                    }
+                    downloadUrl = apk[0];
+                }
+
+                // Step 2: download to a companion-specific path (NEVER the core
+                // APK_PATH, so a concurrent core update and this can't clobber
+                // each other's staged bytes). Same two transfer paths as the
+                // core install: direct OkHttp when we can write /data/local/tmp
+                // (daemon UID), else the ADB-tunnelled shell download.
+                postProgress(callback, "Downloading launcher...");
+                runCallback(() -> callback.onDownloadProgress(-1));
+                final String[] dlResult = {null};
+                if (canWriteLocalTmp()) {
+                    try {
+                        downloadApkOkHttp(downloadUrl, COMPANION_APK_PATH, callback);
+                        dlResult[0] = "OK";
+                    } catch (Exception e) {
+                        dlResult[0] = "ERROR: " + (e.getMessage() == null ? "download failed" : e.getMessage());
+                    }
+                } else {
+                    final boolean[] dlDone = {false};
+                    String downloadCmd = buildDownloadCommand(downloadUrl, COMPANION_APK_PATH);
+                    runShell(downloadCmd, new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                        @Override public void onLog(String m) { dlResult[0] = m; }
+                        @Override public void onLaunched() { dlDone[0] = true; synchronized (dlDone) { dlDone.notify(); } }
+                        @Override public void onError(String e) { dlResult[0] = "ERROR: " + e; dlDone[0] = true; synchronized (dlDone) { dlDone.notify(); } }
+                    });
+                    synchronized (dlDone) { if (!dlDone[0]) dlDone.wait(300000); }
+                }
+
+                if (cancelled) {
+                    runShell("rm -f " + COMPANION_APK_PATH, NOOP_SHELL);
+                    postInstallError(callback, "Cancelled");
+                    return;
+                }
+                String dlOutput = dlResult[0] != null ? dlResult[0] : "";
+                if (dlOutput.startsWith("ERROR") || !dlOutput.contains("OK")) {
+                    postInstallError(callback, "Download failed: " + dlOutput);
+                    return;
+                }
+                runCallback(() -> callback.onDownloadProgress(100));
+
+                // Step 3: size sanity check (same >=1MB floor as the core path).
+                final boolean[] szDone = {false};
+                final String[] szResult = {null};
+                runShell("stat -c%s " + COMPANION_APK_PATH + " 2>/dev/null || echo 0",
+                        new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                    @Override public void onLog(String m) { szResult[0] = m.trim(); }
+                    @Override public void onLaunched() { szDone[0] = true; synchronized (szDone) { szDone.notify(); } }
+                    @Override public void onError(String e) { szResult[0] = "0"; szDone[0] = true; synchronized (szDone) { szDone.notify(); } }
+                });
+                synchronized (szDone) { if (!szDone[0]) szDone.wait(10000); }
+                long fileSize = 0;
+                try { fileSize = Long.parseLong(szResult[0].trim()); } catch (Exception ignored) {}
+                if (fileSize < 1_000_000) {
+                    runShell("rm -f " + COMPANION_APK_PATH, NOOP_SHELL);
+                    postInstallError(callback, "Invalid APK (size: " + fileSize + ")");
+                    return;
+                }
+
+                // Step 4: `pm install -r` the companion. NO daemon kill, NO
+                // relaunch, NO baseline writes — this replaces a DIFFERENT
+                // package, so core keeps running untouched.
+                postProgress(callback, "Installing launcher...");
+                final boolean[] done = {false};
+                final String[] result = {null};
+                String installCmd = "pm install -r " + COMPANION_APK_PATH
+                        + "; rm -f " + COMPANION_APK_PATH;
+                runShell(installCmd, new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                    @Override public void onLog(String m) { Log.i(TAG, "Companion install: " + m); result[0] = m; }
+                    @Override public void onLaunched() { done[0] = true; synchronized (done) { done.notify(); } }
+                    @Override public void onError(String e) { result[0] = "ERROR: " + e; done[0] = true; synchronized (done) { done.notify(); } }
+                });
+                synchronized (done) { if (!done[0]) done.wait(120000); }
+
+                String output = result[0] != null ? result[0] : "";
+                if (output.toLowerCase().contains("success")) {
+                    postProgress(callback, "Launcher installed.");
+                    runCallback(callback::onSuccess);
+                } else {
+                    runShell("rm -f " + COMPANION_APK_PATH, NOOP_SHELL);
+                    postInstallError(callback, "Install failed: " + output);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Companion install error: " + e.getMessage());
+                postInstallError(callback, e.getMessage());
+            } finally {
+                if (gateHeld) endInstall();
+            }
+        });
+    }
+
     /**
      * Build a shell command that downloads a URL to a file path.
      * Uses Java's URL class via a shell one-liner (no curl/wget dependency).
@@ -1709,14 +1887,26 @@ public class AppUpdater {
         // the lock between rm and pkill.
         //
         // Per-daemon disable sentinels remain set after this returns; the
-        // subsequent install script (buildInstallScript) clears them right
-        // before `am start`.
+        // subsequent install script (buildInstallScript) clears the CORE ones
+        // right before `am start`. The OPTIONAL ones (telegram, zrok, …) are
+        // deliberately left in place so a durable user stop survives the update.
+        //
+        // The telegram sentinel is written ONLY IF ABSENT (`[ -f ] || echo`)
+        // rather than with a plain `>`. A clobbering write destroyed the
+        // distinction the ACC-off auto-start gate depends on: it reads the
+        // sentinel's TEXT to tell a machine stop ("stopAllDaemons sweep" — safe
+        // to disregard) from a durable user stop ("disabled by ui"). Overwriting
+        // a pre-existing "disabled by ui" made a real user stop indistinguishable
+        // from our own, and honouring the text then left a parked-only bot unable
+        // to auto-start ever again after any update. Preserving the original text
+        // keeps both readings correct with no ambiguity to resolve downstream.
         String sweepScript =
                 "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/zrok.disabled\n" +
                 "chmod 666 /data/local/tmp/zrok.disabled 2>/dev/null\n" +
                 "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n" +
-                "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/telegram_bot_daemon.disabled\n" +
+                "[ -f /data/local/tmp/telegram_bot_daemon.disabled ] || "
+                + "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/telegram_bot_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/telegram_bot_daemon.disabled 2>/dev/null\n" +
                 "rm -f /data/local/tmp/cam_watchdog.pid 2>/dev/null\n" +
                 "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/start_acc_sentry.sh /data/local/tmp/start_zrok.sh /data/local/tmp/start_telegram.sh 2>/dev/null\n" +

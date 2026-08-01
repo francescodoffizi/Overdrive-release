@@ -76,6 +76,7 @@ class SurveillanceConfigManager(
         private const val KEY_SHADOW_FILTER = "shadowFilterMode"
         private const val KEY_DISCARD_EMPTY_BRIGHT = "discardEmptyBrightMotionEvents"
         private const val KEY_DISCARD_EMPTY_NIGHT = "discardEmptyMotionAtNight"
+        private const val KEY_MOTION_SALIENCE = "motionSalienceEnabled"
     }
     
     /**
@@ -211,6 +212,7 @@ class SurveillanceConfigManager(
             put(KEY_FILTER_DEBUG_LOG, config.isFilterDebugLogEnabled)
             put(KEY_DISCARD_EMPTY_BRIGHT, config.isDiscardEmptyBrightMotionEvents)
             put(KEY_DISCARD_EMPTY_NIGHT, config.isDiscardEmptyMotionAtNight)
+            put(KEY_MOTION_SALIENCE, config.isMotionSalienceEnabled)
             put(KEY_SHADOW_FILTER, config.shadowFilterMode)
 
             // Per-quadrant overrides (null = inherit). Persisted as a single
@@ -307,6 +309,7 @@ class SurveillanceConfigManager(
         if (json.has(KEY_FILTER_DEBUG_LOG)) config.setFilterDebugLogEnabled(json.optBoolean(KEY_FILTER_DEBUG_LOG, false))
         if (json.has(KEY_DISCARD_EMPTY_BRIGHT)) config.setDiscardEmptyBrightMotionEvents(json.optBoolean(KEY_DISCARD_EMPTY_BRIGHT, false))
         if (json.has(KEY_DISCARD_EMPTY_NIGHT)) config.setDiscardEmptyMotionAtNight(json.optBoolean(KEY_DISCARD_EMPTY_NIGHT, false))
+        if (json.has(KEY_MOTION_SALIENCE)) config.setMotionSalienceEnabled(json.optBoolean(KEY_MOTION_SALIENCE, false))
         if (json.has(KEY_SHADOW_FILTER)) config.setShadowFilterMode(json.optInt(KEY_SHADOW_FILTER, 2))
         
         // Per-quadrant overrides

@@ -140,11 +140,16 @@
     border-radius: 20px; padding: 5px 12px; font-size: 11px; font-weight: 500; color: var(--vc-text-primary);
     white-space: nowrap; -webkit-flex-shrink: 0; flex-shrink: 0;
 }
-.vc-pill .dot { width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; }
+.vc-pill .dot { width: 6px; height: 6px; border-radius: 50%; }
 .dot.green { background: #22C55E; box-shadow: 0 0 5px #22C55E; }
 .dot.red { background: #EF4444; box-shadow: 0 0 5px #EF4444; }
 .dot.amber { background: #F59E0B; box-shadow: 0 0 5px #F59E0B; }
 .dot.grey { background: #71717A; box-shadow: 0 0 5px #71717A; }
+/* Partial reading (driver door only, no whole-vehicle confirmation): keep the
+   lock colour but hollow the dot so it doesn't read as a full-car state. */
+.dot.partial { background: transparent; box-shadow: none; border: 1.5px solid currentColor; }
+.dot.green.partial { color: #22C55E; }
+.dot.amber.partial { color: #F59E0B; }
 
 .vc-colors {
     display: -webkit-flex; display: flex; -webkit-align-items: center; align-items: center;
@@ -267,11 +272,13 @@
     width: 168px;
     min-width: 168px;
     padding: 11px 13px 12px;
+    /* No backdrop-filter: four blurred layers over a repainting WebGL canvas
+       force a backdrop re-capture per frame on Chrome 58, and at 0.92 alpha the
+       blur is invisible anyway. */
     background: var(--vc-pill-bg-strong);
-    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
     border: 1px solid var(--vc-border);
     border-radius: 14px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.14);
     color: var(--vc-text-strong);
     font-family: 'JetBrains Mono', ui-monospace, monospace;
     pointer-events: auto;
@@ -683,6 +690,37 @@
 .vc-tile.active { border-color: #00D4AA; background: rgba(0,212,170,.10); color: #00D4AA; }
 /* Disable highlight stays readable: outline grey, not greyed-out invisible. */
 .vc-tile:disabled, .vc-tile[disabled] { color: var(--vc-text-muted); border-color: var(--vc-border-faint); background: var(--vc-tile-bg-disabled); cursor: not-allowed; }
+/* Cloud-only controls stay tappable so they can explain how to connect an
+   account, but carry an explicit cloud marker. A dashed outline means the
+   capability is currently unavailable; local SDK controls remain unchanged. */
+.vc-tile[data-requires-cloud="true"] { position: relative; }
+.vc-tile[data-requires-cloud="true"]::after {
+    /* Draw the cloud from CSS primitives. Android 7 otherwise forces U+2601
+       through its blue colour-emoji font and ignores the state colour. */
+    content: '';
+    position: absolute; top: 7px; right: 6px;
+    width: 9px; height: 4px;
+    border-radius: 5px;
+    background: currentColor;
+    box-shadow:
+        -3px 1px 0 -1px currentColor,
+        3px 1px 0 -1px currentColor,
+        0 -3px 0 -1px currentColor;
+    color: var(--vc-text-muted);
+    pointer-events: none;
+}
+[dir="rtl"] .vc-tile[data-requires-cloud="true"]::after {
+    right: auto; left: 5px;
+}
+.vc-tile[data-cloud-state="connected"]::after { color: #00D4AA; }
+.vc-tile[data-cloud-state="checking"]::after { color: #F59E0B; }
+.vc-tile[data-cloud-state="not_configured"],
+.vc-tile[data-cloud-state="unavailable"] {
+    border-style: dashed;
+    background: var(--vc-tile-bg-disabled);
+}
+.vc-tile[data-cloud-state="not_configured"]::after { color: var(--vc-text-muted); }
+.vc-tile[data-cloud-state="unavailable"]::after { color: #EF4444; }
 .vc-tile.heat:hover { border-color: rgba(239,68,68,.3); color: #EF4444; }
 .vc-tile.heat.on1 { border-color: #EF4444AA; background: rgba(239,68,68,.12); color: #EF4444AA; box-shadow: 0 0 12px rgba(239,68,68,.2); }
 .vc-tile.heat.on2 { border-color: #EF4444; background: rgba(239,68,68,.12); color: #EF4444; box-shadow: 0 0 12px rgba(239,68,68,.2); }
@@ -998,7 +1036,8 @@ button.vc-pill:active { -webkit-transform: scale(.95); transform: scale(.95); }
     .vc-status-bar { left: 54px; right: 8px; }
     .vc-status-bar > * { margin: 0 2px; }
     .vc-pill { padding: 3px 7px; font-size: 9px; }
-    .vc-pill .dot { width: 5px; height: 5px; margin-right: 4px; }
+    /* Spacing comes from the shared RTL-aware .compact-status-pill__dot rule. */
+    .vc-pill .dot { width: 5px; height: 5px; }
     .vc-colors { padding: 2px 4px; }
     .vc-swatch { width: 18px; height: 18px; margin: 0 1px; }
     .vc-swatch-custom { width: 18px; height: 18px; margin: 0 1px; }
@@ -1031,6 +1070,18 @@ button.vc-pill:active { -webkit-transform: scale(.95); transform: scale(.95); }
 }
 
 /* Ultra-short viewports (landscape phone) — keep labels but compact heights. */
+/* Short landscape panels: the size rules above are width-keyed, so a 1280x480
+   head unit keeps full-size callouts and the front/rear pair on one side can
+   overlap. Clamp on height too. */
+@media (max-height: 560px) {
+    .vc-tyre-callout { width: 132px; min-width: 132px; padding: 7px 9px 8px; }
+    .vc-tyre-psi-val { font-size: 20px; }
+    .vc-tyre-callout[data-corner="rl"],
+    .vc-tyre-callout[data-corner="rr"] { top: 96px; }
+    .vc-tyre-callout[data-corner="fl"],
+    .vc-tyre-callout[data-corner="fr"] { bottom: 72px; }
+}
+
 @media (max-height: 500px) {
     .vc-tab { height: 40px; min-width: 56px; }
     .vc-tab svg { width: 14px; height: 14px; margin-bottom: 0; }

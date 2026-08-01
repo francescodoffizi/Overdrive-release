@@ -37,6 +37,21 @@ var CHARGING = {
     electricityRate: 0,
     currency: '$',
     dcRate: 0,
+    // Location-aware tariffs. `matchedTariffId` is the one that would price a
+    // charge started at the CURRENT position (server-computed, so the UI can't
+    // disagree with what pricing will actually do); `defaultTariffId` is the
+    // pinned fallback for charges that match no circle.
+    tariffs: [],
+    defaultTariffId: '',
+    matchedTariffId: '',
+    maxTariffs: 40,
+    tariffGpsLat: null,
+    tariffGpsLng: null,
+    _editingTariff: null,
+    // Default match radius for a new tariff, in metres. Mirrors
+    // TariffProfile.DEFAULT_RADIUS_M — tight enough to mean "this charger"
+    // rather than "this neighbourhood", while covering normal GPS scatter.
+    TARIFF_DEFAULT_RADIUS_M: 50,
     fastSampleSec: 12,
     isPhev: false,
     nominalKwh: 0,
@@ -184,12 +199,18 @@ var CHARGING = {
             if (b.summary)  self._applySummary(b.summary.summary || b.summary);
             if (b.soc)      self._applySoc(b.soc.soc || b.soc);
             if (b.sessions) self._applySessions((b.sessions.sessions || b.sessions), 0);
+            // Tariffs ship in the bootstrap on current daemons; an older one
+            // omits the section, so fetch it separately rather than leaving the
+            // list blank.
+            if (b.tariffs) self._applyTariffs(b.tariffs);
+            else self.loadTariffs();
         }).catch(function () {
             // Sequential fallback.
             self.loadConfig();
             self.loadSummary();
             self.loadSoc();
             self.loadSessions(0);
+            self.loadTariffs();
         });
     },
 
@@ -267,6 +288,14 @@ var CHARGING = {
         // If summary arrived before config (sequential fallback can race),
         // re-render the hero so the cost/kWh fallback picks up the rate.
         if (this.summaryCache) this._applySummary(this.summaryCache);
+
+        // The fallback note quotes the global rate + currency symbol, and tariff
+        // rows fall back to this.currency for a profile with no currency of its
+        // own — so both must be redrawn when either changes. Use the note-only
+        // path when there are no tariffs, to avoid flashing #tariffEmpty during
+        // bootstrap before the tariff payload has landed.
+        if ((this.tariffs || []).length) this.renderTariffs();
+        else this._renderTariffFallbackNote();
     },
 
     _applySummary: function (s) {
@@ -489,6 +518,10 @@ var CHARGING = {
                         (timeRange ? '<span>' + self._esc(timeRange) + '</span>' : '') +
                         (dur ? '<span>' + dur + '</span>' : '') +
                         (odoStr ? '<span>' + self._t('charge.odometer_short', 'ODO') + ' ' + odoStr + '</span>' : '') +
+                        // Which tariff priced this charge. Only when a named
+                        // tariff owns it — a session on the global rate shows
+                        // nothing, exactly as before.
+                        (s.tariffLabel ? '<span>⚡ ' + self._esc(s.tariffLabel) + '</span>' : '') +
                     '</div>' +
                     '<button class="session-delete-btn" title="' + self._t('charge.delete_session_title', 'Delete session') + '">' +
                         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
@@ -749,6 +782,22 @@ var CHARGING = {
         var temp = (s.tempAvg != null) ? s.tempAvg
                  : (s.tempHigh != null ? s.tempHigh : null);
         this._setText('detailTemp', (temp != null) ? Math.round(temp) + '°C' : '--');
+
+        // Tariff provenance: name the tariff that priced this charge and the rate
+        // it used, so a cost is always explainable. Sessions on the global rate
+        // (including every session recorded before tariffs existed) hide the tile
+        // rather than showing a bare rate with no source.
+        var tariffStat = document.getElementById('detailTariffStat');
+        if (tariffStat) {
+            if (s.tariffLabel) {
+                var rateTxt = (s.electricityRate != null && s.electricityRate > 0)
+                    ? ' · ' + this._money(s.electricityRate) + '/kWh' : '';
+                this._setText('detailTariff', s.tariffLabel + rateTxt);
+                tariffStat.style.display = '';
+            } else {
+                tariffStat.style.display = 'none';
+            }
+        }
 
         // Location row: place name (or coords) + a "view on map" button when we
         // have coordinates. Hidden entirely when no location was captured.
@@ -1853,6 +1902,466 @@ var CHARGING = {
         return { list: list, tMin: tMin, tMax: tMax };
     },
 
+    // ==================== TARIFFS (location-aware rates) ====================
+
+    loadTariffs: function () {
+        var self = this;
+        fetch('/api/charging/tariffs').then(function (r) { return r.json(); })
+            .then(function (d) { self._applyTariffs(d); })
+            .catch(function () {});
+    },
+
+    /**
+     * Absorb a /api/charging/tariffs payload (or the matching bootstrap slice).
+     * `meta` carries the default id, the live GPS fix and which tariff matches
+     * it — that's what drives the "auto here" pill without a second request.
+     */
+    _applyTariffs: function (d) {
+        if (!d) return;
+        // A failed endpoint/bootstrap section yields {error:...} (or success:false),
+        // which has no `tariffs` array. Treating that as an empty list wiped the
+        // rendered rows AND closed an open editor on a transient failure. Keep the
+        // last good state instead.
+        if (d.error || d.success === false) return;
+        if (!d.tariffs && !(d.meta && d.meta.tariffs)) return;
+        var meta = d.meta || d;
+        this.tariffs = d.tariffs || meta.tariffs || [];
+        this.defaultTariffId = meta.defaultTariffId || '';
+        this.matchedTariffId = meta.matchedTariffId || '';
+        this.maxTariffs = meta.maxTariffs || 40;
+        // Remember the fix so "add for this location" can show coordinates before
+        // the POST, and so the editor can say when there's no fix to pin to.
+        this.tariffGpsLat = (meta.lat != null) ? meta.lat : null;
+        this.tariffGpsLng = (meta.lng != null) ? meta.lng : null;
+        this.renderTariffs();
+        // Keep the chip honest about the fix the save will actually use.
+        var ed = document.getElementById('tariffEditor');
+        if (ed && ed.style.display !== 'none') this._renderTariffLocChip();
+    },
+
+    renderTariffs: function () {
+        var list = document.getElementById('tariffList');
+        var empty = document.getElementById('tariffEmpty');
+        if (!list) return;
+
+        var rows = this.tariffs || [];
+        // Drop the editor if the tariff it is bound to no longer exists (deleted
+        // here, or removed by another client between refreshes). Otherwise Save
+        // would PUT a dead id, 404, and look like a random failure.
+        if (this._editingTariff) {
+            var stillThere = false;
+            for (var k = 0; k < rows.length; k++) {
+                if (rows[k].id === this._editingTariff.id) { stillThere = true; break; }
+            }
+            if (!stillThere) this.closeTariffEditor();
+        }
+        list.innerHTML = '';
+        if (rows.length === 0) {
+            if (empty) empty.style.display = '';
+            this._updateTariffAddBtn();
+            this._renderTariffFallbackNote();
+            return;
+        }
+        if (empty) empty.style.display = 'none';
+
+        var self = this;
+        for (var i = 0; i < rows.length; i++) {
+            list.appendChild(self._tariffRow(rows[i]));
+        }
+        this._updateTariffAddBtn();
+        this._renderTariffFallbackNote();
+    },
+
+    /**
+     * State the fallback: what prices a charge that matches no tariff circle.
+     * Only rendered when there IS a fallback to name — with no tariffs, no
+     * default and no global rate there is nothing true to say, so we stay silent
+     * rather than explaining a mechanism that isn't doing anything yet.
+     */
+    _renderTariffFallbackNote: function () {
+        var host = document.getElementById('tariffFallbackNote');
+        if (!host) return;
+        var def = null;
+        var rows = this.tariffs || [];
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].id === this.defaultTariffId) { def = rows[i]; break; }
+        }
+        // resolve() requires the default to actually price the gun, and rateFor()
+        // falls back to acRate — so a default with no acRate cannot price a normal
+        // AC charge. Don't promise it covers everything in that case.
+        if (def && def.enabled !== false && def.acRate > 0) {
+            var label = (def.label && def.label !== '')
+                ? def.label : this._t('charge.tariff_unnamed', 'Unnamed tariff');
+            host.textContent = this._t('charge.tariff_fallback_default',
+                'Charges outside every tariff use "' + label + '".', { label: label });
+            host.style.display = '';
+            return;
+        }
+        if (this.electricityRate > 0) {
+            var rate = this._money(this.electricityRate);
+            host.textContent = this._t('charge.tariff_fallback_global',
+                'Charges outside every tariff use ' + rate + '/kWh.', { rate: rate });
+            host.style.display = '';
+            return;
+        }
+        host.style.display = 'none';
+    },
+
+    /** Disable "add" at the cap so the user learns the limit before a failed POST. */
+    _updateTariffAddBtn: function () {
+        var btn = document.getElementById('tariffAddBtn');
+        if (!btn) return;
+        var atCap = (this.tariffs || []).length >= (this.maxTariffs || 40);
+        btn.disabled = atCap;
+        btn.title = atCap
+            ? this._t('charge.tariff_limit', 'Tariff limit reached')
+            : '';
+    },
+
+    _tariffRow: function (t) {
+        var self = this;
+        var row = document.createElement('div');
+        row.className = 'tariff-row'
+            + (t.id === this.matchedTariffId ? ' matched' : '')
+            + (t.enabled === false ? ' disabled' : '');
+
+        var cur = (t.currency && t.currency !== '') ? t.currency : (this.currency || '$');
+        // Rate line: AC always, DC only when this place bills it separately.
+        var rateBits = [];
+        if (t.acRate > 0) {
+            rateBits.push('<span class="mono">' + this._esc(cur) + t.acRate.toFixed(2) + '</span>'
+                + ' ' + this._esc(this._t('charge.tariff_ac_short', 'AC')));
+        }
+        if (t.dcRate > 0) {
+            rateBits.push('<span class="mono">' + this._esc(cur) + t.dcRate.toFixed(2) + '</span>'
+                + ' ' + this._esc(this._t('charge.tariff_dc_short', 'DC')));
+        }
+        if (rateBits.length === 0) {
+            rateBits.push(this._esc(this._t('charge.tariff_no_rate', 'No rate set')));
+        }
+
+        // Sub line: match radius + how often this tariff has actually priced a
+        // charge (provenance beats a bare coordinate pair for recognising a place).
+        var subBits = [Math.round(t.radiusM || 0) + ' m'];
+        if (t.useCount > 0) {
+            subBits.push(this._esc(this._t('charge.tariff_used_count',
+                t.useCount + '×', { count: t.useCount })));
+        }
+        if (t.lat != null && t.lng != null) {
+            subBits.push(t.lat.toFixed(3) + ', ' + t.lng.toFixed(3));
+        }
+
+        var label = (t.label && t.label !== '')
+            ? t.label
+            : this._t('charge.tariff_unnamed', 'Unnamed tariff');
+
+        var pills = '';
+        if (t.id === this.matchedTariffId) {
+            pills += '<span class="tariff-pill here">' + this._esc(this._t('charge.tariff_pill_here', 'auto here')) + '</span>';
+        }
+        if (t.id === this.defaultTariffId) {
+            pills += '<span class="tariff-pill default">' + this._esc(this._t('charge.tariff_pill_default', 'default')) + '</span>';
+        }
+
+        row.innerHTML =
+            '<div class="tariff-info">' +
+                '<div class="tariff-name-row">' +
+                    '<span class="tariff-name">' + this._esc(label) + '</span>' + pills +
+                '</div>' +
+                '<div class="tariff-meta">' + rateBits.join(' · ') + '</div>' +
+                '<div class="tariff-sub">' + subBits.join(' · ') + '</div>' +
+            '</div>' +
+            '<div class="tariff-actions">' +
+                '<button class="tariff-icon-btn' + (t.id === this.defaultTariffId ? ' on' : '') + '" data-act="default" ' +
+                    'title="' + this._esc(this._t('charge.tariff_set_default', 'Use when nothing matches')) + '">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>' +
+                '</button>' +
+                '<button class="tariff-icon-btn" data-act="edit" ' +
+                    'title="' + this._esc(this._t('common.edit', 'Edit')) + '">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>' +
+                '</button>' +
+                '<button class="tariff-icon-btn danger" data-act="delete" ' +
+                    'title="' + this._esc(this._t('common.delete', 'Delete')) + '">' +
+                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
+                '</button>' +
+            '</div>';
+
+        // Listeners rather than inline onclick: the id is data, and building
+        // handler strings from it invites a quoting bug.
+        var btns = row.querySelectorAll('.tariff-icon-btn');
+        for (var i = 0; i < btns.length; i++) {
+            (function (btn) {
+                btn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    var act = btn.getAttribute('data-act');
+                    if (act === 'edit') self.openTariffEditor(t);
+                    else if (act === 'delete') self.deleteTariff(t);
+                    else if (act === 'default') self.setDefaultTariff(t);
+                });
+            })(btns[i]);
+        }
+        return row;
+    },
+
+    /**
+     * Open the add/edit panel. `t` null = create at the current position; an
+     * object = edit that tariff (its stored location is kept as-is, so editing a
+     * rate from the couch can't move the tariff to wherever the car is parked).
+     */
+    openTariffEditor: function (t) {
+        var editor = document.getElementById('tariffEditor');
+        if (!editor) return;
+        this._editingTariff = t || null;
+        // Creating pins to the CURRENT position, so refresh the snapshot rather than
+        // showing whatever fix happened to exist at page load. Async: the chip below
+        // renders from the cached value now and _applyTariffs redraws it on arrival.
+        if (!t) this.loadTariffs();
+
+        this._setInput('tariffLabelInput', t ? (t.label || '') : '');
+        // On CREATE, seed the rates from the existing global settings. Those are
+        // the rates the user already pays, so "save a tariff for here" is usually
+        // just naming a place — pre-filling saves re-typing a number the app
+        // already knows, and the fields stay editable. Left blank when no global
+        // rate is configured (nothing to suggest).
+        this._setInput('tariffAcRateInput',
+            t ? (t.acRate > 0 ? t.acRate : '') : (this.electricityRate > 0 ? this.electricityRate : ''));
+        this._setInput('tariffDcRateInput',
+            t ? (t.dcRate > 0 ? t.dcRate : '') : (this.dcRate > 0 ? this.dcRate : ''));
+        this._setInput('tariffRadiusInput', t ? (t.radiusM || this.TARIFF_DEFAULT_RADIUS_M) : this.TARIFF_DEFAULT_RADIUS_M);
+
+        this._renderTariffLocChip();
+        this._setTariffError('');
+        editor.style.display = '';
+        var labelInput = document.getElementById('tariffLabelInput');
+        if (labelInput) { try { labelInput.focus(); } catch (e) {} }
+    },
+
+    /**
+     * Paint the editor's location chip from the tariff being edited, else the live
+     * fix. Factored out so the async loadTariffs() refresh can REPAINT it — the chip
+     * previously showed the page-load snapshot while the save sent a newer fix, so
+     * the tariff could be pinned somewhere the user never confirmed.
+     */
+    _renderTariffLocChip: function () {
+        var locText = document.getElementById('tariffLocText');
+        if (!locText) return;
+        var t = this._editingTariff;
+        if (t && t.lat != null && t.lng != null) {
+            locText.textContent = t.lat.toFixed(5) + ', ' + t.lng.toFixed(5);
+        } else if (this.tariffGpsLat != null && this.tariffGpsLng != null) {
+            locText.textContent = this.tariffGpsLat.toFixed(5) + ', ' + this.tariffGpsLng.toFixed(5);
+        } else {
+            locText.textContent = this._t('charge.tariff_no_gps', 'Waiting for GPS…');
+        }
+    },
+
+    closeTariffEditor: function () {
+        var editor = document.getElementById('tariffEditor');
+        if (editor) editor.style.display = 'none';
+        this._editingTariff = null;
+        this._setTariffError('');
+    },
+
+    _setTariffError: function (msg) {
+        var el = document.getElementById('tariffError');
+        if (!el) return;
+        if (!msg) { el.style.display = 'none'; el.textContent = ''; return; }
+        el.textContent = msg;
+        el.style.display = '';
+    },
+
+    saveTariff: function () {
+        var self = this;
+        var editing = this._editingTariff;
+        var label = this._getStr('tariffLabelInput').trim();
+        var acRate = this._getNum('tariffAcRateInput');
+        var dcRate = this._getNum('tariffDcRateInput');
+        var radiusM = this._getNum('tariffRadiusInput') || this.TARIFF_DEFAULT_RADIUS_M;
+
+        // Validate before POSTing so the user gets the reason inline. The server
+        // re-checks all of this (never trust the client), but failing here avoids
+        // a round-trip and keeps the message next to the field at fault.
+        //
+        // A tariff with no rate would match a charge and then price it at
+        // nothing, which reads as a bug. Require at least one rate up front.
+        if (acRate <= 0 && dcRate <= 0) {
+            this._setTariffError(this._t('charge.tariff_err_no_rate', 'Enter an AC or DC rate'));
+            return;
+        }
+        if (acRate < 0 || dcRate < 0 || acRate >= 100000 || dcRate >= 100000) {
+            this._setTariffError(this._t('charge.tariff_err_rate_range',
+                'Rates must be between 0 and 100000'));
+            return;
+        }
+        // A radius below GPS scatter can never match; an oversized one would
+        // swallow neighbouring sites on different tariffs.
+        if (radiusM < 25 || radiusM > 2000) {
+            this._setTariffError(this._t('charge.tariff_err_radius',
+                'Match radius must be between 25 and 2000 m'));
+            return;
+        }
+        if (label.length > 48) {
+            this._setTariffError(this._t('charge.tariff_err_label', 'Label is too long'));
+            return;
+        }
+        // Two tariffs with the same name are indistinguishable in the list and on
+        // a session card, which defeats the point of labelling them.
+        var dupe = (this.tariffs || []).some(function (t) {
+            return t.label && label && t.label.toLowerCase() === label.toLowerCase()
+                && (!editing || t.id !== editing.id);
+        });
+        if (dupe) {
+            this._setTariffError(this._t('charge.tariff_err_dupe_label',
+                'A tariff with that label already exists'));
+            return;
+        }
+        // No client-side GPS gate. tariffGpsLat is a snapshot taken at page load;
+        // gating on it permanently blocked "Add tariff" for anyone who opened the
+        // page before the first fix, with no in-page way to refresh. The server
+        // takes its OWN live fix at POST time and returns a 400 with a readable
+        // reason when it genuinely has none — which saveTariff already renders
+        // into #tariffError below.
+        this._setTariffError('');
+
+        var body = {
+            label: label,
+            acRate: acRate,
+            dcRate: dcRate,
+            radiusM: radiusM,
+            currency: this.currency || '$'
+        };
+        if (editing) {
+            body.id = editing.id;
+        } else if (this.tariffGpsLat != null && this.tariffGpsLng != null) {
+            // Pin to the fix the user was shown in the location chip. Otherwise the
+            // server re-reads GPS at POST time and the tariff can land somewhere the
+            // user never confirmed (they may have driven off since opening the form).
+            body.lat = this.tariffGpsLat;
+            body.lng = this.tariffGpsLng;
+        }
+
+        var btn = document.getElementById('tariffSaveBtn');
+        if (btn) { btn.disabled = true; btn.textContent = this._t('common.saving', 'Saving…'); }
+        this._writing = true;
+
+        fetch('/api/charging/tariffs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        }).then(function (r) { return r.json(); })
+          .then(function (d) {
+              self._writing = false;
+              if (btn) { btn.disabled = false; btn.textContent = self._t('common.save', 'Save'); }
+              if (!d || !d.success) {
+                  self._setTariffError((d && d.error) || self._t('charge.tariff_err_save', 'Could not save tariff'));
+                  return;
+              }
+              self.closeTariffEditor();
+              // Confirm the automatic behaviour explicitly on save — the whole
+              // point of a tariff is that the user never touches it again, so
+              // say so once with the actual radius rather than leaving them to
+              // infer it.
+              if (!editing) {
+                  self._toast(self._t('charge.tariff_auto_hint',
+                      'Saved. Charges within ' + radiusM + ' m of here will use this tariff automatically.',
+                      { radius: radiusM }));
+              }
+              self._afterTariffChange(d, null, !editing);
+          })
+          .catch(function () {
+              self._writing = false;
+              if (btn) { btn.disabled = false; btn.textContent = self._t('common.save', 'Save'); }
+              self._setTariffError(self._t('charge.tariff_err_save', 'Could not save tariff'));
+          });
+    },
+
+    deleteTariff: function (t) {
+        var self = this;
+        var label = (t.label && t.label !== '') ? t.label : this._t('charge.tariff_unnamed', 'Unnamed tariff');
+        var ask = this._t('charge.tariff_confirm_delete', 'Delete this tariff? Charges priced with it will fall back to your other rates.');
+        var proceed = function (ok) {
+            if (!ok) return;
+            self._writing = true;
+            fetch('/api/charging/tariffs/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: t.id })
+            }).then(function (r) { return r.json(); })
+              .then(function (d) {
+                  self._writing = false;
+                  if (d && d.success) self._afterTariffChange(d, label);
+                  else self._toast(self._t('charge.tariff_err_delete', 'Could not delete tariff'), 'error');
+              })
+              .catch(function () {
+                  self._writing = false;
+                  self._toast(self._t('charge.tariff_err_delete', 'Could not delete tariff'), 'error');
+              });
+        };
+        if (window.BYD && BYD.utils && typeof BYD.utils.confirmDialog === 'function') {
+            BYD.utils.confirmDialog({
+                title: this._t('common.delete', 'Delete'),
+                body: ask,
+                confirmLabel: this._t('common.delete', 'Delete'),
+                cancelLabel: this._t('common.cancel', 'Cancel'),
+                danger: true
+            }).then(proceed);
+        } else {
+            proceed(window.confirm(ask));
+        }
+    },
+
+    setDefaultTariff: function (t) {
+        var self = this;
+        // Tapping the star on the current default clears it — one control, both
+        // directions, no separate "unset" affordance to discover.
+        var next = (t.id === this.defaultTariffId) ? '' : t.id;
+        this._writing = true;
+        fetch('/api/charging/tariffs/default', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: next })
+        }).then(function (r) { return r.json(); })
+          .then(function (d) {
+              self._writing = false;
+              if (d && d.success) self._afterTariffChange(d);
+              else self._toast(self._t('charge.tariff_err_save', 'Could not save tariff'), 'error');
+          })
+          .catch(function () {
+              self._writing = false;
+              self._toast(self._t('charge.tariff_err_save', 'Could not save tariff'), 'error');
+          });
+    },
+
+    /**
+     * Shared post-mutation refresh. A tariff change re-prices history server-side,
+     * so the session list, the summary tiles and the cost hero all have to reload
+     * — otherwise the page keeps showing costs at the old rate. `repriced` is
+     * surfaced so the user sees that past charges were corrected, not just the
+     * next one.
+     */
+    _afterTariffChange: function (d, deletedLabel, suppressSavedToast) {
+        var n = (d && d.repriced) ? d.repriced : 0;
+        if (n > 0) {
+            // plural() picks one/other; it also returns the raw key on a miss, so
+            // guard the same way _t does.
+            var msg = null;
+            if (window.BYD && BYD.i18n && typeof BYD.i18n.plural === 'function') {
+                var pv = BYD.i18n.plural('charge.tariff_repriced', n, { count: n });
+                if (pv && pv !== 'charge.tariff_repriced') msg = pv;
+            }
+            this._toast(msg || (n + (n === 1 ? ' past charge re-priced' : ' past charges re-priced')));
+        } else if (deletedLabel) {
+            this._toast(this._t('charge.tariff_deleted', 'Tariff deleted'));
+        } else if (!suppressSavedToast) {
+            // The create path already toasted the auto-apply hint; don't stack a
+            // second, less informative "Tariff saved" on top of it.
+            this._toast(this._t('charge.tariff_saved', 'Tariff saved'));
+        }
+        this.loadTariffs();
+        this.loadSessions(0);
+        this.loadSummary();
+    },
+
     // ==================== FORMAT / DOM HELPERS ====================
 
     _money: function (v) {
@@ -1919,29 +2428,44 @@ var CHARGING = {
     _typeKind: function (s) {
         if (!s) return 'unk';
         var peak = (s.peakPower != null && s.peakPower > 0) ? s.peakPower : 0;
-        // Honour a DC gun flag ONLY if the peak is physically consistent with DC.
-        // A DC flag with a sub-DC peak is a gun-state misread — fall through to the
-        // power-based AC split instead of blindly showing "DC fast".
-        if ((s.isDc === true && peak >= this.DC_MIN_PEAK_KW) || peak >= this.DC_KW) return 'dc';
+        // A TRUE isDc flag is already peak-guarded: the backend's deriveIsDc only
+        // returns 1 when the gun says DC *and* the peak cleared DC_MIN_PEAK_KW, and
+        // it is the same call that selects dcRate. Re-testing the peak here was a
+        // SECOND, independent application of that guard against a peak that can come
+        // from a different source (the served peakPower is the max of CPS samples,
+        // while pricing used the in-memory running max) — so a session in the
+        // 15..25 kW band could be priced DC yet fall through to the power-only split
+        // and render "AC fast". Trust the flag; the guard lives in one place.
+        if (s.isDc === true || peak >= this.DC_KW) return 'dc';
         if (s.isDc === false) return peak >= this.AC_FAST_KW ? 'fast' : 'slow';
-        // DC flag but implausibly-low peak, or unknown gun state — bucket by power
-        // so old/partial rows and misread-gun rows still classify sensibly.
+        // Unknown gun state (isDc null: legacy/partial rows, AC_DC/V2L, or a
+        // peak-downgraded misread) — bucket by power so they still classify sensibly.
         if (peak >= this.DC_KW) return 'dc';
         if (peak >= this.AC_FAST_KW) return 'fast';
         if (peak > 0) return 'slow';
         return 'unk';
     },
 
-    // Effective per-kWh rate for the LIVE in-progress session: the separate DC
-    // tariff when the open session is CONFIDENTLY DC and a dcRate is set, else
-    // the base rate. Mirrors the backend deriveIsDc()+effectiveRate() pricing
-    // path EXACTLY (gun==3 AND peak ≥ DC_MIN_PEAK_KW) — NOT the lenient, peak-only
-    // _typeKind() DISPLAY classifier — so this live "Cost this session" estimate
-    // agrees with the session-card cost (backend-computed) shown alongside it and
-    // with the value persisted at session end. Pricing is intentionally stricter
-    // than the label: we only apply the DC premium when the gun confirms DC.
+    // Effective per-kWh rate for the LIVE in-progress session.
+    //
+    // PREFER THE SERVER'S OWN NUMBER. chargingRowToJson stamps the open row's
+    // `electricityRate` with the result of priceSession(deriveIsDc(...)) — the
+    // SAME call that prices the row when it closes — which resolves the
+    // LOCATION-TARIFF layer (TariffManager circles) before falling back to the
+    // global DC/base rate. Re-deriving the rate here could only ever replicate
+    // that fallback: a client-side mirror has no lat/lng, so a charge inside a
+    // tariff circle showed the hero cost at the global rate while the card
+    // beside it showed the tariff-priced cost, and the mismatch resolved only
+    // when the session closed. Reading the served value removes the whole class
+    // of drift, and keeps this in step with deriveIsDc automatically — including
+    // its I5 rule that an unmeasured peak must NOT be read as "trust the gun".
+    //
+    // The local fallback below is retained ONLY for the pre-first-sample window,
+    // where energyAdded is still 0 so the backend has not stamped a rate yet
+    // (and the hero is gated on liveKwh > 0 anyway), and for older daemons.
     _liveRate: function () {
         var s = this._liveSession;
+        if (s && s.electricityRate != null && s.electricityRate > 0) return s.electricityRate;
         if (this.dcRate > 0 && s && s.gunState === 3
                 && s.peakPower != null && s.peakPower >= this.DC_MIN_PEAK_KW) {
             return this.dcRate;
@@ -1990,9 +2514,14 @@ var CHARGING = {
     },
 
     // Minimal HTML escape for interpolated text (place names can contain & < >).
+    // Escapes for BOTH text nodes and quoted attribute values. Quotes matter:
+    // tariff labels are user text and are interpolated into title="..." on the
+    // row action buttons, so a label containing " would otherwise break out of
+    // the attribute and inject markup.
     _esc: function (str) {
         if (str == null) return '';
-        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                          .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     },
 
     _rgba: function (color, alpha) {
@@ -2012,10 +2541,15 @@ var CHARGING = {
         return color;
     },
 
-    _t: function (key, fallback) {
+    // BYD.i18n.t() has THREE returns: the translation, null while the catalog is
+    // still loading, or THE RAW KEY when the key is missing from both the active
+    // and the en catalog. A bare truthiness test treats that raw key as a hit, so
+    // the caller's fallback is dead and the UI renders "charge.tariff_pill_here".
+    // Reject the sentinel explicitly. `vars` forwards {placeholder} values.
+    _t: function (key, fallback, vars) {
         if (window.BYD && BYD.i18n && typeof BYD.i18n.t === 'function') {
-            var v = BYD.i18n.t(key);
-            if (v) return v;
+            var v = BYD.i18n.t(key, vars);
+            if (v && v !== key) return v;
         }
         return fallback;
     },

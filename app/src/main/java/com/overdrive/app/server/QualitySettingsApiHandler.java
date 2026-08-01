@@ -299,31 +299,42 @@ public class QualitySettingsApiHandler {
         response.put("recordingsStorageTypeActive", storage.getActiveRecordingsStorageType().name());
         response.put("surveillanceStorageTypeActive", storage.getActiveSurveillanceStorageType().name());
 
-        // SD card info
+        // SD card info. Each get*Space() builds a fresh StatFs (plus an
+        // exists()/isDirectory() pair), so the raw + formatted pairs below read
+        // each value ONCE into a local instead of calling the getter twice —
+        // this response used to issue ~17 StatFs constructions for 6 distinct
+        // numbers. Also keeps the raw and formatted fields internally
+        // consistent, which two separate reads don't guarantee.
         response.put("sdCardAvailable", storage.isSdCardAvailable());
         response.put("sdCardPath", storage.getSdCardPath());
         if (storage.isSdCardAvailable()) {
-            response.put("sdCardFreeSpace", storage.getSdCardFreeSpace());
-            response.put("sdCardTotalSpace", storage.getSdCardTotalSpace());
-            response.put("sdCardFreeFormatted", StorageManager.formatSize(storage.getSdCardFreeSpace()));
-            response.put("sdCardTotalFormatted", StorageManager.formatSize(storage.getSdCardTotalSpace()));
+            long sdFree = storage.getSdCardFreeSpace();
+            long sdTotal = storage.getSdCardTotalSpace();
+            response.put("sdCardFreeSpace", sdFree);
+            response.put("sdCardTotalSpace", sdTotal);
+            response.put("sdCardFreeFormatted", StorageManager.formatSize(sdFree));
+            response.put("sdCardTotalFormatted", StorageManager.formatSize(sdTotal));
         }
 
         // USB info
         response.put("usbAvailable", storage.isUsbAvailable());
         response.put("usbPath", storage.getUsbPath());
         if (storage.isUsbAvailable()) {
-            response.put("usbFreeSpace", storage.getUsbFreeSpace());
-            response.put("usbTotalSpace", storage.getUsbTotalSpace());
-            response.put("usbFreeFormatted", StorageManager.formatSize(storage.getUsbFreeSpace()));
-            response.put("usbTotalFormatted", StorageManager.formatSize(storage.getUsbTotalSpace()));
+            long usbFree = storage.getUsbFreeSpace();
+            long usbTotal = storage.getUsbTotalSpace();
+            response.put("usbFreeSpace", usbFree);
+            response.put("usbTotalSpace", usbTotal);
+            response.put("usbFreeFormatted", StorageManager.formatSize(usbFree));
+            response.put("usbTotalFormatted", StorageManager.formatSize(usbTotal));
         }
 
         // Internal storage info
-        response.put("internalFreeSpace", storage.getInternalFreeSpace());
-        response.put("internalTotalSpace", storage.getInternalTotalSpace());
-        response.put("internalFreeFormatted", StorageManager.formatSize(storage.getInternalFreeSpace()));
-        response.put("internalTotalFormatted", StorageManager.formatSize(storage.getInternalTotalSpace()));
+        long intFree = storage.getInternalFreeSpace();
+        long intTotal = storage.getInternalTotalSpace();
+        response.put("internalFreeSpace", intFree);
+        response.put("internalTotalSpace", intTotal);
+        response.put("internalFreeFormatted", StorageManager.formatSize(intFree));
+        response.put("internalTotalFormatted", StorageManager.formatSize(intTotal));
 
         HttpResponse.sendJson(out, response.toString());
     }
@@ -655,10 +666,16 @@ public class QualitySettingsApiHandler {
             // fixed quarter turn (0/90/180/270) or "auto" (direction-of-travel); the
             // base angle for "auto" is the sibling "rotationBase". Only honoured for
             // single-view modes (the daemon gates it); persisted by updateSection
-            // above, then re-resolved onto the running SurfaceControl layer here. A
-            // rotationBase edit is also refreshed so an "auto" card re-orients live.
+            // above, then re-resolved onto the running GL scaler (vertex-shader output
+            // rotation — the SurfaceControl layer stays at identity, issue #164) here.
+            // A rotationBase edit is also refreshed so an "auto" card re-orients live.
+            // PER-SIDE: rotationLeft/rotationRight + rotationBaseLeft/rotationBaseRight
+            // edits must refresh too — resolveBsRotation reads the current view's key,
+            // so a right-side rotation change lands live while a right turn is active.
             // No-op when the lane isn't up (next enable re-applies it).
-            if ("blindspot".equals(section) && (data.has("rotation") || data.has("rotationBase"))) {
+            if ("blindspot".equals(section) && (data.has("rotation") || data.has("rotationBase")
+                    || data.has("rotationLeft") || data.has("rotationRight")
+                    || data.has("rotationBaseLeft") || data.has("rotationBaseRight"))) {
                 try {
                     com.overdrive.app.surveillance.GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
                     if (p != null) p.refreshBlindSpotRotation();
@@ -676,6 +693,32 @@ public class QualitySettingsApiHandler {
                     if (p != null) p.relayoutCluster();
                 } catch (Exception e) {
                     CameraDaemon.log("blindspot relayout dispatch failed: " + e.getMessage());
+                }
+            }
+            // A blind-spot FISHEYE (lens-dewarp) change must take effect live. Separate
+            // knob from recording.rectifyStrength; only shapes the single-camera
+            // (side/rear) passthrough. Persisted above; push to the running scalers.
+            if ("blindspot".equals(section) && data.has("rectifyStrength")) {
+                try {
+                    com.overdrive.app.surveillance.GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
+                    if (p != null) p.setBlindSpotRectifyStrength(data.optInt("rectifyStrength", 0));
+                } catch (Exception e) {
+                    CameraDaemon.log("blindspot fisheye dispatch failed: " + e.getMessage());
+                }
+            }
+            // A blind-spot GEOMETRY change (size%/corner, incl. the per-side
+            // cornerLeft/cornerRight) must take effect live. The preset is persisted by
+            // updateSection above; re-resolve the card rect from the live panel + the
+            // current view's per-side corner and re-place it. refreshBlindSpotRotation()
+            // re-runs resolveBsGeometry() (which picks the side's corner via
+            // resolveBsCorner) and re-applies the rect when shown — no ACC cycle needed.
+            // Covers no-bridge (tunnel/browser) clients. No-op when the lane isn't up.
+            if ("blindspot".equals(section) && (data.has("geometry") || data.has("geometryCluster"))) {
+                try {
+                    com.overdrive.app.surveillance.GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
+                    if (p != null) p.refreshBlindSpotRotation();
+                } catch (Exception e) {
+                    CameraDaemon.log("blindspot geometry dispatch failed: " + e.getMessage());
                 }
             }
             // A blind-spot ENABLE flip must take effect live for NO-BRIDGE clients
@@ -1653,14 +1696,63 @@ public class QualitySettingsApiHandler {
     private static void sendTelemetryOverlaySettings(OutputStream out) throws Exception {
         boolean panoEffective = com.overdrive.app.config.UnifiedConfigManager
             .isTelemetryOverlayEnabledFor("pano");
+        boolean survEffective = com.overdrive.app.config.UnifiedConfigManager
+            .isTelemetryOverlayEnabledFor("surveillance");
         boolean oemEffective = com.overdrive.app.config.UnifiedConfigManager
             .isTelemetryOverlayEnabledFor("oemDashcam");
         JSONObject response = new JSONObject();
         response.put("success", true);
         response.put("enabled", panoEffective);              // legacy alias = pano
         response.put("panoEnabled", panoEffective);
+        response.put("surveillanceEnabled", survEffective);
         response.put("oemDashcamEnabled", oemEffective);
+        // Per-flow field selection. Absent list → the legacy eight-field
+        // default (resolved here so the web always gets a concrete array and
+        // renders the checklist consistently regardless of persistence state).
+        response.put("fields", buildFieldsResponse());
+        // Catalogue of every selectable field (key + which are legacy-default),
+        // so the UI can render the checklist without hard-coding the list.
+        response.put("fieldCatalog", buildFieldCatalog());
         HttpResponse.sendJson(out, response.toString());
+    }
+
+    /** Resolved per-flow field arrays: {@code {accOn:[...],surveillance:[...],oemDashcam:[...]}}. */
+    private static JSONObject buildFieldsResponse() throws Exception {
+        JSONObject fields = new JSONObject();
+        for (String flow : new String[]{"accOn", "surveillance", "oemDashcam"}) {
+            org.json.JSONArray arr = com.overdrive.app.config.UnifiedConfigManager
+                .getTelemetryOverlayFields(flow);
+            // fromJsonArray applies the legacy default on null, then re-serialize
+            // so the response is always an explicit, canonical-order array.
+            fields.put(flow, com.overdrive.app.telemetry.TelemetryFields
+                .fromJsonArray(arr).toJsonArray());
+        }
+        return fields;
+    }
+
+    /**
+     * Normalize an incoming field-key array: drop unknown keys, dedupe, and put
+     * into canonical order by round-tripping through TelemetryFields. An empty
+     * result is preserved as an explicit empty array (user deselected all) —
+     * distinct from a missing list (legacy default). NOTE: an all-unknown-keys
+     * input also collapses to empty here; the web UI only ever sends known keys.
+     */
+    private static org.json.JSONArray canonicalizeFields(org.json.JSONArray in) {
+        return com.overdrive.app.telemetry.TelemetryFields
+            .fromJsonArrayStrict(in).toJsonArray();
+    }
+
+    /** All selectable fields as {@code [{key,legacyDefault}]} in canonical order. */
+    private static org.json.JSONArray buildFieldCatalog() throws Exception {
+        org.json.JSONArray cat = new org.json.JSONArray();
+        for (com.overdrive.app.telemetry.TelemetryFields.Field f
+                : com.overdrive.app.telemetry.TelemetryFields.Field.values()) {
+            JSONObject o = new JSONObject();
+            o.put("key", f.getKey());
+            o.put("legacyDefault", f.isLegacyDefault());
+            cat.put(o);
+        }
+        return cat;
     }
 
     /**
@@ -1967,6 +2059,9 @@ public class QualitySettingsApiHandler {
             if (settings.has("panoEnabled")) {
                 delta.put("panoEnabled", settings.optBoolean("panoEnabled", false));
             }
+            if (settings.has("surveillanceEnabled")) {
+                delta.put("surveillanceEnabled", settings.optBoolean("surveillanceEnabled", false));
+            }
             if (settings.has("oemDashcamEnabled")) {
                 delta.put("oemDashcamEnabled", settings.optBoolean("oemDashcamEnabled", false));
             }
@@ -1974,12 +2069,42 @@ public class QualitySettingsApiHandler {
                 com.overdrive.app.config.UnifiedConfigManager.setTelemetryOverlay(delta);
             }
 
-            // Notify pano pipeline of the resolved pano state.
+            // Per-flow field selection. Body key "fields" is an object keyed by
+            // flow ("accOn"/"surveillance"/"oemDashcam"), each an array of field
+            // keys. Persisted independently (setTelemetryOverlayFields merges into
+            // the nested `fields` object so the other flows are preserved).
+            JSONObject fieldsIn = settings.optJSONObject("fields");
+            boolean accOnFieldsChanged = false, survFieldsChanged = false, oemFieldsChanged = false;
+            if (fieldsIn != null) {
+                if (fieldsIn.has("accOn")) {
+                    org.json.JSONArray a = fieldsIn.optJSONArray("accOn");
+                    if (a != null) { com.overdrive.app.config.UnifiedConfigManager
+                        .setTelemetryOverlayFields("accOn", canonicalizeFields(a)); accOnFieldsChanged = true; }
+                }
+                if (fieldsIn.has("surveillance")) {
+                    org.json.JSONArray a = fieldsIn.optJSONArray("surveillance");
+                    if (a != null) { com.overdrive.app.config.UnifiedConfigManager
+                        .setTelemetryOverlayFields("surveillance", canonicalizeFields(a)); survFieldsChanged = true; }
+                }
+                if (fieldsIn.has("oemDashcam")) {
+                    org.json.JSONArray a = fieldsIn.optJSONArray("oemDashcam");
+                    if (a != null) { com.overdrive.app.config.UnifiedConfigManager
+                        .setTelemetryOverlayFields("oemDashcam", canonicalizeFields(a)); oemFieldsChanged = true; }
+                }
+            }
+
+            // Notify pano pipeline of the resolved pano state + surveillance master.
             boolean panoEffective = com.overdrive.app.config.UnifiedConfigManager
                 .isTelemetryOverlayEnabledFor("pano");
+            boolean survEffective = com.overdrive.app.config.UnifiedConfigManager
+                .isTelemetryOverlayEnabledFor("surveillance");
             com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
             if (pipeline != null) {
                 pipeline.setOverlayEnabled(panoEffective);
+                pipeline.setSurveillanceOverlayEnabled(survEffective);
+                // Push live field edits to whichever flow is currently recording.
+                if (accOnFieldsChanged) pipeline.refreshOverlayFields("pano");
+                if (survFieldsChanged) pipeline.refreshOverlayFields("surveillance");
             }
 
             // Notify OEM Dashcam pipeline of its resolved state. The pipeline
@@ -1993,13 +2118,20 @@ public class QualitySettingsApiHandler {
             com.overdrive.app.camera.OemDashcamPipeline oem = CameraDaemon.getOemDashcamPipeline();
             if (oem != null) {
                 oem.setOverlayEnabled(oemEffective);
+                if (oemFieldsChanged) {
+                    oem.setOverlayFields(com.overdrive.app.telemetry.TelemetryFields.fromJsonArray(
+                        com.overdrive.app.config.UnifiedConfigManager
+                            .getTelemetryOverlayFields("oemDashcam")));
+                }
             }
 
             JSONObject response = new JSONObject();
             response.put("success", true);
             response.put("enabled", panoEffective);              // legacy alias
             response.put("panoEnabled", panoEffective);
+            response.put("surveillanceEnabled", survEffective);
             response.put("oemDashcamEnabled", oemEffective);
+            response.put("fields", buildFieldsResponse());
             HttpResponse.sendJson(out, response.toString());
         } catch (Exception e) {
             CameraDaemon.log("Error setting telemetry overlay: " + e.getMessage());

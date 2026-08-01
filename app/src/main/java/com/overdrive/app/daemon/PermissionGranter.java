@@ -478,13 +478,6 @@ public final class PermissionGranter {
     }
 
     private static void log(String msg) {
-        // DaemonLogger, not a bare System.out.println: proguard-rules.pro
-        // applies -assumenosideeffects to java.io.PrintStream in EVERY release
-        // build, so raw println calls are stripped and the field would see
-        // nothing from this class. DaemonLogger's file channel writes via
-        // PrintWriter (not PrintStream), survives that rule, and is gated by
-        // DaemonLogConfig — the supported field-diagnostics path. Its stdout
-        // channel also covers debug daemon runs (with timestamps).
-        com.overdrive.app.logging.DaemonLogger.getInstance(TAG).info(msg);
+        System.out.println(TAG + ": " + msg);
     }
 }

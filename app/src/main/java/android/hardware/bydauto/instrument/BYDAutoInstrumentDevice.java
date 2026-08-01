@@ -39,8 +39,26 @@ public class BYDAutoInstrumentDevice extends AbsBYDAutoDevice {
         return 25;
     }
 
+    /**
+     * Compile-time stub. Returns -1 (a HAL failure code), NOT the 0 the other stubs return.
+     *
+     * <p>Same reasoning as {@code BYDAutoSafetyBeltDevice.getPassengerStatus}: 0 is not a neutral
+     * placeholder here — it is UNBUCKLED, a state automations act on. A fabricated 0 fires a
+     * permanent "seatbelt unbuckled" for BOTH seats at boot and stops any "when buckled" rule
+     * from ever firing.
+     *
+     * <p>-1 rather than INVALID(2), deliberately: {@code sanitizeSeatbelt} maps 2 to UNBUCKLED
+     * for the driver (a best-effort rule so the driver's off-edge publishes), so 2 would only
+     * half-fix this. -1 is in {@code SEATBELT_FAILURE_CODES}, so BOTH seats read UNAVAILABLE and
+     * nothing is published — the only safe answer a stub can give.
+     *
+     * <p>Normally unreachable: on a BYD head unit the boot classloader's real class wins. But
+     * {@code Class.forName} resolves THIS class on a trim whose framework lacks it, and the
+     * primary device path has no stub guard (only {@code BydManagerChannel}'s tier-B fallback
+     * checks {@code isOurOwnStub}), so the stub can become the live handle.
+     */
     public int getSafetyBeltStatus(int i) {
-        return 0;
+        return -1; // HAL failure code → UNAVAILABLE for both seats; deliberately not UNBUCKLED(0)
     }
 
     public int getType() {

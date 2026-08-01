@@ -73,10 +73,12 @@ public class Automations {
         // no automation is enabled). Feeds wifiState / wifiSsid / boot events.
         com.overdrive.app.automation.condition.NetworkEvent.scheduleNetworkEvent();
 
-        // Start the low-cadence Bluetooth poll (self-gating, same as WiFi). Feeds
-        // btState / btDeviceName events. Costs only a parked scheduler thread until an
-        // automation is enabled.
-        com.overdrive.app.automation.condition.BluetoothEvent.scheduleBluetoothEvent();
+        // NOTE: btState / btDeviceName are NOT polled here. Bluetooth can't be read
+        // reliably from the daemon (UID 2000) — Bluetooth is only readable from a normal
+        // app process, not the shell-UID daemon. So
+        // the app-process BluetoothStateMonitor (started by KeepAliveAccessibilityService)
+        // watches ACL connect/disconnect and relays those events to the daemon via
+        // Automations.publishExternalEvent, exactly like callState.
 
         // Start the FAST turn-indicator poll. Self-gates one level tighter than the
         // others (isEventReferenced): it reads the lamps at 500ms ONLY while an enabled
@@ -84,6 +86,25 @@ public class Automations {
         // ticking a cheap map check. Publishes turnSignal on/off far more promptly than
         // the ~5s stationary snapshot cadence used to.
         com.overdrive.app.automation.condition.TurnSignalEvent.scheduleTurnSignalEvent();
+
+        // Start the FAST drive-mode poll. Same self-gating as TurnSignalEvent: reads the
+        // drive-config axis at 1s ONLY while an enabled automation actually triggers on
+        // driveMode, otherwise a parked thread ticking a cheap map check. Publishes the
+        // drive mode far more promptly than the ~5s stationary snapshot cadence used to.
+        com.overdrive.app.automation.condition.DriveModeEvent.scheduleDriveModeEvent();
+
+        // Start the FAST blind-spot poll. Same self-gating as TurnSignalEvent: reads the
+        // radar warning registers at 250ms ONLY while an enabled automation references
+        // blindSpot. The ADAS event callback also pushes alerts instantly; this poll covers
+        // trims that don't deliver those events, and expires the alert hold. See
+        // BlindSpotEvent.
+        com.overdrive.app.automation.condition.BlindSpotEvent.scheduleBlindSpotEvent();
+
+        // Start the FAST seatbelt poll. Identical self-gating to TurnSignalEvent: reads the
+        // belts at 500ms ONLY while an enabled automation actually triggers on a seatbelt,
+        // otherwise a parked thread ticking a cheap map check. Cuts a buckle trigger's lag
+        // from the ~5s stationary snapshot cadence (the reported "2-3s") to near-real-time.
+        com.overdrive.app.automation.condition.SeatbeltEvent.scheduleSeatbeltEvent();
 
         // Start the FAST dynamic-input poll (accelerator / brake / steering). Same
         // self-gating as TurnSignalEvent — reads a signal at 250ms ONLY while an enabled
@@ -95,6 +116,20 @@ public class Automations {
         // regen level at 1s ONLY while an enabled automation references energyRegen,
         // otherwise a parked thread. Fixes the 2-4s lag regen had on the ~5s snapshot.
         com.overdrive.app.automation.condition.EnergyRegenEvent.scheduleEnergyRegenEvent();
+
+        // Start the FAST gear poll. Same self-gating as TurnSignalEvent: reads gear at 500ms
+        // ONLY while an enabled automation triggers on gear, otherwise a parked thread ticking
+        // a cheap map check. Gear otherwise rode the 5s (ACC-on) snapshot; the gearbox HAL
+        // listener can't be used (its learningEPB() path crashes the daemon), so this fast poll
+        // is how a gear trigger becomes prompt. See GearEvent.
+        com.overdrive.app.automation.condition.GearEvent.scheduleGearEvent();
+
+        // Start the FAST climate poll (seat heat/cool per seat + high/low beam). Same
+        // self-gating: reads at 1s ONLY while an enabled automation references one of those
+        // six signals, otherwise a parked thread. These otherwise rode the ~5s snapshot (their
+        // HAL callbacks refresh only a subset — DRL / pushed seat events), so this closes the
+        // lag for the reported seat-cooling ELSE and for beam triggers. See ClimateEvent.
+        com.overdrive.app.automation.condition.ClimateEvent.scheduleClimateEvent();
 
         // Subscribe to raw door open/close edges (event-driven, no poll) so door-state
         // triggers fire the instant a door/lid opens. Self-gates on isDisabled().
@@ -194,7 +229,8 @@ public class Automations {
         // seeded — otherwise its variable would read null (not "") on first run and a
         // "!= true" guard would never pass. forEachAction walks the whole tree.
         forEachAction(actions, action -> {
-            if (!"setVariable".equals(action.getType()) && !"incrementVariable".equals(action.getType())) return;
+            if (!"setVariable".equals(action.getType()) && !"incrementVariable".equals(action.getType())
+                    && !"computeVariable".equals(action.getType())) return;
             Object name = action.getVariables() == null ? null : action.getVariables().get("name");
             if (name == null) return;
             String n = name.toString().trim();
@@ -312,6 +348,23 @@ public class Automations {
     private static final int MAX_RUN_DEPTH = 16;
     private static final ThreadLocal<Integer> RUN_DEPTH = ThreadLocal.withInitial(() -> 0);
 
+    // Set by a Wait Until whose condition never became true, to STOP the rest of the chain.
+    // Previously a timed-out wait just fell through and every following action ran anyway, so
+    // "wait until gear = P → fold mirrors" folded the mirrors even though the car never went
+    // into P — the wait looked like it did nothing. A timeout is now a failed precondition:
+    // the remaining actions (at every nesting level) are skipped and the run ends.
+    // Per-thread for the same reason as RUN_DEPTH, and cleared at the top of each run.
+    private static final ThreadLocal<Boolean> CHAIN_ABORTED = ThreadLocal.withInitial(() -> false);
+
+    /** Called by a wait action when its timeout elapsed without the condition being met. */
+    public static void abortChain() { CHAIN_ABORTED.set(true); }
+
+    /** Clear the abort flag — at the start of every independent action run. */
+    public static void resetChain() { CHAIN_ABORTED.set(false); }
+
+    /** Whether the current chain has been aborted by a timed-out wait. */
+    public static boolean chainAborted() { return CHAIN_ABORTED.get(); }
+
     /**
      * Run a list of actions in order, re-entrantly: a control-flow action's
      * {@code trigger} calls back here with its child list, so loops / if-branches /
@@ -327,9 +380,17 @@ public class Automations {
             logger.warn("Action nesting depth cap (" + MAX_RUN_DEPTH + ") hit — stopping to avoid runaway/cycle");
             return;
         }
+        // Depth 0 = the start of an independent run (the queue worker or /test). Clear any
+        // abort left by a previous run on this same pooled/worker thread, so one timed-out
+        // wait can never suppress the NEXT automation's actions.
+        if (depth == 0) resetChain();
         RUN_DEPTH.set(depth + 1);
         try {
             for (AutomationAction automationAction : actionList) {
+                // A timed-out wait aborts the rest of the chain, including the outer levels
+                // it returns into (a wait inside an If/Loop body stops the whole run, not just
+                // that body) — the precondition it was guarding never came true.
+                if (chainAborted()) break;
                 if (automationAction == null) continue;
                 Action action = getAction(automationAction.getType());
                 if (action == null) continue;
@@ -397,6 +458,81 @@ public class Automations {
             for (AutomationCondition c : a.getAllConditions()) {
                 if (key.equals(c.getEventData())) return true;
             }
+            // ACTION-side references too. The flow actions (if/else, wait-until,
+            // wait-until-signal, loop) test a signal from their own variables, NOT via a
+            // trigger or condition — so without this a self-gated signal's poller stays
+            // parked and the action reads a permanently-null state: an "if seatbelt ==
+            // unbuckled" silently never holds, and a wait-until burns its whole timeout.
+            // Walks nested child/else lists because these actions nest.
+            if (actionsReference(a.getActions(), key)) return true;
+            if (actionsReference(a.getElseActions(), key)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Does any action in this list (or nested beneath it) name {@code key} as an operand?
+     *
+     * <p>An action's operands are plain variable values, so this asks each value whether it
+     * ADDRESSES the key — covering both a left-hand signal address ({@code speed:units=kmph},
+     * and the legacy flat ids) and a dynamic right-hand {@code ${signal:…}} token, since both
+     * make the action depend on that signal being polled.
+     *
+     * <p>Depth-bounded by the same constant the action runner uses, so a malformed/deep tree
+     * can't make this walk unbounded on a scheduler thread.
+     */
+    /**
+     * The action-variable ids that can name a signal: {@code event} is a flow action's
+     * left-hand address ({@code SignalAddressType}) and {@code value} its dynamic right-hand
+     * side, which may hold a {@code ${signal:…}} token. Any other variable is a plain operand
+     * and is deliberately not treated as an address.
+     */
+    private static final String[] ADDRESS_FIELDS = { "event", "value" };
+
+    private static boolean actionsReference(List<AutomationAction> actions, EventData key) {
+        return actionsReference(actions, key, MAX_RUN_DEPTH);
+    }
+
+    /**
+     * Could this stored variable value possibly address a signal of {@code type}? A pure
+     * allocation-free pre-filter for {@link #actionsReference} — see the note there.
+     *
+     * <p>Conservative by construction: it may say "maybe" for a value that turns out not to
+     * match (the caller then does the real parse), but it never says "no" to a value that
+     * would. A real address is {@code type}, {@code type:…} or {@code ${signal:type…}}, so the
+     * type must appear in the string; a legacy alias doesn't contain its target type, so those
+     * are admitted by name.
+     */
+    private static boolean mightAddress(String value, String type) {
+        if (value.isEmpty() || type == null || type.isEmpty()) return false;
+        if (value.contains(type)) return true;
+        return AutomationCondition.isLegacySignalId(value.trim());
+    }
+
+    private static boolean actionsReference(List<AutomationAction> actions, EventData key, int depthLeft) {
+        if (actions == null || actions.isEmpty() || depthLeft <= 0) return false;
+        for (AutomationAction a : actions) {
+            if (a == null) continue;
+            // ONLY the two fields that can hold a signal address are considered: "event" (a
+            // flow action's LHS, a SignalAddressType) and "value" (the dynamic RHS, which may
+            // hold a ${signal:…} token). Scanning EVERY variable would be both wasteful and
+            // WRONG — a user variable or a free-text field could legitimately contain a word
+            // that happens to be a legacy signal id ("hazard", "drl"), which would then keep an
+            // unrelated signal's poller awake for no reason.
+            Map<String, Object> vars = a.getVariables();
+            for (String field : ADDRESS_FIELDS) {
+                Object v = vars.get(field);
+                if (!(v instanceof String)) continue;
+                String s = (String) v;
+                // Cheap reject before allocating. This runs on the fast pollers (the dynamics
+                // poll calls isEventReferenced 3x every 250ms), and parsing an address builds a
+                // fresh EventData plus a HashMap for the attributed case — avoid that for the
+                // overwhelmingly common "this value can't name this key" case.
+                if (!mightAddress(s, key.getType())) continue;
+                if (key.equals(AutomationCondition.resolveSignalAddress(s))) return true;
+            }
+            if (actionsReference(a.getChildActions(), key, depthLeft - 1)) return true;
+            if (actionsReference(a.getElseChildActions(), key, depthLeft - 1)) return true;
         }
         return false;
     }
@@ -755,9 +891,29 @@ public class Automations {
      * @param value The new value of the event
      */
     public static void update(EventData key, Value value) {
-        // Do nothing when no automations enabled
-        if (isDisabled()) return;
+        update(key, value, false);
+    }
+
+    /**
+     * Core state update.
+     *
+     * @param forceStore when true, the value is STORED into the state map even while no
+     *     automation is enabled ({@link #isDisabled()}). This is used ONLY for externally
+     *     relayed signals (btState / btDeviceName / callState — see
+     *     {@link #publishExternalEvent}): the app-process relay dedups on its side and stops
+     *     re-sending once it has pushed a value, so if the daemon dropped that value while
+     *     disabled, a CONDITION evaluated after the user later enables their first rule (or
+     *     after a daemon-only restart clears this map) would read {@code null} instead of the
+     *     real connection state. Forcing the store keeps the map truthful; triggers are still
+     *     only fired when enabled (below), and since triggers are edge-based, seeding a value
+     *     while disabled can never retroactively misfire a rule. Telemetry updates pass
+     *     {@code false} so the hot-path {@link #isDisabled()} short-circuit is preserved.
+     */
+    public static void update(EventData key, Value value, boolean forceStore) {
         if (key == null || value == null) return;
+        boolean disabled = isDisabled();
+        // Hot path: a telemetry update with nothing listening does no work at all.
+        if (disabled && !forceStore) return;
 
         // Atomic compare-and-set: replace only if the current value differs; the winning thread gets the
         // previous value back and is the only one that runs stateChanged for this transition.
@@ -770,7 +926,10 @@ public class Automations {
             return current; // unchanged — leave as-is
         });
         // We transitioned iff the stored value is now the new value AND it differs from what was there.
-        if (committed == value && previous[0] != value) {
+        // Only EVALUATE triggers/conditions when automations are enabled — a forced store while
+        // disabled just seeds the map (there is nothing enabled to run, and triggers are edge-based
+        // so the seed can't misfire once a rule is later enabled).
+        if (!disabled && committed == value && previous[0] != value) {
             stateChanged(key, previous[0]);
         }
     }
@@ -783,6 +942,11 @@ public class Automations {
      */
     public static void update(EventData key, String value) {
         update(key, new StringValue(value));
+    }
+
+    /** String update that also seeds the state map while disabled (external relays only). */
+    public static void update(EventData key, String value, boolean forceStore) {
+        update(key, new StringValue(value), forceStore);
     }
 
     /**
@@ -810,12 +974,36 @@ public class Automations {
         switch (event) {
             case "callState":
                 // Only accept the three real telephony states; anything else is dropped
-                // rather than published (no spurious edge on a garbled relay).
+                // rather than published (no spurious edge on a garbled relay). forceStore:
+                // the relay dedups on its side, so seed the map even while disabled (see
+                // update(..., forceStore)) — otherwise a condition read after the user
+                // enables their first call-state rule would see null.
                 if ("idle".equals(value) || "ringing".equals(value) || "offhook".equals(value)) {
-                    update(com.overdrive.app.automation.condition.BydEvent.CALL_STATE, value);
+                    update(com.overdrive.app.automation.condition.BydEvent.CALL_STATE, value, true);
                     return true;
                 }
                 return false;
+            case "btState":
+                // Bluetooth connection edge, relayed from the app-process
+                // BluetoothStateMonitor (the daemon can't reliably read BT from UID 2000).
+                // Only the two real states; anything else is dropped (no spurious edge).
+                // forceStore so the map is seeded even before the first BT rule is enabled
+                // and survives a daemon-only restart (the relay won't re-send otherwise).
+                if ("on".equals(value) || "off".equals(value)) {
+                    update(com.overdrive.app.automation.condition.BydEvent.BT_STATE, value, true);
+                    return true;
+                }
+                return false;
+            case "btDeviceName":
+                // Connected-device friendly name from the same relay ("" when nothing is
+                // connected). Free-text (bounded) — a name can be any string, so the only
+                // validation is a length cap; null is coerced to "" so a name-match
+                // condition sees a stable value rather than "unseen". forceStore: same
+                // rationale as btState.
+                if (value == null) value = "";
+                if (value.length() > 64) value = value.substring(0, 64);
+                update(com.overdrive.app.automation.condition.BydEvent.BT_DEVICE_NAME, value, true);
+                return true;
             default:
                 return false;
         }

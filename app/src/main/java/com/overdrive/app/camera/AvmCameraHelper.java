@@ -119,36 +119,4 @@ public final class AvmCameraHelper {
         }
     }
 
-    /**
-     * Binds a MediaCodec encoder's frame rate to the BYD camera HAL via
-     * AVMCamera.setMediaCodecFps(MediaCodec, int). This is a separate JNI
-     * path from setCameraFps — when the HAL refuses setCameraFps, this one
-     * may still succeed because it ties the encoder's KEY_FRAME_RATE to the
-     * camera emission rate without going through the sensor-rate validation.
-     *
-     * Pass the encoder MediaCodec instance (not its surface). Returns true
-     * on success.
-     */
-    public static boolean setMediaCodecFps(Object cameraObj, android.media.MediaCodec codec, int fps) {
-        if (cameraObj == null || codec == null) return false;
-        try {
-            java.lang.reflect.Method m = cameraObj.getClass().getDeclaredMethod(
-                    "setMediaCodecFps", android.media.MediaCodec.class, int.class);
-            m.setAccessible(true);
-            Object result = m.invoke(cameraObj, codec, fps);
-            boolean ok = result instanceof Boolean && (Boolean) result;
-            if (ok) {
-                logger.info("MediaCodec FPS bound to " + fps);
-            } else {
-                logger.warn("setMediaCodecFps(" + fps + ") returned false");
-            }
-            return ok;
-        } catch (NoSuchMethodException e) {
-            logger.warn("setMediaCodecFps not available on this AVMCamera version");
-            return false;
-        } catch (Exception e) {
-            logger.warn("setMediaCodecFps failed: " + e.getMessage());
-            return false;
-        }
-    }
 }

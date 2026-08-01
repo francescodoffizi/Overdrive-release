@@ -86,10 +86,10 @@ public final class HighResPreviewSampler {
                 com.overdrive.app.camera.GlUtil.APA_CENTER_INSET_GLSL +
                 "    } else {\n" +
                 "        vec2 gridPos = step(0.5, vTexCoord);\n" +
-                "        float frontOffset = %.5ff;\n" +
-                "        float rightOffset = %.5ff;\n" +
-                "        float rearOffset  = %.5ff;\n" +
-                "        float leftOffset  = %.5ff;\n" +
+                "        float frontOffset = %.5f;\n" +
+                "        float rightOffset = %.5f;\n" +
+                "        float rearOffset  = %.5f;\n" +
+                "        float leftOffset  = %.5f;\n" +
                 "        float stripOffsetX;\n" +
                 "        if (gridPos.x < 0.5) {\n" +
                 "            stripOffsetX = gridPos.y < 0.5 ? frontOffset : rearOffset;\n" +

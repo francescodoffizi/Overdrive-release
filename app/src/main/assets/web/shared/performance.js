@@ -217,6 +217,12 @@ BYD.performance = {
                 // Page visible again - reconnect
                 console.log('[Performance] Page visible - reconnecting');
                 this.connect();
+                // Refresh IMMEDIATELY, do not wait for the next scheduled tick. Browsers throttle
+                // or freeze background timers, so the 60s SOC poll may not have fired for minutes:
+                // returning to the tab showed data as old as the moment it was backgrounded, which
+                // reads exactly like a stuck graph. connect() only restarts the heartbeat.
+                this.fetchData();
+                this.fetchSocHistory();
             }
         });
         
@@ -693,7 +699,16 @@ BYD.performance = {
             this.updateMetric('cpuValue', systemWholeDevice, '');   // system, % of device
             this.updateMetric('cpuAppValue', appWholeDevice, '');   // app, % of device
             this.updateBar('cpuBar', appWholeDevice);
-            this.updateMetric('cpuFreq', data.cpu.freqMhz, ' MHz');
+            // Show current / max so thermal throttling is self-evident: when the
+            // current freq sits well below max under load (and temp is high) the
+            // SoC is throttling — which drags the whole head-unit UI on this
+            // shared SDM665, not just OverDrive. maxFreqMhz is the static hardware
+            // ceiling; omitted (0) on kernels that don't expose it.
+            if (data.cpu.maxFreqMhz) {
+                this.updateMetric('cpuFreq', data.cpu.freqMhz + ' / ' + data.cpu.maxFreqMhz, ' MHz');
+            } else {
+                this.updateMetric('cpuFreq', data.cpu.freqMhz, ' MHz');
+            }
             this.updateMetric('cpuTemp', data.cpu.tempC, '°C');
             this.setCardStatus('cpuCard', appWholeDevice);
 
@@ -740,6 +755,21 @@ BYD.performance = {
         // Update GPU metrics
         if (data.gpu) {
             this.updateMetric('gpuValue', data.gpu.usage || 0, '');
+            // Honesty marker (issue #173): when the value is a hardcoded
+            // freq-ratio guess (no busy counter AND no readable max-freq, e.g.
+            // BYD 2602 firmware → gpuclk/650 = a constant 92.3%), flag it via a
+            // tooltip so a reader doesn't mistake the estimate for a real load.
+            // The displayed number is unchanged.
+            const gpuValueEl = document.getElementById('gpuValue');
+            if (gpuValueEl) {
+                if (data.gpu.usageSource === 'freq_ratio_hardcoded') {
+                    gpuValueEl.title = 'Estimated from clock ratio (no GPU busy counter available on this firmware) — not a measured load.';
+                    gpuValueEl.classList.add('estimated');
+                } else {
+                    gpuValueEl.removeAttribute('title');
+                    gpuValueEl.classList.remove('estimated');
+                }
+            }
             this.updateBar('gpuBar', data.gpu.usage || 0);
             this.updateMetric('gpuFreq', (data.gpu.freqMhz ? data.gpu.freqMhz.toFixed(0) : '--'), ' MHz');
             this.updateMetric('gpuTemp', data.gpu.tempC || '--', '°C');
@@ -1526,11 +1556,40 @@ BYD.performance = {
                 
                 this.updateSocStats();
                 this.renderSocChart();
+                this.socFetchFailures = 0;
             } else {
                 console.error('[Performance] SOC fetch failed:', res.status);
+                this.noteSocFetchFailure();
             }
         } catch (e) {
             console.error('[Performance] SOC fetch error:', e);
+            this.noteSocFetchFailure();
+        }
+    },
+
+    /**
+     * A failed poll leaves the previous chart frame on screen, which is indistinguishable from a
+     * frozen graph. Rather than blank a still-useful chart on one transport blip, mark the readouts
+     * stale only after several consecutive failures, and let a success clear it.
+     */
+    socFetchFailures: 0,
+    SOC_STALE_AFTER_FAILURES: 3,
+    noteSocFetchFailure() {
+        this.socFetchFailures = (this.socFetchFailures || 0) + 1;
+        if (this.socFetchFailures === this.SOC_STALE_AFTER_FAILURES) {
+            // Suffix the current readout rather than wiping it: the last known value is still the
+            // best information available, it just should not look live.
+            //
+            // BOTH readouts, because the page carries two SOC layouts — the stats card writes
+            // #socCurrent (updateSocStats) and the EV dashboard writes #evSocValue. Marking only
+            // the first left the cue invisible on whichever layout was showing the other, which
+            // defeats the point of the marker.
+            ['socCurrent', 'evSocValue'].forEach(function (id) {
+                const el = document.getElementById(id);
+                if (el && el.textContent && el.textContent.indexOf('\u2022') === -1) {
+                    el.textContent = el.textContent + ' \u2022 stale';
+                }
+            });
         }
     },
     
@@ -1671,7 +1730,13 @@ BYD.performance = {
         // Time range
         const timeStart = history[0].t;
         const timeEnd = history[history.length - 1].t;
-        const timeRange = timeEnd - timeStart;
+        // Defence-in-depth: every x is (t - timeStart) / timeRange, so a non-ascending series
+        // (possible only if a clock correction slipped past the backend's upper time bound and
+        // monotonicity guard) would divide by <= 0 and produce Infinity/NaN coordinates — a blank
+        // or garbage line that reads as a frozen graph. Fall back to 1 so the chart degenerates to
+        // a readable flat/left-anchored line instead of vanishing.
+        const rawRange = timeEnd - timeStart;
+        const timeRange = rawRange > 0 ? rawRange : 1;
         
         // Draw grid
         ctx.strokeStyle = this.colors.grid;
@@ -2143,7 +2208,10 @@ BYD.performance = {
 
         const timeStart = history[0].t;
         const timeEnd = history[history.length - 1].t;
-        const timeRange = timeEnd - timeStart || 1;
+        // `> 0 ? :` not `|| 1` — matches the SOC render and also guards a NEGATIVE range,
+        // which a non-monotonic series would produce (|| 1 only catches exactly 0).
+        const rawTimeRange = timeEnd - timeStart;
+        const timeRange = rawTimeRange > 0 ? rawTimeRange : 1;
 
         let minV = Infinity, maxV = -Infinity;
         history.forEach(p => { if (p.voltage < minV) minV = p.voltage; if (p.voltage > maxV) maxV = p.voltage; });
@@ -2235,7 +2303,10 @@ BYD.performance = {
 
         const timeStart = history[0].t;
         const timeEnd = history[history.length - 1].t;
-        const timeRange = timeEnd - timeStart || 1;
+        // `> 0 ? :` not `|| 1` — matches the SOC render and also guards a NEGATIVE range,
+        // which a non-monotonic series would produce (|| 1 only catches exactly 0).
+        const rawTimeRange = timeEnd - timeStart;
+        const timeRange = rawTimeRange > 0 ? rawTimeRange : 1;
 
         // Auto-scale Y
         let minT = Infinity, maxT = -Infinity;

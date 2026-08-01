@@ -14,7 +14,7 @@
     <script src="../shared/app-shell.js?v=2"></script>
     <link rel="stylesheet" href="../shared/leaflet.css">
     <script src="../shared/leaflet.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 </head>
@@ -733,7 +733,7 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
     <script src="../shared/map.js?v=1"></script>
     <script>
@@ -779,9 +779,20 @@
                 var lockEl = document.getElementById('dashLock');
                 if (!lockEl || !data || !data.doors) return;
                 var overall = data.doors.overall;
-                if (overall === 1) lockEl.textContent = BYD.i18n.t('dashboard.status_locked') || 'Locked';
-                else if (overall === 2) lockEl.textContent = BYD.i18n.t('dashboard.status_unlocked') || 'Unlocked';
-                else lockEl.textContent = '--';
+                // `overall` can describe the driver door only (Atto OTA path), so
+                // honour scope rather than claiming a whole-car state.
+                var partial = data.doors.scope && data.doors.scope !== 'vehicle';
+                if (overall === 1) {
+                    lockEl.textContent = partial
+                        ? (BYD.i18n.t('vehicle.driver_door_locked') || 'Driver door locked')
+                        : (BYD.i18n.t('dashboard.status_locked') || 'Locked');
+                } else if (overall === 2) {
+                    lockEl.textContent = partial
+                        ? (BYD.i18n.t('vehicle.driver_door_unlocked') || 'Driver door unlocked')
+                        : (BYD.i18n.t('dashboard.status_unlocked') || 'Unlocked');
+                } else {
+                    lockEl.textContent = '--';
+                }
             },
             updateFromStatus: function(status) {
                 if (!status) return;

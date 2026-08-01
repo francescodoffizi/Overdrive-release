@@ -730,6 +730,10 @@ public class StorageManager {
             }
         }
         if (deleted > 0) {
+            // These partials (.mp4.tmp/.broken/.json.tmp) ARE counted by the
+            // reported size, so freeing them must invalidate the reporting cache
+            // or the storage card keeps showing the bytes we just reclaimed.
+            invalidateCategorySizeCache(null);
             logInfo("Orphan tmp sweep: deleted " + deleted + " files, "
                     + (bytesFreed / 1024) + " KB freed");
         }
@@ -4199,10 +4203,18 @@ public class StorageManager {
             return getDirectoriesTotalSize(category,
                 internalScopedDirs(getReapableDirs(category)), namePrefixForCategory(category));
         }
+        // UNCACHED on purpose: this feeds the reaper / limit enforcement, which
+        // must see the filesystem as it is right now. The public
+        // getRecordingsSize()/getSurveillanceSize()/getProximitySize() getters
+        // carry a short TTL cache for the UI reporting path; routing the reaper
+        // through those would let it delete against a stale measurement (over-
+        // reaping just-freed space, or under-reaping and overflowing to ENOSPC).
+        // trips keeps getTripsSize() because that path is DB-backed (an exact
+        // SUM over rows the reaper itself maintains), not a stale FS snapshot.
         switch (category) {
-            case "recordings":   return getRecordingsSize();
-            case "surveillance": return getSurveillanceSize();
-            case "proximity":    return getProximitySize();
+            case "recordings":   return getRecordingsSizeUncached();
+            case "surveillance": return getSurveillanceSizeUncached();
+            case "proximity":    return getProximitySizeUncached();
             case "trips":        return getTripsSize();   // DB-cached — avoids the FUSE walk
             default:             return getDirectoriesTotalSize(category,
                 getReapableDirs(category), namePrefixForCategory(category));
@@ -4287,15 +4299,408 @@ public class StorageManager {
     
     // ==================== Storage Stats ====================
     
+    // ==================== CATEGORY SIZE/COUNT TTL CACHE ====================
+    //
+    // WHY (perf): getDirectoriesTotalSize / getFileCountAcross are UNCACHED
+    // full directory walks — listFiles() plus a per-entry isFile() and
+    // length() for every file in every reapable dir of the category. Every
+    // recording carries sidecars (.mp4 + .json + .srt), so a 500-clip library
+    // is ~1500 stat()s per walk. On the emulated/FUSE volumes these paths live
+    // on (INTERNAL_BASE_DIR is /storage/emulated/0/Overdrive, and the daemon
+    // runs as UID 2000), every one of those stats is an IPC round-trip through
+    // the FUSE bridge.
+    //
+    // Two callers hit these on a timer:
+    //   1. QualitySettingsApiHandler's storage card — the web UI polls it on a
+    //      10s interval (recording.js + surveillance.js reloadConfig).
+    //   2. The 30s periodic cleanup tick's over-limit snapshot.
+    // That is a sustained metadata load on the same dentry/inode cache the
+    // package manager uses to read APK/dex/oat pages during app launch, which
+    // is why it degrades WHOLE-SYSTEM responsiveness rather than just the app.
+    //
+    // The cache is deliberately conservative, in three ways:
+    //
+    //   a) READ-ONLY CALLERS ONLY. The reaper must never act on a stale size —
+    //      it would under- or over-delete. scopedSizeForCategory() therefore
+    //      calls the *Uncached() variants below, preserving byte-exact reap
+    //      behaviour. Only the reporting getters are cached.
+    //   b) TTL ABOVE THE POLL CADENCE. This was 5s, chosen to sit BELOW the 10s
+    //      UI poll so "each tick still gets a fresh walk" — which meant the
+    //      steady-state poll missed 100% of the time and the cache only ever
+    //      absorbed bursts. On a large library that is a full re-walk of every
+    //      reapable dir 6×/min for as long as a settings page is open, which is
+    //      the "settings page is slow with lots of recordings" report. It is now
+    //      15s, so the poll hits; freshness comes from (c), not from the TTL.
+    //   c) EXPLICIT INVALIDATION — this is what actually guarantees correctness.
+    //      invalidateCategorySizeCache() is called on clip finalize (onFileSaved)
+    //      and on reap, so a just-written or just-deleted clip is reflected on
+    //      the very next poll regardless of TTL.
+    //   d) ONE WALK PER REFRESH. A miss on either the size or the count fills
+    //      BOTH caches from a single traversal (refreshCategoryStats), so the
+    //      4-value storage response costs 2 walks instead of 4.
+    //
+    // LOCKING: a dedicated monitor, and it is NEVER held across the directory
+    // walk. Deliberately NOT `synchronized(this)`:
+    //
+    //   - The StorageManager monitor is also taken by saveConfig() and by the
+    //     trips size/count caches, and those DO hold it across a full FUSE walk
+    //     (pre-existing). Joining that domain would mean invalidation from the
+    //     clip-finalize path could block behind an unrelated multi-hundred-ms
+    //     walk. That path is GpuSegmentFinalizer, which runs at
+    //     THREAD_PRIORITY_BACKGROUND (nice +10), while the walk holder can be a
+    //     request thread — i.e. a priority inversion stalling clip finalize.
+    //   - Holding any lock across the walk also serialises concurrent readers of
+    //     DIFFERENT categories behind each other for no benefit.
+    //
+    // So: take the lock only to read the cache, release it, walk unlocked, then
+    // take it again to publish. Two threads racing the same cold category may
+    // both walk once — harmless (idempotent, read-only) and strictly better than
+    // holding a lock across FUSE I/O. Last writer wins; both values are equally
+    // fresh.
+    // TTL sits ABOVE the 10s UI poll cadence deliberately. It used to be 5s,
+    // which guaranteed a MISS on every steady-state poll (10s > 5s) — the
+    // cache only ever absorbed bursts, so a large library re-walked the whole
+    // dir set 6×/min for as long as a settings page stayed open. That is the
+    // reported "settings page is slow when there are lots of recordings".
+    // 15s means the poll normally hits; correctness is preserved by the
+    // explicit invalidation below (clip finalize + reap), which is what
+    // actually guarantees freshness — not the TTL.
+    private static final long CATEGORY_STAT_CACHE_MS = 15_000;
+    private final Object categoryStatCacheLock = new Object();
+    private final java.util.Map<String, long[]> cachedCategorySize =
+            new java.util.HashMap<>();   // category -> {sizeBytes, atMs}
+    private final java.util.Map<String, long[]> cachedCategoryCount =
+            new java.util.HashMap<>();   // category -> {count, atMs}
+
+    private long categorySizeCached(String category) {
+        return categoryStatCached(category, cachedCategorySize, 0);
+    }
+
+    private int categoryCountCached(String category) {
+        return (int) categoryStatCached(category, cachedCategoryCount, 1);
+    }
+
+    // ---------------- STALE-WHILE-REVALIDATE ----------------
+    //
+    // In-flight guard for the async refresh, so N concurrent readers (both
+    // categories × size+count, plus several HTTP clients) collapse onto ONE
+    // background walk per category instead of stacking threads on a FUSE mount.
+    private final java.util.Set<String> refreshInFlight = new java.util.HashSet<>();
+
+    /**
+     * Read a category stat, NEVER blocking on a directory walk once we have any
+     * previous value for it.
+     *
+     * <p>WHY: this feeds the /api/settings/storage reporting path only, which
+     * both settings pages fetch on load and re-poll every 10s. A fresh walk is
+     * O(files) FUSE stats — on a large library that is what made the settings
+     * page take seconds to become usable, because the HTTP response (and with it
+     * the storage slider, the SD/USB buttons and everything the page awaited
+     * behind it) sat on the walk.
+     *
+     * <p>Semantics:
+     * <ul>
+     *   <li>Fresh value (within TTL) → return it.
+     *   <li>Stale value → return the stale number IMMEDIATELY and kick a
+     *       background refresh. The next poll (10s later, or the client's
+     *       post-save refresh) shows the updated figure. The number is a usage
+     *       readout that is already only as fresh as the last walk, so showing it
+     *       one poll late is a far better trade than blocking the page.
+     *   <li>NO value at all (first call after boot) → walk synchronously, since
+     *       returning a fabricated 0 would render "0 B used" as if authoritative.
+     * </ul>
+     *
+     * <p>Enforcement is unaffected: the reaper reads the *Uncached() variants
+     * (see scopedSizeForCategory), so it never acts on a stale or absent figure.
+     *
+     * @param idx 0 for the size cache, 1 for the count cache — the index into
+     *            refreshCategoryStats()'s {size, count} result.
+     */
+    private long categoryStatCached(String category,
+                                    java.util.Map<String, long[]> cache, int idx) {
+        // MONOTONIC clock for TTL age. These head units correct the RTC from
+        // NTP/GPS after boot; with wall-clock timestamps a BACKWARD jump makes
+        // (now - stamp) negative, which reads as "fresh" and can latch a stale
+        // figure until wall-clock catches back up. elapsedRealtime never goes
+        // backwards. markStale()'s 0 sentinel still works: elapsedRealtime is
+        // always > 0 after boot, so 0 always reads as older than the TTL.
+        long now = statClockMs();
+        synchronized (categoryStatCacheLock) {
+            long[] e = cache.get(category);
+            if (e != null && e[0] >= 0) {
+                if ((now - e[1]) < CATEGORY_STAT_CACHE_MS) {
+                    return e[0];                    // fresh
+                }
+                // Stale: serve it now, refresh behind the response. add() returns
+                // false when a refresh for this category is already running, which
+                // is what collapses a burst of readers onto a single walk.
+                if (refreshInFlight.add(category)) {
+                    // Roll the in-flight marker back if the thread never starts.
+                    // t.start() can throw OutOfMemoryError (pthread_create under
+                    // thread exhaustion — this daemon spawns ad-hoc threads
+                    // freely), and the compensating remove() lives in the thread
+                    // body, so without this the category would stay "in flight"
+                    // forever and NEVER refresh again: markStale only backdates
+                    // the entry, so the cold path can't rescue it either and the
+                    // figure freezes for the daemon's lifetime.
+                    boolean started = false;
+                    try {
+                        kickCategoryStatRefresh(category);
+                        started = true;
+                    } catch (Throwable t) {
+                        logWarn("Category stat refresh spawn failed for " + category
+                                + ": " + t);
+                    } finally {
+                        if (!started) refreshInFlight.remove(category);
+                    }
+                }
+                return e[0];
+            }
+        }
+        // Cold: no prior value for this category — must walk inline rather than
+        // fabricate a 0. Serialised on a per-category monitor so the ~4 readers
+        // of a single /api/settings/storage response (and any concurrent client)
+        // perform ONE walk and the rest wait for it, instead of each launching
+        // its own walk over the same FUSE dirs. Deliberately NOT
+        // categoryStatCacheLock — that must never be held across a walk.
+        Object gate;
+        synchronized (coldWalkGates) {
+            gate = coldWalkGates.computeIfAbsent(category, k -> new Object());
+        }
+        synchronized (gate) {
+            // Re-check: a walk that completed while we waited on the gate has
+            // already published, so use it instead of walking again.
+            synchronized (categoryStatCacheLock) {
+                long[] e = cache.get(category);
+                if (e != null && e[0] >= 0) return e[0];
+            }
+            return refreshCategoryStats(category)[idx];
+        }
+    }
+
+    /** Per-category monitors serialising the cold (no-value-yet) inline walk. */
+    private final java.util.Map<String, Object> coldWalkGates = new java.util.HashMap<>();
+
+    /** Monotonic millisecond clock for the stat-cache TTL. Falls back to
+     *  System.nanoTime (also monotonic) if the Android class isn't present, so
+     *  this never depends on wall-clock corrections. */
+    private static long statClockMs() {
+        try {
+            return android.os.SystemClock.elapsedRealtime();
+        } catch (Throwable t) {
+            return System.nanoTime() / 1_000_000L;
+        }
+    }
+
+    /**
+     * Walk {@code category} on a background thread and publish both caches.
+     * Caller must hold {@link #categoryStatCacheLock} and have just inserted
+     * {@code category} into {@link #refreshInFlight}.
+     *
+     * <p>Detached thread rather than a pooled executor to match the idiom used
+     * by the storage POST path's cleanup kick; these are short-lived and bounded
+     * to ONE per category at a time by {@link #refreshInFlight}.
+     *
+     * <p>Rate: a refresh is only ever started by a READ, and the only periodic
+     * reader is the 10s UI poll, so the ceiling is one walk per category per
+     * poll — the same cadence as before this change, except now it happens
+     * BEHIND the response instead of inside it. There is no self-sustaining loop:
+     * nothing here schedules the next refresh.
+     */
+    private void kickCategoryStatRefresh(String category) {
+        Thread t = new Thread(() -> {
+            try {
+                refreshCategoryStats(category);
+            } catch (Throwable thr) {
+                logWarn("Async category stat refresh failed for " + category
+                        + ": " + thr.getMessage());
+            } finally {
+                synchronized (categoryStatCacheLock) {
+                    refreshInFlight.remove(category);
+                }
+            }
+        }, "CategoryStatRefresh-" + category);
+        t.setDaemon(true);
+        // Below the request/encoder threads: this is a reporting refresh and must
+        // never compete with clip writing for I/O.
+        t.setPriority(Thread.MIN_PRIORITY);
+        t.start();
+    }
+
+    /**
+     * ONE directory walk that produces both the byte total and the file count
+     * for {@code category}, publishing both caches.
+     *
+     * <p>WHY: /api/settings/storage reads size AND count for two categories
+     * (QualitySettingsApiHandler.sendStorageSettings), and the two accessors
+     * used to walk independently — 4 full traversals of the same dirs per
+     * request, each re-listing every directory and re-stat'ing every file.
+     * Sharing one traversal halves the syscall load for free. Same collapse
+     * ExternalStorageCleaner.refreshWalkIfStale already does for its four CDR
+     * accessors.
+     *
+     * <p>The two figures use DIFFERENT prefix gates, exactly as the two
+     * original methods did — do not "unify" them:
+     * <ul>
+     *   <li>size sums primary + sidecar + partial files under the
+     *       aux-inclusive gate ({@code cam*} plus {@code dvr_}/{@code replay_}
+     *       /{@code thumb_}), matching {@link #getDirectoriesTotalSize} and,
+     *       critically, what the reaper actually frees.
+     *   <li>count counts only primary-extension files under the STRICT
+     *       {@code startsWith(namePrefix)} gate, matching
+     *       {@link #getFileCountAcross}. So OEM {@code dvr_} and
+     *       {@code replay_} clips contribute bytes but not to
+     *       {@code recordingsCount} — preserving the number the UI has always
+     *       shown.
+     * </ul>
+     * Dedupe is by filename across dirs so a clip mirrored on internal + SD
+     * isn't double-counted; a shared {@code seen} set is safe because a
+     * sidecar's name never collides with its {@code .mp4}.
+     *
+     * @return {sizeBytes, count}
+     */
+    private long[] refreshCategoryStats(String category) {
+        // Sampled BEFORE the walk so a clip-finalize/reap landing mid-walk is
+        // detected at publish time — see the publish block at the end.
+        final long seqAtStart;
+        synchronized (categoryStatCacheLock) {
+            seqAtStart = statInvalidationSeq;
+        }
+        String primaryExt = primaryExtensionForCategory(category);
+        String[] sidecarExts = sidecarExtensionsForCategory(category);
+        String[] partialExts = partialExtensionsForCategory(category);
+        String[] auxPrefixes = auxiliaryPrefixesForCategory(category);
+        String namePrefix = namePrefixForCategory(category);
+
+        long size = 0;
+        int count = 0;
+        Set<String> seen = new HashSet<>();
+        for (File dir : getReapableDirs(category)) {
+            if (dir == null || !dir.exists() || !dir.isDirectory()) continue;
+            File[] files = dir.listFiles();
+            if (files == null) {
+                files = listFilesViaShell(dir);
+            }
+            if (files == null) continue;
+            for (File f : files) {
+                if (!f.isFile()) continue;
+                String name = f.getName();
+                if (namePrefix != null
+                        && !nameMatchesCategoryPrefix(name, namePrefix, auxPrefixes)) continue;
+
+                boolean isPrimary = name.endsWith(primaryExt);
+                boolean isSidecar = false;
+                boolean isPartial = false;
+                if (!isPrimary) {
+                    for (String ext : sidecarExts) {
+                        if (name.endsWith(ext)) { isSidecar = true; break; }
+                    }
+                }
+                if (!isPrimary && !isSidecar) {
+                    for (String ext : partialExts) {
+                        if (name.endsWith(ext)) { isPartial = true; break; }
+                    }
+                }
+                if (!isPrimary && !isSidecar && !isPartial) continue;
+                if (!seen.add(name)) continue;
+                size += f.length();
+                // STRICT prefix gate for the count — see the javadoc. The gate
+                // above is aux-inclusive (needed for byte parity with the
+                // reaper); getFileCountAcross used a bare startsWith, so
+                // re-test here rather than reusing that result.
+                if (isPrimary
+                        && (namePrefix == null || name.startsWith(namePrefix))) {
+                    count++;
+                }
+            }
+        }
+
+        long at = statClockMs();   // monotonic — see categoryStatCached
+        synchronized (categoryStatCacheLock) {
+            // Publish only if no invalidation landed while we were walking.
+            // invalidateCategorySizeCache() bumps this counter; if it changed,
+            // our figures already predate a clip-finalize or a reap, so we
+            // publish the VALUE but leave the timestamp stale (0) so the next
+            // read serves this best-effort number immediately AND schedules a
+            // fresh walk. Previously the in-flight walk clobbered the
+            // invalidation outright, latching a pre-mutation figure for a full
+            // TTL — tolerable when the TTL was the freshness mechanism, but not
+            // now that invalidation is.
+            boolean superseded = (statInvalidationSeq != seqAtStart);
+            long stamp = superseded ? 0L : at;
+            cachedCategorySize.put(category, new long[]{size, stamp});
+            cachedCategoryCount.put(category, new long[]{count, stamp});
+        }
+        return new long[]{size, count};
+    }
+
+    /**
+     * Drop the cached size/count for a category (or all categories when
+     * {@code category} is null) so the next reporting read re-walks. Called
+     * whenever this process adds or removes a file in a reapable dir, so the
+     * storage card never shows a figure that predates a just-finished clip or
+     * a just-completed reap.
+     *
+     * <p>Cheap and safe to call redundantly — it only rewrites entry timestamps,
+     * and it never blocks on I/O (the walk is done outside this lock), so it is
+     * safe to call from the encoder's finalize path.
+     *
+     * <p>Marks entries STALE (backdates their timestamp) rather than REMOVING
+     * them. That distinction matters now that the reporting getters are
+     * stale-while-revalidate: a removed entry is the "cold" case, which is the
+     * one path that still walks INLINE on the HTTP request thread. Since this is
+     * called on every finalized clip (~2 min) and every reap, deleting entries
+     * would drop the settings page back onto a blocking walk over and over. A
+     * backdated entry instead serves the last known figure immediately and
+     * triggers the background refresh — the user sees the updated number on the
+     * next 10s poll (or the client's post-save refresh ~1s after Apply).
+     *
+     * <p>Note this cannot fully prevent a stale publish: a walk already in flight
+     * when the invalidation lands will still publish its (now slightly stale)
+     * result afterwards. Bounded by CATEGORY_STAT_CACHE_MS and only ever affects
+     * the reported figure — never reap enforcement, which reads uncached.
+     */
+    public void invalidateCategorySizeCache(String category) {
+        synchronized (categoryStatCacheLock) {
+            statInvalidationSeq++;   // makes any in-flight walk publish as stale
+            if (category == null) {
+                markAllStale(cachedCategorySize);
+                markAllStale(cachedCategoryCount);
+            } else {
+                markStale(cachedCategorySize.get(category));
+                markStale(cachedCategoryCount.get(category));
+            }
+        }
+    }
+
+    /** Bumped by every invalidation; sampled by {@link #refreshCategoryStats}
+     *  before it walks so a mutation landing mid-walk isn't clobbered by the
+     *  walk's own publish. Guarded by {@link #categoryStatCacheLock}. */
+    private long statInvalidationSeq = 0L;
+
+    /** Backdate one cache entry past the TTL so the next read revalidates.
+     *  Caller holds {@link #categoryStatCacheLock}. Null-safe (nothing cached
+     *  yet → the next read takes the cold path and walks, as it should). */
+    private static void markStale(long[] entry) {
+        if (entry != null) entry[1] = 0L;
+    }
+
+    private static void markAllStale(java.util.Map<String, long[]> cache) {
+        for (long[] e : cache.values()) markStale(e);
+    }
+
     /**
      * Get current size of recordings across all locations (active dir, the
      * inactive internal/SD-card mirror, and legacy app-files paths).
      *
      * Must match the dirs the cleanup actually reaps — otherwise the UI can
      * report 800 MB used while the limit is 500 MB and cleanup never fires.
+     *
+     * <p>Reporting path: {@value #CATEGORY_STAT_CACHE_MS}ms TTL-cached. The
+     * reaper uses {@link #getRecordingsSizeUncached()}.
      */
     public long getRecordingsSize() {
-        return getDirectoriesTotalSize("recordings", getReapableDirs("recordings"), namePrefixForCategory("recordings"));
+        return categorySizeCached("recordings");
     }
 
     /**
@@ -4303,7 +4708,7 @@ public class StorageManager {
      * inactive internal/SD-card mirror, and the legacy sentry_events path).
      */
     public long getSurveillanceSize() {
-        return getDirectoriesTotalSize("surveillance", getReapableDirs("surveillance"), namePrefixForCategory("surveillance"));
+        return categorySizeCached("surveillance");
     }
 
     /**
@@ -4311,30 +4716,45 @@ public class StorageManager {
      * inactive internal/SD-card mirror, and the legacy proximity_events path).
      */
     public long getProximitySize() {
+        return categorySizeCached("proximity");
+    }
+
+    // Uncached variants — for the reap/enforcement path, which must measure the
+    // filesystem as it is RIGHT NOW. Never route the periodic cleanup or
+    // ensureSpace through the cached getters above.
+    private long getRecordingsSizeUncached() {
+        return getDirectoriesTotalSize("recordings", getReapableDirs("recordings"), namePrefixForCategory("recordings"));
+    }
+
+    private long getSurveillanceSizeUncached() {
+        return getDirectoriesTotalSize("surveillance", getReapableDirs("surveillance"), namePrefixForCategory("surveillance"));
+    }
+
+    private long getProximitySizeUncached() {
         return getDirectoriesTotalSize("proximity", getReapableDirs("proximity"), namePrefixForCategory("proximity"));
     }
-    
+
     /**
      * Get recordings file count across all locations (active + inactive
      * mirror + legacy). Matches the size accounting so per-file averages
      * line up with reported totals.
      */
     public int getRecordingsCount() {
-        return getFileCountAcross("recordings", getReapableDirs("recordings"), namePrefixForCategory("recordings"));
+        return categoryCountCached("recordings");
     }
 
     /**
      * Get surveillance events file count across all locations.
      */
     public int getSurveillanceCount() {
-        return getFileCountAcross("surveillance", getReapableDirs("surveillance"), namePrefixForCategory("surveillance"));
+        return categoryCountCached("surveillance");
     }
 
     /**
      * Get proximity events file count across all locations.
      */
     public int getProximityCount() {
-        return getFileCountAcross("proximity", getReapableDirs("proximity"), namePrefixForCategory("proximity"));
+        return categoryCountCached("proximity");
     }
 
     private int getFileCountAcross(String category, List<File> dirs, String namePrefix) {
@@ -5279,6 +5699,23 @@ public class StorageManager {
                 files = listFilesByExt(dir, primaryExt);
             }
             if (files == null) continue;
+            // PERF (was O(N^2)): the aux-sidecar accounting below used to call
+            // findAuxiliarySiblings(dir, ...) once PER ANCHOR, and that helper
+            // does its own full dir.listFiles() every call. Measuring a
+            // 1000-clip recordings dir therefore issued 1000 full directory
+            // listings — on the FUSE-bridged volumes these dirs live on, each
+            // one is an IPC round-trip per entry. Build the aux index ONCE per
+            // directory instead and look stems up in it.
+            //
+            // Only built when the category actually has aux prefixes
+            // ("recordings" -> dvr_/replay_, "surveillance" -> thumb_); null
+            // otherwise so no listing cost is added for categories without them.
+            // Deliberately reuses the same matching rule as
+            // findAuxiliarySiblings ("<auxPrefix><stem>_" prefix) so the byte
+            // accounting is identical to before — see the assertion in that
+            // method's contract.
+            java.util.Map<String, List<File>> auxIndex =
+                    (auxPrefixes.length > 0) ? buildAuxiliaryIndex(dir, auxPrefixes) : null;
             for (File f : files) {
                 if (!f.isFile()) continue;
                 String name = f.getName();
@@ -5315,8 +5752,18 @@ public class StorageManager {
                         if (sidecar.isFile()) currentSize += sidecar.length();
                     }
                     if (auxPrefixes.length > 0) {
-                        for (File aux : findAuxiliarySiblings(f.getParentFile(), auxPrefixes, stem)) {
-                            currentSize += aux.length();
+                        // Index lookup instead of a per-anchor directory listing.
+                        // Falls back to the direct walk if the index couldn't be
+                        // built (listFiles returned null mid-remount), so a flaky
+                        // volume degrades to the old behaviour rather than
+                        // silently under-counting aux bytes.
+                        List<File> auxHits = (auxIndex != null)
+                                ? auxIndex.get(stem)
+                                : findAuxiliarySiblings(f.getParentFile(), auxPrefixes, stem);
+                        if (auxHits != null) {
+                            for (File aux : auxHits) {
+                                currentSize += aux.length();
+                            }
                         }
                     }
                 }
@@ -5478,6 +5925,11 @@ public class StorageManager {
         }
 
         if (deletedCount > 0) {
+            // Files were removed: drop the reporting size/count TTL cache so the
+            // storage card shows the freed space immediately. The reaper itself
+            // reads the uncached variants (see scopedSizeForCategory), so this
+            // only affects what the UI reports — never enforcement.
+            invalidateCategorySizeCache(null);
             logInfo("Cleanup complete: deleted " + deletedCount + " files (" + formatSize(deletedSize) + ")"
                 + (reapedFromInactive ? " — including orphan/legacy locations" : "")
                 + (budgetExhausted ? " — bounded trim (budget=" + maxDeletes
@@ -5589,6 +6041,11 @@ public class StorageManager {
                 }
             }
             if (orphansDeleted > 0) {
+                // Independent of the anchor loop's deletedCount gate above: when
+                // the anchor pass freed nothing but this pass did, that gate never
+                // fires and the reported size would keep the reclaimed sidecar
+                // bytes. These files are size-counted, so invalidate here too.
+                invalidateCategorySizeCache(null);
                 logInfo("Sidecar orphans reaped: " + orphansDeleted + " files (" + formatSize(orphansFreed) + ")");
             }
         }
@@ -5656,6 +6113,68 @@ public class StorageManager {
      * <p>Returns an empty list when {@code auxPrefixes} is empty, the dir
      * doesn't exist, or no matches are found.
      */
+    /**
+     * Build a stem -> aux-sibling index for one directory in a SINGLE listing,
+     * so callers that need aux bytes for many anchors don't re-list the dir per
+     * anchor (the O(N^2) the size/reap walk used to pay).
+     *
+     * <p>Produces exactly the same grouping {@link #findAuxiliarySiblings} would
+     * return for each stem. That method's rule is
+     * {@code name.startsWith(auxPrefix + stem + "_")}; inverted, a file named
+     * {@code <auxPrefix><stem>_<rest>} contributes to key {@code <stem>}. We
+     * recover the stem by stripping the matched aux prefix and then cutting at
+     * the LAST {@code '_'}-delimited boundary that still leaves a non-empty
+     * stem — but because a stem may itself contain underscores
+     * (e.g. {@code event_20260106_184835}), we cannot simply cut at the first
+     * one. Instead we register the file under EVERY candidate stem prefix, so a
+     * lookup for the real anchor stem always hits. Extra keys are harmless:
+     * they can only be matched by an anchor whose stem is literally that
+     * prefix, which is the same file findAuxiliarySiblings would have matched.
+     *
+     * <p>Uses the SAME listing sequence as {@link #findAuxiliarySiblings}
+     * ({@code dir.listFiles()}, then the shell-ls fallback), so on a flaky
+     * FUSE-bridged volume this degrades exactly the way the per-anchor walk did:
+     * {@code listFilesViaShell} returns an empty array (never null) when the
+     * child fails or times out, which yields an empty index — the same
+     * "no aux siblings found" answer the old code produced for every anchor in
+     * that directory. Never returns null, so callers do not need a null branch;
+     * the caller keeps one only as belt-and-braces.
+     */
+    private java.util.Map<String, List<File>> buildAuxiliaryIndex(File dir, String[] auxPrefixes) {
+        if (dir == null || auxPrefixes == null || auxPrefixes.length == 0
+                || !dir.isDirectory()) {
+            return java.util.Collections.emptyMap();
+        }
+        File[] files = dir.listFiles();
+        if (files == null) files = listFilesViaShell(dir);
+        if (files == null) return java.util.Collections.emptyMap();   // defensive; not reachable today
+
+        java.util.Map<String, List<File>> index = new java.util.HashMap<>();
+        for (File f : files) {
+            if (!f.isFile()) continue;
+            String name = f.getName();
+            for (String aux : auxPrefixes) {
+                if (!name.startsWith(aux)) continue;
+                String rest = name.substring(aux.length());
+                // rest == "<stem>_<suffix…>". Register under every prefix of
+                // `rest` that ends at an '_' boundary, mirroring the
+                // startsWith(aux + stem + "_") test for all possible stems.
+                for (int i = rest.indexOf('_'); i >= 0; i = rest.indexOf('_', i + 1)) {
+                    if (i == 0) continue;               // empty stem — cannot match
+                    String stem = rest.substring(0, i);
+                    List<File> hits = index.get(stem);
+                    if (hits == null) {
+                        hits = new ArrayList<>();
+                        index.put(stem, hits);
+                    }
+                    hits.add(f);
+                }
+                break;   // first matching aux prefix wins, as in findAuxiliarySiblings
+            }
+        }
+        return index;
+    }
+
     private List<File> findAuxiliarySiblings(File dir, String[] auxPrefixes, String stem) {
         if (dir == null || auxPrefixes == null || auxPrefixes.length == 0
                 || !dir.isDirectory()) {
@@ -6055,6 +6574,15 @@ public class StorageManager {
         }
         
         logInfo("Processing saved file: " + file.getName() + " (" + formatSize(file.length()) + ")");
+
+        // Invalidate the reporting size/count TTL cache: a clip just landed, so
+        // the storage card must reflect it on the very next poll rather than up
+        // to CATEGORY_STAT_CACHE_MS later. Clearing all categories (null) keeps
+        // this correct without having to classify the file by prefix here —
+        // the cost is one extra walk per finalized clip (every ~2 min at the
+        // default segment duration), which is negligible next to the 10s UI poll
+        // this cache exists to coalesce.
+        invalidateCategorySizeCache(null);
 
         // 1. Make file readable by all (chmod 666)
         makeFileReadable(file);
@@ -6716,6 +7244,21 @@ public class StorageManager {
         }
 
         if (deletedAnchors > 0) {
+            // Whole finalized clips (+ their size-counted sidecars) are gone, so the
+            // reported size/count cache must drop. Once, after the loop — see the
+            // note in deleteAnchorAndSidecars. This is REQUIRED here: the emergency
+            // reap runs before runPeriodicCategoryCleanup on the same tick, and that
+            // pass's own invalidation is gated on ITS deletedCount, which is zero
+            // precisely because this pass already freed the space. Categories are
+            // mixed across the candidate list, so clear all (null).
+            //
+            // LOCKING: runPhysicalFreeSpaceEmergencyReap holds ALL THREE cleanup
+            // locks (recordings→surveillance→proximity) across this call. Safe
+            // because categoryStatCacheLock is a LEAF — invalidateCategorySizeCache
+            // only bumps a counter and backdates map entries, acquiring nothing
+            // else, and the walk in refreshCategoryStats deliberately runs off-lock.
+            // So there is no cleanupLock↔categoryStatCacheLock cycle.
+            invalidateCategorySizeCache(null);
             logInfo("Physical-free reap: freed " + formatSize(freedTotal) + " across "
                 + deletedAnchors + " clip(s) on " + volume + " — "
                 + formatSize(freeBytesForType(volume)) + " free now"
@@ -6814,6 +7357,12 @@ public class StorageManager {
         try {
             com.overdrive.app.server.RecordingsApiHandler.invalidateRecordingCache(file.getAbsolutePath());
         } catch (Throwable ignored) {}
+        // NOTE: the reported size/count cache is invalidated ONCE by the caller
+        // after its delete loop (see reapForPhysicalFreeSpace), not here per file.
+        // Per-file would also be correct but each call bumps statInvalidationSeq,
+        // and a loop deleting hundreds of clips would repeatedly supersede any
+        // concurrent background walk, forcing it to republish as stale and making
+        // the next read re-walk for no benefit.
         return freed;
     }
 
@@ -7876,6 +8425,15 @@ public class StorageManager {
                 }
             } catch (Exception ignored) {}
         }
+
+        // The reporting size/count cache is now served stale-while-revalidate,
+        // so without this a user-initiated "Reset Data" (which deletes the ENTIRE
+        // category) leaves the storage card reporting the full pre-wipe figure
+        // for the rest of the TTL and one further poll. Every other mutation path
+        // (clip finalize, reap) already invalidates; this one never did, and it
+        // is the most visibly wrong case since the user explicitly asked for the
+        // data to be gone.
+        if (deleted > 0) invalidateCategorySizeCache(category);
 
         logInfo("wipeMediaCategory(" + category + ") deleted " + deleted + " files"
             + (skippedActive > 0 ? " (skipped " + skippedActive

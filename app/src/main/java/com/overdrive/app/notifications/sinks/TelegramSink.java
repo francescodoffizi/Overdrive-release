@@ -27,6 +27,9 @@ import com.overdrive.app.telegram.TelegramNotifier;
  *       Web-Push-only. It would otherwise ride the criticalAlerts toggle (a
  *       blunt master switch shared with proximity/battery/tyre alerts), which
  *       can't silence doors alone; a parked door edge is a push-tier event.</li>
+ *   <li><b>vehicle.health.tyre.*</b> is gated on its OWN {@code tyreAlerts}
+ *       toggle (default ON) so tyre pressure/leak messages can be turned off
+ *       without silencing every other critical vehicle alert.</li>
  * </ul>
  *
  * <p>Delivery rides the {@code CRITICAL} Telegram category (the {@code
@@ -58,12 +61,30 @@ public final class TelegramSink implements NotificationBus.Sink {
             if (event.category != null && event.category.startsWith("vehicle.security.door.")) {
                 return;
             }
-            // INFO is Web-Push-only; only escalate WARN/CRITICAL to Telegram.
-            if (event.severity == NotificationEvent.Severity.INFO) {
+            // Tyre pressure + leak have their own dedicated toggle (default ON),
+            // so they can be silenced without also losing charging faults /
+            // proximity / battery-health, which all share criticalAlerts.
+            if (event.category != null && event.category.startsWith("vehicle.health.tyre.")
+                    && !com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTyreAlerts()) {
+                return;
+            }
+            // INFO is Web-Push-only; only escalate WARN/CRITICAL to Telegram — EXCEPT a
+            // user-authored automation "Send notification" action, which publishes at INFO
+            // (NotificationAction hardcodes Severity.INFO) yet is an intentional, explicitly
+            // configured message, not routine telemetry. Without this exception the INFO
+            // filter silently swallowed every automation notification, so it never reached
+            // Telegram (the reported "send notification via telegram from automation doesn't
+            // work"). Routine INFO telemetry (charging started, door closed) still stays
+            // Web-Push-only. Rides the same CRITICAL lane / criticalAlerts gate as the rest.
+            boolean userAuthored = "automation.action".equals(event.category);
+            if (event.severity == NotificationEvent.Severity.INFO && !userAuthored) {
                 return;
             }
 
-            String icon = event.severity == NotificationEvent.Severity.CRITICAL ? "🚨" : "⚠️";
+            // 🚨 critical, ⚠️ warn, 🔔 the user-authored automation INFO message (a plain
+            // notification, not an alert — a warning icon would misrepresent it).
+            String icon = event.severity == NotificationEvent.Severity.CRITICAL ? "🚨"
+                    : (event.severity == NotificationEvent.Severity.INFO ? "🔔" : "⚠️");
             StringBuilder msg = new StringBuilder();
             msg.append(icon).append(" *").append(md(event.title)).append("*");
             if (event.body != null && !event.body.isEmpty()) {

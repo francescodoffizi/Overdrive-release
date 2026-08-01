@@ -619,6 +619,15 @@ class DashboardFragment : Fragment() {
             com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.STARTING_TAILSCALE,
             com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.WAITING_FOR_URL -> {
                 metricTunnelValue.text = getString(R.string.dashboard_tunnel_connecting)
+                // Amber, matching the toolbar pill for these states.
+                tunnelStateDot.setBackgroundResource(R.drawable.status_dot_starting)
+            }
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.STOPPING -> {
+                metricTunnelValue.text = getString(R.string.dashboard_tunnel_tile_stopping)
+                tunnelStateDot.setBackgroundResource(R.drawable.status_dot_starting)
+            }
+            com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.FAILED -> {
+                metricTunnelValue.text = getString(R.string.dashboard_tunnel_tile_failed)
                 tunnelStateDot.setBackgroundResource(R.drawable.status_dot_offline)
             }
             com.overdrive.app.ui.model.TunnelDisplayPolicy.Kind.HIDDEN -> {

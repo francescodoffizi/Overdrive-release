@@ -162,17 +162,34 @@ public final class CameraPreviewHelper {
             if (cam == null) return null;
             if (cam.isUsingEscoSurfaceTexturePath()) {
                 // 2x2-native HAL on DiLink 4. Slice → role → Variant A
-                // corner+flip mapping (matches recorder / stream / cropper).
-                //   FRONT (slice4) → producer TL  X-flip
+                // corner+flip mapping. Reads Dilink4Constants so this stays in
+                // lockstep with recorder / stream / blind-spot / AI-downscaler /
+                // cropper — this was a SIXTH hardcoded copy of the layout and it
+                // carried the same upside-down bug they did (Front fy=1,
+                // Right fy=1), so per-quadrant high-res JPEG grabs of front and
+                // right came out vertically inverted.
+                //   FRONT (slice4) → producer TL  X-mirror
                 //   RIGHT (slice3) → producer BR  no flip
-                //   REAR  (slice1) → producer TR  Y-flip
-                //   LEFT  (slice2) → producer BL  Y-flip
+                //   REAR  (slice1) → producer TR  no flip
+                //   LEFT  (slice2) → producer BL  no flip
                 float cx, cy, fx, fy;
                 switch (slice) {
-                    case SLICE_4: cx = 0.0f; cy = 0.0f; fx = 1.0f; fy = 1.0f; break; // Front
-                    case SLICE_3: cx = 0.5f; cy = 0.5f; fx = 0.0f; fy = 1.0f; break; // Right
-                    case SLICE_1: cx = 0.5f; cy = 0.0f; fx = 0.0f; fy = 0.0f; break; // Rear
-                    case SLICE_2: cx = 0.0f; cy = 0.5f; fx = 0.0f; fy = 0.0f; break; // Left
+                    case SLICE_4:
+                        cx = Dilink4Constants.CORNER_FRONT[0]; cy = Dilink4Constants.CORNER_FRONT[1];
+                        fx = Dilink4Constants.FLIP_FRONT[0];   fy = Dilink4Constants.FLIP_FRONT[1];
+                        break; // Front
+                    case SLICE_3:
+                        cx = Dilink4Constants.CORNER_RIGHT[0]; cy = Dilink4Constants.CORNER_RIGHT[1];
+                        fx = Dilink4Constants.FLIP_RIGHT[0];   fy = Dilink4Constants.FLIP_RIGHT[1];
+                        break; // Right
+                    case SLICE_1:
+                        cx = Dilink4Constants.CORNER_REAR[0];  cy = Dilink4Constants.CORNER_REAR[1];
+                        fx = Dilink4Constants.FLIP_REAR[0];    fy = Dilink4Constants.FLIP_REAR[1];
+                        break; // Rear
+                    case SLICE_2:
+                        cx = Dilink4Constants.CORNER_LEFT[0];  cy = Dilink4Constants.CORNER_LEFT[1];
+                        fx = Dilink4Constants.FLIP_LEFT[0];    fy = Dilink4Constants.FLIP_LEFT[1];
+                        break; // Left
                     default:      cx = slice.getCornerX(); cy = slice.getCornerY();
                                   fx = 0.0f; fy = 0.0f; break;
                 }

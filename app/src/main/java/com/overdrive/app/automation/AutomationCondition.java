@@ -5,6 +5,7 @@ import com.overdrive.app.automation.condition.BydEvent;
 import com.overdrive.app.automation.condition.EventData;
 import com.overdrive.app.automation.value.BaseValue;
 import com.overdrive.app.automation.value.IntValue;
+import com.overdrive.app.automation.value.StringValue;
 import com.overdrive.app.automation.value.Value;
 
 import org.json.JSONObject;
@@ -100,8 +101,41 @@ public class AutomationCondition {
                 return Boolean.TRUE.equals(value.compare(coerced, comparator));
             }
         }
-        // Compare to true as it will be null when not a valid comparison
-        return Boolean.TRUE.equals(value.compare(this.value, comparator));
+        // Coerce a plain CONSTANT rhs to the LHS's type before comparing. A user VARIABLE
+        // LHS is always a StringValue, but the numeric value picker stores its constant as a
+        // bare JSON number → an Integer on the daemon (and DynamicIntType.isValid accepts
+        // both). StringValue.compareValue is typed to String, so BaseValue.compare then does
+        // (String) Integer → ClassCastException → null → the condition silently evaluates
+        // false. That is exactly why "if variable == 0 then … else …" never took the THEN
+        // branch (e.g. a 0/1 toggle stuck at 0). Coercing here (mirrors coerceForLhs on the
+        // dynamic path) makes the constant comparison type-correct in both directions.
+        Object constant = coerceConstantForLhs(value, this.value);
+        if (constant == null && this.value != null) return false; // non-coercible → not met
+        return Boolean.TRUE.equals(value.compare(constant, comparator));
+    }
+
+    /**
+     * Coerce a plain constant to be comparable against the LHS value's type. A
+     * {@link StringValue} LHS gets the constant as its String form (so a numeric-picker
+     * Integer like {@code 0} compares against a variable's {@code "0"}); an {@link IntValue}
+     * LHS gets it parsed to an Integer (so a string {@code "60"} compares numerically),
+     * returning null when it isn't a whole number (fail-safe → not met). Any other LHS type
+     * (or a null constant) is returned unchanged, so every existing same-type comparison
+     * takes the identical path it did before.
+     */
+    private static Object coerceConstantForLhs(Value lhs, Object constant) {
+        if (constant == null) return null;
+        if (lhs instanceof StringValue) return constant.toString();
+        if (lhs instanceof IntValue) {
+            if (constant instanceof Integer) return constant;
+            if (constant instanceof Number) return ((Number) constant).intValue();
+            try {
+                return Integer.valueOf(constant.toString().trim());
+            } catch (Exception e) {
+                return null; // non-numeric constant vs a numeric signal → not met
+            }
+        }
+        return constant;
     }
 
     /**
@@ -156,6 +190,110 @@ public class AutomationCondition {
         if (!(value instanceof String)) return false;
         String s = ((String) value).trim();
         return s.startsWith("${") && s.endsWith("}") && s.length() > 3;
+    }
+
+    /**
+     * Parse a signal ADDRESS into the {@link EventData} state key it names, without reading
+     * its value. Accepts the same grammar {@link #resolveDynamic} does, with or without the
+     * {@code ${signal:…}} wrapper:
+     *
+     * <ul>
+     *   <li>{@code TYPE} → {@code EventData(TYPE)} — e.g. {@code gear}, {@code batteryLevel}</li>
+     *   <li>{@code TYPE:k1=v1,k2=v2} → an ATTRIBUTED key — e.g. {@code speed:units=kmph},
+     *       {@code lights:area=lowBeam}, {@code turnSignal:side=left}</li>
+     *   <li>{@code ${signal:…}} → the wrapped form, so a value emitted by the editor's
+     *       signal picker can be stored directly as an address</li>
+     * </ul>
+     *
+     * <p>This is the LEFT-hand-side counterpart of the RHS resolver: the flow actions
+     * (if/else, wait-until, wait-until-signal, loop) use it so their comparable-signal list
+     * is the full condition catalog rather than a hardcoded enum per action, addressing every
+     * attributed signal by the one grammar the RHS already speaks. Keeping both in this class
+     * keeps that grammar in a single place.
+     *
+     * @return the addressed key, or null when the address is blank/malformed (callers treat
+     *         null as "no LHS" and fail safe rather than comparing against a wrong signal)
+     */
+    /**
+     * Legacy flow-action signal ids → their equivalent address in the shared grammar.
+     *
+     * <p>Before the flow actions shared the condition catalog, each declared its own enum and
+     * these ids named signals the catalog models as ATTRIBUTED conditions. They are still on
+     * disk in saved automations, and {@link com.overdrive.app.automation.action.BaseAction}
+     * rejects an action whose stored variable no longer validates — which would drop the whole
+     * automation. Translating them here keeps every saved automation working AND keeps the
+     * translation in one place instead of a per-action switch.
+     *
+     * <p>Every other legacy id (brake, batteryLevel, gear, …) is already a catalog id and
+     * needs no entry.
+     */
+    private static final Map<String, String> LEGACY_SIGNAL_IDS = Map.of(
+            "speedKmph", "speed:units=kmph",
+            "speedMph",  "speed:units=mph",
+            "turnLeft",  "turnSignal:side=left",
+            "turnRight", "turnSignal:side=right",
+            "lowBeam",   "lights:area=lowBeam",
+            "highBeam",  "lights:area=highBeam",
+            "hazard",    "lights:area=hazard",
+            "drl",       "lights:area=drl");
+
+    /**
+     * Is this exactly one of the pre-catalog flow-action signal ids? Lets a caller pre-filter
+     * without parsing (a legacy alias does not contain the type it maps to, so a substring
+     * test alone would miss it).
+     */
+    public static boolean isLegacySignalId(String id) {
+        return id != null && LEGACY_SIGNAL_IDS.containsKey(id);
+    }
+
+    public static EventData resolveSignalAddress(String address) {
+        if (address == null) return null;
+        try {
+            String s = address.trim();
+            if (s.isEmpty()) return null;
+            // Saved automations still hold the pre-catalog ids; map them to the shared grammar
+            // before parsing so they resolve to exactly the signal they always did.
+            String legacy = LEGACY_SIGNAL_IDS.get(s);
+            if (legacy != null) s = legacy;
+            // Unwrap ${signal:…} / ${var:…} so the editor's picker output works as-is.
+            if (isDynamicRef(s)) {
+                String inner = s.substring(2, s.length() - 1).trim();
+                int kindColon = inner.indexOf(':');
+                if (kindColon < 0) return null;
+                String kind = inner.substring(0, kindColon).trim();
+                String rest = inner.substring(kindColon + 1).trim();
+                if (rest.isEmpty()) return null;
+                if ("var".equals(kind)) {
+                    return SetVariableAction.variableEvent(rest);
+                }
+                if (!"signal".equals(kind)) return null;
+                s = rest;
+            }
+            int attrColon = s.indexOf(':');
+            if (attrColon < 0) return new EventData(s);
+            String type = s.substring(0, attrColon).trim();
+            if (type.isEmpty()) return null;
+            Map<String, String> attrs = new HashMap<>();
+            // A user VARIABLE is addressed as "variable:name=<free text>", and that text is the
+            // only attribute value here that isn't a fixed token — it may legitimately contain
+            // a comma ("Shopping,List"). Splitting on "," would then produce a fragment with no
+            // "=" and reject the whole address, so the rule would save and silently never fire.
+            // Take the remainder verbatim as the single name attribute instead.
+            if (BydEvent.VARIABLE_TYPE.equals(type)) {
+                String rest = s.substring(attrColon + 1).trim();
+                if (!rest.startsWith("name=")) return null;
+                String name = rest.substring(5).trim();
+                return name.isEmpty() ? null : SetVariableAction.variableEvent(name);
+            }
+            for (String pair : s.substring(attrColon + 1).trim().split(",")) {
+                int eq = pair.indexOf('=');
+                if (eq <= 0) return null;   // malformed attribute → fail safe, never guess
+                attrs.put(pair.substring(0, eq).trim(), pair.substring(eq + 1).trim());
+            }
+            return attrs.isEmpty() ? new EventData(type) : new EventData(type, attrs);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /**

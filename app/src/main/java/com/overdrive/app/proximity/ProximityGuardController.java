@@ -485,7 +485,30 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
         if (keyframePulseTimer != null && !keyframePulseTimer.isDone()) {
             return;
         }
-        long periodSec = Math.max(1L, config.getPreRecordSeconds() / 2L);
+        // Pulse period = 3/4 of the pre-record window (was 1/2).
+        //
+        // The ONLY correctness requirement is that at least one keyframe always
+        // lies inside the pre-record window, so a trigger-time flush produces a
+        // decodable clip. 1/2 satisfied that with 2x margin; 3/4 still keeps a
+        // full quarter-window of margin while cutting forced IDRs by ~33%.
+        //
+        // Why that matters: each pulse is a full-resolution IDR (2560x1920 by
+        // default) on the shared hardware video block, and a keyframe costs
+        // several times a P-frame. At the low monitor ring rate the IDRs were a
+        // large fraction of all encoded frames, so this is a direct reduction in
+        // sustained load on the block the UI also composites through.
+        //
+        // Kept DERIVED from preRecordSeconds rather than hardcoded: the window is
+        // user-configurable 2-15s (ProximityGuardConfig MIN/MAX_PRE_RECORD_SECONDS),
+        // and a fixed period would break the short end (a flat 4s pulse with a 2s
+        // window could leave the window keyframe-less). Math.max(1L, ...) floors
+        // the 2s window at a 1s pulse.
+        //
+        // Note this is independent of camera fps: applyMonitorProfile derives a
+        // draw stride so the ring always fills at ~monitorFps (8 by default)
+        // regardless of whether the HAL runs at 8, 15, 25 or 30 — so the
+        // keyframe-per-window guarantee holds across the whole fps range.
+        long periodSec = Math.max(1L, (config.getPreRecordSeconds() * 3L) / 4L);
         keyframePulseTimer = scheduler.scheduleWithFixedDelay(() -> {
             try {
                 // Only pulse while still MONITORING — a late tick after a state

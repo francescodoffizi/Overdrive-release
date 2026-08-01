@@ -195,8 +195,35 @@ public final class BydFeatureIds {
     public static final int TAILGATE_DOWN_BACK_DOOR_POSITION = resolveOrFallback("Tailgate.DOWN_BACK_DOOR_CURRENT_POSITION", 365953044);
 
     // ==================== MIRROR ====================
+    // These two are the ONLY mirror ids the OEM SDK defines (verified against the reference
+    // app's bundled BYDAutoFeatureIds: its Mirror class has exactly these fields).
     public static final int MIRROR_HAVE_AUTO_FOLD = resolveOrFallback("Mirror.HAVE_REARVIEW_MIRROR_AUTO_FOLD", 1081081882);
     public static final int MIRROR_REARVIEW_SET = resolveOrFallback("Mirror.BODYWORK_REARVIEW_MIRROR_SET", 1324556304);
+    // REMOVED: MIRROR_OUTSIDE_FOLD_SET / "Setting.SET_OUTSIDE_REARVIEW_MIRROR_FOLD_SET"
+    // (0x4C10A028). No such field or value exists anywhere in the OEM SDK, so
+    // resolveOrFallback ALWAYS silently substituted the invented literal — and 0x4C10A0xx is
+    // an Instrument-block range (cf. Instrument.NAVI_TYPE_SET = 0x4C10A018), not a mirror one.
+    // setMirrorsFolded was writing that foreign id to two devices and, because the generic
+    // write's success test is `code >= 0`, reading the result as success. Real mirror writes
+    // live at 0x4EF32010 (MIRROR_REARVIEW_SET above) on the bodywork device.
+    // ==================== HUD ====================
+    // HUD on/off is a DEDICATED Setting feature-id write on the newer OEM firmware —
+    // separate from HUD brightness. It is written as a BYDAutoEventValue via
+    // BYDAutoSettingDevice.set(int[], EventValue) (the same sendSetCommand path as every
+    // other setting write), from a real app process. An earlier build wrongly concluded
+    // "no HUD switch exists" (that was true only on an older firmware that exposed only
+    // setHUDBrightness) and even a prior guess fabricated 0x0780E026 on the instrument
+    // device — both removed. The real ids, confirmed against the OEM SDK:
+    //   SET_HUD_SWITCH_SET             0x4C10E023 (1276174371) — WRITE 1=on / 2=off (NOT 0!)
+    //   SET_HUD_CONFIG                 0x38B00015 (951058453)  — READ: HUD is fitted iff 1 or 2
+    //   SET_HUD_SWITCH_STATUS_FEEDBACK 0x38B0001C (951058460)  — READ: HUD is on iff 1
+    // Note: the switch id lives in the 0x4C10E block a prior comment called "dead" for the
+    // brightness-gear id — that was id-specific; this HUD switch id is live. Brightness
+    // stays the named setHUDBrightness(int) 0..100 method. Both actuate from the app
+    // process (VehicleActuatorService); the UID-2000 daemon's setting writes silently no-op.
+    public static final int SETTING_HUD_SWITCH_SET = resolveOrFallback("Setting.SET_HUD_SWITCH_SET", 1276174371);
+    public static final int SETTING_HUD_CONFIG = resolveOrFallback("Setting.SET_HUD_CONFIG", 951058453);
+    public static final int SETTING_HUD_SWITCH_STATUS_FEEDBACK = resolveOrFallback("Setting.SET_HUD_SWITCH_STATUS_FEEDBACK", 951058460);
 
     // ==================== PM25 ====================
     public static final int PM25_ANION_STATE = resolveOrFallback("Pm25.ANION_STATE", 1033895958);
@@ -262,6 +289,28 @@ public final class BydFeatureIds {
     public static final int ADAS_ESP_STATE_SET = resolveOrFallback("Adas.ADAS_ESP_STATE_SET", 944766984);
     public static final int ADAS_SLW_FUNC_SWITCH_STATE = resolveOrFallback("Adas.ADAS_SLW_FUNC_SWITCH_STATE", 535834664);
     public static final int ADAS_SLW_FUNC_SWITCH_STATE_SET = resolveOrFallback("Adas.ADAS_SLW_FUNC_SWITCH_STATE_SET", 850452531);
+
+    // ── Blind-spot / lane-change / cross-traffic WARNINGS ────────────────
+    // These are the radar ALERT signals (is a vehicle in the blind spot right
+    // now), NOT the BSD on/off switch (ADAS_BSD_STATE below).
+    //
+    // Two DIFFERENT value encodings — mixing them up breaks the feature:
+    //   • The dedicated FL/FR alarms are LEVELS: >= 1 means alerting.
+    //   • LCA / RCTA / DOW are monotonically-increasing COUNTERS: an alert is an
+    //     INCREASE over the last seen value, not a non-zero value. Reading one as
+    //     a level either never fires (if it rests non-zero) or latches forever.
+    public static final int ADAS_FL_BLIND_SPOT_ALARM = resolveOrFallback("Adas.ADAS_FL_BLIND_SPOT_ALARM_ACTIVE_SIGNAL_STATUS", 1098907692);
+    public static final int ADAS_FR_BLIND_SPOT_ALARM = resolveOrFallback("Adas.ADAS_FR_BLIND_SPOT_ALARM_ACTIVE_SIGNAL_STATUS", 1098907694);
+    public static final int ADAS_LCA_WARNING_LEFT = resolveOrFallback("Adas.ADAS_RIGHT_RADAR_LCA_WARNINGLEFT", 1098907664);
+    public static final int ADAS_LCA_WARNING_RIGHT = resolveOrFallback("Adas.ADAS_RIGHT_RADAR_LCA_WARNINGRIGHT", 1098907666);
+    public static final int ADAS_RCTA_WARNING_LEFT = resolveOrFallback("Adas.ADAS_RIGHT_RADAR_RCTA_WARNINGLEFT", 1098907668);
+    public static final int ADAS_RCTA_WARNING_RIGHT = resolveOrFallback("Adas.ADAS_RIGHT_RADAR_RCTA_WARNINGRIGHT", 1098907669);
+    public static final int ADAS_DOW_WARN_LEFT = resolveOrFallback("Adas.ADAS_DOW_WARN_LEFT", 1098907680);
+    public static final int ADAS_DOW_WARN_RIGHT = resolveOrFallback("Adas.ADAS_DOW_WARN_RIGHT", 1098907682);
+    /** Capability flag ("does this trim have BSD hardware"). Encoding unverified
+     *  on-device, so it is NOT used as a gate — a missing/odd value must never
+     *  suppress a real alert. Declared for probing only. */
+    public static final int ADAS_HAS_BSD = resolveOrFallback("Adas.ADAS_HAS_BSD", 1098907648);
 
     // ==================== SENSOR ====================
     public static final int SENSOR_AUTO_SLOPE = resolveOrFallback("Sensor.SENSOR_AUTO_SLOPE", 573571116);

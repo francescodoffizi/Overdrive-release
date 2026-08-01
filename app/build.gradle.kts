@@ -61,7 +61,6 @@ tasks.matching { it.name.contains("CMake") || it.name.contains("ExternalNative")
 
 // OpenCV-mobile version for surveillance module (minimal build, ~3MB vs ~20MB)
 // https://github.com/nihui/opencv-mobile
-val opencvMobileTag = "v31"
 val opencvMobileVersion = "4.10.0"
 tasks.register("downloadOpenCV") {
     val opencvDir = file("src/main/cpp/opencv")
@@ -78,7 +77,7 @@ tasks.register("downloadOpenCV") {
             println("Downloading opencv-mobile ${opencvMobileVersion} for Android...")
             
             // Correct URL format: /releases/download/vVERSION/
-            val zipUrl = "https://github.com/nihui/opencv-mobile/releases/download/${opencvMobileTag}/opencv-mobile-${opencvMobileVersion}-android.zip"
+            val zipUrl = "https://github.com/nihui/opencv-mobile/releases/download/v${opencvMobileVersion}/opencv-mobile-${opencvMobileVersion}-android.zip"
             val zipFile = file("${opencvDir}/opencv-mobile-android.zip")
             
             try {
@@ -105,7 +104,7 @@ tasks.register("downloadOpenCV") {
                     
                     if (extractedDir.exists()) {
                         // Copy arm64-v8a static libs
-                        val extractedLibDir = file("${extractedDir}/sdk/native/staticlibs/arm64-v8a")
+                        val extractedLibDir = file("${extractedDir}/arm64-v8a/lib")
                         if (extractedLibDir.exists()) {
                             extractedLibDir.listFiles()?.forEach { f ->
                                 println("  Copying lib: ${f.name}")
@@ -117,7 +116,7 @@ tasks.register("downloadOpenCV") {
                         }
                         
                         // Copy headers
-                        val extractedInclude = file("${extractedDir}/sdk/native/jni/include")
+                        val extractedInclude = file("${extractedDir}/arm64-v8a/include")
                         if (extractedInclude.exists()) {
                             if (includeDir.exists()) includeDir.deleteRecursively()
                             extractedInclude.copyRecursively(includeDir, overwrite = true)
@@ -206,15 +205,36 @@ android {
 
     defaultConfig {
         applicationId = "com.overdrive.app"
-        minSdk = 25
+        // minSdk=28 required for Image.getHardwareBuffer() — the ImageReader
+        // zero-copy camera path uses it to bypass SurfaceFlinger throttling.
+        // targetSdk pinned at 25 to keep app_process daemon behavior stable
+        // (newer targetSdks tighten background restrictions).
+        minSdk = 28
         targetSdk = 25
-        versionCode = 1
-        versionName = "1.0"
+        // Release identity is the build's TRUE self-identity (BuildConfig), used
+        // by AppUpdater.getInstalledVersion() => "<channel>-v<versionName>" and
+        // every surface that falls back to it (About row, post-update toast,
+        // /status when VERSION_FILE is absent). It MUST track the real shipped
+        // release, otherwise BuildConfig goes stale against the GitHub builds
+        // (the "About shows 26.0 / version mismatch" class of bugs). Driven by
+        // Gradle properties so the release/braveheart pipeline stamps the real
+        // value (e.g. `-PoverdriveVersionName=27.4 -PoverdriveVersionCode=12`)
+        // without a source edit per release; the defaults track the current
+        // rolling head so a plain local build is still accurate.
+        versionCode = (project.findProperty("overdriveVersionCode") as? String)?.toIntOrNull() ?: 58
+        versionName = (project.findProperty("overdriveVersionName") as? String) ?: "36.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
         // Note: abiFilters removed - using splits.abi instead for size optimization
-        
+
         externalNativeBuild { cmake { cppFlags += "-std=c++17" } }
+
+        // Default diagnostics fields (overridden per buildType). LOG_CAPTURE gates the
+        // in-app log-upload UI; LOG_UPLOAD_URL is the Cloudflare Worker endpoint. Both
+        // OFF/empty by default (release/debug); braveheart flips them on. Restored from
+        // the working build's generated BuildConfig (default-config fields).
+        buildConfigField("boolean", "LOG_CAPTURE", "false")
+        buildConfigField("String", "LOG_UPLOAD_URL", "\"\"")
     }
 
     buildFeatures {
@@ -265,22 +285,54 @@ android {
                 // Production: include strip-logs → R8 removes all log calls
                 proguardFilesList.add(file("proguard-rules-strip-logs.pro"))
             }
+            // Console logging (android.util.Log, System.out/err) is ALWAYS stripped in
+            // release builds, independent of the DaemonLogConfig file-logging flags above.
+            // (loggingEnabled only governs DaemonLogger FILE logging via strip-logs.)
+            // Optional: this ruleset is not part of the open-source tree, so only add it
+            // when present. Without it the build still succeeds — console calls simply
+            // survive R8 instead of being stripped.
+            val stripConsole = file("proguard-rules-strip-console.pro")
+            if (stripConsole.exists()) proguardFilesList.add(stripConsole)
             proguardFiles(*proguardFilesList.toTypedArray())
             
             signingConfig = signingConfigs.getByName("release")
             
             // Update channel: "alpha" for release builds (checks alpha tag on GitHub)
             buildConfigField("String", "UPDATE_CHANNEL", "\"alpha\"")
-            buildConfigField("boolean", "LOG_CAPTURE", "true")
-            buildConfigField("String", "LOG_UPLOAD_URL", "\"\"")
         }
         debug {
             isMinifyEnabled = false
-            
+
             // Debug builds also check alpha channel for updates
             buildConfigField("String", "UPDATE_CHANNEL", "\"alpha\"")
+        }
+        // Braveheart: the rolling/bleeding-edge channel, shipped as a RELEASE build but
+        // with diagnostics ON so braveheart customers can upload complete per-daemon
+        // logs. initWith(release) inherits minify/shrink/signing; we reset proguardFiles
+        // to the base rules WITHOUT the log-stripping file so logcat + DaemonLogger file
+        // calls survive R8 regardless of DaemonLogConfig flags.
+        create("braveheart") {
+            initWith(getByName("release"))
+            // initWith copies release's proguardFiles (which may include strip-logs).
+            // Reset and re-add ONLY the base rules — WITHOUT strip-logs — so logging
+            // survives R8 in braveheart. (proguard-rules.pro has no log-stripping rules.)
+            setProguardFiles(emptyList<Any>())
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                file("proguard-rules.pro")
+            )
+            // Release signing carries over via initWith; set explicitly so a future
+            // release-block change can't silently drop it.
+            signingConfig = signingConfigs.getByName("release")
+            // Rolling channel + diagnostics on.
+            buildConfigField("String", "UPDATE_CHANNEL", "\"braveheart\"")
             buildConfigField("boolean", "LOG_CAPTURE", "true")
-            buildConfigField("String", "LOG_UPLOAD_URL", "\"\"")
+            // Cloudflare Worker that stashes an uploaded daemon log and returns a short
+            // retrieval code. Supplied at build time (-PoverdriveLogUploadUrl=…) rather
+            // than hardcoded, so this tree carries no deployment-specific endpoint.
+            // Empty → the in-app log upload is disabled, same as release/debug.
+            buildConfigField("String", "LOG_UPLOAD_URL",
+                "\"${project.findProperty("overdriveLogUploadUrl") as? String ?: ""}\"")
         }
     }
     
@@ -370,13 +422,35 @@ dependencies {
     // Lifecycle & ViewModel
     implementation(libs.androidx.lifecycle.viewmodel.ktx)
     implementation(libs.androidx.lifecycle.livedata.ktx)
+
+    // Onboarding overlay motion. Both were transitive-only (pulled by
+    // navigation-fragment + material); declared explicitly so a transitive
+    // bump can't drop the edge the onboarding guide depends on.
+    //   - dynamicanimation: SpringAnimation for the tip-card settle + wizard
+    //     success scale-in (Choreographer-driven, no GL — cheap on Adreno 610).
+    //   - transition: AutoTransition / MaterialFadeThrough for stepper + card
+    //     content swaps (already used by SettingsFragment, was transitive).
+    implementation(libs.androidx.dynamicanimation)
+    implementation(libs.androidx.transition)
     
     // QR Code generation
     implementation(libs.zxing.core)
 
-    // MapLibre Native — GPU vector map for the RoadSense map / navigation feature
+    // MapLibre Native Android — GPU-accelerated vector map renderer (BSD, no key).
+    // RoadSense map view: route search + hazard-icon plotting over OpenFreeMap tiles.
+    // Pinned to the conservative 11.x line (minSdk 21 << our 28); ships an arm64-v8a
+    // .so that rides the existing arm64-only split + useLegacyPackaging path.
     implementation(libs.maplibre.android.sdk)
 
+    // NOTE: ferrostar:core was evaluated for turn-by-turn guidance and REJECTED —
+    // 0.51.0 is compiled with Kotlin 2.3.0 (+ drags kotlin-stdlib 2.3.20, newer
+    // okhttp/okio) which is incompatible with this project's Kotlin 2.0.21, and it
+    // also requires core-library desugaring + a JNA/Rust .so per ABI. Bumping the
+    // app-wide Kotlin toolchain for one feature is an unacceptable regression risk.
+    // Instead the guidance state machine (Valhalla route parse, off-route detection,
+    // step advancement, ETA) is implemented natively in com.overdrive.app.navmap.nav
+    // against the Valhalla JSON — no heavy native dep, no toolchain change.
+    
     // RTMP streaming client for pushing to MediaMTX
     implementation(libs.rtmp.client)
     
@@ -390,10 +464,13 @@ dependencies {
     
     implementation(libs.androidx.work.runtime.ktx)
     
-    // TensorFlow Lite for AI inference (replaces NCNN)
+    // TensorFlow Lite for AI inference. CPU-only (XNNPACK) — GPU delegate
+    // intentionally removed: on Adreno 610 (unified-memory SoC) concurrent
+    // OpenCL inference and the H.265 hardware encoder share one DDR bus,
+    // producing 200–300 ms eglSwapBuffers stalls during recording. CPU
+    // inference is the only physical bypass for the bandwidth contention.
+    // See YoloDetector.kt for the full mechanism comment.
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
-    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")  // GPU acceleration
-    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.14.0")  // GPU API interfaces
     implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
     
     // OkHttp for Telegram HTTP client with proxy support

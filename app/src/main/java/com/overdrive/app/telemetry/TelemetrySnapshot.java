@@ -77,7 +77,12 @@ public class TelemetrySnapshot {
                 1,                          // gearMode = P
                 false,                      // leftTurnSignal
                 false,                      // rightTurnSignal
-                new boolean[]{true, true},  // seatbeltBuckled (driver + passenger buckled)
+                // seatbeltBuckled — NOT buckled-by-default. This snapshot is what the overlay
+                // renders in the window between startPolling() and the first published poll, so
+                // `true` painted a green ALL-CLEAR on a safety glyph from zero real data (for up
+                // to one worker frame, burned into the recording). Matches
+                // TelemetryDataCollector.lastSeatbelts, which is false/false for the same reason.
+                new boolean[]{false, false},
                 System.currentTimeMillis()  // timestampMs
         );
     }

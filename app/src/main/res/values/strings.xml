@@ -478,6 +478,12 @@
     <string name="recording_lib_building_index_title">Building library index</string>
     <string name="recording_lib_building_index_body">One moment while the daemon scans your recordings.</string>
     <string name="recording_lib_building_index_progress">Indexed %1$d of %2$d clips…</string>
+    <!-- Shown when the daemon reports its recordings index is down (the H2
+         store closed underneath it). The clips are still on disk, so this must
+         NOT read as "no recordings" — the library re-polls and recovers on its
+         own once the daemon re-opens the index. -->
+    <string name="recording_lib_index_down_title">Recordings index unavailable</string>
+    <string name="recording_lib_index_down_body">Your recordings are safe on disk, but the library index is down. Retrying automatically…</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
          filename prefix (cam_/event_/dvr_/proximity_) so power users can
          map a tile back to its file group at a glance. -->
@@ -709,6 +715,8 @@
     <string name="dashboard_starting_cloudflared">Starting Cloudflared tunnel…</string>
     <string name="dashboard_starting_tailscale">Starting Tailscale tunnel…</string>
     <string name="dashboard_waiting_url">Waiting for tunnel URL…</string>
+    <string name="dashboard_tunnel_failed">Tunnel error</string>
+    <string name="dashboard_tunnel_stopping">Stopping tunnel…</string>
     <string name="dashboard_daemons_running">%1$d/%2$d Running</string>
     <string name="tunnel_label_cloudflared">Cloudflared</string>
     <string name="tunnel_label_zrok">Zrok</string>
@@ -867,6 +875,8 @@
     <string name="rail_integrations">Integrations</string>
     <string name="rail_diagnostics">Diagnostics</string>
     <string name="rail_settings">Settings</string>
+    <string name="rail_expand">Show navigation labels</string>
+    <string name="rail_collapse">Hide navigation labels</string>
 
     <!-- Settings sub-rail -->
     <string name="settings_section_appearance">Appearance</string>
@@ -977,6 +987,10 @@
     <string name="recordings_action_settings">Settings</string>
     <!-- Hero subtitle: "%1$d today · %2$d total · %3$s" where %3$s is a pre-formatted size like "42 GB". -->
     <string name="recordings_summary_format">%1$d today · %2$d total · %3$s</string>
+    <!-- Header text when the daemon's recordings index is down. The counters
+         would all be zero and are NOT authoritative, so say so rather than
+         rendering "0 today · 0 total · 0 B" as fact. -->
+    <string name="recordings_summary_index_down">Counts unavailable — recordings index is down</string>
     <!-- Per-segment label with running count, e.g. "Dashcam · 118". -->
     <string name="recordings_segment_dashcam_count">Dashcam · %d</string>
     <string name="recordings_segment_replays_count">Replays · %d</string>
@@ -1095,6 +1109,8 @@
     <string name="dashboard_tunnel_offline">Offline</string>
     <string name="dashboard_tunnel_online">Online</string>
     <string name="dashboard_tunnel_connecting">Connecting…</string>
+    <string name="dashboard_tunnel_tile_failed">Error</string>
+    <string name="dashboard_tunnel_tile_stopping">Stopping…</string>
 
     <!-- Quick actions (now rendered as same-size tiles, not chips) -->
     <string name="dashboard_action_live">Live</string>

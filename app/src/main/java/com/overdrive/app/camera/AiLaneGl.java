@@ -338,9 +338,13 @@ public final class AiLaneGl {
                                 sentry.setFoveatedCropper(foveatedCropper, textureId);
                                 logger.info("FOVEATED-DIAG: lazy-wired cropper into engine (textureId="
                                         + textureId + ")");
-                            } else if (System.currentTimeMillis() - lastFoveatedWireDiagMs > 5000) {
-                                // DIAGNOSTIC: the wire is reachable but didn't fire —
-                                // log which sub-term blocked it (AiLaneGl's own view).
+                            } else if (sentry.getFoveatedCropper() == null
+                                    && System.currentTimeMillis() - lastFoveatedWireDiagMs > 5000) {
+                                // DIAGNOSTIC: the wire is reachable but a sub-term genuinely
+                                // blocked it (cropper still null/uninitialized). The
+                                // already-wired case (engineAlreadyWired=true) is SUCCESS, not
+                                // a blocker, so it is excluded here — otherwise this logged
+                                // every 5s for the daemon's life describing the healthy state.
                                 lastFoveatedWireDiagMs = System.currentTimeMillis();
                                 logger.info("FOVEATED-DIAG: lazy-wire NOT firing: cropperNull="
                                         + (foveatedCropper == null) + " cropperInit="

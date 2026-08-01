@@ -168,7 +168,14 @@ object UnifiedConfigManager {
     // Cleared by a successful load or forceReload().
     @Volatile
     private var corruptionDetected = false
-    
+
+    // One-shot log latch for the tripAnalytics.enabled default migration.
+    // applyDefaults is idempotent and re-runs on every reparse in the app UID
+    // (persistMigrationUnderLock is daemon-only), so without this the migration
+    // line would repeat on every config reload in that process.
+    @Volatile
+    private var tripEnabledMigrationLogged = false
+
     // Change listeners
     private val listeners = CopyOnWriteArrayList<ConfigChangeListener>()
     
@@ -609,6 +616,14 @@ object UnifiedConfigManager {
         // Master gate defaults FALSE: absent ⇒ nothing changes vs today.
         if (!camera.has("surveillanceIdleThrottle")) camera.put("surveillanceIdleThrottle", false)
         if (!camera.has("surveillanceIdleFps"))      camera.put("surveillanceIdleFps", 5)
+        // Quiet tier (issue #174): once the idle throttle is active AND no motion
+        // has occurred for surveillanceQuietTierMinutes, step the AI motion cadence
+        // down to surveillanceQuietTierFps Hz (relaxing the idle-HAL parity floor to
+        // match) so a long parked-idle tail stops paying ~10 Hz readbacks. First
+        // motion restores full cadence. ON by default WHEN the throttle is on
+        // (5 min / 3 Hz); minutes=0 disables the tier. Absent ⇒ these defaults.
+        if (!camera.has("surveillanceQuietTierMinutes")) camera.put("surveillanceQuietTierMinutes", 5)
+        if (!camera.has("surveillanceQuietTierFps"))     camera.put("surveillanceQuietTierFps", 3)
         if (!camera.has("probedCameraId"))    camera.put("probedCameraId", -1)
         if (!camera.has("probedSurfaceMode")) camera.put("probedSurfaceMode", -1)
         if (!camera.has("roleMappings"))      camera.put("roleMappings", JSONObject())
@@ -682,19 +697,56 @@ object UnifiedConfigManager {
         if (!blindspot.has("rotation")) blindspot.put("rotation", 0)
         // Base quarter turn used as the forward-gear orientation when rotation="auto".
         if (!blindspot.has("rotationBase")) blindspot.put("rotationBase", 0)
+        // PER-SIDE card rotation. The left camera (view 7, left turn) and the right
+        // camera (view 8, right turn) are physically mirror-imaged, so each needs its
+        // own on-screen rotation — one global angle that reads upright on the left cam
+        // reads wrong on the right. rotationLeft/rotationRight are the fixed per-side
+        // quarter turns (int 0/90/180/270 or the string "auto"); when rotation="auto",
+        // rotationBaseLeft/rotationBaseRight are that side's forward-gear base (reverse
+        // flips 180°). Defaults mirror the legacy global keys so an existing config is
+        // unchanged; resolveBsRotation falls back to the global keys when these are
+        // absent, so this is purely additive.
+        if (!blindspot.has("rotationLeft")) blindspot.put("rotationLeft", blindspot.opt("rotation"))
+        if (!blindspot.has("rotationRight")) blindspot.put("rotationRight", blindspot.opt("rotation"))
+        if (!blindspot.has("rotationBaseLeft")) blindspot.put("rotationBaseLeft", blindspot.optInt("rotationBase", 0))
+        if (!blindspot.has("rotationBaseRight")) blindspot.put("rotationBaseRight", blindspot.optInt("rotationBase", 0))
+        // Fisheye / lens dewarp for the SINGLE-CAMERA views (side/rear) only. 0..100,
+        // same two-parameter division-model dewarp as recording.rectifyStrength but a
+        // SEPARATE knob so the blind-spot single-cam feed can be straightened
+        // independently of the recording pipeline. 0 = off (default); ignored for the
+        // merged 'both' view (libod already handles that projection).
+        if (!blindspot.has("rectifyStrength")) blindspot.put("rectifyStrength", 0)
 
         // Telemetry Overlay defaults.
         //
-        // Schema:
-        //   enabled            (legacy) — pano fallback when panoEnabled absent
-        //   panoEnabled        explicit pano gate; if absent, falls back to enabled
+        // Master-enable schema (which flows burn in the overlay AT ALL):
+        //   enabled            (legacy) — pano/ACC-on fallback when panoEnabled absent
+        //   panoEnabled        explicit pano/ACC-on gate; if absent, falls back to enabled
+        //   surveillanceEnabled explicit ACC-off surveillance gate; default false
+        //                      (parked burn-in is a deliberate opt-in — it keeps
+        //                      the BYD-HAL poll alive while parked, a 12V draw)
         //   oemDashcamEnabled  explicit OEM Dashcam gate; default false (the OEM
         //                      front sensor doesn't need a stamp by default —
         //                      separate opt-in keeps pano clean while OEM is on)
         //
-        // Resolver lives at isTelemetryOverlayEnabledFor(flow). Don't read
-        // panoEnabled / oemDashcamEnabled directly from callers — the legacy
-        // fallback is part of the contract.
+        // Per-flow FIELD selection (which fields each enabled flow draws) lives
+        // under a nested `fields` object keyed by flow:
+        //   fields.accOn / fields.surveillance / fields.oemDashcam = ["speed",...]
+        // Each flow owns its OWN list — never shared. A MISSING list resolves to
+        // the legacy eight-field default (see TelemetryFields.legacyDefault),
+        // which is exactly what the overlay drew before this feature — so an app
+        // update never changes what an existing overlay shows. New optional
+        // fields (batteryPercent, voltage12v, lowBeam, highBeam, location)
+        // default OFF because they aren't in the legacy default.
+        //
+        // We deliberately DON'T seed the per-flow lists here: absence === legacy
+        // default at read time, so seeding would only risk drift from the
+        // canonical default that TelemetryFields owns. The web UI writes an
+        // explicit list the first time the user edits a flow.
+        //
+        // Master resolver: isTelemetryOverlayEnabledFor(flow). Field resolver:
+        // getTelemetryOverlayFields(flow). Don't read the keys directly from
+        // callers — the legacy fallbacks are part of the contract.
         val telemetryOverlay = config.optJSONObject("telemetryOverlay") ?: JSONObject().also {
             config.put("telemetryOverlay", it)
         }
@@ -757,7 +809,38 @@ object UnifiedConfigManager {
         val tripAnalytics = config.optJSONObject("tripAnalytics") ?: JSONObject().also {
             config.put("tripAnalytics", it)
         }
-        if (!tripAnalytics.has("enabled")) tripAnalytics.put("enabled", false)
+        // Default ON — see TripConfig.DEFAULT_ENABLED. With this false the whole
+        // trip subsystem is never constructed (TripAnalyticsManager.initComponents
+        // is skipped), so the Trips page can only show "No trips recorded yet"
+        // while the one enable switch sits on the Storage tab.
+        if (!tripAnalytics.has("enabled")) tripAnalytics.put("enabled", true)
+        // ONE-SHOT UPGRADE. Flipping the seed default above only helps FRESH
+        // installs: every existing unit already has `enabled: false` persisted
+        // from when false was the default, and load() honours a persisted value.
+        // Those users would keep an inert trips page forever. Flip the stored
+        // false exactly once, marked by enabledDefaultMigrated.
+        //
+        // HONEST LIMITATION: the marker only protects opt-outs made from NOW ON.
+        // A config written before this build has no marker, so a `false` that the
+        // user deliberately chose is indistinguishable from the old default and
+        // IS overridden on this one upgrade. Trips capture GPS + 5Hz telemetry, so
+        // that is a real (one-time) privacy change — release-note it rather than
+        // claiming the design prevents it. After the flip, the marker makes every
+        // subsequent opt-out permanent.
+        if (!tripAnalytics.has("enabledDefaultMigrated")) {
+            tripAnalytics.put("enabledDefaultMigrated", true)
+            if (!tripAnalytics.optBoolean("enabled", true)) {
+                tripAnalytics.put("enabled", true)
+                // Log once per process. applyDefaults is idempotent and re-runs on
+                // every reparse in the APP uid (persistMigrationUnderLock is
+                // daemon-only, so the app never writes the marker back), which
+                // would otherwise re-log this line on each reload.
+                if (!tripEnabledMigrationLogged) {
+                    tripEnabledMigrationLogged = true
+                    Log.i(TAG, "tripAnalytics.enabled false→true (one-shot default migration)")
+                }
+            }
+        }
 
         // Floating status pill segment visibility. Independent of whether the
         // underlying feature (recording / trip analytics) is enabled — these
@@ -938,10 +1021,18 @@ object UnifiedConfigManager {
                     // nested keys wouldn't exist.
                     //
                     // Detect "needs migration" cheaply (legacy key at the
-                    // top of geocoding, or missing new sections/selection
-                    // provenance).
+                    // top of geocoding, or missing new sections).
                     val migrationNeeded = run {
                         if (!config.has("cloudflared")) return@run true
+                        // Trips default-ON one-shot: existing installs carry a
+                        // persisted `enabled:false` that applyDefaults must be
+                        // given the chance to flip exactly once. Without this
+                        // term the whole migration block is skipped on configs
+                        // that are otherwise up to date, and trips stay dead.
+                        val trips = config.optJSONObject("tripAnalytics")
+                        if (trips == null || !trips.has("enabledDefaultMigrated")) return@run true
+                        // Pre-provenance configs have modelId but no modelSource;
+                        // applyDefaults must run once to classify them as legacy.
                         val vehicle = config.optJSONObject("vehicle") ?: return@run true
                         if (!vehicle.has("modelSource")) return@run true
                         val geo = config.optJSONObject("geocoding") ?: return@run true
@@ -1546,7 +1637,17 @@ object UnifiedConfigManager {
         getBlindSpot().optInt("activeFps", 15).coerceIn(1, 30)
 
     /** Master gate for the parked-idle surveillance camera throttle. Default
-     *  FALSE ⇒ every deployed unit is byte-identical until explicit opt-in. */
+     *  FALSE ⇒ every deployed unit is byte-identical until explicit opt-in.
+     *
+     *  When enabled (camera.surveillanceIdleThrottle = true): while ARMED sentry
+     *  sits idle (no motion) the shared camera HAL drops to the idle fps, cutting
+     *  the capture-rail + compose/encode load that otherwise pins ~half a
+     *  little-core 24/7 while parked. Detection parity is preserved by design —
+     *  see desiredCameraState()/reconcileCameraProfileLocked(): the idle HAL floor
+     *  is clamped to the motion cadence and the AI readback is pinned to a
+     *  wall-clock interval, so motion sampling is identical whether the HAL is
+     *  idle or full-rate. Kept opt-in because it changes parked sentry behavior on
+     *  a safety-relevant feature. */
     @JvmStatic
     fun isSurveillanceIdleThrottle(): Boolean =
         loadConfig().optJSONObject("camera")?.optBoolean("surveillanceIdleThrottle", false) ?: false
@@ -1556,6 +1657,25 @@ object UnifiedConfigManager {
     @JvmStatic
     fun getSurveillanceIdleFps(): Int =
         loadConfig().optJSONObject("camera")?.optInt("surveillanceIdleFps", 5)?.coerceIn(1, 15) ?: 5
+
+    /** Quiet-tier step-down (issue #174): after this many minutes of SUSTAINED
+     *  no-motion while the idle throttle is active, drop the AI motion-readback
+     *  cadence (and relax the idle-HAL parity floor) to getSurveillanceQuietTierFps()
+     *  so a parked car overnight stops paying ~10 Hz PBO readbacks all night. The
+     *  first motion event restores the full cadence via the existing motion-edge
+     *  ramp. Only takes effect when surveillanceIdleThrottle is on. Default 5 min;
+     *  0 disables the quiet tier (keeps the pre-#174 constant cadence). */
+    @JvmStatic
+    fun getSurveillanceQuietTierMinutes(): Int =
+        loadConfig().optJSONObject("camera")?.optInt("surveillanceQuietTierMinutes", 5)?.coerceIn(0, 240) ?: 5
+
+    /** AI motion-readback cadence (Hz) once the quiet tier is entered (issue #174).
+     *  Must stay ≤ getSurveillanceIdleFps() so the HAL always delivers at least as
+     *  fast as the AI lane samples (the lane can only DROP delivered frames, never
+     *  manufacture them). Default 3. */
+    @JvmStatic
+    fun getSurveillanceQuietTierFps(): Int =
+        loadConfig().optJSONObject("camera")?.optInt("surveillanceQuietTierFps", 3)?.coerceIn(1, 15) ?: 3
 
     /** Master gate for the OEM dashcam parked-idle encode throttle. Default FALSE. */
     @JvmStatic
@@ -1864,20 +1984,63 @@ object UnifiedConfigManager {
 
     /**
      * Resolve whether the telemetry overlay should burn-in for a given
-     * recording flow ("pano" or "oemDashcam"). The legacy `enabled` key acts
-     * as the pano fallback so pre-split installs keep their toggle. OEM
-     * dashcam defaults to off — separate opt-in.
+     * recording flow: "pano" (ACC-on trips), "surveillance" (ACC-off sentry),
+     * or "oemDashcam". The legacy `enabled` key acts as the pano fallback so
+     * pre-split installs keep their toggle. Surveillance and OEM dashcam
+     * default to off — separate opt-ins (parked burn-in keeps the BYD poll
+     * alive, and the OEM front sensor doesn't need a stamp by default).
      */
     @JvmStatic
     fun isTelemetryOverlayEnabledFor(flow: String): Boolean {
         val tel = getTelemetryOverlay()
         return when (flow) {
             "oemDashcam" -> tel.optBoolean("oemDashcamEnabled", false)
+            "surveillance" -> tel.optBoolean("surveillanceEnabled", false)
             else /* "pano" */ -> {
                 if (tel.has("panoEnabled")) tel.optBoolean("panoEnabled", false)
                 else tel.optBoolean("enabled", false)
             }
         }
+    }
+
+    /**
+     * Canonical config key under `telemetryOverlay.fields` for a flow. Unknown
+     * flows map to the pano/ACC-on list.
+     */
+    private fun fieldsKeyForFlow(flow: String): String = when (flow) {
+        "oemDashcam" -> "oemDashcam"
+        "surveillance" -> "surveillance"
+        else -> "accOn"
+    }
+
+    /**
+     * The per-flow field selection as a JSON array of stable field keys, or
+     * {@code null} if the flow has no explicit selection. A null return MUST be
+     * treated by the caller as "use the legacy default" (TelemetryFields does
+     * this) — do NOT substitute an empty list, which means "user deselected
+     * everything". Each flow's list is independent and never shared.
+     */
+    @JvmStatic
+    fun getTelemetryOverlayFields(flow: String): org.json.JSONArray? {
+        val tel = getTelemetryOverlay()
+        val fields = tel.optJSONObject("fields") ?: return null
+        return fields.optJSONArray(fieldsKeyForFlow(flow))
+    }
+
+    /**
+     * Persist the per-flow field selection (array of stable field keys). Merges
+     * into the nested `fields` object so the other flows' lists are preserved —
+     * updateSection only shallow-merges the top-level `telemetryOverlay`, so we
+     * read-modify-write the `fields` sub-object here.
+     */
+    @JvmStatic
+    fun setTelemetryOverlayFields(flow: String, fieldKeys: org.json.JSONArray): Boolean {
+        val tel = getTelemetryOverlay()
+        val fields = tel.optJSONObject("fields") ?: JSONObject()
+        fields.put(fieldsKeyForFlow(flow), fieldKeys)
+        val delta = JSONObject()
+        delta.put("fields", fields)
+        return setTelemetryOverlay(delta)
     }
 
     // ==================== OEM DASHCAM ====================
@@ -2102,12 +2265,15 @@ object UnifiedConfigManager {
     
     /**
      * Get trip analytics config section.
-     * Defaults to enabled=false if section doesn't exist.
+     * Defaults to enabled=true (matching TripConfig.DEFAULT_ENABLED and the
+     * applyDefaults seed) when the section is absent — the old `false` here
+     * disagreed with every other default and would silently disable trips for
+     * any future caller that trusted it.
      */
     @JvmStatic
     fun getTripAnalytics(): JSONObject {
         return loadConfig().optJSONObject("tripAnalytics") ?: JSONObject().apply {
-            put("enabled", false)
+            put("enabled", true)
         }
     }
     
@@ -2241,6 +2407,116 @@ object UnifiedConfigManager {
             put("color", "#E8E8EC")
             put("driveSide", "rhd")
         }
+    }
+
+    // ==================== TYRE PRESSURE THRESHOLDS ====================
+    //
+    // User-configurable over/under pressure limits, per axle. Before this
+    // section the limits were hardcoded in THREE places that did not even
+    // agree with each other (BydDataCollector kPa constants for
+    // notifications, vehicle-control.js PSI literals for the corner
+    // callouts, and the launcher widget's bar band), so a user running
+    // non-stock tyre placard pressures got wrong alerts with no way to fix it.
+    //
+    // Canonical unit is kPa (integer) — the unit the BYD TPMS HAL reports, so
+    // no rounding drift is introduced on the comparison path. The UI converts
+    // for display.
+    //
+    // `low` is the under-pressure WARN floor and `high` the over-pressure WARN
+    // ceiling; `criticalLow` is the shared deflated/CRITICAL threshold.
+    const val TYRE_LOW_DEFAULT_KPA = 234        // ~34 PSI
+    const val TYRE_HIGH_DEFAULT_KPA = 310       // ~45 PSI
+    const val TYRE_CRITICAL_LOW_DEFAULT_KPA = 152 // ~22 PSI (deflated)
+    // Clamp bounds. Wide enough for anything from a low-pressure spare to a
+    // commercial-load rear axle, tight enough that a fat-fingered or unit-
+    // confused entry (e.g. "35" meaning PSI) can't disable alerting entirely.
+    const val TYRE_KPA_MIN = 80
+    const val TYRE_KPA_MAX = 600
+
+    /**
+     * Tyre pressure alarm thresholds in kPa.
+     *
+     * Schema (all ints, kPa):
+     *   { "frontLow": 234, "frontHigh": 310,
+     *     "rearLow": 234,  "rearHigh": 310,
+     *     "criticalLow": 152 }
+     *
+     * Missing keys are backfilled with the shipped defaults so every call site
+     * can read unconditionally. Values are NOT clamped here — see
+     * [getTyreThresholds] for the clamped, invariant-checked accessor that
+     * consumers should use.
+     */
+    @JvmStatic
+    fun getTyres(): JSONObject {
+        // Build a FRESH object rather than back-filling the one on the config.
+        // loadConfig() hands back the live cachedConfig, and optJSONObject
+        // returns the nested reference inside it — so put()ing defaults there
+        // mutates process-wide shared state. That is reached concurrently by the
+        // TPMS poll loop, the HTTP worker pool, and the launcher/vehicle-control
+        // endpoints, and org.json.JSONObject is HashMap-backed and not
+        // thread-safe (torn map / ConcurrentModificationException on a racing
+        // reader). It is also the NORMAL case, not an edge one: a POST persists
+        // only the keys it changed, so the stored section is routinely sparse.
+        val stored = loadConfig().optJSONObject("tyres")
+        val out = JSONObject()
+        out.put("frontLow", optIntOr(stored, "frontLow", TYRE_LOW_DEFAULT_KPA))
+        out.put("frontHigh", optIntOr(stored, "frontHigh", TYRE_HIGH_DEFAULT_KPA))
+        out.put("rearLow", optIntOr(stored, "rearLow", TYRE_LOW_DEFAULT_KPA))
+        out.put("rearHigh", optIntOr(stored, "rearHigh", TYRE_HIGH_DEFAULT_KPA))
+        out.put("criticalLow", optIntOr(stored, "criticalLow", TYRE_CRITICAL_LOW_DEFAULT_KPA))
+        return out
+    }
+
+    /** Read-only int lookup that tolerates a null section. */
+    private fun optIntOr(section: JSONObject?, key: String, default: Int): Int =
+        if (section == null) default else section.optInt(key, default)
+
+    /**
+     * Clamped, self-consistent tyre thresholds. Use this — not [getTyres] — on
+     * any comparison path.
+     *
+     * Guarantees, so a hand-edited or partially-written config can never
+     * produce an un-alertable or permanently-alerting vehicle:
+     *  - every value inside [TYRE_KPA_MIN]..[TYRE_KPA_MAX]
+     *  - per axle, `high` > `low` (a crossed pair falls back to the defaults
+     *    for that axle rather than silently inverting the comparison)
+     *  - `criticalLow` <= the lower of the two axle lows (a criticalLow above
+     *    a low would make the WARN band unreachable)
+     */
+    @JvmStatic
+    fun getTyreThresholds(): JSONObject {
+        val t = getTyres()
+        fun clamp(key: String, default: Int): Int =
+            t.optInt(key, default).coerceIn(TYRE_KPA_MIN, TYRE_KPA_MAX)
+
+        var frontLow = clamp("frontLow", TYRE_LOW_DEFAULT_KPA)
+        var frontHigh = clamp("frontHigh", TYRE_HIGH_DEFAULT_KPA)
+        var rearLow = clamp("rearLow", TYRE_LOW_DEFAULT_KPA)
+        var rearHigh = clamp("rearHigh", TYRE_HIGH_DEFAULT_KPA)
+        if (frontHigh <= frontLow) {
+            frontLow = TYRE_LOW_DEFAULT_KPA
+            frontHigh = TYRE_HIGH_DEFAULT_KPA
+        }
+        if (rearHigh <= rearLow) {
+            rearLow = TYRE_LOW_DEFAULT_KPA
+            rearHigh = TYRE_HIGH_DEFAULT_KPA
+        }
+        val criticalLow = clamp("criticalLow", TYRE_CRITICAL_LOW_DEFAULT_KPA)
+            .coerceAtMost(minOf(frontLow, rearLow))
+
+        return JSONObject().apply {
+            put("frontLow", frontLow)
+            put("frontHigh", frontHigh)
+            put("rearLow", rearLow)
+            put("rearHigh", rearHigh)
+            put("criticalLow", criticalLow)
+        }
+    }
+
+    /** Update the tyre threshold section (merges; siblings preserved). */
+    @JvmStatic
+    fun setTyres(tyres: JSONObject): Boolean {
+        return updateSection("tyres", tyres)
     }
 
     /**

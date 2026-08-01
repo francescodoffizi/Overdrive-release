@@ -43,6 +43,44 @@ public class TunnelDisplayPolicyTest {
     }
 
     @Test
+    public void aWorkingTunnelOutranksAnotherTunnelsError() {
+        assertEquals(TunnelDisplayPolicy.Kind.ONLINE,
+                resolve(null, "https://cf.example", null,
+                        DaemonStatus.ERROR, DaemonStatus.RUNNING,
+                        DaemonStatus.STOPPED).getKind());
+        assertEquals(TunnelDisplayPolicy.Kind.STARTING_CLOUDFLARED,
+                resolve(null, null, null,
+                        DaemonStatus.ERROR, DaemonStatus.STARTING,
+                        DaemonStatus.STOPPED).getKind());
+        assertEquals(TunnelDisplayPolicy.Kind.WAITING_FOR_URL,
+                resolve(null, null, null,
+                        DaemonStatus.ERROR, DaemonStatus.RUNNING,
+                        DaemonStatus.STOPPED).getKind());
+    }
+
+    @Test
+    public void stoppingTunnelStaysVisible() {
+        TunnelDisplayPolicy.Result result = resolve(
+                null, null, null,
+                DaemonStatus.STOPPING, DaemonStatus.STOPPED, DaemonStatus.STOPPED);
+
+        assertEquals(TunnelDisplayPolicy.Kind.STOPPING, result.getKind());
+        assertTrue(result.isVisible());
+        assertFalse(result.isOnline());
+    }
+
+    @Test
+    public void erroredTunnelStaysVisibleInsteadOfDisappearing() {
+        TunnelDisplayPolicy.Result result = resolve(
+                null, null, null,
+                DaemonStatus.ERROR, DaemonStatus.STOPPED, DaemonStatus.STOPPED);
+
+        assertEquals(TunnelDisplayPolicy.Kind.FAILED, result.getKind());
+        assertTrue(result.isVisible());
+        assertFalse(result.isOnline());
+    }
+
+    @Test
     public void onlineRequiresRunningProcessAndUsesExistingPriority() {
         TunnelDisplayPolicy.Result result = resolve(
                 "https://zrok.example",

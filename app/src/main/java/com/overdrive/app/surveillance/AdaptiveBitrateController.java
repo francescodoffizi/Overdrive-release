@@ -35,6 +35,10 @@ public class AdaptiveBitrateController {
     private HardwareEventRecorderGpu encoder;
     private int currentBitrate;
     private int targetBitrate;
+    /** True once this controller has actually pushed a bitrate to the encoder, i.e.
+     *  once {@link #currentBitrate} reflects hardware rather than the constructor's
+     *  unverified seed. Gates the idempotent-skip in {@link #setImmediateBitrate}. */
+    private boolean pushedOnce = false;
     private ValueAnimator bitrateAnimator;
     
     /**
@@ -96,6 +100,12 @@ public class AdaptiveBitrateController {
             int animatedBitrate = (int) animation.getAnimatedValue();
             encoder.setBitrate(animatedBitrate);
             currentBitrate = animatedBitrate;
+            // A ramp step IS a real push, so currentBitrate now reflects hardware —
+            // mark it so setImmediateBitrate's idempotent skip becomes trustworthy.
+            // Without this the flag stayed false after a completed ramp and the next
+            // same-value immediate-set did a redundant encoder push (harmless, but it
+            // made the flag's meaning inconsistent).
+            pushedOnce = true;
         });
         
         bitrateAnimator.start();
@@ -107,14 +117,35 @@ public class AdaptiveBitrateController {
      * @param bitrate Bitrate in bps
      */
     public void setImmediateBitrate(int bitrate) {
+        // Idempotent: the 30s periodic reconcile re-asserts the same bitrate on
+        // every tick. Skip the redundant work — and, critically, do NOT cancel a
+        // running ramp animator when the target is unchanged, which would kill an
+        // in-flight adaptive/thermal ramp mid-animation.
+        //
+        // GATED ON pushedOnce, NOT on currentBitrate alone. currentBitrate starts as
+        // the CONSTRUCTOR's initialBitrate, which is not guaranteed to equal the
+        // encoder's real bitrate: GpuSurveillancePipeline builds this controller with
+        // a hardcoded 6_000_000 in one path while the encoder is built from the
+        // user's configured bitrate. Comparing against that unverified seed would
+        // silently swallow the FIRST push (e.g. ModeTransitionManager restoring
+        // NORMAL_BITRATE = 6_000_000 after sentry) and leave the codec at the
+        // configured value while this object reported 6 Mbps. Once we have pushed a
+        // value ourselves, currentBitrate is authoritative and de-duping is safe.
+        if (pushedOnce
+                && bitrate == currentBitrate
+                && !(bitrateAnimator != null && bitrateAnimator.isRunning())) {
+            return;
+        }
+
         if (bitrateAnimator != null && bitrateAnimator.isRunning()) {
             bitrateAnimator.cancel();
         }
-        
+
         encoder.setBitrate(bitrate);
         currentBitrate = bitrate;
         targetBitrate = bitrate;
-        
+        pushedOnce = true;
+
         logger.info( "Bitrate set immediately: " + (bitrate / 1_000_000) + " Mbps");
     }
     

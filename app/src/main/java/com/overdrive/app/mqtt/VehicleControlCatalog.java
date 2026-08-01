@@ -39,9 +39,57 @@ public final class VehicleControlCatalog {
         public final VehicleCommand command;
         public final String echoKey;    // state-topic suffix to publish optimistically (nullable)
         public final String echoValue;  // value to publish (nullable)
-        ControlAction(VehicleCommand c, String k, String v) { command = c; echoKey = k; echoValue = v; }
+        /** Deferred "remember what we commanded" hook for blind-toggle entities that have no
+         *  readback (see {@link ControlEntity#toAction}). Null when there is nothing to
+         *  remember. Callers MUST invoke {@link #commitToggleState()} only after the command
+         *  actually succeeded — committing at build time made a REFUSED write still advance
+         *  the cache, so the next blind "toggle" flipped away from a value the car never
+         *  reached and the button appeared to need two presses. */
+        private final Runnable toggleCommit;
+        ControlAction(VehicleCommand c, String k, String v) { this(c, k, v, null); }
+        ControlAction(VehicleCommand c, String k, String v, Runnable commit) {
+            command = c; echoKey = k; echoValue = v; toggleCommit = commit;
+        }
         public static ControlAction of(VehicleCommand c) { return new ControlAction(c, null, null); }
         public static ControlAction echo(VehicleCommand c, String k, String v) { return new ControlAction(c, k, v); }
+        /** Record the just-commanded value so the next blind toggle flips from it. Idempotent
+         *  and a no-op for entities with live readback.
+         *
+         *  <p>Call this when the command was actually ATTEMPTED against the vehicle — see
+         *  {@link #commitIfAttempted}, which is what all callers use. Committing only on a
+         *  confirmed SUCCESS sounds safer but breaks the feature outright on any HAL that
+         *  cannot confirm: the cache never advances, so every "toggle" press re-sends the
+         *  identical value and the opposite action becomes unreachable. A blind toggle has no
+         *  readback by definition, so tracking "what we last commanded" is the only coherent
+         *  semantics — the alternative is a control that only ever does one thing. */
+        public void commitToggleState() {
+            if (toggleCommit != null) toggleCommit.run();
+        }
+        /**
+         * Commit the blind-toggle value iff the command actually reached the vehicle.
+         *
+         * <p>{@code SUCCESS} and {@code FAILED} both mean "we asked the car" — for a set-only
+         * switch with no readback the resulting state is unknown either way, so the next press
+         * must still alternate, otherwise the control freezes on one value forever on any HAL
+         * that cannot confirm a write.
+         *
+         * <p>Everything else means nothing was commanded, so committing would silently swap
+         * what the NEXT press does: {@code BLOCKED_DRIVING} (refused by the motion-safety
+         * gate), {@code AUTH_REQUIRED}, {@code RATE_LIMITED}, and — importantly —
+         * {@code NOT_SUPPORTED}, which {@code VehicleCommandRouter} returns from its
+         * capability guards BEFORE invoking any leg (no SDK path / no cloud path / no legs at
+         * all), not only after a real attempt.
+         */
+        public void commitIfAttempted(VehicleCommandRouter.Outcome outcome) {
+            if (outcome == null) return;
+            if (outcome == VehicleCommandRouter.Outcome.SUCCESS
+                    || outcome == VehicleCommandRouter.Outcome.FAILED) {
+                commitToggleState();
+            }
+        }
+        ControlAction withToggleCommit(Runnable commit) {
+            return new ControlAction(command, echoKey, echoValue, commit);
+        }
     }
 
     /** Builds a command from (sub-key, payload, current snapshot). Return null to ignore. */
@@ -188,11 +236,19 @@ public final class VehicleControlCatalog {
                     LAST_SELECT_PAYLOAD.put(key, payload);
                 }
                 // Same for a set-only switch (mirror fold): record the concrete on/off value
-                // just commanded so the next "toggle" flips from it.
+                // just commanded so the next "toggle" flips from it. DEFERRED, not applied
+                // here: this runs at BUILD time, before the command is executed, so writing the
+                // cache unconditionally would advance it even for a press the motion-safety
+                // gate refuses outright — silently swapping what the NEXT press does. The
+                // caller applies it via ControlAction.commitIfAttempted(outcome) once the
+                // command has actually reached the vehicle (see that method for why "only on
+                // SUCCESS" is the wrong bar for a control with no readback).
                 if (action != null && state == null && (options == null || options.isEmpty())
                         && onVal != null && payload != null
                         && !"toggle".equalsIgnoreCase(payload.trim())) {
-                    LAST_SWITCH_PAYLOAD.put(key, truthy(payload) ? onVal : offVal);
+                    final String committed = truthy(payload) ? onVal : offVal;
+                    final String k = key;
+                    action = action.withToggleCommit(() -> LAST_SWITCH_PAYLOAD.put(k, committed));
                 }
                 return action;
             } catch (Exception e) { return null; }
@@ -547,13 +603,15 @@ public final class VehicleControlCatalog {
                 (sub, payload, snap) -> ControlAction.of(new VehicleCommandRouter.LightsCommand(truthy(payload))),
                 snap -> snap == null ? null : snap.dayTimeLight));
 
-        // ── Hazard (double-flash) lights — switch, real readback ─────────────
-        // State published to light_hazard (getLightStatus(8) → snap.hazard), which is
-        // reliable. The SET (double-flash COMMAND feature) is UNCONFIRMED on this
-        // firmware — no reference-app precedent and an inferred feature id — so the
-        // write may be refused by the HAL; setHazardLights returns false in that case.
-        // Validate actuation via GET /api/debug/light/fire?candidate=A before relying
-        // on it; the readback (and hazard condition/trigger) work regardless.
+        // ── Hazard (double-flash) lights — switch ────────────────────────────
+        // State published to light_hazard (getLightStatus(8) → snap.hazard). The READBACK is
+        // ALSO unverified, not just the write: the SDK's light-type table has no hazard entry
+        // and position 8 is LIGHT_FOOT (the footwell lamp), so this switch's reported state may
+        // actually track the courtesy lighting. See BydDataCollector.collectLight.
+        // The SET (double-flash COMMAND feature) is UNCONFIRMED on this firmware — no
+        // reference-app precedent and an inferred feature id — so the write may be refused by
+        // the HAL; setHazardLights returns false in that case. Validate actuation via
+        // GET /api/debug/light/fire?candidate=A before relying on it.
         register(sw("hazard", "Hazard Lights", "mdi:car-light-alert", null, "light_hazard", "1", "0",
                 (sub, payload, snap) -> ControlAction.of(new VehicleCommandRouter.HazardCommand(truthy(payload))),
                 snap -> snap == null ? null : snap.hazard));
@@ -562,6 +620,34 @@ public final class VehicleControlCatalog {
         register(number("ambient_colour", "Ambient Lights Colour", "mdi:format-color-fill", "config",
                 "ambient_colour", 1, 31, 1, "", (sub, payload, snap) ->
                         ControlAction.of(new VehicleCommandRouter.AmbientColourCommand(pInt(payload, 1)))));
+
+        // ── Ambient lights main switch — switch (whole cabin) ────────────────
+        // State published to ambient_enabled ONLY when the vehicle actually reports it (the
+        // Light-device status feature or the atmosphere_lamp flag); a trim that reports neither
+        // leaves this unavailable rather than showing a wrong "off". The write walks all three
+        // tiers — see BydDataCollector.setAmbientLightEnabled.
+        //
+        // The live reader gives this switch a real "toggle" (flip the reported state). On a trim
+        // that reports NO state the reader returns null, so "toggle" follows the documented
+        // default and turns ON every press (see ControlEntity.toAction strategy (a)) — explicit
+        // on/off payloads still work either way, which is what HA itself sends.
+        register(sw("ambient_power", "Ambient Lights", "mdi:track-light", "config", "ambient_enabled",
+                "1", "0", (sub, payload, snap) ->
+                        ControlAction.of(new VehicleCommandRouter.AmbientPowerCommand(truthy(payload))),
+                snap -> snap == null || snap.ambientEnabled == com.overdrive.app.byd.BydVehicleData.UNAVAILABLE
+                        ? null : snap.ambientEnabled == 1));
+
+        // ── Ambient lights brightness — number, whole cabin, 0-100% ──────────
+        // Optimistic (echo): the SDK exposes a 0..5 LEVEL per zone, not a whole-cabin percent,
+        // so there is no single field to read back — the collector publishes no ambient
+        // brightness telemetry. Echoing the commanded value keeps the HA slider in step.
+        register(number("ambient_brightness", "Ambient Lights Brightness", "mdi:brightness-6", "config",
+                "ambient_brightness", 0, 100, 1, "%", (sub, payload, snap) -> {
+                    int v = Math.max(0, Math.min(100, pInt(payload, 0)));
+                    return ControlAction.echo(
+                            new VehicleCommandRouter.AmbientBrightnessCommand(v), "ambient_brightness",
+                            String.valueOf(v));
+                }));
 
         // ── ADAS speed-limit warning — switch (real state, toggle-capable) ─
         register(sw("adas_slw", "Speed Limit Warning", "mdi:speedometer-slow", "config", "speed_limit_warning",
@@ -745,12 +831,13 @@ public final class VehicleControlCatalog {
                     return ControlAction.echo(new VehicleCommandRouter.EnergyModeCommand(m),
                             "energy_mode", m == 3 ? "hev" : "ev");
                 }));
-        // hold_battery: a friendly alias for "switch to HEV" — the ONLY lever this SDK
-        // exposes for the requested "hold battery at current SOC" behaviour (there is no
-        // settable target-SOC anywhere in the HAL). Switching to HEV makes the ICE drive
-        // the car without recharging the pack above its current level, so the battery is
-        // effectively held. Any payload commands HEV (3); the single "on" option keeps the
-        // UI a one-tap action. Mirrors energy_mode state as hev.
+        // hold_battery: a friendly alias for "switch to HEV". NOTE this does NOT hold the
+        // pack at its current level — field-reported on a SeaLion 6 DM-i: selecting HEV
+        // starts the ICE and RECHARGES the battery. A real SOC-hold lever does exist
+        // (BYDAutoSettingDevice.setSOCTarget + BYDAutoChargingDevice.setSocSaveSwitch,
+        // wired in BydDataCollector as the "charge cap"); the reference app DiPlus drives
+        // exactly that pair for its PHEV battery-hold modes. Prefer charge_cap_* for a
+        // genuine hold. Any payload commands HEV (3); mirrors energy_mode state as hev.
         register(select("hold_battery", "Hold Battery Charge", "mdi:battery-lock", null, "energy_mode",
                 java.util.Arrays.asList("on"),
                 "{% set m = value | int(-1) %}{{ 'on' if m == 3 else 'off' }}",

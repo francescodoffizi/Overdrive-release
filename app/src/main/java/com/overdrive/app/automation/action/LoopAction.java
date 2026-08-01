@@ -3,11 +3,11 @@ package com.overdrive.app.automation.action;
 import com.overdrive.app.automation.AutomationAction;
 import com.overdrive.app.automation.AutomationCondition;
 import com.overdrive.app.automation.Automations;
-import com.overdrive.app.automation.condition.BydEvent;
 import com.overdrive.app.automation.condition.EventData;
 import com.overdrive.app.automation.type.DynamicIntType;
 import com.overdrive.app.automation.type.EnumType;
 import com.overdrive.app.automation.type.IntType;
+import com.overdrive.app.automation.type.SignalAddressType;
 import com.overdrive.app.automation.type.Type;
 import com.overdrive.app.automation.value.IntValue;
 import com.overdrive.app.automation.value.Label;
@@ -52,14 +52,10 @@ public class LoopAction extends BaseAction {
                 // Iteration count (count mode). Clamped to [1, MAX_ITERATIONS] at run time.
                 new IntType(new Label("count", "automation.loop_iterations"), 1, MAX_ITERATIONS),
                 // while/until: the scalar signal + comparison, mirroring WaitUntilAction.
-                new EnumType(new Label("event", "automation.wait_signal"),
-                        new Label("speedKmph", "automation.speed"),
-                        new Label("accelerator", "automation.accelerator"),
-                        new Label("brake", "automation.brake"),
-                        new Label("batteryLevel", "automation.battery_level"),
-                        new Label("estimatedRange", "automation.estimated_range"),
-                        new Label("temperature", "automation.temperature"),
-                        new Label("outsideTemp", "automation.outside_temperature")),
+                // LHS = an ADDRESS into the shared condition catalog (all ~58 conditions,
+                // attributed ones included) instead of a hardcoded signal list. Legacy stored
+                // ids still resolve — see AutomationCondition.resolveSignalAddress.
+                new SignalAddressType(new Label("event", "automation.wait_signal")),
                 IntValue.COMPARATORS,
                 new DynamicIntType(new Label("value", "automation.value"), -540, 1000));
     }
@@ -72,18 +68,15 @@ public class LoopAction extends BaseAction {
     /** This action carries a nested loop-body action list. */
     @Override public boolean hasChildActions() { return true; }
 
+    /**
+     * Resolve the stored LHS address to the state key it names. Delegates to
+     * {@link AutomationCondition#resolveSignalAddress}, the single home of the address
+     * grammar (shared with the condition RHS), so this action covers the whole condition
+     * catalog — attributed signals included — with no local mapping table, and the
+     * pre-catalog ids saved automations still hold resolve to the same signals as before.
+     */
     private static EventData resolveEvent(String id) {
-        if (id == null) return null;
-        switch (id) {
-            case "speedKmph":      return BydEvent.SPEED_KMPH;
-            case "accelerator":    return BydEvent.ACCELERATOR;
-            case "brake":          return BydEvent.BRAKE;
-            case "batteryLevel":   return BydEvent.BATTERY_LEVEL;
-            case "estimatedRange": return BydEvent.ESTIMATED_RANGE;
-            case "temperature":    return BydEvent.TEMPERATURE;
-            case "outsideTemp":    return BydEvent.OUTSIDE_TEMPERATURE;
-            default:               return null;
-        }
+        return AutomationCondition.resolveSignalAddress(id);
     }
 
     public void trigger(AutomationAction automationAction) {
@@ -123,6 +116,13 @@ public class LoopAction extends BaseAction {
             }
             Automations.runActionList(body); // re-entrant; depth-guarded
             i++;
+            // A Wait Until inside the body that timed out aborts the whole run — stop looping
+            // rather than re-entering the body (runActionList would skip every action anyway,
+            // spinning up to `cap` empty iterations).
+            if (Automations.chainAborted()) {
+                logger.info("LoopAction: stopping after " + i + " iterations (wait timed out)");
+                return;
+            }
         }
         logger.info("LoopAction: ran " + i + " iterations (mode=" + mode + ")");
     }

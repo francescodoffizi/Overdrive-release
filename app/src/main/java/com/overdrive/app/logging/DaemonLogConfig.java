@@ -52,6 +52,19 @@ public final class DaemonLogConfig {
     
     /** BydEventDaemon - BYD vehicle event listener */
     public static final boolean BYD_EVENT_DAEMON = false;
+
+    /**
+     * BYD HAL access + telemetry collection ({@code BydManagerChannel}, {@code BydDataCollector}).
+     *
+     * <p>Flip to {@code true} to get a targeted RELEASE capture of the HAL-access diagnostics:
+     * which device-acquisition tier won, whether {@code enableDevice} was accepted, which read
+     * channel produced a charging-power value, and the pre-scale raw feature value. Without it
+     * those lines exist only in a braveheart build — in {@code release} the Gradle auto-detect adds
+     * {@code proguard-rules-strip-logs.pro}, which removes the {@code info()}/{@code debug()} calls
+     * outright, AND no BYD telemetry tag was in the allowlist, so the lines were unreachable three
+     * ways over. Setting this both keeps the calls (via the auto-detect below) and opens the tags.
+     */
+    public static final boolean BYD_TELEMETRY = false;
     
     /** GlobalProxyDaemon - VPN/proxy daemon (uses own log method, not DaemonLogger) */
     public static final boolean GLOBAL_PROXY_DAEMON = false;
@@ -230,7 +243,7 @@ public final class DaemonLogConfig {
      */
     public static final boolean ANY_LOGGING_ENABLED = BuildConfig.LOG_CAPTURE || ENABLE_ALL
         || CAMERA_DAEMON || ACC_SENTRY_DAEMON || SENTRY_DAEMON
-        || TELEGRAM_BOT_DAEMON || BYD_EVENT_DAEMON || GLOBAL_PROXY_DAEMON
+        || TELEGRAM_BOT_DAEMON || BYD_EVENT_DAEMON || BYD_TELEMETRY || GLOBAL_PROXY_DAEMON
         || GPU_PIPELINE || PANORAMIC_CAMERA || EGL_CORE || GL_UTIL
         || GPU_MOSAIC_RECORDER || GPU_DOWNSCALER || GPU_STREAM_SCALER
         || HW_ENCODER || ADAPTIVE_BITRATE || H264_CIRCULAR_BUFFER
@@ -254,6 +267,15 @@ public final class DaemonLogConfig {
             if (SENTRY_DAEMON)              ENABLED_TAGS.add("SentryDaemon");
             if (TELEGRAM_BOT_DAEMON)        ENABLED_TAGS.add("TelegramBotDaemon");
             if (BYD_EVENT_DAEMON)           ENABLED_TAGS.add("BydEventDaemon");
+            if (BYD_TELEMETRY) {
+                // The three tags needed to diagnose a NaN charging surface. BydDeviceHelper is not
+                // optional: it owns callGetProbing's per-width failure lines and
+                // "Could not resolve deviceType", which are the lines that actually explain WHY a
+                // read produced nothing. Without it the capture shows the symptom and not the cause.
+                ENABLED_TAGS.add("BydManagerChannel");
+                ENABLED_TAGS.add("BydDataCollector");
+                ENABLED_TAGS.add("BydDeviceHelper");
+            }
             if (GLOBAL_PROXY_DAEMON)        ENABLED_TAGS.add("GlobalProxyDaemon");
             if (GPU_PIPELINE)               ENABLED_TAGS.add("GpuPipeline");
             if (PANORAMIC_CAMERA)           ENABLED_TAGS.add("PanoramicCameraGpu");

@@ -10,6 +10,36 @@
 # These are compile-time stubs - real classes come from system at runtime
 -keep class android.hardware.bydauto.** { *; }
 -keep class android.hardware.BmmCamera** { *; }
+# IBYDAutoListener is the base marker interface that every AbsBYDAuto*Listener
+# implements. It lives directly in android.hardware (NOT android.hardware.bydauto),
+# so the rule above does NOT cover it. The HAL's registerListener(...) signatures
+# and its typed-listener dispatch match against this interface; if ProGuard renamed
+# or stripped it, our AbsBYDAuto*Listener subclasses (charging/instrument/engine —
+# the typed callbacks that deliver live charging power etc.) could fail to register
+# or never receive callbacks. Keep it intact.
+-keep class android.hardware.IBYDAutoListener { *; }
+# IBYDAutoDevice is in the same boat: it lives directly in android.hardware, so the
+# android.hardware.bydauto.** rule above does NOT cover it. It is the declared parameter
+# type of BYDAutoDeviceManager.enableDevice/disableDevice/addDevice, which we resolve
+# reflectively via Class.forName("android.hardware.IBYDAutoDevice") — a rename or strip
+# would make that lookup miss and silently disable device ACTIVATION (and with it, on
+# trims that need enabling, the whole charging-power surface). Release-build only defect,
+# so it would not show up in debug testing.
+-keep class android.hardware.IBYDAutoDevice { *; }
+# IBYDAutoEvent closes the last hole in this family. It also lives directly in
+# android.hardware, and it appears in the DESCRIPTOR of kept callbacks —
+# IBYDAutoDevice.onPostEvent(IBYDAutoEvent) and AbsBYDAuto*Listener.onDataChanged(IBYDAutoEvent).
+# R8 will not delete a class referenced from a kept member, but it will freely RENAME it. The day
+# app code overrides one of those callbacks (the natural next step for the generic event channel),
+# the override would compile against the renamed type, stop overriding the platform method, and the
+# HAL would dispatch to the platform's no-op base — callback silently never fires, in release only.
+-keep class android.hardware.IBYDAutoEvent { *; }
+# Belt-and-suspenders: never rename a method that OVERRIDES a kept BYD HAL
+# listener method (e.g. onExternalChargingPowerChanged). Overrides normally keep
+# their name because the superclass is kept, but make it explicit for the
+# typed-listener subclasses we construct in BydDeviceHelper.
+-keepclassmembers class * extends android.hardware.bydauto.instrument.AbsBYDAutoInstrumentListener { *; }
+-keepclassmembers class * extends android.hardware.bydauto.charging.AbsBYDAutoChargingListener { *; }
 
 # ==================== Daemon Entry Points (app_process) ====================
 # ONLY keep class names and main() - everything else gets obfuscated
@@ -80,8 +110,25 @@
 # (surveillance package can't compile-time depend on daemon package). The
 # main()-only -keep above doesn't preserve this, so R8 renames it to a()
 # and ScreenDeterrent silently falls through to DaemonBootstrap.
+# getGpuPipeline() — called reflectively by ClusterProjectionController.notifyPipelineReady/
+# notifyPipelineClosed (same surveillance→daemon no-compile-time-dep reason). Without this
+# keep, R8 renames getGpuPipeline() to a short name (mapping.txt: getGpuPipeline -> j), the
+# reflective getMethod("getGpuPipeline") throws NoSuchMethodException (swallowed at
+# logger.debug), and onClusterProjectionReady/Closed NEVER fire — so the warm cluster
+# blind-spot SurfaceControl layer is never re-tagged onto the recreated fission display's
+# new layerStack → it composites onto the destroyed old stack → BS card renders BLACK.
 -keepclassmembers class com.overdrive.app.daemon.CameraDaemon {
     public static android.content.Context getAppContext();
+    public static com.overdrive.app.surveillance.GpuSurveillancePipeline getGpuPipeline();
+}
+
+# GpuSurveillancePipeline.onClusterProjectionReady()/onClusterProjectionClosed() — the
+# SECOND reflective hop from ClusterProjectionController (pipe.getClass().getMethod(...)).
+# Same dead-reflection failure if R8 renames them; keep both so the cluster show/hide
+# re-tag + render-gate callbacks survive R8.
+-keepclassmembers class com.overdrive.app.surveillance.GpuSurveillancePipeline {
+    public void onClusterProjectionReady();
+    public void onClusterProjectionClosed();
 }
 
 # DaemonBootstrap.getContext() — fallback path for the same reflection above.
@@ -118,6 +165,15 @@
 -keep class com.overdrive.app.logging.DaemonLogConfig { *; }
 
 # ==================== Native Methods (all classes) ====================
+# JNI lookup mangles BOTH the class and method name into the C symbol
+# (Java_com_overdrive_app_od_Od_nativeAuthorize). The generic
+# -keepclasseswithmembernames rule below keeps native METHOD names but NOT
+# the CLASS name, so R8 is free to rename `Od` -> `a`, and the runtime
+# System.loadLibrary lookup then misses the .so export and NoSuchMethodErrors.
+# Keep the class name (and its native methods) explicitly first.
+-keep class com.overdrive.app.od.Od {
+    native <methods>;
+}
 # JNI method names must match native function signatures exactly
 -keepclasseswithmembernames class * {
     native <methods>;
@@ -203,6 +259,12 @@
 -keepnames class com.overdrive.app.config.** { }
 -keepnames class com.overdrive.app.launcher.** { }
 -keepnames class com.overdrive.app.manager.** { }
+-keepnames class com.overdrive.app.od.** { }
+# power.** was the only first-party package missing here. Nothing reflects into
+# it today (StealthPanel etc. are reached by direct call from the kept daemon
+# entry points), so this changes nothing now — it closes the trap where a future
+# reflective hop into the package would fail silently in release builds only.
+-keepnames class com.overdrive.app.power.** { }
 -keepnames class com.overdrive.app.proximity.** { }
 -keepnames class com.overdrive.app.recording.** { }
 -keepnames class com.overdrive.app.service.** { }
@@ -273,35 +335,20 @@
 
 # ==================== Log Stripping (Release Builds) ====================
 #
-# CONTROLLED BY: com.overdrive.app.logging.DaemonLogConfig
+# CONTROLLED BY: com.overdrive.app.logging.DaemonLogConfig + buildType
 #
-# DaemonLogger stripping is in a SEPARATE file: proguard-rules-strip-logs.pro
-# build.gradle.kts auto-detects DaemonLogConfig flags:
-#   - All flags false (default) → includes strip-logs → DaemonLogger calls stripped
-#   - Any flag true            → excludes strip-logs → DaemonLogger calls kept
+# Stripping is split across TWO buildType-conditional files so the
+# `braveheart` channel can ship the FULL log surface:
+#   - proguard-rules-strip-logs.pro     → DaemonLogger/LogManager FILE logging.
+#       Included by `release` when no DaemonLogConfig flag is set (auto-detect
+#       in build.gradle.kts); EXCLUDED by `braveheart`.
+#   - proguard-rules-strip-console.pro  → android.util.Log (logcat) + stdout/err.
+#       Included by `release`; EXCLUDED by `braveheart` so logcat AND the daemon
+#       stdout that feeds /data/local/tmp/<daemon>.log are preserved.
 #
-# Console/stdout stripping below is ALWAYS active (even in debug-logging builds).
+# This file (proguard-rules.pro) is applied to ALL buildTypes, so it must NOT
+# contain any log-stripping rules — only keep-rules + class-structure rules.
 # ====================================================================
-
-# Always strip android.util.Log (logcat) — security: no log strings in production
--assumenosideeffects class android.util.Log {
-    public static int v(...);
-    public static int d(...);
-    public static int i(...);
-    public static int w(...);
-    public static int e(...);
-    public static int wtf(...);
-    public static boolean isLoggable(...);
-    public static String getStackTraceString(...);
-    public static int println(...);
-}
-
-# Always strip System.out/err (daemon stdout)
--assumenosideeffects class java.io.PrintStream {
-    public void println(...);
-    public void print(...);
-    public void printf(...);
-}
 
 # Keep DaemonLogConfig (R8 needs it for runtime checks when logging is enabled)
 -keep class com.overdrive.app.logging.DaemonLogConfig { *; }

@@ -58,6 +58,14 @@ BYD.roadSense = {
         bsRotation: 0,
         // Base quarter turn used as the forward orientation when bsRotation === 'auto'.
         bsRotationBase: 0,
+        // PER-SIDE rotation: the left camera (view 7 / left turn) and right camera
+        // (view 8 / right turn) are mirror-imaged, so each has its OWN rotation. These
+        // seed from the global bsRotation/bsRotationBase on load when the per-side keys
+        // aren't persisted yet (backward compatible).
+        bsRotationLeft: 0,
+        bsRotationRight: 0,
+        bsRotationBaseLeft: 0,
+        bsRotationBaseRight: 0,
         bsRearFov: 1.66,
         bsSideFov: 1.98,
         bsYaw: 1.23,
@@ -68,6 +76,10 @@ BYD.roadSense = {
         bsProjExp: 1.0,
         bsRearRoll: 0.0,
         bsRearPitch: 0.0,
+        // Fisheye / lens dewarp strength (0..100) for the SINGLE-CAMERA views
+        // (side/rear). Separate from the recording pipeline's dewarp; 0 = off.
+        // Ignored for the merged 'both' view.
+        bsRectifyStrength: 0,
         // On-screen card size (% of panel width) + corner. Persisted as a preset
         // (not absolute px) so it stays correct across portrait/landscape rotation.
         // PER-TARGET: the head-unit set (bsSizePct/bsCorner) and the cluster set
@@ -75,10 +87,19 @@ BYD.roadSense = {
         // sized for the 15.6" head-unit overflows the short 1920x720 cluster.
         bsSizePct: 40,
         bsCorner: 'tr',
+        // PER-SIDE card corner: the left camera (view 7 / left turn) and right camera
+        // (view 8 / right turn) can each sit at their own corner, so the driver can put
+        // the left card on the left of the screen and the right card on the right. Seed
+        // from bsCorner on load when the per-side keys aren't persisted (backward
+        // compatible). Per-target, like bsCorner (head-unit vs cluster).
+        bsCornerLeft: 'tr',
+        bsCornerRight: 'tr',
         // Blind-spot display target: 'head_unit' (default) or 'cluster'.
         bsTarget: 'head_unit',
         bsSizePctCluster: 80,
         bsCornerCluster: 'tr',
+        bsCornerLeftCluster: 'tr',
+        bsCornerRightCluster: 'tr',
         // Cluster projection layout = OEM size profile (29=8.8", 30=12.3", 31=10.25").
         // 31 is the confirmed-correct default for this cluster.
         bsClusterLayout: 31,
@@ -174,6 +195,15 @@ BYD.roadSense = {
                 if (bs.mergeMode === 'both' || bs.mergeMode === 'side' || bs.mergeMode === 'rear') c.bsMergeMode = bs.mergeMode;
                 if (bs.rotation === 0 || bs.rotation === 90 || bs.rotation === 180 || bs.rotation === 270 || bs.rotation === 'auto') c.bsRotation = bs.rotation;
                 if (bs.rotationBase === 0 || bs.rotationBase === 90 || bs.rotationBase === 180 || bs.rotationBase === 270) c.bsRotationBase = bs.rotationBase;
+                // PER-SIDE rotation (left = view 7 / left turn, right = view 8 / right
+                // turn). Fall back to the legacy global rotation/rotationBase when a
+                // per-side key is absent so an un-migrated config still populates the UI.
+                var _rotOk = function (v) { return v === 0 || v === 90 || v === 180 || v === 270 || v === 'auto'; };
+                var _baseOk = function (v) { return v === 0 || v === 90 || v === 180 || v === 270; };
+                c.bsRotationLeft  = _rotOk(bs.rotationLeft)  ? bs.rotationLeft  : c.bsRotation;
+                c.bsRotationRight = _rotOk(bs.rotationRight) ? bs.rotationRight : c.bsRotation;
+                c.bsRotationBaseLeft  = _baseOk(bs.rotationBaseLeft)  ? bs.rotationBaseLeft  : c.bsRotationBase;
+                c.bsRotationBaseRight = _baseOk(bs.rotationBaseRight) ? bs.rotationBaseRight : c.bsRotationBase;
                 if (typeof bs.rearFov === 'number') c.bsRearFov = this._clamp(bs.rearFov, 1.0, 2.2);
                 if (typeof bs.sideFov === 'number') c.bsSideFov = this._clamp(bs.sideFov, 1.0, 2.2);
                 if (typeof bs.yaw === 'number') c.bsYaw = this._clamp(bs.yaw, 0, 1.4);
@@ -183,6 +213,7 @@ BYD.roadSense = {
                 if (typeof bs.projExp === 'number') c.bsProjExp = this._clamp(bs.projExp, 0.4, 1.6);
                 if (typeof bs.rearRoll === 'number') c.bsRearRoll = this._clamp(bs.rearRoll, -0.4, 0.4);
                 if (typeof bs.rearPitch === 'number') c.bsRearPitch = this._clamp(bs.rearPitch, -0.4, 0.4);
+                if (typeof bs.rectifyStrength === 'number') c.bsRectifyStrength = this._clamp(bs.rectifyStrength, 0, 100);
                 // Display target ('head_unit' default | 'cluster').
                 if (bs.target === 'cluster' || bs.target === 'head_unit') c.bsTarget = bs.target;
                 // Cluster layout (size profile opcode 29/30/31).
@@ -198,6 +229,13 @@ BYD.roadSense = {
                 var geoC = bs.geometryCluster || {};
                 if (typeof geoC.sizePct === 'number') c.bsSizePctCluster = this._clamp(geoC.sizePct, 15, 90);
                 if (typeof geoC.corner === 'string') c.bsCornerCluster = geoC.corner;
+                // PER-SIDE corners (view 7 left / view 8 right). Fall back to the
+                // per-target single corner when a per-side key is absent, so an
+                // un-migrated config still populates both side controls sensibly.
+                c.bsCornerLeft  = (typeof geo.cornerLeft  === 'string') ? geo.cornerLeft  : c.bsCorner;
+                c.bsCornerRight = (typeof geo.cornerRight === 'string') ? geo.cornerRight : c.bsCorner;
+                c.bsCornerLeftCluster  = (typeof geoC.cornerLeft  === 'string') ? geoC.cornerLeft  : c.bsCornerCluster;
+                c.bsCornerRightCluster = (typeof geoC.cornerRight === 'string') ? geoC.cornerRight : c.bsCornerCluster;
             }
             // Map → cluster preference. autoProjectCluster lives in the navMap
             // section (the daemon reads it on ACC-on); default false when absent.
@@ -332,12 +370,24 @@ BYD.roadSense = {
         this._setBadge('bsStatusBadge', c.bsEnabled);
         if (c.bsMergeMode !== 'both' && c.bsMergeMode !== 'side' && c.bsMergeMode !== 'rear') c.bsMergeMode = 'both';
         this._bsHighlightMergeMode(c.bsMergeMode);
-        if (c.bsRotation !== 0 && c.bsRotation !== 90 && c.bsRotation !== 180 && c.bsRotation !== 270 && c.bsRotation !== 'auto') c.bsRotation = 0;
-        if (c.bsRotationBase !== 0 && c.bsRotationBase !== 90 && c.bsRotationBase !== 180 && c.bsRotationBase !== 270) c.bsRotationBase = 0;
-        this._bsHighlightRotation(c.bsRotation);
-        this._bsReflectAutoBaseRow(c.bsRotation);
-        this._bsHighlightAutoBase(c.bsRotationBase);
+        // PER-SIDE rotation: normalise + reflect left (view 7) and right (view 8)
+        // independently. The mirror-imaged cameras each carry their own angle + auto base.
+        var _normRot = function (v) { return (v === 0 || v === 90 || v === 180 || v === 270 || v === 'auto') ? v : 0; };
+        var _normBase = function (v) { return (v === 0 || v === 90 || v === 180 || v === 270) ? v : 0; };
+        c.bsRotationLeft = _normRot(c.bsRotationLeft);
+        c.bsRotationRight = _normRot(c.bsRotationRight);
+        c.bsRotationBaseLeft = _normBase(c.bsRotationBaseLeft);
+        c.bsRotationBaseRight = _normBase(c.bsRotationBaseRight);
+        this._bsHighlightRotation('left', c.bsRotationLeft);
+        this._bsHighlightRotation('right', c.bsRotationRight);
+        this._bsReflectAutoBaseRow('left', c.bsRotationLeft);
+        this._bsReflectAutoBaseRow('right', c.bsRotationRight);
+        this._bsHighlightAutoBase('left', c.bsRotationBaseLeft);
+        this._bsHighlightAutoBase('right', c.bsRotationBaseRight);
         this._bsReflectRotationRow(c.bsMergeMode);
+        // Fisheye slider value + row visibility (single-camera modes only).
+        this._bsSetSlider('bsRectify', 'bsRectifyVal', c.bsRectifyStrength);
+        this._bsReflectRectifyRow(c.bsMergeMode);
         // Live preview is a NATIVE on-car window — only meaningful in the in-app
         // WebView. Hide the preview controls on a tunnel/browser (no AndroidBridge),
         // where tapping them would do nothing. Sliders + Apply still work remotely
@@ -1145,9 +1195,18 @@ BYD.roadSense = {
         this.config.bsMergeMode = mode;
         this._bsHighlightMergeMode(mode);
         this._bsReflectRotationRow(mode);
+        // Same gate as the rotation rows; without this the fisheye row only
+        // re-evaluated on a page reload after switching mode.
+        this._bsReflectRectifyRow(mode);
         const ok = await this._bsSave({ mergeMode: mode });
         if (ok) { this._toastSaved(); }
-        else { this.config.bsMergeMode = prev; this._bsHighlightMergeMode(prev); this._bsReflectRotationRow(prev); this._toastFailed(); }
+        else {
+            this.config.bsMergeMode = prev;
+            this._bsHighlightMergeMode(prev);
+            this._bsReflectRotationRow(prev);
+            this._bsReflectRectifyRow(prev);
+            this._toastFailed();
+        }
     },
 
     /** Highlight the selected merge mode (M3 tonal selection, same pattern as the
@@ -1160,39 +1219,79 @@ BYD.roadSense = {
         }
     },
 
-    /** Rotation only applies to the single-camera views — show the row for
-     *  side/rear, hide it (and the merged panorama can't rotate) for 'both'. */
+    /** Rotation only applies to the single-camera views — show the per-side rows for
+     *  side/rear, hide them (the merged panorama can't rotate) for 'both'. PER-SIDE:
+     *  there are two rotation rows (left camera = left turn / view 7; right camera =
+     *  right turn / view 8) because the two cameras are mirror-imaged. */
     _bsReflectRotationRow(mode) {
         var single = (mode === 'side' || mode === 'rear');
-        var row = document.getElementById('bsRotationRow');
-        if (row) row.style.display = single ? '' : 'none';
-        // The auto-base row hangs off the rotation row; hide it whenever rotation is
-        // gated off (merged 'both'), else defer to the rotation value (auto vs fixed).
-        var baseRow = document.getElementById('bsAutoBaseRow');
-        if (baseRow) baseRow.style.display = (single && this.config.bsRotation === 'auto') ? '' : 'none';
+        ['bsRotationLeftRow', 'bsRotationRightRow'].forEach(function (id) {
+            var row = document.getElementById(id);
+            if (row) row.style.display = single ? '' : 'none';
+        });
+        // Each auto-base row hangs off its side's rotation row; show it only when that
+        // side is single-camera AND set to 'auto'.
+        var baseL = document.getElementById('bsAutoBaseLeftRow');
+        if (baseL) baseL.style.display = (single && this.config.bsRotationLeft === 'auto') ? '' : 'none';
+        var baseR = document.getElementById('bsAutoBaseRightRow');
+        if (baseR) baseR.style.display = (single && this.config.bsRotationRight === 'auto') ? '' : 'none';
     },
 
-    /** Select the on-screen card rotation: a fixed quarter turn (0/90/180/270) or
-     *  'auto' (direction-of-travel — the daemon holds the base angle moving forward
-     *  and flips 180° in reverse gear). Persists immediately and takes effect live on
-     *  the running card (the daemon re-resolves the SurfaceControl geometry —
-     *  aspect-swapped for a quarter turn). */
-    async bsSetRotation(deg) {
+    /** Fisheye/lens-dewarp applies only to the single-camera views — show the row
+     *  for side/rear, hide it for the merged 'both' view (libod handles that). */
+    _bsReflectRectifyRow(mode) {
+        var single = (mode === 'side' || mode === 'rear');
+        var row = document.getElementById('bsRectifyRow');
+        if (row) row.style.display = single ? '' : 'none';
+    },
+
+    /** Live-preview the fisheye strength while dragging (label + running scaler),
+     *  WITHOUT persisting on every input event. Mirrors the stitch sliders' bsTune. */
+    bsRectifyInput(v) {
+        var n = parseInt(v, 10);
+        if (isNaN(n)) return;
+        this.config.bsRectifyStrength = this._clamp(n, 0, 100);
+        var l = document.getElementById('bsRectifyVal');
+        if (l) l.textContent = String(this.config.bsRectifyStrength);
+    },
+
+    /** Commit the fisheye strength on release (change event). Persists to
+     *  blindspot.rectifyStrength; the daemon pushes it live to the BS scaler. */
+    async bsSetRectify(v) {
+        var n = this._clamp(parseInt(v, 10) || 0, 0, 100);
+        var prev = this.config.bsRectifyStrength;
+        this.config.bsRectifyStrength = n;
+        const ok = await this._bsSave({ rectifyStrength: n });
+        if (ok) { this._toastSaved(); }
+        else { this.config.bsRectifyStrength = prev; this._bsSetSlider('bsRectify', 'bsRectifyVal', prev); this._toastFailed(); }
+    },
+
+    /** Select a SIDE's on-screen card rotation: a fixed quarter turn (0/90/180/270)
+     *  or 'auto' (direction-of-travel — the daemon holds that side's base angle moving
+     *  forward and flips 180° in reverse gear). side is 'left' (view 7) or 'right'
+     *  (view 8). Persists immediately and takes effect live on the running card. */
+    async bsSetRotation(side, deg) {
+        var isRight = (side === 'right');
         var d = (deg === 'auto') ? 'auto' : parseInt(deg, 10);
         if (d !== 0 && d !== 90 && d !== 180 && d !== 270 && d !== 'auto') return;
-        var prev = this.config.bsRotation;
+        var key = isRight ? 'bsRotationRight' : 'bsRotationLeft';
+        var saveKey = isRight ? 'rotationRight' : 'rotationLeft';
+        var prev = this.config[key];
         if (d === prev) return;
-        this.config.bsRotation = d;
-        this._bsHighlightRotation(d);
-        this._bsReflectAutoBaseRow(d);
-        const ok = await this._bsSave({ rotation: d });
+        this.config[key] = d;
+        this._bsHighlightRotation(side, d);
+        this._bsReflectAutoBaseRow(side, d);
+        var payload = {}; payload[saveKey] = d;
+        const ok = await this._bsSave(payload);
         if (ok) { this._toastSaved(); }
-        else { this.config.bsRotation = prev; this._bsHighlightRotation(prev); this._bsReflectAutoBaseRow(prev); this._toastFailed(); }
+        else { this.config[key] = prev; this._bsHighlightRotation(side, prev); this._bsReflectAutoBaseRow(side, prev); this._toastFailed(); }
     },
 
-    /** Highlight the selected rotation button (M3 tonal selection). */
-    _bsHighlightRotation(deg) {
-        var map = { 0: 'bsRot0', 90: 'bsRot90', 180: 'bsRot180', 270: 'bsRot270', auto: 'bsRotAuto' };
+    /** Highlight the selected rotation button for one side (M3 tonal selection). */
+    _bsHighlightRotation(side, deg) {
+        var isRight = (side === 'right');
+        var pfx = isRight ? 'bsRotR' : 'bsRotL';
+        var map = { 0: pfx + '0', 90: pfx + '90', 180: pfx + '180', 270: pfx + '270', auto: pfx + 'Auto' };
         for (var k in map) {
             var el = document.getElementById(map[k]);
             if (el) {
@@ -1202,29 +1301,37 @@ BYD.roadSense = {
         }
     },
 
-    /** The forward-orientation base row is only meaningful when rotation is 'auto'. */
-    _bsReflectAutoBaseRow(rot) {
-        var row = document.getElementById('bsAutoBaseRow');
+    /** A side's forward-orientation base row is only meaningful when that side's
+     *  rotation is 'auto'. */
+    _bsReflectAutoBaseRow(side, rot) {
+        var id = (side === 'right') ? 'bsAutoBaseRightRow' : 'bsAutoBaseLeftRow';
+        var row = document.getElementById(id);
         if (row) row.style.display = (rot === 'auto') ? '' : 'none';
     },
 
-    /** Select the forward-gear base orientation used by 'auto' (0/90/180/270).
-     *  Reverse gear flips this 180° on-screen; persisted as bsRotationBase. */
-    async bsSetRotationBase(deg) {
+    /** Select a side's forward-gear base orientation used by 'auto' (0/90/180/270).
+     *  Reverse gear flips this 180° on-screen; persisted as rotationBaseLeft/Right. */
+    async bsSetRotationBase(side, deg) {
+        var isRight = (side === 'right');
         var d = parseInt(deg, 10);
         if (d !== 0 && d !== 90 && d !== 180 && d !== 270) return;
-        var prev = this.config.bsRotationBase;
+        var key = isRight ? 'bsRotationBaseRight' : 'bsRotationBaseLeft';
+        var saveKey = isRight ? 'rotationBaseRight' : 'rotationBaseLeft';
+        var prev = this.config[key];
         if (d === prev) return;
-        this.config.bsRotationBase = d;
-        this._bsHighlightAutoBase(d);
-        const ok = await this._bsSave({ rotationBase: d });
+        this.config[key] = d;
+        this._bsHighlightAutoBase(side, d);
+        var payload = {}; payload[saveKey] = d;
+        const ok = await this._bsSave(payload);
         if (ok) { this._toastSaved(); }
-        else { this.config.bsRotationBase = prev; this._bsHighlightAutoBase(prev); this._toastFailed(); }
+        else { this.config[key] = prev; this._bsHighlightAutoBase(side, prev); this._toastFailed(); }
     },
 
-    /** Highlight the selected auto-base button (M3 tonal selection). */
-    _bsHighlightAutoBase(deg) {
-        var map = { 0: 'bsBase0', 90: 'bsBase90', 180: 'bsBase180', 270: 'bsBase270' };
+    /** Highlight the selected auto-base button for one side (M3 tonal selection). */
+    _bsHighlightAutoBase(side, deg) {
+        var isRight = (side === 'right');
+        var pfx = isRight ? 'bsBaseR' : 'bsBaseL';
+        var map = { 0: pfx + '0', 90: pfx + '90', 180: pfx + '180', 270: pfx + '270' };
         for (var k in map) {
             var el = document.getElementById(map[k]);
             if (el) { if (parseInt(k, 10) === deg) el.classList.add('active'); else el.classList.remove('active'); }
@@ -1282,12 +1389,15 @@ BYD.roadSense = {
     _bsReflectTargetControls(t) {
         var cluster = (t === 'cluster');
         var pct = cluster ? this.config.bsSizePctCluster : this.config.bsSizePct;
-        var corner = cluster ? this.config.bsCornerCluster : this.config.bsCorner;
+        var cornerL = cluster ? this.config.bsCornerLeftCluster : this.config.bsCornerLeft;
+        var cornerR = cluster ? this.config.bsCornerRightCluster : this.config.bsCornerRight;
         var szEl = document.getElementById('bsSize');
         var szVal = document.getElementById('bsSizeVal');
         if (szEl) szEl.value = String(pct);
         if (szVal) szVal.textContent = pct + '%';
-        this._bsHighlightCorner(corner || 'tr');
+        // PER-SIDE corner highlight (left = view 7, right = view 8).
+        this._bsHighlightCorner('left', cornerL || 'tr');
+        this._bsHighlightCorner('right', cornerR || 'tr');
         // Cluster layout dropdown: visible only for the cluster target.
         var row = document.getElementById('bsClusterLayoutRow');
         if (row) row.style.display = cluster ? '' : 'none';
@@ -1328,11 +1438,16 @@ BYD.roadSense = {
         this._bsMarkDirty();
     },
 
-    /** STAGE the card corner (tl/tr/bl/br) for the ACTIVE target. */
-    bsSetCorner(corner) {
-        if (this.config.bsTarget === 'cluster') this.config.bsCornerCluster = corner;
-        else this.config.bsCorner = corner;
-        this._bsHighlightCorner(corner);
+    /** STAGE a side's card corner (tl/tr/bl/br/center) for the ACTIVE target.
+     *  side is 'left' (view 7 / left turn) or 'right' (view 8 / right turn). */
+    bsSetCorner(side, corner) {
+        var cluster = (this.config.bsTarget === 'cluster');
+        var isRight = (side === 'right');
+        var key = cluster
+            ? (isRight ? 'bsCornerRightCluster' : 'bsCornerLeftCluster')
+            : (isRight ? 'bsCornerRight' : 'bsCornerLeft');
+        this.config[key] = corner;
+        this._bsHighlightCorner(side, corner);
         this._bsMarkDirty();
     },
 
@@ -1342,8 +1457,10 @@ BYD.roadSense = {
         var c = this.config;
         return {
             bsTarget: c.bsTarget, bsClusterLayout: c.bsClusterLayout,
-            bsSizePct: c.bsSizePct, bsCorner: c.bsCorner,
-            bsSizePctCluster: c.bsSizePctCluster, bsCornerCluster: c.bsCornerCluster
+            bsSizePct: c.bsSizePct,
+            bsCornerLeft: c.bsCornerLeft, bsCornerRight: c.bsCornerRight,
+            bsSizePctCluster: c.bsSizePctCluster,
+            bsCornerLeftCluster: c.bsCornerLeftCluster, bsCornerRightCluster: c.bsCornerRightCluster
         };
     },
 
@@ -1353,8 +1470,10 @@ BYD.roadSense = {
         var s = this._bsDisplaySaved || {};
         var c = this.config;
         var dirty = (c.bsTarget !== s.bsTarget) || (c.bsClusterLayout !== s.bsClusterLayout)
-            || (c.bsSizePct !== s.bsSizePct) || (c.bsCorner !== s.bsCorner)
-            || (c.bsSizePctCluster !== s.bsSizePctCluster) || (c.bsCornerCluster !== s.bsCornerCluster);
+            || (c.bsSizePct !== s.bsSizePct)
+            || (c.bsCornerLeft !== s.bsCornerLeft) || (c.bsCornerRight !== s.bsCornerRight)
+            || (c.bsSizePctCluster !== s.bsSizePctCluster)
+            || (c.bsCornerLeftCluster !== s.bsCornerLeftCluster) || (c.bsCornerRightCluster !== s.bsCornerRightCluster);
         this._bsDisplayDirty = dirty;
         var btn = document.getElementById('bsApplyBtn');
         if (btn) { btn.disabled = !dirty; btn.classList.toggle('has-changes', dirty); }
@@ -1370,11 +1489,24 @@ BYD.roadSense = {
         if (btn) { btn.disabled = true; }
         // Build per-target geometry presets so the daemon recomputes px from the
         // live panel; include target + cluster layout in the same delta.
+        // PER-SIDE corners persist as cornerLeft/cornerRight inside each geometry
+        // object. Keep the legacy single `corner` in sync with the LEFT side so an
+        // older daemon (or a fallback read) still gets a sensible value.
         var delta = {
             target: c.bsTarget,
             clusterSizeProfile: c.bsClusterLayout,
-            geometry: { sizePct: c.bsSizePct, corner: c.bsCorner },
-            geometryCluster: { sizePct: c.bsSizePctCluster, corner: c.bsCornerCluster }
+            geometry: {
+                sizePct: c.bsSizePct,
+                corner: c.bsCornerLeft,
+                cornerLeft: c.bsCornerLeft,
+                cornerRight: c.bsCornerRight
+            },
+            geometryCluster: {
+                sizePct: c.bsSizePctCluster,
+                corner: c.bsCornerLeftCluster,
+                cornerLeft: c.bsCornerLeftCluster,
+                cornerRight: c.bsCornerRightCluster
+            }
         };
         var ok = await this._bsSave(delta);
         if (ok) {
@@ -1389,10 +1521,16 @@ BYD.roadSense = {
         }
     },
 
-    /** Highlight the currently-selected corner button so the saved position is
-     *  visible at a glance (M3 tonal-selection). */
-    _bsHighlightCorner(corner) {
-        var map = { tl: 'bsCornerTl', tr: 'bsCornerTr', bl: 'bsCornerBl', br: 'bsCornerBr', center: 'bsCornerCenter' };
+    /** Highlight the currently-selected corner button for one side (M3 tonal
+     *  selection). side is 'left' (view 7) or 'right' (view 8); button ids are
+     *  suffixed L/R (bsCornerLTl / bsCornerRTl / …). */
+    _bsHighlightCorner(side, corner) {
+        var sfx = (side === 'right') ? 'R' : 'L';
+        var map = {
+            tl: 'bsCorner' + sfx + 'Tl', tr: 'bsCorner' + sfx + 'Tr',
+            bl: 'bsCorner' + sfx + 'Bl', br: 'bsCorner' + sfx + 'Br',
+            center: 'bsCorner' + sfx + 'Center'
+        };
         for (var k in map) {
             var el = document.getElementById(map[k]);
             if (el) { if (k === corner) el.classList.add('active'); else el.classList.remove('active'); }

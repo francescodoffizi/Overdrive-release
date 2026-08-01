@@ -280,8 +280,13 @@ public class AbrpTelemetryService {
                     // (getChargingState() → engine/ring-buffer-estimator), so the
                     // two surfaces agree. Only used when the raw getters gave
                     // nothing, so PHEVs that DO report a real getter are unaffected.
+                    // !isEstimated: a nominal placeholder (3.3/7.0 kW) or an inferred
+                    // engine-power figure must not be sent as measured charge power — ABRP
+                    // plans routes from it, and the flag exists precisely to mark "not from
+                    // the BYD API". Estimated → leave chargingPower at its raw-getter value.
                     if (chargingPower <= 0.15 && chargingData != null
                             && chargingData.status == ChargingStateData.ChargingStatus.CHARGING
+                            && !chargingData.isEstimated
                             && !Double.isNaN(chargingData.chargingPowerKW)
                             && chargingData.chargingPowerKW > 0.15) {
                         chargingPower = chargingData.chargingPowerKW;

@@ -428,6 +428,24 @@ object ConfigBackupService {
                 if (!toWrite.has(sec) && current.has(sec)) toWrite.put(sec, current.get(sec))
             }
 
+            // A bundle taken BEFORE the trips default-ON change carries
+            // tripAnalytics.enabled=false, while the per-key merge above keeps the
+            // live enabledDefaultMigrated=true. ensureDefaults would then skip
+            // both the seed and the one-shot flip (it sees both keys present), so
+            // restoring an old backup would silently turn trip recording off
+            // FOREVER with no way for the migration to re-fire. Drop the marker
+            // whenever the bundle supplied an explicit `enabled`, so the one-shot
+            // upgrade re-evaluates against the restored value exactly once.
+            try {
+                val restoredTrips = toWrite.optJSONObject("tripAnalytics")
+                val bundleTrips = incoming.optJSONObject("tripAnalytics")
+                if (restoredTrips != null && bundleTrips != null && bundleTrips.has("enabled")) {
+                    restoredTrips.remove("enabledDefaultMigrated")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "trips migration-marker reset failed: ${e.message}")
+            }
+
             // Backfill any key the current app expects but neither the live
             // config nor the bundle carried, so we never PERSIST an incomplete
             // config (saveConfig doesn't run applyDefaults; loadConfig only

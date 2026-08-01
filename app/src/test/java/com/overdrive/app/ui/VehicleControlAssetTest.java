@@ -55,10 +55,55 @@ public class VehicleControlAssetTest {
 
         assertTrue(script.contains("typeof corner.pressureState === 'number'"));
         assertTrue(script.contains("&& corner.pressureState >= 1) return 'warn'"));
-        assertTrue(script.contains("corner.psi < 28 || corner.psi > 50"));
+        // The numeric net still runs after the SDK enum says normal, but the
+        // limits are now the user's configured per-axle kPa band rather than
+        // hardcoded PSI literals.
+        assertTrue(script.contains("if (corner.kPa <= lim.criticalLow) return 'alert'"));
+        assertTrue(script.contains("if (corner.kPa < low || corner.kPa > high) return 'warn'"));
         assertFalse(script.contains(
                 "corner.pressureState >= 1) return 'warn';\n            return 'normal'"));
+        // No PSI-literal thresholds may come back: PSI is a rounded display
+        // unit, so comparing in it lets the corner colour disagree with the
+        // notification thresholds.
         assertFalse(script.contains("corner.psi < 34"));
+        assertFalse(script.contains("corner.psi < 28"));
+        assertFalse(script.contains("corner.psi < 22"));
+        assertFalse(script.contains("corner.psi > 50"));
+    }
+
+    /** The per-axle band must come from the server, not be re-hardcoded. */
+    @Test
+    public void tyreLimitsComeFromServerConfig() throws IOException {
+        String script = readRepositoryFile("app/src/main/assets/web/shared/vehicle-control.js");
+
+        assertTrue(script.contains("_tyreLimits"));
+        assertTrue(script.contains("if (tyres.limits)"));
+        // Front and rear are independent, so the token/label helpers must be
+        // told which axle they are judging.
+        assertTrue(script.contains("_tyreStateToken: function(corner, isFront)"));
+        assertTrue(script.contains("_tyreStateLabel: function(corner, isFront)"));
+        assertTrue(script.contains("var isFront = i < 2;"));
+    }
+
+    /**
+     * The kPa net must be evaluated BEFORE the firmware enum, so the worst of the
+     * two wins as it does server-side (BydDataCollector: level = max(enum, kPa)).
+     * An enum-first early return painted a deflated tyre orange while the server
+     * raised a CRITICAL alert for it — the deflation case normally trips the
+     * firmware flag too, so that was the common path, not an edge case.
+     */
+    @Test
+    public void tyreCriticalOutranksFirmwareWarnInCornerColour() throws IOException {
+        String script = readRepositoryFile("app/src/main/assets/web/shared/vehicle-control.js");
+
+        int criticalCheck = script.indexOf("if (corner.kPa <= lim.criticalLow) return 'alert'");
+        int enumWarn = script.indexOf("&& corner.pressureState >= 1) return 'warn'");
+        assertTrue("both branches must exist", criticalCheck > 0 && enumWarn > 0);
+        assertTrue("kPa criticalLow check must precede the enum warn branch",
+                criticalCheck < enumWarn);
+        // The caption's low test shares the token's boundary (criticalLow may
+        // equal an axle low), so a red corner is never labelled OK.
+        assertTrue(script.contains("if (corner.kPa < low || corner.kPa <= lim.criticalLow)"));
     }
 
     @Test

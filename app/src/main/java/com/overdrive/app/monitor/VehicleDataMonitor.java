@@ -41,6 +41,26 @@ public class VehicleDataMonitor {
     // Throttle for the charging-power resolution diagnostic (see getChargingState).
     private volatile long lastChargePowerLogMs = 0L;
 
+    /**
+     * Last observed {@code clusterChargePowerKw} and when it last CHANGED, used only by the
+     * PHEV CV-taper admission in {@link #getChargingState()}. The cluster feature id keeps
+     * answering its last in-band value after the gun comes out and nothing else ages that field,
+     * so "in band" alone would keep a finished session alive forever; requiring recent MOVEMENT
+     * turns a frozen reading back into the sentinel it is. {@code volatile} — getChargingState()
+     * is called from HTTP, MQTT, ABRP and daemon threads.
+     */
+    /** Guards the taper freshness pair below — read-then-write must be atomic across the many
+     *  threads that call getChargingState(). */
+    private final Object taperLock = new Object();
+    private volatile double lastTaperClusterKw = Double.NaN;
+    private volatile long lastTaperClusterChangeMs = 0L;
+    /**
+     * How long a CV-taper reading may go unchanged before it stops counting as live. A real taper
+     * keeps moving as it decays; a value pinned for this long is the sticky-getter artifact.
+     * Generous enough to tolerate the 90 s parked poll cadence plus quantisation plateaus.
+     */
+    private static final long TAPER_CLUSTER_TTL_MS = 10 * 60_000L;
+
     /** Compact formatter for a possibly-NaN candidate value in the diag line. */
     private static String fmt(double v) {
         return Double.isNaN(v) ? "NaN" : String.format("%.2f", v);
@@ -186,17 +206,34 @@ public class VehicleDataMonitor {
      * detector says yes, else the BMS state if known, else null), and
      * resolve power magnitude.
      *
-     * Power magnitude resolution (when fused says CHARGING):
-     *   1. chargePower (InstrumentDevice.getChargePower — real DC rate INTO the
-     *      pack; matches the BYD app/cloud). Preferred over externalChargingPower
-     *      because on PHEV trims that one reports the AC wall-side input (higher:
-     *      includes onboard-charger conversion loss) or a 104857.5 sentinel.
-     *   2. external charging power (InstrumentDevice — charger-reported, AC-side)
-     *   3. chargingDevice.chargingPower
-     *   4. abs(engine power) — only when ACC is on (NaN-guarded after
-     *      ACC OFF invalidation in BydDataCollector.setAccState)
-     *   5. ring-buffer counter-derivative estimator (measured, not nominal)
-     *   6. nominal-capacity hint (3.3 kW PHEV / 7 kW BEV, marked estimated)
+     * Power magnitude resolution (when fused says CHARGING) SPLITS BY DRIVETRAIN,
+     * because the hardware getters that are authoritative on BEV are actively
+     * wrong on PHEV — getExternalChargingPower() reports the EVSE's RATED
+     * capacity there (a flat 7.13 kW on a real ~1.7 kW charge) and
+     * getChargePower() has been seen returning the AC-side figure:
+     *
+     *   PHEV:
+     *     1. clusterChargePowerKw — the cluster's own dash readout (feature id
+     *        0x32300018). Measured, available on the first poll, and PHEV-only
+     *        because its raw scale is inferred (see the branch comment below).
+     *     2. ring-buffer estimator — SOC-derived, needs ≥2 SOC ticks to warm up.
+     *     3. abs(engine power) when current is flowing into the pack.
+     *     4. nominal-capacity hint (3.3/7 kW, marked estimated).
+     *   PHEV deliberately NEVER falls through to externalChargingPower /
+     *   chargingDevice.chargingPower — a confidently-wrong measured-looking
+     *   value is worse than an honest estimate.
+     *
+     *   BEV:
+     *     1. chargePower (InstrumentDevice.getChargePower — real DC rate INTO the
+     *        pack; matches the BYD app/cloud). Preferred over externalChargingPower
+     *        because that one is the AC wall-side input (higher: includes
+     *        onboard-charger conversion loss) or a 104857.5 sentinel.
+     *     2. external charging power (InstrumentDevice — charger-reported, AC-side)
+     *     3. chargingDevice.chargingPower
+     *     4. abs(engine power) — only when ACC is on (NaN-guarded after
+     *        ACC OFF invalidation in BydDataCollector.setAccState)
+     *     5. ring-buffer counter-derivative estimator (measured, not nominal)
+     *     6. nominal-capacity hint (7 kW, marked estimated)
      *
      * @return ChargingStateData populated from the fused detector, or
      *         null when no state signal is available at all.
@@ -206,6 +243,60 @@ public class VehicleDataMonitor {
         if (vd == null) return null;
 
         boolean fusedCharging = ChargingDetector.getInstance().isCharging();
+
+        // TAPER OVERRIDE — BMS says FINISHED but the cluster still reports a real rate through a
+        // connected gun. On BYD PHEV firmware "FINISHED" means bulk-charge complete, NOT cable
+        // removed: the CV taper continues and the dash keeps showing kW. Field capture
+        // (log_X5RRX996): at 07:01:28 the BMS flipped to 2 at 100% SOC with gunState=2 and the
+        // pack still drawing, and the detector fused ON->OFF on `l1-bms-negative`.
+        //
+        // Without this, relaxing the collector-side suppression of clusterChargePowerKw was
+        // INERT: the whole power block below is gated on effectiveState==CHARGING, which only
+        // fusedCharging can produce, so a stored cluster value could never be read in exactly the
+        // scenario the relaxation targeted. Requires a live cluster reading (the collector already
+        // refuses to store one on a terminal state or a disconnected/V2L gun), so this cannot
+        // resurrect a finished session on its own — when the taper truly ends the cluster read
+        // goes out of band, the collector stores NaN, and this override stops applying.
+        boolean gunCharging = vd.chargingGunState == 2
+                || vd.chargingGunState == 3 || vd.chargingGunState == 4;
+        // PHEV-ONLY. clusterChargePowerKw's unit scale is a magnitude GUESS
+        // (scaleClusterChargePowerKw divides anything >22 by 100), and that guess is only safe
+        // where the ambiguous band is physically unreachable — i.e. below a PHEV onboard
+        // charger's ~7 kW ceiling. Consuming it on BEV would let a genuine 150 kW DC session
+        // read as 1.5 kW, which is squarely in-band and would satisfy this test (invariant I1 +
+        // asymmetry 1). Computed here rather than reusing the cascade's own `phev` local, which
+        // is not resolved until inside the power block below.
+        boolean phevForTaper;
+        try { phevForTaper = isPhev(); } catch (Throwable t) { phevForTaper = false; }
+        // MOVEMENT BOUND. In-band is NOT enough: the cluster feature id is documented to keep
+        // answering the last in-band rate after the gun comes out, and nothing else ages this
+        // field — so an in-band-only test held "charging" for as long as the cable stayed in,
+        // which never closed the session row and fed a permanent phantom to ABRP/MQTT. Requiring
+        // the value to have CHANGED recently makes a frozen reading a sentinel by I4, per
+        // asymmetry 6 ("freshness means the DATA moved").
+        // Tracking is confined to PHEV and serialised. Previously it ran on every call before the
+        // drivetrain gate, so getChargingState() — a READ path reached from HTTP, MQTT, ABRP, the SoC
+        // recorder and the CPS sampler — mutated shared state on BEV too, and the read-then-write was
+        // not atomic across those threads (two callers could each see clusterLive true off the
+        // other's write). The values are only ever consumed inside the phev-gated expression below.
+        boolean clusterLive = false;
+        if (phevForTaper) {
+            synchronized (taperLock) {
+                clusterLive = vd.clusterChargePowerKw != lastTaperClusterKw
+                        || (System.currentTimeMillis() - lastTaperClusterChangeMs) < TAPER_CLUSTER_TTL_MS;
+                if (vd.clusterChargePowerKw != lastTaperClusterKw) {
+                    lastTaperClusterKw = vd.clusterChargePowerKw;
+                    lastTaperClusterChangeMs = System.currentTimeMillis();
+                }
+            }
+        }
+        boolean taperCharging = !fusedCharging
+                && phevForTaper
+                && vd.chargingState == ChargingStateData.CHARGING_BATTERY_STATE_CHARG_FINISH
+                && gunCharging
+                && !Double.isNaN(vd.clusterChargePowerKw)
+                && vd.clusterChargePowerKw > 0.1 && vd.clusterChargePowerKw <= 300
+                && clusterLive;
 
         int effectiveState;
         if (fusedCharging) {
@@ -219,9 +310,15 @@ public class VehicleDataMonitor {
         }
 
         ChargingStateData data = new ChargingStateData(effectiveState);
+        data.isTaperCharging = taperCharging;
 
         // ---- Power magnitude ----
-        if (effectiveState == ChargingStateData.CHARGING_BATTERY_STATE_CHARGING) {
+        // Entered when the fused detector says CHARGING, OR during a PHEV CV taper that the BMS
+        // has already called FINISHED (see taperCharging). The taper case keeps the FINISHED state
+        // code — only the POWER block opens — so `full`/`plugged`/session-close all keep seeing
+        // the truth (asymmetry 8: a C1 relaxation needs a matching C3 admission, but it must not
+        // be bought by lying about the state).
+        if (effectiveState == ChargingStateData.CHARGING_BATTERY_STATE_CHARGING || taperCharging) {
             String powerSource;  // which cascade branch won — surfaced in the diag log below
             double estKw = ChargingPowerEstimator.getInstance().estimatePowerKw();
             // On PHEV, externalChargingPower is NOT trustworthy for charging power:
@@ -234,10 +331,40 @@ public class VehicleDataMonitor {
             try { phev = isPhev(); } catch (Throwable t) { phev = false; }
             boolean estUsable = !Double.isNaN(estKw);
 
-            if (phev && estUsable) {
-                // PHEV: the SOC-derived ring estimator is ground truth from the SOC
-                // gauge, so it OUTRANKS every hardware getter — including chargePowerKw.
-                // On PHEV those getters are unreliable: getChargePower() has been seen
+            // TOP PRIORITY ON PHEV: the INSTRUMENT CLUSTER's own charge readout (feature id
+            // 0x32300018). This is the number on the dash, it is MEASURED, and unlike the typed
+            // getters it is correct on PHEV — where getExternalChargingPower() returns the
+            // EVSE's rated capacity and getChargePower() has been seen returning the AC-side
+            // figure. It outranks the SOC-derived estimator because the estimator needs ≥2 SOC
+            // ticks (≈15 min on a slow charge) to say anything at all, and even then it is a
+            // derivative of a 1%-granular gauge; this is the charger's own number, available on
+            // the first poll.
+            //
+            // NOTE: this read used to be gated behind "only if the typed getters found nothing"
+            // in BydDataCollector, which on PHEV never opened (the wrong-but-present external
+            // value satisfied the gate) — and it passed a wrapper Class to a HAL that matches
+            // primitives only. Both are fixed, so this branch can finally win.
+            //
+            // DELIBERATELY PHEV-ONLY, and this gate is load-bearing. The raw feature value is
+            // reported in two different units across firmware families with no unit flag, so
+            // scaleClusterChargePowerKw() has to GUESS from the magnitude, and it resolves the
+            // ambiguous 22..500 band as hectowatts (which is what our PHEV field captures
+            // show). That guess is safe on PHEV — an onboard charger physically cannot exceed
+            // ~7 kW, so the band is unreachable — but on a BEV a genuine 60-250 kW DC fast
+            // charge lands squarely in it and would be divided by 100, displaying 0.6-2.5 kW
+            // for a 60-250 kW session and poisoning the session peak/avg. BEV already has a
+            // trustworthy source in chargePowerKw (getChargePower, the battery-side figure the
+            // OEM app and cloud show), so there is nothing to gain there and a 100x error to
+            // lose. Restricting the branch to PHEV — the drivetrain that actually had the bug —
+            // keeps BEV behaviour bit-identical to before this change.
+            if (phev && !Double.isNaN(vd.clusterChargePowerKw)
+                    && vd.clusterChargePowerKw > 0.1 && vd.clusterChargePowerKw <= 300) {
+                data.updateChargingPower(vd.clusterChargePowerKw);
+                powerSource = "clusterChargePowerKw(DD)";
+            } else if (phev && estUsable) {
+                // PHEV, cluster readout unavailable on this trim: the SOC-derived ring
+                // estimator is the next best thing, and it OUTRANKS the remaining hardware
+                // getters. On PHEV those are unreliable: getChargePower() has been seen
                 // returning the AC/EVSE-side ~7 kW (not the true DC pack rate) on some
                 // trims, and getExternalChargingPower() reports the EVSE's rated
                 // capacity. Trusting either produced the "shows 7 kW on a 1.7 kW
@@ -265,6 +392,23 @@ public class VehicleDataMonitor {
                 // instead of a wrong measured-looking value.
                 if (!Double.isNaN(vd.enginePowerKw) && vd.enginePowerKw < -0.3) {
                     data.updateChargingPower(Math.abs(vd.enginePowerKw));
+                    // FLAGGED ESTIMATED. abs(engine power) is an INFERENCE — it is the
+                    // motor/generator's own figure, not a charger-side measurement, and the
+                    // reference OEM app deliberately refuses this substitution for charging power
+                    // (its charging band is unsigned, precisely so ICE/regen watts cannot surface
+                    // as a charge rate). Publishing it unflagged let it into the CPS ramp curve and
+                    // hence session energy/cost (invariant I3) — the same defect class as the
+                    // frozen estimator. Newly reachable mid-session now that the estimator can
+                    // expire, so this is no longer a warm-up-only path.
+                    //
+                    // COST: isEstimated is overloaded as both "don't persist" and "don't display"
+                    // — core.js:1015 and local/index.html:887 both hide the NUMBER when it is set,
+                    // so the card shows "Charging"/"--" instead of a value here. That is the right
+                    // trade (an unflagged inference in the cost curve is money-wrong; a blank is
+                    // only unhelpful), but it IS a visible loss. Splitting the flag into
+                    // isEstimated (display) + isInferred (persistence) would let this branch be
+                    // shown-but-not-persisted; left as a deliberate residual, not an oversight.
+                    data.isEstimated = true;
                     powerSource = "enginePowerKw(phev)";
                 } else {
                     powerSource = "phev-awaiting-estimator";
@@ -285,11 +429,6 @@ public class VehicleDataMonitor {
             } else if (!Double.isNaN(vd.chargingPowerKw) && vd.chargingPowerKw > 0) {
                 data.updateChargingPower(vd.chargingPowerKw);
                 powerSource = "chargingPowerKw(device)";
-            } else if (!Double.isNaN(vd.enginePowerKw) && vd.enginePowerKw < -0.3) {
-                // engine current flowing into pack. setAccState(false) wipes
-                // this to NaN, so a value here is fresh from an ACC-on cycle.
-                data.updateChargingPower(Math.abs(vd.enginePowerKw));
-                powerSource = "enginePowerKw";
             } else if (estUsable) {
                 // FALLBACK: no charger-reported power on this model. Derive it
                 // from the time-derivative of the rising charge-energy counter
@@ -298,8 +437,29 @@ public class VehicleDataMonitor {
                 // legitimately seed the session peak/avg and drive the live curve.
                 // The estimator only produces a value while fused-CHARGING + Park,
                 // so it is regen/V2L-safe by construction.
+                //
+                // OUTRANKS enginePowerKw below (it used to sit under it). Both describe the same
+                // charge, but only this one is unflagged — and because isEstimated doubles as
+                // "don't persist", losing the race to the inference zeroed the CPS samples, hence
+                // peak_power_kw, hence deriveIsDc's peak guard, hence DC pricing and both graphs.
+                // Mirrors the PHEV ordering above, where the estimator already outranks it.
                 data.updateChargingPower(estKw);
                 powerSource = "estimator(ring)";
+            } else if (!Double.isNaN(vd.enginePowerKw) && vd.enginePowerKw < -0.3) {
+                // engine current flowing into pack. setAccState(false) wipes
+                // this to NaN, so a value here is fresh from an ACC-on cycle.
+                data.updateChargingPower(Math.abs(vd.enginePowerKw));
+                // FLAGGED, exactly like the PHEV copy of this same inference above. abs(motor power)
+                // is not a charger-side measurement, and I3 requires the flag on every such branch.
+                // The PHEV branch got it and this one did not — an asymmetry with real cost: the
+                // -1.0 sentinel filter is deliberately exact-match, so any OTHER placeholder
+                // (-1.5, -2.0) or a genuine parked motor draw published here as MEASURED, entered
+                // the CPS curve, and priced the session. I1 says BEV must stay bit-identical; I3 is
+                // the load-bearing guard for I5 (money). Where they conflict, I3 wins — an unflagged
+                // inference in the cost integral is wrong in currency, a blank display is only
+                // unhelpful. Recorded as a second sanctioned BEV-visible change in I1.
+                data.isEstimated = true;
+                powerSource = "enginePowerKw";
             } else {
                 // Detector says CHARGING but no real kW signal arrived.
                 // Show a nominal-based hint so the UI doesn't say "Charging at 0 kW".
@@ -325,11 +485,17 @@ public class VehicleDataMonitor {
             if (nowMs - lastChargePowerLogMs > 60_000L) {
                 lastChargePowerLogMs = nowMs;
                 logger.info(String.format(
-                    "ChargingPower resolved=%.2fkW source=%s | candidates: chargePowerKw=%s extChgKw=%s chgDevKw=%s engineKw=%s estimatorKw=%s",
-                    data.chargingPowerKW, powerSource,
+                    "ChargingPower resolved=%.2fkW source=%s phev=%s | candidates: clusterKw=%s chargePowerKw=%s extChgKw=%s chgDevKw=%s engineKw=%s estimatorKw=%s",
+                    data.chargingPowerKW, powerSource, phev,
+                    fmt(vd.clusterChargePowerKw),
                     fmt(vd.chargePowerKw), fmt(vd.externalChargingPowerKw),
                     fmt(vd.chargingPowerKw), fmt(vd.enginePowerKw),
-                    fmt(ChargingPowerEstimator.getInstance().estimatePowerKw())));
+                    // Reuse the SNAPSHOT the cascade actually used, not a fresh read: re-reading
+                    // here can observe a concurrent derive (or reset) on the collector thread and
+                    // print a candidate that contradicts the resolved `source` field — e.g.
+                    // "source=nominalPlaceholder(phev) ... estimatorKw=1.54" — which would send a
+                    // future reader after a phantom cascade bug.
+                    fmt(estKw)));
             }
         }
         return data;
@@ -365,6 +531,46 @@ public class VehicleDataMonitor {
     public double getTotalFuelCon() {
         BydVehicleData vd = getVd();
         return vd != null ? vd.totalFuelCon : Double.NaN;
+    }
+
+    /**
+     * Cumulative electricity-consumption counter, in kWh, straight from the BYD
+     * statistic HAL ({@code getTotalElecConValue}) — the electric twin of
+     * {@link #getTotalFuelCon()}.
+     *
+     * <p>A delta between two reads is the metered kWh drawn over the interval.
+     * This matters most on SHORT trips: {@link #getBatteryRemainPowerKwh()} is
+     * derived from SoC, which is integer-resolution on this trim (~0.6 kWh on a
+     * 60 kWh pack ≈ 4 km of driving), so any trip below that shows zero energy.
+     * This counter keeps advancing regardless, and needs neither the SoC
+     * resolution nor a pack-capacity estimate.
+     *
+     * <p>Read directly rather than via a composite helper so the snapshot can't
+     * be dropped when an unrelated field is momentarily unavailable.
+     *
+     * @return cumulative kWh consumed, or {@code NaN} when the HAL doesn't
+     *         report it.
+     */
+    public double getTotalElecCon() {
+        BydVehicleData vd = getVd();
+        return vd != null ? vd.totalElecCon : Double.NaN;
+    }
+
+    /**
+     * The vehicle's own lifetime average petrol consumption in L/100km, from the
+     * BYD statistic HAL ({@code getTotalFuelConPHMValue}).
+     *
+     * <p>Preferred over deriving L/100km ourselves when showing a lifetime figure:
+     * it is the same number the instrument cluster shows, so the two can't
+     * disagree. Per-trip consumption is still computed from the litres delta over
+     * the trip's distance — this accumulator is lifetime-wide and can't answer
+     * "what did THIS drive use".
+     *
+     * @return L/100km, or {@code NaN} when unreported (BEV, or trim without it)
+     */
+    public double getAvgFuelConPer100Km() {
+        BydVehicleData vd = getVd();
+        return vd != null ? vd.avgFuelConPer100Km : Double.NaN;
     }
     
     public BatteryThermalData getBatteryThermal() {

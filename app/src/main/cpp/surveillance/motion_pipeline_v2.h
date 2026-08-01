@@ -127,7 +127,33 @@ struct PipelineConfigV2 {
     //   trusted; until then flowCoherence is reported as -1 (fail-open).
     float coherenceRatioMin;           // 0.35 default
     float coherenceNetMin;             // 1.5 default (blocks)
-    int   coherenceMinFrames;          // 12 default
+    // Java is the source of truth for every value in this struct (it serializes
+    // the config buffer); PipelineConfigV2 in MotionPipelineV2.java sends 8, i.e.
+    // ~0.8s of fail-open warmup at 10 FPS before coherence is trusted. This
+    // comment previously said 12, which would mislead anyone reasoning about how
+    // long the -1 sentinel window lasts.
+    int   coherenceMinFrames;          // 8 (see MotionPipelineV2.java)
+
+    // ---- Motion salience: rescue a LARGE real object from the flash filter ----
+    // The >25% active-ratio global-flash filter (v2_processQuadrant) treats block
+    // MASS as evidence of a lighting event. That inverts on close subjects: a
+    // person at ~1.5m covers ~18 of 70 blocks and a van covers far more, so the
+    // biggest, closest — most threatening — objects are the ones most likely to
+    // be discarded as "flash", before stages 3/4/4b ever run.
+    //
+    // When salienceEnabled, a high-mass frame is PROBED instead of dropped: run
+    // 3/4/4b and keep the frame only if the mass is ONE COMPACT, RIGIDLY
+    // TRANSLATING blob (an object) rather than a diffuse scene-wide response (an
+    // illumination change). A failed probe restores the pre-probe confidences and
+    // takes the original suppression path, so probe-fail is byte-identical to
+    // salienceEnabled==0. Coherence thresholds are reused from the fields above.
+    //
+    // salienceMinBlocks: minimum largest-component size (blocks) to be an object.
+    // salienceDominanceFrac: largest component as a fraction of confirmed blocks —
+    //   one blob is ~1.0; a flash lighting every textured surface is far lower.
+    int   salienceEnabled;             // 0 = off (default), 1 = probe high-mass frames
+    int   salienceMinBlocks;           // 10 default (~14% of the 70-block grid)
+    float salienceDominanceFrac;       // 0.60 default
 };
 
 // ============================================================================
@@ -153,6 +179,19 @@ struct QuadrantResultV2 {
     //   Java treats <0 as unavailable and falls back to the person-tracker test.
     float flowCoherence;        // |net flow| / |gross flow| over largest component, EMA-smoothed
     float netDriftBlocks;       // windowed cumulative net displacement magnitude (blocks)
+
+    // Number of distinct connected components among the confirmed blocks. One
+    // object is 1 (2-3 when a subject fragments around an occluder or its own
+    // shadow); a diffuse response — rain, wipers, a scene-wide illumination
+    // change — scatters into many. Java's salience test uses this as a cheap
+    // diffuseness guard alongside the dominance fraction. Declared BEFORE
+    // blockConfidence[]; keep in sync with MotionPipelineV2.deserializeResult.
+    int   componentCount;
+    // Flash-filter salience probe outcome, for attribution (invariant I7):
+    // 0 = probe did not run, 1 = probed and SUPPRESSED (diffuse/incoherent →
+    // treated as a lighting event, exactly as before), 2 = probed and RESCUED
+    // (one compact rigidly-translating blob → kept as real motion).
+    int   salienceState;
 
     // Per-block confidence (for heatmap overlay)
     float blockConfidence[V2_TOTAL_BLOCKS];

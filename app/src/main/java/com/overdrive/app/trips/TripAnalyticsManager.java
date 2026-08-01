@@ -24,6 +24,20 @@ public class TripAnalyticsManager {
 
     private static final DaemonLogger logger = DaemonLogger.getInstance("TripAnalyticsManager");
 
+    /**
+     * How far SoC must fall before it is allowed to override a metered reading of
+     * zero energy (see {@code resolveTripEnergyKwh}). SoC is integer-resolution on
+     * this HAL, so anything at or below one step is noise; this sits above it.
+     */
+    static final double SOC_OVERRIDE_MIN_DROP_PCT = 1.0;
+
+    /**
+     * How far back to look for the charge whose tariff prices a trip. Beyond
+     * this, a stale tariff is less trustworthy than the current configured rate
+     * (a car parked for a season, or charging analytics switched off for months).
+     */
+    private static final int LAST_CHARGE_RATE_MAX_AGE_DAYS = 60;
+
     private TripConfig config;
     private TripDatabase database;
     private TripDetector detector;
@@ -66,9 +80,26 @@ public class TripAnalyticsManager {
                     + " (success=" + created + ")");
         }
 
-        // 2. If enabled, initialize all components
+        // 2. If enabled, initialize all components.
+        //
+        // CONTAINED. Previously an uncaught throw in here (H2 open, a thread
+        // factory, RangeEstimator) propagated out of init(), so CameraDaemon never
+        // assigned tripAnalyticsManager and every trips endpoint answered "not
+        // initialized" — including the one the user would need to turn the feature
+        // OFF. That was near-unreachable while the feature defaulted off; now that
+        // it defaults ON it would run on every unit at boot, so a single bad H2
+        // file could brick the trips UI with no way out. Degrade instead: keep the
+        // manager alive and reachable with enabled=false, so the API and toggle
+        // still work and the daemon still boots.
         if (config.isEnabled()) {
-            initComponents();
+            try {
+                initComponents();
+            } catch (Throwable t) {
+                enabled = false;
+                logger.error("Trip components failed to initialize — trips DISABLED for this "
+                        + "session (manager stays reachable so the API/toggle still work): "
+                        + t, t);
+            }
         }
 
         initialized = true;
@@ -233,6 +264,38 @@ public class TripAnalyticsManager {
     }
 
     /**
+     * Durably checkpoint an in-progress trip without ending it.
+     *
+     * <p>Call this before a process kill that is NOT a trip end — specifically
+     * the UI's {@code prepare-restart} + {@code killall -9} flow, which bypasses
+     * the JVM shutdown hook. It flushes buffered telemetry so the
+     * {@code .jsonl.gz} on disk covers everything sampled so far, leaving
+     * next-boot {@code recoverTripsFromDisk} able to rebuild the row.
+     *
+     * <p>Deliberately NOT {@link #shutdown()}. shutdown() calls
+     * finalizeActiveTrip(), which applies the 60s / 0.2km floors and — on a
+     * short leg — routes to discardTrip(), which DELETES the telemetry file. A
+     * restart mid-drive would therefore destroy a trip that used to survive as a
+     * recoverable file. shutdown() also flips {@code initialized}/{@code enabled}
+     * to false and closes the H2 store, which strands trips dead for the rest of
+     * the process if the caller's SIGKILL then fails (see abort-restart).
+     *
+     * <p>Safe to call when nothing is recording; it is then a no-op.
+     */
+    public void checkpointActiveTrip() {
+        if (!enabled || !initialized) return;
+        try {
+            TripTelemetryRecorder rec = recorder;
+            if (rec != null && detector != null && detector.isTripActive()) {
+                rec.flushNow();
+                logger.info("Active trip checkpointed to disk (restart-safe, trip left open)");
+            }
+        } catch (Throwable t) {
+            logger.warn("checkpointActiveTrip failed: " + t.getMessage());
+        }
+    }
+
+    /**
      * Get the active trip record, or null if no trip is active.
      */
     public TripRecord getActiveTrip() {
@@ -349,6 +412,19 @@ public class TripAnalyticsManager {
         rangeEstimator = new RangeEstimator(database, sohEstimator);
 
         enabled = true;
+        // Surface a dead store LOUDLY. `enabled` is set regardless — detection and
+        // telemetry are still worth running, because the .jsonl.gz files let
+        // recoverTripsFromDisk rebuild rows on a later start once the store is
+        // healthy. But without this line a failed database.init() produced a
+        // pipeline that detects trips, writes telemetry, and silently inserts
+        // nothing: the Trips page stays empty with no error anywhere.
+        try {
+            if (database == null || !database.isAvailable()) {
+                logger.error("Trip database is NOT available after init — trips will be"
+                        + " detected and telemetry written, but rows cannot be inserted."
+                        + " Recovery from .jsonl.gz will backfill them on a later start.");
+            }
+        } catch (Throwable ignored) {}
         logger.info("Trip analytics components initialized");
     }
 
@@ -430,7 +506,14 @@ public class TripAnalyticsManager {
         //    ordering is the fix for efficiency/consistency scoring on a
         //    different unit axis than stored history. Used again below for cost.
         double energyUsed = resolveTripEnergyKwh(trip);
-        if (energyUsed > 0 && trip.distanceKm > 0) {
+        if (trip.distanceKm > 0) {
+            // Assign unconditionally, including 0. This resolution is authoritative
+            // and supersedes the provisional rate the detector computed at finalize
+            // time. Leaving a stale value in place when this resolves to 0 was a
+            // real leak: a reading REJECTED by the plausibility gate below had
+            // already been divided into energyPerKm upstream, and that figure then
+            // survived into the rollup totals and the efficiency score — the exact
+            // corruption the gate exists to stop.
             trip.energyPerKm = energyUsed / trip.distanceKm;
         }
 
@@ -465,8 +548,51 @@ public class TripAnalyticsManager {
         // at -1, so the entire fuel branch is skipped — behaviour is bit-for-
         // bit identical to the pre-PHEV implementation.
         if (config != null) {
+            // Electricity price for this trip: the rate the LAST CHARGE was
+            // actually billed at, falling back to the configured global rate.
+            //
+            // Why the last charge and not the config value: the kWh a trip burns
+            // were bought at the previous charge's tariff. A driver who charges at
+            // home for 0.08 and then DC-fasts at 0.55 on a road trip should see
+            // the road-trip legs costed at 0.55 — pricing everything at one global
+            // number makes per-trip cost meaningless the moment more than one
+            // tariff is in play. The charge tariff is itself location-aware (see
+            // TariffManager), so this inherits "same place ⇒ same rate" for free.
+            //
+            // The lookup is capped at 60 days so a car parked for a season doesn't
+            // price today's drive at an ancient tariff. No priced charge in that
+            // window (fresh install, analytics off, or petrol-only PHEV use) ⇒
+            // rateSource "config" and the exact pre-existing behaviour.
             trip.electricityRate = config.getElectricityRate();
             trip.currency = config.getCurrency();
+            trip.rateSource = "config";
+            trip.rateLabel = "";
+            // Currency of the charge that priced the electric leg, applied below
+            // only if the fuel leg (always in the config currency) is absent.
+            String chargeCurrency = "";
+            try {
+                org.json.JSONObject lastCharge = com.overdrive.app.monitor.SocHistoryDatabase
+                        .getInstance().getLastChargeRate(LAST_CHARGE_RATE_MAX_AGE_DAYS);
+                if (lastCharge != null) {
+                    double r = lastCharge.optDouble("rate", 0);
+                    if (r > 0) {
+                        trip.electricityRate = r;
+                        trip.rateSource = "charge";
+                        trip.rateLabel = lastCharge.optString("tariffLabel", "");
+                        // Currency follows the rate — a charge on a foreign tariff
+                        // carries its own symbol, and showing that price under the
+                        // home symbol would be a lie. But DON'T adopt it yet: the
+                        // petrol leg below is priced in the CONFIG currency, and
+                        // tripCost sums the two. Stash it and apply it only once we
+                        // know there is no fuel leg to disagree with.
+                        String c = lastCharge.optString("currency", "");
+                        if (c != null && !c.isEmpty()) chargeCurrency = c;
+                    }
+                }
+            } catch (Throwable t) {
+                // Charging analytics unavailable — keep the config rate.
+                logger.debug("Last-charge rate lookup skipped: " + t.getMessage());
+            }
 
             // energyUsed (kWh) and trip.energyPerKm were already resolved above,
             // before scoring — reuse them here for the cost math.
@@ -525,6 +651,35 @@ public class TripAnalyticsManager {
             trip.fuelCost = fuelCost;
             trip.tripCost = electricCost + fuelCost;
 
+            // Resolve the currency clash properly. Relabelling alone was not enough:
+            // tripCost ADDS the electric leg (priced in the charge's currency) to the
+            // fuel leg (always priced in the config currency), so a foreign charge
+            // currency made the total a sum of two currencies whatever symbol we
+            // printed. There is no FX layer, so when they disagree AND both legs
+            // exist, fall the electric leg back to the CONFIG rate: one currency
+            // throughout, at the cost of not using the foreign tariff for that trip.
+            if (!chargeCurrency.isEmpty()) {
+                boolean clash = fuelCost > 0 && !chargeCurrency.equals(config.getCurrency());
+                if (clash) {
+                    trip.electricityRate = config.getElectricityRate();
+                    trip.rateSource = "config";
+                    trip.rateLabel = "";
+                    double reCost = (energyUsed > 0 && trip.electricityRate > 0)
+                            ? energyUsed * trip.electricityRate : 0;
+                    // Reassign the LOCAL too, not just the field: the cost log below
+                    // prints `electricCost`, so leaving the local at the foreign-rate
+                    // product made the log contradict its own factors and total.
+                    electricCost = reCost;
+                    trip.electricCost = electricCost;
+                    trip.tripCost = electricCost + fuelCost;
+                    logger.info("Trip cost: charge currency " + chargeCurrency
+                            + " != config " + config.getCurrency()
+                            + " and a petrol leg exists — electric leg re-priced at the config rate");
+                } else {
+                    trip.currency = chargeCurrency;
+                }
+            }
+
             if (trip.tripCost > 0) {
                 if (trip.isPhev && fuelCost > 0) {
                     logger.info(String.format(
@@ -533,8 +688,10 @@ public class TripAnalyticsManager {
                             trip.litresUsed, trip.currency, trip.fuelPricePerL, trip.currency, fuelCost,
                             trip.currency, trip.tripCost));
                 } else {
-                    logger.info(String.format("Trip cost: %.2f kWh × %s%.2f = %s%.2f",
-                            energyUsed, trip.currency, trip.electricityRate, trip.currency, trip.tripCost));
+                    logger.info(String.format("Trip cost: %.2f kWh × %s%.2f = %s%.2f (rate from %s%s)",
+                            energyUsed, trip.currency, trip.electricityRate, trip.currency, trip.tripCost,
+                            trip.rateSource,
+                            (trip.rateLabel != null && !trip.rateLabel.isEmpty()) ? " · " + trip.rateLabel : ""));
                 }
             }
         }
@@ -565,6 +722,21 @@ public class TripAnalyticsManager {
         // 4. Insert into database
         if (database != null) {
             long dbId = database.insertTrip(trip);
+
+            // ONE retry. insertTrip's own catch calls reconnect() before
+            // returning -1, so by the time we get here a fresh H2 connection may
+            // already be in place — the classic interrupted-MVStore case recovers
+            // on a second attempt, in-process, instead of deferring to next-boot
+            // .jsonl.gz recovery (which re-derives distance from GPS and re-applies
+            // the discard floors, so it can silently drop the trip entirely).
+            if (dbId <= 0) {
+                logger.warn("insertTrip returned " + dbId + " — retrying once after"
+                        + " the failure path's reconnect()");
+                dbId = database.insertTrip(trip);
+                if (dbId > 0) {
+                    logger.info("Trip insert succeeded on retry — id=" + dbId);
+                }
+            }
 
             if (dbId > 0) {
                 // After DB insert, rename telemetry file to use the DB ID
@@ -608,6 +780,17 @@ public class TripAnalyticsManager {
                         + " SD=" + trip.speedDisciplineScore
                         + " E=" + trip.efficiencyScore
                         + " C=" + trip.consistencyScore + "]");
+            } else {
+                // Previously there was no else branch, so a failed insert
+                // produced NO log line at all here — the trip simply vanished
+                // and the only trace was a lower-level "Failed to insert trip".
+                // Say it loudly, and name the artifact that survives, because
+                // the .jsonl.gz is what next-boot recovery rebuilds the row from.
+                logger.error("Trip NOT saved — insertTrip returned " + dbId
+                        + " (start=" + trip.startTime + ", distance=" + trip.distanceKm
+                        + "km). Telemetry file "
+                        + (telemetryPath != null ? telemetryPath : "(none)")
+                        + " is left on disk for recovery on next daemon start.");
             }
         }
 
@@ -629,19 +812,58 @@ public class TripAnalyticsManager {
     /**
      * Resolve the trip's electrical energy use in kWh.
      *
-     * <p>Prefers direct BMS kWh readings ({@link TripRecord#getEnergyUsedKwh()}).
-     * When those are absent — the common case on trims that don't expose a clean
-     * BMS energy channel — estimate from the SoC delta using the SohEstimator's
-     * calibrated nominal pack capacity. Returns 0 when neither source is usable
-     * (e.g. SoC flat or rose, no capacity estimate).
+     * <p>Three tiers, most to least accurate:
+     * <ol>
+     *   <li><b>Metered</b> — delta of the HAL's cumulative electricity counter.
+     *       The only tier with the resolution to measure a short trip.</li>
+     *   <li><b>Remaining-energy delta</b> — derived from an integer-resolution
+     *       SoC, so it reads a flat 0 below roughly 4 km.</li>
+     *   <li><b>SoC estimate</b> — SoC delta × calibrated pack capacity.</li>
+     * </ol>
+     * The first two live in {@link TripRecord#getEnergyUsedKwh()}. Returns 0 when
+     * no source is usable (e.g. SoC flat or rose, no capacity estimate).
      *
      * <p>Called BEFORE scoring so the efficiency axis and the cost math both see
      * the same kWh figure on a single unit axis.
      */
     private double resolveTripEnergyKwh(TripRecord trip) {
+        // Reject a metered delta that no battery could have supplied over this
+        // distance (generous 100 kWh/100km ceiling, plus 1 kWh of slack for very
+        // short trips). A counter reset or a unit change between the two reads
+        // would otherwise be booked as a huge, confidently-wrong measurement.
+        // Clearing the snapshots makes every downstream tier — here and in
+        // TripRecord — fall through consistently instead of disagreeing.
+        if (trip.hasMeteredEnergy() && trip.distanceKm > 0) {
+            double maxPlausibleKwh = 1.0 + trip.distanceKm;
+            if (trip.getMeteredEnergyKwh() > maxPlausibleKwh) {
+                logger.warn(String.format(
+                        "Metered energy implausible (%.2f kWh over %.2f km) — discarding accumulator, using SoC path",
+                        trip.getMeteredEnergyKwh(), trip.distanceKm));
+                trip.elecConStart = -1;
+                trip.elecConEnd = -1;
+            }
+        }
         double energyUsed = trip.getEnergyUsedKwh();
         if (energyUsed > 0) {
             return energyUsed;
+        }
+        // The meter reported a true zero AND the remaining-energy delta agreed, so
+        // 0 is a measurement rather than a missing value — estimating from SoC
+        // would manufacture consumption the vehicle says did not happen. This is
+        // the normal reading for a PHEV leg driven entirely on the engine.
+        //
+        // Unless SoC disagrees CLEARLY: a counter stuck at a fixed non-zero value
+        // isn't tracking on this trim, and if SoC really fell then energy was used.
+        // The threshold matters — SoC is integer-resolution here, so a 1% step is
+        // indistinguishable from quantisation noise or from parasitic/HVAC draw on
+        // an engine-driven leg, and treating it as propulsion energy would invent
+        // roughly 0.6 kWh of cost the meter says was never drawn. Requiring a
+        // margin above one step means only an unmistakable drop overrides the
+        // meter, while a genuinely stuck counter over any real drive still does.
+        double socDrop = (trip.socStart > 0 && trip.socEnd > 0) ? trip.socStart - trip.socEnd : 0;
+        boolean socFellClearly = socDrop > SOC_OVERRIDE_MIN_DROP_PCT;
+        if (trip.hasMeteredEnergy() && !socFellClearly) {
+            return 0;
         }
 
         // Estimate from SoC delta via SohEstimator's calibrated nominal capacity.

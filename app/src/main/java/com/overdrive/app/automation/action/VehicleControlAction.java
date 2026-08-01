@@ -116,6 +116,15 @@ public class VehicleControlAction extends BaseAction {
             return;
         }
 
-        VehicleCommandRouter.getInstance().execute(action.command);
+        VehicleCommandRouter.CommandResult result =
+                VehicleCommandRouter.getInstance().execute(action.command);
+        // Record what we commanded for a blind-toggle entity once it reached the vehicle, but
+        // not when it was refused before getting there (see ControlAction.commitIfAttempted).
+        if (result != null) action.commitIfAttempted(result.outcome);
+        if (result != null && result.outcome != VehicleCommandRouter.Outcome.SUCCESS) {
+            logger.warn("Vehicle control '" + getLabel().getId() + "' payload='" + payload
+                    + "' -> " + action.command.name() + " " + result.outcome
+                    + " (" + result.displayMessage + ")");
+        }
     }
 }

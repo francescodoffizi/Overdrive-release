@@ -72,6 +72,20 @@ public class GpuStreamScaler {
     private volatile float bsLightDirY  = -1.0f;   // uv.y=0 is buffer top → -1 is "up"
     private volatile float bsSpecW      = 0.009f;  // specular band half-width
     private volatile float bsSpecInt    = 0.30f;   // specular add intensity
+    // ── Fisheye / lens dewarp for the SINGLE-CAMERA blind-spot views (7/8) ────
+    // Same two-parameter division-model dewarp the recorder uses
+    // (GpuMosaicRecorder: r_source = r_output / (1 + k1·r² + k2·r⁴)), applied to
+    // the raw quadrant sample in the merge-mode 1 (side) / 2 (rear) passthrough.
+    // ONLY the single-camera views are dewarped — the merged 'both' view is left
+    // to libod's stitch (uOd*), which already handles projection. Identity at
+    // k1=k2=0 (feature off). uBsRectifyAspect = tile height/width so the radial
+    // distance is measured in true pixel space (0.75 for a 4:3 quadrant).
+    private volatile float bsRectifyK1     = 0.0f;
+    private volatile float bsRectifyK2     = 0.0f;
+    private volatile float bsRectifyAspect = 0.75f;
+    private int uBsRectifyK1Location     = -1;
+    private int uBsRectifyK2Location     = -1;
+    private int uBsRectifyAspectLocation = -1;
     private int uApaModeLocation;
     private int uTexMatrixLocation;
     private int uApplyManualYFlipLocation;
@@ -109,6 +123,27 @@ public class GpuStreamScaler {
     private volatile float odSign = -1.0f;   // resolved for the active side
     private int aPositionLocation;
     private int aTexCoordLocation;
+
+    // Clip-space output rotation (blind-spot card). Column-major mat2 uploaded to
+    // uRotation. Identity by default so every non-BS path (and 0° BS) renders exactly
+    // as before. Written by setContentRotation (app/JS thread), read by drawFrame (GL
+    // thread) — volatile snapshot + dirty bit, same pattern as producerCornerMap.
+    private int uRotationLocation = -1;
+    private final float[] rotationMat = { 1f, 0f, 0f, 1f };   // column-major identity
+    private final float[] scratchRotation = new float[4];     // GL-thread snapshot, no per-frame alloc
+    private volatile boolean rotationDirty = true;            // upload once at init (uniforms default to 0 → must seed identity)
+    private volatile int contentRotationDeg = 0;
+    // Clip-space translation applied AFTER uRotation (blind-spot card only). At a 90/270
+    // quarter turn the 4:3 card becomes portrait and is scaled to FIT (pillarboxed)
+    // inside the 4:3 buffer — centered by default, which makes a corner-anchored card's
+    // video float in the middle of its dest rect instead of hugging the chosen left/
+    // right edge. This offset pushes the pillarboxed content to that edge. Zero at
+    // 0/180 (card fills, no pillarbox) and for a centered card, so those paths are
+    // unchanged. uploaded with the same dirty bit as uRotation.
+    private int uRotationOffsetLocation = -1;
+    private final float[] rotationOffset = { 0f, 0f };
+    private final float[] scratchRotationOffset = new float[2];
+    private volatile int contentAlignX = 0;                   // -1 hug left, 0 center, +1 hug right
 
     // OEM Dashcam (view-6) sampler — bound to texture unit 1 when an OEM
     // pipeline is active and the user picked DVR. uOemTexMatrix carries
@@ -203,10 +238,28 @@ public class GpuStreamScaler {
         "attribute vec2 aTexCoord;\n" +
         "uniform mat4 uTexMatrix;\n" +
         "uniform float uApplyManualYFlip;\n" +
+        // Clip-space rotation of the OUTPUT quad (blind-spot card only). We rotate
+        // the RENDERED GEOMETRY here instead of asking SurfaceControl to rotate the
+        // composited layer, because this firmware's SurfaceFlinger/HWC composites
+        // identity + FLIP/180 transforms but DROPS a 90/270 (axis-transposing)
+        // transform on a non-fullscreen overlay layer → the card went blank at
+        // 90/270 (issue #164). Rotating in-shader keeps SurfaceControl at identity
+        // (the path proven to composite) and never touches the fragment sampling /
+        // od projection, so the image content is unchanged — only its on-screen
+        // orientation. uRotation is a pure rotation (det +1) so it can never mirror;
+        // the aspect term is folded in by the caller (see setContentRotation) so a
+        // quarter turn of a 4:3 card letterboxes inside the 4:3 buffer with a uniform
+        // scale (no stretch). Identity by default → 0° path is byte-for-byte unchanged.
+        "uniform mat2 uRotation;\n" +
+        // Post-rotation clip-space shift (blind-spot card only). At 90/270 the rotated
+        // portrait card is pillarboxed inside the 4:3 output; this nudges it to the
+        // chosen left/right edge so a corner-anchored card hugs that edge instead of
+        // floating centered. (0,0) at 0/180 and for a centered card → no change there.
+        "uniform vec2 uRotationOffset;\n" +
         "varying vec2 vTexCoord;\n" +
         "varying vec2 vUnit;\n" +
         "void main() {\n" +
-        "    gl_Position = aPosition;\n" +
+        "    gl_Position = vec4(uRotation * aPosition.xy + uRotationOffset, aPosition.zw);\n" +
         "    vUnit = aTexCoord;\n" +
         "    vec2 src = aTexCoord;\n" +
         "    if (uApplyManualYFlip > 0.5) src.y = 1.0 - src.y;\n" +
@@ -297,9 +350,14 @@ public class GpuStreamScaler {
         uBsLightDirLocation   = GLES20.glGetUniformLocation(programId, "uBsLightDir");
         uBsSpecWLocation      = GLES20.glGetUniformLocation(programId, "uBsSpecW");
         uBsSpecIntLocation    = GLES20.glGetUniformLocation(programId, "uBsSpecInt");
+        uBsRectifyK1Location     = GLES20.glGetUniformLocation(programId, "uBsRectifyK1");
+        uBsRectifyK2Location     = GLES20.glGetUniformLocation(programId, "uBsRectifyK2");
+        uBsRectifyAspectLocation = GLES20.glGetUniformLocation(programId, "uBsRectifyAspect");
         uApaModeLocation = GLES20.glGetUniformLocation(programId, "uApaMode");
         uTexMatrixLocation = GLES20.glGetUniformLocation(programId, "uTexMatrix");
         uApplyManualYFlipLocation = GLES20.glGetUniformLocation(programId, "uApplyManualYFlip");
+        uRotationLocation = GLES20.glGetUniformLocation(programId, "uRotation");
+        uRotationOffsetLocation = GLES20.glGetUniformLocation(programId, "uRotationOffset");
         uProducerForFrontLocation = GLES20.glGetUniformLocation(programId, "uProducerForFront");
         uProducerForRightLocation = GLES20.glGetUniformLocation(programId, "uProducerForRight");
         uProducerForRearLocation  = GLES20.glGetUniformLocation(programId, "uProducerForRear");
@@ -349,11 +407,61 @@ public class GpuStreamScaler {
     }
 
     /**
+     * Renders a frame to the stream encoder, stamping an explicit presentation
+     * timestamp onto the encoder surface.
+     *
+     * <p><b>Why this overload exists.</b> The plain {@link #drawFrame(int)} ends in
+     * {@code eglCore.swapBuffers(...)}, which pushes the buffer with NO presentation
+     * time — MediaCodec then has to invent one. That is fine when the source rate
+     * matches the encoder's configured {@code KEY_FRAME_RATE}, but on the BYD
+     * byd_apa HAL the camera emits at its own fixed ~4.5 fps and refuses
+     * {@code setCameraFps} entirely (it returns false for every value; the OEM app
+     * and DiPlus both discard that return). A 15 fps-configured encoder fed an
+     * unstamped 4.5 fps source produces near-empty P-frames with no usable
+     * timing, which renders as a frozen picture after the first keyframe.
+     *
+     * <p>Both other lanes already do this — {@code GpuMosaicRecorder:1022} and
+     * {@code OemDashcamPipeline:1748} call {@code swapBuffersWithTimestamp}. The
+     * live-view stream lane was the only one that did not. The OEM's own encode
+     * loop stamps every frame ({@code eglPresentationTimeANDROID} immediately
+     * before {@code eglSwapBuffers}, once per real frame arrival).
+     *
+     * @param cameraTextureId Camera texture ID
+     * @param ptsNs presentation timestamp in nanoseconds, from the same
+     *              single-domain clock the recorder uses. {@code <= 0} falls back
+     *              to the unstamped path, so a caller without a real timestamp
+     *              behaves exactly as before.
+     */
+    public void drawFrame(int cameraTextureId, long ptsNs) {
+        this.pendingPtsNs = ptsNs;
+        try {
+            drawFrame(cameraTextureId);
+        } finally {
+            this.pendingPtsNs = 0L;
+        }
+    }
+
+    /** Presentation timestamp for the in-flight draw, or 0 for "unstamped".
+     *  GL-thread only: set and cleared around a single synchronous drawFrame. */
+    private long pendingPtsNs = 0L;
+
+    /**
      * Renders a frame to the stream encoder.
-     * 
+     *
      * @param cameraTextureId Camera texture ID
      */
     public void drawFrame(int cameraTextureId) {
+        // Skip if init() never completed. init() assigns eglCore/encoderSurface
+        // BEFORE compiling the shader and creating the vertex buffers, so a
+        // shader compile failure leaves this object half-built: callers still
+        // hold a non-null reference and keep calling drawFrame every frame.
+        // Without this guard that path reaches glVertexAttribPointer with a
+        // null Buffer and throws an NPE per frame for the life of the process.
+        if (eglCore == null || encoderSurface == null
+                || programId == 0 || vertexBuffer == null || texCoordBuffer == null) {
+            return;
+        }
+
         // Make encoder surface current
         eglCore.makeCurrent(encoderSurface);
         
@@ -427,6 +535,10 @@ public class GpuStreamScaler {
                 if (uBsLightDirLocation   >= 0) GLES20.glUniform2f(uBsLightDirLocation,   bsLightDirX, bsLightDirY);
                 if (uBsSpecWLocation      >= 0) GLES20.glUniform1f(uBsSpecWLocation,      bsSpecW);
                 if (uBsSpecIntLocation    >= 0) GLES20.glUniform1f(uBsSpecIntLocation,    bsSpecInt);
+                // Fisheye dewarp coeffs for the single-camera passthrough (identity at 0).
+                if (uBsRectifyK1Location     >= 0) GLES20.glUniform1f(uBsRectifyK1Location,     bsRectifyK1);
+                if (uBsRectifyK2Location     >= 0) GLES20.glUniform1f(uBsRectifyK2Location,     bsRectifyK2);
+                if (uBsRectifyAspectLocation >= 0) GLES20.glUniform1f(uBsRectifyAspectLocation, bsRectifyAspect);
             }
             if (uApplyManualYFlipLocation >= 0) {
                 // Legacy → manual Y-flip; DiLink 4 → matrix handles it.
@@ -538,7 +650,23 @@ public class GpuStreamScaler {
         
         GLES20.glEnableVertexAttribArray(aTexCoordLocation);
         GLES20.glVertexAttribPointer(aTexCoordLocation, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer);
-        
+
+        // Output rotation (blind-spot card). Upload the column-major mat2 only when a
+        // setter changed it; identity otherwise, so non-BS lanes and 0° pay nothing
+        // after the first frame. Snapshot under the same lock the setter writes.
+        if (uRotationLocation >= 0 && rotationDirty) {
+            float[] rm = scratchRotation;
+            float[] ro = scratchRotationOffset;
+            synchronized (producerCornerMapLock) {
+                rm[0] = rotationMat[0]; rm[1] = rotationMat[1];
+                rm[2] = rotationMat[2]; rm[3] = rotationMat[3];
+                ro[0] = rotationOffset[0]; ro[1] = rotationOffset[1];
+                rotationDirty = false;
+            }
+            GLES20.glUniformMatrix2fv(uRotationLocation, 1, false, rm, 0);
+            if (uRotationOffsetLocation >= 0) GLES20.glUniform2f(uRotationOffsetLocation, ro[0], ro[1]);
+        }
+
         // Draw
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         
@@ -546,8 +674,17 @@ public class GpuStreamScaler {
         GLES20.glDisableVertexAttribArray(aPositionLocation);
         GLES20.glDisableVertexAttribArray(aTexCoordLocation);
         
-        // Submit to encoder
-        eglCore.swapBuffers(encoderSurface);
+        // Submit to encoder. Stamp the presentation time when the caller supplied
+        // one (see drawFrame(int, long)); otherwise use the historical unstamped
+        // swap so every existing call site — including the blind-spot lane, whose
+        // target is a SurfaceControl layer with no encoder to time — is bit-identical
+        // to before.
+        long pts = pendingPtsNs;
+        if (pts > 0L) {
+            eglCore.swapBuffersWithTimestamp(encoderSurface, pts);
+        } else {
+            eglCore.swapBuffers(encoderSurface);
+        }
     }
 
     /**
@@ -586,6 +723,84 @@ public class GpuStreamScaler {
         this.uniformsDirty.set(true);
         logger.info("Stream view mode set to " + mode);
     }
+
+    /**
+     * Rotate the on-screen blind-spot card by a quarter turn (0/90/180/270), applied
+     * in the vertex shader to the OUTPUT geometry — NOT via the SurfaceControl layer
+     * transform (this firmware's compositor drops a 90/270 layer transform → blank
+     * card, issue #164). The rotation is a pure rotation (never a mirror) and folds in
+     * the output aspect so a quarter turn of the 4:3 card letterboxes inside the 4:3
+     * buffer at a uniform scale (no anamorphic stretch). Any non-multiple-of-90 is
+     * snapped; out-of-range normalised to [0,270]. Thread-safe: stores a column-major
+     * mat2 snapshot + sets a dirty bit that drawFrame consumes on the GL thread.
+     *
+     * <p>Derivation: clip space [-1,1]^2 maps to a WxH viewport, so 1 clip-x unit =
+     * W/2 px and 1 clip-y unit = H/2 px — a unit is NOT visually square (a=W/H). A 4:3
+     * card rotated a quarter turn becomes 3:4, which cannot FILL a 4:3 viewport without
+     * distortion, so it is fit (pillarboxed) — rotate in pixel space then scale by 1/a
+     * to fit the rotated height back inside the viewport. Verified per basis vector:
+     *   90:  clip(1,0)->(0,1),  clip(0,1)->(-1/a^2,0)  =>  (x,y) -> (-y/a^2,  x)
+     *   270: clip(1,0)->(0,-1), clip(0,1)->( 1/a^2,0)  =>  (x,y) -> ( y/a^2, -x)
+     *   180: (x,y) -> (-x, -y)      0: identity
+     * det(M)=1/a^2>0 for the quarter turns (a proper rotation composed with a UNIFORM
+     * 1/a scale — no anamorphic stretch, and det>0 so it can NEVER mirror like the old
+     * SurfaceControl-orientation path did). The rounded-card SDF is computed in
+     * vTexCoord space (unrotated), so the card + its corners rotate as one rigid unit;
+     * the pillarbox regions stay transparent (map shows through), same as at 0°. Where
+     * that pillarboxed content sits horizontally is set by the alignment — see the
+     * 2-arg overload; this 1-arg form keeps the current alignment.
+     */
+    public void setContentRotation(int degrees) {
+        setContentRotation(degrees, this.contentAlignX);
+    }
+
+    /**
+     * Set both the quarter-turn rotation AND the horizontal alignment of the rotated
+     * card, in one atomic publish. {@code alignX}: -1 = hug the LEFT screen edge,
+     * +1 = hug the RIGHT, 0 = stay centered. Alignment only matters at 90/270 (where
+     * the portrait card is pillarboxed inside the 4:3 output); at 0/180 the card fills
+     * its rect so the offset is forced to 0. This keeps a corner-anchored card touching
+     * the chosen edge after a quarter turn instead of floating in the middle.
+     */
+    public void setContentRotation(int degrees, int alignX) {
+        int d = ((degrees % 360) + 360) % 360;
+        d = (Math.round(d / 90f) * 90) % 360;
+        int ax = (alignX > 0) ? 1 : (alignX < 0 ? -1 : 0);
+        if (d == this.contentRotationDeg && ax == this.contentAlignX) return;   // idempotent
+        this.contentRotationDeg = d;
+        this.contentAlignX = ax;
+        float a = (outputHeight > 0) ? (float) outputWidth / (float) outputHeight : 1.0f;
+        float inv2 = 1.0f / (a * a);   // fit-scale (1/a) folded with the aspect conj (1/a)
+        // Column-major mat2: elements are {col0.x, col0.y, col1.x, col1.y}, i.e.
+        // {M00, M10, M01, M11}. M maps aPosition.xy (column vector) as M * v.
+        float m00, m10, m01, m11;
+        // Post-rotation clip-x shift. Only the 90/270 turns pillarbox (content spans
+        // clip-x ∈ [-inv2, +inv2]), leaving (1 - inv2) empty on EACH side; shift by that
+        // full margin to hug an edge. 0/180 fill the width → no shift. Centered → no
+        // shift. clip +x is screen-right, so alignX=+1 shifts +margin (right).
+        float offX = 0f;
+        boolean quarter = (d == 90 || d == 270);
+        if (quarter && ax != 0) offX = ax * (1.0f - inv2);
+        switch (d) {
+            case 90:  m00 = 0f;    m10 = 1f;   m01 = -inv2;   m11 = 0f;   break;
+            case 180: m00 = -1f;   m10 = 0f;   m01 = 0f;      m11 = -1f;  break;
+            case 270: m00 = 0f;    m10 = -1f;  m01 = inv2;    m11 = 0f;   break;
+            default:  m00 = 1f;    m10 = 0f;   m01 = 0f;      m11 = 1f;   break;   // 0°
+        }
+        synchronized (producerCornerMapLock) {
+            rotationMat[0] = m00; rotationMat[1] = m10;
+            rotationMat[2] = m01; rotationMat[3] = m11;
+            rotationOffset[0] = offX; rotationOffset[1] = 0f;
+            // Flag dirty INSIDE the lock so the new matrix and its dirty signal publish
+            // together — drawFrame (which copies under this same lock) can never clear
+            // the flag between the matrix write and the flag set and miss this update.
+            rotationDirty = true;
+        }
+        logger.info("BS content rotation set to " + d + " deg, alignX=" + ax);
+    }
+
+    /** Current on-screen card rotation in degrees (0/90/180/270). */
+    public int getContentRotation() { return contentRotationDeg; }
 
     /**
      * Bind the OEM Dashcam camera texture as the secondary source. View
@@ -811,6 +1026,35 @@ public class GpuStreamScaler {
         int m = (mode == 1 || mode == 2) ? mode : 0;
         if (m == this.bsMergeMode) return;
         this.bsMergeMode = m;
+        this.uniformsDirty.set(true);
+    }
+
+    /**
+     * Set the fisheye/lens-dewarp strength for the SINGLE-CAMERA blind-spot views
+     * (merge mode side/rear). 0..100 maps to the same two-parameter division-model
+     * coefficients the recorder uses (k1 = 0.30·t, k2 = 0.10·t, t = strength/100),
+     * so the on-screen single-cam feed straightens residual barrel curvature exactly
+     * like the recording pipeline. Identity at 0 (feature off). No effect on the
+     * merged 'both' view (that path never samples the rectify uniforms). Idempotent.
+     */
+    public void setBlindSpotRectifyStrength(float strength) {
+        float clamped = Math.max(0f, Math.min(100f, strength));
+        float t = clamped / 100f;
+        float k1 = 0.30f * t;
+        float k2 = 0.10f * t;
+        if (Float.compare(k1, this.bsRectifyK1) == 0
+                && Float.compare(k2, this.bsRectifyK2) == 0) return;
+        this.bsRectifyK1 = k1;
+        this.bsRectifyK2 = k2;
+        this.uniformsDirty.set(true);
+    }
+
+    /** Per-quadrant tile aspect (height/width) for the fisheye radial metric; 0.75
+     *  for a 4:3 camera quadrant. Identity-equivalent when strength is 0. */
+    public void setBlindSpotRectifyAspect(float aspect) {
+        float clamped = Math.max(0.25f, Math.min(1.0f, aspect));
+        if (Float.compare(clamped, this.bsRectifyAspect) == 0) return;
+        this.bsRectifyAspect = clamped;
         this.uniformsDirty.set(true);
     }
 
@@ -1062,6 +1306,30 @@ public class GpuStreamScaler {
             "uniform vec2  uBsLightDir;\n" +    // light dir in aspect space (top-lit)
             "uniform float uBsSpecW;\n" +       // specular band half-width
             "uniform float uBsSpecInt;\n" +     // specular add intensity
+            // Fisheye/lens dewarp for the single-camera passthrough (merge 1/2). Same
+            // two-parameter division model the recorder uses. Identity at k1=k2=0.
+            "uniform float uBsRectifyK1;\n" +
+            "uniform float uBsRectifyK2;\n" +
+            "uniform float uBsRectifyAspect;\n" +   // tile height/width for the radial metric
+            // Dewarp a 0..1 quadrant tile coord: pull each output pixel toward centre by
+            // r_source = r_out / (1 + k1·r² + k2·r⁴), then zoom-to-fill so the corners
+            // still reach the tile edge (no black border). Aspect makes the iso-distortion
+            // contour circular in true pixel space. Identity when k1=k2=0. Mirrors
+            // GpuMosaicRecorder.rectifyTile so BS single-cam matches the recording dewarp.
+            "vec2 bsRectifyTile(vec2 t) {\n" +
+            "    if (uBsRectifyK1 <= 0.0 && uBsRectifyK2 <= 0.0) return t;\n" +
+            "    vec2 nxy = t * 2.0 - 1.0;\n" +
+            "    vec2 nxyAspect = vec2(nxy.x, nxy.y * uBsRectifyAspect);\n" +
+            "    float r2 = dot(nxyAspect, nxyAspect);\n" +
+            "    float r4 = r2 * r2;\n" +
+            "    float invDenom = 1.0 / (1.0 + uBsRectifyK1 * r2 + uBsRectifyK2 * r4);\n" +
+            "    float aspect2 = uBsRectifyAspect * uBsRectifyAspect;\n" +
+            "    float aspect4 = aspect2 * aspect2;\n" +
+            "    float zoom = 1.0 + uBsRectifyK1 * aspect2 + uBsRectifyK2 * aspect4;\n" +
+            "    vec2 srcAspect = (nxyAspect * invDenom) * zoom;\n" +
+            "    vec2 srcTile = vec2(srcAspect.x, srcAspect.y / uBsRectifyAspect);\n" +
+            "    return clamp(srcTile * 0.5 + 0.5, vec2(0.0), vec2(1.0));\n" +
+            "}\n" +
             // Full IQ signed-distance to a rounded box (outside>0, inside<0). Reused
             // for card coverage and the curved bevel band.
             "float bsRoundBoxSDF(vec2 p, vec2 he, float r) {\n" +
@@ -1113,10 +1381,10 @@ public class GpuStreamScaler {
             "        return;\n" +
             "    }\n" +
             "    vec2 samplePos;\n" +
-            "    float frontOffset = %.5ff;\n" +
-            "    float rightOffset = %.5ff;\n" +
-            "    float rearOffset  = %.5ff;\n" +
-            "    float leftOffset  = %.5ff;\n" +
+            "    float frontOffset = %.5f;\n" +
+            "    float rightOffset = %.5f;\n" +
+            "    float rearOffset  = %.5f;\n" +
+            "    float leftOffset  = %.5f;\n" +
             "    if (uApaMode > 2.5 && uViewMode == 0) {\n" +
             "        // DiLink 4 mosaic: rearrange the HAL's 2x2 into the\n" +
             "        // canonical Front=TL / Right=TR / Rear=BL / Left=BR\n" +
@@ -1185,36 +1453,27 @@ public class GpuStreamScaler {
             "        if (bsCov > 0.0029) {\n" +  // skip the sampler outside the card body
             "            vec2 cardUv = clamp((vTexCoord - uBsMargin) / max(1.0 - 2.0 * uBsMargin, 1e-4), 0.0, 1.0);\n" +
             "            vec4 bsCol = vec4(0.0);\n" +
-            // Merge mode 1 = SIDE only, 2 = REAR only: bypass the two-tap stitch and
-            // fill the whole card from ONE tap swept across its FULL FOV. Reuses the
-            // identical odMap projection as the merged taps (same tH / roll / pitch
-            // coefficients) — only the angle ramp differs, so a single view is the
-            // same dewarp, just standalone. Coverage is full (the one camera fills
-            // the card; the rounded-corner / od-edge transparency still comes from
-            // bsCov below). Default (0) keeps the merged rear+side blend.
-            // Both taps sweep the angle DECREASING as cardUv.x increases — the same
-            // direction the merged blend uses for each tap (th and th-ctr both fall
-            // as xOut rises) — so a single view reads with the identical orientation
-            // it has inside "both", just widened to fill the card. The per-camera
-            // flip flags handle any mirror, so this is side-independent.
+            // Merge mode 1 = SIDE only, 2 = REAR only: CLEAN PASSTHROUGH. Show the
+            // one camera's RAW quadrant with NO od dewarp — no FOV/tilt/height/spread
+            // shaping, no libod coefficients. This samples exactly like the
+            // ground-truth-correct single-view modes (mode 2 = RIGHT reads
+            // uProducerForRight, mode 4 = LEFT reads uProducerForLeft, mode 3 = REAR
+            // reads uProducerForRear): corner + cardUv*0.5, with the SAME per-camera
+            // flip flags those modes apply, so the feed is never mirrored/upside-down.
+            // The stitch tuning sliders only shape the merged 'both' view; single-cam
+            // is a plain camera passthrough by design. Coverage is a constant 1.0 (the
+            // camera always fills the card body); the rounded-corner transparency still
+            // comes from bsCov below. Default (0) keeps the merged rear+side blend.
             "            if (uBsMergeMode == 1) {\n" +
-            // SIDE camera only. h1 = uOd1.x is the side tap half-angle; sweep its
-            // full +h1..-h1 field across the card. Coverage = step(h1>0): full in
-            // normal operation (h1 >= ~0.5), but TRANSPARENT if the coefficients are
-            // degenerate/zeroed (unauthorized native resolve) — same map-shows-through
-            // contract odBlend has, so single-cam never paints a solid block.
-            "                float angS = (1.0 - cardUv.x * 2.0) * uOd1.x;\n" +
-            "                bsCol = vec4(texture2D(uCameraTex, odMap(sideCorner, vec2(0.5), sideFlip,\n" +
-            "                                 0.5, angS, uOd2.y, cardUv.y, 1.0, uOd3.z, uOd3.x, uOd3.y)).rgb,\n" +
-            "                             step(0.001, uOd1.x));\n" +
+            "                vec2 sl = bsRectifyTile(cardUv) * 0.5;\n" +   // fisheye dewarp then quadrant-scale
+            "                if (sideFlip.x > 0.5) sl.x = 0.5 - sl.x;\n" +
+            "                if (sideFlip.y > 0.5) sl.y = 0.5 - sl.y;\n" +
+            "                bsCol = vec4(texture2D(uCameraTex, sideCorner + sl).rgb, 1.0);\n" +
             "            } else if (uBsMergeMode == 2) {\n" +
-            // REAR camera only. h0 = uOd0.w is the rear tap half-angle; full +h0..-h0
-            // field shows the whole rear (not the half the blend uses), identical
-            // regardless of turn side. Coverage gated on h0>0 (see mode 1 note).
-            "                float angR = (1.0 - cardUv.x * 2.0) * uOd0.w;\n" +
-            "                bsCol = vec4(texture2D(uCameraTex, odMap(uProducerForRear, vec2(0.5), uFlipForRear,\n" +
-            "                                 0.5, angR, uOd2.x, cardUv.y, 1.0, uOd4.z, uOd4.x, uOd4.y)).rgb,\n" +
-            "                             step(0.001, uOd0.w));\n" +
+            "                vec2 sl = bsRectifyTile(cardUv) * 0.5;\n" +
+            "                if (uFlipForRear.x > 0.5) sl.x = 0.5 - sl.x;\n" +
+            "                if (uFlipForRear.y > 0.5) sl.y = 0.5 - sl.y;\n" +
+            "                bsCol = vec4(texture2D(uCameraTex, uProducerForRear + sl).rgb, 1.0);\n" +
             "            } else {\n" +
             "                bsCol = odBlend(uProducerForRear, uFlipForRear,\n" +
             "                               sideCorner, sideFlip,\n" +
@@ -1287,20 +1546,19 @@ public class GpuStreamScaler {
             "        if (bsCov > 0.0029) {\n" +
             "            vec2 cardUv = clamp((vTexCoord - uBsMargin) / max(1.0 - 2.0 * uBsMargin, 1e-4), 0.0, 1.0);\n" +
             "            vec4 bsCol = vec4(0.0);\n" +
-            // Same merge-mode switch as the DiLink-4 branch — single-cam modes fill
-            // the card from ONE tap's full FOV (legacy 4-strip corners: rear strip at
-            // rearOffset, side strip at sideX, each 0.25 wide × full height). Mode 0
-            // (default) keeps the merged rear+side blend.
+            // Same merge-mode switch as the DiLink-4 branch — single-cam modes are a
+            // CLEAN PASSTHROUGH of one 4-strip slice with NO od dewarp, sampled exactly
+            // like the ground-truth-correct legacy single-view modes (mode 2 = RIGHT
+            // reads rightOffset, mode 4 = LEFT reads leftOffset, mode 3 = REAR reads
+            // rearOffset): startX + cardUv.x*0.25 across the 0.25-wide strip, full
+            // height, no flip (those modes apply none). The stitch tuning sliders only
+            // shape the merged 'both' view. Mode 0 keeps the merged rear+side blend.
             "            if (uBsMergeMode == 1) {\n" +
-            "                float angS = (1.0 - cardUv.x * 2.0) * uOd1.x;\n" +
-            "                bsCol = vec4(texture2D(uCameraTex, odMap(vec2(sideX, 0.0), vec2(0.25, 1.0), vec2(0.0),\n" +
-            "                                 0.5, angS, uOd2.y, cardUv.y, 1.0, uOd3.z, uOd3.x, uOd3.y)).rgb,\n" +
-            "                             step(0.001, uOd1.x));\n" +   // transparent if coeffs degenerate (see DiLink-4 branch note)
+            "                vec2 rc = bsRectifyTile(cardUv);\n" +   // fisheye dewarp (identity at 0)
+            "                bsCol = vec4(texture2D(uCameraTex, vec2(sideX + rc.x * 0.25, rc.y)).rgb, 1.0);\n" +
             "            } else if (uBsMergeMode == 2) {\n" +
-            "                float angR = (1.0 - cardUv.x * 2.0) * uOd0.w;\n" +
-            "                bsCol = vec4(texture2D(uCameraTex, odMap(vec2(rearOffset, 0.0), vec2(0.25, 1.0), vec2(0.0),\n" +
-            "                                 0.5, angR, uOd2.x, cardUv.y, 1.0, uOd4.z, uOd4.x, uOd4.y)).rgb,\n" +
-            "                             step(0.001, uOd0.w));\n" +
+            "                vec2 rc = bsRectifyTile(cardUv);\n" +
+            "                bsCol = vec4(texture2D(uCameraTex, vec2(rearOffset + rc.x * 0.25, rc.y)).rgb, 1.0);\n" +
             "            } else {\n" +
             "                bsCol = odBlend(vec2(rearOffset, 0.0), vec2(0.0),\n" +
             "                               vec2(sideX, 0.0),      vec2(0.0),\n" +

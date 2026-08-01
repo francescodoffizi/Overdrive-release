@@ -97,7 +97,22 @@ window.AudioLibrary = (function () {
         if (file.size === 0) { toast(tr('automation.audio_empty', 'The selected file is empty'), 'error'); return; }
 
         var reader = new FileReader();
-        reader.onerror = function () { toast(tr('automation.audio_read_failed', 'Could not read the file'), 'error'); };
+        // Report the READ failure distinctly from an upload failure. In the in-app
+        // WebView the file arrives as a content:// Uri, and if the WebView is not
+        // permitted to resolve it (WebSettings.allowContentAccess) the read fails
+        // here and NO POST is ever sent — which used to look identical to "nothing
+        // happened", with no trace in the daemon log because the request never
+        // reached it. Name the failure and include the error so it is diagnosable
+        // from the UI alone.
+        reader.onerror = function () {
+            var msg = (reader.error && (reader.error.name || reader.error.message)) || 'unknown';
+            console.error('[audio] FileReader failed:', msg, 'file=', file && file.name);
+            toast(tr('automation.audio_read_failed', 'Could not read the file') + ' (' + msg + ')', 'error');
+        };
+        reader.onabort = function () {
+            console.error('[audio] FileReader aborted for', file && file.name);
+            toast(tr('automation.audio_read_failed', 'Could not read the file'), 'error');
+        };
         reader.onload = function (e) {
             var dataUrl = e.target.result;
             if (!dataUrl) { toast(tr('automation.audio_read_failed', 'Could not read the file'), 'error'); return; }
@@ -111,7 +126,16 @@ window.AudioLibrary = (function () {
                 return r.json();
             }).then(function (data) {
                 if (data && data.success) {
-                    toast(tr('automation.audio_upload_ok', 'Sound uploaded'), 'success');
+                    // Tell the user when this REPLACED an existing sound. The
+                    // server sanitizes filenames (disallowed chars collapse to
+                    // '_'), so two different files can land on the same name and
+                    // silently swap what every automation bound to it will play.
+                    if (data.replaced) {
+                        toast(tr('automation.audio_upload_replaced',
+                            'Replaced existing sound "' + data.name + '"'), 'success');
+                    } else {
+                        toast(tr('automation.audio_upload_ok', 'Sound uploaded'), 'success');
+                    }
                     refresh();
                 } else {
                     toast((data && data.error) || tr('automation.audio_upload_failed', 'Upload failed'), 'error');

@@ -13,6 +13,8 @@ public final class TunnelDisplayPolicy {
         STARTING_CLOUDFLARED,
         STARTING_TAILSCALE,
         WAITING_FOR_URL,
+        STOPPING,
+        FAILED,
         ONLINE
     }
 
@@ -75,6 +77,18 @@ public final class TunnelDisplayPolicy {
                 || cloudflaredStatus == DaemonStatus.RUNNING
                 || tailscaleStatus == DaemonStatus.RUNNING) {
             return new Result(Kind.WAITING_FOR_URL, null);
+        }
+        // A tunnel still shutting down is up and reachable — keep the pill.
+        if (zrokStatus == DaemonStatus.STOPPING
+                || cloudflaredStatus == DaemonStatus.STOPPING
+                || tailscaleStatus == DaemonStatus.STOPPING) {
+            return new Result(Kind.STOPPING, null);
+        }
+        // Keep a died tunnel visible; HIDDEN would remove the pill and show nothing.
+        if (zrokStatus == DaemonStatus.ERROR
+                || cloudflaredStatus == DaemonStatus.ERROR
+                || tailscaleStatus == DaemonStatus.ERROR) {
+            return new Result(Kind.FAILED, null);
         }
         return new Result(Kind.HIDDEN, null);
     }

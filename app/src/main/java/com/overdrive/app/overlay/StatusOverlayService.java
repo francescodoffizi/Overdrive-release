@@ -175,6 +175,19 @@ public class StatusOverlayService extends Service {
     private static final long FAST_POLL_INTERVAL_MS = 1000;
     private static final long FAST_POLL_WINDOW_MS = 30_000;
 
+    // Fully-idle slow poll. The service can't just stopSelf() when the overlay
+    // is disabled — it also drives cabin-audio capture reconcile (see
+    // reconcileAudioCapture) and ACC-edge detection. But when BOTH the overlay
+    // has nothing to show AND audio capture isn't configured, the 3s (ACC-on) /
+    // 10s (ACC-off) /status poll + JSON parse + reconcile is pure wasted CPU +
+    // wakeups on the shared little cores, running 24/7 for a window that's never
+    // drawn. In that case poll at this slow cadence instead. Set by updateUI
+    // (which knows anythingToShow + audioEnabledConfig), read at the reschedule.
+    // An ACC OFF→ON edge still re-arms fast-poll on the next slow tick; the user
+    // has disabled the overlay, so ~30s reaction latency there is acceptable.
+    private volatile boolean overlayFullyIdle = false;
+    private static final long IDLE_POLL_INTERVAL_MS = 30_000;
+
     // Optimistic-mode guard. When the user taps a mode chip, we flip
     // configuredMode locally before the daemon has confirmed. An
     // already-in-flight pollStatus tick (already past fetchStatus, about
@@ -1170,12 +1183,25 @@ public class StatusOverlayService extends Service {
             // consistent across the four downstream reads in this tick;
             // they each call loadConfig()/getOemDashcam()/etc. and hit the
             // freshly-warmed cache without re-doing the I/O.
+            //
+            // ACC-ON COST FIX: this used to be forceReload(), which NULLS the
+            // cache and forces a full readText() + JSONObject parse + the
+            // ~515-line applyDefaults() migration walk on EVERY tick — i.e.
+            // every 3s for the entire drive, on the shared /data/local/tmp
+            // config under a lock the UID-2000 daemon also takes. loadConfig()
+            // achieves the same "warm the cache once for this tick's four
+            // downstream reads" goal, but is mtime-gated: it reparses only when
+            // the file actually changed on disk (which is the correct cross-UID
+            // freshness signal, since the daemon's writes bump mtime) and is
+            // nearly free otherwise. The only behavioural delta is a daemon
+            // write landing in the SAME wall-clock second as this read, which
+            // isCacheFresh() deliberately treats as stale-enough-to-reparse on
+            // the next call — invisible for a 3s status pill.
             try {
-                com.overdrive.app.config.UnifiedConfigManager.forceReload();
+                com.overdrive.app.config.UnifiedConfigManager.loadConfig();
             } catch (Throwable t) {
                 // Tolerate transient I/O — the downstream reads will fall
-                // back to the prior cached snapshot if forceReload didn't
-                // refresh.
+                // back to the prior cached snapshot.
             }
             try {
                 // Stamp BEFORE the fetch: any state the daemon reports was
@@ -1236,6 +1262,10 @@ public class StatusOverlayService extends Service {
                 final long interval;
                 if (fastPollUntilElapsedMs > now) {
                     interval = FAST_POLL_INTERVAL_MS;
+                } else if (overlayFullyIdle) {
+                    // Overlay disabled + no audio to reconcile: slow way down.
+                    // A fresh ACC OFF→ON edge re-arms fast-poll on the next tick.
+                    interval = IDLE_POLL_INTERVAL_MS;
                 } else {
                     interval = accOn ? POLL_INTERVAL_MS : POLL_INTERVAL_ACC_OFF_MS;
                 }
@@ -1615,8 +1645,15 @@ public class StatusOverlayService extends Service {
             Log.d(TAG, "updateUI: nothing to show — removing overlay");
             removeOverlay();
             hadContentBefore = false;
+            // If audio capture also isn't configured, nothing here needs the
+            // fast poll — drop to the idle cadence (the poll can't stop
+            // entirely because it still drives audio reconcile + ACC-edge
+            // detection, but with audio off there's nothing to reconcile).
+            overlayFullyIdle = !audioEnabledConfig;
             return;
         }
+        // Something is shown (or audio is active) — keep the normal poll cadence.
+        overlayFullyIdle = false;
 
         // Hide overlay when ACC is off — car is parked, no need to show status.
         // We keep polling (at a slower rate) so we can show it again when ACC turns on.
@@ -1649,8 +1686,16 @@ public class StatusOverlayService extends Service {
         boolean shouldShowMic = audioEnabledConfig && recConfigured && cameraOverlayEnabled;
 
         if (!shouldShowRec && !shouldShowTrip && !shouldShowMic) {
-            // Configured but conditions don't require display (e.g., drive mode in P)
-            if (overlayView != null) overlayView.setVisibility(View.GONE);
+            // Configured but conditions don't require display (e.g., drive mode in P).
+            // Fully DETACH the window rather than leaving an empty GONE shell
+            // attached: a GONE view inside an attached TYPE_APPLICATION_OVERLAY
+            // still costs the system compositor a surface to blend every frame,
+            // which on the shared Adreno 610 competes with the native IVI. The
+            // poll's createOverlay() re-attaches at the saved position the moment
+            // real content returns (idempotent, restores PREF_POS_X/Y). Mirrors
+            // the "fully remove rather than leave an empty shell" pattern used by
+            // the both-segments-off branch just below.
+            removeOverlay();
             return;
         }
 

@@ -115,7 +115,13 @@ public class DaemonLogger {
     private final String logFilePath;
     private PrintWriter writer;
     private final Object writeLock = new Object();
-    private final SimpleDateFormat timestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US);
+    // SimpleDateFormat is NOT thread-safe, and this logger is shared across daemon threads
+    // (Binder pool, worker threads, GL thread). A shared instance's format() throws
+    // ArrayIndexOutOfBoundsException/NumberFormatException under concurrent calls — which, if it
+    // happens inside a crash-containment catch, can escape and kill the daemon. A ThreadLocal gives
+    // each thread its own formatter, so logging is always safe with no lock contention.
+    private final ThreadLocal<SimpleDateFormat> timestampFormat =
+            ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US));
     private long currentFileSize = 0;
     private volatile boolean writerInitialized = false;
     
@@ -201,7 +207,7 @@ public class DaemonLogger {
         if (level.ordinal() < globalConfig.minLevel.ordinal()) {
             return;
         }
-        String timestamp = timestampFormat.format(new Date());
+        String timestamp = timestampFormat.get().format(new Date());
         String logLine = "[" + timestamp + "] [" + level.name() + "] [" + tag + "] " + message;
         
         // Console log if enabled (standard Android Log for app context)

@@ -75,6 +75,11 @@ public class PerformanceMonitor {
     // -1 sentinel means "no prior sample yet, can't compute delta".
     private long lastGpuBusy = -1;
     private long lastGpuTotal = -1;
+    // Set by readGpuMaxFrequency() on each call: true if a real sysfs max-freq
+    // path resolved, false if it fell through to the hardcoded 650 default.
+    // Lets the freq-ratio fallback tag its estimate honestly (issue #173).
+    // Sampler-thread-confined (collectMetrics runs on a single scheduler task).
+    private boolean lastGpuMaxFreqWasReal = false;
     // Cache the resolved sysfs path once we find one that returns valid data,
     // so we don't pay 4× File.exists() every second forever.
     private java.io.File resolvedGpuBusyFile = null;
@@ -378,9 +383,10 @@ public class PerformanceMonitor {
                 }
             }
             
-            // CPU frequency
+            // CPU frequency (current + static hardware max, for throttle detection)
             snapshot.cpuFreqMhz = readCpuFrequency();
-            
+            snapshot.cpuMaxFreqMhz = readCpuMaxFrequency();
+
             // CPU temperature
             snapshot.cpuTempCelsius = readCpuTemperature();
             
@@ -453,12 +459,14 @@ public class PerformanceMonitor {
                             long load = readLongFromFile(new java.io.File(device, "load"));
                             if (load >= 0 && load <= 100) {
                                 snapshot.gpuUsagePercent = load;
+                                snapshot.gpuUsageSource = "devfreq_load";
                                 break;
                             }
 
                             long busyPercent = readLongFromFile(new java.io.File(device, "gpu_busy_percentage"));
                             if (busyPercent >= 0 && busyPercent <= 100) {
                                 snapshot.gpuUsagePercent = busyPercent;
+                                snapshot.gpuUsageSource = "devfreq_load";
                                 break;
                             }
 
@@ -520,6 +528,7 @@ public class PerformanceMonitor {
                                     if (usage >= 0) {
                                         if (usage > 100) usage = 100;
                                         snapshot.gpuUsagePercent = usage;
+                                        snapshot.gpuUsageSource = "busy_counter";
                                     }
                                     lastGpuBusy = busy;
                                     lastGpuTotal = total;
@@ -537,6 +546,12 @@ public class PerformanceMonitor {
                 double maxFreq = readGpuMaxFrequency();
                 if (maxFreq > 0) {
                     snapshot.gpuUsagePercent = Math.min(100, (snapshot.gpuFreqMhz / maxFreq) * 100);
+                    // Tag provenance (issue #173): a real max-freq read is a true
+                    // ratio-of-max; the 650 default makes gpuclk/650 a fabricated
+                    // constant (e.g. 600/650 = 92.3% forever on 2602 firmware).
+                    snapshot.gpuUsageSource = lastGpuMaxFreqWasReal
+                            ? "freq_ratio_estimate"
+                            : "freq_ratio_hardcoded";
                 }
             }
 
@@ -553,6 +568,7 @@ public class PerformanceMonitor {
      * conservative Adreno default if no sysfs path resolves.
      */
     private double readGpuMaxFrequency() {
+        lastGpuMaxFreqWasReal = false;
         String[] paths = {
             "/sys/class/kgsl/kgsl-3d0/max_gpuclk",
             "/sys/class/kgsl/kgsl-3d0/devfreq/max_freq",
@@ -574,17 +590,18 @@ public class PerformanceMonitor {
                             if (v > maxRaw) maxRaw = v;
                         } catch (NumberFormatException ignored) {}
                     }
-                    if (maxRaw > 0) return normalizeFrequency(maxRaw);
+                    if (maxRaw > 0) { lastGpuMaxFreqWasReal = true; return normalizeFrequency(maxRaw); }
                 } else {
                     try {
                         long v = Long.parseLong(line.trim());
-                        if (v > 0) return normalizeFrequency(v);
+                        if (v > 0) { lastGpuMaxFreqWasReal = true; return normalizeFrequency(v); }
                     } catch (NumberFormatException ignored) {}
                 }
             } catch (Exception ignored) {}
         }
         // Conservative estimate for Adreno GPUs — matches the original behavior
-        // before the multi-sample rewrite.
+        // before the multi-sample rewrite. lastGpuMaxFreqWasReal stays false so
+        // the caller can tag this as a hardcoded (not measured) ratio.
         return 650.0;
     }
 
@@ -697,7 +714,48 @@ public class PerformanceMonitor {
         }
         return 0;
     }
-    
+
+    // Cached CPU max-freq (KHz→MHz). The ceiling is static per boot, so resolve
+    // it once. 0 = not yet resolved; -1 = resolved-absent (don't retry).
+    private int cachedCpuMaxFreqMhz = 0;
+
+    /**
+     * Reads the CPU's maximum scaling frequency. Paired with {@link
+     * #readCpuFrequency()} this makes thermal throttling self-evident on the
+     * Performance page WITHOUT adb: when cpuFreqMhz sits well below
+     * cpuMaxFreqMhz under load (and CPU temp is high), the SoC is throttling —
+     * which on this shared SDM665 drags the whole head-unit UI, not just
+     * OverDrive. cpuinfo_max_freq is the hardware ceiling; scaling_max_freq is
+     * the governor's current cap (can itself be lowered by thermal HAL) — we
+     * prefer cpuinfo_max_freq so a thermally-capped governor still compares
+     * against the true hardware max.
+     */
+    private int readCpuMaxFrequency() {
+        if (cachedCpuMaxFreqMhz != 0) {
+            return cachedCpuMaxFreqMhz > 0 ? cachedCpuMaxFreqMhz : 0;
+        }
+        String[] paths = {
+            "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
+        };
+        for (String path : paths) {
+            try {
+                BufferedReader reader = new BufferedReader(new FileReader(path));
+                String line = reader.readLine();
+                reader.close();
+                if (line != null) {
+                    int mhz = Integer.parseInt(line.trim()) / 1000;  // KHz to MHz
+                    if (mhz > 0) {
+                        cachedCpuMaxFreqMhz = mhz;
+                        return mhz;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+        cachedCpuMaxFreqMhz = -1;  // resolved-absent; stop retrying
+        return 0;
+    }
+
     private double readCpuTemperature() {
         // Fast path: read the already-resolved zone. Resolved once, then reused
         // for the life of the process — the thermal topology is static.
@@ -988,6 +1046,7 @@ public class PerformanceMonitor {
         public double cpuUsagePercent;
         public double appCpuUsagePercent;
         public int cpuFreqMhz;
+        public int cpuMaxFreqMhz;
         public double cpuTempCelsius;
         
         // Memory
@@ -1002,6 +1061,14 @@ public class PerformanceMonitor {
         public double gpuUsagePercent;
         public double gpuFreqMhz;
         public double gpuTempCelsius;
+        // Provenance of gpuUsagePercent so the UI can distinguish a real
+        // measurement from the freq-ratio estimate (issue #173): a device with
+        // no busy counter AND no readable max-freq publishes gpuclk/650 — a
+        // fabricated constant that looks like telemetry. The number is kept
+        // (per product decision) but tagged: "busy_counter" | "devfreq_load" |
+        // "freq_ratio_estimate" (real max_freq read) | "freq_ratio_hardcoded"
+        // (650 default) | "unavailable".
+        public String gpuUsageSource = "unavailable";
         
         // App
         public int threadCount;
@@ -1023,6 +1090,7 @@ public class PerformanceMonitor {
                 // uses in collectCpuMetrics().
                 cpu.put("cores", Runtime.getRuntime().availableProcessors());
                 cpu.put("freqMhz", cpuFreqMhz);
+                cpu.put("maxFreqMhz", cpuMaxFreqMhz);
                 cpu.put("tempC", round(cpuTempCelsius));
                 json.put("cpu", cpu);
                 
@@ -1039,6 +1107,7 @@ public class PerformanceMonitor {
                 // GPU
                 JSONObject gpu = new JSONObject();
                 gpu.put("usage", round(gpuUsagePercent));
+                gpu.put("usageSource", gpuUsageSource);
                 gpu.put("freqMhz", round(gpuFreqMhz));
                 gpu.put("tempC", round(gpuTempCelsius));
                 json.put("gpu", gpu);

@@ -730,6 +730,14 @@ public class HttpServer {
             return true;
         }
 
+        // Launcher aggregation API — stable public /api/launcher/v1/* face over
+        // existing internal handlers (summary/traffic/apps/vehicle/appearance).
+        // Additive, read-mostly; dispatched here like the other modular handlers.
+        // See LauncherApiHandler + docs/LAUNCHER_SPEC.md §2.
+        if (path.startsWith("/api/launcher/")) {
+            return LauncherApiHandler.handle(method, path, body, out);
+        }
+
         // Recordings API (with Range header support for video seeking) + thumbnails + event timelines
         if (path.startsWith("/api/recordings") || path.startsWith("/video/") ||
             path.startsWith("/thumb/") || path.startsWith("/api/events/")) {
@@ -882,6 +890,14 @@ public class HttpServer {
             return VehicleControlApiHandler.handle(method, path, body, out);
         }
 
+        // Tyre pressure thresholds (user-configurable per-axle warn/critical
+        // limits). Its own prefix rather than under /api/vehicle/ because it is
+        // pure configuration — no BYD SDK actuation — and is read by the
+        // notification path as well as the Vehicle Control UI.
+        if (path.startsWith("/api/tyres/")) {
+            return TyreLimitsApiHandler.handle(method, path, body, out);
+        }
+
         // Key-mapping actuation — physical-key bindings fired by the app-process
         // accessibility service POST here so BYD SDK writes run in the daemon UID.
         if (path.startsWith("/api/keymap")) {
@@ -919,6 +935,14 @@ public class HttpServer {
         // See LightDebugApiHandler / HazardLightProbe.
         if (path.startsWith("/api/debug/light/")) {
             return LightDebugApiHandler.handle(method, path, body, out);
+        }
+
+        // Radar blind-spot ALERT register probe — read-only. The `blindSpot` automation
+        // signal has never been confirmed on a car, and its whole read path logs at DEBUG
+        // (stripped by R8 in release), so the values have to come back as JSON.
+        // See AdasDebugApiHandler / AdasBlindSpotProbe.
+        if (path.startsWith("/api/debug/adas/")) {
+            return AdasDebugApiHandler.handle(method, path, body, out);
         }
 
         // THROWAWAY de-risk spike for the native SurfaceControl blind-spot path:
@@ -1607,7 +1631,13 @@ public class HttpServer {
                 CameraDaemon.log("WS: Reusing existing stream encoder (no restart)");
             }
             
-            if (savedViewMode > 0) {
+            // Apply the saved view mode — EXCEPT view 6 (OEM Dashcam), which must wait
+            // until the OEM re-route below actually succeeds. Setting uViewMode=6 while
+            // uOemActive is still 0 makes the shader fall through its OEM early-return
+            // into the AVM mosaic branch — the "DVR view shows the 4-pano mosaic" bug
+            // described in the block below. For view 6 we leave the scaler on its
+            // previous view until the bind lands, then set it in the routed branch.
+            if (savedViewMode > 0 && savedViewMode != 6) {
                 pipeline.setStreamViewMode(savedViewMode);
                 CameraDaemon.log("WS: View mode " + savedViewMode);
             }
@@ -1617,18 +1647,25 @@ public class HttpServer {
             // attachExternalStreamCallback. But after an idle-shutdown +
             // reconnect (mobile browser is most common: backgrounding the
             // tab kills the WS, idle timer disables streaming, scaler is
-            // freshly built on this WS open), the new scaler has NO OEM
-            // binding even though setStreamViewMode(6) above set the
-            // shader's uViewMode to 6. The shader then falls through to
-            // the legacy 4-pano mosaic branch (uViewMode==6 && uOemActive==0
-            // doesn't match the OEM-sample early-return; uApaMode>1.5
-            // catches it via the else-if chain). Symptom: mobile browser
-            // opens DVR view → sees 4-pano mosaic instead of OEM dashcam.
+            // freshly built on this WS open), the new scaler has NO OEM binding.
+            // HISTORICALLY the block above set uViewMode=6 unconditionally, so with
+            // uOemActive==0 the shader fell through its OEM early-return into the
+            // legacy 4-pano mosaic branch (uApaMode>1.5 catches it via the else-if
+            // chain) — symptom: DVR view showed the 4-pano mosaic instead of the OEM
+            // dashcam. The view-6 set is now DEFERRED into the `rerouted` branch
+            // below, so the scaler only enters the OEM branch once the bind actually
+            // landed; until then it keeps showing the previous (valid) view.
             // Re-route here so the WS source switches back to the OEM
             // encoder if the user's saved view is 6.
             if (savedViewMode == 6) {
                 boolean rerouted = CameraDaemon.routeStreamToOemDashcam();
                 CameraDaemon.log("WS: View 6 OEM re-route " + (rerouted ? "ok" : "skipped (OEM not ready)"));
+                if (rerouted) {
+                    // Bind landed (uOemActive will flip 1 on the next published matrix)
+                    // — NOW it's safe to switch the shader to the OEM branch.
+                    pipeline.setStreamViewMode(6);
+                    CameraDaemon.log("WS: View mode 6 (OEM Dashcam)");
+                }
                 // OEM not ready (cold-boot first-WS-open race) — kick the
                 // lifecycle so it warms up; the next WS reconnect /
                 // /api/stream/view/6 poll will catch the route.

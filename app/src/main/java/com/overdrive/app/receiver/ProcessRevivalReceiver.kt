@@ -47,9 +47,12 @@ class ProcessRevivalReceiver : BroadcastReceiver() {
             return
         }
 
-        // Re-arm first so a crash below doesn't break the chain.
+        // Re-arm first so a crash below doesn't break the chain. Pass the
+        // onOnly value we just read above (line ~42) so schedule() doesn't
+        // re-read the config file — same decision, one fewer disk read + parse
+        // per 5-minute fire.
         try {
-            schedule(appContext)
+            schedule(appContext, false)
         } catch (e: Exception) {
             Log.w(TAG, "Re-arm failed: ${e.message}")
         }
@@ -116,7 +119,16 @@ class ProcessRevivalReceiver : BroadcastReceiver() {
          * Schedule (or reschedule) the primary + backup revival alarms.
          * Safe to call repeatedly — FLAG_UPDATE_CURRENT replaces in place.
          */
-        fun schedule(context: Context) {
+        fun schedule(context: Context) = schedule(context, null)
+
+        /**
+         * @param onOnlyKnown when non-null, an already-read isVehicleOnOnlyMode()
+         *   value from the immediate caller — avoids a second config read (which
+         *   can be a full disk read + JSON parse) in the same code path. The
+         *   public [schedule] overload passes null and reads it itself, so every
+         *   existing caller behaves exactly as before.
+         */
+        fun schedule(context: Context, onOnlyKnown: Boolean?) {
             // GATE (G6): "Vehicle ON only" mode — never arm the revival wake-alarms.
             // This single check covers ALL callers (MainActivity.onCreate, BootReceiver
             // .startDaemons, DaemonKeepaliveService.onCreate) AND the app-update relaunch
@@ -124,7 +136,7 @@ class ProcessRevivalReceiver : BroadcastReceiver() {
             // mode is honoured across respawns and updates with no per-caller edit. We
             // also cancel() any alarms a prior onAndOff session left pending so a mid-park
             // toggle-to-onOnly tears the chain down at the next schedule() call.
-            if (com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()) {
+            if (onOnlyKnown ?: com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()) {
                 Log.i(TAG, "onOnly mode — not arming revival alarms; cancelling any pending")
                 cancel(context)
                 return

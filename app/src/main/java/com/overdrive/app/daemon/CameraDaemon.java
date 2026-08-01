@@ -6,6 +6,7 @@ import android.os.Looper;
 import com.overdrive.app.abrp.AbrpConfig;
 import com.overdrive.app.abrp.AbrpTelemetryService;
 import com.overdrive.app.abrp.SohEstimator;
+import com.overdrive.app.logging.DaemonLogConfig;
 import com.overdrive.app.logging.DaemonLogger;
 import com.overdrive.app.monitor.AccMonitor;
 import com.overdrive.app.server.HttpServer;
@@ -486,6 +487,16 @@ public class CameraDaemon {
             com.overdrive.app.surveillance.ClusterProjectionController.clearStaleGateAtBoot();
         } catch (Exception ignored) {}
 
+        // SAFETY (companion to the gauge restore above): if that SIGKILL'd daemon was casting a
+        // 3rd-party app onto the cluster, the app is now stranded on the closed cluster display
+        // with cluster affinity (no stop() / shutdown ran to rehome it). Reparent it back to
+        // display 0. Best-effort, runs on its own thread (dumpsys+am can take seconds), and a
+        // no-op if nothing was stranded or AMS already reparented it. Reads via forceReload like
+        // clearStaleGateAtBoot, so it needs no UnifiedConfigManager.init() first.
+        try {
+            com.overdrive.app.launcher.ClusterCast.reparentStrandedCastAtBoot();
+        } catch (Exception ignored) {}
+
         // Enable daemon logging for StorageManager (uses DaemonLogger instead of android.util.Log).
         // The StorageManager singleton itself is constructed later, after the HTTP/TCP/IPC
         // server threads are already running — so a flaky external volume can't wedge the
@@ -532,7 +543,26 @@ public class CameraDaemon {
         
         // Load native libraries
         loadNativeLibraries();
-        
+
+        // Seed the process font system BEFORE any renderer can draw text.
+        // CameraDaemon is launched standalone (not forked from Zygote), so on
+        // some BSPs (observed on DiLink 5) Android's native default typeface is
+        // never initialized — gDefaultTypeface stays null and the first
+        // Canvas.drawText/Paint.measureText hits a native LOG_ALWAYS_FATAL_IF
+        // ("Assertion failed: src == nullptr && gDefaultTypeface == nullptr")
+        // that abort()s the whole process (SIGABRT / exit 134), crash-looping
+        // the daemon. DaemonFonts loads a real font straight from disk (which
+        // never consults the null default) and seeds the process default so
+        // every daemon-side overlay/deterrent/thumbnail text draw is safe.
+        // No-op / harmless on DiLink 3/4 where the font system already works.
+        try {
+            boolean fontsOk = com.overdrive.app.util.DaemonFonts.bootstrap();
+            log("Font bootstrap: " + (fontsOk ? "OK (text enabled)"
+                    : "FAILED (text disabled — icons/shapes only, daemon stays alive)"));
+        } catch (Throwable t) {
+            log("Font bootstrap threw (continuing): " + t.getMessage());
+        }
+
         // Create directories
         new File(outputDir).mkdirs();
         new File(STREAM_DIR()).mkdirs();
@@ -594,6 +624,29 @@ public class CameraDaemon {
                 sharedAppContext = createAppContext();
             } catch (Throwable ignored) {}
         }
+
+        // Dark-panel recovery (boot). If a previous session turned the backlight
+        // off while parked and its process was killed, the panel is still dark
+        // and nothing is left to wake it. The ACC-sentry daemon does the same
+        // check in its own main(), but if THAT process stays dead this is the
+        // only remaining recovery — and this one is independently watchdogged.
+        // Mirrors the sibling boot-recovery pattern already here (screen-deterrent
+        // flags, clearStaleGateAtBoot, reparentStrandedCastAtBoot).
+        //
+        // Gated on a CONFIRMED ACC-ON reading: waking while genuinely parked
+        // would light up a surveilled car. probeAccStateWithBackoff returns true
+        // when ACC is confirmed OFF, so !it is our ON signal. turnOn() self-skips
+        // when the screen already reads on, so this is a no-op on a normal boot.
+        // Off-thread so we never delay HTTP/IPC startup on binder reflection.
+        new Thread(() -> {
+            try {
+                if (!probeAccStateWithBackoff("panel-recovery")) {
+                    com.overdrive.app.power.StealthPanel.turnOn(sharedAppContext);
+                }
+            } catch (Throwable t) {
+                log("Panel boot recovery failed: " + t.getMessage());
+            }
+        }, "PanelBootRecovery").start();
 
         // Notifications subsystem — registry, push subscriptions, sinks.
         // Lives in this process because HttpServer (where the API routes bind)
@@ -800,6 +853,25 @@ public class CameraDaemon {
                     log("RecordingsIndex init error: " + e.getMessage());
                 } finally {
                     dataLayerInitFuture.complete(null);
+                }
+                // Prime the storage size/count caches off the user-visible path.
+                // /api/settings/storage serves these stale-while-revalidate, so
+                // it only ever blocks on the COLD case (no value cached yet) —
+                // which, without this, is exactly the first settings-page load
+                // after boot. Doing the first walk here means the settings page
+                // gets an instant answer even on its first open. Runs after the
+                // future completes so a slow walk can't delay startup.
+                try {
+                    long t1 = System.currentTimeMillis();
+                    com.overdrive.app.storage.StorageManager sm =
+                            com.overdrive.app.storage.StorageManager.getInstance();
+                    sm.getRecordingsSize();
+                    sm.getRecordingsCount();
+                    sm.getSurveillanceSize();
+                    sm.getSurveillanceCount();
+                    log("Storage stat cache primed in " + (System.currentTimeMillis() - t1) + "ms");
+                } catch (Throwable t) {
+                    log("Storage stat prime failed (non-fatal): " + t.getMessage());
                 }
             }, "RecordingsIndexInit");
             dataLayerThread.setDaemon(true);
@@ -1071,6 +1143,18 @@ public class CameraDaemon {
         // Initialize Vehicle Data Monitor + BydDataCollector
         initVehicleDataMonitor();
 
+        // Re-arm an AC switch-off window that was still pending when this process last exited.
+        // Must run AFTER the collector is up (the timer consults the AC power state before
+        // issuing a shutdown) and only once, before anything else can arm a timer. This is what
+        // makes the window survive the onOnly ACC-off self-terminate (parkTerminate ->
+        // killProcess) and any watchdog restart; without it a pending shutdown would be lost
+        // exactly when the car is parked with the AC still running.
+        try {
+            com.overdrive.app.byd.AcAutoOffTimer.restore();
+        } catch (Exception e) {
+            log("AcAutoOffTimer restore error: " + e.getMessage());
+        }
+
         // Now that BydDataCollector is ready, detect car model for accurate capacity
         try {
             if (sohEstimator != null) {
@@ -1245,6 +1329,16 @@ public class CameraDaemon {
             com.overdrive.app.receiver.CastPackageWatcher.register(getAppContext());
         } catch (Throwable t) {
             log("CastPackageWatcher register failed: " + t.getMessage());
+        }
+
+        // Register the cluster-view mirror Binder service so the Projection screen can hand
+        // its TextureView Surface across the process boundary for SurfaceFlinger to composite
+        // the cluster into (the resize-correct mirror path — HTTP can't carry a Surface).
+        // uid-2000 daemon + live Looper make ServiceManager.addService valid here. Guarded.
+        try {
+            com.overdrive.app.surveillance.ClusterViewMirrorService.register();
+        } catch (Throwable t) {
+            log("ClusterViewMirrorService register failed: " + t.getMessage());
         }
 
         log("Daemon ready on TCP:" + TCP_PORT + " HTTP:" + HTTP_PORT);
@@ -1787,22 +1881,31 @@ public class CameraDaemon {
         // A flapping SD mount could surface a transient IOException out of
         // File.exists(); without this guard one bad tick silently kills the
         // prune cadence for the rest of the daemon's life.
-        memoryLogScheduler.scheduleAtFixedRate(() -> {
-            try {
-                com.overdrive.app.server.RecordingsApiHandler.pruneRecordingCache();
-            } catch (Throwable t) {
-                log("RECORDING_CACHE prune tick failed: "
-                    + t.getClass().getSimpleName() + ": " + t.getMessage());
-            }
-        }, 60, 60, java.util.concurrent.TimeUnit.MINUTES);
-
         // RecordingsIndex reconcile — backstop for FileObserver event drops
-        // on FUSE-mounted SD/USB volumes. Cheap when the index is in sync
-        // (one stat() per row); patches missing rows + drops phantoms.
-        // Same try/catch guard rationale as above: scheduleAtFixedRate
-        // permanently cancels the recurring task on first uncaught throw,
-        // and a flapping SD mount is exactly the case where one tick
-        // failing must not silently kill all future ticks.
+        // on FUSE-mounted SD/USB volumes. Patches missing rows + drops
+        // phantoms; also covers the external-SD edit case (eject + delete on
+        // a host PC, manual file-explorer delete) that leaves phantom cache
+        // entries no in-process invalidation can catch.
+        //
+        // DE-DUPLICATED (perf): this used to be TWO scheduleAtFixedRate tasks
+        // on the same 60-minute cadence — one calling
+        // RecordingsApiHandler.pruneRecordingCache(), one calling
+        // RecordingsIndex.reconcile() directly. pruneRecordingCache() is a
+        // thin wrapper whose entire body is that same reconcile() call, so
+        // the index was reconciled twice per hour, back to back. On a large
+        // library each pass is a full stat() sweep over every indexed row
+        // through the FUSE bridge, so the duplicate was pure cost. reconcile()
+        // is idempotent (documented at RecordingsIndex.reconcile), so the
+        // second pass could never observe anything the first one missed.
+        //
+        // Kept the direct call rather than the wrapper: one less indirection,
+        // and the wrapper stays available for any future caller.
+        //
+        // Wrapped in a try/catch: ScheduledExecutorService.scheduleAtFixedRate
+        // permanently cancels a recurring task on the first uncaught throw.
+        // A flapping SD mount could surface a transient IOException out of
+        // File.exists(); without this guard one bad tick silently kills the
+        // reconcile cadence for the rest of the daemon's life.
         memoryLogScheduler.scheduleAtFixedRate(() -> {
             try {
                 com.overdrive.app.server.RecordingsIndex.getInstance().reconcile();
@@ -1812,7 +1915,7 @@ public class CameraDaemon {
             }
         }, 60, 60, java.util.concurrent.TimeUnit.MINUTES);
 
-        log("Periodic memory monitor started (5-minute cadence); recording cache prune + index reconcile armed (60-minute cadence)");
+        log("Periodic memory monitor started (5-minute cadence); index reconcile armed (60-minute cadence)");
 
         // Geo place-name backfill — re-resolves recordings that have a GPS fix
         // but no resolved place (cache-miss at record time with no working async
@@ -2313,6 +2416,7 @@ public class CameraDaemon {
                     log("Shutdown hook: CastPackageWatcher unregister error: " + e.getMessage());
                 }
                 try {
+                    com.overdrive.app.surveillance.ClusterViewMirrorService.forceDetachIfActive("daemon-shutdown");
                     com.overdrive.app.surveillance.ClusterMirrorController.shutdownIfActive();
                     log("Shutdown hook: cluster mirror torn down");
                 } catch (Exception e) {
@@ -2890,7 +2994,14 @@ public class CameraDaemon {
                     boolean overlayEnabled = com.overdrive.app.config.UnifiedConfigManager
                         .isTelemetryOverlayEnabledFor("pano");
                     gpuPipeline.setOverlayEnabled(overlayEnabled);
-                    log("TelemetryDataCollector initialized, pano overlay=" + overlayEnabled);
+                    // Apply the independent ACC-off surveillance overlay master
+                    // (opt-in, default off). Its field selection is loaded per
+                    // event at record-start via the pipeline's flow resolver.
+                    boolean survOverlayEnabled = com.overdrive.app.config.UnifiedConfigManager
+                        .isTelemetryOverlayEnabledFor("surveillance");
+                    gpuPipeline.setSurveillanceOverlayEnabled(survOverlayEnabled);
+                    log("TelemetryDataCollector initialized, pano overlay=" + overlayEnabled
+                        + " surveillance overlay=" + survOverlayEnabled);
 
                     // Apply persisted recording layout (standard 360 mosaic / dashcam)
                     String recLayout = com.overdrive.app.config.UnifiedConfigManager
@@ -3582,8 +3693,397 @@ public class CameraDaemon {
             accOnDisarmWatchdog = null;
         }
     }
-    
-    
+
+    // PRIVATE monitor for the probe-edge bookkeeping below.
+    //
+    // MUST NOT be the CameraDaemon class monitor (audit R3): applyLockEvent and
+    // the door-lock force-arm block hold `CameraDaemon.class` across
+    // enableSurveillance() -> gpuPipeline.start(), which can reach
+    // RecordingModeManager and acquire its lifecycleSerializer. Meanwhile a
+    // setMode() caller already holds lifecycleSerializer when it probes ACC and
+    // reaches dispatchProbedAccEdge. Making that method `static synchronized`
+    // therefore created a classic opposite-order deadlock
+    // (lifecycleSerializer -> CameraDaemon.class vs CameraDaemon.class ->
+    // lifecycleSerializer) that would freeze arming outright. A dedicated lock
+    // that is never held across any call into RMM or the pipeline removes the
+    // cycle entirely.
+    private static final Object probeEdgeLock = new Object();
+
+    // Ownership token for the probe-edge dispatch gate. 0 == free; any other
+    // value is the generation of the worker that currently owns it.
+    //
+    // WHY A TOKEN AND NOT AN AtomicBoolean (audit R2 defect #2): the gate has to
+    // be STEALABLE (a wedged ACC chain must not block edges forever) but a plain
+    // boolean has no notion of who owns it — a stolen worker's finally would
+    // clear the flag while the thief's worker is still live, leaving the gate
+    // reading "free" with a dispatch running. The next tick then admits a third
+    // worker concurrently with the second, and so on: concurrent ACC chains with
+    // OPPOSITE accIsOff values (gpuPipeline.start() racing stop()). With a
+    // generation token a worker only releases the gate if it still owns it, so a
+    // steal transfers ownership exactly once and over-admission is impossible.
+    private static final java.util.concurrent.atomic.AtomicLong probeEdgeDispatchOwner =
+        new java.util.concurrent.atomic.AtomicLong(0L);
+
+    // Monotonic source of ownership generations. Never reset.
+    private static final java.util.concurrent.atomic.AtomicLong probeEdgeDispatchGen =
+        new java.util.concurrent.atomic.AtomicLong(0L);
+
+    // When the currently-owning dispatch started (0 = none). Read by a later
+    // prober to decide whether the owner is wedged.
+    //
+    // GUARDED BY probeEdgeLock for BOTH reads and writes — including the release
+    // in the worker's finally. It must never be written outside the lock: the
+    // release used to CAS `owner` and then write `since = 0` as a separate
+    // unsynchronized step, so this interleaving was possible —
+    //   W1 releases owner (gen1 -> 0) | P2 claims (owner=gen2, since=T2) |
+    //   W1's late `since = 0` lands
+    // leaving owner=gen2 (busy) with since=0. The stuck test requires since > 0,
+    // so the 5-min steal could then NEVER fire, and every subsequent probe took
+    // the "deferring" branch and decremented the confirm counter — arming starved
+    // for as long as that owner lived, and permanently if it too wedged. Keeping
+    // (owner, since) mutated only under the lock makes them a single unit.
+    private static long probeEdgeDispatchSinceMs = 0L;
+
+    // How long a probe-edge dispatch may own the gate before a later prober
+    // steals it. The ACC chain can legitimately take tens of seconds (trip
+    // finalize, ensureSdCardMounted ~15s, ~4s AVC warmup, pipeline start), and
+    // RecordingModeManager documents a real multi-minute lifecycleSerializer
+    // stall — so this must be generous. 5 min is far past any healthy chain but
+    // still recovers a genuinely wedged one within one park instead of never.
+    private static final long PROBE_EDGE_DISPATCH_STUCK_MS = 300_000L;
+
+    // How many CONSECUTIVE probe observations of "the ACC chain's state disagrees
+    // with hardware" are required before dispatching from the path where
+    // AccMonitor already AGREES with hardware. See dispatchProbedAccEdge.
+    private static final int PROBE_EDGE_CONFIRM_TICKS = 2;
+
+    // Minimum ELAPSED time the disagreement must persist, in addition to the tick
+    // count (audit R3). Measured with System.nanoTime(), NOT currentTimeMillis:
+    // this head unit syncs its clock from GPS, so wall-clock STEPS are real here —
+    // a forward jump would satisfy the floor prematurely (weakening the guard) and
+    // a backward jump would stall it. nanoTime is monotonic, so neither can happen.
+    //
+    // WHY BOTH: the tick count alone is not a time guarantee. Probes are NOT only
+    // the 30s resync ticker — resyncFromHardware is also driven by the SD/USB mount
+    // watchdog (15s cadence), storage-type switches, wipe-media, pipeline storage
+    // retries, recorder writer-aborts and warmup-retriggers, and every one of those
+    // calls queryAccStateFromHardware. A burst from those sources could satisfy
+    // "2 consecutive observations" within a couple of seconds — still inside the
+    // window where a genuine in-flight AccSentry IPC has passed onAccStateChanged's
+    // dedup read but not yet written the latch — re-admitting the duplicate-chain
+    // defect the confirm gate exists to prevent. Requiring real elapsed time makes
+    // the guard independent of probe cadence. 25s sits just under the 30s ticker
+    // period so a normal no-IPC park still arms on its second tick.
+    private static final long PROBE_EDGE_CONFIRM_MIN_MS = 25_000L;
+
+    // Consecutive observations that the chain is behind hardware, when the first
+    // of them was seen (System.nanoTime; 0 = unset), and for which direction. All
+    // reset together whenever the chain catches up or the direction flips.
+    private static int probeEdgeBehindTicks = 0;
+    private static long probeEdgeBehindFirstNanos = 0L;
+    private static Boolean probeEdgeBehindFor = null;
+
+    // Backoff for repeated probe-driven dispatches of the SAME edge. The ACC
+    // chain deliberately nulls lastDispatchedAccIsOff when arming fails so the
+    // next signal retries; with a 30s probe that would otherwise re-run the full
+    // ACC-OFF prologue (a fresh acc_events row, trip-finalize attempt, and a
+    // ~15s ensureSdCardMounted) every 30s forever on a structurally broken
+    // pipeline (audit R2 defect #3). Escalate the spacing instead.
+    private static final long[] PROBE_EDGE_RETRY_BACKOFF_MS = {
+        0L, 60_000L, 300_000L, 900_000L, 1_800_000L
+    };
+    private static int probeEdgeRetryCount = 0;
+    private static Boolean probeEdgeRetryFor = null;
+    private static long probeEdgeRetryNextAllowedMs = 0L;
+
+    /**
+     * Dispatch a full ACC-edge chain that was discovered by a HARDWARE PROBE
+     * rather than by an AccSentryDaemon IPC.
+     *
+     * <p>WHY THIS EXISTS (observed 2026-07-28, log_X7RYXG6B): the sentry-arming
+     * chain lives entirely inside {@link #onAccStateChanged} — the "Vehicle ON
+     * only" gate, safe-zone / schedule gates, {@code startSentryPipeline}, the
+     * arm-mode branch (power vs door-lock gate), and the schedule checker. The
+     * ONLY producers of that call are AccSentryDaemon's IPC
+     * (SurveillanceIpcServer {@code accOff} / TcpCommandServer {@code setAccState})
+     * and the boot {@code RECOVERY:} probe.
+     *
+     * <p>When AccSentryDaemon stops delivering the ACC-OFF IPC (dead, wedged,
+     * killed mid-park, or AP asleep with "Keep USB powered" off) on an
+     * ALREADY-RUNNING daemon, the only component that still notices the
+     * transition is {@link com.overdrive.app.recording.RecordingModeManager}'s
+     * 30s hardware-probe resync. That path used to write straight to
+     * {@code AccMonitor.setAccState(false)}, which updates the static + fires
+     * {@code notifyAccEdge} (cluster/mirror teardown) but NEVER reaches the
+     * arming chain. Net effect: the car parks, RMM tears the pipeline down for
+     * mode=NONE, and surveillance never comes back — a silent 70-minute
+     * unmonitored park in the referenced log, with manual
+     * {@code POST /api/surveillance/enable} working perfectly the whole time
+     * (proving config/gates were fine and only the trigger was dead).
+     *
+     * <p>WHY NOT hook {@code AccMonitor.notifyAccEdge} instead: the IPC path
+     * ({@link #onAccStateChanged}) itself calls {@code AccMonitor.setAccState},
+     * so dispatching from inside the edge funnel would re-enter the whole
+     * ACC chain a second time for every normal IPC — duplicate recordAccEvent
+     * rows, duplicate trip finalize, duplicate arm. The probe write-through is
+     * the only caller that is MISSING the chain, so the hook belongs there.
+     *
+     * <p>THREADING: always dispatched on a fresh thread. The caller is RMM's
+     * {@code queryAccStateFromHardware}, which runs both on the resync ticker
+     * and inside {@code setMode} while holding {@code lifecycleSerializer};
+     * {@link #onAccStateChanged} calls back into
+     * {@code recordingModeManager.onAccStateChanged}, which takes that same
+     * lock and then performs camera/encoder I/O plus a ~4s AVC warmup. A
+     * synchronous call would therefore self-deadlock or pin RMM's lifecycle
+     * lock across seconds of I/O.
+     *
+     * <p>RETRYABILITY — the load-bearing property (audit R1, 2026-07-29). This
+     * method is called AFTER the caller has already written the new state to
+     * {@code AccMonitor}, so the caller's own "does hardware disagree with
+     * AccMonitor?" test will NOT fire again on the next tick. Therefore this
+     * method must NOT gate on AccMonitor agreement, and a skipped dispatch must
+     * not be silently lost. It gates on {@link #lastDispatchedAccIsOff} — the
+     * daemon's record of what the ACC CHAIN has actually processed — so any tick
+     * that finds the chain behind hardware re-dispatches, however many ticks
+     * later that is. Callers must therefore invoke this on EVERY probe with a
+     * definitive reading, not only on write-through ticks
+     * (see {@code RecordingModeManager.queryAccStateFromHardware}).
+     *
+     * <p>Without that, an edge dropped by the in-flight CAS (the chain can hold
+     * it for tens of seconds: trip finalize, {@code ensureSdCardMounted} ~15s,
+     * pipeline start) was lost permanently — and because
+     * {@code lastDispatchedAccIsOff} had already latched the opposite state, the
+     * IPC dedup at the top of {@link #onAccStateChanged} then suppressed every
+     * later edge too: surveillance could never arm again for the daemon's
+     * lifetime. That is strictly worse than the bug this fix targets.
+     *
+     * <p>Because it is therefore called on EVERY definitive probe reading, three
+     * guards keep the every-tick cadence from doing harm (added per audits R2/R3):
+     * a confirm gate requiring the disagreement to survive both
+     * {@link #PROBE_EDGE_CONFIRM_TICKS} observations and
+     * {@link #PROBE_EDGE_CONFIRM_MIN_MS} of wall-clock, so a probe — or a burst of
+     * them from the off-cadence callers — landing inside a genuine in-flight IPC's
+     * dedup window cannot spawn a duplicate chain; a
+     * generation-token gate so a stolen dispatch can't be released by its
+     * displaced owner; and {@link #PROBE_EDGE_RETRY_BACKOFF_MS}, so a chain that
+     * keeps failing to arm is retried with escalating spacing instead of re-running
+     * the heavy ACC-OFF prologue every 30s forever. On a healthy system the whole
+     * method is a silent two-volatile-read no-op.
+     *
+     * <p>LOCKING: the confirm/backoff counters are mutated per call and probes can
+     * arrive concurrently (resync ticker + HTTP {@code setMode}), so they are
+     * guarded by the dedicated {@link #probeEdgeLock}. That lock is deliberately
+     * NOT the {@code CameraDaemon.class} monitor — see the field comment for the
+     * deadlock that choice created. Nothing inside the lock calls into
+     * RecordingModeManager or the pipeline (the ACC chain runs on the spawned
+     * thread), so it is a leaf lock and cannot participate in a cycle.
+     *
+     * @return {@code true} iff a dispatch thread was actually started for THIS
+     *         edge — meaning the caller can rely on
+     *         {@code recordingModeManager.onAccStateChanged} being driven by the
+     *         chain and must NOT drive it again itself (see
+     *         {@code RecordingModeManager.resyncFromHardware}, where a duplicate
+     *         local teardown could land after the chain armed surveillance and
+     *         tear the pipeline back down).
+     */
+    public static boolean dispatchProbedAccEdge(boolean accIsOff, String reason) {
+        // Don't resurrect lifecycle state after teardown has begun. shutdownInternal
+        // / parkTerminate stop the pipeline and shut the RMM down; a dispatch landing
+        // afterwards would re-run the arming chain (pipeline.start, schedule checker,
+        // disarm watchdog, unlock poll) against torn-down state. Racy by a hair
+        // against a concurrent shutdownInternal (bounded by the killProcess that
+        // follows), matching the pre-existing pattern on this path.
+        if (!running.get()) return false;
+        synchronized (probeEdgeLock) {
+            return dispatchProbedAccEdgeLocked(accIsOff, reason);
+        }
+    }
+
+    /** Body of {@link #dispatchProbedAccEdge}; caller holds {@link #probeEdgeLock}.
+     *  Never calls into RecordingModeManager or the pipeline — the ACC chain runs
+     *  on the thread this spawns — so the lock stays a leaf. */
+    private static boolean dispatchProbedAccEdgeLocked(boolean accIsOff, String reason) {
+        // The ACC CHAIN's own record — NOT AccMonitor. If the chain has already
+        // processed this state, there is nothing to drive and the caller should do
+        // its own local sync (return false). If it hasn't, we may dispatch — even
+        // if AccMonitor was reconciled many ticks ago, which is exactly the
+        // dropped-edge recovery path this method exists for.
+        Boolean last = lastDispatchedAccIsOff;
+        if (last != null && last.booleanValue() == accIsOff) {
+            // Chain agrees with hardware — clear the confirm/backoff trackers so a
+            // future disagreement starts from a clean slate.
+            probeEdgeBehindTicks = 0;
+            probeEdgeBehindFirstNanos = 0L;
+            probeEdgeBehindFor = null;
+            probeEdgeRetryCount = 0;
+            probeEdgeRetryFor = null;
+            probeEdgeRetryNextAllowedMs = 0L;
+            return false;
+        }
+
+        long nowMs = System.currentTimeMillis();
+
+        // CONFIRM GATE (audit R2 defect #1; time floor added per audit R3). We are
+        // called on EVERY definitive probe reading, which is what makes a dropped
+        // edge recoverable — but it also means we fire while a GENUINE AccSentry IPC
+        // is mid-flight through onAccStateChanged: that method reads its dedup latch
+        // at entry and only writes it after recordAccEvent + trip finalize, so a
+        // probe landing in that window would spawn a second full chain and write a
+        // duplicate acc_events "OFF" row.
+        //
+        // The disagreement must therefore persist BOTH across
+        // PROBE_EDGE_CONFIRM_TICKS observations AND for PROBE_EDGE_CONFIRM_MIN_MS
+        // of wall-clock. The tick count alone is NOT a time guarantee: probes also
+        // arrive from the 15s SD/USB mount watchdog, storage retries, writer-aborts
+        // and warmup-retriggers, so a burst could otherwise satisfy the gate within
+        // seconds — still inside the IPC's pre-latch window. By the time both
+        // conditions hold, a real in-flight IPC has long since latched, while a
+        // genuinely missed edge (no IPC coming at all — the failure this fix
+        // targets) still arms on the next 30s tick. Direction-tagged so an ACC flap
+        // restarts the count.
+        // nanoTime can legitimately be 0 or negative, so 0 is not a usable
+        // "unset" sentinel on its own — the direction tag is what tells us
+        // whether a run is in progress, and it is always set together with the
+        // stamp below. Offset by 1 so the stored value is never 0 while a run is
+        // active, keeping the field's own 0 == unset invariant intact.
+        long nowNanos = System.nanoTime() | 1L;
+        if (probeEdgeBehindFor == null || probeEdgeBehindFor.booleanValue() != accIsOff) {
+            probeEdgeBehindFor = accIsOff ? Boolean.TRUE : Boolean.FALSE;
+            probeEdgeBehindTicks = 1;
+            probeEdgeBehindFirstNanos = nowNanos;
+        } else {
+            probeEdgeBehindTicks++;
+            if (probeEdgeBehindFirstNanos == 0L) probeEdgeBehindFirstNanos = nowNanos;
+        }
+        // Subtraction is overflow-safe across nanoTime wrap (the JLS-sanctioned
+        // comparison form), and monotonic so no clock step can shortcut it.
+        if (probeEdgeBehindTicks < PROBE_EDGE_CONFIRM_TICKS
+                || (nowNanos - probeEdgeBehindFirstNanos)
+                    < PROBE_EDGE_CONFIRM_MIN_MS * 1_000_000L) {
+            // Quiet: on a healthy system this is the normal overlap with an IPC
+            // that is already being processed.
+            return false;
+        }
+
+        // BACKOFF (audit R2 defect #3). onAccStateChanged nulls its dedup latch
+        // when arming fails, so without this every 30s probe would re-run the full
+        // ACC-OFF prologue — a fresh acc_events row, another trip-finalize, and a
+        // ~15s ensureSdCardMounted — forever on a structurally broken pipeline.
+        if (probeEdgeRetryFor == null || probeEdgeRetryFor.booleanValue() != accIsOff) {
+            probeEdgeRetryFor = accIsOff ? Boolean.TRUE : Boolean.FALSE;
+            probeEdgeRetryCount = 0;
+            probeEdgeRetryNextAllowedMs = 0L;
+        } else if (probeEdgeRetryNextAllowedMs > 0L && nowMs < probeEdgeRetryNextAllowedMs) {
+            log("ACC probe edge (" + reason + "): ACC " + (accIsOff ? "OFF" : "ON")
+                + " chain retry deferred — " + (probeEdgeRetryNextAllowedMs - nowMs)
+                + "ms left in backoff (attempt " + probeEdgeRetryCount + ")");
+            return false;
+        }
+
+        // If the pipeline isn't up, onAccStateChanged only queues pendingAccOff/On
+        // and returns WITHOUT reaching recordingModeManager.onAccStateChanged — so
+        // we must not claim a handoff the chain won't honour, or the caller would
+        // skip its own local ACC sync for that tick (audit R3). Dispatch anyway
+        // (the queue + post-init drain is the whole point) but report no handoff.
+        // Read inside this synchronized method and used for the return value only;
+        // if init completes in the gap the caller merely does one redundant local
+        // sync, which its own dedup absorbs.
+        boolean canDriveRmm = gpuPipeline != null;
+
+        // Claim the gate. Free (0) → claim; owned → steal only once the owner has
+        // clearly wedged. Ownership is a generation token so the displaced worker
+        // cannot release a gate it no longer owns (audit R2 defect #2).
+        long myGen = probeEdgeDispatchGen.incrementAndGet();
+        long owner = probeEdgeDispatchOwner.get();
+        if (owner != 0L) {
+            long since = probeEdgeDispatchSinceMs;
+            // Defence in depth: an owned gate with no start time is a corrupt pair
+            // that must not read as "healthy forever" — that is precisely the state
+            // that used to disable the steal permanently. Re-anchor it to now so the
+            // stuck timer starts running instead of never firing.
+            if (since <= 0L) {
+                log("ACC probe edge (" + reason + "): owned gate had no start time — "
+                    + "re-anchoring the stuck timer");
+                probeEdgeDispatchSinceMs = nowMs;
+                since = nowMs;
+            }
+            boolean stuck = (nowMs - since) > PROBE_EDGE_DISPATCH_STUCK_MS;
+            if (!stuck) {
+                log("ACC probe edge (" + reason + "): dispatch already in flight — "
+                    + "deferring (next probe re-drives; chain state is still "
+                    + (last == null ? "unset" : (last.booleanValue() ? "OFF" : "ON")) + ")");
+                // Roll back the confirm counter by one so the deferral doesn't
+                // consume this observation — the next probe re-confirms. The
+                // first-seen stamp is deliberately NOT rolled back: the
+                // disagreement really has persisted since then, and re-anchoring
+                // it here would let a long in-flight dispatch keep resetting the
+                // time floor.
+                if (probeEdgeBehindTicks > 0) probeEdgeBehindTicks--;
+                return false;
+            }
+            log("ACC probe edge (" + reason + "): previous dispatch owned the gate for "
+                + (nowMs - since) + "ms (threshold " + PROBE_EDGE_DISPATCH_STUCK_MS
+                + "ms) — treating as wedged and taking ownership (gen " + myGen + ")");
+        }
+        probeEdgeDispatchOwner.set(myGen);
+        probeEdgeDispatchSinceMs = nowMs;
+
+        boolean spawned = false;
+        try {
+            Thread t = new Thread(() -> {
+                try {
+                    log("ACC probe edge (" + reason + "): AccSentry IPC absent — dispatching "
+                        + "full ACC " + (accIsOff ? "OFF" : "ON") + " chain from hardware probe");
+                    onAccStateChanged(accIsOff);
+                } catch (Throwable th) {
+                    log("ACC probe edge dispatch failed (" + reason + "): " + th.getMessage());
+                } finally {
+                    // Release ONLY if we still own the gate, and do it UNDER
+                    // probeEdgeLock so (owner, since) move together. If a later
+                    // prober stole the gate (we wedged), the CAS fails and the new
+                    // owner's timestamp stands untouched — see the field comment on
+                    // probeEdgeDispatchSinceMs for the starvation this ordering
+                    // prevents. Taking the lock here is safe: it is a leaf, and the
+                    // ACC chain above has already completed.
+                    synchronized (probeEdgeLock) {
+                        if (probeEdgeDispatchOwner.compareAndSet(myGen, 0L)) {
+                            probeEdgeDispatchSinceMs = 0L;
+                        }
+                    }
+                }
+            }, "ProbedAccEdge");
+            // Daemon thread, matching every other long-lived spawn on this path
+            // (AccOnDisarmWatchdog, UnlockPoll) — must never hold the VM alive.
+            t.setDaemon(true);
+            t.start();
+            spawned = true;
+        } catch (Throwable th) {
+            log("ACC probe edge dispatch spawn failed (" + reason + "): " + th.getMessage());
+        } finally {
+            // Only release here if the thread never started — otherwise the
+            // worker's own finally owns it. A spawn failure leaves
+            // lastDispatchedAccIsOff untouched, so a later probe retries.
+            if (!spawned && probeEdgeDispatchOwner.compareAndSet(myGen, 0L)) {
+                probeEdgeDispatchSinceMs = 0L;
+            }
+        }
+
+        if (spawned) {
+            // Arm the backoff for the NEXT retry of this same edge, and reset the
+            // confirm counter so a re-dispatch has to re-confirm.
+            int idx = Math.min(probeEdgeRetryCount, PROBE_EDGE_RETRY_BACKOFF_MS.length - 1);
+            probeEdgeRetryNextAllowedMs = nowMs + PROBE_EDGE_RETRY_BACKOFF_MS[idx];
+            probeEdgeRetryCount++;
+            probeEdgeBehindTicks = 0;
+            probeEdgeBehindFirstNanos = 0L;
+            probeEdgeBehindFor = null;
+        }
+        // Handoff is promised ONLY when a dispatch is running AND the chain can
+        // actually reach RMM (see canDriveRmm above).
+        return spawned && canDriveRmm;
+    }
+
+
     /**
      * Read driver-door (LF) lock status from {@code BYDAutoOtaDevice}.
      *
@@ -4099,10 +4599,20 @@ public class CameraDaemon {
                 };
 
                 if (isDilink4ModeActive()) {
-                    // ESCO-PARITY: no 60s gate. esco opens AVMCamera
-                    // immediately on PanoCameraRecordService start. The
-                    // FlameoutService 60s timer schedules a SECONDARY
-                    // sentry consumer, not a delay before camera open.
+                    // No delay before camera open on dilink4 — retained
+                    // deliberately (an added gate regressed arming on-device).
+                    //
+                    // CORRECTION to the previous note here: the reference app's
+                    // FlameoutService 60s timer (dh/i.w(60000) → le.b.t()) IS what
+                    // starts its sentry camera consumer, so it does open the camera
+                    // ~60s after ACC-off, not merely schedule a secondary consumer.
+                    // We still do NOT copy that delay; the ordering problem it was
+                    // masking (camera opened before the AVM/ISP rail was held) is
+                    // fixed causally instead — AccSentryDaemon.enterSentryMode now
+                    // casts the dilink4 rail hold INLINE, before the ACC-OFF IPC
+                    // that gets us here. So by this point the rail is already live
+                    // and arming immediately is correct.
+                    //
                     // ensureAvcAlive() (pidof on dilink4 — no am start)
                     // probes AVC presence without launching it.
                     try {
@@ -5308,10 +5818,20 @@ public class CameraDaemon {
     
     private static void initFileLogging() {
         // Configure DaemonLogger for daemon context (enable stdout for app_process)
-        DaemonLogger.configure(DaemonLogger.Config.defaults()
+        DaemonLogger.Config cfg = DaemonLogger.Config.defaults()
             .withStdoutLog(true)  // Enable stdout for daemon processes
             .withFileLog(true)
-            .withConsoleLog(true));
+            .withConsoleLog(true);
+        // The default minLevel is INFO and withMinLevel() was never called anywhere, so every
+        // logger.debug(...) in the whole daemon was discarded at runtime. That silently gutted the
+        // BYD_TELEMETRY capture: the lines explaining WHY a HAL read failed (accessor-width misses,
+        // "Could not resolve deviceType", manager-unavailable reasons) are all debug-level, so a
+        // capture showed the symptom and never the cause. Lower the floor only when that flag is on,
+        // so normal builds keep INFO and no extra I/O.
+        if (DaemonLogConfig.BYD_TELEMETRY) {
+            cfg = cfg.withMinLevel(DaemonLogger.Level.DEBUG);
+        }
+        DaemonLogger.configure(cfg);
         log("=== CameraDaemon Log Started ===");
     }
     

@@ -1,6 +1,7 @@
 package com.overdrive.app.automation.action;
 
 import com.overdrive.app.automation.AutomationAction;
+import com.overdrive.app.automation.ExpressionEvaluator;
 import com.overdrive.app.automation.type.StringType;
 import com.overdrive.app.automation.type.Type;
 import com.overdrive.app.automation.value.Label;
@@ -26,6 +27,15 @@ import java.util.List;
  * <p>Runs in the daemon process, the same context {@code Automations.update}
  * evaluates in, so {@code Runtime.exec} has the daemon's privileges — the same
  * path {@code KeymapApiHandler} uses for the key-mapping shell action.
+ *
+ * <p>The command supports {@code ${var:NAME}} / {@code ${signal:TYPE}} substitution,
+ * restricted to NUMERIC values — see {@link #interpolateNumeric}. That restriction is a
+ * security boundary, not a convenience: variables are externally writable (an MQTT broker
+ * can push arbitrary text into automation state via
+ * {@code Automations.publishMqttTrigger}), and this string is handed to {@code sh -c} as
+ * UID 2000. Substituting free text would let a broker inject shell metacharacters into a
+ * privileged command line. For arithmetic, compute it in a Calculate Variable action and
+ * reference the result — the shell's own {@code $((…))} is left to the shell.
  */
 public class ShellAction extends BaseAction {
     private static final String TYPE = "shell";
@@ -38,6 +48,12 @@ public class ShellAction extends BaseAction {
     // shell field.
     private final List<Type> variables = List.of(
             new StringType(new Label("command", "automation.shell_command"), 500, "automation.shell_warning"));
+
+    // The only two token forms this action substitutes. Everything else that looks like
+    // shell expansion (${HOME}, $((1+2)), $(cmd), $VAR) is left for sh, so a command
+    // written before this feature existed behaves identically.
+    private static final String VAR_PREFIX = "${var:";
+    private static final String SIGNAL_PREFIX = "${signal:";
 
     public ShellAction(Label label, String description) {
         this.label = label;
@@ -72,6 +88,20 @@ public class ShellAction extends BaseAction {
         if (cmd.isEmpty()) {
             logger.warn("ShellAction: empty command, skipping");
             return;
+        }
+        // Substitute state references BEFORE the gate check, so a command whose values
+        // can't be resolved is refused without consulting the gate at all. Only our own
+        // ${var:…}/${signal:…} tokens are touched — see interpolateNumeric.
+        if (cmd.indexOf(VAR_PREFIX) >= 0 || cmd.indexOf(SIGNAL_PREFIX) >= 0) {
+            String resolved = interpolateNumeric(cmd);
+            if (resolved == null) {
+                // Never fall through to the raw template: running `input tap ${…} 400`
+                // verbatim would either error or, worse, tap a wrong coordinate.
+                logger.warn("ShellAction: refusing to run '" + cmd
+                        + "' — a substitution did not resolve to a number");
+                return;
+            }
+            cmd = resolved;
         }
         if (!UnifiedConfigManager.isAutomationShellAllowed()) {
             // Gate off → never execute. Logged so a silently-inert automation is
@@ -126,5 +156,89 @@ public class ShellAction extends BaseAction {
         } catch (Throwable t) {
             logger.warn("ShellAction failed: " + t.getMessage());
         }
+    }
+
+    /**
+     * Replace every {@code ${var:…}} / {@code ${signal:…}} reference with its NUMERIC
+     * value, or return null if any of them fails to resolve to a number.
+     *
+     * <p>Numeric-only is the whole safety argument. The output of each substitution is
+     * re-verified to contain nothing but {@code [-0-9.]} before it is spliced in, so no
+     * value — however it got into automation state — can introduce a quote, semicolon,
+     * backtick, {@code $}, or whitespace into a command line running as UID 2000. A
+     * non-numeric variable (a mode word like "sport") is a refusal, not a silent skip:
+     * an all-or-nothing result means a partially-substituted command never reaches sh.
+     *
+     * <p><b>Only OUR OWN two prefixes are touched</b> — {@code ${var:} and ${signal:}.
+     * {@code ${…}} and {@code $((…))} are also SHELL syntax, so treating every occurrence
+     * as ours would hijack commands that already work: {@code echo ${HOME}} would be
+     * refused (not our grammar → unresolvable), and {@code $((1000/3))} would be computed
+     * in floating point (333.333…) where sh yields the integer 333. Both are pre-existing,
+     * already-shipped shell commands, so anything outside our two prefixes is passed
+     * through untouched for sh to expand exactly as before. To do arithmetic on vehicle
+     * state, use the Calculate Variable action and reference the result as
+     * {@code ${var:NAME}} — that keeps one expression engine instead of a second dialect
+     * shadowing the shell's.
+     */
+    static String interpolateNumeric(String input) {
+        if (input == null) return null;
+        try {
+            StringBuilder out = new StringBuilder(input.length() + 16);
+            int i = 0;
+            while (i < input.length()) {
+                int nameAt = input.startsWith(VAR_PREFIX, i) ? i + VAR_PREFIX.length()
+                           : input.startsWith(SIGNAL_PREFIX, i) ? i + SIGNAL_PREFIX.length()
+                           : -1;
+                // A shell parameter expansion whose parameter happens to be named "var" or
+                // "signal" (${var:-default}, ${var:=x}, ${var:+x}, ${var:?msg}) collides with
+                // our prefix. Those modifier chars can't begin a variable/signal name, so
+                // treat them as the shell's and pass them through rather than refusing.
+                if (nameAt >= 0 && nameAt < input.length()) {
+                    char c = input.charAt(nameAt);
+                    if (c == '-' || c == '=' || c == '+' || c == '?') nameAt = -1;
+                }
+                if (nameAt < 0) {
+                    out.append(input.charAt(i++));
+                    continue;
+                }
+                int close = input.indexOf('}', i + 2);
+                if (close < 0) return null;           // unterminated OUR token → refuse
+                // Resolve through the shared resolver so signal addressing is identical
+                // to a condition's. The full "${…}" text is what it expects.
+                String resolved = com.overdrive.app.automation.AutomationCondition
+                        .resolveDynamicToString(input.substring(i, close + 1));
+                if (resolved == null) return null;
+                Double value;
+                try {
+                    value = Double.valueOf(resolved.trim());
+                } catch (NumberFormatException e) {
+                    return null;                      // non-numeric state → refuse
+                }
+                String text = numericText(value);
+                if (text == null) return null;
+                out.append(text);
+                i = close + 1;
+            }
+            return out.toString();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * The digits-only text for a resolved value, or null if it isn't a finite number.
+     * This is the injection boundary: {@link ExpressionEvaluator#format} only ever emits
+     * digits, {@code -} and {@code .}, but the check is asserted here rather than trusted,
+     * so no state value can introduce a quote, semicolon, backtick, {@code $} or space
+     * into a command line running as UID 2000.
+     */
+    private static String numericText(Double value) {
+        if (value == null || value.isNaN() || value.isInfinite()) return null;
+        String text = ExpressionEvaluator.format(value);
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (!Character.isDigit(c) && c != '-' && c != '.') return null;
+        }
+        return text;
     }
 }

@@ -1,6 +1,7 @@
 package com.overdrive.app.automation.action;
 
 import com.overdrive.app.automation.AutomationAction;
+import com.overdrive.app.automation.TextInterpolator;
 import com.overdrive.app.automation.type.Type;
 import com.overdrive.app.automation.value.Label;
 import com.overdrive.app.daemon.CameraDaemon;
@@ -129,10 +130,47 @@ public class ApiAction extends BaseAction {
         String body = replaceVariables(getBody(), automationAction.getVariables(), true);
         HttpServer server = CameraDaemon.getHttpServer();
         if (server != null && path != null && body != null) {
-            // Ignoring the response for now but it contains the full HTTP response
-            server.automationApiRequest(getMethod(), path, body);
+            String response = server.automationApiRequest(getMethod(), path, body);
+            // The response was previously discarded, so an endpoint that answered
+            // {"success":false,"error":...} — or was refused by the automation allowlist
+            // (null) — looked identical to one that worked. That is what made the
+            // screenshot/system actions "do nothing" with nothing to diagnose from.
+            logFailure(path, response);
         } else {
             logger.error("Could not trigger API action (" + getMethod() + "," + path + "," + body + ")");
+        }
+    }
+
+    /**
+     * Log an API action that did not succeed. A null response means it never ran (see below); a
+     * {@code "success":false} body means the endpoint ran and declined. Anything else — a
+     * non-JSON body, no {@code success} key, or an async {@code "starting":true} — is left
+     * alone, so this never turns a working action into a scary log line.
+     */
+    private void logFailure(String path, String response) {
+        if (response == null) {
+            // null covers three cases in automationApiRequest — allowlist refusal, no handler
+            // matched the path, and a handler that threw — so don't name just one of them.
+            logger.warn("API action " + getMethod() + " " + path + " was not executed"
+                    + " (allowlist refusal, unrouted path, or handler error)");
+            return;
+        }
+        try {
+            // The in-process call returns the body only, but be tolerant of a leading
+            // preamble by starting at the first brace.
+            int start = response.indexOf('{');
+            if (start < 0 || !response.contains("\"success\"")) return;
+            org.json.JSONObject json = new org.json.JSONObject(response.substring(start));
+            // "starting":true is an async "come back later" (camera-view/pano cold start), not a
+            // failure — warning on it would flag a normally-working automation.
+            if (json.optBoolean("starting", false)) return;
+            if (!json.optBoolean("success", true)) {
+                logger.warn("API action " + getMethod() + " " + path + " failed: "
+                        + json.optString("error", "(no reason given)"));
+            }
+        } catch (Exception e) {
+            // Not a JSON envelope we understand — nothing reliable to report.
+            logger.debug("API action " + path + " response not parsed: " + e.getMessage());
         }
     }
 
@@ -157,14 +195,18 @@ public class ApiAction extends BaseAction {
                 String key = m.group(1);
                 String value;
                 if (variables.containsKey(key)) {
-                    // This action's own parameter (the normal case).
-                    value = variables.get(key).toString();
+                    // This action's own parameter (the normal case). Its VALUE may itself
+                    // carry references — a user typing "SOC ${signal:batteryLevel}%" into
+                    // the toast/dialog/speak message field — so resolve those too. The
+                    // action's own template placeholders are already consumed by this pass,
+                    // so a substituted value can never re-enter it.
+                    value = TextInterpolator.interpolate(variables.get(key).toString());
                 } else {
-                    // Fall back to a user VARIABLE of this name from the shared automation
-                    // state, so a message/body can interpolate a counter or flag set by
-                    // another action (e.g. "Door opened ${door_count} times"). Absent →
-                    // keep the literal ${name} placeholder (unchanged legacy behaviour).
-                    String stateVal = lookupStateVariable(key);
+                    // Not one of this action's parameters: resolve it as a state reference —
+                    // ${var:NAME}, ${signal:TYPE[:k=v]}, or the bare ${NAME} variable
+                    // shorthand this path has always accepted. Absent → keep the literal
+                    // placeholder (unchanged legacy behaviour).
+                    String stateVal = TextInterpolator.resolve(m.group(0));
                     value = (stateVal != null) ? stateVal : m.group(0);
                 }
                 if (jsonEscape) value = jsonEscape(value);
@@ -175,23 +217,6 @@ public class ApiAction extends BaseAction {
             return result.toString();
         } catch (Exception e) {
             logger.error("Failed to replace variables for automation", e);
-            return null;
-        }
-    }
-
-    /**
-     * Look up a user VARIABLE's current value from the shared automation state, or null
-     * if it isn't set. Lets an ApiAction body/path interpolate {@code ${name}} against a
-     * variable another action set. Best-effort: any lookup error yields null (the caller
-     * then keeps the literal placeholder), so this can never break action execution.
-     */
-    private static String lookupStateVariable(String name) {
-        try {
-            com.overdrive.app.automation.value.Value v =
-                    com.overdrive.app.automation.Automations.getStateValue(
-                            SetVariableAction.variableEvent(name));
-            return v == null ? null : v.toString();
-        } catch (Throwable t) {
             return null;
         }
     }

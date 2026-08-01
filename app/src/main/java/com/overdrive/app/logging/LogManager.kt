@@ -46,14 +46,38 @@ class LogManager private constructor(@Volatile private var config: LogConfig) {
     private val writers = ConcurrentHashMap<String, PrintWriter>()
     private val fileSizes = ConcurrentHashMap<String, Long>()
     private val writeLock = Any()
-    private val timestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
-    
+    // ThreadLocal: SimpleDateFormat is NOT thread-safe, and format() below runs
+    // OUTSIDE writeLock, concurrently from the daemon-health-check looper, the
+    // adb-shell executor and the tunnel-poll looper. A shared instance can throw
+    // ArrayIndexOutOfBoundsException/NumberFormatException under that race.
+    // DaemonLogger.java already uses exactly this fix; LogManager never got it.
+    private val timestampFormat: ThreadLocal<SimpleDateFormat> =
+        ThreadLocal.withInitial { SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US) }
+
     fun log(tag: String, message: String, level: LogLevel = LogLevel.INFO) {
         // Snapshot the volatile config ONCE so the console gate, file gate, and
         // logDir all read a single consistent instance even if updateConfig()
         // swaps it on another thread mid-call.
         val cfg = config
-        val timestamp = timestampFormat.format(Date())
+        // Level gate for the EXPENSIVE sinks only (logcat + the synchronously
+        // FLUSHED file append, plus the timestamp format + string build they need).
+        // Background paths call debug() on every adb shell command, so an ungated
+        // DEBUG did a flushed disk write under a process-global lock thousands of
+        // times a day. Mirrors DaemonLogger's minLevel gate.
+        //
+        // The listener is deliberately OUTSIDE this gate: it feeds the in-app Logs
+        // screen (MainActivity.setupLogListener → LogsViewModel.addLog), which has
+        // its own DEBUG level and does its own filtering. Early-returning before it
+        // would silently empty the DEBUG view — a user-visible regression, not an
+        // optimisation. Notifying a listener is a cheap in-memory call.
+        try {
+            logListener?.onLog(tag, message, level)
+        } catch (e: Exception) {
+            // Ignore listener errors
+        }
+
+        if (level.ordinal < cfg.minLevel.ordinal) return
+        val timestamp = timestampFormat.get()!!.format(Date())
         val logLine = "[$timestamp] [${level.name}] [$tag] $message"
 
         if (cfg.enableConsoleLog) {
@@ -63,12 +87,6 @@ class LogManager private constructor(@Volatile private var config: LogConfig) {
                 LogLevel.WARN -> Log.w(tag, message)
                 LogLevel.ERROR -> Log.e(tag, message)
             }
-        }
-
-        try {
-            logListener?.onLog(tag, message, level)
-        } catch (e: Exception) {
-            // Ignore listener errors
         }
 
         if (cfg.enableFileLog && cfg.logDir.isNotEmpty()) {

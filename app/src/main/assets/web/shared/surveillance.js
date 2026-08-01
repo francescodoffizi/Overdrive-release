@@ -53,6 +53,7 @@ BYD.surveillance = {
         filterDebugLog: false,
         discardEmptyBrightMotionEvents: false,
         discardEmptyMotionAtNight: false,
+        motionSalienceEnabled: false,
         // Per-quadrant sensitivity / zone overrides. Keys: Q0=front, Q1=right,
         // Q2=rear, Q3=left. Absent key = inherit global. The "Side-cam Boost"
         // UI writes to Q1 + Q3.
@@ -174,17 +175,33 @@ BYD.surveillance = {
     },
 
     async init() {
+        // loadConfig() must land FIRST and alone — every loader below reads or
+        // writes this.config, and updateUI() renders from it.
+        //
+        // The rest are idempotent reads of independent endpoints, so they run
+        // in PARALLEL. They used to be seven sequential `await`s, which made
+        // first paint wait on 11 serial round-trips (loadConfig is itself a
+        // 3-deep chain and loadOemDashcam a 2-deep one). On a head unit where
+        // the storage endpoints take a few hundred ms each against a large
+        // library, that serialization — not any single slow call — is what made
+        // this page take seconds to become usable, with Apply disabled, the OEM
+        // picker dimmed and the Detection tab inert the whole time.
+        // Same fix recording.js already carries (see its init()): ~11 RTTs → ~3.
         await this.loadConfig();
-        await this.loadStorageStats();
-        await this.loadCameraFps();
-        await this.loadGeocoding();
-        // Sentry's own composition layout (independent of the dashcam layout).
-        await this.loadSurveillanceLayout();
-        // Dedicated OEM Dashcam tab — load the mode picker, telemetry
-        // toggle, status badge, and native DVR control on init so the
-        // user can land directly on the OEM tab and find populated state.
-        await this.loadOemDashcam();
-        await this.loadOemNativeDvr();
+        await Promise.all([
+            this.loadStorageStats(),
+            this.loadCameraFps(),
+            this.loadGeocoding(),
+            // Sentry's own composition layout (independent of the dashcam layout).
+            this.loadSurveillanceLayout(),
+            // Dedicated OEM Dashcam tab — load the mode picker, telemetry
+            // toggle, status badge, and native DVR control on init so the
+            // user can land directly on the OEM tab and find populated state.
+            this.loadOemDashcam(),
+            this.loadOemNativeDvr(),
+            // ACC-off surveillance telemetry overlay (own master + field selection).
+            this.loadSurvTelemetryOverlay(),
+        ]);
         this.savedConfig = JSON.parse(JSON.stringify(this.config));
         this.updateUI();
         this.startClock();
@@ -453,6 +470,27 @@ BYD.surveillance = {
         try {
             const resp = await fetch('/api/recordings/stats');
             const data = await resp.json();
+            // Recordings index is down — zeroed counters are not
+            // authoritative, so show "--" instead of claiming zero events.
+            // Flag it so the 10s poller backs off rather than issuing a
+            // permanent 6-req/min 503 stream at the daemon.
+            if (data.indexUnavailable) {
+                this._indexDown = true;
+                var sdIds = ['survStorageUsed', 'survStorageLimit'];
+                for (var si = 0; si < sdIds.length; si++) {
+                    var sel = document.getElementById(sdIds[si]);
+                    if (sel) sel.textContent = '--';
+                }
+                var sFill = document.getElementById('survStorageFill');
+                if (sFill) sFill.style.width = '0%';
+                // Same as recording.js: today's event count is only written in
+                // the success branch and would otherwise keep its "0 →"
+                // default, asserting no events today.
+                var sToday = document.getElementById('eventsToday');
+                if (sToday) sToday.textContent = '--';
+                return;
+            }
+            this._indexDown = false;
             if (data.success) {
                 const usedEl = document.getElementById('survStorageUsed');
                 const limitEl = document.getElementById('survStorageLimit');
@@ -994,8 +1032,13 @@ BYD.surveillance = {
             if (!this.hasUnsavedChanges) {
                 this.reloadConfig();
             }
-            this.loadStorageStats();
-            
+            // Back off to every 3rd tick (10s → 30s) while the recordings
+            // index is down, same rationale as recording.js.
+            this._statsSkip = (this._statsSkip || 0) + 1;
+            if (!this._indexDown || this._statsSkip % 3 === 0) {
+                this.loadStorageStats();
+            }
+
             // Refresh CDR info if SD card is selected
             if (this.config.surveillanceStorageType === 'SD_CARD' && this.storageInfo.sdCardAvailable) {
                 this.loadCdrConfig();
@@ -1021,6 +1064,17 @@ BYD.surveillance = {
         } catch (e) {
             console.warn('Failed to load config:', e);
         }
+
+        // Storage settings run CONCURRENTLY with the unified read below rather
+        // than serially after it. Both must come after the config spread above
+        // (which wholesale-replaces this.config and would clobber their writes),
+        // but they touch disjoint keys — unified writes rectifyStrength /
+        // segmentDurationMinutes / lowPowerWhileParked, storage writes
+        // surveillanceLimitMb / surveillanceStorageType / storageInfo.* — so
+        // there is no ordering dependency between them. This takes
+        // /api/settings/storage (the expensive one) off the tail of the serial
+        // chain, where it was gating everything downstream of loadConfig().
+        const storageSettingsPromise = this.loadStorageSettings();
 
         // Pull rectifyStrength from the unified-config recording section.
         // The surveillance API doesn't surface it (it lives under recording.*
@@ -1061,8 +1115,9 @@ BYD.surveillance = {
             console.warn('Failed to load rectifyStrength: ' + (e && e.message));
         }
 
-        // Load storage settings
-        await this.loadStorageSettings();
+        // Join the storage read kicked off above. loadStorageSettings() swallows
+        // its own errors, so this can't reject and reach callers.
+        await storageSettingsPromise;
     },
 
     sizeToDistance(size) {
@@ -1240,26 +1295,10 @@ BYD.surveillance = {
         }
     },
 
-    updateDistance(value) {
-        this.config.distance = parseInt(value);
-        this.config.minObjectSize = (this.distanceMap[value] || {}).size || 0.08;
-        document.getElementById('distanceValue').textContent = this.distanceLabel(value) || BYD.i18n.t('surveillance.label_default_size');
-        document.getElementById('distanceHint').textContent = this.distanceHint(value) || '';
-        this.markChanged();
-    },
-
-    updateSensitivity(value) {
-        this.config.sensitivity = parseInt(value);
-        document.getElementById('sensitivityValue').textContent = this.sensitivityLabel(value) || BYD.i18n.t('surveillance.label_default');
-        document.getElementById('sensitivityHint').textContent = this.sensitivityHint(value) || '';
-        this.markChanged();
-    },
-
-    updateFlashImmunity(value) {
-        this.config.flashImmunity = parseInt(value);
-        document.getElementById('flashImmunityValue').textContent = this.flashImmunityMap[value] || 'MEDIUM';
-        this.markChanged();
-    },
+    // Removed: updateDistance / updateSensitivity / updateFlashImmunity — the v1
+    // sliders they drove no longer exist on any page (superseded by the v2
+    // sensitivity slider and the detection-zone buttons) and nothing called them.
+    // Their unguarded getElementById(...).textContent would have thrown.
 
     updateDetection() {
         this.config.detectPerson = document.getElementById('detectPerson').checked;
@@ -2053,6 +2092,12 @@ BYD.surveillance = {
         this.markChanged();
     },
 
+    updateMotionSalience() {
+        var el = document.getElementById('v2MotionSalience');
+        this.config.motionSalienceEnabled = (el && el.checked) || false;
+        this.markChanged();
+    },
+
     updateDiscardEmptyMotion() {
         var el = document.getElementById('v2DiscardEmptyMotion');
         this.config.discardEmptyBrightMotionEvents = (el && el.checked) || false;
@@ -2427,9 +2472,10 @@ BYD.surveillance = {
     /**
      * Draw the heatmap overlay on the canvas.
      * 
-     * In mosaic mode (viewMode=0), draws a 2x2 grid:
+     * In mosaic mode (viewMode=0), draws a 2x2 grid matching the recorder's
+     * mosaic (Q0=front, Q1=right, Q2=rear, Q3=left):
      *   [0: FRONT]  [1: RIGHT]
-     *   [2: LEFT ]  [3: REAR ]
+     *   [2: REAR ]  [3: LEFT ]
      *
      * In single-camera mode (viewMode=1-4), draws only the active quadrant
      * filling the full canvas. viewMode mapping: 1=Front, 2=Right, 3=Rear, 4=Left.
@@ -2457,8 +2503,13 @@ BYD.surveillance = {
         // the raw / DVR stream — the canvas was already cleared above.
         if (viewMode === 5 || viewMode === 6) return;
 
-        // Map viewMode to quadrant ID: 1→0(front), 2→1(right), 3→3(rear), 4→2(left)
-        var viewModeToQuadrant = { 1: 0, 2: 1, 3: 3, 4: 2 };
+        // Map viewMode to quadrant ID. Quadrant order is Q0=front, Q1=right,
+        // Q2=rear, Q3=left (MotionPipelineV2.QUADRANT_NAMES) and the stream's
+        // single-view modes are 1=front, 2=right, 3=rear, 4=left (the uViewMode
+        // branches in GpuStreamScaler's fragment shader), so this is the identity
+        // shift. It previously mapped 3→3 and 4→2, painting the LEFT camera's
+        // blocks while the user was watching the REAR stream and vice versa.
+        var viewModeToQuadrant = { 1: 0, 2: 1, 3: 2, 4: 3 };
         var singleQuadrant = (viewMode > 0) ? viewModeToQuadrant[viewMode] : -1;
         
         // In single-camera mode, the heatmap fills the full canvas
@@ -2469,17 +2520,22 @@ BYD.surveillance = {
         var blockW = quadW / gridCols;
         var blockH = quadH / gridRows;
 
+        // Mosaic layout, matching the recorder's output and the GL shader's
+        // uViewMode==0 rearrange: Front=TL, Right=TR, Rear=BL, Left=BR.
+        // Q2 is REAR (bottom-LEFT) and Q3 is LEFT (bottom-RIGHT) — these two were
+        // transposed in both the positions and the labels, which is what made
+        // left-camera motion appear as rear-camera motion on the debug heatmap.
         var quadPositions = [
-            [0, 0],  // 0: front  — top-left
-            [1, 0],  // 1: right  — top-right
-            [1, 1],  // 2: left   — bottom-right
-            [0, 1]   // 3: rear   — bottom-left
+            [0, 0],  // 0: front — top-left
+            [1, 0],  // 1: right — top-right
+            [0, 1],  // 2: rear  — bottom-left
+            [1, 1]   // 3: left  — bottom-right
         ];
         var quadLabels = [
             BYD.i18n.t('surveillance.camera_front'),
             BYD.i18n.t('surveillance.camera_right'),
-            BYD.i18n.t('surveillance.camera_left'),
-            BYD.i18n.t('surveillance.camera_rear')
+            BYD.i18n.t('surveillance.camera_rear'),
+            BYD.i18n.t('surveillance.camera_left')
         ];
         var threatLabels = [
             '',
@@ -2804,6 +2860,8 @@ BYD.surveillance = {
         // Discard non-actor recordings (detection tab) — user-facing toggle,
         // so use setToggle for the Chrome-58 slider repaint (the developer
         // toggles above can stay plain).
+        setToggle(document.getElementById('v2MotionSalience'),
+                  !!this.config.motionSalienceEnabled);
         setToggle(document.getElementById('v2DiscardEmptyMotion'),
                   !!this.config.discardEmptyBrightMotionEvents);
         setToggle(document.getElementById('v2DiscardEmptyMotionNight'),
@@ -2882,7 +2940,8 @@ BYD.surveillance = {
             // Folded in from the (removed) Advanced tab — these motion-
             // detection diagnostics belong with detection.
             'motionHeatmap', 'filterDebugLog',
-            'discardEmptyBrightMotionEvents', 'discardEmptyMotionAtNight'
+            'discardEmptyBrightMotionEvents', 'discardEmptyMotionAtNight',
+            'motionSalienceEnabled'
         ],
         recording: [
             // Backend reads these EXACT names — preRecordSeconds (no "ing").
@@ -4331,6 +4390,123 @@ BYD.surveillance = {
             }
         } catch (e) {
             if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.layout_update_failed'), 'error');
+        }
+    },
+
+    // ==================== Surveillance Telemetry Overlay ====================
+    // ACC-off flow. Own master toggle + field selection, never shared with the
+    // ACC-on recording overlay. Self-contained here because recording.js isn't
+    // loaded on this page.
+
+    _telemetryCatalog: null,
+    _telemetryFields: { accOn: [], surveillance: [], oemDashcam: [] },
+
+    async loadSurvTelemetryOverlay() {
+        try {
+            const resp = await fetch('/api/settings/telemetry-overlay');
+            const data = await resp.json();
+            if (!data.success) return;
+            const toggle = document.getElementById('survTelemetryOverlayEnabled');
+            if (toggle) toggle.checked = !!data.surveillanceEnabled;
+            this._telemetryCatalog = data.fieldCatalog || null;
+            if (data.fields) this._telemetryFields = data.fields;
+            this.renderSurvTelemetryFields();
+            this.updateSurvTelemetryFieldsVisibility(!!(toggle && toggle.checked));
+        } catch (e) {
+            console.warn('Failed to load surveillance telemetry overlay:', e);
+        }
+    },
+
+    survTelemetryFieldLabel(key) {
+        const fallback = {
+            speed: 'Speed', gear: 'Gear', accelPedal: 'Accelerator',
+            brakePedal: 'Brake', seatbeltDriver: 'Driver seatbelt',
+            seatbeltPassenger: 'Passenger seatbelt', turnSignals: 'Turn signals',
+            timestamp: 'Date & time', batteryPercent: 'Battery %',
+            voltage12v: '12V voltage', lowBeam: 'Low beam',
+            highBeam: 'High beam', location: 'GPS location',
+            vin: 'VIN'
+        };
+        const i18nKey = 'recording.telemetry_field_' + key;
+        const t = (BYD.i18n && BYD.i18n.t) ? BYD.i18n.t(i18nKey) : null;
+        return (t && t !== i18nKey) ? t : (fallback[key] || key);
+    },
+
+    renderSurvTelemetryFields() {
+        const grid = document.getElementById('telemetryFieldsSurveillanceGrid');
+        if (!grid || !this._telemetryCatalog) return;
+        const selected = new Set(this._telemetryFields.surveillance || []);
+        grid.innerHTML = '';
+        this._telemetryCatalog.forEach(f => {
+            const label = document.createElement('label');
+            label.className = 'checkbox-item' + (selected.has(f.key) ? ' active' : '');
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.id = 'telField_surveillance_' + f.key;
+            cb.checked = selected.has(f.key);
+            cb.addEventListener('change', () => {
+                label.classList.toggle('active', cb.checked);
+                this.toggleSurvTelemetryField();
+            });
+            const span = document.createElement('span');
+            span.textContent = this.survTelemetryFieldLabel(f.key);
+            label.appendChild(cb);
+            label.appendChild(span);
+            grid.appendChild(label);
+        });
+    },
+
+    updateSurvTelemetryFieldsVisibility(visible) {
+        const wrap = document.getElementById('telemetryFieldsSurveillance');
+        if (wrap) wrap.style.display = visible ? '' : 'none';
+    },
+
+    async toggleSurvTelemetryField() {
+        const grid = document.getElementById('telemetryFieldsSurveillanceGrid');
+        const keys = [];
+        if (grid) grid.querySelectorAll('input[type=checkbox]').forEach(cb => {
+            if (cb.checked) keys.push(cb.id.replace('telField_surveillance_', ''));
+        });
+        this._telemetryFields.surveillance = keys;
+        try {
+            const resp = await fetch('/api/settings/telemetry-overlay', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fields: { surveillance: keys } })
+            });
+            const data = await resp.json();
+            if (data.success && data.fields) this._telemetryFields = data.fields;
+        } catch (e) {
+            console.warn('Failed to update surveillance telemetry fields:', e);
+        }
+    },
+
+    async toggleSurvTelemetryOverlay() {
+        const toggle = document.getElementById('survTelemetryOverlayEnabled');
+        if (!toggle) return;
+        const enabled = toggle.checked;
+        try {
+            const resp = await fetch('/api/settings/telemetry-overlay', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ surveillanceEnabled: enabled })
+            });
+            const data = await resp.json();
+            if (data.success) {
+                toggle.checked = !!data.surveillanceEnabled;
+                this.updateSurvTelemetryFieldsVisibility(!!data.surveillanceEnabled);
+                if (BYD.utils && BYD.utils.toast) {
+                    BYD.utils.toast(data.surveillanceEnabled
+                        ? BYD.i18n.t('recording.telemetry_overlay_enabled')
+                        : BYD.i18n.t('recording.telemetry_overlay_disabled'), 'success');
+                }
+            } else {
+                toggle.checked = !enabled;
+                if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.overlay_update_failed'), 'error');
+            }
+        } catch (e) {
+            toggle.checked = !enabled;
+            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.overlay_update_failed'), 'error');
         }
     }
 };

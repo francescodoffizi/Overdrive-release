@@ -40,6 +40,23 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
         Log.i(TAG, "AccessibilityService connected — process is now protected");
 
+        // Start the app-process signal monitors FIRST — BEFORE the setServiceInfo() block
+        // below, which early-returns if the info-set throws. These monitors are independent
+        // of key-filtering (they relay phone-call + Bluetooth state to the daemon, which
+        // can't read them from UID 2000); gating them behind a successful setServiceInfo
+        // meant a key-filter wiring failure ALSO silently killed call/BT automations. Both
+        // are idempotent + self-guarding, so starting them early is safe.
+        try {
+            CallStateMonitor.start(getApplicationContext());
+        } catch (Throwable t) {
+            Log.w(TAG, "CallStateMonitor start failed: " + t.getMessage());
+        }
+        try {
+            BluetoothStateMonitor.start(getApplicationContext());
+        } catch (Throwable t) {
+            Log.w(TAG, "BluetoothStateMonitor start failed: " + t.getMessage());
+        }
+
         // Config must match the WORKING shape proven on DiLink firmware (verified
         // against a known-good OEM app): a service that subscribes to ZERO event
         // types (eventTypes=0) is treated as inert by this firmware's
@@ -88,15 +105,6 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
             Log.w(TAG, "KeyMapDispatcher warmUp failed: " + t.getMessage());
         }
 
-        // Start the phone call-state monitor in this (app) process — the daemon can't
-        // observe telephony. Idempotent + self-gates on the READ_PHONE_STATE permission,
-        // so this cleanly no-ops when the permission isn't granted.
-        try {
-            CallStateMonitor.start(getApplicationContext());
-        } catch (Throwable t) {
-            Log.w(TAG, "CallStateMonitor start failed: " + t.getMessage());
-        }
-
         // No foreground notification needed — DaemonKeepaliveService already has one.
         // The AccessibilityService binding alone is enough to protect the process.
 
@@ -129,12 +137,18 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
     protected boolean onKeyEvent(KeyEvent event) {
         try {
             boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
-            // Unconditional diagnostic: proves whether the firmware actually
-            // dispatches hardware keys to our filter at all. Without this, an
-            // absent log is ambiguous (never-called vs called-but-unmapped).
-            // Cheap; keep until key mapping is field-confirmed on this firmware.
-            Log.i(TAG, "onKeyEvent keyCode=" + event.getKeyCode()
-                    + " down=" + down + " repeat=" + event.getRepeatCount());
+            // Bring-up diagnostic for "does this firmware dispatch hardware keys
+            // to our filter at all". Now gated behind isLoggable: this method runs
+            // on the PLATFORM INPUT-DISPATCH path, so an unconditional Log.i +
+            // string concat here taxes every hardware key press system-wide (and
+            // fires continuously while a key is held down, via getRepeatCount).
+            // Key mapping is field-confirmed, so the log stays available on demand
+            // (`setprop log.tag.KeepAliveA11y DEBUG`) without paying for it on
+            // every keystroke.
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                Log.d(TAG, "onKeyEvent keyCode=" + event.getKeyCode()
+                        + " down=" + down + " repeat=" + event.getRepeatCount());
+            }
             return KeyMapDispatcher.INSTANCE.onKey(
                     event.getKeyCode(), down, event.getRepeatCount());
         } catch (Throwable t) {

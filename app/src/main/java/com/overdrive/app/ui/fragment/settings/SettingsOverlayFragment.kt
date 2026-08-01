@@ -27,6 +27,8 @@ import org.json.JSONObject
  */
 class SettingsOverlayFragment : Fragment() {
     private var roadSenseSwitch: SwitchMaterial? = null
+    private var roadSenseRow: View? = null
+    private var roadSenseMasterOn = false
     private var applyingRoadSenseConfig = false
 
     override fun onCreateView(
@@ -44,6 +46,8 @@ class SettingsOverlayFragment : Fragment() {
         val swRoadSense =
             view.findViewById<SwitchMaterial>(R.id.swOverlayRoadSense) ?: return
         roadSenseSwitch = swRoadSense
+        // Assign before the first refresh, or its row-dimming branch no-ops.
+        roadSenseRow = view.findViewById(R.id.rowOverlayRoadSense)
 
         val cfg = UnifiedConfigManager.getStatusOverlay()
         swCamera.isChecked = cfg.optBoolean("cameraVisible", true)
@@ -63,7 +67,7 @@ class SettingsOverlayFragment : Fragment() {
         view.findViewById<View>(R.id.rowOverlayTrip).setOnClickListener {
             swTrip.isChecked = !swTrip.isChecked
         }
-        view.findViewById<View>(R.id.rowOverlayRoadSense).setOnClickListener {
+        roadSenseRow?.setOnClickListener {
             swRoadSense.isChecked = !swRoadSense.isChecked
         }
 
@@ -84,6 +88,7 @@ class SettingsOverlayFragment : Fragment() {
 
     override fun onDestroyView() {
         roadSenseSwitch = null
+        roadSenseRow = null
         super.onDestroyView()
     }
 
@@ -99,6 +104,12 @@ class SettingsOverlayFragment : Fragment() {
     }
 
     private fun persistRoadSense(visible: Boolean) {
+        // setChecked() fires the listener even on a disabled switch, so the
+        // master gate has to be enforced here too, not just via row.isEnabled.
+        if (!roadSenseMasterOn) {
+            refreshRoadSenseSwitch(forceReload = false)
+            return
+        }
         if (RoadSenseConfig.setOverlayVisible(visible)) {
             context?.let { RoadSenseOverlayService.syncWithConfig(it) }
         } else {
@@ -108,13 +119,29 @@ class SettingsOverlayFragment : Fragment() {
 
     private fun refreshRoadSenseSwitch(forceReload: Boolean) {
         val toggle = roadSenseSwitch ?: return
-        val visible = try {
-            RoadSenseConfig.snapshot(forceReload).overlayVisible
+        val snapshot = try {
+            RoadSenseConfig.snapshot(forceReload)
         } catch (_: Throwable) {
+            // Unknown state: leave the control untouched but non-editable rather
+            // than clickable-and-undimmed.
+            roadSenseMasterOn = false
+            setRoadSenseRowEnabled(false)
             return
         }
         applyingRoadSenseConfig = true
-        toggle.isChecked = visible
+        toggle.isChecked = snapshot.overlayVisible
         applyingRoadSenseConfig = false
+        // Dim the row when the master switch is off, or the toggle reads ON
+        // with no overlay on screen.
+        roadSenseMasterOn = snapshot.enabled
+        setRoadSenseRowEnabled(snapshot.enabled)
+    }
+
+    private fun setRoadSenseRowEnabled(enabled: Boolean) {
+        roadSenseSwitch?.isEnabled = enabled
+        roadSenseRow?.let { row ->
+            row.isEnabled = enabled
+            row.alpha = if (enabled) 1f else 0.5f
+        }
     }
 }

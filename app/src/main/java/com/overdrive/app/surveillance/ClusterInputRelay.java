@@ -62,77 +62,142 @@ public final class ClusterInputRelay {
 
     private ClusterInputRelay() {}
 
-    /** Relay a single tap at normalized ({@code nx},{@code ny}) in [0,1] of the mirror
-     *  pane. Returns true if an injection was dispatched. */
-    public static boolean tap(double nx, double ny) {
-        int[] panel = resolvePanel();
+    /** Relay a single tap at a mirror-SURFACE px coordinate. Inverts through the live
+     *  projection mapping to a cluster px and injects it. Returns true if dispatched. */
+    public static boolean tap(double sx, double sy) {
+        ProjectionMapping mapping = currentProjectionMapping();
+        if (mapping == null || !Double.isFinite(sx) || !Double.isFinite(sy)) return false;
+        int[] panel = resolvePanel(mapping);
         if (panel == null) return false;
         int id = panel[0], w = panel[1], h = panel[2];
-        float[] crop = activeCrop();
-        int x = clampToPanel(paneToPanel(nx, crop[0], crop[2]), w);
-        int y = clampToPanel(paneToPanel(ny, crop[1], crop[3]), h);
+        int x = clampToPanel(mapping.mapX(sx), w);
+        int y = clampToPanel(mapping.mapY(sy), h);
         if (injectTap(id, x, y)) return true;
         return shellTap(id, x, y);
     }
 
-    /** Relay a swipe/scroll from normalized ({@code nx1},{@code ny1}) to ({@code nx2},
-     *  {@code ny2}) over {@code durationMs}. Returns true if dispatched. */
-    public static boolean swipe(double nx1, double ny1, double nx2, double ny2, int durationMs) {
-        int[] panel = resolvePanel();
+    /** Relay a swipe/scroll between two mirror-SURFACE px coordinates over {@code durationMs}. */
+    public static boolean swipe(double sx1, double sy1, double sx2, double sy2, int durationMs) {
+        ProjectionMapping mapping = currentProjectionMapping();
+        if (mapping == null || !Double.isFinite(sx1) || !Double.isFinite(sy1)
+                || !Double.isFinite(sx2) || !Double.isFinite(sy2)) {
+            return false;
+        }
+        int[] panel = resolvePanel(mapping);
         if (panel == null) return false;
         int id = panel[0], w = panel[1], h = panel[2];
-        float[] crop = activeCrop();
-        int x1 = clampToPanel(paneToPanel(nx1, crop[0], crop[2]), w);
-        int y1 = clampToPanel(paneToPanel(ny1, crop[1], crop[3]), h);
-        int x2 = clampToPanel(paneToPanel(nx2, crop[0], crop[2]), w);
-        int y2 = clampToPanel(paneToPanel(ny2, crop[1], crop[3]), h);
+        int x1 = clampToPanel(mapping.mapX(sx1), w);
+        int y1 = clampToPanel(mapping.mapY(sy1), h);
+        int x2 = clampToPanel(mapping.mapX(sx2), w);
+        int y2 = clampToPanel(mapping.mapY(sy2), h);
         int dur = durationMs <= 0 ? DEFAULT_SWIPE_MS : Math.min(durationMs, MAX_SWIPE_MS);
         if (injectSwipe(id, x1, y1, x2, y2, dur)) return true;
         return shellSwipe(id, x1, y1, x2, y2, dur);
     }
 
-    /** Active mirror source-crop fractions [x, y, w, h] in 0..1 of the panel. In ZOOM the
-     *  pane shows only this sub-window of the cluster; FIT/FILL show the whole panel so the
-     *  identity {0,0,1,1} applies (a pane-normalized coord maps straight to the panel). Read
-     *  from the live mirror controller; identity if it isn't running. */
-    private static float[] activeCrop() {
+    /**
+     * Take one validated live projection snapshot for a complete tap/swipe. Re-reading the
+     * mapping independently for each axis or endpoint lets a concurrent resize combine old
+     * and new rectangles into a diagonal jump. A missing mapping is a hard refusal: falling
+     * back to raw surface coordinates can inject into the wrong cluster location after
+     * teardown.
+     */
+    private static ProjectionMapping currentProjectionMapping() {
         try {
-            ClusterMirrorController c = ClusterMirrorController.getInstance();
-            float[] f = c.currentSrcCropFractions();
-            if (f != null && f.length == 4 && f[2] > 0f && f[3] > 0f) return f;
+            ClusterViewMirrorService m = ClusterViewMirrorService.getInstance();
+            if (m.currentState() != ClusterViewMirrorService.STATE_ACTIVE) return null;
+            int panelW = m.currentClusterW();
+            int panelH = m.currentClusterH();
+            int mode = m.currentScaleMode();
+            int[] src = m.projectionSrc();
+            int[] dst = m.projectionDst();
+            if (m.currentState() != ClusterViewMirrorService.STATE_ACTIVE
+                    || src == null || src.length < 4 || dst == null || dst.length < 4
+                    || panelW <= 0 || panelH <= 0
+                    || src[0] < 0 || src[1] < 0 || src[2] <= 0 || src[3] <= 0
+                    || dst[2] <= 0 || dst[3] <= 0
+                    || (long) src[0] + src[2] > panelW
+                    || (long) src[1] + src[3] > panelH) {
+                return null;
+            }
+            if (mode != ProjectionGeometry.SCALE_FILL
+                    && !aspectsCompatible(src[2], src[3], dst[2], dst[3])) {
+                logger.debug("relay refused inconsistent projection src=" + src[2] + "x"
+                        + src[3] + " dst=" + dst[2] + "x" + dst[3] + " mode=" + mode);
+                return null;
+            }
+            return new ProjectionMapping(src, dst, panelW, panelH);
         } catch (Throwable ignored) {}
-        return new float[] { 0f, 0f, 1f, 1f };
+        return null;
     }
 
-    /** Map a pane-normalized coordinate (0..1 of what the user sees in the mirror pane)
-     *  through the active source-crop window to a panel-normalized coordinate: the pane maps
-     *  onto [{@code cropOffset}, {@code cropOffset}+{@code cropSpan}] of the panel. For the
-     *  identity crop (FIT/FILL) this is a no-op passthrough. */
-    private static double paneToPanel(double paneNorm, float cropOffset, float cropSpan) {
-        if (Double.isNaN(paneNorm)) paneNorm = 0;
-        if (paneNorm < 0) paneNorm = 0; else if (paneNorm > 1) paneNorm = 1;
-        return cropOffset + paneNorm * cropSpan;
+    private static boolean aspectsCompatible(int aw, int ah, int bw, int bh) {
+        long delta = Math.abs((long) aw * bh - (long) ah * bw);
+        long tolerance = Math.max(Math.max(aw, ah), Math.max(bw, bh));
+        return delta <= tolerance;
+    }
+
+    private static final class ProjectionMapping {
+        final int srcX;
+        final int srcY;
+        final int srcW;
+        final int srcH;
+        final int dstX;
+        final int dstY;
+        final int dstW;
+        final int dstH;
+        final int panelW;
+        final int panelH;
+
+        ProjectionMapping(int[] src, int[] dst, int panelW, int panelH) {
+            this.srcX = src[0];
+            this.srcY = src[1];
+            this.srcW = src[2];
+            this.srcH = src[3];
+            this.dstX = dst[0];
+            this.dstY = dst[1];
+            this.dstW = dst[2];
+            this.dstH = dst[3];
+            this.panelW = panelW;
+            this.panelH = panelH;
+        }
+
+        double mapX(double surfaceX) {
+            return ProjectionGeometry.destinationToSource(
+                    surfaceX, srcX, srcW, dstX, dstW);
+        }
+
+        double mapY(double surfaceY) {
+            return ProjectionGeometry.destinationToSource(
+                    surfaceY, srcY, srcH, dstY, dstH);
+        }
     }
 
     // ── Panel/display resolution + safety gate ──────────────────────────────────────
 
     /** {@code [fissionDisplayId, panelW, panelH]}, or null if no safe cluster target.
      *  HARD-REFUSES id <= 0 (0 = head unit) so injection can never hit the infotainment. */
-    private static int[] resolvePanel() {
+    private static int[] resolvePanel(ProjectionMapping mapping) {
         BsNativeLayer.FissionDisplay fd = BsNativeLayer.resolveFissionDisplay();
         if (fd.displayId <= 0) {
             logger.warn("relay refused — no positive fission displayId (id=" + fd.displayId + ")");
             return null;
         }
         Context ctx = resolveContext();
-        Point panel = (ctx != null) ? BsNativeLayer.clusterDisplaySize(ctx) : new Point(1920, 720);
+        Point panel = BsNativeLayer.clusterDisplaySize(ctx, fd);
         int w = Math.max(1, panel.x), h = Math.max(1, panel.y);
+        if (w != mapping.panelW || h != mapping.panelH) {
+            logger.warn("relay refused — live display size " + w + "x" + h
+                    + " differs from projection " + mapping.panelW + "x" + mapping.panelH);
+            return null;
+        }
         return new int[] { fd.displayId, w, h };
     }
 
-    private static int clampToPanel(double norm, int size) {
-        if (Double.isNaN(norm)) norm = 0;
-        int v = (int) Math.round(norm * size);
+    /** Clamp an ABSOLUTE cluster-px coordinate into {@code [0, size-1]}. */
+    private static int clampToPanel(double clusterPx, int size) {
+        if (Double.isNaN(clusterPx)) clusterPx = 0;
+        int v = (int) Math.round(clusterPx);
         if (v < 0) v = 0;
         if (v > size - 1) v = size - 1;
         return v;
@@ -152,9 +217,11 @@ public final class ClusterInputRelay {
     private static boolean injectSwipe(int displayId, int x1, int y1, int x2, int y2, int durMs) {
         long down = SystemClock.uptimeMillis();
         if (!injectMotion(MotionEvent.ACTION_DOWN, down, down, x1, y1, displayId)) return false;
-        int steps = Math.max(2, Math.min(durMs / 16, 64));   // ~60fps of moves, capped
+        int steps = Math.max(1, Math.min(durMs / 16, 64));   // ~60fps of moves, capped
         for (int i = 1; i <= steps; i++) {
-            float t = (float) i / steps;
+            // Keep MOVE timestamps before the final UP. Sending a MOVE and UP at the same
+            // endpoint/time can collapse the end of short swipes on InputDispatcher.
+            float t = (float) i / (steps + 1);
             int mx = Math.round(x1 + (x2 - x1) * t);
             int my = Math.round(y1 + (y2 - y1) * t);
             long ev = down + (long) (durMs * t);

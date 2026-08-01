@@ -337,6 +337,17 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         accelSensor = resolved.accelerometer?.takeIf { resolved.accelIsInertial }
         // SENSOR_DELAY_GAME (~50 Hz) is plenty for heading integration and far cheaper
         // than the detection path's SENSOR_DELAY_FASTEST (~100 Hz).
+        //
+        // DO NOT add hardware FIFO batching (maxReportLatencyUs) to this tap.
+        // Tried and REVERTED: the puck's yaw integrator timestamps each sample with
+        // SystemClock.elapsedRealtime() AT DELIVERY (see gyroListener above) rather
+        // than event.timestamp, and VehicleMotionEstimator.onGyroYaw integrates
+        // yawRate × (tsMs - lastGyroTsMs). Batched samples arrive in a burst with
+        // ~0ms wall-clock between them, so every sample after the first in a burst
+        // gets dtS≈0 and is DISCARDED by the `if (dtS <= 0.0) return` guard —
+        // silently losing ~half the turn rotation until the next GPS fix re-anchors
+        // the heading. Batching here would need the listener to pass
+        // event.timestamp (ns, elapsedRealtime base) into onGyroYaw first.
         accelSensor?.let { sm.registerListener(gyroListener, it, android.hardware.SensorManager.SENSOR_DELAY_GAME, sensorHandler) }
         gyroSensor?.let { sm.registerListener(gyroListener, it, android.hardware.SensorManager.SENSOR_DELAY_GAME, sensorHandler) }
     }

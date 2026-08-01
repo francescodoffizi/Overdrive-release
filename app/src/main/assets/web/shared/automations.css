@@ -471,6 +471,31 @@
     flex-direction: column;
     align-items: stretch;
 }
+/* Location-zone picker: a dropdown of Safe Location zones + "none", with an inline
+   create form (name / lat / long / radius). Column stack; margins stand in for flex gap
+   (Chrome-58 ignores `gap`). */
+.zone-picker { display: flex; flex-direction: column; align-items: stretch; }
+.zone-new-form { display: flex; flex-wrap: wrap; margin-top: 6px; }
+.zone-new-form:empty { display: none; }
+.zone-field { display: flex; flex-direction: column; margin-right: 8px; margin-bottom: 6px; }
+.zone-field > span { font-size: 11px; opacity: 0.75; margin-bottom: 2px; }
+.zone-field > .input { min-width: 120px; }
+.zone-error { flex-basis: 100%; color: #ff6b6b; font-size: 12px; min-height: 14px; }
+.zone-picker .field-help { margin-top: 4px; }
+
+/* Per-attribute selectors of a chosen signal (side / area / seat / units …), used by both
+   the condition-RHS signal picker and the flow actions' LHS address picker. Row-wrapped so
+   a 2-attribute signal (seat climate: type + area) stays on one line when it fits.
+   margin-top stands in for the column gap — Chrome-58 ignores flex `gap`. */
+.cond-signal-attrs {
+    display: flex;
+    flex-wrap: wrap;
+}
+.cond-signal-attrs:empty { display: none; }   /* no attributes → no empty gap under the select */
+.cond-signal-attr {
+    margin-top: 4px;
+    margin-right: 6px;
+}
 .cond-mode-toggle {
     /* inline-flex + align-self:flex-start so the pill HUGS its 2-3 buttons instead of
        stretching to the full cell width (that stretch was the "elongated dark

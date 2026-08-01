@@ -946,11 +946,17 @@ public class SentryDaemon {
     private static void restartLocationService() {
         log("Location Monitor: Restarting Location service via silent activity...");
         
-        // Method 1: Launch silent Location starter activity (preferred - no UI shown)
+        // Method 1: Launch silent Location starter activity (preferred - no UI shown).
+        // The flags MUST be a single OR-ed `-f` value: `am`'s -f handler uses Intent.setFlags
+        // (NOT addFlags), so two `-f` options silently DISCARD the first — the previous form
+        // passed NEW_TASK then a second flag and ended up without the NEW_TASK the launch needs.
+        // 0x10000000 FLAG_ACTIVITY_NEW_TASK | 0x00800000 FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS.
+        // (The old code's second flag was 0x00080000, which is CLEAR_WHEN_TASK_RESET, not
+        // EXCLUDE_FROM_RECENTS — an easy digit slip. Recents exclusion is also declared on the
+        // activity in the manifest, so this flag is belt-and-braces.)
         String result = execShell("am start -n " + APP_PKG() + "/.ui.LocationStarterActivity " +
             "-a " + APP_PKG() + ".START_LOCATION_SILENT " +
-            "-f 0x10000000 " +  // FLAG_ACTIVITY_NEW_TASK
-            "-f 0x00080000 " +  // FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS  
+            "-f 0x10800000 " +
             "2>&1");
         log("Location restart (silent activity): " + result);
         

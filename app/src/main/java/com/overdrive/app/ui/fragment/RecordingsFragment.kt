@@ -1092,6 +1092,27 @@ class RecordingsFragment : Fragment() {
             // /api/recordings/stats — flat counters covering both segments.
             val stats = try { RecordingsApiClient.fetchStats() } catch (_: Throwable) { null }
 
+            // Index down (daemon reachable, its index isn't): the counters are
+            // unknown, not zero. Post the honest header instead of running the
+            // direct-FS aggregate — that walk can't read SD/USB under the app
+            // UID and would render an authoritative "0 today · 0 total · 0 B"
+            // right above the library's own "index unavailable" card.
+            if (stats != null && stats.indexUnavailable) {
+                postCountsToUi(
+                    viewRef = viewRef,
+                    dashcamCount = 0,
+                    replaysCount = 0,
+                    surveillanceCount = 0,
+                    totalCount = 0,
+                    totalToday = 0,
+                    totalBytes = 0,
+                    sortedPlaces = availablePlaces,
+                    warming = false,
+                    indexDown = true
+                )
+                return@execute
+            }
+
             // Fallback path: the daemon couldn't be reached. Use the unified
             // scanner (it owns its own API-then-FS fallback ladder) so we
             // don't duplicate the FS walk here.
@@ -1198,7 +1219,13 @@ class RecordingsFragment : Fragment() {
         totalToday: Long,
         totalBytes: Long,
         sortedPlaces: List<String>,
-        warming: Boolean
+        warming: Boolean,
+        /**
+         * Recordings index is down: every count passed in is zero and NOT
+         * authoritative, so the header must say so instead of rendering
+         * "0 today · 0 total · 0 B" as fact.
+         */
+        indexDown: Boolean = false
     ) {
         val post = object : Runnable {
             override fun run() {
@@ -1213,29 +1240,39 @@ class RecordingsFragment : Fragment() {
                     totalCount.toInt(),
                     sizeText
                 )
-                v.findViewById<TextView>(R.id.tvRecordingsSummary)?.text =
-                    if (warming) "$baseSummary  ·  (building index)" else baseSummary
+                v.findViewById<TextView>(R.id.tvRecordingsSummary)?.text = when {
+                    indexDown -> activeCtx.getString(R.string.recordings_summary_index_down)
+                    warming -> "$baseSummary  ·  (building index)"
+                    else -> baseSummary
+                }
 
                 v.findViewById<TextView>(R.id.tvTitleCountBadge)?.let { badge ->
-                    if (totalCount > 0) {
+                    // Hide rather than show "0" while the index is down — the
+                    // count is unknown, not zero.
+                    if (totalCount > 0 && !indexDown) {
                         badge.visibility = View.VISIBLE
                         badge.text = totalCount.toString()
                     } else {
                         badge.visibility = View.GONE
                     }
                 }
+                // While the index is down the per-segment counts are unknown,
+                // so drop the "· N" suffix instead of asserting zero.
                 v.findViewById<MaterialButton>(R.id.segmentDashcam)?.text =
-                    activeCtx.getString(
+                    if (indexDown) activeCtx.getString(R.string.recordings_segment_dashcam)
+                    else activeCtx.getString(
                         R.string.recordings_segment_dashcam_count,
                         dashcamCount.toInt()
                     )
                 v.findViewById<MaterialButton>(R.id.segmentReplays)?.text =
-                    activeCtx.getString(
+                    if (indexDown) activeCtx.getString(R.string.recordings_segment_replays)
+                    else activeCtx.getString(
                         R.string.recordings_segment_replays_count,
                         replaysCount.toInt()
                     )
                 v.findViewById<MaterialButton>(R.id.segmentSurveillance)?.text =
-                    activeCtx.getString(
+                    if (indexDown) activeCtx.getString(R.string.recordings_segment_surveillance)
+                    else activeCtx.getString(
                         R.string.recordings_segment_surveillance_count,
                         surveillanceCount.toInt()
                     )
@@ -1264,7 +1301,11 @@ class RecordingsFragment : Fragment() {
                 // pile 30 redundant requests on the daemon.
                 warmingRetryRunnable?.let { mainHandler.removeCallbacks(it) }
                 warmingRetryRunnable = null
-                if (warming) {
+                // Poll while the index is REBUILDING or DOWN. Without the
+                // indexDown case the header would latch on "Counts
+                // unavailable" until the next onResume / user action, even
+                // after the daemon re-opened its index seconds later.
+                if (warming || indexDown) {
                     val attempt = warmingRetryAttempt
                             .coerceAtMost(WARMING_POLL_MAX_ATTEMPTS_FOR_BACKOFF)
                     val delay = (WARMING_POLL_INTERVAL_MS shl attempt)

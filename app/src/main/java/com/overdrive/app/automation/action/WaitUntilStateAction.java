@@ -1,11 +1,13 @@
 package com.overdrive.app.automation.action;
 
 import com.overdrive.app.automation.AutomationAction;
+import com.overdrive.app.automation.AutomationCondition;
 import com.overdrive.app.automation.Automations;
 import com.overdrive.app.automation.condition.BydEvent;
 import com.overdrive.app.automation.condition.EventData;
-import com.overdrive.app.automation.type.EnumType;
 import com.overdrive.app.automation.type.IntType;
+import com.overdrive.app.automation.type.SignalAddressType;
+import com.overdrive.app.automation.type.StringType;
 import com.overdrive.app.automation.type.Type;
 import com.overdrive.app.automation.value.Label;
 import com.overdrive.app.automation.value.Value;
@@ -43,6 +45,9 @@ public class WaitUntilStateAction extends BaseAction {
     // EITHER matches "on" (i.e. "indicators are off" vs "an indicator is on").
     private static final String EVENT_TURN_ANY = "turnAny";
 
+    /** Bound for the awaited state word (longest catalog vocabulary word is well under this). */
+    private static final int MAX_STATE_LEN = 32;
+
     private final Label label;
     private final String description;
     private final List<Type> variables;
@@ -53,23 +58,21 @@ public class WaitUntilStateAction extends BaseAction {
         // event: which on/off signal to watch. ids MUST match the resolveEvent switch.
         // state: the target on/off value. timeout: bounded wait ceiling.
         this.variables = List.of(
-                new EnumType(new Label("event", "automation.wait_signal"),
-                        new Label("turnLeft", "automation.turn_left"),
-                        new Label("turnRight", "automation.turn_right"),
-                        new Label(EVENT_TURN_ANY, "automation.turn_indicators"),
-                        new Label("lowBeam", "automation.low_beam"),
-                        new Label("highBeam", "automation.high_beam"),
-                        new Label("hazard", "automation.hazard"),
-                        new Label("drl", "automation.drl"),
-                        new Label("ac", "automation.ac"),
-                        new Label("slw", "automation.slw"),
-                        new Label("wifiState", "automation.wifi"),
-                        new Label("btState", "automation.bluetooth"),
-                        new Label("emergencyAlarm", "automation.emergency_alarm")),
-                new EnumType(new Label("state", "automation.state"),
-                        new Label("on", "automation.on"),
-                        new Label("off", "automation.off")),
-                new IntType(new Label("timeout", "automation.wait_timeout"), 1, MAX_TIMEOUT_S));
+                // LHS = an ADDRESS into the shared condition catalog, so this can wait on ANY
+                // condition (a specific door, seat, gear, window…), not just the 12 on/off
+                // signals it used to hardcode. Legacy stored ids — turnLeft, lowBeam, … — still
+                // resolve (see AutomationCondition.resolveSignalAddress), and the combined
+                // turnAny sentinel is still handled locally in stateMet.
+                new SignalAddressType(new Label("event", "automation.wait_signal")),
+                // The awaited state is FREE-FORM, not a hard on/off pair: the catalog's signals
+                // publish their own vocabularies (open/closed, occupied/empty, P/R/N/D, on/off),
+                // and stateMet compares with "eq" against whatever is stored — so a bounded
+                // string covers all of them, where the old two-option enum could only ever
+                // match the on/off ones. Existing automations store "on"/"off", which remain
+                // valid values of this type.
+                new StringType(new Label("state", "automation.state"), MAX_STATE_LEN),
+                // 0 = wait the full ceiling (see clampTimeout), matching WaitUntilAction.
+                new IntType(new Label("timeout", "automation.wait_timeout"), 0, MAX_TIMEOUT_S));
     }
 
     public String getType() { return TYPE; }
@@ -80,24 +83,15 @@ public class WaitUntilStateAction extends BaseAction {
 
     public List<Type> getVariables() { return variables; }
 
-    /** Map the picker's event id to its published {@link EventData}, or null for the
-     *  combined-indicator sentinel / an unknown id (handled specially by the caller). */
+    /**
+     * Resolve a stored LHS address to its state key. Delegates to the shared grammar
+     * ({@link AutomationCondition#resolveSignalAddress}) so the whole condition catalog is
+     * reachable and the pre-catalog ids saved automations hold keep resolving unchanged.
+     * Returns null for the combined-indicator sentinel, which {@link #stateMet} handles.
+     */
     private static EventData resolveEvent(String id) {
-        if (id == null) return null;
-        switch (id) {
-            case "turnLeft":       return BydEvent.TURN_LEFT;
-            case "turnRight":      return BydEvent.TURN_RIGHT;
-            case "lowBeam":        return BydEvent.LIGHTS_LOW_BEAM;
-            case "highBeam":       return BydEvent.LIGHTS_HIGH_BEAM;
-            case "hazard":         return BydEvent.LIGHTS_HAZARD;
-            case "drl":            return BydEvent.LIGHTS_DRL;
-            case "ac":             return BydEvent.AC;
-            case "slw":            return BydEvent.SLW;
-            case "wifiState":      return BydEvent.WIFI_STATE;
-            case "btState":        return BydEvent.BT_STATE;
-            case "emergencyAlarm": return BydEvent.EMERGENCY_ALARM;
-            default:               return null; // incl. EVENT_TURN_ANY (combined)
-        }
+        if (id == null || EVENT_TURN_ANY.equals(id.trim())) return null;
+        return AutomationCondition.resolveSignalAddress(id);
     }
 
     /**
@@ -123,8 +117,11 @@ public class WaitUntilStateAction extends BaseAction {
                 return;
             }
             if (System.currentTimeMillis() >= deadline) {
+                // Same contract as WaitUntilAction: an unmet wait is a failed precondition, so
+                // the rest of the chain is skipped rather than running as if the state arrived.
                 logger.info("WaitUntilStateAction: timed out after " + timeoutS + "s waiting for "
-                        + eventId + " = " + target);
+                        + eventId + " = " + target + " — stopping the remaining actions");
+                Automations.abortChain();
                 return;
             }
             try {
@@ -151,9 +148,16 @@ public class WaitUntilStateAction extends BaseAction {
         }
         EventData event = resolveEvent(eventId);
         if (event == null) return false;
-        Value current = Automations.getStateValue(event);
-        if (current == null) return false;
-        return Boolean.TRUE.equals(current.compare(target, "eq"));
+        // Compare through the shared condition engine rather than current.compare(target,"eq")
+        // directly. The awaited state is a STRING, but this action's LHS is the whole condition
+        // catalog (SignalAddressType), so it can name a NUMERIC signal (speed, battery, window
+        // percent). Handing a String to an IntValue throws ClassCastException inside
+        // BaseValue.compare, which swallows it and returns null → "not met" on every poll → the
+        // wait could NEVER be satisfied and always burned its full timeout (up to MAX_TIMEOUT_S
+        // with the worker parked). AutomationCondition.evaluate applies coerceConstantForLhs, so
+        // "0" against a numeric signal now compares numerically. A string/enum LHS keeps the
+        // identical equalsIgnoreCase eq path, so on/off waits behave exactly as before.
+        return AutomationCondition.evaluate(event, "eq", target);
     }
 
     /** True iff the event's current state reads "on". Unknown (null) → false. */
@@ -162,9 +166,12 @@ public class WaitUntilStateAction extends BaseAction {
         return v != null && Boolean.TRUE.equals(v.compare("on", "eq"));
     }
 
+    /** As {@link WaitUntilAction#clampTimeout}: 0 (or negative) = the {@link #MAX_TIMEOUT_S}
+     *  ceiling, never an unbounded wait — the single queue worker runs every automation. */
     private static int clampTimeout(Integer t) {
         if (t == null) return DEFAULT_TIMEOUT_S;
-        return Math.max(1, Math.min(MAX_TIMEOUT_S, t));
+        if (t <= 0) return MAX_TIMEOUT_S;
+        return Math.min(MAX_TIMEOUT_S, t);
     }
 
     private static String str(Object o) { return o == null ? null : o.toString(); }

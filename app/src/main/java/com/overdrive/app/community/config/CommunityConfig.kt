@@ -50,6 +50,10 @@ object CommunityConfig {
     private const val K_WORKER_URL = "workerUrl"     // user-configurable community-edge URL
     private const val K_AUTHOR_NAME = "authorName"   // remembered display name for publishing
     private const val K_PUBLISHER_ID = "publisherId" // STABLE per-install id — the ownership key
+    private const val K_PUBLISHED = "publishedIds"   // {localAutomationId: communityRowId} — see publishedIds()
+
+    /** Shell daemon UID — the only process that writes config LOCALLY (others IPC to it). */
+    private const val SHELL_DAEMON_UID = 2000
 
     /** Immutable snapshot of the section — read once per use. */
     data class Snapshot(
@@ -112,6 +116,87 @@ object CommunityConfig {
         } catch (_: Throwable) { /* if persist fails we'll re-seed next call; harmless */ }
         return seed
     }
+
+    /**
+     * The LOCAL→REMOTE publish map: `{localAutomationId: communityRowId}`.
+     *
+     * Publishing is a CREATE on the backend (POST mints a new row id), so without this
+     * map a re-publish of an automation the user already shared would insert a SECOND
+     * catalog row — the "edit my automation, get a duplicate community entry" bug. We
+     * remember which community row each local automation owns at publish time, and the
+     * publish route promotes a re-publish of a mapped automation into an in-place
+     * update (PUT) of that row, which the Worker gates on the publisher id and which
+     * preserves the row's ratings / downloads / id.
+     *
+     * Keyed by the LOCAL automation id, which is stable across an edit (the automations
+     * API PUTs the same id; only create mints a UUID), so the association survives the
+     * edit that triggers the re-publish.
+     *
+     * Lives in the same UCM section as the rest of community config, so it is written
+     * atomically through the same daemon-routed path and shared across UIDs.
+     */
+    fun publishedIds(forceReload: Boolean = false): JSONObject {
+        val root = if (forceReload) UnifiedConfigManager.forceReload()
+        else UnifiedConfigManager.loadConfig()
+        return root.optJSONObject(SECTION)?.optJSONObject(K_PUBLISHED) ?: JSONObject()
+    }
+
+    /** The community row [localId] was published as, or null if it was never published. */
+    fun publishedRowId(localId: String?): String? {
+        if (localId.isNullOrBlank()) return null
+        return publishedIds(forceReload = true).optString(localId, "").ifEmpty { null }
+    }
+
+    /**
+     * Remember (or forget, when [rowId] is null) that local automation [localId] is
+     * published as community row [rowId]. Merge-writes the whole map because
+     * [UnifiedConfigManager.updateSection] merges at the SECTION level only — a nested
+     * object value is replaced wholesale, so we must read-modify-write it here.
+     */
+    fun setPublishedRowId(localId: String, rowId: String?): Boolean {
+        if (localId.isBlank()) return false
+        return underConfigLockIfLocalWriter {
+            val map = publishedIds(forceReload = true)
+            if (rowId.isNullOrBlank()) map.remove(localId) else map.put(localId, rowId)
+            UnifiedConfigManager.updateSection(SECTION, JSONObject().put(K_PUBLISHED, map))
+        }
+    }
+
+    /** Drop every mapping pointing at community row [rowId] (it was deleted/unpublished). */
+    fun forgetPublishedRow(rowId: String): Boolean {
+        if (rowId.isBlank()) return false
+        return underConfigLockIfLocalWriter {
+            val map = publishedIds(forceReload = true)
+            val stale = map.keys().asSequence().filter { map.optString(it, "") == rowId }.toList()
+            if (stale.isEmpty()) true
+            else UnifiedConfigManager.updateSection(SECTION, JSONObject().put(K_PUBLISHED, map))
+        }
+    }
+
+    /**
+     * Run a read-modify-write of the nested publish map as ONE critical section.
+     *
+     * <p>Why a critical section: [UnifiedConfigManager.updateSection] merges at the SECTION
+     * level, so a nested object value is replaced wholesale. Two concurrent publishes of
+     * DIFFERENT automations would each read the old map and the later write would drop the
+     * earlier's mapping — that automation then duplicates on its next re-publish. The HTTP
+     * server dispatches on a 32-thread pool, so this is reachable, not theoretical.
+     *
+     * <p>Why the UID gate: the config lock is a BLOCKING cross-process OS file lock, and in a
+     * non-daemon process `updateSection` reroutes the write to the daemon over IPC. Holding the
+     * lock here and then waiting on a daemon that must acquire the same lock to serve us would
+     * deadlock until the IPC read timeout. Only the shell daemon (which writes locally) may
+     * take it; anywhere else we do the unlocked read-modify-write, which is exactly the
+     * pre-existing behaviour and at worst loses a dedupe hint. This handler currently runs
+     * only in the daemon (HttpServer lives in CameraDaemon), so the locked path is the live
+     * one — the gate exists so reaching it from the app process degrades instead of hanging.
+     */
+    private fun underConfigLockIfLocalWriter(body: () -> Boolean): Boolean =
+        if (android.os.Process.myUid() == SHELL_DAEMON_UID) {
+            UnifiedConfigManager.runUnderConfigLock(body)
+        } else {
+            body()
+        }
 
     /** Persist the remembered author display name (so a user types it once). */
     fun setAuthorName(name: String): Boolean =

@@ -65,7 +65,19 @@ public final class UnifiedTelegramConfig {
     public static final String K_PAIR_PIN_EXPIRY  = "pairPinExpiry";
     public static final String K_VIDEO_UPLOADS    = "videoUploads";
     public static final String K_AUTO_START       = "autoStartAccOff";
+    // Cross-UID mirror of the app-side "Telegram daemon enabled" switch on the
+    // Daemons screen. PreferencesManager lives in app-private storage (UID
+    // 10xxx) which the shell-UID (2000) AccSentryDaemon cannot read, so the
+    // ACC-off auto-start had no way to see that the user had enabled the bot.
+    // Distinct from K_AUTO_START: that one means "parked-only" (start on
+    // ACC-off, stop again on ACC-on), whereas this means "keep it running".
+    public static final String K_DAEMON_ENABLED   = "daemonEnabled";
     public static final String K_CRITICAL_ALERTS  = "criticalAlerts";
+    // Dedicated tyre-pressure/leak toggle, mirroring the per-category control
+    // Web Push already has. Previously tyre alerts could only be silenced by
+    // turning off criticalAlerts, which also killed charging faults, proximity
+    // and battery-health alerts.
+    public static final String K_TYRE_ALERTS      = "tyreAlerts";
     public static final String K_CONNECTIVITY     = "connectivity";
     public static final String K_MOTION_TEXT      = "motionText";
     // Per-severity tier toggles. Sit alongside the category toggles above so
@@ -218,8 +230,36 @@ public final class UnifiedTelegramConfig {
         return load().optBoolean(K_AUTO_START, false);
     }
 
+    /**
+     * Cross-UID mirror of the Daemons-screen enable switch. Read by
+     * AccSentryDaemon (shell UID 2000) which cannot see the app's private
+     * SharedPreferences. Defaults false so a never-toggled install behaves
+     * exactly as before.
+     */
+    public static boolean isDaemonEnabled() {
+        return load().optBoolean(K_DAEMON_ENABLED, false);
+    }
+
+    /**
+     * True when the bot should be (re)started on the ACC-off edge — either the
+     * parked-only auto-start toggle or the always-on Daemons-screen switch.
+     */
+    public static boolean shouldStartOnAccOff() {
+        JSONObject c = load();
+        return c.optBoolean(K_AUTO_START, false) || c.optBoolean(K_DAEMON_ENABLED, false);
+    }
+
     public static boolean isCriticalAlerts() {
         return load().optBoolean(K_CRITICAL_ALERTS, true);
+    }
+
+    /**
+     * Tyre pressure / air-leak Telegram alerts. Default ON to match the
+     * pre-existing behaviour (they used to ride criticalAlerts, itself default
+     * ON), so nobody silently loses tyre alerts on upgrade.
+     */
+    public static boolean isTyreAlerts() {
+        return load().optBoolean(K_TYRE_ALERTS, true);
     }
 
     public static boolean isConnectivity() {

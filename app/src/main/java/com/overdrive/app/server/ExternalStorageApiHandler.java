@@ -25,7 +25,20 @@ import java.util.Map;
  * - POST /api/storage/external/refresh  - Refresh SD card detection
  */
 public class ExternalStorageApiHandler {
-    
+
+    /** Throttle for the auto-refresh in getExternalStorageStatus. Mirrors the
+     *  same guard on /api/settings/storage (QualitySettingsApiHandler's
+     *  AUTO_REFRESH_MIN_INTERVAL_MS) — without it, any install WITHOUT an SD
+     *  card satisfies {@code !isSdCardAvailable()} forever, so every poll of
+     *  this endpoint (the settings pages hit it every 10s) forked
+     *  `sm list-volumes`, parsed /proc/mounts and walked two sysfs trees while
+     *  holding StorageManager's mountLock — stalling storage-type changes and
+     *  the mount path. 30s is well below the time scale of a physical
+     *  insert/remove, and POST /api/storage/external/refresh still forces an
+     *  immediate uncached rescan. */
+    private static volatile long lastAutoRefreshMs = 0L;
+    private static final long AUTO_REFRESH_MIN_INTERVAL_MS = 30_000L;
+
     /**
      * Handle external storage API requests.
      * 
@@ -86,8 +99,12 @@ public class ExternalStorageApiHandler {
         StorageManager storage = StorageManager.getInstance();
         
         // SOTA: Refresh SD card detection if not currently available
-        // This handles the case where SD card was inserted after app start
-        if (!cleaner.isSdCardAvailable()) {
+        // This handles the case where SD card was inserted after app start.
+        // Throttled — see AUTO_REFRESH_MIN_INTERVAL_MS.
+        long now = System.currentTimeMillis();
+        if (!cleaner.isSdCardAvailable()
+                && (now - lastAutoRefreshMs) > AUTO_REFRESH_MIN_INTERVAL_MS) {
+            lastAutoRefreshMs = now;
             cleaner.refresh();
             storage.refreshSdCard();
         }
@@ -324,7 +341,11 @@ public class ExternalStorageApiHandler {
     private static void refreshPaths(OutputStream out) throws Exception {
         ExternalStorageCleaner cleaner = ExternalStorageCleaner.getInstance();
         cleaner.refresh();
-        
+        // Explicit user-driven rescan — bypasses and re-arms the auto-refresh
+        // throttle so this always does real work, and so the next GET doesn't
+        // immediately repeat the discovery we just performed.
+        lastAutoRefreshMs = System.currentTimeMillis();
+
         JSONObject response = new JSONObject();
         response.put("success", true);
         response.put("sdCardAvailable", cleaner.isSdCardAvailable());

@@ -2,41 +2,26 @@ package com.overdrive.app.byd.routing;
 
 import static org.junit.Assert.assertEquals;
 
+import com.overdrive.app.byd.routing.VehicleCommandRouter.AdasEmergencyBrakingCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.AdasEspCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.AdasItacCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.AdasLaneAssistCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.AdasSpeedLimitWarningCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.AmbientColourCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.BatteryHeatCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.BrakeFeelCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.CarSettingCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.ChargeCapPercentCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.ChargeCapToggleCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.ChargeScheduleCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.ChildLockCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.ClimateOffCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.ClimateOnCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.ClimateSetFanCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.ClimateSetTempCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.CloseAllWindowsCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.CommandResult;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.EnergyFeedbackCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.EnergyModeCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.FindCarCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.FlashLightsCommand;
+import com.overdrive.app.byd.routing.VehicleCommandRouter.FrontDefrostCommand;
+import com.overdrive.app.byd.routing.VehicleCommandRouter.HazardCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.LightsCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.LockCommand;
+import com.overdrive.app.byd.routing.VehicleCommandRouter.MirrorFoldCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.OperationModeCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.Outcome;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.Path;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.SeatHeatCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.SeatMemoryCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.SeatVentCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.SettingChildPresenceDetectionCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.SmartChargingToggleCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.SteerAssistCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.SunroofCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.SunshadeCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.TrunkCloseCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.TrunkOpenCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.TrunkOpenSdkCommand;
@@ -44,88 +29,80 @@ import com.overdrive.app.byd.routing.VehicleCommandRouter.TrunkStopCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.UnlockCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.VehicleCommand.MotionSafety;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.WindowMoveCommand;
-import com.overdrive.app.byd.routing.VehicleCommandRouter.WirelessChargingCommand;
 
 import org.junit.Test;
 
 /**
- * Regression guard against tier misclassification: every VehicleCommand subclass
- * must report the risk tier decided in the driving-safety-gate plan. A command
- * silently landing in the wrong tier (e.g. AdasEspCommand becoming UNRESTRICTED)
- * would defeat the whole gate without any other test catching it.
+ * Locks in the motion-safety policy: the gate blocks ONLY a small, explicit
+ * blocklist of physical body actuators — door lock/unlock and the trunk/tailgate.
+ * Everything else (climate, defrost, hazards, ADAS toggles, drive-feel, lighting,
+ * seats, charging, screen/media) is UNRESTRICTED and works while the car moves.
+ *
+ * <p>The default is UNRESTRICTED, so these tests guard two regressions:
+ * (1) one of the 5 body commands silently losing its BLOCK_WHILE_MOVING override
+ * (gate stops protecting), and (2) some unrelated command gaining a block (the
+ * over-broad gating we deliberately reverted). The base-default assertion pins
+ * that a brand-new command ships UNRESTRICTED.
  */
 public class VehicleCommandMotionSafetyTest {
 
-    // ── BLOCK_WHILE_MOVING: safety/physical-actuation/ADAS/drive-feel ──────
+    // ── BLOCK_WHILE_MOVING: the entire blocklist — 5 body actuators ────────
 
     @Test public void lockIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new LockCommand().motionSafety()); }
     @Test public void unlockIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new UnlockCommand().motionSafety()); }
-    @Test public void findCarIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new FindCarCommand().motionSafety()); }
-    @Test public void flashLightsIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new FlashLightsCommand().motionSafety()); }
     @Test public void trunkOpenIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new TrunkOpenCommand().motionSafety()); }
     @Test public void trunkOpenSdkIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new TrunkOpenSdkCommand().motionSafety()); }
     @Test public void trunkCloseIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new TrunkCloseCommand().motionSafety()); }
-    @Test public void adasEspIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new AdasEspCommand(false).motionSafety()); }
-    @Test public void adasItacIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new AdasItacCommand(false).motionSafety()); }
-    @Test public void adasLaneAssistIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new AdasLaneAssistCommand(0).motionSafety()); }
-    @Test public void adasSpeedLimitWarningIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new AdasSpeedLimitWarningCommand(false).motionSafety()); }
-    @Test public void drlLightsIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new LightsCommand(false).motionSafety()); }
-    @Test public void energyFeedbackIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new EnergyFeedbackCommand(1).motionSafety()); }
-    @Test public void brakeFeelIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new BrakeFeelCommand(1).motionSafety()); }
-    @Test public void operationModeIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new OperationModeCommand(1).motionSafety()); }
-    @Test public void energyModeIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new EnergyModeCommand(1).motionSafety()); }
-    @Test public void steerAssistIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new SteerAssistCommand(1).motionSafety()); }
 
-    @Test public void seatMemoryRecallIsBlocked() {
-        assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new SeatMemoryCommand(1, false).motionSafety());
-    }
+    // ── UNRESTRICTED: everything else. A representative spread, weighted ────
+    //    toward commands that were blocked in the earlier, broader design. ──
 
-    @Test public void carSettingEspAssistIsBlocked() {
-        assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new CarSettingCommand("esp_assist", 0).motionSafety());
-    }
-    @Test public void carSettingAebIsBlocked() {
-        assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new CarSettingCommand("aeb", 0).motionSafety());
-    }
-    @Test public void carSettingLaneKeepingIsBlocked() {
-        assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new CarSettingCommand("lane_keeping", 0).motionSafety());
-    }
-    @Test public void carSettingUnrecognizedKeyDefaultsToBlocked() {
-        assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new CarSettingCommand("some_future_key", 0).motionSafety());
-    }
+    // TrunkStop is an abort — must never be blocked, even though it's trunk-related.
+    @Test public void trunkStopIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new TrunkStopCommand().motionSafety()); }
 
-    // ── UNRESTRICTED: comfort/preference, no acute driving-safety impact ───
+    // Horn/lights locate commands — no longer gated.
+    @Test public void findCarIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new FindCarCommand().motionSafety()); }
+    @Test public void flashLightsIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new FlashLightsCommand().motionSafety()); }
 
+    // Mirror fold — unrestricted per the doors/trunk-only scope.
+    @Test public void mirrorFoldIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new MirrorFoldCommand(true).motionSafety()); }
+
+    // ADAS toggles — including safety systems — are NOT motion-gated.
+    @Test public void adasEspIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new AdasEspCommand(false).motionSafety()); }
+    @Test public void adasLaneAssistIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new AdasLaneAssistCommand(0).motionSafety()); }
+    @Test public void adasAebIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new AdasEmergencyBrakingCommand(false).motionSafety()); }
+
+    // Exterior DRL — unrestricted.
+    @Test public void drlLightsIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new LightsCommand(false).motionSafety()); }
+
+    // Drive-dynamics / drive-feel — unrestricted.
+    @Test public void operationModeIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new OperationModeCommand(1).motionSafety()); }
+    @Test public void energyFeedbackIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new EnergyFeedbackCommand(1).motionSafety()); }
+    @Test public void steerAssistIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SteerAssistCommand(1).motionSafety()); }
+    @Test public void brakeFeelIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new BrakeFeelCommand(1).motionSafety()); }
+
+    // Comfort / safety-visibility.
+    @Test public void hazardIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new HazardCommand(true).motionSafety()); }
+    @Test public void frontDefrostIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new FrontDefrostCommand(true).motionSafety()); }
     @Test public void climateOnIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new ClimateOnCommand(22).motionSafety()); }
-    @Test public void climateOffIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new ClimateOffCommand().motionSafety()); }
-    @Test public void climateSetTempIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new ClimateSetTempCommand(1, 22).motionSafety()); }
-    @Test public void climateSetFanIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new ClimateSetFanCommand(3).motionSafety()); }
-    @Test public void seatHeatIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SeatHeatCommand(1, 1, 0, 0, 0, 0).motionSafety()); }
-    @Test public void seatVentIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SeatVentCommand(1, 1, 0, 0, 0, 0).motionSafety()); }
-    @Test public void ambientColourIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new AmbientColourCommand(1).motionSafety()); }
-    @Test public void wirelessChargingIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new WirelessChargingCommand(true).motionSafety()); }
-    @Test public void batteryHeatIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new BatteryHeatCommand(true).motionSafety()); }
-    @Test public void chargeScheduleIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new ChargeScheduleCommand("00:00", "06:00", "s", true).motionSafety()); }
-    @Test public void chargeCapPercentIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new ChargeCapPercentCommand(80).motionSafety()); }
-    @Test public void chargeCapToggleIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new ChargeCapToggleCommand(true).motionSafety()); }
-    @Test public void smartChargingToggleIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SmartChargingToggleCommand(true).motionSafety()); }
-    @Test public void childPresenceDetectionIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SettingChildPresenceDetectionCommand(1).motionSafety()); }
-    @Test public void childLockIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new ChildLockCommand(true).motionSafety()); }
     @Test public void windowMoveIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new WindowMoveCommand(1, 1, null).motionSafety()); }
-    @Test public void closeAllWindowsIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new CloseAllWindowsCommand().motionSafety()); }
-    @Test public void sunroofIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SunroofCommand(1).motionSafety()); }
-    @Test public void sunshadeIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SunshadeCommand(1).motionSafety()); }
 
-    @Test public void trunkStopIsNeverBlocked() {
-        // Abort/stop action — must always be able to halt an in-progress motor movement.
-        assertEquals(MotionSafety.UNRESTRICTED, new TrunkStopCommand().motionSafety());
-    }
+    // Seat memory recall no longer gated (it moved the seat under the old design).
+    @Test public void seatMemoryRecallIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SeatMemoryCommand(1, false).motionSafety()); }
 
-    @Test public void seatMemorySaveIsUnrestricted() {
-        assertEquals(MotionSafety.UNRESTRICTED, new SeatMemoryCommand(1, true).motionSafety());
-    }
+    // The generic CarSetting writer is no longer gated for any key — including the
+    // former safety-key allowlist (esp/aeb/lane) — matching the doors/trunk-only scope.
+    @Test public void carSettingEspAssistIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new CarSettingCommand("esp_assist", 0).motionSafety()); }
+    @Test public void carSettingAebIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new CarSettingCommand("aeb", 0).motionSafety()); }
+    @Test public void carSettingArbitraryKeyIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new CarSettingCommand("some_future_key", 0).motionSafety()); }
 
-    @Test public void carSettingChargeLimitIsUnrestricted() {
-        assertEquals(MotionSafety.UNRESTRICTED, new CarSettingCommand("charge_limit", 80).motionSafety());
+    // ── Base default: a brand-new command ships UNRESTRICTED ───────────────
+
+    @Test public void unknownCommandDefaultsToUnrestricted() {
+        VehicleCommandRouter.VehicleCommand custom = new VehicleCommandRouter.VehicleCommand() {
+            public String name() { return "test-custom"; }
+        };
+        assertEquals(MotionSafety.UNRESTRICTED, custom.motionSafety());
     }
 
     // ── CommandResult.blocked() factory contract ────────────────────────

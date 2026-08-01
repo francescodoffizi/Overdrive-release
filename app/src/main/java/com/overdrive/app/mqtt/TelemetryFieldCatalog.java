@@ -177,6 +177,10 @@ public final class TelemetryFieldCatalog {
         add("light_hazard",    "Hazards",    BINARY, "light", null, null, "mdi:car-light-alert",  true, 0);
         add("light_drl",       "Daytime Running Lights", BINARY, "light", null, null, "mdi:car-light-dimmed", true, 0);
         add("ambient_colour",  "Ambient Lights Colour",  SENSOR, null,   MEAS, null, "mdi:format-color-fill", true, 0);
+        // Ambient main-switch state (1=on/0=off). Published only when the vehicle reports it —
+        // see MqttConnectionManager — so this stays unavailable on a trim that cannot read it
+        // rather than reporting a false "off". The controllable twin is the ambient_power switch.
+        add("ambient_enabled", "Ambient Lights State",   BINARY, "light", null, null, "mdi:track-light", true, 0);
         add("light_left_turn", "Left Turn Signal",  SENSOR, "enum", null, null, "mdi:arrow-left-bold", true, 0);
         add("light_right_turn","Right Turn Signal", SENSOR, "enum", null, null, "mdi:arrow-right-bold", true, 0);
 

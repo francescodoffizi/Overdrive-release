@@ -3,11 +3,11 @@ package com.overdrive.app.automation.action;
 import com.overdrive.app.automation.AutomationAction;
 import com.overdrive.app.automation.AutomationCondition;
 import com.overdrive.app.automation.Automations;
-import com.overdrive.app.automation.condition.BydEvent;
 import com.overdrive.app.automation.condition.EventData;
 import com.overdrive.app.automation.type.DynamicIntType;
 import com.overdrive.app.automation.type.EnumType;
 import com.overdrive.app.automation.type.IntType;
+import com.overdrive.app.automation.type.SignalAddressType;
 import com.overdrive.app.automation.type.Type;
 import com.overdrive.app.automation.value.IntValue;
 import com.overdrive.app.automation.value.Label;
@@ -59,21 +59,18 @@ public class WaitUntilAction extends BaseAction {
         // reuse the IntValue comparators + a 0..1000 int (wide enough for range/temp/
         // speed/percent; signed steering handled by allowing negatives via min).
         this.variables = List.of(
-                new EnumType(new Label("event", "automation.wait_signal"),
-                        new Label("speedKmph", "automation.speed"),
-                        new Label("speedMph", "automation.speed_mph_opt"),
-                        new Label("accelerator", "automation.accelerator"),
-                        new Label("brake", "automation.brake"),
-                        new Label("steeringAngle", "automation.steering_angle"),
-                        new Label("batteryLevel", "automation.battery_level"),
-                        new Label("estimatedRange", "automation.estimated_range"),
-                        new Label("temperature", "automation.temperature"),
-                        new Label("outsideTemp", "automation.outside_temperature")),
+                // LHS = an ADDRESS into the shared condition catalog (all ~58 conditions,
+                // attributed ones included) instead of a hardcoded signal list. Legacy stored
+                // ids still resolve — see AutomationCondition.resolveSignalAddress.
+                new SignalAddressType(new Label("event", "automation.wait_signal")),
                 // Reuse the shared IntValue comparator set (eq/neq/gt/lt/gte/lte).
                 cloneComparators(),
                 // RHS: a constant OR a dynamic ${var:…}/${signal:…} token (resolved live).
                 new DynamicIntType(new Label("value", "automation.value"), -540, 1000),
-                new IntType(new Label("timeout", "automation.wait_timeout"), 1, MAX_TIMEOUT_S));
+                // min 0, not 1: 0 means "wait the full ceiling" (see clampTimeout). A 1s
+                // timeout is almost always a mistake — the chain continues either way, so a
+                // too-short wait silently behaves as if the wait weren't there.
+                new IntType(new Label("timeout", "automation.wait_timeout"), 0, MAX_TIMEOUT_S));
     }
 
     /** A comparator picker backed by the same enum IntValue exposes to conditions. */
@@ -93,20 +90,15 @@ public class WaitUntilAction extends BaseAction {
      * Map the picker's event id to the published {@link EventData}. Returns null for
      * an unknown id (defensive — a hand-edited config), which makes trigger() a no-op.
      */
+    /**
+     * Resolve the stored LHS address to the state key it names. Delegates to
+     * {@link AutomationCondition#resolveSignalAddress}, the single home of the address
+     * grammar (shared with the condition RHS), so this action covers the whole condition
+     * catalog — attributed signals included — with no local mapping table, and the
+     * pre-catalog ids saved automations still hold resolve to the same signals as before.
+     */
     private static EventData resolveEvent(String id) {
-        if (id == null) return null;
-        switch (id) {
-            case "speedKmph":      return BydEvent.SPEED_KMPH;
-            case "speedMph":       return BydEvent.SPEED_MPH;
-            case "accelerator":    return BydEvent.ACCELERATOR;
-            case "brake":          return BydEvent.BRAKE;
-            case "steeringAngle":  return BydEvent.STEERING_ANGLE;
-            case "batteryLevel":   return BydEvent.BATTERY_LEVEL;
-            case "estimatedRange": return BydEvent.ESTIMATED_RANGE;
-            case "temperature":    return BydEvent.TEMPERATURE;
-            case "outsideTemp":    return BydEvent.OUTSIDE_TEMPERATURE;
-            default:               return null;
-        }
+        return AutomationCondition.resolveSignalAddress(id);
     }
 
     /**
@@ -137,8 +129,14 @@ public class WaitUntilAction extends BaseAction {
                 return;
             }
             if (System.currentTimeMillis() >= deadline) {
+                // The condition never became true, so the precondition this wait guards was
+                // NOT satisfied — stop the chain instead of letting every following action run
+                // as if the wait had succeeded (which made a too-short timeout look like the
+                // wait was ignored entirely).
                 logger.info("WaitUntilAction: timed out after " + timeoutS + "s waiting for "
-                        + event.getType() + " " + comparator + " " + target);
+                        + event.getType() + " " + comparator + " " + target
+                        + " — stopping the remaining actions");
+                Automations.abortChain();
                 return;
             }
             try {
@@ -151,9 +149,17 @@ public class WaitUntilAction extends BaseAction {
         }
     }
 
+    /**
+     * Seconds to wait. {@code 0} (or a negative, from a hand-edited config) means "as long as
+     * allowed" and yields the {@link #MAX_TIMEOUT_S} ceiling rather than an unbounded wait:
+     * every automation's actions run on the SINGLE queue worker, so a genuinely infinite wait
+     * would park that thread and stall every other automation indefinitely. The ceiling is the
+     * honest maximum, and the timeout log says the condition was never met.
+     */
     private static int clampTimeout(Integer t) {
         if (t == null) return DEFAULT_TIMEOUT_S;
-        return Math.max(1, Math.min(MAX_TIMEOUT_S, t));
+        if (t <= 0) return MAX_TIMEOUT_S;
+        return Math.min(MAX_TIMEOUT_S, t);
     }
 
     private static String str(Object o) { return o == null ? null : o.toString(); }

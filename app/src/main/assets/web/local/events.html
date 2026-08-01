@@ -12,7 +12,7 @@
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
     <script src="../shared/app-shell.js?v=2"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <style>
@@ -1617,6 +1617,12 @@
             justify-content: center;
             padding: 40px;
         }
+
+        /* Index-warming banner (built by events.js _showWarmingBanner). Reuses
+           .loading + .spinner but left-aligned and compact. */
+        .warming-banner { padding: 16px 12px; justify-content: flex-start; }
+        .warming-banner .spinner { width: 18px; height: 18px; border-width: 2px; flex: none; margin-right: 12px; }
+        .warming-banner-text { font-size: 13px; color: var(--text-secondary); }
         
         .spinner {
             width: 32px;
@@ -2295,7 +2301,7 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
     <script src="../shared/events.js?v=storagefilter1"></script>
     <script>

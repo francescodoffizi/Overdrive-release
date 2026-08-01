@@ -116,6 +116,27 @@ public final class BatteryVoltageMonitorV2 {
         }
     }
 
+    /**
+     * True when the user has selected DiLink 4 (byd_apa) camera mode.
+     *
+     * <p>Reads the config directly rather than calling into {@code AccSentryDaemon}
+     * — this monitor must work in whichever process boots it, exactly as
+     * {@link #isKeepUsbPowerOnAccOff()} above already does. Mirrors
+     * {@code AccSentryDaemon.isDilink4CameraMode()}: same section, same key, same
+     * fail-closed default so a read glitch can never suppress MCU sleep on the
+     * legacy fleet (which would silently change their battery behaviour).
+     */
+    private static boolean isDilink4CameraMode() {
+        try {
+            org.json.JSONObject c = com.overdrive.app.config.UnifiedConfigManager.loadConfig()
+                    .optJSONObject("camera");
+            if (c == null) return false;
+            return "dilink4".equalsIgnoreCase(c.optString("cameraMode", "default"));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     public static synchronized void startMonitor(Context context) {
         // GATE (defense-in-depth): in "Vehicle ON only" mode this voltage-driven
         // MCU sleep/wake monitor — a purely post-vehicle-OFF battery-management loop
@@ -229,6 +250,26 @@ public final class BatteryVoltageMonitorV2 {
     }
 
     private static void scheduleDeferredMcuSleep() {
+        // DiLink 4 gate. The reference app's DEFAULT flameout mode is 0 → V1
+        // (kh/a.c() switching on vj/a.m(), which defaults the
+        // key.flameout.wakeup.mode preference to 0), and V1 (kh/b) has NO sleep
+        // path at all — its entire ACC-off behaviour is one unconditional
+        // "-1442840502 = 1" hold. We ported V2 (kh/d) instead and wired it up as
+        // if it were the shipping default, so on byd_apa we would, after 15 min of
+        // healthy 12 V, request an MCU sleep that collapses the very AVM/ISP rail
+        // the pano cameras feed from — black-framing surveillance for the rest of
+        // the park, which is exactly the reported symptom.
+        //
+        // Suppress the healthy-battery sleep on dilink4 to match V1. The battery
+        // floor is unaffected: the low-voltage forceWake() recovery and
+        // SocCutoffMonitor (<=10% SoC self-shutdown) still run. Every other
+        // variant keeps the full V2 hysteresis model byte-for-byte.
+        if (isDilink4CameraMode()) {
+            if (handler != null) handler.removeMessages(MSG_DEFERRED_MCU_SLEEP);
+            logger.info("scheduleDeferredMcuSleep: SUPPRESSED — dilink4 mirrors reference-app "
+                    + "V1 (no MCU sleep; AVM/ISP rail must stay held for pano cameras)");
+            return;
+        }
         // Keep-USB-powered gate. When the user opted to keep USB powered while
         // parked, we never schedule the healthy-battery MCU sleep — that sleep
         // would drop the USB/SD rail. The low-voltage forceWake() path and the
@@ -263,6 +304,15 @@ public final class BatteryVoltageMonitorV2 {
 
     private static void doMcuSleep() {
         if (!running) return;
+        // Belt-and-suspenders to the dilink4 gate in scheduleDeferredMcuSleep: a
+        // sleep message queued before that gate was evaluated must ALSO be refused
+        // at execution time, or the AVM/ISP rail still collapses mid-park. Same
+        // execution-time-honouring pattern as the keep-USB check below.
+        if (isDilink4CameraMode()) {
+            logger.info("doMcuSleep: SKIPPED — dilink4 never sleeps the MCU "
+                    + "(queued sleep cancelled at execution)");
+            return;
+        }
         // Belt-and-suspenders to scheduleDeferredMcuSleep's gate: if a sleep
         // message was already queued before the toggle was evaluated (e.g. a
         // tick that fired in the 35s window before this monitor started), do

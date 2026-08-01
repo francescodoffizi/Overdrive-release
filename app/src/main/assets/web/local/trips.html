@@ -28,7 +28,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="../shared/leaflet.css" />
@@ -1464,6 +1464,8 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 17h2v-7l4 4 4-4 4 4 4-4v7h2"/><path d="M4 5h16"/></svg>
                         <div class="empty-title" data-i18n="trip.no_trips_yet">No trips recorded yet</div>
                         <div class="empty-text" data-i18n="trip.no_trips_hint">Enable trip analytics and start driving to see your trips here</div>
+                        <!-- Shown by _applyEnabledHint() only while trips are OFF. -->
+                        <button class="btn btn-primary" id="tripEnableFromEmpty" style="display:none;margin-top:16px;" onclick="TRIPS.enableFromEmptyState()" data-i18n="trip.enable_now">Turn on trip recording</button>
                     </div>
 
                     <button class="load-more-btn" data-tab="trips" id="loadMoreBtn" style="display:none;" onclick="TRIPS.loadMore()" data-i18n="trip.load_more">Load More Trips</button>
@@ -1574,6 +1576,15 @@
                                     </select>
                                     <input type="number" id="rateInput" placeholder="0.00" step="0.01" min="0" onchange="TRIPS.showApplyNeeded()" style="width:80px;padding:8px 10px;background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;">
                                     <span style="font-size:11px;color:var(--text-muted);">/kWh</span>
+                                </div>
+                            </div>
+                            <!-- Which rate actually priced recent trips. The inner span
+                                 carries NO data-i18n on purpose: applyRateSourceNote()
+                                 composes a concrete rate string that the i18n hydrate
+                                 pass would otherwise overwrite. -->
+                            <div class="setting-row" id="tripRateSourceNote" style="display:none;">
+                                <div class="setting-info">
+                                    <div class="setting-desc"><span id="tripRateSourceText"></span></div>
                                 </div>
                             </div>
                             <!-- Fuel settings (PHEV only — TRIPS.applyPhevVisibility toggles #phevTankRow + #phevFuelPriceRow) -->
@@ -2049,9 +2060,9 @@
     <script src="../shared/leaflet.js"></script>
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/trips.js?v=daterange1"></script>
+    <script src="../shared/trips.js?v=tripsfix2"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

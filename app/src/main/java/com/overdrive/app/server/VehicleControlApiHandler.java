@@ -4,7 +4,6 @@ import com.overdrive.app.byd.BydDataCollector;
 import com.overdrive.app.byd.BydVehicleData;
 import com.overdrive.app.byd.cloud.BydCloudConfig;
 import com.overdrive.app.byd.light.LightConstants;
-import com.overdrive.app.byd.routing.DrivingSafetyGuard;
 import com.overdrive.app.byd.routing.VehicleCommandRouter;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.CommandResult;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.VehicleCommand;
@@ -172,10 +171,10 @@ public class VehicleControlApiHandler {
             return true;
         }
 
-        // POST /api/vehicle/system — UI navigation + screenshot + move-app-to-display,
-        // all via daemon shell as UID 2000 (input keyevent / screencap / am start). On
-        // this API-29 device the a11y takeScreenshot()/GLOBAL_ACTION_TAKE_SCREENSHOT are
-        // unavailable (API 30+), so screencap is the reachable path.
+        // POST /api/vehicle/system — UI navigation + screenshot + move-app-to-display.
+        // Nav / move shell out as UID 2000 (input keyevent / am start); screenshot captures
+        // in-process by layer stack (the a11y takeScreenshot route is API 30+, and screencap's
+        // -d takes a PhysicalDisplayId that cannot address the cluster's virtual display).
         if (cleanPath.equals("/api/vehicle/system") && method.equals("POST")) {
             handleSystem(out, body);
             return true;
@@ -233,6 +232,22 @@ public class VehicleControlApiHandler {
             handleClusterStop(out);
             return true;
         }
+        // POST /api/vehicle/cluster-resize — { l,t,r,b } in CLUSTER px. Resize the LIVE cast
+        // app ON the cluster to those bounds (freeform). No-op unless the feature flag is on
+        // and a cast is active (then the app stays fullscreen). Distinct from cluster-mirror,
+        // which only moves the head-unit PREVIEW pane.
+        if (cleanPath.equals("/api/vehicle/cluster-resize") && method.equals("POST")) {
+            handleClusterResize(out, body);
+            return true;
+        }
+        // POST /api/vehicle/cluster-window — { package, l,t,r,b } as panel FRACTIONS (0..1).
+        // SAVES a per-app box without touching any live cast, so a cast started with no
+        // Projection screen in the loop (ACC-on auto-start, key mapping, automation) can still
+        // place the app at the user's chosen scale.
+        if (cleanPath.equals("/api/vehicle/cluster-window") && method.equals("POST")) {
+            handleClusterWindow(out, body);
+            return true;
+        }
         // POST /api/vehicle/cluster-mirror — { action: start|stop|rect, x,y,w,h }
         if (cleanPath.equals("/api/vehicle/cluster-mirror") && method.equals("POST")) {
             handleClusterMirror(out, body);
@@ -243,7 +258,8 @@ public class VehicleControlApiHandler {
             handleClusterMirrorStatus(out);
             return true;
         }
-        // POST /api/vehicle/cluster-touch — { type: tap|swipe, x,y[,x2,y2,ms] } normalized 0..1
+        // POST /api/vehicle/cluster-touch — { type: tap|swipe, sx,sy[,sx2,sy2,ms] } in
+        // mirror-SURFACE px (NOT normalized); the relay inverts them to cluster px.
         if (cleanPath.equals("/api/vehicle/cluster-touch") && method.equals("POST")) {
             handleClusterTouch(out, body);
             return true;
@@ -254,11 +270,32 @@ public class VehicleControlApiHandler {
 
     // ── Projection screen handlers ──────────────────────────────────────────────────
 
-    /** List launchable apps for the cast picker (reuses the shared AppLauncher enum). */
+    /**
+     * List launchable apps for the cast picker (reuses the shared AppLauncher enum), MINUS
+     * OverDrive itself.
+     *
+     * <p>OverDrive declares a LAUNCHER activity, so the shared enumeration includes our own
+     * package — but casting ourselves onto the cluster is never what the user wants and is
+     * actively hazardous: {@code com.overdrive.app} also owns the head-unit UI task AND the
+     * nav-map cluster task ({@code .navmap.RoadSenseClusterMapActivity}), so a self-cast makes
+     * "the cast app's task" ambiguous for the freeform resize path. That path is display-scoped
+     * and so resolves correctly regardless, but removing the entry eliminates the ambiguity at
+     * the source rather than relying on the downstream guard. Filtered HERE (not in
+     * {@code listLaunchableApps}) so the automation / key-mapping pickers, where launching our own
+     * UI is legitimate, keep their existing behaviour.
+     */
     private static void handleClusterApps(OutputStream out) throws Exception {
         JSONObject response = new JSONObject();
         try {
-            JSONArray apps = com.overdrive.app.launcher.AppLauncher.listLaunchableApps();
+            JSONArray all = com.overdrive.app.launcher.AppLauncher.listLaunchableApps();
+            String self = com.overdrive.app.BuildConfig.APPLICATION_ID;
+            JSONArray apps = new JSONArray();
+            for (int i = 0; i < all.length(); i++) {
+                JSONObject app = all.optJSONObject(i);
+                if (app == null) continue;
+                if (self.equals(app.optString("package", ""))) continue;
+                apps.put(app);
+            }
             response.put("success", true);
             response.put("apps", apps);
         } catch (Exception e) {
@@ -305,6 +342,54 @@ public class VehicleControlApiHandler {
             response.put("success", true);
         } catch (Exception e) {
             logger.warn("cluster-stop failed: " + e.getMessage());
+            response.put("success", false);
+            response.put("error", e.getMessage());
+        }
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    /** Resize the LIVE cast app ON the cluster to the given CLUSTER-px bounds (freeform).
+     *  Returns {@code applied=false} (not an error) when the feature is off or no cast is
+     *  active — the caller treats that as "app stays fullscreen".
+     *
+     *  <p>{@code commit} (default true) selects the apply strategy: true = gesture release /
+     *  preset / restore, running the full escalation ladder and VERIFYING that AMS honoured the
+     *  rect; false = a live drag frame, issuing a cheap bounds-only update so the window tracks
+     *  the finger without a stack rescan or a shell fallback. */
+    private static void handleClusterResize(OutputStream out, String body) throws Exception {
+        JSONObject response = new JSONObject();
+        try {
+            JSONObject req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
+            int l = req.optInt("l", 0), t = req.optInt("t", 0);
+            int r = req.optInt("r", 0), b = req.optInt("b", 0);
+            boolean commit = req.optBoolean("commit", true);
+            boolean applied = com.overdrive.app.launcher.ClusterCast.resize(l, t, r, b, commit);
+            response.put("success", true);
+            response.put("applied", applied);
+        } catch (Exception e) {
+            logger.warn("cluster-resize failed: " + e.getMessage());
+            response.put("success", false);
+            response.put("error", e.getMessage());
+        }
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    /** Persist a per-app cluster box (panel fractions 0..1) for later UI-less casts. Purely a
+     *  config write — it never resizes a live cast (that is {@code cluster-resize}), so the
+     *  Projection screen can call it while nothing is being cast. {@code saved=false} means the
+     *  rect was rejected as malformed or the write did not land. */
+    private static void handleClusterWindow(OutputStream out, String body) throws Exception {
+        JSONObject response = new JSONObject();
+        try {
+            JSONObject req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
+            String pkg = req.optString("package", "");
+            boolean saved = com.overdrive.app.launcher.ClusterCast.saveWindowFractions(
+                    pkg, req.optDouble("l", Double.NaN), req.optDouble("t", Double.NaN),
+                    req.optDouble("r", Double.NaN), req.optDouble("b", Double.NaN));
+            response.put("success", true);
+            response.put("saved", saved);
+        } catch (Exception e) {
+            logger.warn("cluster-window failed: " + e.getMessage());
             response.put("success", false);
             response.put("error", e.getMessage());
         }
@@ -358,19 +443,43 @@ public class VehicleControlApiHandler {
         HttpResponse.sendJson(out, response.toString());
     }
 
-    /** Current mirror mode (stopped/direct/still/no-projection/unsupported) + fission info. */
+    /** Cast state + real cluster panel size for the Projection screen. The mirror itself is
+     *  driven over the ClusterViewMirrorService Binder channel (a Surface can't ride HTTP),
+     *  so this endpoint only reports the cast flag + the panel aspect the UI locks its box to. */
     private static void handleClusterMirrorStatus(OutputStream out) throws Exception {
         JSONObject response = new JSONObject();
         try {
-            com.overdrive.app.surveillance.ClusterMirrorController ctl =
-                    com.overdrive.app.surveillance.ClusterMirrorController.getInstance();
             response.put("success", true);
-            response.put("mode", ctl.currentMode());
-            response.put("scaleMode", ctl.currentScaleMode());
-            response.put("fissionDisplayId", ctl.currentFissionDisplayId());
-            response.put("panelW", ctl.panelWidth());
-            response.put("panelH", ctl.panelHeight());
             response.put("casting", com.overdrive.app.launcher.ClusterCast.isActive());
+            // WHICH package is on the cluster. The UI needs this because the resize box acts on the
+            // CAST app, while the spinner reflects the user's next PICK — the two diverge as soon as
+            // the user browses the list during a live cast. Without it the UI would key its geometry
+            // (and its restore-on-select) to the spinner and reshape the cast app to another app's
+            // remembered rect. Empty string when nothing is cast.
+            String castPkg = com.overdrive.app.launcher.ClusterCast.getCastPackage();
+            response.put("castPackage", castPkg != null ? castPkg : "");
+            // Real cluster panel size: prefer the live view-mirror's resolved value, else
+            // resolve it directly (so the box aspect-locks correctly even before the first
+            // mirror attach).
+            int pw = 0, ph = 0;
+            try {
+                com.overdrive.app.surveillance.ClusterViewMirrorService vm =
+                        com.overdrive.app.surveillance.ClusterViewMirrorService.getInstance();
+                pw = vm.currentClusterW();
+                ph = vm.currentClusterH();
+            } catch (Throwable ignored) {}
+            if (pw <= 1 || ph <= 1) {
+                try {
+                    android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+                    if (ctx != null) {
+                        android.graphics.Point p =
+                                com.overdrive.app.surveillance.BsNativeLayer.clusterDisplaySize(ctx);
+                        pw = p.x; ph = p.y;
+                    }
+                } catch (Throwable ignored) {}
+            }
+            response.put("panelW", pw);
+            response.put("panelH", ph);
         } catch (Exception e) {
             logger.warn("cluster-mirror-status failed: " + e.getMessage());
             response.put("success", false);
@@ -379,21 +488,24 @@ public class VehicleControlApiHandler {
         HttpResponse.sendJson(out, response.toString());
     }
 
-    /** Relay a tap/swipe (normalized 0..1 of the mirror pane) into the projected app. */
+    /** Relay a tap/swipe (mirror-SURFACE px, sx/sy) into the projected app; the relay inverts
+     *  the live view-mirror projection to reach the right cluster pixel. */
     private static void handleClusterTouch(OutputStream out, String body) throws Exception {
         JSONObject response = new JSONObject();
         try {
             JSONObject req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
             String type = req.optString("type", "tap");
+            // Coordinates are mirror-SURFACE px (sx/sy); the relay inverts them through the
+            // live view-mirror projection mapping to cluster px.
             boolean ok;
             if ("swipe".equals(type)) {
                 ok = com.overdrive.app.surveillance.ClusterInputRelay.swipe(
-                        req.optDouble("x", 0), req.optDouble("y", 0),
-                        req.optDouble("x2", 0), req.optDouble("y2", 0),
+                        req.optDouble("sx", 0), req.optDouble("sy", 0),
+                        req.optDouble("sx2", 0), req.optDouble("sy2", 0),
                         req.optInt("ms", 0));
             } else {
                 ok = com.overdrive.app.surveillance.ClusterInputRelay.tap(
-                        req.optDouble("x", 0), req.optDouble("y", 0));
+                        req.optDouble("sx", 0), req.optDouble("sy", 0));
             }
             response.put("success", ok);
             if (!ok) response.put("error", "no safe cluster display target");
@@ -456,6 +568,7 @@ public class VehicleControlApiHandler {
         // The OTA layer reports SDK semantics (1=UNLOCK, 2=LOCK) which we
         // also invert on output.
         JSONObject doors = new JSONObject();
+        int sdkOverall = -1;
         if (data.doorLockStatus != null && data.doorLockStatus.length >= 7) {
             doors.put("rf", data.doorLockStatus[0]);
             doors.put("lf", data.doorLockStatus[1]);
@@ -464,6 +577,11 @@ public class VehicleControlApiHandler {
             doors.put("trunk", data.doorLockStatus[4]);
             doors.put("hood", data.doorLockStatus[5]);
             doors.put("overall", data.doorLockStatus[6]);
+            if (data.doorLockStatus[6] == 1 || data.doorLockStatus[6] == 2) {
+                sdkOverall = data.doorLockStatus[6];
+                doors.put("source", "sdk");
+                doors.put("scope", "vehicle");
+            }
         }
 
         // Track which source authoritatively set LF so we can derive `overall`
@@ -516,7 +634,10 @@ public class VehicleControlApiHandler {
                 if (rr != -1) doors.put("rr", rr);
                 if (cs.isAnyUnlocked()) cloudOverall = 2;
                 else if (cs.isAllLocked()) cloudOverall = 1;
-                if (cloudOverall != -1) doors.put("overall", cloudOverall);
+                if (cloudOverall != -1) {
+                    doors.put("overall", cloudOverall);
+                    doors.put("scope", "vehicle");
+                }
                 doors.put("source", "cloud");
             }
         } catch (Exception e) {
@@ -527,17 +648,34 @@ public class VehicleControlApiHandler {
         // last so it overrides both cloud and SDK.
         if (otaLf != -1) {
             doors.put("lf", otaLf);
-            // If cloud was unavailable, we still want a meaningful `overall`
-            // when at least the LF state is known — surveillance arming uses
-            // overall, and the LF door is the dominant signal in practice.
+            // If cloud was unavailable, an OTA reading describes the driver
+            // door only. Keep publishing it as `overall` for compatibility
+            // with the surveillance lock gate, but label the scope honestly
+            // so presentation layers never call it whole-vehicle state.
             if (!cloudAvailable) {
-                doors.put("overall", otaLf);
-            } else if (otaLf != cloudOverall && cloudOverall != -1) {
-                // Cloud is fresh AND disagrees with OTA LF (cloud might have
-                // RF/LR/RR contradicting LF). We stick with cloud's overall
-                // because it sees all 4 doors; otaLf overlays only the LF cell.
+                if (sdkOverall == -1) {
+                    doors.put("overall", otaLf);
+                    doors.put("scope", "driver_door");
+                    doors.put("source", "ota");
+                } else if (sdkOverall != otaLf) {
+                    // The two layers disagree: OTA is the fresher read, so it wins
+                    // for `overall` — but only the driver door is actually known.
+                    // Keeping the SDK value under scope "vehicle" made the payload
+                    // self-contradictory (lf unlocked, overall locked).
+                    doors.put("overall", otaLf);
+                    doors.put("scope", "driver_door");
+                    doors.put("source", "sdk+ota");
+                } else {
+                    doors.put("scope", "vehicle");
+                    doors.put("source", "sdk+ota");
+                }
             }
-            doors.put("source", cloudAvailable ? "ota+cloud" : "ota");
+            if (cloudAvailable) {
+                // Cloud sees all four doors, so its overall state remains the
+                // whole-vehicle answer even when the faster OTA LF cell differs.
+                doors.put("scope", "vehicle");
+                doors.put("source", "ota+cloud");
+            }
         }
         response.put("doors", doors);
 
@@ -587,6 +725,11 @@ public class VehicleControlApiHandler {
         lights.put("hazard", data.hazard);
         lights.put("dayTimeLight", data.dayTimeLight);
         lights.put("ambientColour", data.ambientColour);
+        // Ambient main switch as a tri-state: true / false / omitted-when-unreadable, so a UI
+        // can tell "off" apart from "this trim doesn't report it".
+        if (data.ambientEnabled != BydVehicleData.UNAVAILABLE) {
+            lights.put("ambientEnabled", data.ambientEnabled == 1);
+        }
         lights.put("ambientOptions", new JSONArray(LightConstants.AMBIENT_COLOURS));
         response.put("lights", lights);
 
@@ -654,7 +797,7 @@ public class VehicleControlApiHandler {
                         ? data.tyrePressure[i] : BydVehicleData.UNAVAILABLE;
                 if (kPa != BydVehicleData.UNAVAILABLE && kPa > 0) {
                     t.put("kPa", kPa);
-                    // PSI = kPa * 0.1450377 (matches the the OEM firmware
+                    // PSI = kPa * 0.1450377 (matches the OEM vehicle-control app
                     // UnitFormatter conversion). One decimal place is
                     // enough to distinguish ±3 kPa steps the BYD TPMS
                     // actually reports — integer rounding collapses
@@ -683,13 +826,24 @@ public class VehicleControlApiHandler {
         } else {
             tyres.put("available", false);
         }
+        // The user's configured limits ride along with the readings so the web
+        // UI colours corners against the SAME numbers that drive notifications
+        // instead of its own hardcoded PSI literals. Always emitted (even when
+        // no tyre data is available) so the client can paint the limits in its
+        // legend regardless. kPa, already clamped + invariant-checked.
+        try {
+            tyres.put("limits",
+                    com.overdrive.app.config.UnifiedConfigManager.getTyreThresholds());
+        } catch (Throwable ignored) {
+            // Non-fatal: the client falls back to its built-in defaults.
+        }
         response.put("tyres", tyres);
 
         // Engine telemetry block was removed: the BYD Auto SDK's
         // engineCoolantLevel / oilLevel / waterTempC / gearMode feeds
         // were producing unreliable values on the test PHEV
         // (cold-engine sentinels, conflicting Engine vs Setting device
-        // readings, raw 28/254 oil dipstick that the OEM firmware itself
+        // readings, raw 28/254 oil dipstick that the OEM vehicle-control app itself
         // refuses to display). Don't reintroduce without verifying each
         // field against the cluster's own readout first.
 
@@ -889,11 +1043,93 @@ public class VehicleControlApiHandler {
                 case "power_off":
                     cmd = new VehicleCommandRouter.ClimateOffCommand();
                     break;
+                // Arm/cancel the "run for N minutes then switch off" timer WITHOUT touching
+                // the AC's current power state, so it can be set independently of the on
+                // command (from the UI, HA, or a second automation step). autoOffMinutes<=0
+                // cancels. See AcAutoOffTimer for the single-timer / last-write-wins rules.
+                case "auto_off_timer": {
+                    int minutes = req.optInt("autoOffMinutes", 0);
+                    boolean armed = com.overdrive.app.byd.AcAutoOffTimer.arm(minutes);
+                    // Log like every other climate action — this branch returns early and so
+                    // never reaches the shared log line below, which previously left a
+                    // "cancel when nothing was armed" call with no record at all.
+                    logger.info("Climate: action=auto_off_timer minutes=" + minutes
+                            + " armed=" + armed);
+                    JSONObject timerResp = new JSONObject();
+                    timerResp.put("success", true);
+                    timerResp.put("armed", armed);
+                    // Report the countdown ONLY for an actually-armed timer, so the two fields
+                    // can never contradict each other (a failed arm used to be able to answer
+                    // armed=false alongside a positive secondsRemaining).
+                    timerResp.put("secondsRemaining",
+                            armed ? com.overdrive.app.byd.AcAutoOffTimer.secondsRemaining() : -1);
+                    HttpResponse.sendJson(out, timerResp.toString());
+                    return;
+                }
                 case "set_temp": {
                     int zone = req.optInt("zone", 1);
                     double t = req.optDouble("temp", 22);
+                    // Reject an out-of-range request rather than clamping it. setAcTemperature
+                    // now clamps (it must, so a °F conversion lands in-band), which on this
+                    // endpoint would turn "set 40" into a SUCCESS that actually set 33 — a
+                    // silent wrong answer. The old code failed such a request, so keeping the
+                    // rejection here also preserves that contract for existing callers.
+                    //
+                    // NaN is checked EXPLICITLY: optDouble coerces "NaN" (and any unparseable
+                    // string) to Double.NaN, and every NaN comparison is false — so a bare
+                    // range test passes it through, Math.round(NaN) yields 0, and the clamp
+                    // turns that into "AC set to minimum, success". Comparisons alone cannot
+                    // catch this; only isNaN can.
+                    if (Double.isNaN(t)
+                            || t < com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_C
+                            || t > com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_C) {
+                        response.put("success", false);
+                        response.put("error", "temp out of range ("
+                                + com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_C + ".."
+                                + com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_C + " C)");
+                        HttpResponse.sendJson(out, response.toString());
+                        return;
+                    }
                     cmd = new VehicleCommandRouter.ClimateSetTempCommand(zone, t);
                     break;
+                }
+                // RELATIVE step: "delta" dial notches (±1 = one degree in whatever unit the
+                // head unit displays). Answers with the new setpoint so a caller can show it.
+                // "area" selects which dial is READ (1=driver, 2=passenger); "zone" is the
+                // write target (0 = both dials, matching DiPlus's own step).
+                case "step_temp": {
+                    int zone = req.optInt("zone", 0);
+                    int area = req.optInt("area", com.overdrive.app.byd.BydDataCollector.AC_TEMP_AREA_DRIVER);
+                    int delta = req.optInt("delta", 0);
+                    if (delta == 0) {
+                        response.put("success", false);
+                        response.put("error", "delta must be non-zero");
+                        HttpResponse.sendJson(out, response.toString());
+                        return;
+                    }
+                    // Bound the step so a hand-crafted request can't sweep beyond one full range
+                    // in a single call. Derived from the WIDER band (Fahrenheit spans 27 notches,
+                    // 64..91, vs Celsius' 16) so the limit doesn't silently truncate a legitimate
+                    // full-range step on a °F car; the clamp still stops it at the real end.
+                    final int maxDelta = com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_F
+                            - com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_F;
+                    if (delta < -maxDelta || delta > maxDelta) {
+                        response.put("success", false);
+                        response.put("error", "delta out of range (-" + maxDelta + ".." + maxDelta + ")");
+                        HttpResponse.sendJson(out, response.toString());
+                        return;
+                    }
+                    VehicleCommandRouter.ClimateStepTempCommand step =
+                            new VehicleCommandRouter.ClimateStepTempCommand(zone, area, delta);
+                    CommandResult sr = VehicleCommandRouter.getInstance().execute(step);
+                    logger.info("Climate: action=step_temp delta=" + delta + " " + sr.outcome
+                            + " path=" + sr.path + " setpoint=" + step.resultSetpoint);
+                    JSONObject stepResp = routedResponse(sr, "climate");
+                    if (step.resultSetpoint != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) {
+                        stepResp.put("setpoint", step.resultSetpoint);
+                    }
+                    HttpResponse.sendJson(out, stepResp.toString());
+                    return;
                 }
                 case "set_fan": {
                     int fan = req.optInt("fan", 3);
@@ -921,6 +1157,29 @@ public class VehicleControlApiHandler {
             }
             CommandResult r = VehicleCommandRouter.getInstance().execute(cmd);
             logger.info("Climate: action=" + action + " " + r.outcome + " path=" + r.path);
+            // Auto-off timer bookkeeping, applied only when the command actually took effect
+            // so a refused/failed write never leaves a timer that would switch off an AC this
+            // request never managed to switch on.
+            if (r.outcome == VehicleCommandRouter.Outcome.SUCCESS) {
+                if ("power_on".equals(action)) {
+                    // "on for N minutes". Only a POSITIVE value acts; 0 deliberately leaves any
+                    // pending window untouched rather than cancelling it.
+                    //
+                    // It is tempting to treat an explicit 0 as "Stay on → cancel" (so this agrees
+                    // with the standalone timer action, where 0 does cancel), but it must NOT:
+                    // the setAc template ALWAYS emits this key, and an automation saved before
+                    // the field existed gets the retrofit default 0. So a legacy "when unlocked →
+                    // AC on" rule would silently cancel a 30-minute window the user had just
+                    // armed from the UI. `req.has()` cannot tell "the user chose Stay on" from
+                    // "this row defaulted to 0" — both arrive as 0. Use the dedicated
+                    // AC Switch-off Timer action (or auto_off_timer with 0) to cancel.
+                    int minutes = req.optInt("autoOffMinutes", 0);
+                    if (minutes > 0) com.overdrive.app.byd.AcAutoOffTimer.arm(minutes);
+                }
+                // NOTE: power_off does NOT need to cancel the window here — VehicleCommandRouter
+                // retires it centrally on any successful ClimateOffCommand, so every surface (this
+                // endpoint, Home Assistant/MQTT, key mapping) behaves identically.
+            }
             JSONObject resp = routedResponse(r, action);
             HttpResponse.sendJson(out, resp.toString());
         } catch (Exception e) {
@@ -998,7 +1257,9 @@ public class VehicleControlApiHandler {
                 cmd = new VehicleCommandRouter.LightsCommand(enable);
             } else if ("ambientColour".equals(target)) {
                 int value = req.optInt("value", 1);
-                cmd = new VehicleCommandRouter.AmbientColourCommand(value);
+                // Optional zone (front/rear/both); default both keeps prior whole-cabin behaviour.
+                String zone = req.optString("zone", "both");
+                cmd = new VehicleCommandRouter.AmbientColourCommand(value, zone);
             } else if ("welcomeLight".equals(target)) {
                 cmd = new VehicleCommandRouter.WelcomeLightCommand(req.optBoolean("enable", true));
             } else if ("readingLight".equals(target)) {
@@ -1176,18 +1437,6 @@ public class VehicleControlApiHandler {
                 HttpResponse.sendJson(out, response.toString());
                 return;
             }
-            // Every screen/brightness target (infotainment, cluster, HUD, screen
-            // power) removes or dims safety-relevant display information — gate
-            // them all the same way. Volume is excluded: a separate, lower-severity
-            // issue (no ceiling on remote volume changes), not a driving-state gate.
-            boolean screenTarget = !isVolume;
-            if (screenTarget && DrivingSafetyGuard.isMovementBlocked()) {
-                response.put("success", false);
-                response.put("outcome", "blocked_driving");
-                response.put("error", Messages.get("errors.vehicle_blocked_in_motion"));
-                HttpResponse.sendJson(out, 409, response.toString());
-                return;
-            }
             boolean ok;
             if (isMediaKey) {
                 // Transport control via AudioManager.dispatchMediaKeyEvent — a Binder
@@ -1204,7 +1453,17 @@ public class VehicleControlApiHandler {
                 String channel = req.optString("channel", "media");
                 ok = setChannelVolumeIndex(channel, value);
             } else if ("ambient_brightness".equals(target)) {
-                ok = BydDataCollector.getInstance().setAmbientBrightness(value);
+                // Optional zone (front/rear/both); default both preserves prior whole-cabin
+                // behaviour for callers that don't send a zone.
+                String zone = req.optString("zone", "both");
+                ok = BydDataCollector.getInstance().setAmbientBrightnessZoned(zone, value);
+            } else if ("ambient_power".equals(target)) {
+                // Zoned interior-ambient on/off. value 0 → off, >0 → on. "both" uses the real
+                // global main switch (three-tier chain); a single zone has no dedicated switch, so
+                // "off" zeroes that zone and "on" restores its PRE-OFF level, not full — see
+                // setAmbientLightEnabledZoned.
+                String zone = req.optString("zone", "both");
+                ok = BydDataCollector.getInstance().setAmbientLightEnabledZoned(zone, value > 0);
             } else if ("brightness".equals(target)) {
                 ok = BydDataCollector.getInstance().setInfotainmentBrightness(value);
             } else if ("cluster_brightness".equals(target)) {
@@ -1212,11 +1471,11 @@ public class VehicleControlApiHandler {
             } else if ("hud_brightness".equals(target)) {
                 ok = BydDataCollector.getInstance().setHudBrightness(value);
             } else if ("hud_power".equals(target)) {
-                // This platform has no dedicated HUD on/off switch (confirmed against
-                // the OEM firmware — only setHUDBrightness exists). So "off" = brightness
-                // 0 (dims the HUD out), "on" = full brightness. The action sends value=0
-                // for off and value=100 for on; anything >0 is treated as on-at-that-level.
-                ok = BydDataCollector.getInstance().setHudBrightness(value);
+                // HUD on/off: value 0 → off, any value > 0 → on. This is the DEDICATED HUD
+                // power switch (SET_HUD_SWITCH_SET, 1=on/2=off), NOT brightness — driving
+                // brightness to 0 does not turn the HUD off. setHudPower actuates via the
+                // app-process VehicleActuatorService. The action sends value=0 / value=100.
+                ok = BydDataCollector.getInstance().setHudPower(value > 0);
             } else if ("screen_power".equals(target)) {
                 // Turn the infotainment (centre) screen fully on/off via the proven
                 // backlight path (PowerManager.turnBacklightOn/Off → BYDAutoSettingDevice
@@ -1318,9 +1577,9 @@ public class VehicleControlApiHandler {
      * UI navigation + screenshot + move-to-display, run as the UID-2000 daemon via
      * shell. Body: { "target": "home|back|recents|screenshot|move_display",
      *   ["display": 0|1], ["package": "com.x/.Act"] }.
-     * All are fire-and-forget shell execs (never block the request thread on a hung
-     * child). Nav uses `input keyevent`; screenshot uses `screencap` (the a11y route is
-     * API 30+, unavailable on this API-29 head unit); move uses `am start-activity`.
+     * Nav is a fire-and-forget shell exec (`input keyevent`, never blocking the request thread
+     * on a hung child); screenshot captures in-process via {@link
+     * com.overdrive.app.surveillance.DisplayScreenshot}; move uses `am start-activity`.
      */
     private static void handleSystem(OutputStream out, String body) throws Exception {
         JSONObject response = new JSONObject();
@@ -1333,15 +1592,32 @@ public class VehicleControlApiHandler {
                 case "back":     cmd = "input keyevent 4"; break;   // KEYCODE_BACK
                 case "recents":  cmd = "input keyevent 187"; break; // KEYCODE_APP_SWITCH
                 case "screenshot": {
-                    // screencap to a timestamped file under our world-readable tree.
+                    // Capture via SurfaceControl, NOT `screencap -d <id>`: on API 29 that -d is a
+                    // PhysicalDisplayId (the internal panel is used only when -d is OMITTED), so
+                    // `-d 0` did not reliably mean "head unit" and the cluster — a VIRTUAL display
+                    // with no physical token — could never be captured that way. Both reported
+                    // failures. DisplayScreenshot addresses displays by SurfaceFlinger layer stack,
+                    // the mechanism the cluster mirror already proves on this device.
                     // Uptime-based name (no wall clock needed) keeps successive shots unique.
-                    String dir = SCREENSHOT_DIR;
-                    String file = dir + "/shot_" + android.os.SystemClock.uptimeMillis() + ".png";
-                    int display = req.optInt("display", -1);
-                    String disp = display >= 0 ? ("-d " + display + " ") : "";
-                    cmd = "mkdir -p " + dir + " && screencap " + disp + "-p " + file
-                            + " && chmod 644 " + file;
-                    break;
+                    int display = req.optInt("display", 0);
+                    java.io.File shot = new java.io.File(SCREENSHOT_DIR,
+                            "shot_" + android.os.SystemClock.uptimeMillis() + ".png");
+                    android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+                    com.overdrive.app.surveillance.DisplayScreenshot.Result shotResult =
+                            (display == 1)
+                                    ? com.overdrive.app.surveillance.DisplayScreenshot.captureCluster(ctx, shot)
+                                    : com.overdrive.app.surveillance.DisplayScreenshot.captureHeadUnit(ctx, shot);
+                    response.put("success", shotResult.ok);
+                    response.put("target", target);
+                    if (shotResult.ok) {
+                        response.put("path", shotResult.path);
+                        logger.info("screenshot: display=" + display + " -> " + shotResult.path);
+                    } else {
+                        response.put("error", shotResult.error);
+                        logger.warn("screenshot: display=" + display + " FAILED — " + shotResult.error);
+                    }
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
                 }
                 case "move_display": {
                     // Resolve the launcher component + validate the package inside
@@ -1439,16 +1715,10 @@ public class VehicleControlApiHandler {
             JSONObject req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
             String channel = req.optString("channel", "media");
             boolean loop = req.optBoolean("loop", false);
-            // "display": "screen" shows an MP4's picture on the head-unit SurfaceControl
-            // lane; anything else (default) is audio-only (speakers). Audio files ignore it.
+            // "display": "screen" shows an MP4's picture fullscreen via the app-process
+            // VideoPlaybackActivity (a TextureView-backed player); anything else (default) is
+            // audio-only (speakers). Audio files ignore it.
             boolean onScreen = "screen".equalsIgnoreCase(req.optString("display", "speakers"));
-            if (onScreen && DrivingSafetyGuard.isMovementBlocked()) {
-                response.put("success", false);
-                response.put("outcome", "blocked_driving");
-                response.put("error", Messages.get("errors.vehicle_blocked_in_motion"));
-                HttpResponse.sendJson(out, 409, response.toString());
-                return;
-            }
             // Prefer a library "name"; fall back to an explicit "path".
             String name = req.optString("name", null);
             String path = req.optString("path", null);
@@ -1464,6 +1734,21 @@ public class VehicleControlApiHandler {
             if (resolved == null) {
                 response.put("success", false);
                 response.put("error", "name or path is required");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            // Verify the file exists before dispatching. AudioPlaybackController
+            // is fire-and-forget (it shells `am` and returns true unconditionally,
+            // because the daemon UID can't stat the app's view), so an automation
+            // still referencing a sound the user has DELETED reported success while
+            // nothing played. Same for an automation saved with no sound picked,
+            // whose "${name}" placeholder resolves to a literal filename. Report
+            // the real reason so a broken automation is diagnosable from the UI.
+            java.io.File resolvedFile = new java.io.File(resolved);
+            if (!resolvedFile.isFile() || resolvedFile.length() == 0) {
+                response.put("success", false);
+                response.put("error", "sound not found (deleted, or never picked): " + resolved);
+                response.put("path", resolved);
                 HttpResponse.sendJson(out, response.toString());
                 return;
             }
@@ -1502,10 +1787,10 @@ public class VehicleControlApiHandler {
             case "system":      return android.media.AudioManager.STREAM_SYSTEM;
             case "alarm":       return android.media.AudioManager.STREAM_ALARM;
             case "ring":        return android.media.AudioManager.STREAM_RING;
-            case "navigation":  return 14; // STREAM_NAVI — OEM nav-guidance stream (OEM firmware setBroadcastVolume uses 14)
-            case "voice":       return 16; // OEM voice stream (OEM firmware setVoiceVolume uses 16)
+            case "navigation":  return 14; // STREAM_NAVI — OEM nav-guidance stream (the OEM app setBroadcastVolume uses 14)
+            case "voice":       return 16; // OEM voice stream (the OEM app setVoiceVolume uses 16)
                 // These OEM-extended stream ints ARE settable via setStreamVolume on this HU
-                // family (OEM firmware does exactly this), so the "navigation volume" / "voice
+                // family (the OEM app does exactly this), so the "navigation volume" / "voice
                 // volume" controls now move the SAME stream playback uses (MediaPlaybackService
                 // .streamForChannel), keeping the slider and the played audio consistent.
             case "media":
@@ -1615,7 +1900,7 @@ public class VehicleControlApiHandler {
      * <p>Uses explicit PLAY(126)/PAUSE(127) rather than the PLAY_PAUSE toggle for the
      * play/pause action's underlying media codes only where a fixed intent is known; the
      * "play_pause" action keeps the toggle keycode (85) since it is an explicit toggle
-     * request. Codes match the OEM firmware (mediaNext=87, mediaPrevious=88). Returns false on
+     * request. Codes match the OEM vehicle-control app (mediaNext=87, mediaPrevious=88). Returns false on
      * unknown key.
      */
     private static boolean dispatchMediaKey(String key) {

@@ -30,11 +30,11 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/jmuxer@2.0.4/dist/jmuxer.min.js"></script>
-    <script src="../shared/SotaPlayer.js"></script>
+    <script src="../shared/SotaPlayer.js?v=13"></script>
     <script src="../shared/Decoder.js"></script>
     <script src="../shared/YUVCanvas.js"></script>
     <script src="../shared/Player.js"></script>
@@ -419,6 +419,15 @@
                             </div>
                         </div>
 
+                        <!-- OEM-clip field picker; separate selection from the pano flow. -->
+                        <div class="setting-row telemetry-fields" id="telemetryFieldsOemDashcam" style="display:none;">
+                            <div class="setting-info" style="width:100%;">
+                                <div class="setting-name" data-i18n="recording.telemetry_fields_label">Fields to burn in</div>
+                                <div class="setting-desc" data-i18n="oem_dashcam.telemetry_fields_desc">Choose what the overlay draws on OEM dashcam clips.</div>
+                                <div class="telemetry-fields-grid" id="telemetryFieldsOemDashcamGrid"></div>
+                            </div>
+                        </div>
+
                         <div class="setting-row" id="oemPipelineStatusRow" style="border-bottom:none;">
                             <div class="setting-info" style="flex:1 1 auto;">
                                 <div class="setting-name" id="oemPipelineStatus" data-i18n="oem_dashcam.status_idle">Idle</div>
@@ -622,6 +631,8 @@
                         </div>
                     </div>
                     <div class="card-body">
+                        <!-- No divider: the field picker below is a sub-control of
+                             this toggle, and :last-child now binds to the picker. -->
                         <div class="setting-row" style="border-bottom:none;">
                             <div class="setting-info">
                                 <div class="setting-name" data-i18n="recording.telemetry_show_label">Show on Recorded Video</div>
@@ -632,6 +643,16 @@
                                     <input type="checkbox" id="telemetryOverlayEnabled" onchange="RecSettings.toggleTelemetryOverlay()">
                                     <span class="toggle-slider"></span>
                                 </label>
+                            </div>
+                        </div>
+                        <!-- Field picker for the ACC-on (trips/manual) flow. Grid is
+                             populated from /api/settings/telemetry-overlay's catalog by
+                             RecSettings.renderTelemetryFields('accOn', ...). -->
+                        <div class="setting-row telemetry-fields" id="telemetryFieldsAccOn" style="display:none;">
+                            <div class="setting-info" style="width:100%;">
+                                <div class="setting-name" data-i18n="recording.telemetry_fields_label">Fields to burn in</div>
+                                <div class="setting-desc" data-i18n="recording.telemetry_fields_desc">Choose what the overlay draws on trip and manual recordings.</div>
+                                <div class="telemetry-fields-grid" id="telemetryFieldsAccOnGrid"></div>
                             </div>
                         </div>
                     </div>
@@ -865,9 +886,9 @@
     <div id="toastContainer" class="toast-container"></div>
 
     <script src="../shared/auth.js"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/recording.js?v=storageslider1"></script>
+    <script src="../shared/recording.js?v=telemetryfields1"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

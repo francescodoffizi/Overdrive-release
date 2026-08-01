@@ -41,7 +41,49 @@ public class BYDAutoStatisticDevice extends AbsBYDAutoDevice {
         return 0.0d;
     }
 
+    /**
+     * Get the lifetime average fuel consumption per 100 km.
+     * @return L/100km (SDK range 0.0-51.1)
+     */
+    public double getTotalFuelConPHMValue() {
+        return 0.0d;
+    }
+
+    /**
+     * Get the last trip's average fuel consumption per 100 km.
+     * @return L/100km (SDK range 0.0-51.1)
+     */
+    public double getLastFuelConPHMValue() {
+        return 0.0d;
+    }
+
+    /**
+     * Get the lifetime average electricity consumption per 100 km.
+     * @return kWh/100km
+     */
+    public double getTotalElecConPHMValue() {
+        return 0.0d;
+    }
+
+    /**
+     * Get the last trip's average electricity consumption per 100 km.
+     * @return kWh/100km
+     */
+    public double getLastElecConPHMValue() {
+        return 0.0d;
+    }
+
     public int getTotalMileageValue() {
+        return 0;
+    }
+
+    /**
+     * Get a distance register in 0.1 km units — finer than
+     * {@link #getTotalMileageValue()}, which reports whole km.
+     * @param kind which register to read (2 = cumulative total distance)
+     * @return distance in 0.1 km units
+     */
+    public int getMileageNumber(int kind) {
         return 0;
     }
     /**

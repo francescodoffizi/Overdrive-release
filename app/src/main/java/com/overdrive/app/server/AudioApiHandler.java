@@ -218,8 +218,36 @@ public class AudioApiHandler {
             dir.mkdirs();
             try { dir.setReadable(true, false); dir.setExecutable(true, false); } catch (Exception ignored) {}
         }
+        // Sweep stale temp files before writing. A temp orphaned by an earlier
+        // interrupted upload (daemon killed, power cut, the rename race below) is
+        // INVISIBLE and UNDELETABLE through the API: the list filters on audio
+        // extensions so ".tmp" never appears, and delete runs the name through
+        // safeAudioName which rejects ".tmp". Without this sweep each orphan is
+        // permanent, and they accumulate on the partition that also holds the
+        // config, the H2 stores and the logs.
+        sweepStaleTempFiles(dir);
+
         java.io.File outFile = new java.io.File(dir, name);
-        java.io.File tmpFile = new java.io.File(dir, name + ".tmp");
+        // Note whether we are REPLACING an existing sound. Deliberately not an
+        // error — re-uploading a corrected file under the same name is a normal
+        // thing to do, and rejecting it would be worse. But it is worth telling
+        // the caller, because safeAudioName collapses disallowed characters to
+        // '_', so `a*b.mp3` and `a?b.mp3` both land on `a_b.mp3`: a user can
+        // silently replace a sound they never intended to touch, and every
+        // automation or key-mapping bound to that name then plays different audio
+        // with no indication anything changed.
+        boolean replaced = outFile.exists();
+
+        // UNIQUE temp name. It used to be `name + ".tmp"`, derived purely from the
+        // filename — so two concurrent uploads of the same name both opened the
+        // SAME temp with O_TRUNC, each wrote from its own offset 0, and the winner
+        // renamed a byte-level hybrid of two different files into place and
+        // reported success. Worse, either request's failure-path delete() unlinked
+        // the other's in-flight temp. A per-request suffix makes both uploads
+        // independent; last rename wins cleanly, which is the expected semantic
+        // for same-name uploads.
+        java.io.File tmpFile = new java.io.File(dir,
+            name + "." + java.util.UUID.randomUUID() + ".tmp");
         try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpFile)) {
             fos.write(data);
             fos.getFD().sync();
@@ -236,11 +264,50 @@ public class AudioApiHandler {
         }
         try { outFile.setReadable(true, false); } catch (Exception ignored) {}
 
+        if (replaced) {
+            CameraDaemon.log("audio: upload REPLACED existing sound '" + name
+                + "' — automations/key-mappings bound to this name now play the new file");
+        }
+
         JSONObject resp = new JSONObject();
         resp.put("success", true);
         resp.put("name", name);
         resp.put("path", outFile.getAbsolutePath());
+        // Lets the UI warn "replaced an existing sound" instead of the user only
+        // discovering it when an automation plays something unexpected.
+        resp.put("replaced", replaced);
         HttpResponse.sendJson(out, resp.toString());
+    }
+
+    /** Age after which an abandoned {@code *.tmp} in the audio dir is reapable.
+     *  Comfortably longer than any real upload write (the bytes are already fully
+     *  decoded in memory before the stream is opened, so the write is a single
+     *  buffered dump), while still bounded. */
+    private static final long STALE_TMP_AGE_MS = 5L * 60L * 1000L;
+
+    /** Delete abandoned {@code *.tmp} uploads older than {@link #STALE_TMP_AGE_MS}.
+     *  These are otherwise unreachable: the library listing filters on audio
+     *  extensions so they never render, and DELETE routes the name through
+     *  {@code safeAudioName}, which rejects a {@code .tmp} extension. Best-effort
+     *  and never fatal — an upload must not fail because a cleanup did. */
+    private static void sweepStaleTempFiles(java.io.File dir) {
+        try {
+            java.io.File[] files = dir.listFiles();
+            if (files == null) return;
+            long cutoff = System.currentTimeMillis() - STALE_TMP_AGE_MS;
+            for (java.io.File f : files) {
+                if (f == null || !f.isFile()) continue;
+                if (!f.getName().endsWith(".tmp")) continue;
+                if (f.lastModified() > cutoff) continue;   // possibly still being written
+                long size = f.length();
+                if (f.delete()) {
+                    CameraDaemon.log("audio: reaped stale temp " + f.getName()
+                        + " (" + size + " bytes)");
+                }
+            }
+        } catch (Throwable ignored) {
+            // Cleanup is opportunistic; never let it break an upload.
+        }
     }
 
     /** DELETE /api/audio/library?name=xxx — remove one uploaded sound. */
@@ -263,11 +330,30 @@ public class AudioApiHandler {
     /** POST /api/audio/library/play — preview { name, channel? } on the head unit. */
     private static void handleAudioLibraryPlay(OutputStream out, String body) throws Exception {
         JSONObject resp = new JSONObject();
-        JSONObject req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
+        // Guarded parse, mirroring the upload handler. Unguarded, a malformed body
+        // threw JSONException all the way out to HttpServer's catch, which closes
+        // the socket WITHOUT writing a response — the client saw a network error
+        // instead of a clean {"success":false}.
+        JSONObject req;
+        try {
+            req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
+        } catch (Exception e) {
+            HttpResponse.sendJsonError(out, "Invalid JSON");
+            return;
+        }
         String safe = safeAudioName(req.optString("name", ""));
         if (safe == null) { HttpResponse.sendJsonError(out, "Invalid name"); return; }
         String channel = req.optString("channel", "media");
         java.io.File f = new java.io.File(AUDIO_DIR, safe);
+        // Verify the sound still EXISTS before claiming success. dispatchPlay is
+        // fire-and-forget (it shells `am` and returns true unconditionally), so a
+        // sound the user has since deleted — or an automation still holding a stale
+        // name — reported {"success":true} while nothing played, with only logcat
+        // showing the app-side 404. Fail honestly instead.
+        if (!f.isFile() || f.length() == 0) {
+            HttpResponse.sendJsonError(out, "Sound not found: " + safe);
+            return;
+        }
         boolean ok = com.overdrive.app.byd.AudioPlaybackController.play(f.getAbsolutePath(), channel);
         resp.put("success", ok);
         if (!ok) resp.put("error", "Could not play");

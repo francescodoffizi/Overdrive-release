@@ -56,6 +56,7 @@
         // stop(), which is an explicit user stop and clears userWantsStream.
         _suspendForHidden() {
             this.running = false;
+            this._clearFrameWatchdog();
             if (this.ws) { try { this.ws.close(); } catch (e) {} this.ws = null; }
             if (this.decoder) { try { this.decoder.close(); } catch (e) {} this.decoder = null; }
             if (this.onDisconnected) this.onDisconnected();
@@ -86,6 +87,11 @@
             this.pps = null;
             this.hasReceivedKeyframe = false;
             this.frameCount = 0;
+            // Clear the fatal latch + error tally so an explicit restart gets a
+            // genuine retry rather than inheriting the last attempt's verdict.
+            this._failed = false;
+            this.decodeErrors = 0;
+            this.bytesReceived = 0;
             this.connectWebSocket();
         }
 
@@ -103,10 +109,15 @@
             this.ws.onopen = () => {
                 this.reconnectAttempts = 0;  // healthy link — reset backoff
                 this.initDecoder();
+                this._armFrameWatchdog();
                 if (this.onConnected) this.onConnected();
             };
             this.ws.onmessage = (e) => this.ingest(new Uint8Array(e.data));
             this.ws.onclose = () => {
+                // Retire the watchdog for this connection: a closed socket is a
+                // link event, not a decode failure, and the next onopen re-arms
+                // it. Leaving it armed could misfire during the reconnect gap.
+                this._clearFrameWatchdog();
                 if (this.onDisconnected) this.onDisconnected();
                 // Auto-reconnect with capped exponential backoff (2s → 30s) so a
                 // dead tunnel link doesn't reconnect every 2s forever over
@@ -135,18 +146,85 @@
                 output: this.handleFrame,
                 error: this.handleError
             });
-            // SOTA: Use Baseline profile codec string to match server encoder
-            // Server sends H.264 Baseline/Level 3.1 for iOS compatibility
-            // Will be reconfigured from SPS if profile differs
-            this.decoder.configure({
-                codec: "avc1.42C01F",
-                hardwareAcceleration: "prefer-hardware",
-                optimizeForLatency: true
-            });
+            // The server REQUESTS Baseline/3.1, but KEY_PROFILE is only a hint —
+            // plenty of encoders ignore it and emit Main/High. So this initial
+            // config is provisional; processNAL reconfigures from the real SPS.
+            this._configure("avc1.42C01F");
+        }
+
+        /**
+         * Configure the decoder, retrying without hardware acceleration.
+         * "prefer-hardware" is meant to be a preference, but on some mobile GPUs
+         * (notably a range of Mali/Adreno Android builds) configure() throws or
+         * the decoder errors immediately when no hardware path exists for the
+         * profile — and software decode would have worked fine. Falling back
+         * keeps those devices playing instead of showing a black canvas.
+         */
+        _configure(codec) {
+            const attempts = [
+                { codec: codec, hardwareAcceleration: "prefer-hardware", optimizeForLatency: true },
+                { codec: codec, optimizeForLatency: true },
+                { codec: "avc1.42C01F", optimizeForLatency: true }
+            ];
+            for (let i = 0; i < attempts.length; i++) {
+                try {
+                    this.decoder.configure(attempts[i]);
+                    this.codecString = attempts[i].codec;
+                    this.softwareFallback = i > 0;
+                    return true;
+                } catch (e) {
+                    if (i === attempts.length - 1) {
+                        // Nothing configured — surface it so the caller can switch
+                        // decoders rather than sit on a permanently dead canvas.
+                        this._fail('configure failed: ' + (e && e.message ? e.message : e));
+                        return false;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /**
+         * Escalate if bytes arrive but no frame ever gets painted. Some mobile
+         * decoders accept the configure() and every chunk, then emit nothing and
+         * raise no error — indistinguishable from a working player except that
+         * the canvas stays black. Nothing else in the pipeline can catch that.
+         */
+        _armFrameWatchdog() {
+            this._clearFrameWatchdog();
+            this._frameWatchdog = setTimeout(() => {
+                this._frameWatchdog = null;
+                if (!this.running || this._failed) return;
+                if (this.frameCount > 0) return;          // decoding fine
+                if (!this.bytesReceived) return;          // link problem, not decode
+                this._fail('no frame decoded within 8s (' + this.bytesReceived + ' bytes in)');
+            }, 8000);
+        }
+
+        _clearFrameWatchdog() {
+            if (this._frameWatchdog) {
+                clearTimeout(this._frameWatchdog);
+                this._frameWatchdog = null;
+            }
+        }
+
+        /**
+         * Report an unrecoverable decoder failure exactly once. Without this the
+         * player stays "connected" with a black canvas forever: onError was wired
+         * up by callers but never invoked, so no fallback could ever trigger.
+         */
+        _fail(reason) {
+            if (this._failed) return;
+            this._failed = true;
+            console.error('[SotaPlayer] Fatal decode failure:', reason);
+            if (this.onError) {
+                try { this.onError(new Error(reason)); } catch (e) {}
+            }
         }
 
         ingest(data) {
-            if (!this.running) return;
+            if (!this.running || this._failed) return;
+            this.bytesReceived = (this.bytesReceived || 0) + data.length;
             const nalUnits = this.splitNALUnits(data);
             for (const nal of nalUnits) {
                 this.processNAL(nal);
@@ -197,11 +275,26 @@
                     if (this.decoder) {
                         try {
                             this.decoder.reset();
-                            this.decoder.configure({
-                                codec: this.extractCodecFromSPS(data),
-                                hardwareAcceleration: "prefer-hardware",
-                                optimizeForLatency: true
-                            });
+                            this._configure(this.extractCodecFromSPS(data));
+                        } catch (e) {}
+                    }
+                    return;
+                }
+                // FIRST SPS: reconfigure to the stream's ACTUAL profile. initDecoder
+                // guesses Baseline ("avc1.42C01F") because the encoder asks for it,
+                // but MediaFormat.KEY_PROFILE is only a request — many devices emit
+                // Main/High regardless. A decoder configured for Baseline that is
+                // then fed High-profile chunks is exactly the case that fails on
+                // some phones and not others: lenient desktop/WebView decoders
+                // ignore the mismatch, stricter mobile ones reject every frame.
+                if (!this.sps) {
+                    this.sps = data;
+                    const realCodec = this.extractCodecFromSPS(data);
+                    if (this.decoder && realCodec !== this.codecString) {
+                        try {
+                            this.decoder.reset();
+                            this._configure(realCodec);
+                            this.hasReceivedKeyframe = false;
                         } catch (e) {}
                     }
                     return;
@@ -244,6 +337,7 @@
         }
 
         decodeChunk(data, isKey) {
+            if (this._failed || !this.decoder) return;
             try {
                 const chunk = new EncodedVideoChunk({
                     type: isKey ? "key" : "delta",
@@ -251,11 +345,21 @@
                     data: data
                 });
                 this.decoder.decode(chunk);
-            } catch (e) {}
+            } catch (e) {
+                // decode() throws synchronously when the decoder is in a bad
+                // state (unconfigured / closed). Silently swallowing every one of
+                // those was the other half of the black-canvas symptom — count
+                // them so handleError's ceiling can escalate to a fallback.
+                this.handleError(e);
+            }
         }
 
         handleFrame(frame) {
             if (!this.running) { frame.close(); return; }
+            // First painted frame proves the decoder works — retire the watchdog
+            // and the error tally so later transient errors get a full allowance.
+            if (this._frameWatchdog) this._clearFrameWatchdog();
+            this.decodeErrors = 0;
 
             if (this.canvas.width !== frame.displayWidth || this.canvas.height !== frame.displayHeight) {
                 this.canvas.width = frame.displayWidth;
@@ -269,14 +373,21 @@
         }
 
         handleError(e) {
+            // Bound the recovery attempts. A decoder that can't handle this
+            // stream errors on EVERY chunk, and resetting forever kept the canvas
+            // black with no signal to the caller — the reported "camera doesn't
+            // work on my phone" symptom. After a few tries, give up and report so
+            // a working decoder can take over.
+            this.decodeErrors = (this.decodeErrors || 0) + 1;
+            if (this.decodeErrors > 5) {
+                this._fail('decoder errored ' + this.decodeErrors + 'x: '
+                    + (e && e.message ? e.message : e));
+                return;
+            }
             if (this.decoder) {
                 try {
                     this.decoder.reset();
-                    this.decoder.configure({
-                        codec: this.sps ? this.extractCodecFromSPS(this.sps) : "avc1.42C01F",
-                        hardwareAcceleration: "prefer-hardware",
-                        optimizeForLatency: true
-                    });
+                    this._configure(this.sps ? this.extractCodecFromSPS(this.sps) : "avc1.42C01F");
                 } catch (err) {}
             }
             this.hasReceivedKeyframe = false;
@@ -288,6 +399,7 @@
             this.userWantsStream = false;
             this.reconnectAttempts = 0;
             this.running = false;
+            this._clearFrameWatchdog();
             if (this.ws) { this.ws.close(); this.ws = null; }
             if (this.decoder) { try { this.decoder.close(); } catch(e) {} this.decoder = null; }
             this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);

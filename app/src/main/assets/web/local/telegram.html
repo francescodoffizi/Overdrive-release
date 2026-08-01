@@ -26,7 +26,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <style>
@@ -240,6 +240,15 @@
                                 </label>
                             </div>
                         </div>
+                        <!-- Shown only when the native Daemons-screen switch is ON.
+                             That switch means "keep the bot running", which already
+                             covers being parked, so this toggle being off does not
+                             stop it — say so rather than letting the toggle look
+                             broken. -->
+                        <div class="info-box-note" id="tgAlwaysOnNote" style="margin-top:14px;display:none;">
+                            <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                            <div data-i18n="telegram.always_on_note">The daemon is enabled on the native Daemons screen, so it keeps running whether or not this toggle is on — including while parked. Turn it off there to stop it.</div>
+                        </div>
                         <div class="info-box-note" style="margin-top:14px;">
                             <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
                             <div data-i18n="telegram.daemon_start_pointer">Manual start / stop of the daemon lives on the <a href="about.html#daemons" style="color:var(--brand-primary);text-decoration:underline;">Daemons</a> page in the native app.</div>
@@ -255,7 +264,7 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
     <script>
         function toggleSidebar() {
@@ -354,6 +363,11 @@
                 // notifications.html via the same /api/telegram/status
                 // payload, so we don't paint them here.
                 if ($('tgAutoStartAccOff')) $('tgAutoStartAccOff').checked = !!s.autoStartAccOff;
+                // Explain the always-on case (see tgAlwaysOnNote): the native
+                // switch keeps the bot running regardless of this toggle.
+                if ($('tgAlwaysOnNote')) {
+                    $('tgAlwaysOnNote').style.display = s.daemonAlwaysOn ? '' : 'none';
+                }
             }
 
             // ───────────────────────── Bot token ─────────────────────────

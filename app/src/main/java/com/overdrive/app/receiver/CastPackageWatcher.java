@@ -110,6 +110,8 @@ public final class CastPackageWatcher extends BroadcastReceiver {
                 // Mirror FIRST (synchronous unbind+destroy of its VD), THEN the cast hold —
                 // same SurfaceFlinger-safe ordering as ACC-off.
                 try {
+                    com.overdrive.app.surveillance.ClusterViewMirrorService
+                            .forceDetachIfActive("cast-app-uninstalled");
                     com.overdrive.app.surveillance.ClusterMirrorController
                             .forceCloseIfActive("cast-app-uninstalled");
                 } catch (Throwable t) {
@@ -125,7 +127,13 @@ public final class CastPackageWatcher extends BroadcastReceiver {
 
             // 2) On a TRUE removal (not an update), clear a stale persisted auto-start
             //    package so ACC-on doesn't re-fail every ignition on a ghost app.
-            if (!replacing) clearAutoStartIfMatches(pkg);
+            if (!replacing) {
+                clearAutoStartIfMatches(pkg);
+                // Also drop the app's remembered cluster box. Not doing so leaves an entry per
+                // uninstalled app in the config forever, and a reinstall would silently reopen at
+                // a scale the user set for the previous install.
+                clearSavedClusterWindow(pkg);
+            }
         } catch (Throwable t) {
             CameraDaemon.log(TAG + ": handleRemoval failed: " + t.getMessage());
         }
@@ -154,6 +162,29 @@ public final class CastPackageWatcher extends BroadcastReceiver {
             CameraDaemon.log(TAG + ": cleared stale auto-start package " + removedPkg + " (uninstalled)");
         } catch (Throwable t) {
             CameraDaemon.log(TAG + ": clearAutoStart failed: " + t.getMessage());
+        }
+    }
+
+    /** Drop {@code projection.windows.<pkg>} — the per-app cluster box a headless cast applies —
+     *  when the app is uninstalled for good. Read-before-write so the common "nothing saved for
+     *  this package" case costs no config rewrite. Best-effort. */
+    private static void clearSavedClusterWindow(String removedPkg) {
+        try {
+            org.json.JSONObject proj =
+                    com.overdrive.app.config.UnifiedConfigManager.loadConfig().optJSONObject("projection");
+            org.json.JSONObject windows = proj != null ? proj.optJSONObject("windows") : null;
+            if (windows == null || !windows.has(removedPkg)) return;
+            org.json.JSONObject merged = new org.json.JSONObject();
+            java.util.Iterator<String> it = windows.keys();
+            while (it.hasNext()) {
+                String k = it.next();
+                if (!k.equals(removedPkg)) merged.put(k, windows.get(k));
+            }
+            com.overdrive.app.config.UnifiedConfigManager.updateSection(
+                    "projection", new org.json.JSONObject().put("windows", merged));
+            CameraDaemon.log(TAG + ": cleared saved cluster box for " + removedPkg + " (uninstalled)");
+        } catch (Throwable t) {
+            CameraDaemon.log(TAG + ": clearSavedClusterWindow failed: " + t.getMessage());
         }
     }
 }

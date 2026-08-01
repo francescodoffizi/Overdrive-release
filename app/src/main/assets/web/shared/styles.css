@@ -930,6 +930,27 @@ input, select { font-family: inherit; }
 
 .checkbox-item input { display: none; }
 
+/* === TELEMETRY OVERLAY FIELD PICKER ===========================
+ * Chip grid for choosing which telemetry fields burn into recordings.
+ * Reuses the .checkbox-item chip look (active = brand-teal fill). The
+ * wrapper indents slightly under its parent toggle row and animates in
+ * when the overlay is enabled. Purely additive — no other page uses it. */
+.telemetry-fields {
+    padding: 4px 0 12px;
+    border-bottom: none;
+}
+.telemetry-fields-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-top: 4px;
+}
+.telemetry-fields-grid .checkbox-item {
+    padding: 8px 14px;
+    font-size: 12px;
+    user-select: none;
+}
+
 /* === M3 OUTLINED TEXT FIELD ====================================
  * SOTA input pattern used by BYD Cloud and any future credential / data-entry
  * form. Pure CSS — no JS — leans on the "placeholder-shown" trick so the

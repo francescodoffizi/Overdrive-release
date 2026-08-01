@@ -219,6 +219,21 @@ class AdbDaemonLauncher(private val context: Context) {
     fun isDaemonRunning(processName: String, callback: (Boolean) -> Unit) {
         daemonLauncher.isDaemonRunning(processName, callback)
     }
+
+    /**
+     * One `ps -A` snapshot for the whole daemon set — see
+     * [DaemonLauncher.snapshotProcessTable]. Lets a caller that needs to test
+     * several daemons at once pay one `/proc` walk instead of one per daemon.
+     * Callback receives null when the probe failed (treat as "unknown", never
+     * as "dead").
+     */
+    fun snapshotProcessTable(callback: (String?) -> Unit) {
+        daemonLauncher.snapshotProcessTable(callback)
+    }
+
+    /** Test one process name against a [snapshotProcessTable] result. */
+    fun processAliveIn(snapshot: String, processName: String): Boolean =
+        daemonLauncher.processAliveIn(snapshot, processName)
     
     /**
      * Get process uptime for a daemon.

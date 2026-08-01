@@ -125,6 +125,13 @@ public class TelegramApiHandler {
         // Preferences — single source of truth in the unified config.
         response.put("videoUploads",        UnifiedTelegramConfig.isVideoUploads());
         response.put("autoStartAccOff",     UnifiedTelegramConfig.isAutoStartAccOff());
+        response.put("tyreAlerts",          UnifiedTelegramConfig.isTyreAlerts());
+        // The native Daemons-screen switch ("keep the bot running") is a separate,
+        // stronger signal than the parked-only autoStartAccOff toggle above. Both
+        // feed the ACC-off start gate, so the web UI needs to know when this one
+        // is set — otherwise turning autoStartAccOff off looks like it did
+        // nothing. Read-only here; only the native screen owns it.
+        response.put("daemonAlwaysOn",      UnifiedTelegramConfig.isDaemonEnabled());
         response.put("criticalAlerts",      UnifiedTelegramConfig.isCriticalAlerts());
         response.put("connectivityUpdates", UnifiedTelegramConfig.isConnectivity());
         response.put("motionText",          UnifiedTelegramConfig.isMotionText());
@@ -224,6 +231,7 @@ public class TelegramApiHandler {
      *   criticalAlerts      → criticalAlerts
      *   connectivityUpdates → connectivity
      *   motionText          → motionText
+     *   tyreAlerts          → tyreAlerts          (TelegramSink reads)
      */
     private static void handlePreferences(OutputStream out, String body) throws Exception {
         JSONObject response = new JSONObject();
@@ -234,7 +242,8 @@ public class TelegramApiHandler {
                 { "autoStartAccOff",     UnifiedTelegramConfig.K_AUTO_START },
                 { "criticalAlerts",      UnifiedTelegramConfig.K_CRITICAL_ALERTS },
                 { "connectivityUpdates", UnifiedTelegramConfig.K_CONNECTIVITY },
-                { "motionText",          UnifiedTelegramConfig.K_MOTION_TEXT }
+                { "motionText",          UnifiedTelegramConfig.K_MOTION_TEXT },
+                { "tyreAlerts",          UnifiedTelegramConfig.K_TYRE_ALERTS }
             };
             for (int i = 0; i < map.length; i++) {
                 String jsonKey = map[i][0];
@@ -243,6 +252,17 @@ public class TelegramApiHandler {
                     UnifiedTelegramConfig.setBoolean(unifiedKey, req.optBoolean(jsonKey, false));
                 }
             }
+            // This endpoint owns autoStartAccOff (parked-only mode) and must NOT
+            // touch daemonEnabled, the cross-UID mirror of the native
+            // Daemons-screen switch. "Run the daemon" is a strictly stronger
+            // request than "start it when parked", so a native-enabled bot
+            // correctly keeps running while parked even with this toggle off.
+            // An earlier revision cleared daemonEnabled here so the web toggle
+            // would visibly take effect; that silently killed a natively-enabled
+            // daemon while the native UI still displayed ON, and nothing on
+            // either surface could repair it. The status response now reports
+            // daemonAlwaysOn instead so the web UI can EXPLAIN the state rather
+            // than destroy it.
             response.put("success", true);
             HttpResponse.sendJson(out, response.toString());
         } catch (Exception e) {

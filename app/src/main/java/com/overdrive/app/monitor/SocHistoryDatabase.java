@@ -82,7 +82,15 @@ public class SocHistoryDatabase {
     private static final Object lock = new Object();
     
     // H2 Connection (kept open for performance)
-    private Connection connection;
+    /**
+     * Shared H2 connection. {@code volatile} because query methods read it on HTTP threads while
+     * {@code reconnect()} (on the writer/HTTP thread, under the instance monitor) closes and
+     * replaces it — without it there is no happens-before, so a reader could see a stale or
+     * half-published handle. Readers must SNAPSHOT it into a local once and use that, never
+     * re-read the field: guard-then-use on the field itself can observe non-null at the guard and
+     * null at the use, which NPEs mid-query.
+     */
+    private volatile Connection connection;
     
     private ScheduledExecutorService scheduler;
     private volatile boolean isRunning = false;
@@ -321,7 +329,15 @@ public class SocHistoryDatabase {
                 // v5: vehicle odometer (km) at session start. Snapshotted once
                 // at the charge edge (backfilled on a later tick if unavailable
                 // at start). Shown on the charging card/detail. -1 = unknown.
-                "start_odometer_km INTEGER DEFAULT -1"
+                "start_odometer_km INTEGER DEFAULT -1",
+                // v6: WHICH tariff priced this session. The rate itself is
+                // already snapshotted in electricity_rate; these record its
+                // provenance so the detail card can say "priced at Home rate"
+                // and an edit can re-price only the sessions a given tariff
+                // owns. Empty tariff_id = priced by the global rate (every
+                // pre-v6 session, and any charge at an unmapped location).
+                "tariff_id VARCHAR(16) DEFAULT ''",
+                "tariff_label VARCHAR(64) DEFAULT ''"
             };
             for (String col : newChargingCols) {
                 try {
@@ -486,37 +502,188 @@ public class SocHistoryDatabase {
         logger.info("SOC history recording stopped");
     }
     
-    private void reconnect() {
+    /**
+     * SYNCHRONIZED on the same instance monitor as {@link #recordCurrentSoc()}. Query paths run on
+     * HTTP threads and can now reach this (they increment the escalation counter, so
+     * isConnectionDead() can return true for them), which means a query thread could otherwise
+     * close and swap the shared {@code connection} field while the writer was mid-statement on it —
+     * and two concurrent reopens could leak a Connection by overwriting one another's handle.
+     */
+    private synchronized void reconnect() {
         // After stop() flips isRunning=false the connection is intentionally
         // closed. Re-opening here would re-acquire the lock file just before
         // the JVM exits, leaving an orphaned .lock.db that blocks the next
         // daemon start. Same defense in TripDatabase.reconnect.
         if (!isRunning) return;
         try {
-            if (connection == null || connection.isClosed()) {
+            if (isConnectionDead()) {
+                // Drop the dead handle first so the reopen isn't fighting a
+                // half-closed session for the file lock.
+                if (connection != null) {
+                    try { connection.close(); } catch (Exception ignored) { /* already dead */ }
+                    connection = null;
+                }
                 connection = DriverManager.getConnection(JDBC_URL, "sa", "");
-                logger.debug("H2 connection re-established");
+                // Re-assert the schema BEFORE flagging ready. If the store
+                // file was wiped or recreated, H2 hands back a fresh EMPTY
+                // database — flagging initialized without this would leave
+                // every write failing "Table SOC_HISTORY not found" in a
+                // permanent 2-minute retry loop. createTables() is idempotent
+                // (CREATE TABLE IF NOT EXISTS), matching what
+                // RecordingsIndex.reopen() does for the same reason.
+                createTables();
+                // The store is back; without this, a connection that died
+                // after init would stay flagged uninitialized-ish forever in
+                // callers that check isInitialized.
+                isInitialized = true;
+                // MUST clear the escalation counter. isConnectionDead() returns true purely on the
+                // counter once it saturates, so a fresh connection carrying a stale count would be
+                // declared dead again on the very next call — an unbreakable reopen loop, strictly
+                // worse than the bug this counter fixes.
+                writeFailures.set(0);
+                readFailures.set(0);
+                logger.info("H2 SOC connection re-established");
             }
         } catch (Exception e) {
             logger.error("Failed to reconnect to H2", e);
         }
     }
+
+    /**
+     * True when the shared connection is unusable — null, or closed by H2
+     * underneath us. Kept separate from the {@code == null} test because a
+     * closed-but-non-null connection is the exact state that silently broke
+     * SOC recording in the field.
+     */
+    private boolean isConnectionDead() {
+        if (connection == null) return true;
+        try {
+            if (connection.isClosed()) return true;
+        } catch (Exception e) {
+            return true;   // can't even probe it — treat as dead
+        }
+        // BROKEN-BUT-OPEN escalation. isClosed() only catches a session H2 itself tore down.
+        // An MVStore IO error, a full disk, or file corruption makes every statement throw while
+        // leaving the connection OPEN — and reconnect() gates on this method, so the writer looped
+        // "insert throws -> reconnect -> not dead -> return" every 2 min forever, with no new rows
+        // and nothing but ERROR lines to show it. Once enough consecutive statements have failed,
+        // declare it dead so reconnect() actually reopens.
+        //
+        // Counted rather than probed: a SELECT 1 on every call would add a query per write at the
+        // 2-min cadence for a fault that is rare, whereas the counter costs nothing until things
+        // are already failing. Any single success resets it (see noteStatementOk).
+        return writeFailures.get() >= MAX_CONSECUTIVE_FAILURES
+                || readFailures.get() >= MAX_CONSECUTIVE_FAILURES;
+    }
+
+    /**
+     * Consecutive WRITE failures against the current connection; cleared by a successful write.
+     * {@code AtomicInteger} because it is incremented from the SocHistoryDB executor and read from
+     * HTTP query threads — a read-increment-write on a plain {@code volatile} could lose a count.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger writeFailures =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+    /**
+     * SEPARATE from {@link #writeFailures}. A single shared counter let a healthy READER zero it
+     * between the writer's failing attempts: the UI polls the SOC graph every 60 s while the writer
+     * only attempts an INSERT every 120 s (600 s parked), so on the canonical disk-full fault —
+     * SELECT succeeds, INSERT fails — the count never reached the threshold and the store was never
+     * flagged dead. That defeated the escalation for exactly the fault it targets. Keeping the two
+     * apart means a read success can never clear a write escalation, or vice versa.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger readFailures =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /**
+     * Failures tolerated before a still-open connection is treated as dead. 3 covers a transient
+     * lock contention or one-off IO blip without letting a genuinely broken store persist for the
+     * process lifetime.
+     *
+     * <p>Detection latency depends on which path is failing. A UI poll hits the query paths every
+     * 60 s, so a visible graph escalates in ~3 min. The writer alone is slower: while SOC is moving
+     * it attempts an INSERT every 2 min (~6 min), but on a parked car the dedup gate returns before
+     * the INSERT and only the 10-min {@code forceRecord} heartbeat attempts one — worst case ~14 min
+     * (one overdue heartbeat plus three 2-min ticks). Both are bounded, which is the point: before
+     * this the broken-but-open state was never detected at all.
+     */
+    private static final int MAX_CONSECUTIVE_FAILURES = 3;
+
+    /** Record a successful statement — clears the broken-but-open escalation. */
+    private void noteWriteOk() {
+        writeFailures.set(0);
+    }
+
+    /** A successful READ clears only the read counter — never the writer's escalation. */
+    private void noteReadOk() {
+        readFailures.set(0);
+    }
+
+    /**
+     * True when {@code t} (or any cause) is a JDBC failure, i.e. real evidence that the statement
+     * layer — not the HAL, not the SOH estimator — is broken. Matched by type where available and by
+     * simple name through the cause chain, since a driver may wrap it.
+     */
+    private static boolean isSqlFailure(Throwable t) {
+        for (Throwable c = t; c != null && c != c.getCause(); c = c.getCause()) {
+            if (c instanceof java.sql.SQLException) return true;
+            String n = c.getClass().getSimpleName();
+            if (n.startsWith("SQL") || n.startsWith("JdbcSQL")) return true;
+            // H2 wraps store-level faults at the JDBC boundary in almost every path, but a raw
+            // MVStoreException (a RuntimeException, no SQL prefix, no SQLException in its chain) is
+            // exactly the disk-full / corruption case this escalation targets — so match it too
+            // rather than let the one fault we care most about slip through uncounted.
+            if (n.contains("MVStore") || n.contains("DbException")) return true;
+        }
+        return false;
+    }
+
+    /** Record a failed statement; at {@link #MAX_CONSECUTIVE_FAILURES} the connection is dead. */
+    private void noteWriteFailed() {
+        int n = writeFailures.incrementAndGet();
+        if (n == MAX_CONSECUTIVE_FAILURES) {
+            logger.error("SOC store: " + n + " consecutive WRITE failures on an OPEN"
+                    + " connection — treating it as dead so the next call reopens it");
+        }
+    }
+
+    /** Read-path sibling of {@link #noteWriteFailed()}; increments the read counter only. */
+    private void noteReadFailed() {
+        int n = readFailures.incrementAndGet();
+        if (n == MAX_CONSECUTIVE_FAILURES) {
+            logger.error("SOC store: " + n + " consecutive READ failures on an OPEN"
+                    + " connection — treating it as dead so the next call reopens it");
+        }
+    }
     
     // ==================== DATA RECORDING ====================
     
-    private void recordCurrentSoc() {
+    // synchronized: repriceSessionsForTariff runs an explicit transaction on this
+    // SAME shared JDBC Connection (autoCommit is a CONNECTION-level property), so a
+    // write landing from another thread mid-sweep would join that transaction and be
+    // rolled back — or committed — with it. Serializing every writer on the DB
+    // monitor keeps transaction scope to one thread.
+    private synchronized void recordCurrentSoc() {
         // Wrap entire method in try-catch to prevent scheduler death
         try {
             // Bail out cleanly when stop() has already begun — otherwise we
             // race connection.close() and trip H2's "already closed" path,
             // which re-opens the DB on reconnect() and orphans the lock file.
             if (!isRunning) return;
-            if (!isInitialized || connection == null) {
-                logger.debug("SOC recording skipped: not initialized or no connection");
+            // A CLOSED-but-non-null connection must also trigger reconnect:
+            // H2 can close the store underneath us (a thread interrupt during
+            // an MVStore write surfaces as ClosedByInterruptException on the
+            // backing FileChannel and takes the whole database down) while
+            // this field stays non-null and isInitialized stays true. The
+            // previous `connection == null` test therefore never fired, so
+            // reconnect() was never reached and every subsequent write failed
+            // with "The database has been closed [90098-224]" — observed in
+            // the field for the rest of the daemon's uptime.
+            if (!isInitialized || isConnectionDead()) {
+                logger.debug("SOC recording skipped: not initialized or connection dead");
                 reconnect();
                 return;
             }
-            
+
             VehicleDataMonitor monitor = VehicleDataMonitor.getInstance();
             if (monitor == null) {
                 logger.debug("SOC recording skipped: VehicleDataMonitor not available");
@@ -731,6 +898,10 @@ public class SocHistoryDatabase {
                 }
             } catch (Exception e) {
                 logger.error("Connection check failed", e);
+                // Count a genuine JDBC failure so a broken-but-OPEN connection escalates to
+                // dead and the reconnect below actually reopens it. Non-SQL throws are not
+                // counted — they say nothing about the connection (see isSqlFailure).
+                if (isSqlFailure(e)) noteWriteFailed();
                 reconnect();
                 return;
             }
@@ -758,6 +929,9 @@ public class SocHistoryDatabase {
                 pstmt.executeUpdate();
             }
             
+            // The INSERT above completed, so the connection is demonstrably usable — clear any
+            // broken-but-open escalation (see isConnectionDead).
+            noteWriteOk();
             lastRecordTime = now;
             lastRecordedSoc = soc;
             if (remainingKwh > 0) lastRecordedKwh = remainingKwh;
@@ -770,6 +944,18 @@ public class SocHistoryDatabase {
         } catch (Exception e) {
             // Log but don't rethrow - scheduler must continue running
             logger.error("Failed to record SOC: " + e.getMessage(), e);
+            // ONLY count it if the DATABASE failed. This try block also spans non-DB work — the
+            // VehicleDataMonitor HAL reads above and the SohEstimator/BydDataCollector calls — and a
+            // throw from any of those says nothing about the connection. Counting it would blame the
+            // store for a HAL fault and force needless reopens (3 unlucky HAL throws would close and
+            // reopen a perfectly healthy H2 file). SQLException is the only evidence that the
+            // statement layer failed; anything else is left uncounted so isConnectionDead() keeps
+            // reporting the truth.
+            if (isSqlFailure(e)) {
+                // Counted BEFORE reconnect(): once the threshold is reached isConnectionDead()
+                // returns true, so this same call's reconnect() is the one that reopens the store.
+                noteWriteFailed();
+            }
             try {
                 reconnect();
             } catch (Exception re) {
@@ -800,7 +986,8 @@ public class SocHistoryDatabase {
                         String sql = "UPDATE " + TABLE_CHARGING +
                             " SET end_time = ?, end_soc = ?, energy_added_kwh = ?, avg_power_kw = ?, peak_power_kw = ?, " +
                             "range_gained_km = ?, is_dc = ?, electricity_rate = ?, currency = ?, session_cost = ?, " +
-                            "time_to_full_min = ?, hv_temp_high = ?, hv_temp_low = ?, hv_temp_avg = ? " +
+                            "time_to_full_min = ?, hv_temp_high = ?, hv_temp_low = ?, hv_temp_avg = ?, " +
+                            "tariff_id = ?, tariff_label = ? " +
                             "WHERE start_time = ? AND end_time IS NULL;";
                         try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
                             // Prefer ∫P·dt over recorded samples (same basis as the
@@ -829,10 +1016,12 @@ public class SocHistoryDatabase {
                             // Peak-guarded so a misread DC gun on a low-power charge isn't stored as DC.
                             int isDc = deriveIsDc(chargingGunState, chargingPeakPower);
                             int rangeGained = rangeGainedFromEnergy(energyAdded);
-                            // DC sessions bill at the separate DC tariff when set.
-                            double rate = effectiveRate(isDc);
-                            String curr = getCurrencySymbol();
-                            double cost = (rate > 0 && energyAdded > 0) ? energyAdded * rate : -1;
+                            // Price at the tariff for WHERE this charge happened,
+                            // else the global DC/base rate (see priceSession).
+                            PricingDecision pd = priceSession(isDc, chargingStartLat, chargingStartLng);
+                            double rate = pd.rate;
+                            String curr = pd.currency;
+                            double cost = pd.costFor(energyAdded);
                             int ttf = chargingTimeToFullMin;
 
                             // Battery temperature at session end
@@ -861,8 +1050,11 @@ public class SocHistoryDatabase {
                             pstmt.setDouble(12, tHi);
                             pstmt.setDouble(13, tLo);
                             pstmt.setDouble(14, tAvg);
-                            pstmt.setLong(15, chargingStartTime);
+                            pstmt.setString(15, pd.tariffId);
+                            pstmt.setString(16, pd.tariffLabel);
+                            pstmt.setLong(17, chargingStartTime);
                             pstmt.executeUpdate();
+                            noteTariffUsed(pd.tariffId, closeTime);
 
                             // Fold this interrupted session into the permanent daily
                             // rollup, keyed on the actual session-end day (closeTime),
@@ -1044,11 +1236,12 @@ public class SocHistoryDatabase {
                 // elecRangeKm delta was unavailable during parked charging (always
                 // blank) and noisy. Same basis as the live in-progress card.
                 int rangeGained = rangeGainedFromEnergy(energyAdded);
-                // DC sessions bill at the separate DC tariff when set; AC/unknown
-                // fall back to the base rate (see effectiveRate).
-                double rate = effectiveRate(isDc);
-                String curr = getCurrencySymbol();
-                double cost = (rate > 0 && energyAdded > 0) ? energyAdded * rate : -1;
+                // Price at the tariff registered for WHERE this charge happened;
+                // absent a match, the global DC/base rate (see priceSession).
+                PricingDecision pd = priceSession(isDc, chargingStartLat, chargingStartLng);
+                double rate = pd.rate;
+                String curr = pd.currency;
+                double cost = pd.costFor(energyAdded);
                 // Use the value latched WHILE charging — re-reading now would
                 // get ~0 since charging just stopped.
                 int ttf = chargingTimeToFullMin;
@@ -1057,7 +1250,8 @@ public class SocHistoryDatabase {
                 String sql = "UPDATE " + TABLE_CHARGING +
                     " SET end_time = ?, end_soc = ?, energy_added_kwh = ?, avg_power_kw = ?, peak_power_kw = ?, " +
                     "range_gained_km = ?, is_dc = ?, electricity_rate = ?, currency = ?, session_cost = ?, " +
-                    "time_to_full_min = ?, hv_temp_high = ?, hv_temp_low = ?, hv_temp_avg = ? " +
+                    "time_to_full_min = ?, hv_temp_high = ?, hv_temp_low = ?, hv_temp_avg = ?, " +
+                    "tariff_id = ?, tariff_label = ? " +
                     "WHERE start_time = ? AND end_time IS NULL;";
 
                 try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
@@ -1075,9 +1269,12 @@ public class SocHistoryDatabase {
                     pstmt.setDouble(12, tHi);
                     pstmt.setDouble(13, tLo);
                     pstmt.setDouble(14, tAvg);
-                    pstmt.setLong(15, chargingStartTime);
+                    pstmt.setString(15, pd.tariffId);
+                    pstmt.setString(16, pd.tariffLabel);
+                    pstmt.setLong(17, chargingStartTime);
                     pstmt.executeUpdate();
                 }
+                noteTariffUsed(pd.tariffId, now);
 
                 // Fold this session into the permanent daily rollup.
                 foldSessionIntoDaily(now, energyAdded, cost, isDc, chargingPeakPower, rangeGained);
@@ -1432,7 +1629,12 @@ public class SocHistoryDatabase {
      * daily rollup. Skips a row whose last sample is too recent (< 2 min) — that
      * could be a charge the resume path is about to re-adopt.
      */
-    public void finalizeStaleOpenSessions() {
+    // synchronized: an EXTERNAL entry point (ChargingSessionManager.init) that
+    // writes session rows + daily rollups. repriceSessionsForTariff runs an explicit
+    // transaction on the shared JDBC Connection, and autoCommit is connection-level,
+    // so an unserialized write here could land inside that transaction and be
+    // committed or rolled back with it.
+    public synchronized void finalizeStaleOpenSessions() {
         if (!isInitialized || connection == null) return;
         try {
             java.util.List<Long> staleStarts = new java.util.ArrayList<>();
@@ -1520,23 +1722,36 @@ public class SocHistoryDatabase {
             double avgPower = count > 0 ? sum / count : -1;
             int rangeGained = rangeGainedFromEnergy(energyAdded);
             // Determine AC/DC first — the DC tariff selection depends on it.
+            // Read the charge LOCATION from the row too: this path runs after a
+            // daemon restart, so the in-memory chargingStartLat/Lng are gone and
+            // the stored coordinates are the only way to price this session at
+            // its location's tariff.
             int gun = -1;
+            double rowLat = 0, rowLng = 0;
             try (PreparedStatement r = connection.prepareStatement(
-                    "SELECT gun_state FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
+                    "SELECT gun_state, start_lat, start_lng FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
                 r.setLong(1, start);
-                try (ResultSet rs = r.executeQuery()) { if (rs.next()) gun = rs.getInt(1); }
+                try (ResultSet rs = r.executeQuery()) {
+                    if (rs.next()) {
+                        gun = rs.getInt(1);
+                        rowLat = rs.getDouble(2);
+                        rowLng = rs.getDouble(3);
+                    }
+                }
             }
             int isDc = deriveIsDc(gun, peak);  // peak-guarded against a misread DC gun
-            // DC sessions bill at the separate DC tariff when set.
-            double rate = effectiveRate(isDc);
-            double cost = (rate > 0 && energyAdded > 0) ? energyAdded * rate : -1;
-            String curr = getCurrencySymbol();
+            // Price at the location's tariff, else the global DC/base rate.
+            PricingDecision pd = priceSession(isDc, rowLat, rowLng);
+            double rate = pd.rate;
+            double cost = pd.costFor(energyAdded);
+            String curr = pd.currency;
             double tAvg = lastTemp > -999 ? lastTemp : -999;
 
             try (PreparedStatement upd = connection.prepareStatement(
                     "UPDATE " + TABLE_CHARGING + " SET end_time = ?, end_soc = ?, energy_added_kwh = ?, " +
                     "avg_power_kw = ?, peak_power_kw = ?, range_gained_km = ?, is_dc = ?, " +
-                    "electricity_rate = ?, currency = ?, session_cost = ?, hv_temp_avg = ? " +
+                    "electricity_rate = ?, currency = ?, session_cost = ?, hv_temp_avg = ?, " +
+                    "tariff_id = ?, tariff_label = ? " +
                     "WHERE start_time = ? AND end_time IS NULL;")) {
                 upd.setLong(1, endTime);
                 upd.setDouble(2, endSoc);
@@ -1549,9 +1764,12 @@ public class SocHistoryDatabase {
                 upd.setString(9, curr);
                 upd.setDouble(10, cost);
                 upd.setDouble(11, tAvg);
-                upd.setLong(12, start);
+                upd.setString(12, pd.tariffId);
+                upd.setString(13, pd.tariffLabel);
+                upd.setLong(14, start);
                 upd.executeUpdate();
             }
+            noteTariffUsed(pd.tariffId, endTime);
             foldSessionIntoDaily(endTime, energyAdded, cost, isDc, peak, rangeGained);
             logger.info("Finalized stale open charging session start=" + start +
                 " (samples=" + count + ", energy=" + String.format("%.1f", energyAdded) +
@@ -1588,6 +1806,304 @@ public class SocHistoryDatabase {
             }
         } catch (Exception e) {
             logger.debug("reverseDailyFoldForSession failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Re-price closed sessions after a tariff edit, and keep the daily rollups
+     * consistent with the new costs.
+     *
+     * <p><b>Why this is needed.</b> A session's cost is snapshotted at close
+     * time, so correcting a mistyped rate would otherwise leave every historical
+     * charge priced wrong forever, with no way to fix it short of deleting the
+     * sessions. This walks the affected rows, re-runs the SAME
+     * {@link #priceSession} resolution used at session end, and rewrites
+     * {@code electricity_rate} / {@code currency} / {@code session_cost} /
+     * {@code tariff_id} — folding the cost delta into {@code charging_daily} so
+     * period and lifetime totals stay in agreement with the session list.
+     *
+     * <p><b>Scope.</b> {@code tariffId} non-empty ⇒ only sessions that tariff
+     * priced, plus any unpriced-but-in-range session it now covers (so widening
+     * a radius or adding a rate retroactively adopts the charges it should own).
+     * {@code tariffId} empty ⇒ every session is re-evaluated (used when a tariff
+     * is deleted, so its orphaned sessions fall back to the global rate).
+     *
+     * <p>Sessions with no energy recorded are skipped — there is nothing to
+     * price, and rewriting them would churn the rollups for no gain.
+     *
+     * @return the number of sessions whose cost actually changed
+     */
+    public synchronized int repriceSessionsForTariff(String tariffId) {
+        if (!isAvailable()) return 0;
+        int changed = 0;
+        try {
+            // Snapshot the rows first: we mutate inside the loop, and H2 doesn't
+            // like an open ResultSet over a table being updated.
+            java.util.List<long[]> keys = new java.util.ArrayList<>();      // startTime, endTime
+            java.util.List<double[]> vals = new java.util.ArrayList<>();    // energy, oldCost, lat, lng, oldRate
+            java.util.List<int[]> flags = new java.util.ArrayList<>();      // isDc, rangeGained
+            java.util.List<String> owners = new java.util.ArrayList<>();    // existing tariff_id
+            java.util.List<String[]> texts = new java.util.ArrayList<>();   // currency, tariff_label
+
+            // Select EVERY column the UPDATE below writes, so the "nothing changed"
+            // skip can be decided on all of them (a label-only or currency-only
+            // edit must not be dropped just because the cost is unchanged).
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT start_time, end_time, energy_added_kwh, session_cost, start_lat, start_lng, " +
+                    "is_dc, range_gained_km, tariff_id, currency, tariff_label, electricity_rate FROM " + TABLE_CHARGING +
+                    " WHERE end_time IS NOT NULL;")) {
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        double energy = rs.getDouble(3);
+                        if (Double.isNaN(energy) || energy <= 0) continue;
+                        keys.add(new long[]{ rs.getLong(1), rs.getLong(2) });
+                        vals.add(new double[]{ energy, rs.getDouble(4), rs.getDouble(5), rs.getDouble(6), rs.getDouble(12) });
+                        flags.add(new int[]{ rs.getInt(7), rs.getInt(8) });
+                        String owner = rs.getString(9);
+                        owners.add(owner != null ? owner : "");
+                        String cur = rs.getString(10);
+                        String lbl = rs.getString(11);
+                        texts.add(new String[]{ cur != null ? cur : "", lbl != null ? lbl : "" });
+                    }
+                }
+            }
+
+            // One prepared statement reused for every row, and ONE transaction for
+            // the whole sweep: 2N autocommits on a 2000-session history is minutes
+            // of disk churn on a head unit, and a mid-sweep failure would otherwise
+            // leave half the rows re-priced with charging_daily half-adjusted.
+            boolean priorAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            boolean committed = false;
+            try (PreparedStatement upd = connection.prepareStatement(
+                    "UPDATE " + TABLE_CHARGING + " SET electricity_rate = ?, currency = ?, " +
+                    "session_cost = ?, tariff_id = ?, tariff_label = ? WHERE start_time = ?;")) {
+
+                for (int i = 0; i < keys.size(); i++) {
+                    long startTime = keys.get(i)[0];
+                    long endTime = keys.get(i)[1];
+                    double energy = vals.get(i)[0];
+                    double oldCost = vals.get(i)[1];
+                    double lat = vals.get(i)[2];
+                    double lng = vals.get(i)[3];
+                    double oldRate = vals.get(i)[4];
+                    int isDc = flags.get(i)[0];
+                    int rangeGained = flags.get(i)[1];
+                    String owner = owners.get(i);
+                    String oldCurrency = texts.get(i)[0];
+                    String oldLabel = texts.get(i)[1];
+
+                    // Adoption of a previously-global session must be EARNED by an
+                    // explicit geofence match, never inherited from the pinned
+                    // default. Pre-v3 rows carry start_lat/start_lng = 0 from the
+                    // ALTER default, so the lenient resolve() would hand every one
+                    // of them to whichever profile happens to be default — which,
+                    // since the first tariff a user creates is auto-promoted to
+                    // default, would silently restate the ENTIRE cost history the
+                    // moment they added one tariff. That is the I2 violation.
+                    PricingDecision pd = (owner.isEmpty())
+                            ? priceSessionInCircle(isDc, lat, lng)
+                            : priceSession(isDc, lat, lng);
+
+                    // NEVER re-price a session that was priced by the global rate
+                    // and still is. Those costs are a historical record of what the
+                    // driver actually paid; electricity_rate is a deliberate
+                    // at-session-end snapshot (that is why the column exists).
+                    if (owner.isEmpty() && pd.tariffId.isEmpty()) continue;
+
+                    // A globally-priced session that a tariff now geofences may be
+                    // adopted ONLY if it was never actually priced (no rate, no
+                    // cost). Restating a real historical price is the I2 violation.
+                    if (owner.isEmpty() && (oldRate > 0 || oldCost > 0)) continue;
+
+                    // Targeted mode: touch only sessions this tariff owned before,
+                    // or that it owns now. Other tariffs' sessions are untouched.
+                    if (tariffId != null && !tariffId.isEmpty()
+                            && !tariffId.equals(owner) && !tariffId.equals(pd.tariffId)) {
+                        continue;
+                    }
+
+                    double newCost = pd.costFor(energy);
+                    // Sub-cent moves aren't worth a rollup adjustment...
+                    boolean costSame = (oldCost <= -1 && newCost <= -1)
+                            || (oldCost > -1 && newCost > -1 && Math.abs(oldCost - newCost) < 0.005);
+                    // ...but the row still has to be written when ANY other
+                    // persisted column moved (a rename, a currency switch, an
+                    // ownership transfer, or a rate change too small to move the
+                    // cost). Deciding the skip on cost alone silently dropped
+                    // those edits onto history.
+                    boolean rowSame = costSame
+                            && pd.tariffId.equals(owner)
+                            && pd.currency.equals(oldCurrency)
+                            && pd.tariffLabel.equals(oldLabel)
+                            && Math.abs(pd.rate - oldRate) < 1e-9;
+                    if (rowSame) continue;
+
+                    upd.setDouble(1, pd.rate);
+                    upd.setString(2, pd.currency);
+                    upd.setDouble(3, newCost);
+                    upd.setString(4, pd.tariffId);
+                    upd.setString(5, pd.tariffLabel);
+                    upd.setLong(6, startTime);
+                    // Only shift the rollup if the row actually changed. A 0-row
+                    // update (row deleted between the snapshot SELECT and now) would
+                    // otherwise move charging_daily for a session that no longer
+                    // carries the new cost.
+                    if (upd.executeUpdate() <= 0) continue;
+
+                    // Keep charging_daily in step by shifting ONLY the cost column
+                    // by the delta. Deliberately NOT reverse-fold + re-fold:
+                    // re-folding rewrites soh_at_day with TODAY's SOH estimate,
+                    // corrupting that day's point on the SOH-trend chart, and would
+                    // churn session_count/dc/ac/peak that haven't changed.
+                    //
+                    // Called unconditionally, NOT under !costSame: an ownership
+                    // transfer whose cost moved sub-cent still WROTE the new
+                    // session_cost above, so skipping the shift here left the
+                    // rollup permanently out of step with the session rows.
+                    // adjustDailyCost already no-ops on a zero/NaN delta.
+                    adjustDailyCost(endTime, (newCost > 0 ? newCost : 0) - (oldCost > 0 ? oldCost : 0));
+                    if (!costSame) changed++;
+                }
+                connection.commit();
+                committed = true;
+            } finally {
+                if (!committed) {
+                    try { connection.rollback(); } catch (Exception ignored) {}
+                    // Nothing persisted — never report a count for rolled-back work,
+                    // or the UI would claim "N past charges re-priced" after a failure.
+                    changed = 0;
+                }
+                try { connection.setAutoCommit(priorAutoCommit); } catch (Exception ignored) {}
+            }
+            if (changed > 0) {
+                logger.info("Re-priced " + changed + " charging session(s) for tariff "
+                        + (tariffId == null || tariffId.isEmpty() ? "(all)" : tariffId));
+            }
+        } catch (Exception e) {
+            logger.error("repriceSessionsForTariff failed: " + e.getMessage());
+        }
+        return changed;
+    }
+
+    /**
+     * The per-kWh rate the most recent completed charge was billed at, with the
+     * currency and tariff label that produced it — the price the energy currently
+     * in the pack actually cost.
+     *
+     * <p>This is what Trips uses to cost a drive: energy consumed on a trip came
+     * out of the last charge, so it should be valued at that charge's tariff, not
+     * at whatever global rate happens to be configured now. A driver who charges
+     * cheaply at home and expensively on a road trip gets per-trip costs that
+     * reflect where the electrons were bought.
+     *
+     * <p>Only sessions with a real recorded rate qualify ({@code electricity_rate
+     * > 0}); an unpriced session is skipped so we fall back to an older priced one
+     * rather than reporting a zero rate. Returns {@code null} when no priced
+     * session exists at all (fresh install, or analytics never enabled), which
+     * callers treat as "use the configured global rate" — the pre-existing
+     * behaviour, so nothing regresses.
+     *
+     * @param maxAgeDays ignore charges older than this; {@code <= 0} = no limit
+     */
+    public JSONObject getLastChargeRate(int maxAgeDays) {
+        if (!isAvailable()) return null;
+        try {
+            // Take the MOST RECENT priced charge, then require that it be
+            // tariff-owned. Filtering tariff-ownership inside the WHERE clause
+            // instead would let a 59-day-old home tariff price today's trip while
+            // ignoring yesterday's public charge — the opposite of "the energy in
+            // the pack came from the last charge".
+            //
+            // Ownership is required because a globally-priced row must not set a
+            // trip's rate: with no tariffs at all, a DC fast charge stores the
+            // global dcRate, and inheriting it would cost every later trip at the
+            // DC premium instead of collapsing to the base rate (invariant I1).
+            StringBuilder sql = new StringBuilder(
+                    "SELECT end_time, electricity_rate, currency, tariff_id, tariff_label, is_dc " +
+                    "FROM " + TABLE_CHARGING +
+                    " WHERE end_time IS NOT NULL AND electricity_rate > 0");
+            if (maxAgeDays > 0) {
+                // end_time is the real bound. start_time is added ONLY as an index
+                // prune (idx_charging_start is the sole index), and is slacked back
+                // 30 days: a session STARTS before it ENDS, so binding both to the
+                // same cutoff would drop a charge that began just before the cutoff
+                // and ended after it — including, at the boundary, the most recent
+                // one. The slack is far wider than any real session span.
+                sql.append(" AND start_time >= ? AND end_time >= ?");
+            }
+            sql.append(" ORDER BY end_time DESC LIMIT 1;");
+
+            try (PreparedStatement ps = connection.prepareStatement(sql.toString())) {
+                if (maxAgeDays > 0) {
+                    long cutoff = System.currentTimeMillis() - (maxAgeDays * 86_400_000L);
+                    ps.setLong(1, cutoff - 30L * 86_400_000L);   // index prune, slacked
+                    ps.setLong(2, cutoff);                        // the real age bound
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return null;
+                    double rate = rs.getDouble(2);
+                    if (Double.isNaN(rate) || rate <= 0) return null;
+                    String tId = null, tLabel = null;
+                    try {
+                        tId = rs.getString(4);
+                        tLabel = rs.getString(5);
+                    } catch (Exception ignored) {
+                        // Pre-v6 row without the tariff columns — treated as global.
+                    }
+                    // The latest priced charge was on the GLOBAL rate (or predates
+                    // tariffs): return null so trips fall back to the configured
+                    // base rate — the pre-feature behaviour (I1).
+                    if (tId == null || tId.isEmpty()) return null;
+                    JSONObject out = new JSONObject();
+                    out.put("endTime", rs.getLong(1));
+                    out.put("rate", rate);
+                    String curr = rs.getString(3);
+                    out.put("currency", curr != null ? curr : "");
+                    out.put("tariffId", tId != null ? tId : "");
+                    out.put("tariffLabel", tLabel != null ? tLabel : "");
+                    int isDc = rs.getInt(6);
+                    out.put("isDc", isDc == 1);
+                    return out;
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("getLastChargeRate failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Shift one day's rollup cost by {@code delta} (may be negative), clamped at
+     * zero. Used by {@link #repriceSessionsForTariff} so period/lifetime cost
+     * totals track a re-priced session without disturbing that day's session
+     * count, AC/DC split, peak power, or {@code soh_at_day}.
+     *
+     * <p>No-ops when the day has no rollup row: a session whose day bucket was
+     * never folded has nothing to correct.
+     */
+    private void adjustDailyCost(long endTime, double delta) {
+        if (!isInitialized || connection == null) return;
+        if (delta == 0 || Double.isNaN(delta)) return;
+        try {
+            long day = (endTime / 86_400_000L) * 86_400_000L;
+            try (PreparedStatement upd = connection.prepareStatement(
+                    "UPDATE " + TABLE_CHARGING_DAILY +
+                    " SET cost = GREATEST(cost + ?, 0) WHERE day_epoch = ?;")) {
+                upd.setDouble(1, delta);
+                upd.setLong(2, day);
+                int rows = upd.executeUpdate();
+                if (rows == 0) {
+                    // No rollup row for that day — foldSessionIntoDaily swallows its
+                    // own exceptions, so this state is reachable. Warn rather than
+                    // drop the correction silently: period/lifetime cost totals will
+                    // be short by `delta` for that day and nothing else would say so.
+                    logger.warn("adjustDailyCost: no charging_daily row for day " + day
+                            + " — cost correction of " + String.format("%.4f", delta) + " not applied");
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("adjustDailyCost failed: " + e.getMessage());
         }
     }
 
@@ -1715,6 +2231,15 @@ public class SocHistoryDatabase {
      * we downgrade to unknown (-1) and let the power-based classifier bucket it as
      * AC. gun==2 (AC) is trusted as-is. The 15 kW floor mirrors charging.js
      * DC_MIN_PEAK_KW — comfortably above any AC wallbox, well below a real DC ramp.
+     *
+     * <p>An UNMEASURED peak (0) deliberately lands on -1 too, i.e. base rate. It is
+     * tempting to read 0 as "no evidence, so trust the gun" and return 1, but that is
+     * the wrong default here: an AC-only PHEV whose charger getters are all dead
+     * misreads gun==3 and would then be priced at {@code dcRate} FOREVER (I5 — the row
+     * is an immutable snapshot). The peak is only 0 for the first sample interval of a
+     * working trim, so the DC verdict is merely deferred, not lost; on a trim that never
+     * measures anything, refusing to guess is I2. Overcharging permanently to fix a
+     * seconds-long label transient is not a trade worth making.
      */
     private static final double DC_MIN_PEAK_KW = 15.0;
     private int deriveIsDc(int gunState, double peakKw) {
@@ -1773,7 +2298,14 @@ public class SocHistoryDatabase {
                 BatterySocData sd = (vm != null) ? vm.getBatterySoc() : null;
                 double soc = (sd != null) ? sd.socPercent : Double.NaN;
                 ChargingStateData cs = (vm != null) ? vm.getChargingState() : null;
-                double powerKw = (cs != null) ? cs.chargingPowerKW : Double.NaN;
+                // Reject ESTIMATED power, exactly as recordCurrentSoc does for peak/avg. A
+                // nominal placeholder (3.3 kW PHEV / 7.0 kW BEV) or an inferred engine-power
+                // figure would yield a confident-looking time-to-full derived from a number the
+                // cascade itself flagged as not measured — and trackChargingSession LATCHES the
+                // most recent positive TTF into the persisted session row, so the guess would
+                // outlive the window that produced it. Estimated → no TTF; the caller falls back
+                // to the HAL's own charging-rest-time.
+                double powerKw = (cs != null && !cs.isEstimated) ? cs.chargingPowerKW : Double.NaN;
                 double sohFrac = (soh != null && soh.hasDisplaySoh()) ? soh.getDisplaySoh() / 100.0 : 1.0;
                 if (sohFrac <= 0) sohFrac = 1.0;
                 if (!Double.isNaN(soc) && soc >= 0 && soc < 100
@@ -1828,19 +2360,147 @@ public class SocHistoryDatabase {
     }
 
     /**
-     * Effective per-kWh rate for a session's cost. Uses the separate DC tariff
-     * ONLY when the session is confidently DC ({@code isDc == 1}) and a DC rate
-     * is configured; otherwise the base (AC/home) rate. A tri-state {@code isDc}
-     * of -1 (unknown / peak-downgraded gun misread) or 0 (AC) both use the base
-     * rate — the safe default. This is the single rate-selection point shared by
-     * every cost-writing path so DC and AC sessions can't diverge.
+     * The tariff + rate + currency that price one session — the SINGLE
+     * rate-selection point every cost-writing path shares, so AC/DC and
+     * mapped/unmapped sessions can't diverge.
+     *
+     * <p>Resolution, in order:
+     * <ol>
+     *   <li><b>Location-matched tariff</b> — a {@link TariffProfile} whose circle
+     *       contains {@code (lat,lng)} and which prices this gun type. This is
+     *       what makes "charging at the same place reuses that place's rate"
+     *       automatic. Carries its own currency when the user set one (a public
+     *       DC network abroad can bill in a different currency than home).</li>
+     *   <li><b>Global DC tariff</b> — when the session is confidently DC
+     *       ({@code isDc == 1}) and a global {@code dcRate} is set.</li>
+     *   <li><b>Global base rate</b> — the AC/home rate. A tri-state {@code isDc}
+     *       of -1 (unknown / peak-downgraded gun misread) or 0 (AC) lands here,
+     *       the safe default.</li>
+     * </ol>
+     *
+     * <p>With no tariff profiles configured this collapses to exactly the
+     * previous base/DC behaviour, so nothing regresses for existing installs.
+     *
+     * @param isDc tri-state gun verdict from {@link #deriveIsDc}: 1=DC, 0=AC, -1=unknown
+     * @param lat  session start latitude, 0 when no fix was captured
+     * @param lng  session start longitude, 0 when no fix was captured
      */
-    private double effectiveRate(int isDc) {
-        if (isDc == 1) {
-            double dc = getDcRate();
-            if (dc > 0) return dc;
+    private PricingDecision priceSession(int isDc, double lat, double lng) {
+        try {
+            com.overdrive.app.charging.TariffProfile p =
+                    com.overdrive.app.charging.TariffManager.getInstance().resolve(lat, lng, isDc);
+            if (p != null) {
+                double r = p.rateFor(isDc);
+                if (r > 0) {
+                    String curr = (p.getCurrency() != null && !p.getCurrency().isEmpty())
+                            ? p.getCurrency() : globalPricing(isDc).currency;
+                    return new PricingDecision(r, curr, p.getId(), p.getLabel());
+                }
+            }
+        } catch (Throwable t) {
+            // Tariff layer must never break session accounting — fall through
+            // to the global rate exactly as before.
+            logger.debug("Tariff resolve skipped: " + t.getMessage());
         }
-        return getElectricityRate();
+        return globalPricing(isDc);
+    }
+
+    /**
+     * Global (non-tariff) pricing resolved from a SINGLE config read.
+     *
+     * <p>getElectricityRate/getDcRate/getCurrencySymbol each call loadConfig()
+     * separately, so composing them did up to 3 reads per priced row - and both
+     * repriceSessionsForTariff and the live session-list render call the pricing
+     * path once PER ROW. Same values, one read.
+     *
+     * <p>Keeps the pre-existing return conventions exactly: an unset base rate is
+     * -1 (never 0), an unset DC rate is ignored, and the currency is "" when unset.
+     */
+    private PricingDecision globalPricing(int isDc) {
+        double rate = -1;
+        double dc = 0;
+        String curr = "";
+        try {
+            org.json.JSONObject cfg = com.overdrive.app.config.UnifiedConfigManager.loadConfig();
+            org.json.JSONObject trips = cfg != null ? cfg.optJSONObject("tripAnalytics") : null;
+            if (trips != null) {
+                double r = trips.optDouble("electricityRate", -1);
+                if (r > 0) rate = r;
+                String c = trips.optString("currency", "");
+                if (c != null && !c.isEmpty()) curr = c;
+            }
+            org.json.JSONObject charging = cfg != null ? cfg.optJSONObject("chargingAnalytics") : null;
+            if (charging != null) {
+                double d = charging.optDouble("dcRate", 0);
+                if (d > 0) dc = d;
+            }
+        } catch (Exception ignored) {}
+        if (isDc == 1 && dc > 0) return new PricingDecision(dc, curr, "", "");
+        return new PricingDecision(rate, curr, "", "");
+    }
+
+    /**
+     * Like {@link #priceSession} but the tariff must EARN the match by geofence —
+     * the pinned default is never consulted.
+     *
+     * <p>Used when deciding whether a historical session that the global rate
+     * priced may be adopted by a tariff. Falling back to the default there would
+     * let one new tariff claim every location-less legacy row at once.
+     */
+    private PricingDecision priceSessionInCircle(int isDc, double lat, double lng) {
+        try {
+            com.overdrive.app.charging.TariffProfile p =
+                    com.overdrive.app.charging.TariffManager.getInstance()
+                            .resolveInCircle(lat, lng, isDc);
+            if (p != null) {
+                double r = p.rateFor(isDc);
+                if (r > 0) {
+                    String curr = (p.getCurrency() != null && !p.getCurrency().isEmpty())
+                            ? p.getCurrency() : globalPricing(isDc).currency;
+                    return new PricingDecision(r, curr, p.getId(), p.getLabel());
+                }
+            }
+        } catch (Throwable t) {
+            logger.debug("Tariff geofence resolve skipped: " + t.getMessage());
+        }
+        // No geofence match: report "global rate" so the caller leaves the row alone.
+        return globalPricing(isDc);
+    }
+
+    /**
+     * Outcome of {@link #priceSession}: the per-kWh rate, the currency to record
+     * it in, and the provenance of the tariff that supplied it ({@code tariffId}
+     * empty ⇒ the global rate priced this session).
+     */
+    private static final class PricingDecision {
+        final double rate;
+        final String currency;
+        final String tariffId;
+        final String tariffLabel;
+
+        PricingDecision(double rate, String currency, String tariffId, String tariffLabel) {
+            this.rate = rate;
+            this.currency = currency != null ? currency : "";
+            this.tariffId = tariffId != null ? tariffId : "";
+            this.tariffLabel = tariffLabel != null ? tariffLabel : "";
+        }
+
+        /** Cost for an energy amount, or -1 when this session can't be priced. */
+        double costFor(double energyKwh) {
+            return (rate > 0 && energyKwh > 0) ? energyKwh * rate : -1;
+        }
+    }
+
+    /**
+     * Bump the use-counter on the tariff that priced a just-closed session, so
+     * the UI can order profiles by real usage and show provenance. Best-effort:
+     * the rate is already persisted on the row, so a failure here costs nothing.
+     */
+    private void noteTariffUsed(String tariffId, long whenMs) {
+        if (tariffId == null || tariffId.isEmpty()) return;
+        try {
+            com.overdrive.app.charging.TariffManager.getInstance().markUsed(tariffId, whenMs);
+        } catch (Throwable ignored) {}
     }
 
     private String getCurrencySymbol() {
@@ -1922,7 +2582,7 @@ public class SocHistoryDatabase {
      * Append a fine-grained in-session sample (driven by ChargingSessionManager's
      * fast sampler while ChargingDetector.isCharging()). Best-effort; never throws.
      */
-    public void recordChargingSample(long sessionStartTime, long t, double powerKw, double soc,
+    public synchronized void recordChargingSample(long sessionStartTime, long t, double powerKw, double soc,
                                      double temp, double tempHigh, double tempLow) {
         if (!isInitialized || connection == null || sessionStartTime <= 0) return;
         if (Double.isNaN(powerKw)) return;
@@ -1996,7 +2656,11 @@ public class SocHistoryDatabase {
     public JSONArray getSocHistory(int hoursBack, int maxPoints) {
         JSONArray results = new JSONArray();
         
-        if (!isInitialized || connection == null) {
+        // Snapshot ONCE — see the connection field's doc. Guard-then-use on the field could pass
+        // the null check and then read null at prepareStatement() if reconnect() swapped it in
+        // between, NPE-ing mid-query and handing the UI an empty graph for that refresh.
+        final Connection conn = connection;
+        if (!isInitialized || conn == null) {
             logger.debug("Database not initialized for getSocHistory");
             return results;
         }
@@ -2034,15 +2698,28 @@ public class SocHistoryDatabase {
                 "  AVG(CASE WHEN hv_temp_avg > -999 THEN hv_temp_avg END) as temp, " +
                 "  AVG(CASE WHEN soh_percent > 0 THEN soh_percent END) as soh " +
                 "FROM " + TABLE_SOC + " " +
-                "WHERE timestamp >= ? " +
+                "WHERE timestamp >= ? AND timestamp <= ? " +
                 "GROUP BY (timestamp / ?) " +
                 "ORDER BY t ASC " +
                 "LIMIT ?;";
             
-            try (PreparedStatement pstmt = connection.prepareStatement(querySql)) {
+            try (PreparedStatement pstmt = conn.prepareStatement(querySql)) {
                 pstmt.setLong(1, startTime);
-                pstmt.setLong(2, bucketMs);
-                pstmt.setInt(3, rowLimit);
+                // UPPER BOUND = now. Without it, rows written before a BACKWARD wall-clock
+                // correction (these head units set the clock from GPS/NTP after boot, and a dead
+                // RTC can start them years ahead) carry timestamps LARGER than the current time yet
+                // still satisfy `>= startTime`. They come back interleaved with the live point that
+                // getFullReport appends using the corrected clock, so the series stops being
+                // ascending — and the chart maps x as (t - history[0].t) / (last.t - history[0].t),
+                // which then collapses to ~0 or throws points off-canvas, rendering a blank or
+                // garbage line that looks exactly like a frozen graph until the stale rows age out.
+                // Reuse the SAME `now` that startTime was derived from. Calling the clock twice
+                // left a window where a backward NTP step between the two reads could make the
+                // upper bound EARLIER than startTime, returning zero rows for that refresh. Sharing
+                // one timestamp makes upper >= startTime true by construction.
+                pstmt.setLong(2, now);
+                pstmt.setLong(3, bucketMs);
+                pstmt.setInt(4, rowLimit);
 
                 try (ResultSet rs = pstmt.executeQuery()) {
                     while (rs.next()) {
@@ -2065,9 +2742,19 @@ public class SocHistoryDatabase {
                     }
                 }
             }
+            // The query completed, so the connection is demonstrably usable — clear any
+            // broken-but-open escalation. Without this, an escalation triggered by a FAILING QUERY
+            // could only be cleared by a successful WRITE, and the writer dedups (0.5% SOC / 10-min
+            // heartbeat) — so a recovered store could stay flagged dead for up to 10 minutes while
+            // reads were already succeeding.
+            noteReadOk();
             
         } catch (Exception e) {
             logger.error("Failed to get SOC history", e);
+            // Count a genuine JDBC failure so a broken-but-OPEN connection escalates to
+            // dead and the reconnect below actually reopens it. Non-SQL throws are not
+            // counted — they say nothing about the connection (see isSqlFailure).
+            if (isSqlFailure(e)) noteReadFailed();
             reconnect();
         }
         
@@ -2080,7 +2767,9 @@ public class SocHistoryDatabase {
     public JSONArray getChargingSessions(int daysBack) {
         JSONArray results = new JSONArray();
         
-        if (!isInitialized || connection == null) {
+        // Snapshot once — see the connection field's doc.
+        final Connection conn = connection;
+        if (!isInitialized || conn == null) {
             return results;
         }
         
@@ -2091,7 +2780,7 @@ public class SocHistoryDatabase {
                 "end_soc as endSoc, energy_added_kwh as energyAdded, peak_power_kw as peakPower " +
                 "FROM " + TABLE_CHARGING + " WHERE start_time >= ? ORDER BY start_time DESC;";
             
-            try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
                 pstmt.setLong(1, startTime);
                 
                 try (ResultSet rs = pstmt.executeQuery()) {
@@ -2110,6 +2799,10 @@ public class SocHistoryDatabase {
             
         } catch (Exception e) {
             logger.error("Failed to get charging sessions", e);
+            // Count a genuine JDBC failure so a broken-but-OPEN connection escalates to
+            // dead and the reconnect below actually reopens it. Non-SQL throws are not
+            // counted — they say nothing about the connection (see isSqlFailure).
+            if (isSqlFailure(e)) noteReadFailed();
             reconnect();
         }
 
@@ -2122,7 +2815,8 @@ public class SocHistoryDatabase {
     private static final String CHARGING_V2_COLS =
         "id, start_time, end_time, start_soc, end_soc, energy_added_kwh, peak_power_kw, avg_power_kw, " +
         "range_gained_km, gun_state, is_dc, electricity_rate, currency, session_cost, time_to_full_min, " +
-        "hv_temp_high, hv_temp_low, hv_temp_avg, start_lat, start_lng, place_label, start_odometer_km";
+        "hv_temp_high, hv_temp_low, hv_temp_avg, start_lat, start_lng, place_label, start_odometer_km, " +
+        "tariff_id, tariff_label";
 
     private JSONObject chargingRowToJson(ResultSet rs) throws Exception {
         JSONObject o = new JSONObject();
@@ -2173,6 +2867,19 @@ public class SocHistoryDatabase {
         // Odometer at charge start (km). -1 sentinel → null so the UI shows "--".
         int odo = rs.getInt("start_odometer_km");
         o.put("startOdometerKm", odo > -1 ? odo : JSONObject.NULL);
+        // Which tariff priced this session. Empty (every pre-v6 row, and any
+        // charge at an unmapped location) → null, and the UI simply omits the
+        // provenance chip. Read defensively: a session row written before the
+        // v6 migration ran is still served, just without the chip.
+        try {
+            String tId = rs.getString("tariff_id");
+            String tLabel = rs.getString("tariff_label");
+            o.put("tariffId", (tId != null && !tId.isEmpty()) ? tId : JSONObject.NULL);
+            o.put("tariffLabel", (tLabel != null && !tLabel.isEmpty()) ? tLabel : JSONObject.NULL);
+        } catch (Exception ignored) {
+            o.put("tariffId", JSONObject.NULL);
+            o.put("tariffLabel", JSONObject.NULL);
+        }
 
         // ---- Live enrichment for the OPEN (in-progress) session ----
         // The end_soc / energy / range / cost / ttf / temp columns are only
@@ -2188,6 +2895,18 @@ public class SocHistoryDatabase {
             o.put("inProgress", true);
             long nowMs = System.currentTimeMillis();
             o.put("durationMinutes", Math.max(0, Math.round((nowMs - start) / 60000.0)));
+            // AC/DC verdict for the OPEN session. The is_dc COLUMN is not written by
+            // the session INSERT, so it sits at its -1 default until session end and
+            // serialises as null — which left the UI's label classifier with no gun
+            // evidence, guessing purely from power against its own (higher) DC_KW
+            // threshold. A live DC session in the 15..25 kW band was therefore
+            // labelled "AC fast" while being PRICED at dcRate (pricing uses this same
+            // deriveIsDc below), and the DC/AC tile counted it in the AC bucket.
+            // Publishing the verdict makes one authority — deriveIsDc — drive the
+            // label, the price and the tile. Same tri-state mapping as the column read
+            // above, so -1 still means "don't claim to know".
+            int liveIsDc = deriveIsDc(chargingGunState, chargingPeakPower);
+            o.put("isDc", liveIsDc == 1 ? Boolean.TRUE : liveIsDc == 0 ? Boolean.FALSE : JSONObject.NULL);
             try {
                 VehicleDataMonitor vm = VehicleDataMonitor.getInstance();
                 double liveSoc = Double.NaN;
@@ -2207,11 +2926,22 @@ public class SocHistoryDatabase {
                 }
                 if (e > 0) {
                     o.put("energyAdded", e);
-                    // DC sessions bill at the separate DC tariff when set — same
-                    // classifier + rate selection as the SESSION END path, so this
-                    // live card cost matches the value persisted when it closes.
-                    double rate2 = effectiveRate(deriveIsDc(chargingGunState, chargingPeakPower));
-                    if (rate2 > 0) o.put("cost", e * rate2);
+                    // Same classifier + tariff resolution as the SESSION END path
+                    // (location tariff first, then global DC/base), so this live
+                    // card cost matches the value persisted when it closes — and
+                    // the live card already names the tariff that will price it.
+                    PricingDecision livePd = priceSession(
+                            deriveIsDc(chargingGunState, chargingPeakPower),
+                            chargingStartLat, chargingStartLng);
+                    if (livePd.rate > 0) {
+                        o.put("cost", e * livePd.rate);
+                        o.put("electricityRate", livePd.rate);
+                        if (!livePd.currency.isEmpty()) o.put("currency", livePd.currency);
+                        if (!livePd.tariffId.isEmpty()) {
+                            o.put("tariffId", livePd.tariffId);
+                            o.put("tariffLabel", livePd.tariffLabel);
+                        }
+                    }
                     // Range gained derived from energy × efficiency (the car's
                     // elecRangeKm delta is unavailable while parked/charging).
                     int rg = rangeGainedFromEnergy(e);
@@ -2347,11 +3077,13 @@ public class SocHistoryDatabase {
      */
     public JSONArray getChargingSessionsV2Range(long fromMs, long toMs, int limit, int offset) {
         JSONArray results = new JSONArray();
-        if (!isInitialized || connection == null) return results;
+        // Snapshot once — see the connection field's doc (guard-then-use can NPE).
+        final Connection conn = connection;
+        if (!isInitialized || conn == null) return results;
         try {
             String sql = "SELECT " + CHARGING_V2_COLS + " FROM " + TABLE_CHARGING +
                 " WHERE start_time >= ? AND start_time <= ? ORDER BY start_time DESC LIMIT ? OFFSET ?;";
-            try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
                 pstmt.setLong(1, fromMs);
                 pstmt.setLong(2, toMs);
                 pstmt.setInt(3, limit);
@@ -2362,6 +3094,10 @@ public class SocHistoryDatabase {
             }
         } catch (Exception e) {
             logger.error("Failed to get charging sessions v2 (range)", e);
+            // Count a genuine JDBC failure so a broken-but-OPEN connection escalates to
+            // dead and the reconnect below actually reopens it. Non-SQL throws are not
+            // counted — they say nothing about the connection (see isSqlFailure).
+            if (isSqlFailure(e)) noteReadFailed();
             reconnect();
         }
         return results;
@@ -2369,10 +3105,12 @@ public class SocHistoryDatabase {
 
     /** Single session by its IDENTITY id, or null. */
     public JSONObject getChargingSessionById(long id) {
-        if (!isInitialized || connection == null) return null;
+        // Snapshot once — see the connection field's doc (guard-then-use can NPE).
+        final Connection conn = connection;
+        if (!isInitialized || conn == null) return null;
         try {
             String sql = "SELECT " + CHARGING_V2_COLS + " FROM " + TABLE_CHARGING + " WHERE id = ?;";
-            try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
                 pstmt.setLong(1, id);
                 try (ResultSet rs = pstmt.executeQuery()) {
                     if (rs.next()) return chargingRowToJson(rs);
@@ -2387,11 +3125,13 @@ public class SocHistoryDatabase {
     /** Per-session fine-grained ramp samples (ASC by time) for the given session id. */
     public JSONArray getChargingSamples(long id) {
         JSONArray results = new JSONArray();
-        if (!isInitialized || connection == null) return results;
+        // Snapshot once — see the connection field's doc (guard-then-use can NPE).
+        final Connection conn = connection;
+        if (!isInitialized || conn == null) return results;
         try {
             // Resolve id -> start_time (the FK used by charging_power_samples).
             long start = -1;
-            try (PreparedStatement sel = connection.prepareStatement(
+            try (PreparedStatement sel = conn.prepareStatement(
                     "SELECT start_time FROM " + TABLE_CHARGING + " WHERE id = ?;")) {
                 sel.setLong(1, id);
                 try (ResultSet rs = sel.executeQuery()) {
@@ -2399,7 +3139,7 @@ public class SocHistoryDatabase {
                 }
             }
             if (start <= 0) return results;
-            try (PreparedStatement pstmt = connection.prepareStatement(
+            try (PreparedStatement pstmt = conn.prepareStatement(
                     "SELECT t, power_kw, soc, temp, temp_high, temp_low FROM " + TABLE_CPS +
                     " WHERE session_start_time = ? AND power_kw >= 0 ORDER BY t ASC;")) {
                 pstmt.setLong(1, start);
@@ -2515,7 +3255,7 @@ public class SocHistoryDatabase {
     }
 
     /** Wipe only the charging-related tables (user "Clear charging history"). Returns rows deleted. */
-    public long clearChargingHistory() {
+    public synchronized long clearChargingHistory() {
         if (!isInitialized || connection == null) return -1;
         long total = 0;
         try (Statement stmt = connection.createStatement()) {
@@ -2547,7 +3287,7 @@ public class SocHistoryDatabase {
      * stay consistent. Mirrors the Trips per-trip delete. Returns true on
      * success (also true if the row was already gone).
      */
-    public boolean deleteChargingSession(long id) {
+    public synchronized boolean deleteChargingSession(long id) {
         if (!isInitialized || connection == null) return false;
         try {
             // Read the row first so we can reverse its contribution to the daily rollup.
@@ -2642,7 +3382,10 @@ public class SocHistoryDatabase {
                 stats.put("isCritical", currentSoc.isCritical);
             }
             
-            if (!isInitialized || connection == null) {
+            // Snapshot once — see the connection field's doc (guard-then-use can NPE if
+            // reconnect() swaps the field between the two reads).
+            final Connection conn = connection;
+            if (!isInitialized || conn == null) {
                 return stats;
             }
             
@@ -2652,7 +3395,7 @@ public class SocHistoryDatabase {
             String statsSql = "SELECT MIN(soc_percent), MAX(soc_percent), AVG(soc_percent), COUNT(*) " +
                 "FROM " + TABLE_SOC + " WHERE timestamp >= ?;";
             
-            try (PreparedStatement pstmt = connection.prepareStatement(statsSql)) {
+            try (PreparedStatement pstmt = conn.prepareStatement(statsSql)) {
                 pstmt.setLong(1, startTime);
                 
                 try (ResultSet rs = pstmt.executeQuery()) {
@@ -2668,7 +3411,7 @@ public class SocHistoryDatabase {
             // Get charging session count
             String chargingSql = "SELECT COUNT(*) FROM " + TABLE_CHARGING + " WHERE start_time >= ?;";
             
-            try (PreparedStatement pstmt = connection.prepareStatement(chargingSql)) {
+            try (PreparedStatement pstmt = conn.prepareStatement(chargingSql)) {
                 pstmt.setLong(1, startTime);
                 
                 try (ResultSet rs = pstmt.executeQuery()) {
@@ -2725,7 +3468,24 @@ public class SocHistoryDatabase {
                     livePoint.put("soh", Math.round(sohEst.getDisplaySoh() * 10) / 10.0);
                 }
 
-                history.put(livePoint);
+                // MONOTONICITY GUARD, belt-and-braces with the query's upper bound. The chart
+                // requires history to be ascending in `t`; appending a live point stamped with the
+                // current clock behind a row that somehow carries a later timestamp would break
+                // that and blank the line. If the last row is already newer, drop the live point
+                // rather than corrupt the series — the row itself already carries current data.
+                long liveT = livePoint.optLong("t", 0L);
+                long lastT = Long.MIN_VALUE;
+                if (history.length() > 0) {
+                    JSONObject prev = history.optJSONObject(history.length() - 1);
+                    if (prev != null) lastT = prev.optLong("t", Long.MIN_VALUE);
+                }
+                if (history.length() == 0 || liveT >= lastT) {
+                    history.put(livePoint);
+                } else {
+                    logger.debug("Live SOC point dropped: its timestamp (" + liveT
+                            + ") precedes the last stored row (" + lastT
+                            + ") — clock moved backwards; keeping the series ascending");
+                }
             }
             
             // Ensure stats has current SOC even if DB query returned nothing
@@ -2874,7 +3634,9 @@ public class SocHistoryDatabase {
      */
     public JSONArray getBatteryVoltageHistory(int hoursBack, int maxPoints) {
         JSONArray results = new JSONArray();
-        if (!isInitialized || connection == null) return results;
+        // Snapshot once — see the connection field's doc (guard-then-use can NPE).
+        final Connection conn = connection;
+        if (!isInitialized || conn == null) return results;
         
         try {
             long now = System.currentTimeMillis();
@@ -2886,13 +3648,17 @@ public class SocHistoryDatabase {
             String sql = 
                 "SELECT MIN(timestamp) as t, AVG(voltage_v) as voltage, " +
                 "  MAX(is_charging) as charging " +
-                "FROM " + TABLE_SOC + " WHERE timestamp >= ? AND voltage_v > 0 " +
+                // Upper-bounded by now for the same reason as getSocHistory: after a backward
+                // clock correction, pre-correction rows carry future timestamps, still match
+                // `>= startTime`, and break this chart's ascending-time assumption.
+                "FROM " + TABLE_SOC + " WHERE timestamp >= ? AND timestamp <= ? AND voltage_v > 0 " +
                 "GROUP BY (timestamp / ?) ORDER BY t ASC LIMIT ?;";
             
-            try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
                 pstmt.setLong(1, startTime);
-                pstmt.setLong(2, bucketMs);
-                pstmt.setInt(3, maxPoints);
+                pstmt.setLong(2, now);   // same clock read as startTime — see getSocHistory
+                pstmt.setLong(3, bucketMs);
+                pstmt.setInt(4, maxPoints);
                 try (ResultSet rs = pstmt.executeQuery()) {
                     while (rs.next()) {
                         JSONObject row = new JSONObject();
@@ -2905,6 +3671,10 @@ public class SocHistoryDatabase {
             }
         } catch (Exception e) {
             logger.error("Failed to get voltage history", e);
+            // Count a genuine JDBC failure so a broken-but-OPEN connection escalates to
+            // dead and the reconnect below actually reopens it. Non-SQL throws are not
+            // counted — they say nothing about the connection (see isSqlFailure).
+            if (isSqlFailure(e)) noteReadFailed();
             reconnect();
         }
         return results;
@@ -2915,7 +3685,9 @@ public class SocHistoryDatabase {
      */
     public JSONArray getThermalHistory(int hoursBack, int maxPoints) {
         JSONArray results = new JSONArray();
-        if (!isInitialized || connection == null) return results;
+        // Snapshot once — see the connection field's doc (guard-then-use can NPE).
+        final Connection conn = connection;
+        if (!isInitialized || conn == null) return results;
         
         try {
             long now = System.currentTimeMillis();
@@ -2930,14 +3702,16 @@ public class SocHistoryDatabase {
                 "  AVG(CASE WHEN hv_temp_low > -999 THEN hv_temp_low END) as temp_low, " +
                 "  AVG(CASE WHEN hv_temp_avg > -999 THEN hv_temp_avg END) as temp_avg, " +
                 "  MAX(is_charging) as charging " +
-                "FROM " + TABLE_SOC + " WHERE timestamp >= ? " +
+                // Upper-bounded by now — see getSocHistory / getBatteryVoltageHistory.
+                "FROM " + TABLE_SOC + " WHERE timestamp >= ? AND timestamp <= ? " +
                 "AND (hv_temp_high > -999 OR hv_temp_low > -999 OR hv_temp_avg > -999) " +
                 "GROUP BY (timestamp / ?) ORDER BY t ASC LIMIT ?;";
             
-            try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
                 pstmt.setLong(1, startTime);
-                pstmt.setLong(2, bucketMs);
-                pstmt.setInt(3, maxPoints);
+                pstmt.setLong(2, now);   // same clock read as startTime — see getSocHistory
+                pstmt.setLong(3, bucketMs);
+                pstmt.setInt(4, maxPoints);
                 try (ResultSet rs = pstmt.executeQuery()) {
                     while (rs.next()) {
                         JSONObject row = new JSONObject();
@@ -2958,6 +3732,10 @@ public class SocHistoryDatabase {
             }
         } catch (Exception e) {
             logger.error("Failed to get thermal history", e);
+            // Count a genuine JDBC failure so a broken-but-OPEN connection escalates to
+            // dead and the reconnect below actually reopens it. Non-SQL throws are not
+            // counted — they say nothing about the connection (see isSqlFailure).
+            if (isSqlFailure(e)) noteReadFailed();
             reconnect();
         }
         return results;
@@ -3045,7 +3823,10 @@ public class SocHistoryDatabase {
             
             // 12V voltage stats
             if (isInitialized && connection != null) {
-                long startTime = System.currentTimeMillis() - (hoursBack * 60 * 60 * 1000L);
+                // One clock read shared by startTime and the queries' upper bound, so a backward
+                // NTP step between two reads cannot make upper < startTime (see getSocHistory).
+                long now = System.currentTimeMillis();
+                long startTime = now - (hoursBack * 60 * 60 * 1000L);
                 String statsSql = "SELECT MIN(voltage_v), MAX(voltage_v), AVG(voltage_v) " +
                     "FROM " + TABLE_SOC + " WHERE timestamp >= ? AND voltage_v > 0;";
                 try (PreparedStatement pstmt = connection.prepareStatement(statsSql)) {
@@ -3063,14 +3844,18 @@ public class SocHistoryDatabase {
                 
                 // SOH history (last N samples where soh > 0)
                 String sohSql = "SELECT MIN(timestamp) as t, AVG(soh_percent) as soh " +
-                    "FROM " + TABLE_SOC + " WHERE timestamp >= ? AND soh_percent > 0 " +
+                    // Upper-bounded by now — third time-series chart with the same backward-clock
+                    // hazard as getSocHistory / voltage / thermal.
+                    "FROM " + TABLE_SOC + " WHERE timestamp >= ? AND timestamp <= ? "
+                    + "AND soh_percent > 0 " +
                     "GROUP BY (timestamp / ?) ORDER BY t ASC LIMIT ?;";
                 long sohBucketMs = Math.max(120_000L, (long)(hoursBack) * 60 * 60 * 1000L / maxPoints);
                 JSONArray sohHistory = new JSONArray();
                 try (PreparedStatement pstmt = connection.prepareStatement(sohSql)) {
                     pstmt.setLong(1, startTime);
-                    pstmt.setLong(2, sohBucketMs);
-                    pstmt.setInt(3, maxPoints);
+                    pstmt.setLong(2, now);
+                    pstmt.setLong(3, sohBucketMs);
+                    pstmt.setInt(4, maxPoints);
                     try (ResultSet rs = pstmt.executeQuery()) {
                         while (rs.next()) {
                             JSONObject row = new JSONObject();
@@ -3250,7 +4035,9 @@ public class SocHistoryDatabase {
      *
      * Best-effort: any exception is caught and logged; never propagates.
      */
-    public void recordAccEvent(String eventType, com.overdrive.app.byd.BydVehicleData data) {
+    // synchronized for the same reason as finalizeStaleOpenSessions: an external
+    // caller (CameraDaemon's ACC edge) that INSERTs on the shared Connection.
+    public synchronized void recordAccEvent(String eventType, com.overdrive.app.byd.BydVehicleData data) {
         try {
             if (eventType == null) return;
             String type = eventType.trim().toUpperCase();

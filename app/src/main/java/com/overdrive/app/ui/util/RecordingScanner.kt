@@ -196,14 +196,15 @@ object RecordingScanner {
 
     fun getTotalRecordingsSize(context: Context): Long {
         val s = RecordingsApiClient.fetchStats()
-        if (s != null) return s.totalSize
+        // indexUnavailable => counters are zeroed placeholders, not real sizes.
+        if (s != null && !s.indexUnavailable) return s.totalSize
         Log.w(TAG, "getTotalRecordingsSize: API unreachable, falling back")
         return scanRecordingsDirect(context).sumOf { it.sizeBytes }
     }
 
     fun getNormalRecordingsSize(context: Context): Long {
         val s = RecordingsApiClient.fetchStats()
-        if (s != null) return s.normalSize
+        if (s != null && !s.indexUnavailable) return s.normalSize
         Log.w(TAG, "getNormalRecordingsSize: API unreachable, falling back")
         return scanRecordingsDirect(context)
             .filter { it.type == RecordingFile.RecordingType.NORMAL }
@@ -212,7 +213,7 @@ object RecordingScanner {
 
     fun getSentryRecordingsSize(context: Context): Long {
         val s = RecordingsApiClient.fetchStats()
-        if (s != null) return s.sentrySize
+        if (s != null && !s.indexUnavailable) return s.sentrySize
         Log.w(TAG, "getSentryRecordingsSize: API unreachable, falling back")
         return scanRecordingsDirect(context)
             .filter { it.type == RecordingFile.RecordingType.SENTRY }
@@ -221,7 +222,7 @@ object RecordingScanner {
 
     fun getProximityRecordingsSize(context: Context): Long {
         val s = RecordingsApiClient.fetchStats()
-        if (s != null) return s.proximitySize
+        if (s != null && !s.indexUnavailable) return s.proximitySize
         Log.w(TAG, "getProximityRecordingsSize: API unreachable, falling back")
         return scanRecordingsDirect(context)
             .filter { it.type == RecordingFile.RecordingType.PROXIMITY }

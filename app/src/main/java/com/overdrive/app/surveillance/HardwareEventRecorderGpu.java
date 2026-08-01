@@ -1396,7 +1396,24 @@ public class HardwareEventRecorderGpu {
         
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
         format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);  // I-frame every 2 seconds
+        // I-frame cadence. Recording keeps its historical 2s. LIVE-VIEW STREAMING
+        // uses 1s, matching the OEM app (sl/g.java:238 sets "i-frame-interval" to 1
+        // for its AVM encoder).
+        //
+        // Why it matters here specifically: the byd_apa HAL emits at its own fixed
+        // low rate (~4.5 fps observed) and cannot be retimed — setCameraFps returns
+        // false for every value, and both the OEM app and DiPlus discard that
+        // return. At 4.5 fps a 2-second interval is ~9 frames between keyframes, so
+        // a viewer that joins late, drops a packet, or sees a run of near-empty
+        // P-frames has no recovery point for two seconds and the picture appears
+        // stuck. A 1-second cadence bounds that. Cost is a modest bitrate increase
+        // on a 2 Mbps stream — cheap next to an unusable preview.
+        //
+        // Scoped to stream-only encoders (usePreRecordBuffer == false, set before
+        // init() by GpuSurveillancePipeline:4037 and OemDashcamPipeline), so
+        // recordings on EVERY vehicle — dilink4 or legacy — keep byte-identical
+        // encoder settings.
+        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, usePreRecordBuffer ? 2 : 1);
 
         // Bitrate mode left to encoder default (typically VBR). CBR was tried
         // but caused recordings to freeze 5-6s in on the BYD DiLink 5.0 H.265
@@ -3155,8 +3172,22 @@ public class HardwareEventRecorderGpu {
                         " (frames=" + recordedFrames + ", size=" + tempFile.length() + ")");
                 tempFile.delete();
             }
+
+            // Every FAILURE branch above unlinks (or renames to .broken) a
+            // *.mp4.tmp that StorageManager counts toward the category's reported
+            // size (partialExtensionsForCategory). Only the SUCCESS branch reaches
+            // onFileSaved, which is what normally invalidates the reporting cache —
+            // so without this an aborted segment's bytes (tens to hundreds of MB)
+            // stayed in the storage card's figure until some unrelated mutation.
+            // Cheap and idempotent, so it runs for the success path too.
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance()
+                        .invalidateCategorySizeCache(null);
+            } catch (Throwable ignored) {
+                // StorageManager may not be initialised in every process.
+            }
         }
-        
+
         // Reset state
         recordedFrames = 0;
         firstFramePtsUs = -1;
@@ -3632,6 +3663,16 @@ public class HardwareEventRecorderGpu {
         } finally {
             cursor.close();
             releaseManualClipReservation();
+            // The three abort paths above each unlink a size-counted
+            // <clip>.mp4.tmp; only the success path reaches onFileSaved (via
+            // ManualClipService). Invalidating in the finally covers every exit
+            // without duplicating the call at each return.
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance()
+                        .invalidateCategorySizeCache(null);
+            } catch (Throwable ignored) {
+                // StorageManager may not be initialised in every process.
+            }
         }
     }
 
@@ -4973,6 +5014,17 @@ public class HardwareEventRecorderGpu {
                     logger.warn("Deleting empty segment " + oldSegmentNumber + " tmp file");
                     oldTemp.delete();
                 }
+
+                // Same reason as closeEventRecording: the failure branches unlink a
+                // size-counted *.mp4.tmp for a COMPLETE rotated segment, and only
+                // the success branch reaches onFileSaved. Without this the reported
+                // size keeps counting a segment that is already gone.
+                try {
+                    com.overdrive.app.storage.StorageManager.getInstance()
+                            .invalidateCategorySizeCache(null);
+                } catch (Throwable ignored) {
+                    // StorageManager may not be initialised in every process.
+                }
             }
 
             // Notify the engine after the rename so consumers can read the
@@ -5145,6 +5197,7 @@ public class HardwareEventRecorderGpu {
         if (orphans == null || orphans.length == 0) return;
 
         long now = System.currentTimeMillis();
+        boolean anyDeleted = false;
         for (File f : orphans) {
             long age = now - f.lastModified();
             if (age > 5 * 60 * 1000) { // Older than 5 minutes
@@ -5157,9 +5210,25 @@ public class HardwareEventRecorderGpu {
                     ok = deleteViaShell(f);
                 }
                 if (ok) {
+                    anyDeleted = true;
                     logger.info("Cleaned orphan: " + f.getName() + " (" + (size / 1024)
                             + " KB, age=" + (age / 1000) + "s)");
                 }
+            }
+        }
+
+        // These .tmp/.broken partials ARE counted by StorageManager's reported size
+        // (partialExtensionsForCategory), and an aborted segment partial is a full
+        // clip — hundreds of MB. This sweep is separate from cleanupOldSegments and
+        // from StorageManager.sweepOrphanTempFiles, so nothing else invalidates the
+        // reporting cache for it; without this the storage card keeps counting bytes
+        // that are already freed.
+        if (anyDeleted) {
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance()
+                        .invalidateCategorySizeCache(null);
+            } catch (Throwable ignored) {
+                // StorageManager may not be initialised in every process.
             }
         }
     }
@@ -5232,6 +5301,7 @@ public class HardwareEventRecorderGpu {
         }
         
         // Delete oldest files if over limit
+        boolean anyDeleted = false;
         if (totalSize > maxSizeBytes) {
             // Sort by last modified (oldest first)
             java.util.Arrays.sort(files, (f1, f2) -> 
@@ -5266,6 +5336,7 @@ public class HardwareEventRecorderGpu {
                 long fileSize = file.length();
                 if (file.delete()) {
                     totalSize -= fileSize;
+                    anyDeleted = true;
                     long sidecarBytes = deleteSegmentSidecars(file);
                     logger.info("Deleted old segment: " + file.getName() +
                             " (" + (fileSize / 1024) + " KB"
@@ -5274,6 +5345,20 @@ public class HardwareEventRecorderGpu {
                 } else {
                     logger.warn("Failed to delete file: " + file.getName());
                 }
+            }
+        }
+
+        // This rotation frees size-counted .mp4s AND their .json/.jpg/thumb_
+        // sidecars, but it is the recorder's OWN loop-rotation — it does not go
+        // through StorageManager's reap, so nothing else invalidates the reporting
+        // size/count cache. Without this the storage card keeps reporting the
+        // rotated-away bytes until some other mutation happens to invalidate.
+        if (anyDeleted) {
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance()
+                        .invalidateCategorySizeCache(null);
+            } catch (Throwable ignored) {
+                // StorageManager may not be initialised in every process.
             }
         }
     }

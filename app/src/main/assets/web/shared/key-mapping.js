@@ -68,6 +68,12 @@ window.KM = (function () {
         { id: 'ac_fan',          i18n: 'keymap.act_ac_fan',           kind: 'api',
           method: 'POST', path: '/api/vehicle/climate', body: '{"action":"set_fan","fan":${v}}',
           payloads: [ { v: '1', i18n: 'keymap.fan_1' }, { v: '2', i18n: 'keymap.fan_2' }, { v: '3', i18n: 'keymap.fan_3' }, { v: '4', i18n: 'keymap.fan_4' }, { v: '5', i18n: 'keymap.fan_5' }, { v: '6', i18n: 'keymap.fan_6' }, { v: '7', i18n: 'keymap.fan_7' } ] },
+        // AC temperature — RELATIVE step, the natural fit for a hardware key: one press = one
+        // degree warmer/cooler from wherever the dial is now. ${v} carries the signed delta.
+        // (An absolute "set to 22" binding would need one key per temperature.)
+        { id: 'ac_temp_step',    i18n: 'keymap.act_ac_temp_step',     kind: 'api',
+          method: 'POST', path: '/api/vehicle/climate', body: '{"action":"step_temp","delta":${v}}',
+          payloads: [ { v: '1', i18n: 'keymap.temp_warmer' }, { v: '-1', i18n: 'keymap.temp_cooler' } ] },
         // AC auto / fan-only / steering-wheel heater. ${v} carries the on|off suffix into
         // the /api/vehicle/climate action string (auto_on, fan_only_off, …).
         { id: 'ac_auto',         i18n: 'keymap.act_ac_auto',          kind: 'api',
@@ -415,7 +421,7 @@ window.KM = (function () {
         window_lr: 'windows_body', window_rr: 'windows_body', tailgate: 'windows_body',
         sunroof: 'windows_body', sunshade: 'windows_body', child_lock: 'windows_body',
         mirror_fold: 'windows_body', wireless_charging: 'windows_body',
-        climate: 'climate', ac_fan: 'climate',
+        climate: 'climate', ac_fan: 'climate', ac_temp_step: 'climate',
         ac_auto: 'climate', fan_only: 'climate', steering_heat: 'climate', recirculation: 'climate',
         defrost_front: 'climate', defrost_rear: 'climate',
         seat_heat_driver: 'climate', seat_heat_passenger: 'climate',
@@ -491,6 +497,14 @@ window.KM = (function () {
         { code: 306, i18n: 'keymap.btn_rotate_long', fixed: 'single' },
         { code: 312, i18n: 'keymap.btn_voice_long',  fixed: 'single' }
     ];
+
+    // Buttons whose OEM function the car firmware performs itself at a layer BELOW the
+    // Android input pipeline (audio-policy mute / the phone-BT app or MCU). An
+    // accessibility key filter can consume the app-level event but CANNOT veto that
+    // parallel action, so the stock function may still fire alongside the mapped one.
+    // We surface a warning for these; the double-press + block-single-click binding is
+    // the best available suppression. 293 = Mute, 313 = Phone/Bluetooth.
+    var NATIVE_SIDE_EFFECT_CODES = { 293: 1, 313: 1 };
 
     var state = {
         enabled: false,
@@ -1316,6 +1330,14 @@ window.KM = (function () {
 
     // When a known button is chosen: set the keycode, reveal/hide the capture
     // area, and tailor the press-type selector to what THIS button supports.
+    // Show the "OEM function may still fire" note iff the chosen keycode is one the
+    // firmware handles below the app (Mute / BT-Phone). Safe on a missing element.
+    function syncNativeSideEffectWarn(code) {
+        var w = $('kmNativeSideEffectWarn');
+        if (!w) return;
+        w.style.display = (code != null && NATIVE_SIDE_EFFECT_CODES[code]) ? '' : 'none';
+    }
+
     function onKnownButtonChange() {
         var sel = $('kmKnownButton');
         var val = sel ? sel.value : '';
@@ -1340,14 +1362,16 @@ window.KM = (function () {
             captured = null;
             $('kmManualKeycode').value = '';
             refreshPressTypeForManual();
+            syncNativeSideEffectWarn(null); // re-evaluated from the typed keycode below
             return;
         }
         if (customWrap) customWrap.style.display = 'none';
-        if (!val) { captured = null; $('kmManualKeycode').value = ''; buildPressTypeOptions(null); return; }
+        if (!val) { captured = null; $('kmManualKeycode').value = ''; buildPressTypeOptions(null); syncNativeSideEffectWarn(null); return; }
         var code = parseInt(val, 10);
         captured = code;
         $('kmManualKeycode').value = code;
         buildPressTypeOptions(knownByCode(code));
+        syncNativeSideEffectWarn(code);
     }
 
     // Rebuild the press-type <select> for the chosen button:
@@ -1414,6 +1438,9 @@ window.KM = (function () {
     function refreshPressTypeForManual() {
         var code = parseInt($('kmManualKeycode').value, 10);
         buildPressTypeOptions(code ? knownByCode(code) : null);
+        // A manually-typed/captured Mute(293) or Phone-BT(313) code gets the same
+        // "OEM function may still fire" note as picking it from the known list.
+        syncNativeSideEffectWarn(code ? code : null);
     }
 
     // In-progress sequence steps (each a fire-action object). When non-empty,
@@ -1470,6 +1497,16 @@ window.KM = (function () {
                 return { kind: 'radio', radio: c.radio, state: payload || 'on' };
             }
             if (c.kind === 'api') {
+                // If this action's template needs a payload (${v} in path or body) but
+                // none was chosen, refuse rather than baking an empty value — e.g. a
+                // "Play Video" bound with no file picked would fire {"name":""} and the
+                // daemon would reject it with "name or path is required" (silent no-play).
+                var needsPayload = (c.path && c.path.indexOf('${v}') >= 0) ||
+                                   (c.body && c.body.indexOf('${v}') >= 0);
+                if (needsPayload && !payload) {
+                    toast(tr(c.dynamicPayloads === 'audio' ? 'keymap.need_audio' : 'keymap.need_value'), 'error');
+                    return null;
+                }
                 // Substitute the chosen payload into the path/body templates; the
                 // daemon receives a concrete method/path/body (no ${v} at fire time).
                 var sub = function (s) { return (s || '').split('${v}').join(payload); };

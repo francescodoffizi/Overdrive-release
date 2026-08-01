@@ -29,6 +29,14 @@ object BlindSpotControl {
     /** Backoff ceiling between re-arm polls. */
     private const val REARM_MAX_BACKOFF_MS = 2_000L
 
+    /**
+     * Monotonic arm-loop token. Bumped on EVERY sync() (both branches) so any
+     * in-flight re-arm loop carrying an older token is invalidated. Gives both
+     * cancellation (a disable supersedes a running arm loop) and dedup (a fresh
+     * enable supersedes a previous one — only the newest loop survives).
+     */
+    private val armGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
     private val http: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(2, TimeUnit.SECONDS)
@@ -45,6 +53,11 @@ object BlindSpotControl {
      */
     @JvmStatic
     fun sync(context: Context) {
+        // Capture a fresh token on EVERY sync, before dispatching. Bumping it here
+        // (both enable AND disable branches) invalidates any still-running arm loop:
+        // a disable can no longer be silently undone by a stale re-arm, and rapid
+        // toggles collapse to the newest loop instead of piling up threads.
+        val gen = armGeneration.incrementAndGet()
         Thread({
             try {
                 val bs = UnifiedConfigManager.forceReload().optJSONObject("blindspot")
@@ -57,7 +70,7 @@ object BlindSpotControl {
                     // lane is not armed by one shot. Drive a bounded re-arm loop that keeps
                     // re-POSTing /api/bs/enable and polling /api/bs/status until the lane
                     // reports enabled:true (or we hit the deadline). Idempotent daemon-side.
-                    armWithRetry()
+                    armWithRetry(gen)
                 } else {
                     post("/api/bs/disable")
                 }
@@ -72,14 +85,32 @@ object BlindSpotControl {
      * /api/bs/status with 500ms→2s backoff, re-POSTing enable each pass, until the
      * lane reports enabled:true or [REARM_DEADLINE_MS] elapses. Survives the initial
      * sync() call by running on its own daemon thread; converges (no infinite loop —
-     * hard deadline) and never flaps the lane (only ever POSTs enable, never disable).
+     * hard deadline).
+     *
+     * Cancellable + intent-aware: [gen] is the arm token captured by the sync() that
+     * spawned this loop. Each iteration first bails if a newer sync (a disable OR a
+     * fresh enable) has bumped [armGeneration] past [gen] — giving cancellation and
+     * dedup — then re-reads the persisted intent and exits WITHOUT POSTing enable the
+     * moment blindspot.{enabled,debugPreview} are both false, so a user disable can
+     * never be silently undone by a stale re-arm.
      */
-    private fun armWithRetry() {
+    private fun armWithRetry(gen: Int) {
         Thread({
             val deadline = System.currentTimeMillis() + REARM_DEADLINE_MS
             var delayMs = 500L
             var attempts = 0
             while (System.currentTimeMillis() < deadline) {
+                // Superseded by a newer sync (disable OR fresh enable): stop, do not POST.
+                if (armGeneration.get() != gen) {
+                    return@Thread
+                }
+                // Re-read intent every pass: if the feature was turned off while we were
+                // cold-starting, exit before re-arming the lane the user just disabled.
+                val bs = UnifiedConfigManager.forceReload().optJSONObject("blindspot")
+                if (!(bs?.optBoolean("enabled", false) ?: false) &&
+                    !(bs?.optBoolean("debugPreview", false) ?: false)) {
+                    return@Thread
+                }
                 attempts++
                 post("/api/bs/enable")
                 if (isLaneEnabled()) {

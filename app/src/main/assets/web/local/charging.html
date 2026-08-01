@@ -28,7 +28,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <style>
@@ -342,6 +342,63 @@
         .ch-period-tabs { margin-bottom: 14px; overflow: visible; }
         .ch-period-tabs .filter-tab { flex: 0 0 auto; padding: 5px 12px; font-size: 12px; }
         .ch-period-tabs .filter-tab + .filter-tab { margin-left: 6px; }
+
+        /* ===== LOCATION TARIFF ROWS =====
+           Rows are built by CHARGING._tariffRow(); these are the only rules for
+           the classes it emits. WebView 58 has no flex `gap`, so use margins. */
+        .tariff-row {
+            display: -webkit-flex; display: flex;
+            -webkit-align-items: center; align-items: center;
+            -webkit-justify-content: space-between; justify-content: space-between;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-md);
+            padding: 12px 14px;
+            margin-top: 8px;
+        }
+        .tariff-row.matched { border-color: var(--brand-primary); }
+        .tariff-row.disabled { opacity: 0.55; }
+        .tariff-info { min-width: 0; -webkit-flex: 1 1 auto; flex: 1 1 auto; }
+        .tariff-name-row {
+            display: -webkit-flex; display: flex;
+            -webkit-align-items: center; align-items: center;
+            -webkit-flex-wrap: wrap; flex-wrap: wrap;
+        }
+        .tariff-name {
+            font-size: 14px; font-weight: 700; color: var(--text-primary);
+            margin-right: 8px;
+        }
+        .tariff-meta { font-size: 12px; color: var(--text-primary); margin-top: 4px; }
+        .tariff-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+        .tariff-pill {
+            display: inline-block;
+            padding: 2px 8px; margin-right: 6px;
+            border: 1px solid var(--border-subtle); border-radius: 999px;
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            color: var(--text-muted);
+        }
+        .tariff-pill.here { border-color: var(--brand-primary); color: var(--brand-primary); }
+        .tariff-pill.default { border-color: var(--text-muted); color: var(--text-primary); }
+        .tariff-actions {
+            display: -webkit-flex; display: flex;
+            -webkit-align-items: center; align-items: center;
+            -webkit-flex: 0 0 auto; flex: 0 0 auto;
+            margin-left: 10px;
+        }
+        .tariff-icon-btn {
+            display: -webkit-inline-flex; display: inline-flex;
+            -webkit-align-items: center; align-items: center;
+            -webkit-justify-content: center; justify-content: center;
+            width: 36px; height: 36px; margin-left: 6px;
+            border: 1px solid var(--border-subtle); border-radius: 10px;
+            background: transparent; color: var(--text-muted); cursor: pointer;
+        }
+        /* The JS emits bare <svg viewBox> with no width/height — size them here
+           or they collapse to 0 (or balloon) in WebView 58. */
+        .tariff-icon-btn svg { width: 18px; height: 18px; }
+        .tariff-icon-btn.on { border-color: var(--brand-primary); color: var(--brand-primary); }
+        .tariff-icon-btn.danger { color: var(--danger, #EF4444); }
+        .tariff-row .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 
         /* ===== SUMMARY / DETAIL STAT GRID ===== */
         .ch-stat-grid {
@@ -682,6 +739,82 @@
                         <div class="ch-note" data-i18n="charge.baking_note">Detailed metrics fill in as you complete new charges</div>
                     </div>
 
+                    <!-- Location tariffs. Rows are built by CHARGING._tariffRow(), which
+                         also attaches its own edit/delete/default handlers — only the
+                         add/save/cancel buttons are wired inline here. -->
+                    <div class="ch-card" data-tab="settings">
+                        <h3 data-i18n="charge.tariffs_title">Tariffs by Location</h3>
+                        <div class="ch-note" data-i18n="charge.tariffs_desc" style="margin-top:0;">Save a rate for a place; charges near it are priced with it automatically.</div>
+
+                        <div id="tariffList"></div>
+
+                        <div id="tariffEmpty" style="display:none;">
+                            <div class="ch-note" data-i18n="charge.tariffs_empty">No location tariffs yet</div>
+                            <div class="ch-note" data-i18n="charge.tariffs_empty_hint">Add one while parked where you charge.</div>
+                        </div>
+
+                        <div id="tariffFallbackNote" class="ch-note" style="display:none;"></div>
+
+                        <div class="settings-button-row" style="margin-top:12px;">
+                            <button class="btn btn-secondary" id="tariffAddBtn" onclick="CHARGING.openTariffEditor()" style="flex:1;" data-i18n="charge.tariff_add_here">Add tariff for this location</button>
+                        </div>
+
+                        <!-- Editor. display:none is load-bearing: renderTariffs() reads
+                             this element's inline display to decide if it is open. -->
+                        <div id="tariffEditor" style="display:none;">
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <div class="setting-name" data-i18n="charge.tariff_label">Label</div>
+                                </div>
+                                <div class="setting-control">
+                                    <input type="text" id="tariffLabelInput" maxlength="48" data-i18n-attr="placeholder:charge.tariff_label_placeholder" placeholder="Home">
+                                </div>
+                            </div>
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <div class="setting-name" data-i18n="charge.tariff_ac_rate">AC rate</div>
+                                </div>
+                                <div class="setting-control ch-rate-control">
+                                    <input type="number" id="tariffAcRateInput" placeholder="0.00" step="0.01" min="0">
+                                    <span style="font-size:11px;color:var(--text-muted);">/kWh</span>
+                                </div>
+                            </div>
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <div class="setting-name" data-i18n="charge.tariff_dc_rate">DC rate (optional)</div>
+                                    <div class="setting-desc" data-i18n="charge.tariff_dc_rate_hint">Leave blank to use the AC rate for DC charges.</div>
+                                </div>
+                                <div class="setting-control ch-rate-control">
+                                    <input type="number" id="tariffDcRateInput" placeholder="0.00" step="0.01" min="0">
+                                    <span style="font-size:11px;color:var(--text-muted);">/kWh</span>
+                                </div>
+                            </div>
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <div class="setting-name" data-i18n="charge.tariff_radius">Match radius</div>
+                                    <div class="setting-desc" data-i18n="charge.tariff_radius_hint">How close a charge must be to use this tariff.</div>
+                                </div>
+                                <div class="setting-control ch-rate-control">
+                                    <input type="number" id="tariffRadiusInput" step="5" min="25" max="2000">
+                                    <span style="font-size:11px;color:var(--text-muted);">m</span>
+                                </div>
+                            </div>
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <div class="setting-name" data-i18n="charge.tariff_location">Location</div>
+                                </div>
+                                <div class="setting-control">
+                                    <span id="tariffLocText" style="font-size:12px;color:var(--text-muted);">--</span>
+                                </div>
+                            </div>
+                            <div id="tariffError" class="ch-note" style="display:none;color:var(--danger, #EF4444);"></div>
+                            <div class="settings-button-row" style="margin-top:12px;">
+                                <button class="btn btn-primary" id="tariffSaveBtn" onclick="CHARGING.saveTariff()" style="flex:1;" data-i18n="common.save">Save</button>
+                                <button class="btn btn-secondary" onclick="CHARGING.closeTariffEditor()" style="flex:1;" data-i18n="common.cancel">Cancel</button>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="ch-card" data-tab="settings">
                         <h3 data-i18n="charge.settings_data_title">Data</h3>
                         <div class="setting-row">
@@ -720,6 +853,8 @@
                             <div class="ch-stat"><span data-i18n="charge.detail_range_gained">Range gained</span><strong id="detailRangeGained">--</strong></div>
                             <div class="ch-stat"><span data-i18n="charge.detail_odometer">Odometer</span><strong id="detailOdometer">--</strong></div>
                             <div class="ch-stat"><span data-i18n="charge.detail_cost">Cost</span><strong id="detailCost">--</strong></div>
+                            <!-- Hidden unless the session was priced by a named tariff. -->
+                            <div class="ch-stat" id="detailTariffStat" style="display:none;"><span data-i18n="charge.detail_tariff">Tariff</span><strong id="detailTariff">--</strong></div>
                             <div class="ch-stat"><span data-i18n="charge.detail_type">Type</span><strong id="detailType">--</strong></div>
                             <div class="ch-stat"><span data-i18n="charge.detail_temp">Battery temp</span><strong id="detailTemp">--</strong></div>
                             <div class="ch-stat"><span data-i18n="charge.detail_time_to_full">Time to full</span><strong id="detailTimeToFull">--</strong></div>
@@ -770,9 +905,9 @@
     <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
     <div id="toastContainer" class="toast-container"></div>
 
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/charging.js?v=27"></script>
+    <script src="../shared/charging.js?v=28"></script>
     <script>
         function toggleSidebar() {
             var sb = document.getElementById('sidebar');

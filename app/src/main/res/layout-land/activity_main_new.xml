@@ -42,7 +42,7 @@
         <!--  system bars. Without scroll, "Diagnostics" + "Settings" got   -->
         <!--  clipped off the bottom.                                       -->
         <!-- ============================================================== -->
-        <androidx.core.widget.NestedScrollView
+        <com.overdrive.app.ui.widget.SwipeExpandableRailScrollView
             android:id="@+id/navigationRailScroll"
             android:layout_width="80dp"
             android:layout_height="match_parent"
@@ -59,10 +59,17 @@
                 android:orientation="vertical"
                 android:paddingBottom="12dp">
 
-                <include
-                    layout="@layout/rail_header"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content" />
+                <!-- Accessible alternative to the horizontal expand/collapse swipe. -->
+                <ImageButton
+                    android:id="@+id/railExpandButton"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="4dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/rail_expand"
+                    android:padding="12dp"
+                    android:src="@drawable/ic_chevron_right"
+                    app:tint="?attr/colorOnSurfaceVariant" />
 
                 <include
                     android:id="@+id/railDestDashboard"
@@ -148,8 +155,36 @@
                     layout="@layout/item_rail_destination"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content" />
+
+                <!-- Fill any spare height before the secondary actions. When
+                     destinations exceed the viewport this collapses to zero
+                     and the whole rail remains vertically scrollable. -->
+                <Space
+                    android:layout_width="1dp"
+                    android:layout_height="0dp"
+                    android:layout_weight="1" />
+
+                <View
+                    android:layout_width="40dp"
+                    android:layout_height="1dp"
+                    android:layout_marginVertical="4dp"
+                    android:background="?attr/colorOutlineVariant" />
+
+                <!-- Secondary actions use the same compact/expanded row
+                     treatment as destinations and stay grouped at the end. -->
+                <include
+                    android:id="@+id/railLanguageButton"
+                    layout="@layout/item_rail_destination"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+
+                <include
+                    android:id="@+id/railHelpButton"
+                    layout="@layout/item_rail_destination"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
             </LinearLayout>
-        </androidx.core.widget.NestedScrollView>
+        </com.overdrive.app.ui.widget.SwipeExpandableRailScrollView>
 
         <!-- ============================================================== -->
         <!--  Main stage — toolbar (compact) → URL bar → fragment host.     -->

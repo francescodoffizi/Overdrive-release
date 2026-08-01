@@ -254,6 +254,14 @@ class RecordingLibraryFragment : Fragment() {
      */
     private var warmupRetryAttempt: Int = 0
 
+    /**
+     * True while the shared warmup backoff counter has been advanced by the
+     * index-down poller rather than a real warmup. Lets the next successful
+     * response reset the counter so a later warmup starts at the 2 s base
+     * instead of inheriting the index-down poller's 10 s cap.
+     */
+    private var indexDownBackoffUsed: Boolean = false
+
     enum class RecordingFilter {
         ALL, NORMAL, SENTRY, PROXIMITY, REPLAY
     }
@@ -952,6 +960,33 @@ class RecordingLibraryFragment : Fragment() {
                     return@runOnUiThread
                 }
 
+                // Daemon is up but its recordings index is down. The clips are
+                // on disk and the daemon is the only reader that can see
+                // SD/USB volumes, so do NOT latch into the direct-FS fallback
+                // (it would kill pagination and return nothing on external
+                // storage). Keep whatever is on screen and poll with the same
+                // cancel-and-backoff logic as the warmup path.
+                if (page.indexUnavailable) {
+                    // Render an explicit state. Without this the panel is
+                    // completely blank on a fresh mount (recycler empty,
+                    // emptyStateContainer starts GONE) while it silently
+                    // re-polls — worse than the misleading "No recordings" it
+                    // replaced.
+                    showIndexDownState()
+                    scheduleWarmupRetry(gen)
+                    indexDownBackoffUsed = true
+                    return@runOnUiThread
+                }
+                // The index answered, so any backoff accumulated by the
+                // index-down poller above is stale. Reset it here (and NOT in
+                // the warming branch's own reset below, which this path
+                // early-returns past) so a subsequent warmup starts from the
+                // 2s base instead of inheriting the 10s cap.
+                if (indexDownBackoffUsed) {
+                    indexDownBackoffUsed = false
+                    warmupRetryAttempt = 0
+                }
+
                 if (page.warming) {
                     // Show building-index skeleton; schedule a retry.
                     showWarmingState(page.warmingDone, page.warmingTotal)
@@ -1023,10 +1058,11 @@ class RecordingLibraryFragment : Fragment() {
                     pagingState.hasMore = false
                     return@runOnUiThread
                 }
-                if (page.warming) {
-                    // Mid-paging warmup is rare but possible (index rebuild
-                    // triggered while user was browsing). Stop appending,
-                    // keep current rows.
+                // Mid-paging warmup is rare but possible (index rebuild
+                // triggered while user was browsing), and the index can also
+                // go down mid-scroll. Either way: stop appending, keep the
+                // rows already on screen rather than clearing them.
+                if (page.warming || page.indexUnavailable) {
                     pagingState.hasMore = false
                     return@runOnUiThread
                 }
@@ -1061,6 +1097,27 @@ class RecordingLibraryFragment : Fragment() {
         }
         warmupPollRunnable = r
         mainHandler.postDelayed(r, delay)
+    }
+
+    /**
+     * "Recordings index unavailable" state. Mirrors [showWarmingState]'s view
+     * wiring so the panel is never left blank; the copy deliberately says the
+     * clips are safe, because this is an index failure and NOT an empty
+     * library. [scheduleWarmupRetry] polls us out of it on recovery.
+     */
+    private fun showIndexDownState() {
+        currentList = emptyList()
+        recordingAdapter.submitList(emptyList())
+        recyclerRecordings.visibility = View.GONE
+        emptyStateContainer?.visibility = View.VISIBLE
+        tvEmptyState.visibility = View.VISIBLE
+        tvEmptyState.text = getString(R.string.recording_lib_index_down_title)
+        tvEmptyStateBody?.visibility = View.VISIBLE
+        tvEmptyStateBody?.text = getString(R.string.recording_lib_index_down_body)
+        // Filters aren't the reason the list is empty — hide the clear-filters
+        // affordance so the user isn't sent down a dead end.
+        btnEmptyClearFilters?.visibility = View.GONE
+        tvDayClipCount?.visibility = View.GONE
     }
 
     /**

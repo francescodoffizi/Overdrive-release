@@ -436,38 +436,50 @@ public final class BsNativeLayer {
         }
     }
 
-    /** Real size of the driver-cluster display (the OEM "fission" PRESENTATION
-     *  VirtualDisplay, layerStack 1, ~1920×720). Only valid while an OEM cluster
-     *  projection is open — call AFTER projection-ready. Enumerates DisplayManager
-     *  rather than WindowManager.getDefaultDisplay (which only ever returns the
-     *  head-unit). Falls back to the known fixed 1920×720 if the display can't be
-     *  read. Selection order: name contains "fission" → displayId==1 → a non-default
-     *  PRESENTATION display. */
+    /** Resolve the live descriptor and return the corresponding cluster's real size. */
     public static Point clusterDisplaySize(Context ctx) {
+        return clusterDisplaySize(ctx, resolveFissionDisplay());
+    }
+
+    /**
+     * Real size of the driver-cluster display (the OEM "fission" VirtualDisplay).
+     * The supplied descriptor lets callers use the SAME identity for display routing and
+     * sizing. This matters when stale fission entries or another PRESENTATION display exist:
+     * choosing by name or category first can combine one display's id with another's size.
+     *
+     * <p>Resolution order is exact positive displayId via DisplayManager/getRealSize, the
+     * real size parsed from that descriptor's dumpsys line, then an identity-matched dumpsys
+     * retry. A name lookup is allowed only when no id was resolved. An arbitrary presentation
+     * display is never accepted as the cluster.
+     */
+    public static Point clusterDisplaySize(Context ctx, FissionDisplay fission) {
         Point p = new Point(1920, 720);
         try {
+            if (ctx == null) throw new IllegalStateException("no context");
             android.hardware.display.DisplayManager dm =
                 (android.hardware.display.DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
-            if (dm == null) return p;
+            if (dm == null) throw new IllegalStateException("no DisplayManager");
             android.view.Display chosen = null;
             android.view.Display[] displays = dm.getDisplays();
             if (displays != null) {
-                // 1) name contains "fission"
-                for (android.view.Display d : displays) {
-                    String n = d.getName();
-                    if (n != null && n.toLowerCase(java.util.Locale.US).contains("fission")) { chosen = d; break; }
-                }
-                // 2) displayId == 1
-                if (chosen == null) {
+                // 1) Exact id from the authoritative live fission DisplayInfo line.
+                if (fission != null && fission.displayId > 0) {
                     for (android.view.Display d : displays) {
-                        if (d.getDisplayId() == 1) { chosen = d; break; }
+                        if (d.getDisplayId() == fission.displayId) {
+                            chosen = d;
+                            break;
+                        }
                     }
                 }
-                // 3) a non-default PRESENTATION display
-                if (chosen == null) {
+                // 2) Name fallback only when dumpsys did not resolve an identity.
+                if (chosen == null && (fission == null || fission.displayId < 0)) {
                     for (android.view.Display d : displays) {
-                        if (d.getDisplayId() != android.view.Display.DEFAULT_DISPLAY
-                                && (d.getFlags() & android.view.Display.FLAG_PRESENTATION) != 0) { chosen = d; break; }
+                        String n = d.getName();
+                        if (d.getDisplayId() != android.view.Display.DEFAULT_DISPLAY && n != null
+                                && n.toLowerCase(java.util.Locale.US).contains("fission")) {
+                            chosen = d;
+                            break;
+                        }
                     }
                 }
             }
@@ -491,14 +503,13 @@ public final class BsNativeLayer {
         } catch (Throwable t) {
             logger.debug("clusterDisplaySize failed: " + t.getMessage());
         }
+        if (fission != null && fission.width > 0 && fission.height > 0) {
+            return new Point(fission.width, fission.height);
+        }
         // DisplayManager couldn't surface the fission display (its cache misses the
-        // foreign uid-1000 display on many models). Before giving up to the fixed
-        // 1920×720, parse the AUTHORITATIVE real W×H from the fission display's own
-        // `dumpsys display` block (same source resolveFissionDisplay uses for the id /
-        // layerStack — it reflects reality even when the DisplayManager cache is stale).
-        // This is what stops a non-Seal cluster (real panel ≠ 1920×720) from silently
-        // snapping to the fallback and mis-sizing / under-rendering the projection.
-        Point fromDump = clusterDisplaySizeViaDumpsys();
+        // foreign uid-1000 display on many models). Retry dumpsys, tied to the same id.
+        int expectedId = fission != null ? fission.displayId : -1;
+        Point fromDump = clusterDisplaySizeViaDumpsys(expectedId);
         if (fromDump != null && fromDump.x > 0 && fromDump.y > 0) {
             logger.info("clusterDisplaySize: resolved " + fromDump.x + "x" + fromDump.y
                     + " from dumpsys (DisplayManager cache missed the fission display)");
@@ -508,7 +519,8 @@ public final class BsNativeLayer {
         // cluster panel differs AND whose dumpsys layout we couldn't parse, this
         // mis-sizes the projection.
         logger.warn("clusterDisplaySize: fission panel not found via DisplayManager OR "
-                + "dumpsys — using fixed 1920x720 fallback (may mis-size on non-Seal clusters)");
+                + "identity-matched dumpsys — using fixed 1920x720 fallback"
+                + " (displayId=" + expectedId + ", may mis-size on non-Seal clusters)");
         return p;
     }
 
@@ -527,36 +539,29 @@ public final class BsNativeLayer {
      * does. Bounds-checked (1..8192) so a stray small pair (e.g. a density "1 x 1")
      * can't win. Best-effort: any failure returns null and the caller uses its fallback.
      */
-    private static Point clusterDisplaySizeViaDumpsys() {
+    private static Point clusterDisplaySizeViaDumpsys(int expectedDisplayId) {
         Process proc = null;
         try {
             proc = new ProcessBuilder("dumpsys", "display").redirectErrorStream(true).start();
             java.io.BufferedReader r = new java.io.BufferedReader(
                     new java.io.InputStreamReader(proc.getInputStream()));
-            // <W> x <H> with optional spaces around the 'x' (e.g. "1920 x 720" or "1920x720").
-            java.util.regex.Pattern dim =
-                    java.util.regex.Pattern.compile("(\\d{3,4})\\s*[xX]\\s*(\\d{3,4})");
             String line;
             Point best = null;
             while ((line = r.readLine()) != null) {
-                if (!line.toLowerCase(java.util.Locale.US).contains("fission")) continue;
-                java.util.regex.Matcher mt = dim.matcher(line);
-                while (mt.find()) {
-                    int w = Integer.parseInt(mt.group(1));
-                    int h = Integer.parseInt(mt.group(2));
-                    // Plausible panel dimensions only; prefer the LARGEST pair on the
-                    // line (the real resolution, not an inset/density artifact).
-                    if (w >= 200 && w <= 8192 && h >= 200 && h <= 8192) {
-                        if (best == null || (long) w * h > (long) best.x * best.y) {
-                            best = new Point(w, h);
-                        }
-                    }
+                String low = line.toLowerCase(java.util.Locale.US);
+                if (!low.contains("fission")
+                        || low.matches(".*\\bstate[ =]+(off|unknown)\\b.*")) {
+                    continue;
                 }
-                if (best != null) {
+                int lineId = extractDisplayIdOnLine(line);
+                if (expectedDisplayId > 0 && lineId != expectedDisplayId) continue;
+                Point candidate = extractLargestSizeOnLine(line);
+                if (candidate != null) {
+                    best = candidate; // Prefer the last live Base/Override DisplayInfo line.
                     logger.info("clusterDisplaySizeViaDumpsys raw: " + line.trim());
-                    return best;
                 }
             }
+            return best;
         } catch (Throwable t) {
             logger.debug("clusterDisplaySizeViaDumpsys failed: " + t.getMessage());
         } finally {
@@ -565,14 +570,100 @@ public final class BsNativeLayer {
         return null;
     }
 
+    /**
+     * Parse the fission display's REAL physical size from a {@code dumpsys display} line.
+     *
+     * <p>The DisplayInfo line inlines SEVERAL {@code W x H} pairs, e.g.
+     * {@code ... app 1920 x 720, real 1920 x 720, overscan (80,50,80,50), largest app 1920 x 1920,
+     * smallest app 720 x 720, ...}. The {@code real}/{@code app} pair is the authoritative panel
+     * size (1920×720 = 8:3 on the Seal); {@code largest app}/{@code smallest app} are AMS's
+     * rotation/overscan envelope bounds (here 1920×1920 and 720×720) and are NOT the panel — a
+     * plain "largest area wins" scan wrongly picked {@code 1920 x 1920}, giving a 1:1 aspect that
+     * made the projection box render SQUARE (confirmed on-car: cluster-mirror-status reported
+     * panelH=1920). So we prefer, in order: the {@code real} pair, then the {@code app} pair (but
+     * NOT {@code largest app}/{@code smallest app}), and only if neither token is present do we
+     * fall back to the first valid pair on the line (covers the DisplayDeviceInfo line, whose bare
+     * leading {@code 1920 x 720} carries no envelope pairs).
+     */
+    /** {@link Point} wrapper over the pure {@link #parseSizeFromDumpsysLine} parser. Kept because
+     *  {@code new Point(w,h)} only stores its args on a real device — under the plain-JVM unit test
+     *  the {@code android.graphics.Point} stub is a no-op, so ALL parsing is done in int[] space
+     *  and the Point is built ONLY here (never exercised by the test). */
+    private static Point extractLargestSizeOnLine(String line) {
+        int[] wh = parseSizeFromDumpsysLine(line);
+        return wh == null ? null : new Point(wh[0], wh[1]);
+    }
+
+    /**
+     * Pure size parse (returns {@code [w, h]} or null) — the testable core of
+     * {@link #extractLargestSizeOnLine}. Package-private so the unit test can pin it against real
+     * on-car {@code dumpsys display} lines without a device (and without the Point stub).
+     */
+    static int[] parseSizeFromDumpsysLine(String line) {
+        // 1) Authoritative: "real <W> x <H>".
+        int[] real = matchLabeledSize(line, "real");
+        if (real != null) return real;
+        // 2) Base app size: "app <W> x <H>", but reject the envelope pairs whose "app" is preceded
+        //    by "largest"/"smallest".
+        int[] app = matchAppSize(line);
+        if (app != null) return app;
+        // 3) No labeled size on this line — take the FIRST valid pair (not the largest; the bogus
+        //    square envelope, if present, would otherwise win an area contest).
+        java.util.regex.Matcher mt = java.util.regex.Pattern
+                .compile("(\\d{3,4})\\s*[xX]\\s*(\\d{3,4})")
+                .matcher(line);
+        while (mt.find()) {
+            int[] p = validSize(mt.group(1), mt.group(2));
+            if (p != null) return p;
+        }
+        return null;
+    }
+
+    /** First {@code <label> <W> x <H>} pair on the line (e.g. label="real"), or null. */
+    private static int[] matchLabeledSize(String line, String label) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\\b" + label + "\\s+(\\d{3,4})\\s*[xX]\\s*(\\d{3,4})")
+                .matcher(line);
+        return m.find() ? validSize(m.group(1), m.group(2)) : null;
+    }
+
+    /** The base {@code app <W> x <H>} pair, EXCLUDING {@code largest app}/{@code smallest app}. */
+    private static int[] matchAppSize(String line) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(largest |smallest )?app\\s+(\\d{3,4})\\s*[xX]\\s*(\\d{3,4})")
+                .matcher(line);
+        while (m.find()) {
+            if (m.group(1) != null) continue;   // skip "largest app" / "smallest app"
+            int[] p = validSize(m.group(2), m.group(3));
+            if (p != null) return p;
+        }
+        return null;
+    }
+
+    /** Bounds-checked (200..8192) {@code [w, h]}, or null. */
+    private static int[] validSize(String ws, String hs) {
+        int w = parseIntSafe(ws), h = parseIntSafe(hs);
+        if (w >= 200 && w <= 8192 && h >= 200 && h <= 8192) return new int[] { w, h };
+        return null;
+    }
+
     /** Resolved cluster (fission) display descriptor from {@code dumpsys display}.
      *  displayId / layerStack are -1 when not parsed. */
     public static final class FissionDisplay {
         public final int displayId;
         public final int layerStack;
+        public final int width;
+        public final int height;
+
         FissionDisplay(int displayId, int layerStack) {
+            this(displayId, layerStack, 0, 0);
+        }
+
+        FissionDisplay(int displayId, int layerStack, int width, int height) {
             this.displayId = displayId;
             this.layerStack = layerStack;
+            this.width = width;
+            this.height = height;
         }
         /** True when we positively identified the fission display (id and/or stack). */
         public boolean present() { return displayId >= 0 || layerStack >= 0; }
@@ -629,7 +720,7 @@ public final class BsNativeLayer {
             java.util.regex.Pattern sameLineStack =
                 java.util.regex.Pattern.compile("(?i)layerstack[ =]+(\\d+)");
             String line;
-            int foundId = -1, foundStack = -1;
+            int foundId = -1, foundStack = -1, foundW = 0, foundH = 0;
             while ((line = r.readLine()) != null) {
                 String low = line.toLowerCase(java.util.Locale.US);
                 if (!low.contains("fission")) continue;
@@ -695,11 +786,29 @@ public final class BsNativeLayer {
                 // Base; identical N).
                 java.util.regex.Matcher m = sameLineStack.matcher(line);
                 int id = extractDisplayIdOnLine(line);
-                if (m.find()) {
+                Point size = extractLargestSizeOnLine(line);
+                if (m.find() && id >= 0) {
+                    boolean sameDisplay = foundId == id;
                     foundStack = parseIntSafe(m.group(1));
-                    if (id >= 0) foundId = id;          // id paired with THIS stack's line
+                    foundId = id;                       // id paired with THIS stack's line
+                    if (size != null) {
+                        foundW = size.x;
+                        foundH = size.y;
+                    } else if (!sameDisplay) {
+                        // Never carry dimensions from a different fission entry into this id.
+                        foundW = 0;
+                        foundH = 0;
+                    }
                 } else if (id >= 0 && foundStack < 0) {
+                    boolean sameDisplay = foundId == id;
                     foundId = id;                        // id-only line, no stack seen yet
+                    if (size != null) {
+                        foundW = size.x;
+                        foundH = size.y;
+                    } else if (!sameDisplay) {
+                        foundW = 0;
+                        foundH = 0;
+                    }
                 }
             }
             // DIAGNOSTIC: log the RESOLVED result so the next on-car log shows whether
@@ -708,8 +817,8 @@ public final class BsNativeLayer {
             // "resolveFissionDisplay raw:" above are the two datums every prior log
             // lacked, which left code-vs-environment unanswerable.
             logger.info("resolveFissionDisplay result: displayId=" + foundId
-                    + " layerStack=" + foundStack);
-            return new FissionDisplay(foundId, foundStack);
+                    + " layerStack=" + foundStack + " real=" + foundW + "x" + foundH);
+            return new FissionDisplay(foundId, foundStack, foundW, foundH);
         } catch (Throwable t) {
             logger.warn("resolveFissionDisplay parse failed: " + t.getMessage());
             return new FissionDisplay(-1, -1);
@@ -764,14 +873,30 @@ public final class BsNativeLayer {
         // (live stack but OEM never panel-composites it).
         if (fd.layerStack >= 0) {
             logger.info("clusterLayerStack: branch=live stack=" + fd.layerStack);
-            return fd.layerStack;   // live, authoritative
-        }
-        if (fd.displayId >= 0) {
+        } else if (fd.displayId >= 0) {
             logger.info("clusterLayerStack: branch=FALLBACK stack=" + fallback
                     + " (displayId=" + fd.displayId + " but layerStack unparsed)");
-            return fallback;          // fission seen, stack unparsed → last-known-good
+        } else {
+            logger.info("clusterLayerStack: branch=UNRESOLVED (no fission display)");
         }
-        logger.info("clusterLayerStack: branch=UNRESOLVED (no fission display)");
+        return clusterLayerStack(fd, fallback);
+    }
+
+    /**
+     * Resolve the cluster layerStack from an ALREADY-resolved {@link FissionDisplay} so a
+     * caller that ALSO needs the display id or panel size uses ONE consistent descriptor for
+     * all three, instead of parsing {@code dumpsys display} a second time. Two back-to-back
+     * parses can straddle a layerStack change across a projection re-open (the stack is a
+     * process-global counter that increments per re-open), pairing one display's stack with
+     * another's size/id — the exact hazard the descriptor-carry refactor removes. Same
+     * resolution order as {@link #clusterLayerStack(int)}: the live parsed stack, else the
+     * {@code fallback} when the fission display was seen but its stack was unparsed, else
+     * {@link #STACK_UNRESOLVED} (no fission display → caller must not show).
+     */
+    public static int clusterLayerStack(FissionDisplay fd, int fallback) {
+        if (fd == null) return STACK_UNRESOLVED;
+        if (fd.layerStack >= 0) return fd.layerStack;   // live, authoritative
+        if (fd.displayId >= 0) return fallback;          // fission seen, stack unparsed
         return STACK_UNRESOLVED;                          // no fission display → don't show
     }
 

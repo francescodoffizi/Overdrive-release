@@ -106,8 +106,13 @@ public final class ConditionGroup {
             List<AutomationCondition> conds = new ArrayList<>();
             JSONArray condsJson = input.optJSONArray("conditions");
             if (condsJson != null) {
-                for (int i = 0; i < condsJson.length(); i++) {
-                    JSONObject cj = condsJson.getJSONObject(i);
+                // Migrate stale stored options here too — a nested group's condition rows come
+                // from the SAME condition catalog as the flat ones, so a withdrawn option would
+                // otherwise reject this group and drop the whole automation (see
+                // Automation.migrateStaleOptions for why dropping loses user data). The
+                // array-aware form is used so a group holding BOTH seats can't be migrated into
+                // a contradictory AND.
+                for (JSONObject cj : Automation.migrateStaleOptions(condsJson)) {
                     String key = cj.getString("type");
                     EventCondition ec = Automations.getCondition(key);
                     if (ec == null) return null;
@@ -115,6 +120,13 @@ public final class ConditionGroup {
                     if (ac == null) return null;
                     conds.add(ac);
                 }
+                // A group the migration emptied must REJECT, not become a no-op. evaluate()
+                // returns true for a group with no terms, so silently keeping an emptied group
+                // turns a gate into no gate — the automation would then FIRE unconditionally,
+                // which is worse than not firing (it can actuate the vehicle). This can only
+                // happen when every stored condition in the group was dropped as a collided
+                // duplicate; rejecting drops just this automation and leaves the .bak intact.
+                if (condsJson.length() > 0 && conds.isEmpty()) return null;
             }
             List<ConditionGroup> subs = new ArrayList<>();
             JSONArray groupsJson = input.optJSONArray("groups");

@@ -28,10 +28,31 @@ class ScreenOffReceiver : BroadcastReceiver() {
             val filter = IntentFilter().apply {
                 addAction(Intent.ACTION_SCREEN_OFF)
             }
-            context.applicationContext.registerReceiver(receiver, filter)
-            Log.i(TAG, "ScreenOffReceiver registered")
+            // Deliver on a background looper, NOT the main thread. onReceive
+            // delegates to BootReceiver.onReceive, which does file stats,
+            // possibly PreferencesManager.init (a file move), startService and
+            // startOnBoot — all blocking. Screen off/on is exactly when the
+            // native head-unit UI is animating, and this receiver is registered
+            // 24/7 by DaemonKeepaliveService, so paying that on the app main
+            // thread contends with system_server over binder and drops frames
+            // system-wide. Safe off-main: the delegated work is already
+            // async/idempotent (DaemonStartupManager.bootStarted is @Volatile and
+            // startOnBoot no-ops on re-entry), so nothing depends on main-thread
+            // delivery. Same actions, same ordering, same reliability.
+            if (deliveryThread == null) {
+                deliveryThread = android.os.HandlerThread("ScreenOffReceiver").apply { start() }
+                deliveryHandler = android.os.Handler(deliveryThread!!.looper)
+            }
+            context.applicationContext.registerReceiver(
+                receiver, filter, null, deliveryHandler)
+            Log.i(TAG, "ScreenOffReceiver registered (background delivery)")
             return receiver
         }
+
+        // Dedicated delivery looper (see register). Held statically because the
+        // receiver is a process-lifetime singleton owned by DaemonKeepaliveService.
+        private var deliveryThread: android.os.HandlerThread? = null
+        private var deliveryHandler: android.os.Handler? = null
         
         /**
          * Unregister this receiver.
@@ -43,6 +64,19 @@ class ScreenOffReceiver : BroadcastReceiver() {
             } catch (e: Exception) {
                 Log.w(TAG, "Error unregistering: ${e.message}")
             }
+            // NOTE: deliberately do NOT quitSafely() the delivery looper here.
+            // The thread/handler are process-lifetime statics shared by every
+            // registration, but `register` mints a NEW receiver per call and
+            // DaemonKeepaliveService is START_STICKY (it is destroyed + respawned,
+            // and parkStanddown stops it). So instance A's unregister could quit
+            // the looper while instance B's receiver is still bound to it — after
+            // which ActivityThread cannot enqueue B's dispatch and onReceive stops
+            // firing FOREVER, silently killing screen-off-driven daemon startup.
+            // A single idle HandlerThread parked in Looper.loop() costs ~nothing
+            // (zero CPU, one stack); a permanently dead broadcast path costs the
+            // feature. Keeping it alive also makes a later re-register work.
+            // (If this ever needs real teardown, refcount registrations and quit
+            // only at zero — do not quit unconditionally.)
         }
     }
     

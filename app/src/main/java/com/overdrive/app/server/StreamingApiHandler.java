@@ -1192,6 +1192,13 @@ public class StreamingApiHandler {
                 HttpResponse.sendJson(out, err.toString());
                 return;
             }
+            // NOTE: the "warm but on an independent GL context while recording" case is
+            // no longer surfaced as a terminal error. startPipeline() now ACTIVELY brings
+            // pano up and waits for its EGLCore before creating OEM's context, so OEM
+            // starts in pano's share group in the first place and DVR just works. If it
+            // still lands unshared (pano genuinely broken), the ordinary "starting" path
+            // below keeps polling and the self-heal restart repairs it as soon as no
+            // recording is open — a transient wait, not a dead end the user must decode.
             // resolveOemDashcamId honours the XOR-of-pano default, so on
             // every install (even fresh, no manual override) we get back
             // a candidate id and ATTEMPT a start. Only after the start
@@ -1229,13 +1236,22 @@ public class StreamingApiHandler {
             } catch (Throwable ignored) {}
             // Streaming-only kick — we never flip recordingMode in UCM.
             // applyTriggerLifecycleFromUcm sees isAnyStreamingViewerActive()
-            // (view 6 about to be set) and brings the camera + EGL up
+            // (view 6 intent persisted just below) and brings the camera + EGL up
             // without flipping recording on. Only schedule a recalc when
             // the pipeline isn't already started — re-kicking an in-flight
             // start() is wasted lifecycle churn.
-            try {
-                if (pano != null) pano.setStreamViewMode(6);
-            } catch (Throwable ignored) {}
+            //
+            // DO NOT set the scaler to view 6 here. The shader's OEM branch is gated
+            // on `uViewMode == 6 && uOemActive == 1`; uOemActive only goes 1 after
+            // bindOemSource + the first matrix publish, which cannot have happened yet
+            // on this not-ready path. With uViewMode=6 and uOemActive=0 the gate FALLS
+            // THROUGH into the uApaMode branches and renders the 4-cam AVM mosaic —
+            // the "DVR shows the 4-cam strip" bug. Leaving the view mode alone keeps
+            // the previous (correct) feed on screen while OEM warms; view 6 is applied
+            // only on the success path below, once the bind actually landed.
+            // isAnyStreamingViewerActive() reads the PERSISTED intent
+            // (setLastDesiredViewMode(6) below), not the scaler, so the lifecycle kick
+            // still sees the view-6 request.
             // Persist intent now (not only on the success branch). A WS
             // reconnect during the OEM warmup window would otherwise read
             // lastDesiredViewMode=-1, fall back to scaler-state, and miss

@@ -341,7 +341,11 @@ public class SurveillanceApiHandler {
             config.put("sadThreshold", sentry != null ? sentry.getSadThreshold() : 0.05f);
             config.put("preRecordSeconds", sentryConfig.getPreRecordSeconds());
             config.put("postRecordSeconds", sentryConfig.getPostRecordSeconds());
-            config.put("totalBlocks", sentry != null ? sentry.getTotalBlocks() : 300);
+            // Fallback must match the real per-quadrant grid (10×7=70), not the
+            // old dead 640×480 figure — the ROI editor posts back a length-70
+            // roiBlocks_Q* array and applyEffectiveRoi drops any other length.
+            config.put("totalBlocks", sentry != null ? sentry.getTotalBlocks()
+                    : com.overdrive.app.surveillance.MotionPipelineV2.TOTAL_BLOCKS);
             config.put("flashImmunity", sentryConfig.getFlashImmunity());
             config.put("aiEnabled", true);
             config.put("aiConfidence", sentryConfig.getAiConfidence());
@@ -393,7 +397,8 @@ public class SurveillanceApiHandler {
             config.put("sadThreshold", 0.05f);
             config.put("sensitivity", 3);  // Default slider value
             config.put("distance", 3);     // Default slider value
-            config.put("totalBlocks", 300);
+            config.put("totalBlocks",
+                    com.overdrive.app.surveillance.MotionPipelineV2.TOTAL_BLOCKS);
             config.put("flashImmunity", 2);
             config.put("aiEnabled", true);
             config.put("aiConfidence", 0.4f);
@@ -511,6 +516,7 @@ public class SurveillanceApiHandler {
             config.put("filterDebugLog", sentryConfig.isFilterDebugLogEnabled());
             config.put("discardEmptyBrightMotionEvents", sentryConfig.isDiscardEmptyBrightMotionEvents());
             config.put("discardEmptyMotionAtNight", sentryConfig.isDiscardEmptyMotionAtNight());
+            config.put("motionSalienceEnabled", sentryConfig.isMotionSalienceEnabled());
             config.put("telegramSendStartPing", sentryConfig.isTelegramSendStartPing());
             // Per-tier filter now lives in the telegram unified-config section
             // (see UnifiedTelegramConfig.K_TIER_*). Wire format on
@@ -611,6 +617,23 @@ public class SurveillanceApiHandler {
                     config.put("dilink4RedMask",
                         camCfg.optBoolean("dilink4RedMask", false));
                 }
+                // DiLink 4 mosaic-viewpoint handshake result. This is the write
+                // that flips the byd_apa HAL out of single-camera dashcam mode;
+                // when it does not land, the HAL streams ONE camera and every 2x2
+                // quadrant assumption downstream is wrong — which looks to a user
+                // like a garbled or wrong-looking tile. Surfacing it here is what
+                // makes that distinguishable in the field instead of guessed at.
+                //
+                // Emitted ONLY on dilink4 so a legacy car's response payload is
+                // byte-identical to before (the values would be meaningless there
+                // anyway — the viewpoint write is never attempted).
+                if (camCfg != null
+                        && "dilink4".equalsIgnoreCase(camCfg.optString("cameraMode", "default"))) {
+                    config.put("dilink4MosaicViewpointConfirmed",
+                        com.overdrive.app.camera.BydApaViewpointHelper.isMosaicViewpointConfirmed());
+                    config.put("dilink4ViewpointRc",
+                        com.overdrive.app.camera.BydApaViewpointHelper.getLastAcquireRc());
+                }
             } catch (Exception ignored) {}
         } else {
             config.put("environmentPreset", "outdoor");
@@ -626,6 +649,7 @@ public class SurveillanceApiHandler {
             config.put("filterDebugLog", false);
             config.put("discardEmptyBrightMotionEvents", false);
             config.put("discardEmptyMotionAtNight", false);
+            config.put("motionSalienceEnabled", false);
             config.put("telegramSendStartPing", false);
             // Tier toggles live on the telegram unified-config section, so
             // they're available even when SurveillanceConfig isn't loaded.
@@ -1394,6 +1418,11 @@ public class SurveillanceApiHandler {
                         configJson.optBoolean("discardEmptyBrightMotionEvents", false));
                 configChanged = true;
             }
+            if (configJson.has("motionSalienceEnabled")) {
+                sentryConfig.setMotionSalienceEnabled(
+                        configJson.optBoolean("motionSalienceEnabled", false));
+                configChanged = true;
+            }
             if (configJson.has("discardEmptyMotionAtNight")) {
                 sentryConfig.setDiscardEmptyMotionAtNight(
                         configJson.optBoolean("discardEmptyMotionAtNight", false));
@@ -1463,7 +1492,13 @@ public class SurveillanceApiHandler {
                 }
             }
             
-            // Per-quadrant ROI enabled/disabled toggle (separate from polygon data)
+            // Per-quadrant ROI enabled/disabled toggle (separate from polygon/block data).
+            // Handles BOTH storage modes:
+            //   - polygon ROI: re-apply the persisted polygon on enable.
+            //   - block-tap ROI: the mask lives in unified config; on disable we must
+            //     clear the unified-config roiEnabled_* flag too, otherwise the
+            //     engine's applyEffectiveRoi() (which reads unified config) would
+            //     revive the just-disabled zone on the setConfig() re-apply below.
             {
                 String[] quadrantKeys = {"Q0", "Q1", "Q2", "Q3"};
                 for (int q = 0; q < 4; q++) {
@@ -1471,13 +1506,28 @@ public class SurveillanceApiHandler {
                     if (configJson.has(enabledKey)) {
                         boolean enabled = configJson.optBoolean(enabledKey, false);
                         if (enabled && sentryConfig.getRoiPolygon(q) != null) {
-                            // Enable ROI — apply the persisted polygon to C++
+                            // Enable polygon ROI — apply the persisted polygon to C++
                             sentryConfig.setRoiEnabled(q, true);
                             if (sentry != null) sentry.applyQuadrantRoi(q, sentryConfig.getRoiPolygon(q));
-                        } else {
-                            // Disable ROI — clear C++ mask but keep polygon in config
+                        } else if (!enabled) {
+                            // Disable ROI — clear C++ mask, keep polygon data in config,
+                            // and mirror the disable into unified config so the block-tap
+                            // mask is not revived by the engine's config re-apply.
                             sentryConfig.setRoiEnabled(q, false);
                             if (sentry != null) sentry.clearQuadrantRoi(q);
+                            try {
+                                org.json.JSONObject survCfg =
+                                    com.overdrive.app.config.UnifiedConfigManager.getSurveillance();
+                                survCfg.put(enabledKey, false);
+                                com.overdrive.app.config.UnifiedConfigManager.setSurveillance(survCfg);
+                            } catch (Exception e) {
+                                CameraDaemon.log("ROI disable persist failed Q" + q + ": " + e.getMessage());
+                            }
+                        } else {
+                            // enabled==true but no polygon: a block-tap ROI is being
+                            // enabled. The roiBlocks_* handler below carries the mask and
+                            // its own enable flag; just record the intent on sentryConfig.
+                            sentryConfig.setRoiEnabled(q, true);
                         }
                         configChanged = true;
                     }
@@ -1903,6 +1953,30 @@ public class SurveillanceApiHandler {
             HttpResponse.sendJsonSuccess(out);
             return;
         }
+        // CHECKPOINT any in-progress trip before the caller SIGKILLs us. The
+        // client's restart flow is prepare-restart + `killall -9`, which never
+        // runs the JVM shutdown hook, so the hook's trip finalize is skipped
+        // here and the trip would otherwise lose everything buffered since the
+        // last periodic flush.
+        //
+        // Deliberately checkpointActiveTrip(), NOT shutdown(). shutdown() would
+        // finalizeActiveTrip() → apply the 60s/0.2km floors → discardTrip() →
+        // DELETE the telemetry file, destroying a short trip that previously
+        // survived the kill as a recoverable file. It would also flip
+        // initialized/enabled false and close the H2 store, which strands trips
+        // dead for the rest of the process whenever the caller's SIGKILL fails
+        // (the abort-restart endpoint exists precisely because it can).
+        // Best-effort and fully guarded — never block the restart.
+        try {
+            com.overdrive.app.trips.TripAnalyticsManager tam =
+                CameraDaemon.getTripAnalyticsManager();
+            if (tam != null && tam.isEnabled() && tam.isInitialized()) {
+                CameraDaemon.log("prepare-restart: checkpointing active trip before kill");
+                tam.checkpointActiveTrip();
+            }
+        } catch (Throwable t) {
+            CameraDaemon.log("prepare-restart: trip checkpoint failed: " + t.getMessage());
+        }
         try {
             GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
             if (pipeline != null && pipeline.isRunning()) {
@@ -1956,7 +2030,14 @@ public class SurveillanceApiHandler {
         response.put("viewMode", viewMode);
         
         JSONArray quadrants = new JSONArray();
-        String[] names = {"front", "right", "left", "rear"};
+        // MUST match MotionPipelineV2.QUADRANT_NAMES: Q0=front, Q1=right, Q2=REAR,
+        // Q3=LEFT. This array had "left" and "rear" transposed, so the heatmap
+        // labelled every Q2 (rear) reading "left" and every Q3 (left) reading
+        // "rear" — i.e. enabling the debug heatmap showed motion blocks on the
+        // rear camera when the motion was actually on the left one. It was the
+        // only place in the codebase with this order (grep: EventTimelineCollector
+        // and MotionPipelineV2 both use the canonical one).
+        String[] names = MotionPipelineV2.QUADRANT_NAMES;
         
         SurveillanceEngineGpu sentry = (gpuPipeline != null) ? gpuPipeline.getSentry() : null;
         MotionPipelineV2.QuadrantResult[] results = (sentry != null) ? sentry.getV2Results() : null;

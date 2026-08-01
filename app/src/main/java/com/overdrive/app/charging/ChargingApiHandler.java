@@ -65,6 +65,24 @@ public class ChargingApiHandler {
                 if ("POST".equals(method)) return handlePostConfig(body);
             }
 
+            // Location-aware tariffs. POST doubles as create/update (an "id" in
+            // the body means update) so the WebView never needs PUT, which it
+            // drops on some head-unit builds — same reason /delete exists below.
+            if (path.equals("/api/charging/tariffs")) {
+                if ("GET".equals(method)) return handleGetTariffs();
+                if ("POST".equals(method)) return handlePostTariff(body);
+                if ("PUT".equals(method)) return handlePostTariff(body);
+                if ("DELETE".equals(method)) return handleDeleteTariff(body);
+            }
+            // POST fallback for delete (the in-app WebView can drop DELETE bodies).
+            if (path.equals("/api/charging/tariffs/delete") && "POST".equals(method)) {
+                return handleDeleteTariff(body);
+            }
+            // Pin the fallback tariff used when a charge location matches nothing.
+            if (path.equals("/api/charging/tariffs/default") && "POST".equals(method)) {
+                return handleSetDefaultTariff(body);
+            }
+
             if (path.equals("/api/charging/history") && "DELETE".equals(method)) {
                 return handleClearHistory();
             }
@@ -129,6 +147,11 @@ public class ChargingApiHandler {
             sessionsParams.put("limit", "20");
             sessionsParams.put("offset", "0");
             bootstrap.put("sessions", invokeSectionStripped(() -> handleListSessions(sessionsParams)));
+
+            // Tariffs ride first paint so the settings tab renders its list
+            // without a second round-trip (the page is often opened straight
+            // to Settings after a charge).
+            bootstrap.put("tariffs", invokeSectionStripped(this::handleGetTariffs));
 
             response.put("success", true);
             response.put("bootstrap", bootstrap);
@@ -400,6 +423,16 @@ public class ChargingApiHandler {
     private JSONObject handlePostConfig(String body) {
         try {
             JSONObject bodyJson = new JSONObject(body != null ? body : "{}");
+            // Validate before applying. The setters clamp out-of-range values to 0
+            // ("unset"), so without this an absurd or non-numeric rate would be
+            // accepted, silently stored as 0, and reported as a success.
+            for (String rk : new String[]{ "electricityRate", "dcRate" }) {
+                if (!bodyJson.has(rk)) continue;
+                double rv = bodyJson.optDouble(rk, Double.NaN);
+                if (Double.isNaN(rv) || rv < 0 || rv >= 100000) {
+                    return errorResponse(rk + " must be between 0 and 100000", 400);
+                }
+            }
             ChargingConfig config = manager.getConfig();
             if (config != null) {
                 if (bodyJson.has("enabled")) config.setEnabled(bodyJson.getBoolean("enabled"));
@@ -409,16 +442,268 @@ public class ChargingApiHandler {
                 // editing here too; ChargingConfig.save() mirrors them back.
                 if (bodyJson.has("electricityRate")) config.setElectricityRate(bodyJson.getDouble("electricityRate"));
                 if (bodyJson.has("currency")) config.setCurrency(bodyJson.getString("currency"));
-                config.save();
+                // Report a persistence failure instead of claiming success: the
+                // in-memory config would price charges with a rate that is not in
+                // the file, and would silently revert on the next daemon start.
+                if (!config.save()) {
+                    return errorResponse("Could not save charging settings", 500);
+                }
                 manager.onConfigChanged();
             }
             JSONObject response = new JSONObject();
             response.put("success", true);
+            // Deliberately NO re-price here. Sessions priced by the global rate
+            // keep the rate snapshotted when they closed — that is the historical
+            // record of what was actually paid, and restating it because the user
+            // updated their current tariff would be wrong (and is the long-
+            // standing behaviour). Only named location tariffs are re-priceable,
+            // because there the user is explicitly correcting a labelled rate.
             return response;
         } catch (Exception e) {
             logger.error("Error saving charging config", e);
             return errorResponse("Failed to save config: " + e.getMessage(), 400);
         }
+    }
+
+    // ==================== TARIFFS ====================
+
+    /**
+     * List tariffs (usage-ordered) plus the current GPS fix and which profile
+     * matches it, so the UI can flag "auto-applies here" without a second call.
+     */
+    private JSONObject handleGetTariffs() {
+        JSONObject response = new JSONObject();
+        try {
+            double[] loc = currentLocation();
+            JSONObject payload = TariffManager.getInstance().toStatusJson(loc[0], loc[1]);
+            // Global fallbacks, so the UI can render "otherwise X/kWh" without
+            // also fetching /config.
+            ChargingConfig cfg = manager.getConfig();
+            if (cfg != null) {
+                cfg.load();
+                payload.put("globalRate", cfg.getElectricityRate());
+                payload.put("globalDcRate", cfg.getDcRate());
+                payload.put("currency", cfg.getCurrency());
+            }
+            response.put("success", true);
+            response.put("tariffs", payload.optJSONArray("tariffs"));
+            response.put("meta", payload);
+        } catch (Exception e) {
+            logger.error("Error listing tariffs", e);
+            return errorResponse("Failed to list tariffs", 500);
+        }
+        return response;
+    }
+
+    /**
+     * Create or update a tariff. An {@code id} in the body updates that profile;
+     * absent, a new one is created. When {@code lat}/{@code lng} are omitted on
+     * create we snapshot the CURRENT position — that's the "save the rate for
+     * where I am right now" flow, which is the common case.
+     *
+     * <p>A rate change re-prices the sessions this tariff owns (and adopts any
+     * in-range sessions it should now own) so history and the period/lifetime
+     * totals stay consistent instead of silently keeping the old price.
+     */
+    private JSONObject handlePostTariff(String body) {
+        try {
+            JSONObject b = new JSONObject(body != null ? body : "{}");
+            TariffManager mgr = TariffManager.getInstance();
+            String id = b.optString("id", "");
+
+            // Validate BEFORE mutating. TariffProfile clamps silently (it has to —
+            // it also parses a user-writable config file), so without an explicit
+            // check here a nonsense rate would be accepted as 0 and the tariff
+            // would match charges and then price them at nothing. Rejecting with a
+            // reason lets the UI say what's wrong instead of appearing to succeed.
+            String invalid = validateTariffBody(b, id.isEmpty());
+            if (invalid != null) return errorResponse(invalid, 400);
+
+            if (!id.isEmpty()) {
+                if (mgr.findById(id) == null) return errorResponse("Tariff not found", 404);
+                if (!mgr.update(id, b)) return errorResponse("Could not save tariff", 500);
+                int repriced = repriceQuietly(id);
+                JSONObject response = new JSONObject();
+                response.put("success", true);
+                response.put("tariff", tariffJson(mgr, id));
+                response.put("repriced", repriced);
+                return response;
+            }
+
+            double lat = b.optDouble("lat", Double.NaN);
+            double lng = b.optDouble("lng", Double.NaN);
+            if (Double.isNaN(lat) || Double.isNaN(lng)) {
+                double[] loc = currentLocation();
+                lat = loc[0];
+                lng = loc[1];
+            }
+            if (lat == 0 && lng == 0) {
+                // Without a position the profile could never match a charge, so
+                // refuse rather than silently creating a dead entry at (0,0).
+                return errorResponse("No location available — wait for a GPS fix or pass lat/lng", 400);
+            }
+
+            ChargingConfig cfg = manager.getConfig();
+            String fallbackCurrency = cfg != null ? cfg.getCurrency() : "";
+            // Pre-check the cap so add()'s null can be attributed to the real cause.
+            // Reporting "Tariff limit reached" for a persistence failure told the
+            // user to delete tariffs to fix a disk/lock problem.
+            if (mgr.getProfiles().size() >= TariffManager.MAX_PROFILES) {
+                return errorResponse("Tariff limit reached", 400);
+            }
+            TariffProfile p = mgr.add(
+                    b.optString("label", ""),
+                    lat, lng,
+                    b.optInt("radiusM", TariffProfile.DEFAULT_RADIUS_M),
+                    b.optDouble("acRate", 0),
+                    b.optDouble("dcRate", 0),
+                    b.optString("currency", fallbackCurrency));
+            if (p == null) return errorResponse("Could not save tariff", 500);
+
+            // A brand-new tariff can retroactively own past charges at this place.
+            int repriced = repriceQuietly(p.getId());
+            JSONObject response = new JSONObject();
+            response.put("success", true);
+            response.put("tariff", p.toJson());
+            response.put("repriced", repriced);
+            return response;
+        } catch (Exception e) {
+            logger.error("Error saving tariff", e);
+            return errorResponse("Failed to save tariff: " + e.getMessage(), 400);
+        }
+    }
+
+    private JSONObject handleDeleteTariff(String body) {
+        try {
+            JSONObject b = new JSONObject(body != null ? body : "{}");
+            String id = b.optString("id", "");
+            if (id.isEmpty()) return errorResponse("Missing tariff id", 400);
+            TariffManager mgr = TariffManager.getInstance();
+            if (mgr.findById(id) == null) return errorResponse("Tariff not found", 404);
+            if (!mgr.remove(id)) return errorResponse("Could not save tariff", 500);
+            // Sessions this tariff priced must fall back to whatever now applies —
+            // another profile, or the global rate. Pass "" to re-evaluate every
+            // session, since the deleted id is gone from the list and can no
+            // longer be matched on. (Sessions that were already on the global
+            // rate are skipped inside repriceSessionsForTariff — their historical
+            // cost is never restated.)
+            int repriced = repriceQuietly("");
+            JSONObject response = new JSONObject();
+            response.put("success", true);
+            response.put("repriced", repriced);
+            return response;
+        } catch (Exception e) {
+            logger.error("Error deleting tariff", e);
+            return errorResponse("Failed to delete tariff", 400);
+        }
+    }
+
+    private JSONObject handleSetDefaultTariff(String body) {
+        try {
+            JSONObject b = new JSONObject(body != null ? body : "{}");
+            String id = b.optString("id", "");
+            TariffManager mgr = TariffManager.getInstance();
+            if (!id.isEmpty() && mgr.findById(id) == null) {
+                return errorResponse("Tariff not found", 404);
+            }
+            if (!mgr.setDefault(id)) return errorResponse("Could not save tariff", 500);
+            // The default prices any charge that matched no circle, so changing it
+            // changes which tariff owns those sessions. Re-evaluate all; sessions
+            // that are on the global rate before AND after are left untouched.
+            int repriced = repriceQuietly("");
+            JSONObject response = new JSONObject();
+            response.put("success", true);
+            response.put("defaultTariffId", TariffManager.getInstance().getDefaultId());
+            response.put("repriced", repriced);
+            return response;
+        } catch (Exception e) {
+            logger.error("Error setting default tariff", e);
+            return errorResponse("Failed to set default tariff", 400);
+        }
+    }
+
+    /**
+     * Validate a tariff create/update body. Returns null when acceptable, else a
+     * user-facing reason.
+     *
+     * <p>On UPDATE only the keys actually present are checked, so a partial edit
+     * (say, renaming a label) isn't rejected for omitting rates. On CREATE at
+     * least one usable rate is required — a rate-less tariff would match charges
+     * and price them at zero, which reads as a bug rather than a setting.
+     */
+    private String validateTariffBody(JSONObject b, boolean isCreate) {
+        double ac = b.has("acRate") ? b.optDouble("acRate", -1) : -1;
+        double dc = b.has("dcRate") ? b.optDouble("dcRate", -1) : -1;
+
+        if (b.has("acRate") && (Double.isNaN(ac) || ac < 0 || ac >= 100000)) {
+            return "AC rate must be between 0 and 100000";
+        }
+        if (b.has("dcRate") && (Double.isNaN(dc) || dc < 0 || dc >= 100000)) {
+            return "DC rate must be between 0 and 100000";
+        }
+        if (isCreate && !(ac > 0) && !(dc > 0)) {
+            return "Enter an AC or DC rate";
+        }
+        // On update, evaluate the MERGED result: a body that zeroes only acRate
+        // still leaves a rate-less tariff when the stored dcRate is already 0.
+        if (!isCreate && (b.has("acRate") || b.has("dcRate"))) {
+            TariffProfile cur = TariffManager.getInstance().findById(b.optString("id", ""));
+            double mergedAc = b.has("acRate") ? ac : (cur != null ? cur.getAcRate() : 0);
+            double mergedDc = b.has("dcRate") ? dc : (cur != null ? cur.getDcRate() : 0);
+            if (!(mergedAc > 0) && !(mergedDc > 0)) return "Enter an AC or DC rate";
+        }
+
+        if (b.has("radiusM")) {
+            int r = b.optInt("radiusM", -1);
+            if (r < TariffProfile.MIN_RADIUS_M || r > TariffProfile.MAX_RADIUS_M) {
+                return "Radius must be between " + TariffProfile.MIN_RADIUS_M
+                        + " and " + TariffProfile.MAX_RADIUS_M + " m";
+            }
+        }
+        // Validate each coordinate that was SUPPLIED. optDouble yields NaN for a
+        // non-numeric value, and TariffProfile clamps NaN to 0 — which is the "no
+        // location" sentinel — so without an explicit reject a garbage coordinate
+        // would be accepted and produce a tariff that can never match.
+        if (b.has("lat")) {
+            double lat = b.optDouble("lat", Double.NaN);
+            if (Double.isNaN(lat) || lat < -90 || lat > 90) return "Latitude out of range";
+        }
+        if (b.has("lng")) {
+            double lng = b.optDouble("lng", Double.NaN);
+            if (Double.isNaN(lng) || lng < -180 || lng > 180) return "Longitude out of range";
+        }
+        if (b.has("label") && b.optString("label", "").length() > 48) {
+            return "Label is too long";
+        }
+        return null;
+    }
+
+    private JSONObject tariffJson(TariffManager mgr, String id) {
+        TariffProfile p = mgr.findById(id);
+        return p != null ? p.toJson() : new JSONObject();
+    }
+
+    /** Re-price history for a tariff change; never let it fail the request. */
+    private int repriceQuietly(String tariffId) {
+        try {
+            SocHistoryDatabase db = db();
+            if (db != null) return db.repriceSessionsForTariff(tariffId);
+        } catch (Throwable t) {
+            logger.warn("Reprice skipped: " + t.getMessage());
+        }
+        return 0;
+    }
+
+    /** Current GPS fix as {lat, lng}, or {0,0} when there's none. */
+    private double[] currentLocation() {
+        try {
+            com.overdrive.app.monitor.GpsMonitor gps =
+                    com.overdrive.app.monitor.GpsMonitor.getInstance();
+            if (gps != null && gps.hasLocation()) {
+                return new double[]{ gps.getLatitude(), gps.getLongitude() };
+            }
+        } catch (Throwable ignored) {}
+        return new double[]{ 0, 0 };
     }
 
     private JSONObject handleClearHistory() {

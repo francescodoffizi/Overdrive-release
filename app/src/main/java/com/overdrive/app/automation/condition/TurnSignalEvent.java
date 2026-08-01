@@ -24,8 +24,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * gap by reading the same reliable combined getter ({@code readTurnNow}) directly on
  * the daemon at a fast cadence.
  *
- * <p><b>Zero cost unless a turn automation exists.</b> Mirrors {@link NetworkEvent} /
- * {@link BluetoothEvent} self-gating, but tightened one level: the poll reschedules
+ * <p><b>Zero cost unless a turn automation exists.</b> Mirrors {@link NetworkEvent}
+ * self-gating, but tightened one level: the poll reschedules
  * itself every tick yet does NO SDK read unless {@link Automations#isEventReferenced}
  * reports an enabled automation actually triggers on {@code turnSignal}. So the fast
  * cadence is paid ONLY while a turn-signal automation is configured — an idle feature

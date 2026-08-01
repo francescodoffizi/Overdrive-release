@@ -27,11 +27,33 @@ public class TripRecord {
     public double socEnd;              // %
     public double kwhStart;            // Remaining kWh at trip start (from BMS)
     public double kwhEnd;              // Remaining kWh at trip end (from BMS)
+    // Cumulative HAL electricity-consumption accumulator (kWh) snapshotted at
+    // trip start/end — the electric twin of fuelConStart/End. The delta
+    // (end-start) is the vehicle's own metered kWh drawn, which is what makes
+    // SHORT trips measurable: remaining-energy is derived from a 1%-resolution
+    // SoC (~0.6 kWh on a 60 kWh pack ≈ 4 km of driving), so any trip shorter
+    // than that reads a flat 0. This counter advances continuously and is
+    // independent of both SoC quantisation and the pack-capacity estimate.
+    // -1 = unavailable (trim without the accumulator) → fall back to the
+    // remaining-kWh delta, then to the SoC estimate.
+    public double elecConStart = -1;
+    public double elecConEnd = -1;
     public double efficiencySocPerKm;  // SoC% / km (legacy)
     public double energyPerKm;         // kWh / km (from BMS kWh readings)
     public double electricityRate;     // Cost per kWh at time of trip
     public String currency;            // Currency symbol (₹, $, €, £)
     public double tripCost;            // Total trip cost (electric leg + fuel leg)
+    // Where electricityRate came from. The energy a trip burns was bought at the
+    // LAST CHARGE's tariff, so that is what we price it at (see
+    // TripAnalyticsManager). "" = the configured global rate (also every trip
+    // recorded before this existed, so old rows read exactly as before).
+    //   "charge"  → the most recent completed charging session's rate
+    //   "config"  → the global electricityRate from settings
+    public String rateSource = "";
+    // Human label of the tariff behind a "charge" rate ("Home", "Office"), so the
+    // trip card can show WHY it was priced that way. Empty when the charge was
+    // priced by the global rate, or when unknown.
+    public String rateLabel = "";
 
     // ── PHEV / hybrid bookkeeping (BEV trips leave these at sentinel) ────
     // For BEVs: isPhev=false, all fuel* fields are 0/NaN, behavior is
@@ -95,13 +117,82 @@ public class TripRecord {
     }
 
     /**
-     * Get the actual energy consumed in kWh from BMS readings.
-     * Returns 0 if kWh data not available (caller should use SoC-based estimation).
-     * Always non-negative — used for cost and total-energy accounting.
+     * Metered electricity drawn this trip (kWh) from the HAL's cumulative
+     * consumption accumulator, or 0 when unavailable.
+     *
+     * <p>This is the MOST accurate electric-energy source we have and the only
+     * one with usable resolution on short trips — see {@link #elecConStart}.
+     * Mirrors the metered-litres path used for the fuel leg, including its
+     * reset/rollover guard: a counter that went BACKWARDS (firmware reset, or a
+     * unit rollover) would yield a negative volume, so we require
+     * {@code end >= start} and otherwise report 0 so callers fall through to the
+     * next tier rather than booking a bogus figure.
+     *
+     * <p>A flat counter legitimately returns 0 (e.g. a PHEV leg driven entirely
+     * on the engine), which is a true reading, not a missing one — callers
+     * distinguish the two via {@link #hasMeteredEnergy()}.
+     */
+    public double getMeteredEnergyKwh() {
+        if (elecConStart >= 0 && elecConEnd >= 0 && elecConEnd >= elecConStart) {
+            return elecConEnd - elecConStart;
+        }
+        return 0;
+    }
+
+    /**
+     * Whether both ends of the cumulative electricity counter were captured and
+     * are self-consistent — i.e. {@link #getMeteredEnergyKwh()} is a real
+     * measurement (possibly a true 0) rather than "no data". Callers use this to
+     * avoid falling through to a coarser tier when the meter legitimately says
+     * the pack supplied nothing.
+     */
+    public boolean hasMeteredEnergy() {
+        return elecConStart >= 0 && elecConEnd >= 0 && elecConEnd >= elecConStart;
+    }
+
+    /**
+     * Get the actual energy consumed in kWh from direct measurement.
+     * Returns 0 if no measured source is available (caller should use SoC-based
+     * estimation). Always non-negative — used for cost and total-energy accounting.
+     *
+     * <p><b>The remaining-energy delta wins whenever it can answer.</b> It is NET
+     * of regeneration, which is the quantity cost and efficiency must be based on:
+     * you only buy back the energy the pack actually ended up short. The metered
+     * counter is GROSS draw, so preferring it would inflate the cost of a
+     * regen-heavy trip and put stored history on two different axes depending on
+     * which channels a trim happens to expose.
+     *
+     * <p>The metered counter is therefore used only where the net delta CANNOT
+     * answer — which is precisely the case this whole tier exists for. Remaining
+     * energy is derived from a 1%-resolution SoC (~0.6 kWh, several km of
+     * driving), so on a short trip it reports a flat 0; the accumulator still
+     * advances. Trading a little regen accuracy for a real number beats reporting
+     * zero, and on a trip that short the regen component is negligible anyway.
      */
     public double getEnergyUsedKwh() {
-        if (kwhStart > 0 && kwhEnd > 0 && kwhStart > kwhEnd) {
+        boolean haveNet = kwhStart > 0 && kwhEnd > 0;
+        // Tier 1 — net remaining-energy delta (regen-inclusive).
+        if (haveNet && kwhStart > kwhEnd) {
             return kwhStart - kwhEnd;
+        }
+        // A pack that ended strictly FULLER than it started regenerated more than it
+        // drew, so on balance it consumed nothing. Report 0 rather than falling
+        // through to the gross counter: billing energy that was put back would charge
+        // for a trip that cost nothing, and it would leave this trip's cost and its
+        // efficiency score on opposite signs. The signed figure lives in
+        // getSignedEnergyKwh; this accessor is the consumption figure.
+        if (haveNet && kwhEnd > kwhStart) {
+            return 0;
+        }
+        // Tier 2 — metered gross draw. Reached when the net delta cannot resolve the
+        // trip: either there is no remaining-energy channel at all, or (the important
+        // case) the two readings are EQUAL. Equal is not "consumed nothing" — it is
+        // "below the resolution of this channel", because remaining energy is derived
+        // from an integer SoC whose smallest step is several km of driving. That is
+        // precisely the short trip this tier exists to measure, so it must not be
+        // mistaken for a measured zero.
+        if (hasMeteredEnergy()) {
+            return getMeteredEnergyKwh();
         }
         return 0;
     }
@@ -116,8 +207,13 @@ public class TripRecord {
      * Always non-negative.
      */
     public double getResolvedEnergyKwh() {
-        double bms = getEnergyUsedKwh();
-        if (bms > 0) return bms;
+        double measured = getEnergyUsedKwh();
+        if (measured > 0) return measured;
+        // energyPerKm is resolved upstream from whichever tier actually answered,
+        // so honouring it here keeps a rollup total consistent with the per-trip
+        // figure the UI and the cost were computed from. When the meter measured a
+        // true zero, energyPerKm is 0 too, so this correctly yields 0 rather than
+        // resurrecting a value.
         if (energyPerKm > 0 && distanceKm > 0) return energyPerKm * distanceKm;
         return 0;
     }
@@ -133,10 +229,20 @@ public class TripRecord {
      * too noisy to distinguish genuine regen from sensor jitter.
      */
     public double getSignedEnergyKwh() {
-        if (kwhStart > 0 && kwhEnd > 0) {
+        // A strict inequality either way is a real net movement, signed.
+        if (kwhStart > 0 && kwhEnd > 0 && kwhStart != kwhEnd) {
             return kwhStart - kwhEnd; // negative when kwhEnd > kwhStart (net regen)
         }
-        return 0;
+        // Equal readings are NOT "zero energy" — they mean the trip was below this
+        // channel's resolution (it is derived from an integer SoC). Falling through
+        // keeps the efficiency score on the same footing as the cost figure, which
+        // resolves the same case from the meter; otherwise a short trip would be
+        // costed from measured energy but scored as if none had been measured.
+        //
+        // The metered counter is monotonic (gross draw, regen not subtracted), so it
+        // is always >= 0 and cannot express net regen — but a trip too short for the
+        // net channel to see is also too short for regen to matter.
+        return getMeteredEnergyKwh();
     }
 
     /**
@@ -158,11 +264,24 @@ public class TripRecord {
             json.put("socEnd", socEnd);
             json.put("kwhStart", kwhStart);
             json.put("kwhEnd", kwhEnd);
+            if (elecConStart >= 0) json.put("elecConStart", elecConStart);
+            if (elecConEnd >= 0) json.put("elecConEnd", elecConEnd);
             json.put("energyUsedKwh", getEnergyUsedKwh());
+            // Signed twin of the above: negative on a regen-dominant trip where
+            // the pack ended fuller than it started. energyUsedKwh clamps that to
+            // 0 because it feeds cost and rollup totals, which must never go
+            // negative — but the UI needs the sign so the Energy tile agrees with
+            // the SoC Used tile instead of reading 0 next to a negative delta.
+            json.put("signedEnergyKwh", getSignedEnergyKwh());
+            // Lets the UI say "energy was measured, and it was ~0" (a genuinely
+            // tiny trip) instead of "no data" — the two look identical otherwise.
+            json.put("energyMetered", hasMeteredEnergy());
             json.put("efficiencySocPerKm", efficiencySocPerKm);
             json.put("energyPerKm", energyPerKm);
             json.put("electricityRate", electricityRate);
             json.put("currency", currency != null ? currency : "");
+            json.put("rateSource", rateSource != null ? rateSource : "");
+            json.put("rateLabel", rateLabel != null ? rateLabel : "");
             json.put("tripCost", tripCost);
             json.put("kinematicState", kinematicState != null ? kinematicState : "");
             json.put("gradientProfile", gradientProfile != null ? gradientProfile : "");
@@ -217,11 +336,24 @@ public class TripRecord {
             json.put("socEnd", socEnd);
             json.put("kwhStart", kwhStart);
             json.put("kwhEnd", kwhEnd);
+            if (elecConStart >= 0) json.put("elecConStart", elecConStart);
+            if (elecConEnd >= 0) json.put("elecConEnd", elecConEnd);
             json.put("energyUsedKwh", getEnergyUsedKwh());
+            // Signed twin of the above: negative on a regen-dominant trip where
+            // the pack ended fuller than it started. energyUsedKwh clamps that to
+            // 0 because it feeds cost and rollup totals, which must never go
+            // negative — but the UI needs the sign so the Energy tile agrees with
+            // the SoC Used tile instead of reading 0 next to a negative delta.
+            json.put("signedEnergyKwh", getSignedEnergyKwh());
+            // Lets the UI say "energy was measured, and it was ~0" (a genuinely
+            // tiny trip) instead of "no data" — the two look identical otherwise.
+            json.put("energyMetered", hasMeteredEnergy());
             json.put("efficiencySocPerKm", efficiencySocPerKm);
             json.put("energyPerKm", energyPerKm);
             json.put("electricityRate", electricityRate);
             json.put("currency", currency != null ? currency : "");
+            json.put("rateSource", rateSource != null ? rateSource : "");
+            json.put("rateLabel", rateLabel != null ? rateLabel : "");
             json.put("tripCost", tripCost);
             json.put("kinematicState", kinematicState != null ? kinematicState : "");
             json.put("gradientProfile", gradientProfile != null ? gradientProfile : "");

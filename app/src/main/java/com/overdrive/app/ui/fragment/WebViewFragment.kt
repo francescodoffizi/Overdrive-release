@@ -444,8 +444,28 @@ class WebViewFragment : Fragment() {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
+            // allowFileAccess stays FALSE — the page never needs file:// and
+            // leaving it off keeps the local-file attack surface closed.
             settings.allowFileAccess = false
-            settings.allowContentAccess = false
+            // allowContentAccess MUST be true, and this is not optional for
+            // uploads to work at all.
+            //
+            // onShowFileChooser hands the WebView a content:// Uri from
+            // ACTION_GET_CONTENT. When the page then does
+            // `FileReader.readAsDataURL(input.files[0])`, the WebView itself has to
+            // resolve that content:// Uri through the ContentResolver to produce
+            // the bytes. With allowContentAccess=false that read is refused, so
+            // readAsDataURL never yields data and the upload silently never sends
+            // its POST — which is exactly the observed symptom: the picker opens,
+            // a file is chosen, and the daemon log shows only GET /api/audio/library
+            // with no POST ever arriving. Affects BOTH upload paths that use this
+            // idiom (audio-library.js and the screen-deterrent image in
+            // surveillance.js).
+            //
+            // This does NOT widen the page's reach: content:// access is limited to
+            // providers that have granted this app a URI permission — i.e. exactly
+            // the file the user just picked in the system picker.
+            settings.allowContentAccess = true
             settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             // Respect server Cache-Control headers. The daemon serves HTML with no-store
             // and shared static assets (CSS/JS/fonts/icons, ~360KB total) with a 24h
@@ -457,8 +477,12 @@ class WebViewFragment : Fragment() {
             // Resolve background color from the active theme so the WebView's
             // outer chrome flips with light/dark mode.
             setBackgroundColor(resolveThemeBackground())
-            // Enable hardware acceleration for video playback
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            // WebView is already hardware-accelerated by default; promoting to
+            // LAYER_TYPE_HARDWARE allocates a persistent full-window GPU texture
+            // and adds a render-into-layer + composite pass on every invalidation
+            // (~10-30×/sec during live video). Removed: LAYER_TYPE_NONE is the
+            // correct default for continuously-animating content.
+            setLayerType(View.LAYER_TYPE_NONE, null)
 
             webViewClient = object : WebViewClient() {
                 
@@ -1160,10 +1184,13 @@ class WebViewFragment : Fragment() {
         fun syncRoadSenseOverlay(): String {
             return try {
                 val ctx = context ?: return "no_context"
+                // Read here (WebView worker): snapshot(forceReload) hits disk.
+                val shouldShow = com.overdrive.app.roadsense.config.RoadSenseConfig
+                    .snapshot(forceReload = true).overlayShouldShow()
                 ctx.mainExecutor.execute {
                     try {
                         com.overdrive.app.roadsense.overlay.RoadSenseOverlayService
-                            .syncWithConfig(ctx)
+                            .syncWithConfig(ctx, shouldShow)
                     } catch (e: Exception) {
                         android.util.Log.w("WebViewFragment", "syncRoadSenseOverlay apply failed: ${e.message}")
                     }
@@ -1578,6 +1605,14 @@ class WebViewFragment : Fragment() {
                 }
             }
         }
+        // Native pause counterpart to the onResume resume signal: these head
+        // units don't always deliver the Page Visibility event, and webView
+        // .onPause() stops neither JS timers nor the socket.
+        webView?.evaluateJavascript(
+            "(function(){if(window.BYD&&BYD.stream&&BYD.stream.pauseForBackground){" +
+                "BYD.stream.pauseForBackground();}})();",
+            null
+        )
         webView?.onPause()
         super.onPause()
     }

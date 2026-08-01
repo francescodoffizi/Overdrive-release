@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Byte-callback probe — opens AVMCamera and sweeps (cameraId, viewIndex)
  * combinations using setPreviewCallback + enablePreviewCallback (the path
- * DiPlus uses on units where SurfaceTexture attachment yields no frames).
+ * the secondary reference app uses on units where SurfaceTexture attachment yields no frames).
  *
  * Per combo: wait up to PER_COMBO_FIRST_FRAME_TIMEOUT_MS for the first
  * frame; on arrival, record for PER_COMBO_RECORD_MS. Frames encode to MP4
@@ -226,7 +226,7 @@ public final class AvmByteCallbackProbe {
         }
     }
 
-    /** Try standard then DiPlus-style addDexPath fallback for bmmcamera.jar. */
+    /** Try standard then secondary-reference-style addDexPath fallback for bmmcamera.jar. */
     private static Class<?> loadAvmCameraClass() {
         try {
             return Class.forName("android.hardware.AVMCamera");
@@ -298,7 +298,7 @@ public final class AvmByteCallbackProbe {
             logger.info("  setPreviewCallback installed (proxy)");
 
             // Order matters on this HAL: startPreview BEFORE enablePreviewCallback,
-            // matching DiPlus AbstractC4100i.mo4507i.
+            // matching the secondary reference app AbstractC4100i.mo4507i.
             long t2 = System.currentTimeMillis();
             Method mStart = avmClass.getDeclaredMethod("startPreview");
             mStart.setAccessible(true);

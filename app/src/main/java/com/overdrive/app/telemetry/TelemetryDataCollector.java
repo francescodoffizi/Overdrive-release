@@ -89,6 +89,29 @@ public class TelemetryDataCollector {
     // pollingLock via setOverlayRecordingActive().
     private volatile boolean overlayRecordingActive = false;
 
+    // ── Overlay-only field demand ────────────────────────────────────────
+    // Turn signals and seatbelts are polled ONLY to feed the burn-in overlay:
+    //   • Automations read them via their OWN dedicated fast polls
+    //     (TurnSignalEvent / SeatbeltEvent), gated on an enabled automation.
+    //   • Trips / ABRP / GearMonitor never read snapshot.leftTurnSignal /
+    //     rightTurnSignal / seatbeltBuckled (verified: no other consumer).
+    // So when no ACTIVE overlay flow selects them, the per-tick reflective HAL
+    // reads (1× getTurnLightFlashState, 2× getSafetyBeltStatus) are pure waste.
+    // Each overlay consumer ("pano", "oem") publishes its current need here via
+    // setOverlayFieldDemand; the poll reads only the union volatiles below.
+    // Keyed map keeps set idempotent (no start/stop pairing to get wrong).
+    //
+    // SAFE DEFAULT (no-regression): when NO overlay consumer has published
+    // demand (map empty), both flags stay TRUE — i.e. exactly today's behavior
+    // (poll turn+seatbelt on every tick). The optimization only narrows the
+    // reads once a live overlay explicitly reports its resolved field set. So
+    // an install that never touches this, or any code path that doesn't wire
+    // demand, behaves bit-for-bit as before.
+    private final java.util.concurrent.ConcurrentHashMap<String, boolean[]>
+        overlayFieldDemand = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile boolean demandTurnSignals = true;
+    private volatile boolean demandSeatbelts = true;
+
     // Reference counting: polling stays alive as long as any consumer needs it
     // (pipeline overlay, trip recorder, etc.). Mutated under pollingLock so the
     // count and the executor lifecycle stay coherent.
@@ -107,10 +130,21 @@ public class TelemetryDataCollector {
     private int lastGearMode = 1; // P
     private boolean lastLeftTurn = false;
     private boolean lastRightTurn = false;
-    private boolean[] lastSeatbelts = new boolean[]{true, true}; // buckled by default
+    // NOT buckled-by-default. This array is what the overlay renders when the seatbelt read
+    // has never succeeded (the reflective invoke throws on every tick from boot, so
+    // seatbeltScratch is never written and the catch falls through to "use defaults"). A true
+    // here painted a green ALL-CLEAR on a safety glyph — burned into the recording — from zero
+    // real data. false renders the honest "not confirmed buckled" instead, matching the
+    // (raw & 0xFFFF) == 1 rule below. A trim that reports properly overwrites this on the
+    // first successful poll, so a working vehicle is unaffected.
+    private boolean[] lastSeatbelts = new boolean[]{false, false};
     private long pollCount = 0;
     private int leftTurnStickyCount = 0;
     private int rightTurnStickyCount = 0;
+    // One-time seatbelt-API probe guard. Deferred to first seatbelt demand
+    // (was pollCount==0) so an overlay that never draws belts skips the probe's
+    // reflective device sweep entirely. Set on the executor thread only.
+    private boolean seatbeltProbed = false;
 
     // FIX H2: per-tick reusable scratch to avoid allocation churn at 5 Hz.
     // We can NOT mutate lastSeatbelts in place because the published snapshot
@@ -243,6 +277,62 @@ public class TelemetryDataCollector {
             // Restart scheduler at new rate if currently running
             restartAtCurrentRateLocked();
         }
+    }
+
+    /**
+     * Publish which overlay-only fields a given consumer currently needs, so
+     * the poll can skip the reflective turn-signal / seatbelt HAL reads when no
+     * active overlay flow draws them. {@code key} identifies the consumer
+     * ("pano" / "oem"); pass all-false (or drop demand) when that consumer's
+     * overlay is off or its selection excludes these fields. Idempotent and
+     * thread-safe; recomputes the union immediately.
+     *
+     * <p>Deliberately independent of {@link #setOverlayRecordingActive} /
+     * refcount: rate and lifecycle are one axis, per-field demand another. The
+     * poll still runs for speed/gear/pedals (trips, GearMonitor) regardless;
+     * this only gates the two overlay-exclusive reflective reads.
+     */
+    public void setOverlayFieldDemand(String key, boolean needTurnSignals, boolean needSeatbelts) {
+        if (key == null) return;
+        // Always STORE (even all-false) so "active overlay that draws neither"
+        // is distinct from "no active overlay" (empty map → legacy fallback).
+        // Consumers call clearOverlayFieldDemand(key) when their overlay stops.
+        overlayFieldDemand.put(key, new boolean[]{ needTurnSignals, needSeatbelts });
+        recomputeFieldDemand();
+    }
+
+    /**
+     * Drop a consumer's overlay field demand entirely (its overlay went
+     * inactive). When the last consumer clears, the map is empty and demand
+     * falls back to the legacy TRUE/TRUE default. Idempotent.
+     */
+    public void clearOverlayFieldDemand(String key) {
+        if (key == null) return;
+        overlayFieldDemand.remove(key);
+        recomputeFieldDemand();
+    }
+
+    /**
+     * Recompute the union of per-consumer overlay field demand into the
+     * volatiles. When NO consumer has published demand (map empty), fall back
+     * to TRUE/TRUE — the pre-feature behavior — so the reflective reads are
+     * only ever narrowed by an explicit, live selection, never by the mere
+     * absence of wiring.
+     */
+    private void recomputeFieldDemand() {
+        if (overlayFieldDemand.isEmpty()) {
+            demandTurnSignals = true;
+            demandSeatbelts = true;
+            return;
+        }
+        boolean turn = false, belt = false;
+        for (boolean[] d : overlayFieldDemand.values()) {
+            if (d.length > 0 && d[0]) turn = true;
+            if (d.length > 1 && d[1]) belt = true;
+            if (turn && belt) break;
+        }
+        demandTurnSignals = turn;
+        demandSeatbelts = belt;
     }
 
     /**
@@ -459,7 +549,14 @@ public class TelemetryDataCollector {
         // Turn signals (every poll = 5Hz). Read on the fast path so a cancelled
         // indicator clears from the overlay within ~600ms instead of lingering
         // for up to 10s. Sticky counter bridges the off-phase of the blink cycle.
-        if (lightDevice != null && getTurnLightFlashStateMethod != null) {
+        //
+        // Overlay-only: skipped entirely when no active overlay flow selects the
+        // turn-signal field (demandTurnSignals=false). Automations read turn
+        // lamps via their own TurnSignalEvent poll; no other consumer reads
+        // snapshot.leftTurnSignal/rightTurnSignal. When demand is off we leave
+        // leftTurn/rightTurn at their carried-forward last-known values (cheap,
+        // no reflection) — they simply aren't drawn.
+        if (demandTurnSignals && lightDevice != null && getTurnLightFlashStateMethod != null) {
             try {
                 int flashState = (int) getTurnLightFlashStateMethod.invoke(lightDevice);
 
@@ -487,10 +584,17 @@ public class TelemetryDataCollector {
 
         // Seatbelt status (every poll = 5Hz). Drawn on the overlay every frame,
         // so a buckle/unbuckle must reflect within one frame instead of up to 1s.
-        if (pollCount == 0) {
+        //
+        // Overlay-only: skipped entirely when no active overlay flow selects a
+        // seatbelt field (demandSeatbelts=false). Seatbelt automations use their
+        // own SeatbeltEvent poll; no other consumer reads snapshot.seatbeltBuckled.
+        // The one-time probeSeatbeltApis() is also deferred until first demand so
+        // an overlay that never draws belts pays zero probe cost.
+        if (demandSeatbelts && !seatbeltProbed) {
             probeSeatbeltApis(savedContext);
+            seatbeltProbed = true;
         }
-        if (instrumentDeviceForBelt != null && getSafetyBeltStatusMethod != null) {
+        if (demandSeatbelts && instrumentDeviceForBelt != null && getSafetyBeltStatusMethod != null) {
             try {
                 // FIX H2: reuse a 2-slot scratch instead of allocating a fresh
                 // boolean[2] every tick. We only publish a NEW array when the
@@ -498,8 +602,31 @@ public class TelemetryDataCollector {
                 // passenger both buckled, unchanging) never allocates.
                 int driverRaw = (int) getSafetyBeltStatusMethod.invoke(instrumentDeviceForBelt, 1);
                 int passengerRaw = (int) getSafetyBeltStatusMethod.invoke(instrumentDeviceForBelt, 2);
-                seatbeltScratch[0] = (driverRaw != 0);
-                seatbeltScratch[1] = (passengerRaw != 0);
+                // BUCKLED is (raw & 0xFFFF) == 1 — the same rule as
+                // BydDataCollector.sanitizeSeatbelt and the OEM firmware's own
+                // sanitizeSeatbeltState, so the raw HAL value is never DECODED differently here.
+                //
+                // That is decode parity, NOT end-to-end parity: the automation/MQTT path layers a
+                // passenger boot-latch (passengerBeltEverUnlatched — a never-unlatched belt idles
+                // at "buckled", so its 1 is held as unbuckled until one genuine 0) and an
+                // occupancy gate on top. So at boot this overlay can legitimately show the
+                // passenger green while a "passenger buckled" automation has not fired. Deliberate:
+                // the latch suppresses a possibly-bogus edge, whereas the overlay just draws the
+                // sensor. Do not "reconcile" them by copying the latch here.
+                //
+                // Two separate hazards, hence neither a bare "!= 0" nor a bare "== 1":
+                //  - "!= 0" read every HAL failure code (-1, the -21474826xx family,
+                //    Integer.MIN_VALUE) and every not-available sentinel as BUCKLED — a green
+                //    all-clear painted onto a SAFETY glyph burned into the recording, on a trim
+                //    that actually reported nothing.
+                //  - a mask-less "== 1" would call a genuinely buckled belt UNBUCKLED on any trim
+                //    that packs flags/counters into the high 16 bits (exactly what the OEM's mask
+                //    defends against), turning a correct green into a permanent red false alarm.
+                // The failure codes all mask to something other than 1, so masking first is safe
+                // AND keeps them reading unbuckled. This boolean[] cannot express "unknown", so
+                // "not definitely buckled" is the honest rendering.
+                seatbeltScratch[0] = ((driverRaw & 0xFFFF) == 1);
+                seatbeltScratch[1] = ((passengerRaw & 0xFFFF) == 1);
                 if (lastSeatbelts == null
                         || lastSeatbelts.length != 2
                         || lastSeatbelts[0] != seatbeltScratch[0]

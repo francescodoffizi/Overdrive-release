@@ -1238,8 +1238,12 @@ public class GpuDownscaler {
      */
     private static String buildFragmentShader(float[] offsets) {
         // uApaMode > 2.5 = DiLink 4 / 2x2-native HAL. The producer surface
-        // emits a non-canonical 2x2 (e.g. Variant A: Front X-mirrored at TL,
-        // Rear Y-flipped at TR, Left Y-flipped at BL, Right at BR). We
+        // emits a non-canonical 2x2 (Variant A: Front X-mirrored at TL,
+        // Rear at TR, Left at BL, Right at BR — no Y flip on any role; see
+        // Dilink4Constants, which is the single source of truth. An earlier
+        // version of this comment claimed Rear/Left were Y-flipped, which
+        // was wrong and matched the constants that rendered front+right
+        // upside down). We
         // rearrange to the canonical Front=TL / Right=TR / Rear=BL / Left=BR
         // upright layout — same math as GpuMosaicRecorder — so V2 motion's
         // hardcoded quadrant-index assumption (Q0=Front, Q1=Right, Q2=Rear,
@@ -1285,10 +1289,10 @@ public class GpuDownscaler {
             com.overdrive.app.camera.GlUtil.APA_CENTER_INSET_GLSL +
             "    } else {\n" +
             "        vec2 gridPos = step(0.5, vTexCoord);\n" +
-            "        float frontOffset = %.5ff;\n" +
-            "        float rightOffset = %.5ff;\n" +
-            "        float rearOffset  = %.5ff;\n" +
-            "        float leftOffset  = %.5ff;\n" +
+            "        float frontOffset = %.5f;\n" +
+            "        float rightOffset = %.5f;\n" +
+            "        float rearOffset  = %.5f;\n" +
+            "        float leftOffset  = %.5f;\n" +
             "        float stripOffsetX;\n" +
             "        if (gridPos.x < 0.5) {\n" +
             "            stripOffsetX = gridPos.y < 0.5 ? frontOffset : rearOffset;\n" +

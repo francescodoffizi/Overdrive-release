@@ -129,10 +129,6 @@ public final class ClusterMirrorController {
     private int fissionDisplayId = -1;
     private Rect paneRect = new Rect(0, 0, 0, 0);   // head-unit dest rect (screen px)
     private int scaleMode = SCALE_FIT;              // FIT/FILL/ZOOM (from the UI POST)
-    // Active normalized source-crop fractions [x, y, w, h] in 0..1 of the cluster panel —
-    // published so ClusterInputRelay can remap taps in ZOOM (where the pane shows only a
-    // sub-rect of the panel). FIT/FILL use the identity {0,0,1,1} (whole panel visible).
-    private volatile float[] activeSrcCrop = { 0f, 0f, 1f, 1f };
     private ScheduledFuture<?> stillFuture;         // still-poll tick (fallback only)
     private Paint stillPaint;                        // reused in still mode (no per-frame alloc)
 
@@ -255,15 +251,6 @@ public final class ClusterMirrorController {
     public int panelHeight() { return panelH; }
     public int currentScaleMode() { return scaleMode; }
 
-    /** Active source-crop fractions [x, y, w, h] in 0..1 of the cluster panel. In ZOOM the
-     *  pane shows only this sub-rect, so {@link ClusterInputRelay} must map a pane-normalized
-     *  tap through this window to hit the right panel pixel. FIT/FILL return the identity
-     *  {0,0,1,1}. Returns a copy; volatile read is fine (advisory, refreshed per transaction). */
-    public float[] currentSrcCropFractions() {
-        float[] c = activeSrcCrop;
-        return new float[] { c[0], c[1], c[2], c[3] };
-    }
-
     /**
      * One-shot RESIZE DIAGNOSTIC (device debugging only — no behaviour change). Resizes the
      * mirror pane to {@code (w×h)} at the current top-left, then captures the mirror layer's
@@ -367,8 +354,11 @@ public final class ClusterMirrorController {
 
         // Resolve the LIVE fission panel size + compositing stack (authoritative dumpsys
         // parse — the daemon's DisplayManager cache misses the foreign uid-1000 display).
+        // Resolve ONCE and size from the SAME descriptor: a second resolveFissionDisplay()
+        // (what the 1-arg clusterDisplaySize does internally) could straddle a layerStack/id
+        // change across a projection re-open and pair one display's size with another's stack.
         BsNativeLayer.FissionDisplay fd = BsNativeLayer.resolveFissionDisplay();
-        Point panel = BsNativeLayer.clusterDisplaySize(ctx);
+        Point panel = BsNativeLayer.clusterDisplaySize(ctx, fd);
         this.panelW = Math.max(1, panel.x);
         this.panelH = Math.max(1, panel.y);
         this.fissionStack = fd.layerStack;
@@ -460,29 +450,21 @@ public final class ClusterMirrorController {
      * </ul>
      *
      * The virtual display is NEVER touched here (capture stays decoupled from presentation),
-     * so no black-frame / ACC-off-teardown regression. Also publishes the active source-crop
-     * fractions for {@link ClusterInputRelay} so ZOOM taps map to the right panel pixel.
+     * so no black-frame / ACC-off-teardown regression.
      */
     private void presentScaled(Rect pane, boolean show) {
         if (hostLayer == null) return;
         if (scaleMode == SCALE_FILL) {
-            activeSrcCrop = new float[] { 0f, 0f, 1f, 1f };
             logger.info("present FILL pane(" + pane.width() + "x" + pane.height() + ")");
             if (show) hostLayer.setGeometry(pane.left, pane.top, pane.width(), pane.height());
             else hostLayer.setGeometryHidden(pane.left, pane.top, pane.width(), pane.height());
         } else if (scaleMode == SCALE_ZOOM) {
             Rect src = coverCrop(pane);
-            activeSrcCrop = new float[] {
-                    (float) src.left / Math.max(1, panelW),
-                    (float) src.top / Math.max(1, panelH),
-                    (float) src.width() / Math.max(1, panelW),
-                    (float) src.height() / Math.max(1, panelH) };
             logger.info("present ZOOM pane(" + pane.width() + "x" + pane.height()
                     + ") src=" + src.left + "," + src.top + " " + src.width() + "x" + src.height());
             if (show) hostLayer.setGeometry(src, pane.left, pane.top, pane.width(), pane.height());
             else hostLayer.setGeometryHidden(src, pane.left, pane.top, pane.width(), pane.height());
         } else { // SCALE_FIT (default)
-            activeSrcCrop = new float[] { 0f, 0f, 1f, 1f };
             Rect fitted = fitPreserveAspect(pane);
             logger.info("present FIT pane(" + pane.width() + "x" + pane.height()
                     + ") → fitted(" + fitted.left + "," + fitted.top + " "
@@ -774,9 +756,6 @@ public final class ClusterMirrorController {
         }
         if (hostLayer != null) { try { hostLayer.release(); } catch (Throwable ignored) {} hostLayer = null; }
         stillPaint = null;
-        // Reset the published crop to identity so a stale ZOOM window can't misdirect a
-        // ClusterInputRelay tap that races the teardown.
-        activeSrcCrop = new float[] { 0f, 0f, 1f, 1f };
         // Release our projection hold LAST so the controller can restore the gauges when
         // no other consumer (cast app / map / blind-spot) still wants the projection.
         try { ClusterProjectionController.getInstance().releaseSustained("mirror"); }

@@ -28,7 +28,16 @@ data class LogConfig(
     val maxFileSizeMB: Int = 5,
     val rotationCount: Int = 3,
     val enableConsoleLog: Boolean = true,
-    val enableFileLog: Boolean = false
+    val enableFileLog: Boolean = false,
+    // Minimum level that is emitted at all. Mirrors DaemonLogger's existing
+    // Config.minLevel gate (default INFO), which LogManager never had: without
+    // it EVERY debug() call formatted a timestamp, built a string, hit logcat
+    // and did a synchronously-FLUSHED file append under a process-global lock.
+    // Background paths call debug() on every adb shell command, so an idle app
+    // process was doing thousands of flushed disk writes a day for lines nobody
+    // reads (the release channel strips them via R8 anyway). DEBUG is still
+    // available by passing a config with minLevel = LogLevel.DEBUG.
+    val minLevel: LogLevel = LogLevel.INFO
 ) {
     companion object {
         private var appLogDir: String? = null

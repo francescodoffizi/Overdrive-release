@@ -367,8 +367,13 @@ public final class ClusterProjectionController {
      * is held. Re-acquiring the same token is idempotent. See {@link #releaseSustained(String)}.
      */
     public void acquireSustained(String token) {
-        if (shuttingDown) return;
-        sustainedHolders.add(token != null ? token : "default");
+        synchronized (this) {
+            // A hard close must win over a concurrent cast/map start. Adding a holder while
+            // ST_CLOSING would strand the token because requestOpen intentionally refuses to
+            // supersede the gauge-restore sequence.
+            if (shuttingDown || projState == ST_CLOSING) return;
+            sustainedHolders.add(token != null ? token : "default");
+        }
         // Cancel any pending auto-close left over from a prior transient session.
         watchdogHandler.removeCallbacks(lingerTask);
         watchdogHandler.removeCallbacks(maxCapTask);
@@ -479,23 +484,44 @@ public final class ClusterProjectionController {
 
     /**
      * Hard close + gauge restore. Idempotent and harmless when already closed.
-     * Clears the UCM gate flags FIRST so even if the close opcodes fail, a respawn
-     * won't see a leaked "projection active" flag. Public so disable / disarm /
-     * target-flip / errors can all force the gauges back.
+     * Marks the projection non-open first, synchronously detaches every dependent mirror,
+     * then clears the UCM gate flags so even if the close opcodes fail, a respawn won't see
+     * a leaked "projection active" flag. Public so disable / disarm / target-flip / errors
+     * can all force the gauges back.
      */
     public void forceClose(String reason) {
-        // An explicit/safety close always drops ALL sustained holds — the projection
-        // is being torn down; no holder must linger and re-suppress the restore.
+        final int epoch;
+        synchronized (this) {
+            if (projState == ST_CLOSED) {
+                epoch = -1;
+            } else {
+                projState = ST_CLOSING;
+                ready = false;
+                epoch = ++seqEpoch;   // supersede any in-flight open sequence
+            }
+        }
+
+        // The app-view mirror owns a second SF display that reads the fission layer stack.
+        // Unbind/destroy it synchronously before the close sequence can destroy that source.
+        // This also closes hard-error paths, not only the explicit ACC-off/relayout callers.
+        try { ClusterViewMirrorService.detachBeforeProjectionClose(reason); }
+        catch (Throwable t) {
+            logger.warn("view mirror pre-close detach failed: " + t.getMessage());
+        }
+
+        // An explicit/safety close always drops ALL sustained holds. Clear after the mirror
+        // detach so an attach already in flight cannot leave its viewmirror lease stranded.
         sustainedHolders.clear();
         try { clearGateFlags(); } catch (Throwable ignored) {}
         watchdogHandler.removeCallbacks(maxCapTask);
         watchdogHandler.removeCallbacks(lingerTask);
-        final int epoch;
+        if (epoch < 0) return;
+
         synchronized (this) {
-            if (projState == ST_CLOSED) return;
+            // A concurrent forceClose may have superseded this one while the synchronous
+            // mirror teardown was running. Its newer epoch owns the physical close.
+            if (seqEpoch != epoch || projState != ST_CLOSING) return;
             projState = ST_CLOSING;
-            ready = false;
-            epoch = ++seqEpoch;   // supersede any in-flight open sequence
         }
         // Retire the speed badge AFTER projState is ST_CLOSING (every close path —
         // linger, max-cap, ACC-off, disable, error, retarget — funnels through here).
@@ -830,19 +856,29 @@ public final class ClusterProjectionController {
     public void shutdown() {
         watchdogHandler.removeCallbacks(maxCapTask);
         watchdogHandler.removeCallbacks(lingerTask);
-        sustainedHolders.clear();   // teardown drops ALL holds; restore proceeds normally
+        final boolean alreadyClosed;
         synchronized (this) {
             shuttingDown = true;   // terminal — blocks any future requestOpen re-entry
-            if (projState == ST_CLOSED) {
-                // Nothing open. Best-effort clear (read-guarded no-op if already clear).
-                try { clearGateFlags(); } catch (Throwable ignored) {}
-                // Still retire the badge in case a stray arm slipped in (idempotent).
-                try { ClusterSpeedOverlay.stopIfActive(); } catch (Throwable ignored) {}
-                return;
+            alreadyClosed = projState == ST_CLOSED;
+            if (!alreadyClosed) {
+                projState = ST_CLOSING;
+                ready = false;
+                ++seqEpoch;   // supersede any in-flight open sequence
             }
-            projState = ST_CLOSING;
-            ready = false;
-            ++seqEpoch;   // supersede any in-flight open sequence
+        }
+        // Preserve the same source-before-dependent ordering as forceClose even if shutdown()
+        // is invoked outside the daemon hook's normal pre-detach sequence.
+        try { ClusterViewMirrorService.detachBeforeProjectionClose("shutdown"); }
+        catch (Throwable t) {
+            logger.warn("view mirror shutdown detach failed: " + t.getMessage());
+        }
+        sustainedHolders.clear();   // teardown drops ALL holds; restore proceeds normally
+        if (alreadyClosed) {
+            // Nothing open. Best-effort clear (read-guarded no-op if already clear).
+            try { clearGateFlags(); } catch (Throwable ignored) {}
+            // Still retire the badge in case a stray arm slipped in (idempotent).
+            try { ClusterSpeedOverlay.stopIfActive(); } catch (Throwable ignored) {}
+            return;
         }
         // Tear down the speed badge on daemon exit (SIGTERM / normal). Posted AFTER
         // projState→ST_CLOSING + ++seqEpoch (mirrors forceClose's ordering) so a racing

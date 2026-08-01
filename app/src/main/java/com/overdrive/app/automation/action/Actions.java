@@ -21,6 +21,29 @@ public class Actions {
     private final Map<String, Action> actions = new LinkedHashMap<>();
 
     /**
+     * Preset "switch the AC off again after…" windows, in MINUTES, shared by the {@code setAc}
+     * (AC power) and {@code acAutoOff} (standalone timer) actions so both offer the identical list.
+     *
+     * <p>An enum (not an IntType) because these are the only windows worth offering and a picker
+     * cannot produce a nonsense value. The ids are the minute counts the daemon consumes
+     * directly — the RHS is substituted into {@code "autoOffMinutes":${autoOffMinutes}} as a bare
+     * JSON number, so the id MUST stay numeric text.
+     *
+     * <p>{@code "0"} = "stay on", which is both the default for automations saved before this
+     * variable existed and the way to cancel a window.
+     */
+    static final EnumType AC_AUTO_OFF_MINUTES = new EnumType(
+            new Label("autoOffMinutes", "automation.ac_auto_off"),
+            new Label("0", "automation.ac_auto_off_never"),
+            new Label("10", "automation.ac_auto_off_10"),
+            new Label("15", "automation.ac_auto_off_15"),
+            new Label("30", "automation.ac_auto_off_30"),
+            new Label("45", "automation.ac_auto_off_45"),
+            new Label("60", "automation.ac_auto_off_60"),
+            new Label("90", "automation.ac_auto_off_90"),
+            new Label("120", "automation.ac_auto_off_120"));
+
+    /**
      * Initialize actions list with actions that can be selected
      */
     public Actions() {
@@ -133,6 +156,16 @@ public class Actions {
                 "/api/vehicle/climate",
                 "{\"action\":\"auto_${action}\"}",
                 new EnumType(new Label("action", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
+        // A standalone "switch the AC off in N minutes" step, so a window can be armed (or
+        // cancelled, with "0") without also re-issuing a power command — e.g. extend the window
+        // when the cabin is still too warm, or cancel it when someone gets in.
+        addAction(new ApiAction(
+                new Label("acAutoOff", "automation.set_ac_auto_off"),
+                "automation.set_ac_auto_off_description",
+                "POST",
+                "/api/vehicle/climate",
+                "{\"action\":\"auto_off_timer\",\"autoOffMinutes\":${autoOffMinutes}}",
+                AC_AUTO_OFF_MINUTES));
         addAction(new ApiAction(
                 new Label("fanOnly", "automation.set_fan_only"),
                 "automation.set_fan_only_description",
@@ -288,13 +321,24 @@ public class Actions {
                         new Label("close", "automation.close"),
                         new Label("open", "automation.open"),
                         new Label("stop", "automation.stop"))));
+        // AC power, with an optional "then switch off after N minutes" window. The duration is
+        // an ENUM of preset intervals rather than a free-text number: these are the windows a
+        // user actually wants (a quick cabin airing through to an hour of pre-conditioning),
+        // and a picker can't produce a typo'd 600. "0" = stay on indefinitely, preserving the
+        // behaviour of every automation saved before this variable existed (see
+        // BaseAction.RETROFITTED_DEFAULTS, which defaults it for those rows).
+        //
+        // The window is honoured only for action=on. The daemon arms a single cancellable timer
+        // (AcAutoOffTimer) instead of blocking, because the automation worker is one thread and
+        // sleeping it for an hour would stall every other rule.
         addAction(new ApiAction(
                 new Label("setAc", "automation.set_ac"),
                 "automation.set_ac_description",
                 "POST",
                 "/api/vehicle/climate",
-                "{\"action\":\"power_${action}\"}",
-                new EnumType(new Label("action", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
+                "{\"action\":\"power_${action}\",\"autoOffMinutes\":${autoOffMinutes}}",
+                new EnumType(new Label("action", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on")),
+                AC_AUTO_OFF_MINUTES));
         addAction(new ApiAction(
                 new Label("setAcTemp", "automation.set_ac_temp"),
                 "automation.set_ac_temp_description",
@@ -302,6 +346,21 @@ public class Actions {
                 "/api/vehicle/climate",
                 "{\"action\":\"set_temp\",\"temp\":${temperature}}",
                 new IntType(new Label("temperature", "automation.temperature"), 17, 33)));
+        // RELATIVE temperature step — "one degree warmer/cooler than it is now", the thing an
+        // absolute setpoint can't express. Reads the driver dial, adds the delta, clamps to the
+        // dial range for the CURRENT display unit (so ±1 is one notch on a °C or °F car alike).
+        // Enum rather than a signed IntType: the two values users actually want, and it keeps
+        // the stored value validated against a fixed set instead of an open numeric range.
+        addAction(new ApiAction(
+                new Label("stepAcTemp", "automation.step_ac_temp"),
+                "automation.step_ac_temp_description",
+                "POST",
+                "/api/vehicle/climate",
+                "{\"action\":\"step_temp\",\"delta\":${delta}}",
+                new EnumType(
+                        new Label("delta", "automation.step_direction"),
+                        new Label("1", "automation.step_warmer"),
+                        new Label("-1", "automation.step_cooler"))));
         addAction(new ApiAction(
                 new Label("setAcFan", "automation.set_ac_fan"),
                 "automation.set_ac_fan_description",
@@ -361,8 +420,9 @@ public class Actions {
                 "automation.set_ambient_description",
                 "POST",
                 "/api/vehicle/lights",
-                "{\"target\":\"ambientColour\",\"value\":${colour}}",
-                new ColourType(new Label("colour", "automation.colour"), LightConstants.AMBIENT_COLOURS)));
+                "{\"target\":\"ambientColour\",\"value\":${colour},\"zone\":\"${zone}\"}",
+                new ColourType(new Label("colour", "automation.colour"), LightConstants.AMBIENT_COLOURS),
+                ambientZoneType()));
         // Media volume (STREAM_MUSIC) as an ABSOLUTE step 0-40 — the same scale as the
         // car's own volume button. Routes through the allowlisted /api/vehicle/media
         // (AudioManager on the daemon context; the index is clamped to the stream max).
@@ -399,10 +459,9 @@ public class Actions {
                 "/api/vehicle/media",
                 "{\"target\":\"hud_brightness\",\"value\":${percent}}",
                 new IntType(new Label("percent", "automation.percent"), 0, 100)));
-        // HUD on/off — a friendlier switch than the brightness slider. This platform
-        // has no dedicated HUD power switch (confirmed against the OEM firmware), so
-        // "off" sets brightness 0 (dims it out) and "on" restores full brightness. The
-        // enum value IS the brightness the daemon writes (0=off, 100=on).
+        // HUD on/off — the DEDICATED HUD power switch (SET_HUD_SWITCH_SET, 1=on/2=off on
+        // the setting HAL), distinct from brightness. The daemon maps value 0 → off and any
+        // value > 0 → on (see hud_power handling → setHudPower, actuated in the app process).
         addAction(new ApiAction(
                 new Label("hudPower", "automation.set_hud_power"),
                 "automation.set_hud_power_description",
@@ -498,15 +557,32 @@ public class Actions {
                         new Label("direction", "automation.direction"),
                         new Label("1", "automation.volume_up"),
                         new Label("-1", "automation.volume_down"))));
-        // Ambient (interior atmosphere) light brightness 0-100 — dedicated setter on
-        // the light HAL, distinct from the colour action.
+        // Ambient (interior atmosphere) light brightness 0-100, per zone (front/rear/both).
+        // The daemon converts the percent to the SDK's 0-5 level and writes the chosen IAL area.
         addAction(new ApiAction(
                 new Label("ambientBrightness", "automation.set_ambient_brightness"),
                 "automation.set_ambient_brightness_description",
                 "POST",
                 "/api/vehicle/media",
-                "{\"target\":\"ambient_brightness\",\"value\":${percent}}",
-                new IntType(new Label("percent", "automation.percent"), 0, 100)));
+                "{\"target\":\"ambient_brightness\",\"value\":${percent},\"zone\":\"${zone}\"}",
+                new IntType(new Label("percent", "automation.percent"), 0, 100),
+                ambientZoneType()));
+        // Ambient light on/off, per zone (front/rear/both). "Both" uses the real global main
+        // switch (a three-tier chain); a single zone has no dedicated switch on this platform, so
+        // "off" zeroes that zone's brightness and "on" restores the level it had BEFORE the off
+        // (not full — see setAmbientLightEnabledZoned). The enum value IS what the daemon writes
+        // (0=off / 100=on).
+        addAction(new ApiAction(
+                new Label("ambientPower", "automation.set_ambient_power"),
+                "automation.set_ambient_power_description",
+                "POST",
+                "/api/vehicle/media",
+                "{\"target\":\"ambient_power\",\"value\":${state},\"zone\":\"${zone}\"}",
+                new EnumType(
+                        new Label("state", "automation.action"),
+                        new Label("0", "automation.off"),
+                        new Label("100", "automation.on")),
+                ambientZoneType()));
         // Play an uploaded sound (MP3/WAV/MP4) through the daemon MediaPlayer on a
         // chosen channel — AUDIO ONLY (an MP4's picture is not shown; use Play Video
         // for that). The sound is chosen from the audio library via a live dropdown
@@ -639,9 +715,10 @@ public class Actions {
                 new EnumType(new Label("payload", "automation.mode"),
                         new Label("ev", "automation.mode_ev"),
                         new Label("hev", "automation.mode_hev"))));
-        // Friendly one-tap "hold battery at current charge" — switches to HEV, the only
-        // SDK lever for this (no settable target-SOC exists). Single "on" option so it
-        // reads as an action, not a mode picker. See VehicleControlCatalog hold_battery.
+        // One-tap "switch to HEV". Does NOT actually hold the pack — on a SeaLion 6 DM-i
+        // the ICE starts and recharges it. The real SOC-hold pair (setSOCTarget +
+        // setSocSaveSwitch) is exposed as the charge cap instead; see the note on
+        // VehicleControlCatalog hold_battery.
         addAction(new VehicleControlAction(
                 new Label("hold_battery", "automation.hold_battery"), "automation.hold_battery_description",
                 new EnumType(new Label("payload", "automation.action"),
@@ -830,6 +907,11 @@ public class Actions {
         addAction(new IncrementVariableAction(
                 new Label("incrementVariable", "automation.increment_variable"),
                 "automation.increment_variable_description"));
+        // Store an arithmetic EXPRESSION in a variable — the general form of the above,
+        // with live ${signal:…}/${var:…} operands (e.g. a tap coordinate derived from SOC).
+        addAction(new ComputeVariableAction(
+                new Label("computeVariable", "automation.compute_variable"),
+                "automation.compute_variable_description"));
         // Loop — run nested actions N times, or while/until a signal condition holds.
         addAction(new LoopAction(
                 new Label("loop", "automation.loop"), "automation.loop_description"));
@@ -864,6 +946,20 @@ public class Actions {
         addAction(new ShellAction(
                 new Label("shell", "automation.run_shell"), "automation.run_shell_description"));
 
+    }
+
+    /**
+     * The shared front/rear/both zone selector for the ambient-light actions. "both" is the
+     * default (first option) so a user who ignores the field gets the whole cabin — matching the
+     * pre-zoning behaviour. The stored value is the zone token the daemon maps to a BYD IAL area
+     * (front=1 / rear=2 / both=3); a fresh EnumType per action keeps each schema independent.
+     */
+    private static EnumType ambientZoneType() {
+        return new EnumType(
+                new Label("zone", "automation.area"),
+                new Label("both", "automation.area_all"),
+                new Label("front", "automation.ambient_zone_front"),
+                new Label("rear", "automation.ambient_zone_rear"));
     }
 
     /**

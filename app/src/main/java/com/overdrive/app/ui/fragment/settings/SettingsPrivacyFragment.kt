@@ -13,6 +13,7 @@ import com.google.android.material.button.MaterialButton
 import com.overdrive.app.R
 import com.overdrive.app.ui.MainActivity
 import com.overdrive.app.ui.util.RecordingScanner
+import com.overdrive.app.ui.util.RecordingsApiClient
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -87,8 +88,16 @@ class SettingsPrivacyFragment : Fragment() {
 
         executor.execute {
             val result: Pair<Int, Long>? = try {
-                val all = RecordingScanner.scanRecordings(ctx)
-                all.size to all.sumOf { it.sizeBytes }
+                // Ask the daemon first so we can tell "index down" (counts
+                // unknown) apart from "genuinely no clips". scanRecordings()
+                // returns an empty list in BOTH cases, which would render an
+                // authoritative "0 clips · 0 B" while recordings sit on disk.
+                if (RecordingsApiClient.fetchStats()?.indexUnavailable == true) {
+                    null
+                } else {
+                    val all = RecordingScanner.scanRecordings(ctx)
+                    all.size to all.sumOf { it.sizeBytes }
+                }
             } catch (t: Throwable) {
                 Log.w(TAG, "Storage scan failed: ${t.message}")
                 null

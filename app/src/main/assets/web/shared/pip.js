@@ -241,19 +241,31 @@ BYD.pip = {
     /**
      * Start streaming with selected view mode
      */
+    activeFps: 10,
+
     async startStream(viewMode) {
         this.showPlaceholder(BYD.i18n.t('pip.connecting'));
-        
+
         try {
             // 1. Set view mode first
             await fetch('/api/stream/view/' + viewMode);
-            
+
             // 2. Enable streaming
             await fetch('/api/stream/enable', { method: 'POST' });
-            
-            // 3. Initialize decoder and connect
+
+            // 3. Fetch active preset fps for JMuxer timing accuracy
+            try {
+                const qRes = await fetch('/api/stream/quality');
+                const qData = await qRes.json();
+                if (qData.current && qData.options) {
+                    const preset = qData.options.find(o => o.id === qData.current);
+                    if (preset && preset.fps) this.activeFps = preset.fps;
+                }
+            } catch (e) {}
+
+            // 4. Initialize decoder and connect
             await this.initDecoder();
-            
+
             this.streamStarted = true;
         } catch (e) {
             console.error('[PiP] Failed to start stream:', e);
@@ -357,7 +369,7 @@ BYD.pip = {
                 node: 'pip_hw_player',
                 mode: 'video',
                 flushingTime: 0,
-                fps: 15,
+                fps: this.activeFps || 10,
                 debug: false,
                 onReady: () => {
                     video.style.display = 'block';

@@ -73,7 +73,12 @@ public class AvcHalWarmup {
         "am", "start",
         "--user", "0",
         "-n", "com.byd.avc/.MainActivity",
-        "-f", "0x10020000"  // FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_NO_ANIMATION
+        // 0x10000000 FLAG_ACTIVITY_NEW_TASK | 0x00010000 FLAG_ACTIVITY_NO_ANIMATION.
+        // NOT 0x00020000 — that is FLAG_ACTIVITY_REORDER_TO_FRONT, the OPPOSITE of what this
+        // silent warmup wants: it moves an existing com.byd.avc task to the front of its stack,
+        // popping the OEM camera UI over whatever the driver is looking at on every keep-alive
+        // tick, and with no NO_ANIMATION it does so with the full window animation.
+        "-f", "0x10010000"
     };
 
     private volatile Thread keepAliveThread;
@@ -208,6 +213,23 @@ public class AvcHalWarmup {
                 // presence probe; an explicit launch is suspected of
                 // stealing the HAL's mosaic mode.
                 if (isDilink4Mode()) {
+                    // Periodic panorama-viewpoint re-assert. Substitutes for the
+                    // reference app's IProcessObserver, which re-issues
+                    // setViewpoint(2012) within 50ms of com.byd.avc leaving the
+                    // foreground — we can't register one (SET_ACTIVITY_WATCHER is
+                    // signature-level and PACKAGE_USAGE_STATS isn't granted), so this
+                    // 60s poll is the bounded-recovery equivalent. See
+                    // BydApaViewpointHelper.reassertIfHeld() for the full rationale.
+                    //
+                    // Self-gating and idempotent: a no-op unless something currently
+                    // holds the viewpoint, so it can never flip the HAL into mosaic
+                    // mode with no consumer attached. This whole branch is dilink4-only,
+                    // so legacy pano_h/pano_l keep-alive behaviour is unchanged.
+                    try {
+                        BydApaViewpointHelper.reassertIfHeld();
+                    } catch (Throwable t) {
+                        logger.warn("Keep-alive viewpoint re-assert failed: " + t.getMessage());
+                    }
                     logger.info("Keep-alive tick (dilink4): skipping AVC re-launch (esco-parity)");
                     continue;
                 }

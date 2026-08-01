@@ -16,6 +16,7 @@ import android.view.Surface;
 
 import com.overdrive.app.config.UnifiedConfigManager;
 import com.overdrive.app.logging.DaemonLogger;
+import com.overdrive.app.util.DaemonFonts;
 
 import java.util.Locale;
 import java.util.concurrent.Executors;
@@ -100,6 +101,18 @@ public final class ClusterSpeedOverlay {
 
     private static volatile ClusterSpeedOverlay instance;
 
+    // True while a head-unit VIEW-MIRROR session ({@link ClusterViewMirrorService}) is compositing
+    // the cluster onto the Projection screen. SurfaceFlinger mirrors the WHOLE cluster layer stack
+    // with no per-layer exclusion, so this badge — a layer on that same stack — is otherwise
+    // re-captured into the head-unit preview (the "speed overlay in the resize box" report). We
+    // therefore HIDE the badge layer for the duration of a mirror session and re-show it the
+    // instant the mirror detaches. The trade-off is honest and bounded: while the user is at the
+    // head unit adjusting the cast (the only time the view-mirror is attached) the badge is not on
+    // the cluster either, but it returns immediately on leaving the Projection screen / onPause.
+    // Static + volatile so it is authoritative regardless of whether the badge or the mirror
+    // arms first (either ordering converges: createAndShow reads it; setMirrorActive reconciles).
+    private static volatile boolean sMirrorActive = false;
+
     private final ScheduledExecutorService exec;
     private Object surfaceControl;     // android.view.SurfaceControl (reflected) — exec thread only
     private Surface surface;           // exec thread only
@@ -161,6 +174,36 @@ public final class ClusterSpeedOverlay {
         ClusterSpeedOverlay i = instance;
         if (i != null) i.stop();
     }
+
+    /**
+     * Tell the badge whether a head-unit view-mirror session is live. Called by
+     * {@link ClusterViewMirrorService} on attach (true) and detach (false). While true the badge
+     * is torn down so the mirror preview doesn't re-capture it; on false the badge re-arms if a
+     * projection is still open (the common case: the mirror stopped but the cast is still up).
+     *
+     * <p>Idempotent + any-thread: it just records the flag and posts a reconcile onto the badge's
+     * own exec. Ordering-independent — if the mirror arms before the badge, {@link #startOnExec}'s
+     * flag check keeps the badge down; if the badge is already up, the posted stop retires it.
+     */
+    public static void setMirrorActive(boolean active) {
+        sMirrorActive = active;
+        ClusterSpeedOverlay i = instance;
+        if (i == null) {
+            // No badge instance yet. If a mirror just detached we may need to arm the badge, but
+            // only the controller's projection-open path constructs+starts it; nothing to do here
+            // for the arm case (the controller re-drives start() on its own events). For the
+            // suppress case there is likewise no layer to hide. So a null instance is a safe no-op.
+            return;
+        }
+        if (active) {
+            i.stop();               // hide the badge for the mirror's duration
+        } else {
+            i.start();              // re-arm; start()'s own gates no-op if projection is closed
+        }
+    }
+
+    /** Whether a head-unit view-mirror is currently capturing the cluster stack. */
+    static boolean isMirrorActive() { return sMirrorActive; }
 
     /** Sentinel epoch meaning "no supersession check" — for callers that have no
      *  open-sequence epoch to pin against (none today; the overload is the live path). */
@@ -228,6 +271,13 @@ public final class ClusterSpeedOverlay {
             logger.info("speed overlay disabled (surveillance.clusterSpeedEnabled=false)");
             return;
         }
+        // Do NOT show the badge while a head-unit view-mirror is capturing the cluster stack: the
+        // whole-stack mirror would re-capture the badge into the Projection preview. It re-arms via
+        // setMirrorActive(false) when the mirror detaches (the controller also re-drives start()).
+        if (sMirrorActive) {
+            logger.info("speed overlay start dropped — head-unit mirror active (avoids re-capture)");
+            return;
+        }
         if (!createAndShow()) return;              // unsupported trim / failure — stay stopped
         running = true;
         tickFuture = exec.scheduleWithFixedDelay(
@@ -257,9 +307,13 @@ public final class ClusterSpeedOverlay {
 
             // Resolve the cluster panel size + compositing stack (authoritative dumpsys
             // parse, reused from BsNativeLayer — the daemon's DisplayManager cache is
-            // unreliable for the foreign uid-1000 fission display).
-            Point panel = BsNativeLayer.clusterDisplaySize(ctx);
-            int stack = BsNativeLayer.clusterLayerStack(CLUSTER_LAYER_STACK_FALLBACK);
+            // unreliable for the foreign uid-1000 fission display). Resolve ONCE and derive
+            // BOTH the size and the stack from that single descriptor: two independent
+            // resolves can straddle a per-re-open layerStack change and size the badge from
+            // one display while compositing it onto another's stack.
+            BsNativeLayer.FissionDisplay fd = BsNativeLayer.resolveFissionDisplay();
+            Point panel = BsNativeLayer.clusterDisplaySize(ctx, fd);
+            int stack = BsNativeLayer.clusterLayerStack(fd, CLUSTER_LAYER_STACK_FALLBACK);
             // Decline on UNRESOLVED (no fission display) OR stack 0. Per the layerStack
             // contract, 0 == HEAD UNIT — a cluster projection is never legitimately
             // stack 0, and applyGeometry's `!= 0` guard would skip setLayerStack and
@@ -327,6 +381,10 @@ public final class ClusterSpeedOverlay {
         // Mid-session disable: if the user turned the badge off via UCM while a
         // (possibly whole-drive) projection is held open, retire it now.
         if (!enabledInConfig()) { stopOnExec(); return; }
+        // A head-unit mirror armed AFTER the badge was already showing (user opened the
+        // Projection screen mid-drive): retire the badge so it's not re-captured. It re-arms on
+        // the mirror's detach via setMirrorActive(false).
+        if (sMirrorActive) { logger.info("speed overlay retired — head-unit mirror armed"); stopOnExec(); return; }
         try {
             double kmh = readSpeedKmh();
             boolean miles = unitsMiles();
@@ -402,13 +460,13 @@ public final class ClusterSpeedOverlay {
         // shorter) strip height; the number fills most of the row, the unit is smaller.
         pNum = new Paint(Paint.ANTI_ALIAS_FLAG);
         pNum.setColor(Color.WHITE);
-        pNum.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
+        DaemonFonts.apply(pNum, Typeface.BOLD);
         pNum.setTextAlign(Paint.Align.LEFT);
         pNum.setTextSize(h * 0.62f);
 
         pUnit = new Paint(Paint.ANTI_ALIAS_FLAG);
         pUnit.setColor(Color.argb(0xCC, 0xFF, 0xFF, 0xFF));
-        pUnit.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL));
+        DaemonFonts.apply(pUnit, Typeface.NORMAL);
         pUnit.setTextAlign(Paint.Align.LEFT);
         pUnit.setTextSize(h * 0.34f);
     }
@@ -445,6 +503,12 @@ public final class ClusterSpeedOverlay {
         // whole thing is centred in the badge (both paints are LEFT-aligned). The unit
         // baseline is nudged up slightly so its smaller cap-height looks optically aligned
         // with the number's midline rather than sitting on the same baseline.
+        //
+        // Guard: on a BSP with an unusable font system, measureText/drawText
+        // would abort the daemon process natively (gDefaultTypeface == null).
+        // The glass badge itself already drew above; skip only the numerals so
+        // the daemon survives. Healthy devices always take this path.
+        if (!DaemonFonts.canDrawText()) return;
         String unitStr = unit.toUpperCase(Locale.US);
         float gap = pNum.getTextSize() * 0.22f;          // space between number and unit
         float numW = pNum.measureText(value);

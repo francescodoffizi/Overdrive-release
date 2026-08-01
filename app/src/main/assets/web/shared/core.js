@@ -163,7 +163,14 @@ BYD.i18n = (function () {
             })
             .catch(function () {
                 if (lang === DEFAULT_LANG) return {};
-                return fetch('/i18n/' + DEFAULT_LANG + '.json').then(function (r) { return r.json(); });
+                // Same { cache: 'no-cache' } as the primary fetch above. The daemon
+                // serves /i18n/*.json with `public, max-age=86400`, so without it a
+                // browser could hold a day-old English catalog — and since init()
+                // now WAITS on this catalog to supply the fallback for keys missing
+                // from a locale, a stale copy means missing dropdown labels persist
+                // for up to 24h after an app update that added them.
+                return fetch('/i18n/' + DEFAULT_LANG + '.json', { cache: 'no-cache' })
+                    .then(function (r) { return r.json(); });
             });
     }
 
@@ -367,22 +374,19 @@ BYD.i18n = (function () {
         return fetchCatalog(resolved).then(function (cat) {
             state.catalog = cat || {};
             state.loaded = true;
-            // Same en-fallback hydration as init(): fire-and-forget so the
-            // active locale renders immediately and any unresolved keys
-            // pick up an en string on the next t() call.
-            if (state.lang !== 'en' && state.enCatalog == null) {
-                fetchCatalog('en').then(function (enCat) {
-                    state.enCatalog = enCat || {};
-                    // Re-hydrate so any first-paint elements that fell
-                    // through to the raw key (because en wasn't loaded
-                    // yet) pick up the English string. notify() also
-                    // wakes any consumer subscribed via onChange().
-                    hydrate(document);
-                    notify();
-                }).catch(function () { /* best-effort */ });
-            }
-            hydrate(document);
-            notify();
+            // AWAIT the en fallback before hydrate/notify, for the same reason
+            // init() does: an onChange subscriber re-renders imperative text
+            // (dropdown <option>s) that no later hydrate() can repair, so the
+            // fallback has to be in place BEFORE we wake them.
+            var fallbackReady = (state.lang !== 'en' && state.enCatalog == null)
+                ? fetchCatalog('en').then(function (enCat) {
+                      state.enCatalog = enCat || {};
+                  }).catch(function () { /* best-effort */ })
+                : Promise.resolve();
+            return fallbackReady.then(function () {
+                hydrate(document);
+                notify();
+            });
         });
     }
 
@@ -434,47 +438,52 @@ BYD.i18n = (function () {
         state.loadingPromise = fetchCatalog(state.lang).then(function (cat) {
             state.catalog = cat || {};
             state.loaded = true;
-            // Load en as a side-channel fallback when the active locale
-            // is non-en. Fire-and-forget — the visible hydrate already
-            // ran and any subsequent t() call that misses on the active
-            // catalog will check enCatalog before returning the raw key.
-            if (state.lang !== 'en' && state.enCatalog == null) {
-                fetchCatalog('en').then(function (enCat) {
-                    state.enCatalog = enCat || {};
-                    // Re-hydrate so any first-paint elements that fell
-                    // through to the raw key (because en wasn't loaded
-                    // yet) pick up the English string. notify() also
-                    // wakes any consumer subscribed via onChange().
-                    hydrate(document);
-                    notify();
-                }).catch(function () { /* best-effort */ });
-            }
-            hydrate(document);
-            notify();
-            // External mode: pull the server-stored web locale to handle
-            // the tunnel-URL-rotation case (localStorage on the new
-            // origin is empty, but the server remembers the last pick).
-            // Skipped in-app — the AndroidBridge sync read above is
-            // already authoritative.
-            if (!inAppWebView()) {
-                fetchServerWebLocale().then(function (serverLang) {
-                    if (!serverLang) return;
-                    var resolved = resolveLang(serverLang);
-                    if (resolved && resolved !== state.lang) {
-                        // Mirror the server pick into localStorage so a
-                        // subsequent reload short-circuits without a fetch.
-                        setStored(resolved);
-                        // setLang() refetches + rehydrates. Skip the
-                        // server POST inside it (we just READ the value).
-                        state.lang = resolved;
-                        fetchCatalog(resolved).then(function (cat2) {
-                            state.catalog = cat2 || {};
-                            hydrate(document);
-                            notify();
-                        });
-                    }
-                });
-            }
+            // Load en as a side-channel fallback when the active locale is non-en.
+            // AWAITED, not fire-and-forget: callers gate their whole UI build on
+            // init() (see key-mapping.html / automations.html), and dropdown
+            // <option> text is written imperatively via textContent — it carries no
+            // [data-i18n] attribute, so the later hydrate() cannot repair it. If a
+            // page built its selects before enCatalog landed, every key missing from
+            // the active locale rendered as the RAW KEY forever ("keymap.act_bsd").
+            // That is not hypothetical: web/i18n/ar.json has no keymap or automation
+            // section at all (all 188 keymap options), and nb.json is missing 77.
+            // Waiting costs one parallel fetch of an already-cached asset.
+            var fallbackReady = (state.lang !== 'en' && state.enCatalog == null)
+                ? fetchCatalog('en').then(function (enCat) {
+                      state.enCatalog = enCat || {};
+                  }).catch(function () { /* best-effort — active catalog still usable */ })
+                : Promise.resolve();
+            return fallbackReady.then(function () {
+                hydrate(document);
+                notify();
+                // External mode: pull the server-stored web locale to handle
+                // the tunnel-URL-rotation case (localStorage on the new
+                // origin is empty, but the server remembers the last pick).
+                // Skipped in-app — the AndroidBridge sync read above is
+                // already authoritative. Stays fire-and-forget: it only
+                // CORRECTS an already-rendered page, so gating init() on it
+                // would delay first paint for every tunnel user.
+                if (!inAppWebView()) {
+                    fetchServerWebLocale().then(function (serverLang) {
+                        if (!serverLang) return;
+                        var resolved = resolveLang(serverLang);
+                        if (resolved && resolved !== state.lang) {
+                            // Mirror the server pick into localStorage so a
+                            // subsequent reload short-circuits without a fetch.
+                            setStored(resolved);
+                            // setLang() refetches + rehydrates. Skip the
+                            // server POST inside it (we just READ the value).
+                            state.lang = resolved;
+                            fetchCatalog(resolved).then(function (cat2) {
+                                state.catalog = cat2 || {};
+                                hydrate(document);
+                                notify();
+                            });
+                        }
+                    });
+                }
+                return cat;
+            });
         });
         return state.loadingPromise;
     }
@@ -525,10 +534,20 @@ BYD.units = {
     mode: 'km',  // 'km' or 'mi' — updated from /status.distanceUnit
     KM_TO_MI: 0.621371,
 
-    /** Format a distance value (stored in km) for display. */
+    /**
+     * Format a distance value (stored in km) for display.
+     *
+     * `decimals` is honoured in BOTH unit modes. It previously applied only to km
+     * and miles always rounded to whole, which silently discarded the precision
+     * at call sites that ask for it — e.g. two odometer readings a few hundred
+     * metres apart rendered as the same number.
+     */
     dist(km, decimals) {
         if (km == null || isNaN(km)) return '--';
-        if (this.mode === 'mi') return Math.round(km * this.KM_TO_MI) + ' mi';
+        if (this.mode === 'mi') {
+            var mi = km * this.KM_TO_MI;
+            return (decimals != null ? mi.toFixed(decimals) : Math.round(mi)) + ' mi';
+        }
         return (decimals != null ? km.toFixed(decimals) : Math.round(km)) + ' km';
     },
 

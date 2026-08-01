@@ -175,7 +175,12 @@ public class GpuSurveillancePipeline {
 
     // Telemetry overlay
     private TelemetryDataCollector telemetryCollector;
+    // ACC-on (pano trip) overlay master. Preserves the legacy single-flag
+    // behavior for the driving flow; set from the "pano" resolver.
     private volatile boolean overlayEnabledConfig = false;
+    // ACC-off surveillance overlay master. Independent opt-in, defaults off, so
+    // sentry event clips are unchanged (no burn-in) until the user enables it.
+    private volatile boolean surveillanceOverlayEnabledConfig = false;
 
     // Config-change listener for live propagation of recording.rectifyStrength
     // edits. UI writes to UnifiedConfigManager; this listener picks up the
@@ -232,6 +237,16 @@ public class GpuSurveillancePipeline {
     // goes away the camera can drop back to the BS idle rate (or recording rate).
     // Set by RecordingModeManager; null otherwise.
     private volatile Runnable streamStateListener;
+
+    /** Max frame rate we declare to the LIVE-VIEW stream encoder on dilink4.
+     *
+     *  <p>Matches the OEM's own AVM panoramic request (10 fps,
+     *  {@code PanoCameraRecordService:530}); its publisher lane uses 8. That HAL
+     *  refuses {@code setCameraFps} outright and emits at its own fixed low rate,
+     *  so declaring more than it delivers just makes the encoder treat most ticks
+     *  as duplicates. Applies to the stream encoder's declared rate only —
+     *  resolution, bitrate and every legacy-vehicle path are unaffected. */
+    private static final int DILINK4_STREAM_FPS_CAP = 10;
 
     // Configuration
     private final int cameraWidth;
@@ -1427,6 +1442,66 @@ public class GpuSurveillancePipeline {
     }
 
     /**
+     * Push the camera layout, the DiLink 4 producer-corner/flip map, and the
+     * dilink4-only red-mask + APA inset onto the CURRENT {@link #recorder}.
+     *
+     * <p>Single source of truth, called from BOTH the init path and
+     * {@link #reinitializeEncoder()}. Reinit can allocate a brand-new
+     * {@code GpuMosaicRecorder}, whose {@code cameraLayout} defaults to 0 and
+     * whose producer-corner map is all zeros; before this was factored out, only
+     * init pushed them, so a codec/quality/fps change on a working DiLink 4 car
+     * silently reverted the recorder to legacy 4-strip geometry with every
+     * output quadrant sampling the producer's top-left corner.
+     *
+     * <p>Layout 3 = DiLink 4 (HAL emits a non-canonical 2x2; we rearrange via
+     * the per-role corner remap). Layout 0 = legacy 4-strip. Corner/flip values
+     * come from {@link com.overdrive.app.camera.Dilink4Constants} — the shared
+     * constant the recorder, stream scaler, blind-spot scaler, AI downscaler and
+     * motion cropper all read, so they can never silently disagree.
+     *
+     * <p>DiLink 4 layout is the only known-good arrangement for that HAL:
+     * Front=TL X-mirrored, Right=BR, Rear=TR, Left=BL, NO Y flip on any role.
+     * A previous comment here claimed rear/left were Y-flipped; that was wrong
+     * on device (front and right were the inverted tiles). Do not reintroduce Y
+     * bits without a device frame showing rear/left inverted.
+     */
+    private void applyRecorderDilink4Layout() {
+        GpuMosaicRecorder rec = recorder;
+        if (rec == null) return;
+        int layoutMode = camera != null ? camera.getCameraLayoutMode() : 0;
+        rec.setCameraLayout(layoutMode);
+        rec.setProducerLayout(
+            com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
+            com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
+            com.overdrive.app.camera.Dilink4Constants.CORNER_REAR,
+            com.overdrive.app.camera.Dilink4Constants.CORNER_LEFT,
+            com.overdrive.app.camera.Dilink4Constants.FLIP_FRONT,
+            com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
+            com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
+            com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
+        try {
+            org.json.JSONObject camCfg = com.overdrive.app.config
+                .UnifiedConfigManager.loadConfig().optJSONObject("camera");
+            if (camCfg != null && layoutMode == 3) {
+                // LAYOUT-GATED. The red-mask GLSL block sits OUTSIDE the
+                // `uApaMode > 2.5` branch chain in every shader, so unlike the
+                // corner/flip uniforms it is NOT structurally inert on legacy
+                // cars: pushing 1.0 would desaturate every red-dominant pixel
+                // (brake lights, red vehicles) in a LEGACY car's recordings.
+                // The flag is a dilink4-only remedy — its API handler, its UI
+                // label and its own comments all say so — so gate to match.
+                rec.setRedMaskEnabled(camCfg.optBoolean("dilink4RedMask", false));
+                // APA center inset — esco APACropFilter parity. Default
+                // 240/2560 = 0.09375 trims the chrome-painted seams on byd_apa.
+                rec.setApaCenterInset(
+                    (float) camCfg.optDouble("dilink4ApaCenterInset", 0.09375));
+            }
+        } catch (Throwable t) {
+            logger.warn("Failed to apply dilink4 red-mask/inset to recorder: " + t.getMessage());
+        }
+    }
+
+    /**
      * Reinitializes the encoder with current config settings.
      * This is a synchronous operation that waits for completion.
      *
@@ -1621,6 +1696,15 @@ public class GpuSurveillancePipeline {
                         // wedge-ticker grace-windowing keeps working post-
                         // encoder-reinit.
                         recorder.setSegmentRotatedListener(this::noteSegmentRotated);
+                        // FIX: a FRESH recorder starts with cameraLayout=0 and
+                        // an all-zero producer-corner map, because the DiLink 4
+                        // layout push lives only in the init path above. Without
+                        // re-applying it here, a codec/quality/fps change on a
+                        // WORKING DiLink 4 car silently reverts the recorder to
+                        // legacy 4-strip geometry — all four output quadrants
+                        // then sample the producer's top-left corner and the
+                        // recording is garbled until the next daemon restart.
+                        applyRecorderDilink4Layout();
                     }
                     recorder.init(camera.getEglCore(), encoder);
                     logger.info("Recorder reinitialized on GL thread");
@@ -1651,8 +1735,21 @@ public class GpuSurveillancePipeline {
             }
         }
         
-        // Update bitrate controller
+        // Update bitrate controller. Release the OLD one before replacing it:
+        // AdaptiveBitrateController holds a hard reference to the encoder it was
+        // constructed against, and its ramp animator calls encoder.setBitrate()
+        // from a callback. Dropping the reference without release() leaves a
+        // running animator driving the encoder we just tore down above — a
+        // use-after-release on the stale MediaCodec, not merely a leaked object.
+        // release() only cancels the animator (no encoder interaction), so it is
+        // safe to call unconditionally here. Mirrors the correct teardown at
+        // stop() and the start()-rollback path.
         if (bitrateController != null) {
+            try {
+                bitrateController.release();
+            } catch (Throwable t) {
+                logger.warn("Stale bitrateController release failed: " + t.getMessage());
+            }
             bitrateController = new AdaptiveBitrateController(encoder, bitrate);
         }
 
@@ -1857,10 +1954,31 @@ public class GpuSurveillancePipeline {
         downscaler = new GpuDownscaler(quadrantStripOffsetX);
         // Note: downscaler.init() will be called after EGL context is created by camera
 
-        // 4. Create surveillance engine (uses shared recorder)
+        // 4. Create surveillance engine (uses shared recorder).
+        //
+        // Release any PREVIOUS engine first. init() is re-entered from start()
+        // whenever !initialized, and stop() clears initialized in its finally —
+        // so every arm/disarm cycle lands here again. Normal teardown paths call
+        // sentry.disable() but never sentry.release() (release() is reachable only
+        // from the start()-failure rollback), so without this the outgoing engine's
+        // executor threads — aiExecutor, aiScheduler, segmentMetadata, mosaicJpeg,
+        // storageMaintenance — were abandoned still parked on their queues, one set
+        // per cycle until process death. They are daemon threads, which is why the
+        // leak stayed invisible. Mirrors the recorder guard above.
+        if (sentry != null) {
+            try {
+                sentry.release();
+            } catch (Throwable t) {
+                logger.warn("Previous sentry engine release failed: " + t.getMessage());
+            }
+            sentry = null;
+        }
         sentry = new SurveillanceEngineGpu();
         sentry.init(eventOutputDir, downscaler, assetManager, context);  // Pass Context for Java TFLite
         sentry.setRecorder(recorder);  // Share recorder with normal recording
+        // Drive the (opt-in, default-off) surveillance telemetry overlay for the
+        // exact span of each sentry event clip.
+        sentry.setEventOverlayHook(this::applySurveillanceOverlayForEvent);
         // Per-vehicle camera-tile height for the foveated FOV scaling math
         // in DistanceEstimator. Seal=960, Tang=720. Without this the
         // foveated path uses a Seal-specific 0.66 ratio and reads ~30%
@@ -1972,11 +2090,15 @@ public class GpuSurveillancePipeline {
         camera.setCameraProbeCallback((cameraId, surfaceMode) -> {
             logger.info("Probe found working camera: id=" + cameraId + ", surfaceMode=" + surfaceMode);
             try {
+                // OBSERVED dims, never the configured cameraWidth/Height —
+                // passing the configured pair made probedWidth/Height a
+                // self-confirming copy of the profile default, so a car whose
+                // HAL emits a different size could never be detected.
                 com.overdrive.app.camera.CameraConfigResolver.persistPanoramicProbe(
                     cameraId,
                     surfaceMode,
-                    cameraWidth,
-                    cameraHeight,
+                    camera.getObservedProducerWidth(),
+                    camera.getObservedProducerHeight(),
                     true,
                     false);
                 logger.info("Saved camera config for next launch");
@@ -1989,54 +2111,11 @@ public class GpuSurveillancePipeline {
             }, "PendingRecCheck").start();
         });
         
-        // esco-parity: when the camera is using the SurfaceTexture path, the
-        // BYD HAL emits its final framing into the producer surface directly
-        // Layout 3 = DiLink 4 (HAL emits 2x2 natively but in non-canonical
-        // arrangement; recorder/stream/cropper rearrange via per-role corner
-        // remap below). Layout 0 = legacy 4-strip → 2x2 rearrangement. The
-        // camera class returns 3 whenever cameraMode=dilink4 is selected
-        // (USE_ESCO_SURFACE_TEXTURE_PATH path), 0 for every other car.
-        int layoutMode = camera != null ? camera.getCameraLayoutMode() : 0;
         if (recorder != null) {
-            recorder.setCameraLayout(layoutMode);
-            // DiLink 4 layout is hardcoded to the only known-good arrangement
-            // for that HAL: Front=TL X-flipped, Rear=TR Y-flipped, Left=BL
-            // Y-flipped, Right=BR no flip. No user-tunable surface — every
-            // DiLink 4 trim seen so far emits this exact mosaic.
-            // Combined setter — single source of truth for the DiLink 4
-            // mosaic arrangement (Dilink4Constants). Recorder + stream
-            // scaler both reference this so they can never silently
-            // disagree.
-            recorder.setProducerLayout(
-                com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
-                com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
-                com.overdrive.app.camera.Dilink4Constants.CORNER_REAR,
-                com.overdrive.app.camera.Dilink4Constants.CORNER_LEFT,
-                com.overdrive.app.camera.Dilink4Constants.FLIP_FRONT,
-                com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
-                com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
-                com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
-            // Red-overlay mask (HAL 'calibration failed' chrome suppression).
-            // Off by default; user opts in when the car is uncalibrated and
-            // the chrome is in the way.
-            try {
-                org.json.JSONObject camCfg = com.overdrive.app.config
-                    .UnifiedConfigManager.loadConfig().optJSONObject("camera");
-                if (camCfg != null) {
-                    recorder.setRedMaskEnabled(
-                        camCfg.optBoolean("dilink4RedMask", false));
-                    // APA center inset — esco APACropFilter parity. Default
-                    // 240/2560 = 0.09375 trims the chrome-painted seams on
-                    // byd_apa firmware. Only applied when cameraLayout=3
-                    // because the inset uniform is gated by uApaMode>2.5.
-                    if (layoutMode == 3) {
-                        recorder.setApaCenterInset(
-                            (float) camCfg.optDouble("dilink4ApaCenterInset", 0.09375));
-                    }
-                }
-            } catch (Throwable t) {
-                logger.warn("Failed to read dilink4RedMask from config: " + t.getMessage());
-            }
+            // Camera layout + DiLink 4 producer-corner map + dilink4 red-mask /
+            // APA inset. Shared with reinitializeEncoder() so a fresh recorder
+            // can never come up with legacy geometry on a DiLink 4 car.
+            applyRecorderDilink4Layout();
             // Recording dewarp strength — shader gates on uApaMode==0, so
             // pushing a non-zero value on dilink4 is a no-op (safe).
             // We push regardless of layout so a layout flip later picks up
@@ -2062,7 +2141,18 @@ public class GpuSurveillancePipeline {
             }
         }
 
-        // 6. Create adaptive bitrate controller
+        // 6. Create adaptive bitrate controller. Defensive release of any
+        // pre-existing instance for the same reason as the reinit path above:
+        // a surviving animator would keep driving a prior encoder. Normally
+        // null here (stop() clears it), but a start() that follows a partial
+        // teardown can reach this with a stale controller still set.
+        if (bitrateController != null) {
+            try {
+                bitrateController.release();
+            } catch (Throwable t) {
+                logger.warn("Stale bitrateController release failed (init): " + t.getMessage());
+            }
+        }
         bitrateController = new AdaptiveBitrateController(encoder, 6_000_000);
 
         // Register a single config-change listener that pushes rectifyStrength
@@ -2204,6 +2294,13 @@ public class GpuSurveillancePipeline {
                     // which nulls the camera's local refs. The pipeline still holds the actual objects.
                     if (streamingEnabled && streamScaler != null && streamEncoder != null && camera != null) {
                         camera.setStreamingComponents(streamScaler, streamEncoder);
+                        camera.updateStreamFrameStride();
+                        // Re-arm the client-presence gate — a yield may have run
+                        // clearStreamingComponents() which reset it to fail-open.
+                        com.overdrive.app.streaming.WebSocketStreamServer wsRe = wsStreamServer;
+                        if (wsRe != null) {
+                            camera.setStreamClientProbe(wsRe::hasActiveClients);
+                        }
                         logger.info("Post-reacquire: streaming components restored");
                     }
                     
@@ -2335,8 +2432,11 @@ public class GpuSurveillancePipeline {
                     recorder.startRecording();
                     currentMode = Mode.NORMAL_RECORDING;
                     
-                    // Enable overlay for auto-started recording
+                    // Enable overlay for auto-started recording (pano flow).
+                    // Push the pano field selection (additive) then the ORIGINAL
+                    // polling mechanics — unchanged from before this feature.
                     recorder.setOverlayRecordingModeAllowed(true);
+                    pushOverlayFieldsForFlow("pano");
                     if (telemetryCollector != null && recorder.isOverlayEnabled()) {
                         telemetryCollector.setOverlayRecordingActive(true);
                         telemetryCollector.startPolling();
@@ -2914,6 +3014,7 @@ public class GpuSurveillancePipeline {
                     activeRecordingDir = outputDir;
                     activeRecordingPrefix = prefix;
                     snapRecorder.setOverlayRecordingModeAllowed(true);
+                    pushOverlayFieldsForFlow("pano");
                     if (telemetryCollector != null) {
                         telemetryCollector.setOverlayRecordingActive(true);
                         telemetryCollector.startPolling();
@@ -3058,6 +3159,7 @@ public class GpuSurveillancePipeline {
             activeRecordingDir = dir;
             activeRecordingPrefix = prefix;
             localRecorder.setOverlayRecordingModeAllowed(true);
+            pushOverlayFieldsForFlow("pano");
             if (telemetryCollector != null) {
                 telemetryCollector.setOverlayRecordingActive(true);
                 telemetryCollector.startPolling();
@@ -3201,6 +3303,7 @@ public class GpuSurveillancePipeline {
                             activeRecordingDir = outputDir;
                             activeRecordingPrefix = prefix;
                             snapRec.setOverlayRecordingModeAllowed(true);
+                            pushOverlayFieldsForFlow("pano");
                             if (telemetryCollector != null) {
                                 telemetryCollector.setOverlayRecordingActive(true);
                                 telemetryCollector.startPolling();
@@ -3339,6 +3442,7 @@ public class GpuSurveillancePipeline {
                             activeRecordingDir = outputDir;
                             activeRecordingPrefix = prefix;
                             snapRec.setOverlayRecordingModeAllowed(true);
+                            pushOverlayFieldsForFlow("pano");
                             if (telemetryCollector != null) {
                                 telemetryCollector.setOverlayRecordingActive(true);
                                 telemetryCollector.startPolling();
@@ -3934,12 +4038,45 @@ public class GpuSurveillancePipeline {
         // unbinding an OEM source that this fresh enable never bound.
         externalStreamSourceActive = false;
 
+        // On dilink4, cap the ENCODER's declared frame rate to what this HAL can
+        // actually deliver.
+        //
+        // The byd_apa AVM HAL emits at its own fixed low rate and cannot be
+        // retimed: setCameraFps returns false for every value we pass (1, 15, 25),
+        // and the OEM app (gl/a.java:402) and DiPlus both discard that return —
+        // false is simply normal here. The OEM's answer is to ASK LOW: its
+        // panoramic recorder requests 10 fps (PanoCameraRecordService:530) and its
+        // publisher 8 (qi/g.java:316), never the 15-30 our quality presets offer.
+        // With the request at or below delivery, the gap never manifests.
+        //
+        // We keep the user's preset for RESOLUTION and BITRATE — only the declared
+        // frame rate is clamped, because that is the number MediaCodec uses to
+        // budget bits and pace its rate control. Declaring 15 while receiving ~4.5
+        // makes it treat two of every three ticks as a duplicate.
+        //
+        // Legacy (ImageReader) vehicles are untouched: their HAL honours the
+        // requested rate, so the clamp is skipped entirely and streaming behaves
+        // byte-identically to before.
+        int effectiveStreamFps = streamFps;
+        try {
+            if (camera != null && camera.isUsingEscoSurfaceTexturePath()
+                    && streamFps > DILINK4_STREAM_FPS_CAP) {
+                effectiveStreamFps = DILINK4_STREAM_FPS_CAP;
+                logger.info("dilink4: clamping stream encoder fps " + streamFps + " → "
+                    + effectiveStreamFps + " (this HAL refuses setCameraFps and emits"
+                    + " at its own low fixed rate; OEM asks 10 on this lane)."
+                    + " Resolution/bitrate keep the user's preset.");
+            }
+        } catch (Throwable t) {
+            logger.warn("dilink4 stream-fps clamp check failed: " + t.getMessage());
+        }
+
         logger.info(String.format("Enabling H.264 streaming: %dx%d @ %dfps, %d Mbps",
-                streamWidth, streamHeight, streamFps, streamBitrate / 1_000_000));
-        
+                streamWidth, streamHeight, effectiveStreamFps, streamBitrate / 1_000_000));
+
         // Create stream encoder
         logger.info("Creating stream encoder...");
-        streamEncoder = new HardwareEventRecorderGpu(streamWidth, streamHeight, streamFps, streamBitrate);
+        streamEncoder = new HardwareEventRecorderGpu(streamWidth, streamHeight, effectiveStreamFps, streamBitrate);
         streamEncoder.setUsePreRecordBuffer(false);  // Stream-only, no pre-record needed
         // Do NOT pin KEY_OPERATING_RATE on this SECONDARY encoder. The primary
         // recording encoder already pins it at fps to hold the Venus clock; if
@@ -4093,12 +4230,23 @@ public class GpuSurveillancePipeline {
         // Now set components on camera (scaler is guaranteed initialized)
         logger.info("Setting streaming components on camera...");
         camera.setStreamingComponents(streamScaler, streamEncoder);
-        
+        camera.updateStreamFrameStride();
+
         // Create WebSocket stream server (port 8887)
         // WebSocket has zero buffering delay vs HTTP Chunked (64KB+ buffer)
         logger.info("Starting WebSocket stream server...");
         wsStreamServer = new com.overdrive.app.streaming.WebSocketStreamServer();
-        
+
+        // Gate PASS 1B on live client presence: with no viewer on either the
+        // port-8887 or the /ws relay path, skip the stream raster + encode
+        // entirely (the encoded bytes would be dropped anyway). hasActiveClients
+        // counts both consumer paths; the camera re-requests an IDR on the
+        // rising edge so a reconnect within the 30s idle window is instantly
+        // decodable. Cleared to fail-open in clearStreamingComponents().
+        final com.overdrive.app.streaming.WebSocketStreamServer wsForProbe = wsStreamServer;
+        camera.setStreamClientProbe(wsForProbe::hasActiveClients);
+
+
         // Set idle shutdown callback - auto-stop pipeline when no clients for
         // WebSocketStreamServer.IDLE_TIMEOUT_MS (30 seconds; was mis-documented as 15s)
         final GpuSurveillancePipeline self = this;
@@ -4483,6 +4631,41 @@ public class GpuSurveillancePipeline {
                 s.setViewMode(mode);          // sets side sign internally (7→-1, 8→+1)
                 applyBlindSpotCalibration(s);
             }
+            // PER-SIDE POSITION: on the turn edge, jump the card to THIS camera's
+            // chosen corner (cornerLeft vs cornerRight). Do NOT call resolveBsGeometry()
+            // here — on the cluster target it runs clusterDisplaySize() → `dumpsys
+            // display` (a subprocess) under this lock, which the turn path deliberately
+            // avoids (see bsTurnTick's "no panel query, no dumpsys" note). The panel
+            // size can't change on a mere side switch, so reuse the size cached by the
+            // last resolveBsGeometry (bsLastPanelW/H) and only recompute the rect from
+            // the new side's corner via presetRect. Falls back to a full resolve only if
+            // the panel size was never cached (lane just armed → resolveBsGeometry ran).
+            // Reposition ONLY when the card is in PRESET form (sizePct persisted) — the
+            // exact same discriminator resolveBsGeometry uses. If the user pinned an
+            // ABSOLUTE rect (/api/bs/geometry/{x}/{y}/{w}/{h}, no sizePct), leave it put:
+            // recomputing a preset rect here would override their absolute placement on
+            // the first turn-side flip (a regression). currentGeometryObj is a cheap
+            // cached config read (no panel query).
+            org.json.JSONObject gNow = currentGeometryObj();
+            boolean presetForm = (gNow != null && gNow.has("sizePct"));
+            if (presetForm && bsLastPanelW > 0 && bsLastPanelH > 0 && bsSizePct > 0) {
+                bsCorner = resolveBsCorner(gNow);
+                // presetRect already fits the card (pct% width, 4:3, 24px inset) inside
+                // the given panel, so its rect is in-bounds by construction — no
+                // clampBsRect() here (that calls panelForTarget → clusterDisplaySize →
+                // dumpsys, the very subprocess this path avoids). Use the cached panel
+                // size; a size/panel change comes through the full resolveBsGeometry
+                // path (enable / orientation / settings), not a turn-side flip.
+                int[] pr = presetRect(new android.graphics.Point(bsLastPanelW, bsLastPanelH));
+                if (pr != null) {
+                    bsGeomRect = new int[]{pr[0], pr[1], pr[2], pr[3]};   // atomic publish
+                }
+            }
+            com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
+            if (layer != null && layer.isCreated() && bsLayerVisible) {
+                int[] gr = bsGeomRect;
+                if (gr[0] >= 0) layer.setGeometry(gr[0], gr[1], gr[2], gr[3]);
+            }
         } finally {
             bsLifecycleLock.unlock();
         }
@@ -4507,6 +4690,33 @@ public class GpuSurveillancePipeline {
                 // Merge mode (both/side/rear) — re-applied here so it survives an
                 // enable or a side switch, same lifecycle as the stitch calibration.
                 s.setBlindSpotMergeMode(bsMergeModeCode(bs.optString("mergeMode", "both")));
+                // Fisheye/lens dewarp for the single-camera views (side/rear). Separate
+                // knob from recording.rectifyStrength; the shader applies it ONLY in the
+                // merge 1/2 passthrough (identity at 0, and never touches 'both'). The
+                // BS card buffer is 4:3 (1280×960) → aspect 0.75, same as a camera tile.
+                s.setBlindSpotRectifyStrength((float) bs.optInt("rectifyStrength", 0));
+                s.setBlindSpotRectifyAspect((float) BS_HEIGHT / (float) BS_WIDTH);
+                // On-screen card rotation is done in the GL vertex shader (output
+                // geometry), NOT via the SurfaceControl layer transform — this
+                // firmware's compositor drops a 90/270 layer transform → blank card
+                // (issue #164). resolveBsRotation already gates rotation to the
+                // single-view side/rear modes and reads AUTO/gear; re-apply it here so
+                // it survives enable/side-switch, same lifecycle as the calibration.
+                // PER-SIDE: pass the current view (7=left/8=right) so a side switch
+                // re-resolves to that camera's own rotation. Keep bsRotationDeg in sync
+                // with what we just pushed, so the 250ms turn-tick change-detector
+                // (wantRot != bsRotationDeg) doesn't see a stale angle after a side
+                // switch and either miss a needed re-apply or churn a redundant one.
+                int rot = resolveBsRotation(bs, bsViewMode);
+                bsRotationDeg = rot;
+                // Align the rotated card to the CURRENT side's corner edge. Resolve the
+                // corner from this same config object (not the bsCorner field, which the
+                // reposition step updates only AFTER this call) so a 90/270 card hugs the
+                // right/left edge matching where it's anchored, per side.
+                String geomKey = isClusterTarget() ? "geometryCluster" : "geometry";
+                org.json.JSONObject g = bs.optJSONObject(geomKey);
+                int alignX = bsCornerAlignX(resolveBsCorner(g));
+                s.setContentRotation(rot, alignX);
             }
         } catch (Throwable t) {
             logger.warn("blindspot calib apply failed: " + t.getMessage());
@@ -4752,6 +4962,25 @@ public class GpuSurveillancePipeline {
                 com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
                 com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
                 com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
+            // Parity with the recorder + stream lanes: the blind-spot scaler is
+            // another GpuStreamScaler sampling the SAME producer, so it needs the
+            // same two dilink4 corrections or its card diverges visually from
+            // every other view — it was the only feed site never given either.
+            // (Its 7/8 branches return before the red-mask splice, so the mask
+            // is inert for those views today; pushing it keeps the contract
+            // uniform if the branch layout ever changes.)
+            try {
+                org.json.JSONObject bsCamCfg = com.overdrive.app.config.UnifiedConfigManager
+                    .loadConfig().optJSONObject("camera");
+                if (bsCamCfg != null) {
+                    bsScaler.setRedMaskEnabled(
+                        bsCamCfg.optBoolean("dilink4RedMask", false));
+                    bsScaler.setApaCenterInset(
+                        (float) bsCamCfg.optDouble("dilink4ApaCenterInset", 0.09375));
+                }
+            } catch (Throwable t) {
+                logger.warn("BS: failed to apply dilink4 red-mask/inset: " + t.getMessage());
+            }
         }
 
         // GL-thread init + WAIT (captured locals, same rationale as the stream lane).
@@ -4862,7 +5091,7 @@ public class GpuSurveillancePipeline {
             // (side/rear) may rotate; the merged panorama stays landscape. This makes
             // the effective rotation self-correcting when the user switches back to
             // "both" without having to clear the stored angle.
-            bsRotationDeg = resolveBsRotation(bs);
+            bsRotationDeg = resolveBsRotation(bs, bsViewMode);
 
             android.graphics.Point panel = (ctx != null)
                 ? panelForTarget(ctx)
@@ -4882,7 +5111,13 @@ public class GpuSurveillancePipeline {
             if (g != null && g.has("sizePct")) {
                 // Preset form (orientation-safe): recompute px from the live panel.
                 bsSizePct = g.optInt("sizePct", bsSizePct);
-                if (g.has("corner")) bsCorner = g.optString("corner", bsCorner);
+                // PER-SIDE POSITION: the left camera (view 7, left turn) and right
+                // camera (view 8, right turn) can each sit at their own corner —
+                // mirroring per-side rotation, so a driver can put the left card on the
+                // left of the screen and the right card on the right. Pick the current
+                // view's corner key (cornerLeft/cornerRight) with a fallback to the
+                // legacy single "corner" so an un-migrated config is unchanged.
+                bsCorner = resolveBsCorner(g);
                 r = presetRect(panel);
             } else if (g != null && g.has("x") && g.has("w")) {
                 // Absolute form: honour the stored rect, clamped to the live panel.
@@ -4907,11 +5142,21 @@ public class GpuSurveillancePipeline {
                 r = clampBsRect(r[0], r[1], r[2], r[3]);
             }
             bsGeomRect = new int[]{r[0], r[1], r[2], r[3]};   // atomic publish
-            // Push the resolved rotation onto the layer so the setGeometry calls that
-            // follow (enable / show / retarget) composite the buffer at the right
-            // angle. Cheap store; the rect above already matches the rotated aspect.
+            // Rotation is applied in the GL render (bsScaler.setContentRotation via
+            // applyBlindSpotCalibration), so the SurfaceControl layer stays at IDENTITY
+            // orientation — a 90/270 LAYER transform is dropped by this firmware's
+            // compositor and blanks the card (issue #164). Force the layer's buffer
+            // rotation to 0 so no setGeometry call ever re-introduces a layer-level
+            // transform, and keep the dest rect at the buffer's native 4:3 (done above).
             com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
-            if (layer != null) layer.setBufferRotation(bsRotationDeg);
+            if (layer != null) layer.setBufferRotation(0);
+            // Keep the GL scaler's card rotation in sync with the freshly-resolved angle
+            // (covers the settings-write / enable path; the turn-tick AUTO path syncs it
+            // too). Gated to side/rear inside resolveBsRotation. bsCorner is resolved for
+            // the current side just above (preset branch), so align the rotated card to
+            // that corner's edge — a 90/270 card hugs left/right per side, not centered.
+            com.overdrive.app.streaming.GpuStreamScaler bss = bsScaler;
+            if (bss != null) bss.setContentRotation(bsRotationDeg, bsRotationAlignX());
         } catch (Throwable t) {
             logger.warn("resolveBsGeometry failed: " + t.getMessage());
             if (bsGeomRect[2] <= 0) bsGeomRect = new int[]{24, 24, 640, 480};
@@ -4922,21 +5167,41 @@ public class GpuSurveillancePipeline {
      *  Rotation is honoured ONLY for the single-view merge modes (side/rear); the
      *  merged "both" panorama is inherently landscape and always renders upright.
      *
-     *  <p>The stored {@code rotation} is either a fixed quarter turn (int
-     *  0/90/180/270) or the string {@code "auto"}. In AUTO mode the on-screen angle
-     *  tracks the DIRECTION OF TRAVEL: it holds the configured base angle
-     *  ({@code rotationBase}) while moving forward and flips 180° in reverse gear,
+     *  <p>PER-SIDE: the left camera (view 7, left turn) and the right camera (view 8,
+     *  right turn) are physically mirror-imaged, so each needs its OWN rotation — a
+     *  single global angle that reads upright on the left camera reads upside-down /
+     *  sideways on the right one. The stored config therefore carries per-side keys:
+     *  fixed {@code rotationLeft}/{@code rotationRight} (int 0/90/180/270 or the
+     *  string {@code "auto"}) and, for AUTO, per-side forward bases
+     *  {@code rotationBaseLeft}/{@code rotationBaseRight}. When a per-side key is
+     *  ABSENT we fall back to the legacy global {@code rotation}/{@code rotationBase}
+     *  so an existing config (and any device that only ever set the old keys) keeps
+     *  its current behaviour byte-for-byte.
+     *
+     *  <p>In AUTO mode the on-screen angle tracks the DIRECTION OF TRAVEL: it holds
+     *  the configured base angle while moving forward and flips 180° in reverse gear,
      *  so the view reads naturally when backing up. Gear is read live from the
      *  daemon-local {@link com.overdrive.app.monitor.GearMonitor} (5 Hz), so no
      *  cross-process hop is involved. Any non-multiple-of-90 value is snapped to the
-     *  nearest quarter turn. */
-    private int resolveBsRotation(org.json.JSONObject bs) {
+     *  nearest quarter turn.
+     *
+     *  @param viewMode the active blind-spot view (7 = left camera, 8 = right camera).
+     *                  Any other value falls back to the left-side keys. */
+    private int resolveBsRotation(org.json.JSONObject bs, int viewMode) {
         if (bs == null) return 0;
         String merge = bs.optString("mergeMode", "both");
         if (!"side".equals(merge) && !"rear".equals(merge)) return 0;
-        Object rotVal = bs.opt("rotation");
+        // view 8 = RIGHT camera; everything else (incl. 7) = LEFT camera.
+        boolean right = (viewMode == 8);
+        // Fixed-rotation key: per-side (rotationRight/rotationLeft) with a fallback to
+        // the legacy global "rotation" so an un-migrated config is unchanged.
+        String sideKey = right ? "rotationRight" : "rotationLeft";
+        Object rotVal = bs.has(sideKey) ? bs.opt(sideKey) : bs.opt("rotation");
         if (rotVal instanceof String && "auto".equalsIgnoreCase((String) rotVal)) {
-            int base = snapDeg(bs.optInt("rotationBase", 0));
+            String baseKey = right ? "rotationBaseRight" : "rotationBaseLeft";
+            int base = bs.has(baseKey)
+                    ? snapDeg(bs.optInt(baseKey, 0))
+                    : snapDeg(bs.optInt("rotationBase", 0));
             boolean reverse = false;
             try {
                 reverse = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear()
@@ -4944,13 +5209,62 @@ public class GpuSurveillancePipeline {
             } catch (Throwable ignored) {}
             return reverse ? (base + 180) % 360 : base;
         }
-        return snapDeg(bs.optInt("rotation", 0));
+        // Fixed angle: read the per-side key when present, else the legacy global.
+        int fixed = bs.has(sideKey) ? bs.optInt(sideKey, 0) : bs.optInt("rotation", 0);
+        return snapDeg(fixed);
     }
 
     /** Normalise an angle into {0,90,180,270} (mod 360, nearest quarter turn). */
     private static int snapDeg(int deg) {
         deg = ((deg % 360) + 360) % 360;
         return (Math.round(deg / 90f) * 90) % 360;
+    }
+
+    /** Resolve the on-screen card corner for the CURRENT view from a per-target
+     *  geometry object. PER-SIDE: view 8 (right turn) reads {@code cornerRight},
+     *  everything else (incl. view 7 / left turn) reads {@code cornerLeft}; either
+     *  falls back to the legacy single {@code corner} (then the current field, then
+     *  "tr") when the per-side key is absent, so an un-migrated config keeps its
+     *  existing placement. Kept side-aware so a turn-signal side switch repositions
+     *  the card to that camera's chosen corner. */
+    private String resolveBsCorner(org.json.JSONObject g) {
+        if (g == null) return bsCorner != null ? bsCorner : "tr";
+        String legacy = g.optString("corner", bsCorner != null ? bsCorner : "tr");
+        String sideKey = (bsViewMode == 8) ? "cornerRight" : "cornerLeft";
+        return g.optString(sideKey, legacy);
+    }
+
+    /** Horizontal alignment (+1 right / -1 left / 0 center) for a rotated (90/270)
+     *  card anchored at {@code corner}: a RIGHT corner (tr/br) hugs the right screen
+     *  edge, a LEFT corner (tl/bl) the left, a centered card stays centered. Passed to
+     *  {@code setContentRotation} so the pillarboxed portrait content sits flush with
+     *  the same edge the card is anchored to instead of floating in the middle of its
+     *  dest rect. No effect at 0/180 (no pillarbox). */
+    private static int bsCornerAlignX(String corner) {
+        String c = (corner != null) ? corner : "tr";
+        if ("center".equals(c)) return 0;
+        if (c.endsWith("r")) return 1;
+        if (c.endsWith("l")) return -1;
+        return 0;
+    }
+
+    /** {@link #bsCornerAlignX} for the current {@link #bsCorner} field. */
+    private int bsRotationAlignX() {
+        return bsCornerAlignX(bsCorner);
+    }
+
+    /** The ACTIVE target's geometry JSON object ("geometry" for head-unit,
+     *  "geometryCluster" for cluster), or null. Cheap config read (no panel query),
+     *  so it's safe on the turn-signal side-switch path. Used by the per-side
+     *  reposition to pick cornerLeft/cornerRight without a full resolveBsGeometry. */
+    private org.json.JSONObject currentGeometryObj() {
+        try {
+            org.json.JSONObject bs = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+            if (bs == null) return null;
+            return bs.optJSONObject(isClusterTarget() ? "geometryCluster" : "geometry");
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /** Update the on-screen geometry live (from /api/bs/geometry / settings UI).
@@ -5002,11 +5316,27 @@ public class GpuSurveillancePipeline {
             // Persist the PRESET (sizePct + corner) under the target's key — NOT
             // absolute px — so it stays correct across rotation. resolveBsGeometry()
             // recomputes the px rect from the LIVE target panel on enable + rotation.
-            // updateSection is a shallow per-key merge, so writing one geometry key
-            // never clobbers the other target's key.
+            // updateSection is a shallow per-key merge at the TOP level only, so it
+            // REPLACES the whole geometry object — we must therefore carry forward the
+            // existing keys we don't set here, or a single-corner preset write would
+            // silently drop the user's per-side cornerLeft/cornerRight. This
+            // single-corner API means "put the card here" for BOTH sides, so mirror
+            // `corner` into cornerLeft+cornerRight (keeping them coherent) while still
+            // preserving any other keys (e.g. absolute x/y/w/h) already stored.
             String geomKey = cluster ? "geometryCluster" : "geometry";
-            org.json.JSONObject g = new org.json.JSONObject();
-            g.put("sizePct", p); g.put("corner", (corner != null) ? corner : "tr");
+            String cornerVal = (corner != null) ? corner : "tr";
+            org.json.JSONObject g;
+            try {
+                org.json.JSONObject bsNow = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+                org.json.JSONObject existing = (bsNow != null) ? bsNow.optJSONObject(geomKey) : null;
+                g = (existing != null) ? new org.json.JSONObject(existing.toString()) : new org.json.JSONObject();
+            } catch (Throwable t) {
+                g = new org.json.JSONObject();
+            }
+            g.put("sizePct", p);
+            g.put("corner", cornerVal);
+            g.put("cornerLeft", cornerVal);
+            g.put("cornerRight", cornerVal);
             com.overdrive.app.config.UnifiedConfigManager.updateSection("blindspot",
                 new org.json.JSONObject().put(geomKey, g));
             // Apply live only if editing the active target; otherwise it's persisted
@@ -5564,24 +5894,26 @@ public class GpuSurveillancePipeline {
             // AUTO rotation (direction-of-travel): when rotation="auto" the effective
             // angle depends on gear (forward=base, reverse=base+180), so it must be
             // re-evaluated live rather than only on a settings write. Re-resolve
-            // cheaply each tick and re-apply only on change. AUTO flips by 180° only,
-            // so base↔base+180 keeps the same 4:3/3:4 aspect parity — the dest rect is
-            // unchanged, so we skip the panel query entirely (no resolveBsGeometry).
-            // That also keeps this cluster-safe: unlike the orientation-change branch
-            // above, it never touches clusterDisplaySize/dumpsys on the 250ms loop.
-            // No-op churn for fixed rotations (want == bsRotationDeg in steady state).
+            // cheaply each tick and re-apply only on change. Rotation is applied in the
+            // GL vertex shader (bsScaler.setContentRotation), NOT the SurfaceControl
+            // layer (a 90/270 LAYER transform blanks the card on this firmware — issue
+            // #164), so the change is a single cheap uniform swap: no setGeometry, no
+            // panel query, no dumpsys — keeping this cluster-safe on the 250ms loop.
+            // The dest rect is always the buffer's 4:3, so it never needs recomputing
+            // on a rotation change. No-op churn when want == bsRotationDeg (steady state).
             {
-                int wantRot = resolveBsRotation(bs);
+                // PER-SIDE: resolve for the CURRENT view (7=left/8=right). A side
+                // switch above (setBlindSpotViewMode) already re-applied the new side's
+                // angle and synced bsRotationDeg, so here we only catch the AUTO gear
+                // flip (forward↔reverse) for the side we're on — no double-apply churn.
+                int wantRot = resolveBsRotation(bs, bsViewMode);
                 if (wantRot != bsRotationDeg) {
                     bsRotationDeg = wantRot;
-                    com.overdrive.app.surveillance.BsNativeLayer rl = bsLayer;
-                    if (rl != null) {
-                        rl.setBufferRotation(wantRot);
-                        if (bsLayerVisible && rl.isCreated()) {
-                            int[] g = bsGeomRect;
-                            rl.setGeometry(g[0], g[1], g[2], g[3]);
-                        }
-                    }
+                    com.overdrive.app.streaming.GpuStreamScaler bss = bsScaler;
+                    // bsCorner reflects the current side (setBlindSpotViewMode's
+                    // reposition runs before this on a side change), so align the
+                    // rotated card to that side's edge.
+                    if (bss != null) bss.setContentRotation(wantRot, bsRotationAlignX());
                 }
             }
             boolean debugPreview = bs.optBoolean("debugPreview", false);
@@ -6257,6 +6589,22 @@ public class GpuSurveillancePipeline {
         logger.info("Blind-spot merge mode set to " + mode);
     }
 
+    /**
+     * Fisheye/lens-dewarp strength (0..100) for the single-camera blind-spot views
+     * (side/rear). Separate knob from recording.rectifyStrength. Pushes to BOTH the
+     * shared stream scaler (browser preview) and the dedicated BS lane's scaler (what
+     * the overlay renders), mirroring {@link #setBlindSpotMergeMode}. The dewarp is a
+     * no-op in the merged 'both' view (shader only samples it in the merge 1/2
+     * passthrough). No-op-safe when a lane isn't up.
+     */
+    public void setBlindSpotRectifyStrength(int strength) {
+        com.overdrive.app.streaming.GpuStreamScaler ss = streamScaler;
+        if (ss != null) ss.setBlindSpotRectifyStrength((float) strength);
+        com.overdrive.app.streaming.GpuStreamScaler bs = bsScaler;
+        if (bs != null) bs.setBlindSpotRectifyStrength((float) strength);
+        logger.info("Blind-spot fisheye strength set to " + strength);
+    }
+
     /** Map the persisted string merge mode to the scaler's int code. */
     private static int bsMergeModeCode(String mode) {
         if ("side".equals(mode)) return 1;
@@ -6509,6 +6857,18 @@ public class GpuSurveillancePipeline {
     }
 
     /**
+     * @return milliseconds of sustained no-motion since the sentry last saw
+     * active motion (issue #174), or 0 while motion is active / the sentry is
+     * absent. RMM uses this to step the parked-idle AI cadence down into the
+     * quiet tier after a long no-motion period. Falls through to 0 (never
+     * triggers the tier) when the sentry is not wired.
+     */
+    public long getSurveillanceQuietDurationMs() {
+        SurveillanceEngineGpu s = sentry;
+        return s != null ? s.getQuietDurationMs() : 0L;
+    }
+
+    /**
      * @return true when surveillance is in CONTINUOUS (always-record) mode,
      * which has NO AI lane and already records at full fps — the parked-idle
      * throttle must exclude it. False when the sentry is absent.
@@ -6713,6 +7073,10 @@ public class GpuSurveillancePipeline {
      * state keeps every start/stop pair balanced regardless of mode.
      */
     private boolean overlayPollingHeld = false;
+    // Dedicated poll-hold flag for the ACC-off surveillance overlay flow, kept
+    // separate from the pano overlayPollingHeld so the two flows' start/stop
+    // pairs on the shared TelemetryDataCollector can never underflow each other.
+    private boolean surveillanceOverlayPollingHeld = false;
 
     /**
      * Select the DASHCAM recording composition layout (0 = standard 360
@@ -6822,8 +7186,134 @@ public class GpuSurveillancePipeline {
      * issues an unmatched decrement that the collector's atomic floor
      * absorbs but that steals the next legitimate consumer's release.
      */
+    // The overlay flow the recorder is CURRENTLY configured for. The shared
+    // recorder serves both normal/manual clips (pano) and sentry event clips
+    // (surveillance) but only one at a time; this tracks which selection is
+    // loaded so a live field edit knows whether it applies. Written only from
+    // the overlay-apply paths.
+    private volatile String activeOverlayFlow = "pano";
+
+    /**
+     * Resolve a specific overlay flow ("pano" or "surveillance"), push its
+     * master-enable + field selection to the shared recorder, and reconcile the
+     * telemetry-collector polling hold. Centralizes what the scattered
+     * record-start sites used to do inline.
+     *
+     * <p>The flow is chosen by the CALL SITE (normal-recording sites pass
+     * "pano"; the sentry-event path passes "surveillance"), NOT by ACC state —
+     * so manual recording while parked stays on the pano flow exactly as before.
+     *
+     * <p>No-regression: for "pano" with the legacy toggle on and no explicit
+     * field list, this resolves to exactly {@code overlayEnabledConfig} + the
+     * legacy eight fields — identical to before. Surveillance is a separate
+     * opt-in that defaults off.
+     */
+    /**
+     * Push a flow's field selection to the shared recorder WITHOUT touching the
+     * polling refcount or the master-enable bit. Called from the record-start
+     * sites (pano) and the sentry-event hook (surveillance) so the drawn field
+     * set matches the clip being written. This is deliberately additive — the
+     * original polling mechanics at each site are left exactly as they were, so
+     * no refcount balance changes.
+     */
+    private void pushOverlayFieldsForFlow(String flow) {
+        boolean surv = "surveillance".equals(flow);
+        this.activeOverlayFlow = surv ? "surveillance" : "pano";
+        if (recorder != null) {
+            recorder.setOverlayDemandKey("pano"); // shared recorder → single demand key
+            recorder.setOverlayFields(resolveFieldsForFlow(activeOverlayFlow));
+        }
+    }
+
+    /** Load the persisted field selection for a flow, or the legacy default. */
+    private com.overdrive.app.telemetry.TelemetryFields resolveFieldsForFlow(String flow) {
+        try {
+            org.json.JSONArray arr = com.overdrive.app.config.UnifiedConfigManager
+                    .getTelemetryOverlayFields(flow);
+            return com.overdrive.app.telemetry.TelemetryFields.fromJsonArray(arr);
+        } catch (Throwable t) {
+            return com.overdrive.app.telemetry.TelemetryFields.legacyDefault();
+        }
+    }
+
+    /**
+     * Enable/disable the telemetry overlay for a sentry EVENT clip, called by
+     * the surveillance engine around {@link SurveillanceEngineGpu} event
+     * recording. Opt-in and default-off, so event clips are unchanged until the
+     * user turns the surveillance overlay on. Compositing/polling only runs for
+     * the actual event window — never while merely armed.
+     *
+     * @param recordingActive true at event start, false at event stop
+     */
+    void applySurveillanceOverlayForEvent(boolean recordingActive) {
+        if (recorder == null) return;
+        if (recordingActive && surveillanceOverlayEnabledConfig) {
+            // Push surveillance field selection + enable the master + open the
+            // composite gate for this event clip.
+            pushOverlayFieldsForFlow("surveillance");
+            recorder.setOverlayEnabled(true);
+            recorder.setOverlayRecordingModeAllowed(true);
+            // Start telemetry polling for the event window. Uses a DEDICATED
+            // surveillance hold flag (not the pano overlayPollingHeld) so the
+            // two flows' start/stop pairs can never underflow each other on the
+            // shared collector — the sentry event and an ACC-on clip never
+            // overlap in practice, but the separate flag makes it safe if the
+            // pipeline is torn down/rebuilt across an ACC edge mid-event.
+            if (telemetryCollector != null && !surveillanceOverlayPollingHeld) {
+                telemetryCollector.setOverlayRecordingActive(true);
+                telemetryCollector.startPolling();
+                surveillanceOverlayPollingHeld = true;
+            }
+        } else {
+            recorder.setOverlayRecordingModeAllowed(false);
+            // Restore the recorder's master-enable bit to the PANO config. The
+            // recorder is SHARED and persists across the ACC-off→ACC-on edge
+            // (onAccOn reuses it, never recreates it). Without this reset, a
+            // sentry event that set overlayEnabled=true would leave it true, and
+            // a later ACC-on pano/dashcam clip (which only sets
+            // overlayRecordingModeAllowed, never overlayEnabled) would open the
+            // composite gate and burn in the overlay even with the pano toggle
+            // OFF. Resetting to overlayEnabledConfig keeps the two masters
+            // independent as documented.
+            recorder.setOverlayEnabled(overlayEnabledConfig);
+            if (telemetryCollector != null && surveillanceOverlayPollingHeld) {
+                telemetryCollector.setOverlayRecordingActive(false);
+                telemetryCollector.stopPolling();
+                surveillanceOverlayPollingHeld = false;
+            }
+        }
+    }
+
+    /**
+     * Set the ACC-off surveillance overlay master. Independent of the ACC-on
+     * (pano) master. Takes effect at the next sentry event's record-start via
+     * {@link #applySurveillanceOverlayForEvent}; if a surveillance clip is
+     * already recording, apply live.
+     */
+    public void setSurveillanceOverlayEnabled(boolean enabled) {
+        this.surveillanceOverlayEnabledConfig = enabled;
+        if ("surveillance".equals(activeOverlayFlow)
+                && recorder != null && recorder.isRecording()) {
+            applySurveillanceOverlayForEvent(enabled);
+        }
+    }
+
+    /**
+     * Push a live field-selection change for a flow to the recorder if that
+     * flow is the one currently loaded. Lets the settings API update the drawn
+     * fields mid-clip without a restart. No-op when the changed flow isn't live.
+     */
+    public void refreshOverlayFields(String flow) {
+        if (recorder != null && activeOverlayFlow.equals(flow)) {
+            recorder.setOverlayFields(resolveFieldsForFlow(flow));
+        }
+    }
+
     public void setOverlayEnabled(boolean enabled) {
         this.overlayEnabledConfig = enabled;
+        // Push the pano field selection to the recorder (additive — does not
+        // alter polling). Then reproduce the EXACT legacy polling mechanics.
+        pushOverlayFieldsForFlow("pano");
         if (recorder != null) {
             recorder.setOverlayEnabled(enabled);
         }

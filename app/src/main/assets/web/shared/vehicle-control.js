@@ -23,6 +23,8 @@ var VC = {
     // State
     vehicleState: {
         locked: null,
+        lockScope: 'unknown',
+        lockSource: null,
         trunkOpen: false,
         doors: { lf: 1, rf: 1, lr: 1, rr: 1, trunk: -1, hood: -1 },
         windows: { lf: 0, rf: 0, lr: 0, rr: 0, sunroof: 0, sunshade: 0 },
@@ -32,6 +34,7 @@ var VC = {
         soc: 0,
         rangeKm: 0,
         cloudConfigured: false,
+        cloudState: 'checking',
         acOn: false,
         acTemp: 22,
         acFan: 3,
@@ -40,6 +43,8 @@ var VC = {
     },
 
     pollInterval: null,
+    cloudStatusInterval: null,
+    cloudLockInterval: null,
     _toastTimer: null,
     stateGlows: {},  // persistent glow lights keyed by position name
     _3dViewActive: false,
@@ -80,7 +85,15 @@ var VC = {
         // (for example, Seagull is sold as Dolphin Mini in Brazil). Refresh
         // the already-built picker when the user changes the web locale.
         if (BYD.i18n && typeof BYD.i18n.onChange === 'function') {
-            BYD.i18n.onChange(function() { self.refreshModelPickerNames(); });
+            BYD.i18n.onChange(function() {
+                self.refreshModelPickerNames();
+                // These labels are live state, not static translated copy.
+                // Re-render after hydration so the i18n pass can never reset
+                // them to the HTML's initial "Checking" / "Unknown" text.
+                self.updateHUD();
+                self.updateCloudIndicator();
+                self.updateCloudControlAvailability();
+            });
         }
         // Default: Aurora White (converted to linear so it matches the rest
         // of the colour pipeline; see applyColor() for the rationale).
@@ -89,12 +102,13 @@ var VC = {
         this.initColorPicker();
         this.bindControls();
         this.startStateSync();
-        this.checkCloudStatus();
+        this.startCloudStatusSync();
         this.requestCloudLockRefresh();
         this.startCloudLockSync();
         this.animate();
         this.init3dButton();
         this.initCloudModal();
+        this.initVisibilitySync();
 
         // Vehicle appearance (model + color) is stored unified server-side so AVN
         // and phone-over-tunnel access show the same car. Fetch manifest + persisted
@@ -1469,7 +1483,10 @@ var VC = {
         // Security tab — has-active if locked (null = unknown, don't show)
         var secTab = tabs[0];
         if (secTab) {
-            if (this.vehicleState.locked === true) secTab.classList.add('has-active');
+            if (this.vehicleState.locked === true
+                    && this.vehicleState.lockScope === 'vehicle') {
+                secTab.classList.add('has-active');
+            }
             else secTab.classList.remove('has-active');
         }
 
@@ -1567,6 +1584,7 @@ var VC = {
         // optimistically; the server message resolves cloud-required prompt
         // automatically when not connected (per memory: tap-to-discover).
         this.bindBtn('btnBatteryHeat', function() {
+            if (!self.requireCloud()) return;
             var current = !!(self.vehicleState && self.vehicleState.batteryHeat);
             var next = !current;
             self.setPending('btnBatteryHeat', true);
@@ -2194,8 +2212,33 @@ var VC = {
 
     startStateSync: function() {
         var self = this;
+        if (this.pollInterval) clearInterval(this.pollInterval);
         this.fetchState();
         this.pollInterval = setInterval(function() { self.fetchState(); }, 3000);
+    },
+
+    /**
+     * Stop/restart the three pollers with page visibility. A hidden WebView kept
+     * hitting /api/vehicle/state every 3s, and each of those spawns a server-side
+     * refresh thread on the head unit.
+     */
+    initVisibilitySync: function() {
+        var self = this;
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                self.stopSyncPollers();
+            } else {
+                self.startStateSync();
+                self.startCloudStatusSync();
+                self.startCloudLockSync();
+            }
+        });
+    },
+
+    stopSyncPollers: function() {
+        if (this.pollInterval) { clearInterval(this.pollInterval); this.pollInterval = null; }
+        if (this.cloudStatusInterval) { clearInterval(this.cloudStatusInterval); this.cloudStatusInterval = null; }
+        if (this.cloudLockInterval) { clearInterval(this.cloudLockInterval); this.cloudLockInterval = null; }
     },
 
     fetchState: function() {
@@ -2206,6 +2249,7 @@ var VC = {
             if (!data.success) return;
 
             var wasLocked = self.vehicleState.locked;
+            var wasLockScope = self.vehicleState.lockScope;
 
             // Doors (lock status: 1=locked, 2=unlocked)
             if (data.doors) {
@@ -2216,15 +2260,27 @@ var VC = {
                     trunk: d.trunk || -1, hood: d.hood || -1
                 };
                 var overall = (d.overall !== undefined && d.overall !== null) ? d.overall : -1;
+                var reportedScope = d.scope
+                    || (d.source === 'ota' ? 'driver_door' : 'vehicle');
                 if (overall === 1) {
                     self.vehicleState.locked = true;
+                    self.vehicleState.lockScope = reportedScope;
+                    self.vehicleState.lockSource = d.source || null;
                 } else if (overall === 2) {
                     self.vehicleState.locked = false;
+                    self.vehicleState.lockScope = reportedScope;
+                    self.vehicleState.lockSource = d.source || null;
                 } else {
-                    // Unknown from CAN bus — keep last known state if we had one
+                    // Unknown from all vehicle sources — keep the last known
+                    // state if we had one.
                     // Only set to null if we never received a valid state
-                    if (wasLocked === null) self.vehicleState.locked = null;
-                    // else keep wasLocked (persist last known)
+                    if (wasLocked === null) {
+                        self.vehicleState.locked = null;
+                        self.vehicleState.lockScope = 'unknown';
+                        self.vehicleState.lockSource = null;
+                    } else {
+                        self.vehicleState.lockScope = wasLockScope;
+                    }
                 }
             }
 
@@ -2299,14 +2355,38 @@ var VC = {
         });
     },
 
+    startCloudStatusSync: function() {
+        var self = this;
+        this.updateCloudIndicator();
+        this.updateCloudControlAvailability();
+        this.checkCloudStatus();
+        if (this.cloudStatusInterval) clearInterval(this.cloudStatusInterval);
+        // Keep the badge and capability markers current if credentials are
+        // connected or removed from Settings while this page remains open.
+        this.cloudStatusInterval = setInterval(function() {
+            self.checkCloudStatus();
+        }, 30 * 1000);
+    },
+
     checkCloudStatus: function() {
         var self = this;
         fetch('/api/vehicle/cloud-status').then(function(resp) {
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
             return resp.json();
         }).then(function(data) {
-            self.vehicleState.cloudConfigured = data.configured && data.verified;
+            self.vehicleState.cloudConfigured = !!(data.configured && data.verified);
+            self.vehicleState.cloudState = self.vehicleState.cloudConfigured
+                ? 'connected'
+                : 'not_configured';
             self.updateCloudIndicator();
+            self.updateCloudControlAvailability();
         }).catch(function(e) {
+            // A failed probe means "status unknown", not "account gone". Clearing
+            // cloudConfigured here would lock out every cloud control for 30s on
+            // one dropped response, with valid credentials.
+            self.vehicleState.cloudState = 'unavailable';
+            self.updateCloudIndicator();
+            self.updateCloudControlAvailability();
             console.warn('[VC] Cloud status error:', e);
         });
     },
@@ -2334,20 +2414,31 @@ var VC = {
             if (!data || !data.success || !data.status) return;
             var s = data.status;
 
-            // Prefer cloud lock state when CAN bus didn't give us a valid one.
-            // CAN bus sets self.vehicleState.locked = true/false; null = no
-            // valid reading yet. We only override null — if CAN said locked
-            // or unlocked, trust it (it's a few hundred ms fresh vs MQTT's
-            // potentially-minutes-old snapshot).
-            var canIsAuthoritative = self.vehicleState.locked === true || self.vehicleState.locked === false;
-            if (!canIsAuthoritative) {
+            // A full local vehicle reading is authoritative. The Atto's OTA
+            // path exposes only the driver door, however, so a fresh full-car
+            // cloud snapshot may replace that partial reading.
+            var localIsAuthoritative =
+                    (self.vehicleState.locked === true || self.vehicleState.locked === false)
+                    && self.vehicleState.lockScope === 'vehicle';
+            // Evaluate staleness BEFORE writing: an old snapshot must not replace a
+            // fresh partial reading and get promoted to scope 'vehicle'.
+            var isStale = s.lockState === 'unknown'
+                    || s.lastMessageAge === -1
+                    || (typeof s.lastMessageAge === 'number' && s.lastMessageAge > self.STALE_RESPONSE_AGE_S);
+            var haveLocalReading =
+                    self.vehicleState.locked === true || self.vehicleState.locked === false;
+            if (!localIsAuthoritative && !(isStale && haveLocalReading)) {
                 if (s.lockState === 'locked') {
                     self.vehicleState.locked = true;
+                    self.vehicleState.lockScope = 'vehicle';
+                    self.vehicleState.lockSource = 'cloud';
                     self.updateHUD();
                     self.updateDoorIndicators();
                     self.updateTabIndicators();
                 } else if (s.lockState === 'unlocked') {
                     self.vehicleState.locked = false;
+                    self.vehicleState.lockScope = 'vehicle';
+                    self.vehicleState.lockSource = 'cloud';
                     self.updateHUD();
                     self.updateDoorIndicators();
                     self.updateTabIndicators();
@@ -2358,10 +2449,7 @@ var VC = {
             // schedule one follow-up to pick up the result of the server's
             // background REST refresh. Skipped if this is itself a follow-up
             // call (avoids loops on persistently stale data).
-            var isStale = s.lockState === 'unknown'
-                    || s.lastMessageAge === -1
-                    || (typeof s.lastMessageAge === 'number' && s.lastMessageAge > self.STALE_RESPONSE_AGE_S);
-            if (!_isFollowup && isStale && !canIsAuthoritative) {
+            if (!_isFollowup && isStale && !localIsAuthoritative) {
                 setTimeout(function() { self.requestCloudLockRefresh(true); }, self.FOLLOWUP_DELAY_MS);
             }
         }).catch(function(e) {
@@ -2375,6 +2463,7 @@ var VC = {
     // moves, this is just a heartbeat for the cold-cache case.
     startCloudLockSync: function() {
         var self = this;
+        if (this.cloudLockInterval) clearInterval(this.cloudLockInterval);
         this.cloudLockInterval = setInterval(function() {
             self.requestCloudLockRefresh();
         }, 30 * 1000);
@@ -2387,6 +2476,18 @@ var VC = {
         var dismissBtn = document.getElementById('cloudModalDismiss');
         if (dismissBtn) {
             dismissBtn.addEventListener('click', function() { self.hideCloudModal(); });
+        }
+        var statusPill = document.getElementById('cloudStatus');
+        if (statusPill) {
+            statusPill.setAttribute('role', 'button');
+            statusPill.setAttribute('tabindex', '0');
+            var explainCloud = function() {
+                if (!self.vehicleState.cloudConfigured) self.showCloudModal();
+            };
+            statusPill.addEventListener('click', explainCloud);
+            statusPill.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' || e.key === ' ') explainCloud();
+            });
         }
         // Also dismiss on overlay click (outside the modal card)
         var overlay = document.getElementById('cloudModal');
@@ -2420,32 +2521,61 @@ var VC = {
 
     // ==================== UI UPDATES ====================
 
-    updateHUD: function() {
-        var socEl = document.getElementById('socValue');
-        if (socEl) socEl.textContent = Math.round(this.vehicleState.soc) + '%';
-
-        var socFill = document.getElementById('socFill');
-        if (socFill) socFill.style.width = Math.min(100, Math.max(0, this.vehicleState.soc)) + '%';
-
-        var rangeEl = document.getElementById('rangeValue');
-        if (rangeEl) rangeEl.textContent = BYD.units.dist(this.vehicleState.rangeKm);
-
-        this.updateLockUI(this.vehicleState.locked);
+    translatedText: function(key, fallback) {
+        var value = BYD.i18n && typeof BYD.i18n.t === 'function'
+            ? BYD.i18n.t(key)
+            : null;
+        return value && value !== key ? value : fallback;
     },
 
-    updateLockUI: function(locked) {
+    // SOC / range are owned by the app-shell sidebar card (core.js polls /status
+    // and writes evPercentValue / evBatteryFill / evRange). The in-page HUD that
+    // #socValue / #socFill / #rangeValue targeted never existed on this page, so
+    // those writes were dead; only the lock UI is ours.
+    updateHUD: function() {
+        this.updateLockUI(this.vehicleState.locked, this.vehicleState.lockScope);
+    },
+
+    updateLockUI: function(locked, scope) {
         var lockBtn = document.getElementById('btnLock');
         var unlockBtn = document.getElementById('btnUnlock');
         var lockStatus = document.getElementById('lockStatus');
+        var wholeVehicleKnown = scope === 'vehicle';
 
-        // locked can be true, false, or null (unknown)
-        if (lockBtn) { if (locked === true) lockBtn.classList.add('on'); else lockBtn.classList.remove('on'); }
-        if (unlockBtn) { if (locked === false) unlockBtn.classList.add('on'); else unlockBtn.classList.remove('on'); }
+        // Do not present a driver-door-only reading as whole-car state.
+        if (lockBtn) {
+            if (locked === true && wholeVehicleKnown) lockBtn.classList.add('on');
+            else lockBtn.classList.remove('on');
+        }
+        if (unlockBtn) {
+            if (locked === false && wholeVehicleKnown) unlockBtn.classList.add('on');
+            else unlockBtn.classList.remove('on');
+        }
         if (lockStatus) {
-            lockStatus.textContent = locked === true ? BYD.i18n.t('vehicle.locked') : (locked === false ? BYD.i18n.t('vehicle.unlocked') : BYD.i18n.t('common.unknown'));
+            var label;
+            if (locked !== true && locked !== false) {
+                label = this.translatedText('common.unknown', 'Unknown');
+            } else if (scope === 'driver_door') {
+                label = locked
+                    ? this.translatedText('vehicle.driver_door_locked', 'Driver door locked')
+                    : this.translatedText('vehicle.driver_door_unlocked', 'Driver door unlocked');
+            } else {
+                label = locked
+                    ? this.translatedText('vehicle.locked', 'Locked')
+                    : this.translatedText('vehicle.unlocked', 'Unlocked');
+            }
+            lockStatus.textContent = label;
             var dot = lockStatus.previousElementSibling;
             if (dot) {
-                dot.className = 'dot ' + (locked === true ? 'green' : (locked === false ? 'amber' : 'grey'));
+                // Colour tracks the lock state; the label carries the scope. Folding
+                // partial scope onto amber made "Driver door locked" show the
+                // unlocked colour and made the two driver-door states identical.
+                var known = (locked === true || locked === false);
+                var tone = !known ? 'grey' : (locked ? 'green' : 'amber');
+                // 'partial' only decorates a KNOWN state — on grey it would just
+                // inherit the pill's text colour and read as a fourth state.
+                dot.className = 'dot compact-status-pill__dot ' + tone +
+                    (known && !wholeVehicleKnown ? ' partial' : '');
             }
         }
     },
@@ -2617,12 +2747,40 @@ var VC = {
         var pillEl = document.getElementById('cloudStatus');
         if (!pillEl) return;
         var dot = pillEl.querySelector('.dot');
-        if (this.vehicleState.cloudConfigured) {
-            if (dot) dot.className = 'dot green';
-            if (textEl) textEl.textContent = BYD.i18n.t('vehicle.cloud_connected');
+        var state = this.vehicleState.cloudState || 'checking';
+        pillEl.setAttribute('data-cloud-state', state);
+        if (state === 'connected') {
+            if (dot) dot.className = 'dot compact-status-pill__dot green';
+            if (textEl) {
+                textEl.textContent = this.translatedText(
+                    'vehicle.cloud_connected', 'BYD account connected');
+            }
+        } else if (state === 'not_configured') {
+            if (dot) dot.className = 'dot compact-status-pill__dot grey';
+            if (textEl) {
+                textEl.textContent = this.translatedText(
+                    'vehicle.cloud_not_configured', 'BYD account not connected');
+            }
+        } else if (state === 'unavailable') {
+            if (dot) dot.className = 'dot compact-status-pill__dot red';
+            if (textEl) {
+                textEl.textContent = this.translatedText(
+                    'vehicle.cloud_unavailable', 'Cloud status unavailable');
+            }
         } else {
-            if (dot) dot.className = 'dot red';
-            if (textEl) textEl.textContent = BYD.i18n.t('vehicle.cloud_not_configured');
+            if (dot) dot.className = 'dot compact-status-pill__dot amber';
+            if (textEl) {
+                textEl.textContent = this.translatedText(
+                    'vehicle.checking', 'Checking...');
+            }
+        }
+    },
+
+    updateCloudControlAvailability: function() {
+        var state = this.vehicleState.cloudState || 'checking';
+        var controls = document.querySelectorAll('[data-requires-cloud="true"]');
+        for (var i = 0; i < controls.length; i++) {
+            controls[i].setAttribute('data-cloud-state', state);
         }
     },
 
@@ -4424,40 +4582,94 @@ var VC = {
      // BYD WebView's hot path.
     _updateTyreCalloutPositions: function() { /* no-op — CSS handles it */ },
 
-    /** Map raw BYD enums + raw PSI to a 3-tier visual-state scale:
-     *    'alert'  → red     leak (airLeakState>=1) or fallback PSI < 22
-     *    'warn'   → orange  pressureState UNDER/OVER, or fallback PSI < 28 / > 50
-     *    'normal' → teal    plausible PSI with no SDK warning
+    // User-configured kPa limits from /api/vehicle/state (tyres.limits), kept
+    // in sync by updateTyreCallouts. Defaults mirror UnifiedConfigManager so
+    // the colouring is correct on the first paint, before any response lands,
+    // and if the server omits the block.
+    _tyreLimits: { frontLow: 234, frontHigh: 310, rearLow: 234, rearHigh: 310, criticalLow: 152 },
+
+    /** Map raw BYD enums + raw kPa to a 3-tier visual-state scale:
+     *    'alert'  → red     leak (airLeakState>=1) or kPa <= criticalLow
+     *    'warn'   → orange  pressureState UNDER/OVER, or kPa outside the
+     *                       configured [low, high] band for that axle
+     *    'normal' → teal    in-band reading with no SDK warning
      *    'muted'  → grey    no signal / no data
-     *  SDK warnings are authoritative, while conservative raw limits catch a
+     *  SDK warnings are authoritative, while the numeric limits catch a
      *  genuinely low/high reading even when a vehicle reports state=normal.
-     *  Manufacturer-normal pressures such as 31.9 PSI remain teal.
+     *
+     *  Compares in kPa, not PSI: kPa is what the TPMS actually reports and what
+     *  the user's limits are stored in, so the corner colour can never disagree
+     *  with the notification thresholds because of rounding.
+     *
+     *  @param corner  the per-corner object from tyres[fl|fr|rl|rr]
+     *  @param isFront true for the front axle (fl/fr), which has its own band
      */
-    _tyreStateToken: function(corner) {
+    _tyreStateToken: function(corner, isFront) {
         if (!corner || corner.available === false) return 'muted';
         if (corner.signalState === 1) return 'muted';
         if (corner.airLeakState && corner.airLeakState >= 1) return 'alert';
+        // The numeric net is evaluated BEFORE the firmware enum, and the worst
+        // of the two wins — mirroring the server's `level = max(enum, kPa)` in
+        // BydDataCollector.evaluatePressureCorner. Order matters: a genuinely
+        // deflated tyre normally ALSO trips the firmware under-pressure flag, so
+        // an enum-first early return painted the most serious case orange while
+        // the server sent a CRITICAL alert for it.
+        var lim = this._tyreLimits;
+        var low = isFront ? lim.frontLow : lim.rearLow;
+        var high = isFront ? lim.frontHigh : lim.rearHigh;
+        if (typeof corner.kPa === 'number' && corner.kPa > 0) {
+            if (corner.kPa <= lim.criticalLow) return 'alert';
+            if (corner.kPa < low || corner.kPa > high) return 'warn';
+        }
+        // In-band (or no reading): the enum can still assert a problem we can't
+        // see numerically, and it stays authoritative for that.
         if (typeof corner.pressureState === 'number'
                 && corner.pressureState >= 1) return 'warn';
-        if (typeof corner.psi === 'number') {
-            if (corner.psi < 22) return 'alert';
-            if (corner.psi < 28 || corner.psi > 50) return 'warn';
-        }
         return 'normal';
     },
 
-    _tyreStateLabel: function(corner) {
+    _tyreStateLabel: function(corner, isFront) {
         if (!corner || corner.available === false) return BYD.i18n.t('vehicle.tyre_no_data');
         if (corner.signalState === 1) return BYD.i18n.t('vehicle.tyre_no_signal');
         if (corner.airLeakState === 2) return BYD.i18n.t('vehicle.tyre_fast_leak');
         if (corner.airLeakState === 1) return BYD.i18n.t('vehicle.tyre_slow_leak');
         if (corner.pressureState === 1) return BYD.i18n.t('vehicle.tyre_low');
         if (corner.pressureState === 2) return BYD.i18n.t('vehicle.tyre_high');
+        // Firmware reports normal but the reading is outside the user's band —
+        // name the direction so the LOW/HIGH word matches the warn colour the
+        // token function just assigned. Without this the callout said "OK" in
+        // orange, which read as a UI bug.
+        //
+        // The low test must use the SAME boundary as _tyreStateToken: it treats
+        // kPa <= criticalLow as 'alert', and criticalLow is allowed to equal an
+        // axle low, so a strict `< low` here left a red corner captioned "OK" at
+        // exactly that value.
+        var lim = this._tyreLimits;
+        var low = isFront ? lim.frontLow : lim.rearLow;
+        var high = isFront ? lim.frontHigh : lim.rearHigh;
+        if (typeof corner.kPa === 'number' && corner.kPa > 0) {
+            if (corner.kPa < low || corner.kPa <= lim.criticalLow) {
+                return BYD.i18n.t('vehicle.tyre_low');
+            }
+            if (corner.kPa > high) return BYD.i18n.t('vehicle.tyre_high');
+        }
         return BYD.i18n.t('vehicle.tyre_ok');
     },
 
     updateTyreCallouts: function(tyres) {
         if (!tyres) return;
+        // Adopt the server's limits when present; otherwise keep the previous
+        // (or default) set rather than reverting mid-session.
+        if (tyres.limits) {
+            var L = tyres.limits, cur = this._tyreLimits;
+            this._tyreLimits = {
+                frontLow:    typeof L.frontLow    === 'number' ? L.frontLow    : cur.frontLow,
+                frontHigh:   typeof L.frontHigh   === 'number' ? L.frontHigh   : cur.frontHigh,
+                rearLow:     typeof L.rearLow     === 'number' ? L.rearLow     : cur.rearLow,
+                rearHigh:    typeof L.rearHigh    === 'number' ? L.rearHigh    : cur.rearHigh,
+                criticalLow: typeof L.criticalLow === 'number' ? L.criticalLow : cur.criticalLow
+            };
+        }
         var corners = ['fl', 'fr', 'rl', 'rr'];
         for (var i = 0; i < corners.length; i++) {
             var key = corners[i];
@@ -4465,8 +4677,10 @@ var VC = {
             var box = document.getElementById('tyre' + key.toUpperCase());
             if (!box) continue;
 
-            var state = this._tyreStateToken(data);
-            var label = this._tyreStateLabel(data);
+            // corners[] is [fl, fr, rl, rr] — the first two are the front axle.
+            var isFront = i < 2;
+            var state = this._tyreStateToken(data, isFront);
+            var label = this._tyreStateLabel(data, isFront);
             box.setAttribute('data-state', state);
 
             var psiEl  = box.querySelector('.vc-tyre-psi-val');

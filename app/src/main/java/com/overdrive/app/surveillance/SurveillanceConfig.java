@@ -222,6 +222,14 @@ public class SurveillanceConfig {
     // evidence instead of the brightness clauses. Higher low-light risk → separate
     // explicit opt-in. See SurveillanceEngineGpu.shouldDiscardEvent() night path.
     private boolean discardEmptyMotionAtNight = false;
+    // MOTION SALIENCE (third evidence channel). Record when the motion itself is
+    // object-grade evidence — large, compact, sustained, photometrically stable and
+    // rigidly translating — even though YOLO returned no class and the subject
+    // never held still long enough to read as a loiter. Default OFF; with it off
+    // both the native flash-filter probe and the Java trigger channel are inert.
+    // Pairs with discardEmptyBrightMotionEvents: salience supplies recall, the
+    // discard supplies precision. See SurveillanceEngineGpu's salience* fields.
+    private boolean motionSalienceEnabled = false;
     private int shadowFilterMode = 2;               // 0=OFF, 1=LIGHT, 2=NORMAL, 3=AGGRESSIVE
 
     // ========================================================================
@@ -298,6 +306,7 @@ public class SurveillanceConfig {
     public boolean isFilterDebugLogEnabled() { return filterDebugLogEnabled; }
     public boolean isDiscardEmptyBrightMotionEvents() { return discardEmptyBrightMotionEvents; }
     public boolean isDiscardEmptyMotionAtNight() { return discardEmptyMotionAtNight; }
+    public boolean isMotionSalienceEnabled() { return motionSalienceEnabled; }
     public int getShadowFilterMode() { return shadowFilterMode; }
     
     // V2 setters
@@ -319,6 +328,7 @@ public class SurveillanceConfig {
     public void setMotionHeatmapEnabled(boolean enabled) { this.motionHeatmapEnabled = enabled; }
     public void setDiscardEmptyBrightMotionEvents(boolean enabled) { this.discardEmptyBrightMotionEvents = enabled; }
     public void setDiscardEmptyMotionAtNight(boolean enabled) { this.discardEmptyMotionAtNight = enabled; }
+    public void setMotionSalienceEnabled(boolean enabled) { this.motionSalienceEnabled = enabled; }
     public void setFilterDebugLogEnabled(boolean enabled) { this.filterDebugLogEnabled = enabled; }
     public void setShadowFilterMode(int mode) { this.shadowFilterMode = Math.max(0, Math.min(3, mode)); }
     

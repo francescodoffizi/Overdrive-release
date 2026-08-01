@@ -35,6 +35,12 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
 
     private static final int BACKOFF_BASE_SECONDS = 5;
     private static final int BACKOFF_CAP_SECONDS = 300;
+    // Base for the "broker resolved but connect failed" (downstream/transient)
+    // ramp. Starts at the original fast 15s retry for a transient blip, then
+    // doubles toward BACKOFF_CAP_SECONDS so a persistently unreachable :8883
+    // backs off instead of spinning a broker-lookup + fresh TLS handshake every
+    // 15s forever (the parked-night data leak).
+    private static final int PROGRESS_BACKOFF_BASE_SECONDS = 15;
     private static final long SESSION_REFRESH_MS = 25 * 60 * 1000; // 25 min (before 30 min expiry)
     private static final long REAUTH_COOLDOWN_MS = 60 * 1000; // matches pyBYD _MQTT_REAUTH_COOLDOWN_S
 
@@ -258,14 +264,24 @@ public final class BydCloudMqttSubscriber implements MqttCallback {
 
             // Backoff strategy: if we made any forward progress (broker
             // resolved) the failure is downstream — TLS race, broker hiccup —
-            // and we should retry quickly instead of ramping into a 5-minute
-            // window. If we never resolved the broker, escalate normally.
-            // Transient service errors (1005/1008/1009) get a fixed short
-            // delay because they're an upstream BYD condition that's unlikely
-            // to clear faster on exponential ramp.
+            // and we should retry quickly at first instead of ramping straight
+            // into a 5-minute window. But it must NOT retry at a fixed 15s
+            // FOREVER: a persistently unreachable :8883 (metered/restrictive
+            // network, or BYD broker trouble) then re-does a broker-lookup HTTPS
+            // POST + a fresh TLS handshake every 15s, 24/7 while parked —
+            // ~40-70 MB/day of pure reconnect churn (each attempt builds a new
+            // MqttClient, so no TLS session reuse). Instead: count the failures
+            // and grow the delay from ~15s toward the cap so a transient blip
+            // still clears fast (first retries ≈15s) while a stuck :8883 decays
+            // to the 5-minute ceiling. Transient service errors (1005/1008/1009)
+            // share this gentle ramp for the same reason.
             if (brokerResolved || isTransientService) {
-                consecutiveFailures = 1; // reset, but keep at first-attempt
-                scheduleReconnect(15);   // 15-second fixed retry
+                consecutiveFailures++;
+                // 15s, 30s, 60s, 120s, 240s, capped at BACKOFF_CAP_SECONDS.
+                long delay = Math.min(
+                        PROGRESS_BACKOFF_BASE_SECONDS * (1L << Math.min(consecutiveFailures - 1, 10)),
+                        BACKOFF_CAP_SECONDS);
+                scheduleReconnect(delay);
             } else {
                 consecutiveFailures++;
                 scheduleReconnect(0); // 0 = compute from consecutiveFailures

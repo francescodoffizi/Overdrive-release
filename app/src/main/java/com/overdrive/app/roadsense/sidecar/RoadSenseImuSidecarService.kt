@@ -148,8 +148,24 @@ class RoadSenseImuSidecarService : Service(), SensorEventListener {
             ImuRate.FAST -> SensorManager.SENSOR_DELAY_FASTEST   // ~100 Hz (F-005)
             ImuRate.SLOW -> SensorManager.SENSOR_DELAY_NORMAL    // relaxed, ~5 Hz
         }
-        accel?.let { sm.registerListener(this, it, delay, ioHandler) }
-        gyro?.let { sm.registerListener(this, it, delay, ioHandler) }
+        // Hardware FIFO batching (FAST only): ask the sensor hub to buffer up to
+        // ~TARGET_BATCH_MS of samples and wake the AP once per window instead of
+        // per sample. At 100 Hz × 2 sensors this cuts AP wakeups from ~200/s to
+        // ~10/s with ZERO detection impact — every SensorEvent still carries its
+        // own hardware timestamp (see wallClockFromElapsed), and the daemon
+        // reassembles by that timestamp, so batched delivery is indistinguishable
+        // downstream. End-to-end latency is unchanged: the software flush window
+        // (TARGET_BATCH_MS) already delayed shipping by the same amount. If the
+        // sensor has no hardware FIFO, Android silently falls back to per-sample
+        // delivery — strictly no worse than before. SLOW keeps latency 0 (it is
+        // already low-rate, so batching would buffer ~1 sample). The batch is also
+        // hard-capped by MAX_SAMPLES_PER_FRAME in onSensorChanged.
+        val maxReportLatencyUs = when (rate) {
+            ImuRate.FAST -> (ImuFrameCodec.TARGET_BATCH_MS * 1000L).toInt()
+            ImuRate.SLOW -> 0
+        }
+        accel?.let { sm.registerListener(this, it, delay, maxReportLatencyUs, ioHandler) }
+        gyro?.let { sm.registerListener(this, it, delay, maxReportLatencyUs, ioHandler) }
         registeredRate = rate
         Log.i(TAG, "IMU sidecar registered: accel=${accel?.name} gyro=${gyro?.name} rate=$rate")
     }

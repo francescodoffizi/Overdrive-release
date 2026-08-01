@@ -58,7 +58,7 @@
             : __OT_ALL_TABS;
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="manifest" href="/manifest.json">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
@@ -264,6 +264,73 @@
         .empty-state {
             padding: 24px 16px; text-align: center;
             color: var(--text-secondary); font-size: 13px;
+        }
+
+        /* ============================================================
+           TYRE PRESSURE LIMITS
+           Numeric min/max entry per axle. Reuses the .notif-row grid so the
+           card lines up with the LHD/RHD picker directly above it. The two
+           inputs sit in a fixed-width group on the row's right edge, where
+           every other row in this page puts its control.
+           ============================================================ */
+        .notif-range {
+            display: flex; align-items: center; gap: 6px;
+            flex-shrink: 0;
+        }
+        .notif-num {
+            width: 68px; height: 34px;
+            padding: 0 8px;
+            border: 1px solid var(--border-default);
+            border-radius: 8px;
+            background: var(--bg-base);
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px; text-align: center;
+            /* Chrome 58 in the head-unit WebView still paints spinners on
+               number inputs; they'd overlap the 68px field. */
+            -moz-appearance: textfield;
+        }
+        .notif-num::-webkit-outer-spin-button,
+        .notif-num::-webkit-inner-spin-button {
+            -webkit-appearance: none; margin: 0;
+        }
+        .notif-num:focus {
+            outline: none;
+            border-color: #00E5FF;
+            box-shadow: 0 0 0 2px rgba(0,229,255,0.18);
+        }
+        /* Server rejected the value, or it fails the local sanity check. */
+        .notif-num.invalid {
+            border-color: #FF6B6B;
+            box-shadow: 0 0 0 2px rgba(255,107,107,0.18);
+        }
+        .notif-range-sep { color: var(--text-muted); font-size: 12px; }
+        .notif-num-unit {
+            color: var(--text-muted); font-size: 11px;
+            width: 26px; text-align: left;
+        }
+        /* Live PSI echo under each axle label, so a user thinking in PSI can
+           sanity-check a kPa entry without leaving the page. */
+        .notif-row-conv {
+            font-size: 11px; color: var(--text-muted);
+            margin-top: 3px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .notif-card-actions {
+            display: flex; justify-content: flex-end; gap: 10px;
+            align-items: center; flex-wrap: wrap;
+            padding: 14px 16px;
+        }
+        .notif-card-actions .notif-hint {
+            font-size: 12px; color: var(--text-muted);
+            margin-right: auto; max-width: 60%;
+        }
+        @media (max-width: 520px) {
+            /* Stack the control under the label so the two inputs keep their
+               tap targets on the narrow head-unit portrait layout. */
+            #tyreLimitsCard .notif-row { flex-wrap: wrap; }
+            #tyreLimitsCard .notif-row-text { padding-right: 0; }
+            #tyreLimitsCard .notif-range { margin-top: 10px; }
         }
 
         /* ============================================================
@@ -751,6 +818,69 @@
                         </div>
                     </div>
 
+                    <!-- ===== Tyre pressure limits =====
+                         Also cross-cuts every tab (same reasoning as the
+                         vehicle-layout picker above): these limits drive BOTH
+                         delivery channels plus the Vehicle Control corner
+                         colouring, so they don't belong to the push or the
+                         Telegram tab. Saves to /api/tyres/limits, which
+                         persists the `tyres` section of the unified config.
+                         Values are kPa — the unit the BYD TPMS reports — so
+                         the comparison path never rounds. -->
+                    <div class="notif-section" id="tyreLimitsSection">
+                        <h2 id="tyreLimitsHeading" data-i18n="notif.tyre_limits">Tyre pressure limits</h2>
+                        <p class="notif-section-sub" data-i18n="notif.tyre_limits_sub">Set the normal pressure range for each axle. A tyre below the minimum or above the maximum raises a warning; below the critical value it raises a deflated-tyre alert. Used for push and Telegram notifications and for the corner colours in Vehicle Control. Defaults suit stock tyres — change them if your placard pressures differ.</p>
+                        <div class="notif-card" id="tyreLimitsCard">
+                            <div class="notif-row">
+                                <div class="notif-row-text">
+                                    <div class="notif-row-label" data-i18n="notif.tyre_front">Front axle</div>
+                                    <div class="notif-row-note" data-i18n="notif.tyre_axle_note">Normal range — minimum and maximum.</div>
+                                    <div class="notif-row-conv" id="tyreFrontConv">&nbsp;</div>
+                                </div>
+                                <div class="notif-range">
+                                    <input class="notif-num" id="tyreFrontLow" type="number" inputmode="numeric"
+                                           min="80" max="600" step="1" aria-label="Front minimum pressure in kPa">
+                                    <span class="notif-range-sep">–</span>
+                                    <input class="notif-num" id="tyreFrontHigh" type="number" inputmode="numeric"
+                                           min="80" max="600" step="1" aria-label="Front maximum pressure in kPa">
+                                    <span class="notif-num-unit">kPa</span>
+                                </div>
+                            </div>
+                            <div class="notif-row">
+                                <div class="notif-row-text">
+                                    <div class="notif-row-label" data-i18n="notif.tyre_rear">Rear axle</div>
+                                    <div class="notif-row-note" data-i18n="notif.tyre_axle_note">Normal range — minimum and maximum.</div>
+                                    <div class="notif-row-conv" id="tyreRearConv">&nbsp;</div>
+                                </div>
+                                <div class="notif-range">
+                                    <input class="notif-num" id="tyreRearLow" type="number" inputmode="numeric"
+                                           min="80" max="600" step="1" aria-label="Rear minimum pressure in kPa">
+                                    <span class="notif-range-sep">–</span>
+                                    <input class="notif-num" id="tyreRearHigh" type="number" inputmode="numeric"
+                                           min="80" max="600" step="1" aria-label="Rear maximum pressure in kPa">
+                                    <span class="notif-num-unit">kPa</span>
+                                </div>
+                            </div>
+                            <div class="notif-row">
+                                <div class="notif-row-text">
+                                    <div class="notif-row-label" data-i18n="notif.tyre_critical">Critical (deflated)</div>
+                                    <div class="notif-row-note" data-i18n="notif.tyre_critical_note">At or below this, the alert is escalated to critical. Applies to all four tyres and cannot exceed either axle minimum.</div>
+                                    <div class="notif-row-conv" id="tyreCriticalConv">&nbsp;</div>
+                                </div>
+                                <div class="notif-range">
+                                    <input class="notif-num" id="tyreCriticalLow" type="number" inputmode="numeric"
+                                           min="80" max="600" step="1" aria-label="Critical low pressure in kPa">
+                                    <span class="notif-num-unit">kPa</span>
+                                </div>
+                            </div>
+                            <div class="notif-card-actions">
+                                <span class="notif-hint" id="tyreLimitsHint"></span>
+                                <button class="notif-btn" id="tyreLimitsReset" data-i18n="notif.tyre_reset">Reset to defaults</button>
+                                <button class="notif-btn" id="tyreLimitsSave" data-i18n="common.save">Save</button>
+                            </div>
+                        </div>
+                    </div>
+
 
                     <div class="notif-section" id="permissionSection" data-tab="push">
                         <h2 data-i18n="notif.push_delivery">Push delivery</h2>
@@ -928,6 +1058,22 @@
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
+                            <!-- Tyre pressure gets its own toggle, matching the
+                                 per-category control Web Push already has.
+                                 Previously the only way to silence tyre alerts
+                                 on Telegram was to turn off Critical alerts,
+                                 which also killed charging faults, proximity
+                                 and battery-health messages. -->
+                            <div class="notif-row">
+                                <div class="notif-row-text">
+                                    <div class="notif-row-label" data-i18n="telegram.tyre_alerts">Tyre pressure alerts</div>
+                                    <div class="notif-row-note" data-i18n="telegram.tyre_alerts_desc">Send a Telegram message when a tyre goes outside your configured pressure range, or when the TPMS reports a leak. Uses the limits set under Tyre pressure limits.</div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="tgPrefTyreAlerts" onchange="TelegramPrefs.save()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
                         </div>
                     </div>
 
@@ -995,13 +1141,13 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
     <!-- surveillance.js owns the SurvSettings module that backs the Telegram
          tier toggles. We load it here so the v2TelegramSendStartPing /
          v2TelegramTierGroup controls hooked into surveillance.js wiring
          keep firing without a per-page bridge. -->
-    <script src="../shared/surveillance.js?v=index1"></script>
+    <script src="../shared/surveillance.js?v=survfix1"></script>
     <script src="../shared/notif-log.js?v=3"></script>
     <script>
         function toggleSidebar() {
@@ -1047,6 +1193,9 @@
                 // config section as model + body color, so it goes through
                 // /api/models/selected.
                 if (window.DriveSidePicker) DriveSidePicker.load();
+                // Tyre pressure limits — own section of the unified config,
+                // read by the notification path and Vehicle Control alike.
+                if (window.TyreLimits) TyreLimits.load();
                 // Paint-drop guard for the toggle sliders is now done inside
                 // each save handler (TelegramPrefs.save and SurvSettings._
                 // persistTelegramFields), where the authoritative state is
@@ -1081,7 +1230,7 @@
             // visual state always matches what we just sent / what we're
             // reverting to.
             function _repaint(state) {
-                var ids = ['tgPrefCriticalAlerts','tgPrefConnectivity','tgPrefMotionText','tgPrefVideoUploads'];
+                var ids = ['tgPrefCriticalAlerts','tgPrefConnectivity','tgPrefMotionText','tgPrefVideoUploads','tgPrefTyreAlerts'];
                 ids.forEach(function (id) {
                     if (!(id in state)) return;
                     var el = $(id); if (!el) return;
@@ -1108,7 +1257,11 @@
                             tgPrefCriticalAlerts: s.criticalAlerts !== false,
                             tgPrefConnectivity:   !!s.connectivityUpdates,
                             tgPrefMotionText:     s.motionText !== false,
-                            tgPrefVideoUploads:   !!s.videoUploads
+                            tgPrefVideoUploads:   !!s.videoUploads,
+                            // Default ON (matches UnifiedTelegramConfig), so an
+                            // older daemon that omits the field doesn't paint
+                            // the toggle off and imply alerts are disabled.
+                            tgPrefTyreAlerts:     s.tyreAlerts !== false
                         });
                     })
                     .catch(function () { /* status endpoint unreachable — leave defaults */ });
@@ -1121,13 +1274,15 @@
                     tgPrefCriticalAlerts: $('tgPrefCriticalAlerts') && $('tgPrefCriticalAlerts').checked,
                     tgPrefConnectivity:   $('tgPrefConnectivity')   && $('tgPrefConnectivity').checked,
                     tgPrefMotionText:     $('tgPrefMotionText')     && $('tgPrefMotionText').checked,
-                    tgPrefVideoUploads:   $('tgPrefVideoUploads')   && $('tgPrefVideoUploads').checked
+                    tgPrefVideoUploads:   $('tgPrefVideoUploads')   && $('tgPrefVideoUploads').checked,
+                    tgPrefTyreAlerts:     $('tgPrefTyreAlerts')     && $('tgPrefTyreAlerts').checked
                 };
                 var body = {
                     criticalAlerts:      pending.tgPrefCriticalAlerts,
                     connectivityUpdates: pending.tgPrefConnectivity,
                     motionText:          pending.tgPrefMotionText,
-                    videoUploads:        pending.tgPrefVideoUploads
+                    videoUploads:        pending.tgPrefVideoUploads,
+                    tyreAlerts:          pending.tgPrefTyreAlerts
                 };
                 fetch('/api/telegram/preferences', {
                     method: 'POST',
@@ -1359,6 +1514,256 @@
                 });
             });
             return { load: load, pick: pick };
+        }());
+
+        // ===== Tyre pressure limits =====
+        // Five kPa integers (per-axle min/max + a shared critical floor) over
+        // /api/tyres/limits. Explicit Save rather than save-on-change: these
+        // are four interdependent numbers, and persisting a half-typed value
+        // would briefly arm a nonsense threshold on the notification path.
+        // The server clamps and enforces the invariants too — this module
+        // validates locally only to give immediate feedback.
+        window.TyreLimits = (function () {
+            'use strict';
+            var MIN = 80, MAX = 600;
+            var DEFAULTS = {
+                frontLow: 234, frontHigh: 310,
+                rearLow: 234, rearHigh: 310,
+                criticalLow: 152
+            };
+            var FIELDS = {
+                frontLow: 'tyreFrontLow', frontHigh: 'tyreFrontHigh',
+                rearLow: 'tyreRearLow', rearHigh: 'tyreRearHigh',
+                criticalLow: 'tyreCriticalLow'
+            };
+            var inFlight = false;
+            function $(id) { return document.getElementById(id); }
+            // vars are passed through to BYD.i18n.t for {name} interpolation, and
+            // applied to the fallback too so the English text stays correct when
+            // the catalog hasn't loaded.
+            function tr(k, fb, vars) {
+                var v = (window.BYD && BYD.i18n && BYD.i18n.t) ? BYD.i18n.t(k, vars) : null;
+                var s = v || fb || k;
+                if (vars) {
+                    for (var name in vars) {
+                        if (!vars.hasOwnProperty(name)) continue;
+                        s = s.replace('{' + name + '}', vars[name]);
+                    }
+                }
+                return s;
+            }
+            function toast(msg, kind) {
+                if (window.BYD && BYD.utils && BYD.utils.toast) BYD.utils.toast(msg, kind || 'info');
+            }
+            function psi(kPa) { return (kPa * 0.1450377).toFixed(1); }
+
+            function paint(vals) {
+                for (var key in FIELDS) {
+                    if (!FIELDS.hasOwnProperty(key)) continue;
+                    var el = $(FIELDS[key]);
+                    if (el && typeof vals[key] === 'number') el.value = vals[key];
+                }
+                paintConversions();
+            }
+
+            // Echo the entered kPa as PSI so a user working from a PSI placard
+            // can verify the numbers without converting by hand. Reads the
+            // live inputs (not the saved state) so it tracks typing.
+            function paintConversions() {
+                var v = readInputs();
+                var f = $('tyreFrontConv'), r = $('tyreRearConv'), c = $('tyreCriticalConv');
+                if (f) f.textContent = (v.frontLow !== null && v.frontHigh !== null)
+                    ? psi(v.frontLow) + ' – ' + psi(v.frontHigh) + ' PSI' : ' ';
+                if (r) r.textContent = (v.rearLow !== null && v.rearHigh !== null)
+                    ? psi(v.rearLow) + ' – ' + psi(v.rearHigh) + ' PSI' : ' ';
+                if (c) c.textContent = (v.criticalLow !== null)
+                    ? psi(v.criticalLow) + ' PSI' : ' ';
+            }
+
+            // null for a blank / non-integer field so validate() can tell
+            // "empty" from a real 0.
+            function readInputs() {
+                var out = {};
+                for (var key in FIELDS) {
+                    if (!FIELDS.hasOwnProperty(key)) continue;
+                    var el = $(FIELDS[key]);
+                    var raw = el ? el.value.trim() : '';
+                    var n = /^-?\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
+                    out[key] = isNaN(n) ? null : n;
+                }
+                return out;
+            }
+
+            function mark(key, bad) {
+                var el = $(FIELDS[key]);
+                if (!el) return;
+                if (bad) el.classList.add('invalid');
+                else el.classList.remove('invalid');
+            }
+
+            /** @return an error string, or null when the values are usable. */
+            function validate(v) {
+                var err = null;
+                for (var key in FIELDS) {
+                    if (!FIELDS.hasOwnProperty(key)) continue;
+                    var bad = v[key] === null || v[key] < MIN || v[key] > MAX;
+                    mark(key, bad);
+                    if (bad && !err) {
+                        // Bounds are interpolated, not baked into the string, so
+                        // retuning MIN/MAX can't leave every locale quoting stale
+                        // numbers (the server's equivalent message is already
+                        // placeholder-driven).
+                        err = tr('notif.tyre_err_range',
+                                 'Enter a whole number between {min} and {max} kPa.',
+                                 { min: MIN, max: MAX });
+                    }
+                }
+                if (err) return err;
+                // Crossed pairs would invert the comparison and either alert
+                // constantly or never.
+                if (v.frontHigh <= v.frontLow) {
+                    mark('frontLow', true); mark('frontHigh', true);
+                    return tr('notif.tyre_err_order', 'The maximum must be higher than the minimum.');
+                }
+                if (v.rearHigh <= v.rearLow) {
+                    mark('rearLow', true); mark('rearHigh', true);
+                    return tr('notif.tyre_err_order', 'The maximum must be higher than the minimum.');
+                }
+                // A critical floor above an axle minimum makes the warning band
+                // unreachable for that axle.
+                if (v.criticalLow > Math.min(v.frontLow, v.rearLow)) {
+                    mark('criticalLow', true);
+                    return tr('notif.tyre_err_critical', 'The critical value must not exceed either axle minimum.');
+                }
+                return null;
+            }
+
+            // Re-run validation on every keystroke and repaint ALL five rings from
+            // the result. Clearing only the edited field's ring (the previous
+            // approach) left its partner stuck red after a cross-field failure:
+            // "max must be higher than min" marks BOTH inputs, so fixing the min
+            // cleared the min but left a now-perfectly-valid max ringed until the
+            // next Save. Rings are only ever CLEARED here, never newly shown —
+            // showing errors mid-typing would flag every half-entered number.
+            function reflectValidity() {
+                var v = readInputs();
+                var before = {};
+                var key;
+                for (key in FIELDS) {
+                    if (!FIELDS.hasOwnProperty(key)) continue;
+                    var el = $(FIELDS[key]);
+                    before[key] = !!(el && el.className.indexOf('invalid') >= 0);
+                }
+                // validate() repaints every ring as a side effect; capture whether
+                // anything was already flagged so we can avoid introducing new
+                // rings for fields the user hasn't finished typing.
+                validate(v);
+                for (key in FIELDS) {
+                    if (!FIELDS.hasOwnProperty(key)) continue;
+                    if (!before[key]) mark(key, false);
+                }
+            }
+
+            function setBusy(busy) {
+                inFlight = busy;
+                var save = $('tyreLimitsSave'), reset = $('tyreLimitsReset');
+                if (save) save.classList.toggle('disabled', busy);
+                if (reset) reset.classList.toggle('disabled', busy);
+            }
+
+            function load() {
+                // Paint the defaults first so the fields are never empty during
+                // the fetch — an empty numeric field reads as "unset", which
+                // would be wrong (a limit is always in force).
+                paint(DEFAULTS);
+                var fetcher = (typeof BYDAuth !== 'undefined' && BYDAuth.fetch)
+                    ? BYDAuth.fetch.bind(BYDAuth) : fetch;
+                fetcher('/api/tyres/limits', { cache: 'no-store' })
+                    .then(function (r) { return r.ok ? r.json() : null; })
+                    .then(function (j) {
+                        if (j && j.limits) paint(j.limits);
+                    })
+                    .catch(function () {
+                        // Leave the defaults painted and say so, rather than
+                        // implying these are the persisted values.
+                        var hint = $('tyreLimitsHint');
+                        if (hint) hint.textContent =
+                            tr('notif.tyre_load_failed', 'Could not load saved limits — showing defaults.');
+                    });
+            }
+
+            function save() {
+                if (inFlight) return;
+                var v = readInputs();
+                var err = validate(v);
+                var hint = $('tyreLimitsHint');
+                if (err) {
+                    if (hint) hint.textContent = err;
+                    toast(err, 'error');
+                    return;
+                }
+                if (hint) hint.textContent = '';
+                setBusy(true);
+                var fetcher = (typeof BYDAuth !== 'undefined' && BYDAuth.fetch)
+                    ? BYDAuth.fetch.bind(BYDAuth) : fetch;
+                fetcher('/api/tyres/limits', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(v)
+                }).then(function (r) {
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.json();
+                }).then(function (data) {
+                    setBusy(false);
+                    if (!data || data.success === false || data.ok === false) {
+                        var m = (data && data.error)
+                            ? data.error
+                            : tr('notif.tyre_save_failed', 'Could not save tyre limits');
+                        if (hint) hint.textContent = m;
+                        toast(m, 'error');
+                        return;
+                    }
+                    // Repaint from the server's echo: it clamps, so the stored
+                    // value can legitimately differ from what was typed and the
+                    // user should see what actually took effect.
+                    if (data.limits) paint(data.limits);
+                    toast(tr('notif.tyre_saved', 'Tyre limits saved'), 'success');
+                }).catch(function () {
+                    setBusy(false);
+                    var m = tr('notif.tyre_save_failed', 'Could not save tyre limits');
+                    if (hint) hint.textContent = m;
+                    toast(m, 'error');
+                });
+            }
+
+            // Repopulate the fields with the shipped defaults. Deliberately
+            // does NOT persist — the user still has to press Save, so a
+            // mis-tap is recoverable by navigating away.
+            function reset() {
+                if (inFlight) return;
+                paint(DEFAULTS);
+                for (var key in FIELDS) {
+                    if (FIELDS.hasOwnProperty(key)) mark(key, false);
+                }
+                var hint = $('tyreLimitsHint');
+                if (hint) hint.textContent =
+                    tr('notif.tyre_reset_hint', 'Defaults restored — press Save to apply.');
+            }
+
+            document.addEventListener('DOMContentLoaded', function () {
+                var save_ = $('tyreLimitsSave'), reset_ = $('tyreLimitsReset');
+                if (save_) save_.addEventListener('click', save);
+                if (reset_) reset_.addEventListener('click', reset);
+                for (var key in FIELDS) {
+                    if (!FIELDS.hasOwnProperty(key)) continue;
+                    var el = $(FIELDS[key]);
+                    if (!el) continue;
+                    el.addEventListener('input', paintConversions);
+                    el.addEventListener('input', reflectValidity);
+                }
+            });
+
+            return { load: load, save: save, reset: reset };
         }());
 
         // ==================== ORIGIN GATE ====================
@@ -2089,12 +2494,16 @@
         // The Log tab reads persisted history via NOTIFLOG (notif-log.js). Two
         // hooks: (1) lazy-load the log the first time the tab becomes active so
         // the page's first paint stays cheap; (2) hide the always-visible
-        // Vehicle-layout picker while the Log tab is active (it's untagged so
-        // app-tabs keeps it on every tab otherwise). Also refresh the log's
-        // relative timestamps whenever the user returns to it.
+        // Vehicle-layout picker and Tyre-limits card while the Log tab is
+        // active (both are untagged so app-tabs keeps them on every tab
+        // otherwise). Also refresh the log's relative timestamps whenever the
+        // user returns to it.
         function nlSyncChrome(activeId) {
-            var drive = document.getElementById('driveSideSection');
-            if (drive) drive.style.display = (activeId === 'log') ? 'none' : '';
+            var hideOnLog = ['driveSideSection', 'tyreLimitsSection'];
+            for (var i = 0; i < hideOnLog.length; i++) {
+                var el = document.getElementById(hideOnLog[i]);
+                if (el) el.style.display = (activeId === 'log') ? 'none' : '';
+            }
             if (activeId === 'log' && window.NOTIFLOG) {
                 if (!NOTIFLOG.loaded) NOTIFLOG.ensureLoaded();
                 else NOTIFLOG.load();

@@ -49,7 +49,15 @@ public class DeterrentActivity extends Activity {
     private static final long ABSOLUTE_MAX_MS = 60_000;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    /** When THIS instance was created. Fixed for the instance's lifetime; used only for the
+     *  startup grace window (see shouldFinishNow), which must not be re-openable. */
     private long createdAtMs = 0;
+    /** Anchor for {@link #ABSOLUTE_MAX_MS}. Re-anchored on each daemon re-launch
+     *  ({@link #onNewIntent}) so the ceiling means "60s per deterrent" rather than "60s per
+     *  Activity instance" — a surviving instance would otherwise carry its elapsed time into
+     *  the next fire and self-finish seconds in, dropping touch capture while the daemon's
+     *  layer stayed up. Separate from {@link #createdAtMs} on purpose. */
+    private long deterrentStartedAtMs = 0;
     private boolean finishing = false;
     /** Tracks consecutive UCM read failures so a corrupted config doesn't
      *  keep us alive for the full 60s ABSOLUTE_MAX_MS. */
@@ -76,6 +84,7 @@ public class DeterrentActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         createdAtMs = System.currentTimeMillis();
+        deterrentStartedAtMs = createdAtMs;
 
         // Best-effort flags. Most of these are noise during ACC-off because
         // BYD's compositor ignores us anyway, but they cost nothing and help
@@ -111,8 +120,18 @@ public class DeterrentActivity extends Activity {
     @Override
     protected void onNewIntent(android.content.Intent intent) {
         super.onNewIntent(intent);
-        // Re-launched by daemon during sustained motion. Do nothing — the
-        // deadline poll already handles "stay up while motion fires".
+        // Re-launched by the daemon during sustained motion. The deadline poll already keeps us
+        // up, so there is nothing to restart — but re-anchor the ABSOLUTE_MAX_MS bound so it
+        // means "60s per deterrent", not "60s per Activity instance". Without this a surviving
+        // instance carried its elapsed time into the next fire and self-finished seconds in,
+        // dropping touch capture while the daemon's layer stayed up (screen covered, taps
+        // passing through). This does not weaken the ceiling: it guards a stuck deadline with a
+        // dead/wedged daemon, and a dead daemon issues no re-launch, so nothing re-anchors.
+        // createdAtMs is deliberately NOT touched — the startup grace window must stay closed
+        // (publishGate has already written a real deadline by now). Main thread, same as the
+        // poll, so no race.
+        deterrentStartedAtMs = System.currentTimeMillis();
+        consecutiveReadFailures = 0;
     }
 
     private void applyImmersive() {
@@ -146,7 +165,7 @@ public class DeterrentActivity extends Activity {
 
     private boolean shouldFinishNow() {
         long now = System.currentTimeMillis();
-        if (now - createdAtMs > ABSOLUTE_MAX_MS) return true;
+        if (now - deterrentStartedAtMs > ABSOLUTE_MAX_MS) return true;
         try {
             JSONObject s = UnifiedConfigManager.forceReload().optJSONObject("surveillance");
             consecutiveReadFailures = 0;

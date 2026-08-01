@@ -181,8 +181,15 @@ public class AccSentryDaemon {
     
     // Magic config IDs from BYD malware analysis (C1310c class)
     // These control the BCM's peripheral power rail behavior
-    private static final int SPECIAL_CONFIG_REMOTE_POWER_MODE = 782237711;  // Keeps 5V rails active
-    private static final int SPECIAL_CONFIG_DATA_MODULE_POWER = 782237728;  // Keeps Modem/USB active
+    // Per the DiCarServer feature catalog (dev/byd-property-bus/dicarserver_feature_catalog.txt)
+    // these two are the vehicle's own SENTRY-MODE flags, not power-rail holds:
+    //   782237711 = 0x2EA0000F SPECIAL_LOCAL_CTL_ENTER_SENTRY_MODE_SET
+    //   782237728 = 0x2EA00020 SPECIAL_SENTRY_MODE_SET
+    // The names below are kept (widely referenced) but the trailing comments are corrected:
+    // holding sentry mode is what stops the MCU cutting the 5V/modem rails, which is why the
+    // effect reads as a rail hold. Values unchanged.
+    private static final int SPECIAL_CONFIG_REMOTE_POWER_MODE = 782237711;  // 0x2EA0000F enter sentry mode
+    private static final int SPECIAL_CONFIG_DATA_MODULE_POWER = 782237728;  // 0x2EA00020 sentry-mode state
     
     /**
      * Get or create the cached BYDAutoPowerDevice instance.
@@ -202,23 +209,103 @@ public class AccSentryDaemon {
     }
     
     /**
+     * Candidate FQNs for BYDAutoSpecialDevice, probed in order.
+     *
+     * <p>TWO PACKAGES EXIST IN THE WILD. The Escort reference app
+     * (com.yrdata.escort_auto, flavor bydSofaPro) imports the BARE
+     * {@code android.hardware.special.BYDAutoSpecialDevice} — confirmed in its
+     * raw dex string table, not just a decompiler artifact:
+     * <pre>
+     *   classes2.dex:  /Landroid/hardware/special/BYDAutoSpecialDevice;
+     * </pre>
+     * Corroborating: the BYD SDK javadoc bundled in this repo under {@code doc/}
+     * lists 20 {@code android.hardware.bydauto.*} packages and NO {@code special}
+     * one — consistent with the class living outside the {@code bydauto} subtree.
+     *
+     * <p>We previously hardcoded ONLY the {@code .bydauto.special.} variant. When
+     * that FQN is absent, {@code Class.forName} throws, this resolver returns null,
+     * and EVERY {@link #setSpecialConfig} write becomes a silent no-op — which
+     * silently disabled the esco sentry keep-alive pair (1901/1902) AND the OEM 409
+     * camera/ISP power vote on any trim using the bare package. That is exactly the
+     * "pano cameras unreachable with ACC off" symptom: the AVM/ISP rail is never
+     * actually held, so post-ACC-OFF AVMCamera frames come back all-zero.
+     *
+     * <p>The previously-working FQN is tried FIRST, so any unit that resolved before
+     * resolves identically now (same class, same instance, zero behaviour change).
+     *
+     * <p><b>The bare fallback is gated to DiLink 4.</b> It would be wrong to call the
+     * extra candidate "strictly additive because the old path already returned null":
+     * {@link #setSpecialConfig} is also reached from the FLEET-WIDE writes in
+     * {@link #configurePeripheralPower} (782237711 / 782237728) and
+     * {@link #applySentryIspPowerVote} (the 409 pair), which run on every variant. On
+     * a legacy trim that ships only the bare class, all of those are currently inert
+     * no-ops; making them start landing would newly drive BCM peripheral-power and
+     * camera/ISP flags on hardware they have never been exercised against. Gating
+     * keeps the legacy write set byte-identical while DiLink 4 gets the real device.
+     */
+    private static final String[] SPECIAL_DEVICE_CLASS_CANDIDATES = {
+        // Tried first: preserves bit-exact behaviour on every trim that already
+        // resolved this class (the 90% legacy fleet).
+        "android.hardware.bydauto.special.BYDAutoSpecialDevice",
+        // Escort/DiLink4 reality — verified in raw dex (see above). DiLink 4 ONLY.
+        "android.hardware.special.BYDAutoSpecialDevice",
+    };
+
+    /** Number of leading {@link #SPECIAL_DEVICE_CLASS_CANDIDATES} probed on non-dilink4. */
+    private static final int SPECIAL_DEVICE_LEGACY_CANDIDATE_COUNT = 1;
+
+    /**
      * Get the BYDAutoSpecialDevice instance via reflection.
      * This device controls hidden BCM configuration for peripheral power.
+     *
+     * <p>Probes {@link #SPECIAL_DEVICE_CLASS_CANDIDATES} in order and caches the
+     * first FQN whose {@code getInstance(Context)} returns non-null. Logs which
+     * FQN won so a field log tells us unambiguously whether the rail writes are
+     * landing at all — previously the failure was a single easy-to-miss line and
+     * every downstream write no-oped in silence.
      */
     private static Object getSpecialDevice() {
         if (cachedSpecialDevice != null) return cachedSpecialDevice;
         if (appContext == null) return null;
-        
+
+        Context permissiveContext;
         try {
-            Context permissiveContext = new PermissionBypassContext(appContext);
-            Class<?> clazz = Class.forName("android.hardware.bydauto.special.BYDAutoSpecialDevice");
-            Method getInstance = clazz.getMethod("getInstance", Context.class);
-            cachedSpecialDevice = getInstance.invoke(null, permissiveContext);
-            log("BYDAutoSpecialDevice acquired");
-        } catch (Exception e) {
-            log("Failed to get BYDAutoSpecialDevice: " + e.getMessage());
+            permissiveContext = new PermissionBypassContext(appContext);
+        } catch (Throwable t) {
+            log("Failed to wrap context for BYDAutoSpecialDevice: " + t.getMessage());
+            return null;
         }
-        return cachedSpecialDevice;
+
+        // Non-dilink4 probes ONLY the historically-resolved FQN so its write set is
+        // byte-identical to before this change (see SPECIAL_DEVICE_CLASS_CANDIDATES).
+        int limit = isDilink4CameraMode()
+                ? SPECIAL_DEVICE_CLASS_CANDIDATES.length
+                : SPECIAL_DEVICE_LEGACY_CANDIDATE_COUNT;
+        for (int i = 0; i < limit; i++) {
+            String fqn = SPECIAL_DEVICE_CLASS_CANDIDATES[i];
+            try {
+                Class<?> clazz = Class.forName(fqn);
+                Method getInstance = clazz.getMethod("getInstance", Context.class);
+                Object device = getInstance.invoke(null, permissiveContext);
+                if (device == null) {
+                    log("BYDAutoSpecialDevice [" + fqn + "] getInstance returned null — trying next");
+                    continue;
+                }
+                cachedSpecialDevice = device;
+                log("BYDAutoSpecialDevice acquired via " + fqn);
+                return cachedSpecialDevice;
+            } catch (ClassNotFoundException e) {
+                log("BYDAutoSpecialDevice [" + fqn + "] not present — trying next");
+            } catch (Exception e) {
+                log("BYDAutoSpecialDevice [" + fqn + "] resolve failed: " + e.getMessage());
+            }
+        }
+        // Every probed candidate failed: all setSpecialConfig writes will no-op.
+        // Log loudly — this is the difference between "sentry keep-alive armed"
+        // and "silently doing nothing all night".
+        log("ERROR: BYDAutoSpecialDevice unavailable (" + limit + " candidate(s) probed) — "
+            + "sentry keep-alive (1901/1902) and 409 ISP vote will NOT be applied");
+        return null;
     }
     
     /**
@@ -256,9 +343,21 @@ public class AccSentryDaemon {
             Class<?> deviceClass = device.getClass();
             Method setMethod = deviceClass.getMethod("set", int[].class, valueClass);
             int[] ids = { configId };
-            setMethod.invoke(device, ids, valueObj);
-            
-            log("Special Config [" + configId + "] set to: " + value);
+            Object rc = setMethod.invoke(device, ids, valueObj);
+
+            // Log the RAW result code, not just "set to: N". BYD's contract is
+            // rc==0 for success; a non-zero code means the HAL REJECTED the write.
+            // The previous log line was emitted unconditionally after a
+            // no-exception invoke, so a rejected write was indistinguishable from
+            // an applied one — which is how a completely inert sentry keep-alive
+            // could look healthy in a field log.
+            if (rc instanceof Integer && ((Integer) rc) != 0) {
+                log("Special Config [" + configId + "] <- " + value
+                    + " REJECTED by HAL (rc=" + rc + ")");
+            } else {
+                log("Special Config [" + configId + "] set to: " + value
+                    + " (rc=" + rc + ")");
+            }
         } catch (Exception e) {
             log("Failed to set Special Config [" + configId + "]: " + e.getMessage());
         }
@@ -302,7 +401,7 @@ public class AccSentryDaemon {
 
     /**
      * Toggles the "Remote Surveillance" power flags in the Gateway/BCM.
-     * Matches the reference implementation exactly:
+     * Matches the secondary reference app C1310c implementation exactly:
      *
      * DISABLE path:
      *   - SpecialDevice 782237711 = 0 (sentry keep-alive OFF)
@@ -315,7 +414,7 @@ public class AccSentryDaemon {
      *   - PowerDevice  -1442840502 = 1 ON dilink4 ONLY — esco kh/C6861d.java:344
      *     writes this on its sentry wake path. Without it the byd_apa MCU
      *     drops the AVM/ISP rail seconds after ACC OFF and any subsequent
-     *     AVMCamera frames are all-zero. legacy path skips this write
+     *     AVMCamera frames are all-zero. Legacy secondary-reference path skips this write
      *     (untouched, bit-exact 90% fleet behaviour).
      *
      * ENABLE path (MCU needs wake):
@@ -399,7 +498,7 @@ public class AccSentryDaemon {
     // (configurePeripheralPower DISABLE branch). The matching set=1 was
     // missing on the enable branches, by mistake.
     //
-    // Gated to dilink4 — legacy path stays bit-exact unchanged.
+    // Gated to dilink4 — legacy secondary-reference path stays bit-exact unchanged.
     private static final int ESCO_MCU_POWER_HOLD_ID = -1442840502;
 
     private static void applyEscoMcuPowerHold(boolean enable) {
@@ -413,10 +512,56 @@ public class AccSentryDaemon {
         // call needed here. Kept symmetric for future callers.
     }
 
+    // ==================== V1-PARITY UNCONDITIONAL POWER HOLD (DILINK 4) ====================
+
+    /**
+     * V1-parity MCU power hold: write {@code -1442840502 = 1} IMMEDIATELY and
+     * UNCONDITIONALLY on the ACC-OFF path, with no MCU-status precondition.
+     *
+     * <p><b>Why this exists.</b> We ported the reference app's
+     * BatteryVoltageMonitor<b>V2</b> (its {@code kh/d}) and wired it up as if it
+     * were the shipping behaviour. It is not. The reference app selects its
+     * monitor at runtime from the {@code key.flameout.wakeup.mode} preference
+     * ({@code kh/a.c()}), and that preference <b>defaults to 0 → V1</b>
+     * ({@code vj/a.m()} returns {@code d("key.flameout.wakeup.mode", 0)}).
+     *
+     * <p>V1 ({@code kh/b}) is drastically simpler than what we implemented — its
+     * whole ACC-off behaviour is a single unconditional write:
+     * <pre>
+     *   BYDAutoEventValue v; v.intValue = 1;
+     *   powerDevice.set(new int[]{-1442840502}, v);   // "wakeUp"
+     * </pre>
+     * and it <b>never sleeps the MCU at all</b> — no voltage hysteresis, no
+     * 15-minute deferred sleep, no {@code getMcuStatus} gate.
+     *
+     * <p>Our equivalent write ({@link #applyEscoMcuPowerHold}) only fires from
+     * inside {@link #configurePeripheralPower}'s branches, all of which are
+     * predicated on {@code getMcuStatus()} reading 1 or 10 (or on a wake-retry
+     * succeeding). When the MCU reports any other status the hold was never
+     * written, so on DiLink 4 the AVM/ISP rail could collapse right after ACC OFF
+     * and every subsequent AVMCamera frame came back all-zero.
+     *
+     * <p>Idempotent (it is the same value the status-gated path writes when it
+     * does run), cheap (one binder write), and gated to
+     * {@code cameraMode=dilink4} so the legacy fleet's sequence is byte-identical.
+     */
+    private static void applyV1ParityMcuPowerHold() {
+        if (!isDilink4CameraMode()) return;
+        log("[v1-parity] unconditional MCU power hold (PowerDevice -1442840502 = 1) "
+            + "— no MCU-status precondition, mirrors reference-app default mode 0 (V1)");
+        setPowerConfig(ESCO_MCU_POWER_HOLD_ID, 1);
+    }
+
+    // NOTE: the matching "never sleep the MCU on dilink4" gate lives in
+    // BatteryVoltageMonitorV2.isDilink4CameraMode() — that class deliberately
+    // reads the config itself rather than calling across into this daemon
+    // (it must work in whichever process boots it), exactly as it already does
+    // for isKeepUsbPowerOnAccOff().
+
     // ==================== ESCO-PARITY SENTRY KEYS (DILINK 4) ====================
 
     // Esco's BatteryVoltageMonitorV2 sentry keep-alive IDs. Different magic
-    // numbers from our 782237711 / 782237728 (which are reference-derived, kept
+    // numbers from our 782237711 / 782237728 (which are secondary-reference-derived, kept
     // additive and unchanged for legacy fleet). On byd_apa firmware the
     // AVMCamera HAL gates frame production on these specific BYD-internal
     // peripheral-power flags being held active; without them the producer
@@ -446,7 +591,7 @@ public class AccSentryDaemon {
 
     // The OEM BYD Sentry Mode app (com.byd.sentrymode) casts a dedicated
     // camera/ISP power vote on its sentry-arm path that NONE of our existing
-    // keep-alive writes cover. The reference keys (782237711/782237728) hold the
+    // keep-alive writes cover. The secondary-reference keys (782237711/782237728) hold the
     // 5V/modem/USB rails; the esco keys (1901/1902) and MCU hold (-1442840502)
     // hold the byd_apa AVM rail on dilink4. But the OEM's "409" pair is the
     // sentry-mode CAMERA/ISP power request specifically. Without it, on certain
@@ -628,6 +773,26 @@ public class AccSentryDaemon {
                 }
                 //forceSmartSleepReflection();
                 
+                // SIGKILL recovery: if the previous instance darkened the panel
+                // while parked and was then killed, the backlight is still off
+                // and nothing is left to wake it. Restore here when ACC reads
+                // ON, so a driver can never be handed a dark panel by a daemon
+                // that died. probeAccState() returns true only when ACC is
+                // confirmed OFF, so `!probeAccState` is our ON signal; on any
+                // HAL/reflection failure it returns false, which reads as "ON"
+                // here — deliberately fail-VISIBLE: the worst case is waking a
+                // parked car's panel, which the keep-alive re-darkens within one
+                // 10 s tick, whereas the opposite failure (leaving it dark) is
+                // not recoverable by the user. turnOn() self-skips when the
+                // screen already reads on, so this is a no-op on a normal boot.
+                try {
+                    if (!com.overdrive.app.monitor.AccMonitor.probeAccState(appContext)) {
+                        com.overdrive.app.power.StealthPanel.turnOn(appContext);
+                    }
+                } catch (Throwable t) {
+                    log("Stealth panel boot recovery failed: " + t.getMessage());
+                }
+
                 // CRITICAL: Whitelist our app from ACC power management killing
                 whitelistAppPackageOld();
 
@@ -949,7 +1114,7 @@ public class AccSentryDaemon {
      *
      * BYD's BgDataCacheService accepts the shell UID (2000), so calls from this
      * daemon succeed where the same call from MainActivity (UID 10xxx) hits the
-     * AppOps gate. Mirrors the reference privileged daemon, which arrives at shell UID via
+     * AppOps gate. Mirrors the secondary reference app's vanss daemon, which arrives at shell UID via
      * an ADB-localhost tunnel and then makes this exact call.
      *
      * SDK ≥ 31 → byd_datacached.setAppStartupData(uid, 0)
@@ -1308,6 +1473,56 @@ public class AccSentryDaemon {
         inSentryMode = true;
         log("=== ENTERING SENTRY MODE ===");
 
+        // ORDERING FIX (DiLink 4 only): cast the MCU/AVM power hold BEFORE the IPC
+        // that makes CameraDaemon (re)open AVMCamera.
+        //
+        // The reference app's FlameoutService orders ACC-OFF strictly as
+        // "hold power, THEN start the sentry camera consumer" (dh/i.q(): y() →
+        // MCU wake at delay 0, then w(60000) → sentry camera start).
+        //
+        // Ours had no such ordering guarantee. notifyAccState(true) below hands the
+        // IPC to a single-thread executor, and CameraDaemon then runs
+        // startSentryPipeline → gpuPipeline.start() → AVMCamera open in ITS process.
+        // Meanwhile our rail writes only began after this method spawned the
+        // SentrySetup worker, behind ~300ms + 500ms of sleeps. The two sequences are
+        // concurrent and unsynchronised, so the camera could — and on byd_apa
+        // evidently did — get opened against an AVM/ISP rail that had not been held
+        // yet, after which the HAL hands back all-zero buffers for the whole park.
+        //
+        // Casting the hold here — inline, before the IPC is even queued — makes the
+        // rail live before CameraDaemon can possibly receive the ACC-OFF edge, which
+        // is the ordering the reference app gets for free by holding power first. It
+        // adds NO delay to the arm path (the deliberate "no 60s gate on dilink4"
+        // decision in CameraDaemon.onAccStateChanged stays intact — this is a
+        // reorder, not a delay). The SentrySetup worker still re-applies the full
+        // rail set afterwards; every write involved is idempotent.
+        //
+        // COST: this runs on the BYD HAL listener thread, which is single-threaded —
+        // stalling it makes the HAL drop later ACC edges. Five binder writes (MCU
+        // hold, 1901/1902, the 409 pair) plus a one-time device resolution on first
+        // call. No sleeps, no shell, no disk, no config writes. That is the same
+        // order of work the listener already does elsewhere on this path.
+        // No-op on every non-dilink4 variant.
+        //
+        // GATE (G1 parity): ALSO skipped in "Vehicle ON only" mode. That mode's whole
+        // contract is that nothing keeps the head unit awake after vehicle-OFF, and
+        // holding the MCU / AVM / ISP rails is precisely such a keep-awake. The G1
+        // check below (and the one in the SentrySetup worker) would otherwise be
+        // defeated by these writes, because they execute BEFORE it. Read here rather
+        // than relying on the later gate — same mtime-cached read, fail-open to
+        // "not onOnly" so a read glitch can never silently suppress the fix.
+        if (isDilink4CameraMode()
+                && !com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()) {
+            try {
+                applyV1ParityMcuPowerHold();         // PowerDevice -1442840502 = 1
+                applyEscoSentrySpecialConfig(true);  // SpecialDevice 1901=1, 1902=1
+                applySentryIspPowerVote(true);       // SpecialDevice 409 camera/ISP vote
+                log("[dilink4] pre-IPC rail hold cast before camera arm");
+            } catch (Throwable t) {
+                log("[dilink4] pre-IPC rail hold failed: " + t.getMessage());
+            }
+        }
+
         // CRITICAL: Always notify CameraDaemon that ACC is OFF immediately.
         // enableSurveillance() may skip the IPC if surveillanceEnabled is already true
         // or if the user has surveillance disabled in config, which would leave
@@ -1385,10 +1600,19 @@ public class AccSentryDaemon {
 
                 // 1. Initialize voltage monitoring FIRST (for battery protection)
                 initVehicleDataMonitor();
-                
+
+                // 1a. DiLink 4 only: V1-parity unconditional MCU power hold, cast
+                // BEFORE anything that can early-return or depend on MCU status.
+                // The reference app's DEFAULT flameout mode (0 → V1) does exactly
+                // this one write and nothing else; our status-gated equivalent
+                // inside configurePeripheralPower could skip it entirely when
+                // getMcuStatus() reported an unexpected value, letting the AVM/ISP
+                // rail collapse. No-op on every other variant.
+                applyV1ParityMcuPowerHold();
+
                 // 2. Wake MCU immediately (triggers DC-DC converter for stable power)
                 immediateWakeUpMcu();
-                
+
                 // 3. Configure peripheral power to keep camera/ISP/AVM rails active.
                 // ALWAYS enabled and identical in both toggle states — all rail writes
                 // (esco AVM keys, MCU hold, 409 ISP vote, 5V sentry keep-alive, USB/modem
@@ -1491,6 +1715,43 @@ public class AccSentryDaemon {
         // isHeld) so this is a harmless no-op on the onAndOff path and when already held.
         acquireWakeLock();
 
+        // Stamp the ACC-ON edge FIRST (cheap volatile write, no I/O). From here
+        // until the trust window lapses, StealthPanel.turnOff() refuses to darken
+        // the panel — which closes the race where the keep-alive's final in-flight
+        // tick, or a deterrent teardown, darkens the screen just as the driver
+        // starts the car. Deliberately before the !inSentryMode early-return, for
+        // the same respawn-while-parked reason as G4b/G4c.
+        try {
+            com.overdrive.app.power.StealthPanel.noteAccOnObserved();
+        } catch (Throwable ignored) {}
+
+        // GATE (G4c): wake the panel BEFORE the !inSentryMode early-return, for
+        // exactly the reason G4b above sits here. Respawn-while-parked: a
+        // previous daemon instance turned the backlight off and was killed; the
+        // replacement never saw an ACC-OFF edge, so enterSentryMode() never ran
+        // and inSentryMode is false. The real ACC-ON then lands here and would
+        // bail below — leaving a dark panel on a car the driver just started,
+        // which the user cannot recover from (nothing visible to interact with).
+        // The backlight is DEVICE state, not in-memory state, so it outlives the
+        // process that set it and must be undone independently of inSentryMode.
+        //
+        // turnOn() self-skips when the screen already reads on, so this is
+        // effectively free on the normal path and on the whole DiLink 3 fleet.
+        //
+        // Dispatched OFF this thread per the listener-thread contract in the
+        // javadoc above: turnOn() does up to five binder reflection round-trips,
+        // and stalling the BYD HAL callback would queue the next ACC edge behind
+        // us. A dedicated short-lived thread (not the shared teardown worker,
+        // which is only spawned past the gate) keeps this correct on the respawn
+        // path too.
+        new Thread(() -> {
+            try {
+                com.overdrive.app.power.StealthPanel.turnOn(appContext);
+            } catch (Throwable t) {
+                log("Stealth panel wake (pre-gate) failed: " + t.getMessage());
+            }
+        }, "StealthPanelWake").start();
+
         if (!inSentryMode) {
             log("Not in sentry mode");
             return;
@@ -1588,6 +1849,20 @@ public class AccSentryDaemon {
         // while the deterrent surface still covers the screen.
         new Thread(() -> {
             try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+            // dilink4: wake via the reference app's verified two-tier path
+            // BEFORE the legacy retry loop below. setBacklightState(true) only
+            // has tier 1 (PowerManager.turnBacklightOn) — on firmware where the
+            // panel was darkened by TurnBacklightOffWithLock, tier 1 alone can
+            // be silently ignored and the driver gets a black screen. turnOn()
+            // escalates to TurnBacklightOnWithLock and verifies with
+            // getPowerScreenStatus(). Deliberately not mode-gated (see
+            // StealthPanel.turnOn) so a cameraMode change made while parked can
+            // never strand the panel dark.
+            try {
+                com.overdrive.app.power.StealthPanel.turnOn(appContext);
+            } catch (Throwable t) {
+                log("Stealth panel wake failed: " + t.getMessage());
+            }
             for (int attempt = 1; attempt <= 3; attempt++) {
                 setBacklightState(true);
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) { break; }
@@ -2112,6 +2387,28 @@ public class AccSentryDaemon {
             return;
         }
 
+        // DiLink 4: use the verified two-tier backlight path rather than
+        // goToSleep. goToSleep is a full AP sleep request, which the reference
+        // app reserves for its own shutdown path — for "dark panel, CPU alive"
+        // it uses TurnBacklightOff(+WithLock) and verifies with
+        // getPowerScreenStatus(). The setBacklightState(false) fallback below is
+        // tier-1-only and can be silently ignored on this firmware.
+        //
+        // This method currently has NO callers. The gate is here because it
+        // reads as the obvious helper to reach for ("enforce stealth power
+        // state"), so the next person to wire it up gets the verified path
+        // instead of an unverified one. Legacy pano_h/pano_l units are
+        // unaffected and keep the original goToSleep behaviour.
+        if (isDilink4CameraMode()) {
+            try {
+                com.overdrive.app.power.StealthPanel.turnOff(appContext);
+                log("enforceSmartSleep: used verified backlight-off path (dilink4)");
+            } catch (Throwable t) {
+                log("enforceSmartSleep backlight-off failed: " + t.getMessage());
+            }
+            return;
+        }
+
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
             PowerManager pm = (PowerManager) permissiveContext.getSystemService(Context.POWER_SERVICE);
@@ -2163,6 +2460,8 @@ public class AccSentryDaemon {
             // in enterSentryMode; this only defends against the MCU/BCM
             // silently dropping the flag mid-session.
             final long ISP_VOTE_REASSERT_EVERY_TICKS = 30;  // 30 * 10s = 5 min
+            // Cadence for re-reporting a panel that refuses to darken (~5 min).
+            final long PANEL_FAILURE_REPORT_EVERY_TICKS = 30;
             // Periodic MCU re-wake + peripheral-rail re-assert cadence. On some
             // models the BCM drifts the MCU back to sleep mid-park after the
             // one-shot enterSentryMode wake, which collapses the USB-bridged SD
@@ -2226,10 +2525,31 @@ public class AccSentryDaemon {
                     // makes the HAL emit event=8 ("camera died") and tear
                     // down the preview, killing 24/7 sentry recording on a
                     // 10s cadence. Skip the backlight-off entirely on
-                    // dilink4 — the wakelock keeps CPU alive, and the
-                    // display naturally dims via the head-unit's own timeout.
-                    // Legacy pano_h/pano_l HALs are display-state-agnostic
-                    // and keep their existing power-save behaviour.
+                    // dilink4. Legacy pano_h/pano_l HALs are
+                    // display-state-agnostic and keep their existing
+                    // power-save behaviour.
+                    //
+                    // BUT skipping backlight-off did NOT mean the panel dimmed
+                    // by itself. This comment used to claim the "display
+                    // naturally dims via the head-unit's own timeout" — it
+                    // cannot: injectFakeUserActivity() above pumps
+                    // PowerManager.userActivity() every 10s to hold the AP
+                    // awake, which is precisely what resets the display-off
+                    // timer. So dilink4 parked with a fully-lit screen.
+                    //
+                    // The fix is NOT to suppress display power. Verified against
+                    // the byd_apa reference app (Escort_Auto.apk,
+                    // BacklightController + DeviceWakeupMonitor): it turns the
+                    // backlight genuinely OFF at park entry WHILE its
+                    // AVMCameraRecordAgent is recording, so backlight-off is not
+                    // what kills the AVM preview. It also never writes
+                    // screen_brightness — brightness 0 does not sleep this
+                    // panel. What it has that we lacked is a second tier
+                    // (TurnBacklightOffWithLock on PowerManager.mService) plus
+                    // getPowerScreenStatus() verification, which is what makes
+                    // the off actually stick. StealthPanel.turnOff() reproduces
+                    // that. Strictly dilink4-only; legacy units keep
+                    // setBacklightState(false) byte-for-byte.
                     //
                     // The cameraActiveUntilMs check is the finer-grained
                     // gate: only the slice of time when the GPU pipeline is
@@ -2261,10 +2581,57 @@ public class AccSentryDaemon {
                     //     (cameraActiveUntilMs lease) on a display-coupled HAL.
                     // Legacy pano_h/pano_l HALs are display-state-agnostic, so on
                     // those the backlight goes off here even mid-recording.
+                    // Evaluate each predicate ONCE per tick. Both read config, and
+                    // the branches below used to ask for the same answer twice.
+                    // isScreenDeterrentActive(true) escalates to a fresh read only
+                    // when the cheap read says "inactive" — see its javadoc: a
+                    // same-second stale read here would darken the panel out from
+                    // under a deterrent that is actively rendering.
+                    final boolean dilink4Tick = isDilink4CameraMode();
+                    // NOTE ON EVALUATION ORDER — this is deliberate, not stylistic.
+                    // The legacy branch keeps the ORIGINAL cheap mtime-gated read
+                    // (isScreenDeterrentActive()), so the pano_h/pano_l fleet pays
+                    // exactly what it always did. The confirm-with-forceReload
+                    // variant is evaluated ONLY inside the dilink4 branch, and only
+                    // after the cheap deterrent check has already said "inactive"
+                    // and the panel is about to be darkened. Hoisting it into a
+                    // local (the obvious-looking cleanup) would force a ~10 KB JSON
+                    // re-parse every 10 s on EVERY unit — the ≈3.6 MB/hour churn
+                    // that isScreenDeterrentActive's own javadoc exists to avoid.
                     if (!isScreenDeterrentActive()
-                            && !isDilink4CameraMode()
+                            && !dilink4Tick
                             && !isCameraPipelineActive()) {
                         setBacklightState(false);
+                    } else if (dilink4Tick && shouldDarkenPanelNow()) {
+                        // dilink4: real backlight-off, via the reference app's
+                        // two-tier + verify path. Deliberately NOT gated on
+                        // isCameraPipelineActive(): the reference app darkens the
+                        // panel while its AVM agent records, and on dilink4 the
+                        // pipeline runs for essentially the whole park, so
+                        // honouring that gate would mean never darkening at all.
+                        //
+                        // turnOff() self-skips when getPowerScreenStatus()
+                        // already reads off, so the steady-state cost on the
+                        // remaining ~8600 ticks of an overnight park is a single
+                        // status read — and it re-darkens automatically if
+                        // anything (the 8-min wakeUp, a deterrent) relit the
+                        // panel, which is why it is called every tick rather
+                        // than once.
+                        try {
+                            // Surface a persistent failure. StealthPanel de-dups its
+                            // own logging to one line per transition, so a panel that
+                            // refuses to darken would otherwise be a single line at
+                            // the start of the park and silence for the next ~8600
+                            // ticks. Report on a slow cadence so the symptom is
+                            // visible in a log pull without becoming the log.
+                            if (!com.overdrive.app.power.StealthPanel.turnOff(appContext)
+                                    && tick % PANEL_FAILURE_REPORT_EVERY_TICKS == 0) {
+                                log("WARN: parked panel still not dark after both tiers "
+                                    + "(tick " + tick + ") — screen may be lit while parked");
+                            }
+                        } catch (Throwable t) {
+                            log("Stealth panel turnOff failed: " + t.getMessage());
+                        }
                     }
 
                     // DiLink 4 AVC keep-alive (June 2026 reversal). The
@@ -2361,10 +2728,48 @@ public class AccSentryDaemon {
                             // wakeUp() persists with the panel dark — exactly the desired
                             // state. Gated on the same toggle so the OFF path is untouched.
                             performSystemWakeUp();
+                            // wakeUp() just relit the panel. On firmware with no
+                            // getPowerScreenStatus() that relight is invisible to
+                            // StealthPanel, so declare it — otherwise its
+                            // unverifiable-firmware latch would treat the
+                            // re-darken below as redundant and skip it, leaving
+                            // the panel lit for the rest of the park.
+                            //
+                            // Gated on dilink4: this is a CONFIG WRITE, and the key
+                            // it clears is one only the dilink4 path ever reads. Run
+                            // unconditionally it would bump the config mtime every
+                            // ~8 min on the legacy fleet too, invalidating the
+                            // mtime-gated loadConfig() cache in every daemon process
+                            // and forcing a ~10 KB re-parse on their next read — the
+                            // churn the gates here are carefully written to avoid.
+                            if (isDilink4CameraMode()) {
+                                try {
+                                    com.overdrive.app.power.StealthPanel
+                                        .notePanelStateChangedExternally();
+                                } catch (Throwable ignored) {}
+                            }
                             if (!isScreenDeterrentActive()
                                     && !isDilink4CameraMode()
                                     && !isCameraPipelineActive()) {
                                 setBacklightState(false);
+                            } else if (isDilink4CameraMode()
+                                    && !isScreenDeterrentActive(true)
+                                    && !com.overdrive.app.power.StealthPanel
+                                            .isUserOverrideActive()) {
+                                // Same rationale as the per-tick gate above, and the
+                                // same two guards (fresh-read deterrent check so we
+                                // can't darken a rendering warning; user-override
+                                // grace so an explicit screen-on survives). This call
+                                // is load-bearing rather than merely idempotent:
+                                // performSystemWakeUp() just relit the panel, so the
+                                // status now reads ON and turnOff() genuinely
+                                // re-darkens instead of self-skipping. Without it the
+                                // panel stays lit until the next 10 s tick.
+                                try {
+                                    com.overdrive.app.power.StealthPanel.turnOff(appContext);
+                                } catch (Throwable t) {
+                                    log("Stealth panel re-darken failed: " + t.getMessage());
+                                }
                             }
                         } catch (Throwable t) {
                             log("Periodic MCU re-wake / rail re-assert failed: " + t.getMessage());
@@ -2411,15 +2816,120 @@ public class AccSentryDaemon {
      * flag can never disable the stealth keep-alive permanently.
      */
     private static boolean isScreenDeterrentActive() {
+        return isScreenDeterrentActive(false);
+    }
+
+    /**
+     * The dilink4 "should the keep-alive darken the panel this tick?" decision.
+     *
+     * <p>Factored out of the keep-alive's {@code else if} condition deliberately.
+     * Those guards previously sat in the condition itself, OUTSIDE the narrow
+     * try/catch around the darken call — so a throw from any of them would escape
+     * to the loop-body handler and abandon the REST of that tick (AVC keep-alive,
+     * SD-rail recovery, USB-power re-assert, the 8-min MCU re-wake), every tick,
+     * for the whole park. Each guard catches Throwable internally today, but the
+     * structure made a future edit to any of them a fleet-wide surveillance
+     * outage. Here a failure is contained and fails CLOSED (don't darken), which
+     * is the safe direction: a lit panel is visible and self-corrects next tick,
+     * whereas losing the tick's rail work is not visible at all.
+     *
+     * <p>Order is a cost decision, not style. {@code isAlreadyDark} is checked
+     * FIRST because it is the cheap common case (~99.9% of ticks) and short-
+     * circuits the two expensive guards, both of which do a full config re-parse.
+     */
+    private static boolean shouldDarkenPanelNow() {
+        String reason;
+        try {
+            if (com.overdrive.app.power.StealthPanel.isAlreadyDark(appContext)) {
+                reason = "already-dark";
+            } else if (isScreenDeterrentActive(true)) {
+                reason = "deterrent-active";
+            } else if (com.overdrive.app.power.StealthPanel.isUserOverrideActive()) {
+                reason = "user-override";
+            } else {
+                logPanelGate(null);
+                return true;
+            }
+        } catch (Throwable t) {
+            log("Panel-darken gate failed, skipping this tick: " + t.getMessage());
+            return false;
+        }
+        // Log WHY we declined, on state change only. Without this a park that
+        // stayed lit produced no log line at all from either file: all three
+        // branches above skip turnOff() entirely, so neither StealthPanel's
+        // per-transition log nor the ~5-min failure WARN can fire. That made the
+        // four possible causes of "my screen stayed on all night" indistinguishable
+        // in a customer log pull.
+        logPanelGate(reason);
+        return false;
+    }
+
+    private static volatile String lastPanelGateReason = "";
+
+    private static void logPanelGate(String reason) {
+        String key = (reason == null) ? "" : reason;
+        if (key.equals(lastPanelGateReason)) return;
+        lastPanelGateReason = key;
+        if (reason == null) log("Panel-darken gate: proceeding (darkening panel)");
+        else log("Panel-darken gate: declining — " + reason);
+    }
+
+    /**
+     * @param confirmInactive when true, a negative answer from the mtime-cached
+     *        read is re-checked with {@link
+     *        com.overdrive.app.config.UnifiedConfigManager#forceReload()} before
+     *        being believed.
+     *
+     * <p>Why that escalation exists: ext4 mtime resolution is 1 s, and
+     * ScreenDeterrent (a DIFFERENT process) publishes its gate immediately before
+     * waking the panel. If that write lands in the same wall-clock second as our
+     * cached read, loadConfig()'s {@code fileModified <= lastModified} check
+     * returns the STALE config without the new deadline, we conclude no deterrent
+     * is active, and turnOff() darkens the panel while the deterrent's
+     * z=Integer.MAX_VALUE layer is being composited — an intruder warning nobody
+     * can see. ScreenDeterrent guards the mirror-image hazard the same way
+     * (forceReload in shouldStop / isForceStop).
+     *
+     * <p>Cost is bounded to the case that matters: the extra parse happens only
+     * when the cheap read says "inactive" AND the caller is about to darken the
+     * panel. Once the panel is dark, turnOff() self-skips before consulting this,
+     * so the steady state does not pay it — nowhere near the ≈3.6 MB/hour that an
+     * unconditional forceReload here would cost.
+     */
+    private static boolean isScreenDeterrentActive(boolean confirmInactive) {
         try {
             org.json.JSONObject s = com.overdrive.app.config.UnifiedConfigManager.loadConfig()
                     .optJSONObject("surveillance");
-            if (s == null) return false;
-            long deadline = s.optLong("screenDeterrentActiveUntilMs", 0L);
-            return deadline > System.currentTimeMillis();
+            long deadline = (s == null) ? 0L : s.optLong("screenDeterrentActiveUntilMs", 0L);
+            if (isDeterrentDeadlineLive(deadline)) return true;
+            if (!confirmInactive) return false;
+            // Cheap read says inactive — re-read fresh before acting on it.
+            org.json.JSONObject fresh = com.overdrive.app.config.UnifiedConfigManager.forceReload()
+                    .optJSONObject("surveillance");
+            if (fresh == null) return false;
+            return isDeterrentDeadlineLive(
+                    fresh.optLong("screenDeterrentActiveUntilMs", 0L));
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /**
+     * Upper-bound the deterrent gate the same way StealthPanel bounds its
+     * user-override deadline. ScreenDeterrent only ever publishes {@code now +
+     * duration} with duration clamped to 3-30 s, so any legitimate deadline is
+     * seconds away. A far-future value means a stale gate survived an unclean
+     * teardown (the deterrent was SIGKILLed before cleanup() zeroed it) AND the
+     * wall clock stepped backward — a documented condition on these head units.
+     * Unbounded, that reads as "deterrent active" forever and silently suppresses
+     * parked darkening for the whole park. The 5-minute ceiling is ~10x the
+     * longest real deterrent, so it cannot reject a genuine one.
+     */
+    private static final long DETERRENT_GATE_MAX_HORIZON_MS = 5 * 60_000L;
+
+    private static boolean isDeterrentDeadlineLive(long deadlineMs) {
+        long now = System.currentTimeMillis();
+        return deadlineMs > now && deadlineMs <= now + DETERRENT_GATE_MAX_HORIZON_MS;
     }
 
     /**
@@ -2854,6 +3364,37 @@ public class AccSentryDaemon {
                 }
             }
 
+            // DILINK 4 ONLY: prefer the 2-arg variant
+            // userActivity(uptime, noChangeLights=true) — "reset the sleep
+            // timer, but do NOT touch the lights". This is what the keep-alive
+            // loop's own comment has always claimed it used, but the 1-arg
+            // branch below returns first, so on any firmware that exposes
+            // 1-arg (i.e. all of them) the noChangeLights call was unreachable.
+            //
+            // Why it matters on dilink4: this pump is the reason the parked panel
+            // came back on. The 1-arg call resets the display's dim/off state
+            // machine — i.e. it actively fights the backlight-off we just
+            // performed. (The byd_apa reference app sidesteps this entirely: it
+            // never calls userActivity at all, holding the AP awake with
+            // PowerManager.wakeUp on a 60 s cadence instead. We keep the pump
+            // because our USB-VBUS-follows-wakefulness requirement depends on
+            // it, and just stop it from touching the lights.)
+            //
+            // Strictly gated: legacy pano_h/pano_l units keep the original
+            // 1-arg-first order byte-for-byte. There the pump self-skips once
+            // getPowerScreenStatus()==0 anyway, and that path is long-proven on
+            // the fleet — no reason to re-sequence it. Falls through to the
+            // 1-arg path below if this firmware has no 2-arg overload.
+            if (isDilink4CameraMode()) {
+                resolvePmUserActivity2Arg();
+                if (pmUserActivity2ArgResolved) {
+                    pmUserActivity2ArgMethod.invoke(
+                        pm, android.os.SystemClock.uptimeMillis(), true);
+                    log("userActivity(long, noChangeLights=true) called [dilink4 stealth]");
+                    return;
+                }
+            }
+
             // 1-arg version ( style). Original semantics: only
             // NoSuchMethodException falls through to the 2-arg fallback;
             // invocation exceptions bubble to the outer catch. We preserve
@@ -2866,6 +3407,10 @@ public class AccSentryDaemon {
                 log("userActivity(long) called");
                 return;
             } else {
+                // Preserved verbatim from the original ordering: on firmware with
+                // no 1-arg overload this line fired BEFORE the 2-arg fallback was
+                // attempted. Keeping it here (rather than folding it into an else
+                // on the 2-arg branch) keeps the legacy log stream identical.
                 log("userActivity: no compatible method found");
             }
 
@@ -3624,6 +4169,12 @@ public class AccSentryDaemon {
     
     /**
      * Check if Telegram daemon auto-start on ACC off is enabled.
+     *
+     * <p>True for EITHER signal: the parked-only {@code autoStartAccOff}
+     * toggle, or {@code daemonEnabled} — the cross-UID mirror of the
+     * Daemons-screen switch. The latter is what makes "I enabled the Telegram
+     * daemon" survive a park: the app-side SharedPreferences that used to be
+     * the only record of it is unreadable from this shell-UID process.
      */
     private static boolean isTelegramAutoStartEnabled() {
         try {
@@ -3631,9 +4182,30 @@ public class AccSentryDaemon {
             // (different UID, different mtime tick) is visible immediately
             // rather than after the cache expires.
             com.overdrive.app.config.UnifiedConfigManager.forceReload();
-            boolean enabled = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isAutoStartAccOff();
-            log("Telegram autoStartAccOff = " + enabled);
+            boolean enabled = com.overdrive.app.telegram.config.UnifiedTelegramConfig.shouldStartOnAccOff();
+            log("Telegram start-on-ACC-off = " + enabled
+                + " (autoStartAccOff=" + com.overdrive.app.telegram.config.UnifiedTelegramConfig.isAutoStartAccOff()
+                + ", daemonEnabled=" + com.overdrive.app.telegram.config.UnifiedTelegramConfig.isDaemonEnabled() + ")");
             return enabled;
+        } catch (Exception e) {
+            log("Error reading telegram config: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * ACC-ON stop gate. Deliberately NOT the same predicate as the start gate:
+     * only the parked-only {@code autoStartAccOff} mode means "stop again when
+     * the vehicle starts". A daemon the user switched on from the Daemons
+     * screen must keep running across ACC-on.
+     */
+    private static boolean isTelegramParkedOnlyMode() {
+        try {
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            boolean parkedOnly = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isAutoStartAccOff()
+                    && !com.overdrive.app.telegram.config.UnifiedTelegramConfig.isDaemonEnabled();
+            log("Telegram parked-only mode = " + parkedOnly);
+            return parkedOnly;
         } catch (Exception e) {
             log("Error reading telegram config: " + e.getMessage());
             return false;
@@ -3670,20 +4242,31 @@ public class AccSentryDaemon {
         // user stopped from the Daemons UI (which never wrote the .properties
         // file) would get silently resurrected on the next ACC-on.
         //
-        // BUT the sentinel file is overloaded: this daemon's own ACC-on
-        // auto-stop (stopTelegramDaemonIfAutoStarted) writes the SAME file
-        // with content "disabled by ACC-on …". That is an ACC-arbitration
-        // pause, NOT a user stop, and must not suppress the next park.
-        // So we discriminate by CONTENT: only "disabled by ui" / "disabled
-        // by telegram" are real user stops. An ACC-on pause falls through to
-        // launchTelegramDaemon(), which rm's the sentinel (line ~3489) before
-        // redeploying. (A missing/unreadable file also falls through.)
+        // BUT the sentinel file is overloaded — three kinds of writer use it:
+        //   "disabled by ui"/"disabled by telegram"  → a REAL user stop, honor it
+        //   "disabled by ACC-on"                     → our own ACC arbitration pause
+        //   "disabled by stopAllDaemons sweep"       → the app-update sweep
+        //                                              (AppUpdater.stopAllDaemons)
+        //
+        // "ACC-on" — we wrote it ourselves on the last ACC-on edge, and
+        // launchTelegramDaemon() rm's it before redeploying.
+        // "stopAllDaemons sweep" — the app-update sweep, which is write-if-absent
+        // (AppUpdater.stopAllDaemons), so this text can ONLY appear when no user
+        // stop was already recorded. Both are therefore unambiguous machine
+        // stops. Honouring the sweep text as a user stop is what previously left
+        // a parked-only bot permanently unable to auto-start after any update,
+        // since nothing clears the optional-daemon sentinels post-update.
+        //
+        // A missing/unreadable file also falls through to auto-start.
         java.io.File telegramSentinel =
             new java.io.File("/data/local/tmp/telegram_bot_daemon.disabled");
         if (telegramSentinel.exists()) {
             String reason = readSentinelReason(telegramSentinel);
-            if (reason != null && reason.contains("ACC-on")) {
-                log("Telegram disable sentinel is an ACC-on pause, not a user stop; proceeding to auto-start");
+            boolean machineStop = reason != null
+                    && (reason.contains("ACC-on") || reason.contains("stopAllDaemons"));
+            if (machineStop) {
+                log("Telegram disable sentinel is a machine stop (" + reason
+                    + "), not a user stop; proceeding to auto-start");
             } else {
                 log("Telegram daemon disable sentinel present (user-stopped), not auto-starting");
                 return;
@@ -3871,8 +4454,8 @@ public class AccSentryDaemon {
      * Stop Telegram daemon if it was auto-started.
      */
     private static void stopTelegramDaemonIfAutoStarted() {
-        if (!isTelegramAutoStartEnabled()) {
-            log("Telegram auto-start not enabled, not stopping");
+        if (!isTelegramParkedOnlyMode()) {
+            log("Telegram not in parked-only mode, not stopping");
             return;
         }
 

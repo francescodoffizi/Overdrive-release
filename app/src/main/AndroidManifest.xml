@@ -50,7 +50,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     
     <!-- ==================== BYD HAL Permissions ==================== -->
-    <!-- Full BYD SDK access -->
+    <!-- Matches the OEM vehicle-control app manifest for full BYD SDK access -->
 
     <!-- AC (climate control) -->
     <uses-permission android:name="android.permission.BYDAUTO_AC_COMMON" />
@@ -334,10 +334,19 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density|fontScale"
             android:theme="@style/Theme.Overdrive.M3" />
 
-        <!-- Blocker Activity for Sentry Mode (transparent click blocker) -->
+        <!-- Blocker Activity for Sentry Mode (transparent click blocker).
+             exported=false: this activity has NO launch site anywhere in the
+             app, but while exported it could be started externally
+             (`am start -n com.overdrive.app/.BlockerActivity`). Its
+             killBacklight() writes screen_brightness=0 and its restore path
+             writes back a hardcoded 128 default — which would fight the dilink4
+             stealth panel in both directions (capturing our 0 as "the user's
+             brightness", or overwriting it). Nothing in-app regresses from
+             closing it off; the panel-darkening job it was written for is now
+             owned by com.overdrive.app.power.StealthPanel. -->
         <activity
             android:name="com.overdrive.app.BlockerActivity"
-            android:exported="true"
+            android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen"
             android:excludeFromRecents="true"
             android:launchMode="singleInstance"
@@ -365,8 +374,11 @@
              automation/keymap action. exported=true is REQUIRED: the CameraDaemon
              (shell uid 2000) launches it via `am start -n com.overdrive.app/.ui.VideoPlaybackActivity`
              (same bridge as DeterrentActivity) — the daemon can't render video itself.
-             singleTask + clear-task so a repeat play replaces the current clip in one
-             instance. Library clips stream from the daemon's authenticated raw endpoint. -->
+             singleTask so a repeat play is delivered to the SAME instance via onNewIntent,
+             which swaps the clip in place (setVideoURI releases the old player and resets
+             its first-frame state). The launch passes NO activity-flag options: NEW_TASK is
+             added by am itself, and the clear-task option would destroy the instance and
+             defeat onNewIntent. Library clips stream from the daemon's raw endpoint. -->
         <activity
             android:name="com.overdrive.app.ui.VideoPlaybackActivity"
             android:exported="true"
@@ -529,6 +541,26 @@
             android:name="com.overdrive.app.services.MediaPlaybackService"
             android:foregroundServiceType="mediaPlayback"
             android:exported="true" />
+
+        <!-- Vehicle Actuator Service - runs BYD SDK writes (mirror fold, HUD) in the REAL
+             app process (UID 10xxx, real Context), as a SECOND attempt after the daemon's
+             own write, in case this HAL only honours the call from a normal app process.
+             NOTE: this is a hypothesis, not a proven mechanism — the OEM vehicle-control app
+             app never actually calls its own mirror-fold code (no callers anywhere; the
+             DiLink-5 controller hard-returns false), so "it works there" is unsupported.
+             Treat this service as a belt-and-braces path, not the fix. exported=true is REQUIRED: the
+             CameraDaemon (shell uid 2000) reaches it via
+             `am start-foreground-service -n com.overdrive.app/.services.VehicleActuatorService`
+             — the same proven bridge as MediaPlaybackService. Inputs are Intent extras
+             (fold / level), so exporting carries no file/data surface. -->
+        <service
+            android:name="com.overdrive.app.services.VehicleActuatorService"
+            android:foregroundServiceType="specialUse|dataSync"
+            android:exported="true">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Owner-initiated BYD vehicle control (mirror fold, HUD) from the app process" />
+        </service>
 
         <!-- Message Overlay Service - draws the "Show Toast" / "Show Dialog"
              automation/keymap message as a TYPE_APPLICATION_OVERLAY in the REAL app

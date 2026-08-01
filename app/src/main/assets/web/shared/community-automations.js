@@ -43,9 +43,15 @@ BYD.communityAutomations = {
     mineOnly: false,   // true = show only automations THIS install published
     _searchTimer: null,
     _loading: false,
+    // {localAutomationId: communityRowId} from the daemon — which local automation owns
+    // which published row. Populated by _loadPublishedIds; {} until then.
+    _publishedIds: {},
 
     init: function () {
         this.renderControls();
+        // Cache the local→remote publish map up front so the Edit button on a detail
+        // modal can resolve the local source exactly (see _matchLocalId).
+        this._loadPublishedIds();
         // Load the catalog immediately on page init (matches every other tab's
         // controller — the browse grid is on its own tab, hidden until selected, so
         // there's no cost to fetching now and it guarantees data is present the first
@@ -667,7 +673,15 @@ BYD.communityAutomations = {
             BYD.utils.alertDialog({ title: t('community.publish'), body: t('community.publish_shell_blocked') });
             return;
         }
+        // Already published from this local automation? Then this is an UPDATE of that
+        // row, not a new publish — label the form accordingly. The daemon enforces this
+        // regardless (it promotes the POST to a PUT on the mapped row), so this only
+        // keeps the UI honest about what the button will do.
         var isEdit = !!(edit && edit.id);
+        if (!isEdit && this._publishedIds && this._publishedIds[localId]) {
+            edit = { id: this._publishedIds[localId] };
+            isEdit = true;
+        }
 
         var backdrop = document.createElement('div');
         backdrop.className = 'modal-backdrop';
@@ -695,7 +709,13 @@ BYD.communityAutomations = {
         // the remembered value above; category is selected below).
         if (isEdit) {
             if (edit.name) nameInput.value = edit.name;
+            else if (rules.name) nameInput.value = rules.name;
             if (edit.description) descInput.value = edit.description;
+        } else if (rules.name) {
+            // Fresh publish: default the catalog name to the automation's LOCAL name, so
+            // the name the author gave it is what downloaders see (and what import now
+            // restores) instead of them retyping it. Still editable before publishing.
+            nameInput.value = rules.name;
         }
 
         // Category select.
@@ -719,6 +739,23 @@ BYD.communityAutomations = {
         form.appendChild(catWrap);
         // Edit mode: preselect the published row's category.
         if (isEdit && edit.category) { try { catSel.value = edit.category; } catch (e) {} }
+        // A re-publish promoted to an update carries only the row id, so pull the row's
+        // current name/description/category from the catalog to prefill (description is
+        // required — the user must not have to retype it). Async + non-blocking: it only
+        // fills fields the user hasn't already typed into, and a failure leaves the form
+        // usable as-is.
+        if (isEdit && !edit.description) {
+            fetch('/api/community/automation/' + encodeURIComponent(edit.id), { cache: 'no-store' })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    var row = (data && data.automation) ? data.automation : null;
+                    if (!row) return;
+                    if (row.name && !nameInput.value) nameInput.value = row.name;
+                    if (row.description && !descInput.value) descInput.value = row.description;
+                    if (row.category) { try { catSel.value = row.category; } catch (e) {} }
+                })
+                .catch(function () {});
+        }
         card.appendChild(form);
 
         var actions = document.createElement('div');
@@ -760,10 +797,15 @@ BYD.communityAutomations = {
                     description: description,
                     category: catSel.value,
                     rules: rules,
+                    // The LOCAL automation this upload came from. The daemon remembers
+                    // localId → community row id, so re-publishing an automation that was
+                    // already shared UPDATES that row instead of creating a duplicate.
+                    localId: localId,
                     actionGroups: self._collectActionGroups(rules, groupMap || {})
                 };
                 // Edit → PUT /api/community/automation/{id} (same row, keeps ratings/downloads).
-                // Publish → POST /api/community/publish (new row). Both re-validate on the daemon
+                // Publish → POST /api/community/publish, which the daemon promotes to a PUT when
+                // localId is already mapped to a row. Both re-validate on the daemon
                 // + Worker; both refuse a shell automation.
                 var url = isEdit ? ('/api/community/automation/' + encodeURIComponent(edit.id)) : '/api/community/publish';
                 return fetch(url, {
@@ -775,7 +817,12 @@ BYD.communityAutomations = {
               .then(function (data) {
                   if (data && (data.id || data.success || data.updated)) {
                       dismiss();
-                      self._toast(t(isEdit ? 'community.updated' : 'community.published'), 'success');
+                      // A publish may have been promoted to an in-place update by the daemon
+                      // (already-published local automation) — say what actually happened.
+                      var wasUpdate = isEdit || !!(data && data.updated);
+                      self._toast(t(wasUpdate ? 'community.updated' : 'community.published'), 'success');
+                      // Pick up the (possibly new) local→remote mapping the daemon just wrote.
+                      self._loadPublishedIds();
                       self.loadPage(1);
                   } else {
                       pubBtn.disabled = false;
@@ -813,6 +860,9 @@ BYD.communityAutomations = {
                     if (res.d && (res.d.ok || res.d.deleted)) {
                         self._toast(self._t('community.unpublished'), 'success');
                         if (typeof closeModal === 'function') closeModal();
+                        // The daemon dropped this row's mapping — refresh so a later
+                        // publish of the same local automation creates a fresh entry.
+                        self._loadPublishedIds();
                         self.loadPage(self.currentPage);
                     } else if (res.status === 404) {
                         // Server said not-owner (or already gone) — this device didn't publish it.
@@ -1001,18 +1051,29 @@ BYD.communityAutomations = {
     },
 
     // Find the LOCAL automation to edit-then-update a published community row from. The
-    // community id and local id differ (import mints a fresh local UUID), so we match by
-    // the user-given NAME: an automation named the same as the published row. Returns the
-    // local automation id, or null when there's no local source (the user deleted it, or
-    // it's on another device) — the caller then explains they must recreate it locally to
-    // push an edit. Name match is a heuristic; the daemon+Worker still gate the PUT on the
-    // publishing-device id, so a wrong match can only ever update the user's OWN row.
+    // community id and local id differ (the server mints the row id), so resolution is:
+    //   1. the daemon's local→remote publish map (_publishedIds, exact — this install
+    //      published that row from that local automation), then
+    //   2. the user-given NAME as a fallback, for rows published before the map existed.
+    // Returns the local automation id, or null when there's no local source (the user
+    // deleted it, or it's on another device) — the caller then explains they must recreate
+    // it locally to push an edit. The daemon+Worker still gate the PUT on the publishing
+    // id, so a wrong name match can only ever update the user's OWN row.
     _matchLocalId: function (a) {
         if (!(window.BYD && BYD.automations && BYD.automations.automations)) return null;
         var locals = BYD.automations.automations;
-        var wantName = (a && a.name ? String(a.name) : '').trim().toLowerCase();
         var id;
-        // Prefer an exact name match.
+        // Exact: the row id we recorded at publish time.
+        var map = this._publishedIds || {};
+        var wantRow = a && a.id ? String(a.id) : '';
+        if (wantRow) {
+            for (id in map) {
+                if (!Object.prototype.hasOwnProperty.call(map, id)) continue;
+                if (String(map[id]) === wantRow && locals[id]) return id;
+            }
+        }
+        // Fallback: exact name match.
+        var wantName = (a && a.name ? String(a.name) : '').trim().toLowerCase();
         if (wantName) {
             for (id in locals) {
                 if (!Object.prototype.hasOwnProperty.call(locals, id)) continue;
@@ -1040,9 +1101,22 @@ BYD.communityAutomations = {
         return input;
     },
 
-    _prefillAuthor: function (input) {
-        fetch('/api/community/settings', { cache: 'no-store' })
+    // Refresh the cached local→remote publish map ({localId: communityRowId}) from the
+    // daemon. Used by _matchLocalId to resolve a published row back to its local source
+    // exactly. Best-effort — a failure just leaves the name-match fallback.
+    _loadPublishedIds: function () {
+        var self = this;
+        return fetch('/api/community/settings', { cache: 'no-store' })
             .then(function (r) { return r.json(); })
+            .then(function (data) {
+                self._publishedIds = (data && data.publishedIds) ? data.publishedIds : {};
+                return data;
+            })
+            .catch(function () { return null; });
+    },
+
+    _prefillAuthor: function (input) {
+        this._loadPublishedIds()
             .then(function (data) { if (data && data.authorName) input.value = data.authorName; })
             .catch(function () {});
     },

@@ -4,12 +4,12 @@
 
   Cast an installed app onto the driver-cluster display and mirror it here, with
   tap/swipe forwarded back. The mirror PIXELS are composited by the daemon onto a
-  head-unit SurfaceControl layer that floats over [projectionMirrorPane]; this layout
-  only owns the pane geometry + a transparent touch-catcher (see ProjectionFragment).
+  Surface owned by [projectionTexture]; this layout owns both the output buffer and the
+  draggable pane geometry within it (see ProjectionFragment).
 
   IDs (ProjectionFragment.kt findViewById targets):
     projectionAppSpinner / projectionCastButton / projectionStopButton
-    projectionStatus / projectionMirrorPane / projectionTouchCatcher / projectionProgress
+    projectionStatus / projectionStage / projectionTexture / projectionBounds / projectionProgress
 -->
 <androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -23,7 +23,6 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:animateLayoutChanges="true"
         android:paddingHorizontal="@dimen/page_padding_horizontal"
         android:paddingTop="@dimen/page_padding_top"
         android:paddingBottom="@dimen/page_padding_bottom"
@@ -103,17 +102,6 @@
                 android:text="@string/projection_status_idle"
                 android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                 android:textColor="?attr/colorOnSurfaceVariant" />
-
-            <!-- Adjust bounds toggle: enters ADJUST mode so the user can drag/resize the
-                 draggable bounding rectangle the mirror is projected into. -->
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/projectionAdjustButton"
-                style="@style/Widget.Material3.Button.TextButton"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:enabled="false"
-                android:text="@string/projection_adjust_bounds" />
         </LinearLayout>
 
         <!-- ================== SCALING MODE ================== -->
@@ -212,39 +200,141 @@
             </LinearLayout>
         </LinearLayout>
 
-        <!-- ================== MIRROR STAGE ==================
-             The daemon composites the live cluster onto a head-unit SurfaceControl layer
-             sized to the bounding rect the user sets in [projectionBounds]. That layer
-             floats ABOVE this window, so ProjectionBoundsView draws its resize handles
-             OUTSIDE the box (visible beside the mirror) and forwards touches to the cluster
-             in control mode. The dark backdrop shows before the mirror lands / when idle. -->
-        <FrameLayout
-            android:id="@+id/projectionStage"
-            android:layout_width="match_parent"
-            android:layout_height="300dp"
-            android:layout_marginTop="@dimen/card_gap_vertical"
-            android:background="@android:color/black">
-
-            <com.overdrive.app.ui.view.ProjectionBoundsView
-                android:id="@+id/projectionBounds"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent" />
-
-            <ProgressBar
-                android:id="@+id/projectionProgress"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="center"
-                android:visibility="gone" />
-        </FrameLayout>
-
-        <!-- ================== NOTE ================== -->
-        <TextView
+        <!-- ================== MIRROR + RESIZE CONTROLS ==================
+             A single card: the live cluster mirror, with its resize/layout controls attached
+             directly beneath it (so "resize window" lives WITH the mirror, not in a separate
+             card up top). The daemon composites the cluster into the TextureView Surface and
+             projects it into the rect set in [projectionBounds]; the overlay draws the resize
+             frame + handles and forwards touches in control mode. -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="@dimen/card_gap_vertical"
-            android:text="@string/projection_note_single_app"
-            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
-            android:textColor="?attr/colorOnSurfaceVariant" />
+            android:background="@drawable/dialog_m3_background"
+            android:orientation="vertical"
+            android:padding="@dimen/card_padding_standard">
+
+            <FrameLayout
+                android:id="@+id/projectionStage"
+                android:layout_width="match_parent"
+                android:layout_height="300dp"
+                android:background="@android:color/black">
+
+                <TextureView
+                    android:id="@+id/projectionTexture"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent" />
+
+                <com.overdrive.app.ui.view.ProjectionBoundsView
+                    android:id="@+id/projectionBounds"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent" />
+
+                <ProgressBar
+                    android:id="@+id/projectionProgress"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center"
+                    android:visibility="gone" />
+            </FrameLayout>
+
+            <!-- Resize row: the primary "Resize window" toggle sits right under the mirror,
+                 alongside the one-tap layout presets. -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/projectionAdjustButton"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="8dp"
+                    android:enabled="false"
+                    app:icon="@android:drawable/ic_menu_crop"
+                    android:text="@string/projection_adjust_bounds" />
+
+                <com.google.android.material.button.MaterialButtonToggleGroup
+                    android:id="@+id/projectionPresetGroup"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    app:selectionRequired="false"
+                    app:singleSelection="true">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/projectionPresetFull"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:paddingHorizontal="4dp"
+                        android:insetLeft="0dp"
+                        android:insetRight="0dp"
+                        android:text="@string/projection_preset_full" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/projectionPresetLeft"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:paddingHorizontal="4dp"
+                        android:insetLeft="0dp"
+                        android:insetRight="0dp"
+                        android:text="@string/projection_preset_left" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/projectionPresetRight"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:paddingHorizontal="4dp"
+                        android:insetLeft="0dp"
+                        android:insetRight="0dp"
+                        android:text="@string/projection_preset_right" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/projectionPresetCenter"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:paddingHorizontal="4dp"
+                        android:insetLeft="0dp"
+                        android:insetRight="0dp"
+                        android:text="@string/projection_preset_center" />
+                </com.google.android.material.button.MaterialButtonToggleGroup>
+            </LinearLayout>
+
+            <!-- Keep-cluster-aspect toggle for free-form vs locked resizing. -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal"
+                android:baselineAligned="false">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_gravity="center_vertical"
+                    android:text="@string/projection_lock_aspect"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textColor="?attr/colorOnSurface" />
+
+                <com.google.android.material.materialswitch.MaterialSwitch
+                    android:id="@+id/projectionAspectLockSwitch"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center_vertical" />
+            </LinearLayout>
+        </LinearLayout>
     </LinearLayout>
 </androidx.core.widget.NestedScrollView>

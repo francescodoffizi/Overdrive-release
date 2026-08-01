@@ -24,6 +24,18 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
     
     private val _daemonStates = MutableLiveData<Map<DaemonType, DaemonState>>()
     val daemonStates: LiveData<Map<DaemonType, DaemonState>> = _daemonStates
+
+    // Authoritative map for read-modify-write. postValue does NOT update
+    // _daemonStates.value until the main thread drains, so deriving the base
+    // from .value lets back-to-back background updates lose each other's keys
+    // (an ERROR posted between two poll callbacks would silently vanish).
+    private val authoritativeStates =
+        java.util.concurrent.ConcurrentHashMap<DaemonType, DaemonState>()
+
+    private fun publishState(type: DaemonType, state: DaemonState) {
+        authoritativeStates[type] = state
+        _daemonStates.postValue(HashMap(authoritativeStates))
+    }
     
     // Expose cloudflared controller for tunnel URL access
     val cloudflaredController: CloudflaredController
@@ -50,7 +62,15 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
     fun setStartupManager(manager: DaemonStartupManager) {
         startupManager = manager
     }
-    
+
+    // Dedicated looper + retained runnable for the tunnel status poll, so the
+    // loop is both OFF the main thread and cancellable in onCleared().
+    private var tunnelPollThread: android.os.HandlerThread? = null
+    private var tunnelPollHandler: android.os.Handler? = null
+    private var tunnelPollRunnable: Runnable? = null
+    /** Set in onCleared so an already-executing tick does not re-arm itself. */
+    @Volatile private var tunnelPollStopped = false
+
     init {
         cloudflaredController = CloudflaredController(app, adbLauncher)
         zrokController = ZrokController(app, adbLauncher)
@@ -71,6 +91,7 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
         
         // Initialize all states as stopped
         val initialStates = DaemonType.values().associateWith { DaemonState.stopped(it) }
+        authoritativeStates.putAll(initialStates)
         _daemonStates.value = initialStates
         
         // Refresh all statuses after a short delay to ensure ADB connection is ready
@@ -79,17 +100,39 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
             refreshAllStatuses(logResults = true)
         }, 1500)
         
-        // Periodic refresh for tunnel daemons (every 30 seconds)
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(object : Runnable {
+        // Periodic refresh for tunnel daemons (every 30 seconds).
+        //
+        // Runs on a DEDICATED background looper, not the main looper, and the
+        // runnable is retained so onCleared() can cancel it. Previously this
+        // allocated a fresh main-thread Handler every tick and kept no
+        // reference, so (a) it was un-cancellable and ticked for the entire
+        // process lifetime — backgrounded, screen-off, parked — and (b) each
+        // tick did its config reads (loadConfig → possible file read + JSON
+        // parse under a blocking flock that a UID-2000 daemon can hold) ON THE
+        // APP MAIN THREAD. A stalled app main thread contends with system_server
+        // via binder and steals frames from the native head-unit UI, which is
+        // the whole-system lag we're chasing.
+        //
+        // Behaviour is otherwise IDENTICAL: same 30s cadence, same three probes,
+        // same order, same results. Safe off-main because every status update
+        // goes through LiveData.postValue (thread-safe by contract); the only
+        // `.value =` assignment is the init-time seed above, still on main.
+        tunnelPollThread = android.os.HandlerThread("DaemonsVM-TunnelPoll").apply { start() }
+        tunnelPollHandler = android.os.Handler(tunnelPollThread!!.looper)
+        val poll = object : Runnable {
             override fun run() {
+                if (tunnelPollStopped) return
                 // Only refresh tunnel statuses periodically
                 refreshDaemonStatus(DaemonType.CLOUDFLARED_TUNNEL)
                 refreshDaemonStatus(DaemonType.ZROK_TUNNEL)
                 refreshDaemonStatus(DaemonType.TAILSCALE_TUNNEL)
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(this, 30000)
+                if (!tunnelPollStopped) tunnelPollHandler?.postDelayed(this, 30000)
             }
-        }, 30000)
+        }
+        tunnelPollRunnable = poll
+        tunnelPollHandler?.postDelayed(poll, 30000)
     }
+
     
     /**
      * Start (or revive) a daemon.
@@ -131,7 +174,7 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
             // silently kill the sibling tunnel.
             if (type == DaemonType.CLOUDFLARED_TUNNEL) {
                 // Stop zrok if running before starting cloudflared
-                val zrokState = _daemonStates.value?.get(DaemonType.ZROK_TUNNEL)
+                val zrokState = authoritativeStates[DaemonType.ZROK_TUNNEL]
                 if (zrokState?.status == DaemonStatus.RUNNING) {
                     LogManager.getInstance().info("Daemons", "Stopping Zrok (mutually exclusive with Cloudflared)")
                     stopDaemonSilent(DaemonType.ZROK_TUNNEL)
@@ -140,7 +183,7 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } else if (type == DaemonType.ZROK_TUNNEL) {
                 // Stop cloudflared if running before starting zrok
-                val cloudflaredState = _daemonStates.value?.get(DaemonType.CLOUDFLARED_TUNNEL)
+                val cloudflaredState = authoritativeStates[DaemonType.CLOUDFLARED_TUNNEL]
                 if (cloudflaredState?.status == DaemonStatus.RUNNING) {
                     LogManager.getInstance().info("Daemons", "Stopping Cloudflared (mutually exclusive with Zrok)")
                     stopDaemonSilent(DaemonType.CLOUDFLARED_TUNNEL)
@@ -453,10 +496,8 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
         uptime: String?,
         subprocesses: List<SubprocessInfo>
     ) {
-        val currentStates = _daemonStates.value?.toMutableMap() ?: mutableMapOf()
         val startTime = uptime?.let { System.currentTimeMillis() - parseUptimeToMillis(it) }
-        currentStates[type] = DaemonState(type, status, message, uptime, startTime, subprocesses)
-        _daemonStates.postValue(currentStates)
+        publishState(type, DaemonState(type, status, message, uptime, startTime, subprocesses))
     }
     
     fun refreshAllStatuses(logResults: Boolean = false) {
@@ -473,42 +514,40 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
         
         // Reset all states to stopped
         val stoppedStates = DaemonType.values().associateWith { DaemonState.stopped(it) }
-        _daemonStates.postValue(stoppedStates)
+        authoritativeStates.putAll(stoppedStates)
+        _daemonStates.postValue(HashMap(authoritativeStates))
     }
     
     private fun updateState(type: DaemonType, status: DaemonStatus, message: String) {
-        val currentStates = _daemonStates.value?.toMutableMap() ?: mutableMapOf()
-        currentStates[type] = DaemonState(type, status, message)
-        _daemonStates.postValue(currentStates)
+        publishState(type, DaemonState(type, status, message))
     }
     
-    fun getState(type: DaemonType): DaemonState? = _daemonStates.value?.get(type)
+    // Reads the authoritative map, not LiveData.value: postValue leaves .value
+    // stale until the main thread drains, so a caller could act on old state.
+    fun getState(type: DaemonType): DaemonState? = authoritativeStates[type]
     
     /**
      * Update Zrok state to indicate configuration is needed.
      */
     fun updateZrokNeedsConfig(message: String) {
-        val currentStates = _daemonStates.value?.toMutableMap() ?: mutableMapOf()
-        currentStates[DaemonType.ZROK_TUNNEL] = DaemonState.needsConfig(DaemonType.ZROK_TUNNEL, message)
-        _daemonStates.postValue(currentStates)
+        publishState(DaemonType.ZROK_TUNNEL,
+            DaemonState.needsConfig(DaemonType.ZROK_TUNNEL, message))
     }
 
     /**
      * Update Cloudflared state to indicate configuration is needed.
      */
     fun updateCloudflaredNeedsConfig(message: String) {
-        val currentStates = _daemonStates.value?.toMutableMap() ?: mutableMapOf()
-        currentStates[DaemonType.CLOUDFLARED_TUNNEL] = DaemonState.needsConfig(DaemonType.CLOUDFLARED_TUNNEL, message)
-        _daemonStates.postValue(currentStates)
+        publishState(DaemonType.CLOUDFLARED_TUNNEL,
+            DaemonState.needsConfig(DaemonType.CLOUDFLARED_TUNNEL, message))
     }
 
     /**
      * Update Tailscale state to indicate needs login.
      */
     fun updateTailscaleNeedsLogin(message: String) {
-        val currentStates = _daemonStates.value?.toMutableMap() ?: mutableMapOf()
-        currentStates[DaemonType.TAILSCALE_TUNNEL] = DaemonState.needsConfig(DaemonType.TAILSCALE_TUNNEL, message)
-        _daemonStates.postValue(currentStates)
+        publishState(DaemonType.TAILSCALE_TUNNEL,
+            DaemonState.needsConfig(DaemonType.TAILSCALE_TUNNEL, message))
     }
     
     /**
@@ -521,6 +560,23 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
     
     override fun onCleared() {
         super.onCleared()
+        // Stop the tunnel status poll and its looper. Previously this loop was
+        // un-cancellable (new main-thread Handler per tick, no retained
+        // reference) and outlived the ViewModel for the whole process lifetime.
+        // Order matters: set the stop flag, drop the queued tick, THEN quit the
+        // looper, and only null the fields last. Nulling the handler before the
+        // quit left an in-flight tick's `tunnelPollHandler?.postDelayed(...)`
+        // re-post silently no-oping on one interleaving and targeting a
+        // just-quit looper on the other — benign either way, but the flag makes
+        // the intent explicit rather than luck-dependent.
+        tunnelPollStopped = true
+        tunnelPollRunnable?.let { tunnelPollHandler?.removeCallbacks(it) }
+        try { tunnelPollThread?.quitSafely() } catch (e: Exception) {
+            // best-effort; a failed quit must not skip the releases below
+        }
+        tunnelPollRunnable = null
+        tunnelPollHandler = null
+        tunnelPollThread = null
         // Release per-controller threads (e.g. ZrokController's dedicated
         // reconcileScheduler + AdbShellExecutor) WITHOUT killing the
         // daemons themselves. Daemons run in their own UID 2000 processes

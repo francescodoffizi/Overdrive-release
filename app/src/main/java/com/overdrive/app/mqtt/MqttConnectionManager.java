@@ -595,6 +595,10 @@ public class MqttConnectionManager {
                         && vd.chargePowerKw > 0.1 && vd.chargePowerKw <= 300) {
                     chargeKw = vd.chargePowerKw;
                 } else if (chargingState != null
+                        // !isEstimated: keep the nominal placeholder (3.3/7.0 kW) and inferred
+                        // engine-power figures out of the MQTT/Home-Assistant feed, which charts
+                        // this as measured charge power. The raw HAL getter above is unaffected.
+                        && !chargingState.isEstimated
                         && !Double.isNaN(chargingState.chargingPowerKW)
                         && chargingState.chargingPowerKW > 0.1
                         && chargingState.chargingPowerKW <= 300) {
@@ -752,7 +756,15 @@ public class MqttConnectionManager {
                     payload.put("coolant_temp", vd.waterTempC);
                 if (!Double.isNaN(vd.bodyworkBattTempC) && vd.bodyworkBattTempC >= -40 && vd.bodyworkBattTempC <= 80)
                     payload.put("bodywork_batt_temp", vd.bodyworkBattTempC);
-                if (!Double.isNaN(vd.insideTempC) && vd.insideTempC >= -40 && vd.insideTempC <= 80)
+                // No band here: insideTempC is validated at the SOURCE for both of its producers —
+                // the HAL read (BydDataCollector.readCabinTempC) and the cloud fallback in
+                // mergeCloudData — which share one isPlausibleCabinTempC definition (sentinels
+                // rejected, physical range enforced). A second, TIGHTER clip here made this
+                // disagree with cabin_temp, which comes from the same reader with no band: a
+                // genuinely hot parked cabin (85 C) was published as cabin_temp while inside_temp
+                // silently held its last <=80 value, leaving two HA entities from one sensor
+                // reporting different temperatures.
+                if (!Double.isNaN(vd.insideTempC))
                     payload.put("inside_temp", vd.insideTempC);
 
                 // 12V battery (voltage12v is already source-validated to 8.0–16.0V in BydDataCollector)
@@ -880,6 +892,11 @@ public class MqttConnectionManager {
                 payload.put("light_hazard", vd.hazard ? 1 : 0);
                 payload.put("light_drl", vd.dayTimeLight ? 1 : 0);
                 payload.put("ambient_colour", vd.ambientColour);
+                // Ambient main switch: only published when actually readable, so a trim that
+                // cannot report it leaves the entity unavailable instead of showing a wrong "off".
+                if (vd.ambientEnabled != BydVehicleData.UNAVAILABLE) {
+                    payload.put("ambient_enabled", vd.ambientEnabled);
+                }
 
                 // Climate
                 if (vd.acStartState != BydVehicleData.UNAVAILABLE) payload.put("ac_on", vd.acStartState);
@@ -887,11 +904,35 @@ public class MqttConnectionManager {
                 if (vd.acWindMode != BydVehicleData.UNAVAILABLE) payload.put("ac_wind", vd.acWindMode);
                 if (vd.acFanLevel != BydVehicleData.UNAVAILABLE) payload.put("ac_fan", vd.acFanLevel);
                 if (vd.tempUnit != BydVehicleData.UNAVAILABLE) payload.put("temp_unit", vd.tempUnit);
+                // Real dial readback. The climate entity's temperature_state_topic pointed at
+                // `climate_setpoint`, which only ever carried an OPTIMISTIC echo of our own
+                // write — so before OverDrive ever set the temperature HA showed nothing, and
+                // turning the physical dial left the echo stale. Publishing the polled setpoint
+                // to the same key makes it a true state topic; the echo now just fills the gap
+                // until the next poll instead of being the only source.
+                //
+                // Published in CELSIUS. The dial is read in the head unit's display unit, but the
+                // HA climate entity declares min_temp 17 / max_temp 33 and its command topic takes
+                // Celsius — so a raw °F value (72) would render as 72 inside a 17..33 slider and
+                // read as a wildly hot cabin. Converting here keeps the state and command sides in
+                // the same scale; `temp_unit` above still tells a consumer what the car displays.
+                if (vd.acSetpointDriver != BydVehicleData.UNAVAILABLE) {
+                    payload.put("climate_setpoint", setpointToCelsius(vd.acSetpointDriver));
+                }
+                if (vd.acSetpointPassenger != BydVehicleData.UNAVAILABLE) {
+                    payload.put("climate_setpoint_passenger", setpointToCelsius(vd.acSetpointPassenger));
+                }
 
                 // Seats
                 if (vd.seatbeltStatus != null) {
+                    // Per-seat UNAVAILABLE → null, not the raw sentinel. readSeatbeltPair returns
+                    // null only when BOTH seats are unreadable, so a mixed pair (one seat
+                    // UNAVAILABLE, the other real) is published — and -2147483648 on a SAFETY
+                    // signal reads as a garbage/truthy "buckled" to an MQTT consumer.
                     JSONArray a = new JSONArray();
-                    for (int s : vd.seatbeltStatus) a.put(s);
+                    for (int s : vd.seatbeltStatus) {
+                        a.put(s == BydVehicleData.UNAVAILABLE ? JSONObject.NULL : (Object) s);
+                    }
                     payload.put("seatbelt", a);
                 }
                 if (vd.seatHeat != null) {
@@ -980,6 +1021,21 @@ public class MqttConnectionManager {
     }
 
     /** True if any enabled connection has vehicle control turned on. */
+    /**
+     * A dial setpoint (read in the head unit's DISPLAY unit) as whole Celsius, so the MQTT state
+     * matches the HA climate entity's declared 17..33 bounds and its Celsius command topic.
+     *
+     * <p>The unit is decided by the value's own band rather than {@code temp_unit}: the two dial
+     * ranges are disjoint (17..33 vs 64..91), so the reading identifies its own scale, and a
+     * value already in Celsius must pass through untouched.
+     */
+    private static int setpointToCelsius(int setpoint) {
+        if (setpoint >= BydDataCollector.AC_SETPOINT_MIN_F && setpoint <= BydDataCollector.AC_SETPOINT_MAX_F) {
+            return (int) Math.round((setpoint - 32) * 5.0 / 9.0);
+        }
+        return setpoint;   // already Celsius (or outside both bands — publish verbatim)
+    }
+
     private boolean anyControlEnabled() {
         try {
             for (MqttConnectionConfig cfg : store.getEnabled()) {

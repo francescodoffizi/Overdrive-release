@@ -70,6 +70,12 @@ public class MqttCommandRouter {
             VehicleCommandRouter.CommandResult r =
                     VehicleCommandRouter.getInstance().executeSdkOnly(action.command);
 
+            // Record what we commanded for a blind-toggle entity once the command reached the
+            // vehicle (either outcome), but never when it was refused before getting there —
+            // see ControlAction.commitIfAttempted. Kept outside the SUCCESS branch on purpose:
+            // committing only on SUCCESS would freeze a no-readback toggle on one value.
+            action.commitIfAttempted(r.outcome);
+
             if (r.outcome == VehicleCommandRouter.Outcome.SUCCESS) {
                 logger.info("Control '" + entity.key + (sub != null ? "/" + sub : "")
                         + "' -> " + action.command.name() + " ok (" + r.latencyMs + "ms)");

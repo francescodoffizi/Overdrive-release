@@ -198,6 +198,23 @@ public final class SocCutoffMonitor {
         // 1. Stop the V2 monitor's wake-lock + handler.
         try { BatteryVoltageMonitorV2.stopMonitor(); } catch (Throwable ignored) {}
 
+        // 1b. Re-arm the backlight BEFORE we tear everything down. On dilink4 the
+        // parked panel may currently be held off via TurnBacklightOffWithLock —
+        // a vendor lock-holding call. This method then force-stops every process
+        // in the package and calls Runtime.exit(0), so nothing is left alive to
+        // undo it. Waking the panel here means the state the device is left in
+        // is the platform's own (the goToSleep below then sleeps it normally),
+        // rather than a vendor backlight lock taken by a process that no longer
+        // exists.
+        //
+        // turnOn() self-skips when the screen already reads on, so this is a
+        // no-op on legacy units and whenever the panel was never darkened.
+        try {
+            StealthPanel.turnOn(appContext);
+        } catch (Throwable t) {
+            logger.warn("Panel wake before shutdown failed: " + t.getMessage());
+        }
+
         // 2. Ask the head unit to enter sleep — display off + system idle.
         // Uses the caller-supplied context (this monitor may run in any
         // daemon process; don't reach into another daemon's static).

@@ -204,6 +204,9 @@ public class AccMonitor {
             // SYNCHRONOUS (awaits the unbind+destroy) so the mirror's VD is fully gone
             // before we touch the source. No-op if the mirror was never started.
             try {
+                // Detach the view-into-Surface mirror FIRST (unbind its SF display before the
+                // fission source closes — same load-bearing ordering as the legacy mirror).
+                com.overdrive.app.surveillance.ClusterViewMirrorService.forceDetachIfActive("acc-off");
                 com.overdrive.app.surveillance.ClusterMirrorController.forceCloseIfActive("acc-off");
             } catch (Throwable t) {
                 CameraDaemon.log("notifyAccEdge ACC-off cluster mirror stop failed: " + t.getMessage());
@@ -220,6 +223,40 @@ public class AccMonitor {
                 CameraDaemon.log("notifyAccEdge ACC-off cluster force-close failed: " + t.getMessage());
             }
             return;
+        }
+        // ACC-ON: wake the panel from THIS process too. AccSentryDaemon already
+        // wakes it on its own ACC-ON edge, but that daemon is a separate process
+        // and can be dead, wedged, or killed mid-park — in which case nothing
+        // there runs and the driver is handed a dark screen with no way to
+        // recover. byd_cam_daemon is independently watchdogged and also UID 2000,
+        // which makes this the natural second wake path. This is the narrowest
+        // de-duped OFF→ON edge in the process and is reached from BOTH the IPC
+        // path and the independent hardware probe, so it also covers a
+        // lost/never-sent ACC-ON IPC.
+        //
+        // turnOn() self-skips when getPowerScreenStatus() already reads on, so
+        // this is effectively free whenever the panel is already awake —
+        // including on the whole DiLink 3 fleet. Dispatched off this thread: it
+        // does binder reflection round-trips and this edge runs on the IPC/probe
+        // thread, where the side effects below expect to stay quick.
+        // Stamp the real ACC-ON edge so StealthPanel honours "vehicle in use" and
+        // suppresses any darken attempt during the transition (notably the screen
+        // deterrent's teardown, which runs in this process). Cheap volatile write;
+        // done inline, before the dispatch, so the suppression is in effect
+        // immediately rather than after a thread starts.
+        try {
+            com.overdrive.app.power.StealthPanel.noteAccOnObserved();
+        } catch (Throwable ignored) {}
+        try {
+            new Thread(() -> {
+                try {
+                    com.overdrive.app.power.StealthPanel.turnOn(CameraDaemon.getAppContext());
+                } catch (Throwable t) {
+                    CameraDaemon.log("notifyAccEdge panel wake failed: " + t.getMessage());
+                }
+            }, "StealthPanelWake-AccOn").start();
+        } catch (Throwable t) {
+            CameraDaemon.log("notifyAccEdge panel wake dispatch failed: " + t.getMessage());
         }
         try {
             // ACC-ON: at most ONE cluster takeover can auto-start (the cluster is a single

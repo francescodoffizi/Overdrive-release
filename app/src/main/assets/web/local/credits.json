@@ -11,7 +11,9 @@
     { "name": "Marlon Chalegre", "github": "marlonchalegre" },
     { "name": "Pål Kristensen", "github": "paalkr" },
     { "name": "Thiago Costa", "github": "ThiagoCAltoe" },
-    { "name": "Saleh Ibrahim", "github": "Slh-Ibrahim" }
+    { "name": "Saleh Ibrahim", "github": "Slh-Ibrahim" },
+    { "name": "Shaun Eccles-Smith", "github": "shauneccles" },
+    { "name": "Paul Hepple", "github": "MetalHepple" }
   ],
   "supporters": [
     { "name": "Oizopower" },
@@ -49,6 +51,9 @@
     { "name": "Muhammed AKYUZ" },
     { "name": "Azham" },
     { "name": "Federico Valsania" },
-    { "name": "Renato Veiga" }
+    { "name": "Renato Veiga" },
+    { "name": "Werner Wagener" },
+    { "name": "Ioannis Kazakopoulos" },
+    { "name": "Adrian b" }
   ]
 }

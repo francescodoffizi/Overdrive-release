@@ -33,6 +33,17 @@ public final class BydCarSettings {
     private static final String TAG = "BydCarSettings";
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
     private static final String CLS = "android.provider.CarSettings$UserTableData";
+    /**
+     * The provider exposes SEVERAL independent tables — {@code UserTableData} (the per-user
+     * settings the curated {@link #REGISTRY} lives in), {@code Config}, and {@code Global}.
+     * They are NOT interchangeable: a key written to the wrong table is simply a different
+     * key, so it either fails or silently stores a value nothing reads.
+     *
+     * <p>{@code atmosphere_lamp} — the ambient main-switch flag — lives in {@code Config}
+     * (verified against the reference app, which reads/writes it via
+     * {@code CarSettings$Config.getInt/putInt}), hence this second class name.
+     */
+    private static final String CLS_CONFIG = "android.provider.CarSettings$Config";
 
     /** How a setting maps onto a Home Assistant entity. */
     public enum Kind { BOOL, INT_RANGE, INT_ENUM }
@@ -78,6 +89,34 @@ public final class BydCarSettings {
         r.add(enumInt("unit_temperature", "Temperature Unit (0=C,1=F)", "mdi:temperature-celsius", new int[]{0, 1}));
         r.add(range("lighting_ambient_brightness", "Ambient Light Brightness", "mdi:track-light", 0, 10, 1, null));
         return Collections.unmodifiableList(r);
+    }
+
+    /**
+     * Keys this class may WRITE but which are NOT surfaced as their own Home Assistant
+     * entity. The {@link #REGISTRY} above doubles as the HA entity list (see
+     * {@code VehicleControlCatalog}'s tier-3 loop), so a key that already has a richer
+     * dedicated control must not go there — it would publish a second, weaker entity for
+     * the same function and the two would disagree.
+     *
+     * <p>{@code atmosphere_lamp} is the interior-ambient main switch as BYD's own settings
+     * UI stores it. It is the LAST tier of {@link BydDataCollector#setAmbientLightEnabled}
+     * (after the Light-device main switch and the Bodywork execute feature), matching the
+     * reference app's three-tier chain. Ambient power already has a dedicated control that
+     * drives all three tiers, hence write-only here.
+     */
+    private static final java.util.Set<String> INTERNAL_WRITABLE =
+            java.util.Set.of("atmosphere_lamp");
+
+    /**
+     * Provider key for the interior-ambient main switch (1 = on, 0 = off).
+     *
+     * <p>Lives in the {@code Config} table, NOT {@code UserTableData} — see {@link #CLS_CONFIG}.
+     */
+    public static final String KEY_ATMOSPHERE_LAMP = "atmosphere_lamp";
+
+    /** Which provider table a key belongs to. Getting this wrong reads/writes a different key. */
+    private static String tableFor(String key) {
+        return INTERNAL_WRITABLE.contains(key) ? CLS_CONFIG : CLS;
     }
 
     private static CarSetting bool(String k, String n, String i) {
@@ -128,18 +167,32 @@ public final class BydCarSettings {
     public int readInt(String key, int def) {
         ContentResolver cr = resolver();
         if (cr == null) return def;
+        boolean internal = INTERNAL_WRITABLE.contains(key);
         try {
-            Class<?> cls = Class.forName(CLS);
+            Class<?> cls = Class.forName(tableFor(key));
             Method m;
             try {
                 m = cls.getMethod("getSystemInt", ContentResolver.class, String.class, int.class);
             } catch (NoSuchMethodException e) {
-                m = cls.getMethod("getInt", ContentResolver.class, String.class, int.class);
+                try {
+                    m = cls.getMethod("getInt", ContentResolver.class, String.class, int.class);
+                } catch (NoSuchMethodException e2) {
+                    // The Config table's getInt is the 2-arg form (no default) — see the
+                    // reference app. Fall back to it and treat "no value" as the default.
+                    Method m2 = cls.getMethod("getInt", ContentResolver.class, String.class);
+                    Object v2 = m2.invoke(null, cr, key);
+                    return (v2 instanceof Integer) ? (Integer) v2 : def;
+                }
             }
             Object v = m.invoke(null, cr, key, def);
             return (v instanceof Integer) ? (Integer) v : def;
         } catch (Throwable t) {
-            unavailable = true;
+            // Only a REGISTRY-key failure marks the whole provider unavailable (that flag
+            // suppresses refresh() for every curated setting). An internal key lives in a
+            // different table, so its absence says nothing about UserTableData — letting it
+            // set the flag would silently stop all car-settings refreshes on a trim that
+            // simply lacks this one key.
+            if (!internal) unavailable = true;
             logger.debug("readInt(" + key + ") failed: " + t.getMessage());
             return def;
         }
@@ -149,6 +202,16 @@ public final class BydCarSettings {
     public boolean writeInt(String key, int value) {
         CarSetting s = find(key);
         if (s == null) {
+            // A write-only internal key (see INTERNAL_WRITABLE) is allowlisted for writing
+            // but has no CarSetting descriptor, so it is domain-checked as a plain 0/1 flag
+            // here rather than through isValid. Anything else is still refused.
+            if (INTERNAL_WRITABLE.contains(key)) {
+                if (value != 0 && value != 1) {
+                    logger.warn("Refusing out-of-domain value " + value + " for " + key);
+                    return false;
+                }
+                return putInt(key, value);
+            }
             logger.warn("Refusing to write non-allowlisted setting: " + key);
             return false;
         }
@@ -156,10 +219,58 @@ public final class BydCarSettings {
             logger.warn("Refusing out-of-domain value " + value + " for " + key);
             return false;
         }
+        return putInt(key, value);
+    }
+
+    /**
+     * As {@link #writeInt}, but true ONLY when the provider explicitly CONFIRMED the write
+     * (returned {@code Boolean.TRUE}). A void/unknown return — which {@code writeInt} treats
+     * optimistically as success — reports false here.
+     *
+     * <p>For a fallback CHAIN this distinction is the whole point: an optimistic "true" from
+     * the last tier would report overall success while nothing physically moved, and callers
+     * that surface that boolean (or use it to pick the next tier) would be misled. Entities
+     * that merely echo their commanded value keep using the lenient {@link #writeInt}, whose
+     * behaviour is deliberately unchanged.
+     */
+    public boolean writeIntConfirmed(String key, int value) {
+        CarSetting s = find(key);
+        if (s == null && !INTERNAL_WRITABLE.contains(key)) {
+            logger.warn("Refusing to write non-allowlisted setting: " + key);
+            return false;
+        }
+        if (s != null ? !isValid(s, value) : (value != 0 && value != 1)) {
+            logger.warn("Refusing out-of-domain value " + value + " for " + key);
+            return false;
+        }
+        return putIntRaw(key, value) == CONFIRMED;
+    }
+
+    /** The raw provider write, shared by the registry and internal-key paths above. */
+    private boolean putInt(String key, int value) {
+        // Optimistic: anything short of an explicit "false" / a throw counts as success,
+        // because this provider's putInt is void on some trims. Unchanged behaviour.
+        return putIntRaw(key, value) != REJECTED;
+    }
+
+    private static final int CONFIRMED = 1;   // provider returned Boolean.TRUE
+    private static final int UNCONFIRMED = 0; // void / non-boolean return — cannot tell
+    private static final int REJECTED = -1;   // explicit Boolean.FALSE, or the call threw
+
+    /**
+     * The single provider write. Returns {@link #CONFIRMED} / {@link #UNCONFIRMED} /
+     * {@link #REJECTED} so each caller can choose its own strictness rather than collapsing
+     * "it didn't contradict us" and "it said yes" into one boolean.
+     */
+    private int putIntRaw(String key, int value) {
         ContentResolver cr = resolver();
-        if (cr == null) return false;
+        if (cr == null) return REJECTED;
+        // Only REGISTRY keys belong in the cache — it is dumped wholesale into telemetry as
+        // setting_<key> by snapshotInto, so caching an internal key would publish a phantom
+        // field with no matching entity.
+        boolean cacheable = !INTERNAL_WRITABLE.contains(key);
         try {
-            Class<?> cls = Class.forName(CLS);
+            Class<?> cls = Class.forName(tableFor(key));
             Method m;
             try {
                 m = cls.getMethod("putInt", ContentResolver.class, String.class, int.class);
@@ -167,12 +278,21 @@ public final class BydCarSettings {
                 m = cls.getMethod("setSystemInt", ContentResolver.class, String.class, int.class);
             }
             Object r = m.invoke(null, cr, key, value);
-            boolean ok = !(r instanceof Boolean) || (Boolean) r;
-            if (ok) cache.put(key, value);
-            return ok;
+            if (r instanceof Boolean) {
+                if (!(Boolean) r) {
+                    logger.debug("writeInt(" + key + "=" + value + ") refused by provider");
+                    return REJECTED;
+                }
+                if (cacheable) cache.put(key, value);
+                return CONFIRMED;
+            }
+            // Void / unknown return: cache the intent (the pre-existing behaviour) but tell
+            // strict callers we could not confirm it.
+            if (cacheable) cache.put(key, value);
+            return UNCONFIRMED;
         } catch (Throwable t) {
             logger.warn("writeInt(" + key + "=" + value + ") failed: " + t.getMessage());
-            return false;
+            return REJECTED;
         }
     }
 

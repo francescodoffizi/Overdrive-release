@@ -23,7 +23,8 @@ import java.io.OutputStream
  * Endpoints:
  *  - GET    /api/community/list[?sort&order&page&pageSize&q&category] → paginated catalog (proxied)
  *  - GET    /api/community/automation/{id}   → one shared automation + per-vehicle capability enrichment
- *  - POST   /api/community/publish           → publish a local automation ({rules,authorName,name,description,category})
+ *  - POST   /api/community/publish           → publish a local automation ({rules,authorName,name,description,category,localId})
+ *  - PUT    /api/community/automation/{id}   → update a shared automation I published (device-match)
  *  - POST   /api/community/import/{id}       → import a shared automation into the LOCAL store (disabled)
  *  - POST   /api/community/rate/{id}         → rate 1..5 ({stars})
  *  - POST   /api/community/report/{id}       → flag abuse ({reason?})
@@ -45,6 +46,11 @@ import java.io.OutputStream
  *  4. Publish is SERVER-AUTHORITATIVE — the blob is re-parsed through
  *     [Automation.fromJson] and re-serialized ([Automation.toJson]) so a tampered
  *     client payload is normalized to the canonical, schema-valid form before upload.
+ *  5. RE-PUBLISH DEDUPE — the backend POST is a CREATE, so publishing an automation that
+ *     was already shared would add a duplicate catalog row. The local→remote row map
+ *     ([CommunityConfig.publishedRowId], keyed by local automation id) promotes such a
+ *     re-publish to an in-place update instead. Not a security gate — the Worker still
+ *     owns ownership via the publisher-id match — purely duplicate prevention.
  */
 object CommunityApiHandler {
 
@@ -52,6 +58,9 @@ object CommunityApiHandler {
 
     /** Wire format version of the automation blob (mirrors community-edge schema_version). */
     private const val SCHEMA_VERSION = 1
+
+    /** Name clamp on import — mirrors the local editor's name field maxLength (automations.js). */
+    private const val MAX_NAME_LEN = 64
 
     private const val PREFIX = "/api/community/"
 
@@ -127,14 +136,32 @@ object CommunityApiHandler {
     // ── Publish ────────────────────────────────────────────────────────────────
 
     /**
-     * POST publish — body { rules, authorName, name, description?, category? }.
+     * POST publish — body { rules, authorName, name, description?, category?, localId? }.
      * Server-authoritative: re-parse the rules through [Automation.fromJson] (the
      * canonical validator) and re-serialize, blocking any shell action, before upload.
+     *
+     * RE-PUBLISH IS AN UPDATE. Publishing is a CREATE on the backend (POST mints a new
+     * row id), so re-publishing an automation this install already shared would insert a
+     * duplicate catalog entry. When [localId] maps to a known community row
+     * ([CommunityConfig.publishedRowId]) we therefore route to [updateOwn] instead, which
+     * PUTs the same row (preserving its id / ratings / downloads). A stale mapping (the
+     * row was deleted server-side) falls back to a real publish and is re-pointed at the
+     * new row — [promote]=false marks that fallback so the two paths can't ping-pong if
+     * clearing the stale mapping failed to persist.
      */
-    private fun publish(body: String?, out: OutputStream): Boolean {
+    private fun publish(body: String?, out: OutputStream, promote: Boolean = true): Boolean {
         val json = parseBody(body) ?: run { safeError(out, 400, "invalid JSON body"); return true }
         val rules = json.optJSONObject("rules")
         if (rules == null) { safeError(out, 400, "rules required"); return true }
+
+        // Already published from this local automation → update that row, never insert a
+        // second one. Handled before validation so updateOwn applies the identical gate.
+        val localId = json.optString("localId", "").trim()
+        val existingRow = if (promote) CommunityConfig.publishedRowId(localId) else null
+        if (existingRow != null) {
+            logger.info("Re-publish of local $localId → updating community row $existingRow in place")
+            return updateOwn(existingRow, body, out, localId)
+        }
 
         // Authoritative validate + canonicalize (drops any junk the client added).
         val parsed = Automation.fromJson(rules)
@@ -172,6 +199,15 @@ object CommunityApiHandler {
         // still remove their upload after a RoadSense id rotation.
         val publisherId = CommunityConfig.publisherId()
         val res = provider.publish(publisherId, authorName, name, description, category, canonical, SCHEMA_VERSION, bundledGroups)
+        // Remember local→remote so a later re-publish of this automation UPDATES the row
+        // it created instead of inserting a duplicate. Best-effort: a failed persist only
+        // costs us the dedupe on the next publish, never the publish itself.
+        val newRow = res.body?.optString("id", "")?.ifEmpty { null }
+        if (res.ok && newRow != null && localId.isNotEmpty()) {
+            try { CommunityConfig.setPublishedRowId(localId, newRow) } catch (t: Throwable) {
+                logger.warn("could not remember published row $newRow for local $localId: ${t.message}")
+            }
+        }
         forward(res, out)
         return true
     }
@@ -227,8 +263,13 @@ object CommunityApiHandler {
      * automation (edit locally → Update) instead of delete-and-republish (which would
      * reset stars/downloads and mint a new id). A non-owner / unknown id gets the
      * Worker's 404 forwarded as-is.
+     *
+     * [mappedLocalId] is set only when [publish] promoted a re-publish to an update via
+     * the local→remote map: a 404 then means the mapping is STALE (the row was deleted
+     * server-side), so we drop it and fall back to a genuine publish rather than failing
+     * the user's action.
      */
-    private fun updateOwn(id: String?, body: String?, out: OutputStream): Boolean {
+    private fun updateOwn(id: String?, body: String?, out: OutputStream, mappedLocalId: String? = null): Boolean {
         if (id.isNullOrBlank()) { safeError(out, 400, "missing id"); return true }
         val json = parseBody(body) ?: run { safeError(out, 400, "invalid JSON body"); return true }
         val rules = json.optJSONObject("rules") ?: run { safeError(out, 400, "rules required"); return true }
@@ -261,6 +302,22 @@ object CommunityApiHandler {
         // stored author_device, so only the original publisher can update the row.
         val publisherId = CommunityConfig.publisherId()
         val res = provider.update(id, publisherId, authorName, name, description, category, canonical, SCHEMA_VERSION, bundledGroups)
+
+        // Stale mapping: the remembered row is gone (or no longer ours). Forget it and
+        // publish afresh so the user's Publish still does something sensible. Only ever
+        // taken on the publish-promoted path — a direct PUT keeps forwarding the 404.
+        if (!res.ok && res.httpCode == 404 && mappedLocalId != null) {
+            logger.warn("mapped community row $id is gone — re-publishing local $mappedLocalId")
+            try { CommunityConfig.setPublishedRowId(mappedLocalId, null) } catch (_: Throwable) { }
+            return publish(body, out, promote = false)
+        }
+
+        // An explicit PUT (the Edit button) also (re)asserts the mapping, so a later
+        // re-publish of the same local automation updates this row instead of duplicating.
+        val localId = mappedLocalId ?: json.optString("localId", "").trim().ifEmpty { null }
+        if (res.ok && localId != null) {
+            try { CommunityConfig.setPublishedRowId(localId, id) } catch (_: Throwable) { }
+        }
         forward(res, out)
         return true
     }
@@ -269,8 +326,9 @@ object CommunityApiHandler {
 
     /**
      * POST import — fetch the shared automation's authoritative rules from the Worker,
-     * refuse a shell action, force it disabled, and save it into the LOCAL automation
-     * store (minting a fresh local UUID). Fires the best-effort install counter.
+     * refuse a shell action, carry its NAME across, force it disabled, and save it into
+     * the LOCAL automation store (minting a fresh local UUID). Fires the best-effort
+     * install counter.
      */
     private fun importAutomation(id: String?, out: OutputStream): Boolean {
         if (id.isNullOrBlank()) { safeError(out, 400, "missing id"); return true }
@@ -311,8 +369,24 @@ object CommunityApiHandler {
             }
         }
 
+        // Carry the shared automation's NAME across. The catalog row keeps the name in its
+        // own column and the Worker's canonical rules blob drops it (its allowlist is
+        // structural only), so without this an imported automation lands unnamed and shows
+        // as "Automation 1a2b3c4d" — the user can't tell what they just added. The ROW name
+        // is what they saw in the catalog and what the publisher typed into the publish form,
+        // so it wins over any name a blob happens to carry. Clamped to the editor's own
+        // maxLength so a hostile/oversized backend value can't bloat the local store.
+        // Only ever written on this freshly-fetched import blob — existing saved automations
+        // are never touched, and an empty row name leaves the blob exactly as it was.
+        val sharedName = automation.optString("name", "").trim()
+        if (sharedName.isNotEmpty()) {
+            rules.put("name", if (sharedName.length > MAX_NAME_LEN) sharedName.substring(0, MAX_NAME_LEN) else sharedName)
+        }
         // Import-as-disabled: the user reviews the rules before enabling.
         rules.put("disabled", true)
+        // Never inherit the publisher's run stats — a fresh import has never fired here.
+        rules.remove("triggerCount")
+        rules.remove("lastTriggered")
         // Reuse the exact create path the automations API uses (validates + saves + mints UUID).
         if (!Automations.updateAutomation(null, rules)) {
             safeError(out, 400, "shared automation does not match this app's schema")
@@ -350,7 +424,13 @@ object CommunityApiHandler {
         if (id.isNullOrBlank()) { safeError(out, 400, "missing id"); return true }
         // Delete uses the STABLE publisher id (the ownership key the row was published
         // under), so the author can still remove it after a RoadSense id rotation.
-        forward(provider.delete(id, CommunityConfig.publisherId()), out)
+        val res = provider.delete(id, CommunityConfig.publisherId())
+        // Drop the local→remote mapping for the removed row so a later publish of the
+        // same local automation creates a fresh entry instead of PUTting a dead id.
+        if (res.ok) {
+            try { CommunityConfig.forgetPublishedRow(id) } catch (_: Throwable) { }
+        }
+        forward(res, out)
         return true
     }
 
@@ -362,6 +442,9 @@ object CommunityApiHandler {
             .put("success", true)
             .put("workerUrl", snap.workerUrl ?: "")
             .put("authorName", snap.authorName ?: "")
+            // {localAutomationId: communityRowId} — lets the UI resolve "which local
+            // automation is this published row" exactly, instead of guessing by name.
+            .put("publishedIds", CommunityConfig.publishedIds(forceReload = true))
         HttpResponse.sendJson(out, resp.toString())
         return true
     }

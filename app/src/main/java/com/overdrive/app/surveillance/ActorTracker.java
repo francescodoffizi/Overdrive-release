@@ -50,6 +50,13 @@ public final class ActorTracker {
     /** IoU below this is not a match. */
     private static final float MATCH_IOU_MIN = 0.20f;
 
+    // Minimum quiet gap before the xqTrackId hint path demands same-quadrant bbox
+    // overlap (see Path A in update()). Chosen above the slowest legitimate YOLO
+    // period (AI_COOLDOWN_MS = 500 ms) with headroom for a skipped tick, so a
+    // continuously-tracked mover is never subjected to the check, while a track
+    // that went quiet long enough for a DIFFERENT object to take its place is.
+    private static final long HINT_IOU_CHECK_MIN_GAP_MS = 1500;
+
     /** History window for trend + static decision. */
     private static final int TREND_WINDOW = 6;
 
@@ -194,10 +201,53 @@ public final class ActorTracker {
                 // Path A: cross-quadrant trackId match (any quadrant). This is
                 // the primary identity signal — same xqTrackId means the
                 // CrossQuadrantTracker says it's the same physical thing.
+                //
+                // SAME-QUADRANT SANITY CHECK. Accepting the hint unconditionally
+                // makes this Track inherit everMoved=false and the accumulated
+                // historyCount of whatever the hint used to describe, which stamps
+                // isStaticForTimeline on a genuinely-moving object's first frame
+                // (skipped by every count/threat loop, eventEverSawMovingObject
+                // never latches, promoted into DetectionBaseline). CQT bounds that
+                // for stale tracks with a jitter radius, but a wrongly-absorbed
+                // hint can still arrive. So when the hinted Track was last seen in
+                // THIS quadrant, require the boxes to actually overlap — a real
+                // same-quadrant continuation always does at the ~2-4 Hz cadence.
+                //
+                // Deliberately NOT applied across quadrants: a genuine handoff has
+                // no reason to overlap (different camera, different pixels), and
+                // rejecting it would mint a fresh actorId whose
+                // MIN_ESCALATION_FRAMES pins it at NOTICE — a suppressed
+                // notification, the failure this hint path exists to prevent.
+                //
+                // Also gated on the track being STALE (> HINT_IOU_CHECK_MIN_GAP_MS).
+                // On consecutive YOLO ticks a fast close-range mover legitimately
+                // clears its own previous box, so demanding overlap there would
+                // fragment exactly the subject we most want tracked. Absorption
+                // only becomes possible after a multi-second gap, which is where
+                // the check is both safe and needed.
+                boolean hintRejected = false;
                 if (hint != 0) {
                     for (Track t : tracks) {
                         if (t.classGroup == group && t.xqTrackId == hint) {
+                            boolean staleSameQuadrant =
+                                    t.quadrant == quadrant
+                                    && (wallNowMs - t.lastSeenWallMs) > HINT_IOU_CHECK_MIN_GAP_MS;
+                            if (staleSameQuadrant
+                                    && iou(t.lastX, t.lastY, t.lastW, t.lastH,
+                                           d.getX(), d.getY(), d.getW(), d.getH()) <= 0f) {
+                                // This hint describes a DIFFERENT physical object that
+                                // happened to reuse the id. Remember the rejection so
+                                // the id is not re-stamped below onto whatever Track we
+                                // end up using — otherwise two Tracks would share one
+                                // xqTrackId and the next frame's Path A `break` would
+                                // pick whichever comes first in `tracks`, oscillating
+                                // the actorId between them (and with it the severity
+                                // history each surface reads).
+                                hintRejected = true;
+                                continue;
+                            }
                             best = t;
+                            hintRejected = false;
                             break;
                         }
                     }
@@ -229,7 +279,13 @@ public final class ActorTracker {
                     best = new Track(nextActorId++, group, quadrant);
                     tracks.add(best);
                 }
-                if (hint != 0 && best.xqTrackId == 0) {
+                // Bind the cross-quadrant id to this Track, EXCEPT when the sanity
+                // check above rejected it: re-stamping would recreate the duplicate
+                // the rejection exists to avoid. The Track then carries xqTrackId=0
+                // and is matched by per-quadrant IoU (Path B) until CQT issues it a
+                // fresh id — degrading to the legacy behaviour, which is correct
+                // rather than wrong.
+                if (hint != 0 && !hintRejected && best.xqTrackId == 0) {
                     best.xqTrackId = hint;
                 }
                 best.observe(d, quadrant, quadrantW, quadrantH, recordingStartWallMs, wallNowMs);

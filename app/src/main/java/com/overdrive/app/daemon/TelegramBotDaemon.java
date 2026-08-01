@@ -149,7 +149,24 @@ public class TelegramBotDaemon {
     private static final AtomicBoolean spoolDrainInProgress = new AtomicBoolean(false);
 
     private static long lastUpdateId = 0;
-    
+
+    // Poll-error backoff. getUpdates errors (409 Conflict, 401 Unauthorized,
+    // 429 rate-limit, 5xx) return a normal HTTP response — NOT an exception — so
+    // they bypass the catch-block's 5s sleep in the poll loop. Without a backoff
+    // here a persistent error (very common: a 409 when two pollers share one
+    // token, or a revoked token 401) spins getUpdates every network RTT, 24/7
+    // while parked — hundreds of MB/day of mobile data. This backoff sleeps on
+    // every error return, doubling from BASE up to MAX, and resets to 0 on the
+    // next successful poll. Read/written only on the single "TelegramPoll" thread.
+    private static long pollErrorBackoffMs = 0;
+    private static final long POLL_BACKOFF_BASE_MS = 5_000;
+    private static final long POLL_BACKOFF_MAX_MS = 300_000;   // 5 min ceiling
+    // 409/401 are terminal for the current token — a fixed poll cadence can never
+    // clear them (they need operator action: kill the other poller / fix token).
+    // Poll at this slow rate so we still notice when the condition resolves
+    // (token replaced, other poller stopped) without burning data meanwhile.
+    private static final long POLL_TERMINAL_ERROR_MS = 60_000;
+
     // Track processed update IDs to prevent duplicate processing
     private static final java.util.Set<Long> processedUpdateIds = 
         java.util.Collections.newSetFromMap(new java.util.LinkedHashMap<Long, Boolean>() {
@@ -1852,17 +1869,19 @@ public class TelegramBotDaemon {
             return;
         }
 
-        // Bypass throttle when this restart was caused by an app update —
-        // the user just installed a new version and DOES want the
-        // bot-online confirmation, even if a prior greeting fired within
-        // the throttle window. The hint file is consumed elsewhere (by
-        // notifyTunnel for the post-update tunnel-URL message); we only
-        // peek here so both flows can read it independently.
-        boolean postUpdateBypass = new File(
-                "/data/local/tmp/overdrive_post_update_pending_telegram").exists();
-
+        // NOTE: there is deliberately no post-update bypass here. An earlier
+        // revision peeked overdrive_post_update_pending_telegram to force a
+        // greeting after an update, but that peek was already dead code:
+        // startPolling calls surfaceInstallResultOnStartup() first, which
+        // CONSUMES (deletes) the hint before this method runs. It was also
+        // redundant — that same call sends the owner an explicit
+        // "Overdrive updated to X" message under criticalAlerts (default ON),
+        // so the update is surfaced either way, and forcing an extra
+        // bot-online greeting alongside it is exactly the duplication this
+        // throttle exists to prevent.
+        //
         // Cross-process throttle: skip if we greeted within the last hour
-        // AND under the same kernel boot_id. File lives in /data/local/tmp
+        // AND we cannot prove a reboot happened. File lives in /data/local/tmp
         // (writable by UID 2000 shell that runs this daemon) so it survives
         // SIGKILL, lock-collision exit(1), and watchdog clean/error
         // respawns. /data is ext4 (persistent), so it ALSO survives reboot
@@ -1873,16 +1892,18 @@ public class TelegramBotDaemon {
         // .stopTelegramDaemon, so toggle-off-then-on also bypasses without
         // needing a special signal here.
         String currentBootId = readBootId();
-        if (!postUpdateBypass) {
+        {
             try {
                 File stamp = new File(GREETING_STAMP_FILE);
                 if (stamp.exists()) {
+                    // Clamp a future mtime to "just now" instead of treating it as
+                    // un-throttled. The head unit boots with a wrong RTC and
+                    // corrects it seconds later — exactly the window in which the
+                    // restart triggers cluster — so a backwards clock step made
+                    // `age` negative and re-announced the greeting.
                     long age = System.currentTimeMillis() - stamp.lastModified();
-                    if (age >= 0 && age < GREETING_THROTTLE_MS) {
-                        // Read stamped boot_id from the file. Empty/missing
-                        // content = pre-boot_id-aware stamp, treat as
-                        // "different boot" and bypass (one extra greeting
-                        // on upgrade-day, then steady state).
+                    if (age < 0) age = 0;
+                    if (age < GREETING_THROTTLE_MS) {
                         String stampedBootId = "";
                         try (java.io.BufferedReader r = new java.io.BufferedReader(
                                 new java.io.InputStreamReader(new java.io.FileInputStream(stamp)))) {
@@ -1890,26 +1911,36 @@ public class TelegramBotDaemon {
                             if (line != null) stampedBootId = line.trim();
                         } catch (Exception ignored) {}
 
-                        if (!currentBootId.isEmpty()
+                        // Only a PROVEN reboot bypasses the throttle: both ids
+                        // readable AND different. When either is empty we cannot
+                        // prove a reboot, so we fall back to mtime-only and
+                        // SUPPRESS.
+                        //
+                        // The previous condition required both ids non-empty to
+                        // suppress, which inverted that: on any device where
+                        // /proc/sys/kernel/random/boot_id is unreadable,
+                        // currentBootId is "" forever, every restart bypassed the
+                        // throttle, and the stamp was rewritten as "" — a stable
+                        // always-bypass state that reproduced the duplicate
+                        // "bot ready" flood the throttle exists to stop.
+                        boolean provenReboot = !currentBootId.isEmpty()
                                 && !stampedBootId.isEmpty()
-                                && currentBootId.equals(stampedBootId)) {
-                            log("Startup greeting throttled (last sent " + (age / 1000) + "s ago, same boot)");
+                                && !currentBootId.equals(stampedBootId);
+                        if (!provenReboot) {
+                            log("Startup greeting throttled (last sent " + (age / 1000)
+                                + "s ago; boot_id "
+                                + (currentBootId.isEmpty() || stampedBootId.isEmpty()
+                                    ? "unavailable, mtime-only" : "unchanged") + ")");
                             return;
                         }
-                        // boot_id mismatch (or unreadable) → reboot
-                        // happened or stamp is from before this feature
-                        // shipped — let the greeting fire.
                         log("Greeting throttle bypassed (reboot detected: stamped="
-                                + (stampedBootId.isEmpty() ? "<empty>" : stampedBootId)
-                                + ", current=" + (currentBootId.isEmpty() ? "<empty>" : currentBootId) + ")");
+                                + stampedBootId + ", current=" + currentBootId + ")");
                     }
                 }
             } catch (Exception e) {
                 // Fail-open: a stat blip shouldn't suppress the greeting.
                 log("Greeting throttle check error: " + e.getMessage());
             }
-        } else {
-            log("Greeting throttle bypassed (post-update)");
         }
 
         try {
@@ -1922,35 +1953,53 @@ public class TelegramBotDaemon {
                         {tr("buttons.tunnel_url"), "cmd:/url"}}
             };
 
-            boolean sent = sendMessageWithButtons(ownerChatId, greeting, buttons);
-            log("Startup greeting sent: " + sent);
+            // CLAIM BEFORE SEND. Stamping only after a successful send left two
+            // windows where the greeting re-fired on every respawn:
+            //   (1) a competing daemon's killOldInstances SIGKILLs us between
+            //       the send and the stamp write — the watchdog sees exit 137,
+            //       respawns, and the un-stamped throttle greets again. Stacked
+            //       watchdogs make this a loop, one "bot ready" per cycle.
+            //   (2) an AMBIGUOUS send failure (post-connect read timeout) —
+            //       Telegram may well have delivered it, but `sent` was false so
+            //       no stamp was written and the next start re-announced.
+            // Writing the stamp first makes the throttle hold in both cases. If
+            // the send then fails DEFINITIVELY-undelivered (DNS/connect — the
+            // request provably never left the device) we roll the stamp back so
+            // a genuine network blip still retries on the next start.
+            writeGreetingStamp(currentBootId);
 
-            if (sent) {
-                // Only stamp on success — if delivery failed (network blip),
-                // we want the next restart to retry, not silently swallow.
-                // Write current boot_id into the file body so a post-reboot
-                // throttle check can detect the boot transition. Using
-                // FileWriter (not FileOutputStream + write(0)) so the body
-                // is the actual boot_id, not a sentinel byte.
-                try {
-                    File stamp = new File(GREETING_STAMP_FILE);
-                    String body = currentBootId.isEmpty() ? "" : currentBootId;
-                    try (java.io.FileWriter fw = new java.io.FileWriter(stamp)) {
-                        fw.write(body);
-                    }
-                    // First-write chmod 666 so the app-side process can
-                    // stat for diagnostics (read-only). Idempotent on
-                    // subsequent rewrites.
-                    try { stamp.setReadable(true, false); } catch (Exception ignored) {}
-                    try { stamp.setWritable(true, false); } catch (Exception ignored) {}
-                } catch (Exception e) {
-                    // Worst case here is one extra greeting on the next
-                    // restart — not worth surfacing as an error.
-                    log("Greeting stamp write error: " + e.getMessage());
-                }
+            int outcome = sendMessageWithButtonsClassified(ownerChatId, greeting, buttons);
+            if (outcome == SEND_NOT_DELIVERED) {
+                // Provably never reached Telegram — release the claim so the
+                // next start retries. A replay cannot duplicate.
+                log("Startup greeting not delivered — clearing stamp so the next start retries");
+                try { new File(GREETING_STAMP_FILE).delete(); } catch (Exception ignored) {}
+            } else if (outcome == SEND_AMBIGUOUS) {
+                log("Startup greeting outcome ambiguous — keeping stamp to avoid a duplicate");
+            } else {
+                log("Startup greeting sent");
             }
         } catch (Exception e) {
             log("Startup greeting error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Persist the greeting throttle stamp with the current boot_id as its body,
+     * so a post-reboot throttle check can detect the boot transition. chmod 666
+     * so the app-side process can stat it for diagnostics.
+     */
+    private static void writeGreetingStamp(String currentBootId) {
+        try {
+            File stamp = new File(GREETING_STAMP_FILE);
+            try (java.io.FileWriter fw = new java.io.FileWriter(stamp)) {
+                fw.write(currentBootId == null || currentBootId.isEmpty() ? "" : currentBootId);
+            }
+            try { stamp.setReadable(true, false); } catch (Exception ignored) {}
+            try { stamp.setWritable(true, false); } catch (Exception ignored) {}
+        } catch (Exception e) {
+            // Worst case is one extra greeting on the next restart.
+            log("Greeting stamp write error: " + e.getMessage());
         }
     }
     
@@ -1975,12 +2024,48 @@ public class TelegramBotDaemon {
         
         Request request = new Request.Builder().url(url).get().build();
         
+        // Backoff delay decided inside the response block but SLEPT after it closes
+        // (see backoffSleep below). Sleeping while the Response is still open would
+        // pin an OkHttp connection out of the pool for up to POLL_BACKOFF_MAX_MS.
+        long pendingBackoffMs = 0L;
         try (Response response = httpClient.newCall(request).execute()) {
             if (!response.isSuccessful()) {
-                log("Poll HTTP error: " + response.code());
+                int code = response.code();
+                log("Poll HTTP error: " + code);
                 onHttpFailure();
-                return;
-            }
+                // Backoff so an error response (which is NOT an exception and so
+                // skips the poll loop's catch-sleep) can't spin getUpdates every
+                // RTT. 429 → honor Telegram's retry_after; 409/401 are terminal
+                // for this token → slow fixed cadence; everything else → doubling
+                // backoff. Reads the body here (small error JSON) to extract
+                // retry_after; the success path re-reads below only on 2xx.
+                if (code == 429) {
+                    long retryAfterSec = 0;
+                    try {
+                        String eb = response.body() != null ? response.body().string() : "";
+                        if (!eb.isEmpty()) {
+                            JSONObject ej = new JSONObject(eb);
+                            retryAfterSec = ej.optJSONObject("parameters") != null
+                                    ? ej.getJSONObject("parameters").optLong("retry_after", 0)
+                                    : ej.optLong("retry_after", 0);
+                        }
+                    } catch (Exception ignored) {}
+                    // Cap a server-supplied retry_after so a hostile/absurd value
+                    // can't park the poll thread indefinitely.
+                    pendingBackoffMs = retryAfterSec > 0
+                            ? Math.min(retryAfterSec * 1000L, POLL_BACKOFF_MAX_MS)
+                            : nextPollBackoffMs();
+                } else if (code == 409 || code == 401) {
+                    pendingBackoffMs = POLL_TERMINAL_ERROR_MS;
+                } else {
+                    pendingBackoffMs = nextPollBackoffMs();
+                }
+            } else {
+            // NOTE: the error-backoff reset is NOT here. A 2xx only proves the
+            // transport works; the body can still say ok:false. Resetting here made
+            // the ok:false path restart from BASE every time (a flat 5s floor,
+            // ~17k requests/day) instead of escalating. The reset now lives in the
+            // ok:true branch below.
 
             // A successful poll (2xx) is the authoritative "connectivity is
             // back" signal. If a prior poll or send saw the network go down and
@@ -2007,29 +2092,81 @@ public class TelegramBotDaemon {
             
             if (!json.optBoolean("ok", false)) {
                 log("Poll API error: " + json.optString("description"));
-                return;
-            }
-            
-            JSONArray updates = json.optJSONArray("result");
-            if (updates == null || updates.length() == 0) return;
-            
-            for (int i = 0; i < updates.length(); i++) {
-                JSONObject update = updates.getJSONObject(i);
-                long updateId = update.getLong("update_id");
-                
-                // Skip if already processed (deduplication)
-                if (processedUpdateIds.contains(updateId)) {
-                    log("Skipping duplicate update: " + updateId);
-                    continue;
+                // ok:false with a 2xx status still means the poll FAILED, so back off
+                // — a 200 body of {"ok":false,...} would otherwise loop with no delay,
+                // the same spin as the non-2xx path. This ESCALATES (5s→10s→…→300s)
+                // because the reset below only runs on a genuinely successful poll
+                // (2xx AND ok:true). A persistent body-level error (e.g. a token that
+                // authenticates but is rejected for this method) would otherwise sit
+                // at a flat 5s floor forever ≈ 17k requests/day.
+                pendingBackoffMs = nextPollBackoffMs();
+            } else {
+                // Genuine success (2xx + ok) — only now is the transport AND the API
+                // call proven healthy, so clear the accumulated error backoff.
+                pollErrorBackoffMs = 0;
+                JSONArray updates = json.optJSONArray("result");
+                if (updates != null && updates.length() > 0) {
+                    for (int i = 0; i < updates.length(); i++) {
+                        JSONObject update = updates.getJSONObject(i);
+                        long updateId = update.getLong("update_id");
+
+                        // Skip if already processed (deduplication)
+                        if (processedUpdateIds.contains(updateId)) {
+                            log("Skipping duplicate update: " + updateId);
+                            continue;
+                        }
+                        processedUpdateIds.add(updateId);
+
+                        lastUpdateId = Math.max(lastUpdateId, updateId);
+                        processUpdate(update);
+                    }
                 }
-                processedUpdateIds.add(updateId);
-                
-                lastUpdateId = Math.max(lastUpdateId, updateId);
-                processUpdate(update);
+            }
             }
         }
+
+        // Sleep AFTER the Response (and its connection) has been released, and in
+        // interruptible slices that re-check `running` — a single Thread.sleep of up
+        // to POLL_BACKOFF_MAX_MS would have delayed daemon shutdown by that long.
+        backoffSleep(pendingBackoffMs);
     }
-    
+
+    /**
+     * Sleeps for {@code totalMs} in short slices, bailing out early if the daemon is
+     * shutting down or polling was stopped. Keeps a 5-minute backoff from blocking a
+     * stop request for 5 minutes.
+     */
+    private static void backoffSleep(long totalMs) {
+        if (totalMs <= 0) return;
+        final long slice = 1000L;
+        long remaining = totalMs;
+        while (remaining > 0 && running && polling.get()) {
+            long chunk = Math.min(slice, remaining);
+            try {
+                Thread.sleep(chunk);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            remaining -= chunk;
+        }
+    }
+
+    /**
+     * Returns the next poll-error backoff delay (ms) and advances the counter:
+     * BASE on the first error, doubling each subsequent error, capped at MAX.
+     * Reset to 0 by the poll loop on the next successful (2xx + ok) poll. Called
+     * only on the single TelegramPoll thread, so the read-modify-write is safe
+     * without synchronization.
+     */
+    private static long nextPollBackoffMs() {
+        long next = (pollErrorBackoffMs <= 0)
+                ? POLL_BACKOFF_BASE_MS
+                : Math.min(pollErrorBackoffMs * 2, POLL_BACKOFF_MAX_MS);
+        pollErrorBackoffMs = next;
+        return next;
+    }
+
     // ==================== UPDATE PROCESSING ====================
     
     private static void processUpdate(JSONObject update) {
@@ -2342,9 +2479,33 @@ public class TelegramBotDaemon {
      * @param buttons Array of button rows, each row is array of [text, callbackData] pairs
      */
     public static boolean sendMessageWithButtons(long chatId, String text, String[][][] buttons) {
+        return sendMessageWithButtonsClassified(chatId, text, buttons) == SEND_OK;
+    }
+
+    /** Message was accepted by Telegram. */
+    static final int SEND_OK = 0;
+    /**
+     * Provably NOT delivered — the request never left the device (DNS/connect
+     * failure) or Telegram answered with a client-error/rate-limit rejection.
+     * Safe to retry: a replay cannot duplicate.
+     */
+    static final int SEND_NOT_DELIVERED = 1;
+    /**
+     * Unknown outcome — a post-connect read/write timeout, or a Telegram 5xx.
+     * The message MAY already have been delivered, so a replay risks a
+     * duplicate. Callers that dedupe must treat this as "sent".
+     */
+    static final int SEND_AMBIGUOUS = 2;
+
+    /**
+     * Same send as {@link #sendMessageWithButtons} but reports WHY it failed, so
+     * a caller holding a de-duplication stamp can tell a dup-safe retry from a
+     * possible double-send. See the SEND_* constants.
+     */
+    static int sendMessageWithButtonsClassified(long chatId, String text, String[][][] buttons) {
         try {
             String url = TELEGRAM_API_BASE() + botToken + "/sendMessage";
-            
+
             JSONObject body = new JSONObject();
             body.put("chat_id", chatId);
             body.put("text", text);
@@ -2377,7 +2538,7 @@ public class TelegramBotDaemon {
 
                 try (Response response = httpClient.newCall(request).execute()) {
                     if (response.isSuccessful()) {
-                        return true;
+                        return SEND_OK;
                     }
                     if (response.code() == 429 && attempt == 0) {
                         long sleepSec = parseRetryAfter(response, 1L);
@@ -2385,20 +2546,23 @@ public class TelegramBotDaemon {
                         try { Thread.sleep(Math.min(sleepSec * 1000L, 30_000L)); }
                         catch (InterruptedException ie) {
                             Thread.currentThread().interrupt();
-                            return false;
+                            return SEND_NOT_DELIVERED;
                         }
                         continue;  // retry
                     }
                     String respBody = response.body() != null
                             ? response.body().string() : "";
                     log("sendMessageWithButtons HTTP " + response.code() + ": " + respBody);
-                    return false;
+                    // Telegram answered, so we know the verdict: a 4xx rejected
+                    // the message outright (not delivered), while a 5xx may have
+                    // been applied server-side before the error — ambiguous.
+                    return response.code() >= 500 ? SEND_AMBIGUOUS : SEND_NOT_DELIVERED;
                 }
             }
-            return false;
+            return SEND_NOT_DELIVERED;
         } catch (Exception e) {
             log("sendMessageWithButtons error: " + e.getMessage());
-            return false;
+            return isDefinitivelyUndelivered(e) ? SEND_NOT_DELIVERED : SEND_AMBIGUOUS;
         }
     }
     

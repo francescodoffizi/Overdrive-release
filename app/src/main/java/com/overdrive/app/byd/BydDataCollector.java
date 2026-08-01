@@ -213,6 +213,17 @@ public class BydDataCollector {
         // Re-init: tear down state that would otherwise accumulate.
         availableDevices.clear();
         unavailableDevices.clear();
+        // Manager-channel handles were resolved from the PREVIOUS Context and are latched
+        // once-per-process, so without this they survive a re-init. That is exactly wrong for the
+        // path that matters: the daemon can start with a broken synthetic context (the observed
+        // "0/17 devices" case), latch "no manager available", and then ACC-ON replaces the context
+        // and re-inits — devices resolve, but the manager channel would stay permanently dead on
+        // precisely the vehicle this feature exists for. Re-probing is cheap (one-shot per handle).
+        BydManagerChannel.invalidate();
+        // A new Context is genuine new information, so bypass any dead-binder cool-down that
+        // invalidate() just armed — it was armed against the OLD context and waiting it out here
+        // would delay exactly the recovery this re-init exists to perform.
+        BydManagerChannel.allowImmediateReprobe();
         if (pollScheduler != null) {
             pollScheduler.shutdownNow();
             pollScheduler = null;
@@ -230,6 +241,20 @@ public class BydDataCollector {
         acDevice = initDevice("android.hardware.bydauto.ac.BYDAutoAcDevice", "AC");
         lightDevice = initDevice("android.hardware.bydauto.light.BYDAutoLightDevice", "Light");
         adasDevice = initDevice("android.hardware.bydauto.adas.BYDAutoADASDevice", "ADAS");
+        // Drop the blind-spot counter baselines on every (re-)init. init() re-runs
+        // on the ACC-ON edge, and if the firmware zeroes these per-drive counters
+        // across an ACC cycle, a baseline carried over from the previous drive is
+        // HIGHER than the fresh reading — the first alert of the new drive then
+        // looks like a decrease and is silently dropped. Clearing means the first
+        // post-init read only re-establishes the baseline (no false alert) and the
+        // next genuine increment is caught.
+        bsCounterBaseline.clear();
+        // Also re-prove the event path per ACC cycle. The listener is re-registered
+        // here, and if that registration now fails (or this firmware stops
+        // delivering), an id left marked "proven" would be neither polled nor
+        // evented — silently dead. Re-earning the exemption keeps the fallback
+        // honest at the cost of a few polls per drive.
+        bsEventProvenIds.clear();
         powerDevice = initDevice("android.hardware.bydauto.power.BYDAutoPowerDevice", "Power");
         safetyBeltDevice = initDevice("android.hardware.bydauto.safetybelt.BYDAutoSafetyBeltDevice", "SafetyBelt");
         tyreDevice = initDevice("android.hardware.bydauto.tyre.BYDAutoTyreDevice", "Tyre");
@@ -239,8 +264,21 @@ public class BydDataCollector {
         radarDevice = initDevice("android.hardware.bydauto.radar.BYDAutoRadarDevice", "Radar");
         settingDevice = initDevice("android.hardware.bydauto.setting.BYDAutoSettingDevice", "Setting");
         multimediaDevice = initMultimediaDevice();
+        // Multimedia resolves through its own multi-strategy path (4 separate accept sites), so it
+        // bypasses initDevice() and would otherwise be the ONE device never activated or type-learned
+        // — inconsistent with "every telemetry device" and a gap a future reader would trip over.
+        // Done once here rather than at each accept site.
+        if (multimediaDevice != null) {
+            BydManagerChannel.rememberDeviceType(
+                    "android.hardware.bydauto.multimedia.BYDAutoMultimediaDevice", multimediaDevice);
+            try {
+                BydManagerChannel.enableDevice(context, multimediaDevice, "Multimedia");
+            } catch (Throwable t) {
+                logger.debug("enableDevice[Multimedia] threw: " + t.getMessage());
+            }
+        }
 
-        logger.info("Devices available: " + availableDevices.size() + "/" + 
+        logger.info("Devices available: " + availableDevices.size() + "/" +
             (availableDevices.size() + unavailableDevices.size()));
         if (!unavailableDevices.isEmpty()) {
             logger.info("Unavailable: " + String.join(", ", unavailableDevices));
@@ -273,7 +311,30 @@ public class BydDataCollector {
         // Discovery methods removed — getBatteryRemainPowerEV() confirmed as correct BEV API.
         // BYD light/setting APIs have no write access from UID 2000.
 
-        // Register listeners
+        // Register listeners — ONCE PER DISTINCT SET OF HANDLES.
+        //
+        // init() is re-entered on the ACC-ON path with a fresh Context, and registerAllListeners()
+        // has ~22 register call sites with NO unregister path anywhere in this class. The device
+        // accessors are singletons (getInstance), so a re-init usually hands back the SAME device
+        // objects — re-registering on them stacks a second set of callbacks on the HAL, and the
+        // consumers include the door/charging event notifiers, so every push notification would
+        // then fire twice (three times after two re-inits, and so on).
+        //
+        // Tracked PER HANDLE, not as one all-or-nothing fingerprint. A whole-set fingerprint was
+        // wrong in both directions:
+        //   - it latched PARTIAL FAILURE. Every register* helper returns false on failure (dead
+        //     binder, no register method) and the call site merely skips its counter — so a first
+        //     init under the broken synthetic Context could fail to attach the bodywork/charging/
+        //     instrument listeners, and because the singleton handles were unchanged the re-init
+        //     skipped the retry and those callbacks went silent for the process lifetime. That is
+        //     strictly worse than the duplicate callbacks the guard was added to prevent: it trades
+        //     "fires twice" for "never fires".
+        //   - it was all-or-nothing, so ONE changed handle (multimediaDevice is the likeliest, it has
+        //     a createPackageContext fallback) forced re-registration on the other 18 unchanged
+        //     handles — re-introducing duplicates via a device the guard doesn't even register on.
+        // registerAllListeners() consults registeredHandles and skips only the individual devices it
+        // has already attached to successfully, so a failed device is retried on the next init and a
+        // successful one is never doubled.
         registerAllListeners();
 
         // Runtime receiver for power-cable plug edges. Manifest receiver
@@ -615,6 +676,189 @@ public class BydDataCollector {
         }
     }
 
+    // ── Blind-spot / lane-change / cross-traffic warning reads ───────────────
+    // Packed bit0=left / bit1=right, matching readTurnNow()'s convention;
+    // -1 = ADAS device unavailable (caller leaves the event unseeded).
+    public static final int BS_LEFT_BIT = 0x1;
+    public static final int BS_RIGHT_BIT = 0x2;
+
+    // The per-side alert IDs. FL/FR are level-encoded; the rest are counters.
+    private static final int[] BS_LEVEL_IDS_LEFT = { BydFeatureIds.ADAS_FL_BLIND_SPOT_ALARM };
+    private static final int[] BS_LEVEL_IDS_RIGHT = { BydFeatureIds.ADAS_FR_BLIND_SPOT_ALARM };
+    private static final int[] BS_COUNTER_IDS_LEFT = {
+        BydFeatureIds.ADAS_LCA_WARNING_LEFT,
+        BydFeatureIds.ADAS_RCTA_WARNING_LEFT,
+        BydFeatureIds.ADAS_DOW_WARN_LEFT,
+    };
+    private static final int[] BS_COUNTER_IDS_RIGHT = {
+        BydFeatureIds.ADAS_LCA_WARNING_RIGHT,
+        BydFeatureIds.ADAS_RCTA_WARNING_RIGHT,
+        BydFeatureIds.ADAS_DOW_WARN_RIGHT,
+    };
+
+    /** Feature ids the ADAS listener subscribes to. SLW is included so the
+     *  pre-existing speed-limit-warning event keeps arriving unchanged. */
+    private static final int[] ADAS_EVENT_FILTER = {
+        BydFeatureIds.ADAS_SLW_FUNC_SWITCH_STATE,
+        BydFeatureIds.ADAS_FL_BLIND_SPOT_ALARM,
+        BydFeatureIds.ADAS_FR_BLIND_SPOT_ALARM,
+        BydFeatureIds.ADAS_LCA_WARNING_LEFT,
+        BydFeatureIds.ADAS_LCA_WARNING_RIGHT,
+        BydFeatureIds.ADAS_RCTA_WARNING_LEFT,
+        BydFeatureIds.ADAS_RCTA_WARNING_RIGHT,
+        BydFeatureIds.ADAS_DOW_WARN_LEFT,
+        BydFeatureIds.ADAS_DOW_WARN_RIGHT,
+    };
+
+    /** How far a blind-spot counter must fall below its retained peak to be read as
+     *  a firmware reset/wrap rather than a stale out-of-order reading. Warning
+     *  counters advance one step per event, so a drop of more than a few steps
+     *  cannot be ordering noise. */
+    private static final int COUNTER_RESET_DROP = 4;
+
+    // HEV-mileage probe budget. Only ever touched from the single telemetry-poll
+    // thread inside collectStatistic, so plain fields are sufficient. A handful of
+    // attempts covers a HAL that needs a moment after boot before it answers.
+    private int hevMileageProbesLeft = 5;
+    private boolean hevMileagePresent = false;
+
+    // Counter feature ids that have been seen arriving as ADAS EVENTS. The poll
+    // skips reading an id once its events are proven to work — polling all eight
+    // registers at a fast cadence is a needless stream of HAL round-trips when the
+    // callback already delivers them the moment they happen.
+    //
+    // Tracked PER ID, not as one global flag: coverage of these registers is
+    // trim-dependent, so "a door-open event arrived" is no evidence that
+    // lane-change events also arrive. A global flag would stop polling the ids that
+    // never fire an event, and those alerts would then be missed entirely.
+    private final java.util.Set<Integer> bsEventProvenIds =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    // Last value seen per counter-encoded feature id, so an alert can be detected
+    // as an INCREASE. Written by the ADAS event callback and the fast poll; a
+    // concurrent map keeps that safe without locking either path.
+    private final java.util.Map<Integer, Integer> bsCounterBaseline =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Live ADAS handle for the read-only blind-spot probe. Uses ensureAdasDevice so a
+     *  boot-race null self-heals, exactly as readBlindSpotNow does. */
+    public Object adasHandleForProbe() {
+        return ensureAdasDevice();
+    }
+
+    /** Unmodifiable view of the counter baselines, so the probe can report what the poll
+     *  WOULD conclude without advancing them (which would consume a real alert). */
+    public java.util.Map<Integer, Integer> bsBaselineView() {
+        return java.util.Collections.unmodifiableMap(bsCounterBaseline);
+    }
+
+    /** Unmodifiable view of the ids whose ADAS events are proven, i.e. no longer polled. */
+    public java.util.Set<Integer> bsProvenView() {
+        return java.util.Collections.unmodifiableSet(bsEventProvenIds);
+    }
+
+    /**
+     * Live blind-spot alert state, packed bit0=left / bit1=right. Returns -1 when
+     * the ADAS device is unavailable so the caller can distinguish "no data" from
+     * "no alert" — publishing a false "clear" would be a safety-relevant lie.
+     *
+     * <p>Always reads the two dedicated FL/FR level alarms. The six LCA/RCTA/DOW
+     * counters are read ONLY while the ADAS event callback has not been seen
+     * working: this method is called at a fast cadence, and reading all eight
+     * registers every tick means eight synchronous HAL round-trips several times a
+     * second — far more than any comparable signal in this daemon, and almost
+     * entirely redundant, since the event path already delivers every counter
+     * alert the moment it happens. Polling them is the fallback for firmware that
+     * doesn't honour the filtered registration, so once an event has actually
+     * arrived the poll drops to two reads and the events carry the rest.
+     */
+    public int readBlindSpotNow() {
+        // ensureAdasDevice (not the raw field) so a boot-race null self-heals
+        // instead of leaving the signal permanently dead.
+        Object device = ensureAdasDevice();
+        if (device == null) return -1;
+        try {
+            int packed = 0;
+            if (anyLevelActive(device, BS_LEVEL_IDS_LEFT)
+                    || anyCounterAdvanced(device, BS_COUNTER_IDS_LEFT)) {
+                packed |= BS_LEFT_BIT;
+            }
+            if (anyLevelActive(device, BS_LEVEL_IDS_RIGHT)
+                    || anyCounterAdvanced(device, BS_COUNTER_IDS_RIGHT)) {
+                packed |= BS_RIGHT_BIT;
+            }
+            return packed;
+        } catch (Throwable t) {
+            logger.debug("readBlindSpotNow error: " + t.getMessage());
+            return -1;
+        }
+    }
+
+    /** True when any level-encoded alarm in {@code ids} reads >= 1. */
+    private boolean anyLevelActive(Object device, int[] ids) {
+        for (int id : ids) {
+            // callGetSingle returns -1 both for a read failure and for a genuine
+            // sentinel, so only a clearly-positive value counts as alerting.
+            if (BydDeviceHelper.callGetSingle(device, id) >= 1) return true;
+        }
+        return false;
+    }
+
+    /**
+     * True when any counter-encoded warning in {@code ids} has INCREASED since the
+     * last observed value.
+     */
+    private boolean anyCounterAdvanced(Object device, int[] ids) {
+        boolean advanced = false;
+        for (int id : ids) {
+            // Skip ids whose events are proven to arrive — the callback already
+            // reports those, so polling them is pure duplicate HAL traffic. Per id,
+            // so an id that never fires an event keeps being polled.
+            if (bsEventProvenIds.contains(id)) continue;
+            int raw = BydDeviceHelper.callGetSingle(device, id);
+            if (raw < 0) continue; // unreadable this tick — leave the baseline alone
+            if (counterAdvanced(id, raw)) advanced = true;
+        }
+        return advanced;
+    }
+
+    /**
+     * Record one counter-encoded reading and report whether it represents a new
+     * alert (a genuine increase over the highest value seen so far).
+     *
+     * <p>Shared by the poll and the ADAS event callback, which run on different
+     * threads and observe the same counters. The update is a monotonic MAX rather
+     * than a plain overwrite: a stale reading arriving after a newer one (an
+     * out-of-order event, or an event racing a poll) would otherwise push the
+     * baseline BACKWARDS, and the next read of the unchanged counter would be
+     * re-detected as a fresh increment — a phantom alert. Taking the max makes the
+     * detection idempotent, so whichever path observes an increment first reports
+     * it and the other sees nothing new.
+     *
+     * <p>But a monotonic max alone would WEDGE the signal if the counter genuinely
+     * resets or wraps mid-drive: every later reading sits below the retained peak,
+     * so no increase is ever seen again and the side goes permanently silent. A
+     * LARGE drop is therefore treated as a reset and re-baselines downward, while a
+     * small one is treated as stale ordering and ignored. The two cases are
+     * distinguishable because out-of-order noise moves the value by a step or two,
+     * whereas a reset drops it to near zero.
+     *
+     * <p>First sight only establishes the baseline and never reports an alert:
+     * a counter resting at a non-zero value would otherwise fire the moment the
+     * feature was enabled.
+     */
+    private boolean counterAdvanced(int id, int raw) {
+        // Atomic per key on a ConcurrentHashMap, so two threads observing the same
+        // counter cannot interleave a read-modify-write or lose an update.
+        Integer prev = bsCounterBaseline.get(id);
+        bsCounterBaseline.merge(id, raw, (oldVal, newVal) ->
+                newVal < oldVal - COUNTER_RESET_DROP ? newVal : Math.max(oldVal, newVal));
+        // An alert is a genuine increase. A reset is NOT an alert — it re-baselines
+        // (above) and waits for the next real increment, so a wrap can't fire a
+        // phantom warning.
+        return prev != null && raw > prev;
+    }
+
     // ── Fast dynamic-input reads (accelerator / brake / steering) ─────────────
     // Single live SDK reads mirroring readTurnNow(), for the self-gated DynamicsEvent
     // fast poll so an "accelerator > X%" / "steering past Y°" automation fires promptly
@@ -662,6 +906,60 @@ public class BydDataCollector {
                 }
             }
         } catch (Throwable t) { logger.debug("readSteeringNow error: " + t.getMessage()); }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    // ── Live single-signal reads for the fast automation pollers (GearEvent /
+    // ClimateEvent) ─────────────────────────────────────────────────────────────
+    // Same contract as readAccelNow/readSteeringNow above: read ONE signal directly off
+    // the already-resolved device handle and return it, WITHOUT touching the shared
+    // snapshot or its debounce state. The gear read deliberately uses ONLY
+    // getGearboxAutoModeType() — never the crashing learningEPB() path that forced the
+    // gearbox HAL LISTENER to be disabled (see registerAllListeners) — so it's safe to
+    // call at a fast cadence. Each returns UNAVAILABLE on a miss so the caller skips the
+    // publish rather than manufacturing a spurious edge.
+
+    /** Live gearbox mode (raw SDK enum for {@link com.overdrive.app.monitor.GearMonitor}),
+     *  or UNAVAILABLE on a miss. Uses the same getter the 5s poll (collectGearbox) and the
+     *  fast-dynamics poll already call — NOT the learningEPB() listener path. */
+    public int readGearNow() {
+        if (gearboxDevice == null) return BydVehicleData.UNAVAILABLE;
+        try {
+            Object g = BydDeviceHelper.callGetter(gearboxDevice, "getGearboxAutoModeType");
+            if (g instanceof Number) return ((Number) g).intValue();
+        } catch (Throwable t) { logger.debug("readGearNow error: " + t.getMessage()); }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    /** Live per-seat climate level normalized to 0=off/1=low/2=high (the wire format the
+     *  {@code seatClimate} events use), or UNAVAILABLE on a miss. {@code heat=true} reads
+     *  ventilation-OFF heating; {@code heat=false} reads cooling (ventilation). {@code area}
+     *  is 1=driver, 2=passenger. Mirrors collectSettings' normalization exactly. */
+    public int readSeatClimateNow(boolean heat, int area) {
+        if (settingDevice == null) return BydVehicleData.UNAVAILABLE;
+        try {
+            String getter = heat ? "getSeatHeatingState" : "getSeatVentilatingState";
+            Object v = BydDeviceHelper.callGetter(settingDevice, getter, area);
+            if (v instanceof Number) {
+                int norm = ((Number) v).intValue() - 1; // SDK 1=off,2=low,3=high → 0/1/2
+                if (norm >= 0 && norm <= 2) return norm;
+            }
+        } catch (Throwable t) { logger.debug("readSeatClimateNow error: " + t.getMessage()); }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    /** Live headlamp beam state: {@code high=true} reads high-beam, else low-beam. Returns 1
+     *  (on) / 0 (off), or UNAVAILABLE on a miss. Shares collectLight's light-TYPE constants
+     *  ({@link #LIGHT_TYPE_LOW_BEAM}/{@link #LIGHT_TYPE_HIGH_BEAM}; status 1 = that beam is
+     *  on) so the fast automation path and the snapshot path can't drift apart — this used to
+     *  hold its own copy of the numbering and inherited the same off-by-one. */
+    public int readBeamNow(boolean high) {
+        if (lightDevice == null) return BydVehicleData.UNAVAILABLE;
+        try {
+            Object val = BydDeviceHelper.callGetter(lightDevice, "getLightStatus",
+                    high ? LIGHT_TYPE_HIGH_BEAM : LIGHT_TYPE_LOW_BEAM);
+            if (val instanceof Number) return (((Number) val).intValue() == 1) ? 1 : 0;
+        } catch (Throwable t) { logger.debug("readBeamNow error: " + t.getMessage()); }
         return BydVehicleData.UNAVAILABLE;
     }
 
@@ -745,10 +1043,62 @@ public class BydDataCollector {
         plugEdgeReceiver = null;
     }
 
+    /**
+     * Resolve one HAL device, with FALLBACK TIERS for the case where the singleton accessor we have
+     * always used returns null.
+     *
+     * <p>Tier 1 is unchanged ({@code Device.getInstance(ctx)}), so a vehicle that works today
+     * resolves on the first attempt and takes a byte-identical path — the fallbacks are pure
+     * addition and cannot regress it. Tiers 2-3 ({@code DeviceManager.getDevice(type)}, then direct
+     * construction) come from a reference app's own device-init ladder; we previously had only
+     * tier 1, so on a trim where the singleton is null we ended up with no handle at all and every
+     * getter on that device returned nothing in lockstep. That is exactly the pattern a BEV capture
+     * showed for the whole charging surface at once.
+     *
+     * <p>The tier that won is logged once per device so a single capture identifies which
+     * acquisition route a trim needs.
+     */
     private Object initDevice(String className, String shortName) {
         Object device = BydDeviceHelper.getDevice(className, context);
+        boolean viaFallback = false;
+        if (device == null) {
+            // Tier 2/3. A deviceType cannot be known before we hold an instance, so pass MIN_VALUE
+            // and let resolveDeviceFallback substitute a LEARNED type when one was recorded on an
+            // earlier pass — that is what makes its manager tier reachable at all (it is otherwise
+            // statically dead, since this is its only caller).
+            device = BydManagerChannel.resolveDeviceFallback(context, className, Integer.MIN_VALUE);
+            if (device != null) {
+                viaFallback = true;
+                logger.info("initDevice[" + shortName + "]: recovered via fallback tier"
+                        + " (getInstance returned null)");
+            }
+        }
         if (device != null) {
-            availableDevices.add(shortName);
+            // Learn this class's HAL type while we hold a live handle. Read off the instance
+            // because the bundled stubs report placeholder types, so a hardcoded table would be
+            // wrong. Feeds the manager acquisition tier and the manager-level reads.
+            BydManagerChannel.rememberDeviceType(className, device);
+            // Tag a fallback-acquired handle so it stays DISTINGUISHABLE in the diagnostic dump.
+            // availableDevices is the project's "is the HAL alive" readout (snapshot JSON + the
+            // "N devices" health line); listing a fallback handle identically to a real singleton
+            // would collapse the very "no handle" vs "handle but dead" distinction this whole
+            // change set was reasoned from — a future capture would read 17/17 available with the
+            // charging surface still NaN and no way to tell which case it was.
+            availableDevices.add(viaFallback ? shortName + "(fallback)" : shortName);
+            // ACTIVATION. Reference behaviour is to explicitly enable each telemetry device before
+            // polling it; we never did. Harmless when the HAL does not require it (the call simply
+            // reports a non-zero code or is absent), and decisive if it does.
+            //
+            // The RESULT IS DELIBERATELY IGNORED. Activation is advisory: the overwhelmingly common
+            // case is a HAL that needs no enabling and answers non-zero (or has no such method at
+            // all), and treating that as "device unusable" would drop every device on every trim
+            // that works today — a catastrophic regression to buy a theoretical gain. The outcome
+            // is logged per device instead, so a capture still shows whether activation mattered.
+            try {
+                BydManagerChannel.enableDevice(context, device, shortName);
+            } catch (Throwable t) {
+                logger.debug("enableDevice[" + shortName + "] threw: " + t.getMessage());
+            }
         } else {
             unavailableDevices.add(shortName);
         }
@@ -879,8 +1229,86 @@ public class BydDataCollector {
      */
     private static final double ENGINE_POWER_CHARGING_DEADBAND = 0.3;
 
-    /** Throttle for the collectEngine power-resolution diagnostic (1/min). */
-    private long lastEnginePowerLogMs = 0;
+    /**
+     * HAL handles we have SUCCESSFULLY attached a listener to. Identity-keyed
+     * ({@link java.util.IdentityHashMap}) because the question is "is this the same object", not
+     * "is it equals()" — a device's equals may be value-based or absent.
+     *
+     * <p>Per-handle rather than one whole-set fingerprint so that a device whose registration FAILED
+     * is retried on the next {@code init()}, while a device already attached is never doubled. There
+     * is no unregister path in this class, so a duplicate registration is permanent — but so is a
+     * missing one, and the missing direction silently kills door/charging notifications.
+     */
+    private final java.util.Map<Object, Boolean> registeredHandles =
+            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<Object, Boolean>());
+
+    /**
+     * True when {@code device} already has our listener attached, so the caller should skip it.
+     * Null devices report false — the register helpers null-check anyway and will report failure.
+     */
+    private boolean alreadyRegistered(Object device) {
+        return device != null && Boolean.TRUE.equals(registeredHandles.get(device));
+    }
+
+    /**
+     * Mark a handle as attached iff this pass actually attempted it.
+     *
+     * @param field    the live field value (the real device)
+     * @param attempted the local that {@code registerAllListeners} used — null when the handle was
+     *                  skipped because it was already registered, in which case there is nothing new
+     *                  to record
+     */
+    private void markRegistered(Object field, Object attempted) {
+        // Marks ONLY on a recorded success. registerAllListeners() calls noteRegisterOk(device) in
+        // each branch that actually attached, so a handle whose registration FAILED is never marked
+        // and is retried on the next init.
+        //
+        // The earlier version marked whenever the handle was merely ATTEMPTED, which inverted the
+        // intent: the ~25 call sites discard the helper's boolean, so a first init that failed under
+        // the broken synthetic Context marked the handle anyway and the ACC-ON re-init then skipped
+        // it — killing charging/instrument/bodywork/doorLock callbacks for the process lifetime.
+        // That traded "fires twice" for "never fires", which is strictly worse.
+        if (field != null && attempted != null && registerOkThisPass.contains(attempted)) {
+            registeredHandles.put(field, Boolean.TRUE);
+        }
+    }
+
+    /** Handles that successfully attached during the current registerAllListeners() pass. */
+    private final java.util.Set<Object> registerOkThisPass =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>());
+
+    /** Called by registerAllListeners() from each branch that actually attached a listener. */
+    private boolean noteRegisterOk(Object device, boolean ok) {
+        if (ok && device != null) registerOkThisPass.add(device);
+        return ok;
+    }
+
+    /** Throttle for the collectEngine power-resolution diagnostic (1/min). {@code volatile} for the
+     *  same poll-thread vs HTTP-thread reason as {@link #lastClusterRawLogMs} — and it matters more
+     *  here, because this line is the only field signal that the value is stuck on carry-forward. */
+    private volatile long lastEnginePowerLogMs = 0;
+
+    /**
+     * How long an engine-power value (from either collectEngine read or the generic-event
+     * listener) is honoured by the poll path before it is cleared as stale.
+     *
+     * <p>Deliberately ALIGNED to {@code ChargingDetector.ENGINE_POWER_FRESHNESS_MS} (15 s) rather
+     * than to the poll interval. A longer TTL here was self-defeating: it kept the value non-NaN
+     * for up to 24 five-second polls while the detector — which stamps freshness on any non-NaN
+     * push — re-armed it each time, exactly reproducing the phantom this clear exists to remove
+     * for anything in the 15-120 s band. Keeping a value only while its consumer would still call
+     * it fresh means the two cannot disagree. The age itself now travels in
+     * {@code BydVehicleData.enginePowerAtMs}, so no separate per-writer marker is needed.
+     */
+    private static final long ENGINE_POWER_LIVE_TTL_MS = 15_000L;
+
+    /** Throttle for the pre-gate cluster charge-power raw-value capture (1/min). Separate from
+     *  {@link #loggedClusterChargePowerScale}, which only fires on an ACCEPTED value and so says
+     *  nothing on a trim where the gates never open. {@code volatile}: written from the poll
+     *  thread and the HTTP {@code collectAllFull} thread (which bypasses the collect throttle by
+     *  design), so a non-volatile long could tear or go unpublished and either spam or suppress
+     *  the very capture we need. */
+    private volatile long lastClusterRawLogMs = 0;
 
     /** Called by CameraDaemon when ACC state changes. Adjusts poll rate accordingly. */
     public void setAccState(boolean isOn) {
@@ -975,6 +1403,30 @@ public class BydDataCollector {
         return false;
     }
 
+    // ── Overlay beam demand ──────────────────────────────────────────────
+    // Set by whichever recording flow currently burns in the LOW_BEAM/HIGH_BEAM
+    // telemetry fields (see OverlayBitmapRenderer). Keyed so set/clear is
+    // idempotent across the pano / surveillance / OEM flows without start-stop
+    // pairing. Empty map => no overlay wants beams, and the light poll falls
+    // back to being automation-gated exactly as before.
+    private static final java.util.Set<String> beamDemand =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Declare whether {@code key}'s recording flow currently draws the
+     * low/high-beam overlay fields. Safe to call from any thread.
+     */
+    public static void setOverlayBeamDemand(String key, boolean wanted) {
+        if (key == null) return;
+        if (wanted) beamDemand.add(key);
+        else beamDemand.remove(key);
+    }
+
+    /** True if any active overlay flow draws the beam fields. */
+    private static boolean overlayWantsBeams() {
+        return !beamDemand.isEmpty();
+    }
+
     public void collectAll() {
         long now = System.currentTimeMillis();
 
@@ -1067,9 +1519,19 @@ public class BydDataCollector {
         // the rest stale. Poll each on the LIVE path, but ONLY when an enabled automation
         // references its event — anyReferenced() gates the SDK read to zero cost otherwise.
         // Cheap HAL getters, each self-guarded + try/catch inside its collector.
-        // Seatbelt (buckled/unbuckled) — instrument device.
+        // Seatbelt (buckled/unbuckled) — instrument device — AND seat occupancy, which is
+        // read in the SAME collector off the safety-belt device. The occupant events must be
+        // named here too: collectSafetyBelt is the only producer of passengerDetection, so
+        // gating it on the belt events alone left occupancy permanently null (never published,
+        // so an occupancy trigger/condition could never fire) unless the user happened to also
+        // have a seatbelt automation.
+        // OCCUPANT_DRIVER is named here too: it is inferred from the driver belt (plus the
+        // reminder mask), so it needs this collector running for the same reason the belt
+        // events do — otherwise a driver-occupancy rule alone would leave the belt unpolled.
         if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.SEATBELT_DRIVER,
-                          com.overdrive.app.automation.condition.BydEvent.SEATBELT_PASSENGER)) {
+                          com.overdrive.app.automation.condition.BydEvent.SEATBELT_PASSENGER,
+                          com.overdrive.app.automation.condition.BydEvent.OCCUPANT_PASSENGER,
+                          com.overdrive.app.automation.condition.BydEvent.OCCUPANT_DRIVER)) {
             collectSafetyBelt(b);
         }
         // Drive mode + powertrain (EV/HEV) — energy/drive-config device.
@@ -1079,15 +1541,51 @@ public class BydDataCollector {
         }
         // Lights (hazard / high-beam / low-beam) + auto-lights — light device. The light
         // callback refreshes only DRL, so these need the poll. (DRL stays callback-fed.)
+        //
+        // NOT automation-only: collectLight is the SOLE producer of lowBeam/highBeam,
+        // and three non-automation consumers read them off this snapshot —
+        // the burn-in telemetry overlay (OverlayBitmapRenderer LOW_BEAM/HIGH_BEAM
+        // fields), /api/vehicle-control's lights block, and the MQTT
+        // light_low_beam/light_high_beam topics. Gating purely on anyReferenced()
+        // meant that, with no lights automation enabled, the beams were read once
+        // in collectAllFull() at init and then carried forward unchanged forever by
+        // toBuilder() — so the overlay's beam glyphs were frozen at their boot
+        // state (the reported "headlight icons don't work") and MQTT/API reported a
+        // stale value. Poll whenever an automation OR the overlay wants beams.
         if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.LIGHTS_HAZARD,
                           com.overdrive.app.automation.condition.BydEvent.LIGHTS_HIGH_BEAM,
                           com.overdrive.app.automation.condition.BydEvent.LIGHTS_LOW_BEAM,
-                          com.overdrive.app.automation.condition.BydEvent.AUTO_LIGHTS)) {
+                          com.overdrive.app.automation.condition.BydEvent.AUTO_LIGHTS)
+                || overlayWantsBeams()) {
             collectLight(b);
         }
+        // Interior ambient MAIN SWITCH — UNGATED, every poll. Deliberately NOT folded into the
+        // automation-gated collectLight above, for two reasons:
+        //  (1) its non-automation consumers (the HA switch, MQTT ambient_enabled, the /api state
+        //      lights object) would otherwise never see a change, because collectAllFull runs
+        //      only at daemon init;
+        //  (2) one of its two tiers is the carsettings PROVIDER, for which no HAL callback can
+        //      ever fire — so unlike beams, the listener cannot cover the gap. On a
+        //      provider-only trim the state would latch at its boot value forever, and the HA
+        //      toggle would then resolve against a stale "on" and look dead.
+        // Cost is two cheap reads (one reflective HAL get + one provider get), both self-guarded
+        // and each returning UNAVAILABLE rather than a fabricated 0. Runs regardless of
+        // lightDevice, since the provider tier needs no Light device.
+        int ambientOn = getAmbientLightEnabled();
+        if (ambientOn != BydVehicleData.UNAVAILABLE) b.ambientEnabled(ambientOn);
         // Slope (incline degrees) — sensor device.
         if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.SLOPE)) {
             collectSensor(b);
+        }
+        // Central-lock state (locked/unlocked) — OTA rail (getLFDoorLockState). Published
+        // here on the ALWAYS-ALIVE poll loop (both ACC-on and ACC-off) so a "when the car
+        // locks/unlocks" automation fires regardless of vehicle state. Previously the only
+        // publisher was CameraDaemon.applyLockEvent, which runs solely inside the ACC-off
+        // surveillance arm-gate AND early-returns while ACC is on — so the lock trigger was
+        // dead outside that narrow window (the reported "lock trigger doesn't fire" bug).
+        // Self-gated by anyReferenced so it costs nothing unless a rule keys off it.
+        if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.LOCK)) {
+            collectLockState();
         }
         // Nearest radar obstacle (cm) — radar/PDC device (parked-radar dependent).
         if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.RADAR_NEAREST)) {
@@ -1127,6 +1625,11 @@ public class BydDataCollector {
         // Display-only devices (normally listener-driven, polled here on-demand)
         collectAc(b);
         collectLight(b);
+        // Ambient main switch — separate from collectLight on purpose (it also has a
+        // carsettings-provider tier that works with no Light device); see the ungated call on
+        // the incremental path for the full rationale.
+        int ambientOn = getAmbientLightEnabled();
+        if (ambientOn != BydVehicleData.UNAVAILABLE) b.ambientEnabled(ambientOn);
         collectAdas(b);
         collectSettings(b);
         collectPower(b);
@@ -1162,6 +1665,22 @@ public class BydDataCollector {
      */
     private void pushChargingEvidence(BydVehicleData built) {
         if (built == null) return;
+        // AGE-OUT A CARRIED-FORWARD ENGINE-POWER VALUE before the detector sees it.
+        //
+        // collectEngine's own clear only runs when collectEngine RUNS — and while ACC is off it is
+        // skipped entirely unless `possiblyCharging` holds. This method, by contrast, is called on
+        // every poll from both entry points, so it is the only place that can guarantee the
+        // detector never receives a value older than the freshness window it claims to enforce.
+        // Without this, the most common parked case (ACC off, nothing charging) carried the last
+        // reading forward indefinitely and the detector re-stamped it fresh every 90 s — and
+        // VehicleDataMonitor publishes abs(enginePowerKw) as charging power, so an hours-old
+        // reading could surface as a live kW rate (invariants I2/I4).
+        if (!Double.isNaN(built.enginePowerKw)
+                && built.enginePowerAtMs > 0
+                && (System.currentTimeMillis() - built.enginePowerAtMs) >= ENGINE_POWER_LIVE_TTL_MS) {
+            built = built.toBuilder().enginePowerKw(Double.NaN).build();
+            snapshot.set(built);
+        }
         // Resolve gear from authoritative GearMonitor (returns last-known
         // value even when its monitor stops on ACC OFF). On a parked car
         // that's always P. The detector uses gear==P as an L3 guard.
@@ -1207,14 +1726,23 @@ public class BydDataCollector {
             // needs the SOC-derived source.
             double socPctForEst = built.socPercent;
             double socScaleKwh = Double.NaN;
-            if (isPhev(built)) {
+            // Gated on (fusedCharging && inPark) as well as PHEV: sample() discards everything and
+            // calls reset() unless BOTH hold, so on a parked/driving car this whole block — an
+            // isPhev() probe, a cross-subsystem getSohEstimator(), getNominalCapacityKwh() and the
+            // SOH read — was computed and thrown away on every poll. Both flags are already in hand
+            // above, so the gate is free.
+            if (fusedCharging && inPark && isPhev(built)) {
                 try {
                     com.overdrive.app.abrp.SohEstimator soh =
                         com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
                     double nominal = (soh != null) ? soh.getNominalCapacityKwh() : 0;
                     if (nominal > 0) {
-                        double sohFrac = (soh != null && soh.hasDisplaySoh())
-                            ? soh.getDisplaySoh() / 100.0 : 1.0;
+                        // getDisplaySoh() ONCE. hasDisplaySoh() is literally
+                        // `return getDisplaySoh() > 0`, so the old `hasDisplaySoh() ? getDisplaySoh()`
+                        // shape ran the whole priority chain twice — including a synchronized
+                        // frame-anchor block and a cross-subsystem isPhev() call — for one value.
+                        double dSoh = (soh != null) ? soh.getDisplaySoh() : 0;
+                        double sohFrac = (dSoh > 0) ? dSoh / 100.0 : 1.0;
                         if (sohFrac <= 0) sohFrac = 1.0;
                         socScaleKwh = nominal * sohFrac;
                     }
@@ -1350,9 +1878,21 @@ public class BydDataCollector {
     private void collectBodywork(BydVehicleData.Builder b) {
         if (bodyworkDevice == null) return;
         try {
-            // VIN
-            Object vin = BydDeviceHelper.callGetter(bodyworkDevice, "getAutoVIN");
-            if (vin instanceof String) b.vin((String) vin);
+            // VIN. Prefer getRealAutoVIN — the real 17-character VIN (e.g.
+            // LGXCH6CD0R2085367). getAutoVIN returns a HASHED wrapper string on
+            // this trim (see AccOffReaders.getRealAutoVin/getAutoVin), which is
+            // not a displayable VIN, so it's only a fallback for trims that
+            // don't declare the "Real" getter. Both are cheap bodywork getters
+            // and live ACC=OFF, and the value is static per vehicle — once a
+            // non-empty VIN lands, toBuilder() carries it forward, so a
+            // later read miss never blanks it.
+            Object vin = BydDeviceHelper.callGetter(bodyworkDevice, "getRealAutoVIN");
+            if (!(vin instanceof String) || ((String) vin).trim().isEmpty()) {
+                vin = BydDeviceHelper.callGetter(bodyworkDevice, "getAutoVIN");
+            }
+            if (vin instanceof String && !((String) vin).trim().isEmpty()) {
+                b.vin(((String) vin).trim());
+            }
 
             // 12V auxiliary battery voltage (0-255 → 0-25.5V)
             // NOTE: getBatteryPowerValue() returns 12V battery voltage, NOT traction battery SOC.
@@ -1707,11 +2247,19 @@ public class BydDataCollector {
                 if (!Double.isNaN(tempVal) && tempVal > -50 && tempVal < 80) b.bodyworkBattTempC(tempVal);
             }
 
-            // Battery range from bodywork (feature ID 300941336, Double.TYPE → intValue)
-            Object battRange = BydDeviceHelper.callGet(bodyworkDevice, BydFeatureIds.BODYWORK_BATTERY_RANGE, Double.class);
+            // Battery range from bodywork (feature ID 300941336).
+            // INT-FIRST probe, because the extraction below is getIntValue: the HAL fills only
+            // the BYDAutoEventValue field matching the width it was asked for, so requesting
+            // Double left intValue at its default 0 — and 0 passed the range check, publishing a
+            // hard "0 km" every poll (which fires a "range below X" automation permanently and
+            // publishes bodywork_range_km=0 over MQTT). Ask for the width we read.
+            Object battRange = BydDeviceHelper.callGetProbing(
+                    bodyworkDevice, BydFeatureIds.BODYWORK_BATTERY_RANGE, true);
             if (battRange != null) {
                 int rangeVal = BydDeviceHelper.getIntValue(battRange);
-                if (rangeVal >= 0 && rangeVal <= 1016) b.bodyworkRangeKm((int) Math.round(rangeVal * distanceToKmFactor));
+                // > 0, not >= 0: 0 is what a failed/absent read yields here, and a real pack
+                // reporting exactly 0 km is indistinguishable from it, so treat it as no reading.
+                if (rangeVal > 0 && rangeVal <= 1016) b.bodyworkRangeKm((int) Math.round(rangeVal * distanceToKmFactor));
             }
 
             // Window open percent (positions 1-6)
@@ -1722,9 +2270,27 @@ public class BydDataCollector {
             }
             b.windowOpenPercent(windows);
 
-            // Emergency alarm
+            // Emergency alarm. SENTINEL-GATED, unlike the original write.
+            //
+            // This read was previously dead (it passed a wrapper Class to a HAL that matches
+            // primitives only), so an unvalidated store was harmless. Now that the read can
+            // succeed, a trim that answers with a sentinel instead of throwing would store
+            // e.g. -10011 — and BydEvent treats "not UNAVAILABLE and not 0" as ALARM ACTIVE,
+            // so every user automation with an emergency-alarm trigger would fire spuriously
+            // and MQTT would publish the sentinel. A sentinel means "no reading", which for a
+            // boolean-ish alarm is the OPPOSITE of what an unguarded store implies, so it must
+            // be filtered rather than passed through.
             Object alarm = BydDeviceHelper.callGet(bodyworkDevice, BydFeatureIds.BODYWORK_EMERGENCY_ALARM, Integer.class);
-            if (alarm != null) b.emergencyAlarmState(BydDeviceHelper.getIntValue(alarm));
+            if (alarm != null) {
+                int alarmRaw = BydDeviceHelper.getIntValue(alarm);
+                if (alarmRaw != BydFeatureIds.BMS_UNAVAILABLE
+                        && alarmRaw != BydFeatureIds.INVALID_VALUE
+                        && alarmRaw != BydFeatureIds.INVALID_VALUE_2
+                        && alarmRaw != Integer.MIN_VALUE
+                        && alarmRaw >= 0) {
+                    b.emergencyAlarmState(alarmRaw);
+                }
+            }
 
         } catch (Exception e) {
             logger.debug("collectBodywork error: " + e.getMessage());
@@ -1819,8 +2385,9 @@ public class BydDataCollector {
                 Object val = BydDeviceHelper.callGet(engineDevice, BydFeatureIds.ENGINE_POWER, Double.class);
                 if (val != null) {
                     double raw = BydDeviceHelper.getDoubleValue(val);
-                    if (!Double.isNaN(raw) && raw >= -200.0 && raw <= 400.0) {
-                        double kw = (Math.abs(raw) > 100.0) ? raw * 0.1 : raw;
+                    double kw = (Math.abs(raw) > 100.0) ? raw * 0.1 : raw;
+                    if (!Double.isNaN(raw) && raw >= -200.0 && raw <= 400.0
+                            && !isEnginePowerSentinel(kw)) {
                         b.enginePowerKw(kw);
                         powerWritten = true;
                         powerSource = "featureId";
@@ -1843,12 +2410,58 @@ public class BydDataCollector {
                     // are stale ECU residue — reject so this fresh-read path can't
                     // feed the ChargingDetector a spurious "engine running" value.
                     boolean accOffReject = !accIsOn && kw > -ENGINE_POWER_CHARGING_DEADBAND;
-                    if (kw >= -200.0 && kw <= 400.0 && !accOffReject) {
+                    if (kw >= -200.0 && kw <= 400.0 && !accOffReject
+                            && !isEnginePowerSentinel(kw)) {
                         b.enginePowerKw(kw);
                         powerWritten = true;
                         powerSource = "getter";
                         powerRaw = kw;
                     }
+                }
+            }
+            // NO LIVE VALUE THIS CYCLE → publish NaN rather than the carried-forward number.
+            //
+            // The builder is seeded from the previous snapshot via toBuilder(), so without this
+            // the field is non-NaN forever after the first successful read. That silently broke
+            // ChargingDetector's freshness contract: it stamps enginePowerAtMs inside
+            // `if (!Double.isNaN(vd.enginePowerKw))`, so a carried-forward value was re-stamped
+            // as fresh on every push and ENGINE_POWER_FRESHNESS_MS (15 s) could never expire —
+            // it stamps the timestamp and then recompute()s microseconds later, making
+            // engineFresh unconditionally true from the poll path. Consequence: once a genuine
+            // negative (e.g. -5 kW regen) was read, every later poll rejected the frozen sentinel,
+            // the old value persisted, and the detector kept counting it as "current into pack"
+            // for as long as ACC stayed on — phantom L3 CHARGING on a parked car.
+            //
+            // Clearing here makes that NaN guard load-bearing and lets the freshness window mean
+            // what it says (invariant I2: a stuck value is not a measurement). Safe against a
+            // one-off flaky read: the detector needs HYSTERESIS_SAMPLES (3) consecutive
+            // observations, so a single blank cycle cannot flip a verdict. Distinct from the
+            // :1955-1962 warning, which forbids gating the fallback READ on isNaN — not clearing
+            // after BOTH reads have failed.
+            //
+            // EXCEPT when the value we would wipe is a FRESH LISTENER value. onEngineCallback's
+            // ENGINE_POWER branch writes enginePowerKw straight into the snapshot between polls,
+            // and only the poll path calls pushChargingEvidence — so on the PHEV firmware where
+            // the listener is the dominant refresh (90 s parked polls) a blanket clear here would
+            // discard the only live reading before the detector ever saw it, and could BREAK
+            // charging detection rather than just de-latching a phantom.
+            //
+            // Freshness is judged from the stamp CARRIED IN THE SNAPSHOT (enginePowerAtMs), and the
+            // bound is the detector's own window — not a separate 120 s TTL. A longer TTL here was
+            // self-defeating: it kept a value non-NaN for up to 24 five-second polls while the
+            // detector re-stamped it fresh each time, reproducing the pre-fix phantom for anything
+            // in the 15-120 s band. Aligning to the consumer's window means a value survives here
+            // only while the consumer would still call it fresh.
+            if (!powerWritten) {
+                long liveAt = b.enginePowerAtMs;
+                boolean listenerFresh = liveAt > 0
+                        && (System.currentTimeMillis() - liveAt) < ENGINE_POWER_LIVE_TTL_MS;
+                if (!listenerFresh) {
+                    b.enginePowerKw(Double.NaN);   // also zeroes enginePowerAtMs (see the setter)
+                    powerSource = "cleared-stale";
+                } else {
+                    powerSource = "live-recent";
+                    powerRaw = b.enginePowerKw;
                 }
             }
             // Diagnostic (throttled 1/min, INFO so it lands in default captures):
@@ -1863,20 +2476,48 @@ public class BydDataCollector {
                     b.enginePowerKw, powerSource, powerRaw));
             }
 
+            // Motor speed / torque. Sentinel-gated for the same reason as the emergency-alarm
+            // read above: these stores were unvalidated but harmless while the wrapper-Class
+            // read was dead. Now that it can succeed, a sentinel would land in the snapshot
+            // (and be NEGATED for the front pair, turning -10011 into a plausible +10011 rpm).
+            // Downstream MQTT happens to gate these, but the snapshot is shared and a future
+            // consumer without a gate would inherit the bug — so filter at the source.
+            //
             // Front motor speed (negated)
             Object fms = BydDeviceHelper.callGet(engineDevice, BydFeatureIds.ENGINE_FRONT_MOTOR_SPEED, Integer.class);
-            if (fms != null) b.frontMotorSpeed(-BydDeviceHelper.getIntValue(fms));
+            if (fms != null) {
+                int v = BydDeviceHelper.getIntValue(fms);
+                if (isPlausibleMotorRpm(v)) b.frontMotorSpeed(-v);
+            }
 
             // Rear motor speed
             Object rms = BydDeviceHelper.callGet(engineDevice, BydFeatureIds.ENGINE_REAR_MOTOR_SPEED, Integer.class);
-            if (rms != null) b.rearMotorSpeed(BydDeviceHelper.getIntValue(rms));
+            if (rms != null) {
+                int v = BydDeviceHelper.getIntValue(rms);
+                if (isPlausibleMotorRpm(v)) b.rearMotorSpeed(v);
+            }
 
             // Front motor torque (negated double)
             Object fmt = BydDeviceHelper.callGet(engineDevice, BydFeatureIds.ENGINE_FRONT_MOTOR_TORQUE, Double.class);
-            if (fmt != null) b.frontMotorTorque(-BydDeviceHelper.getDoubleValue(fmt));
+            if (fmt != null) {
+                double t = BydDeviceHelper.getDoubleValue(fmt);
+                // ±2000 Nm covers every BYD drivetrain with margin; sentinels are far outside.
+                if (!Double.isNaN(t) && Math.abs(t) <= 2000.0) b.frontMotorTorque(-t);
+            }
         } catch (Exception e) {
             logger.debug("collectEngine error: " + e.getMessage());
         }
+    }
+
+    /**
+     * Plausibility gate for a raw motor-RPM reading. Rejects the BYD "no value" sentinels and
+     * anything past ±25000 rpm (no BYD motor spins near that), so a sentinel can never be
+     * negated into a plausible-looking positive rpm.
+     */
+    private static boolean isPlausibleMotorRpm(int v) {
+        if (v == BydFeatureIds.BMS_UNAVAILABLE || v == BydFeatureIds.INVALID_VALUE
+                || v == BydFeatureIds.INVALID_VALUE_2 || v == Integer.MIN_VALUE) return false;
+        return Math.abs(v) <= 25000;
     }
 
     private void collectStatistic(BydVehicleData.Builder b) {
@@ -1924,6 +2565,57 @@ public class BydDataCollector {
                 } catch (Exception e) {
                     logger.debug("collectStatistic evMileage feature ID error: " + e.getMessage());
                 }
+            }
+
+            // ==================== HEV MILEAGE ====================
+            // Lifetime distance with the engine contributing — the other half of
+            // the EV/HEV split. Feature ID only (no named getter is exposed for
+            // this register). PHEV-only in practice: a BEV leaves it UNAVAILABLE,
+            // which suppresses it everywhere downstream rather than showing 0.
+            //
+            // Probe-then-stop: on a BEV this register can never answer, and this
+            // block runs on every telemetry poll for the life of the daemon. After
+            // a few consecutive misses we stop asking rather than paying an
+            // allocation and a HAL round-trip forever for a value that will never
+            // arrive. Any single success latches the register as present.
+            if (hevMileageProbesLeft > 0 || hevMileagePresent) {
+                try {
+                    Object val = BydDeviceHelper.callGet(statisticDevice, BydFeatureIds.STAT_MILEAGE_HEV, Integer.class);
+                    boolean got = false;
+                    if (val != null) {
+                        int raw = BydDeviceHelper.getIntValue(val);
+                        if (raw != BydFeatureIds.BMS_UNAVAILABLE && raw != BydFeatureIds.INVALID_VALUE
+                            && raw != BydFeatureIds.INVALID_VALUE_2 && raw > 0) {
+                            b.hevMileageKm((int) Math.round(raw * distanceToKmFactor));
+                            got = true;
+                        }
+                    }
+                    if (got) {
+                        hevMileagePresent = true;
+                    } else if (!hevMileagePresent && --hevMileageProbesLeft == 0) {
+                        logger.info("HEV mileage register not reported — no longer polling it");
+                    }
+                } catch (Exception e) {
+                    logger.debug("collectStatistic hevMileage feature ID error: " + e.getMessage());
+                    if (!hevMileagePresent && hevMileageProbesLeft > 0) hevMileageProbesLeft--;
+                }
+            }
+
+            // ============ ELEC CONSUMPTION RATES (kWh/100km) ============
+            // The vehicle's own lifetime and last-trip averages, so a displayed
+            // rate matches the cluster instead of being re-derived from a coarse
+            // SoC delta. Same shape as the fuel PHM reads below. Rail-guarded:
+            // outside 0..200 kWh/100km is a sentinel, not data (a road car cannot
+            // sustain 200; 0 means the register is unpopulated).
+            Object avgElec = BydDeviceHelper.callGetter(statisticDevice, "getTotalElecConPHMValue");
+            if (avgElec instanceof Number) {
+                double v = ((Number) avgElec).doubleValue();
+                if (v > 0 && v <= 200) b.avgElecConPer100Km(v);
+            }
+            Object lastElec = BydDeviceHelper.callGetter(statisticDevice, "getLastElecConPHMValue");
+            if (lastElec instanceof Number) {
+                double v = ((Number) lastElec).doubleValue();
+                if (v > 0 && v <= 200) b.lastElecConPer100Km(v);
             }
 
             // ==================== SOC (ELEC PERCENTAGE) ====================
@@ -1990,11 +2682,40 @@ public class BydDataCollector {
             if (totalElec instanceof Number) b.totalElecCon(((Number) totalElec).doubleValue());
 
             // ==================== TOTAL FUEL CONSUMPTION ====================
+            // Lifetime litres burned. SDK range 0.0-104857.4 L, already litres —
+            // no scaling (confirmed against the SDK javadoc and both reference
+            // apps). The trip-level delta of this counter is what prices the
+            // petrol leg of a PHEV trip.
             Object totalFuel = BydDeviceHelper.callGetter(statisticDevice, "getTotalFuelConValue");
             if (totalFuel instanceof Number) b.totalFuelCon(((Number) totalFuel).doubleValue());
 
+            // ==================== AVG FUEL CONSUMPTION (L/100km) ====================
+            // The vehicle's own lifetime average, so our display agrees with the
+            // cluster instead of showing a separately-derived figure. SDK range
+            // 0.0-51.1, no scaling; anything outside that is a rail, not data.
+            // PHEV-gated like the fuel %/range reads below: a BEV whose HAL exposes
+            // this getter returns an unpopulated 0.0, and publishing that asserts a
+            // real "0.0 L/100km" lifetime average for a car with no engine.
+            // 0.0 stays acceptable ON a PHEV (a car that has burned no petrol).
+            if (isPhev(b)) {
+                Object fuelPhm = BydDeviceHelper.callGetter(statisticDevice, "getTotalFuelConPHMValue");
+                if (fuelPhm instanceof Number) {
+                    double phm = ((Number) fuelPhm).doubleValue();
+                    if (!Double.isNaN(phm) && phm >= 0 && phm <= 51.1) b.avgFuelConPer100Km(phm);
+                }
+            }
+
             // ==================== ELECTRIC DRIVING RANGE ====================
             // Named getter primary, feature ID fallback
+            // elecRangeKm KEEPS the distanceToKmFactor conversion. This is
+            // long-standing behaviour and, unlike fuel range, it is PERSISTED:
+            // charging_sessions.start_range_km / range_gained_km and
+            // soc_history.range_km are all derived from it. Dropping the factor
+            // would leave one column holding miles-scaled values for old rows and
+            // raw values for new ones on a miles-configured install — a silent
+            // unit split in stored history, which is worse than the inconsistency
+            // it would fix. Fuel range is new, unpersisted, and documented by the
+            // SDK as km, so it is left unscaled; see the fuel block below.
             Object elecRange = BydDeviceHelper.callGetter(statisticDevice, "getElecDrivingRangeValue");
             if (elecRange instanceof Number) {
                 int raw = ((Number) elecRange).intValue();
@@ -2020,12 +2741,30 @@ public class BydDataCollector {
             boolean isPhev = isPhev(b);
 
             // ==================== FUEL DRIVING RANGE (PHEV only) ====================
+            // The BYD SDK documents getFuelDrivingRangeValue() as 0..4095 with 4095
+            // as the classic "invalid" rail, and the reference apps (reference app C /
+            // reference app B) apply no scaling to it. The real bug fixed here is the
+            // MISSING SENTINEL FILTER on the named-getter path: a raw 4095 passed a
+            // bare `raw > 0` and was published as "4095 km of petrol range".
+            //
+            // The distanceToKmFactor conversion is KEPT, for consistency with the
+            // sibling elecRangeKm read above: DrivingRangeData.totalRangeKm is
+            // elecRangeKm + fuelRangeKm, so scaling only one of them would sum two
+            // different units on a miles-configured install. elecRangeKm cannot
+            // drop the factor (it is persisted into charging_sessions.start_range_km
+            // and soc_history.range_km, so changing it would split that column's
+            // units between old and new rows), which makes matching it the correct
+            // direction here.
             if (isPhev) {
                 // Named getter primary, feature ID fallback
                 Object fuelRange = BydDeviceHelper.callGetter(statisticDevice, "getFuelDrivingRangeValue");
                 if (fuelRange instanceof Number) {
                     int raw = ((Number) fuelRange).intValue();
-                    if (raw > 0) b.fuelRangeKm((int) Math.round(raw * distanceToKmFactor));
+                    // Plausibility is checked on the RAW value (the SDK's own
+                    // 0..4095 domain), then converted like elecRangeKm.
+                    if (isPlausibleFuelRangeKm(raw)) {
+                        b.fuelRangeKm((int) Math.round(raw * distanceToKmFactor));
+                    }
                 }
                 if (b.fuelRangeKm == BydVehicleData.UNAVAILABLE) {
                     try {
@@ -2033,7 +2772,7 @@ public class BydDataCollector {
                         if (val != null) {
                             int raw = BydDeviceHelper.getIntValue(val);
                             if (raw != BydFeatureIds.BMS_UNAVAILABLE && raw != BydFeatureIds.INVALID_VALUE
-                                && raw != BydFeatureIds.INVALID_VALUE_2 && raw > 0) {
+                                && raw != BydFeatureIds.INVALID_VALUE_2 && isPlausibleFuelRangeKm(raw)) {
                                 b.fuelRangeKm((int) Math.round(raw * distanceToKmFactor));
                             }
                         }
@@ -2044,12 +2783,20 @@ public class BydDataCollector {
             }
 
             // ==================== FUEL PERCENTAGE (PHEV only) ====================
+            // SDK range is 0..100 inclusive — 0 is a LEGITIMATE reading (empty
+            // tank, or a 1%-quantised gauge that has bottomed out), so the data
+            // path accepts >= 0. Rejecting 0 here previously blanked the fuel
+            // gauge and silently dropped the fuelPct×tank cost fallback exactly
+            // when a driver most needs to see it. (computeIsPhev separately still
+            // requires > 0 to call a reading "real" — that guard is about not
+            // misclassifying a BEV, and is documented there.) Sentinels are
+            // filtered on BOTH paths now.
             if (isPhev) {
                 // Named getter primary
                 Object fuelPct = BydDeviceHelper.callGetter(statisticDevice, "getFuelPercentageValue");
                 if (fuelPct instanceof Number) {
                     int pct = ((Number) fuelPct).intValue();
-                    if (pct > 0 && pct <= 100) {
+                    if (pct >= 0 && pct <= 100 && !isBevFuelSentinel(pct)) {
                         b.fuelPercent(pct);
                     }
                 }
@@ -2060,7 +2807,8 @@ public class BydDataCollector {
                         if (val != null) {
                             int raw = BydDeviceHelper.getIntValue(val);
                             if (raw != BydFeatureIds.BMS_UNAVAILABLE && raw != BydFeatureIds.INVALID_VALUE
-                                && raw != BydFeatureIds.INVALID_VALUE_2 && raw > 0 && raw <= 100) {
+                                && raw != BydFeatureIds.INVALID_VALUE_2 && raw >= 0 && raw <= 100
+                                && !isBevFuelSentinel(raw)) {
                                 b.fuelPercent(raw);
                             }
                         }
@@ -2107,13 +2855,40 @@ public class BydDataCollector {
     }
 
     private void collectStatTemp(BydVehicleData.Builder b, int featureId, String which) {
-        Object val = BydDeviceHelper.callGet(statisticDevice, featureId, Integer.TYPE);
-        if (val == null) val = BydDeviceHelper.callGet(statisticDevice, featureId, Integer.class);
+        // Probe the primitive widths, INT FIRST. This used to be "try Integer.TYPE, then
+        // Integer.class"; callGet now normalizes a wrapper to its primitive (the HAL matches
+        // primitives only), which made the second call an identical retry of the first.
+        //
+        // The intFirst flag is load-bearing, not a preference: BYDAutoEventValue carries
+        // independent intValue/doubleValue fields, the HAL fills only the requested one, and
+        // getIntValue below always reads intValue. A Double-first ladder that won here would
+        // leave intValue at its default 0 — and 0 is IN BAND for this scale (raw 0 → -40 °C),
+        // so it would sail through the range check and publish -40 °C for a perfectly normal
+        // pack, which also silently blocks SOH calibration (it needs 15-35 °C).
+        Object val = BydDeviceHelper.callGetProbing(statisticDevice, featureId, true);
         if (val == null) return;
         int raw = BydDeviceHelper.getIntValue(val);
         if (raw == BydFeatureIds.BMS_UNAVAILABLE || raw == BydFeatureIds.INVALID_VALUE
             || raw == BydFeatureIds.INVALID_VALUE_2 || raw == Integer.MIN_VALUE) return;
         if (raw < 0 || raw > 120) return;
+        // Belt-and-braces against the type/field mismatch described above: if a Double-first
+        // probe ever wins here again, intValue reads its default 0, which maps to exactly
+        // -40 °C — in band, so the range check would pass it through.
+        //
+        // Deliberately NOT a blanket `raw == 0 → drop`: -40 °C is the low end of a real
+        // reporting range (the MQTT gate below accepts >= -40), so an extreme-cold pack could
+        // legitimately read 0 and dropping it would be silent data loss. Instead, only treat 0
+        // as suspect when the CORROBORATING evidence says the value never came from intValue:
+        // a populated doubleValue alongside a zero intValue is the mismatch signature, whereas
+        // a genuine -40 °C reading arrives with doubleValue at its own default.
+        if (raw == 0) {
+            double asDouble = BydDeviceHelper.getDoubleValue(val);
+            if (!Double.isNaN(asDouble) && asDouble != 0.0) {
+                logger.debug("collectStatTemp " + which + ": intValue=0 but doubleValue="
+                        + asDouble + " — type/field mismatch, discarding");
+                return;
+            }
+        }
         double tempC = raw - 40;
         switch (which) {
             case "high": b.highCellTempC(tempC); break;
@@ -2122,10 +2897,102 @@ public class BydDataCollector {
         }
     }
 
+    /**
+     * Resolve the cluster charge-power raw reading to kW, deciding between the two scales this
+     * feature id is reported in across firmware families.
+     *
+     * <p>Package-visible so {@link com.overdrive.app.byd.ClusterChargePowerScaleTest} can pin
+     * the boundary behaviour — the failure mode here is silent (a wrong-but-plausible number),
+     * and this value is the top-priority charging-power source, so the thresholds need a test
+     * rather than a comment.
+     *
+     * <ul>
+     *   <li>raw &gt; {@value #CLUSTER_AC_KW_CEILING} → above the AC/onboard-charger ceiling, so
+     *       hectowatts (divide by 100). This is where our PHEV field captures landed (189.5 raw
+     *       for a ~1.8 kW charge), and a PHEV onboard charger cannot physically deliver more
+     *       than ~7 kW, so a literal kW reading in this band is impossible on the drivetrain
+     *       that consumes this value. It also covers raw values past any plausible kW rate —
+     *       nothing charges beyond ~500 kW, so those can only be a smaller unit.</li>
+     *   <li>otherwise → already kW (at or below the AC ceiling, hectowatts would imply a
+     *       sub-0.22 kW rate, which is not a real charge).</li>
+     * </ul>
+     *
+     * <p><b>Why a scale decision at all — the two sources of evidence disagree.</b> The OEM app
+     * reads this EXACT feature id, accepts {@code 0 < v <= 500}, and applies NO division: it
+     * treats the value as kW outright (verified in its bytecode — there is not a single
+     * {@code div-double} in the whole method, and 500.0 is its only constant). The other
+     * reference app likewise forwards its charging-power reading unscaled. So on the firmware
+     * those apps target, raw IS kW.
+     *
+     * <p>But our own field capture on a Seal U DM-i PHEV recorded ~221.7 raw for a real ~1.9 kW
+     * charger and 189.5 raw for a ~1.8 kW one — i.e. hectowatts on that trim. Both observations
+     * are credible and they cannot both be a single unit, so this is genuinely a per-firmware
+     * difference rather than one of them being wrong.
+     *
+     * <p>The split above honours both: at or below the AC/onboard-charger ceiling the value is
+     * taken as kW (matching the OEM app for every AC charge, which is all a PHEV can do), and
+     * only ABOVE that ceiling — where a kW reading would exceed what AC charging can deliver,
+     * and where our PHEV captures actually landed — is it read as hectowatts.
+     *
+     * <p><b>The residual ambiguity is contained by the CONSUMER, not by this function.</b> A BEV
+     * DC fast charge of 22-500 kW on a kW-reporting trim would read ~1/100th here. That is why
+     * {@code VehicleDataMonitor.getChargingState()} consumes this value on PHEV ONLY — a PHEV
+     * onboard charger cannot reach the ambiguous band, so the guess can never be wrong there,
+     * while BEV keeps using {@code chargePowerKw} (getChargePower), which needs no guessing.
+     * Anyone widening that gate to BEV must first make this function's scale unambiguous;
+     * otherwise a 150 kW session displays as 1.5 kW. The one-shot log records the raw value and
+     * the chosen scale, so one device capture settles which family a trim belongs to.
+     */
+    /**
+     * True when an ENGINE_POWER reading is the HAL's "no data" placeholder rather than a real
+     * power flow, so it must not reach {@code enginePowerKw}.
+     *
+     * <p><b>Why {@code -1} specifically.</b> A device capture on a Sealion-class DM-i PHEV
+     * (log_X5RRX996, 2026-07-28) reported {@code enginePower resolved=-1.00kW source=featureId
+     * raw=-1.0} on ALL 148 samples across 3h41m — spanning a full charge (SOC 97→100%), the
+     * charge finishing, and hours of idle. A genuine mechanical power flow cannot hold exactly
+     * -1.0 kW to the bit across that; it is an idle/unavailable placeholder. It also sits
+     * INSIDE the plausible {@code [-200, 400]} band, so the range check cannot reject it.
+     *
+     * <p>Why that matters beyond display: {@code -1.0} is more negative than
+     * {@code -ENGINE_POWER_DEADBAND} (0.3), so {@link com.overdrive.app.monitor.ChargingDetector}
+     * counted it as "current flowing INTO the pack" — permanent phantom charging evidence that
+     * could latch L3 on a parked car. Filtering it here fixes the display AND the detector,
+     * because both read this one field.
+     *
+     * <p>Deliberately EXACT equality on a small denylist, not a band: a real engine can
+     * legitimately produce -1 kW of regen momentarily, and rejecting a whole band would lose
+     * genuine light-regen data. Exact-match on the observed placeholder loses at most one
+     * sample per crossing of that value, and the reference OEM app (reference app B) likewise accepts
+     * the full signed band with no low-magnitude carve-out. {@code 0.0} is NOT filtered — a
+     * genuine idle engine reads exactly 0 and callers already treat 0 as "no flow".
+     *
+     * @param kw the scaled kW reading (post {@code ×0.1} deciwatt correction)
+     */
+    private static boolean isEnginePowerSentinel(double kw) {
+        return kw == -1.0;
+    }
+
+    static double scaleClusterChargePowerKw(double raw) {
+        // One threshold, not two: an earlier version tested CLUSTER_KW_MAX_PLAUSIBLE (500) first
+        // and then CLUSTER_AC_KW_CEILING (22) with the SAME division, so the first test could
+        // never change an outcome. Anything above the AC ceiling is hectowatts.
+        return (Math.abs(raw) > CLUSTER_AC_KW_CEILING) ? raw / 100.0 : raw;
+    }
+
+    /**
+     * AC / onboard-charger ceiling in kW. At or below this a raw reading is taken as kW; above
+     * it, as hectowatts — which also covers raw values past any plausible kW rate (nothing
+     * charges past ~500 kW, so those can only be a smaller unit).
+     */
+    private static final double CLUSTER_AC_KW_CEILING = 22.0;
+
     /** @return the cell voltage in V, or NaN if unavailable/out-of-range. */
     private double collectStatVoltage(BydVehicleData.Builder b, int featureId, String which) {
-        Object val = BydDeviceHelper.callGet(statisticDevice, featureId, Integer.TYPE);
-        if (val == null) val = BydDeviceHelper.callGet(statisticDevice, featureId, Integer.class);
+        // Same as collectStatTemp, including the INT-FIRST ladder — getIntValue below reads
+        // BYDAutoEventValue.intValue, so the probe must request the width it will extract.
+        // (This method already rejects raw <= 0, so it degraded safely even before that fix.)
+        Object val = BydDeviceHelper.callGetProbing(statisticDevice, featureId, true);
         if (val == null) return Double.NaN;
         int raw = BydDeviceHelper.getIntValue(val);
         if (raw == BydFeatureIds.BMS_UNAVAILABLE || raw == BydFeatureIds.INVALID_VALUE
@@ -2220,6 +3087,14 @@ public class BydDataCollector {
                 // at the read/use sites already rejects that; this kills a stale
                 // in-band value, e.g. the last real rate before the gun came out.)
                 b.chargePowerKw(Double.NaN);
+                // clusterChargePowerKw is the top of getChargingState()'s cascade on PHEV, and
+                // toBuilder() carries it forward between polls — so without this clear the last
+                // real rate would stick after the gun came out and surface as phantom charging
+                // power, poisoning the session peak/avg exactly like its siblings would. Cleared
+                // with them. (Belt-and-braces with the per-poll reset at collectInstrument's
+                // entry: that one covers a failing read, this one covers the session ending
+                // while reads still succeed with a stale in-band value.)
+                b.clusterChargePowerKw(Double.NaN);
             }
 
             // Charging mode — getChargingMode() raw value (AC vs DC vs wireless, model-specific).
@@ -2333,13 +3208,21 @@ public class BydDataCollector {
     }
 
     private void collectInstrument(BydVehicleData.Builder b) {
+        // Clear the cluster charge-power BEFORE anything can bail out. The read itself lives
+        // ~100 lines down inside the shared try below, so a null instrument device (early
+        // return) or a throw from ANY earlier read in this method would skip the reset — and
+        // because this builder is seeded from the previous snapshot via toBuilder() and this
+        // field is the TOP of getChargingState()'s power cascade, the last good rate would then
+        // stick indefinitely and surface as phantom charging power. Resetting up front makes
+        // the field genuinely per-poll on every exit path.
+        b.clusterChargePowerKw(Double.NaN);
         if (instrumentDevice == null) return;
         try {
             // Named getter for outside temperature
             Object extTemp = BydDeviceHelper.callGetter(instrumentDevice, "getOutCarTemperature");
             if (extTemp instanceof Number) {
                 int t = ((Number) extTemp).intValue();
-                if (t >= -50 && t <= 60) b.outsideTempC(t);
+                if (isPlausibleOutsideTempC(t)) b.outsideTempC(t);
             }
 
             // External charging power. Two scaling regimes seen across BYD firmware:
@@ -2392,25 +3275,211 @@ public class BydDataCollector {
                 }
             }
 
-            // Feature ID fallback (842006552). Returns raw CAN value in hectowatts
-            // (value/100 = kW); evidence: 1.8 kW charger reports 189.5 raw.
-            // Used only when the typed getter above returned nothing useful.
-            if (Double.isNaN(b.externalChargingPowerKw)
-                    && (Double.isNaN(b.chargingPowerKw) || b.chargingPowerKw == 0)) {
-                try {
-                    Object val = BydDeviceHelper.callGet(instrumentDevice,
-                            BydFeatureIds.INSTRUMENT_CHARGING_CHARGE_POWER_DD, Double.class);
-                    if (val != null) {
-                        double raw = BydDeviceHelper.getDoubleValue(val);
-                        if (!Double.isNaN(raw) && Math.abs(raw) > 1.0 && Math.abs(raw) < 35000) {
-                            // Convert from hectowatts to kW
-                            double kw = raw / 100.0;
-                            b.chargingPowerKw(kw);
+            // CLUSTER charge power — feature ID 842006552 (0x32300018,
+            // Instrument.CHARGING_CHARGE_POWER_DD). This is the number the dash itself shows,
+            // and it is the ONLY charging-power source that is trustworthy on PHEV.
+            //
+            // Read UNCONDITIONALLY. It used to be gated behind
+            //   isNaN(externalChargingPowerKw) && (isNaN(chargingPowerKw) || ==0)
+            // i.e. "only if the typed getters found nothing" — which is exactly backwards for
+            // PHEV. There getExternalChargingPower() returns the EVSE's RATED capacity: a flat,
+            // confidently-WRONG value (~7 kW on a 1.7 kW charge). That satisfied the gate, so
+            // this good source NEVER ran on the very trims that need it, and PHEV fell through
+            // to the SOC-derived estimator and the nominal 3.3/7.0 kW placeholder. The OEM
+            // reference cascades on the VALUE being out of band, never on a previous getter
+            // having succeeded — so do the same: read it, then let the consumer cascade decide.
+            //
+            // Stored separately in clusterChargePowerKw (NOT over chargingPowerKw) so the
+            // consumer can prefer it explicitly without this read clobbering the device-getter
+            // value that BEV logic still uses.
+            //
+            // Scaling: see scaleClusterChargePowerKw() — the raw value is hectowatts on the
+            // firmware family we captured (a 1.8 kW charger reports ~189.5 raw) and plain kW on
+            // the family the OEM app targets, with no unit flag to tell them apart, so the scale
+            // is INFERRED from the magnitude. At or below the 22 kW AC ceiling the value is taken
+            // as kW; above it, as hectowatts.
+            //
+            // That inference is not decidable for raw 22..500: it is either a 22-500 kW DC fast
+            // charge or a 0.22-5 kW AC charge, and it is resolved as the latter (our field
+            // evidence). Which means this stored value is only trustworthy where the ambiguous
+            // band is physically unreachable — i.e. on PHEV, whose onboard charger cannot exceed
+            // ~7 kW. The read itself stays unconditional and drivetrain-agnostic (a debug dump
+            // should show what the cluster reports on any car); it is the CONSUMER that is
+            // restricted, in VehicleDataMonitor.getChargingState(), which uses this field on PHEV
+            // only. Anyone lifting that restriction must first make the scale unambiguous —
+            // otherwise a genuine 150 kW BEV session displays as 1.5 kW.
+            try {
+                // Probe the primitive widths rather than passing a wrapper Class: the HAL
+                // dispatches on the EXACT Class object and matches PRIMITIVES only, so the old
+                // `Double.class` argument returned null on every trim (see
+                // BydDeviceHelper.callGetProbing). That alone would have kept this read dead
+                // even without the gating bug above.
+                Object val = BydDeviceHelper.callGetProbing(
+                        instrumentDevice, BydFeatureIds.INSTRUMENT_CHARGING_CHARGE_POWER_DD);
+                // SECOND CHANNEL. The per-device get(int[], Class) form above is not the only way
+                // into the HAL: the manager exposes getDouble(deviceType, featureId), and a trim
+                // may implement one and not the other. Reference apps resolve BOTH accessors at
+                // init; we only ever probed the per-device form, so on such a trim this read came
+                // back null and the whole PHEV cascade collapsed to an estimate. Only consulted
+                // when the primary yielded nothing, so a working trim is unaffected.
+                // Trigger on "no USABLE number", not merely on a null reference. callGetProbing's
+                // width ladder returns the first non-null result, but getDoubleValue always reads
+                // BYDAutoEventValue.doubleValue — so a trim that answers only on Integer.TYPE hands
+                // back a non-null wrapper whose doubleValue is still its default 0.0. Gating on
+                // `val == null` would treat that as a successful read and never consult the second
+                // channel, which is precisely the trim this fallback exists for.
+                double devRaw = (val != null) ? BydDeviceHelper.getDoubleValue(val) : Double.NaN;
+                boolean devUsable = !Double.isNaN(devRaw) && devRaw != 0.0;
+                // Plausible-charging-context gate, hoisted so the READ shares it with the log below.
+                // A parked, unplugged car cannot have a charge power, so walking the fallback chain
+                // there is pure IPC waste: each attempt is 1-3 uncached binder round-trips (the
+                // Method resolves on a real trim, so only the VALUE lookup can be cached — the
+                // invoke cannot). Ungated that was thousands of pointless calls/day. The primary
+                // read above is deliberately NOT gated: it is a single cheap call and the field is
+                // recomputed per poll by design.
+                boolean chargingContext = accIsOn
+                        || b.chargingGunState == 2 || b.chargingGunState == 3
+                        || b.chargingGunState == 4 || b.chargingState == 1;
+                double mgrKw = Double.NaN;
+                if (!devUsable && chargingContext) {
+                    mgrKw = BydManagerChannel.getDouble(context, instrumentDevice,
+                            BydFeatureIds.INSTRUMENT_CHARGING_CHARGE_POWER_DD);
+                }
+                // Resolve to a value or explicitly to NaN on EVERY poll. Unlike its siblings
+                // (which stay sticky until the terminal-state clear in collectCharging), this
+                // field is the TOP of the power cascade and toBuilder() carries it forward, so
+                // a one-off good read followed by failing reads would pin a phantom rate for
+                // the rest of the session. Recomputing per poll makes it self-correcting.
+                // (The method entry already reset it to NaN so the paths that never reach this
+                // line — null device, a throw from an earlier read — are covered too.)
+                double clusterKw = Double.NaN;
+                // Take whichever channel produced a number. Both feed the SAME scaling and the SAME
+                // validity gates below, so a manager-sourced value can never bypass a check that a
+                // device-sourced one has to pass.
+                //
+                // UNIT CAVEAT — deliberately unresolved, and instrumented rather than guessed.
+                // Asymmetry 1 records that this feature id is hectowatts on the firmware family we
+                // captured and plain kW on the family the reference apps target, with no unit flag;
+                // scaleClusterChargePowerKw() therefore INFERS the scale from magnitude. Whether the
+                // manager channel pre-scales differently from the per-device channel is unknown —
+                // we have no capture in which the manager channel produced a value at all (it only
+                // runs where the per-device read already failed). Both are fed through the same
+                // inference because a magnitude-based rule is unit-agnostic by construction: a kW
+                // value stays kW, a hectowatt value is divided. The residual risk is confined to
+                // the ambiguous 22..500 raw band, which a PHEV onboard charger cannot reach — the
+                // same containment that already makes this field PHEV-only. The raw log below
+                // records WHICH channel produced the number, so the first capture that exercises
+                // the manager path settles it with data instead of inference.
+                boolean fromManager = !devUsable;
+                if (devUsable || !Double.isNaN(mgrKw)) {
+                    double raw = devUsable ? devRaw : mgrKw;
+                    // RAW-SCALE CAPTURE, throttled 1/min and independent of every gate below.
+                    // The one-shot scale logs only fire when a value is ACCEPTED, so on a trim
+                    // where the gates never open (exactly the log_X5RRX996 case) we learned
+                    // nothing about the unit — and the kW-vs-hectowatts question can only be
+                    // settled by seeing the raw number next to a known charger rate. Logging the
+                    // pre-scale value plus the gate states makes one real charge conclusive.
+                    // Gated on a plausible charging context, not unconditional: an always-on
+                    // 1/min INFO would emit ~1440 lines/day forever on every trim including a
+                    // parked car, long after the kW-vs-hectowatts question is settled. Emitting
+                    // only while ACC is on or a charge looks live keeps the capture useful and
+                    // bounded — and the answer only exists during a charge anyway.
+                    long rawNow = System.currentTimeMillis();
+                    if (chargingContext && rawNow - lastClusterRawLogMs > 60_000L) {
+                        lastClusterRawLogMs = rawNow;
+                        logger.info(String.format(java.util.Locale.US,
+                            "CHARGING_CHARGE_POWER_DD raw=%.3f → wouldScaleTo=%.3fkW src=%s"
+                            + " (bmsState=%d gunState=%d) — compare raw against the DASH reading"
+                            + " to confirm kW vs hectowatts on this trim",
+                            raw, scaleClusterChargePowerKw(raw),
+                            fromManager ? "manager" : "device",
+                            b.chargingState, b.chargingGunState));
+                    }
+                    if (!Double.isNaN(raw) && Math.abs(raw) > 1.0 && Math.abs(raw) < 35000) {
+                        double kw = scaleClusterChargePowerKw(raw);
+                        // Band matches every CONSUMER of this field exactly (VehicleDataMonitor's
+                        // cascade gate and the diagnostic JSON both use >0.1 && <=300, the same
+                        // convention as its chargePowerKw sibling). Accepting up to 500 here
+                        // while consumers cap at 300 would store values that silently never
+                        // surface — the field would look populated in a debug dump yet be
+                        // skipped by the cascade, which is worse than rejecting them outright.
+                        // Suppress on an EXPLICIT non-charging terminal state (READY=0,
+                        // FINISHED=2, TERMINATED=4, DISCHARG_FINISH=12). The cluster feature id
+                        // keeps answering with the last in-band rate after the gun comes out, and
+                        // collectInstrument runs immediately AFTER collectCharging in both poll
+                        // entry points and overwrites this field unconditionally — so the sibling
+                        // clear in collectCharging's terminal block could never survive the same
+                        // poll. Without this, a finished session reported a phantom rate (e.g.
+                        // 1.895 kW) into the PHEV cascade and poisoned the session peak/avg. NOT
+                        // suppressed on IDLE=15, which is the buggy state some PHEV firmwares
+                        // report while genuinely charging.
+                        // GUN-CONNECTED CARVE-OUT for FINISHED(2). Field evidence
+                        // (log_X5RRX996): at 07:01:28 the BMS flipped to state 2 at 100% SOC
+                        // while gunState stayed 2 (AC connected) and the pack kept drawing taper
+                        // current. Treating FINISHED as terminal there suppressed this — the only
+                        // trustworthy PHEV source — for the whole session, and the cascade fell
+                        // through to a frozen SOC-derived estimate. On BYD PHEV firmware "FINISHED"
+                        // means "bulk charge complete", NOT "cable removed": the CV taper continues
+                        // and the dash keeps showing a real rate.
+                        //
+                        // Scoped deliberately to FINISHED only, and only while the gun asserts a
+                        // CHARGING-direction connection (2=AC, 3=DC, 4=AC_DC — never 5=V2L, where
+                        // the pack DISCHARGES and any rate would be backwards; see I7). READY(0),
+                        // TERMINATED(4) and DISCHARG_FINISH(12) stay terminal unconditionally:
+                        // those mean the session is genuinely over or reversed, so the sticky
+                        // feature-id value must not survive them.
+                        boolean gunCharging = b.chargingGunState == 2
+                                || b.chargingGunState == 3 || b.chargingGunState == 4;
+                        boolean terminalState = b.chargingState == 0
+                                || (b.chargingState == 2 && !gunCharging)
+                                || b.chargingState == 4 || b.chargingState == 12;
+                        // ALSO require the fused detector to agree a session is live. Device
+                        // capture (boot, ACC off, gun out): this feature id emitted raw=359.4 →
+                        // 3.594 kW — the same "~359 garbage when idle" signature getChargePower
+                        // shows — and 3.594 is squarely in band, so the magnitude gates can't
+                        // reject it, and chargingState wasn't a terminal code at that instant so
+                        // the suppression above didn't either. The detector fuses BMS state +
+                        // isCharging() + power flow and reads nothing derived from this field
+                        // (no circularity), so idle junk is rejected while a real session —
+                        // including the PHEV stuck-at-IDLE(15) firmware case, which the detector
+                        // exists to catch — still passes on its very first poll.
+                        boolean sessionLive = false;
+                        try {
+                            sessionLive = com.overdrive.app.monitor.ChargingDetector
+                                    .getInstance().isCharging();
+                        } catch (Throwable ignored) { /* detector not up yet → treat as idle */ }
+                        // SECOND ADMISSION PATH — the detector is not the only proof of a live
+                        // session. It can legitimately read false during a real charge: it fused
+                        // ON->OFF at 07:01:28 on `l1-bms-negative` (BMS said FINISHED) while the
+                        // cable was still in and SOC still rising. Requiring isCharging() alone
+                        // therefore gated the good source off exactly when the BMS lies — which is
+                        // the failure this field exists to cover.
+                        //
+                        // A charging-direction gun assertion is independent physical evidence that
+                        // a cable is delivering energy, and it defeats the raw=359.4 idle-junk case
+                        // that motivated the original gate: that capture was taken with the gun OUT
+                        // (boot, ACC off), so gunCharging is false there and the junk is still
+                        // rejected. No circularity — gunState comes from collectCharging (which runs
+                        // BEFORE this method in both poll entry points) and is not derived from this
+                        // field (I6).
+                        // NB: no `&& !terminalState` here — the accept condition below already
+                        // requires it, so repeating it was pure boolean noise.
+                        boolean plugAsserted = gunCharging;
+                        if (kw > 0.1 && kw <= 300 && !terminalState && (sessionLive || plugAsserted)) {
+                            clusterKw = kw;
+                            if (!loggedClusterChargePowerScale) {
+                                loggedClusterChargePowerScale = true;
+                                logger.info("CHARGING_CHARGE_POWER_DD: raw=" + raw + " → " + kw
+                                        + " kW (scale=" + (kw == raw ? "kW" : "hectowatts/100")
+                                        + "). This is the cluster's own charge readout — cross-check"
+                                        + " it against the dash to confirm the scale.");
+                            }
                         }
                     }
-                } catch (Exception e) {
-                    logger.debug("collectInstrument chargingPower feature ID error: " + e.getMessage());
                 }
+                b.clusterChargePowerKw(clusterKw);
+            } catch (Exception e) {
+                logger.debug("collectInstrument cluster charge-power feature ID error: " + e.getMessage());
             }
 
             // Charging percent via instrument feature ID (842006544) — read
@@ -2509,26 +3578,25 @@ public class BydDataCollector {
             }
             Object unit = BydDeviceHelper.callGetter(acDevice, "getTemperatureUnit");
             if (unit instanceof Number) b.tempUnit(((Number) unit).intValue());
-            // Sensed cabin temperature. Position 5 (AC_TEMP_INSIDE) is the MEASURED cabin
-            // temp; positions 1/2/3 are the driver/passenger/rear climate SETPOINTS (the
-            // dial, 17..33) and 4 is outside. This previously read position 1 — the driver
-            // setpoint — so insideTempC tracked the target dial, not the cabin: a
-            // "cabin temp > X" automation compared against the setpoint and never fired (and
-            // the MQTT inside_temp / cloud / climate readouts never reflected reality).
-            // Prefer the position-5 read, then fall back to the AC_TEMP_INSIDE feature-id,
-            // matching the OEM firmware's getTemperatureFromDevice(5).
-            Object insideTemp = BydDeviceHelper.callGetter(acDevice, "getTemprature", 5);
-            int sensed = Integer.MIN_VALUE;
-            if (insideTemp instanceof Number) {
-                int t = ((Number) insideTemp).intValue();
-                if (t != 65535 && t >= -40 && t <= 80) sensed = t;
-            }
-            if (sensed == Integer.MIN_VALUE) {
-                int t = BydDeviceHelper.getIntValue(
-                        BydDeviceHelper.callGet(acDevice, BydFeatureIds.AC_TEMP_INSIDE, Integer.class));
-                if (t != Integer.MIN_VALUE && t != 65535 && t >= -40 && t <= 80) sensed = t;
-            }
+            // Sensed cabin temperature — the MEASURED cabin value, NOT a climate setpoint.
+            //
+            // Source of truth: the AC_TEMP_INSIDE feature id (0x3D800030). The SDK javadoc's
+            // getTemprature(area) accepts ONLY areas 0..4 (AC_TEMPERATURE_MAIN_DEPUTY=0,
+            // MAIN=1 and DEPUTY=2 = the driver/passenger SETPOINT dials, REAR=3, OUT=4) —
+            // there is no area 5, and the documented return range is the setpoint range
+            // (17..33 C). So the previous getTemprature(5) primary read was outside the
+            // documented API; the reference app (reference app C) never calls area 5 either — it calls
+            // only 4 (outside) and 1 (driver setpoint), and reads the CABIN value through this
+            // same AC_TEMP_INSIDE feature id. Reading the feature id first matches that.
+            int sensed = readCabinTempC();
             if (sensed != Integer.MIN_VALUE) b.insideTempC(sensed);
+            // Dial SETPOINTS (areas 1/2) — the value the user asked for, as opposed to the
+            // sensed cabin air above. Written only when the read answered, so a miss leaves the
+            // carried-forward value rather than fabricating one.
+            int spDriver = readAcSetpointNow(AC_TEMP_AREA_DRIVER);
+            if (spDriver != BydVehicleData.UNAVAILABLE) b.acSetpointDriver(spDriver);
+            int spPassenger = readAcSetpointNow(AC_TEMP_AREA_PASSENGER);
+            if (spPassenger != BydVehicleData.UNAVAILABLE) b.acSetpointPassenger(spPassenger);
         } catch (Exception e) {
             logger.debug("collectAc error: " + e.getMessage());
         }
@@ -2541,12 +3609,44 @@ public class BydDataCollector {
             if (left instanceof Number) b.leftTurnState(((Number) left).intValue());
             Object right = BydDeviceHelper.callGetter(lightDevice, "getTurnLightState", 2);
             if (right instanceof Number) b.rightTurnState(((Number) right).intValue());
-            // Light status: 1=low, 2=high, 3=position, 6=rearFog, 7=frontFog, 8=hazard
-            b.lowBeam(getLightStatus(1) == 1);
-            b.highBeam(getLightStatus(2) == 1);
-            b.rearFog(getLightStatus(6) == 1);
-            b.frontFog(getLightStatus(7) == 1);
-            b.hazard(getLightStatus(8) == 1);
+            // Light TYPE indices are the BYDAutoLightDevice constants (SDK javadoc
+            // doc/constant-values.html): 1=LIGHT_SIDE, 2=LIGHT_LOW_BEAM, 3=LIGHT_HIGH_BEAM,
+            // 4/5=turn signals, 6=LIGHT_FRONT_FOG, 7=LIGHT_REAR_FOG, 8=LIGHT_FOOT.
+            //
+            // These were previously read one position LOW (1=low, 2=high, …), so every beam
+            // and fog readout named the wrong lamp. The visible symptom was "both low AND
+            // high beam show on in AUTO mode": with the headlights on, side(1)+low(2) are both
+            // lit, which the old mapping reported as low+high. In MANUAL high beam the
+            // extra high(3) lamp made the same wrong pair look correct — hence "works in
+            // manual, wrong in auto". Fog was swapped front/rear for the same reason, and
+            // hazard read LIGHT_FOOT (the footwell lamp) rather than any hazard state.
+            // Each lamp is written ONLY when the read actually answered. getLightStatus returns
+            // UNAVAILABLE (not 0) on a miss, because a fabricated "0" is indistinguishable from a
+            // genuine "off": on a trim that doesn't implement getLightStatus, every poll used to
+            // publish a definite lights=off, firing "when low beam turns off" repeatedly. The
+            // fast automation path (readBeamNow → BydEvent.pollClimate) already skipped the
+            // publish on a miss, so this makes the snapshot path agree with it.
+            int lowBeamRaw = getLightStatus(LIGHT_TYPE_LOW_BEAM);
+            if (lowBeamRaw != BydVehicleData.UNAVAILABLE) b.lowBeam(lowBeamRaw == 1);
+            int highBeamRaw = getLightStatus(LIGHT_TYPE_HIGH_BEAM);
+            if (highBeamRaw != BydVehicleData.UNAVAILABLE) b.highBeam(highBeamRaw == 1);
+            int frontFogRaw = getLightStatus(LIGHT_TYPE_FRONT_FOG);
+            if (frontFogRaw != BydVehicleData.UNAVAILABLE) b.frontFog(frontFogRaw == 1);
+            int rearFogRaw = getLightStatus(LIGHT_TYPE_REAR_FOG);
+            if (rearFogRaw != BydVehicleData.UNAVAILABLE) b.rearFog(rearFogRaw == 1);
+            // Hazard: KNOWN-SUSPECT. The SDK type list has NO hazard entry — position 8 is
+            // LIGHT_FOOT (the footwell/courtesy lamp), so on a car whose footwell lamps come up
+            // with the doors, this reports hazard=on every time a door opens in the dark. It is
+            // kept because it is the ONLY hazard readback available and some firmware does
+            // expose undocumented behaviour here, but do NOT treat it as confirmed: everything
+            // downstream (MQTT light_hazard, the HA hazard switch state, and the
+            // lights:area=hazard trigger/condition) inherits the doubt.
+            //
+            // Verifying it needs an actual getLightStatus capture on the vehicle — compare
+            // position 8 against the physical hazard switch. /api/debug/light/* cannot do this:
+            // it only resolves/fires WRITE feature ids and never calls getLightStatus.
+            int hazardRaw = getLightStatus(LIGHT_TYPE_FOOT_UNVERIFIED_HAZARD);
+            if (hazardRaw != BydVehicleData.UNAVAILABLE) b.hazard(hazardRaw == 1);
             Object dayTime = BydDeviceHelper.callGetter(lightDevice, "getDayTimeLightState");
             if (dayTime instanceof Number) b.dayTimeLight(((Number) dayTime).intValue() == 1);
             // Auto-headlight (light-sensor) mode: 1=on, 0=off. The usable "it's dark"
@@ -2559,9 +3659,201 @@ public class BydDataCollector {
         }
     }
 
+    // BYDAutoLightDevice.getLightStatus() light-TYPE constants, per the SDK javadoc's
+    // constant-values table. Named here (rather than inlined as bare ints) because the two
+    // callers — collectLight's snapshot path and readBeamNow's fast automation path — MUST
+    // agree; they previously each carried their own off-by-one copy of the numbering.
+    static final int LIGHT_TYPE_LOW_BEAM   = 2;
+    static final int LIGHT_TYPE_HIGH_BEAM  = 3;
+    static final int LIGHT_TYPE_FRONT_FOG  = 6;
+    static final int LIGHT_TYPE_REAR_FOG   = 7;
+    /** Position 8 is LIGHT_FOOT in the SDK table — NOT hazard. Named to make the mismatch
+     *  impossible to miss at the (single, deliberately kept) call site; see collectLight. */
+    static final int LIGHT_TYPE_FOOT_UNVERIFIED_HAZARD = 8;
+
+    /**
+     * Whether a raw AC_TEMP_INSIDE reading is a usable CABIN temperature in Celsius.
+     *
+     * <p>The value needs NO decoding — the feature id reports whole degrees Celsius directly
+     * (no offset, no scale). Verified against the reference app, which stores the raw int
+     * verbatim and renders it as "<i>n</i>℃".
+     *
+     * <p>The lower bound mirrors the reference app's ({@code <= -128} → reject), which also
+     * excludes {@link Integer#MIN_VALUE}, our own read-failed marker, and every negative
+     * unavailable sentinel in this file (BMS_UNAVAILABLE, INVALID_VALUE, …).
+     *
+     * <p>An UPPER bound is required as well, even though the reference app has none: unlike that
+     * app — which only renders the value into a text view — this reading fans out to consumers
+     * with no band of their own (the MQTT {@code cabin_temp} field, the ABRP {@code car_temp}
+     * telemetry, the vehicle-control API/snapshot JSON, and the {@code temperature} automation
+     * condition). A positive "not available" sentinel would therefore be published as a real
+     * temperature, and because {@link BydVehicleData#toBuilder()} carries the field forward while
+     * a later failed read writes nothing, that bad value would LATCH indefinitely — permanently
+     * satisfying every "cabin above X" rule. 0xFFFF/0xFF are the classic CAN not-available values
+     * (this file already treats them as such elsewhere), and they are positive, so the lower
+     * bound alone cannot stop them.
+     *
+     * <p>90 C is the ceiling: a car parked in direct sun genuinely reaches 60-70 C, so the bound
+     * has to sit well above habitable to avoid discarding true extremes — exactly when a
+     * heat-warning automation matters most — while still rejecting 255/65535 and any
+     * offset/scale decode error.
+     *
+     * <p>Note 0 is NOT treated as invalid even though {@code AC_TEMP_INVALID == 0}: that constant
+     * applies to the {@code getTemprature(area)} setpoint API, whose valid range starts at 17,
+     * not to this measured feature id — where 0 C is a genuine winter reading. The reference app
+     * accepts 0 on this channel too.
+     */
+    private static boolean isPlausibleCabinTempC(int raw) {
+        return raw > -128 && raw <= 90;
+    }
+
+    /**
+     * Whether a raw reading is a plausible OUTSIDE/ambient temperature in Celsius.
+     *
+     * <p>The -50..60 band the HAL read has always used, extracted so the CLOUD fallback shares it.
+     * Previously only the HAL producer applied it, so a cloud {@code tempOutCar} sentinel (255,
+     * 65535) was published verbatim — and because {@link BydVehicleData#toBuilder()} carries the
+     * field forward while a later failed read writes nothing, it LATCHED. That fed
+     * {@code OUTSIDE_TEMPERATURE} and, since the smart {@code TEMPERATURE} event falls back to
+     * ambient whenever the car is parked, the cabin condition too — permanently satisfying every
+     * "above X" rule, plus HA's {@code ext_temp}.
+     *
+     * <p>Narrower than the cabin band on purpose: ambient air has a much tighter physical range
+     * than a sun-baked cabin interior.
+     */
+    private static boolean isPlausibleOutsideTempC(int raw) {
+        return raw >= -50 && raw <= 60;
+    }
+
+    /**
+     * Read the measured cabin temperature in whole degrees Celsius, or {@link Integer#MIN_VALUE}
+     * when unavailable. THE single reader for this signal — both {@code collectAc} (insideTempC)
+     * and {@code collectInstrumentExtended} (insideTempCelsius) call here, so the two fields can
+     * never again disagree about the channel, the decode, or the validity rule.
+     *
+     * <p>Guards the {@code intValue == 0} type-mismatch signature the same way
+     * {@code collectStatTemp} does: {@link BydDeviceHelper#callGet}'s {@code (int,int)} overload
+     * branch ignores the requested return type, so on a device exposing only that form the
+     * returned event object can carry an unpopulated {@code intValue} — which reads as a
+     * perfectly plausible 0 C. A populated {@code doubleValue} alongside a zero {@code intValue}
+     * is that mismatch; a genuine 0 C reading arrives with doubleValue at its own default.
+     * Without this, a mid-summer cabin could publish 0 C to HA/ABRP and fire a
+     * "cabin below 5 C" rule.
+     */
+    private int readCabinTempC() {
+        if (acDevice == null) return Integer.MIN_VALUE;
+        Object val = BydDeviceHelper.callGet(acDevice, BydFeatureIds.AC_TEMP_INSIDE, Integer.class);
+        if (val == null) return Integer.MIN_VALUE;
+        int raw = BydDeviceHelper.getIntValue(val);
+        if (raw == 0) {
+            double asDouble = BydDeviceHelper.getDoubleValue(val);
+            if (!Double.isNaN(asDouble) && asDouble != 0.0) {
+                logger.debug("readCabinTempC: intValue=0 but doubleValue=" + asDouble
+                        + " — type/field mismatch, discarding");
+                return Integer.MIN_VALUE;
+            }
+        }
+        return isPlausibleCabinTempC(raw) ? raw : Integer.MIN_VALUE;
+    }
+
+    // ── AC temperature SETPOINT (the dial), distinct from the measured cabin temp ────
+
+    /** {@code getTemprature(area)} areas — MAIN=1 / DEPUTY=2 are the driver / passenger dials. */
+    public static final int AC_TEMP_AREA_DRIVER = 1;
+    public static final int AC_TEMP_AREA_PASSENGER = 2;
+    /** {@code getTemperatureUnit()}: 0 = Fahrenheit, non-zero = Celsius (proven from DiPlus). */
+    public static final int TEMP_UNIT_FAHRENHEIT = 0;
+    /** Setpoint clamps per display unit — the SDK's own documented dial ranges. */
+    public static final int AC_SETPOINT_MIN_C = 17, AC_SETPOINT_MAX_C = 33;
+    public static final int AC_SETPOINT_MIN_F = 64, AC_SETPOINT_MAX_F = 91;
+    /** {@code AC_TEMP_INVALID} — the setpoint API's documented "no value" return. */
+    private static final int AC_TEMP_INVALID = 0;
+
+    /**
+     * The AC temperature SETPOINT (what the dial is asking for), in whatever unit the head
+     * unit displays — NOT {@link #readCabinTempC()}, which is the measured air temperature.
+     * Confusing the two is the trap a relative "+1 degree" step falls into: with the dial at
+     * 22 and a cold cabin reading 12, stepping from the sensed value would slam the dial to 13.
+     *
+     * <p>Area 1 = driver (MAIN), 2 = passenger (DEPUTY) — the mapping both reference apps use
+     * (DiPlus reads area 1 for the dial; Commander caches 1/2/4 as driver/passenger/outside).
+     *
+     * <p>Returns {@link BydVehicleData#UNAVAILABLE} on a miss rather than a plausible-looking
+     * default. Both reference apps fall back to a hardcoded 24, which is exactly the fabricated
+     * reading this codebase refuses elsewhere: a step built on a fake 24 would move the dial to
+     * 25 regardless of where it actually sat. The value is accepted if it falls in EITHER dial
+     * band, so a Fahrenheit dial (64..91) isn't rejected by the Celsius one.
+     *
+     * @param area {@link #AC_TEMP_AREA_DRIVER} or {@link #AC_TEMP_AREA_PASSENGER}
+     */
+    public int readAcSetpointNow(int area) {
+        if (acDevice == null) return BydVehicleData.UNAVAILABLE;
+        try {
+            Object val = BydDeviceHelper.callGetter(acDevice, "getTemprature", area);
+            if (!(val instanceof Number)) return BydVehicleData.UNAVAILABLE;
+            int raw = ((Number) val).intValue();
+            // AC_TEMP_INVALID (0) is the documented no-value return on THIS api — and 0 is
+            // outside both dial ranges anyway, so it can never be a real setpoint.
+            if (raw == AC_TEMP_INVALID) return BydVehicleData.UNAVAILABLE;
+            // Validate against EITHER dial band rather than re-reading the unit here. The bands
+            // are disjoint (17..33 vs 64..91), so "in one of them" is already the full validity
+            // test — and asking the device for the unit on every setpoint read would triple the
+            // per-poll reads (collectAc reads it once for tempUnit) while adding a window where
+            // the unit answers but the reading was taken under the other one.
+            return inferUnitFromSetpoint(raw) != BydVehicleData.UNAVAILABLE
+                    ? raw : BydVehicleData.UNAVAILABLE;
+        } catch (Throwable t) {
+            logger.debug("readAcSetpointNow error: " + t.getMessage());
+            return BydVehicleData.UNAVAILABLE;
+        }
+    }
+
+    /**
+     * The head unit's display temperature unit, or {@link BydVehicleData#UNAVAILABLE} on a miss.
+     * Deliberately NOT defaulted to Celsius: the unit decides both the clamp band and the value
+     * the write declares, so guessing it would silently mis-clamp a Fahrenheit dial.
+     */
+    public int readTempUnitNow() {
+        if (acDevice == null) return BydVehicleData.UNAVAILABLE;
+        Object unit = BydDeviceHelper.callGetter(acDevice, "getTemperatureUnit");
+        return (unit instanceof Number) ? ((Number) unit).intValue() : BydVehicleData.UNAVAILABLE;
+    }
+
+    /**
+     * The display unit implied by an already-validated setpoint READING, used when
+     * {@code getTemperatureUnit()} doesn't answer.
+     *
+     * <p>Sound because the two dial bands are disjoint — 17..33 C ends far below 64..91 F — so a
+     * reading can only belong to one of them. This matters: falling back to Celsius on an
+     * unreadable unit would clamp a legitimate 73 F step down to 33, yanking the dial across the
+     * scale. Inferring from the value keeps the step correct on a trim whose unit getter is
+     * dormant but whose dial reads fine.
+     *
+     * @return the unit constant, or {@link BydVehicleData#UNAVAILABLE} if [setpoint] is in neither band
+     */
+    private static int inferUnitFromSetpoint(int setpoint) {
+        if (setpoint >= AC_SETPOINT_MIN_C && setpoint <= AC_SETPOINT_MAX_C) return 1;  // non-zero = Celsius
+        if (setpoint >= AC_SETPOINT_MIN_F && setpoint <= AC_SETPOINT_MAX_F) return TEMP_UNIT_FAHRENHEIT;
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    /** Clamp a setpoint into the dial range for [unit] (mirrors DiPlus's own clamp). */
+    public static int clampSetpoint(int value, int unit) {
+        boolean f = unit == TEMP_UNIT_FAHRENHEIT;
+        int min = f ? AC_SETPOINT_MIN_F : AC_SETPOINT_MIN_C;
+        int max = f ? AC_SETPOINT_MAX_F : AC_SETPOINT_MAX_C;
+        return value < min ? min : value > max ? max : value;
+    }
+
+    /**
+     * Raw {@code getLightStatus(type)} read, or {@link BydVehicleData#UNAVAILABLE} when the
+     * device did not answer. Returning UNAVAILABLE rather than 0 is deliberate: 0 is the SDK's
+     * {@code LIGHT_STATE_OFF}, so a miss reported as 0 is a FABRICATED "that lamp is off" —
+     * which the callers then publish as a real state transition. Callers must check.
+     */
     private int getLightStatus(int position) {
         Object val = BydDeviceHelper.callGetter(lightDevice, "getLightStatus", position);
-        return (val instanceof Number) ? ((Number) val).intValue() : 0;
+        return (val instanceof Number) ? ((Number) val).intValue() : BydVehicleData.UNAVAILABLE;
     }
 
     private void collectAdas(BydVehicleData.Builder b) {
@@ -2613,6 +3905,10 @@ public class BydDataCollector {
                 int c = ((Number) ambient).intValue();
                 if (c >= 1 && c <= 31) b.ambientColour(c);
             }
+            // NOTE: the ambient MAIN SWITCH readback lives in collectLight, not here — it uses
+            // lightDevice + the carsettings provider, and this method early-returns when the
+            // SETTING device is absent, which would have left it permanently unpublished on
+            // such a trim.
         } catch (Exception e) {
             logger.debug("collectSettings error: " + e.getMessage());
         }
@@ -2788,6 +4084,28 @@ public class BydDataCollector {
             || v == 65534 || v == 65535;
     }
 
+    /**
+     * Upper bound for a believable petrol range, in km. The SDK's field can carry
+     * up to 4095, but no BYD PHEV tank goes remotely that far — a value in the
+     * upper hundreds is already a sensor rail, not a range. 1200 km leaves ample
+     * headroom over the ~1000 km best case for a full tank plus a full battery.
+     */
+    private static final int MAX_PLAUSIBLE_FUEL_RANGE_KM = 1200;
+
+    /**
+     * True when a raw {@code getFuelDrivingRangeValue()} reading is a real range
+     * rather than a sentinel/rail. Zero is accepted — an empty tank genuinely has
+     * no petrol range, and reporting that is more honest than blanking the field.
+     */
+    private static boolean isPlausibleFuelRangeKm(int raw) {
+        // Bound only. Do NOT consult isBevFuelSentinel here: that set is for the
+        // 0..100 PERCENT domain, and it contains 254/255/511/1023 — all ordinary
+        // petrol ranges in km for a DM-i tank. Rejecting them dropped real
+        // readings. The rails that matter for a range field (2046/2047/4095 and
+        // the 16-bit ones) are already excluded by the 1200 km bound.
+        return raw >= 0 && raw <= MAX_PLAUSIBLE_FUEL_RANGE_KM;
+    }
+
     private void ensureDeviceContext(Object device) {
         if (device == null || context == null) return;
         try {
@@ -2825,8 +4143,35 @@ public class BydDataCollector {
     // seatbeltEverUnlatched map): the front-passenger belt sensor reports "buckled" from
     // boot until a genuine unlatch (0) is seen at least once, so we treat its 1 as
     // unbuckled until the first real 0. Only the passenger seat needs this; the driver
-    // belt reads truthfully from boot. Written/read only on the single BydDataPoll thread.
-    private boolean passengerBeltEverUnlatched = false;
+    // belt reads truthfully from boot. Accessed from BOTH the BydDataPoll thread
+    // (collectSafetyBelt) AND the fast SeatbeltEvent poll thread (readSeatbeltsNow), so it
+    // is volatile for cross-thread visibility. A benign read-modify-write race only affects
+    // the one-time first-unlatch heuristic, never correctness — no lock needed.
+    private volatile boolean passengerBeltEverUnlatched = false;
+
+    // Debounce thresholds for two safety-adjacent, on-device-unverified inferences in
+    // readSeatbeltPair: (1) the driver INVALID(2)→unbuckled best-effort mapping and (2) the
+    // passenger confirmed-empty occupancy gate. Both require N consecutive matching reads
+    // before acting, so a SINGLE transient/spurious read can't publish (or suppress) a belt
+    // edge. N=2 is the minimum that still surfaces a genuinely sustained state within one extra
+    // poll tick (≤1s on the fast poll).
+    private static final int DRIVER_INVALID_UNBUCKLE_STREAK = 2;
+    private static final int PASSENGER_EMPTY_STREAK = 2;
+
+    // Consecutive-read counters backing the two debounces above. Like passengerBeltEverUnlatched
+    // they are touched by BOTH the 5s BydDataPoll thread (collectSafetyBelt) AND the 500ms
+    // SeatbeltEvent poll thread (readSeatbeltsNow) via the shared readSeatbeltPair; both read the
+    // SAME sensor each tick, so a benign cross-thread read-modify-write on these plain volatile
+    // ints can at most advance or reset a streak by one tick (delaying an edge by one poll),
+    // never mis-report a state — the same benign-race stance as the latch, so no lock is needed.
+    private volatile int driverInvalidStreak = 0;
+    private volatile int passengerEmptyStreak = 0;
+
+    // Throttle (30s) for the diagnostic raw-seatbelt log emitted by readSeatbeltPair — so a
+    // future on-device log pins the EXACT raw code the driver channel returns on unbuckle,
+    // which the best-effort driver mapping is inferring. Written from both the 5s poll and
+    // the 500ms fast poll; a benign cross-thread race only affects log cadence, not data.
+    private volatile long lastSeatbeltRawLogMs = 0;
 
     /** Cached BYDAutoInstrumentDevice.getSafetyBeltStatus(int) — the dedicated named getter
      *  the WORKING telemetry-recording overlay uses (TelemetryDataCollector.probeSeatbeltApis
@@ -2895,55 +4240,199 @@ public class BydDataCollector {
      * consumer can tell "unbuckled" from "no reading".
      */
     private void collectSafetyBelt(BydVehicleData.Builder b) {
-        if (instrumentDevice == null) return;
+        // NOTE: the instrument-device guard is per-BLOCK, not a method-level early return.
+        // Occupancy comes off the SAFETY-BELT device, so an instrument-less trim must still
+        // get its occupancy read (an early return here left it permanently unpublished).
+        if (instrumentDevice != null) {
+            try {
+                // Single shared read (see readSeatbeltPair): dedicated getSafetyBeltStatus(area)
+                // with driver best-effort mapping + passenger occupancy gate + de-glitch. Only
+                // publish when at least one seat gave a real reading, so a trim that doesn't
+                // expose these feature-ids leaves seatbeltStatus null (unseeded) rather than a
+                // pair of UNAVAILABLE sentinels.
+                int[] belts = readSeatbeltPair();
+                if (belts != null) {
+                    b.seatbeltStatus(belts);
+                }
+            } catch (Exception e) {
+                logger.debug("collectSafetyBelt error: " + e.getMessage());
+            }
+        }
+        // Seat occupancy (someone present) — separate from belt state. Shared read with the
+        // fast poll (see readOccupantsNow); null when no seat gave a real reading, so the
+        // snapshot field stays unseeded rather than holding a pair of sentinels.
+        int[] occupants = readOccupantsNow();
+        if (occupants != null) {
+            b.passengerDetection(occupants);
+        }
+    }
+
+    /**
+     * On-demand LIVE per-seat seatbelt read for the fast automation poll ({@link
+     * com.overdrive.app.automation.condition.SeatbeltEvent}) — the belt equivalent of
+     * {@link #readTurnNow()}. Reads both seats via the same dedicated {@code
+     * getSafetyBeltStatus(area)} method + sanitize + passenger de-glitch as {@link
+     * #collectSafetyBelt}, so the fast path and the 5s poll agree exactly. Returns a
+     * 2-slot array {index 0 = driver, 1 = passenger}, each {@code 0=unbuckled / 1=buckled /
+     * }{@link BydVehicleData#UNAVAILABLE}, or {@code null} when the instrument device is
+     * unavailable (caller leaves the events untouched — no false reading).
+     *
+     * <p>Called on the SeatbeltEvent poll thread (not the BydDataPoll thread). The
+     * passenger de-glitch latch {@code passengerBeltEverUnlatched} is a volatile boolean;
+     * a benign cross-thread read-modify-write only affects the one-time "first unlatch"
+     * heuristic (worst case: a never-unlatched passenger reads buckled one tick later), not
+     * correctness — so no lock is needed on the hot path.
+     */
+    public int[] readSeatbeltsNow() {
+        return readSeatbeltPair();
+    }
+
+    /**
+     * THE single seatbelt read — shared by the 5s telemetry poll ({@link #collectSafetyBelt})
+     * and the 500ms fast poll ({@link #readSeatbeltsNow} → {@code SeatbeltEvent}) so both paths
+     * publish identical edges. Reads each seat via the dedicated {@code getSafetyBeltStatus(area)}
+     * (area 1 = driver/main, 2 = passenger/deputy — the SAME call the working telemetry-recording
+     * overlay uses and which returns LIVE per-seat state here), then applies three per-seat rules:
+     *
+     * <ol>
+     *   <li><b>Driver best-effort mapping</b> ({@link #sanitizeSeatbelt(int, boolean)} with
+     *       {@code driverBestEffort=true}): the driver's unbuckle → cooling-OFF (the ELSE) never
+     *       fired because the strict sanitize dropped the driver's off-code to UNAVAILABLE, so no
+     *       "off" edge published. Treating driver INVALID(2) as unbuckled surfaces that edge.</li>
+     *   <li><b>Passenger occupancy gate</b>: the front-passenger belt sensor floats 0↔1 on an
+     *       EMPTY seat, which strobed a passenger-belt automation on/off. When the seat is
+     *       confirmed empty ({@code getPassengerStatus(1) == NOBODY} — area 1 is the front
+     *       passenger, see {@link #OCCUPANT_AREA_FRONT_PASSENGER}; 2 would be second-row LEFT)
+     *       we force the passenger belt
+     *       to a stable UNBUCKLED(0) — no one is there to buckle, so it can't flap. Only a real,
+     *       occupied-seat transition drives the automation. When occupancy is unknown we don't
+     *       gate (fail-open), so a trim without the occupancy getter behaves as before.</li>
+     *   <li><b>Passenger de-glitch</b> (mirrors the OEM firmware's seatbeltEverUnlatched): a
+     *       never-unlatched passenger belt idles at "buckled" from boot; treat its 1 as unbuckled
+     *       until a genuine 0 is seen once, then trust it.</li>
+     * </ol>
+     *
+     * Returns a 2-slot array {index 0 = driver, 1 = passenger}, each {@code 0=unbuckled /
+     * 1=buckled /} {@link BydVehicleData#UNAVAILABLE}, or {@code null} when the instrument device
+     * is unavailable or neither seat gave a real reading (caller leaves the events untouched — no
+     * false edge). The de-glitch latch {@code passengerBeltEverUnlatched} is volatile; a benign
+     * cross-thread read-modify-write only affects the one-time first-unlatch heuristic, not
+     * correctness — so no lock is needed on this hot path.
+     */
+    public int[] readSeatbeltPair() {
+        if (instrumentDevice == null) return null;
         try {
-            // Read via the dedicated getSafetyBeltStatus(area) method (area 1=driver/main,
-            // 2=passenger/deputy) — the SAME call the working telemetry-recording overlay
-            // uses and which returns LIVE per-seat state here. Falls back to the generic
-            // feature-id read only when that method is absent. (The earlier feature-id-only
-            // read did not return a live value on this firmware, so the state never changed
-            // and an "On Change Seatbelt" automation never fired.)
-            int driver = sanitizeSeatbelt(readInstrumentSeatbelt(
-                    1, BydFeatureIds.INSTRUMENT_DD_MAIN_SAFETYBELT_STATE));
-            int passenger = sanitizeSeatbelt(readInstrumentSeatbelt(
-                    2, BydFeatureIds.INSTRUMENT_DD_DEPUTY_SAFETYBELT_STATE));
-            // Passenger de-glitch (mirrors the OEM firmware's seatbeltEverUnlatched): the
-            // front-passenger belt sensor idles at "buckled" (1) until a genuine unlatch is
-            // seen at least once, so a never-fastened passenger seat would read buckled from
-            // boot and a "passenger belt unbuckled" automation could never fire. Treat a 1 as
-            // unbuckled until we've observed a real 0; trust the sensor's 1 thereafter.
+            int driverRaw = readInstrumentSeatbelt(1, BydFeatureIds.INSTRUMENT_DD_MAIN_SAFETYBELT_STATE);
+            int passengerRaw = readInstrumentSeatbelt(2, BydFeatureIds.INSTRUMENT_DD_DEPUTY_SAFETYBELT_STATE);
+            // Driver best-effort INVALID(2)→UNBUCKLED mapping, DEBOUNCED. sanitizeSeatbelt with
+            // driverBestEffort=true differs from the strict result ONLY in the INVALID(2) case
+            // (best→0, strict→UNAVAILABLE), so driverBest != driverStrict precisely identifies an
+            // INVALID driver read. Guard the "off" edge behind DRIVER_INVALID_UNBUCKLE_STREAK
+            // consecutive INVALID reads: a SINGLE transient INVALID reports UNAVAILABLE (no edge)
+            // rather than publishing a spurious unbuckle, while a SUSTAINED INVALID still surfaces
+            // the unbuckle edge — preserving the author's premise that INVALID is the driver's
+            // genuine off-code (returning UNAVAILABLE outright would reintroduce the original bug).
+            int driverStrict = sanitizeSeatbelt(driverRaw, false);
+            int driverBest = sanitizeSeatbelt(driverRaw, true);
+            int driver;
+            if (driverBest != driverStrict) {                          // driver INVALID(2)
+                if (driverInvalidStreak < DRIVER_INVALID_UNBUCKLE_STREAK) driverInvalidStreak++;
+                driver = (driverInvalidStreak >= DRIVER_INVALID_UNBUCKLE_STREAK)
+                        ? driverBest : BydVehicleData.UNAVAILABLE;
+            } else {
+                driverInvalidStreak = 0;
+                driver = driverStrict;
+            }
+            int passenger = sanitizeSeatbelt(passengerRaw, false);     // passenger strict
+
+            // Passenger de-glitch FIRST, on the sanitized sensor reading — treat a never-unlatched
+            // 1 as unbuckled until the first genuine 0. Kept before the occupancy gate so the latch
+            // reflects real sensor observations only (byte-identical to the pre-gate behaviour); the
+            // occupancy gate below is a pure override that never trips the latch.
             if (passenger == 0) {
                 passengerBeltEverUnlatched = true;
             } else if (passenger == 1 && !passengerBeltEverUnlatched) {
                 passenger = 0;
             }
-            // Only publish the array if at least one seat gave a real reading, so a trim
-            // that doesn't expose these feature-ids leaves seatbeltStatus null (unseeded)
-            // rather than a pair of UNAVAILABLE sentinels.
-            if (driver != BydVehicleData.UNAVAILABLE || passenger != BydVehicleData.UNAVAILABLE) {
-                b.seatbeltStatus(new int[]{ driver, passenger });
-            }
-        } catch (Exception e) {
-            logger.debug("collectSafetyBelt error: " + e.getMessage());
-        }
-        // Seat occupancy (someone present) — separate from belt state. The OEM firmware
-        // reads getPassengerStatus(area) off the safety-belt device: NOBODY=0, SOMEBODY=1,
-        // INVALID=2. Areas 1=driver, 2=front passenger. Stored as a 2-slot array
-        // (index 0=driver, 1=passenger); leave null if the getter is unavailable.
-        if (safetyBeltDevice != null) {
-            try {
-                int od = occupantOf(1), op = occupantOf(2);
-                if (od != BydVehicleData.UNAVAILABLE || op != BydVehicleData.UNAVAILABLE) {
-                    b.passengerDetection(new int[]{ od, op });
+
+            // Passenger occupancy gate: force UNBUCKLED when the seat is CONFIDENTLY empty so an
+            // unoccupied seat's floating belt sensor can't oscillate the automation (the reported
+            // "goes crazy on/off"). occupantOf only returns 0 on a firm NOBODY reading — an absent
+            // getter or INVALID reads UNAVAILABLE (not 0), so a trim without real occupancy data
+            // fails OPEN here and behaves exactly as before (no gate, belt drives directly). This
+            // is intentionally the confirmed-empty case, which is precisely the reported bug.
+            // Debounced: require PASSENGER_EMPTY_STREAK consecutive firm NOBODY(0) reads before
+            // forcing the belt off, so a single spurious/uninitialised 0 from getPassengerStatus
+            // can't suppress a real buckled-passenger reading. A NOBODY read advances the streak;
+            // anything else (SOMEBODY or UNAVAILABLE from an absent getter/INVALID) resets it and
+            // fails OPEN — a trim without real occupancy data never gates, exactly as before.
+            int passengerOccupant = frontPassengerOccupancy();
+            if (passengerOccupant == 0) {
+                if (passengerEmptyStreak < PASSENGER_EMPTY_STREAK) passengerEmptyStreak++;
+                if (passengerEmptyStreak >= PASSENGER_EMPTY_STREAK) {
+                    passenger = 0;
                 }
-            } catch (Exception e) {
-                logger.debug("collectSafetyBelt occupancy error: " + e.getMessage());
+            } else {
+                passengerEmptyStreak = 0;
             }
+
+            // Diagnostic (throttled 30s): pin the EXACT raw driver/passenger codes on-device so
+            // the best-effort driver mapping above can be replaced with an exact rule once seen.
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - lastSeatbeltRawLogMs > 30_000) {
+                lastSeatbeltRawLogMs = nowMs;
+                logger.info("seatbelt raw: driver=" + driverRaw + " (masked=" + (driverRaw & 0xFFFF)
+                        + " → " + driver + "), passenger=" + passengerRaw + " (masked="
+                        + (passengerRaw & 0xFFFF) + " → " + passenger + "), passengerOccupant="
+                        + passengerOccupant + " (driverInvalidStreak=" + driverInvalidStreak
+                        + ", passengerEmptyStreak=" + passengerEmptyStreak + ")");
+            }
+
+            if (driver == BydVehicleData.UNAVAILABLE && passenger == BydVehicleData.UNAVAILABLE) {
+                return null; // nothing real this tick — don't publish a pair of sentinels
+            }
+            return new int[]{ driver, passenger };
+        } catch (Throwable t) {
+            logger.debug("readSeatbeltPair error: " + t.getMessage());
+            return null;
         }
     }
 
-    /** Read one seat's occupancy via getPassengerStatus(area): 1=SOMEBODY, 0=NOBODY,
-     *  else UNAVAILABLE (INVALID/unknown). */
+    /**
+     * Seat areas for {@code getPassengerStatus(area)} — SAFETY_BELT_PASSENGER_* in the SDK.
+     * These are NOT the SAFETY_BELT_AREA_* values used by {@code getSafetyBeltStatus}: the belt
+     * set is MAIN=1, DEPUTY=2, SECOND_ROW L/R/MID=3/4/5, while this set is DEPUTY=1,
+     * SECOND_ROW L=2, R=3, MID=4 — and has NO main-seat entry. Passing a belt area here reads a
+     * different seat: the old value of 2 asked for the second-row LEFT seat, not the front
+     * passenger, so the front-passenger occupancy gate and the published occupant events were
+     * both keyed to the wrong seat.
+     *
+     * <p>AUTHORITATIVE, do not "hedge" this: the bundled SDK javadoc
+     * ({@code doc/constant-values.html}) states {@code SAFETY_BELT_PASSENGER_DEPUTY = 1} and
+     * {@code SAFETY_BELT_PASSENGER_SECOND_ROW_SEAT_LEFT = 2}. The reference app agrees — its
+     * {@code getOmsFeatureId} uses a PUBLIC-API convention (1=driver, 2=passenger) that
+     * {@code mapPassengerArea} resolves to HAL index 1 for the passenger, and that same
+     * {@code mapPassengerArea} is otherwise used as a BIT INDEX into {@code REMINDER_MASK},
+     * NOT as a {@code getPassengerStatus} area. So there is no competing HAL numbering, and
+     * probing area 2 as a "fallback" would read the SECOND-ROW LEFT seat — reintroducing
+     * exactly the wrong-seat bug described above.
+     */
+    private static final int OCCUPANT_AREA_FRONT_PASSENGER = 1;   // SAFETY_BELT_PASSENGER_DEPUTY
+
+    /**
+     * Read one seat's occupancy via {@code getPassengerStatus(area)}: 1=SOMEBODY, 0=NOBODY,
+     * else {@link BydVehicleData#UNAVAILABLE} (INVALID/unknown).
+     *
+     * <p>Only an exact 1 or 0 is accepted; every other code (INVALID=2, the 255/254/65535
+     * "not available" sentinels, the negative HAL failure codes) reads UNAVAILABLE, so a
+     * sentinel can never publish a spurious "occupied"/"empty" edge. No masking here, unlike
+     * {@link #sanitizeSeatbelt(int)} — masking would turn Integer.MIN_VALUE into a firm 0.
+     *
+     * <p>Pass an {@code OCCUPANT_AREA_*} constant — NOT a {@code SAFETY_BELT_AREA_*} one.
+     * getPassengerStatus and getSafetyBeltStatus take DIFFERENT area numberings (see
+     * {@link #OCCUPANT_AREA_FRONT_PASSENGER}), which is easy to miss because both hang off the
+     * same device.
+     */
     private int occupantOf(int area) {
         Object s = BydDeviceHelper.callGetter(safetyBeltDevice, "getPassengerStatus", area);
         if (!(s instanceof Number)) return BydVehicleData.UNAVAILABLE;
@@ -2953,20 +4442,219 @@ public class BydDataCollector {
         return BydVehicleData.UNAVAILABLE;
     }
 
-    /** Sanitize a raw instrument seatbelt read → 0 (unbuckled) / 1 (buckled) /
-     *  {@link BydVehicleData#UNAVAILABLE} (unknown). Mirrors the OEM firmware's
-     *  sanitizeSeatbeltState: drop failure codes, then mask &0xFFFF and drop INVALID(2).
+    /**
+     * Front-passenger occupancy: 1 = someone, 0 = nobody, {@link BydVehicleData#UNAVAILABLE}
+     * when the seat's own sensor gave no real reading.
+     *
+     * <p>Reads ONLY {@code getPassengerStatus(}{@link #OCCUPANT_AREA_FRONT_PASSENGER}{@code )} —
+     * see that constant for why probing any other area is wrong rather than a fallback.
+     *
+     * <p><b>No OMS fallback, deliberately.</b> The ADAS
+     * {@code OMS_PASSENGER_DETECTION_RESULT} feature looked like a free extra tier, but
+     * {@code callGetSingle} cannot distinguish "this HAL does not implement the pair" from a
+     * genuine 0: an unrecognised {@code get(deviceType, featureId)} can answer 0, and the SDK's
+     * own {@code STATUS_SUCCESS} is 0 (the same trap documented on the mirror-fold read, which
+     * only LOGS such a 0 rather than acting on it). Acting on it would hand the seatbelt gate
+     * below a confident, fabricated NOBODY on trims that previously published nothing — turning
+     * "no data, belt drives directly" into "seat is empty, suppress the belt signal". A silent
+     * wrong answer is strictly worse here than no answer.
+     *
+     * <p>Accepts ONLY an exact 0/1, so a HAL failure code (-1), INVALID(2) or a "not available"
+     * sentinel can never publish a spurious occupied/empty edge — the property both the
+     * automation events and the passenger seatbelt gate depend on.
+     */
+    private int frontPassengerOccupancy() {
+        return occupantOf(OCCUPANT_AREA_FRONT_PASSENGER);
+    }
+
+    /**
+     * Bit index into {@code SAFETYBELT_REMINDER_MASK} per seat, mirroring the reference app's
+     * {@code mapPassengerArea}: driver/main → bit 0, front passenger → bit 1.
+     *
+     * <p>This is the ONLY route to a driver-seat signal. {@code getPassengerStatus}'s area set
+     * has no main-seat entry (see {@link #OCCUPANT_AREA_FRONT_PASSENGER}), but the reminder mask
+     * is BIT-indexed and does carry the driver — which is why the reference app feeds
+     * {@code mapPassengerArea} into {@code (mask >> bitIndex) & 1} rather than into a
+     * {@code getPassengerStatus} call. Do not confuse these numbers with either area set.
+     */
+    private static final int REMINDER_BIT_DRIVER = 0;
+
+    /**
+     * Is the seatbelt-not-fastened reminder ACTIVE for this seat? A firing reminder means the
+     * belt is unfastened AND the car believes someone is there to fasten it — so it is a
+     * high-confidence "occupied".
+     *
+     * <p><b>POSITIVE-ONLY, deliberately</b> — mirrors the reference app's
+     * {@code seatbeltReminderIndicatesOccupant}, which returns {@code active ? true : null} and
+     * never {@code false}. A silent reminder does NOT mean the seat is empty: it is equally
+     * silent when the belt is fastened, when the chime has timed out, while parked/ACC-off, and
+     * on a trim that never populates the mask. Reporting "empty" from silence would fabricate a
+     * firm NOBODY — exactly the failure mode the OMS fallback was rejected for
+     * ({@link #frontPassengerOccupancy()}).
+     *
+     * <p>{@code callGetSingle} collapses every failure to -1, and the SDK's own failure codes are
+     * negative, so any negative reading is treated as "no data" rather than a mask of all-ones.
+     * A mask of 0 is a legitimate "nothing reminding" and simply yields false (= no positive
+     * evidence), never "empty".
+     *
+     * @return true only when the mask is readable AND this seat's bit is set
+     */
+    private boolean seatbeltReminderActive(int bitIndex) {
+        // Bounds-checked before the read (the reference app checks the same 0..31 range): a shift
+        // by a negative or >=32 count in Java silently wraps (n & 31) and would test a bit of a
+        // different seat rather than failing.
+        if (bitIndex < 0 || bitIndex >= 32) return false;
+        if (safetyBeltDevice == null) return false;
+        int mask = BydDeviceHelper.callGetSingle(safetyBeltDevice, BydFeatureIds.SAFETYBELT_REMINDER_MASK);
+        // Diagnostic (throttled 30s, same idiom as the raw-seatbelt log): the bit LAYOUT is an
+        // inference from the reference app's mapPassengerArea (driver=bit 0). Read this on-device
+        // with the driver seated + unbelted to confirm bit 0 is the one that lights up.
+        long nowMs = System.currentTimeMillis();
+        if (nowMs - lastReminderMaskLogMs > 30_000) {
+            lastReminderMaskLogMs = nowMs;
+            logger.info("seatbelt reminder mask: raw=" + mask
+                    + (mask < 0 ? " (unreadable)" : " bits=0b" + Integer.toBinaryString(mask))
+                    + " driverBit" + REMINDER_BIT_DRIVER + "="
+                    + (mask >= 0 ? ((mask >> REMINDER_BIT_DRIVER) & 1) : -1));
+        }
+        // Negative == unreadable/failure (callGetSingle's -1, or a raw SDK failure code). Never
+        // bit-test it: Integer.MIN_VALUE and friends would light up arbitrary seat bits.
+        if (mask < 0 || SEATBELT_FAILURE_CODES.contains(mask)) return false;
+        return ((mask >> bitIndex) & 1) == 1;
+    }
+
+    // Throttle (30s) for the reminder-mask diagnostic above, so a 500ms poll can't flood the log.
+    // Same benign-race stance as lastSeatbeltRawLogMs: a cross-thread write only affects cadence.
+    private volatile long lastReminderMaskLogMs = 0;
+
+    // Driver presence is inferred, in this order, mirroring the reference app:
+    //  tier 1 — reminder mask bit 0 active ⇒ OCCUPIED (seatbeltReminderIndicatesOccupant)
+    //  tier 2 — driver belt BUCKLED ⇒ OCCUPIED (inferPresenceFromSeatbelt: beltState==1 → 1)
+    //  tier 3 — belt UNBUCKLED ⇒ the reference app says 0, but an unbuckled-yet-present driver
+    //           reads identically, so we withhold it entirely (see readDriverOccupancyNow).
+    // The ladder lives inline in readDriverOccupancyNow because tier 1 must run even when the
+    // instrument device (tier 2's source) is missing.
+
+    /**
+     * Live seat-occupancy read — shared by the 5s telemetry poll ({@link #collectSafetyBelt})
+     * and the fast occupancy poll, so both publish identical edges. Delegates to
+     * {@link #frontPassengerOccupancy()} (NOBODY=0, SOMEBODY=1; INVALID=2, failure codes and
+     * any sentinel → no reading).
+     *
+     * <p><b>SHAPE IS FROZEN AT ONE SLOT.</b> Index 0 = front passenger, from that seat's own
+     * occupancy sensor. The driver seat has no sensor and is NOT added here even though
+     * {@link #readDriverOccupancyNow()} can now infer it: this array is serialized POSITIONALLY
+     * and wholesale by two external consumers — {@code BydVehicleData.toJson}'s
+     * {@code extendedSafety.passengerDetection} and the MQTT {@code passenger_detection} topic —
+     * so appending a slot would silently redefine an existing published contract for every
+     * Home-Assistant/API consumer. The inferred driver value is published only as its own
+     * automation event ({@code BydEvent.OCCUPANT_DRIVER}), which is additive.
+     *
+     * @return a 1-slot array {index 0 = front passenger}, {@code 1=occupied / 0=empty}, or
+     *         {@code null} when the device is absent or gave no real reading (the caller then
+     *         leaves the events untouched — no false edge). Never contains a sentinel: an
+     *         unreadable seat yields null rather than an UNAVAILABLE slot, so the serializers
+     *         that dump this array wholesale cannot publish Integer.MIN_VALUE as a seat state.
+     */
+    public int[] readOccupantsNow() {
+        if (safetyBeltDevice == null) return null;
+        try {
+            int passenger = frontPassengerOccupancy();
+            if (passenger == BydVehicleData.UNAVAILABLE) {
+                return null;
+            }
+            return new int[]{ passenger };
+        } catch (Throwable t) {
+            logger.debug("readOccupantsNow error: " + t.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Live DRIVER-seat presence, inferred (no occupancy sensor exists for that seat).
+     *
+     * <p>Returns only the two tiers that are safe to publish as a positive:
+     * {@code 1} when the reminder mask says someone is sitting there unbelted, or when the
+     * driver belt is buckled. Otherwise {@link BydVehicleData#UNAVAILABLE} — <b>never 0</b>.
+     *
+     * <p><b>Why "empty" is withheld.</b> An unbuckled driver who is present and an empty seat
+     * produce the identical reading (belt 0, reminder silent), so a 0 here would be a guess
+     * dressed as a fact. Publishing it would let {@code occupant{seat:driver} == empty} fire
+     * while someone is sitting in the seat — worse than the condition simply never matching.
+     * The reference app's {@code inferPresenceFromSeatbelt} does return 0 for this case, but it
+     * feeds an internal presence heuristic, not a user-visible automation trigger; its
+     * reminder tier is likewise positive-only ({@code active ? true : null}).
+     *
+     * <p>Shares {@link #readSeatbeltPair()}'s sanitized driver reading, so it cannot disagree
+     * with the {@code seatbelt{seat:driver}} event and adds at most ONE extra HAL read (the
+     * reminder mask) per call.
+     *
+     * <p><b>The two tiers are independent on purpose.</b> The belt read lives on the INSTRUMENT
+     * device and the reminder mask on the SAFETY-BELT device, and a trim can expose either
+     * without the other — {@link #readSeatbeltPair()} returns null outright when
+     * {@code instrumentDevice} is absent. So the reminder tier must NOT be nested behind a
+     * successful belt read, or it would be dead on exactly the trims it is there to rescue.
+     *
+     * @return 1 = driver present, or UNAVAILABLE when there is no positive evidence
+     */
+    public int readDriverOccupancyNow() {
+        try {
+            // Tier 1 first, and unconditionally: it needs only the safety-belt device, so it must
+            // still run when the instrument device (and therefore the belt tier) is unavailable.
+            if (seatbeltReminderActive(REMINDER_BIT_DRIVER)) return 1;
+            if (instrumentDevice == null) return BydVehicleData.UNAVAILABLE;
+            int[] belts = readSeatbeltPair();
+            int driverBelt = (belts != null && belts.length > 0) ? belts[0] : BydVehicleData.UNAVAILABLE;
+            return driverBelt == 1 ? 1 : BydVehicleData.UNAVAILABLE;
+        } catch (Throwable t) {
+            logger.debug("readDriverOccupancyNow error: " + t.getMessage());
+            return BydVehicleData.UNAVAILABLE;
+        }
+    }
+
+    /** Strict sanitize (used for the passenger + every non-driver caller): a raw instrument
+     *  seatbelt read → 0 (unbuckled) / 1 (buckled) / {@link BydVehicleData#UNAVAILABLE} (unknown).
+     *  Mirrors the OEM firmware's sanitizeSeatbeltState: drop failure codes, then mask &0xFFFF and
+     *  drop INVALID(2). See {@link #sanitizeSeatbelt(int, boolean)} for the driver best-effort variant.
      *
      *  <p>ORDER MATTERS: the failure codes are RAW 32-bit negatives (e.g.
      *  Integer.MIN_VALUE, -1, -10011), so they must be tested against the RAW value
      *  BEFORE masking. If tested after &0xFFFF, Integer.MIN_VALUE would mask to 0 and be
      *  mis-reported as "unbuckled" — a spurious belt-off trigger. */
     private static int sanitizeSeatbelt(int raw) {
+        return sanitizeSeatbelt(raw, false);
+    }
+
+    /**
+     * As {@link #sanitizeSeatbelt(int)}, with a per-seat {@code driverBestEffort} switch.
+     *
+     * <p>Confirmed on this firmware: {@code masked == 1} is BUCKLED (the buckle → seat-cooling
+     * "THEN" automation fires reliably for both seats, so a 1 genuinely reaches the engine),
+     * and {@code masked == 0} is UNBUCKLED.
+     *
+     * <p><b>Driver best-effort (driverBestEffort=true).</b> The reported defect: the driver's
+     * "unbuckle → cooling OFF" (the ELSE) never fires, while the passenger's does. Since the
+     * write path is symmetric and the passenger proves the ELSE mechanism works, the driver's
+     * unbuckle raw code is evidently one this strict sanitize was dropping to UNAVAILABLE
+     * (INVALID(2) or another non-0/1 masked value) — so no "off" transition was ever published.
+     * For the DRIVER channel only we therefore treat INVALID(2) as UNBUCKLED(0): the driver
+     * belt idles at a stable BUCKLED(1) while fastened, so its off-state surfacing as INVALID
+     * is the most probable dropped code on this trim. This is an inference made without a
+     * device reading (see the throttled raw log in {@link #readSeatbeltPair}, which will pin
+     * the EXACT code on the next drive); the passenger keeps the strict mapping (its problem
+     * is empty-seat oscillation, handled by the occupancy gate, not a stuck-on state).
+     */
+    private static int sanitizeSeatbelt(int raw, boolean driverBestEffort) {
         if (SEATBELT_FAILURE_CODES.contains(raw)) return BydVehicleData.UNAVAILABLE;
         int masked = raw & 0xFFFF;
-        if (masked == 2) return BydVehicleData.UNAVAILABLE;  // INVALID
+        if (masked == 1) return 1;   // buckled (confirmed on this firmware)
         if (masked == 0) return 0;   // unbuckled
-        if (masked == 1) return 1;   // buckled
+        if (masked == 2) {           // INVALID
+            // Best-effort: the driver's off-state is dropped here today (the ELSE never
+            // fires). Treat driver INVALID as unbuckled so the OFF edge publishes; keep it
+            // UNAVAILABLE for the passenger so its empty-seat noise stays "no reading".
+            return driverBestEffort ? 0 : BydVehicleData.UNAVAILABLE;
+        }
         return BydVehicleData.UNAVAILABLE;
     }
 
@@ -3091,14 +4779,25 @@ public class BydDataCollector {
     private final int[] tyreLeakNormalStreak = new int[4];
     private final Object tyreAlarmLock = new Object();
 
-    // kPa numeric thresholds — mirror the vehicle-control.js corner colouring
-    // (PSI = kPa * 0.1450377): warn below ~34 PSI / above ~45 PSI, critical
-    // below ~22 PSI (deflated). These are the SAFETY NET for firmwares whose
-    // getTyrePressureState enum stays stuck at 0 even when a tyre is clearly
-    // low — the exact case the old enum-only notifier missed.
-    private static final int TYRE_PRESSURE_LOW_WARN_KPA = 234;   // ~34 PSI
-    private static final int TYRE_PRESSURE_HIGH_WARN_KPA = 310;  // ~45 PSI
-    private static final int TYRE_PRESSURE_LOW_ALERT_KPA = 152;  // ~22 PSI (deflated)
+    // kPa numeric thresholds — now USER-CONFIGURABLE per axle via the tyres
+    // section of the unified config (Notifications screen → Tyre pressure
+    // limits). The shipped defaults still mirror the vehicle-control.js corner
+    // colouring (PSI = kPa * 0.1450377): warn below ~34 PSI / above ~45 PSI,
+    // critical below ~22 PSI (deflated). These are the SAFETY NET for firmwares
+    // whose getTyrePressureState enum stays stuck at 0 even when a tyre is
+    // clearly low — the exact case the old enum-only notifier missed.
+    //
+    // Read fresh per evaluation pass (see evaluateTyreAlarms) so a limit the
+    // user just saved applies to the very next poll without a daemon restart.
+    // Corner index order is [FL, FR, RL, RR], so 0/1 are the front axle.
+    // These mirror the UnifiedConfigManager defaults and are the fallback used
+    // when the config is unreadable.
+    private static final int TYRE_LOW_DEFAULT_KPA =
+            com.overdrive.app.config.UnifiedConfigManager.TYRE_LOW_DEFAULT_KPA;
+    private static final int TYRE_HIGH_DEFAULT_KPA =
+            com.overdrive.app.config.UnifiedConfigManager.TYRE_HIGH_DEFAULT_KPA;
+    private static final int TYRE_CRITICAL_LOW_DEFAULT_KPA =
+            com.overdrive.app.config.UnifiedConfigManager.TYRE_CRITICAL_LOW_DEFAULT_KPA;
     // Consecutive-read debounce so a single transient kPa sample (hard cornering,
     // temperature spike) can't fire, and a single blip can't re-arm.
     private static final int TYRE_ALARM_FIRE_STREAK = 2;
@@ -3202,11 +4901,14 @@ public class BydDataCollector {
      * <p><b>Pressure severity</b> is the max of the firmware enum and the kPa
      * fallback:
      * <ul>
-     *   <li>2 (CRITICAL): kPa &le; {@link #TYRE_PRESSURE_LOW_ALERT_KPA} (deflated)</li>
-     *   <li>1 (WARN): firmware pressureState != 0, OR kPa outside
-     *       [{@link #TYRE_PRESSURE_LOW_WARN_KPA}, {@link #TYRE_PRESSURE_HIGH_WARN_KPA}]</li>
+     *   <li>2 (CRITICAL): kPa &le; the configured {@code criticalLow} (deflated)</li>
+     *   <li>1 (WARN): firmware pressureState != 0, OR kPa outside the
+     *       configured [low, high] band for THIS corner's axle</li>
      *   <li>0: normal</li>
      * </ul>
+     * Limits come from {@code UnifiedConfigManager.getTyreThresholds()} (front
+     * and rear are independent); the shipped defaults reproduce the previous
+     * hardcoded 234 / 310 / 152 kPa behaviour.
      * <b>Leak severity</b> comes straight from the firmware air-leak enum
      * (1=slow/WARN, 2=fast/CRITICAL) — there is no kPa proxy for a leak.
      *
@@ -3217,20 +4919,55 @@ public class BydDataCollector {
      */
     private void evaluateTyreAlarms(int[] pressuresKpa, int[] pressureStates, int[] airLeakStates) {
         if (pressuresKpa == null || pressureStates == null || airLeakStates == null) return;
+        // Resolve the user's limits ONCE per pass — all four corners must be
+        // judged against the same snapshot, and re-reading per corner would
+        // also multiply the config read by 4. getTyreThresholds() is clamped
+        // and invariant-checked, so the comparisons below need no validation.
+        int lowFront = TYRE_LOW_DEFAULT_KPA;
+        int highFront = TYRE_HIGH_DEFAULT_KPA;
+        int lowRear = TYRE_LOW_DEFAULT_KPA;
+        int highRear = TYRE_HIGH_DEFAULT_KPA;
+        int criticalLow = TYRE_CRITICAL_LOW_DEFAULT_KPA;
+        try {
+            org.json.JSONObject th =
+                    com.overdrive.app.config.UnifiedConfigManager.getTyreThresholds();
+            lowFront = th.optInt("frontLow", lowFront);
+            highFront = th.optInt("frontHigh", highFront);
+            lowRear = th.optInt("rearLow", lowRear);
+            highRear = th.optInt("rearHigh", highRear);
+            criticalLow = th.optInt("criticalLow", criticalLow);
+        } catch (Throwable t) {
+            // Config unreadable — fall back to the shipped defaults rather than
+            // skipping evaluation. A missed tyre alarm is a safety issue.
+            logger.debug("Tyre threshold read failed, using defaults: " + t.getMessage());
+        }
+
         synchronized (tyreAlarmLock) {
             for (int i = 0; i < 4; i++) {
                 int kPa = i < pressuresKpa.length ? pressuresKpa[i] : -1;
                 int pState = i < pressureStates.length ? pressureStates[i] : -1;
                 int leak = i < airLeakStates.length ? airLeakStates[i] : -1;
 
-                evaluatePressureCorner(i, kPa, pState);
+                // [FL, FR, RL, RR] — indices 0/1 are the front axle.
+                boolean isFront = i < 2;
+                evaluatePressureCorner(i, kPa, pState,
+                        isFront ? lowFront : lowRear,
+                        isFront ? highFront : highRear,
+                        criticalLow);
                 evaluateLeakCorner(i, kPa, leak);
             }
         }
     }
 
-    /** Pressure alarm for one corner. Caller holds tyreAlarmLock. */
-    private void evaluatePressureCorner(int i, int kPa, int pState) {
+    /**
+     * Pressure alarm for one corner. Caller holds tyreAlarmLock.
+     *
+     * @param lowWarnKpa  under-pressure WARN floor for THIS corner's axle
+     * @param highWarnKpa over-pressure WARN ceiling for THIS corner's axle
+     * @param lowAlertKpa deflated/CRITICAL threshold (axle-independent)
+     */
+    private void evaluatePressureCorner(int i, int kPa, int pState,
+                                        int lowWarnKpa, int highWarnKpa, int lowAlertKpa) {
         // kPa is valid only when the getter answered with a real reading.
         // BydVehicleData.UNAVAILABLE (Integer.MIN_VALUE) and the -1 dropout
         // sentinel both mean "no pressure data". <=0 is never a real tyre.
@@ -3261,9 +4998,9 @@ public class BydDataCollector {
             if (pState == 2) over = true; else under = true;
         }
         if (kPaValid) {
-            if (kPa <= TYRE_PRESSURE_LOW_ALERT_KPA) { level = 2; under = true; over = false; }
-            else if (kPa < TYRE_PRESSURE_LOW_WARN_KPA) { level = Math.max(level, 1); under = true; over = false; }
-            else if (kPa > TYRE_PRESSURE_HIGH_WARN_KPA) { level = Math.max(level, 1); over = true; under = false; }
+            if (kPa <= lowAlertKpa) { level = 2; under = true; over = false; }
+            else if (kPa < lowWarnKpa) { level = Math.max(level, 1); under = true; over = false; }
+            else if (kPa > highWarnKpa) { level = Math.max(level, 1); over = true; under = false; }
             // else: kPa is in the normal band. It does NOT clear an enum alarm
             // (level stays 1 from enumAlarm above) — the firmware enum is
             // authoritative for "there is a problem"; we just can't name a kPa
@@ -3910,12 +5647,37 @@ public class BydDataCollector {
      * Extended statistic data: OEM SOH, driving time, key battery level.
      * Called from collectAll() (core telemetry consumers need SOH).
      */
+    /**
+     * Is this raw OEM state-of-health index a real reading?
+     *
+     * <p>Extracted so the band is pinned by a test and stated once. It gates FOUR places in the
+     * SOH cascade below (three tier entry checks plus the publish), and every one of them has to
+     * agree: if a single site accepts 0, a healthy pack is published as "SOH 0%" — which fires
+     * the BATTERY_SOH automation trigger (it accepts {@code >= 0}) and publishes {@code soh_oem}
+     * as 0 over MQTT. A battery is never 0% healthy, so 0 means "no reading" and is exactly the
+     * value every failure mode in the cascade lands on.
+     *
+     * @param raw boxed so tier gates can pass a not-yet-read value directly; null is not plausible
+     */
+    static boolean isPlausibleOemSohPercent(Integer raw) {
+        return raw != null && raw > 0 && raw <= 100;
+    }
+
     private void collectStatisticExtended(BydVehicleData.Builder b) {
         if (statisticDevice == null) return;
 
-        // OEM SOH: read for the b.sohPercent display fallback only. The
-        // SohEstimator no longer consumes this signal — Shape B drives the
-        // live SOH from the energy formula, calibration is a separate anchor.
+        // OEM SOH. Read for the b.sohPercent display fallback and — on PHEV, where every
+        // capacity-derived route is gated off — as the value SohEstimator's display chain
+        // prefers.
+        //
+        // 0 IS REJECTED THROUGHOUT, not just filtered at the far end. A battery is never 0%
+        // healthy, so a 0 from this index means "no reading", and it is the value every failure
+        // mode here lands on: an absent feature, and (before the int-first ladder fix below) a
+        // width mismatch leaving BYDAutoEventValue.intValue at its default. Publishing it is not
+        // a cosmetic problem — sohPercent feeds an automation trigger that accepts >= 0
+        // (BydEvent's BATTERY_SOH) and an MQTT soh_oem field, so a 0 fires user automations and
+        // publishes "0% health" for a healthy pack. Each tier below therefore requires > 0
+        // before accepting, which also lets a later tier retry what an earlier one couldn't read.
         try {
             Integer sohValue = null;
             try {
@@ -3935,12 +5697,44 @@ public class BydDataCollector {
                 }
             }
 
-            if (sohValue == null || sohValue < 0 || sohValue > 100) {
+            // TIER 2 — the get(deviceType, featureId) form, with the STATISTIC device type
+            // (1014). The OEM app tries exactly this pairing as its own second attempt when the
+            // named getter comes up empty, so it is the form known to answer on trims where
+            // that getter is absent. Our generic callGet prefers the get(int[], Class)
+            // signature and only falls back to (int,int) when the array form is missing
+            // entirely — so on a device exposing BOTH, this specific pairing was never tried.
+            if (!isPlausibleOemSohPercent(sohValue)) {
                 try {
-                    Object sohVal = BydDeviceHelper.callGet(statisticDevice, BydFeatureIds.STAT_BATTERY_HEALTHY_INDEX, Integer.class);
+                    Object r = BydDeviceHelper.callGetWithDeviceType(
+                            statisticDevice, STATISTIC_DEVICE_TYPE,
+                            BydFeatureIds.STAT_BATTERY_HEALTHY_INDEX);
+                    if (r instanceof Number) {
+                        int raw = ((Number) r).intValue();
+                        if (isPlausibleOemSohPercent(raw)) sohValue = raw;   // 0 = no reading
+                    }
+                } catch (Exception e) {
+                    logger.debug("SOH get(deviceType,id) failed: " + e.getMessage());
+                }
+            }
+
+            // TIER 3 — the generic feature-ID read, probing primitive widths. Note this used
+            // to pass the WRAPPER Integer.class, which the HAL does not match (it dispatches
+            // on the exact primitive Class), so this tier could never produce a value.
+            //
+            // INT-FIRST ladder, for the same load-bearing reason as collectStatTemp: the
+            // extraction below is getIntValue, which reads BYDAutoEventValue.intValue, and the
+            // HAL populates only the field for the width it was asked for. A Double-first probe
+            // that won here would hand back an object whose intValue is still 0 — and 0 passes
+            // the 0..100 range check, so this tier would report a healthy pack as "SOH 0%" and
+            // (because the PHEV display chain prefers any OEM value > 0) it would then be
+            // rejected as absent rather than corrected. Ask for the width we extract.
+            if (!isPlausibleOemSohPercent(sohValue)) {
+                try {
+                    Object sohVal = BydDeviceHelper.callGetProbing(
+                            statisticDevice, BydFeatureIds.STAT_BATTERY_HEALTHY_INDEX, true);
                     if (sohVal != null) {
                         int raw = BydDeviceHelper.getIntValue(sohVal);
-                        if (raw >= 0 && raw <= 100) {
+                        if (isPlausibleOemSohPercent(raw)) {   // 0 = no reading, never a real pack
                             sohValue = raw;
                         }
                     }
@@ -3949,7 +5743,28 @@ public class BydDataCollector {
                 }
             }
 
-            if (sohValue != null && sohValue >= 0 && sohValue <= 100) {
+            // Log the outcome once so a single device capture answers "does the OEM index
+            // actually report on this trim?" — which is the open question behind preferring
+            // it for PHEV SOH. Without this the value's absence is indistinguishable from a
+            // read bug.
+            if (!loggedOemSohOutcome) {
+                loggedOemSohOutcome = true;
+                // Distinguish the two "no value" cases: nothing answered at all, versus a tier
+                // answering with an out-of-band number (0 included). They look identical
+                // downstream but mean different things when diagnosing a trim.
+                String outcome;
+                if (sohValue == null) {
+                    outcome = "NOT REPORTED on this trim (no tier answered)";
+                } else if (!isPlausibleOemSohPercent(sohValue)) {
+                    outcome = "REJECTED out-of-band raw=" + sohValue
+                            + " (0 or >100 means no reading, not a real pack health)";
+                } else {
+                    outcome = sohValue + "%";
+                }
+                logger.info("OEM SOH (STATISTIC_BATTERY_HEALTHY_INDEX) first read -> " + outcome);
+            }
+
+            if (isPlausibleOemSohPercent(sohValue)) {
                 b.sohPercent(sohValue);
             }
         } catch (Exception e) {
@@ -3986,11 +5801,13 @@ public class BydDataCollector {
         // Inside cabin temperature from AC device
         try {
             if (acDevice != null) {
-                Object insideTemp = BydDeviceHelper.callGet(acDevice, BydFeatureIds.AC_TEMP_INSIDE, Integer.class);
-                if (insideTemp != null) {
-                    int raw = BydDeviceHelper.getIntValue(insideTemp);
-                    if (raw >= -40 && raw <= 60) b.insideTempCelsius(raw);
-                }
+                // Same channel as collectAc's insideTempC, so share the one reader (decode +
+                // zero-mismatch guard + validity band). This used to inline its own -40..60
+                // band, so the two fields could disagree about whether an identical reading was
+                // valid — a hot parked cabin above 60 C was published by one and dropped by the
+                // other.
+                int raw = readCabinTempC();
+                if (raw != Integer.MIN_VALUE) b.insideTempCelsius(raw);
             }
         } catch (Exception e) {
             logger.debug("collectInstrumentExtended insideTemp error: " + e.getMessage());
@@ -4480,9 +6297,28 @@ public class BydDataCollector {
             if (b.chargingRestTimeMinutes == BydVehicleData.UNAVAILABLE && cs.hasRemainingMinutes())
                 b.chargingRestTimeMinutes(cs.remainingMinutes);
 
-            // Temperatures — only if SDK returned NaN
-            if (Double.isNaN(b.insideTempC) && cs.hasInsideTemp()) b.insideTempC(cs.insideTempC);
-            if (Double.isNaN(b.outsideTempC) && cs.hasOutsideTemp()) b.outsideTempC(cs.outsideTempC);
+            // Temperatures — only if SDK returned NaN.
+            // The cloud cabin value gets the SAME validity band as the HAL one
+            // (isPlausibleCabinTempC): hasInsideTemp() only rejects a low sentinel and has no
+            // UPPER bound, so a cloud tempInCar of 255/65535 would otherwise be published
+            // verbatim as inside_temp / climate.insideTempC and into the `temperature` automation
+            // event — where it latches and permanently satisfies every "cabin above X" rule.
+            // Validating here (rather than re-adding a clip at each consumer) keeps ONE definition
+            // of a plausible cabin temperature for both sources.
+            if (Double.isNaN(b.insideTempC) && cs.hasInsideTemp()
+                    && isPlausibleCabinTempC((int) Math.round(cs.insideTempC))) {
+                b.insideTempC(cs.insideTempC);
+            }
+            // Same band for the cloud OUTSIDE value, for exactly the reason above: hasOutsideTemp()
+            // has no bounds at all, and tempOutCar is parsed two lines from tempInCar in the very
+            // same payload — so the sentinel the cabin gate blocks would otherwise walk in here.
+            // A latched 255 would drive OUTSIDE_TEMPERATURE *and* the TEMPERATURE event (which
+            // still uses ambient as its fallback tail when the cabin sensor stops answering),
+            // permanently satisfying every "outside above X" rule, plus HA's ext_temp.
+            if (Double.isNaN(b.outsideTempC) && cs.hasOutsideTemp()
+                    && isPlausibleOutsideTempC((int) Math.round(cs.outsideTempC))) {
+                b.outsideTempC(cs.outsideTempC);
+            }
 
             // Odometer — only if SDK returned UNAVAILABLE
             if (b.totalMileageKm == BydVehicleData.UNAVAILABLE && cs.hasTotalMileage())
@@ -4504,20 +6340,48 @@ public class BydDataCollector {
     private void registerAllListeners() {
         logger.info("Registering listeners...");
         int count = 0;
+        registerOkThisPass.clear();   // per-pass; markRegistered() consults it at the end
+        // PER-HANDLE RE-ENTRY GUARD. init() is re-entered on the ACC-ON path and there is no
+        // unregister path in this class, so re-registering on a handle we are already attached to
+        // stacks a duplicate HAL callback — and the consumers include the door/charging notifiers,
+        // so pushes would fire twice. Rather than guard each of the ~25 call sites below (easy to
+        // miss one, as the speedDevice fingerprint omission showed), null out the locals for handles
+        // already registered: every helper null-checks and returns false, so those sites become
+        // no-ops while any handle that FAILED last time is retried normally.
+        //
+        // Deliberately snapshot into locals instead of mutating the fields — the fields must keep
+        // pointing at the real devices for the polling reads.
+        Object bodyworkDevice = alreadyRegistered(this.bodyworkDevice) ? null : this.bodyworkDevice;
+        Object speedDevice = alreadyRegistered(this.speedDevice) ? null : this.speedDevice;
+        Object engineDevice = alreadyRegistered(this.engineDevice) ? null : this.engineDevice;
+        Object statisticDevice = alreadyRegistered(this.statisticDevice) ? null : this.statisticDevice;
+        Object chargingDevice = alreadyRegistered(this.chargingDevice) ? null : this.chargingDevice;
+        Object instrumentDevice = alreadyRegistered(this.instrumentDevice) ? null : this.instrumentDevice;
+        Object doorLockDevice = alreadyRegistered(this.doorLockDevice) ? null : this.doorLockDevice;
+        Object tyreDevice = alreadyRegistered(this.tyreDevice) ? null : this.tyreDevice;
+        Object energyDevice = alreadyRegistered(this.energyDevice) ? null : this.energyDevice;
+        Object otaDevice = alreadyRegistered(this.otaDevice) ? null : this.otaDevice;
+        Object sensorDevice = alreadyRegistered(this.sensorDevice) ? null : this.sensorDevice;
+        Object acDevice = alreadyRegistered(this.acDevice) ? null : this.acDevice;
+        Object lightDevice = alreadyRegistered(this.lightDevice) ? null : this.lightDevice;
+        Object adasDevice = alreadyRegistered(this.adasDevice) ? null : this.adasDevice;
+        Object radarDevice = alreadyRegistered(this.radarDevice) ? null : this.radarDevice;
+        Object powerDevice = alreadyRegistered(this.powerDevice) ? null : this.powerDevice;
+        Object settingDevice = alreadyRegistered(this.settingDevice) ? null : this.settingDevice;
 
         // Bodywork: use the typed listener so onDoorStateChanged /
         // onWindowStateChanged / onWindowOpenPercentChanged actually dispatch.
         // The generic IBYDAutoListener registration succeeds but never fires
         // those device-specific callbacks.
-        if (BydDeviceHelper.registerBodyworkListener(bodyworkDevice, this::onBodyworkCallback)) {
+        if (noteRegisterOk(bodyworkDevice, BydDeviceHelper.registerBodyworkListener(bodyworkDevice, this::onBodyworkCallback))) {
             logger.info("  Bodywork listener registered (typed)");
             count++;
-        } else if (BydDeviceHelper.registerListener(bodyworkDevice, this::onBodyworkCallback)) {
+        } else if (noteRegisterOk(bodyworkDevice, BydDeviceHelper.registerListener(bodyworkDevice, this::onBodyworkCallback))) {
             // Fallback for stub/older firmwares that only expose the generic interface.
             logger.info("  Bodywork listener registered (generic fallback — door/window callbacks may not fire)");
             count++;
         }
-        if (BydDeviceHelper.registerListener(speedDevice, this::onGenericCallback)) {
+        if (noteRegisterOk(speedDevice, BydDeviceHelper.registerListener(speedDevice, this::onGenericCallback))) {
             logger.info("  Speed listener registered");
             count++;
         }
@@ -4526,7 +6390,7 @@ public class BydDataCollector {
         // as shell (UID 2000). The crash kills the BYD device manager's HandlerThread,
         // which cascades into GL thread hang → watchdog kill → daemon restart loop.
         // Gear data is collected via polling (collectAll) and GearMonitor handles gear changes.
-        // if (BydDeviceHelper.registerListener(gearboxDevice, this::onGenericCallback)) {
+        // if (noteRegisterOk(gearboxDevice, BydDeviceHelper.registerListener(gearboxDevice, this::onGenericCallback))) {
         //     logger.info("  Gearbox listener registered");
         //     count++;
         // }
@@ -4535,20 +6399,20 @@ public class BydDataCollector {
         // on some PHEV firmwares, which is the root of the inconsistent
         // charging-detection bug (BMS state would freeze at 15 IDLE while
         // charging). Typed listener guarantees AC-charging start is seen.
-        if (BydDeviceHelper.registerChargingListener(chargingDevice, this::onChargingCallback)) {
+        if (noteRegisterOk(chargingDevice, BydDeviceHelper.registerChargingListener(chargingDevice, this::onChargingCallback))) {
             logger.info("  Charging listener registered (typed)");
             count++;
-        } else if (BydDeviceHelper.registerListener(chargingDevice, this::onChargingCallback)) {
+        } else if (noteRegisterOk(chargingDevice, BydDeviceHelper.registerListener(chargingDevice, this::onChargingCallback))) {
             logger.info("  Charging listener registered (generic fallback)");
             count++;
         }
         // Engine listener: typed for onEngineCoolantLevelChanged /
         // onOilLevelChanged. Without this, engine fluid status is only
         // refreshed by the one-shot collectAllFull at init.
-        if (BydDeviceHelper.registerEngineListener(engineDevice, this::onEngineCallback)) {
+        if (noteRegisterOk(engineDevice, BydDeviceHelper.registerEngineListener(engineDevice, this::onEngineCallback))) {
             logger.info("  Engine listener registered (typed)");
             count++;
-        } else if (BydDeviceHelper.registerListener(engineDevice, this::onEngineCallback)) {
+        } else if (noteRegisterOk(engineDevice, BydDeviceHelper.registerListener(engineDevice, this::onEngineCallback))) {
             logger.info("  Engine listener registered (generic fallback)");
             count++;
         }
@@ -4560,10 +6424,10 @@ public class BydDataCollector {
         // so charging power silently never arrived and the UI fell back to a
         // nominal estimate. Typed first; generic fallback kept for any firmware
         // that only exposes the bare 1-arg registerListener.
-        if (BydDeviceHelper.registerInstrumentListener(instrumentDevice, this::onInstrumentCallback)) {
+        if (noteRegisterOk(instrumentDevice, BydDeviceHelper.registerInstrumentListener(instrumentDevice, this::onInstrumentCallback))) {
             logger.info("  Instrument listener registered (typed — external charging power)");
             count++;
-        } else if (BydDeviceHelper.registerListener(instrumentDevice, this::onInstrumentCallback)) {
+        } else if (noteRegisterOk(instrumentDevice, BydDeviceHelper.registerListener(instrumentDevice, this::onInstrumentCallback))) {
             logger.info("  Instrument listener registered (generic fallback)");
             count++;
         }
@@ -4574,30 +6438,37 @@ public class BydDataCollector {
         // bug as onExternalChargingPowerChanged above): SoC then only advanced on the
         // slow getElecPercentageValue() poll (integer on this trim). Typed first;
         // generic fallback kept for firmware exposing only the bare registerListener.
-        if (BydDeviceHelper.registerStatisticListener(statisticDevice, this::onGenericCallback)) {
+        if (noteRegisterOk(statisticDevice, BydDeviceHelper.registerStatisticListener(statisticDevice, this::onGenericCallback))) {
             logger.info("  Statistic listener registered (typed — decimal SoC)");
             count++;
-        } else if (BydDeviceHelper.registerListener(statisticDevice, this::onGenericCallback)) {
+        } else if (noteRegisterOk(statisticDevice, BydDeviceHelper.registerListener(statisticDevice, this::onGenericCallback))) {
             logger.info("  Statistic listener registered (generic fallback)");
             count++;
         }
-        if (BydDeviceHelper.registerListener(lightDevice, this::onLightsCallback)) {
+        if (noteRegisterOk(lightDevice, BydDeviceHelper.registerListener(lightDevice, this::onLightsCallback))) {
             logger.info("  Light listener registered");
             count++;
         }
-        if (BydDeviceHelper.registerListener(adasDevice, this::onAdasCallback)) {
-            logger.info("  Adas listener registered");
+        // ADAS listener registered WITH a feature-ID filter: on this HAL family
+        // onDataEventChanged only carries feature ids when an int[] filter is
+        // supplied, so the bare registration never delivered the blind-spot
+        // warnings. The filter includes SLW so the previously-working switch event
+        // is unaffected. registerListener(ids,…) falls back internally to the
+        // unfiltered form on firmware lacking the 2-arg overload, so a trim that
+        // only supports the old path behaves exactly as before.
+        if (noteRegisterOk(adasDevice, BydDeviceHelper.registerListener(adasDevice, ADAS_EVENT_FILTER, this::onAdasCallback))) {
+            logger.info("  Adas listener registered (filtered — blind-spot warnings)");
             count++;
         }
-        if (BydDeviceHelper.registerListener(settingDevice, this::onSettingsCallback)) {
+        if (noteRegisterOk(settingDevice, BydDeviceHelper.registerListener(settingDevice, this::onSettingsCallback))) {
             logger.info("  Settings listener registered");
             count++;
         }
-        if (BydDeviceHelper.registerListener(radarDevice, this::onGenericCallback)) {
+        if (noteRegisterOk(radarDevice, BydDeviceHelper.registerListener(radarDevice, this::onGenericCallback))) {
             logger.info("  Radar listener registered");
             count++;
         }
-        if (BydDeviceHelper.registerListener(otaDevice, this::onOtaCallback)) {
+        if (noteRegisterOk(otaDevice, BydDeviceHelper.registerListener(otaDevice, this::onOtaCallback))) {
             logger.info("  OTA listener registered");
             count++;
         }
@@ -4608,38 +6479,66 @@ public class BydDataCollector {
         // DoorLock requires the typed AbsBYDAutoDoorLockListener — the generic
         // IBYDAutoListener registration succeeds but never receives
         // onDoorLockStatusChanged. This was the root cause of stale lock data.
-        if (BydDeviceHelper.registerDoorLockListener(doorLockDevice, this::onDoorLockCallback)) {
+        if (noteRegisterOk(doorLockDevice, BydDeviceHelper.registerDoorLockListener(doorLockDevice, this::onDoorLockCallback))) {
             logger.info("  DoorLock listener registered (typed)");
             count++;
-        } else if (BydDeviceHelper.registerListener(doorLockDevice, this::onDoorLockCallback)) {
+        } else if (noteRegisterOk(doorLockDevice, BydDeviceHelper.registerListener(doorLockDevice, this::onDoorLockCallback))) {
             logger.info("  DoorLock listener registered (generic fallback — lock callbacks may not fire)");
             count++;
         }
-        if (BydDeviceHelper.registerTyreListener(tyreDevice, this::onTyreCallback)) {
+        if (noteRegisterOk(tyreDevice, BydDeviceHelper.registerTyreListener(tyreDevice, this::onTyreCallback))) {
             logger.info("  Tyre listener registered (typed)");
             count++;
-        } else if (BydDeviceHelper.registerListener(tyreDevice, this::onDisplayCallback)) {
+        } else if (noteRegisterOk(tyreDevice, BydDeviceHelper.registerListener(tyreDevice, this::onDisplayCallback))) {
             logger.info("  Tyre listener registered (generic fallback)");
             count++;
         }
-        if (BydDeviceHelper.registerListener(acDevice, this::onDisplayCallback)) {
+        if (noteRegisterOk(acDevice, BydDeviceHelper.registerListener(acDevice, this::onDisplayCallback))) {
             logger.info("  AC listener registered");
             count++;
         }
-        if (BydDeviceHelper.registerListener(sensorDevice, this::onDisplayCallback)) {
+        if (noteRegisterOk(sensorDevice, BydDeviceHelper.registerListener(sensorDevice, this::onDisplayCallback))) {
             logger.info("  Sensor listener registered");
             count++;
         }
-        if (BydDeviceHelper.registerListener(energyDevice, this::onDisplayCallback)) {
+        if (noteRegisterOk(energyDevice, BydDeviceHelper.registerListener(energyDevice, this::onDisplayCallback))) {
             logger.info("  Energy listener registered");
             count++;
         }
-        if (BydDeviceHelper.registerListener(powerDevice, this::onDisplayCallback)) {
+        if (noteRegisterOk(powerDevice, BydDeviceHelper.registerListener(powerDevice, this::onDisplayCallback))) {
             logger.info("  Power listener registered");
             count++;
         }
 
-        logger.info("Listeners registered: " + count);
+        // Record which handles are now attached, so a re-init skips exactly these and retries the
+        // rest. A handle whose registration FAILED is deliberately not recorded — it must be
+        // retried, which is the whole point of tracking per handle rather than per batch.
+        //
+        // NOTE: this marks a handle as registered if it was non-null on entry (i.e. not already
+        // skipped) and at least one register attempt for it ran. The helpers return false on
+        // failure, but the call sites above discard that boolean in several branches, so this is
+        // intentionally conservative in the SAFE direction: it can only over-record a handle that
+        // was genuinely attempted while non-null, and the alternative (re-attempting everything
+        // every init) is the duplicate-callback bug.
+        markRegistered(this.bodyworkDevice, bodyworkDevice);
+        markRegistered(this.speedDevice, speedDevice);
+        markRegistered(this.engineDevice, engineDevice);
+        markRegistered(this.statisticDevice, statisticDevice);
+        markRegistered(this.chargingDevice, chargingDevice);
+        markRegistered(this.instrumentDevice, instrumentDevice);
+        markRegistered(this.doorLockDevice, doorLockDevice);
+        markRegistered(this.tyreDevice, tyreDevice);
+        markRegistered(this.energyDevice, energyDevice);
+        markRegistered(this.otaDevice, otaDevice);
+        markRegistered(this.sensorDevice, sensorDevice);
+        markRegistered(this.acDevice, acDevice);
+        markRegistered(this.lightDevice, lightDevice);
+        markRegistered(this.adasDevice, adasDevice);
+        markRegistered(this.radarDevice, radarDevice);
+        markRegistered(this.powerDevice, powerDevice);
+        markRegistered(this.settingDevice, settingDevice);
+        logger.info("Listeners registered: " + count
+                + " (tracked handles: " + registeredHandles.size() + ")");
     }
 
     private void onBodyworkCallback(String method, Object[] args) {
@@ -4732,7 +6631,9 @@ public class BydDataCollector {
         if ("onFuelPercentageChanged".equals(method) && args != null && args.length > 0) {
             try {
                 int fuel = ((Number) args[0]).intValue();
-                if (fuel > 0 && fuel <= 100) {
+                // 0 is a valid reading (empty tank) — accept it, but reject the
+                // BEV/rail sentinels. Matches the polled path in collectStatistic.
+                if (fuel >= 0 && fuel <= 100 && !isBevFuelSentinel(fuel)) {
                     BydVehicleData current = snapshot.get();
                     if (current != null && isPhev(current)) {
                         snapshot.set(current.toBuilder().fuelPercent(fuel).build());
@@ -4841,6 +6742,19 @@ public class BydDataCollector {
     // time we successfully publish a value, so the next field log capture can
     // confirm the hectowatt vs kW scaling against the cluster's own readout.
     private volatile boolean loggedExtChargePowerScale = false;
+
+    // Same one-shot, for the cluster's own CHARGING_CHARGE_POWER_DD readout — the PHEV-
+    // trustworthy source. Logged once so a single field capture pins its scale.
+    private volatile boolean loggedClusterChargePowerScale = false;
+
+    // One-shot: whether the OEM battery-health index reports at all on this trim. The
+    // PHEV SOH path prefers that value, so "absent" vs "present" has to be visible in a
+    // single log capture rather than inferred from a missing number.
+    private volatile boolean loggedOemSohOutcome = false;
+
+    // Device-type argument for the STATISTIC family's get(deviceType, featureId) overload.
+    // 1014 per the OEM app's own SOH read (its second-tier attempt).
+    private static final int STATISTIC_DEVICE_TYPE = 1014;
 
     private void onChargingCallback(String method, Object[] args) {
         // Typed callbacks for real-time charging updates
@@ -4956,6 +6870,26 @@ public class BydDataCollector {
             // Previously, events like INSTRUMENT_2IN1_CURRENT_JOURNEY_DRIVE_MILEAGE
             // (event 1246801948, value=18.7 km) were misinterpreted as 18.7 kW charging.
         }
+        if ("onSafetyBeltStatusChanged".equals(method)) {
+            // TRULY-INSTANT belt push. The HAL fires this only on a genuine belt-state edge, so
+            // it beats even the 500ms fast poll. We deliberately IGNORE the callback's (seat,
+            // state) args — their seat convention (0/1 vs 1/2) and state encoding are unverified
+            // on this firmware — and instead re-sample BOTH seats through readSeatbeltPair (the
+            // proven getSafetyBeltStatus(area) path). So the callback is only a "something
+            // changed, read now" trigger; the mapping/gating/de-glitch stays in one place and a
+            // wrong-convention arg can never swap driver↔passenger or invert buckled↔unbuckled.
+            // Gated on an enabled seatbelt automation so it stays zero-cost otherwise, mirroring
+            // SeatbeltEvent.poll().
+            try {
+                if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.SEATBELT_DRIVER,
+                                  com.overdrive.app.automation.condition.BydEvent.SEATBELT_PASSENGER)) {
+                    com.overdrive.app.automation.condition.BydEvent.pollSeatbelts();
+                }
+            } catch (Throwable t) {
+                logger.debug("onSafetyBeltStatusChanged re-sample error: " + t.getMessage());
+            }
+            return;
+        }
         if ("onExternalChargingPowerChanged".equals(method) && args != null && args.length > 0) {
             try {
                 double power = ((Number) args[0]).doubleValue();
@@ -5000,9 +6934,43 @@ public class BydDataCollector {
                     if (current != null) {
                         snapshot.set(current.toBuilder().dayTimeLight(iVal == 1).build());
                     }
+                    return;
                 }
+
+                // Ambient main switch. ATMOSPHERE_MAIN_SWITCH_STATUS is a LIGHT-family id
+                // (0x3F30…) read off lightDevice, so this is its natural callback — but the
+                // same handler also runs in onSettingsCallback because the sibling ambient
+                // COLOUR events were observed arriving there. Registering both costs nothing
+                // (the id match is exact) and means we don't have to guess which device the
+                // firmware routes it through.
+                applyAmbientEnabledEvent(eventId, iVal);
             } catch (Exception ignored) {}
         }
+    }
+
+    /**
+     * Mirror an interior-ambient MAIN SWITCH event into the snapshot so a change made in the
+     * OEM UI (or by another app) shows up without waiting for the next 5s poll.
+     *
+     * <p>Shared by {@link #onLightsCallback} and {@link #onSettingsCallback} because the
+     * feature id is Light-family but the sibling ambient-colour events were observed arriving
+     * on the Setting device — rather than guess which one the firmware uses, both listen and
+     * the exact id match makes a double registration harmless.
+     *
+     * <p>Only an exact 1/0 is accepted, so an INVALID/sentinel event cannot flip the published
+     * state to a wrong value (the field stays UNAVAILABLE and nothing is published).
+     *
+     * @return true when this event WAS the ambient main switch (caller should stop processing).
+     */
+    private boolean applyAmbientEnabledEvent(int eventId, int iVal) {
+        if (eventId != BydFeatureIds.LIGHT_ATMOSPHERE_MAIN_SWITCH_STATUS) return false;
+        if (iVal == 0 || iVal == 1) {
+            BydVehicleData current = snapshot.get();
+            if (current != null) {
+                snapshot.set(current.toBuilder().ambientEnabled(iVal).build());
+            }
+        }
+        return true;
     }
 
     private void onAdasCallback(String method, Object[] args) {
@@ -5017,8 +6985,54 @@ public class BydDataCollector {
                     if (current != null) {
                         snapshot.set(current.toBuilder().speedLimitWarning(iVal == 2).build());
                     }
+                    return;
                 }
+                // Blind-spot / lane-change / cross-traffic alert. This is the
+                // INSTANT path — the alert is a brief pulse, so waiting for the
+                // next poll can miss it entirely.
+                handleBlindSpotEvent(eventId, iVal);
             } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Route one ADAS event to the blind-spot state if it is a warning id, applying
+     * the encoding that id uses (level for the dedicated FL/FR alarms, counter
+     * increase for LCA/RCTA/DOW). Non-warning ids are ignored.
+     */
+    private void handleBlindSpotEvent(int eventId, int value) {
+        boolean left, alerting;
+        if (eventId == BydFeatureIds.ADAS_FL_BLIND_SPOT_ALARM
+                || eventId == BydFeatureIds.ADAS_FR_BLIND_SPOT_ALARM) {
+            left = (eventId == BydFeatureIds.ADAS_FL_BLIND_SPOT_ALARM);
+            alerting = value >= 1;
+        } else if (eventId == BydFeatureIds.ADAS_LCA_WARNING_LEFT
+                || eventId == BydFeatureIds.ADAS_RCTA_WARNING_LEFT
+                || eventId == BydFeatureIds.ADAS_DOW_WARN_LEFT
+                || eventId == BydFeatureIds.ADAS_LCA_WARNING_RIGHT
+                || eventId == BydFeatureIds.ADAS_RCTA_WARNING_RIGHT
+                || eventId == BydFeatureIds.ADAS_DOW_WARN_RIGHT) {
+            left = (eventId == BydFeatureIds.ADAS_LCA_WARNING_LEFT
+                    || eventId == BydFeatureIds.ADAS_RCTA_WARNING_LEFT
+                    || eventId == BydFeatureIds.ADAS_DOW_WARN_LEFT);
+            if (value < 0) return;
+            // An event for THIS id proves its callback works, so the poll can stop
+            // reading it (see anyCounterAdvanced). Recorded per id — an event for one
+            // warning says nothing about the others.
+            if (bsEventProvenIds.add(eventId)) {
+                logger.info("ADAS blind-spot events confirmed for id=" + eventId
+                        + " — no longer polling it");
+            }
+            alerting = counterAdvanced(eventId, value);
+        } else {
+            return;
+        }
+        // Only an ALERT is pushed from the event path. The "clear" edge is owned by
+        // the hold timer in the automation layer: these signals are momentary
+        // pulses, so treating a non-alerting event as "clear" would cancel a live
+        // warning almost immediately.
+        if (alerting) {
+            com.overdrive.app.automation.condition.BlindSpotEvent.onAlert(left);
         }
     }
 
@@ -5050,6 +7064,10 @@ public class BydDataCollector {
                 }
                 return;
             }
+
+            // Interior ambient MAIN SWITCH status. Placed before the seat 1..3 guard below,
+            // which would otherwise swallow the 0 (off) edge — the very state this reports.
+            if (applyAmbientEnabledEvent(eventId, iVal)) return;
 
             // SDK reports 1=off, 2=low, 3=high for seats. Anything else is unknown — ignore.
             if (iVal < 1 || iVal > 3) return;
@@ -5228,7 +7246,18 @@ public class BydDataCollector {
                         double kw = (Math.abs(raw) > 100.0) ? raw * 0.1 : raw;
                         // After scaling, re-check the kW range so a hectowatt value
                         // like 3095 (→ 309.5) gets rejected instead of mis-stored.
-                        if (kw >= -200.0 && kw <= 400.0) {
+                        //
+                        // Sentinel check MUST be here too, not only in collectEngine's two read
+                        // paths. This generic-event listener is a THIRD writer of the same field,
+                        // and on the targeted PHEV firmware it is the DOMINANT one: the typed
+                        // listeners are dormant there (see the note above), and while parked the
+                        // poll interval is 90 s, so the listener supplies nearly every refresh.
+                        // A -1.0 sentinel also survives the ACC-off gate below (-1.0 > -0.3 is
+                        // false), so without this the phantom re-entered the snapshot downstream
+                        // of the filter and ChargingDetector behaviour was bit-identical to
+                        // pre-fix — it also re-armed after invalidateAccDependentSignals() had
+                        // just cleared it on the ACC-off edge (invariant I4).
+                        if (kw >= -200.0 && kw <= 400.0 && !isEnginePowerSentinel(kw)) {
                             // ACC OFF gating: when the key is removed, the only
                             // physically plausible engine-power direction is
                             // current INTO the pack (kw < 0, plug-in charging).
@@ -5243,6 +7272,9 @@ public class BydDataCollector {
                             }
                             BydVehicleData current = snapshot.get();
                             if (current != null) {
+                                // The Builder setter stamps enginePowerAtMs itself, so this write
+                                // is self-dating: the next poll and ChargingDetector both read the
+                                // age from the snapshot and cannot disagree about it.
                                 snapshot.set(current.toBuilder().enginePowerKw(kw).build());
                             }
                         }
@@ -5339,18 +7371,6 @@ public class BydDataCollector {
         }
     }
 
-    private void handleSafetyBeltStatusChanged(Object[] args) {
-        if (args != null && args.length > 0 && snapshot.get() != null) {
-            try {
-                int status = BydDeviceHelper.getIntValue(args[0]);
-                if (status >= 0) {
-                    // Safety belt status is a bitmask — store raw value
-                    // Individual seat belt states are decoded by consumers
-                    snapshot.set(snapshot.get().toBuilder().build());
-                }
-            } catch (Exception e) { logger.debug("handleSafetyBeltStatusChanged error: " + e.getMessage()); }
-        }
-    }
 
     // ==================== VEHICLE CONTROL SETTERS ====================
     // All setters call BydDeviceHelper directly from UID 2000.
@@ -5404,18 +7424,135 @@ public class BydDataCollector {
         }
     }
 
+    /**
+     * Set the AC temperature. [tempCelsius] is a CELSIUS value from our own API surface; it is
+     * converted to the head unit's display unit before the write, because the SDK takes the value
+     * in the DISPLAYED unit and declares which one in the 4th argument.
+     *
+     * <p>The 4th argument used to be the constant 1. That is Celsius by luck, not by derivation:
+     * on a head unit set to Fahrenheit the SDK expects 64..91 with unit 0, so the old code's
+     * {@code 17..33} pre-check rejected every legitimate write outright — AC temperature simply
+     * did nothing on a °F car. DiPlus reads {@code getTemperatureUnit()} and clamps to 64..91 or
+     * 17..33 accordingly (proven in its bytecode), which is what this now mirrors.
+     *
+     * <p>An unreadable unit falls back to Celsius — the previous hardcoded behaviour, so a device
+     * that never answers the unit getter behaves exactly as it does today rather than losing the
+     * write entirely.
+     */
     public boolean setAcTemperature(int zone, double tempCelsius) {
         try {
-            // Temperature is sent as int (degrees × 1 for most BYD models)
-            int tempInt = (int) Math.round(tempCelsius);
-            if (tempInt < 17 || tempInt > 33) return false;
-            // SDK method: acDevice.setAcTemperature(zone, temp, 0, 1)
-            Object result = BydDeviceHelper.callMethod(acDevice, "setAcTemperature", zone, tempInt, 0, 1);
-            return result instanceof Integer && ((Integer) result).intValue() == 0;
+            // NaN/Inf would survive to Math.round as 0 (or a rail) and then be CLAMPED into a
+            // valid-looking setpoint — silently setting the dial to its minimum. Refuse here so
+            // every caller is covered, not just the ones that range-check first.
+            if (Double.isNaN(tempCelsius) || Double.isInfinite(tempCelsius)) {
+                logger.warn("setAcTemperature: refusing non-finite temperature");
+                return false;
+            }
+            int unit = readTempUnitNow();
+            int effectiveUnit = (unit == BydVehicleData.UNAVAILABLE) ? 1 : unit;
+            // Convert to the DISPLAY unit, then clamp in that unit's own band.
+            int tempInt = (effectiveUnit == TEMP_UNIT_FAHRENHEIT)
+                    ? (int) Math.round(tempCelsius * 9.0 / 5.0 + 32.0)
+                    : (int) Math.round(tempCelsius);
+            int clamped = clampSetpoint(tempInt, effectiveUnit);
+            return setAcTemperatureRaw(zone, clamped, effectiveUnit);
         } catch (Exception e) {
             logger.debug("setAcTemperature failed: " + e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Write an ALREADY-display-unit, already-clamped setpoint. The single SDK seam for both the
+     * absolute setter above and the relative step (which reads the dial in display units and must
+     * not round-trip through Celsius — that conversion would lose a degree on a °F car, so
+     * "+1 °F" could land back on the same value or skip two).
+     *
+     * @param displayTemp the value in [unit]'s own scale, pre-clamped by {@link #clampSetpoint}
+     * @param unit        {@code getTemperatureUnit()}'s value, passed through to the SDK verbatim
+     * @return true only on the SDK's success code (0) — never accept-on-no-throw
+     */
+    public boolean setAcTemperatureRaw(int zone, int displayTemp, int unit) {
+        try {
+            // Reject the UNAVAILABLE sentinel specifically. Without this, a Celsius-range value
+            // paired with UNAVAILABLE would slip past the clamp check below (clampSetpoint treats
+            // any non-zero unit as Celsius, so 22 clamps to itself) and hand Integer.MIN_VALUE to
+            // the SDK as its unit argument. Only the sentinel is refused — any other non-zero
+            // value is passed through verbatim, because "non-zero == Celsius" is the SDK's own
+            // rule and DiPlus forwards whatever getTemperatureUnit() returned rather than
+            // normalizing it to 1.
+            if (unit == BydVehicleData.UNAVAILABLE) {
+                logger.warn("setAcTemperatureRaw: refusing write with unresolved unit");
+                return false;
+            }
+            if (displayTemp != clampSetpoint(displayTemp, unit)) return false;   // caller bug guard
+            // SDK: acDevice.setAcTemperature(zone, temp, 0, unit)
+            Object result = BydDeviceHelper.callMethod(acDevice, "setAcTemperature", zone, displayTemp, 0, unit);
+            return result instanceof Integer && ((Integer) result).intValue() == 0;
+        } catch (Exception e) {
+            logger.debug("setAcTemperatureRaw failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Relative temperature step: read the dial, add [delta] (in DISPLAY units — so ±1 is one
+     * dial notch whether the car shows °C or °F), clamp, write. Returns the new setpoint, or
+     * {@link BydVehicleData#UNAVAILABLE} when the dial couldn't be read or the write failed.
+     *
+     * <p>Reading the dial is mandatory — there is no safe fallback. If the read misses we refuse
+     * rather than assuming a value: stepping from a fabricated 24 (what both reference apps
+     * default to) would yank the temperature to 25 from wherever it actually was.
+     *
+     * <p>Already at the end of the range is reported as SUCCESS with the unchanged value, not a
+     * failure: pressing "+" at 33 C is a no-op the user expects, not an error to surface.
+     *
+     * <p><b>Asymmetric by design, matching both reference apps:</b> [area] is the dial READ
+     * (1 = driver), [zone] is the write target, and zone 0 = {@code AC_TEMPERATURE_MAIN_DEPUTY}
+     * sets BOTH dials. DiPlus does exactly this (reads area 1, writes zone 0), and Commander's
+     * setter defaults zone to 0, so zone 0 is the proven "set the cabin temperature" target
+     * rather than an oversight. On a dual-zone car with split dials this does move the passenger
+     * side to match — which is the single-temperature behaviour these actions advertise. Pass
+     * zone = area to step one dial only, once a per-dial setter is verified on real hardware.
+     */
+    public int stepAcTemperature(int zone, int area, int delta) {
+        int current = readAcSetpointNow(area);
+        if (current == BydVehicleData.UNAVAILABLE) {
+            logger.warn("stepAcTemperature: dial unreadable (area " + area + ") — refusing to step");
+            return BydVehicleData.UNAVAILABLE;
+        }
+        // Unit for the clamp. The value's OWN band decides it, because the value is what we are
+        // about to add to and clamp — trusting getTemperatureUnit() over the reading would be
+        // trusting a DIFFERENT getter about this one's scale. When the two disagree we refuse
+        // rather than pick: a 22 reading with the unit claiming Fahrenheit would clamp 23 into
+        // the F band and write 64, dropping the dial ~4 C in response to a "+1" press. Which
+        // scale getTemprature actually returns is not device-proven here (the SDK javadoc
+        // documents a Celsius range; DiPlus's clamp implies display units), so a disagreement
+        // means we do not know what we are holding — the one case where doing nothing is right.
+        int bandUnit = inferUnitFromSetpoint(current);
+        if (bandUnit == BydVehicleData.UNAVAILABLE) {
+            logger.warn("stepAcTemperature: setpoint " + current + " matches no known dial band — refusing");
+            return BydVehicleData.UNAVAILABLE;
+        }
+        int reportedUnit = readTempUnitNow();
+        if (reportedUnit != BydVehicleData.UNAVAILABLE
+                && (reportedUnit == TEMP_UNIT_FAHRENHEIT) != (bandUnit == TEMP_UNIT_FAHRENHEIT)) {
+            logger.warn("stepAcTemperature: unit disagreement — getTemperatureUnit()=" + reportedUnit
+                    + " but setpoint " + current + " is in the "
+                    + (bandUnit == TEMP_UNIT_FAHRENHEIT ? "Fahrenheit" : "Celsius")
+                    + " band; refusing rather than guessing the scale");
+            return BydVehicleData.UNAVAILABLE;
+        }
+        int effectiveUnit = bandUnit;
+        int target = clampSetpoint(current + delta, effectiveUnit);
+        if (target == current) {
+            logger.info("stepAcTemperature: already at limit (" + current + ") — no write");
+            return current;
+        }
+        if (!setAcTemperatureRaw(zone, target, effectiveUnit)) return BydVehicleData.UNAVAILABLE;
+        logger.info("stepAcTemperature: " + current + " -> " + target + " (delta " + delta
+                + ", unit " + effectiveUnit + ")");
+        return target;
     }
 
     public boolean setAcFanLevel(int level) {
@@ -5428,7 +7565,7 @@ public class BydDataCollector {
             // Fallback: on some DiLink 3.0 firmware setAcWindLevel is a no-op
             // (returns null / non-zero). The generic feature write
             // set(1000, AC_WIND_LEVEL_SET, level) drives the fan directly and is
-            // verified to work on the Dolphin (HAL research).
+            // verified to work on the Dolphin (wheregoes/byd-apps research).
             // Only reached when the named path did NOT report success, so the
             // path that already works on other firmware is left untouched.
             logger.debug("setAcWindLevel named path returned " + result + "; trying generic feature write");
@@ -5460,7 +7597,7 @@ public class BydDataCollector {
 
     /**
      * Write a defrost feature id, trying each accepted encoding until one lands — mirroring
-     * the OEM firmware, which sends the preferred value first then a fallback ({@code
+     * the OEM vehicle-control app, which sends the preferred value first then a fallback ({@code
      * enable → 1 then 2}; {@code disable → 0 then 2}). Some trims accept only one of the
      * encodings, so a single fixed value silently missed. sendSetCommand success = code >= 0.
      */
@@ -5599,15 +7736,15 @@ public class BydDataCollector {
     }
 
     /**
-     * Interior cabin / reading light on/off. PARITY with the OEM firmware's
+     * Interior cabin / reading light on/off. PARITY with the OEM vehicle-control app's
      * turnInsideLightsOn/Off, which uses a TWO-TIER ladder — we previously only had the
      * second tier, so on a trim where the bodywork feature-id write silently no-ops the
      * cabin light never changed.
      *
-     * <p>Tier 1 (PREFERRED, matches the OEM firmware): the named method {@code turnOffInsideLight(int)}
+     * <p>Tier 1 (PREFERRED, matches OEM vehicle-control app): the named method {@code turnOffInsideLight(int)}
      * on the SETTING device. Note the counter-intuitive name + inverted argument the OEM
      * uses: {@code turnOffInsideLight(2)} turns the light ON, {@code turnOffInsideLight(1)}
-     * turns it OFF (OEM firmware: "Inside lights ON via turnOffInsideLight(state=2)").
+     * turns it OFF (OEM vehicle-control app: "Inside lights ON via turnOffInsideLight(state=2)").
      *
      * <p>Tier 2 (FALLBACK): the feature-id write {@code Body.INSIDE_LIGHT_STATE_SET} on the
      * BODYWORK device, value on=1 / off=2 (the original path). Reached only if the named
@@ -5885,10 +8022,56 @@ public class BydDataCollector {
         return DOOR_STATE_INVALID;
     }
 
+    // UNLOCK-direction debounce for collectLockState, mirroring CameraDaemon's unlock poll:
+    // the OTA getLFDoorLockState rail emits transient/bluff DOOR_STATE_UNLOCK reads on this
+    // hardware, so a single one must NOT fire an "unlocked" automation. Require 2 consecutive
+    // UNLOCK reads before publishing unlocked; LOCK publishes eagerly (a real lock is safe to
+    // report immediately and resets the streak). Read/written only on the BydDataPoll thread,
+    // but volatile because setAccState() swaps that single-thread executor on every ACC edge
+    // (shutdownNow + new executor), so successive ticks can run on different threads with no
+    // happens-before — same reason passengerBeltEverUnlatched is volatile. A stale read only
+    // nudges the debounce counter by one for one cycle (the transition gate still prevents any
+    // spurious/duplicate fire), but volatile closes the gap for the price of one word.
+    private volatile int lockUnlockStreak = 0;
+
+    /**
+     * Publish the central-lock state to the automation engine as a {@code locked}/
+     * {@code unlocked} word, sourced from the OTA rail ({@link #readDoorLockState}). Called
+     * from {@link #collectAll} on the always-alive poll loop when an automation references
+     * {@link com.overdrive.app.automation.condition.BydEvent#LOCK}. {@code Automations.update}
+     * is transition-gated + deduped, so a repeated same-state read no-ops; a genuine
+     * lock↔unlock edge fires the trigger. An INVALID/unreadable tick is skipped so we never
+     * manufacture a false transition. This is the ACC-agnostic counterpart to the
+     * surveillance arm-gate's own lock funnel (which stays ACC-off only, by design) — and it
+     * shares that funnel's 2-consecutive-read UNLOCK debounce so a transient OTA misread
+     * can't fire a spurious "unlocked" automation.
+     */
+    private void collectLockState() {
+        int state = readDoorLockState();
+        boolean locked;
+        if (state == DOOR_STATE_LOCK) {
+            lockUnlockStreak = 0;
+            locked = true;
+        } else if (state == DOOR_STATE_UNLOCK) {
+            // Debounce the UNLOCK direction: need 2 consecutive reads before publishing.
+            if (++lockUnlockStreak < 2) return;
+            locked = false;
+        } else {
+            return; // INVALID/unreadable → no false edge, and don't disturb the streak
+        }
+        try {
+            com.overdrive.app.automation.Automations.update(
+                    com.overdrive.app.automation.condition.BydEvent.LOCK,
+                    locked ? "locked" : "unlocked");
+        } catch (Throwable t) {
+            logger.debug("collectLockState publish failed: " + t.getMessage());
+        }
+    }
+
     // --- Tailgate ---
 
     public boolean openTailgate() {
-        // Method 1: SettingDevice.voiceCtlBackDoor(1) — official BYD SDK method
+        // Method 1: SettingDevice.voiceCtlBackDoor(1) — official OEM vehicle-control app method
         if (settingDevice != null) {
             try {
                 Object result = BydDeviceHelper.callGetter(settingDevice, "voiceCtlBackDoor", 1);
@@ -5911,7 +8094,7 @@ public class BydDataCollector {
 
     public boolean closeTailgate() {
         // SOTA FIX: the OEM firmware uses value 3 for close via SETTING_VOICE_CTRL_BACK_DOOR_SET
-        // Values: 1=open, 2=stop, 3=close (confirmed from OEM firmware analysis)
+        // Values: 1=open, 2=stop, 3=close (confirmed from the OEM vehicle-control app (decompiled))
         
         // Method 1: SettingDevice sendSetCommand with value 3 (close)
         if (settingDevice != null) {
@@ -6094,7 +8277,7 @@ public class BydDataCollector {
     // All schedule reads/writes go through BydCloudClient smart-charging
     // endpoints in VehicleControlApiHandler / VehicleCommandRouter.
 
-    // BEV charge cap — TWO paths, tried in priority order:
+    // Charge cap / SOC hold — TWO paths, tried in priority order:
     //
     //  1. PRIMARY: the SOC-target / battery-hold feature. Setting device's
     //     setSOCTarget(percent) picks the target state-of-charge and the
@@ -6103,6 +8286,12 @@ public class BydDataCollector {
     //     The target is clamped exactly like the OEM: floor = 15 (or 25 when
     //     getSOCConfig()==2), ceiling = 70 (SET_DR_SOC_TARGET_MAX). Value 0/1
     //     result == success, same convention as every other SDK setter.
+    //     NOTE: despite the [15,70] window this is NOT BEV-only — it is the PHEV
+    //     "hold battery at N%" lever. Reference app DiPlus drives this exact pair
+    //     for its two DM-i modes: city = setSOCTarget(floor) + setSocSaveSwitch(1),
+    //     long-distance = setSOCTarget(min(currentSOC,50)) + setSocSaveSwitch(2).
+    //     So switch mode 2 means "hold at the target", not merely on/off. The
+    //     "Hold Battery Charge" action (energy-mode HEV) does NOT do this.
     //
     //  2. FALLBACK: BYDAutoChargingDevice.setChargeStopCapacityState (target %)
     //     + setChargeStopSwitchState (master on/off). On Seal trims the
@@ -6337,16 +8526,180 @@ public class BydDataCollector {
     }
 
     // --- Ambient Lighting ---
+    //
+    // Zoning per the OEM SDK: the Setting-device methods setIALArea(area),
+    // setIALBrightness(area, level, 0) and setIALColor(area, value, 0) take an AREA code —
+    // FRONT=1, REAR=2, BOTH/ALL=3 — where the "all" one-shot (area 3) falls back to writing
+    // FRONT then REAR if the combined call is rejected. Brightness is a 0..5 LEVEL at the SDK
+    // (we accept a 0..100 percent from the UI and convert). CRITICAL: the SDK methods are
+    // 3-int with a fixed trailing 0 — reflecting a 2-int form NoSuchMethods and silently
+    // no-ops (the old ambient-colour bug). The interior on/off main switch is GLOBAL (no
+    // per-zone switch exists on this platform).
 
-    public boolean setAmbientLightEnabled(boolean on) {
-        try {
-            return BydDeviceHelper.sendSetCommand(lightDevice, BydFeatureIds.LIGHT_ATMOSPHERE_MAIN_SWITCH_SET, on ? 1 : 0);
-        } catch (Exception e) {
-            logger.debug("setAmbientLightEnabled failed: " + e.getMessage());
-            return false;
-        }
+    /** Map a zone token to a BYD IAL area code: front=1, rear=2, both/all=3 (default both). */
+    private static int ambientZoneToArea(String zone) {
+        if ("front".equalsIgnoreCase(zone)) return 1;
+        if ("rear".equalsIgnoreCase(zone)) return 2;
+        return 3; // "both" / null / unknown → all
     }
 
+    /**
+     * GLOBAL interior-ambient main switch (no per-zone switch exists on this platform).
+     *
+     * <p>THREE TIERS, tried in order until one lands — matching the reference app's
+     * {@code setAmbientLightEnabled} exactly. A single-tier write was the bug: when the
+     * Light-device main switch is refused (it is signature-gated on some trims), "ambient
+     * light off" did nothing at all and reported failure with no second attempt.
+     *
+     * <ol>
+     *   <li>Light device {@code ATMOSPHERE_MAIN_SWITCH_SET} — on=1 / off=0.</li>
+     *   <li>Bodywork {@code ATMOSPHERE_LIGHT_SWITCH_EXECUTE} — on=1 / <b>off=2</b>. NOTE the
+     *       different off value: this is an EXECUTE-style command feature where 2 means off,
+     *       not 0 (0 would be "no command"). Confirmed against the reference app.</li>
+     *   <li>The carsettings provider's {@code atmosphere_lamp} flag — on=1 / off=0, the same
+     *       key BYD's own settings UI writes.</li>
+     * </ol>
+     *
+     * <p>Tier 3 uses the CONFIRMED-only write: an optimistic "true" from a void provider
+     * call would let this method claim success when nothing moved.
+     */
+    public boolean setAmbientLightEnabled(boolean on) {
+        boolean ok = false;
+        try {
+            ok = BydDeviceHelper.sendSetCommand(
+                    lightDevice, BydFeatureIds.LIGHT_ATMOSPHERE_MAIN_SWITCH_SET, on ? 1 : 0);
+        } catch (Exception e) {
+            logger.debug("setAmbientLightEnabled tier1 (light main switch) failed: " + e.getMessage());
+        }
+        if (!ok) {
+            try {
+                // on=1 / off=2 — an execute-style feature, NOT the 1/0 of tier 1.
+                ok = BydDeviceHelper.sendSetCommand(
+                        bodyworkDevice, BydFeatureIds.BODY_ATMOSPHERE_LIGHT_SWITCH, on ? 1 : 2);
+            } catch (Exception e) {
+                logger.debug("setAmbientLightEnabled tier2 (body execute) failed: " + e.getMessage());
+            }
+        }
+        if (!ok) {
+            try {
+                ok = BydCarSettings.getInstance()
+                        .writeIntConfirmed(BydCarSettings.KEY_ATMOSPHERE_LAMP, on ? 1 : 0);
+            } catch (Exception e) {
+                logger.debug("setAmbientLightEnabled tier3 (atmosphere_lamp) failed: " + e.getMessage());
+            }
+        }
+        if (!ok) {
+            logger.warn("setAmbientLightEnabled(" + on + ") failed across all three tiers");
+        }
+        return ok;
+    }
+
+    /**
+     * Interior-ambient main-switch READBACK: 1 = on, 0 = off, {@link BydVehicleData#UNAVAILABLE}
+     * when neither source answers. Mirrors the reference app's {@code isAmbientLightEnabled}
+     * (Light-device status feature, then the {@code atmosphere_lamp} provider flag).
+     *
+     * <p>Only an exact 0/1 counts. {@code callGetSingle} returns -1 both for "absent" and for a
+     * HAL failure, and the provider read needs a sentinel default for the same reason — so any
+     * other value reads UNAVAILABLE rather than being coerced to "off". Without that, a trim
+     * that cannot report ambient state would publish a permanent, wrong "ambient off".
+     */
+    public int getAmbientLightEnabled() {
+        try {
+            int direct = BydDeviceHelper.callGetSingle(
+                    lightDevice, BydFeatureIds.LIGHT_ATMOSPHERE_MAIN_SWITCH_STATUS);
+            if (direct == 0 || direct == 1) return direct;
+            int flag = BydCarSettings.getInstance()
+                    .readInt(BydCarSettings.KEY_ATMOSPHERE_LAMP, Integer.MIN_VALUE);
+            if (flag == 0 || flag == 1) return flag;
+        } catch (Exception e) {
+            logger.debug("getAmbientLightEnabled failed: " + e.getMessage());
+        }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    /**
+     * Zoned ambient on/off. "both" uses the real GLOBAL main switch above (all three tiers).
+     *
+     * <p>A single zone (front/rear) has NO dedicated switch on this platform, so "off" zeroes
+     * that zone's brightness and "on" restores the level it had BEFORE the off — read live if
+     * the trim supports it, else from the in-memory pre-off level, else full. Restoring to full
+     * unconditionally (the earlier behaviour) silently reset anyone running a dimmed cabin.
+     *
+     * <p>zone: front/rear/both.
+     */
+    public boolean setAmbientLightEnabledZoned(String zone, boolean on) {
+        int area = ambientZoneToArea(zone);
+        if (area == 3) return setAmbientLightEnabled(on);
+        if (on) {
+            // Restore the level this zone had before it was dimmed out, so off→on does not
+            // silently reset a user who runs the cabin at level 2 to full brightness. Falls
+            // back to full only when there is no remembered/readable level (first-ever use on
+            // a trim with no readback), which is the old behaviour.
+            int restore = ambientZoneRestoreLevel(area);
+            return applyIalBrightness(area, restore);
+        }
+        // Remember the pre-off level so the matching "on" can restore it. Read it BEFORE
+        // zeroing; a failed read leaves the previous memory intact rather than recording 0
+        // (which would make the next "on" a no-op). This read is what captures a level the
+        // user set in the CAR's own UI (which we never commanded, so applyIalBrightness had no
+        // chance to record it); levels we DID command are recorded at write time instead, which
+        // is the only tier that works on a trim with no readback.
+        int current = readIalBrightness(area);
+        if (current > 0) rememberAmbientZoneLevel(area, current);
+        return applyIalBrightness(area, 0);
+    }
+
+    /**
+     * Per-zone "level before we dimmed it out", so a zoned ambient off→on round-trip preserves
+     * the user's brightness. Keyed by IAL area (1=front, 2=rear). Absent → no memory yet.
+     *
+     * <p>Populated from BOTH directions: every non-zero level we command (in
+     * {@link #applyIalBrightness}, the only tier that works with no readback) and the pre-off
+     * live read (which catches a level set in the car's own UI).
+     *
+     * <p>Deliberately in-memory only: a stale level persisted across a reboot could fight a
+     * change the user made in the OEM UI meanwhile, and the live readback is preferred whenever
+     * the trim supports it.
+     */
+    private final java.util.Map<Integer, Integer> ambientZoneLevelMemory =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private void rememberAmbientZoneLevel(int area, int level) {
+        if (level >= 1 && level <= 5) ambientZoneLevelMemory.put(area, level);
+    }
+
+    /**
+     * The level to restore for a zoned "ambient on": the live SDK level if this trim reports
+     * one and it is non-zero, else the remembered pre-off level, else full (5).
+     *
+     * <p>A live read of 0 is ignored on purpose — the zone is currently dimmed out, which is
+     * exactly the state we are leaving, so 0 would make "on" a no-op.
+     */
+    private int ambientZoneRestoreLevel(int area) {
+        int live = readIalBrightness(area);
+        if (live >= 1 && live <= 5) return live;
+        Integer remembered = ambientZoneLevelMemory.get(area);
+        if (remembered != null && remembered >= 1 && remembered <= 5) return remembered;
+        return 5;
+    }
+
+    /**
+     * Read one zone's IAL brightness LEVEL (0..5) via {@code getIALBrightness(area)}, or
+     * {@link BydVehicleData#UNAVAILABLE} when the getter is absent or answers out of band.
+     * The SDK getter is the 1-arg form (see the reference app); a negative is a HAL failure
+     * code, not a level.
+     */
+    private int readIalBrightness(int area) {
+        Object v = BydDeviceHelper.callGetter(settingDevice, "getIALBrightness", area);
+        if (!(v instanceof Number)) return BydVehicleData.UNAVAILABLE;
+        int level = ((Number) v).intValue();
+        return (level >= 0 && level <= 5) ? level : BydVehicleData.UNAVAILABLE;
+    }
+
+    /** Whole-cabin ambient brightness (0..100) via the Light-device custom-brightness feature
+     *  id — the pre-existing path, kept unchanged for existing callers and as the "both"
+     *  fallback below. */
     public boolean setAmbientBrightness(int level) {
         try {
             if (level < 0 || level > 100) return false;
@@ -6355,6 +8708,140 @@ public class BydDataCollector {
             logger.debug("setAmbientBrightness failed: " + e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Zoned ambient brightness. {@code percent} 0..100 (converted to the SDK's 0..5 level).
+     * zone: front/rear/both. For "both" (area 3), if the IAL path is rejected we
+     * fall back to the whole-cabin custom-brightness feature id.
+     */
+    public boolean setAmbientBrightnessZoned(String zone, int percent) {
+        if (percent < 0 || percent > 100) return false;
+        int area = ambientZoneToArea(zone);
+        int level = Math.round(percent / 100f * 5f); // percent → 0..5 SDK level
+        boolean ok = applyIalBrightness(area, level);
+        if (!ok && area == 3) {
+            ok = setAmbientBrightness(percent);
+        }
+        return ok;
+    }
+
+    /**
+     * IAL brightness write: select the area, then {@code setIALBrightness(area, level, 0)}
+     * (level 0..5). area 1=front / 2=rear / 3=all; area 3 falls back to front-then-rear if
+     * the combined write is rejected. Returns true when the SDK reports success (result == 0).
+     */
+    private boolean applyIalBrightness(int area, int level) {
+        // Record every NON-ZERO level we command, whatever the caller. This is what makes the
+        // zoned off→on restore work on a trim with NO readback: readIalBrightness returns
+        // UNAVAILABLE there, so remembering only at off-time never populated the map and the
+        // restore always fell through to full brightness — defeating the feature on exactly the
+        // trims the memory exists for. Recording at write time also captures the level the user
+        // actually chose via setAmbientBrightnessZoned. Level 0 is skipped: that IS the off
+        // state, and storing it would make the next "on" a no-op.
+        if (level > 0) {
+            if (area == 3) { rememberAmbientZoneLevel(1, level); rememberAmbientZoneLevel(2, level); }
+            else rememberAmbientZoneLevel(area, level);
+        }
+        boolean areaSelected = prepareAmbientArea(area);
+        Object r = BydDeviceHelper.callMethod(settingDevice, "setIALBrightness", area, level, 0);
+        // STRICT result == 0, deliberately. A void setIALBrightness would return null here on a
+        // successful invoke, so this can under-report success — but the callers TREAT false as
+        // "try the next path" (area 3 → front+rear, then the whole-cabin custom-brightness
+        // feature id), and those extra attempts are what make ambient control work on this
+        // fleet. Loosening this to accept-on-no-throw would stop the fallbacks from running.
+        boolean ok = r instanceof Integer && ((Integer) r).intValue() == 0;
+        if (!ok && area == 3) {
+            ok = applyIalBrightness(1, level);
+            ok = applyIalBrightness(2, level) || ok; // run both; OR so either landing = success
+        }
+        // Per-zone legacy fallback: the IAL setter is absent/refused on some trims, and area 3
+        // has already been decomposed into front+rear above, so only areas 1/2 land here.
+        if (!ok && area != 3) {
+            ok = applyLegacyZoneBrightness(area, ialLevelToPercent(level), areaSelected);
+        }
+        return ok;
+    }
+
+    /** SDK level (0..5) → percent, the inverse of the percent→level conversion above. */
+    private static int ialLevelToPercent(int level) {
+        int clamped = Math.max(0, Math.min(5, level));
+        return Math.round(clamped / 5f * 100f);
+    }
+
+    /** Percent (0..100) → the 0..255 byte scale some legacy brightness features expect. */
+    private static int ambientPercentToByte(int percent) {
+        int clamped = Math.max(0, Math.min(100, percent));
+        return Math.round(clamped / 100f * 255f);
+    }
+
+    /**
+     * Select an ambient zone before a write: {@code setIALArea(area)}, falling back to the
+     * legacy Light-device {@code ATMOSPHERE_ADJUST_AREA_SET} (written as {area} then {0}, per
+     * the reference app) on trims that lack the SDK method. Returns whether the zone was
+     * actually selected — the legacy whole-cabin brightness features below apply to the
+     * SELECTED area, so writing them without a confirmed selection would hit the wrong zone.
+     */
+    private boolean prepareAmbientArea(int area) {
+        Object r = BydDeviceHelper.callMethod(settingDevice, "setIALArea", area);
+        if (r instanceof Integer && ((Integer) r).intValue() == 0) return true;
+        // Legacy selection is defined for the PHYSICAL zones only. The reference app never
+        // writes the synthetic "all" code (3) to this feature — it only ever selects FRONT or
+        // REAR — so sending 3 here would push an out-of-domain value the HAL has no meaning
+        // for. Area 3 simply reports "not selected"; its callers already decompose into
+        // front+rear, which each select their own zone properly.
+        if (area != 1 && area != 2) return false;
+        // The reference app pushes {area} then a trailing {0} to this feature; keep both writes
+        // so a trim that needs the pair behaves identically.
+        //
+        // But ONLY the {area} write decides the return value. The reference ORs both results,
+        // which means a HAL that refuses the zone code yet accepts 0 reports "selected" while
+        // the selection actually points at area 0 (whole cabin). Our callers use that boolean to
+        // decide whether the selected-area-relative brightness features are safe to write, so
+        // trusting a 0-only success is precisely how "off front" would dim the rear — the thing
+        // the areaSelected guard exists to prevent. Fail closed instead.
+        boolean zoneSelected = BydDeviceHelper.sendSetCommand(
+                lightDevice, BydFeatureIds.LIGHT_ATMOSPHERE_ADJUST_AREA_SET, area);
+        BydDeviceHelper.sendSetCommand(
+                lightDevice, BydFeatureIds.LIGHT_ATMOSPHERE_ADJUST_AREA_SET, 0);
+        return zoneSelected;
+    }
+
+    /**
+     * Legacy per-zone brightness fallback for trims whose Setting-device IAL setter is missing
+     * or refuses the write — the chain the reference app walks, in its order:
+     *
+     * <ol>
+     *   <li>{@code ATMOSPHERE_CUSTOM_BRIGHTNESS_SET} (percent) — applies to the SELECTED area,
+     *       so only attempted when the area selection was confirmed.</li>
+     *   <li>{@code ATMOSPHERE_VEHICLE_BRIGHTNESS_SET} (percent, then the 0..255 byte scale) —
+     *       same selected-area caveat.</li>
+     *   <li>The zone's own dedicated feature id (percent), then its {@code _ALT} byte-scaled
+     *       twin. These carry the zone in the feature id itself, so they need no selection.</li>
+     * </ol>
+     *
+     * @param areaSelected whether {@link #prepareAmbientArea} confirmed the zone selection;
+     *                     when false the selected-area-relative tiers are SKIPPED rather than
+     *                     gambled on, so an "off front" cannot silently dim the rear instead.
+     */
+    private boolean applyLegacyZoneBrightness(int area, int percent, boolean areaSelected) {
+        int zoneId = (area == 2)
+                ? BydFeatureIds.LIGHT_AMBIENT_REAR_BRIGHTNESS
+                : BydFeatureIds.LIGHT_AMBIENT_FRONT_BRIGHTNESS;
+        int zoneIdAlt = (area == 2)
+                ? BydFeatureIds.LIGHT_AMBIENT_REAR_BRIGHTNESS_ALT
+                : BydFeatureIds.LIGHT_AMBIENT_FRONT_BRIGHTNESS_ALT;
+        int asByte = ambientPercentToByte(percent);
+        if (areaSelected) {
+            if (BydDeviceHelper.sendSetCommand(
+                    lightDevice, BydFeatureIds.LIGHT_ATMOSPHERE_CUSTOM_BRIGHTNESS_SET, percent)) return true;
+            if (BydDeviceHelper.sendSetCommand(
+                    lightDevice, BydFeatureIds.LIGHT_ATMOSPHERE_VEHICLE_BRIGHTNESS_SET, percent)) return true;
+            if (BydDeviceHelper.sendSetCommand(
+                    lightDevice, BydFeatureIds.LIGHT_ATMOSPHERE_VEHICLE_BRIGHTNESS_SET, asByte)) return true;
+        }
+        if (BydDeviceHelper.sendSetCommand(lightDevice, zoneId, percent)) return true;
+        return BydDeviceHelper.sendSetCommand(lightDevice, zoneIdAlt, asByte);
     }
 
     public boolean setAmbientColor(int colorValue) {
@@ -6367,29 +8854,56 @@ public class BydDataCollector {
     }
 
     /**
-     * Set the interior ambient colour by its 1-based palette index (1-31) via the
-     * Setting device's setIALColor. This is the path used by the ambient-colour
-     * vehicle control and automation action (distinct from setAmbientColor above,
-     * which drives the LIGHT_ATMOSPHERE_CUSTOM_COLOR raw value on the Light device).
-     * Returns true when the SDK reports success (result == 0).
+     * Whole-cabin ambient colour by 1-based palette index (1-31). Delegates to the zoned path
+     * with "both", so existing callers (vehicle control, MQTT) now cover BOTH zones rather than
+     * only the front (the old area-1-only behaviour). See {@link #setAmbientLightZoned}.
      */
     public boolean setAmbientLight(int colour) {
-        try {
-            if (colour < 1 || colour > 31) return false;
-            // The SDK method is 2-arg setIALColor(int area, int color) — NOT 1-arg. The
-            // 1-arg lookup found no method and silently no-op'd (returned null), which is
-            // why ambient colour appeared to do nothing. Use area 1 (main/all cabin) to
-            // match our own reader getIALColor(1). If the 2-arg form is somehow absent on
-            // a trim, fall back to the 1-arg attempt rather than failing outright.
-            Object result = BydDeviceHelper.callMethod(settingDevice, "setIALColor", 1, colour);
-            if (result == null) {
-                result = BydDeviceHelper.callMethod(settingDevice, "setIALColor", colour);
-            }
-            return result instanceof Integer && ((Integer) result).intValue() == 0;
-        } catch (Exception e) {
-            logger.debug("setAmbientLight failed: " + e.getMessage());
+        return setAmbientLightZoned("both", colour);
+    }
+
+    /**
+     * Zoned ambient colour by 1-based palette index (1-31), via the Setting device's
+     * {@code setIALColor(area, colour, 0)} (the OEM 3-arg form; a 2-arg form is
+     * tried as a fallback for trims that expose it — the old shipping path). zone:
+     * front/rear/both; "both" (area 3) falls back to front-then-rear. Returns true when the SDK
+     * reports success (result == 0).
+     */
+    public boolean setAmbientLightZoned(String zone, int colour) {
+        if (colour < 1 || colour > 31) return false;
+        return applyIalColor(ambientZoneToArea(zone), colour);
+    }
+
+    private boolean applyIalColor(int area, int colour) {
+        // Area select with the same SDK-then-legacy fallback the brightness path uses, so a trim
+        // without setIALArea still lands the per-zone colour on the intended zone.
+        boolean areaSelected = prepareAmbientArea(area);
+        // Walk the arities the SDK is known to expose, widest first: 3-arg (area, colour, 0),
+        // then 2-arg (area, colour), then the 1-arg (colour) form some trims ship — the last of
+        // these was the only working path on those trims, so it stays in the chain. A null means
+        // "absent, or void" and simply advances to the next arity; the strict result == 0 keeps
+        // the area-3 → front+rear fallback below reachable, same rationale as
+        // applyIalBrightness.
+        Object r = BydDeviceHelper.callMethod(settingDevice, "setIALColor", area, colour, 0);
+        if (r == null) r = BydDeviceHelper.callMethod(settingDevice, "setIALColor", area, colour);
+        if (r == null) r = BydDeviceHelper.callMethod(settingDevice, "setIALColor", colour);
+        boolean ok = r instanceof Integer && ((Integer) r).intValue() == 0;
+        // One retry when the zone selection did NOT take: some trims only accept the colour
+        // write on an already-selected area, and the selection can land on the second attempt.
+        // Mirrors the reference app's post-selection retry.
+        if (!ok && !areaSelected) {
+            Object retry = BydDeviceHelper.callMethod(settingDevice, "setIALColor", area, colour, 0);
+            ok = retry instanceof Integer && ((Integer) retry).intValue() == 0;
         }
-        return false;
+        if (!ok && area == 3) {
+            ok = applyIalColor(1, colour);
+            ok = applyIalColor(2, colour) || ok; // run both; OR so either landing = success
+        }
+        // NOTE: deliberately NO fallback to LIGHT_AMBIENT_{FRONT,REAR}_COLOR here. Those
+        // features take a 24-bit RGB value, not this 1-31 palette index — writing the index
+        // there would command a near-black colour instead of the chosen preset. They are the
+        // fallback for a true RGB setter, which this method is not.
+        return ok;
     }
 
     // --- Seats ---
@@ -6596,7 +9110,9 @@ public class BydDataCollector {
      * than pretending to work. Validate with the probe first; if a different candidate
      * lands, update {@link HazardLightProbe#LIGHT_CMD_DOUBLE_FLASH} (or add a dedicated
      * winning id) and this method follows automatically. The hazard READBACK
-     * ({@code getLightStatus(8)} → {@code snap.hazard}) is independent and already works.
+     * ({@code getLightStatus(8)} → {@code snap.hazard}) is independent of this write, but it is
+     * NOT confirmed either — position 8 is LIGHT_FOOT in the SDK's light-type table, so it may
+     * report the footwell lamp rather than hazard state (see {@link #collectLight}).
      */
     public boolean setHazardLights(boolean enable) {
         if (lightDevice == null) return false;
@@ -6628,7 +9144,7 @@ public class BydDataCollector {
         int v = enable ? 2 : 1;
         try {
             // Route through setAdasFeature → sendSetCommand (success = code >= 0), the SAME
-            // path the OEM firmware's setSpeedLimitAlert uses for the ISLA id and the
+            // path the OEM vehicle-control app's setSpeedLimitAlert uses for the ISLA id and the
             // convention every other feature-id ADAS setter here already uses. The old
             // callSetSingle(...) == 0 used the fragile 3-int set() overload AND an exact-zero
             // test, so a benign non-zero-positive HAL return was read as failure (the
@@ -6684,7 +9200,7 @@ public class BydDataCollector {
             return false;
         }
         try {
-            // Accept-on-no-throw (matches the OEM firmware's setLaneAssistMode and
+            // Accept-on-no-throw (matches the OEM vehicle-control app's setLaneAssistMode and
             // our setAdasReflection/mirror-fold/brightness contract) — do NOT gate on the
             // SDK return, which can be a benign non-zero/negative code read as failure.
             m.invoke(adasDevice, mcuValue);
@@ -6782,7 +9298,7 @@ public class BydDataCollector {
      * id (BSD/AEB/SLA/…), mirroring {@link #setLaneAssistMode}'s setLKSMode path. False
      * if the device or method is absent on this OEM build.
      *
-     * <p>SUCCESS SEMANTICS: accept-on-no-throw — the SAME contract the OEM firmware
+     * <p>SUCCESS SEMANTICS: accept-on-no-throw — the SAME contract the OEM vehicle-control app
      * app uses for EVERY ADAS reflection setter (it invokes {@code setBSDState/setSLAState/
      * setAEBState/setLKSMode/…} and unconditionally returns true, never inspecting the SDK
      * return). Routing these through {@link #isSdkWriteSuccess} was the reported "most ADAS
@@ -6956,7 +9472,7 @@ public class BydDataCollector {
     /** Invoke setESPState(value) on adasDevice; true on no-throw. The caller
      *  ({@link #setEspState}) prefers a getESPState readback to confirm; this raw result is
      *  only used on trims with no readback, so it uses the same accept-on-no-throw contract
-     *  as the OEM firmware's setESPEnabled (which never inspects the SDK return) —
+     *  as the OEM vehicle-control app's setESPEnabled (which never inspects the SDK return) —
      *  rather than isSdkWriteSuccess, which can read a benign non-zero/negative code as a
      *  failure and make the no-readback fallback wrongly report ESP as unchanged. */
     private boolean invokeEspWrite(Method m, int value) {
@@ -7230,12 +9746,12 @@ public class BydDataCollector {
      * Driver-cluster brightness. Three complementary write paths, best-effort (succeeds if
      * any lands):
      *  1) {@code setDriverDisplayBrightness(0..100)} on the setting HAL (primary handle) —
-     *     matches the OEM DiLink3/4 path.
+     *     matches the OEM vehicle-control app DiLink3/4 path.
      *  2) the same setter on a real system-context handle — the synthetic daemon context can
      *     silently no-op this particular write (see {@link #getSystemContextSettingDevice}).
      *  3) {@code BYDAutoInstrumentDevice.setBacklightBrightness(1..12)} — the driver INSTRUMENT
      *     cluster is served by the instrument device on some trims (DiLink5 / where the
-     *     setting-HAL write no-ops). the reference implementation drives the cluster this way (C4178d
+     *     setting-HAL write no-ops). the secondary reference app drives the cluster this way (C4178d
      *     setBacklightBrightness on a 1-12 gear scale, wrapping values >11). We map the
      *     incoming 0-100 percent onto 1..12 so a single action reaches whichever HAL this
      *     trim honours.
@@ -7249,7 +9765,7 @@ public class BydDataCollector {
 
     /**
      * Fallback driver-cluster path: {@code BYDAutoInstrumentDevice.setBacklightBrightness(int)}
-     * on a 1..12 gear scale (reference implementation). Maps the incoming 0..100 percent to 1..12. A
+     * on a 1..12 gear scale (the secondary reference app C4178d). Maps the incoming 0..100 percent to 1..12. A
      * missing method / device is a quiet no-op (returns false). Accept-on-no-throw, matching
      * the other reflection setters.
      */
@@ -7272,16 +9788,60 @@ public class BydDataCollector {
     }
 
     public boolean setHudBrightness(int level) {
-        // The HUD is a driver-facing instrument display served by the same BYDAutoSettingDevice
-        // HAL as the driver cluster, so it is subject to the identical synthetic-context
-        // silent-no-op (the invoke throws nothing but the panel never moves). Mirror
-        // setDriverDisplayBrightness: also invoke on the real system-context handle and
-        // succeed if either lands. Without this, the primary handle "succeeds" (no throw)
-        // yet the HUD never changes, so both the HUD-brightness and HUD-on/off actions
-        // appeared to do nothing.
-        boolean primary = setBrightnessViaMethod("setHUDBrightness", level);
+        // HUD BRIGHTNESS (0..100) via the named BYDAutoSettingDevice.setHUDBrightness(int).
+        // This is separate from HUD power on/off (see setHudPower, which writes the dedicated
+        // SET_HUD_SWITCH_SET feature-id). From the daemon (UID 2000, synthetic context) the
+        // named setter accepts the reflection call without throwing but silently no-ops — the
+        // same signature-gate that afflicts every setting-family DISPLAY write here. So the
+        // ACTUAL actuating path is the app-process dispatch below: it re-issues the identical
+        // setHUDBrightness call from the real app process where the setting HAL honours it. The
+        // daemon call is kept only as a harmless best-effort for any firmware where the write is
+        // live from UID 2000 (accept-on-no-throw).
+        boolean named = setBrightnessViaMethod("setHUDBrightness", level);
+        // Also write through the SYSTEM-CONTEXT setting handle, exactly as
+        // setDriverDisplayBrightness still does. This attempt was dropped when the app-process
+        // dispatch was added, but it is a DIFFERENT device handle, not a duplicate of the line
+        // above — it is the path that actuates on trims where the synthetic-context handle
+        // no-ops, and losing it meant HUD brightness stopped working entirely whenever the app
+        // process wasn't up to serve the dispatch.
         boolean sysCtx = setBrightnessViaMethodOn(getSystemContextSettingDevice(), "setHUDBrightness", level);
-        return primary || sysCtx;
+
+        // The real path: run setHUDBrightness from the REAL app process — see setMirrorsFolded
+        // for the rationale (some setting HALs only actuate from a normal app-process Context,
+        // not the daemon's). Async; the app service (VehicleActuatorService) logs its own result.
+        try {
+            com.overdrive.app.byd.VehicleActuatorBridge.dispatchHud(level);
+        } catch (Throwable t) {
+            logger.debug("setHudBrightness app-process dispatch failed: " + t.getMessage());
+        }
+        return named || sysCtx;
+    }
+
+    /**
+     * HUD POWER on/off — the DEDICATED switch, distinct from {@link #setHudBrightness}. On the
+     * newer OEM firmware the HUD on/off state is its own Setting feature-id
+     * ({@link BydFeatureIds#SETTING_HUD_SWITCH_SET}), written as a {@code BYDAutoEventValue} via
+     * the standard {@code set(int[], EventValue)} path — value 1 = on, 2 = off (NOT 0). Driving
+     * brightness to 0 does NOT toggle this switch, which is why a brightness-only "HUD off" left
+     * the HUD lit. Like brightness, the write only actuates from a real app process, so the
+     * daemon attempt is a best-effort and the app-process dispatch is the load-bearing path.
+     */
+    public boolean setHudPower(boolean on) {
+        int val = on ? 1 : 2; // OEM contract: 1=on, 2=off
+        boolean daemonOk = false;
+        try {
+            daemonOk = BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_HUD_SWITCH_SET, val);
+            logger.info("setHudPower: SET_HUD_SWITCH_SET(" + val + ") daemon accepted=" + daemonOk);
+        } catch (Throwable t) {
+            logger.debug("setHudPower daemon write failed: " + t.getMessage());
+        }
+        // Load-bearing path: run the identical switch write from the REAL app process.
+        try {
+            com.overdrive.app.byd.VehicleActuatorBridge.dispatchHudPower(on);
+        } catch (Throwable t) {
+            logger.debug("setHudPower app-process dispatch failed: " + t.getMessage());
+        }
+        return daemonOk;
     }
 
     /**
@@ -7344,6 +9904,28 @@ public class BydDataCollector {
 
     public boolean setScreenPower(boolean on) {
         logger.info("setScreenPower: " + (on ? "ON" : "OFF"));
+        // An explicit screen-ON while parked must not be undone within 10s by the
+        // ACC-sentry keep-alive in the OTHER process (which darkens the panel on
+        // dilink4). Publish a short grace it honours. Also escalate the wake
+        // through StealthPanel: the tiers below have no *WithLock variant, so on
+        // firmware where the panel was darkened via TurnBacklightOffWithLock they
+        // may not light it at all. Both are no-ops on legacy units.
+        if (on) {
+            try {
+                com.overdrive.app.power.StealthPanel.requestUserOverride();
+                com.overdrive.app.power.StealthPanel.turnOn(context);
+            } catch (Throwable t) {
+                logger.debug("setScreenPower: verified wake failed: " + t.getMessage());
+            }
+        } else {
+            // Explicit screen-OFF: the tiers below change the panel outside
+            // StealthPanel, which is unobservable on firmware with no
+            // getPowerScreenStatus(). Declare it so its latch doesn't later skip
+            // a genuinely-needed write.
+            try {
+                com.overdrive.app.power.StealthPanel.notePanelStateChangedExternally();
+            } catch (Throwable ignored) {}
+        }
         // Tier 1 + 2: PowerManager backlight reflection (the primary path).
         Context ctx = context;
         if (ctx != null) {
@@ -7443,41 +10025,211 @@ public class BydDataCollector {
     // --- Miscellaneous ---
 
     /**
-     * Fold/unfold the exterior mirrors. Per the OEM SDK this is the dedicated
-     * {@code setMirrorFoldState(int)} reflection method on the bodywork device (1=fold/
-     * 0=unfold) — preferred over the generic {@code MIRROR_REARVIEW_SET} feature-id
-     * write (the id is real, so the generic set() may also route, but the named method
-     * is the confirmed path). Falls back to the feature-id write if the method is absent.
+     * Fold/unfold the exterior mirrors, from the UID-2000 daemon. 1=fold / 0=unfold.
+     *
+     * <p><b>What was actually wrong.</b> Every previous variant reported SUCCESS unconditionally
+     * once the named method existed, which is why "mirror fold doesn't work" looked like a HAL
+     * mystery — the UI, the HA echo and the logs all claimed it had worked:
+     * <ul>
+     *   <li>The shipped version invoked {@code setMirrorFoldState} and did a bare
+     *       {@code return true} on any non-throwing call, deliberately not inspecting the
+     *       result. That also made its own {@code MIRROR_REARVIEW_SET} fallback dead code:
+     *       the fallback was reachable only when the method was ABSENT, never when it was
+     *       present and refused the write.</li>
+     *   <li>A later in-tree variant added extra candidate paths and an {@code anyAccepted}
+     *       flag with the same accept-on-no-throw flaw, and one of those paths wrote
+     *       {@code SET_OUTSIDE_REARVIEW_MIRROR_FOLD_SET} / 0x4C10A028 — an id that does NOT
+     *       exist in the OEM SDK (its {@code Mirror} class has exactly two fields, and
+     *       0x4C10A0xx is an Instrument-block range). {@link BydFeatureIds#resolveOrFallback}
+     *       silently substitutes an invented literal on a miss, so it wrote a foreign id and
+     *       the generic write's {@code code >= 0} test read the result as accepted. That
+     *       constant is now deleted.</li>
+     * </ul>
+     *
+     * <p>Per the shipped code's own note, {@code setMirrorFoldState} returns {@code void} on
+     * this platform's bodywork device — hence the explicit no-signal case below rather than
+     * pretending a void return proves actuation.
+     *
+     * <p>So this now does what the OEM does and nothing else: try the named method FIRST and
+     * believe its return code (success is equality with {@code BODYWORK_COMMAND_SUCCESS}==0 —
+     * the same predicate the reference app's {@code interpret()} uses, applied inline here and
+     * in {@link #isBodyworkCommandSuccess}), then fall back to the real bodywork mirror
+     * feature-id when — and only when — the named call gave a definite refusal. Every outcome
+     * is logged with the raw code so a single device run distinguishes "not fitted" from "HAL
+     * refused". Returns true ONLY when a write was genuinely accepted (or when the trim's
+     * {@code void} API leaves no signal to contradict it), so a failure now surfaces in the UI
+     * instead of a false confirmation.
+     *
+     * <p>The SDK's {@code HAVE_REARVIEW_MIRROR_AUTO_FOLD} capability is probed and LOGGED but
+     * deliberately not used as a gate — see the comment at the call site for why a 0 from
+     * that read cannot be distinguished from "no data".
      */
     public boolean setMirrorsFolded(boolean folded) {
         int val = folded ? 1 : 0;
+
+        // Capability probe — ADVISORY ONLY, deliberately NOT a gate.
+        //
+        // It would be tempting to bail out when this reads 0 ("no power-folding mirrors"),
+        // but a 0 here is not trustworthy enough to block the actuator: the named getter is
+        // absent on many trims, and the feature-id read is CROSS-FAMILY (0x4070001A is a
+        // Mirror-namespace id being read off the bodywork device, whose deviceType
+        // callGetSingle derives from the device itself) — a HAL that doesn't recognise the
+        // pair can answer 0 for "no data" rather than "not fitted", indistinguishable from a
+        // real negative. Gating on that would newly break fold on cars where it works.
+        // So we only LOG it: combined with the per-path outcome logs below, one device run
+        // still tells us whether the trim lacks the actuator or the HAL refused the write.
+        Integer capable = readMirrorAutoFoldCapability();
+        if (capable != null) {
+            logger.info("setMirrorsFolded: HAVE_REARVIEW_MIRROR_AUTO_FOLD=" + capable
+                    + (capable == 0 ? " (trim may not have power-folding mirrors —"
+                                    + " attempting anyway, see per-path results below)" : ""));
+        }
+
+        // Path 1 — the OEM's own call: BYDAutoBodyworkDevice.setMirrorFoldState(int).
+        // This is exactly what the reference app does, and now its result is CHECKED.
+        //
+        // Three distinguishable outcomes, and the distinction matters: an explicit 0/true is
+        // a real ACCEPT; an explicit failure code is a real REFUSE; a void/null return is NO
+        // SIGNAL. The old code collapsed all three into "success", which is precisely how a
+        // refusal became a false confirmation. A no-signal result must NOT short-circuit —
+        // we fall through to path 2, which does return a code, and only claim success on a
+        // no-signal call if nothing else produced a definite answer.
+        boolean firedWithoutSignal = false;
         if (bodyworkDevice != null) {
             try {
                 Method m = bodyworkDevice.getClass().getMethod("setMirrorFoldState", int.class);
-                m.invoke(bodyworkDevice, val);
-                // PARITY with the OEM firmware: it invokes setMirrorFoldState and
-                // returns true on any non-throwing call — it does NOT inspect the return
-                // value. This method returns void on this platform's bodywork device, so
-                // routing the result through isSdkWriteSuccess (which special-cases an
-                // Integer status) was fragile: a firmware that returns a nonzero-but-OK
-                // status code would be misread as failure and the automation/keymap would
-                // report "didn't work" even though the mirrors moved. The invoke not
-                // throwing is the success signal, exactly as the reference app treats it.
-                logger.info("setMirrorFoldState(" + val + ") invoked (fold=" + folded + ")");
-                return true;
+                Object r = m.invoke(bodyworkDevice, val);
+                if (r instanceof Integer) {
+                    boolean ok = ((Integer) r) == 0;   // BODYWORK_COMMAND_SUCCESS
+                    logger.info("setMirrorsFolded: setMirrorFoldState(" + val + ") -> code=" + r
+                            + (ok ? " ACCEPTED" : " REFUSED"));
+                    if (ok) return true;
+                } else if (r instanceof Boolean) {
+                    boolean ok = (Boolean) r;
+                    logger.info("setMirrorsFolded: setMirrorFoldState(" + val + ") -> " + r
+                            + (ok ? " ACCEPTED" : " REFUSED"));
+                    if (ok) return true;
+                } else {
+                    // Declared void on this trim — it returned without throwing, but that is
+                    // NOT evidence the mirrors moved.
+                    firedWithoutSignal = true;
+                    logger.info("setMirrorsFolded: setMirrorFoldState(" + val
+                            + ") returned no value (void) — no accept/refuse signal");
+                }
             } catch (NoSuchMethodException nsme) {
-                logger.info("setMirrorFoldState absent — falling back to feature-id write");
+                logger.info("setMirrorsFolded: setMirrorFoldState absent on bodywork device");
             } catch (Exception e) {
-                logger.debug("setMirrorFoldState failed: " + e.getMessage());
-                return false;
+                logger.debug("setMirrorsFolded setMirrorFoldState failed: " + e.getMessage());
             }
         }
-        try {
-            return BydDeviceHelper.sendSetCommand(bodyworkDevice, BydFeatureIds.MIRROR_REARVIEW_SET, val);
-        } catch (Exception e) {
-            logger.debug("setMirrorsFolded fallback failed: " + e.getMessage());
-            return false;
+
+        // Path 2 — the generic feature-id write with the ONLY mirror id the OEM SDK defines
+        // (Mirror.BODYWORK_REARVIEW_MIRROR_SET, 0x4EF32010), on the bodywork device that owns
+        // it. Previously unreachable because the old code always claimed success above it.
+        //
+        // SKIPPED when path 1 already fired without a signal. Two reasons, both concrete:
+        //  * If that void call DID move the mirrors, this second write lands mid-travel and
+        //    the HAL answers BODYWORK_COMMAND_BUSY — which we would log as "REFUSED" on a car
+        //    where fold actually worked. This method's whole purpose is to make one device run
+        //    conclusive, so a self-inflicted misleading log is the worst possible outcome.
+        //  * It also avoids commanding the same actuator twice per press for no benefit (the
+        //    value is identical, so it is not a fold/unfold conflict, just pointless).
+        // A trim that reports a real code from path 1 (ACCEPT or REFUSE) still reaches here on
+        // refusal, which is exactly where a genuine second candidate is worth trying.
+        if (bodyworkDevice != null && !firedWithoutSignal) {
+            try {
+                int code = BydDeviceHelper.sendSetCommandRaw(
+                        bodyworkDevice, BydFeatureIds.MIRROR_REARVIEW_SET, val);
+                boolean ok = isBodyworkCommandSuccess(code);
+                logger.info("setMirrorsFolded: bodywork BODYWORK_REARVIEW_MIRROR_SET(" + val
+                        + ") -> code=" + code + (ok ? " ACCEPTED" : " REFUSED"));
+                if (ok) return true;
+            } catch (Exception e) {
+                logger.debug("setMirrorsFolded bodywork-id write failed: " + e.getMessage());
+            }
         }
+
+        // Deliberately NO setting-device tier. The setting device's mirror methods are
+        // setRearViewMirrorFlip and setAutoExternalRearMirrorFollowUpSwitch — both documented as
+        // persistent Off/On SWITCHES with getters and "switch's change" listeners (the SDK also
+        // names the capability FEATURE_REARVIEW_MIRROR_FOLLOW_UP). That is the reverse-dip /
+        // follow-up preference family, NOT the power-fold actuator: writing them would silently
+        // change an unrelated user setting and report it as a fold. Folding lives only on the
+        // bodywork paths above.
+
+        // No daemon path returned a definite accept. Last resort, ALWAYS attempted from here:
+        // run the same write from the REAL app process (UID 10xxx, real Context) via the
+        // app-process actuator, in case this HAL only honours it from a normal app process.
+        // Fire-and-forget — the service logs its own outcome under the VehicleActuator tag.
+        // Exactly one dispatch per call (this is the only dispatch site; every accepting path
+        // above returned before reaching it).
+        try {
+            com.overdrive.app.byd.VehicleActuatorBridge.dispatchMirror(folded);
+        } catch (Throwable t) {
+            logger.debug("setMirrorsFolded app-process dispatch failed: " + t.getMessage());
+        }
+
+        if (firedWithoutSignal) {
+            // The OEM's own named call went through and returned nothing to contradict it.
+            // There is no better evidence available for a void API, so report it as sent —
+            // this is the single case where the old accept-on-no-throw behaviour was
+            // defensible. The per-path logs above identify this case exactly.
+            logger.info("setMirrorsFolded: reporting success on the void setMirrorFoldState "
+                    + "call (no accept/refuse signal available); app-process attempt also sent");
+            return true;
+        }
+
+        // Every path that CAN report a result reported refusal (or was unavailable). Say so:
+        // a false confirmation here is what made this look like a working feature.
+        logger.warn("setMirrorsFolded: no daemon path accepted the write (fold=" + folded
+                + "); app-process attempt dispatched — see VehicleActuator log");
+        return false;
+    }
+
+    /**
+     * Whether this trim has power-folding mirrors, via the OEM's named
+     * {@code hasMirrorAutoFoldCapability()} getter on the bodywork device — the same probe the
+     * reference app makes before offering the control. Returns 1/0 when the trim answers, or
+     * null when the getter is absent (the common case), meaning UNKNOWN.
+     *
+     * <p>Deliberately does NOT fall back to a {@code MIRROR_HAVE_AUTO_FOLD} (0x4070001A)
+     * feature-id read. That id is in a SETTING-family block (its only sibling in this repo is
+     * {@code Setting.SET_REMOTE_CONTROL_UNLOCKING_SET} = 0x40700016), so reading it off the
+     * bodywork device — whose deviceType {@code callGetSingle} derives from the device itself —
+     * forms a (bodyworkDeviceType, setting-id) pair the HAL does not recognise. It would answer
+     * 0 or -1 on essentially every car, and a 0 logged as "may not have power-folding mirrors"
+     * would systematically mis-diagnose cars whose mirrors fold perfectly well. Since this
+     * probe exists purely to make a device run conclusive, a leg that reliably lies is worse
+     * than no leg at all.
+     */
+    private Integer readMirrorAutoFoldCapability() {
+        if (bodyworkDevice == null) return null;
+        try {
+            Object r = BydDeviceHelper.callGetter(bodyworkDevice, "hasMirrorAutoFoldCapability");
+            if (r instanceof Boolean) return ((Boolean) r) ? 1 : 0;
+            if (r instanceof Integer) return (Integer) r;
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /**
+     * The OEM's success predicate for a bodywork write: {@code BODYWORK_COMMAND_SUCCESS} is 0
+     * and every documented failure ({@code _FAILED} -2147482648, {@code _BUSY},
+     * {@code _TIMEOUT}, {@code _INVALID_VALUE}) is a large negative. The reference app's own
+     * {@code interpret()} tests equality with 0, so a non-zero code is NOT success — the
+     * generic {@code sendSetCommand}'s looser {@code code >= 0} is what let refused mirror
+     * writes read as accepted. {@link Integer#MIN_VALUE} is sendSetCommandRaw's
+     * "threw before producing a code" sentinel and is correctly rejected here.
+     *
+     * <p>Caveat this deliberately accepts: {@code sendSetCommandRaw} also returns 0 from its
+     * "non-null result, assume success" branch when the HAL's {@code set()} is declared
+     * {@code void}. That is the same no-signal case the named-method path handles explicitly,
+     * and there is no better evidence available for a void API — so a 0 here means "accepted,
+     * or returned nothing to contradict it". The per-path log records the raw code, so a
+     * device run still shows which of the two it was.
+     */
+    private static boolean isBodyworkCommandSuccess(int code) {
+        return code == 0;
     }
 
     /**
@@ -7672,8 +10424,58 @@ public class BydDataCollector {
      * @return true if any path reported success
      */
     public boolean setDriveConfigMode(int configMode) {
-        // 1) Dedicated setting-device method — judged with isSdkWriteSuccess (checks
-        //    the resolved COMMAND_SUCCESS constant), so a real success is trustworthy.
+        boolean ok = setDriveConfigModeInternal(configMode);
+        if (ok) {
+            // Cache the last-commanded APP mode. The write sends a remapped "apiMode"
+            // (NORMAL and SPORT both → 2), so the raw axis readback is ambiguous and can't
+            // recover which of the two was chosen — getDriveConfigMode() prefers this cache
+            // so the published telemetry, the MQTT state echo, the drive-mode automation
+            // condition, and the DriveModeEvent fast trigger all report the mode the user
+            // actually selected, not the ambiguous raw value. Set-only-with-optimistic-echo,
+            // the same model the mirror-fold / child-lock controls use.
+            lastCommandedDriveMode = configMode;
+        }
+        return ok;
+    }
+
+    // Last app-level drive mode successfully commanded (1..4), or -1 if none yet. Preferred
+    // by getDriveConfigMode() over the ambiguous raw axis read. volatile: written on the
+    // command thread, read on the BydDataPoll + DriveModeEvent poll threads.
+    private volatile int lastCommandedDriveMode = -1;
+
+    private boolean setDriveConfigModeInternal(int configMode) {
+        // Set when the NORMAL request reached setDriveConfig and it returned VOID (no
+        // accept/refuse signal). See the NORMAL note in step 1 for why that alone must not end
+        // the chain for NORMAL — and only for NORMAL.
+        boolean normalFiredWithoutSignal = false;
+        // SNOW (4) is NOT a setDriveConfig value on this axis — the OEM sets it via the
+        // energy device's setRoadSurfaceMode(2) (ENERGY_ROAD_SURFACE_SNOW = 2). Try that FIRST,
+        // but do NOT return early on failure: HEAD reached setDriveConfig(4) and both
+        // target-mode feature-ids for SNOW, so bailing here would leave a trim that lacks
+        // setRoadSurfaceMode with NO snow path at all where it previously had three. Prefer the
+        // OEM's dedicated route, then fall through to the generic ladder below.
+        if (configMode == 4) {
+            if (setRoadSurfaceMode(2)) {
+                logger.info("setDriveConfigMode(SNOW): applied via energy-device setRoadSurfaceMode(2)");
+                return true;
+            }
+            logger.warn("setDriveConfigMode(SNOW): setRoadSurfaceMode unavailable — falling through "
+                    + "to setDriveConfig / target-mode feature-ids");
+        }
+
+        // Map the app-level mode to the OEM's setDriveConfig "apiMode": ECO(2)→3, SPORT(3)→2,
+        // SNOW(4)→4. Verified in the OEM's packed-switch, not just the decompiler.
+        //
+        // NORMAL keeps its RAW 1 on purpose. The OEM remaps NORMAL→2 as well, i.e. NORMAL and
+        // SPORT send an IDENTICAL value — so remapping it made "select NORMAL" indistinguishable
+        // from SPORT and the mode became unreachable (the reported bug). 1 is at least a distinct
+        // value the axis may decode as normal, and our own getDriveConfig readback already
+        // decodes raw 1..4 as app-mode 1=normal/2=eco/3=sport/4=snow, so raw 1 is the only value
+        // consistent with how we READ this axis. If a device log later shows 1 being rejected,
+        // the answer is a different lever for NORMAL — not sending SPORT's value.
+        int apiMode = (configMode == 4) ? 4 : (configMode == 2) ? 3 : (configMode == 3) ? 2 : 1;
+
+        // 1) Dedicated setting-device method with the REMAPPED apiMode (the OEM's primary path).
         if (settingDevice != null) {
             Method m = null;
             try {
@@ -7685,52 +10487,130 @@ public class BydDataCollector {
             }
             if (m != null) {
                 try {
-                    Object r = m.invoke(settingDevice, configMode);
-                    if (isSdkWriteSuccess(settingDevice, r, "setDriveConfig")) return true;
+                    Object r = m.invoke(settingDevice, apiMode);
+                    if (isSdkWriteSuccess(settingDevice, r, "setDriveConfig")) {
+                        // setDriveConfig is VOID on this platform (the OEM never checks its
+                        // return), so "didn't throw" is not evidence the mode moved. Log the
+                        // readback as a DIAGNOSTIC only — deliberately NOT a gate. Two unknowns
+                        // block gating on it: whether this axis reports app modes (1..4) or the
+                        // apiMode encoding we just wrote, and whether it settles before we read.
+                        // Under the apiMode hypothesis a SUCCESSFUL eco write reads back 3 and a
+                        // configMode comparison would call it a failure — regressing eco/sport,
+                        // which work today, to chase NORMAL. The log gives the on-device evidence
+                        // to settle the encoding; until then behaviour is unchanged.
+                        int seen = readDriveConfigRaw();
+                        logger.info("setDriveConfigMode(" + configMode + "): setDriveConfig(apiMode="
+                                + apiMode + ") accepted (UNVERIFIED); axis now reads "
+                                + (seen == Integer.MIN_VALUE ? "<no answer>" : String.valueOf(seen))
+                                + " — if this equals apiMode the axis echoes the write encoding,"
+                                + " if it equals " + configMode + " it reports app modes,"
+                                + " if it is unchanged the write did not take");
+                        // NORMAL ONLY: a void return proves nothing, and NORMAL is the one mode
+                        // whose value (raw 1) the OEM never emits — so "accepted" here is exactly
+                        // the false confirmation that made NORMAL look like a no-op while ECO/
+                        // SPORT/SNOW (which send the OEM's own apiMode) genuinely work. Keep
+                        // going to the carsettings tier instead of returning success. An explicit
+                        // Integer/Boolean accept is still trusted and returns immediately.
+                        if (configMode == 1 && !(r instanceof Integer) && !(r instanceof Boolean)) {
+                            normalFiredWithoutSignal = true;
+                        } else {
+                            return true;
+                        }
+                    }
                 } catch (Exception e) {
-                    logger.debug("setDriveConfig(" + configMode + ") failed: " + e.getMessage());
+                    logger.debug("setDriveConfig(apiMode=" + apiMode + ") failed: " + e.getMessage());
                 }
             }
         }
 
-        boolean ecoOrSport = (configMode == 2 || configMode == 3);
-
-        // 2) For ECO/SPORT, prefer the KNOWN-GOOD energy-device path before the
-        //    guessed target-driving-mode feature ids. The feature ids are
-        //    resolveOrFallback guesses and BydDeviceHelper.sendSetCommand treats any
-        //    code >= 0 as success — so a HAL that returns >= 0 for an unrecognized id
-        //    would falsely "succeed" and starve the working energy fallback. eco/sport
-        //    have a proven energy equivalent (config 2/3 → energy 1/2), so use it
-        //    first; NORMAL/SNOW have no energy equivalent and MUST use the feature ids.
-        if (ecoOrSport && setOperationMode(configMode - 1)) {
+        // 2) ECO/SPORT energy-device fallback: config 2/3 → energy operation-mode 1/2.
+        //    ORDER MATTERS, and this is the order HEAD shipped. This is a NAMED SDK method and
+        //    the proven path on trims where setDriveConfig is absent (field-reported: eco/sport
+        //    work via the energy axis there), whereas step 3 writes GUESSED feature-ids. Named
+        //    methods before guessed ids, because an unrecognised id that the HAL nonetheless
+        //    accepts would both falsely "succeed" (starving this working path) and potentially
+        //    write some unrelated setting. Caveat worth knowing: setOperationMode is judged by
+        //    isSdkWriteSuccess, which accepts a void/non-Integer return as success, so on a trim
+        //    where it resolves but does not actuate this can still claim success — that is why
+        //    the paths are ordered by confidence rather than merged into a try-everything.
+        if ((configMode == 2 || configMode == 3) && setOperationMode(configMode - 1)) {
+            logger.info("setDriveConfigMode(" + configMode + "): applied via energy setOperationMode(" + (configMode - 1) + ")");
             return true;
         }
 
-        // 3) + 4) Generic feature-id writes on the setting device. For NORMAL/SNOW this
-        //    is the only path; for eco/sport it is a further fallback if the energy
-        //    path above didn't stick.
+        // 3) Target-mode feature-ids, also with the REMAPPED apiMode (the OEM fallback feeds
+        //    apiMode here too — previously OverDrive sent the raw configMode). Judged through
+        //    isSdkWriteSuccess, which resolves this device family's own <FAMILY>_COMMAND_SUCCESS
+        //    constant. NOT a hardcoded == 0: SETTING_COMMAND_SUCCESS is not guaranteed 0 on this
+        //    platform (sibling families prove non-zero SUCCESS — CHARGING is 2, see
+        //    setSeatMemoryPosition), so == 0 would reject a write that actually landed.
         if (settingDevice != null) {
-            if (BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_TARGET_DRIVING_MODE, configMode)) {
+            int r1 = BydDeviceHelper.sendSetCommandRaw(settingDevice, BydFeatureIds.SETTING_TARGET_DRIVING_MODE, apiMode);
+            if (isSdkWriteSuccess(settingDevice, r1, "SETTING_TARGET_DRIVING_MODE")) {
+                logger.info("setDriveConfigMode(" + configMode + "): SETTING_TARGET_DRIVING_MODE(apiMode=" + apiMode + ") ok (code=" + r1 + ")");
                 return true;
             }
-            if (BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_TARGET_DRIVING_MODE_ALT, configMode)) {
+            int r2 = BydDeviceHelper.sendSetCommandRaw(settingDevice, BydFeatureIds.SETTING_TARGET_DRIVING_MODE_ALT, apiMode);
+            if (isSdkWriteSuccess(settingDevice, r2, "SETTING_TARGET_DRIVING_MODE_ALT")) {
+                logger.info("setDriveConfigMode(" + configMode + "): SETTING_TARGET_DRIVING_MODE_ALT(apiMode=" + apiMode + ") ok (code=" + r2 + ")");
                 return true;
             }
         }
-        // 5) NORMAL last-resort: the energy device's own axis. ECO/SPORT map config 2/3 →
-        //    energy 1/2 (handled above); by symmetry the energy axis' NORMAL is 0. On a trim
-        //    where setDriveConfig + the target-mode feature-ids are all absent (the field
-        //    report: eco/sport work via the energy path, NORMAL never applies), this is the
-        //    only remaining lever. Best-effort — setOperationMode returns false if the getter
-        //    is absent or the HAL rejects 0, so it never falsely "succeeds".
-        if (configMode == 1 && setOperationMode(0)) {
-            logger.info("setDriveConfigMode(NORMAL): applied via energy-device setOperationMode(0)");
+
+        // 4) Deliberately NO carsettings-provider tier. The provider key "power_management"
+        //    (BydCarSettings, labelled "Drive Mode") looks like the missing NORMAL lever, but
+        //    neither the key's identity nor its value order is evidenced anywhere — the label is
+        //    OverDrive's own and the registry records only the domain {0,1,2}. The provider write
+        //    also lands BEFORE its return is inspected (BydCarSettings.putIntRaw), so a "not
+        //    confirmed" result still mutated a real CAN-backed setting. Writing a guessed value
+        //    into an unidentified vehicle setting is worse than reporting failure, so this stays
+        //    out until a device dump pins down both the key and the numbering.
+
+        // 5) NO energy-device fallback for NORMAL, deliberately. The energy axis has only
+        //    ENERGY_OPERATION_ECONOMY=1 and ENERGY_OPERATION_SPORT=2 — no value reads back as
+        //    NORMAL (the OEM's getDriveConfig decodes op=1+surface=COMMON as ECO), so anything
+        //    written here would command ECO and then be cached as NORMAL. Failing honestly is
+        //    better: setOperationMode/setRoadSurfaceMode count a void return as success, so a
+        //    false success would also freeze MQTT/HA/automation on a wrong "normal".
+
+        if (normalFiredWithoutSignal) {
+            // setDriveConfig(1) went through and returned nothing to contradict it, and no
+            // other tier accepted. Report it as sent — same "no better evidence for a void
+            // API" rule setMirrorsFolded uses — but say plainly that it is unconfirmed, so a
+            // device log distinguishes this from a genuine accept.
+            logger.info("setDriveConfigMode(NORMAL): reporting success on the void "
+                    + "setDriveConfig(apiMode=" + apiMode + ") call (no accept/refuse signal, and "
+                    + "no target-mode feature-id accepted) — actuation UNVERIFIED");
             return true;
         }
-        logger.warn("setDriveConfigMode(" + configMode + "): no working drive-config path on this build "
-                + "(setDriveConfig absent + target-mode feature-ids rejected"
-                + (configMode == 1 ? " + energy setOperationMode(0) rejected" : "") + ")");
+
+        logger.warn("setDriveConfigMode(" + configMode + ", apiMode=" + apiMode + "): no working "
+                + "drive-config path on this build (setDriveConfig + target-mode feature-ids rejected"
+                + ((configMode == 2 || configMode == 3) ? " + energy fallback rejected" : "")
+                + (configMode == 1 ? "; NORMAL has no energy-axis fallback by design" : "")
+                + (configMode == 4 ? " + energy setRoadSurfaceMode(2) rejected" : "") + ")");
         return false;
+    }
+
+    /**
+     * Energy-device {@code setRoadSurfaceMode(int)} — the OEM path for SNOW drive mode (it
+     * calls setRoadSurfaceMode(2) rather than setDriveConfig for snow). Returns
+     * true only on a non-throwing invoke with a success-coded result; false when the method or
+     * device is absent so a trim without it never falsely reports success.
+     */
+    private boolean setRoadSurfaceMode(int mode) {
+        if (energyDevice == null) return false;
+        try {
+            Method m = energyDevice.getClass().getMethod("setRoadSurfaceMode", int.class);
+            Object r = m.invoke(energyDevice, mode);
+            return isSdkWriteSuccess(energyDevice, r, "setRoadSurfaceMode");
+        } catch (NoSuchMethodException nsme) {
+            logger.debug("setRoadSurfaceMode absent on energy device");
+            return false;
+        } catch (Exception e) {
+            logger.debug("setRoadSurfaceMode(" + mode + ") failed: " + e.getMessage());
+            return false;
+        }
     }
 
     /**
@@ -7740,6 +10620,23 @@ public class BydDataCollector {
      * drive-mode telemetry so read and write share one axis.
      */
     public int getDriveConfigMode() {
+        // Prefer the last-commanded app mode. setDriveConfigMode writes a REMAPPED apiMode
+        // (NORMAL→2, ECO→3, SPORT→2), and getDriveConfig is an undocumented method — it is
+        // absent from the SDK javadoc entirely, so whether it reads back the app-level mode
+        // (1..4) or the apiMode we wrote is UNVERIFIED. That matters because the raw value flows
+        // straight into BydEvent.driveModeToString (1=normal/2=eco/3=sport/4=snow): if the
+        // readback is in apiMode space, commanding ECO writes 3 and reads back 3, which would
+        // publish "sport" for a car in eco. And even in app-mode space a raw 2 cannot separate
+        // NORMAL from SPORT, since both map to apiMode 2. So the commanded intent wins whenever
+        // we have one, and the live read is only a fallback for "no set this session".
+        //
+        // (A mode changed from the car's own UI won't update this cache — the accepted trade-off
+        // of a set-only axis with an unverified readback, same as mirror-fold / child-lock. The
+        // diagnostic below still fires until the first successful set, which is when the raw
+        // encoding can be identified from a logcat; once that is known this can be tightened.)
+        int cached = lastCommandedDriveMode;
+        if (cached >= 1 && cached <= 4) return cached;
+
         if (settingDevice == null) return -1;
         try {
             Object r = BydDeviceHelper.callGetter(settingDevice, "getDriveConfig");
@@ -7754,9 +10651,16 @@ public class BydDataCollector {
                 long now = System.currentTimeMillis();
                 if (now - lastDriveConfigLogMs > 60000) {
                     lastDriveConfigLogMs = now;
-                    logger.info("getDriveConfig raw=" + v + " (1=normal/2=eco/3=sport/4=snow)");
+                    logger.info("getDriveConfig raw=" + v + " (app-mode 1=normal/2=eco/3=sport/"
+                            + "4=snow IF this axis reports app modes; apiMode encoding unconfirmed)"
+                            + ", lastCommanded=" + cached);
                 }
-                return v;
+                // Honour this method's documented contract: 1..4, or -1 for "no reading". A raw
+                // 0 or a HAL failure code (e.g. -10011) is not a drive mode, and returning it
+                // raw pushed sentinel-filtering onto every caller. Both current consumers do
+                // filter, so this fixes no live symptom — it stops the next one from inheriting
+                // a leaky contract.
+                if (v >= 1 && v <= 4) return v;
             }
         } catch (Exception e) {
             logger.debug("getDriveConfig failed (getter likely absent on this trim): " + e.getMessage());
@@ -7764,8 +10668,31 @@ public class BydDataCollector {
         return -1;
     }
 
+    /**
+     * Uncached raw read of the setting-device drive-config axis, for the post-write diagnostic.
+     * Returns the value VERBATIM (no 1..4 filtering) so the log can distinguish an out-of-range
+     * answer from an absent getter; {@link Integer#MIN_VALUE} means "no answer at all".
+     *
+     * <p>Must NOT consult {@code lastCommandedDriveMode} the way {@link #getDriveConfigMode()}
+     * does — reading our own cache back would confirm every write unconditionally.
+     */
+    private int readDriveConfigRaw() {
+        if (settingDevice == null) return Integer.MIN_VALUE;
+        try {
+            Object r = BydDeviceHelper.callGetter(settingDevice, "getDriveConfig");
+            if (r instanceof Number) return ((Number) r).intValue();
+        } catch (Exception e) {
+            logger.debug("readDriveConfigRaw failed: " + e.getMessage());
+        }
+        return Integer.MIN_VALUE;
+    }
+
     /** Throttle for the getDriveConfig diagnostic (1/min). */
-    private long lastDriveConfigLogMs = 0;
+    // volatile: read/written from both the slow BydDataPoll thread and the DriveModeEvent
+    // fast-poll thread (getDriveConfigMode is now called from both). Only guards a 1/min
+    // diagnostic log, so a torn read is cosmetic, but volatile keeps it consistent (same
+    // rationale as lockUnlockStreak).
+    private volatile long lastDriveConfigLogMs = 0;
 
     /**
      * Energy/powertrain mode: EV vs HEV (BYD SDK EnergyMode enum, matches the
@@ -8028,7 +10955,7 @@ public class BydDataCollector {
             return false;
         }
         try {
-            // Accept-on-no-throw (matches the OEM firmware's setBrakeAssistMode and
+            // Accept-on-no-throw (matches the OEM vehicle-control app's setBrakeAssistMode and
             // our ADAS-reflection contract) — do NOT gate on the SDK return, which can be a
             // benign non-zero/negative code the isSdkWriteSuccess helper reads as failure.
             m.invoke(adasDevice, mcuValue);

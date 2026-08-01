@@ -55,6 +55,19 @@ public class GpsMonitor {
     private volatile long lastLoggedAt = 0;
     private static final long LOG_INTERVAL_MS = 30_000;
 
+    // Cache-write throttle. The on-disk cache exists ONLY for restart recovery
+    // (all live consumers read the in-memory volatile fields, which are always
+    // fresh). Writing it on every ~1-2 Hz IPC update is thousands of flash
+    // writes per drive for no benefit. Persist at most every CACHE_WRITE_MIN_MS
+    // OR when the fix moves > CACHE_WRITE_MIN_MOVE_M — so a parked car writes
+    // rarely and a moving car keeps the recovered position reasonably current.
+    // stop() forces a final flush so the freshest fix survives a clean shutdown.
+    private static final long CACHE_WRITE_MIN_MS = 30_000;
+    private static final double CACHE_WRITE_MIN_MOVE_M = 50.0;
+    private volatile long lastCacheWriteAt = 0;
+    private volatile double lastCachedLat = 0.0;
+    private volatile double lastCachedLng = 0.0;
+
     private GpsMonitor() {}
 
     public static GpsMonitor getInstance() {
@@ -111,9 +124,11 @@ public class GpsMonitor {
         this.fixElapsedMs = fixElapsedMs;
         this.loadedFromCache = false; // We have live data now
 
-        // Persist to cache file
-        saveToCache();
-        
+        // Persist to cache file — throttled (see CACHE_WRITE_MIN_MS). Live
+        // consumers read the in-memory fields above; the disk cache is only for
+        // restart recovery, so it does not need per-update freshness.
+        maybeSaveToCache(lat, lng);
+
         // SOTA: Notify SafeLocationManager for geofence checks
         try {
             com.overdrive.app.surveillance.SafeLocationManager.getInstance()
@@ -130,6 +145,33 @@ public class GpsMonitor {
         if (hasLocation() && now - lastLoggedAt >= LOG_INTERVAL_MS) {
             lastLoggedAt = now;
             CameraDaemon.log(TAG + ": GPS: " + lat + ", " + lng + " (speed=" + speed + "m/s)");
+        }
+    }
+
+    /**
+     * Throttled cache write: persist only if enough time has passed since the
+     * last write OR the position moved far enough to matter for restart
+     * recovery. Cheap equirectangular distance approximation (fine at the 50 m
+     * scale). Runs on the IPC-server thread, same as the direct saveToCache path.
+     */
+    private void maybeSaveToCache(double lat, double lng) {
+        long now = System.currentTimeMillis();
+        boolean timeElapsed = (now - lastCacheWriteAt) >= CACHE_WRITE_MIN_MS;
+        boolean movedFar = false;
+        if (lastCacheWriteAt != 0 && (lastCachedLat != 0.0 || lastCachedLng != 0.0)) {
+            double dLatM = (lat - lastCachedLat) * 111_320.0;
+            double dLngM = (lng - lastCachedLng) * 111_320.0
+                    * Math.cos(Math.toRadians(lat));
+            movedFar = (dLatM * dLatM + dLngM * dLngM)
+                    >= (CACHE_WRITE_MIN_MOVE_M * CACHE_WRITE_MIN_MOVE_M);
+        }
+        // First write after startup (lastCacheWriteAt==0) always persists so a
+        // fresh fix is recoverable even if the daemon dies within 30 s.
+        if (lastCacheWriteAt == 0 || timeElapsed || movedFar) {
+            saveToCache();
+            lastCacheWriteAt = now;
+            lastCachedLat = lat;
+            lastCachedLng = lng;
         }
     }
 
@@ -252,6 +294,9 @@ public class GpsMonitor {
 
     public void stop() {
         isRunning = false;
+        // Force a final flush so the freshest in-memory fix survives a clean
+        // shutdown even if the last throttled write was skipped.
+        saveToCache();
         CameraDaemon.log(TAG + ": Stopped");
     }
 

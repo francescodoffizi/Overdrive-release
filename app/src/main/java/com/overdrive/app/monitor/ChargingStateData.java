@@ -39,6 +39,22 @@ public class ChargingStateData {
     public double chargingPowerKW;       // Current charging power in KW (negative = discharging)
     public boolean isDischarging;        // true if power < 0
     public boolean isEstimated;          // true if power is computed from SOC rate (not from BYD API)
+    /**
+     * True when the BMS reports CHARG_FINISH but the pack is still drawing a real CV-taper
+     * current through a connected gun, so a charging POWER is legitimately available even though
+     * the session state is "finished".
+     *
+     * <p>Deliberately a SEPARATE flag rather than rewriting {@link #stateCode} to CHARGING:
+     * {@code stateName}/{@code status}/{@code isError} are all derived from the code, so
+     * overwriting it destroys the FINISHED signal — which collapses the {@code full} and
+     * {@code plugged} flags in the HTTP/API layer (a fully-charged plugged-in car reported
+     * "Idle") and, worse, makes {@code SocHistoryDatabase}'s session-close test
+     * ({@code !isCharging && wasCharging}) never fire, leaving the session row open and its
+     * peak/avg advancing indefinitely. It is also exactly the state-code inconsistency
+     * {@code ChargingDetector} explicitly refused to create. Consumers that want the power
+     * during a taper opt in by reading this flag; every state consumer keeps seeing the truth.
+     */
+    public boolean isTaperCharging;
     public final long timestamp;
     
     /**

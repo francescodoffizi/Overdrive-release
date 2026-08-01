@@ -79,11 +79,32 @@ public final class MediaPlaybackService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
-        createChannel();
+        // NOTHING in here may throw. This service is started by an `am
+        // start-foreground-service` from the daemon whenever an automation or a
+        // key-mapping plays a sound, so an escaping Throwable is a user-visible
+        // "OverDrive has stopped" in the REAL app process — triggered by pressing
+        // a mapped button or firing an automation, with no obvious cause. Every
+        // step below is optional relative to actually playing audio, so each
+        // degrades independently instead of taking the process down.
+        try {
+            createChannel();
+        } catch (Throwable t) {
+            Log.w(TAG, "createChannel failed: " + t.getMessage());
+        }
         startForegroundCompat();
-        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        registerReceiver(stopReceiver, new IntentFilter(ACTION_STOP));
-        stopReceiverRegistered = true;
+        try {
+            audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        } catch (Throwable t) {
+            Log.w(TAG, "AudioManager unavailable: " + t.getMessage());
+        }
+        try {
+            registerReceiver(stopReceiver, new IntentFilter(ACTION_STOP));
+            stopReceiverRegistered = true;
+        } catch (Throwable t) {
+            // Losing the stop receiver only costs remote-stop; playback and the
+            // completion-driven stopSelf() still work.
+            Log.w(TAG, "stop receiver registration failed: " + t.getMessage());
+        }
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -125,28 +146,40 @@ public final class MediaPlaybackService extends Service {
     private void startPlayback(Uri uri, Map<String, String> headers, String channel, boolean loop) {
         releasePlayer();
         requestFocus(channel, loop);
-        MediaPlayer mp = new MediaPlayer();
+        // Constructor INSIDE a guard. `new MediaPlayer()` runs native_setup and
+        // throws RuntimeException when mediaserver is dead or mid-restart — which
+        // is reachable right after a malformed clip kills the native decoder. It
+        // used to sit outside the try below, making it the only unguarded call on
+        // the whole playback path, and an escape here crashes the REAL app process
+        // (user sees "OverDrive has stopped" from pressing a mapped button).
+        MediaPlayer mp;
+        try {
+            mp = new MediaPlayer();
+        } catch (Throwable t) {
+            Log.w(TAG, "MediaPlayer construction failed (mediaserver down?): " + t.getMessage());
+            stopSelf();
+            return;
+        }
         player = mp;
         try {
             int stream = streamForChannel(channel);
-            if (isOemExtendedStream(stream)) {
-                // OEM-EXTENDED stream (navigation=14, voice=16): these are NOT public
-                // AudioManager constants, and AudioAttributes.setLegacyStreamType(14) does
-                // NOT route to them — MediaPlayer derives its output stream from the usage
-                // (USAGE_UNKNOWN→STREAM_MUSIC), so nav audio still came out the media
-                // amplifier (the reported bug). the reference implementation routes nav via the
-                // DEPRECATED-but-working direct setter setAudioStreamType(14) BEFORE prepare,
-                // which is the only mechanism that lands on the OEM nav channel. Use it here.
-                mp.setAudioStreamType(stream);
-            } else {
-                // Public stream (media/phone/alarm/system): the modern usage + legacy stream
-                // type pair routes correctly and preserves focus/ducking. Unchanged path.
-                mp.setAudioAttributes(new AudioAttributes.Builder()
-                        .setUsage(usageForChannel(channel))
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .setLegacyStreamType(stream)
-                        .build());
-            }
+            // Route to the target stream EXACTLY as the OEM reference does: set BOTH an
+            // AudioAttributes with
+            // setLegacyStreamType(stream) AND the deprecated setAudioStreamType(stream),
+            // in that order, for EVERY channel — public and OEM-extended (nav=14/voice=16)
+            // alike. Neither alone is sufficient on this head unit: setLegacyStreamType by
+            // itself doesn't reach the OEM-extended streams, and setAudioStreamType can be
+            // reset by a subsequent attributes-bearing focus grant — so the OEM applies
+            // both and lets the direct setter win. Critically, the usage is USAGE_MEDIA for
+            // ALL channels (the OEM hardcodes setUsage(1)); using
+            // USAGE_ASSISTANCE_NAVIGATION_GUIDANCE for "navigation" is what pulled the sound
+            // back onto the media amp — the reported "nav audio plays on media" bug.
+            mp.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .setLegacyStreamType(stream)
+                    .build());
+            mp.setAudioStreamType(stream);
             if (headers != null) {
                 mp.setDataSource(this, uri, headers);
             } else {
@@ -191,34 +224,87 @@ public final class MediaPlaybackService extends Service {
         pendingSpeak = text;
         pendingSpeakChannel = channel;
         if (tts == null) {
-            tts = new TextToSpeech(getApplicationContext(), status -> {
-                ttsReady = (status == TextToSpeech.SUCCESS);
-                if (ttsReady) {
-                    try { tts.setLanguage(Locale.getDefault()); } catch (Throwable ignored) {}
-                    String pend = pendingSpeak;
-                    String pendCh = pendingSpeakChannel;
-                    pendingSpeak = null;
-                    if (pend != null) speakNow(pend, pendCh);
-                } else {
-                    Log.w(TAG, "TTS init failed (status=" + status + ")");
-                    stopSelf();
-                }
-            });
+            // GUARDED. The TextToSpeech constructor synchronously resolves and
+            // binds an engine, so on a ROM with no/broken TTS it can throw
+            // (IllegalArgumentException / NPE / SecurityException from the package
+            // resolver). speak() is called straight from onStartCommand with no
+            // try/catch above it, so an escape here crashes the REAL app process —
+            // the user presses a "Speak" automation or mapped button and sees
+            // "OverDrive has stopped", with the foreground service leaked too.
+            try {
+                tts = new TextToSpeech(getApplicationContext(), status -> {
+                    ttsReady = (status == TextToSpeech.SUCCESS);
+                    if (ttsReady) {
+                        try { tts.setLanguage(Locale.getDefault()); } catch (Throwable ignored) {}
+                        String pend = pendingSpeak;
+                        String pendCh = pendingSpeakChannel;
+                        pendingSpeak = null;
+                        if (pend != null) speakNow(pend, pendCh);
+                    } else {
+                        Log.w(TAG, "TTS init failed (status=" + status + ")");
+                        // Release the handle so a LATER speak retries init instead
+                        // of wedging: with a non-null tts and ttsReady false, the
+                        // `tts != null && ttsReady` fast path fails AND the
+                        // `tts == null` init path is skipped, so every subsequent
+                        // speak would silently drop for the service's lifetime.
+                        try { tts.shutdown(); } catch (Throwable ignored) {}
+                        tts = null;
+                        pendingSpeak = null;
+                        stopSelf();
+                    }
+                });
+            } catch (Throwable t) {
+                Log.w(TAG, "TextToSpeech unavailable on this ROM: " + t.getMessage());
+                tts = null;
+                pendingSpeak = null;
+                stopSelf();
+            }
         }
     }
 
     private void speakNow(String text, String channel) {
         try {
             android.os.Bundle params = new android.os.Bundle();
-            params.putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, streamForChannel(channel));
+            // TextToSpeech can only route to a PUBLIC AudioManager stream — its
+            // KEY_PARAM_STREAM has no equivalent of MediaPlayer.setAudioStreamType's
+            // OEM-extended path. The default "voice" channel maps to STREAM_VOICE_OEM(16)
+            // (see streamForChannel), which is NOT a valid TTS stream: passing it made the
+            // utterance route to an invalid AudioTrack and produce NO sound (the reported
+            // "text pronunciation doesn't work"). Clamp any OEM-extended stream to
+            // STREAM_MUSIC — the same public stream the known-working AVAS TTS path uses.
+            int ttsStream = streamForChannel(channel);
+            if (isOemExtendedStream(ttsStream)) ttsStream = AudioManager.STREAM_MUSIC;
+            params.putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, ttsStream);
             String uttId = "overdrive-tts";
             tts.setOnUtteranceProgressListener(new android.speech.tts.UtteranceProgressListener() {
                 @Override public void onStart(String id) {}
                 @Override public void onDone(String id) { stopSelf(); }
                 @Override public void onError(String id) { stopSelf(); }
             });
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, uttId);
-            Log.i(TAG, "speak (" + channel + "): " + (text.length() > 40 ? text.substring(0, 40) + "…" : text));
+            // Truncate to the engine's limit. TextToSpeech.speak() REJECTS input
+            // longer than getMaxSpeechInputLength() (4000) by returning ERROR
+            // rather than throwing — so nothing is spoken, no utterance callback
+            // ever fires, and this service holds audio focus plus its foreground
+            // notification FOREVER. Truncating speaks what fits instead.
+            String toSpeak = text;
+            int maxLen;
+            try { maxLen = TextToSpeech.getMaxSpeechInputLength(); }
+            catch (Throwable t) { maxLen = 4000; }
+            if (maxLen > 0 && toSpeak.length() > maxLen) {
+                Log.w(TAG, "speak text " + toSpeak.length() + " chars exceeds engine max "
+                        + maxLen + " — truncating");
+                toSpeak = toSpeak.substring(0, maxLen);
+            }
+            int rc = tts.speak(toSpeak, TextToSpeech.QUEUE_FLUSH, params, uttId);
+            if (rc != TextToSpeech.SUCCESS) {
+                // No utterance started ⇒ onDone/onError will never fire ⇒ nothing
+                // would ever stop this service. Stop it ourselves.
+                Log.w(TAG, "tts.speak returned " + rc + " — stopping service (no utterance)");
+                stopSelf();
+                return;
+            }
+            Log.i(TAG, "speak (" + channel + "): "
+                + (toSpeak.length() > 40 ? toSpeak.substring(0, 40) + "…" : toSpeak));
         } catch (Throwable t) {
             Log.w(TAG, "speak failed: " + t.getMessage());
             stopSelf();
@@ -234,6 +320,16 @@ public final class MediaPlaybackService extends Service {
         } catch (Throwable t) {
             Log.w(TAG, "auth header build failed: " + t.getMessage());
         }
+        // LOUD on empty. /api/audio/library/raw is NOT a public path — it is
+        // dispatched after AuthMiddleware.checkAuth — so with no cookie the daemon
+        // answers 401, MediaPlayer errors out, and playback silently does nothing
+        // while every API call in the chain already reported success. That is
+        // indistinguishable from "the sound file is broken" unless we say so here.
+        if (h.isEmpty()) {
+            Log.w(TAG, "NO AUTH COOKIE for the raw-media fetch — /api/audio/library/raw "
+                    + "requires auth, so playback will 401 and silently do nothing. "
+                    + "AuthManager could not mint a JWT in the app process.");
+        }
         return h;
     }
 
@@ -244,20 +340,19 @@ public final class MediaPlaybackService extends Service {
             int gain = loop ? AudioManager.AUDIOFOCUS_GAIN
                             : AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK;
             focusListener = fc -> { /* best-effort; don't pause on transient loss */ };
-            if (Build.VERSION.SDK_INT >= 26) {
-                android.media.AudioFocusRequest req = new android.media.AudioFocusRequest.Builder(gain)
-                        .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(usageForChannel(channel))
-                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                .build())
-                        .setOnAudioFocusChangeListener(focusListener)
-                        .build();
-                audioManager.requestAudioFocus(req);
-                audioFocusRequest = req;
-            } else {
-                audioManager.requestAudioFocus(focusListener, streamForChannel(channel), gain);
-                audioFocusRequest = Boolean.TRUE;
-            }
+            // Request focus with the DEPRECATED legacy form
+            // requestAudioFocus(listener, streamType, gain) — passing the SAME target
+            // stream the player uses. This is exactly what the OEM reference does
+            // (requestAudioFocus(listener, targetStream, gain)). Building a modern
+            // AudioFocusRequest with
+            // AudioAttributes here would re-assert usage-based routing on the shared
+            // AudioFlinger session and pull an OEM-extended-stream (nav=14/voice=16)
+            // clip back onto the media amplifier — the "nav audio plays on media" bug.
+            // The legacy stream-typed focus request keeps focus scoped to the same
+            // stream setAudioStreamType targets, so routing stays put.
+            int stream = streamForChannel(channel);
+            audioManager.requestAudioFocus(focusListener, stream, gain);
+            audioFocusRequest = Boolean.TRUE;
         } catch (Throwable t) {
             Log.w(TAG, "requestAudioFocus failed: " + t.getMessage());
         }
@@ -324,7 +419,7 @@ public final class MediaPlaybackService extends Service {
             case "ring":       return AudioManager.STREAM_RING;
             // Navigation / voice guidance ride the OEM-EXTENDED streams (STREAM_NAVI=14,
             // OEM voice=16), which is where the head unit's own nav prompts/TTS play and
-            // which the "navigation volume" control adjusts (OEM firmware setBroadcastVolume
+            // which the "navigation volume" control adjusts (the OEM app setBroadcastVolume
             // uses stream 14, setVoiceVolume 16). These are reached via the DIRECT
             // MediaPlayer.setAudioStreamType path (see startPlayback + isOemExtendedStream);
             // the previous STREAM_MUSIC fallback made nav audio physically identical to
@@ -339,9 +434,29 @@ public final class MediaPlaybackService extends Service {
     // OEM-extended (non-public) BYD stream ints. STREAM_NAVI(14) = navigation guidance,
     // STREAM_VOICE_OEM(16) = voice/assistant. Not part of the public AudioManager contract,
     // so they must be applied via the deprecated-but-working MediaPlayer.setAudioStreamType
-    // (the reference implementation's proven path), NOT AudioAttributes.setLegacyStreamType.
-    private static final int STREAM_NAVI = 14;
+    // (the secondary reference app's proven path), NOT AudioAttributes.setLegacyStreamType.
+    //
+    // Resolve the value from the BYD-modified AudioManager class by FIELD NAME first,
+    // falling back to the known literal. the secondary reference app does exactly this (its C1569m reflects
+    // AudioManager.STREAM_NAVI with a 14 fallback) rather than hardcoding, because the
+    // int can differ by DiLink generation — a hardcoded 14 that doesn't match this
+    // trim's real STREAM_NAVI is another way nav audio silently lands on media.
+    // STREAM_NAVI is reflected by name (the secondary reference app's proven C1569m pattern); voice stays the
+    // literal 16 that the OEM's voice-volume path uses (the secondary reference app does not reflect a voice
+    // field, so there is no proven field name to look up — the literal is the known-good).
+    private static final int STREAM_NAVI = resolveStreamConst("STREAM_NAVI", 14);
     private static final int STREAM_VOICE_OEM = 16;
+
+    /** Reflect a (possibly OEM-added) {@code AudioManager.<name>} int constant; fall back
+     *  to {@code def} when the field is absent (non-BYD build / different SDK). Mirrors
+     *  the secondary reference app's C1569m.m1744a reflective stream-constant resolution. */
+    private static int resolveStreamConst(String fieldName, int def) {
+        try {
+            return AudioManager.class.getField(fieldName).getInt(null);
+        } catch (Throwable t) {
+            return def;
+        }
+    }
 
     /** True for the OEM-extended stream ints that need the direct setAudioStreamType path. */
     private static boolean isOemExtendedStream(int stream) {
@@ -353,7 +468,20 @@ public final class MediaPlaybackService extends Service {
     }
 
     private void startForegroundCompat() {
-        Notification n = buildNotification();
+        Notification n;
+        try {
+            n = buildNotification();
+        } catch (Throwable t) {
+            // buildNotification touches the notification channel and a drawable
+            // resource; either can fail on an OEM ROM. It ran unguarded inside
+            // onCreate(), so a failure here crashed the app process before a
+            // single byte of audio was read. Without a notification we cannot
+            // promote to foreground — but we CAN still play, so return and let
+            // the service run unpromoted.
+            Log.w(TAG, "buildNotification failed — continuing without foreground "
+                    + "promotion: " + t.getMessage());
+            return;
+        }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
@@ -362,7 +490,23 @@ public final class MediaPlaybackService extends Service {
             }
         } catch (Throwable t) {
             Log.w(TAG, "startForeground failed: " + t.getMessage());
-            startForeground(NOTIFICATION_ID, n);
+            // RETRY WITHOUT the foreground-service-type arg — but guarded. The
+            // bare retry used to sit outside any try, so when it ALSO failed the
+            // Throwable escaped onCreate() and crashed the whole app process
+            // (visible to the user as "OverDrive has stopped" the moment an
+            // automation or key-mapping tried to play a sound). Both calls can
+            // legitimately fail on this firmware: a missing/blocked notification
+            // channel, or the OEM ROM rejecting FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK.
+            // Playback itself does not depend on the foreground promotion, so
+            // degrade rather than die: the service still starts, plays, and
+            // stopSelf()s normally — it just risks being reaped earlier under
+            // memory pressure.
+            try {
+                startForeground(NOTIFICATION_ID, n);
+            } catch (Throwable t2) {
+                Log.w(TAG, "startForeground retry failed too — continuing without "
+                        + "foreground promotion: " + t2.getMessage());
+            }
         }
     }
 

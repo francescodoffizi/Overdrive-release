@@ -633,7 +633,17 @@ public class TripApiHandler {
             try {
                 response.put("success", true);
                 response.put("range", JSONObject.NULL);
-                response.put("message", "Not enough data");
+                // Distinguish "feature is off" from "not driven enough yet".
+                // These are null precisely because initComponents() never ran,
+                // which is only ever caused by tripAnalytics.enabled=false.
+                // Reporting "Not enough data" for a disabled subsystem is what
+                // made this state undiagnosable in the field: the UI showed an
+                // innocuous empty state and the daemon logged no error.
+                boolean disabled = !manager.isEnabled();
+                response.put("enabled", !disabled);
+                response.put("message", disabled
+                    ? "Trip analytics is disabled"
+                    : "Not enough data");
             } catch (Exception e) {
                 logger.error("Error building range response", e);
             }
@@ -703,29 +713,45 @@ public class TripApiHandler {
                 response.put("message", "Not enough data");
             }
 
-            // PHEV — petrol leg. Computed only if vehicle is currently
-            // PHEV-classified, fuel% is readable, AND user has set tank
-            // capacity. Each precondition fails silently and the JSON key
-            // is simply absent on BEVs / PHEVs without enough config.
+            // PHEV — petrol leg. The LEARNED estimate needs a user-set tank
+            // capacity AND enough fuel-mode trips to seed a bucket, so the
+            // vehicle's own HAL fuel range ships alongside it as an immediate
+            // fallback. Without it a PHEV shows no petrol range at all until
+            // both preconditions are met — same precedence the dashboard uses.
+            // Keys are simply absent on BEVs.
             try {
                 com.overdrive.app.monitor.VehicleDataMonitor vdm =
                         com.overdrive.app.monitor.VehicleDataMonitor.getInstance();
                 if (vdm.isPhev()) {
                     com.overdrive.app.monitor.DrivingRangeData rangeData = vdm.getDrivingRange();
                     TripConfig cfg = manager.getConfig();
+                    double halFuelKm = (rangeData != null) ? rangeData.fuelRangeKm : 0;
+                    if (halFuelKm > 0) response.put("halFuelRangeKm", halFuelKm);
+                    if (rangeData != null && rangeData.hasFuelPercent()) {
+                        response.put("fuelPercent", rangeData.fuelPercent);
+                    }
+
+                    RangeEstimate fuelEst = null;
                     if (rangeData != null && rangeData.hasFuelPercent()
                             && cfg != null && cfg.getTankCapacityL() > 0) {
-                        RangeEstimate fuelEst = estimator.estimateFuelRange(
+                        fuelEst = estimator.estimateFuelRange(
                                 rangeData.fuelPercent, cfg.getTankCapacityL(),
                                 currentSpeed, extTemp, dnaOverall);
                         if (fuelEst != null) {
                             fuelEst.builtInRangeKm = rangeData.fuelRangeKm;
                             response.put("fuelRange", fuelEst.toJson());
-                            // Combined headline number for the UI.
-                            double total = (estimate != null ? estimate.predictedRangeKm : 0)
-                                    + fuelEst.predictedRangeKm;
-                            response.put("totalRangeKm", total);
                         }
+                    }
+
+                    // Combined headline: learned figure per leg, else that leg's
+                    // HAL value. Each leg falls back independently — using 0 for
+                    // an unseeded electric leg would report a "combined" range
+                    // smaller than the petrol leg alone.
+                    double petrolKm = (fuelEst != null) ? fuelEst.predictedRangeKm : halFuelKm;
+                    double evKm = (estimate != null) ? estimate.predictedRangeKm
+                            : ((rangeData != null) ? rangeData.elecRangeKm : 0);
+                    if (petrolKm > 0 && evKm > 0) {
+                        response.put("totalRangeKm", evKm + petrolKm);
                     }
                 }
             } catch (Exception e) {
@@ -793,6 +819,23 @@ public class TripApiHandler {
                         com.overdrive.app.monitor.VehicleDataMonitor.getInstance().isPhev());
             } catch (Throwable t) {
                 logger.debug("isPhev probe skipped: " + t.getMessage());
+            }
+            // The rate the NEXT trip will actually be costed at: the last
+            // charge's tariff when one exists, else the configured rate above.
+            // Surfaced so the settings note can name the real number instead of
+            // describing the rule abstractly — and so the UI can stay silent
+            // when there's nothing to report (no charge history yet).
+            try {
+                org.json.JSONObject lastCharge = com.overdrive.app.monitor.SocHistoryDatabase
+                        .getInstance().getLastChargeRate(60);
+                if (lastCharge != null && lastCharge.optDouble("rate", 0) > 0) {
+                    configJson.put("lastChargeRate", lastCharge.optDouble("rate", 0));
+                    configJson.put("lastChargeCurrency", lastCharge.optString("currency", ""));
+                    configJson.put("lastChargeTariffLabel", lastCharge.optString("tariffLabel", ""));
+                    configJson.put("lastChargeAt", lastCharge.optLong("endTime", 0));
+                }
+            } catch (Throwable t) {
+                logger.debug("lastChargeRate enrichment skipped: " + t.getMessage());
             }
             response.put("config", configJson);
         } catch (Exception e) {
@@ -1185,7 +1228,17 @@ public class TripApiHandler {
         // Electric leg back-fill: estimate energy from SoC delta when BMS
         // kWh wasn't available at the time. Only persists to in-memory record
         // so the API response shows a useful value; DB stays untouched.
-        if (trip.getEnergyUsedKwh() <= 0
+        // Mirrors the finalize-time cascade in TripAnalyticsManager: when the
+        // vehicle's own consumption counter measured this trip and reported zero,
+        // that is an answer, not a gap — estimating from SoC here would resurrect
+        // the phantom electric cost the pipeline deliberately declined to book
+        // (e.g. a PHEV leg driven on the engine, where a 1% HV dip is parasitic
+        // draw, not propulsion). Only an unmistakable SoC drop overrides it, using
+        // the same threshold as the pipeline so the card can never contradict what
+        // was stored.
+        boolean meteredZero = trip.hasMeteredEnergy()
+                && (trip.socStart - trip.socEnd) <= TripAnalyticsManager.SOC_OVERRIDE_MIN_DROP_PCT;
+        if (trip.getEnergyUsedKwh() <= 0 && !meteredZero
                 && trip.socStart > 0 && trip.socEnd > 0 && trip.socStart > trip.socEnd) {
             try {
                 com.overdrive.app.abrp.SohEstimator soh =

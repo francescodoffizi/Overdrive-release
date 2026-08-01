@@ -250,6 +250,11 @@ const TRIPS = {
         if (!data || !data.config) return;
         const el = document.getElementById('tripsEnabled');
         if (el) el.checked = data.config.enabled || false;
+        // Remember it so the Trips-tab empty state can distinguish "feature is
+        // off" from "you haven't driven enough yet" — the switch itself is on
+        // the Storage tab and is otherwise undiscoverable from here.
+        this.tripsEnabled = !!data.config.enabled;
+        this._applyEnabledHint();
         // Load electricity rate
         this.electricityRate = data.config.electricityRate || 0;
         this.currency = data.config.currency || '$';
@@ -267,6 +272,11 @@ const TRIPS = {
         this.fuelUnit = data.config.fuelUnit === 'gal' ? 'gal' : 'L';
         this.applyPhevVisibility();
         this.applyFuelInputs();
+        // Last-charge pricing note (names the actual rate the next trip will use).
+        this.lastChargeRate = data.config.lastChargeRate || 0;
+        this.lastChargeCurrency = data.config.lastChargeCurrency || '';
+        this.lastChargeTariffLabel = data.config.lastChargeTariffLabel || '';
+        this.applyRateSourceNote();
         // Load distance unit preference, refresh button + all labels
         var distUnit = data.config.distanceUnit || 'km';
         BYD.units.mode = distUnit;
@@ -284,6 +294,8 @@ const TRIPS = {
 
     async toggleEnabled() {
         const checked = document.getElementById('tripsEnabled').checked;
+        this.tripsEnabled = checked;
+        this._applyEnabledHint();
         try {
             await fetch('/api/trips/config', {
                 method: 'POST',
@@ -291,6 +303,31 @@ const TRIPS = {
                 body: JSON.stringify({ enabled: checked })
             });
         } catch (e) { console.warn('[Trips] Toggle failed:', e); }
+    },
+
+    /** Show the "turn it on" affordance inside the Trips-tab empty state only
+     *  while the feature is actually disabled. Purely additive: when enabled
+     *  (the new default) this hides the button and nothing else changes. */
+    _applyEnabledHint() {
+        const btn = document.getElementById('tripEnableFromEmpty');
+        if (!btn) return;
+        btn.style.display = (this.tripsEnabled === false) ? '' : 'none';
+    },
+
+    /** Enable trip recording straight from the empty state, then refresh. */
+    async enableFromEmptyState() {
+        const el = document.getElementById('tripsEnabled');
+        if (el) el.checked = true;
+        this.tripsEnabled = true;
+        this._applyEnabledHint();
+        try {
+            await fetch('/api/trips/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: true })
+            });
+        } catch (e) { console.warn('[Trips] Enable failed:', e); }
+        try { this.loadTrips(); } catch (e) { /* list refresh is best-effort */ }
     },
 
     async saveCostConfig() {
@@ -343,6 +380,68 @@ const TRIPS = {
             const el = document.getElementById(id);
             if (el) el.style.display = this.isPhev ? '' : 'none';
         });
+    },
+
+    /**
+     * Explain which rate the next trip will be costed at.
+     *
+     * Three states, and the note only appears when it has something real to say:
+     *  - a charge has been recorded → name that rate (and its tariff, if any), so
+     *    the number on the card is traceable to a specific charge;
+     *  - no charge yet but a global rate is set → say the global rate is standing
+     *    in until the first charge is logged;
+     *  - nothing configured at all → hide the note entirely rather than lecture
+     *    about a mechanism the user hasn't given any inputs to.
+     */
+    applyRateSourceNote() {
+        const box = document.getElementById('tripRateSourceNote');
+        const txt = document.getElementById('tripRateSourceText');
+        if (!box || !txt) return;
+
+        // Re-compose after any locale change. hydrate() rewrites [data-i18n] nodes
+        // and core.js fires onChange right after each hydrate, so without this a
+        // language switch would leave the generic sentence in place of the concrete
+        // last-charge rate. Subscribed once; the node itself no longer carries
+        // data-i18n, so nothing else can overwrite it.
+        if (!this._rateNoteI18nHooked
+                && window.BYD && BYD.i18n && typeof BYD.i18n.onChange === 'function') {
+            this._rateNoteI18nHooked = true;
+            const self = this;
+            BYD.i18n.onChange(function () { self.applyRateSourceNote(); });
+        }
+
+        const tRC = (k, fb, vars) => {
+            if (window.BYD && BYD.i18n && BYD.i18n.t) {
+                const v = BYD.i18n.t(k, vars);
+                if (v && v !== k) return v;
+            }
+            return fb;
+        };
+
+        if (this.lastChargeRate > 0) {
+            const cur = this.lastChargeCurrency || this.currency || '$';
+            const rate = cur + this.lastChargeRate.toFixed(2);
+            const label = this.lastChargeTariffLabel;
+            txt.textContent = label
+                ? tRC('trip.settings.rate_from_charge_named',
+                      'Trips are costed at your last charge: ' + rate + '/kWh (' + label + ').',
+                      { rate: rate, label: label })
+                : tRC('trip.settings.rate_from_charge',
+                      'Trips are costed at your last charge: ' + rate + '/kWh.',
+                      { rate: rate });
+            box.style.display = '';
+            return;
+        }
+
+        if (this.electricityRate > 0) {
+            txt.textContent = tRC('trip.settings.rate_source_note',
+                'Trips are costed at the rate of your last charge at a saved tariff location. This rate applies until then.');
+            box.style.display = '';
+            return;
+        }
+
+        // Nothing to price with and no history — say nothing.
+        box.style.display = 'none';
     },
 
     /** Populate tank/fuel inputs in the user's chosen unit. */
@@ -690,12 +789,13 @@ const TRIPS = {
     },
 
     updateLimitLabel(val) {
+        // #storageLimitValue only. A second #storageLimitDesc sink was dropped:
+        // the adjacent desc line is a translated sentence, and writing the raw
+        // "500 MB" label into it would clobber that copy.
         const el = document.getElementById('storageLimitValue');
-        const desc = document.getElementById('storageLimitDesc');
         const v = parseInt(val);
         const label = v >= 1000 ? (v / 1000) + ' GB' : v + ' MB';
         if (el) el.textContent = label;
-        if (desc) desc.textContent = label;
     },
 
     showApplyNeeded() {
@@ -1311,6 +1411,47 @@ const TRIPS = {
         return 82.56;
     },
 
+    /**
+     * Signed net energy for a trip (kWh) — negative when the pack ended fuller
+     * than it started (regen-dominant descent). The backend's energyUsedKwh is
+     * clamped to 0 in that case because it feeds cost and rollup totals, so
+     * display paths use this instead to stay consistent with SoC Used.
+     * Derives from the kWh pair when the key is missing (legacy payloads).
+     */
+    signedEnergy(trip) {
+        if (!trip) return 0;
+        var signed = trip.signedEnergyKwh != null ? trip.signedEnergyKwh
+            : (trip.signed_energy_kwh != null ? trip.signed_energy_kwh : null);
+        if (typeof signed === 'number' && signed !== 0) return signed;
+        var ks = trip.kwhStart || trip.kwh_start || 0;
+        var ke = trip.kwhEnd || trip.kwh_end || 0;
+        if (ks > 0 && ke > 0 && ks !== ke) return ks - ke;
+        // No kWh pair (legacy row, or a HAL without remaining-energy). SoC alone
+        // is integer-resolution, so a 1% "rise" is indistinguishable from jitter
+        // and would fabricate ~0.8 kWh of regen — hence getSignedEnergyKwh stays
+        // consumption-only here. Require MORE than one quantisation step (same
+        // margin as the daemon's SOC_OVERRIDE_MIN_DROP_PCT) so only an
+        // unmistakable gain reports, and noise still reads 0.
+        var ss = trip.socStart || trip.soc_start || 0;
+        var se = trip.socEnd || trip.soc_end || 0;
+        if (ss > 0 && (se - ss) > 1.0) return ((ss - se) / 100) * this.estimateNominalKwh(trip);
+        return 0;
+    },
+
+    /**
+     * HTML-escape interpolated text. Needed anywhere a user-supplied string
+     * (a tariff label) is concatenated into innerHTML — numeric .toFixed values
+     * elsewhere on the card can't carry metacharacters, but labels can.
+     */
+    esc(s) {
+        if (s == null) return '';
+        // textContent->innerHTML escapes & < > but NOT quotes, and this output is
+        // interpolated into title="..." on the rate-provenance capsule. Escape
+        // quotes explicitly so a tariff label containing one can't break out.
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    },
+
     createTripCard(trip) {
         const card = document.createElement('div');
         card.className = 'trip-card';
@@ -1358,6 +1499,32 @@ const TRIPS = {
             }
         }
 
+        // ── Cost breakdown on the CARD (PHEV) ───────────────────────────────
+        // A PHEV trip that ran the engine has two cost legs, and a single total
+        // hides which one dominated. Show "EV + petrol = total" inline so the
+        // split is readable without opening the detail view. BEV trips (and PHEV
+        // trips that stayed full-EV) render only the total capsule, exactly as
+        // before — no extra row, no layout change.
+        const electricCost = trip.electricCost || trip.electric_cost || 0;
+        const fuelCostVal = trip.fuelCost || trip.fuel_cost || 0;
+        const litresVal = trip.litresUsed || trip.litres_used || 0;
+        let breakdownStr = '';
+        if (!recovered && fuelCostVal > 0 && electricCost > 0) {
+            breakdownStr = '⚡ ' + cur + electricCost.toFixed(2)
+                + '  +  ⛽ ' + cur + fuelCostVal.toFixed(2);
+        } else if (!recovered && fuelCostVal > 0) {
+            // Petrol-only leg (charge-sustain / empty battery): label it so the
+            // cost isn't mistaken for an electricity charge.
+            breakdownStr = '⛽ ' + cur + fuelCostVal.toFixed(2)
+                + (litresVal > 0 ? ' · ' + litresVal.toFixed(2) + ' L' : '');
+        }
+
+        // Rate provenance: name the tariff the electricity was priced at, since a
+        // trip is now costed at the LAST CHARGE's rate rather than one global
+        // number. Empty on trips recorded before this existed → capsule omitted.
+        const rateLabel = trip.rateLabel || trip.rate_label || '';
+        const rateSource = trip.rateSource || trip.rate_source || '';
+
         const elevGain = trip.elevationGainM || trip.elevation_gain_m || 0;
         const gradProfile = trip.gradientProfile || trip.gradient_profile || '';
         const gradIcons = { FLAT: '🛣️', HILLY: '⛰️', MOUNTAIN_CLIMB: '🏔️', MOUNTAIN_DESCENT: '⬇️' };
@@ -1379,9 +1546,13 @@ const TRIPS = {
 
         // Energy capsule: real kWh > SoC-per-km efficiency. On a recovered trip
         // neither exists, so drop the capsule rather than print "0.00 %/km".
+        // A regen-dominant trip shows its NEGATIVE net kWh (energyUsed is clamped
+        // to 0 for costing) so the capsule agrees with the SoC capsule beside it.
+        const signedEnergyVal = this.signedEnergy(trip);
+        const capsuleEnergy = signedEnergyVal < 0 ? signedEnergyVal : energyUsed;
         const energyCapsule = recovered
             ? ''
-            : '<span class="trip-capsule"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> ' + (energyUsed > 0 ? energyUsed.toFixed(2) + ' kWh' : eff + BYD.units.socPerDistLabel()) + '</span>';
+            : '<span class="trip-capsule"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> ' + (capsuleEnergy !== 0 ? capsuleEnergy.toFixed(2) + ' kWh' : eff + BYD.units.socPerDistLabel()) + '</span>';
         // SoC capsule: omit on recovered (would read 0.00→0.00%).
         const socCapsule = recovered
             ? ''
@@ -1421,7 +1592,15 @@ const TRIPS = {
                 odoCapsule +
                 fuelStr +
                 (elevStr ? '<span class="trip-capsule" style="color:#0EA5E9;">' + elevStr + '</span>' : '') +
-                (!recovered && costStr ? '<span class="trip-capsule" style="color:var(--warning);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg> ' + costStr + '</span>' : '') +
+                (!recovered && costStr ? '<span class="trip-capsule trip-capsule-cost" style="color:var(--warning);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg> ' + costStr +
+                    (breakdownStr ? '<span class="trip-cost-split">' + breakdownStr + '</span>' : '') + '</span>' : '') +
+                // Where the electricity price came from. Only for a named tariff —
+                // a trip on the global rate has nothing worth a capsule.
+                (!recovered && rateSource === 'charge' && rateLabel
+                    ? '<span class="trip-capsule trip-rate-src" title="' + this.esc(tRC('trip.rate_from_charge_title', 'Priced at the rate of your last charge')) + '">'
+                        + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-6-5.5-6-10a6 6 0 0 1 12 0c0 4.5-6 10-6 10z"/><circle cx="12" cy="11" r="2"/></svg> '
+                        + this.esc(rateLabel) + '</span>'
+                    : '') +
             '</div>' +
             '<button class="trip-delete-btn" onclick="event.stopPropagation(); TRIPS.deleteTrip(\'' + tripId + '\')" title="' + BYD.i18n.t('trip.delete_trip_title') + '">' +
                 '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
@@ -1888,12 +2067,14 @@ const TRIPS = {
                 if (capsule) capsule.style.display = 'none';
             }
 
-            // PHEV petrol leg — backend returns data.fuelRange when the
-            // vehicle is PHEV-classified, fuel% is readable, and the user
-            // has set tankCapacityL. Renders a sub-line under the hero
-            // circle. BEV / unconfigured PHEV → tile hidden.
+            // PHEV petrol leg — data.fuelRange is the LEARNED estimate (needs
+            // tankCapacityL + seeded buckets); data.halFuelRangeKm is the car's
+            // own figure, always present on a PHEV. Pass both so the sub-line
+            // shows a real number immediately and upgrades to the learned one
+            // later. BEV → both absent → tile hidden.
             this.renderPetrolRange((data && data.fuelRange) || null,
-                                   data && data.totalRangeKm);
+                                   data && data.totalRangeKm,
+                                   data && data.halFuelRangeKm);
         } catch (e) {
             console.warn('[Trips] Range apply failed:', e);
             this.renderCircleGauge('rangeCircleCanvas', 0, 'rgba(14,165,233,0.2)');
@@ -1906,9 +2087,18 @@ const TRIPS = {
      * mounts a div on first PHEV trip and toggles via display:none for
      * subsequent BEV / no-data refreshes — same pattern as renderCostBreakdown.
      */
-    renderPetrolRange(fuelRange, totalRangeKm) {
+    renderPetrolRange(fuelRange, totalRangeKm, halFuelRangeKm) {
         var existing = document.getElementById('petrolRangeSubline');
-        if (!fuelRange) {
+        // Learned estimate first, else the HAL fuel range. Only a PHEV with
+        // neither hides the row entirely.
+        var petrolKm = 0;
+        if (fuelRange) {
+            petrolKm = fuelRange.predictedRangeKm || fuelRange.predicted_range_km || 0;
+        }
+        if (petrolKm <= 0 && typeof halFuelRangeKm === 'number' && halFuelRangeKm > 0) {
+            petrolKm = halFuelRangeKm;
+        }
+        if (petrolKm <= 0) {
             if (existing) existing.style.display = 'none';
             return;
         }
@@ -1925,7 +2115,6 @@ const TRIPS = {
             capsule.parentNode.insertBefore(container, capsule.nextSibling);
         }
 
-        var petrolKm = fuelRange.predictedRangeKm || fuelRange.predicted_range_km || 0;
         var petrolDisplay = BYD.units.distVal(petrolKm);
         var distLbl = BYD.units.distLabel();
         var totalDisplay = (totalRangeKm != null && totalRangeKm > 0)
@@ -1967,15 +2156,35 @@ const TRIPS = {
             this.setEl('detailSocDelta', recovered ? '--' : ((trip.socStart || trip.soc_start || 0) - (trip.socEnd || trip.soc_end || 0)).toFixed(2) + '%');
             // Show energy kWh or efficiency
             const detailEnergy = trip.energyUsedKwh || trip.energy_used_kwh || 0;
-            this.setEl('detailEfficiency', recovered ? '--' : (detailEnergy > 0 ? detailEnergy.toFixed(2) + ' kWh' : (trip.efficiencySocPerKm || trip.efficiency_soc_per_km || 0).toFixed(2)));
+            // Signed net energy: negative when the pack ended FULLER than it
+            // started (regen-dominant descent). energyUsedKwh is deliberately
+            // clamped to 0 there because it feeds cost, but displaying that 0
+            // next to a negative "SoC Used" reads as a bug — so the tiles below
+            // prefer the signed figure whenever it's negative.
+            const detailSignedEnergy = this.signedEnergy(trip);
+            const displayEnergy = detailSignedEnergy < 0 ? detailSignedEnergy : detailEnergy;
+            // True when energy came from the vehicle's own metered counter, so a
+            // near-zero figure is a real measurement of a very short trip rather
+            // than missing data. Absent on legacy rows → falsy → old behaviour.
+            const energyMetered = !!(trip.energyMetered || trip.energy_metered);
+            // Metered trips get 3 decimals: a sub-km hop draws ~0.1 kWh, which
+            // 2 decimals would round toward a misleading "0.00".
+            this.setEl('detailEfficiency', recovered ? '--'
+                : (displayEnergy !== 0 ? (energyMetered ? displayEnergy.toFixed(3) : displayEnergy.toFixed(2)) + ' kWh'
+                : (energyMetered ? '0.000 kWh' : (trip.efficiencySocPerKm || trip.efficiency_soc_per_km || 0).toFixed(2))));
             // Average consumption: kWh/100km or %/100km — convert per-100 rate
             // when the user is on miles (kWh/100mi = kWh/100km / KM_TO_MI).
             const tripDist = trip.distanceKm || trip.distance_km || 0;
             if (recovered) {
                 this.setEl('detailConsumption', '--');
-            } else if (tripDist > 0.1 && detailEnergy > 0) {
-                const per100km = (detailEnergy / tripDist) * 100;
+            } else if (tripDist > 0.1 && displayEnergy !== 0) {
+                const per100km = (displayEnergy / tripDist) * 100;
                 this.setEl('detailConsumption', BYD.units.per100Val(per100km).toFixed(2));
+            } else if (tripDist > 0.1 && energyMetered) {
+                // Metered zero over a real distance — report the rate as 0, not
+                // "--": the vehicle measured it and it genuinely drew nothing
+                // (e.g. a PHEV leg driven entirely on the engine).
+                this.setEl('detailConsumption', (0).toFixed(2));
             } else if (tripDist > 0.1) {
                 const socDelta = (trip.socStart || trip.soc_start || 0) - (trip.socEnd || trip.soc_end || 0);
                 if (socDelta > 0) {
@@ -2010,8 +2219,15 @@ const TRIPS = {
             const odoStartTile = document.getElementById('detailOdoStartTile');
             const odoEndTile = document.getElementById('detailOdoEndTile');
             if (detailOdoStart > 0 && detailOdoEnd > 0) {
-                this.setEl('detailOdoStart', BYD.units.dist(detailOdoStart));
-                this.setEl('detailOdoEnd', BYD.units.dist(detailOdoEnd));
+                // Show a decimal when the two readings are less than 10 units
+                // apart, otherwise whole numbers stay readable. Without this a
+                // short trip displays the same value twice, which reads as a bug.
+                // The span is measured in DISPLAY units so the threshold means
+                // the same thing in km and miles.
+                const odoSpan = Math.abs(BYD.units.distVal(detailOdoEnd) - BYD.units.distVal(detailOdoStart));
+                const odoDecimals = odoSpan < 10 ? 1 : null;
+                this.setEl('detailOdoStart', BYD.units.dist(detailOdoStart, odoDecimals));
+                this.setEl('detailOdoEnd', BYD.units.dist(detailOdoEnd, odoDecimals));
                 if (odoStartTile) odoStartTile.style.display = '';
                 if (odoEndTile) odoEndTile.style.display = '';
             } else {

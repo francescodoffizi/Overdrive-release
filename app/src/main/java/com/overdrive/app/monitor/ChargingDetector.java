@@ -227,7 +227,16 @@ public final class ChargingDetector {
             // from yesterday's drive cannot retrigger inference.
             if (!Double.isNaN(vd.enginePowerKw)) {
                 enginePowerKw = vd.enginePowerKw;
-                enginePowerAtMs = System.currentTimeMillis();
+                // Use the age CARRIED WITH the value, not our own clock. Stamping now() made a
+                // carried-forward reading of arbitrary age look 0 ms old — and because
+                // updatePollEvidence stamps and then recompute()s microseconds later,
+                // ENGINE_POWER_FRESHNESS_MS was unconditionally satisfied from the poll path, so
+                // the freshness window never expired on the staleness it exists to catch. The
+                // snapshot stamps this at the moment of a LIVE read (BydVehicleData.Builder
+                // .enginePowerKw), so the window now measures real data age. Fall back to now()
+                // only if the snapshot predates the field (0), preserving old behaviour there.
+                enginePowerAtMs = (vd.enginePowerAtMs > 0)
+                        ? vd.enginePowerAtMs : System.currentTimeMillis();
             }
             externalChargingPowerKw = vd.externalChargingPowerKw;
             chargingPowerKw = vd.chargingPowerKw;

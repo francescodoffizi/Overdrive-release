@@ -79,6 +79,14 @@ public class Conditions {
                         new Label("highBeam", "automation.lights_highbeam"),
                         new Label("hazard", "automation.lights_hazard"),
                         new Label("drl", "automation.lights_drl"))));
+        // Interior ambient light on/off. Fires only on a vehicle that actually reports the
+        // main-switch state (see BydEvent.AMBIENT_STATE).
+        addCondition(new EventCondition(
+                new Label("ambient", "automation.ambient_state"),
+                "automation.ambient_state_description",
+                new EnumType(new Label("state", "automation.state"),
+                        new Label("on", "automation.on"),
+                        new Label("off", "automation.off"))));
         addCondition(new EventCondition(
                 new Label("slw", "automation.slw"),
                 "automation.slw_description",
@@ -152,16 +160,37 @@ public class Conditions {
                 new Label("ac", "automation.ac"),
                 "automation.ac_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
+        // Cabin temperature. The range must cover SUB-ZERO: a parked cabin in winter genuinely goes
+        // below 0 (and the event falls back to the ambient reading if the cabin sensor stops
+        // answering — see BydEvent.updateTemperature), so a 0..100 floor made "cabin below freezing"
+        // impossible to even express in the picker while the daemon was publishing those negative
+        // values. The ceiling stays above habitable because a car parked in the
+        // sun reaches 60-70 C.
+        //
+        // The ceiling stays at 100, NOT the sensor band's 90: only the LOWER bound moves. An
+        // existing automation saved with a threshold of 91..100 must keep validating — IntType
+        // rejects an out-of-range stored value, and the editor marks such a field .invalid,
+        // which disables Save for the whole form (a global '#formGrid .invalid' gate) and would
+        // leave that automation uneditable. Widening only downward is therefore strictly
+        // backward-compatible.
         addCondition(new EventCondition(
                 new Label("temperature", "automation.temperature"),
                 "automation.temperature_description",
-                new IntType(new Label("celsius", "automation.celsius"), 0, 100)));
-        // Outside/ambient temperature — allows sub-zero values (frost automations),
-        // hence the -40..60 range vs the cabin-oriented 0..100 above.
+                new IntType(new Label("celsius", "automation.celsius"), -40, 100)));
+        // Outside/ambient temperature — same sub-zero rationale (frost automations).
         addCondition(new EventCondition(
                 new Label("outsideTemp", "automation.outside_temperature"),
                 "automation.outside_temperature_description",
                 new IntType(new Label("celsius", "automation.celsius"), -40, 60)));
+        // AC dial SETPOINT — what the climate control was ASKED for, not what the cabin
+        // measures. Always CELSIUS (BydEvent normalizes a Fahrenheit dial), so a rule means the
+        // same thing on any car and the range is the Celsius dial band.
+        addCondition(new EventCondition(
+                new Label("acSetpoint", "automation.ac_setpoint"),
+                "automation.ac_setpoint_description",
+                new IntType(new Label("celsius", "automation.celsius"),
+                        com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_C,
+                        com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_C)));
         // Rain likelihood (%) over the next few hours (Open-Meteo by GPS). "raise the
         // windows if rain > 60%". Forecast-ahead, unlike the reactive autoWiper proxy.
         addCondition(new EventCondition(
@@ -287,6 +316,18 @@ public class Conditions {
                 new Label("emergencyAlarm", "automation.emergency_alarm"),
                 "automation.emergency_alarm_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
+        // Radar blind-spot / lane-change / cross-traffic alert, per side. The OEM
+        // radar warning (not the side-camera overlay). Alerts are momentary pulses,
+        // so the publisher holds "on" briefly — see BlindSpotEvent. The `side`
+        // sub-variable selects left vs right so one schema serves both.
+        addCondition(new EventCondition(
+                new Label("blindSpot", "automation.blind_spot"),
+                "automation.blind_spot_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off")),
+                new EnumType(
+                        new Label("side", "automation.side"),
+                        new Label("left", "automation.side_left"),
+                        new Label("right", "automation.side_right"))));
         // Tyre pressure warning (worst wheel): normal / under / over.
         addCondition(new EventCondition(
                 new Label("tyrePressureWarn", "automation.tyre_pressure_warn"),
@@ -444,15 +485,25 @@ public class Conditions {
                 new Label("autoLights", "automation.auto_lights"),
                 "automation.auto_lights_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
-        // Seat occupancy (someone sitting), per seat.
+        // Seat occupancy (someone sitting).
+        //  - PASSENGER: a real occupancy sensor (getPassengerStatus area 1) — occupied AND empty.
+        //  - DRIVER: no sensor exists; presence is INFERRED from the seatbelt-reminder mask
+        //    (bit 0) + the driver belt, and is POSITIVE-ONLY — it publishes "occupied" and never
+        //    "empty" (an unbuckled-but-present driver reads identically to an empty seat; see
+        //    BydDataCollector.readDriverOccupancyNow).
+        // The schema carries ONE value enum per condition, so "empty" is still offered for the
+        // driver seat in the picker. A driver+empty rule parses and loads, but can only ever be
+        // satisfied while the state is unseeded — it is documented as unsupported in the
+        // description rather than being silently dropped at load, which would delete the user's
+        // whole automation (see Automation.fromJson).
         addCondition(new EventCondition(
                 new Label("occupant", "automation.occupant"),
                 "automation.occupant_description",
                 new EnumType(new Label("state", "automation.state"), new Label("occupied", "automation.occupied"), new Label("empty", "automation.empty")),
                 new EnumType(
                         new Label("seat", "automation.seat"),
-                        new Label("driver", "automation.driver"),
-                        new Label("passenger", "automation.passenger"))));
+                        new Label("passenger", "automation.passenger"),
+                        new Label("driver", "automation.driver"))));
         // User variable / flag — free-text name + string value (eq/neq). Set by the
         // "Set Variable" action; lets an automation gate on its own or another's marker
         // ("if Parking_Mode != true"). VariableCondition handles the free-text name (not

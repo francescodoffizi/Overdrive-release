@@ -60,7 +60,7 @@ public final class AutomationCategories {
         put(CLIMATE, "setAc", "setAcTemp", "setAcFan", "ac", "temperature", "outsideTemp",
                 "seat", "seatClimate", "seat_heat_driver", "seat_heat_passenger",
                 "seat_vent_driver", "seat_vent_passenger",
-                "acAuto", "fanOnly", "steeringHeat", "recirculation",
+                "acAuto", "acAutoOff", "fanOnly", "steeringHeat", "recirculation",
                 "frontDefrost", "rearDefrost");
         // ── Windows / body / openings ──
         put(WINDOWS_BODY, "windows", "windowsAll", "windowsPreset", "windowState",
@@ -68,12 +68,16 @@ public final class AutomationCategories {
                 "child_lock", "doorState", "wireless_charging", "wireless_charging_state");
         // ── Lighting ──
         put(LIGHTING, "drl", "hazard", "setAmbient", "ambient_colour", "ambientBrightness",
+                // "ambientPower" = the on/off ACTION's id, "ambient" = the on/off CONDITION's id.
+                // Only action/condition ids belong in this map — the MQTT telemetry field name
+                // (ambient_enabled) is never looked up here and would be dead weight.
+                "ambientPower", "ambient",
                 "lights", "autoLights", "turnSignal",
                 "welcomeLight", "readingLight", "ambientMusic", "headlightLevel");
         // ── ADAS / safety ──
         put(ADAS_SAFETY, "adas_slw", "slw", "esp_control", "esp_state", "itac",
                 "lane_assist", "cpd", "adas_cpd", "emergencyAlarm", "tyrePressureWarn",
-                "tyreLeakWarn", "seatbelt", "occupant", "radarNearest",
+                "tyreLeakWarn", "seatbelt", "occupant", "radarNearest", "blindSpot",
                 // Expanded ADAS matrix
                 "adas_bsd", "adas_tsr", "adas_rcta", "adas_fcta", "adas_tla", "adas_dow",
                 "adas_rcw", "adas_islc", "adas_elka", "adas_rctb", "adas_fctb",
@@ -100,7 +104,7 @@ public final class AutomationCategories {
                 "surveillanceArmed", "surveillanceThreat", "surveillanceObject");
         // ── Flow control / variables ──
         put(FLOW, "pause", "waitUntil", "waitUntilState", "setVariable", "incrementVariable",
-                "variable", "loop", "if", "actionGroup", "automationControl");
+                "computeVariable", "variable", "loop", "if", "actionGroup", "automationControl");
         // ── Sensor-only signals (triggers/conditions with no matching action) ──
         put(SENSORS, "batteryLevel", "estimatedRange", "chargingState", "chargeGun",
                 "batterySoh", "keyBattery", "aux12vBattery", "fuelLevel", "pm25",

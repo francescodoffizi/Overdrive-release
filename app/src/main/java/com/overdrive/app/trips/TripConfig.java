@@ -18,7 +18,26 @@ public class TripConfig {
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
     private static final String SECTION = "tripAnalytics";
 
-    private boolean enabled = false;
+    // Default ON. Trip logging is a passive, local-only recorder: with it off,
+    // initComponents() never runs, so there is no database, no detector and no
+    // recorder — the Trips page can only ever show "No trips recorded yet", and
+    // the sole enable switch lives on the Storage tab where users never find it.
+    // Reference implementations (e.g. BYDMate) ship trip logging always-on with
+    // no toggle at all.
+    //
+    // PRIVACY CAVEAT — be honest about this. load() honours an explicitly
+    // persisted value, so an opt-out made AFTER this build lands is respected.
+    // But the one-shot migration in UnifiedConfigManager.applyDefaults cannot
+    // distinguish a pre-existing `enabled:false` that was merely the old DEFAULT
+    // from one the user deliberately chose — no marker existed before this
+    // change. So on upgrade, a deliberate pre-upgrade opt-out IS overridden,
+    // exactly once. That matters because trips record GPS coordinates plus 5 Hz
+    // telemetry. Flagged as a release-note item rather than silently papered
+    // over; the alternative (leaving every existing unit inert) is what the fix
+    // exists to correct.
+    private static final boolean DEFAULT_ENABLED = true;
+
+    private boolean enabled = DEFAULT_ENABLED;
     private double electricityRate = 0;  // Cost per kWh
     private String currency = "";        // Currency symbol (₹, $, €, £)
     // Distance unit preference: "km" (default) or "mi".
@@ -41,7 +60,7 @@ public class TripConfig {
     private String fuelUnit = "L";
 
     public TripConfig() {
-        this.enabled = false;
+        this.enabled = DEFAULT_ENABLED;
     }
 
     /**
@@ -53,7 +72,10 @@ public class TripConfig {
         try {
             JSONObject section = UnifiedConfigManager.loadConfig().optJSONObject(SECTION);
             if (section != null) {
-                enabled = section.optBoolean("enabled", false);
+                // An explicitly persisted value always wins (including false —
+                // a user who turned this off must stay off). Only an ABSENT key
+                // falls back to the new default.
+                enabled = section.optBoolean("enabled", DEFAULT_ENABLED);
                 electricityRate = section.optDouble("electricityRate", 0);
                 currency = section.optString("currency", "");
                 distanceUnit = section.optString("distanceUnit", "km");

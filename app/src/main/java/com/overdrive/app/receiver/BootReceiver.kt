@@ -36,27 +36,18 @@ class BootReceiver : BroadcastReceiver() {
 
         Log.d(TAG, "Received broadcast: $action")
 
-        // Forward plug edges to ChargingDetector BEFORE the debounce gate.
-        // The debounce only protects daemon restarts from thrashing; plug
-        // edges must always reach the detector or a quick unplug-replug
-        // sequence will lose the second connect event and the detector will
-        // miss the start of the new charging session.
-        when (action) {
-            Intent.ACTION_POWER_CONNECTED -> {
-                try {
-                    com.overdrive.app.monitor.ChargingDetector.getInstance().onPowerConnected()
-                } catch (e: Exception) {
-                    Log.w(TAG, "ChargingDetector connect notify failed: ${e.message}")
-                }
-            }
-            Intent.ACTION_POWER_DISCONNECTED -> {
-                try {
-                    com.overdrive.app.monitor.ChargingDetector.getInstance().onPowerDisconnected()
-                } catch (e: Exception) {
-                    Log.w(TAG, "ChargingDetector disconnect notify failed: ${e.message}")
-                }
-            }
-        }
+        // NOTE: plug edges are deliberately NOT forwarded to ChargingDetector here.
+        // ChargingDetector is a plain per-process `static final INSTANCE`
+        // (ChargingDetector.java:110), so calling it from THIS (app) process
+        // mutated a different object than the one every consumer reads — all of
+        // which (VehicleDataMonitor, BydDataCollector, MQTT, automations) run
+        // daemon-side. The calls were therefore dead: the plug edge never reached
+        // the detector that matters, and they class-loaded ChargingDetector +
+        // BydVehicleData + DaemonLogger into the app process for nothing.
+        //
+        // The daemon already registers its OWN ACTION_POWER_CONNECTED/DISCONNECTED
+        // receiver feeding its own detector (BydDataCollector.java:763-778), so the
+        // real edge path is intact and unaffected by this removal.
 
         // "Vehicle ON only" RECOVERY must bypass the 5s debounce. While parked in onOnly
         // the whole stack is terminated; the only automatic recovery is a recovery trigger

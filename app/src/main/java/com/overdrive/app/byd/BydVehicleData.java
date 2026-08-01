@@ -50,12 +50,34 @@ public class BydVehicleData {
     public final double frontMotorTorque; // Nm (negated from SDK)
     public final int engineSpeedRpm;
     public final double enginePowerKw;
+    /**
+     * Wall-clock ms when {@link #enginePowerKw} was last written by a LIVE read (either
+     * collectEngine path, or the generic-event listener). 0 = never / not applicable.
+     *
+     * <p>Exists because the Builder is seeded via {@code toBuilder()}, so the value itself is
+     * non-NaN forever after the first successful read — which made every downstream freshness
+     * check meaningless. {@code ChargingDetector} used to stamp its own clock on any non-NaN
+     * push, so a value of arbitrary age looked 0 ms old and its 15 s freshness window could
+     * never expire. Carrying the age WITH the value is the only way a consumer can tell a live
+     * reading from a carried-forward one; consumers must prefer this over their own clock.
+     */
+    public final long enginePowerAtMs;
 
     // ==================== ENERGY ====================
     public final int energyMode;          // EV/HEV
     public final int operationMode;       // ECO/SPORT/NORMAL
     public final double totalElecCon;     // total electricity consumed
-    public final double totalFuelCon;     // total fuel consumed
+    public final double totalFuelCon;     // total fuel consumed (litres, lifetime)
+    // Average petrol consumption in L/100km straight from the statistic HAL
+    // (getTotalFuelConPHMValue, SDK range 0.0-51.1, no scaling). Lifetime
+    // average — the vehicle's own figure, so it agrees with the cluster.
+    // NaN on BEVs / trims that don't report it.
+    public final double avgFuelConPer100Km;
+    // Electricity-consumption rates straight from the vehicle, in kWh/100km, so a
+    // displayed average matches the cluster instead of being re-derived from a
+    // coarse SoC delta. NaN when the trim doesn't report them.
+    public final double avgElecConPer100Km;   // lifetime average
+    public final double lastElecConPer100Km;  // previous trip's average
 
     // ==================== RANGE ====================
     public final int elecRangeKm;
@@ -66,6 +88,9 @@ public class BydVehicleData {
     // ==================== MILEAGE ====================
     public final int totalMileageKm;
     public final int evMileageKm;
+    // Lifetime distance driven with the engine contributing (PHEV). The EV/HEV
+    // split of totalMileageKm; UNAVAILABLE on a BEV or a trim without it.
+    public final int hevMileageKm;
 
     // ==================== CHARGING ====================
     public final int chargingState;
@@ -75,6 +100,22 @@ public class BydVehicleData {
     public final double chargingPowerKw;
     public final double externalChargingPowerKw;
     public final double chargePowerKw;    // DC charge power into pack (kW), InstrumentDevice.getChargePower()
+    /** Charge power as the INSTRUMENT CLUSTER reports it (kW), read from feature id
+     *  0x32300018 (Instrument.CHARGING_CHARGE_POWER_DD). This is the figure shown on the dash
+     *  and the only charging-power source that is trustworthy on PHEV, where the typed getters
+     *  report the EVSE's rated capacity instead of the actual draw. Kept separate from
+     *  {@link #chargePowerKw} / {@link #externalChargingPowerKw} so the consumer cascade can
+     *  prefer it explicitly without this read clobbering the values BEV logic uses.
+     *
+     *  <p><b>PHEV-only as a power source.</b> The raw feature value is hectowatts on some
+     *  firmware families and kW on others with no unit flag, so the collector infers the scale
+     *  from the magnitude and cannot resolve raw 22..500 (either a 22-500 kW DC charge or a
+     *  0.22-5 kW AC one). A PHEV onboard charger cannot reach that band, so the inference is
+     *  always right there; on a BEV a real DC fast charge sits inside it. Hence
+     *  {@code VehicleDataMonitor.getChargingState()} consumes this on PHEV only, and BEV keeps
+     *  using {@link #chargePowerKw}. It is still populated on every drivetrain — the JSON dump
+     *  below carries it so a device capture can settle which family a trim belongs to. */
+    public final double clusterChargePowerKw;
     public final double hvPackVoltage;    // HV battery pack voltage (V), from CAN event
 
     // ==================== GEAR ====================
@@ -107,6 +148,11 @@ public class BydVehicleData {
     // Interior ambient (atmosphere) light colour: 1-based index into the fixed
     // 31-colour palette (LightConstants.AMBIENT_COLOURS). Defaults to 1 until read.
     public final int ambientColour;
+    // Interior ambient main switch: 1 = on, 0 = off, UNAVAILABLE when this trim reports
+    // neither the Light-device status feature nor the atmosphere_lamp provider flag. Kept as
+    // a tri-state int (not a boolean) so an unreadable switch cannot masquerade as "off" —
+    // consumers skip UNAVAILABLE rather than publishing a wrong state.
+    public final int ambientEnabled;
 
     // ==================== ADAS ====================
     public final boolean speedLimitWarning;
@@ -127,6 +173,10 @@ public class BydVehicleData {
     public final int acWindMode;
     public final int acFanLevel;
     public final int tempUnit;
+    // AC temperature SETPOINT (the dial), in whatever unit tempUnit says — NOT insideTempC,
+    // which is the MEASURED cabin air. Driver = area 1, passenger = area 2.
+    public final int acSetpointDriver;
+    public final int acSetpointPassenger;
 
     // ==================== SENSOR ====================
     public final double slopeDegrees;
@@ -200,13 +250,24 @@ public class BydVehicleData {
     public final boolean driftModeEnabled;
 
     // ==================== EXTENDED SAFETY ====================
-    public final int[] passengerDetection;    // OMS detection per seat
+    // Seat occupancy. ONE slot: index 0 = FRONT PASSENGER (getPassengerStatus area 1, off the
+    // safety-belt device — not OMS/ADAS). 1=occupied / 0=empty; never a sentinel (the producer
+    // returns null instead). There is no driver slot — that seat has no occupancy sensor.
+    public final int[] passengerDetection;
 
     // ==================== EXTENDED AIR QUALITY ====================
     public final int pm25Inside;
     public final int pm25Outside;
 
     // ==================== META ====================
+    /**
+     * When {@link #insideTempC} was last actually READ from the AC device (epoch ms), or 0 if
+     * never. Needed because insideTempC is carried forward by {@link #toBuilder()} and never reset
+     * to NaN, so its presence alone cannot distinguish "the cabin sensor answered this cycle" from
+     * "a value left over from before the car was parked". Consumers that must not act on a stale
+     * cabin reading (the {@code temperature} automation event) compare against this.
+     */
+    public final long insideTempReadAt;
     public final long timestamp;
     public final String[] availableDevices;
     public final String[] unavailableDevices;
@@ -236,16 +297,21 @@ public class BydVehicleData {
         this.frontMotorTorque = b.frontMotorTorque;
         this.engineSpeedRpm = b.engineSpeedRpm;
         this.enginePowerKw = b.enginePowerKw;
+        this.enginePowerAtMs = b.enginePowerAtMs;
         this.energyMode = b.energyMode;
         this.operationMode = b.operationMode;
         this.totalElecCon = b.totalElecCon;
         this.totalFuelCon = b.totalFuelCon;
+        this.avgFuelConPer100Km = b.avgFuelConPer100Km;
+        this.avgElecConPer100Km = b.avgElecConPer100Km;
+        this.lastElecConPer100Km = b.lastElecConPer100Km;
         this.elecRangeKm = b.elecRangeKm;
         this.fuelRangeKm = b.fuelRangeKm;
         this.fuelPercent = b.fuelPercent;
         this.bodyworkRangeKm = b.bodyworkRangeKm;
         this.totalMileageKm = b.totalMileageKm;
         this.evMileageKm = b.evMileageKm;
+        this.hevMileageKm = b.hevMileageKm;
         this.chargingState = b.chargingState;
         this.chargingGunState = b.chargingGunState;
         this.chargerWorkState = b.chargerWorkState;
@@ -253,6 +319,7 @@ public class BydVehicleData {
         this.chargingPowerKw = b.chargingPowerKw;
         this.externalChargingPowerKw = b.externalChargingPowerKw;
         this.chargePowerKw = b.chargePowerKw;
+        this.clusterChargePowerKw = b.clusterChargePowerKw;
         this.hvPackVoltage = b.hvPackVoltage;
         this.gearMode = b.gearMode;
         this.tyrePressure = b.tyrePressure;
@@ -273,6 +340,7 @@ public class BydVehicleData {
         this.hazard = b.hazard;
         this.dayTimeLight = b.dayTimeLight;
         this.ambientColour = b.ambientColour;
+        this.ambientEnabled = b.ambientEnabled;
         this.speedLimitWarning = b.speedLimitWarning;
         this.childPresenceDetection = b.childPresenceDetection;
         this.seatbeltStatus = b.seatbeltStatus;
@@ -283,6 +351,8 @@ public class BydVehicleData {
         this.acWindMode = b.acWindMode;
         this.acFanLevel = b.acFanLevel;
         this.tempUnit = b.tempUnit;
+        this.acSetpointDriver = b.acSetpointDriver;
+        this.acSetpointPassenger = b.acSetpointPassenger;
         this.slopeDegrees = b.slopeDegrees;
         this.powerLevel = b.powerLevel;
         this.mcuStatus = b.mcuStatus;
@@ -328,6 +398,7 @@ public class BydVehicleData {
         this.passengerDetection = b.passengerDetection;
         this.pm25Inside = b.pm25Inside;
         this.pm25Outside = b.pm25Outside;
+        this.insideTempReadAt = b.insideTempReadAt;
         this.timestamp = b.timestamp;
         this.availableDevices = b.availableDevices;
         this.unavailableDevices = b.unavailableDevices;
@@ -411,6 +482,9 @@ public class BydVehicleData {
             if (operationMode != UNAVAILABLE) eng.put("operationMode", operationMode);
             putIfValid(eng, "totalElecCon", totalElecCon);
             putIfValid(eng, "totalFuelCon", totalFuelCon);
+            putIfValid(eng, "avgFuelConPer100Km", avgFuelConPer100Km);
+            putIfValid(eng, "avgElecConPer100Km", avgElecConPer100Km);
+            putIfValid(eng, "lastElecConPer100Km", lastElecConPer100Km);
             j.put("energy", eng);
 
             // Range
@@ -425,6 +499,7 @@ public class BydVehicleData {
             JSONObject mil = new JSONObject();
             if (totalMileageKm != UNAVAILABLE) mil.put("totalKm", totalMileageKm);
             if (evMileageKm != UNAVAILABLE) mil.put("evKm", evMileageKm);
+            if (hevMileageKm != UNAVAILABLE) mil.put("hevKm", hevMileageKm);
             j.put("mileage", mil);
 
             // Charging
@@ -441,6 +516,14 @@ public class BydVehicleData {
             // consumers (getChargingState / MQTT / ABRP) gate on.
             if (!Double.isNaN(chargePowerKw) && chargePowerKw > 0.1 && chargePowerKw <= 300) {
                 putIfValid(chg, "chargePowerKw", chargePowerKw);
+            }
+            // Emitted alongside its siblings and on the SAME band, because this is now the
+            // TOP-priority source in getChargingState()'s cascade — a diagnostic capture that
+            // omitted the winning candidate would be misleading about where a displayed rate
+            // came from.
+            if (!Double.isNaN(clusterChargePowerKw)
+                    && clusterChargePowerKw > 0.1 && clusterChargePowerKw <= 300) {
+                putIfValid(chg, "clusterChargePowerKw", clusterChargePowerKw);
             }
             j.put("charging", chg);
 
@@ -505,8 +588,13 @@ public class BydVehicleData {
 
             // Seatbelts
             if (seatbeltStatus != null) {
+                // Per-element UNAVAILABLE → null, same as tyreTemperature above. The producer
+                // (readSeatbeltPair) returns null only when BOTH seats are unreadable, so a pair
+                // like {UNAVAILABLE, 0} IS stored and published — dumping it raw emitted
+                // -2147483648 as a seat state, which a consumer reads as a garbage/truthy
+                // "buckled" on a safety signal.
                 JSONArray sb = new JSONArray();
-                for (int s : seatbeltStatus) sb.put(s);
+                for (int s : seatbeltStatus) sb.put(s == UNAVAILABLE ? JSONObject.NULL : (Object) s);
                 j.put("seatbeltStatus", sb);
             }
             if (seatHeat != null) {
@@ -527,6 +615,8 @@ public class BydVehicleData {
             if (acWindMode != UNAVAILABLE) clim.put("windMode", acWindMode);
             if (acFanLevel != UNAVAILABLE) clim.put("fanLevel", acFanLevel);
             if (tempUnit != UNAVAILABLE) clim.put("tempUnit", tempUnit);
+            if (acSetpointDriver != UNAVAILABLE) clim.put("setpointDriver", acSetpointDriver);
+            if (acSetpointPassenger != UNAVAILABLE) clim.put("setpointPassenger", acSetpointPassenger);
             j.put("climate", clim);
 
             // Sensor
@@ -653,22 +743,30 @@ public class BydVehicleData {
         b.voltageLevelRaw = voltageLevelRaw;
         b.highCellTempC = highCellTempC;
         b.lowCellTempC = lowCellTempC; b.avgCellTempC = avgCellTempC;
+        // insideTempReadAt rides along with insideTempC: the value is carried forward, and so is
+        // the age of the read that produced it (NOT refreshed here — that would make every stale
+        // carry-forward look brand new, defeating the whole point of the stamp).
         b.waterTempC = waterTempC; b.outsideTempC = outsideTempC; b.insideTempC = insideTempC;
+        b.insideTempReadAt = insideTempReadAt;
         b.bodyworkBattTempC = bodyworkBattTempC; b.highCellVoltage = highCellVoltage;
         b.lowCellVoltage = lowCellVoltage; b.speedKmh = speedKmh; b.accelPercent = accelPercent;
         b.brakePercent = brakePercent; b.frontMotorSpeed = frontMotorSpeed;
         b.rearMotorSpeed = rearMotorSpeed; b.frontMotorTorque = frontMotorTorque;
         b.engineSpeedRpm = engineSpeedRpm; b.enginePowerKw = enginePowerKw;
+        b.enginePowerAtMs = enginePowerAtMs;
         b.energyMode = energyMode; b.operationMode = operationMode;
         b.totalElecCon = totalElecCon; b.totalFuelCon = totalFuelCon;
+        b.avgFuelConPer100Km = avgFuelConPer100Km;
+        b.avgElecConPer100Km = avgElecConPer100Km; b.lastElecConPer100Km = lastElecConPer100Km;
         b.elecRangeKm = elecRangeKm; b.fuelRangeKm = fuelRangeKm;
         b.fuelPercent = fuelPercent;
         b.bodyworkRangeKm = bodyworkRangeKm; b.totalMileageKm = totalMileageKm;
-        b.evMileageKm = evMileageKm; b.chargingState = chargingState;
+        b.evMileageKm = evMileageKm; b.hevMileageKm = hevMileageKm; b.chargingState = chargingState;
         b.chargingGunState = chargingGunState; b.chargerWorkState = chargerWorkState;
         b.chargingMode = chargingMode;
         b.chargingPowerKw = chargingPowerKw; b.externalChargingPowerKw = externalChargingPowerKw;
         b.chargePowerKw = chargePowerKw;
+        b.clusterChargePowerKw = clusterChargePowerKw;
         b.hvPackVoltage = hvPackVoltage;
         b.gearMode = gearMode; b.tyrePressure = tyrePressure;
         b.tyrePressureState = tyrePressureState; b.tyreAirLeakState = tyreAirLeakState;
@@ -681,11 +779,13 @@ public class BydVehicleData {
         b.rearFog = rearFog; b.frontFog = frontFog; b.hazard = hazard;
         b.dayTimeLight = dayTimeLight; b.seatbeltStatus = seatbeltStatus;
         b.ambientColour = ambientColour;
+        b.ambientEnabled = ambientEnabled;
         b.seatHeat = seatHeat; b.seatCool = seatCool;
         b.speedLimitWarning = speedLimitWarning;
         b.childPresenceDetection = childPresenceDetection;
         b.acStartState = acStartState; b.acCycleMode = acCycleMode; b.acWindMode = acWindMode; b.acFanLevel = acFanLevel;
         b.tempUnit = tempUnit; b.slopeDegrees = slopeDegrees; b.powerLevel = powerLevel;
+        b.acSetpointDriver = acSetpointDriver; b.acSetpointPassenger = acSetpointPassenger;
         b.mcuStatus = mcuStatus; b.emergencyAlarmState = emergencyAlarmState;
         b.radarDistances = radarDistances; b.timestamp = timestamp;
         b.availableDevices = availableDevices; b.unavailableDevices = unavailableDevices;
@@ -729,14 +829,18 @@ public class BydVehicleData {
         double speedKmh = NaN; int accelPercent = UNAVAILABLE, brakePercent = UNAVAILABLE;
         int frontMotorSpeed = UNAVAILABLE, rearMotorSpeed = UNAVAILABLE;
         double frontMotorTorque = NaN; int engineSpeedRpm = UNAVAILABLE; double enginePowerKw = NaN;
+        long enginePowerAtMs = 0L;
         int energyMode = UNAVAILABLE, operationMode = UNAVAILABLE;
         double totalElecCon = NaN, totalFuelCon = NaN;
+        double avgFuelConPer100Km = NaN;
+        double avgElecConPer100Km = NaN, lastElecConPer100Km = NaN;
         int elecRangeKm = UNAVAILABLE, fuelRangeKm = UNAVAILABLE, bodyworkRangeKm = UNAVAILABLE;
         double fuelPercent = NaN;
-        int totalMileageKm = UNAVAILABLE, evMileageKm = UNAVAILABLE;
+        int totalMileageKm = UNAVAILABLE, evMileageKm = UNAVAILABLE, hevMileageKm = UNAVAILABLE;
         int chargingState = UNAVAILABLE, chargingGunState = UNAVAILABLE, chargerWorkState = UNAVAILABLE;
         int chargingMode = UNAVAILABLE;
         double chargingPowerKw = NaN, externalChargingPowerKw = NaN, chargePowerKw = NaN, hvPackVoltage = NaN;
+        double clusterChargePowerKw = NaN;
         int gearMode = UNAVAILABLE;
         int[] tyrePressure, doorLockStatus, windowOpenPercent, seatbeltStatus, radarDistances;
         int[] seatHeat, seatCool;
@@ -745,12 +849,15 @@ public class BydVehicleData {
         int leftTurnState = UNAVAILABLE, rightTurnState = UNAVAILABLE;
         boolean lowBeam, highBeam, rearFog, frontFog, hazard, dayTimeLight;
         int ambientColour = 1;
+        int ambientEnabled = UNAVAILABLE;
         boolean speedLimitWarning;
         int childPresenceDetection;
         int acStartState = UNAVAILABLE, acCycleMode = UNAVAILABLE, acWindMode = UNAVAILABLE, acFanLevel = UNAVAILABLE, tempUnit = UNAVAILABLE;
+        int acSetpointDriver = UNAVAILABLE, acSetpointPassenger = UNAVAILABLE;
         double slopeDegrees = NaN;
         int powerLevel = UNAVAILABLE, mcuStatus = UNAVAILABLE, emergencyAlarmState = UNAVAILABLE;
         long timestamp = System.currentTimeMillis();
+        long insideTempReadAt = 0L;
         String[] availableDevices, unavailableDevices;
 
         // Extended fields
@@ -806,7 +913,14 @@ public class BydVehicleData {
         public Builder avgCellTempC(double v) { avgCellTempC = v; return this; }
         public Builder waterTempC(double v) { waterTempC = v; return this; }
         public Builder outsideTempC(double v) { outsideTempC = v; return this; }
-        public Builder insideTempC(double v) { insideTempC = v; return this; }
+        /** Sets the cabin temperature AND stamps it as freshly read (see insideTempReadAt). Every
+         *  caller of this setter is a real sensor/cloud read, so the stamp belongs here rather than
+         *  at each call site — that way a new producer can't forget it and look permanently stale. */
+        public Builder insideTempC(double v) {
+            insideTempC = v;
+            insideTempReadAt = System.currentTimeMillis();
+            return this;
+        }
         public Builder bodyworkBattTempC(double v) { bodyworkBattTempC = v; return this; }
         public Builder highCellVoltage(double v) { highCellVoltage = v; return this; }
         public Builder lowCellVoltage(double v) { lowCellVoltage = v; return this; }
@@ -817,17 +931,27 @@ public class BydVehicleData {
         public Builder rearMotorSpeed(int v) { rearMotorSpeed = v; return this; }
         public Builder frontMotorTorque(double v) { frontMotorTorque = v; return this; }
         public Builder engineSpeedRpm(int v) { engineSpeedRpm = v; return this; }
-        public Builder enginePowerKw(double v) { enginePowerKw = v; return this; }
+        /** Sets the value AND its freshness stamp together, so the two can never drift.
+         *  A NaN write clears the stamp (nothing live to age). */
+        public Builder enginePowerKw(double v) {
+            enginePowerKw = v;
+            enginePowerAtMs = Double.isNaN(v) ? 0L : System.currentTimeMillis();
+            return this;
+        }
         public Builder energyMode(int v) { energyMode = v; return this; }
         public Builder operationMode(int v) { operationMode = v; return this; }
         public Builder totalElecCon(double v) { totalElecCon = v; return this; }
         public Builder totalFuelCon(double v) { totalFuelCon = v; return this; }
+        public Builder avgFuelConPer100Km(double v) { avgFuelConPer100Km = v; return this; }
+        public Builder avgElecConPer100Km(double v) { avgElecConPer100Km = v; return this; }
+        public Builder lastElecConPer100Km(double v) { lastElecConPer100Km = v; return this; }
         public Builder elecRangeKm(int v) { elecRangeKm = v; return this; }
         public Builder fuelRangeKm(int v) { fuelRangeKm = v; return this; }
         public Builder fuelPercent(double v) { fuelPercent = v; return this; }
         public Builder bodyworkRangeKm(int v) { bodyworkRangeKm = v; return this; }
         public Builder totalMileageKm(int v) { totalMileageKm = v; return this; }
         public Builder evMileageKm(int v) { evMileageKm = v; return this; }
+        public Builder hevMileageKm(int v) { hevMileageKm = v; return this; }
         public Builder chargingState(int v) { chargingState = v; return this; }
         public Builder chargingGunState(int v) { chargingGunState = v; return this; }
         public Builder chargerWorkState(int v) { chargerWorkState = v; return this; }
@@ -835,6 +959,7 @@ public class BydVehicleData {
         public Builder chargingPowerKw(double v) { chargingPowerKw = v; return this; }
         public Builder externalChargingPowerKw(double v) { externalChargingPowerKw = v; return this; }
         public Builder chargePowerKw(double v) { chargePowerKw = v; return this; }
+        public Builder clusterChargePowerKw(double v) { clusterChargePowerKw = v; return this; }
         public Builder hvPackVoltage(double v) { hvPackVoltage = v; return this; }
         public Builder gearMode(int v) { gearMode = v; return this; }
         public Builder tyrePressure(int[] v) { tyrePressure = v; return this; }
@@ -855,6 +980,7 @@ public class BydVehicleData {
         public Builder hazard(boolean v) { hazard = v; return this; }
         public Builder dayTimeLight(boolean v) { dayTimeLight = v; return this; }
         public Builder ambientColour(int v) { ambientColour = v; return this; }
+        public Builder ambientEnabled(int v) { ambientEnabled = v; return this; }
         public Builder speedLimitWarning(boolean v) { speedLimitWarning = v; return this; }
         public Builder childPresenceDetection(int v) { childPresenceDetection = v; return this; }
         public Builder seatbeltStatus(int[] v) { seatbeltStatus = v; return this; }
@@ -865,6 +991,8 @@ public class BydVehicleData {
         public Builder acWindMode(int v) { acWindMode = v; return this; }
         public Builder acFanLevel(int v) { acFanLevel = v; return this; }
         public Builder tempUnit(int v) { tempUnit = v; return this; }
+        public Builder acSetpointDriver(int v) { acSetpointDriver = v; return this; }
+        public Builder acSetpointPassenger(int v) { acSetpointPassenger = v; return this; }
         public Builder slopeDegrees(double v) { slopeDegrees = v; return this; }
         public Builder powerLevel(int v) { powerLevel = v; return this; }
         public Builder mcuStatus(int v) { mcuStatus = v; return this; }

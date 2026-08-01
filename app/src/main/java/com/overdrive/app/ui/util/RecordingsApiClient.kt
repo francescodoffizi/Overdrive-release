@@ -164,7 +164,14 @@ object RecordingsApiClient {
          * caller should retry the same query after [retryAfterMs].
          */
         val reconciling: Boolean = false,
-        val retryAfterMs: Long = 1500L
+        val retryAfterMs: Long = 1500L,
+        /**
+         * Daemon reported its recordings index is down (H2 closed the store).
+         * The clips are still on disk, so this is explicitly NOT an empty
+         * library and NOT a reason to fall back to a direct-FS scan — the
+         * caller should keep the current list and retry after [retryAfterMs].
+         */
+        val indexUnavailable: Boolean = false
     )
 
     /** /api/recordings/stats — flat numbers + warmup state. */
@@ -175,7 +182,12 @@ object RecordingsApiClient {
         val proximityCount: Long, val proximitySize: Long, val proximityToday: Long,
         // Instant replays (replay_*). Zero on daemons predating type='replay'.
         val replayCount: Long, val replaySize: Long, val replayToday: Long,
-        val warming: Boolean, val warmingDone: Int, val warmingTotal: Int
+        val warming: Boolean, val warmingDone: Int, val warmingTotal: Int,
+        /**
+         * Daemon reported its recordings index is down. Every counter in this
+         * payload is zero and NOT authoritative — render "unknown", never "0".
+         */
+        val indexUnavailable: Boolean = false
     )
 
     /** /api/recordings/places row. */
@@ -198,6 +210,24 @@ object RecordingsApiClient {
             val url = "$BASE_URL/api/recordings?" + filter.toQuery(page, pageSize)
             val body = httpGet(url) ?: return null
             val root = JSONObject(body)
+            // Index-down is a distinct, retryable state — surface it instead
+            // of collapsing to null (which the caller treats as "daemon
+            // unreachable" and answers with a latched direct-FS fallback).
+            if (root.optBoolean("indexUnavailable", false)) {
+                Log.w(TAG, "fetchRecordings: recordings index unavailable, retryable")
+                return Page(
+                    recordings = emptyList(),
+                    totalCount = 0,
+                    totalPages = 1,
+                    page = root.optInt("page", page),
+                    pageSize = root.optInt("pageSize", pageSize),
+                    warming = false,
+                    warmingDone = 0,
+                    warmingTotal = 0,
+                    retryAfterMs = root.optLong("retryAfterMs", 5000L),
+                    indexUnavailable = true
+                )
+            }
             if (!root.optBoolean("success", false)) {
                 Log.w(TAG, "fetchRecordings success=false: ${root.optString("error")}")
                 return null
@@ -240,6 +270,14 @@ object RecordingsApiClient {
     fun fetchAllRecordings(filter: Filter): List<RecordingFile>? {
         val pageSize = 200
         val first = fetchRecordings(filter, 1, pageSize) ?: return null
+        // Index down: return emptyList(), NOT null. null means "daemon
+        // unreachable", and every RecordingScanner entry point answers that
+        // with a full multi-dir direct-FS walk (sidecar-parsing every clip).
+        // The dashboard alone would fire ~4 of those per onResume, and on
+        // SD/USB volumes the walk returns nothing anyway because the app UID
+        // can't read them — maximum cost, zero benefit. Same contract as the
+        // warming case just below: empty now, correct after the retry.
+        if (first.indexUnavailable) return emptyList()
         if (first.warming) return emptyList()
         if (first.recordings.isEmpty()) return emptyList()
 
@@ -251,9 +289,12 @@ object RecordingsApiClient {
         all.addAll(first.recordings)
         for (p in 2..totalPages) {
             val next = fetchRecordings(filter, p, pageSize) ?: return null
-            // If the index began warming mid-paging (rare), bail to empty
-            // so the caller doesn't show a partial library.
-            if (next.warming) return emptyList()
+            // If the index began warming — or went down — mid-paging (rare),
+            // bail to empty so the caller doesn't show a PARTIAL library as if
+            // it were complete. Without the indexUnavailable clause an outage
+            // starting on page 2 would return page 1's rows as an
+            // authoritative full result (e.g. 200 of 500 clips, no error).
+            if (next.warming || next.indexUnavailable) return emptyList()
             all.addAll(next.recordings)
         }
         return all
@@ -264,6 +305,23 @@ object RecordingsApiClient {
         return try {
             val body = httpGet("$BASE_URL/api/recordings/stats") ?: return null
             val root = JSONObject(body)
+            // Index down: report it explicitly rather than collapsing to null.
+            // null means "daemon unreachable", which sends the caller down a
+            // direct-FS aggregate that (on SD/USB, or when the walk finds
+            // nothing) renders an authoritative "0 clips · 0 B" header — the
+            // same lie this whole fix exists to remove, and it would sit
+            // directly above the library's honest "index unavailable" card.
+            if (root.optBoolean("indexUnavailable", false)) {
+                return StatsPayload(
+                    totalCount = 0, totalSize = 0, totalToday = 0,
+                    normalCount = 0, normalSize = 0, normalToday = 0,
+                    sentryCount = 0, sentrySize = 0, sentryToday = 0,
+                    proximityCount = 0, proximitySize = 0, proximityToday = 0,
+                    replayCount = 0, replaySize = 0, replayToday = 0,
+                    warming = false, warmingDone = 0, warmingTotal = 0,
+                    indexUnavailable = true
+                )
+            }
             if (!root.optBoolean("success", false)) return null
             val warmObj = root.optJSONObject("indexState")
             StatsPayload(
@@ -377,6 +435,17 @@ object RecordingsApiClient {
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) {
                 Log.w(TAG, "GET $url -> HTTP ${resp.code}")
+                // 503 is the daemon's structured "recordings index is down"
+                // reply and carries a JSON body ({indexUnavailable:true,
+                // retryAfterMs}). Return it so callers can distinguish a
+                // transient index outage — which should be RETRIED — from the
+                // daemon being unreachable, which falls back to a direct-FS
+                // scan. Dropping the body here made every index outage look
+                // like an unreachable daemon: the library fragment latched
+                // into no-pagination fallback mode with no retry, and on
+                // SD/USB installs (unreadable from the app UID) that meant a
+                // permanently empty library.
+                if (resp.code == 503) return resp.body?.string()
                 return null
             }
             return resp.body?.string()

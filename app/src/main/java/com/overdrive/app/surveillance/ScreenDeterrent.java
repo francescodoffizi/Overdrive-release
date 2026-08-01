@@ -19,6 +19,7 @@ import android.view.WindowManager;
 import com.overdrive.app.config.UnifiedConfigManager;
 import com.overdrive.app.daemon.DaemonBootstrap;
 import com.overdrive.app.logging.DaemonLogger;
+import com.overdrive.app.util.DaemonFonts;
 
 import org.json.JSONObject;
 
@@ -264,8 +265,22 @@ public final class ScreenDeterrent {
         activityLaunched = false;
 
         // Restore stealth backlight unless somebody else owns the wake (ACC-on).
+        //
+        // The isAccOn() read is deliberate and mirrors shouldStop()'s guard: the
+        // other two conditions are not sufficient on the ACC-ON edge. `cancelled`
+        // is never set on ACC-ON (only by the CameraDaemon shutdown hook and
+        // SurveillanceEngineGpu), and `isForceStop()` reads a flag that
+        // AccSentryDaemon CLEARS ~3.3 s into its wake sequence — and never sets at
+        // all if that daemon is dead or wedged at the transition. Without this,
+        // "owner walks up → deterrent fires → owner starts the car" can darken the
+        // panel after the last wake and leave the driver with a black screen.
+        // Note: turnBacklightOff → StealthPanel.turnOff also refuses while a fresh
+        // ACC-ON edge is in its trust window, so this is belt-and-braces; keeping it
+        // here avoids even starting the teardown chain (locked config writes +
+        // binder calls) on the ACC-ON edge.
         Context ctx = resolveContext();
-        if (ctx != null && !cancelled.get() && !isForceStop()) {
+        if (ctx != null && !cancelled.get() && !isForceStop()
+                && !com.overdrive.app.monitor.AccMonitor.isAccOn()) {
             turnBacklightOff(ctx);
         }
 
@@ -678,13 +693,24 @@ public final class ScreenDeterrent {
             drawCameraIcon(c, iconCx, iconCy, 200f * minRatio, FG);
         }
 
+        // Text lines below. On a BSP where the daemon font system is unusable,
+        // drawText would abort the whole process natively (SIGABRT —
+        // gDefaultTypeface == null). The brand glyph / camera icon above still
+        // conveys "you are on camera" without text, so skip the wordmark +
+        // headline + subtitle rather than crash the daemon. Healthy DiLink
+        // 3/4/5 devices always take the text path.
+        if (!DaemonFonts.canDrawText()) {
+            logger.warn("drawDefaultText: font system unusable, rendering deterrent without text");
+            return;
+        }
+
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         p.setColor(FG);
         p.setTextAlign(Paint.Align.CENTER);
 
         // 2. OVERDRIVE wordmark — white, sits below the card.
         p.setTextSize(56f * minRatio);
-        p.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
+        DaemonFonts.apply(p, Typeface.BOLD);
         p.setLetterSpacing(0.20f);
         c.drawText("OVERDRIVE", dispW / 2f, dispH * 0.50f, p);
 
@@ -693,14 +719,14 @@ public final class ScreenDeterrent {
         //    smaller panels don't blow the text off the canvas.
         //    Letter-spacing 0.04 keeps it readable at this size.
         p.setTextSize(144f * minRatio);
-        p.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
+        DaemonFonts.apply(p, Typeface.BOLD);
         p.setLetterSpacing(0.04f);
         String headline = readMessage("YOU ARE ON CAMERA");
         c.drawText(headline, dispW / 2f, dispH * 0.70f, p);
 
         // 4. Subtitle.
         p.setTextSize(64f * minRatio);
-        p.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL));
+        DaemonFonts.apply(p, Typeface.NORMAL);
         p.setLetterSpacing(0.04f);
         p.setAlpha(220);
         c.drawText("Surveillance recording in progress",
@@ -793,6 +819,23 @@ public final class ScreenDeterrent {
 
     // ── Wake / sleep panel (BYD PowerManager extension, UID 2000 only) ─────
 
+    /**
+     * Bring the panel up so the deterrent layer is actually visible.
+     *
+     * <p>Tier 1 is the original {@code TurnBacklightOn(long)} reflection,
+     * unchanged. On dilink4 we then escalate through
+     * {@link com.overdrive.app.power.StealthPanel#turnOn} — which adds the
+     * vendor {@code TurnBacklightOnWithLock} tier and verifies the result with
+     * {@code getPowerScreenStatus()}. That matters here specifically: the
+     * keep-alive may have darkened the panel with
+     * {@code TurnBacklightOffWithLock}, and a plain tier-1 wake can be silently
+     * ignored against that vendor lock — leaving the deterrent compositing its
+     * z=MAX layer onto a dark screen, i.e. an intruder warning nobody sees.
+     *
+     * <p>{@code turnOn()} self-skips when the screen already reads on, so on
+     * legacy units (where tier 1 works) it costs one status read and performs no
+     * additional panel write.
+     */
     private static void wakePanel(Context ctx) {
         try {
             PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
@@ -800,15 +843,62 @@ public final class ScreenDeterrent {
                 try {
                     Method m = pm.getClass().getMethod(name, long.class);
                     m.invoke(pm, SystemClock.uptimeMillis());
-                    return;
+                    break;
                 } catch (NoSuchMethodException ignored) {}
             }
         } catch (Throwable t) {
             logger.warn("TurnBacklightOn reflection failed: " + t.getMessage());
         }
+        // dilink4: escalate to the WithLock tier + verify, else the layer may be
+        // invisible. Self-gated — no-op on legacy.
+        try {
+            if (com.overdrive.app.power.StealthPanel.isDilink4()) {
+                // The tier-1 write above already changed the panel behind
+                // StealthPanel's back. On firmware with no getPowerScreenStatus()
+                // that is unobservable, so declare it — otherwise the
+                // unverifiable-firmware latch could treat this wake (and the
+                // re-darken after the deterrent) as redundant and skip the write,
+                // leaving the warning invisible or the panel lit afterwards.
+                com.overdrive.app.power.StealthPanel.notePanelStateChangedExternally();
+                com.overdrive.app.power.StealthPanel.turnOn(ctx);
+            }
+        } catch (Throwable t) {
+            logger.debug("Verified panel wake failed: " + t.getMessage());
+        }
     }
 
+    /**
+     * Return the panel to dark after the deterrent ends.
+     *
+     * <p>Tier 1 ({@code TurnBacklightOff(long)}) is the original path and is
+     * kept for legacy units exactly as it was. On dilink4 we use the verified
+     * two-tier path instead: the reference app (Escort_Auto.apk
+     * {@code BacklightController.turnOffBacklight}) escalates to
+     * {@code TurnBacklightOffWithLock} and re-checks
+     * {@code getPowerScreenStatus()}, because tier 1 alone does not reliably
+     * stick on this firmware — which would leave the panel lit for the rest of
+     * the park after every motion event.
+     */
     private static void turnBacklightOff(Context ctx) {
+        try {
+            if (com.overdrive.app.power.StealthPanel.isDilink4()) {
+                // Honour an in-flight user screen-on request. Without this the
+                // deterrent defeats it from the OTHER process: the user taps
+                // screen-on, walks to the car, motion fires a deterrent, and this
+                // cleanup darkens the panel inside the 60 s grace — so the
+                // screen-on button appears not to work whenever you are near the
+                // car. The keep-alive already declines to darken in that window;
+                // this is the same rule applied to the deterrent's own teardown.
+                if (com.overdrive.app.power.StealthPanel.isUserOverrideActive()) {
+                    logger.info("Deterrent end: leaving panel lit — user screen-on override active");
+                    return;
+                }
+                com.overdrive.app.power.StealthPanel.turnOff(ctx);
+                return;
+            }
+        } catch (Throwable t) {
+            logger.debug("Verified backlight-off failed, falling back: " + t.getMessage());
+        }
         try {
             PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
             for (String name : new String[]{"TurnBacklightOff", "turnBacklightOff"}) {
@@ -827,12 +917,37 @@ public final class ScreenDeterrent {
 
     private static void launchActivity() {
         try {
+            // TWO fixes here, both the same class of bug:
+            //
+            // 1. `--activity-new-task` was passed and is NOT a valid `am` option —
+            //    Intent.parseCommandArgs has no case for it, so its default: branch throws
+            //    IllegalArgumentException("Unknown option: …") and ShellCommand.exec aborts
+            //    the ENTIRE command. This activity therefore never launched at all; the
+            //    failure was invisible because the deterrent's visible output comes from the
+            //    daemon-owned SurfaceControl layer (only the touch capture was silently
+            //    lost) and output here goes to /dev/null. NEW_TASK is added unconditionally
+            //    by ActivityManagerShellCommand.runStartActivity, so nothing replaces it.
+            //
+            // 2. NO `--activity-*` options at all now — both of the previous ones were wrong
+            //    for this activity, and neither buys anything:
+            //
+            //    * `--activity-no-history` (FLAG_ACTIVITY_NO_HISTORY) finishes the activity as
+            //      soon as it stops being foreground. During an ACC-off deterrent anything that
+            //      briefly takes foreground (a vendor overlay, a display off/on cycle) would
+            //      therefore kill it MID-FIRE — and because that is not an orderly finish,
+            //      onDestroy writes screenDeterrentForceStop=true, which the daemon's
+            //      shouldStop() reads on its next ~200ms tick and tears the whole render down.
+            //      The deterrent would silently truncate, and the latched force-stop can also
+            //      cut the next one short. `excludeFromRecents=true` in the manifest already
+            //      covers the only thing no-history was wanted for (staying out of recents).
+            //    * `--activity-clear-task` would defeat the coalescing this class documents:
+            //      re-launching during sustained motion is meant to land on onNewIntent (a
+            //      deliberate no-op — "the deadline poll keeps us up"), not destroy and
+            //      re-create the instance. (For a singleInstance activity alone in its task
+            //      CLEAR_TASK is largely a no-op, but it is still the wrong intent to express.)
             ProcessBuilder pb = new ProcessBuilder("sh", "-c",
                 "am start -n com.overdrive.app/.DeterrentActivity "
                     + "-a android.intent.action.MAIN "
-                    + "--activity-no-history "
-                    + "--activity-clear-task "
-                    + "--activity-new-task "
                     + ">/dev/null 2>&1 &");
             pb.redirectErrorStream(true);
             pb.start();

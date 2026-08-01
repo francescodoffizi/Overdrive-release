@@ -3,10 +3,9 @@ package com.overdrive.app.automation.action;
 import com.overdrive.app.automation.AutomationAction;
 import com.overdrive.app.automation.AutomationCondition;
 import com.overdrive.app.automation.Automations;
-import com.overdrive.app.automation.condition.BydEvent;
 import com.overdrive.app.automation.condition.EventData;
 import com.overdrive.app.automation.type.DynamicIntType;
-import com.overdrive.app.automation.type.EnumType;
+import com.overdrive.app.automation.type.SignalAddressType;
 import com.overdrive.app.automation.type.StringType;
 import com.overdrive.app.automation.type.Type;
 import com.overdrive.app.automation.value.IntValue;
@@ -57,18 +56,12 @@ public class IfAction extends BaseAction {
         this.label = label;
         this.description = description;
         this.variables = List.of(
-                new EnumType(new Label("event", "automation.wait_signal"),
-                        new Label("speedKmph", "automation.speed"),
-                        new Label("accelerator", "automation.accelerator"),
-                        new Label("brake", "automation.brake"),
-                        new Label("steeringAngle", "automation.steering_angle"),
-                        new Label("batteryLevel", "automation.battery_level"),
-                        new Label("estimatedRange", "automation.estimated_range"),
-                        new Label("temperature", "automation.temperature"),
-                        new Label("outsideTemp", "automation.outside_temperature"),
-                        // Compare a user VARIABLE (its name typed into the bespoke "name"
-                        // field). String eq/neq only — see class doc.
-                        new Label("variable", "automation.variable")),
+                // The LHS is an ADDRESS into the shared condition catalog, so an If can test
+                // ANY of the ~58 conditions (including attributed ones like a specific door,
+                // seat or light) instead of the 9 signals this action used to hardcode. The
+                // legacy ids remain readable — see AutomationCondition.resolveSignalAddress.
+                // "variable" still addresses a user variable via the bespoke "name" field.
+                new SignalAddressType(new Label("event", "automation.wait_signal")),
                 IntValue.COMPARATORS,
                 new DynamicIntType(new Label("value", "automation.value"), -540, 1000));
     }
@@ -126,24 +119,24 @@ public class IfAction extends BaseAction {
         return base;
     }
 
+    /**
+     * Resolve the stored LHS to the state key it names.
+     *
+     * <p>Delegates to {@link AutomationCondition#resolveSignalAddress} — the one place the
+     * address grammar lives, shared with the condition RHS — so this action gets the whole
+     * condition catalog (attributed signals included) with no per-action mapping table, and
+     * the pre-catalog ids saved automations still hold keep resolving to the same signals.
+     * "variable" is the one address that needs local handling, because it is keyed by the
+     * free-text name in the bespoke "name" field rather than by a fixed type.
+     */
     private static EventData resolveEvent(String id, String name) {
         if (id == null) return null;
-        switch (id) {
-            case "speedKmph":      return BydEvent.SPEED_KMPH;
-            case "accelerator":    return BydEvent.ACCELERATOR;
-            case "brake":          return BydEvent.BRAKE;
-            case "steeringAngle":  return BydEvent.STEERING_ANGLE;
-            case "batteryLevel":   return BydEvent.BATTERY_LEVEL;
-            case "estimatedRange": return BydEvent.ESTIMATED_RANGE;
-            case "temperature":    return BydEvent.TEMPERATURE;
-            case "outsideTemp":    return BydEvent.OUTSIDE_TEMPERATURE;
-            case "variable":
-                // A user variable, keyed by the typed name (same state key SetVariableAction
-                // writes). Blank name → no LHS (trigger runs the else branch).
-                if (name == null || name.trim().isEmpty()) return null;
-                return SetVariableAction.variableEvent(name.trim());
-            default:               return null;
+        if ("variable".equals(id.trim())) {
+            // Blank name → no LHS (trigger runs the else branch).
+            if (name == null || name.trim().isEmpty()) return null;
+            return SetVariableAction.variableEvent(name.trim());
         }
+        return AutomationCondition.resolveSignalAddress(id);
     }
 
     public void trigger(AutomationAction automationAction) {

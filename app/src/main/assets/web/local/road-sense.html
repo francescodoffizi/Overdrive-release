@@ -27,7 +27,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=18">
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 </head>
@@ -540,32 +540,70 @@
                              panorama is landscape and always upright), so this row is shown
                              only for the "Side only" / "Rear only" modes. "Auto" orients to
                              the direction of travel (flips 180° in reverse). -->
-                        <div class="setting-row" id="bsRotationRow" style="border-bottom:none;display:none;">
+                        <!-- Rotation and forward-orientation are PER SIDE: the JS is
+                             bsSetRotation(side, deg) and highlights bsRot{L,R}* /
+                             bsBase{L,R}*. Single-argument calls no-op. -->
+                        <div class="setting-row" id="bsRotationLeftRow" style="display:none;">
                             <div class="setting-info">
-                                <div class="setting-name" data-i18n="road_sense.bs_rotation_title">Rotate view</div>
-                                <div class="setting-desc" data-i18n="road_sense.bs_rotation_desc">Rotate the single-camera view on screen. Useful when a side camera reads better turned upright. The window reshapes to match the rotation.</div>
+                                <div class="setting-name" data-i18n="road_sense.bs_rotation_left_title">Rotate view — left</div>
+                                <div class="setting-desc" data-i18n="road_sense.bs_rotation_left_desc">Rotate the left-turn view on screen. The window reshapes to match.</div>
                             </div>
                             <div class="setting-control" style="display:flex;flex-wrap:wrap;">
-                                <button class="btn btn-secondary" id="bsRot0" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation(0)" data-i18n="road_sense.bs_rotation_0">0&deg;</button>
-                                <button class="btn btn-secondary" id="bsRot90" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation(90)" data-i18n="road_sense.bs_rotation_90">90&deg;</button>
-                                <button class="btn btn-secondary" id="bsRot180" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation(180)" data-i18n="road_sense.bs_rotation_180">180&deg;</button>
-                                <button class="btn btn-secondary" id="bsRot270" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation(270)" data-i18n="road_sense.bs_rotation_270">270&deg;</button>
-                                <button class="btn btn-secondary" id="bsRotAuto" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetRotation('auto')" data-i18n="road_sense.bs_rotation_auto">Auto</button>
+                                <button class="btn btn-secondary" id="bsRotL0" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 0)" data-i18n="road_sense.bs_rotation_0">0&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotL90" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 90)" data-i18n="road_sense.bs_rotation_90">90&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotL180" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 180)" data-i18n="road_sense.bs_rotation_180">180&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotL270" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 270)" data-i18n="road_sense.bs_rotation_270">270&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotLAuto" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 'auto')" data-i18n="road_sense.bs_rotation_auto">Auto</button>
                             </div>
                         </div>
-                        <!-- Forward-orientation base for "Auto". Reverse gear flips this 180°
-                             on screen. Shown only when rotation is set to Auto. -->
-                        <div class="setting-row" id="bsAutoBaseRow" style="border-bottom:none;display:none;">
+                        <div class="setting-row" id="bsAutoBaseLeftRow" style="display:none;">
                             <div class="setting-info">
-                                <div class="setting-name" data-i18n="road_sense.bs_auto_base_title">Forward orientation</div>
+                                <div class="setting-name" data-i18n="road_sense.bs_auto_base_left_title">Forward orientation — left</div>
                                 <div class="setting-desc" data-i18n="road_sense.bs_auto_base_desc">The angle used while driving forward. Reverse gear flips the view 180° so it reads naturally when backing up.</div>
                             </div>
                             <div class="setting-control" style="display:flex;flex-wrap:wrap;">
-                                <button class="btn btn-secondary" id="bsBase0" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase(0)" data-i18n="road_sense.bs_rotation_0">0&deg;</button>
-                                <button class="btn btn-secondary" id="bsBase90" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase(90)" data-i18n="road_sense.bs_rotation_90">90&deg;</button>
-                                <button class="btn btn-secondary" id="bsBase180" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase(180)" data-i18n="road_sense.bs_rotation_180">180&deg;</button>
-                                <button class="btn btn-secondary" id="bsBase270" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase(270)" data-i18n="road_sense.bs_rotation_270">270&deg;</button>
+                                <button class="btn btn-secondary" id="bsBaseL0" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase('left', 0)" data-i18n="road_sense.bs_rotation_0">0&deg;</button>
+                                <button class="btn btn-secondary" id="bsBaseL90" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase('left', 90)" data-i18n="road_sense.bs_rotation_90">90&deg;</button>
+                                <button class="btn btn-secondary" id="bsBaseL180" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase('left', 180)" data-i18n="road_sense.bs_rotation_180">180&deg;</button>
+                                <button class="btn btn-secondary" id="bsBaseL270" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase('left', 270)" data-i18n="road_sense.bs_rotation_270">270&deg;</button>
                             </div>
+                        </div>
+                        <div class="setting-row" id="bsRotationRightRow" style="display:none;">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="road_sense.bs_rotation_right_title">Rotate view — right</div>
+                                <div class="setting-desc" data-i18n="road_sense.bs_rotation_right_desc">Rotate the right-turn view on screen; mirror-imaged from the left.</div>
+                            </div>
+                            <div class="setting-control" style="display:flex;flex-wrap:wrap;">
+                                <button class="btn btn-secondary" id="bsRotR0" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 0)" data-i18n="road_sense.bs_rotation_0">0&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotR90" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 90)" data-i18n="road_sense.bs_rotation_90">90&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotR180" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 180)" data-i18n="road_sense.bs_rotation_180">180&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotR270" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 270)" data-i18n="road_sense.bs_rotation_270">270&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotRAuto" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 'auto')" data-i18n="road_sense.bs_rotation_auto">Auto</button>
+                            </div>
+                        </div>
+                        <div class="setting-row" id="bsAutoBaseRightRow" style="display:none;">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="road_sense.bs_auto_base_right_title">Forward orientation — right</div>
+                                <div class="setting-desc" data-i18n="road_sense.bs_auto_base_desc">The angle used while driving forward. Reverse gear flips the view 180° so it reads naturally when backing up.</div>
+                            </div>
+                            <div class="setting-control" style="display:flex;flex-wrap:wrap;">
+                                <button class="btn btn-secondary" id="bsBaseR0" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase('right', 0)" data-i18n="road_sense.bs_rotation_0">0&deg;</button>
+                                <button class="btn btn-secondary" id="bsBaseR90" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase('right', 90)" data-i18n="road_sense.bs_rotation_90">90&deg;</button>
+                                <button class="btn btn-secondary" id="bsBaseR180" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase('right', 180)" data-i18n="road_sense.bs_rotation_180">180&deg;</button>
+                                <button class="btn btn-secondary" id="bsBaseR270" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetRotationBase('right', 270)" data-i18n="road_sense.bs_rotation_270">270&deg;</button>
+                            </div>
+                        </div>
+                        <!-- Single-camera fisheye rectifier; hidden in merged mode
+                             (libod dewarps that path itself). -->
+                        <div class="setting-row" id="bsRectifyRow" style="border-bottom:none;display:none;">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="road_sense.bs_rectify_title">Fisheye correction</div>
+                                <div class="setting-desc" data-i18n="road_sense.bs_rectify_desc">Straighten the fisheye/barrel curve of the single-camera side and rear views. Higher values flatten the bulge but crop the edges slightly. Only applies to the single-camera views, not the merged one.</div>
+                            </div>
+                            <div class="setting-control"><div class="slider-control">
+                                <span class="slider-value" id="bsRectifyVal">0</span>
+                                <input type="range" class="slider" id="bsRectify" min="0" max="100" step="1" value="0" oninput="RoadSenseSettings.bsRectifyInput(this.value)" onchange="RoadSenseSettings.bsSetRectify(this.value)">
+                            </div></div>
                         </div>
                     </div>
                 </div>
@@ -611,13 +649,25 @@
                                 <input type="range" class="slider" id="bsSize" min="15" max="90" step="5" value="40" oninput="RoadSenseSettings.bsSetSize(this.value)">
                             </div></div>
                         </div>
-                        <div class="setting-row" style="border-bottom:none;"><div class="setting-info"><div class="setting-name" data-i18n="road_sense.bs_position">Position</div></div>
+                        <!-- Position is PER SIDE: bsSetCorner(side, corner) writes
+                             bsCornerLeft/bsCornerRight (or the *Cluster keys) and
+                             highlights bsCorner{L,R}*. One-arg calls no-op. -->
+                        <div class="setting-row"><div class="setting-info"><div class="setting-name" data-i18n="road_sense.bs_position_left">Position — left</div></div>
                             <div class="setting-control" style="display:flex;flex-wrap:wrap;">
-                                <button class="btn btn-secondary" id="bsCornerTl" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('tl')" data-i18n="road_sense.bs_corner_tl">Top-left</button>
-                                <button class="btn btn-secondary" id="bsCornerTr" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('tr')" data-i18n="road_sense.bs_corner_tr">Top-right</button>
-                                <button class="btn btn-secondary" id="bsCornerBl" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('bl')" data-i18n="road_sense.bs_corner_bl">Bottom-left</button>
-                                <button class="btn btn-secondary" id="bsCornerBr" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('br')" data-i18n="road_sense.bs_corner_br">Bottom-right</button>
-                                <button class="btn btn-secondary" id="bsCornerCenter" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetCorner('center')" data-i18n="road_sense.bs_corner_center">Center</button>
+                                <button class="btn btn-secondary" id="bsCornerLTl" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('left', 'tl')" data-i18n="road_sense.bs_corner_tl">Top-left</button>
+                                <button class="btn btn-secondary" id="bsCornerLTr" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('left', 'tr')" data-i18n="road_sense.bs_corner_tr">Top-right</button>
+                                <button class="btn btn-secondary" id="bsCornerLBl" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('left', 'bl')" data-i18n="road_sense.bs_corner_bl">Bottom-left</button>
+                                <button class="btn btn-secondary" id="bsCornerLBr" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('left', 'br')" data-i18n="road_sense.bs_corner_br">Bottom-right</button>
+                                <button class="btn btn-secondary" id="bsCornerLCenter" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetCorner('left', 'center')" data-i18n="road_sense.bs_corner_center">Center</button>
+                            </div>
+                        </div>
+                        <div class="setting-row" style="border-bottom:none;"><div class="setting-info"><div class="setting-name" data-i18n="road_sense.bs_position_right">Position — right</div></div>
+                            <div class="setting-control" style="display:flex;flex-wrap:wrap;">
+                                <button class="btn btn-secondary" id="bsCornerRTl" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('right', 'tl')" data-i18n="road_sense.bs_corner_tl">Top-left</button>
+                                <button class="btn btn-secondary" id="bsCornerRTr" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('right', 'tr')" data-i18n="road_sense.bs_corner_tr">Top-right</button>
+                                <button class="btn btn-secondary" id="bsCornerRBl" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('right', 'bl')" data-i18n="road_sense.bs_corner_bl">Bottom-left</button>
+                                <button class="btn btn-secondary" id="bsCornerRBr" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetCorner('right', 'br')" data-i18n="road_sense.bs_corner_br">Bottom-right</button>
+                                <button class="btn btn-secondary" id="bsCornerRCenter" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetCorner('right', 'center')" data-i18n="road_sense.bs_corner_center">Center</button>
                             </div>
                         </div>
                         <!-- Apply for the display+placement group (target/layout/size/position
@@ -726,9 +776,9 @@
     <div id="toastContainer" class="toast-container"></div>
 
     <script src="../shared/auth.js"></script>
-    <script src="../shared/core.js"></script>
+    <script src="../shared/core.js?v=15"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/road-sense.js?v=7"></script>
+    <script src="../shared/road-sense.js?v=roadsensefix1"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

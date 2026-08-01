@@ -322,7 +322,6 @@ class YoloDetector(private val context: Context) {
         // on the single-thread aiExecutor is uncontended steady-state; the
         // brief contention with close() is fine — close happens rarely
         // (toggle off, daemon shutdown).
-        val output: FloatArray
         synchronized(interpLock) {
             val interp = interpreter ?: return emptyList()
 
@@ -395,13 +394,32 @@ class YoloDetector(private val context: Context) {
                 // Java float[] in one JNI call.
                 outputBuffer!!.asFloatBuffer().get(fo)
             }
-            output = fo
+            // parseOutput INSIDE the lock, deliberately.
+            //
+            // It reads/writes `boxesScratch` and `nmsScratch` — shared instance
+            // fields, not locals. Their thread-safety previously rested on the
+            // implicit invariant that every detect() caller runs on the engine's
+            // single-thread aiExecutor. That is true today (all five call sites in
+            // SurveillanceEngineGpu dispatch onto it, so calls queue rather than
+            // overlap), but it is an undocumented cross-class assumption, and the
+            // AI-lane watchdog added to the engine is explicitly premised on the
+            // lane possibly being held by work it cannot observe. Making the
+            // exclusion explicit here means the detector is safe regardless of who
+            // calls it, instead of safe-by-coincidence.
+            //
+            // It also closes a real (if minor) race with close(), which nulls both
+            // scratch fields under this lock: parseOutput would otherwise re-create
+            // a 134 KB buffer after close() and retain it until the next init().
+            //
+            // Cost: parseOutput is ~10-20 ms of pure CPU (no JNI, no I/O) on top of
+            // a ~250 ms inference that already holds the lock, and the only other
+            // contender is close() — which happens on class-toggle or shutdown, and
+            // whose whole purpose is to WAIT for in-flight work anyway.
+            return parseOutput(
+                fo, width, height, confThreshold,
+                detectPerson, detectCar, detectAnimal, detectBike, minRelativeHeight
+            )
         }
-
-        return parseOutput(
-            output, width, height, confThreshold,
-            detectPerson, detectCar, detectAnimal, detectBike, minRelativeHeight
-        )
     }
     
     /**
@@ -427,8 +445,26 @@ class YoloDetector(private val context: Context) {
 
         val scaleX = imgWidth.toFloat() / inputSize
         val scaleY = imgHeight.toFloat() / inputSize
-        val quadrantHeight = imgHeight / 2
-        val quadrantWidth = imgWidth / 2
+
+        // Size-gate reference frame.
+        //
+        // The `/2` here dated from when this method was handed the FULL 2×2 mosaic
+        // and had to derive one quadrant's dims from it. The surveillance caller
+        // now passes a SINGLE crop — either a 320×240 mosaic quadrant or a 640×640
+        // foveated window — so halving produced a reference of 160×120 (confirmed
+        // on-device: "quad=160x120" in the raw-funnel diagnostic). Every relative
+        // size was therefore computed against half the true extent, i.e. DOUBLED,
+        // making the gate ~2× more permissive than the configured minObjectSize
+        // (an effective 0.04 against a configured 0.08) and admitting small
+        // shadow/foliage blobs the user's setting was meant to exclude.
+        //
+        // The crop IS the reference frame — use it directly. This TIGHTENS the
+        // gate to the configured value, so it is FP-REDUCING; the tradeoff is that
+        // a genuinely tiny distant object now has to clear the bar the user
+        // actually set. Callers that really do pass a full mosaic would want
+        // halving, but none does: the two call sites pass qW×qH from the crop.
+        val quadrantHeight = imgHeight
+        val quadrantWidth = imgWidth
 
         // Class-membership bitmask. Every COCO class we care about has id < 24,
         // so a single Long bit-tests in O(1) without allocating an IntRange or
@@ -452,6 +488,42 @@ class YoloDetector(private val context: Context) {
         val carWidthThreshold = minRelativeHeight * 1.33f
         val bikeHeightThreshold = minRelativeHeight * 0.7f
 
+        // Implausible-class confidence floor.
+        //
+        // train/boat/airplane are retained in the vehicle mask so that a LARGE
+        // close vehicle (van, high-sided truck) which YOLO11n mislabels on a dark,
+        // fisheye-warped crop still produces a box here. But a parked car is never
+        // actually approached by a train, boat or aeroplane, so a LOW-confidence
+        // box of those classes is noise — the project's field record shows an
+        // earlier low-light experiment abandoned on-car over phantom
+        // `class=4 (airplane) @0.29-0.33` detections, which this mask promoted to
+        // real vehicle actors. Requiring high confidence cuts that channel while
+        // keeping the genuine large-vehicle case (which scores well precisely
+        // because the object is big and close). Applied only to the three
+        // implausible classes; the caller's own threshold governs everything else.
+        //
+        // NOTE ON REACH — do not "complete" this by widening the engine filter.
+        // The surveillance consumer drops classes 4/6/8 unconditionally
+        // (SurveillanceEngineGpu's class-filter step: setObjectFilters only ever
+        // emits 0/1/2/3/5/7/14-23, and the no-filter fallback allows the same
+        // set). So a box that survives this floor is still discarded downstream,
+        // and the retention here is effectively inert for sentry.
+        //
+        // That is DELIBERATE, not an oversight. Admitting 4/6/8 into the engine
+        // would add a whole detection channel whose only unique yield is a vehicle
+        // — the class the system already demotes to NOTICE and suppresses via
+        // DetectionBaseline — while re-opening the phantom path the field record
+        // above got burned by. NMS is class-aware (`det.classId == res.classId`),
+        // so a van scored as BOTH truck and train emits both boxes and the engine
+        // keeps the truck one; only a van scored EXCLUSIVELY as train/boat/airplane
+        // is lost, and paying for that with new false positives on an unattended
+        // parked car is the wrong trade. Keep the mask (it costs nothing and keeps
+        // these boxes from cannibalising a real vehicle box) and keep the engine
+        // filter narrow.
+        val implausibleClassMask = (1L shl CLASS_TRAIN) or (1L shl CLASS_BOAT) or
+                (1L shl CLASS_AIRPLANE)
+        val implausibleClassMinConf = maxOf(confThreshold, 0.55f)
+
         // Reuse pre-extracted box-coords scratch (134 KB). Re-allocate only
         // if numBoxes ever changes (which it can't with a fixed YOLO11n
         // model, but the guard costs nothing).
@@ -470,6 +542,26 @@ class YoloDetector(private val context: Context) {
 
         val detections = ArrayList<Detection>(16)
 
+        // ---- RAW FUNNEL DIAGNOSTICS (no gate changes) ----
+        //
+        // The summary line below reports max_conf over KEPT detections only, so a
+        // frame that keeps nothing logs "max_conf=0.000 class=-1" — which is
+        // tautological and tells us nothing about what the model actually saw.
+        // That made a real field miss unattributable: a close, fisheye-warped
+        // person on the right camera produced 0 objects across a 40s clip, and
+        // there was no way to tell whether the model scored them 0.24 (a
+        // threshold problem) or 0.02 (a model/crop problem) — which need
+        // OPPOSITE fixes. Track the raw pre-threshold peak plus a per-gate
+        // rejection tally so the next occurrence names its own cause.
+        // Diagnostics only: every value here is observed, never acted on.
+        var rawPeakConf = 0f
+        var rawPeakClass = -1
+        var rejConf = 0      // below caller's confThreshold
+        var rejImplausible = 0
+        var rejUnwanted = 0  // class not in the user's enabled set
+        var rejSize = 0      // failed the quadrant-relative size gate
+        var peakPersonConf = 0f   // best person-class score BEFORE any gate
+
         for (i in 0 until numBoxes) {
             val base = i * 4
             val cx = boxes[base]
@@ -487,9 +579,20 @@ class YoloDetector(private val context: Context) {
                 }
             }
 
-            if (bestConf < confThreshold) continue
+            // Raw peak across ALL boxes/classes, before any gate.
+            if (bestConf > rawPeakConf) {
+                rawPeakConf = bestConf
+                rawPeakClass = bestClass
+            }
+            val personConf = output[(4 + CLASS_PERSON) * numBoxes + i]
+            if (personConf > peakPersonConf) peakPersonConf = personConf
+
+            if (bestConf < confThreshold) { rejConf++; continue }
             if (bestClass < 0 || bestClass >= 64) continue
-            if ((wantedMask and (1L shl bestClass)) == 0L) continue
+            // Implausible-class floor (train/boat/airplane) — see the mask above.
+            if ((implausibleClassMask and (1L shl bestClass)) != 0L
+                    && bestConf < implausibleClassMinConf) { rejImplausible++; continue }
+            if ((wantedMask and (1L shl bestClass)) == 0L) { rejUnwanted++; continue }
 
             // Convert to image coordinates
             val cxPx = cx * inputSize
@@ -512,7 +615,18 @@ class YoloDetector(private val context: Context) {
                 CLASS_BICYCLE, CLASS_MOTORCYCLE -> relH >= bikeHeightThreshold
                 else -> relH >= minRelativeHeight
             }
-            if (!passes) continue
+            if (!passes) {
+                rejSize++
+                // Log the near-miss geometry: a close, fisheye-warped subject can
+                // clear the confidence bar and then die HERE, and without the
+                // actual ratios there is no way to tell a genuinely tiny far
+                // object from a big partial-body blob whose bbox is short.
+                if (bestClass == CLASS_PERSON) {
+                    logger.info("YOLO size-gate dropped PERSON conf=%.3f relH=%.3f (need %.3f) box=%dx%d quad=%dx%d"
+                        .format(bestConf, relH, minRelativeHeight, objW, objH, quadrantWidth, quadrantHeight))
+                }
+                continue
+            }
 
             detections.add(Detection(bestClass, bestConf, objX, objY, objW, objH))
         }
@@ -520,10 +634,20 @@ class YoloDetector(private val context: Context) {
         // Apply NMS (in-place sort + culling, no per-call lambda allocation).
         val filtered = nms(detections, 0.45f)
 
-        // Ghost filter
+        // Ghost filter. TRUNCATE, never clear.
+        //
+        // This used to return emptyList() above the cap, so a single pathological
+        // frame (glare, rain streaks, a genuinely crowded scene) discarded the
+        // real person along with the noise — the worst possible behaviour in the
+        // highest-activity case, and a silent false negative. `nms()` returns
+        // detections in descending-confidence order, so taking the first 50 keeps
+        // the most probable ones and drops only the tail.
+        //
+        // Measured post-NMS counts on real device crops are 1-3, so this branch is
+        // effectively unreachable today; it is insurance, not a hot path.
         val final = if (filtered.size > 50) {
-            logger.warn("Ghost filter: ${filtered.size} > 50, clearing")
-            emptyList()
+            logger.warn("Ghost filter: ${filtered.size} > 50, keeping top 50 by confidence")
+            filtered.take(50)
         } else {
             filtered
         }
@@ -536,6 +660,7 @@ class YoloDetector(private val context: Context) {
         var animalCount = 0
         var bestKeptConf = 0f
         var bestKeptClass = -1
+        // Mirrors the vehicle set in `wantedMask` above.
         val carMask = (1L shl CLASS_CAR) or (1L shl CLASS_BUS) or
                 (1L shl CLASS_TRUCK) or (1L shl CLASS_TRAIN) or
                 (1L shl CLASS_BOAT) or (1L shl CLASS_AIRPLANE) or
@@ -559,6 +684,25 @@ class YoloDetector(private val context: Context) {
         }
 
         logger.info("Detected ${final.size} objects: person=$personCount car=$carCount bike=$bikeCount animal=$animalCount (max_conf=${"%.3f".format(bestKeptConf)} class=$bestKeptClass)")
+
+        // Raw-funnel line — only when NOTHING survived, which is the case that was
+        // previously unattributable. `raw` is the model's true peak before any gate,
+        // `person` its best person-class score, and the rej* tallies say which gate
+        // consumed the boxes. Reading it: raw≈0 ⇒ the model genuinely saw nothing
+        // (crop/orientation/exposure problem, look at the crop not the thresholds);
+        // raw just under conf=${confThreshold} ⇒ a threshold call; rejSize>0 with a
+        // healthy person score ⇒ the partial-body/size-gate case; rejUnwanted>0 ⇒ a
+        // class-filter mismatch. Emitted at most once per inference and only on the
+        // empty path, so it costs nothing in the common case.
+        if (final.isEmpty()) {
+            logger.info(("YOLO raw funnel: raw=%.3f class=%d person=%.3f | " +
+                    "rej conf=%d implausible=%d unwanted=%d size=%d | " +
+                    "confThr=%.2f minRelH=%.3f in=%dx%d quad=%dx%d")
+                .format(rawPeakConf, rawPeakClass, peakPersonConf,
+                        rejConf, rejImplausible, rejUnwanted, rejSize,
+                        confThreshold, minRelativeHeight,
+                        imgWidth, imgHeight, quadrantWidth, quadrantHeight))
+        }
 
         return final
     }

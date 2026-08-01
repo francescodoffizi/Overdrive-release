@@ -1,17 +1,23 @@
 package com.overdrive.app.ui
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.TooltipCompat
 import androidx.navigation.NavController
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.AppBarConfiguration
@@ -24,7 +30,9 @@ import com.overdrive.app.storage.StorageSetup
 import com.overdrive.app.ui.daemon.DaemonStartupManager
 import com.overdrive.app.ui.model.DaemonStatus
 import com.overdrive.app.ui.model.DaemonType
+import com.overdrive.app.ui.model.NavigationRailSwipePolicy
 import com.overdrive.app.ui.model.TunnelDisplayPolicy
+import com.overdrive.app.ui.widget.SwipeExpandableRailScrollView
 import com.overdrive.app.ui.viewmodel.DaemonsViewModel
 import com.overdrive.app.ui.viewmodel.LogsViewModel
 import com.overdrive.app.ui.viewmodel.MainViewModel
@@ -60,6 +68,10 @@ class MainActivity : AppCompatActivity() {
     // Bounded poll while waiting for an onboarding navigation to commit (~2s total).
     private val NAV_POLL_INTERVAL_MS = 100L
     private val NAV_POLL_MAX_ATTEMPTS = 20
+    private val RAIL_COMPACT_WIDTH_DP = 80
+    private val RAIL_EXPANDED_WIDTH_DP = 216
+    private val RAIL_ANIMATION_MS = 220L
+    private val KEY_RAIL_EXPANDED = "navigation_rail_expanded"
 
     // Handler + runnable owned by the activity so they can be cancelled in
     // onDestroy() — prevents the periodic update check from leaking the
@@ -79,6 +91,11 @@ class MainActivity : AppCompatActivity() {
     // UI elements
     private lateinit var toolbar: MaterialToolbar
     private lateinit var navigationRail: LinearLayout
+    private lateinit var navigationRailScroll: SwipeExpandableRailScrollView
+    private var navigationRailExpanded = false
+    private var navigationRailAnimator: ValueAnimator? = null
+    private var railItems: List<RailItem> = emptyList()
+    private var railActionItems: List<RailActionItem> = emptyList()
     private lateinit var tvCurrentUrl: TextView
     private lateinit var urlBar: View
     private lateinit var statusPill: View
@@ -178,6 +195,7 @@ class MainActivity : AppCompatActivity() {
 
         initViews()
         setupNavigation(savedInstanceState)
+        handleNavigateExtra(intent)
         setupCopyButton()
         setupLogListener()
         observeViewModels()
@@ -371,6 +389,7 @@ class MainActivity : AppCompatActivity() {
         maybeShowPinLock()
         intent?.let {
             handleLocationStartIntent(it)
+            handleNavigateExtra(it)
             // Critical: when MainActivity is already running and the install
             // script's `am start --ez post_update true` re-delivers the
             // intent (singleTop launchMode → onNewIntent, not onCreate), the
@@ -382,6 +401,33 @@ class MainActivity : AppCompatActivity() {
             // consumed, subsequent calls become no-ops).
             runDaemonStartup(it, fromOnCreate = false)
         }
+    }
+
+    /**
+     * Deep-link entry for external surfaces (the OverDrive launcher's glance
+     * widgets, notifications). A plain string extra keeps the contract stable
+     * across both APKs without sharing code: `--es navigate_to trips`.
+     * The extra is STRIPPED once consumed so an OS task-restore of the same
+     * intent record cannot replay the navigation over the user's later state.
+     * Unknown values are ignored (forward/backward compatible).
+     */
+    private fun handleNavigateExtra(intent: android.content.Intent) {
+        val target = intent.getStringExtra(EXTRA_NAVIGATE_TO) ?: return
+        intent.removeExtra(EXTRA_NAVIGATE_TO)
+        setIntent(intent)
+        val destinationId = when (target) {
+            "trips" -> R.id.tripsFragment
+            "charging" -> R.id.chargingFragment
+            "roadsense" -> R.id.roadSenseFragment
+            "recordings" -> R.id.recordingsFragment
+            "live" -> R.id.liveViewFragment
+            "vehicle" -> R.id.vehicleControlFragment
+            "dashboard" -> R.id.dashboardFragment
+            else -> return
+        }
+        // navigateToRailDestination self-defers via pendingRailDestination when
+        // FragmentManager state is saved, so this is safe from onCreate/onNewIntent.
+        navigateToRailDestination(destinationId)
     }
 
     /**
@@ -629,6 +675,14 @@ class MainActivity : AppCompatActivity() {
         // reconciles against the live config so it never clobbers a later Settings
         // change (see flushPendingOperatingMode).
         com.overdrive.app.onboarding.OnboardingHost.flushPendingOperatingMode(applicationContext)
+
+        // Re-drive a rail tap that was deferred because it raced Activity state saving. Now
+        // resumed, FragmentManager can commit. navigateToRailDestination re-checks isStateSaved
+        // and clears the pending value, so this can't loop or fire a stale destination.
+        pendingRailDestination?.let { dest ->
+            pendingRailDestination = null
+            navigateToRailDestination(dest)
+        }
     }
 
     /**
@@ -1294,6 +1348,7 @@ class MainActivity : AppCompatActivity() {
     private fun initViews() {
         toolbar = findViewById(R.id.toolbar)
         navigationRail = findViewById(R.id.navigationRail)
+        navigationRailScroll = findViewById(R.id.navigationRailScroll)
         tvCurrentUrl = findViewById(R.id.tvCurrentUrl)
         urlBar = findViewById(R.id.urlBar)
         statusPill = findViewById(R.id.statusPill)
@@ -1334,7 +1389,7 @@ class MainActivity : AppCompatActivity() {
 
         toolbar.setupWithNavController(navController, appBarConfiguration)
 
-        setupCustomRail()
+        setupCustomRail(savedInstanceState)
     }
 
     /**
@@ -1346,7 +1401,7 @@ class MainActivity : AppCompatActivity() {
      * Selection sync is driven from the NavController so deep links and
      * code-driven nav also light up the right rail item.
      */
-    private fun setupCustomRail() {
+    private fun setupCustomRail(savedInstanceState: Bundle?) {
         // Order matches the previous rail_menu.xml so user's mental model
         // stays the same.
         val items = listOf(
@@ -1384,12 +1439,38 @@ class MainActivity : AppCompatActivity() {
             RailItem(R.id.railDestAbout, R.id.settingsAboutFragment,
                 R.drawable.ic_update, R.string.settings_section_about)
         )
+        railItems = items
+
+        val languageClick = View.OnClickListener {
+            com.overdrive.app.ui.dialog.LanguagePickerDialog.show(this) {
+                recreate()
+            }
+        }
+        val helpClick = View.OnClickListener { startOnboardingReplay() }
+        val actions = listOf(
+            RailActionItem(
+                R.id.railLanguageButton,
+                R.drawable.ic_language,
+                R.string.settings_language_label,
+                languageClick
+            ),
+            RailActionItem(
+                R.id.railHelpButton,
+                R.drawable.ic_help,
+                R.string.onboarding_help_cd,
+                helpClick
+            )
+        )
+        railActionItems = actions
 
         // Bind icon + label and click handler per row.
         items.forEach { item ->
             val row = navigationRail.findViewById<View>(item.rowId) ?: return@forEach
             row.findViewById<ImageView>(R.id.railItemIcon)?.setImageResource(item.iconRes)
             row.findViewById<TextView>(R.id.railItemLabel)?.setText(item.labelRes)
+            val label = getString(item.labelRes)
+            row.contentDescription = label
+            TooltipCompat.setTooltipText(row, label)
             row.setOnClickListener {
                 val activity = item.launchActivity
                 if (activity != null) {
@@ -1399,6 +1480,39 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        actions.forEach { item ->
+            val row = navigationRail.findViewById<View>(item.rowId) ?: return@forEach
+            row.findViewById<ImageView>(R.id.railItemIcon)?.setImageResource(item.iconRes)
+            row.findViewById<TextView>(R.id.railItemLabel)?.setText(item.labelRes)
+            val label = getString(item.labelRes)
+            row.contentDescription = label
+            TooltipCompat.setTooltipText(row, label)
+            row.setOnClickListener(item.onClick)
+        }
+
+        // Portrait keeps these actions in the toolbar. Landscape renders
+        // them as full rail rows after the destination list.
+        findViewById<View>(R.id.toolbarLanguageButton)?.setOnClickListener(languageClick)
+        findViewById<View>(R.id.toolbarHelpButton)?.setOnClickListener(helpClick)
+
+        val expandButton = navigationRail.findViewById<ImageButton>(R.id.railExpandButton)
+        expandButton?.setOnClickListener {
+            setNavigationRailExpanded(!navigationRailExpanded, animate = true)
+        }
+        navigationRailScroll.onRailSwipe = { action ->
+            when (action) {
+                NavigationRailSwipePolicy.Action.EXPAND ->
+                    setNavigationRailExpanded(true, animate = true)
+                NavigationRailSwipePolicy.Action.COLLAPSE ->
+                    setNavigationRailExpanded(false, animate = true)
+                NavigationRailSwipePolicy.Action.NONE -> Unit
+            }
+        }
+        setNavigationRailExpanded(
+            savedInstanceState?.getBoolean(KEY_RAIL_EXPANDED, false) == true,
+            animate = false
+        )
 
         // Selection sync — light up the row whose destinationId matches
         // the current nav destination (or any of its ancestors).
@@ -1423,24 +1537,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Language picker — moved to the toolbar end-cluster so it's
-        // reachable from the top-right at every screen size. Falls back
-        // to the legacy rail-header button if a downstream layout ever
-        // restores it; the dialog itself is the same.
-        val languageClick = View.OnClickListener {
-            com.overdrive.app.ui.dialog.LanguagePickerDialog.show(this) {
-                recreate()
-            }
-        }
-        findViewById<View>(R.id.toolbarLanguageButton)?.setOnClickListener(languageClick)
-        navigationRail.findViewById<View>(R.id.railLanguageButton)?.setOnClickListener(languageClick)
-
-        // Onboarding replay "?" — opens the guide's chapter menu (parked-gated inside
-        // the host). Present in the portrait toolbar AND the landscape rail header; wire
-        // both null-safely since only one exists per orientation.
-        val helpClick = View.OnClickListener { startOnboardingReplay() }
-        findViewById<View>(R.id.toolbarHelpButton)?.setOnClickListener(helpClick)
-        navigationRail.findViewById<View>(R.id.railHelpButton)?.setOnClickListener(helpClick)
     }
 
     private data class RailItem(
@@ -1455,6 +1551,129 @@ class MainActivity : AppCompatActivity() {
         val launchActivity: Class<*>? = null
     )
 
+    private data class RailActionItem(
+        val rowId: Int,
+        val iconRes: Int,
+        val labelRes: Int,
+        val onClick: View.OnClickListener
+    )
+
+    /**
+     * Compact is the default: icons keep their full 56dp touch targets while labels
+     * are removed from the narrow 80dp rail. A right swipe (or chevron button)
+     * expands to a comfortable horizontal icon+label layout; left reverses it.
+     */
+    private fun setNavigationRailExpanded(expanded: Boolean, animate: Boolean) {
+        val stateChanged = navigationRailExpanded != expanded
+        navigationRailExpanded = expanded
+        navigationRailAnimator?.cancel()
+        navigationRailAnimator = null
+
+        updateRailExpandButton(expanded)
+
+        val targetWidth = dp(
+            if (expanded) RAIL_EXPANDED_WIDTH_DP else RAIL_COMPACT_WIDTH_DP
+        )
+        if (!animate || !stateChanged || !navigationRailScroll.isLaidOut) {
+            navigationRailScroll.layoutParams =
+                navigationRailScroll.layoutParams.apply { width = targetWidth }
+            applyRailItemLayout(expanded)
+            return
+        }
+
+        // Hide labels before collapsing so they are never squeezed into the
+        // narrowing rail. When expanding, reveal them only after enough room exists.
+        if (!expanded) applyRailItemLayout(false)
+        val startWidth = navigationRailScroll.width
+            .takeIf { it > 0 } ?: navigationRailScroll.layoutParams.width
+        navigationRailAnimator = ValueAnimator.ofInt(startWidth, targetWidth).apply {
+            duration = RAIL_ANIMATION_MS
+            interpolator = android.view.animation.DecelerateInterpolator()
+            addUpdateListener { animator ->
+                navigationRailScroll.layoutParams =
+                    navigationRailScroll.layoutParams.apply {
+                        width = animator.animatedValue as Int
+                    }
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (navigationRailExpanded == expanded) {
+                        applyRailItemLayout(expanded)
+                    }
+                    if (navigationRailAnimator === this@apply) {
+                        navigationRailAnimator = null
+                    }
+                }
+            })
+            start()
+        }
+    }
+
+    private fun applyRailItemLayout(expanded: Boolean) {
+        railItems.forEach { item ->
+            applyRailRowLayout(item.rowId, item.labelRes, expanded)
+        }
+        railActionItems.forEach { item ->
+            applyRailRowLayout(item.rowId, item.labelRes, expanded)
+        }
+    }
+
+    private fun applyRailRowLayout(rowId: Int, labelRes: Int, expanded: Boolean) {
+        val row = navigationRail.findViewById<LinearLayout>(rowId) ?: return
+        val label = row.findViewById<TextView>(R.id.railItemLabel) ?: return
+        val horizontalPadding = if (expanded) dp(12) else 0
+        val verticalPadding = dp(6)
+
+        row.orientation =
+            if (expanded) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        row.gravity =
+            if (expanded) Gravity.CENTER_VERTICAL else Gravity.CENTER
+        row.minimumHeight = dp(56)
+        row.setPadding(
+            horizontalPadding,
+            verticalPadding,
+            horizontalPadding,
+            verticalPadding
+        )
+
+        val labelParams = label.layoutParams as LinearLayout.LayoutParams
+        labelParams.width =
+            if (expanded) 0 else ViewGroup.LayoutParams.WRAP_CONTENT
+        labelParams.weight = if (expanded) 1f else 0f
+        labelParams.marginStart = if (expanded) dp(12) else 0
+        labelParams.topMargin = if (expanded) 0 else dp(4)
+        label.layoutParams = labelParams
+        label.gravity =
+            if (expanded) Gravity.START or Gravity.CENTER_VERTICAL
+            else Gravity.CENTER_HORIZONTAL
+        label.visibility = if (expanded) View.VISIBLE else View.GONE
+
+        // Compact rows still announce and tooltip their destination or action
+        // even though the visual label is intentionally absent.
+        val text = getString(labelRes)
+        row.contentDescription = text
+        TooltipCompat.setTooltipText(row, if (expanded) null else text)
+    }
+
+    private fun updateRailExpandButton(expanded: Boolean) {
+        val button = navigationRail.findViewById<ImageButton>(R.id.railExpandButton)
+            ?: return
+        val descriptionRes = if (expanded) R.string.rail_collapse else R.string.rail_expand
+        button.setImageResource(
+            if (expanded) R.drawable.ic_chevron_left else R.drawable.ic_chevron_right
+        )
+        button.contentDescription = getString(descriptionRes)
+        TooltipCompat.setTooltipText(button, getString(descriptionRes))
+        (button.layoutParams as? LinearLayout.LayoutParams)?.let { params ->
+            params.gravity = if (expanded) Gravity.END else Gravity.CENTER_HORIZONTAL
+            params.marginEnd = if (expanded) dp(8) else 0
+            button.layoutParams = params
+        }
+    }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density + 0.5f).toInt()
+
     /**
      * Navigate to a rail destination, popping any sub-pages so the tab
      * resets to its root. Uses M3 expressive fade-through (the incoming
@@ -1462,6 +1681,19 @@ class MainActivity : AppCompatActivity() {
      * switch reads as motion, not just a cross-fade.
      */
     private fun navigateToRailDestination(destinationId: Int) {
+        // Reselecting an already-visible top-level screen is a no-op. Besides avoiding a
+        // pointless transition, this prevents Surface-backed screens such as Projection from
+        // being torn down and recreated while a resize transaction is still settling.
+        if (navController.currentDestination?.id == destinationId) return
+        // A late click can race Activity state saving (for example while a configuration
+        // transition is settling). Navigation cannot commit after that point; FragmentManager
+        // would throw. Stash the target and re-drive it from onResume (once the Activity is
+        // resumed and state is no longer saved) so the user's tap isn't silently dropped.
+        if (supportFragmentManager.isStateSaved) {
+            pendingRailDestination = destinationId
+            return
+        }
+        pendingRailDestination = null
         val options = androidx.navigation.NavOptions.Builder()
             .setLaunchSingleTop(true)
             .setRestoreState(false)
@@ -1475,6 +1707,8 @@ class MainActivity : AppCompatActivity() {
             navController.navigate(destinationId, /* args = */ null, options)
         } catch (_: IllegalArgumentException) {
             // Destination not in graph — defensive only.
+        } catch (_: IllegalStateException) {
+            // FragmentManager state may have been saved between the guard and navigate().
         }
     }
     
@@ -1566,6 +1800,10 @@ class MainActivity : AppCompatActivity() {
                 getString(R.string.dashboard_starting_tailscale)
             TunnelDisplayPolicy.Kind.WAITING_FOR_URL ->
                 getString(R.string.dashboard_waiting_url)
+            TunnelDisplayPolicy.Kind.STOPPING ->
+                getString(R.string.dashboard_tunnel_stopping)
+            TunnelDisplayPolicy.Kind.FAILED ->
+                getString(R.string.dashboard_tunnel_failed)
             TunnelDisplayPolicy.Kind.ONLINE -> display.url
             TunnelDisplayPolicy.Kind.HIDDEN -> getString(R.string.dashboard_no_tunnel)
         }
@@ -1574,7 +1812,9 @@ class MainActivity : AppCompatActivity() {
             TunnelDisplayPolicy.Kind.STARTING_ZROK,
             TunnelDisplayPolicy.Kind.STARTING_CLOUDFLARED,
             TunnelDisplayPolicy.Kind.STARTING_TAILSCALE,
-            TunnelDisplayPolicy.Kind.WAITING_FOR_URL -> R.drawable.status_dot_starting
+            TunnelDisplayPolicy.Kind.WAITING_FOR_URL,
+            TunnelDisplayPolicy.Kind.STOPPING -> R.drawable.status_dot_starting
+            TunnelDisplayPolicy.Kind.FAILED,
             TunnelDisplayPolicy.Kind.HIDDEN -> R.drawable.status_dot_offline
         }
         statusIndicator.setBackgroundResource(drawableRes)
@@ -3422,13 +3662,28 @@ class MainActivity : AppCompatActivity() {
     
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        // This Activity handles rotation in place, so re-assert the current rail
+        // width/layout against the new density/orientation without losing its state.
+        if (::navigationRailScroll.isInitialized) {
+            setNavigationRailExpanded(navigationRailExpanded, animate = false)
+        }
         // MainActivity uses android:configChanges (no recreate on rotation), so the
         // onboarding overlay's launch-orientation card width + spotlight cutout would go
         // stale. Forward so it re-measures + re-resolves the anchor for the new orientation.
         onboardingHost?.onConfigChanged()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(KEY_RAIL_EXPANDED, navigationRailExpanded)
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
+        navigationRailAnimator?.cancel()
+        navigationRailAnimator = null
+        if (::navigationRailScroll.isInitialized) {
+            navigationRailScroll.onRailSwipe = null
+        }
         // Remove log listener
         LogManager.setLogListener(null)
         // Tear down the onboarding overlay + its ACC receiver (mirrors the auth-callback
@@ -3460,6 +3715,23 @@ class MainActivity : AppCompatActivity() {
             }
             daemonStartupCoordinator.pendingWatchdog = null
             daemonStartupCoordinator.watchdogHandler = null
+        }
+        // Stop the Activity-scoped DaemonStartupManager's health-check loop and quit
+        // its dedicated "DaemonHealthCheck" HandlerThread. Without this it leaks one
+        // live OS thread per Activity recreate (theme switch, language change, any
+        // config change outside the manifest's configChanges set), each pinning the
+        // destroyed Activity via the Context it was constructed with.
+        //
+        // Deliberately NOT the full cleanup(): that also calls
+        // adbLauncher.releasePerInstanceResources() and shuts down the zrok
+        // launcher/executor, and this Activity's adbLauncher is shared with other
+        // components (AdbConsoleFragment, AppUpdater, the update-APK rm at ~line 231).
+        // Releasing those here would be a behaviour change beyond fixing the thread
+        // leak I introduced, so this stops only what I added.
+        if (::daemonStartupManager.isInitialized) {
+            try { daemonStartupManager.stopHealthCheckThread() } catch (t: Throwable) {
+                android.util.Log.w("MainActivity", "stopHealthCheckThread failed: ${t.message}")
+            }
         }
         // Note: We intentionally do NOT call cleanupAll() here
         // Daemons should persist after app closure
@@ -3622,6 +3894,12 @@ class MainActivity : AppCompatActivity() {
 
     private var navPollRunnable: Runnable? = null
 
+    // A rail tap that arrived while FragmentManager state was saved (config transition
+    // settling / backgrounding) is stashed here and re-driven from onResume, so the tap is
+    // deferred rather than silently dropped. Cleared once consumed or when a later navigation
+    // supersedes it.
+    private var pendingRailDestination: Int? = null
+
     /**
      * Orientation-agnostic Settings anchor for the Expert tour (portrait card vs landscape
      * sub-rail row). The live SettingsFragment resolves it and, in landscape, selects the
@@ -3656,5 +3934,10 @@ class MainActivity : AppCompatActivity() {
         // reset boundary. Best-effort + retrying; the replay pick's own POST is ungated.
         com.overdrive.app.onboarding.OnboardingHost.clearOperatingModeUserFlag()
         ensureOnboardingHost().startReplay()
+    }
+
+    companion object {
+        /** Deep-link extra consumed by [handleNavigateExtra] (launcher glance widgets). */
+        const val EXTRA_NAVIGATE_TO = "navigate_to"
     }
 }

@@ -82,6 +82,13 @@ public class ChargingConfig {
     public boolean save() {
         boolean ok = true;
         try {
+            // Write a DELTA of only the keys this class owns. updateSection MERGES
+            // each key into the on-disk section under a cross-process file lock, so
+            // TariffManager's sibling "tariffs"/"defaultTariffId" survive without
+            // being re-sent. Do NOT read-modify-write the object loadConfig()
+            // returns: that is the live CACHED instance other daemon readers price
+            // from, and re-sending a stale copy of it could resurrect a tariff the
+            // user just deleted.
             JSONObject section = new JSONObject();
             section.put("enabled", enabled);
             section.put("dcRate", dcRate);
@@ -91,10 +98,10 @@ public class ChargingConfig {
             section.put("currency", currency);
             ok &= UnifiedConfigManager.updateSection(SECTION, section);
 
-            // Mirror rate/currency into tripAnalytics (source of truth) without
-            // clobbering the other Trips keys.
-            JSONObject trip = UnifiedConfigManager.loadConfig().optJSONObject(TRIP_SECTION);
-            if (trip == null) trip = new JSONObject();
+            // Mirror rate/currency into tripAnalytics (source of truth). Delta
+            // again — updateSection's merge preserves the other Trips keys
+            // (distanceUnit, tankCapacityL, fuelPricePerL, fuelUnit, enabled).
+            JSONObject trip = new JSONObject();
             trip.put("electricityRate", electricityRate);
             trip.put("currency", currency);
             ok &= UnifiedConfigManager.updateSection(TRIP_SECTION, trip);
@@ -121,10 +128,12 @@ public class ChargingConfig {
     public double getElectricityRate() { return electricityRate; }
     public String getCurrency() { return currency; }
 
-    // Rate selection for cost (DC tariff vs base) lives in SocHistoryDatabase
-    // .effectiveRate(int isDc) — the single point shared by every cost-writing
-    // path — since that is where sessions are priced and the is_dc verdict is
-    // computed. ChargingConfig only owns the stored dcRate value (see getDcRate).
+    // Rate selection for cost lives in SocHistoryDatabase.priceSession(isDc,
+    // lat, lng) — the single point shared by every cost-writing path — since
+    // that is where sessions are priced and the is_dc verdict is computed. It
+    // consults the location-matched TariffProfile first and falls back to these
+    // global values. ChargingConfig owns only the stored global dcRate (see
+    // getDcRate); per-location rates belong to TariffManager.
 
     // ==================== SETTERS ====================
 
