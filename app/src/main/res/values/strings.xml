@@ -1177,6 +1177,35 @@
     <string name="settings_privacy_storage_count_format_plural">%1$d clips</string>
     <string name="settings_privacy_reset_subtitle">Choose categories: recordings, events, daemon configs, cached telemetry…</string>
 
+    <!-- Diagnostics — log verbosity.
+         Lives on the Privacy pane because logs are on-device data, and this is
+         the control that decides how much of it gets written. Verbose is a
+         deliberate opt-in: at Debug the ADB layer traces every shell command,
+         which fills the rotation window fast and evicts older history.
+
+         Segment labels are single words on purpose — this is a four-way choice
+         on a head-unit screen, so the buttons carry the name and the paragraph
+         below carries the meaning, rather than cramming both into the control. -->
+    <string name="settings_privacy_overline_diagnostics">DIAGNOSTICS</string>
+    <string name="settings_privacy_log_level_label">Log detail</string>
+    <string name="settings_privacy_log_level_debug">Debug</string>
+    <string name="settings_privacy_log_level_info">Info</string>
+    <string name="settings_privacy_log_level_warn">Warnings</string>
+    <string name="settings_privacy_log_level_error">Errors</string>
+
+    <!-- One description per level; swapped as the selection changes, so the pane
+         explains the choice the user is actually looking at. -->
+    <string name="settings_privacy_log_level_debug_desc">Traces every ADB command and daemon check. Use this while diagnosing a fault — it fills the log files quickly, so older entries are discarded sooner.</string>
+    <string name="settings_privacy_log_level_info_desc">Normal operation. Records what the app and its daemons are doing, without the per-command detail.</string>
+    <string name="settings_privacy_log_level_warn_desc">Only problems and failures are recorded.</string>
+    <string name="settings_privacy_log_level_error_desc">Only failures are recorded. Everything leading up to one is discarded.</string>
+
+    <!-- Advisory shown at BOTH extremes. Verbose costs history; near-silent costs
+         the ability to diagnose anything later — the quiet end is the easier one
+         to set and forget, so it warns too. -->
+    <string name="settings_privacy_log_level_note_verbose">Verbose logging is on — older log history is discarded sooner.</string>
+    <string name="settings_privacy_log_level_note_quiet">Most logging is suppressed — a later fault will be harder to diagnose.</string>
+
     <!-- Settings → Security pane copy + PIN unlock screen.
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
          surveillance, recording, Telegram alerts, status overlay, and the
