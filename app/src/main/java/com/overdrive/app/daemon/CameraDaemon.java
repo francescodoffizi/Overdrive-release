@@ -1164,10 +1164,13 @@ public class CameraDaemon {
                     // another deterministic opportunity.
                     com.overdrive.app.monitor.SocHistoryDatabase
                         .getInstance().setSohEstimator(sohEstimator);
-                    log("SohEstimator: " + (sohEstimator.hasEstimate()
-                            ? String.format("%.1f%%", sohEstimator.getCurrentSoh())
-                            : "no estimate")
-                        + " (capacity: " + String.format("%.2f kWh", sohEstimator.getNominalCapacityKwh()) + ")");
+                    com.overdrive.app.abrp.SohEstimator.ResolvedSoh resolvedSoh =
+                        sohEstimator.getResolvedSoh();
+                    log("SOH: " + (resolvedSoh.getPercent() > 0
+                            ? String.format("%.1f%%", resolvedSoh.getPercent())
+                            : "unavailable")
+                        + " (source: " + resolvedSoh.getSource()
+                        + ", capacity: " + String.format("%.2f kWh", sohEstimator.getNominalCapacityKwh()) + ")");
                 } else {
                     log("SohEstimator auto-detection deferred; config authority unavailable");
                 }

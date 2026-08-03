@@ -123,7 +123,7 @@ public class SocHistoryDatabaseSohMigrationTest {
     public void sohConsumersUseOneDisplaySnapshot() throws IOException {
         String source = databaseSource();
         String record = between(source,
-                "// SOH from SohEstimator (via AbrpTelemetryService)",
+                "// SOH from the canonical resolver.",
                 "long now = System.currentTimeMillis();");
         String daily = between(source,
                 "private void foldSessionIntoDaily(long endTime",

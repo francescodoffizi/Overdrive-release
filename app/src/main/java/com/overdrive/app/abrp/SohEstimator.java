@@ -2433,19 +2433,40 @@ public class SohEstimator {
 
     // ==================== GETTERS ====================
 
+    /** Capacity-derived diagnostic estimate; presentation consumers use {@link #getDisplaySoh()}. */
     public double getCurrentSoh() { return currentSoh; }
 
+    /** One immutable result from the canonical SOH priority chain. */
+    public static final class ResolvedSoh {
+        private final double percent;
+        private final String source;
+        private final double oemPercent;
+
+        ResolvedSoh(double percent, String source, double oemPercent) {
+            this.percent = percent;
+            this.source = source;
+            this.oemPercent = oemPercent;
+        }
+
+        public double getPercent() { return percent; }
+        public String getSource() { return source; }
+        public double getOemPercent() { return oemPercent; }
+    }
+
     /**
-     * Headline-displayed SoH percent — same priority chain as
-     * {@link #getStatus()}'s {@code displaySoh} field. Returns the highest-
-     * priority real value across all available sources, so chip / dashboard
-     * / battery-health UIs read a consistent number with the detail card.
+     * Pure, unit-testable SOH resolver used by every public presentation.
      *
      * <p>Priority order:
      * <ul>
      *   <li>PHEV: OEM &gt; frame anchor &gt; calibration &gt; live</li>
-     *   <li>BEV: live &gt; calibration</li>
+     *   <li>BEV: OEM &gt; live &gt; calibration</li>
      * </ul>
+     *
+     * <p>The vehicle/BMS health index is authoritative on both BEV and PHEV. It is the
+     * same slowly-changing battery-health value exposed to diagnostic tools and does not
+     * depend on instantaneous SOC, remaining-energy quantisation, temperature, or the
+     * configured nominal capacity. Capacity-derived estimates remain useful fallbacks on
+     * vehicles that do not expose the OEM index, but must never override it.
      *
      * <p>Returns {@code -1} when no source has a real value yet.
      *
@@ -2602,7 +2623,7 @@ public class SohEstimator {
                 phev = col.isPhevPublic();
             }
         } catch (Throwable ignored) {}
-        final double oemSoh = phev ? readOemSohPercent() : -1;
+        final double oemSoh = readOemSohPercent();
 
         return captureCapacitySohSnapshot(phev, oemSoh);
     }
@@ -2619,13 +2640,50 @@ public class SohEstimator {
     }
 
     private double getDisplaySohLocked(boolean phev, double oemSoh) {
-        double frameSoh = getFrameAnchorSohLocked();
-        if (phev && oemSoh > 0) return oemSoh;
-        if (phev && frameSoh > 0) return frameSoh;
-        if (phev && calibrationSoh > 0) return calibrationSoh;
-        if (currentSoh > 0) return currentSoh;
-        if (calibrationSoh > 0) return calibrationSoh;
-        return -1;
+        return resolveDisplaySoh(
+            phev, oemSoh, getFrameAnchorSohLocked(), currentSoh, calibrationSoh).percent;
+    }
+
+    static ResolvedSoh resolveDisplaySoh(boolean phev, double oemSoh, double frameSoh,
+                                         double currentSoh, double calibrationSoh) {
+        double validOem = isValidSohPercent(oemSoh) ? oemSoh : -1;
+        if (validOem > 0) return new ResolvedSoh(validOem, "oem", validOem);
+        if (phev && isValidSohPercent(frameSoh)) {
+            return new ResolvedSoh(frameSoh, "frame_anchor", -1);
+        }
+        if (phev && isValidSohPercent(calibrationSoh)) {
+            return new ResolvedSoh(calibrationSoh, "calibration", -1);
+        }
+        if (isValidSohPercent(currentSoh)) {
+            return new ResolvedSoh(currentSoh, "live", -1);
+        }
+        if (isValidSohPercent(calibrationSoh)) {
+            return new ResolvedSoh(calibrationSoh, "calibration", -1);
+        }
+        return new ResolvedSoh(-1, "unavailable", -1);
+    }
+
+    private static boolean isValidSohPercent(double value) {
+        return !Double.isNaN(value) && value > 0 && value <= MAX_SOH;
+    }
+
+    /** Canonical SOH value and provenance for UI, APIs and integrations. */
+    public ResolvedSoh getResolvedSoh() {
+        // Collector calls stay outside autoDetectLock: its own locks can call back into
+        // estimator consumers, so nesting them would invite a cross-subsystem deadlock.
+        boolean phev = false;
+        try {
+            com.overdrive.app.byd.BydDataCollector col =
+                com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (col != null && col.isInitialized()) {
+                phev = col.isPhevPublic();
+            }
+        } catch (Throwable ignored) {}
+        final double oemSoh = readOemSohPercent();
+        synchronized (autoDetectLock) {
+            return resolveDisplaySoh(
+                phev, oemSoh, getFrameAnchorSohLocked(), currentSoh, calibrationSoh);
+        }
     }
 
     /**
@@ -2633,8 +2691,8 @@ public class SohEstimator {
      * ({@code STATISTIC_BATTERY_HEALTHY_INDEX}) and surfaced on the snapshot as
      * {@code sohPercent}. Already a plain 0..100 percent — the collector validates the
      * range before publishing — so it needs no scaling, no nominal capacity, and no
-     * usable-vs-gross frame assumption. That is exactly why it is preferable on PHEV,
-     * where every capacity-derived route is untrustworthy.
+     * usable-vs-gross frame assumption. It is authoritative for both BEV and PHEV;
+     * capacity-derived values are fallbacks only when this index is unavailable.
      *
      * @return the OEM percent in (0,100], or -1 when the trim doesn't report it.
      */
@@ -2819,7 +2877,7 @@ public class SohEstimator {
                 phev = col.isPhevPublic();
             }
         } catch (Throwable ignored) {}
-        final double oemSoh = phev ? readOemSohPercent() : -1;
+        final double oemSoh = readOemSohPercent();
 
         String modelId = null;
         try {
@@ -2829,13 +2887,16 @@ public class SohEstimator {
         final StatusSnapshot snapshot =
             captureStatusSnapshot(phev, oemSoh);
         try {
-            status.put("soh", roundedOrUnavailable(snapshot.currentSoh));
+            // Keep the legacy headline field canonical while retaining the moving
+            // capacity-derived estimate explicitly for diagnostics.
+            status.put("soh", roundedOrUnavailable(snapshot.displaySoh));
+            status.put("estimatedSoh", roundedOrUnavailable(snapshot.currentSoh));
             status.put(
                 "nominalCapacityKwh", snapshot.nominalCapacityKwh);
             status.put(
                 "estimatedCapacityKwh",
                 roundedOrUnavailable(snapshot.estimatedCapacityKwh));
-            status.put("hasEstimate", snapshot.currentSoh > 0);
+            status.put("hasEstimate", snapshot.displaySoh > 0);
             status.put("nominalSource", snapshot.nominalSource);
 
             org.json.JSONObject calibration = new org.json.JSONObject();
@@ -2915,27 +2976,10 @@ public class SohEstimator {
             boolean phev, double oemSoh) {
         synchronized (autoDetectLock) {
             double frameSoh = getFrameAnchorSohLocked();
-            double displaySoh;
-            String displaySource;
-            if (phev && oemSoh > 0) {
-                displaySoh = oemSoh;
-                displaySource = "oem";
-            } else if (phev && frameSoh > 0) {
-                displaySoh = frameSoh;
-                displaySource = "frame_anchor";
-            } else if (phev && calibrationSoh > 0) {
-                displaySoh = calibrationSoh;
-                displaySource = "calibration";
-            } else if (currentSoh > 0) {
-                displaySoh = currentSoh;
-                displaySource = "live";
-            } else if (calibrationSoh > 0) {
-                displaySoh = calibrationSoh;
-                displaySource = "calibration";
-            } else {
-                displaySoh = -1;
-                displaySource = "unavailable";
-            }
+            ResolvedSoh resolved = resolveDisplaySoh(
+                phev, oemSoh, frameSoh, currentSoh, calibrationSoh);
+            double displaySoh = resolved.percent;
+            String displaySource = resolved.source;
 
             double frameRatio =
                 peakRemainKwhAtFull > 0 && nominalCapacityKwh > 0

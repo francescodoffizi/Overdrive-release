@@ -71,7 +71,18 @@ plus device logs `log_X5RRX996` (Sealion/Tang-class DM-i PHEV, 21.5 kWh nominal,
   stepping rate and 8 of 37 ticks fell outside `DIRECT_SCALE_CORROBORATION_FACTOR` (1.35) at the
   taper knees, holing the curve and resetting the trapezoid chain at each one. That factor is the
   bar for LATCHING a divisor; loosening it weakens divisor latching everywhere.
-  Those FOUR are the only knowingly BEV-visible changes; anything else touching BEV is a
+  **Fifth sanctioned exception — confirmed AC cross-validates BEV counters.** On the Atto 3,
+  `remainKwh` is not remaining pack energy: it cycles backwards and jumped 1.5→6.6 kWh in one
+  poll while `chargingCapacityKwh` rose smoothly at the granny charger's rate. The old
+  remain-first rule turned that jump into 155.5 kW, then persisted 41.6 false kWh and classified
+  an explicit AC session as DC. When gun==2, C4 now waits briefly for both present counters,
+  rejects slopes above the physical AC ceiling, and latches capacity only when remain is more
+  than 4x the simultaneous capacity slope. The 4x guard deliberately preserves the known
+  half-scale capacity counter on the Seal (2:1 still selects remain). DC/unknown connector
+  states retain the old remain-first order. A transient gun==1 with fused charging publishes
+  no estimate until the connector byte catches up, so pre-comparison samples cannot poison the
+  session curve.
+  Those FIVE are the only knowingly BEV-visible changes; anything else touching BEV is a
   regression.
 - **I2 — Never publish a confidently-wrong measured-looking value.** An honest
   estimate flagged `isEstimated` beats a precise-looking wrong number. A *stuck*
