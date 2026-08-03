@@ -261,6 +261,19 @@ Then build with Gradle:
 ./gradlew assembleRelease
 ```
 
+### Closed component: `libod.so`
+
+The blind-spot lens-projection coefficients ship as a prebuilt, closed-source
+`libod.so` (`app/src/main/jniLibs/arm64-v8a/`); its source (`cpp/od/`) is not
+part of this repository. At runtime the library authorizes against the app's
+signing certificate, so a **release** build signed with a different key will
+render the blind-spot camera card black.
+
+**Debug builds bypass this check** — `./gradlew assembleDebug` works normally
+from a clean clone, including for contributors, and the native build configures
+fine without the `od` source. Only release forks signed with a non-matching key
+are affected.
+
 ## VLESS Proxy Setup (Optional)
 
 The ISP blocklist bypass feature uses a VLESS Reality proxy. The app ships with placeholder credentials — you need to supply your own.
@@ -863,3 +876,7 @@ Android app + web companion rebuilt around how you actually use the car. Materia
 ## License
 
 Open source under MIT License. Your data stays on your device.
+
+OverDrive's own code is MIT-licensed. Bundled third-party components (cloudflared,
+zrok, sing-box, tailscale, YOLO11n, and others) remain under their own licenses —
+see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
