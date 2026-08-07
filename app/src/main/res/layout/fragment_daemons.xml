@@ -2,15 +2,16 @@
 <!--
   SOTA Daemons page — portrait (1080×1920 / ~540dp × 960dp).
 
-  Hero header (title + live "X of Y running" subtitle) above a flat
-  RecyclerView of daemon cards. Card surface alternation comes from
+  Hero header (title + live "X of Y running" subtitle), an OverDrive Wi-Fi
+  keep-alive preference, then a flat RecyclerView of daemon cards. Card surface alternation comes from
   M3 surface tier (?attr/colorSurfaceContainer); side padding is owned
   by the recycler so individual cards can use marginHorizontal=0.
 
-  IDs preserved (DaemonsFragment.kt findViewById targets):
-    recyclerDaemons, tvDaemonsCount
+  IDs read by DaemonsFragment.kt:
+    recyclerDaemons, tvDaemonsCount, rowWifiAutoEnable, swWifiAutoEnable
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -47,10 +48,69 @@
             tools:text="3 of 8 running" />
     </LinearLayout>
 
+    <com.google.android.material.card.MaterialCardView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="@dimen/page_padding_horizontal"
+        android:layout_marginBottom="@dimen/card_gap_vertical"
+        app:cardBackgroundColor="?attr/colorSurfaceContainer"
+        app:cardCornerRadius="@dimen/card_radius_standard"
+        app:cardElevation="0dp">
+
+        <LinearLayout
+            android:id="@+id/rowWifiAutoEnable"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:padding="@dimen/card_padding_standard">
+
+            <ImageView
+                android:layout_width="@dimen/card_icon_standard"
+                android:layout_height="@dimen/card_icon_standard"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_signal_disconnected"
+                app:tint="?attr/colorPrimary" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="16dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/daemons_wifi_auto_enable_title"
+                    android:textAppearance="@style/TextAppearance.Material3.TitleMedium"
+                    android:textColor="?attr/colorOnSurface" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="@string/daemons_wifi_auto_enable_subtitle"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+            </LinearLayout>
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/swWifiAutoEnable"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="@string/daemons_wifi_auto_enable_title" />
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/recyclerDaemons"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
         android:clipToPadding="false"
         android:paddingHorizontal="@dimen/page_padding_horizontal"
         android:paddingBottom="@dimen/page_padding_bottom" />
