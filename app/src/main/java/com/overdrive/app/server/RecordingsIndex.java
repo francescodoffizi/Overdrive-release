@@ -2287,7 +2287,10 @@ public final class RecordingsIndex {
         if (animal > 0) rec.put("animalCount", animal);
 
         String hero = rs.getString("hero_thumb");
-        if (hero != null) rec.put("heroThumbnailUrl", "/thumb/id/" + recordingId);
+        if (hero != null) {
+            rec.put("heroThumbnailName", hero);
+            rec.put("heroThumbnailUrl", "/thumb/id/" + recordingId);
+        }
 
         String classes = rs.getString("actor_classes");
         if (classes != null && !classes.isEmpty()) {

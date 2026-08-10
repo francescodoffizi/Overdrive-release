@@ -1496,7 +1496,9 @@ public class RecordingsApiHandler {
             
             // Limit batch size to prevent abuse
             int maxBatch = 100;
-            int batchSize = ids != null && ids.length() > 0 ? ids.length() : filenames.length();
+            int idCount = ids != null ? ids.length() : 0;
+            int filenameCount = filenames != null ? filenames.length() : 0;
+            int batchSize = idCount + filenameCount;
             if (batchSize > maxBatch) {
                 response.put("success", false);
                 response.put("error", Messages.get("errors.recordings_max_batch_with_count", maxBatch));
@@ -1509,8 +1511,8 @@ public class RecordingsApiHandler {
             JSONArray errors = new JSONArray();
             
             for (int i = 0; i < batchSize; i++) {
-                String recordingId = ids != null && ids.length() > 0 ? ids.getString(i) : null;
-                String filename = recordingId == null ? filenames.getString(i) : null;
+                String recordingId = i < idCount ? ids.getString(i) : null;
+                String filename = recordingId == null ? filenames.getString(i - idCount) : null;
                 
                 // Security: prevent path traversal
                 if ((recordingId != null && !validRecordingId(recordingId))
