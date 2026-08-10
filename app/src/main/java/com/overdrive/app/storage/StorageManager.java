@@ -186,6 +186,10 @@ public class StorageManager {
     
     // Periodic cleanup interval (30 seconds)
     private static final long CLEANUP_INTERVAL_SECONDS = 30;
+    // Out-of-band edits and missed events still need an integrity backstop, but
+    // an idle daemon does not need to walk every recording directory every 30s.
+    private static final long PERIODIC_INTEGRITY_INTERVAL_MS = TimeUnit.HOURS.toMillis(1);
+    private volatile long lastPeriodicIntegrityAtMs = 0L;
 
     // Max anchor files to delete in a single BOUNDED-TRIM pass that runs WHILE the
     // encoder is writing. This caps SD-card I/O contention against the muxer's disk
@@ -6626,7 +6630,8 @@ public class StorageManager {
     
     /**
      * Start periodic cleanup for long recording sessions.
-     * Runs every 30 seconds while recording is active.
+      * Runs every 30 seconds while storage work is active and performs an
+      * hourly full integrity pass while idle.
      */
     public void startPeriodicCleanup() {
         if (cleanupScheduler != null && !cleanupScheduler.isShutdown()) {
@@ -6647,8 +6652,13 @@ public class StorageManager {
             t.setPriority(Thread.MIN_PRIORITY);
             return t;
         });
-        
-        cleanupScheduler.scheduleAtFixedRate(() -> {
+
+        // The constructor already queued a startup reap. Start the idle
+        // integrity clock here so the first 30-second tick does not duplicate
+        // that whole-library work while daemon initialization is still busy.
+        lastPeriodicIntegrityAtMs = statClockMs();
+
+        cleanupScheduler.scheduleWithFixedDelay(() -> {
             try {
                 // Don't run un-gated cleanup before the encoder probe is wired.
                 // Daemon-init ordering: startPeriodicCleanup() fires early
@@ -6659,6 +6669,25 @@ public class StorageManager {
                 if (!probeWired.get()) {
                     logDebug("Periodic cleanup tick skipped — encoder probe not wired yet");
                     return;
+                }
+                final long tickNowMs = statClockMs();
+                final boolean encoderWriting = isEncoderWriting();
+                final boolean activeSession = recordingActive.get()
+                    || surveillanceActive.get()
+                    || activeTripFilePath != null
+                    || encoderWriting;
+                final boolean deferredWork = !deferredCleanupDirs.isEmpty();
+                final boolean fallbackWasActive = recordingsEnospcFallbackActive;
+                final boolean integrityDue = isPeriodicIntegrityDue(
+                    tickNowMs, lastPeriodicIntegrityAtMs);
+                if (!shouldRunPeriodicMaintenance(activeSession, deferredWork,
+                        fallbackWasActive, integrityDue)) {
+                    return;
+                }
+                if (integrityDue) {
+                    // Advance before I/O so a failed or degraded-volume pass
+                    // cannot retry continuously on every 30-second tick.
+                    lastPeriodicIntegrityAtMs = tickNowMs;
                 }
                 // Self-clear a stale ENOSPC fallback. recordingsEnospcFallbackActive
                 // latches true when a mounted-but-full external volume redirects a
@@ -6710,8 +6739,8 @@ public class StorageManager {
                 // to run the whole-tree idle-only work (deferred drain + orphan
                 // tmp sweep) — kept OUT of the steady-state recording path to
                 // hold tick I/O low, but still run during a genuine emergency.
-                boolean encoderWriting = isEncoderWriting();
                 boolean diskCritical = false;
+                boolean emergencyMaintenance = false;
 
                 // Scoped size/limit snapshot for recordings/surveillance/proximity,
                 // measured ONCE per tick in the recording branch and reused by the
@@ -6781,6 +6810,7 @@ public class StorageManager {
                         || (sdFree > 0 && sdFree < 200L * 1024 * 1024);  // <200MB free
 
                     boolean hardOverlimit = recHard || survHard || tripsHard || proxHard || diskCritical;
+                    emergencyMaintenance = hardOverlimit;
                     if (hardOverlimit) {
                         // Emergency: log it AND run the idle-only whole-tree work
                         // (orphan tmp sweep) right now — the disk is about to
@@ -6793,7 +6823,6 @@ public class StorageManager {
                             + " trips=" + formatSize(tripsBytes) + "/" + formatSize(tripsLim) + (tripsHard ? " HARD" : "")
                             + " prox=" + formatSize(proxBytes) + "/" + formatSize(proxLim) + (proxHard ? " HARD" : "")
                             + " sdFree=" + formatSize(sdFree) + (diskCritical ? " CRITICAL" : ""));
-                        sweepOrphanTempFiles();
                     }
                     // Soft state (over cap ≤5%, disk healthy): fall through to the
                     // per-category passes, which run a BOUNDED trim. We intentionally
@@ -6801,10 +6830,22 @@ public class StorageManager {
                     // keep steady-state recording-tick I/O low; both run at idle.
                 } else {
                     // Encoder idle: drain any deferred work first so storage limits
-                    // re-converge after a long recording, then sweep orphan
-                    // .mp4.tmp / .broken / .jpg.tmp partials (whole-tree walk, safe
-                    // when idle; otherwise partials only get reaped at daemon boot).
+                    // re-converge after a long recording. Sweep orphan partials only
+                    // on the hourly integrity pass; startup and hard-emergency paths
+                    // retain their immediate sweeps.
                     drainDeferredCleanupIfDue();
+                    boolean fallbackRecovered = fallbackWasActive
+                        && !recordingsEnospcFallbackActive;
+                    if (!shouldRunFullPeriodicMaintenance(
+                            activeSession, integrityDue, fallbackRecovered)) {
+                        // A deferred-only tick already drained its categories. An
+                        // unresolved fallback-only tick already performed the cheap
+                        // free-space probe. Neither needs the four full scans below.
+                        return;
+                    }
+                }
+
+                if (shouldSweepOrphanTempFiles(integrityDue, emergencyMaintenance)) {
                     sweepOrphanTempFiles();
                 }
 
@@ -6887,6 +6928,28 @@ public class StorageManager {
         }, CLEANUP_INTERVAL_SECONDS, CLEANUP_INTERVAL_SECONDS, TimeUnit.SECONDS);
         
         logInfo("Started periodic storage cleanup (interval=" + CLEANUP_INTERVAL_SECONDS + "s)");
+    }
+
+    static boolean shouldRunPeriodicMaintenance(boolean activeSession,
+                                                boolean deferredWork,
+                                                boolean fallbackActive,
+                                                boolean integrityDue) {
+        return activeSession || deferredWork || fallbackActive || integrityDue;
+    }
+
+    static boolean isPeriodicIntegrityDue(long nowMs, long lastRunMs) {
+        return lastRunMs <= 0L || (nowMs - lastRunMs) >= PERIODIC_INTEGRITY_INTERVAL_MS;
+    }
+
+    static boolean shouldRunFullPeriodicMaintenance(boolean activeSession,
+                                                    boolean integrityDue,
+                                                    boolean fallbackRecovered) {
+        return activeSession || integrityDue || fallbackRecovered;
+    }
+
+    static boolean shouldSweepOrphanTempFiles(boolean integrityDue,
+                                              boolean emergencyMaintenance) {
+        return integrityDue || emergencyMaintenance;
     }
     
     /**
