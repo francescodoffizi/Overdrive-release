@@ -554,6 +554,10 @@ public class HttpServer {
                 if (!serveStaticFile(out, "local/notifications.html")) {
                     HttpResponse.sendError(out, 404, "notifications.html not found");
                 }
+            } else if (path.equals("/seat-positions.html") || path.equals("/seat-positions")) {
+                if (!serveStaticFile(out, "local/seat-positions.html")) {
+                    HttpResponse.sendError(out, 404, "seat-positions.html not found");
+                }
             } else if (path.equals("/key-mapping.html") || path.equals("/key-mapping")) {
                 if (!serveStaticFile(out, "local/key-mapping.html")) {
                     HttpResponse.sendError(out, 404, "key-mapping.html not found");
@@ -642,6 +646,11 @@ public class HttpServer {
         "/api/recording/mode", // recording mode
         "/api/apps/launch",    // open-app action: launch a user-selected app (NOT /api/apps/list)
         "/api/camview/",       // camera-view show/hide (native lane, shares blind-spot pipeline)
+        // Saved seat/mirror position recall. EXACT path, not the /api/positions/ prefix: the
+        // sibling endpoints create, overwrite and delete stored positions, which an ApiAction
+        // has no business reaching. startsWith() on the query-stripped path matches
+        // /api/positions/apply?id=.. and nothing else under /api/positions/.
+        "/api/positions/apply",
     };
 
     /** Whether an automation-originated request path is inside the allowlist above. */

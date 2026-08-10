@@ -72,6 +72,7 @@ BYD.automations = {
         this.loadAutomationSchema();
         this.loadSettings();
         this.loadGroups();
+        this.loadPositionList();
         // Re-sync the Groups tab whenever the user switches TO it. app-tabs only
         // toggles element visibility; without this the list wouldn't refresh (a group
         // saved on another visit, or a stale editor pane left open) until a full reload.
@@ -2088,6 +2089,7 @@ BYD.automations = {
             case 'colour': return this.createColourInput(data, defaultValue, eventListener);
             case 'time': return this.createTimeInput(data, defaultValue, eventListener);
             case 'app': return this.createAppInput(data, defaultValue, eventListener);
+            case 'savedSeatPosition': return this.createSeatPositionInput(data, defaultValue, eventListener);
             case 'audio': return this.createAudioInput(data, defaultValue, eventListener);
             case 'actionGroup': return this.createActionGroupInput(data, defaultValue, eventListener);
             case 'automationRef': return this.createAutomationRefInput(data, defaultValue, eventListener);
@@ -2377,6 +2379,16 @@ BYD.automations = {
             const app = (this._appList || []).find(a => a.package === rawVal);
             return this._escVal((app && app.label) ? app.label : rawVal);
         }
+        if (spec && spec.type === 'savedSeatPosition' && rawVal != null) {
+            // Stored value is the position id; show the position's NAME. Distinguish "cache
+            // not loaded yet" from "loaded and the id is gone" — collapsing the two would
+            // label every position as missing for the moment before loadPositionList lands.
+            const list = this._positionList;
+            if (!list) return this._escVal(rawVal);
+            const pos = list.find(p => p.id === rawVal);
+            if (pos) return this._escVal(pos.name);
+            return this._escVal(rawVal) + ' (' + this._escVal(BYD.i18n.t('automation.position_missing')) + ')';
+        }
         if (spec && spec.type === 'actionGroup' && rawVal != null) {
             // The stored value is a group UUID; show its friendly NAME from the cached
             // group list (loadGroups fills this._groups on init + after any change, and
@@ -2453,6 +2465,83 @@ BYD.automations = {
 
         // Async-load the app list once; reuse the cache on subsequent renders.
         this.loadAppList().then(fill).catch(() => { changeEvent(); this._syncSaveDisabled(); });
+        changeEvent();
+        return selector;
+    },
+
+    // Saved seat/mirror position dropdown, populated live from GET /api/positions. The
+    // value stored is the position ID, never its name: a captured position's name is
+    // rebuilt from the car on every capture, so a name-keyed binding would silently stop
+    // matching after a rename in the car. Options are NOT in the schema (positions are
+    // created and deleted at runtime, and captured ones differ per signed-in DiLink
+    // profile). Mirrors createAppInput, with optgroups because the list mixes the user's
+    // own positions with the car's slots for one or more profiles.
+    createSeatPositionInput(data, defaultValue, eventListener) {
+        const selector = document.createElement('select');
+        selector.classList.add('input', 'enum', 'seat-position');
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = data.label;
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        placeholder.hidden = true;
+        selector.append(placeholder);
+
+        const fill = (positions) => {
+            while (selector.options.length > 1) selector.remove(1);
+
+            const add = (parent, p) => {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.textContent = p.name || p.id;
+                parent.append(opt);
+            };
+            const group = (label) => {
+                const g = document.createElement('optgroup');
+                g.label = label;
+                selector.append(g);
+                return g;
+            };
+
+            const mine = positions.filter(p => p.source === 'user');
+            if (mine.length) {
+                const g = group(BYD.i18n.t('automation.positions_mine'));
+                mine.forEach(p => add(g, p));
+            }
+            // Captured positions are per-profile, so group by profile — the same slot
+            // number means different geometry for a different signed-in account.
+            const profiles = [];
+            positions.forEach(p => {
+                if (p.source === 'captured' && profiles.indexOf(p.profile) === -1) profiles.push(p.profile);
+            });
+            profiles.forEach(prof => {
+                const g = group(BYD.i18n.t('automation.positions_from_car') + ' — ' + prof);
+                positions.filter(p => p.source === 'captured' && p.profile === prof).forEach(p => add(g, p));
+            });
+
+            // If the stored id isn't in the list (deleted since), add it so the binding
+            // shows what it points at rather than silently blanking — same as apps.
+            if (defaultValue && !positions.some(p => p.id === defaultValue)) {
+                const opt = document.createElement('option');
+                opt.value = defaultValue;
+                opt.textContent = defaultValue + ' (' + BYD.i18n.t('automation.position_missing') + ')';
+                selector.append(opt);
+            }
+            if (defaultValue) selector.value = defaultValue;
+            changeEvent();
+            // Same reason as createAppInput: the list resolves after showForm() already
+            // ran _syncSaveDisabled() against the placeholder-only state.
+            this._syncSaveDisabled();
+        };
+
+        const changeEvent = () => {
+            const ok = !!selector.value;
+            selector.classList.toggle('invalid', !ok);
+            if (ok && eventListener) eventListener(selector, selector.value);
+        };
+        selector.addEventListener('change', changeEvent);
+
+        this.loadPositionList().then(fill).catch(() => { changeEvent(); this._syncSaveDisabled(); });
         changeEvent();
         return selector;
     },
@@ -2629,6 +2718,29 @@ BYD.automations = {
             })
             .catch(e => { this._appList = []; return this._appList; });
         return this._appListPromise;
+    },
+
+    // Fetch + cache the saved seat/mirror positions. Resolves to
+    // [{id, name, source, profile, slot, axes}]. Loaded on init as well as on demand,
+    // because the saved-automation cards resolve a stored position id to its name for
+    // display — same reasoning as loadGroups.
+    loadPositionList() {
+        if (this._positionList) return Promise.resolve(this._positionList);
+        if (this._positionListPromise) return this._positionListPromise;
+        this._positionListPromise = fetch('/api/positions', { cache: 'no-store' })
+            .then(r => r.json())
+            .then(j => {
+                this._positionList = (j && Array.isArray(j.positions)) ? j.positions : [];
+                // Re-render the automation list now the cache is fresh, or a card summary
+                // would show the raw position id until the next full reload. loadPositions
+                // and loadAutomations race on init. Cheap no-op when the list is empty.
+                try {
+                    if (this.automations && Object.keys(this.automations).length) this.render();
+                } catch (_) {}
+                return this._positionList;
+            })
+            .catch(() => { this._positionList = []; return this._positionList; });
+        return this._positionListPromise;
     },
 
     _switchTab(id) {

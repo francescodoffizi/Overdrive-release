@@ -498,8 +498,8 @@
     "windows_all_description": "Open, close, or stop all windows.",
     "tailgate": "Tailgate",
     "tailgate_description": "Open, close, or stop the tailgate/trunk.",
-    "save_seat_position": "Save Seat Position",
-    "save_seat_position_description": "Store the current driver-seat position into a memory slot.",
+    "save_seat_position": "Save To Car Seat Memory",
+    "save_seat_position_description": "Store the current driver-seat position into one of the car's own hardware memory banks. This is a different system from OverDrive's saved positions, and it does not store the mirrors.",
     "child_lock": "Child Lock",
     "child_lock_description": "Enable or disable the rear-door child lock.",
     "wireless_charging": "Phone Wireless Charger",
@@ -714,8 +714,8 @@
     "set_headlight_level": "Headlight Level",
     "set_headlight_level_description": "Set the headlight beam height/level (1–11).",
     "headlight_level_value": "Level (1–11)",
-    "set_seat_position": "Control Seat Position",
-    "set_seat_position_description": "Load a seat memory position. Ensure the memory has been saved first from the vehicle. This control does not work while the vehicle is powered off.",
+    "set_seat_position": "Set Car Seat Memory",
+    "set_seat_position_description": "Recall one of the car's own hardware seat memory banks. This is a different system from OverDrive's saved positions, and it does not move the mirrors. On some models these banks are not reachable from the car's screen, so they can still hold factory defaults. Does not work while the vehicle is powered off.",
     "position_1": "Position 1",
     "position_2": "Position 2",
     "open_windows": "Open Windows",
@@ -1093,7 +1093,9 @@
     "mqtt_trigger": "MQTT Message",
     "mqtt_trigger_description": "Fires when your MQTT broker publishes to <base>/automation/<channel> (e.g. from Home Assistant). Enter the channel name and match its value.",
     "mqtt_channel": "Channel",
-    "mqtt_value": "Value"
+    "mqtt_value": "Value",
+    "apply_seat_position": "Apply Seat & Mirror Position",
+    "apply_seat_position_description": "Move the driver seat and both door mirrors to a position saved in OverDrive. Positions are captured from the car's own memory slots by holding a position button in the car, or saved on the Seat Positions page. The car must be on."
   },
   "messages": {
     "logged_out": "Logged out",
