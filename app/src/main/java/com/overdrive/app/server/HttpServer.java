@@ -937,6 +937,22 @@ public class HttpServer {
             return LightDebugApiHandler.handle(method, path, body, out);
         }
 
+        // OverDrive-native seat/mirror POSITIONS store (feature: seat positions).
+        // list / capture (fired by the long-press a11y hook) / apply / delete.
+        // Runs in the daemon (only uid that can read/write BYD geometry).
+        if (path.startsWith("/api/positions")) {
+            return PositionsApiHandler.handle(method, path, body, out);
+        }
+
+        // Bodywork seat/keyfob feature-id READS — read-only probe of the
+        // absolute seat geometry (System B) and the keyfob-identity ids via
+        // BYDAutoBodyworkDevice.get(int[], Class) through a PermissiveContext,
+        // the reach the CarProperty bridge lacks. No writes; the seat never
+        // moves. See SeatDebugApiHandler / BodyworkSeatProbe.
+        if (path.startsWith("/api/debug/seat/")) {
+            return SeatDebugApiHandler.handle(method, path, body, out);
+        }
+
         // Radar blind-spot ALERT register probe — read-only. The `blindSpot` automation
         // signal has never been confirmed on a car, and its whole read path logs at DEBUG
         // (stripped by R8 in release), so the values have to come back as JSON.

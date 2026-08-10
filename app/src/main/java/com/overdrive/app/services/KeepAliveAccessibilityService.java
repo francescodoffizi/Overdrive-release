@@ -6,8 +6,14 @@ import android.content.Intent;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 
 import com.overdrive.app.ui.daemon.DaemonStartupManager;
+import com.overdrive.app.util.DaemonHttpClient;
+
+import java.net.HttpURLConnection;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Minimal AccessibilityService that keeps the app process alive indefinitely.
@@ -77,7 +83,14 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         // Mirror the proven OEM config EXACTLY (no extra flags): subscribe to a
         // real event type + report-view-ids + filter-key-events. Adding more than
         // the known-good set risks a different firmware quirk, so match it 1:1.
-        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
+        // One addition on top of that shape: seat-position capture subscribes to
+        // TYPE_VIEW_LONG_CLICKED so onAccessibilityEvent sees the user long-pressing
+        // BYD's seat-position buttons. No extra flags — the handler reads the event
+        // source's resource-id, which flagReportViewIds already covers. eventTypes
+        // changes have regressed key delivery on this firmware before, so a build
+        // carrying this should re-verify that a mapped hardware key still fires.
+        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                | AccessibilityEvent.TYPE_VIEW_LONG_CLICKED;
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
         info.notificationTimeout = 100;
         info.flags |= AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
@@ -116,9 +129,72 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         }
     }
 
+    /** BYD's seat-position UI (the long-press-to-save dialog) lives in this package. */
+    private static final String SEAT_POS_PKG = "com.byd.carsettings";
+
+    /** Off-thread HTTP to the daemon so the a11y callback never blocks. */
+    private final ExecutorService captureExecutor = Executors.newSingleThreadExecutor();
+
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // No-op — we don't process accessibility events
+        // Only interested in the user long-pressing a BYD seat-position button (the
+        // "save current position" gesture). Everything else is ignored cheaply.
+        if (event == null || event.getEventType() != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return;
+        CharSequence pkg = event.getPackageName();
+        if (pkg == null || !SEAT_POS_PKG.contentEquals(pkg)) return;
+        int slot = seatSlotFromEvent(event);
+        if (slot < 1) return;
+        Log.i(TAG, "seat-position long-press: slot " + slot + " — capturing geometry");
+        captureSeatPosition(slot);
+    }
+
+    /**
+     * Resolve which native slot (1..3) was long-pressed, by the source view's
+     * resource-id ({@code com.byd.carsettings:id/location{1,2,3}}). Resource-id is
+     * language-independent, unlike the button text ("Posisjon N"). Returns -1 if the
+     * long-press wasn't on a seat-position button.
+     */
+    private int seatSlotFromEvent(AccessibilityEvent event) {
+        AccessibilityNodeInfo src = null;
+        try {
+            src = event.getSource();
+            if (src == null) return -1;
+            CharSequence rid = src.getViewIdResourceName();
+            if (rid == null) return -1;
+            String s = rid.toString();
+            String prefix = SEAT_POS_PKG + ":id/location";
+            if (s.startsWith(prefix) && s.length() == prefix.length() + 1) {
+                char c = s.charAt(s.length() - 1);
+                if (c >= '1' && c <= '3') return c - '0';
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "seatSlotFromEvent: " + t.getMessage());
+        } finally {
+            if (src != null) { try { src.recycle(); } catch (Throwable ignored) {} }
+        }
+        return -1;
+    }
+
+    /**
+     * Ask the daemon to read the live seat+mirror geometry and store it as the
+     * captured entry for this native slot. The a11y service runs in the app UI
+     * process (uid = app), which cannot read BYD geometry directly (signature-perm
+     * gated to uid 2000); the daemon on :8080 can, so we POST there — same pattern
+     * as KeyMapDispatcher.fire(). Runs off the a11y callback thread.
+     */
+    private void captureSeatPosition(int slot) {
+        captureExecutor.execute(() -> {
+            HttpURLConnection conn = null;
+            try {
+                conn = DaemonHttpClient.open("/api/positions/capture?slot=" + slot, "POST", 3000, 8000);
+                int code = conn.getResponseCode();
+                Log.i(TAG, "capture slot " + slot + " -> HTTP " + code);
+            } catch (Throwable t) {
+                Log.w(TAG, "capture slot " + slot + " failed: " + t.getMessage());
+            } finally {
+                if (conn != null) { try { conn.disconnect(); } catch (Throwable ignored) {} }
+            }
+        });
     }
 
     /**
