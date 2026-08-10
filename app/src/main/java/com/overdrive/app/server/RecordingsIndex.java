@@ -1218,19 +1218,6 @@ public final class RecordingsIndex {
         addDirFiles(entries, sm.getAllRecordingsDirs(), null);
         addDirFiles(entries, sm.getAllSurveillanceDirs(), null);
         addDirFiles(entries, sm.getAllProximityDirs(), null);
-        // Legacy paths — keep mirrored with RecordingsApiHandler.
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files")),
-                null);
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files/recordings")),
-                null);
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files/sentry_events")),
-                null);
-        addDirFiles(entries,
-                List.of(new File("/storage/emulated/0/Android/data/com.overdrive.app/files/proximity_events")),
-                null);
 
         // Dedup by filename (mirror dirs hold the same .mp4).
         Set<String> seen = new HashSet<>(entries.size() * 2);

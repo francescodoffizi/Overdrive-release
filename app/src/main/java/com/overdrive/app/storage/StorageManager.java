@@ -130,8 +130,8 @@ public class StorageManager {
     // Legacy paths from older app versions. Files here aren't written anymore
     // but they still count toward the user's configured limit and must be
     // reaped — otherwise a 500 MB limit can show 800 MB used in the UI.
-    private static final String LEGACY_APP_FILES_DIR = "/storage/emulated/0/Android/data/com.overdrive.app/files";
-    private static final String LEGACY_SURVEILLANCE_DIR = LEGACY_APP_FILES_DIR + "/sentry_events";
+    private static final String LEGACY_APP_FILES_DIR = RecordingDirectoryRegistry.LEGACY_BASE;
+    private static final String LEGACY_SURVEILLANCE_DIR = RecordingDirectoryRegistry.LEGACY_SENTRY;
 
     // Subdirectories
     public static final String RECORDINGS_SUBDIR = "recordings";
@@ -3530,15 +3530,18 @@ public class StorageManager {
      * Callers should iterate all returned directories to find all files.
      */
     public List<File> getAllRecordingsDirs() {
-        return getAllDirsForType(recordingsDir, internalRecordingsDir, sdCardRecordingsDir, usbRecordingsDir);
+        return RecordingDirectoryRegistry.recordings(
+            recordingsDir, internalRecordingsDir, sdCardRecordingsDir, usbRecordingsDir);
     }
 
     public List<File> getAllSurveillanceDirs() {
-        return getAllDirsForType(surveillanceDir, internalSurveillanceDir, sdCardSurveillanceDir, usbSurveillanceDir);
+        return RecordingDirectoryRegistry.surveillance(
+            surveillanceDir, internalSurveillanceDir, sdCardSurveillanceDir, usbSurveillanceDir);
     }
 
     public List<File> getAllProximityDirs() {
-        return getAllDirsForType(proximityDir, internalProximityDir, sdCardProximityDir, usbProximityDir);
+        return RecordingDirectoryRegistry.proximity(
+            proximityDir, internalProximityDir, sdCardProximityDir, usbProximityDir);
     }
 
     public List<File> getAllTripsDirs() {
@@ -3580,60 +3583,29 @@ public class StorageManager {
     }
 
     /**
-     * Same as {@link #getAllSurveillanceDirs()} et al, but additionally
-     * includes legacy app-files locations from older app versions where
-     * stale media may still be living and counting toward the limit.
+    * Same canonical roots as {@link #getAllSurveillanceDirs()} et al.
      *
      * Used by both the size accounting and the cleanup reaper so the two
      * agree about what "the surveillance pool" actually is — otherwise
      * the UI can show 800 MB used against a 500 MB limit while cleanup
      * (which only saw the active dir) thinks everything is fine.
      *
-     * Includes the flat legacy base ({@link #LEGACY_APP_FILES_DIR}) when a
-     * non-null filename prefix is supplied via {@link #namePrefixForCategory},
-     * because the flat base is shared across categories and only files
-     * matching the category's prefix should be touched.
+     * The flat legacy base is shared across categories, so callers use
+     * {@link #namePrefixForCategory} to touch only matching files.
      */
     private List<File> getReapableDirs(String category) {
-        List<File> dirs;
-        String legacyPath = null;
-        boolean includeFlatBase = false;
         switch (category) {
             case "recordings":
-                dirs = new ArrayList<>(getAllRecordingsDirs());
-                legacyPath = LEGACY_APP_FILES_DIR + "/recordings";
-                includeFlatBase = true;  // some old installs wrote cam_* into <base>
-                break;
+                return new ArrayList<>(getAllRecordingsDirs());
             case "surveillance":
-                dirs = new ArrayList<>(getAllSurveillanceDirs());
-                legacyPath = LEGACY_SURVEILLANCE_DIR;
-                break;
+                return new ArrayList<>(getAllSurveillanceDirs());
             case "proximity":
-                dirs = new ArrayList<>(getAllProximityDirs());
-                legacyPath = LEGACY_APP_FILES_DIR + "/proximity_events";
-                break;
+                return new ArrayList<>(getAllProximityDirs());
             case "trips":
-                dirs = new ArrayList<>(getAllTripsDirs());
-                break;
+                return new ArrayList<>(getAllTripsDirs());
             default:
                 return new ArrayList<>();
         }
-        if (legacyPath != null) {
-            addDirIfMissing(dirs, new File(legacyPath));
-        }
-        if (includeFlatBase) {
-            addDirIfMissing(dirs, new File(LEGACY_APP_FILES_DIR));
-        }
-        return dirs;
-    }
-
-    private static void addDirIfMissing(List<File> dirs, File candidate) {
-        if (candidate == null || !candidate.exists() || !candidate.isDirectory()) return;
-        String path = candidate.getAbsolutePath();
-        for (File d : dirs) {
-            if (d != null && d.getAbsolutePath().equals(path)) return;
-        }
-        dirs.add(candidate);
     }
 
     /**
