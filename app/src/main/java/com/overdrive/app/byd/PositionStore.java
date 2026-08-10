@@ -21,13 +21,18 @@ import java.nio.file.Files;
  *
  * <p>Schema:
  * <pre>{ "version":1, "positions":[ {
- *     "id":       "slot-1" | uuid,
+ *     "id":       "&lt;profile&gt;-slot-1" (captured) | "user-&lt;slug&gt;" (user-created),
  *     "name":     "Posisjon 1",
+ *     "profile":  "paa*****@gmail.com",   // captured only
  *     "slot":     1,            // native DiLink slot for captured entries; absent for user-added
  *     "source":   "captured" | "user",
  *     "createdAt": &lt;epoch ms&gt;,
+ *     "updatedAt": &lt;epoch ms&gt;,   // user entries, set when the geometry is re-saved
  *     "axes":     { "HORIZONTAL":52, "BACKREST":56, ..., "LEFT_H":31, ... }
  * } ] }</pre>
+ *
+ * <p>Ids are stable for the life of the entry. Automations reference a position by id, so a
+ * rename must not change it, and re-capturing a native slot must land on the same id.
  *
  * <p>Captured entries are keyed by native slot (1..3) and UPSERTED, so re-saving a
  * native position updates OverDrive's mirror of it rather than piling up duplicates.
@@ -146,6 +151,96 @@ public final class PositionStore {
             }
             return entry;
         }
+    }
+
+    /**
+     * Create a user-owned position from the geometry passed in. Unlike captured entries there
+     * is no natural key, so the id is derived from the name and then made unique by suffix.
+     * It is deliberately NOT re-derived on rename: automations reference positions by id, so
+     * the id has to outlive whatever the entry is called (mirrors how AppType stores a package
+     * name rather than an app label). Charset is the sanitize() output, [a-z0-9_-], which is
+     * what the automation-side value validator accepts.
+     *
+     * @return the stored entry, or null if the name is empty or over-long.
+     */
+    public JSONObject createUser(String name, JSONObject axes, long nowMs) {
+        String clean = (name == null) ? "" : name.trim();
+        if (clean.isEmpty() || clean.length() > 60) return null;
+        synchronized (LOCK) {
+            JSONObject root = load();
+            JSONArray arr = root.optJSONArray("positions");
+            String base = "user-" + sanitize(clean);
+            String id = base;
+            for (int n = 2; indexOf(arr, id) >= 0; n++) id = base + "-" + n;
+            JSONObject entry = new JSONObject();
+            try {
+                entry.put("id", id);
+                entry.put("name", clean);
+                entry.put("source", "user");
+                entry.put("createdAt", nowMs);
+                entry.put("axes", axes != null ? axes : new JSONObject());
+                arr.put(entry);
+                save(root);
+            } catch (Throwable t) {
+                log("createUser failed: " + t);
+                return null;
+            }
+            return entry;
+        }
+    }
+
+    /**
+     * Replace the geometry of an existing USER entry, keeping its id and name. Captured entries
+     * mirror the car and are rejected — their geometry only ever comes from a capture.
+     *
+     * @return the updated entry, or null if absent or captured.
+     */
+    public JSONObject updateAxes(String id, JSONObject axes, long nowMs) {
+        return mutate(id, axes, null, nowMs);
+    }
+
+    /**
+     * Rename a USER entry. The id is untouched, so automations pointing at it keep working.
+     *
+     * @return the updated entry, or null if absent, captured, or the name is empty/over-long.
+     */
+    public JSONObject rename(String id, String name) {
+        String clean = (name == null) ? "" : name.trim();
+        if (clean.isEmpty() || clean.length() > 60) return null;
+        return mutate(id, null, clean, 0L);
+    }
+
+    /** Shared body of updateAxes/rename: find a user entry by id, apply what was passed, save. */
+    private JSONObject mutate(String id, JSONObject axes, String name, long nowMs) {
+        if (id == null) return null;
+        synchronized (LOCK) {
+            JSONObject root = load();
+            JSONArray arr = root.optJSONArray("positions");
+            int i = indexOf(arr, id);
+            if (i < 0) return null;
+            JSONObject entry = arr.optJSONObject(i);
+            if (entry == null || !"user".equals(entry.optString("source"))) return null;
+            try {
+                if (axes != null) { entry.put("axes", axes); entry.put("updatedAt", nowMs); }
+                if (name != null) entry.put("name", name);
+                arr.put(i, entry);
+                save(root);
+            } catch (Throwable t) {
+                log("mutate failed: " + t);
+                return null;
+            }
+            return entry;
+        }
+    }
+
+    /** Index of the entry with this id, or -1. */
+    private static int indexOf(JSONArray arr, String id) {
+        if (arr == null || id == null) return -1;
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject p = arr.optJSONObject(i);
+            if (p != null && id.equals(p.optString("id"))) return i;
+        }
+        return -1;
     }
 
     /** Remove a position by id. Returns true if something was removed. */

@@ -26,9 +26,19 @@ import java.util.Map;
  *   <li>{@code POST /api/positions/capture?slot=N&name=..} — read the live full bundle and
  *       upsert it as the captured entry for native slot N (1..3). Fired by the long-press hook.</li>
  *   <li>{@code POST /api/positions/apply?id=..}         — apply a stored position (moves seat+mirrors,
- *       full spi.p7.m() two-batch sequence via {@link BodyworkSeatProbe#applyFull}). Parked-gated.</li>
+ *       full spi.p7.m() two-batch sequence via {@link BodyworkSeatProbe#applyFull}). Movement-gated,
+ *       {@code force=YES} overrides. Also accepts the id in a JSON body, which is how the
+ *       automation action reaches it.</li>
  *   <li>{@code POST /api/positions/delete?id=..}        — remove a stored position</li>
+ *   <li>{@code POST /api/positions/create?name=..}      — save the live geometry as a new user entry</li>
+ *   <li>{@code POST /api/positions/save?id=..}          — overwrite a user entry with the live geometry</li>
+ *   <li>{@code POST /api/positions/rename?id=..&name=..} — rename a user entry, id unchanged</li>
  * </ul>
+ *
+ * <p>Only {@code /api/positions/apply} is reachable from an automation. Everything else here
+ * creates, overwrites or destroys stored positions, which an {@code ApiAction} has no business
+ * doing — see {@code HttpServer.AUTOMATION_ALLOWED_PREFIXES}, which lists the exact apply path
+ * rather than the {@code /api/positions/} prefix for precisely that reason.
  */
 public final class PositionsApiHandler {
 
@@ -59,15 +69,65 @@ public final class PositionsApiHandler {
         if (pathOnly.equals("/api/positions") && "GET".equals(method)) {
             JSONObject r = new JSONObject();
             r.put("positions", PositionStore.getInstance().list());
+            // Car state rides along with the list so the management page can gate its
+            // buttons without a second round trip. Both are advisory for the UI — the
+            // authority is still applyFull's own gate, which the UI cannot talk its way past.
+            // ACC off matters most: the seat motors are unpowered, so a write is accepted
+            // (code 0) and does nothing, which would otherwise look like success.
+            try { r.put("acc", com.overdrive.app.monitor.AccMonitor.isAccOn()); }
+            catch (Throwable ignore) { }
+            try { r.put("movementBlocked", com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked()); }
+            catch (Throwable ignore) { }
             HttpResponse.sendJson(out, r.toString());
             return true;
         }
+        // Live geometry, so the management page can show what the car is in right now and
+        // the user can pose the seat and then save what they see. Read-only; deliberately
+        // separate from /api/debug/seat/read, which is a probe with a debug posture.
+        if (pathOnly.equals("/api/positions/current") && "GET".equals(method)) {
+            JSONObject axes = readLive(out);
+            if (axes == null) return true;
+            HttpResponse.sendJson(out, new JSONObject().put("axes", axes).toString());
+            return true;
+        }
         if (pathOnly.equals("/api/positions/capture")) return handleCapture(out, q);
-        if (pathOnly.equals("/api/positions/apply"))   return handleApply(out, q);
+        if (pathOnly.equals("/api/positions/apply"))   return handleApply(out, q, body);
         if (pathOnly.equals("/api/positions/delete"))  return handleDelete(out, q);
+        if (pathOnly.equals("/api/positions/create"))  return handleCreate(out, q, body);
+        if (pathOnly.equals("/api/positions/save"))    return handleSave(out, q, body);
+        if (pathOnly.equals("/api/positions/rename"))  return handleRename(out, q, body);
 
         HttpResponse.sendError(out, 404, "Unknown positions endpoint");
         return true;
+    }
+
+    /**
+     * Read a parameter from either the query string or a JSON body, query first.
+     *
+     * <p>Both forms are needed. The management UI posts query parameters, but an automation
+     * {@code ApiAction} renders a JSON body from a template ({@code {"id":"${id}"}}) like every
+     * other action in the catalog, so accepting only {@code ?id=} would make this endpoint the
+     * odd one out. Query values are URL-decoded here — the splitter above deliberately does not
+     * decode, so a name with a space or a Norwegian vowel would otherwise arrive percent-encoded.
+     */
+    private static String param(Map<String, String> q, String body, String key) {
+        String v = q.get(key);
+        if (v != null && !v.isEmpty()) {
+            try {
+                return java.net.URLDecoder.decode(v, "UTF-8");
+            } catch (Throwable t) {
+                return v;
+            }
+        }
+        if (body != null && !body.trim().isEmpty()) {
+            try {
+                String s = new JSONObject(body).optString(key, "");
+                if (!s.isEmpty()) return s;
+            } catch (Throwable ignore) {
+                // not JSON, or key absent — fall through
+            }
+        }
+        return null;
     }
 
     /** Read the live geometry and upsert it under native slot N. */
@@ -156,9 +216,79 @@ public final class PositionsApiHandler {
         return null;
     }
 
+    /**
+     * Save the live geometry as a NEW user-owned position. The management UI's "Save as new":
+     * the user poses the seat with the physical controls, then names what the car is currently in.
+     * There is no axis-level editing anywhere — a hand-typed value is a seat pose nobody chose.
+     */
+    private static boolean handleCreate(OutputStream out, Map<String, String> q, String body) throws Exception {
+        String name = param(q, body, "name");
+        if (name == null) { HttpResponse.sendJsonError(out, "create needs a name"); return true; }
+        JSONObject axes = readLive(out);
+        if (axes == null) return true;
+        JSONObject entry = PositionStore.getInstance().createUser(name, axes, System.currentTimeMillis());
+        if (entry == null) { HttpResponse.sendJsonError(out, "name must be 1..60 characters"); return true; }
+        log("created " + entry.optString("id") + " name=" + name);
+        HttpResponse.sendJson(out, entry.toString());
+        return true;
+    }
+
+    /**
+     * Overwrite an existing USER position with the live geometry ("Save here" on the row).
+     * Captured entries are rejected by the store: they mirror the car, so their geometry only
+     * ever comes from a capture.
+     */
+    private static boolean handleSave(OutputStream out, Map<String, String> q, String body) throws Exception {
+        String id = param(q, body, "id");
+        if (id == null) { HttpResponse.sendJsonError(out, "save needs an id"); return true; }
+        JSONObject axes = readLive(out);
+        if (axes == null) return true;
+        JSONObject entry = PositionStore.getInstance().updateAxes(id, axes, System.currentTimeMillis());
+        if (entry == null) {
+            HttpResponse.sendJsonError(out, "no user position with id=" + id + " (captured positions cannot be overwritten)");
+            return true;
+        }
+        log("saved over " + id);
+        HttpResponse.sendJson(out, entry.toString());
+        return true;
+    }
+
+    /** Rename a USER position. The id is untouched so automations referencing it keep working. */
+    private static boolean handleRename(OutputStream out, Map<String, String> q, String body) throws Exception {
+        String id = param(q, body, "id");
+        String name = param(q, body, "name");
+        if (id == null || name == null) { HttpResponse.sendJsonError(out, "rename needs an id and a name"); return true; }
+        JSONObject entry = PositionStore.getInstance().rename(id, name);
+        if (entry == null) {
+            HttpResponse.sendJsonError(out, "no user position with id=" + id + ", or the name is not 1..60 characters");
+            return true;
+        }
+        log("renamed " + id + " to " + name);
+        HttpResponse.sendJson(out, entry.toString());
+        return true;
+    }
+
+    /**
+     * Read the live 13-axis bundle, writing the error response itself and returning null when it
+     * cannot. Shared by create and save.
+     */
+    private static JSONObject readLive(OutputStream out) throws Exception {
+        Context ctx = resolveContext();
+        if (ctx == null) {
+            HttpResponse.sendJson(out, 503, new JSONObject().put("error", "Daemon Context unavailable").toString());
+            return null;
+        }
+        JSONObject axes = BodyworkSeatProbe.readFullBundle(ctx);
+        if (axes.length() == 0) {
+            HttpResponse.sendJsonError(out, "read of live geometry returned nothing (bodywork device unavailable?)");
+            return null;
+        }
+        return axes;
+    }
+
     /** Apply a stored position (moves seat + mirrors). */
-    private static boolean handleApply(OutputStream out, Map<String, String> q) throws Exception {
-        String id = q.get("id");
+    private static boolean handleApply(OutputStream out, Map<String, String> q, String body) throws Exception {
+        String id = param(q, body, "id");
         JSONObject pos = PositionStore.getInstance().getById(id);
         if (pos == null) { HttpResponse.sendJsonError(out, "no position with id=" + id); return true; }
         Context ctx = resolveContext();
