@@ -1006,6 +1006,63 @@ public final class RecordingsIndex {
         });
     }
 
+    public static final class RecordingRef {
+        public final String id;
+        public final String filename;
+        public final String absolutePath;
+        public final String heroThumbnail;
+
+        RecordingRef(String id, String filename, String absolutePath, String heroThumbnail) {
+            this.id = id;
+            this.filename = filename;
+            this.absolutePath = absolutePath;
+            this.heroThumbnail = heroThumbnail;
+        }
+
+        public File file() {
+            return new File(absolutePath);
+        }
+    }
+
+    public synchronized RecordingRef resolveById(String recordingId) {
+        if (recordingId == null || recordingId.isEmpty()) return null;
+        final String id = recordingId;
+        return withRetry("resolveById", null, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT recording_id, filename, abs_path, hero_thumb FROM recordings"
+                            + " WHERE recording_id = ? AND is_available = TRUE LIMIT 1")) {
+                ps.setString(1, id);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? recordingRef(rs) : null;
+                }
+            }
+        });
+    }
+
+    public synchronized RecordingRef resolveByFilename(String filename) {
+        if (filename == null || filename.isEmpty()) return null;
+        final String name = filename;
+        return withRetry("resolveByFilename", null, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT recording_id, filename, abs_path, hero_thumb FROM recordings"
+                            + " WHERE filename = ? AND is_available = TRUE"
+                            + " ORDER BY root_rank ASC, ts_ms DESC LIMIT 1")) {
+                ps.setString(1, name);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? recordingRef(rs) : null;
+                }
+            }
+        });
+    }
+
+    private static RecordingRef recordingRef(ResultSet rs) throws Exception {
+        return new RecordingRef(
+                rs.getString("recording_id"),
+                rs.getString("filename"),
+                rs.getString("abs_path"),
+                rs.getString("hero_thumb"));
+    }
+
     // =================================================================
     // Warmup
     // =================================================================
@@ -2204,8 +2261,13 @@ public final class RecordingsIndex {
         rec.put("dateFormatted", FMT_DATE_DISPLAY.get().format(d));
         rec.put("timeFormatted", FMT_TIME_DISPLAY.get().format(d));
 
-        rec.put("videoUrl", "/video/" + name);
-        rec.put("thumbnailUrl", "/thumb/" + name);
+        String recordingId = rs.getString("recording_id");
+        rec.put("videoUrl", "/video/id/" + recordingId);
+        rec.put("thumbnailUrl", "/thumb/id/" + recordingId);
+        rec.put("deleteUrl", "/api/recordings/id/" + recordingId);
+        rec.put("eventUrl", "/api/events/id/" + recordingId);
+        rec.put("legacyVideoUrl", "/video/" + name);
+        rec.put("legacyThumbnailUrl", "/thumb/" + name);
 
         int sv = rs.getInt("schema_version");
         if (sv > 0) rec.put("schemaVersion", sv);
@@ -2225,7 +2287,7 @@ public final class RecordingsIndex {
         if (animal > 0) rec.put("animalCount", animal);
 
         String hero = rs.getString("hero_thumb");
-        if (hero != null) rec.put("heroThumbnailUrl", "/thumb/" + hero);
+        if (hero != null) rec.put("heroThumbnailUrl", "/thumb/id/" + recordingId);
 
         String classes = rs.getString("actor_classes");
         if (classes != null && !classes.isEmpty()) {

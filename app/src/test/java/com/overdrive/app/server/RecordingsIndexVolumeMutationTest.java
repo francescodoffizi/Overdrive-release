@@ -44,6 +44,13 @@ public class RecordingsIndexVolumeMutationTest {
         assertEquals(2, rows.size());
         assertEquals(rows.get(0).getString("filename"), rows.get(1).getString("filename"));
         assertNotEquals(rows.get(0).getString("id"), rows.get(1).getString("id"));
+        assertTrue(rows.get(0).getString("videoUrl").startsWith("/video/id/"));
+        assertTrue(rows.get(0).getString("thumbnailUrl").startsWith("/thumb/id/"));
+        assertTrue(rows.get(0).getString("deleteUrl").startsWith("/api/recordings/id/"));
+
+        String firstId = RecordingIdentity.fromFile(first).recordingId;
+        RecordingsIndex.RecordingRef exact = index.resolveById(firstId);
+        assertEquals(first.getAbsolutePath(), exact.absolutePath);
 
         assertTrue(index.removeByPath(first.getAbsolutePath()));
         assertEquals(1, index.queryCount(new RecordingsIndex.Filter()));

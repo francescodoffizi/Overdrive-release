@@ -5923,8 +5923,8 @@ public class StorageManager {
                 // only knows about .mp4 filenames.
                 if (file.getName().endsWith(".mp4")) {
                     try {
-                        com.overdrive.app.server.RecordingsIndex
-                                .getInstance().remove(file.getName());
+                            com.overdrive.app.server.RecordingsIndex
+                                .getInstance().removeByPath(file.getAbsolutePath());
                     } catch (Throwable ignored) {}
                 }
 
@@ -7392,7 +7392,8 @@ public class StorageManager {
 
         if (file.getName().endsWith(".mp4")) {
             try {
-                com.overdrive.app.server.RecordingsIndex.getInstance().remove(file.getName());
+                com.overdrive.app.server.RecordingsIndex.getInstance()
+                    .removeByPath(file.getAbsolutePath());
             } catch (Throwable ignored) {}
         }
         if (sidecarExts.length > 0) {
