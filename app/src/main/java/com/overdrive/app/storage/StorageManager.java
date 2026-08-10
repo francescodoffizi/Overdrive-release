@@ -6309,9 +6309,6 @@ public class StorageManager {
         asyncCleanupExecutor.execute(() -> {
             synchronized (recordingsCleanupLock) {
                 try {
-                    // Make all files in directory readable
-                    makeFilesReadable(recordingsDir);
-
                     // Scoped to the active volume so a fallback to internal triggers
                     // (and bounds) on internal's pool + effective limit, not the
                     // combined cross-volume pool vs the raw external limit.
@@ -6370,9 +6367,6 @@ public class StorageManager {
         asyncCleanupExecutor.execute(() -> {
             synchronized (surveillanceCleanupLock) {
                 try {
-                    // Make all files in directory readable
-                    makeFilesReadable(surveillanceDir);
-
                     long currentSize = scopedSizeForCategory("surveillance");
                     long limitBytes = scopedLimitBytesForCategory("surveillance");
 
@@ -6415,9 +6409,6 @@ public class StorageManager {
         asyncCleanupExecutor.execute(() -> {
             synchronized (proximityCleanupLock) {
                 try {
-                    // Make all files in directory readable
-                    makeFilesReadable(proximityDir);
-
                     long currentSize = scopedSizeForCategory("proximity");
                     long limitBytes = scopedLimitBytesForCategory("proximity");
 
@@ -6458,9 +6449,6 @@ public class StorageManager {
         asyncCleanupExecutor.execute(() -> {
             synchronized (tripsCleanupLock) {
                 try {
-                    // Make all files in directory readable
-                    makeFilesReadable(tripsDir);
-
                     // Scoped (parity with the other onXxxFileSaved handlers) so a
                     // trips fallback to internal triggers on internal's pool + cap.
                     // scopedSizeForCategory("trips") still uses the DB-cached size in
