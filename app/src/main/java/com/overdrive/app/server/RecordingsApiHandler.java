@@ -1254,24 +1254,11 @@ public class RecordingsApiHandler {
     }
 
     private static void deleteSidecars(File mp4File, String filename) {
-        // Invalidate the in-memory parse cache so the next /api/recordings
-        // call doesn't return a phantom entry for the just-deleted file.
-        // Tearing down the inverted-index entry happens here too so a
-        // place chip pointing at this file's place key vanishes the
-        // moment the delete completes. Use the helper so the new
-        // (path|type) compound key is matched correctly.
+        // This helper is the single index-removal owner. It delegates to
+        // RecordingsIndex.remove(filename), so a second explicit remove here
+        // would repeat the synchronized DELETE and advance the tombstone
+        // sequence twice for every file deletion.
         invalidateRecordingCache(mp4File.getAbsolutePath());
-
-        // Drop the H2 row eagerly so a /api/recordings call immediately
-        // after delete can't return the just-deleted row. FileObserver
-        // would catch this too, but FUSE-mounted SD cards can drop the
-        // DELETE event.
-        try {
-            com.overdrive.app.server.RecordingsIndex.getInstance().remove(filename);
-        } catch (Throwable ignored) {
-            // RecordingsIndex may not be initialised yet; the
-            // FileObserver / reconcile path will catch up.
-        }
 
         // Sidecar stem: strip a TRAILING ".mp4" only.
         //
