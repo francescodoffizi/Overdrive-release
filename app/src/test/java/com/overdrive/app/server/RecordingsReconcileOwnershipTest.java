@@ -43,6 +43,23 @@ public class RecordingsReconcileOwnershipTest {
         assertTrue(reconcile.contains("reconcileInternal()"));
     }
 
+    @Test
+    public void storageHandlersDelegateIndexMaintenanceToStorageManager() throws IOException {
+        assertNoHandlerOwnedReconcile(
+                "app/src/main/java/com/overdrive/app/server/QualitySettingsApiHandler.java");
+        assertNoHandlerOwnedReconcile(
+                "app/src/main/java/com/overdrive/app/server/SurveillanceIpcServer.java");
+        assertNoHandlerOwnedReconcile(
+                "app/src/main/java/com/overdrive/app/server/TcpCommandServer.java");
+    }
+
+    private static void assertNoHandlerOwnedReconcile(String relativePath) throws IOException {
+        String source = readRepositoryFile(relativePath);
+        assertFalse(source.contains("RecordingsIndexFileWatcher.getInstance().refresh()"));
+        assertFalse(source.contains("RecordingsIndex.getInstance().reconcile()"));
+        assertFalse(source.contains("RecordingsIndexStorageSwitchReconcile"));
+    }
+
     private static String methodBody(String source, String signature) {
         int start = source.indexOf(signature);
         if (start < 0) throw new AssertionError("Could not locate " + signature);
