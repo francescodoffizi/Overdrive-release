@@ -20,6 +20,9 @@ const SeatPositions = {
     current: null,
     acc: false,
     movementBlocked: false,
+    modelId: null,
+    modelConfirmed: false,
+    modelAcknowledged: false,
     appliedId: null,
     _pollTimer: null,
 
@@ -100,6 +103,9 @@ const SeatPositions = {
             this.positions = Array.isArray(j.positions) ? j.positions : [];
             this.acc = !!j.acc;
             this.movementBlocked = !!j.movementBlocked;
+            this.modelId = j.modelId || null;
+            this.modelConfirmed = !!j.modelConfirmed;
+            this.modelAcknowledged = !!j.modelAcknowledged;
         } catch (e) {
             this.positions = [];
         }
@@ -228,6 +234,18 @@ const SeatPositions = {
     },
 
     renderGate() {
+        // Reading and capturing are safe on any car, so the notice explains rather than warns:
+        // the list is the instrument that tells an owner whether the addresses fit their car.
+        const unconf = document.getElementById('spUnconfirmed');
+        if (unconf) {
+            unconf.style.display = this.modelConfirmed ? 'none' : '';
+            const txt = document.getElementById('spUnconfirmedText');
+            if (txt && !this.modelConfirmed) {
+                txt.textContent = this.modelId
+                    ? this.t('seatpos.unconfirmed_note', 'These addresses are confirmed on a BYD Seal. Reading and saving positions is safe on any model — capture one, move the seat, capture another, and see whether the values follow. Applying asks first.')
+                    : this.t('seatpos.unconfirmed_note_unset', 'No vehicle model is selected in Settings, so this car is treated as unknown. Reading and saving positions is safe — capture one, move the seat, capture another, and see whether the values follow. Applying asks first.');
+            }
+        }
         const gate = document.getElementById('spGate');
         const moving = document.getElementById('spMoving');
         const badge = document.getElementById('spStateBadge');
@@ -381,6 +399,26 @@ const SeatPositions = {
 
     async apply(p) {
         if (!this.acc) return;
+
+        // The axis ids are confirmed on a Seal only. On any other model — or a car where the
+        // owner never picked one — ask before the first write rather than either writing
+        // silently or refusing outright. Refusing would freeze the confirmed-model list at the
+        // one car it was written on, since nobody could ever produce the evidence to extend it.
+        // Asked here rather than off the endpoint's needsModelAck reply so the batch indicator
+        // never animates a write that did not happen; the server check remains the authority
+        // for the automation path and any direct API caller.
+        let ack = '';
+        if (!this.modelConfirmed && !this.modelAcknowledged) {
+            const ok = await this.confirm(
+                this.t('seatpos.unconfirmed_title', 'Not confirmed for this car'),
+                this.t('seatpos.unconfirmed_body',
+                    'Seat and mirror positions are read using addresses confirmed on a BYD Seal, and your car may use different ones. Every value being sent was read back from this same car when the position was captured, and the car must be parked, so the likely worst case is that something other than the seat moves slightly. Worth checking the numbers first: capture a position, move the seat, capture another, and see whether the values follow the seat.'),
+                '', false, this.t('seatpos.unconfirmed_confirm', 'Apply anyway'));
+            if (!ok) return;
+            ack = '&ack=YES';
+            this.modelAcknowledged = true;
+        }
+
         const host = document.getElementById('spBatches');
         const b1 = document.getElementById('spBatch1');
         const b2 = document.getElementById('spBatch2');
@@ -391,13 +429,13 @@ const SeatPositions = {
         // default, matching the native app; overriding it is how we find out whether the
         // refusal is OverDrive's own or something below it.
         const url = '/api/positions/apply?id=' + encodeURIComponent(p.id) +
-            (this.movementBlocked ? '&force=YES' : '');
+            (this.movementBlocked ? '&force=YES' : '') + ack;
         const res = await this.post(url).catch(() => null);
         b1.className = 'sp-batch done';
         b2.className = 'sp-batch done';
         setTimeout(() => { host.style.display = 'none'; }, 900);
 
-        if (!res || res.error || res.skipped) {
+        if (!res || res.error || res.skipped || res.needsModelAck) {
             this.toast((res && (res.error || res.reason)) || this.t('seatpos.apply_failed', 'Could not apply the position'), 'error');
             return;
         }

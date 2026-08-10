@@ -46,6 +46,20 @@ public final class PositionsApiHandler {
 
     private PositionsApiHandler() {}
 
+    /**
+     * The owner's selected vehicle model, or null when unset. Null is deliberately NOT treated as
+     * a Seal: {@code VehicleModelSelection} exists because fresh installs used to write
+     * {@code modelId=seal} and camera auto-configuration then treated every unconfigured BYD as
+     * one. Unknown means unknown.
+     */
+    private static String resolvedModel() {
+        try {
+            return com.overdrive.app.config.UnifiedConfigManager.getSelectedVehicleModelId();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     private static Context resolveContext() {
         Context ctx = null;
         try { ctx = CameraDaemon.getAppContext(); } catch (Throwable ignore) {}
@@ -78,6 +92,10 @@ public final class PositionsApiHandler {
             catch (Throwable ignore) { }
             try { r.put("movementBlocked", com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked()); }
             catch (Throwable ignore) { }
+            String model = resolvedModel();
+            r.put("modelId", model != null ? model : JSONObject.NULL);
+            r.put("modelConfirmed", PositionStore.isModelConfirmed(model));
+            r.put("modelAcknowledged", PositionStore.getInstance().isModelAcknowledged(model));
             HttpResponse.sendJson(out, r.toString());
             return true;
         }
@@ -157,7 +175,8 @@ public final class PositionsApiHandler {
         String name = (profile != null ? profile : "default") + " - " + slotName;
         long now = System.currentTimeMillis();
         JSONObject entry = PositionStore.getInstance().upsertCaptured(profile, slot, name, axes, now);
-        log("captured profile=" + profile + " slot=" + slot + " name=" + name);
+        log("captured profile=" + profile + " slot=" + slot + " name=" + name
+                + " model=" + resolvedModel() + " axes=" + axes);
         HttpResponse.sendJson(out, entry.toString());
         return true;
     }
@@ -298,6 +317,28 @@ public final class PositionsApiHandler {
         }
         JSONObject axes = pos.optJSONObject("axes");
         if (axes == null || axes.length() == 0) { HttpResponse.sendJsonError(out, "position has no axes"); return true; }
+
+        // Applying on a model the axis map has not been confirmed against needs one explicit
+        // acknowledgement, not a refusal. The write is a round trip — every value was read from
+        // these same properties on this same car when the position was captured — so the realistic
+        // worst case on a mismatched id map is restoring some other property's own earlier value,
+        // on a parked car. Blocking it outright would leave the confirmed-model list frozen at the
+        // one car it was written on. Answered as 200 with needsModelAck so the UI can explain and
+        // ask, rather than as an error the user has to decode.
+        String model = resolvedModel();
+        PositionStore store = PositionStore.getInstance();
+        boolean acked = "YES".equals(q.get("ack")) || "1".equals(q.get("ack"));
+        if (!PositionStore.isModelConfirmed(model) && !store.isModelAcknowledged(model)) {
+            if (!acked) {
+                JSONObject r = new JSONObject();
+                r.put("needsModelAck", true);
+                r.put("modelId", model != null ? model : JSONObject.NULL);
+                r.put("appliedId", id);
+                HttpResponse.sendJson(out, r.toString());
+                return true;
+            }
+            store.acknowledgeModel(model);
+        }
         Map<String, Float> overrides = new LinkedHashMap<>();
         for (java.util.Iterator<String> it = axes.keys(); it.hasNext(); ) {
             String k = it.next();
@@ -306,7 +347,8 @@ public final class PositionsApiHandler {
         boolean force = "YES".equals(q.get("force"));
         JSONObject res = BodyworkSeatProbe.applyFull(ctx, overrides, force);
         res.put("appliedId", id);
-        log("apply " + id + " -> batch1=" + res.optJSONObject("batch1") + " batch2=" + res.optJSONObject("batch2"));
+        log("apply " + id + " model=" + model + " confirmed=" + PositionStore.isModelConfirmed(model)
+                + " -> batch1=" + res.optJSONObject("batch1") + " batch2=" + res.optJSONObject("batch2"));
         HttpResponse.sendJson(out, res.toString());
         return true;
     }

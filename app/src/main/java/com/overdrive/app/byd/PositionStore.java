@@ -233,6 +233,62 @@ public final class PositionStore {
         }
     }
 
+    /**
+     * Vehicle models the bodywork axis map in {@link BodyworkSeatProbe#fullAxes()} has actually
+     * been confirmed against. The ids were read off a BYD Seal; no other model has been tested.
+     *
+     * <p>Reading and capturing is safe everywhere and is how this list grows: capture a position,
+     * move the seat, capture another, and compare. If the seat axes track the seat and the mirror
+     * axes track the mirrors, the map fits that car. Applying on an unconfirmed model is allowed
+     * after an explicit acknowledgement rather than blocked, because a feature that refuses to run
+     * anywhere it has not already been proven can never be proven anywhere new.
+     */
+    private static final String[] CONFIRMED_MODELS = { "seal" };
+
+    /** Whether the axis map is confirmed for this model id. Null/unknown is NOT confirmed. */
+    public static boolean isModelConfirmed(String modelId) {
+        if (modelId == null) return false;
+        String m = modelId.trim().toLowerCase(java.util.Locale.US);
+        for (String c : CONFIRMED_MODELS) if (c.equals(m)) return true;
+        return false;
+    }
+
+    /**
+     * Acknowledgement key. An unset model still has to be acknowledgeable, or a user who never
+     * picked their car in Settings would be asked again on every single apply, forever.
+     */
+    private static String ackKey(String modelId) {
+        return (modelId == null || modelId.trim().isEmpty())
+                ? "unknown"
+                : modelId.trim().toLowerCase(java.util.Locale.US);
+    }
+
+    /** Whether the user has already accepted applying on this (unconfirmed) model. */
+    public boolean isModelAcknowledged(String modelId) {
+        synchronized (LOCK) {
+            JSONArray acked = load().optJSONArray("acknowledgedModels");
+            if (acked == null) return false;
+            String m = ackKey(modelId);
+            for (int i = 0; i < acked.length(); i++) {
+                if (m.equals(String.valueOf(acked.optString(i)).toLowerCase(java.util.Locale.US))) return true;
+            }
+            return false;
+        }
+    }
+
+    /** Record that the user accepted applying on this model. Idempotent. */
+    public void acknowledgeModel(String modelId) {
+        if (isModelAcknowledged(modelId)) return;
+        synchronized (LOCK) {
+            JSONObject root = load();
+            JSONArray acked = root.optJSONArray("acknowledgedModels");
+            if (acked == null) acked = new JSONArray();
+            acked.put(ackKey(modelId));
+            try { root.put("acknowledgedModels", acked); save(root); }
+            catch (Throwable t) { log("acknowledgeModel failed: " + t); }
+        }
+    }
+
     /** Index of the entry with this id, or -1. */
     private static int indexOf(JSONArray arr, String id) {
         if (arr == null || id == null) return -1;

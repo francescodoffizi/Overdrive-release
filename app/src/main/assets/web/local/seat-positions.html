@@ -64,6 +64,19 @@
                     </div>
                 </div>
 
+                <!-- Shown on any model the axis map has not been confirmed against, including a
+                     car whose owner never picked one. Informational, not a warning: reading and
+                     capturing are safe everywhere, and the values in the list are how an owner
+                     finds out whether the addresses fit their car. -->
+                <div class="card" id="spUnconfirmed" style="display:none;">
+                    <div class="card-body">
+                        <div class="info-box-note">
+                            <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="11"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                            <div id="spUnconfirmedText"></div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="card">
                     <div class="card-body sp-hero">
                         <div class="seat-frame hero-size" id="spCurrentGlyph"></div>

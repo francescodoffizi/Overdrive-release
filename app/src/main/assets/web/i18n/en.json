@@ -2899,7 +2899,12 @@
     "delete_unused": "Nothing references this position.",
     "delete_failed": "Could not delete the position",
     "applied_toast": "Applied {0}",
-    "apply_failed": "Could not apply the position"
+    "apply_failed": "Could not apply the position",
+    "unconfirmed_note": "These addresses are confirmed on a BYD Seal. Reading and saving positions is safe on any model \u2014 capture one, move the seat, capture another, and see whether the values follow. Applying asks first.",
+    "unconfirmed_note_unset": "No vehicle model is selected in Settings, so this car is treated as unknown. Reading and saving positions is safe \u2014 capture one, move the seat, capture another, and see whether the values follow. Applying asks first.",
+    "unconfirmed_title": "Not confirmed for this car",
+    "unconfirmed_body": "Seat and mirror positions are read using addresses confirmed on a BYD Seal, and your car may use different ones. Every value being sent was read back from this same car when the position was captured, and the car must be parked, so the likely worst case is that something other than the seat moves slightly. Worth checking the numbers first: capture a position, move the seat, capture another, and see whether the values follow the seat.",
+    "unconfirmed_confirm": "Apply anyway"
   },
   "keymap": {
     "page_title": "Key Mapping",
