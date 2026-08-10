@@ -5063,13 +5063,12 @@ public class StorageManager {
         } catch (Throwable t) {
             logWarn(reason + ": RecordingsIndexFileWatcher refresh failed: " + t.getMessage());
         }
-        new Thread(() -> {
-            try {
-                com.overdrive.app.server.RecordingsIndex.getInstance().reconcile();
-            } catch (Throwable t) {
-                logWarn(reason + ": RecordingsIndex reconcile failed: " + t.getMessage());
-            }
-        }, "RecordingsIndexHotplugReconcile").start();
+        try {
+            com.overdrive.app.server.RecordingsIndex.getInstance()
+                    .requestReconcile(reason);
+        } catch (Throwable t) {
+            logWarn(reason + ": RecordingsIndex reconcile request failed: " + t.getMessage());
+        }
     }
 
     // ==================== Cleanup Logic ====================
