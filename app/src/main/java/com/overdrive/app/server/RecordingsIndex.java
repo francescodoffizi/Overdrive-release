@@ -16,9 +16,12 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -841,10 +844,8 @@ public final class RecordingsIndex {
      * per unindexed file, so a K-file drift chopped the monitor into K windows
      * of ~30ms and every concurrent queryStats/queryRecordings/queryDates
      * request queued behind them. That defeated the explicit intent documented
-     * in reconcile() ("we deliberately do NOT hold the lock across the
-     * locateFile() stat() calls ... they can each block 100-500ms, serializing
-     * every concurrent queryRecordings/queryCount/queryStats request"), which
-     * kept locateFile() out of the lock but then re-entered it here.
+    * in reconcile(): filesystem fingerprinting stays outside the monitor so
+    * FUSE metadata stalls cannot serialize every query behind a parse.
      *
      * <p>Only the short MERGE ({@link #upsertRow}) is synchronized — the same
      * split the warmup pipeline already uses (4 unsynchronized parser threads
@@ -1386,60 +1387,58 @@ public final class RecordingsIndex {
     }
 
     /**
-     * Reconcile the index against the filesystem. Walks every dir,
-     * upserts unknown files, removes index rows whose mp4 is gone.
+      * Reconcile the index against the filesystem. Walks every dir,
+      * upserts new or changed files, removes index rows whose mp4 is gone.
      * Backstop for FileObserver event drops on FUSE-mounted SD cards.
-     * Cheap when the index is in sync — every existing row is one
-     * stat() call.
+      * Cheap when the index is in sync — existing rows compare filesystem
+      * fingerprints without parsing sidecar JSON.
      */
     public void reconcile() {
         if (!isAvailable()) return;
         long t0 = System.currentTimeMillis();
         StorageManager sm = StorageManager.getInstance();
 
-        Set<String> diskNames = new HashSet<>();
-        scanDirNames(diskNames, sm.getAllRecordingsDirs());
-        scanDirNames(diskNames, sm.getAllSurveillanceDirs());
-        scanDirNames(diskNames, sm.getAllProximityDirs());
+          Map<String, RecordingFileFingerprint> diskFiles = new LinkedHashMap<>();
+          scanDirFiles(diskFiles, sm.getAllRecordingsDirs());
+          scanDirFiles(diskFiles, sm.getAllSurveillanceDirs());
+          scanDirFiles(diskFiles, sm.getAllProximityDirs());
 
-        // Three-phase walk: index enumerate → drop missing → upsert new.
+          // Three-phase walk: index snapshot → drop missing → upsert new/changed.
         // The SELECT enumerate is synchronized so the snapshot is
         // consistent. The per-row remove()/upsert() calls re-acquire the
-        // monitor themselves; we deliberately do NOT hold the lock across
-        // the locateFile() stat() calls because on FUSE-mounted SD cards
-        // they can each block 100-500ms, serializing every concurrent
+          // monitor themselves; filesystem fingerprinting stays outside that
+          // monitor because FUSE metadata calls can block, serializing every concurrent
         // queryRecordings/queryCount/queryStats request behind reconcile.
         // Accept temporary inconsistency — a file deleted between the
         // collect and verify phases will be cleaned up on the next
         // periodic reconcile (the operation is idempotent).
         int removed = 0;
         int added = 0;
-        // Files seen by scanDirNames() (exists, readable, size>0) but not
-        // findable by locateFile() — usually means a mount path drift or a
-        // symlinked dir that scanDirNames() followed but locateFile()'s
-        // canonical dir list does not. Surfaced in the summary so operators
-        // can spot data-loss-shaped gaps instead of silent skips.
-        int unlocatable = 0;
+        int refreshed = 0;
 
         // Phase 1: snapshot the index under the monitor.
-        Set<String> indexNames;
+        Map<String, IndexedFileState> indexFiles;
         synchronized (this) {
             // Built inside the body so a reconnect-retry re-enumerates into a
-            // fresh set rather than merging two partial snapshots.
-            indexNames = withRetry("reconcile: index enumerate", null, () -> {
-                Set<String> names = new HashSet<>();
+            // fresh map rather than merging two partial snapshots.
+            indexFiles = withRetry("reconcile: index enumerate", null, () -> {
+                Map<String, IndexedFileState> rows = new HashMap<>();
                 try (PreparedStatement ps = connection.prepareStatement(
-                        "SELECT filename FROM recordings");
+                        "SELECT filename, abs_path, size_bytes, mp4_mtime, sidecar_mtime"
+                                + " FROM recordings");
                      ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) names.add(rs.getString(1));
+                    while (rs.next()) {
+                        rows.put(rs.getString(1), new IndexedFileState(
+                                rs.getString(2), rs.getLong(3), rs.getLong(4), rs.getLong(5)));
+                    }
                 }
-                return names;
+                return rows;
             });
         }
         // null (not empty) distinguishes "enumerate failed" from "index is
         // legitimately empty". Bailing on failure is important: an empty
         // snapshot would make Phase 2 believe every indexed row is missing.
-        if (indexNames == null) {
+        if (indexFiles == null) {
             logger.warn("reconcile: index enumerate unavailable — skipping this pass");
             return;
         }
@@ -1447,31 +1446,66 @@ public final class RecordingsIndex {
         // Phase 2: drop rows whose file is gone. remove() takes the
         // monitor per call; that's fine — we want short critical sections
         // here so query threads can interleave.
-        for (String name : indexNames) {
-            if (!diskNames.contains(name)) {
+        for (String name : indexFiles.keySet()) {
+            if (!diskFiles.containsKey(name)) {
                 if (remove(name)) removed++;
             }
         }
 
-        // Phase 3: upsert anything not already known. locateFile() is
-        // intentionally OUTSIDE any synchronized block — its stat() calls
-        // can stall on FUSE mounts and would otherwise serialize queries.
-        for (String name : diskNames) {
-            if (!indexNames.contains(name)) {
-                File f = locateFile(name, sm);
-                if (f != null) {
-                    if (upsert(f)) added++;
-                } else {
-                    unlocatable++;
-                    logger.warn("reconcile: file seen on disk but not locatable: " + name);
-                }
+        // Phase 3: parse only new or fingerprint-changed files. Active-first
+        // map insertion also repairs abs_path when the same filename moved
+        // between roots or volumes.
+        for (Map.Entry<String, RecordingFileFingerprint> entry : diskFiles.entrySet()) {
+            RecordingFileFingerprint fingerprint = entry.getValue();
+            IndexedFileState indexed = indexFiles.get(entry.getKey());
+            RecordingFileFingerprint.Decision decision = fingerprint.decisionAgainst(
+                    indexed != null ? indexed.absolutePath : null,
+                    indexed != null ? indexed.sizeBytes : 0L,
+                    indexed != null ? indexed.mp4Mtime : 0L,
+                    indexed != null ? indexed.sidecarMtime : 0L);
+            switch (decision) {
+                case ADD:
+                    if (upsert(fingerprint.file)) added++;
+                    break;
+                case REFRESH:
+                    if (upsert(fingerprint.file)) refreshed++;
+                    break;
+                case UNCHANGED:
+                    break;
             }
         }
         long ms = System.currentTimeMillis() - t0;
-        if (added > 0 || removed > 0 || unlocatable > 0) {
-            logger.info("Reconcile: +" + added + " / -" + removed
-                    + (unlocatable > 0 ? " / unlocatable=" + unlocatable : "")
+        if (added > 0 || refreshed > 0 || removed > 0) {
+            logger.info("Reconcile: +" + added + " / ~" + refreshed + " / -" + removed
                     + " in " + ms + "ms");
+        }
+    }
+
+    private static final class IndexedFileState {
+        final String absolutePath;
+        final long sizeBytes;
+        final long mp4Mtime;
+        final long sidecarMtime;
+
+        IndexedFileState(String absolutePath, long sizeBytes,
+                         long mp4Mtime, long sidecarMtime) {
+            this.absolutePath = absolutePath;
+            this.sizeBytes = sizeBytes;
+            this.mp4Mtime = mp4Mtime;
+            this.sidecarMtime = sidecarMtime;
+        }
+    }
+
+    private void scanDirFiles(Map<String, RecordingFileFingerprint> out, List<File> dirs) {
+        StorageManager sm = StorageManager.getInstance();
+        for (File dir : dirs) {
+            if (dir == null) continue;
+            File[] files = sm.listMp4Files(dir);
+            for (File file : files) {
+                if (!file.isFile() || out.containsKey(file.getName())) continue;
+                RecordingFileFingerprint fingerprint = RecordingFileFingerprint.from(file);
+                if (fingerprint.sizeBytes > 0) out.put(file.getName(), fingerprint);
+            }
         }
     }
 
@@ -1486,22 +1520,6 @@ public final class RecordingsIndex {
                 if (f.isFile() && f.length() > 0) out.add(f.getName());
             }
         }
-    }
-
-    private File locateFile(String name, StorageManager sm) {
-        for (File dir : sm.getAllRecordingsDirs()) {
-            File f = new File(dir, name);
-            if (f.exists() && f.canRead() && f.length() > 0) return f;
-        }
-        for (File dir : sm.getAllSurveillanceDirs()) {
-            File f = new File(dir, name);
-            if (f.exists() && f.canRead() && f.length() > 0) return f;
-        }
-        for (File dir : sm.getAllProximityDirs()) {
-            File f = new File(dir, name);
-            if (f.exists() && f.canRead() && f.length() > 0) return f;
-        }
-        return null;
     }
 
     // =================================================================
@@ -1986,7 +2004,7 @@ public final class RecordingsIndex {
         // Sidecar enrichment — same logic as
         // RecordingsApiHandler.parseRecordingUncached, kept close to
         // identical so existing callers don't notice the swap.
-        File sidecar = new File(mp4.getParentFile(), name.replace(".mp4", ".json"));
+        File sidecar = RecordingFileFingerprint.sidecarFor(mp4);
         if (sidecar.exists() && sidecar.canRead()) {
             r.sidecarMtime = sidecar.lastModified();
             try {
