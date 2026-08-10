@@ -1,0 +1,250 @@
+/*
+ * Seat positions page. Only what this page adds — cards, buttons, chips, badges and
+ * form controls all come from shared/styles.css.
+ */
+
+/* ── Seat glyph ───────────────────────────────────────────────────────────────
+ * The car's own side render (CarSetting.apk res/drawable-xhdpi-v4/
+ * seat_adjust_main_normal.png), duotoned to the OverDrive palette. It is drawn
+ * TWICE and clipped along the crease at the recliner, so the backrest half can
+ * rotate against the cushion. One flat image would be a static picture; two
+ * halves make the glyph actually show the geometry it is labelling, and the wedge
+ * that opens at the join reads as the seam between the two cushions.
+ *
+ * Geometry measured off the 519px source: crease (292,368) -> (400,470), recliner
+ * pivot (325,415). As percentages of the 430x509 crop those are 53.95%,70.33% ->
+ * 79.07%,90.37% and 61.63%,79.57%.
+ * ───────────────────────────────────────────────────────────────────────────── */
+.seat {
+    position: relative;
+    flex: none;
+    /* The source render faces left; facing right reads better beside a name. */
+    transform: scaleX(-1);
+}
+
+.seat-body { position: absolute; top: 0; right: 0; bottom: 0; left: 0; }
+
+.seat-part {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    background-image: url('images/seat-side.png');
+    background-size: 100% 100%;
+    background-repeat: no-repeat;
+    transform-origin: 61.63% 79.57%;
+}
+
+.seat-part.cushion { -webkit-clip-path: polygon(0% 62%, 53.95% 70.33%, 79.07% 90.37%, 100% 100%, 0% 100%); clip-path: polygon(0% 62%, 53.95% 70.33%, 79.07% 90.37%, 100% 100%, 0% 100%); }
+.seat-part.back    { -webkit-clip-path: polygon(0% 0%, 100% 0%, 100% 100%, 79.07% 90.37%, 53.95% 70.33%, 0% 62%); clip-path: polygon(0% 0%, 100% 0%, 100% 100%, 79.07% 90.37%, 53.95% 70.33%, 0% 62%); }
+
+/*
+ * Floor reference. Outside .seat-body so it does NOT move with the seat — without a
+ * fixed datum a height change is invisible. Clearance is measured, not guessed: the
+ * artwork's solid content ends at 91.6% and its shadow at 95%, and the lowest HEIGHT
+ * adds 6% of downward travel, so 107% keeps a gap under the seat even at its lowest.
+ */
+.seat-floor {
+    position: absolute;
+    left: -12%;
+    right: -12%;
+    top: 107%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--outline) 20%, var(--outline) 80%, transparent);
+    opacity: 0.55;
+}
+
+.seat-frame {
+    flex: none;
+    display: grid;
+    place-items: center;
+    background: var(--surface-container-high);
+    border: 1px solid var(--outline-variant);
+    border-radius: var(--radius-sm);
+}
+.seat-frame.row-size { width: 64px; height: 64px; }
+.seat-frame.hero-size { width: 116px; height: 116px; align-self: center; }
+
+/* ── Current position hero ───────────────────────────────────────────────────── */
+.sp-hero { display: flex; align-items: stretch; gap: 18px; }
+.sp-hero-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.sp-hero-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.sp-eyebrow {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--outline);
+}
+.sp-match { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+.sp-match em { font-style: normal; color: var(--primary); }
+
+/* ── Axis readout ────────────────────────────────────────────────────────────── */
+.sp-axes { display: flex; flex-direction: column; gap: 5px; }
+.sp-axis-line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.sp-axis-group {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--outline);
+    width: 56px;
+    flex: none;
+}
+.sp-axis {
+    font-family: var(--family-mono);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--on-surface-variant);
+    white-space: nowrap;
+}
+.sp-axis .k { color: var(--outline); }
+.sp-axis .v { color: var(--on-surface); font-weight: 500; }
+.sp-axis + .sp-axis::before { content: '\00b7'; color: var(--outline-variant); margin: 0 6px 0 2px; }
+
+/* Two-batch apply progress, mirroring what applyFull actually does. */
+.sp-batches { display: flex; gap: 8px; align-items: center; }
+.sp-batch {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--family-mono);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--outline-variant);
+    color: var(--outline);
+}
+.sp-batch .led { width: 6px; height: 6px; border-radius: 50%; background: var(--outline); }
+.sp-batch.run .led { background: var(--status-warning); animation: sp-pulse 700ms ease-in-out infinite; }
+.sp-batch.done { color: var(--status-success); border-color: var(--outline-variant); }
+.sp-batch.done .led { background: var(--status-success); }
+@keyframes sp-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* ── List ────────────────────────────────────────────────────────────────────── */
+.sp-group-head { display: flex; align-items: center; gap: 10px; padding: 16px 2px 4px; }
+.sp-group-title { font-size: 13px; font-weight: 650; }
+.sp-group-meta { font-size: 12px; color: var(--outline); }
+.sp-group-rule { flex: 1; height: 1px; background: var(--outline-variant); }
+
+.sp-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 16px;
+    border-radius: var(--radius-md);
+    background: var(--surface-container);
+    border: 1px solid var(--outline-variant);
+    transition: background var(--duration-short) var(--easing-standard),
+                border-color var(--duration-short) var(--easing-standard);
+}
+.sp-row + .sp-row { margin-top: 8px; }
+.sp-row:hover { background: var(--surface-container-high); }
+.sp-row.is-applied { border-color: var(--primary); }
+
+.sp-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.sp-name-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sp-name { font-weight: 650; font-size: 14.5px; letter-spacing: -0.005em; }
+
+.sp-chip {
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--outline-variant);
+    color: var(--outline);
+    white-space: nowrap;
+}
+.sp-chip.from-car { color: var(--tertiary); border-color: var(--outline-variant); }
+.sp-chip.applied {
+    color: var(--status-success);
+    border-color: var(--outline-variant);
+    background: var(--surface-container-high);
+}
+
+/* Used-by marker. Dependency info only — automations are edited on the Automations
+   page, never here. This exists so deleting or overwriting a position is not a
+   silent break. */
+.sp-chip.used-by {
+    appearance: none;
+    font-family: inherit;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--on-surface-variant);
+    background: transparent;
+}
+.sp-chip.used-by svg { width: 12px; height: 12px; }
+.sp-chip.used-by:hover { background: var(--surface-container-highest); color: var(--on-surface); }
+
+.sp-row-actions { flex: none; display: flex; align-items: center; gap: 6px; }
+
+/* ── Overflow menu ───────────────────────────────────────────────────────────── */
+.sp-menu-wrap { position: relative; }
+.sp-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    min-width: 210px;
+    background: var(--surface-container-high);
+    border: 1px solid var(--outline-variant);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    padding: 6px;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 15;
+}
+.sp-menu.open { display: flex; }
+.sp-menu button {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    font-size: 13.5px;
+    color: var(--on-surface);
+    text-align: left;
+    padding: 9px 12px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    white-space: nowrap;
+}
+.sp-menu button svg { width: 15px; height: 15px; flex: none; opacity: 0.8; }
+.sp-menu button:hover { background: var(--surface-container-highest); }
+.sp-menu button.danger { color: var(--status-danger); }
+.sp-menu-sep { height: 1px; background: var(--outline-variant); margin: 4px 6px; }
+
+/* ── Used-by dialog list ─────────────────────────────────────────────────────── */
+.sp-uses { display: flex; flex-direction: column; gap: 8px; }
+.sp-use {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 9px 12px;
+    border-radius: var(--radius-sm);
+    background: var(--surface-container-low);
+    border: 1px solid var(--outline-variant);
+}
+.sp-use-name { font-weight: 600; font-size: 13.5px; }
+.sp-use-trigger { font-size: 12px; color: var(--outline); }
+
+.sp-empty {
+    padding: 18px;
+    border: 1px dashed var(--outline-variant);
+    border-radius: var(--radius-md);
+    color: var(--outline);
+    font-size: 13px;
+    text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .sp-batch.run .led { animation: none; }
+}
