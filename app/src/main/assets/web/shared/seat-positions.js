@@ -208,10 +208,39 @@ const SeatPositions = {
         '</div>';
     },
 
+    // Largest per-axis deviation still counted as "this position". The seat does not land
+    // exactly on the stored numbers — physical actuation has a deadband. Measured on the car
+    // 2026-08-11: after applying slot 2 the geometry read back 1-3 units off on six axes.
+    // An exact comparison therefore never matches a position that was genuinely just applied,
+    // which is what "Not saved as any position" after a successful apply actually meant.
+    //
+    // 4 sits well above the observed error and far below the smallest real gap between stored
+    // positions (33 on SITPOINT between slots 1 and 2, 98 on HEIGHT between 2 and 3), so it
+    // cannot blur two distinct positions together.
+    MATCH_TOLERANCE: 4,
+
+    /**
+     * The stored position the car is currently in, or null. Nearest wins when more than one is
+     * within tolerance, so the answer is deterministic rather than list-order dependent.
+     */
     sameAs(axes) {
         if (!axes) return null;
-        return this.positions.find(p =>
-            this.AXES.every(a => Math.abs((p.axes && p.axes[a.key] || 0) - (axes[a.key] || 0)) < 0.01)) || null;
+        let best = null;
+        let bestTotal = Infinity;
+        for (const p of this.positions) {
+            if (!p.axes) continue;
+            let total = 0;
+            let within = true;
+            for (const a of this.AXES) {
+                const stored = (p.axes[a.key] === undefined) ? 0 : p.axes[a.key];
+                const live = (axes[a.key] === undefined) ? 0 : axes[a.key];
+                const d = Math.abs(stored - live);
+                if (d > this.MATCH_TOLERANCE) { within = false; break; }
+                total += d;
+            }
+            if (within && total < bestTotal) { bestTotal = total; best = p; }
+        }
+        return best;
     },
 
     renderCurrent() {
