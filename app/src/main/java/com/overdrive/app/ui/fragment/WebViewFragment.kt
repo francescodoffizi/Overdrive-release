@@ -467,10 +467,13 @@ class WebViewFragment : Fragment() {
             // the file the user just picked in the system picker.
             settings.allowContentAccess = true
             settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            // Respect server Cache-Control headers. The daemon serves HTML with no-store
-            // and shared static assets (CSS/JS/fonts/icons, ~360KB total) with a 24h
-            // max-age, so switching from LOAD_NO_CACHE keeps HTML always fresh while
-            // avoiding a full re-download of every asset on each page load.
+            // Respect server Cache-Control headers. The daemon serves HTML with no-store,
+            // and shared static assets (CSS/JS/fonts/icons, ~360KB total) with
+            // "max-age=300, must-revalidate" plus an ETag — so HTML is always fresh, assets
+            // are not re-downloaded on every page load, and a pushed asset change is picked
+            // up on the next revalidation (a 304 when unchanged) instead of being stuck.
+            // This used to be a 24h max-age with no validator, which is what made a
+            // freshly-deployed /shared/app-shell.js invisible for up to a day.
             settings.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
             settings.loadWithOverviewMode = true
             settings.useWideViewPort = true
