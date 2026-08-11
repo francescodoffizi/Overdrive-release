@@ -177,6 +177,18 @@ public final class PositionsApiHandler {
         JSONObject entry = PositionStore.getInstance().upsertCaptured(profile, slot, name, axes, now);
         log("captured profile=" + profile + " slot=" + slot + " name=" + name
                 + " model=" + resolvedModel() + " axes=" + axes);
+        // Confirm the capture on screen. Without this the long-press is completely silent from
+        // OverDrive's side — the car shows its own feedback for ITS save, so the user has no way
+        // to tell whether OverDrive mirrored it or quietly missed it (which is exactly what
+        // happened for every long-press in the floating widget until it was supported).
+        // TYPE_APPLICATION_OVERLAY, so it draws above the BYD widget rather than behind it.
+        try {
+            com.overdrive.app.byd.MessageOverlayController.showToast(
+                    Messages.get("messages.seat_position_captured", name),
+                    "short", "bottom", "info");
+        } catch (Throwable t) {
+            log("capture toast failed (capture itself is unaffected): " + t);
+        }
         HttpResponse.sendJson(out, entry.toString());
         return true;
     }

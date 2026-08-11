@@ -320,7 +320,7 @@ const SeatPositions = {
             '<div class="sp-row-actions">' +
                 (isUser ? '<button class="btn btn-secondary" data-act="saveHere"' + (this.acc ? '' : ' disabled') + '>' +
                     this.esc(this.t('seatpos.save_here', 'Save here')) + '</button>' : '') +
-                '<button class="btn btn-primary" data-act="apply"' + (this.acc ? '' : ' disabled') + '>' +
+                '<button class="btn btn-primary" data-act="apply"' + ((this.acc && !this.movementBlocked) ? '' : ' disabled') + '>' +
                     this.esc(this.t('seatpos.apply', 'Apply')) + '</button>' +
                 '<div class="sp-menu-wrap">' +
                     '<button class="btn btn-secondary icon-btn" data-act="menu" aria-haspopup="true" aria-expanded="false">' +
@@ -431,7 +431,7 @@ const SeatPositions = {
     },
 
     async apply(p) {
-        if (!this.acc) return;
+        if (!this.acc || this.movementBlocked) return;
 
         // The axis ids are confirmed on a Seal only. On any other model — or a car where the
         // owner never picked one — ask before the first write rather than either writing
@@ -458,11 +458,11 @@ const SeatPositions = {
         host.style.display = '';
         b1.className = 'sp-batch run';
         b2.className = 'sp-batch';
-        // force is only sent while the car is moving. applyFull refuses a moving car by
-        // default, matching the native app; overriding it is how we find out whether the
-        // refusal is OverDrive's own or something below it.
-        const url = '/api/positions/apply?id=' + encodeURIComponent(p.id) +
-            (this.movementBlocked ? '&force=YES' : '') + ack;
+        // No force. That question is settled: Pål confirmed on the car (2026-08-11) that a
+        // moving vehicle refuses the write itself and shows its own warning, so the block is
+        // below OverDrive, not applyFull's gate. Overriding it only produces a doomed write and
+        // a native warning popup, so the UI blocks Apply while moving instead.
+        const url = '/api/positions/apply?id=' + encodeURIComponent(p.id) + ack;
         const res = await this.post(url).catch(() => null);
         b1.className = 'sp-batch done';
         b2.className = 'sp-batch done';

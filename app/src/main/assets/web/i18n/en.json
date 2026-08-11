@@ -2845,7 +2845,7 @@
     "state_moving": "Driving",
     "state_acc_off": "ACC off",
     "gate_acc_off": "The car is off, so the seat motors have no power. Applying or saving a position would be accepted and do nothing. Turn the car on to continue.",
-    "gate_moving": "The car is moving. Applying still sends the position, but the car may refuse to move the seat while driving.",
+    "gate_moving": "The car is moving. Seat positions can only be applied when the car is stationary \u2014 the vehicle itself refuses while driving. Saving and renaming still work.",
     "current": "Current position",
     "current_unavailable": "Could not read the seat",
     "matches": "Matches {0}",

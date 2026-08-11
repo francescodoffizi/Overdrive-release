@@ -1098,6 +1098,7 @@
     "apply_seat_position_description": "Move the driver seat and both door mirrors to a position saved in OverDrive. Positions are captured from the car's own memory slots by holding a position button in the car, or saved on the Seat Positions page. The car must be on."
   },
   "messages": {
+    "seat_position_captured": "Saved \u201c{0}\u201d to OverDrive",
     "logged_out": "Logged out",
     "bydcloud_connected": "Connected successfully",
     "bydcloud_command_executed": "Command executed",

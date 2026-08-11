@@ -52,14 +52,15 @@
                     </div>
                 </div>
 
-                <!-- Movement is NOT a blocker. The write still goes out, with the movement
-                     gate overridden, because whether the car honours a seat move while
-                     driving is not yet known and trying is the only way to find out. -->
+                <!-- Movement blocks Apply. Confirmed on the car 2026-08-11: the refusal is the
+                     VEHICLE's, not applyFull's own gate — it rejects the write while driving and
+                     shows its own warning, so force=YES buys nothing and only adds a native
+                     popup. Saving and renaming stay available; those only read geometry. -->
                 <div class="card" id="spMoving" style="display:none;">
                     <div class="card-body">
                         <div class="info-box-note">
                             <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="11"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-                            <div data-i18n="seatpos.gate_moving">The car is moving. Applying still sends the position, but the car may refuse to move the seat while driving.</div>
+                            <div data-i18n="seatpos.gate_moving">The car is moving. Seat positions can only be applied when the car is stationary &mdash; the vehicle itself refuses while driving. Saving and renaming still work.</div>
                         </div>
                     </div>
                 </div>
