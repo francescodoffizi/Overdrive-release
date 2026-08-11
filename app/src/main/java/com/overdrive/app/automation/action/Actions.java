@@ -395,11 +395,26 @@ public class Actions {
                         new Label("position", "automation.action"),
                         new Label("1", "automation.position_1"),
                         new Label("2", "automation.position_2"))));
+        // Save current driver-seat position into a memory slot (parity with keymap
+        // seat_save; mirror of the recall above).
+        addAction(new ApiAction(
+                new Label("seatSave", "automation.save_seat_position"),
+                "automation.save_seat_position_description",
+                "POST",
+                "/api/vehicle/seat",
+                "{\"action\":\"save\",\"position\":${position}}",
+                new EnumType(
+                        new Label("position", "automation.action"),
+                        new Label("1", "automation.position_1"),
+                        new Label("2", "automation.position_2"))));
         // Recall a saved seat AND mirror position from OverDrive's own store. This is a
         // different memory system from seatPosition/seatSave above: those drive the car's
-        // hardware ECU banks, which the Seal never exposes in its UI, so they hold defaults
-        // and recalling one moves the seat somewhere nobody chose. This one replays the
-        // absolute geometry the DiLink profile system uses, mirrors included.
+        // hardware ECU banks. On the Seal this was developed against, recalling a bank moves
+        // the seat to a position the owner never set — consistent with the banks holding
+        // defaults because nothing on that car writes them, though their contents were never
+        // read to confirm it. Which models expose those banks (door buttons) and which only
+        // have the profile system is unknown. This action replays the absolute geometry the
+        // DiLink profile system uses, mirrors included.
         //
         // The position list is per-device and changes at runtime (user entries come and go,
         // captured entries differ per signed-in profile), so the variable is a live picker
@@ -416,18 +431,6 @@ public class Actions {
                 "/api/positions/apply",
                 "{\"id\":\"${id}\"}",
                 new SavedSeatPositionType(new Label("id", "automation.position"))));
-        // Save current driver-seat position into a memory slot (parity with keymap
-        // seat_save; mirror of the recall above).
-        addAction(new ApiAction(
-                new Label("seatSave", "automation.save_seat_position"),
-                "automation.save_seat_position_description",
-                "POST",
-                "/api/vehicle/seat",
-                "{\"action\":\"save\",\"position\":${position}}",
-                new EnumType(
-                        new Label("position", "automation.action"),
-                        new Label("1", "automation.position_1"),
-                        new Label("2", "automation.position_2"))));
         // Child lock on/off (parity with keymap child_lock). label id "child_lock"
         // matches the VehicleControlCatalog key.
         addAction(new VehicleControlAction(

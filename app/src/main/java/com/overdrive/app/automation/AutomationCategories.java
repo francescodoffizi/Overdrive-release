@@ -65,7 +65,10 @@ public final class AutomationCategories {
         // ── Windows / body / openings ──
         put(WINDOWS_BODY, "windows", "windowsAll", "windowsPreset", "windowState",
                 "windowOpenPercent", "sunroof", "sunshade", "tailgate", "mirror_fold",
-                "child_lock", "doorState", "wireless_charging", "wireless_charging_state");
+                "child_lock", "doorState", "wireless_charging", "wireless_charging_state",
+                // Seat/mirror GEOMETRY — physically moving the body, unlike the seat
+                // heating/venting ids above, which are climate.
+                "seatPosition", "seatSave", "applySeatPosition");
         // ── Lighting ──
         put(LIGHTING, "drl", "hazard", "setAmbient", "ambient_colour", "ambientBrightness",
                 // "ambientPower" = the on/off ACTION's id, "ambient" = the on/off CONDITION's id.
