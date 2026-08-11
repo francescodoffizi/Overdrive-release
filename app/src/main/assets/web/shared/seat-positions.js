@@ -209,15 +209,19 @@ const SeatPositions = {
     },
 
     // Largest per-axis deviation still counted as "this position". The seat does not land
-    // exactly on the stored numbers — physical actuation has a deadband. Measured on the car
-    // 2026-08-11: after applying slot 2 the geometry read back 1-3 units off on six axes.
-    // An exact comparison therefore never matches a position that was genuinely just applied,
-    // which is what "Not saved as any position" after a successful apply actually meant.
+    // exactly on the numbers it is sent — physical actuation has a deadband, so an exact
+    // comparison never matches a position that was genuinely just applied. That is what
+    // "Not saved as any position" right after a successful apply actually meant.
     //
-    // 4 sits well above the observed error and far below the smallest real gap between stored
-    // positions (33 on SITPOINT between slots 1 and 2, 98 on HEIGHT between 2 and 3), so it
-    // cannot blur two distinct positions together.
-    MATCH_TOLERANCE: 4,
+    // Confirmed by Pål applying several positions and reading each back (2026-08-11): height
+    // and fore/aft typically land 1-2 out, the cushion usually 2-3. An earlier single
+    // measurement of mine agreed (SITPOINT 93 -> 90) but was weak on its own — it assumed
+    // which position had been applied from the fact that it was the closest match.
+    //
+    // 5 clears the common case with margin and stays far below the smallest real gap between
+    // stored positions (14 on LEFT_H for the closest pair here, 33 on SITPOINT between slots
+    // 1 and 2, 98 on HEIGHT between 2 and 3), so it cannot blur two positions together.
+    MATCH_TOLERANCE: 5,
 
     /**
      * The stored position the car is currently in, or null. Nearest wins when more than one is

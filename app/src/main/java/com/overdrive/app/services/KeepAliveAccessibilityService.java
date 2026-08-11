@@ -129,8 +129,22 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         }
     }
 
-    /** BYD's seat-position UI (the long-press-to-save dialog) lives in this package. */
+    /**
+     * BYD exposes the SAME three profile positions from two different apps, and a long-press
+     * saves in both — so both have to be watched or capture silently misses half the ways the
+     * user actually saves a position.
+     *
+     * <p>{@code com.byd.carsettings} is the Settings "Sjåfør" dialog, ids {@code location1..3}.
+     *
+     * <p>{@code com.byd.diLinkAccount} is a floating widget that appears OVER whatever app is
+     * open, whenever the seat or mirrors are moved with the physical controls while the car is
+     * on and stationary. Confirmed as the window owner on the car (2026-08-11). Its layout is
+     * {@code window_glb_driver_pos} and its own prompt string reads "Long press the widget to
+     * save the seat/steering wheel/rearview mirror position, and tap the widget to apply the
+     * position" — i.e. the same save gesture, on the same three slots.
+     */
     private static final String SEAT_POS_PKG = "com.byd.carsettings";
+    private static final String SEAT_POS_WIDGET_PKG = "com.byd.diLinkAccount";
 
     /** Off-thread HTTP to the daemon so the a11y callback never blocks. */
     private final ExecutorService captureExecutor = Executors.newSingleThreadExecutor();
@@ -141,7 +155,8 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         // "save current position" gesture). Everything else is ignored cheaply.
         if (event == null || event.getEventType() != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return;
         CharSequence pkg = event.getPackageName();
-        if (pkg == null || !SEAT_POS_PKG.contentEquals(pkg)) return;
+        if (pkg == null) return;
+        if (!SEAT_POS_PKG.contentEquals(pkg) && !SEAT_POS_WIDGET_PKG.contentEquals(pkg)) return;
         int slot = seatSlotFromEvent(event);
         if (slot < 1) return;
         Log.i(TAG, "seat-position long-press: slot " + slot + " — capturing geometry");
@@ -149,10 +164,24 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
     }
 
     /**
-     * Resolve which native slot (1..3) was long-pressed, by the source view's
-     * resource-id ({@code com.byd.carsettings:id/location{1,2,3}}). Resource-id is
-     * language-independent, unlike the button text ("Posisjon N"). Returns -1 if the
-     * long-press wasn't on a seat-position button.
+     * Resolve which native slot (1..3) was long-pressed, from the source view's resource-id.
+     * Resource-id is language-independent, unlike the button text ("Posisjon N").
+     *
+     * <p>Two id schemes, because the same three slots are presented by two apps:
+     * <ul>
+     *   <li>Settings dialog: {@code com.byd.carsettings:id/location1|2|3} — the number IS the slot.
+     *   <li>Floating widget: {@code com.byd.diLinkAccount:id/(iv|tv)_(drive|rest|standby)} —
+     *       named, not numbered. Both the image and the label carry an id, and which one the
+     *       long-press reports depends on where the finger lands, so accept either.
+     * </ul>
+     *
+     * <p>The widget's drive/rest/standby → 1/2/3 mapping is INFERRED from the order the three
+     * groups appear in {@code window_glb_driver_pos} matching the app's own "Position 1/2/3"
+     * strings. It is not proven. If it were wrong the mistake would be loud rather than silent:
+     * the daemon names a captured entry from {@code driverPos_N}, so pressing the top slot would
+     * visibly store it as "Posisjon 2". Worth a glance on the first widget capture.
+     *
+     * <p>Returns -1 if the long-press wasn't on a seat-position slot.
      */
     private int seatSlotFromEvent(AccessibilityEvent event) {
         AccessibilityNodeInfo src = null;
@@ -162,10 +191,24 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
             CharSequence rid = src.getViewIdResourceName();
             if (rid == null) return -1;
             String s = rid.toString();
+
+            // Settings dialog — numbered ids.
             String prefix = SEAT_POS_PKG + ":id/location";
             if (s.startsWith(prefix) && s.length() == prefix.length() + 1) {
                 char c = s.charAt(s.length() - 1);
                 if (c >= '1' && c <= '3') return c - '0';
+            }
+
+            // Floating widget — named ids, either the icon (iv_) or the label (tv_).
+            String widgetPrefix = SEAT_POS_WIDGET_PKG + ":id/";
+            if (s.startsWith(widgetPrefix)) {
+                String name = s.substring(widgetPrefix.length());
+                if (name.startsWith("iv_") || name.startsWith("tv_")) {
+                    String slot = name.substring(3);
+                    if ("drive".equals(slot)) return 1;
+                    if ("rest".equals(slot)) return 2;
+                    if ("standby".equals(slot)) return 3;
+                }
             }
         } catch (Throwable t) {
             Log.w(TAG, "seatSlotFromEvent: " + t.getMessage());
