@@ -52,15 +52,18 @@
                     </div>
                 </div>
 
-                <!-- Movement blocks Apply. Confirmed on the car 2026-08-11: the refusal is the
-                     VEHICLE's, not applyFull's own gate — it rejects the write while driving and
-                     shows its own warning, so force=YES buys nothing and only adds a native
-                     popup. Saving and renaming stay available; those only read geometry. -->
+                <!-- Gear-not-in-P blocks Apply. The gate is the GEAR, not motion: Pål confirmed
+                     the car refuses with the brake fully pressed and the car standing still, as
+                     long as the gear is out of P. DrivingSafetyGuard already keys on gear
+                     (NOT_PARK blocks; P only counts as parked below 2 km/h, to catch rolling in
+                     Park), so the signal was right and only this wording was wrong. The refusal
+                     is the VEHICLE's, not applyFull's gate, so force=YES buys nothing and only
+                     adds a native popup. Saving and renaming stay available; those only read. -->
                 <div class="card" id="spMoving" style="display:none;">
                     <div class="card-body">
                         <div class="info-box-note">
                             <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="11"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-                            <div data-i18n="seatpos.gate_moving">The car is moving. Seat positions can only be applied when the car is stationary &mdash; the vehicle itself refuses while driving. Saving and renaming still work.</div>
+                            <div data-i18n="seatpos.gate_moving">The car is not in Park. Seat positions can only be applied with the gear in P &mdash; the vehicle refuses otherwise, even standing still with the brake pressed. Saving and renaming still work.</div>
                         </div>
                     </div>
                 </div>

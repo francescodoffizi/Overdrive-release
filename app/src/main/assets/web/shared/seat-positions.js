@@ -293,7 +293,7 @@ const SeatPositions = {
             badge.textContent = this.t('seatpos.state_acc_off', 'ACC off');
         } else if (this.movementBlocked) {
             badge.className = 'status-badge';
-            badge.textContent = this.t('seatpos.state_moving', 'Driving');
+            badge.textContent = this.t('seatpos.state_moving', 'Not in Park');
         } else {
             badge.className = 'status-badge active';
             badge.textContent = this.t('seatpos.state_parked', 'Parked');
@@ -458,10 +458,10 @@ const SeatPositions = {
         host.style.display = '';
         b1.className = 'sp-batch run';
         b2.className = 'sp-batch';
-        // No force. That question is settled: Pål confirmed on the car (2026-08-11) that a
-        // moving vehicle refuses the write itself and shows its own warning, so the block is
-        // below OverDrive, not applyFull's gate. Overriding it only produces a doomed write and
-        // a native warning popup, so the UI blocks Apply while moving instead.
+        // No force. Settled on the car (2026-08-11): the VEHICLE refuses the write unless the
+        // gear is in P — not a motion gate, it refuses with the brake pressed and the car
+        // standing still — and shows its own warning. So the block is below OverDrive, not
+        // applyFull's gate, and overriding only buys a doomed write plus a native popup.
         const url = '/api/positions/apply?id=' + encodeURIComponent(p.id) + ack;
         const res = await this.post(url).catch(() => null);
         b1.className = 'sp-batch done';

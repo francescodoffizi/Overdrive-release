@@ -2842,10 +2842,10 @@
   "seatpos": {
     "page_title": "Seat Positions",
     "state_parked": "Parked",
-    "state_moving": "Driving",
+    "state_moving": "Not in Park",
     "state_acc_off": "ACC off",
     "gate_acc_off": "The car is off, so the seat motors have no power. Applying or saving a position would be accepted and do nothing. Turn the car on to continue.",
-    "gate_moving": "The car is moving. Seat positions can only be applied when the car is stationary \u2014 the vehicle itself refuses while driving. Saving and renaming still work.",
+    "gate_moving": "The car is not in Park. Seat positions can only be applied with the gear in P \u2014 the vehicle refuses otherwise, even standing still with the brake pressed. Saving and renaming still work.",
     "current": "Current position",
     "current_unavailable": "Could not read the seat",
     "matches": "Matches {0}",
