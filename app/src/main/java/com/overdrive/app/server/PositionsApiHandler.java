@@ -182,10 +182,14 @@ public final class PositionsApiHandler {
         // to tell whether OverDrive mirrored it or quietly missed it (which is exactly what
         // happened for every long-press in the floating widget until it was supported).
         // TYPE_APPLICATION_OVERLAY, so it draws above the BYD widget rather than behind it.
+        // TOP, not bottom: the long-press happens in BYD's own UI, so the user's attention is
+        // already there and a bottom pill is easy to miss (Pål wasn't sure he'd seen it at all).
+        // "long" too — this is the only signal that OverDrive mirrored the save, so it is worth
+        // more than the default couple of seconds.
         try {
             com.overdrive.app.byd.MessageOverlayController.showToast(
                     Messages.get("messages.seat_position_captured", name),
-                    "short", "bottom", "info");
+                    "long", "top", "info");
         } catch (Throwable t) {
             log("capture toast failed (capture itself is unaffected): " + t);
         }
