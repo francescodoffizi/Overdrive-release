@@ -1413,6 +1413,8 @@ class MainActivity : AppCompatActivity() {
                 R.drawable.ic_recording, R.string.rail_recordings),
             RailItem(R.id.railDestVehicle, R.id.vehicleControlFragment,
                 R.drawable.ic_vehicle_control, R.string.rail_vehicle),
+            RailItem(R.id.railDestSeatPositions, R.id.seatPositionsFragment,
+                R.drawable.ic_seat_positions, R.string.rail_seat_positions),
             RailItem(R.id.railDestProjection, R.id.projectionFragment,
                 R.drawable.ic_projection, R.string.rail_projection),
             RailItem(R.id.railDestTrips, R.id.tripsFragment,

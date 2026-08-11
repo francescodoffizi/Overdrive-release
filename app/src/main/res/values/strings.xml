@@ -872,6 +872,7 @@
     <string name="rail_charging">Charging</string>
     <string name="rail_automations">Automations</string>
     <string name="rail_key_mapping">Key Mapping</string>
+    <string name="rail_seat_positions">Seat Positions</string>
     <string name="rail_integrations">Integrations</string>
     <string name="rail_diagnostics">Diagnostics</string>
     <string name="rail_settings">Settings</string>
