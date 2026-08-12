@@ -52,15 +52,6 @@ public class RecordingsApiHandler {
         return StorageManager.getInstance().getSurveillancePath();
     }
     
-    // Legacy paths for backward compatibility (migration). Used by the
-    // findVideoFile / findSiblingJpeg / findJsonSidecar fallback paths
-    // when the active StorageManager dirs don't contain the requested
-    // file — covers very old installs that wrote into <base>/recordings
-    // or directly into <base>.
-    private static final String LEGACY_RECORDINGS_DIR = "/storage/emulated/0/Android/data/com.overdrive.app/files";
-    private static final String LEGACY_SENTRY_DIR = LEGACY_RECORDINGS_DIR + "/sentry_events";
-
-
     // -----------------------------------------------------------------
     // Index integration
     // -----------------------------------------------------------------
@@ -527,14 +518,6 @@ public class RecordingsApiHandler {
             if (f.exists() && f.canRead() && f.length() > 0) return f;
         }
 
-        // Check legacy recordings location
-        File legacyFile = new File(LEGACY_RECORDINGS_DIR, filename);
-        if (legacyFile.exists() && legacyFile.canRead() && legacyFile.length() > 0) return legacyFile;
-
-        // Check legacy sentry location
-        File legacySentryFile = new File(LEGACY_SENTRY_DIR, filename);
-        if (legacySentryFile.exists() && legacySentryFile.canRead() && legacySentryFile.length() > 0) return legacySentryFile;
-
         // In-flight fallback (thumbnails only): a notification fires the moment
         // startRecording() returns, but the file on disk is still
         // <name>.mp4.tmp until closeEventRecording() finishes (10-15s
@@ -582,10 +565,6 @@ public class RecordingsApiHandler {
             File f = new File(dir, jpegName);
             if (f.exists() && f.canRead() && f.length() > 0) return f;
         }
-        File legacy = new File(LEGACY_RECORDINGS_DIR, jpegName);
-        if (legacy.exists() && legacy.canRead() && legacy.length() > 0) return legacy;
-        File legacySentry = new File(LEGACY_SENTRY_DIR, jpegName);
-        if (legacySentry.exists() && legacySentry.canRead() && legacySentry.length() > 0) return legacySentry;
         return null;
     }
 
