@@ -313,14 +313,19 @@ class RecordingAdapter(
         }
 
         private fun extractThumbnail(path: String): Bitmap? {
+            var retriever: MediaMetadataRetriever? = null
             return try {
-                val retriever = MediaMetadataRetriever()
+                retriever = MediaMetadataRetriever()
                 retriever.setDataSource(path)
-                val frame = retriever.getFrameAtTime(1_000_000) // 1 second in
-                retriever.release()
-                frame
+                retriever.getFrameAtTime(1_000_000) // 1 second in
             } catch (e: Exception) {
                 null
+            } finally {
+                try {
+                    retriever?.release()
+                } catch (_: Throwable) {
+                    // Best-effort cleanup; thumbnail extraction has already completed.
+                }
             }
         }
     }
