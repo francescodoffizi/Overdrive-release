@@ -665,7 +665,10 @@ BYD.screenshotPrivacy = (function () {
     var observer = null;
     var scanQueued = false;
     var ipv4 = /(^|[^\d])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{1,5})?(?!\d)/;
-    var coordinates = /(^|[^\d.])[+-]?(?:\d{1,2}|1[0-7]\d|180)\.\d{4,}\s*[,;\/]\s*[+-]?(?:\d{1,2}|1[0-7]\d|180)\.\d{4,}(?![\d.])/;
+    // Charging history renders stored coordinates to three decimal places,
+    // while other screens retain the full precision. Treat both as location
+    // data so a presentation-oriented rounding step cannot bypass the mask.
+    var coordinates = /(^|[^\d.])[+-]?(?:\d{1,2}|1[0-7]\d|180)\.\d{3,}\s*[,;\/]\s*[+-]?(?:\d{1,2}|1[0-7]\d|180)\.\d{3,}(?![\d.])/;
     var labelledCoordinate = /\b(?:lat(?:itude)?|lon(?:gitude)?|lng)\s*[:=]\s*[+-]?\d{1,3}\.\d{3,}/i;
     var url = /\b(?:https?|wss?):\/\/\S+/i;
     var email = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;

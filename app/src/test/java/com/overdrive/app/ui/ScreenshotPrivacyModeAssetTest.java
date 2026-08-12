@@ -42,6 +42,13 @@ public class ScreenshotPrivacyModeAssetTest {
     }
 
     @Test
+    public void roundedChargingCoordinatesAreStillSensitive() throws IOException {
+        String core = readRepositoryFile("app/src/main/assets/web/shared/core.js");
+
+        assertTrue(core.contains("\\.\\d{3,}\\s*[,;\\/]\\s*"));
+    }
+
+    @Test
     public void changedPrPagesAllLoadTheSharedCore() throws IOException {
         assertTrue(readRepositoryFile("app/src/main/assets/web/local/index.html")
                 .contains("../shared/core.js"));
