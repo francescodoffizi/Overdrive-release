@@ -51,6 +51,17 @@ public class ScreenshotPrivacyModeAssetTest {
                 .contains("../shared/core.js"));
     }
 
+    @Test
+    public void nativeTextureIsClippedToEachSensitiveView() throws IOException {
+        String controller = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/ui/privacy/ScreenshotPrivacyController.kt");
+
+        int clip = controller.indexOf("canvas.clipPath(clipPath)");
+        int stripe = controller.indexOf("canvas.drawLine(");
+        int restore = controller.indexOf("canvas.restoreToCount(checkpoint)");
+        assertTrue(clip >= 0 && stripe > clip && restore > stripe);
+    }
+
     private static String readRepositoryFile(String relativePath) throws IOException {
         Path current = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
         while (current != null) {

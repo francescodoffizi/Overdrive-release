@@ -5,6 +5,7 @@ import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.view.View
@@ -119,11 +120,17 @@ class ScreenshotPrivacyController(private val activity: Activity) {
             for (rect in maskRects) {
                 canvas.drawRoundRect(rect, radius, radius, edgePaint)
                 canvas.drawRoundRect(rect, radius, radius, fillPaint)
+                val checkpoint = canvas.save()
+                val clipPath = Path().apply {
+                    addRoundRect(rect, radius, radius, Path.Direction.CW)
+                }
+                canvas.clipPath(clipPath)
                 var x = rect.left - rect.height()
                 while (x < rect.right) {
                     canvas.drawLine(x, rect.bottom, x + rect.height(), rect.top, texturePaint)
                     x += stripeStep
                 }
+                canvas.restoreToCount(checkpoint)
             }
         }
 
