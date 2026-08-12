@@ -33,7 +33,8 @@ public class ScreenshotPrivacyModeAssetTest {
                 "app/src/main/java/com/overdrive/app/server/HttpServer.java");
         String core = readRepositoryFile("app/src/main/assets/web/shared/core.js");
 
-        assertTrue(server.contains("status.put(\n                \"screenshotPrivacyMode\""));
+        assertTrue(server.contains("\"screenshotPrivacyMode\""));
+        assertTrue(server.contains("isScreenshotPrivacyModeEnabled()"));
         assertTrue(core.contains("BYD.screenshotPrivacy = (function ()"));
         assertTrue(core.contains("setEnabled(!!status.screenshotPrivacyMode)"));
         assertTrue(core.contains("new MutationObserver(queueScan)"));
