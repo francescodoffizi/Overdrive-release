@@ -21,9 +21,10 @@ public class RecordingsReconcileFreshnessTest {
 
         assertTrue(reconcile.contains("Map<String, RecordingFileFingerprint> diskFiles"));
         assertTrue(source.contains(
-                "SELECT filename, abs_path, size_bytes, mp4_mtime, sidecar_mtime"));
+            "SELECT recording_id, filename, root_id, abs_path, size_bytes"));
         assertTrue(source.contains("fingerprint.decisionAgainst("));
         assertTrue(source.contains("if (upsert(fingerprint.file)) refreshed++"));
+        assertTrue(source.contains("RecordingReconcilePolicy.shouldDeleteMissingRow("));
         assertFalse(source.contains("private File locateFile("));
     }
 

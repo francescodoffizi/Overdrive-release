@@ -6,14 +6,19 @@ final class RecordingFileFingerprint {
     enum Decision { ADD, REFRESH, UNCHANGED }
 
     final File file;
+    final String recordingId;
+    final String rootId;
     final String absolutePath;
     final long sizeBytes;
     final long mp4Mtime;
     final long sidecarMtime;
 
-    private RecordingFileFingerprint(File file, String absolutePath, long sizeBytes,
+    private RecordingFileFingerprint(File file, String recordingId, String rootId,
+                                     String absolutePath, long sizeBytes,
                                      long mp4Mtime, long sidecarMtime) {
         this.file = file;
+        this.recordingId = recordingId;
+        this.rootId = rootId;
         this.absolutePath = absolutePath;
         this.sizeBytes = sizeBytes;
         this.mp4Mtime = mp4Mtime;
@@ -22,8 +27,11 @@ final class RecordingFileFingerprint {
 
     static RecordingFileFingerprint from(File mp4) {
         File sidecar = sidecarFor(mp4);
+        RecordingIdentity identity = RecordingIdentity.fromFile(mp4);
         return new RecordingFileFingerprint(
                 mp4,
+            identity.recordingId,
+            identity.rootId,
                 mp4.getAbsolutePath(),
                 mp4.length(),
                 mp4.lastModified(),

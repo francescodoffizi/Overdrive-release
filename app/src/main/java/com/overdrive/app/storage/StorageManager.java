@@ -3552,6 +3552,25 @@ public class StorageManager {
         return getAllDirsForType(tripsDir, internalTripsDir, sdCardTripsDir, usbTripsDir);
     }
 
+    /** Active-first rank used only to resolve legacy filename-only requests. */
+    public int getRecordingRootRank(File file) {
+        if (file == null) return 100;
+        String path = file.getAbsolutePath();
+        List<File> roots = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (List<File> category : java.util.Arrays.asList(
+                getAllRecordingsDirs(), getAllSurveillanceDirs(), getAllProximityDirs())) {
+            for (File root : category) {
+                if (root != null && seen.add(root.getAbsolutePath())) roots.add(root);
+            }
+        }
+        for (int rank = 0; rank < roots.size(); rank++) {
+            String root = roots.get(rank).getAbsolutePath();
+            if (path.equals(root) || path.startsWith(root + File.separator)) return rank;
+        }
+        return 100;
+    }
+
     /**
      * Bounded directory listing for callers (e.g. trip recovery) that walk a
      * possibly-FUSE-bridged SD/USB trips dir. Runs the in-process
@@ -4871,7 +4890,21 @@ public class StorageManager {
      * This handles the case where UI app owns the directory but daemon needs to list files.
      * Returns every file in the directory regardless of extension.
      */
+    static final class FileListResult {
+        final File[] files;
+        final boolean complete;
+
+        FileListResult(File[] files, boolean complete) {
+            this.files = files;
+            this.complete = complete;
+        }
+    }
+
     private File[] listFilesViaShell(File dir) {
+        return listFilesViaShellWithStatus(dir).files;
+    }
+
+    private FileListResult listFilesViaShellWithStatus(File dir) {
         Process p = null;
         try {
             p = Runtime.getRuntime().exec(new String[]{"ls", dir.getAbsolutePath()});
@@ -4906,6 +4939,7 @@ public class StorageManager {
             drain.setDaemon(true);
             drain.start();
             drain.join(4_000);
+            boolean complete = false;
             if (drain.isAlive()) {
                 logWarn("listFilesViaShell(" + dir.getName() + "): `ls` drain exceeded 4s"
                     + " — killing child and returning partial list (" + files.size() + " so far)");
@@ -4915,7 +4949,8 @@ public class StorageManager {
                 drain.join(500);
             } else {
                 // Drain finished; reap the (now-exited or about-to-exit) child.
-                waitForBounded(p, 1_000, "listFilesViaShell(" + dir.getName() + ")");
+                complete = waitForBounded(
+                        p, 1_000, "listFilesViaShell(" + dir.getName() + ")") == 0;
             }
 
             File[] snapshot;
@@ -4923,13 +4958,13 @@ public class StorageManager {
                 snapshot = files.toArray(new File[0]);
             }
             logDebug("listFilesViaShell: found " + snapshot.length + " files in " + dir.getName());
-            return snapshot;
+            return new FileListResult(snapshot, complete);
         } catch (Exception e) {
             logWarn("listFilesViaShell failed: " + e.getMessage());
             if (p != null) {
                 try { p.destroyForcibly(); } catch (Exception ignored) {}
             }
-            return new File[0];
+            return new FileListResult(new File[0], false);
         }
     }
 
@@ -4962,6 +4997,68 @@ public class StorageManager {
      */
     public File[] listMp4Files(File dir) {
         return listFilesWithFallback(dir, ".mp4");
+    }
+
+    public static final class Mp4Listing {
+        public final File[] files;
+        public final boolean available;
+        public final boolean complete;
+
+        Mp4Listing(File[] files, boolean available, boolean complete) {
+            this.files = files;
+            this.available = available;
+            this.complete = complete;
+        }
+    }
+
+    /**
+     * MP4 listing with enough status for destructive reconciliation. A partial
+     * shell result may add/update rows, but callers must delete missing rows
+     * only when {@link Mp4Listing#complete} is true.
+     */
+    public Mp4Listing listMp4FilesWithStatus(File dir) {
+        if (dir == null || !dir.exists() || !dir.isDirectory()) {
+            return new Mp4Listing(new File[0], false, false);
+        }
+        java.io.FileFilter mp4Filter = file -> file.getName().endsWith(".mp4");
+        FileListResult direct = listFilesDirectWithStatus(dir, mp4Filter, 4_000L);
+        if (direct.complete) {
+            return new Mp4Listing(direct.files, true, true);
+        }
+        FileListResult shell = listFilesViaShellWithStatus(dir);
+        java.util.List<File> mp4 = new java.util.ArrayList<>();
+        for (File file : shell.files) {
+            if (file.getName().endsWith(".mp4")) mp4.add(file);
+        }
+        return new Mp4Listing(mp4.toArray(new File[0]), true, shell.complete);
+    }
+
+    static FileListResult listFilesDirectWithStatus(
+            File dir, java.io.FileFilter filter, long timeoutMs) {
+        java.util.concurrent.atomic.AtomicReference<File[]> files =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicBoolean finished =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        Thread worker = new Thread(() -> {
+            try {
+                files.set(dir.listFiles(filter));
+            } catch (Throwable ignored) {
+                files.set(null);
+            } finally {
+                finished.set(true);
+            }
+        }, "StorageDirectList-" + dir.getName());
+        worker.setDaemon(true);
+        worker.start();
+        try {
+            worker.join(Math.max(1L, timeoutMs));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new FileListResult(new File[0], false);
+        }
+        File[] result = files.get();
+        return new FileListResult(result != null ? result : new File[0],
+                finished.get() && result != null);
     }
 
     /**
@@ -5829,8 +5926,8 @@ public class StorageManager {
                 // only knows about .mp4 filenames.
                 if (file.getName().endsWith(".mp4")) {
                     try {
-                        com.overdrive.app.server.RecordingsIndex
-                                .getInstance().remove(file.getName());
+                            com.overdrive.app.server.RecordingsIndex
+                                .getInstance().removeByPath(file.getAbsolutePath());
                     } catch (Throwable ignored) {}
                 }
 
@@ -7345,7 +7442,8 @@ public class StorageManager {
 
         if (file.getName().endsWith(".mp4")) {
             try {
-                com.overdrive.app.server.RecordingsIndex.getInstance().remove(file.getName());
+                com.overdrive.app.server.RecordingsIndex.getInstance()
+                    .removeByPath(file.getAbsolutePath());
             } catch (Throwable ignored) {}
         }
         if (sidecarExts.length > 0) {

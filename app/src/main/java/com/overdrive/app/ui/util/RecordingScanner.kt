@@ -95,7 +95,7 @@ object RecordingScanner {
         // row — so on success we only need to mop up any sibling thumbs
         // that live under directories the daemon's StorageManager view
         // doesn't enumerate (rare, but harmless to do).
-        val apiOk = RecordingsApiClient.deleteRecording(recording.file.name)
+        val apiOk = RecordingsApiClient.deleteRecording(recording)
         if (apiOk) {
             cleanupLocalSidecars(recording)
             invalidateCache()
