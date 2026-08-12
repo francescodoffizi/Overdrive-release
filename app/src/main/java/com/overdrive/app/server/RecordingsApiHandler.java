@@ -120,9 +120,9 @@ public class RecordingsApiHandler {
      */
     public static void pruneRecordingCache() {
         try {
-            RecordingsIndex.getInstance().reconcile();
+            RecordingsIndex.getInstance().requestReconcile("periodic-prune");
         } catch (Throwable t) {
-            CameraDaemon.log("RecordingsApiHandler reconcile failed: " + t.getMessage());
+            CameraDaemon.log("RecordingsApiHandler reconcile request failed: " + t.getMessage());
         }
     }
     
@@ -835,32 +835,11 @@ public class RecordingsApiHandler {
         return files != null && files.length > 0;
     }
 
-    private static final java.util.concurrent.atomic.AtomicBoolean RECONCILE_IN_FLIGHT =
-            new java.util.concurrent.atomic.AtomicBoolean(false);
-
     /**
-     * @return true when this call started a fresh reconcile thread.
-     *         false when one was already in flight (caller may still
-     *         signal "reconciling" to the client — the existing
-     *         in-flight pass will pick up the missing rows).
+     * @return true only when the coalesced repair request was accepted.
      */
     private static boolean kickBackgroundReconcile(RecordingsIndex idx) {
-        if (!RECONCILE_IN_FLIGHT.compareAndSet(false, true)) {
-            // Already running. Tell caller we're reconciling so the
-            // client retries — but don't spawn a duplicate thread.
-            return true;
-        }
-        Thread t = new Thread(() -> {
-            try { idx.reconcile(); }
-            catch (Throwable thr) {
-                CameraDaemon.log("Reconcile kick failed: " + thr.getMessage());
-            } finally {
-                RECONCILE_IN_FLIGHT.set(false);
-            }
-        }, "RecordingsIndexReconcileKick");
-        t.setDaemon(true);
-        t.start();
-        return true;
+        return idx.requestReconcile("api-repair-on-read");
     }
 
     /**

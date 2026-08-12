@@ -143,9 +143,14 @@ public final class RecordingsIndex {
     // value means something is interrupting the DB write threads.
     private int reconnectCount = 0;
 
-    // Coalesces the post-reconnect heal so repeated reconnects don't stack
-    // reconcile threads.
-    private final AtomicBoolean reconcileAfterReconnectRunning = new AtomicBoolean(false);
+        // All asynchronous repair sources converge here. A burst before execution
+        // becomes one pass; requests arriving during that pass become one follow-up.
+        private final java.util.concurrent.ConcurrentLinkedQueue<String> reconcileReasons =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
+        private final CoalescingTaskRunner reconcileRequests;
+        // Synchronous warmup reconciliation and asynchronous repair must not walk
+        // the same FUSE roots concurrently.
+        private final Object reconcileExecutionLock = new Object();
 
     // ---------------- queryStats() memo ----------------
     //
@@ -276,7 +281,13 @@ public final class RecordingsIndex {
     private final AtomicInteger warmupTotal = new AtomicInteger(0);
     private final AtomicInteger warmupDone = new AtomicInteger(0);
 
-    private RecordingsIndex() {}
+    private RecordingsIndex() {
+        reconcileRequests = new CoalescingTaskRunner(command -> {
+            Thread thread = new Thread(command, "RecordingsIndexReconcile");
+            thread.setDaemon(true);
+            thread.start();
+        }, this::runRequestedReconcile);
+    }
 
     // =================================================================
     // Lifecycle
@@ -509,7 +520,7 @@ public final class RecordingsIndex {
                     + " re-index anything missed while it was down.");
             // The dead window silently dropped upserts/removes, so the index
             // now drifts from disk. Heal it in the background.
-            kickReconcileAfterReconnect();
+            requestReconcile("store-reconnect");
             return true;
         } catch (Exception e) {
             // CRITICAL: drop the half-open connection. getConnection() may
@@ -600,24 +611,41 @@ public final class RecordingsIndex {
     }
 
     /**
-     * Fire a one-shot background reconcile after a reconnect so rows missed
-     * while the connection was dead get re-indexed without waiting for the
-     * next storage hot-plug. Coalesced — a second reconnect while a heal is
-     * still running does not stack another thread.
+     * Queue a background reconcile without stacking FUSE walks.
+     *
+     * @return true when the request was queued or merged into a running worker;
+     *         false during shutdown or when the worker could not be started.
      */
-    private void kickReconcileAfterReconnect() {
-        if (!reconcileAfterReconnectRunning.compareAndSet(false, true)) return;
-        Thread t = new Thread(() -> {
-            try {
-                reconcile();
-            } catch (Throwable thr) {
-                logger.warn("Post-reconnect reconcile failed: " + thr.getMessage());
-            } finally {
-                reconcileAfterReconnectRunning.set(false);
-            }
-        }, "RecordingsIndexReconnectHeal");
-        t.setDaemon(true);
-        t.start();
+    public boolean requestReconcile(String reason) {
+        if (shuttingDown) return false;
+        if (reason != null && !reason.isEmpty()) reconcileReasons.offer(reason);
+        try {
+            reconcileRequests.request();
+            return true;
+        } catch (Throwable failure) {
+            logger.warn("Could not schedule recordings reconcile (" + reason + "): "
+                    + failure.getMessage());
+            // The runner keeps its pending bit and the reason remains queued.
+            // A later request retries scheduling without losing diagnostics.
+            return false;
+        }
+    }
+
+    private void runRequestedReconcile() {
+        StringBuilder reasons = new StringBuilder();
+        String reason;
+        while ((reason = reconcileReasons.poll()) != null) {
+            if (reasons.length() > 0) reasons.append(',');
+            reasons.append(reason);
+        }
+        if (reasons.length() > 0) {
+            logger.debug("Running requested reconcile: " + reasons);
+        }
+        try {
+            reconcile();
+        } catch (Throwable failure) {
+            logger.warn("Requested reconcile failed: " + failure.getMessage());
+        }
     }
 
     /**
@@ -1406,6 +1434,12 @@ public final class RecordingsIndex {
      * stat() call.
      */
     public void reconcile() {
+        synchronized (reconcileExecutionLock) {
+            reconcileInternal();
+        }
+    }
+
+    private void reconcileInternal() {
         if (!isAvailable()) return;
         long t0 = System.currentTimeMillis();
         StorageManager sm = StorageManager.getInstance();
