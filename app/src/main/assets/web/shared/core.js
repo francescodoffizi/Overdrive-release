@@ -1784,13 +1784,45 @@ BYD.utils._showModal = function (opts) {
         }
         if (opts.body) {
             var p = document.createElement('p');
-            p.style.margin = '0 0 4px 0';
+            p.style.margin = opts.prompt ? '0 0 12px 0' : '0 0 4px 0';
             p.style.fontSize = '14px';
             p.style.lineHeight = '1.5';
             p.style.color = 'var(--text-secondary, var(--text-primary))';
             p.style.whiteSpace = 'pre-wrap';
             p.textContent = opts.body;
             card.appendChild(p);
+        }
+
+        var input = null;
+        if (opts.prompt) {
+            input = document.createElement('input');
+            input.type = 'text';
+            input.value = opts.promptValue || '';
+            input.placeholder = opts.promptPlaceholder || '';
+            input.style.width = '100%';
+            input.style.boxSizing = 'border-box';
+            input.style.padding = '10px 12px';
+            input.style.marginBottom = '18px';
+            input.style.border = '1px solid var(--border-subtle, #ccc)';
+            input.style.borderRadius = 'var(--radius-md, 8px)';
+            input.style.background = 'var(--bg-surface, #fff)';
+            input.style.color = 'var(--text-primary, #000)';
+            input.style.fontSize = '15px';
+            input.style.outline = 'none';
+            input.addEventListener('focus', function () {
+                input.style.borderColor = 'var(--brand-primary, #007AFF)';
+            });
+            input.addEventListener('blur', function () {
+                input.style.borderColor = 'var(--border-subtle, #ccc)';
+            });
+            card.appendChild(input);
+
+            input.addEventListener('keydown', function (ev) {
+                if (ev.key === 'Enter') {
+                    ev.preventDefault();
+                    dismiss(true);
+                }
+            });
         }
 
         var actions = document.createElement('div');
@@ -1826,10 +1858,18 @@ BYD.utils._showModal = function (opts) {
         var prevFocus = document.activeElement;
         document.body.appendChild(backdrop);
 
-        // Focus the primary action so Enter confirms without an extra tap.
-        try { confirmBtn.focus(); } catch (e) {}
+        try {
+            if (input) {
+                input.focus();
+                if (opts.promptValue) {
+                    input.setSelectionRange(opts.promptValue.length, opts.promptValue.length);
+                }
+            } else {
+                confirmBtn.focus();
+            }
+        } catch (e) {}
 
-        var entry = { dismiss: dismiss };
+        var entry = { dismiss: function () { dismiss(false); } };
         BYD.utils._modalStack.push(entry);
 
         function dismiss(result) {
@@ -1841,7 +1881,12 @@ BYD.utils._showModal = function (opts) {
             // Pop from stack if still there (e.g. button click path).
             var idx = BYD.utils._modalStack.indexOf(entry);
             if (idx !== -1) BYD.utils._modalStack.splice(idx, 1);
-            resolve(result);
+            
+            if (opts.prompt) {
+                resolve(result ? input.value : null);
+            } else {
+                resolve(result);
+            }
         }
     });
 };
@@ -1890,111 +1935,14 @@ BYD.utils.confirmDialog = function (opts) {
 BYD.utils.promptDialog = function (opts) {
     opts = opts || {};
     var t = BYD.i18n && BYD.i18n.t ? BYD.i18n.t.bind(BYD.i18n) : null;
-    return new Promise(function (resolve) {
-        BYD.utils._ensureModalEscHandler();
-
-        var backdrop = document.createElement('div');
-        backdrop.className = 'modal-backdrop';
-        backdrop.setAttribute('role', 'presentation');
-        backdrop.style.display = 'flex';
-
-        var card = document.createElement('div');
-        card.className = 'modal-card';
-        card.setAttribute('role', 'dialog');
-        card.setAttribute('aria-modal', 'true');
-
-        if (opts.title) {
-            var h = document.createElement('h3');
-            h.className = 'soh-modal-title';
-            h.textContent = opts.title;
-            card.appendChild(h);
-        }
-        if (opts.body) {
-            var p = document.createElement('p');
-            p.style.margin = '0 0 12px 0';
-            p.style.fontSize = '14px';
-            p.style.lineHeight = '1.5';
-            p.style.color = 'var(--text-secondary, var(--text-primary))';
-            p.style.whiteSpace = 'pre-wrap';
-            p.textContent = opts.body;
-            card.appendChild(p);
-        }
-
-        var input = document.createElement('input');
-        input.type = 'text';
-        input.value = opts.value || '';
-        input.placeholder = opts.placeholder || '';
-        input.style.width = '100%';
-        input.style.boxSizing = 'border-box';
-        input.style.padding = '10px 12px';
-        input.style.marginBottom = '18px';
-        input.style.border = '1px solid var(--border-subtle, #ccc)';
-        input.style.borderRadius = 'var(--radius-md, 8px)';
-        input.style.background = 'var(--bg-surface, #fff)';
-        input.style.color = 'var(--text-primary, #000)';
-        input.style.fontSize = '15px';
-        input.style.outline = 'none';
-        input.addEventListener('focus', function () {
-            input.style.borderColor = 'var(--brand-primary, #007AFF)';
-        });
-        input.addEventListener('blur', function () {
-            input.style.borderColor = 'var(--border-subtle, #ccc)';
-        });
-        card.appendChild(input);
-
-        var actions = document.createElement('div');
-        actions.className = 'soh-modal-actions';
-
-        var cancelBtn = document.createElement('button');
-        cancelBtn.className = 'btn btn-secondary';
-        cancelBtn.type = 'button';
-        cancelBtn.textContent = opts.cancelLabel || (t && t('common.cancel')) || 'Cancel';
-        cancelBtn.addEventListener('click', function () { dismiss(null); });
-        actions.appendChild(cancelBtn);
-
-        var confirmBtn = document.createElement('button');
-        confirmBtn.className = 'btn btn-primary';
-        confirmBtn.type = 'button';
-        confirmBtn.textContent = opts.confirmLabel || (t && t('common.ok')) || 'OK';
-        confirmBtn.addEventListener('click', function () { dismiss(input.value); });
-        actions.appendChild(confirmBtn);
-
-        input.addEventListener('keydown', function (ev) {
-            if (ev.key === 'Enter') {
-                ev.preventDefault();
-                dismiss(input.value);
-            }
-        });
-
-        card.appendChild(actions);
-        backdrop.appendChild(card);
-
-        backdrop.addEventListener('click', function (ev) {
-            if (ev.target === backdrop) dismiss(null);
-        });
-
-        var prevFocus = document.activeElement;
-        document.body.appendChild(backdrop);
-
-        try {
-            input.focus();
-            if (opts.value) {
-                input.setSelectionRange(input.value.length, input.value.length);
-            }
-        } catch (e) {}
-
-        var entry = { dismiss: function () { dismiss(null); } };
-        BYD.utils._modalStack.push(entry);
-
-        function dismiss(result) {
-            if (entry._done) return;
-            entry._done = true;
-            try { backdrop.remove(); } catch (e) {}
-            try { if (prevFocus && prevFocus.focus) prevFocus.focus(); } catch (e) {}
-            var idx = BYD.utils._modalStack.indexOf(entry);
-            if (idx !== -1) BYD.utils._modalStack.splice(idx, 1);
-            resolve(result);
-        }
+    return BYD.utils._showModal({
+        title: opts.title || (t && t('common.notice')) || 'Notice',
+        body: opts.body || '',
+        confirmLabel: opts.confirmLabel || (t && t('common.ok')) || 'OK',
+        cancelLabel: opts.cancelLabel || (t && t('common.cancel')) || 'Cancel',
+        prompt: true,
+        promptValue: opts.value || '',
+        promptPlaceholder: opts.placeholder || ''
     });
 };
 
