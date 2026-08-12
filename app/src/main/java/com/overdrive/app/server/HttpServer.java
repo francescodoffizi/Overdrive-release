@@ -1101,6 +1101,16 @@ public class HttpServer {
         JSONObject status = new JSONObject();
         status.put("status", "ok");
         status.put("deviceId", CameraDaemon.getDeviceId());
+        try {
+            status.put(
+                "screenshotPrivacyMode",
+                com.overdrive.app.config.UnifiedConfigManager.isScreenshotPrivacyModeEnabled()
+            );
+        } catch (Exception ignored) {
+            // A status response must remain available even if unified config
+            // is temporarily unreadable during a cross-process replacement.
+            status.put("screenshotPrivacyMode", false);
+        }
 
         // Vehicle-data readiness, surfaced explicitly so the web UI can render
         // a "waiting for vehicle…" state instead of silently leaving every

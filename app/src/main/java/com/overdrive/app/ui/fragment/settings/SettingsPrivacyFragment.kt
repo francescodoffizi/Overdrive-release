@@ -11,8 +11,10 @@ import android.widget.TextView
 import androidx.fragment.app.Fragment
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.materialswitch.MaterialSwitch
 import com.overdrive.app.R
 import com.overdrive.app.config.ConfigManager
+import com.overdrive.app.config.UnifiedConfigManager
 import com.overdrive.app.logging.LogLevel
 import com.overdrive.app.logging.LogManager
 import com.overdrive.app.ui.MainActivity
@@ -62,6 +64,7 @@ class SettingsPrivacyFragment : Fragment() {
             (activity as? MainActivity)?.invokeResetDataDialog()
         }
         setupLogLevel(view)
+        setupScreenshotPrivacyMode(view)
         populateStorage(view)
     }
 
@@ -153,6 +156,32 @@ class SettingsPrivacyFragment : Fragment() {
         R.id.btnLogLevelWarn -> LogLevel.WARN
         R.id.btnLogLevelError -> LogLevel.ERROR
         else -> null
+    }
+
+    private fun setupScreenshotPrivacyMode(root: View) {
+        val toggle = root.findViewById<MaterialSwitch>(R.id.switchScreenshotPrivacy) ?: return
+        toggle.isChecked = UnifiedConfigManager.isScreenshotPrivacyModeEnabled()
+
+        var reverting = false
+        toggle.setOnCheckedChangeListener { _, enabled ->
+            if (reverting) return@setOnCheckedChangeListener
+            if (UnifiedConfigManager.setScreenshotPrivacyModeEnabled(enabled)) {
+                (activity as? MainActivity)?.applyScreenshotPrivacyMode(enabled)
+                LogManager.getInstance().info(
+                    TAG,
+                    "Screenshot privacy mode ${if (enabled) "enabled" else "disabled"}"
+                )
+            } else {
+                reverting = true
+                toggle.isChecked = !enabled
+                reverting = false
+                android.widget.Toast.makeText(
+                    requireContext(),
+                    R.string.settings_screenshot_privacy_save_failed,
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            }
+        }
     }
 
     private fun populateStorage(root: View) {
