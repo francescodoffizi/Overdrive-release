@@ -96,6 +96,23 @@ public final class PositionsApiHandler {
             r.put("modelId", model != null ? model : JSONObject.NULL);
             r.put("modelConfirmed", PositionStore.isModelConfirmed(model));
             r.put("modelAcknowledged", PositionStore.getInstance().isModelAcknowledged(model));
+            // Which DiLink profile is signed in right now. Opt-in via ?withProfile=1
+            // because resolving it shells out to the `content` binary (an in-process
+            // ContentResolver is refused: package android != uid 2000), and this
+            // endpoint is also polled for the acc/movement gate. Callers that need to
+            // know whose Pos 1/2/3 the captured entries belong to ask for it; the
+            // pollers do not pay for it.
+            if ("1".equals(q.get("withProfile")) || "YES".equals(q.get("withProfile"))) {
+                String profile = null;
+                try {
+                    Context ctx = resolveContext();
+                    if (ctx != null) {
+                        String[] ps = readProfileSlot(ctx, 1);
+                        if (ps != null && ps.length > 0) profile = ps[0];
+                    }
+                } catch (Throwable ignore) { }
+                r.put("currentProfile", profile != null ? profile : JSONObject.NULL);
+            }
             HttpResponse.sendJson(out, r.toString());
             return true;
         }
