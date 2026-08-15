@@ -13,7 +13,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -24,6 +23,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
+import com.overdrive.app.overlay.OverlayPermissionChecker
 import com.overdrive.app.roadsense.config.RoadSenseConfig
 import com.overdrive.app.roadsense.warn.OverlayState
 import com.overdrive.app.services.DaemonKeepaliveService
@@ -34,7 +34,7 @@ import com.overdrive.app.services.DaemonKeepaliveService
  * All detection + warning logic is daemon-side; this service owns only the window.
  *
  * Mirrors StatusOverlayService's proven mechanics: TYPE_APPLICATION_OVERLAY window,
- * `Settings.canDrawOverlays` gate, themedContext() for day/night, drag-to-move with
+ * the shared overlay-permission gate, themedContext() for day/night, drag-to-move with
  * persisted position, foreground service, rebuild on configuration change. Tap the
  * pill to expand → card; tap the card header / auto-timeout to collapse.
  *
@@ -136,7 +136,7 @@ class RoadSenseOverlayService : Service() {
         // on ACC-on + feature-on, which bypasses the app-side canDrawOverlays gate. If
         // permission isn't granted, addView would throw and leave a zombie foreground
         // service with no window — so stop cleanly instead.
-        if (!Settings.canDrawOverlays(this)) {
+        if (!OverlayPermissionChecker.isGranted(this)) {
             Log.w(TAG, "overlay permission not granted — stopping")
             stopSelf()
             return START_NOT_STICKY
@@ -943,7 +943,7 @@ class RoadSenseOverlayService : Service() {
                 Log.i(TAG, "RoadSense disabled or overlay hidden - not starting")
                 return false
             }
-            if (!Settings.canDrawOverlays(context)) {
+            if (!OverlayPermissionChecker.isGranted(context)) {
                 Log.w(TAG, "no overlay permission — not starting")
                 return false
             }

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Network & Hotspot mark — M3, single-color, tint-driven (24dp grid).
+  Concept: a broadcast dot with two rising arcs = "this device is the access
+  point". Mirrored by the web stroke icon in app-shell.js / network.html.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="?attr/colorOnSurfaceVariant">
+
+    <!-- Broadcast source. -->
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M12,17.2 m-2.1,0 a2.1,2.1 0 1,0 4.2,0 a2.1,2.1 0 1,0 -4.2,0 Z" />
+
+    <!-- Inner arc pair. -->
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M8.3,13.6 L7.0,12.3 A7.1,7.1 0 0 1 17.0,12.3 L15.7,13.6 A5.2,5.2 0 0 0 8.3,13.6 Z" />
+
+    <!-- Outer arc pair. -->
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M5.0,10.3 L3.7,9.0 A11.7,11.7 0 0 1 20.3,9.0 L19.0,10.3 A9.8,9.8 0 0 0 5.0,10.3 Z" />
+</vector>

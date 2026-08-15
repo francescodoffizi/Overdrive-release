@@ -35,12 +35,17 @@ public class RetrofittedVariableDefaultTest {
 
     /** Minimal concrete action with a caller-chosen variable list. */
     private static class FakeAction extends BaseAction {
+        private final String actionId;
         private final List<Type> variables;
-        FakeAction(Type... vars) { this.variables = Arrays.asList(vars); }
+        FakeAction(Type... vars) { this("fake", vars); }
+        FakeAction(String actionId, Type... vars) {
+            this.actionId = actionId;
+            this.variables = Arrays.asList(vars);
+        }
         @Override public String getType() { return "fake"; }
         @Override public String getDescription() { return "fake"; }
         @Override public List<Type> getVariables() { return variables; }
-        @Override public Label getLabel() { return new Label("fake", "fake"); }
+        @Override public Label getLabel() { return new Label(actionId, "fake"); }
         @Override public void trigger(AutomationAction automationAction) { }
     }
 
@@ -62,10 +67,28 @@ public class RetrofittedVariableDefaultTest {
      */
     @Test
     public void absentRetrofittedVariableTakesTheBackCompatDefault() throws Exception {
-        AutomationAction a = new FakeAction(zoneType()).fromJson(action("{}"));
+        AutomationAction a = new FakeAction("ambientPower", zoneType()).fromJson(action("{}"));
 
         assertNotNull("an automation saved before this variable existed must still parse", a);
         assertEquals("both", a.getVariables().get("zone"));
+    }
+
+    @Test
+    public void legacyAcPowerRuleGetsTheOriginalRemoteTargetAndDuration() throws Exception {
+        EnumType duration = new EnumType(new Label("remoteDurationMinutes", "duration"),
+                new Label("10", "10"), new Label("15", "15"), new Label("20", "20"),
+                new Label("25", "25"), new Label("30", "30"));
+        AutomationAction a = new FakeAction("setAc",
+                new IntType(new Label("temp", "automation.temperature"), 15, 33),
+                duration,
+                new EnumType(new Label("autoOffMinutes", "automation.ac_auto_off"),
+                        new Label("0", "automation.ac_auto_off_never")))
+                .fromJson(action("{}"));
+
+        assertNotNull(a);
+        assertEquals(Integer.valueOf(22), a.getVariables().get("temp"));
+        assertEquals("20", a.getVariables().get("remoteDurationMinutes"));
+        assertEquals("0", a.getVariables().get("autoOffMinutes"));
     }
 
     /** A stored value always wins over the default. */
@@ -108,7 +131,8 @@ public class RetrofittedVariableDefaultTest {
     /** A wholly absent "variables" object behaves like an empty one, not a crash. */
     @Test
     public void missingVariablesObjectIsHandled() throws Exception {
-        AutomationAction a = new FakeAction(zoneType()).fromJson(new JSONObject("{\"type\":\"fake\"}"));
+        AutomationAction a = new FakeAction("ambientPower", zoneType())
+                .fromJson(new JSONObject("{\"type\":\"fake\"}"));
 
         assertNotNull("the retrofitted default still applies with no variables object at all", a);
         assertEquals("both", a.getVariables().get("zone"));
@@ -130,7 +154,7 @@ public class RetrofittedVariableDefaultTest {
                 new Label("front", "automation.ambient_zone_front"),
                 new Label("both", "automation.area_all"));
 
-        AutomationAction a = new FakeAction(reordered).fromJson(action("{}"));
+        AutomationAction a = new FakeAction("ambientPower", reordered).fromJson(action("{}"));
         assertNotNull(a);
         assertEquals("the allowlisted value is used, not merely whichever option is first",
                 "both", a.getVariables().get("zone"));

@@ -164,7 +164,7 @@
     "tyre_wheel_reading": "{0} — {1}",
     "tyre_fast_leak": "빠른 누출 감지",
     "tyre_slow_leak": "느린 누출 감지",
-    "tyre_wheel_pressure": "{0} ({1} kPa)"
+    "tyre_wheel_pressure": "{0} ({1})"
   },
   "telegram": {
     "recording_caption": " 녹음 ({0}) - {1}",
@@ -486,6 +486,9 @@
     "close_all_windows_label": "모든 창문을 닫아"
   },
   "automation": {
+    "wait_until_state_description": "선택한 켜짐/꺼짐 신호가 특정 상태에 도달하거나 시간 초과될 때까지 나머지 작업을 일시정지합니다. 예: 계속하기 전에 Indicators = Off가 될 때까지 대기.",
+    "wait_timeout": "시간 초과 (초)",
+    "wait_until_description": "선택한 신호가 비교 조건을 충족하거나 시간 초과될 때까지 나머지 작업을 일시정지합니다. 예: 창문을 닫기 전에 Speed = 0이 될 때까지 대기.",
     "run_shell": "셸 명령 실행",
     "run_shell_description": "이 자동화가 실행될 때 데몬에서 셸 명령을 실행합니다. 자동 실행되며 — 별도의 automation-shell 권한이 필요합니다(기본값은 꺼짐). 실시간 숫자를 삽입할 수 있습니다: 차량 값은 ${signal:batteryLevel}, 변수는 ${var:NAME} — 예: input tap ${var:tap_x} 400. 숫자만 치환되며, 값을 숫자로 읽을 수 없으면 명령이 실행되지 않습니다. 먼저 계산이 필요하면 변수 계산 작업을 사용하고 그 결과를 참조하세요. 그 외의 것($HOME, $((1+2)), $(cmd))은 이전과 같이 셸이 처리합니다.",
     "shell_command": "명령",
@@ -824,7 +827,7 @@
     "auto_lights": "자동 헤드라이트",
     "auto_lights_description": "광센서 자동 헤드라이트가 켜지거나 꺼질 때 실행됩니다 — 차량이 제공하는 '어둡다'에 가장 가까운 신호입니다.",
     "occupant": "좌석 탑승",
-    "occupant_description": "조수석에 사람이 앉거나 비워질 때 실행됩니다.",
+    "occupant_description": "조수석에 사람이 앉거나 비워질 때 실행됩니다. 차량에 착석 감지 신호가 없으면 조수석 안전벨트 알림과 버클 상태로 점유 상태를 추정합니다. 빈 좌석에 벨트가 채워져 있거나 알림이 음소거된 경우 이 추정은 틀릴 수 있습니다.",
     "occupied": "탑승 중",
     "empty": "비어 있음",
     "boot": "시스템 부팅",
@@ -1083,10 +1086,7 @@
     "mqtt_trigger": "MQTT 메시지",
     "mqtt_trigger_description": "MQTT 브로커가 <base>/automation/<channel>에 발행할 때 실행됩니다(예: Home Assistant에서). 채널 이름을 입력하고 그 값과 일치시키세요.",
     "mqtt_channel": "채널",
-    "mqtt_value": "값",
-    "wait_until_description": "선택한 신호가 비교 조건을 충족하거나 시간 초과될 때까지 나머지 작업을 일시정지합니다. 예: 창문을 닫기 전에 Speed = 0이 될 때까지 대기.",
-    "wait_timeout": "시간 초과 (초)",
-    "wait_until_state_description": "선택한 켜짐/꺼짐 신호가 특정 상태에 도달하거나 시간 초과될 때까지 나머지 작업을 일시정지합니다. 예: 계속하기 전에 Indicators = Off가 될 때까지 대기."
+    "mqtt_value": "값"
   },
   "messages": {
     "logged_out": "로그아웃",
@@ -1114,5 +1114,10 @@
     "update_installing_finishing": " 헤드 유닛을 설치하는 것은 곧 다시 연결될 것입니다.",
     "update_install_failed": "설치 실패",
     "update_install_crashed": "설치 오류"
+  },
+  "units": {
+    "bar": "bar",
+    "kpa": "kPa",
+    "psi": "PSI"
   }
 }

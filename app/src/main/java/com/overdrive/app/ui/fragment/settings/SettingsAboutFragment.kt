@@ -712,7 +712,16 @@ class SettingsAboutFragment : Fragment() {
         }
 
         renderRows(contribContainer, json.optJSONArray("contributors"), withGithub = true)
-        renderRows(supportContainer, json.optJSONArray("supporters"), withGithub = false)
+        val supporters = json.optJSONArray("supporters")
+        renderRows(supportContainer, supporters, withGithub = false)
+
+        // Only surface the tier/×N explainer when the data actually uses them.
+        val hasTiers = (0 until (supporters?.length() ?: 0)).any { i ->
+            val o = supporters?.optJSONObject(i) ?: return@any false
+            tierLabel(o.optString("tier").trim().lowercase()) != null || o.optInt("count", 0) > 1
+        }
+        root.findViewById<TextView>(R.id.textSupportersLegend)?.visibility =
+            if (hasTiers) View.VISIBLE else View.GONE
     }
 
     private fun renderRows(container: LinearLayout, arr: org.json.JSONArray?, withGithub: Boolean) {
@@ -732,11 +741,20 @@ class SettingsAboutFragment : Fragment() {
             val name = obj.optString("name").trim()
             if (name.isEmpty()) continue
             val github = if (withGithub) obj.optString("github").trim().ifEmpty { null } else null
-            container.addView(buildRow(container, name, github))
+            val tier = obj.optString("tier").trim().lowercase()
+            // Only a count above 1 earns a badge; "x1" reads as "only once".
+            val count = obj.optInt("count", 0).let { if (it > 1) it else 0 }
+            container.addView(buildRow(container, name, github, tier, count))
         }
     }
 
-    private fun buildRow(parent: LinearLayout, name: String, github: String?): View {
+    private fun buildRow(
+        parent: LinearLayout,
+        name: String,
+        github: String?,
+        tier: String = "",
+        count: Int = 0
+    ): View {
         val ctx = parent.context
         val row = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -757,25 +775,67 @@ class SettingsAboutFragment : Fragment() {
         // the GitHub profile picture (matches about.html behavior). The
         // CDN URL `https://github.com/<user>.png?size=72` 302-redirects to
         // the user's avatar; if it fails we keep the initial circle.
-        val avatarSize = dp(36)
+        // Every avatar stays 36dp; the medal is a ring plus a labelled pip.
+        val avatarDp = 36
+        val ringColor = medalColor(tier)
+        val avatarSize = dp(avatarDp)
         val avatar = ImageView(ctx).apply {
             layoutParams = LinearLayout.LayoutParams(avatarSize, avatarSize)
-            setImageDrawable(initialCircle(name))
+            setImageDrawable(initialCircle(name, avatarDp, ringColor))
         }
         row.addView(avatar)
         if (github != null) {
             loadGithubAvatar(github, avatar)
         }
 
-        val text = TextView(ctx).apply {
+        row.addView(TextView(ctx).apply {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginStart = dp(14)
             }
             this.text = name
             setTextColor(resolveAttr(android.R.attr.textColorPrimary))
             textSize = 15f
+        })
+
+        // Medal name — the text is what makes the colour legible to everyone,
+        // so the ring and the label always ship together.
+        val tierName = tierLabel(tier)
+        if (tierName != null && ringColor != null) {
+            row.addView(TextView(ctx).apply {
+                this.text = tierName.uppercase()
+                setTextColor(resolveAttr(android.R.attr.textColorSecondary))
+                textSize = 11f
+                letterSpacing = 0.04f
+                compoundDrawablePadding = dp(5)
+                setCompoundDrawablesRelative(
+                    medalPip(tier, ringColor, dp(11)), null, null, null
+                )
+            })
         }
-        row.addView(text)
+
+        if (count > 0) {
+            // Neutral chip — the medal owns the colour on this row, so the
+            // count stays ink-on-surface rather than competing with it.
+            val chipInk = resolveAttr(android.R.attr.textColorSecondary)
+            row.addView(TextView(ctx).apply {
+                this.text = "×$count"
+                setTextColor(chipInk)
+                textSize = 11f
+                typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                val padH = dp(7); val padV = dp(3)
+                setPadding(padH, padV, padH, padV)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(10) }
+                contentDescription = getString(R.string.settings_about_support_count, count)
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                    cornerRadius = dp(999).toFloat()
+                    setColor(Color.argb(30, Color.red(chipInk), Color.green(chipInk), Color.blue(chipInk)))
+                }
+            })
+        }
 
         if (github != null) {
             val chev = ImageView(ctx).apply {
@@ -904,7 +964,12 @@ class SettingsAboutFragment : Fragment() {
         }
     }
 
-    private fun initialCircle(name: String): Drawable {
+    /**
+     * Monogram avatar. [sizeDp] must match the ImageView's layout size —
+     * the glyph is scaled off it, so a hardcoded size would leave a large
+     * tier avatar with a small letter. [ringColor] draws the tier ring.
+     */
+    private fun initialCircle(name: String, sizeDp: Int = 36, ringColor: Int? = null): Drawable {
         val initial = name.firstOrNull { it.isLetterOrDigit() }?.uppercaseChar() ?: '?'
         val palette = intArrayOf(
             0xFF6366F1.toInt(), 0xFFEC4899.toInt(), 0xFF14B8A6.toInt(),
@@ -912,12 +977,18 @@ class SettingsAboutFragment : Fragment() {
             0xFFEF4444.toInt(), 0xFF22C55E.toInt()
         )
         val color = palette[Math.floorMod(name.hashCode(), palette.size)]
-        val sz = dp(36)
+        val sz = dp(sizeDp)
+        val ringPx = if (ringColor == null) 0f else if (sizeDp >= 56) dp(2).toFloat() else dp(2).toFloat() * 0.75f
 
         return object : Drawable() {
             private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 this.color = color
                 style = Paint.Style.FILL
+            }
+            private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = ringColor ?: Color.TRANSPARENT
+                style = Paint.Style.STROKE
+                strokeWidth = ringPx
             }
             private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 this.color = Color.WHITE
@@ -929,8 +1000,11 @@ class SettingsAboutFragment : Fragment() {
             override fun draw(canvas: Canvas) {
                 val cx = bounds.exactCenterX()
                 val cy = bounds.exactCenterY()
-                val r = minOf(bounds.width(), bounds.height()) / 2f
+                // Inset by the ring so the stroke sits inside the bounds
+                // instead of being clipped at the edge.
+                val r = minOf(bounds.width(), bounds.height()) / 2f - ringPx / 2f
                 canvas.drawCircle(cx, cy, r, bgPaint)
+                if (ringColor != null) canvas.drawCircle(cx, cy, r, ringPaint)
                 val baseline = cy - (textPaint.descent() + textPaint.ascent()) / 2f
                 canvas.drawText(initial.toString(), cx, baseline, textPaint)
             }
@@ -943,6 +1017,70 @@ class SettingsAboutFragment : Fragment() {
             override fun getIntrinsicWidth(): Int = sz
             override fun getIntrinsicHeight(): Int = sz
         }
+    }
+
+    /**
+     * Medal colours, mirroring about.html. NOT the classic metal hexes —
+     * #D4AF37/#C0C0C0/#CD7F32 put gold and bronze below the normal-vision
+     * separation floor and collapse under deuteranopia. These are
+     * lightness-separated and have their own darker light-mode steps, because
+     * the dark-mode gold and silver only reach ~2-3:1 on a light surface.
+     */
+    private fun isNightMode(): Boolean =
+        (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+
+    private fun medalColor(tier: String): Int? {
+        val night = isNightMode()
+        return when (tier) {
+            "diamond" -> if (night) 0xFF7FE0F5.toInt() else 0xFF0E8FB0.toInt()
+            "platinum" -> if (night) 0xFFD8E2EA.toInt() else 0xFF5C6A78.toInt()
+            "gold" -> if (night) 0xFFF0C043.toInt() else 0xFFE0A81F.toInt()
+            "silver" -> if (night) 0xFFAFBECC.toInt() else 0xFF8494A3.toInt()
+            "bronze" -> if (night) 0xFFB4602C.toInt() else 0xFF9A4A22.toInt()
+            else -> null
+        }
+    }
+
+    /**
+     * Pip for [tier]. Diamond is a rotated square and platinum a hollow ring —
+     * no hue pair separates two pale cool tiers under deuteranopia (cyan↔violet
+     * measures ΔE 1.0), so the top two carry shape as the primary channel.
+     */
+    private fun medalPip(tier: String, color: Int, size: Int): Drawable = when (tier) {
+        "diamond" -> android.graphics.drawable.RotateDrawable().apply {
+            drawable = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                cornerRadius = size * 0.18f
+                setColor(color)
+                setSize(size, size)
+            }
+            fromDegrees = 45f
+            toDegrees = 45f
+            setBounds(0, 0, size, size)
+        }
+        "platinum" -> android.graphics.drawable.GradientDrawable().apply {
+            shape = android.graphics.drawable.GradientDrawable.OVAL
+            setColor(Color.TRANSPARENT)
+            setStroke((size * 0.28f).toInt(), color)
+            setSize(size, size)
+            setBounds(0, 0, size, size)
+        }
+        else -> android.graphics.drawable.GradientDrawable().apply {
+            shape = android.graphics.drawable.GradientDrawable.OVAL
+            setColor(color)
+            setSize(size, size)
+            setBounds(0, 0, size, size)
+        }
+    }
+
+    private fun tierLabel(tier: String): String? = when (tier) {
+        "diamond" -> getString(R.string.settings_about_tier_diamond)
+        "platinum" -> getString(R.string.settings_about_tier_platinum)
+        "gold" -> getString(R.string.settings_about_tier_gold)
+        "silver" -> getString(R.string.settings_about_tier_silver)
+        "bronze" -> getString(R.string.settings_about_tier_bronze)
+        else -> null
     }
 
     private fun resolveAttr(attr: Int): Int {

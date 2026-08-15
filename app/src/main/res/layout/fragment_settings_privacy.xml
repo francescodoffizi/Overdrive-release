@@ -9,9 +9,8 @@
     STORAGE     : overline + 2-row card (Clips on disk / Total size).
                   Populated at runtime by SettingsPrivacyFragment via
                   RecordingScanner.
-    DIAGNOSTICS : overline + card with the log-level segmented picker, a
-                  description of the selected level, and an advisory shown
-                  at either extreme (verbose / near-silent).
+    DIAGNOSTICS : overline + log-verbosity card (segmented control +
+                  per-level description + both-extremes advisory).
     RESET CARD  : destructive action — colorErrorContainer background,
                   outlined error MaterialButton.
 
@@ -250,11 +249,8 @@
                 </LinearLayout>
 
                 <!-- Segmented control, matching the update-channel picker in Settings →
-                     About. A dropdown was the wrong idiom here: it needs a second precise
-                     tap on a ~48dp floating row, which is poor on a head unit. Four
-                     weighted segments give full-width touch targets in one tap. Selection
-                     maps by explicit button id (see SettingsPrivacyFragment), NOT by
-                     index, so reordering the buttons cannot silently change the meaning. -->
+                     About. Selection maps by explicit button id, not by index, so
+                     reordering the buttons cannot silently change the meaning. -->
                 <com.google.android.material.button.MaterialButtonToggleGroup
                     android:id="@+id/toggleLogLevel"
                     android:layout_width="match_parent"
@@ -296,9 +292,7 @@
                         android:text="@string/settings_privacy_log_level_error" />
                 </com.google.android.material.button.MaterialButtonToggleGroup>
 
-                <!-- Description of the SELECTED level; swapped by the fragment. BodyMedium
-                     to match the pane's other explanatory copy (the stance card) — BodySmall
-                     is too small to read at head-unit distance. -->
+                <!-- Description of the SELECTED level; swapped by the fragment. -->
                 <TextView
                     android:id="@+id/tvLogLevelDesc"
                     android:layout_width="match_parent"
@@ -309,8 +303,7 @@
                     android:textColor="?attr/colorOnSurfaceVariant" />
 
                 <!-- Advisory for either extreme. colorTertiary, not colorError: choosing a
-                     log level is a deliberate setting, not a fault, and red here would cry
-                     wolf next to the genuinely destructive reset card below. -->
+                     log level is a deliberate setting, not a fault. -->
                 <TextView
                     android:id="@+id/tvLogLevelNote"
                     android:layout_width="match_parent"
@@ -318,7 +311,6 @@
                     android:layout_marginTop="8dp"
                     android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
                     android:textColor="?attr/colorTertiary"
-                    android:textStyle="bold"
                     android:visibility="gone" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>

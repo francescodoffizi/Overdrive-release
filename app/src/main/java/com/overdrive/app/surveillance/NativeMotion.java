@@ -166,6 +166,57 @@ public class NativeMotion {
      * @return true if MOG2 is available, false if only SAD is available
      */
     public static native boolean isMog2Available();
+
+    /**
+     * Resets the process-global MOG2 background model (fresh sentry session).
+     *
+     * <p>Called from SurveillanceEngineGpu.enable() so a session never inherits
+     * the previous parking spot's background (invariant I2). Cheap; safe to
+     * call when OpenCV is absent (returns false).
+     *
+     * @return true if the model was reset, false if MOG2 is unavailable
+     */
+    public static native boolean resetMOG2();
+
+    /**
+     * Release the MOG2 background model (disarm teardown — audit R3b
+     * Ext-14). Frees ~18.7MB of native model storage that otherwise stays
+     * resident across disarm; enable() rebuilds via {@link #resetMOG2()}.
+     * Safe against a straggler apply() (mutex-guarded natively). No-op when
+     * OpenCV is absent or the model was never created.
+     */
+    public static native void releaseMOG2();
+
+    /**
+     * MOG2 background subtraction over the FULL 2x2 mosaic, with per-quadrant
+     * foreground fractions.
+     *
+     * <p>One background-model update per call; the model is process-global and
+     * single-stream, so callers must feed the SAME full-mosaic view every time
+     * (per-quadrant feeding would corrupt learning). Quadrant indexing matches
+     * {@code cropFromMosaic}: Q0=TL front, Q1=TR right, Q2=BL rear, Q3=BR left.
+     *
+     * <p>Single-threaded by contract: only the engine's frame-processing
+     * thread may call this (same discipline as the V2 pipeline itself).
+     *
+     * @param rgbFrame     Direct ByteBuffer, full 640×480 RGB mosaic
+     * @param width        Mosaic width (640)
+     * @param height       Mosaic height (480)
+     * @param learningRate OpenCV semantics: -1 = automatic (1/history),
+     *                     1.0 = reseed background from this frame entirely
+     * @param outQuadrantFractions float[4] out param — per-quadrant foreground
+     *                     pixel fraction in [0,1]
+     * @return whole-frame foreground fraction in [0,1], or negative on error /
+     *         OpenCV absent (callers MUST treat negative as "no evidence" —
+     *         the consuming channel is adding-only and fails closed, I9)
+     */
+    public static native float computeMOG2Quadrants(
+        ByteBuffer rgbFrame,
+        int width,
+        int height,
+        float learningRate,
+        float[] outQuadrantFractions
+    );
     
     /**
      * Checks if object detection is available (requires YOLO model).

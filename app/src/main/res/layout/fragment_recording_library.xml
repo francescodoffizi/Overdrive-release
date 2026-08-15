@@ -54,8 +54,8 @@
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnPrevDay"
             style="@style/Widget.Material3.Button.IconButton"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:contentDescription="@string/cd_previous_day"
             app:icon="@drawable/ic_chevron_left"
             app:iconSize="24dp"
@@ -133,8 +133,8 @@
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnNextDay"
             style="@style/Widget.Material3.Button.IconButton"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:contentDescription="@string/cd_next_day"
             app:icon="@drawable/ic_chevron_right"
             app:iconSize="24dp"
@@ -177,19 +177,19 @@
             android:id="@+id/btnOpenFilters"
             style="@style/Widget.Material3.Button.OutlinedButton"
             android:layout_width="wrap_content"
-            android:layout_height="36dp"
+            android:layout_height="48dp"
             android:layout_marginStart="8dp"
             android:contentDescription="@string/cd_open_filters"
             android:text="@string/recording_lib_filter_button"
             android:textSize="13sp"
             android:paddingHorizontal="14dp"
-            android:minHeight="36dp"
+            android:minHeight="48dp"
             android:insetTop="0dp"
             android:insetBottom="0dp"
             app:icon="@drawable/ic_filter_list"
             app:iconSize="18dp"
             app:iconGravity="textStart"
-            app:cornerRadius="18dp"
+            app:cornerRadius="@dimen/card_radius_standard"
             app:strokeColor="?attr/colorOutline" />
     </LinearLayout>
 
@@ -208,7 +208,30 @@
             android:clipToPadding="false"
             android:paddingHorizontal="20dp"
             android:paddingTop="4dp"
-            android:paddingBottom="20dp" />
+            android:paddingBottom="76dp" />
+
+        <LinearLayout
+            android:id="@+id/initialLoadingContainer"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="32dp"
+            android:visibility="gone">
+
+            <ProgressBar
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:indeterminateTint="?attr/colorPrimary" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="@string/recording_library_loading"
+                android:textAppearance="@style/TextAppearance.Material3.BodyLarge"
+                android:textColor="?attr/colorOnSurfaceVariant" />
+        </LinearLayout>
 
         <!-- SOTA empty state: tonal icon disc + headline + body + CTA.
              Reads like the events.html "no events match" panel rather
@@ -265,15 +288,73 @@
                 android:id="@+id/btnEmptyClearFilters"
                 style="@style/Widget.Material3.Button.TonalButton"
                 android:layout_width="wrap_content"
-                android:layout_height="40dp"
+                android:layout_height="48dp"
                 android:layout_marginTop="20dp"
                 android:text="@string/recording_lib_empty_clear_filters"
                 android:textAllCaps="false"
                 android:visibility="gone"
-                app:cornerRadius="20dp"
+                app:cornerRadius="@dimen/card_radius_standard"
                 app:icon="@drawable/ic_clear"
                 app:iconSize="18dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnEmptyRetry"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="wrap_content"
+                android:layout_height="48dp"
+                android:layout_marginTop="16dp"
+                android:text="@string/action_retry"
+                android:textAllCaps="false"
+                android:visibility="gone" />
         </LinearLayout>
+
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/loadStatusBar"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|center_horizontal"
+            android:layout_margin="16dp"
+            android:visibility="gone"
+            app:cardBackgroundColor="?attr/colorSurfaceContainerHigh"
+            app:cardCornerRadius="8dp"
+            app:cardElevation="4dp">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="56dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="16dp"
+                android:paddingEnd="8dp">
+
+                <ProgressBar
+                    android:id="@+id/loadStatusProgress"
+                    style="?android:attr/progressBarStyleSmall"
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:indeterminateTint="?attr/colorPrimary" />
+
+                <TextView
+                    android:id="@+id/tvLoadStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="12dp"
+                    android:maxWidth="320dp"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textColor="?attr/colorOnSurface"
+                    tools:text="Loading more recordings" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnLoadRetry"
+                    style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="48dp"
+                    android:layout_marginStart="8dp"
+                    android:text="@string/action_retry"
+                    android:textAllCaps="false"
+                    android:visibility="gone" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
     </FrameLayout>
     </LinearLayout>
 
@@ -318,7 +399,7 @@
                 android:id="@+id/btnSelectAll"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="36dp"
+                android:layout_height="48dp"
                 android:text="@string/action_select_all_short"
                 android:textSize="12sp"
                 android:textAllCaps="false" />
@@ -327,7 +408,7 @@
                 android:id="@+id/btnShareSelected"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="36dp"
+                android:layout_height="48dp"
                 android:contentDescription="@string/cd_share"
                 android:text="@string/action_share"
                 android:textSize="12sp"
@@ -339,7 +420,7 @@
                 android:id="@+id/btnDeleteSelected"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="36dp"
+                android:layout_height="48dp"
                 android:text="@string/action_delete"
                 android:textSize="12sp"
                 android:textAllCaps="false"
@@ -351,8 +432,8 @@
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnCancelSelect"
                 style="@style/Widget.Material3.Button.IconButton"
-                android:layout_width="36dp"
-                android:layout_height="36dp"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
                 android:contentDescription="@string/action_cancel"
                 app:icon="@drawable/ic_clear"
                 app:iconSize="18dp"

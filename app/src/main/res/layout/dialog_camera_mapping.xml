@@ -32,6 +32,7 @@
 -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:fillViewport="true">
@@ -68,7 +69,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="@string/camera_mapping_title"
-                    android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+                    android:textAppearance="@style/TextAppearance.Overdrive.HeadlineSmall"
                     android:textColor="?attr/colorOnSurface" />
 
                 <TextView
@@ -81,6 +82,176 @@
                     android:textColor="?attr/colorOnSurfaceVariant" />
             </LinearLayout>
         </LinearLayout>
+
+        <!-- Camera pairing card (ADDITIVE — a visual mirror of the pano +
+             OEM dashcam radio pickers further down). Shows both role
+             assignments side by side with live snapshots so the mirrored
+             trim labels below can be verified by eye, and a one-tap Swap
+             for the most common failure (the two IDs reversed). Swap
+             re-checks the radio groups and drives the SAME Save buttons a
+             manual tap (or CameraWizardCoach) uses — no new write path.
+             All views here are bound null-safely in
+             MainActivity.showCameraMappingDialog; removing this card
+             degrades gracefully to the classic pickers. Thumbnails come
+             from the existing kind=direct preview candidates and are
+             one-shot fetches (no polling); a failed fetch leaves the
+             placeholder icon and never blocks selection — preserving the
+             wedged-pipeline rescue path of the manual pickers. -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardCameraPairing"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/card_gap_vertical"
+            app:cardBackgroundColor="?attr/colorSurfaceContainer"
+            app:cardCornerRadius="@dimen/card_radius_standard"
+            app:cardElevation="0dp"
+            app:strokeColor="?attr/colorOutlineVariant"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="14dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/camera_pair_title"
+                    android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
+                    android:textColor="?attr/colorOnSurface" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:baselineAligned="false"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <!-- 360 Surround slot -->
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <com.google.android.material.card.MaterialCardView
+                            android:layout_width="match_parent"
+                            android:layout_height="110dp"
+                            app:cardBackgroundColor="?attr/colorSurfaceContainerHigh"
+                            app:cardCornerRadius="@dimen/card_radius_standard"
+                            app:cardElevation="0dp"
+                            app:strokeWidth="0dp">
+
+                            <ImageView
+                                android:layout_width="36dp"
+                                android:layout_height="36dp"
+                                android:layout_gravity="center"
+                                android:alpha="0.5"
+                                android:contentDescription="@null"
+                                android:src="@drawable/ic_camera_select"
+                                app:tint="?attr/colorOnSurfaceVariant" />
+
+                            <ImageView
+                                android:id="@+id/ivPairPanoThumb"
+                                android:layout_width="match_parent"
+                                android:layout_height="match_parent"
+                                android:contentDescription="@string/camera_pair_pano_label"
+                                android:scaleType="centerCrop" />
+                        </com.google.android.material.card.MaterialCardView>
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="6dp"
+                            android:text="@string/camera_pair_pano_label"
+                            android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
+                            android:textColor="?attr/colorOnSurface" />
+
+                        <TextView
+                            android:id="@+id/tvPairPanoValue"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="1dp"
+                            android:text="@string/camera_option_auto"
+                            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                            android:textColor="?attr/colorOnSurfaceVariant" />
+                    </LinearLayout>
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnSwapCameraIds"
+                        style="@style/Widget.Material3.Button.TonalButton.Icon"
+                        android:layout_width="wrap_content"
+                        android:layout_height="48dp"
+                        android:layout_marginHorizontal="10dp"
+                        android:contentDescription="@string/cd_camera_pair_swap"
+                        android:text="@string/camera_pair_swap"
+                        android:textAllCaps="false"
+                        app:icon="@drawable/ic_swap_horiz"
+                        app:iconGravity="textStart"
+                        app:iconSize="18dp" />
+
+                    <!-- Forward dashcam slot -->
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <com.google.android.material.card.MaterialCardView
+                            android:layout_width="match_parent"
+                            android:layout_height="110dp"
+                            app:cardBackgroundColor="?attr/colorSurfaceContainerHigh"
+                            app:cardCornerRadius="@dimen/card_radius_standard"
+                            app:cardElevation="0dp"
+                            app:strokeWidth="0dp">
+
+                            <ImageView
+                                android:layout_width="36dp"
+                                android:layout_height="36dp"
+                                android:layout_gravity="center"
+                                android:alpha="0.5"
+                                android:contentDescription="@null"
+                                android:src="@drawable/ic_camera_select"
+                                app:tint="?attr/colorOnSurfaceVariant" />
+
+                            <ImageView
+                                android:id="@+id/ivPairDashcamThumb"
+                                android:layout_width="match_parent"
+                                android:layout_height="match_parent"
+                                android:contentDescription="@string/camera_pair_dashcam_label"
+                                android:scaleType="centerCrop" />
+                        </com.google.android.material.card.MaterialCardView>
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="6dp"
+                            android:text="@string/camera_pair_dashcam_label"
+                            android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
+                            android:textColor="?attr/colorOnSurface" />
+
+                        <TextView
+                            android:id="@+id/tvPairDashcamValue"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="1dp"
+                            android:text="@string/camera_option_auto"
+                            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                            android:textColor="?attr/colorOnSurfaceVariant" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="@string/camera_pair_hint"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
 
         <!-- Camera ingestion mode selector. Top-of-dialog control because it
              determines which path the daemon takes (legacy ImageReader +
@@ -257,6 +428,56 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <!-- Advanced expander for the two manual ID picker cards. The
+             pairing card above covers the common cases (verify + Swap);
+             the full 7-option pickers stay available but collapsed so the
+             dialog isn't three screens of radio buttons. COLLAPSED by
+             default; MainActivity auto-expands when a manual override is
+             already saved (configured devices see their state without an
+             extra tap) and CameraWizardCoach expands it via the toggle
+             when the user chooses manual picking. The pickers inside keep
+             their exact ids and save semantics — including working while
+             the preview pipeline is wedged. -->
+        <LinearLayout
+            android:id="@+id/btnToggleAdvancedIds"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="@dimen/card_gap_vertical"
+            android:background="?attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="4dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/camera_advanced_ids_toggle"
+                android:textAllCaps="true"
+                android:fontFamily="sans-serif-medium"
+                android:letterSpacing="0.06"
+                android:textAppearance="@style/TextAppearance.Material3.LabelMedium"
+                android:textColor="?attr/colorOnSurfaceVariant" />
+
+            <ImageView
+                android:id="@+id/ivAdvancedIdsChevron"
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_expand"
+                app:tint="?attr/colorOnSurfaceVariant" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/advancedIdSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            tools:visibility="visible">
+
         <!-- Manual camera ID picker. The simple knob: pick which AVMCamera
              the daemon opens (0..5 or Auto). Independent of role mapping —
              saves via /api/surveillance/config { manualCameraId }, does NOT
@@ -282,7 +503,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="@string/camera_selection_title"
+                    android:text="@string/camera_ids_pano_title"
                     android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
                     android:textColor="?attr/colorOnSurface" />
 
@@ -292,6 +513,14 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="2dp"
                     android:text="@string/camera_current_auto"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/camera_ids_pano_caption"
                     android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="?attr/colorOnSurfaceVariant" />
 
@@ -440,7 +669,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="@string/camera_oem_dashcam_title"
+                    android:text="@string/camera_ids_oem_title"
                     android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
                     android:textColor="?attr/colorOnSurface" />
 
@@ -450,6 +679,14 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="2dp"
                     android:text="@string/camera_current_auto"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/camera_ids_oem_caption"
                     android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="?attr/colorOnSurfaceVariant" />
 
@@ -586,6 +823,24 @@
                     android:textColor="?attr/colorOnSurfaceVariant" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
+        </LinearLayout><!-- /advancedIdSection -->
+
+        <!-- Section header: separates the slice-calibration workflow below
+             from the camera-ID pickers above. Slice calibration answers
+             "which slice of the pano frame is front/right/rear/left" —
+             a different question from "which physical camera is which"
+             answered above, and mistaking one for the other was the top
+             source of confusion in this dialog. -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/camera_section_slice_calibration"
+            android:textAllCaps="true"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.06"
+            android:textAppearance="@style/TextAppearance.Material3.LabelMedium"
+            android:textColor="?attr/colorOnSurfaceVariant" />
 
         <!-- Role selector: label + spinner + current-mapping description.
              Advanced workflow: identify each panoramic slice via the preview
@@ -625,6 +880,25 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="6dp"
                     android:text="@string/camera_mapping_current_none"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+
+                <!-- Per-role explainer, updated from Kotlin when the spinner
+                     selection changes. Distinguishes the two role families
+                     this one spinner mixes: direct-camera roles (windshield /
+                     cabin — pick WHICH camera feeds a layout view) vs the
+                     four pano slice roles (calibrate WHERE each direction
+                     lives inside the mosaic). In particular it spells out
+                     that the Windshield role is NOT the Forward dashcam
+                     recorder ID above — the coupling users kept tripping
+                     over. Null-safely bound; absent view = no behaviour
+                     change. -->
+                <TextView
+                    android:id="@+id/tvRoleExplainer"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/camera_role_explainer_slice"
                     android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="?attr/colorOnSurfaceVariant" />
             </LinearLayout>

@@ -10,7 +10,7 @@
     <title data-i18n="app.notifications_title">Notifications - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <!--
       WebView detection MUST run before app-tabs.js builds the tab bar so
       we can filter OT_TABS to the Telegram-only flow on the head unit.
@@ -58,10 +58,8 @@
             : __OT_ALL_TABS;
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <link rel="manifest" href="/manifest.json">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <style>
         .notif-page-body { max-width: 720px; margin: 0 auto; }
         .notif-section { margin-bottom: 28px; }
@@ -203,6 +201,15 @@
         }
         .notif-seg.disabled { opacity: 0.5; pointer-events: none; }
         .notif-seg-hint { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
+        /* Compact variant: sits inline on the right of a .notif-row (like
+           .notif-range does) instead of spanning the card. Same look,
+           fixed-size segments. */
+        .notif-seg-compact {
+            width: auto; flex-shrink: 0;
+        }
+        .notif-seg-compact .notif-seg-btn {
+            flex: 0 0 auto; padding: 8px 14px; font-size: 12px;
+        }
         .notif-status {
             font-size: 13px; padding: 12px 16px; border-radius: 8px;
             margin: 12px 0; line-height: 1.5;
@@ -331,6 +338,7 @@
             #tyreLimitsCard .notif-row { flex-wrap: wrap; }
             #tyreLimitsCard .notif-row-text { padding-right: 0; }
             #tyreLimitsCard .notif-range { margin-top: 10px; }
+            #tyreLimitsCard .notif-seg-compact { margin-top: 10px; }
         }
 
         /* ============================================================
@@ -459,7 +467,7 @@
 
         /* ---- Header: count (left) + icon actions (right) ---- */
         .nl-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
-        .nl-count { font-size: 15px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.01em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .nl-count { font-size: 15px; font-weight: 700; color: var(--text-primary); letter-spacing: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .nl-actions { display: flex; flex: 0 0 auto; }
         .nl-actions > * + * { margin-left: 8px; }
         .nl-icon-btn {
@@ -831,6 +839,24 @@
                         <h2 id="tyreLimitsHeading" data-i18n="notif.tyre_limits">Tyre pressure limits</h2>
                         <p class="notif-section-sub" data-i18n="notif.tyre_limits_sub">Set the normal pressure range for each axle. A tyre below the minimum or above the maximum raises a warning; below the critical value it raises a deflated-tyre alert. Used for push and Telegram notifications and for the corner colours in Vehicle Control. Defaults suit stock tyres — change them if your placard pressures differ.</p>
                         <div class="notif-card" id="tyreLimitsCard">
+                            <!-- Display-unit picker. Presentation only: the
+                                 limit inputs below stay kPa (the canonical,
+                                 compared unit) — this drives how readings are
+                                 shown in Vehicle Control, the dashboard glance,
+                                 the conversion echoes here, and notification
+                                 text. Saves immediately on tap (no Save press
+                                 needed), same as the min-severity segments. -->
+                            <div class="notif-row">
+                                <div class="notif-row-text">
+                                    <div class="notif-row-label" data-i18n="notif.tyre_unit">Display unit</div>
+                                    <div class="notif-row-note" data-i18n="notif.tyre_unit_note">How pressure readings are shown across the dashboard and in alerts. Limits below are always set in kPa.</div>
+                                </div>
+                                <div class="notif-seg notif-seg-compact" id="tyreUnitSeg" role="radiogroup" aria-label="Pressure display unit">
+                                    <button type="button" class="notif-seg-btn" data-unit="kpa" role="radio" aria-checked="false">kPa</button>
+                                    <button type="button" class="notif-seg-btn" data-unit="psi" role="radio" aria-checked="true">PSI</button>
+                                    <button type="button" class="notif-seg-btn" data-unit="bar" role="radio" aria-checked="false">bar</button>
+                                </div>
+                            </div>
                             <div class="notif-row">
                                 <div class="notif-row-text">
                                     <div class="notif-row-label" data-i18n="notif.tyre_front">Front axle</div>
@@ -1141,13 +1167,13 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
     <!-- surveillance.js owns the SurvSettings module that backs the Telegram
          tier toggles. We load it here so the v2TelegramSendStartPing /
          v2TelegramTierGroup controls hooked into surveillance.js wiring
          keep firing without a per-page bridge. -->
-    <script src="../shared/surveillance.js?v=survfix1"></script>
+    <script src="../shared/surveillance.js?v=survtoggle1"></script>
     <script src="../shared/notif-log.js?v=3"></script>
     <script>
         function toggleSidebar() {
@@ -1555,7 +1581,22 @@
             function toast(msg, kind) {
                 if (window.BYD && BYD.utils && BYD.utils.toast) BYD.utils.toast(msg, kind || 'info');
             }
-            function psi(kPa) { return (kPa * 0.1450377).toFixed(1); }
+            // The user's display unit ('kpa' | 'psi' | 'bar'). Kept in sync
+            // with BYD.units.pressureMode so the rest of the page (and every
+            // other page, via /status polling) renders pressure identically.
+            var displayUnit = (window.BYD && BYD.units && BYD.units.pressureMode)
+                ? BYD.units.pressureMode : 'psi';
+
+            // Format a kPa value in the conversion-echo unit. The echo's job
+            // is a cross-check against the kPa inputs, so when the display
+            // unit IS kPa it echoes PSI (the historical behaviour) rather
+            // than repeating the same number.
+            function echoUnit() { return displayUnit === 'kpa' ? 'psi' : displayUnit; }
+            function conv(kPa) {
+                if (echoUnit() === 'bar') return (kPa / 100).toFixed(2);
+                return (kPa * 0.1450377).toFixed(1);
+            }
+            function convLabel() { return echoUnit() === 'bar' ? 'bar' : 'PSI'; }
 
             function paint(vals) {
                 for (var key in FIELDS) {
@@ -1566,18 +1607,62 @@
                 paintConversions();
             }
 
-            // Echo the entered kPa as PSI so a user working from a PSI placard
-            // can verify the numbers without converting by hand. Reads the
-            // live inputs (not the saved state) so it tracks typing.
+            // Echo the entered kPa in the display unit so a user working
+            // from a PSI/bar placard can verify the numbers without
+            // converting by hand. Reads the live inputs (not the saved
+            // state) so it tracks typing.
             function paintConversions() {
                 var v = readInputs();
                 var f = $('tyreFrontConv'), r = $('tyreRearConv'), c = $('tyreCriticalConv');
                 if (f) f.textContent = (v.frontLow !== null && v.frontHigh !== null)
-                    ? psi(v.frontLow) + ' – ' + psi(v.frontHigh) + ' PSI' : ' ';
+                    ? conv(v.frontLow) + ' – ' + conv(v.frontHigh) + ' ' + convLabel() : ' ';
                 if (r) r.textContent = (v.rearLow !== null && v.rearHigh !== null)
-                    ? psi(v.rearLow) + ' – ' + psi(v.rearHigh) + ' PSI' : ' ';
+                    ? conv(v.rearLow) + ' – ' + conv(v.rearHigh) + ' ' + convLabel() : ' ';
                 if (c) c.textContent = (v.criticalLow !== null)
-                    ? psi(v.criticalLow) + ' PSI' : ' ';
+                    ? conv(v.criticalLow) + ' ' + convLabel() : ' ';
+            }
+
+            function paintUnitSeg() {
+                var seg = $('tyreUnitSeg');
+                if (!seg) return;
+                var btns = seg.querySelectorAll('.notif-seg-btn');
+                for (var i = 0; i < btns.length; i++) {
+                    btns[i].setAttribute('aria-checked',
+                        btns[i].getAttribute('data-unit') === displayUnit ? 'true' : 'false');
+                }
+            }
+
+            function applyUnit(unit, persist) {
+                var previous = displayUnit;
+                displayUnit = unit;
+                if (window.BYD && BYD.units) BYD.units.pressureMode = unit;
+                paintUnitSeg();
+                paintConversions();
+                if (!persist) return;
+                // Revert the optimistic repaint if the POST fails — otherwise
+                // this page renders a unit the server never accepted and the
+                // next /status poll fights it back anyway.
+                function revert() {
+                    applyUnit(previous, false);
+                    toast(tr('notif.tyre_unit_save_failed', 'Could not save display unit'), 'error');
+                }
+                // Persist immediately (no Save press) -- the segments behave
+                // like the min-severity control, and the unit is independent
+                // of the (validated, Save-gated) numeric limits.
+                var fetcher = (typeof BYDAuth !== 'undefined' && BYDAuth.fetch)
+                    ? BYDAuth.fetch.bind(BYDAuth) : fetch;
+                fetcher('/api/tyres/limits', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pressureUnit: unit })
+                }).then(function (r) { return r.ok ? r.json() : null; })
+                  .then(function (j) {
+                    if (!j || j.success === false) {
+                        revert();
+                        return;
+                    }
+                    toast(tr('notif.tyre_unit_saved', 'Display unit saved'), 'success');
+                }).catch(revert);
             }
 
             // null for a blank / non-integer field so validate() can tell
@@ -1681,6 +1766,12 @@
                 fetcher('/api/tyres/limits', { cache: 'no-store' })
                     .then(function (r) { return r.ok ? r.json() : null; })
                     .then(function (j) {
+                        // Unit first, then limits: paint(limits) repaints the
+                        // conversion echoes, which must use the loaded unit.
+                        if (j && (j.pressureUnit === 'kpa' || j.pressureUnit === 'psi'
+                                || j.pressureUnit === 'bar')) {
+                            applyUnit(j.pressureUnit, false);
+                        }
                         if (j && j.limits) paint(j.limits);
                     })
                     .catch(function () {
@@ -1761,6 +1852,18 @@
                     el.addEventListener('input', paintConversions);
                     el.addEventListener('input', reflectValidity);
                 }
+                // Unit segments: delegated click, tap = apply + persist.
+                var seg = $('tyreUnitSeg');
+                if (seg) {
+                    seg.addEventListener('click', function (e) {
+                        var btn = e.target && e.target.closest
+                            ? e.target.closest('.notif-seg-btn') : null;
+                        if (!btn) return;
+                        var unit = btn.getAttribute('data-unit');
+                        if (unit && unit !== displayUnit) applyUnit(unit, true);
+                    });
+                }
+                paintUnitSeg();
             });
 
             return { load: load, save: save, reset: reset };

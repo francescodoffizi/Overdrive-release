@@ -13,6 +13,7 @@ import com.overdrive.app.telegram.TelegramNotifier;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.util.Locale;
+import java.util.concurrent.CopyOnWriteArraySet;
 
 /**
  * HardwareEventRecorderGpu - MediaCodec encoder with Surface input for GPU pipeline.
@@ -1128,15 +1129,12 @@ public class HardwareEventRecorderGpu {
     private Runnable fileClosedCallback;
     
     // Streaming
-    // Volatile: setStreamCallback / clearStreamCallback run on the HTTP
-    // worker thread; the drainer thread reads `streamCallback != null &&
-    // streamHeadersSent` on every output buffer. Without volatile, a fresh
-    // callback set just after CSD publish can be invisible to the drainer
-    // (no SPS/PPS sent → late client gets a corrupt stream until the next
-    // IDR), and a `streamHeadersSent=false` reset can be missed (drainer
-    // keeps thinking headers were sent → never re-sends them).
-    private volatile StreamCallback streamCallback;
-    private volatile boolean streamHeadersSent = false;
+    // One encoder feeds the legacy port-8887 server and every /ws client.
+    // A single replaceable callback lets one reconnect erase another
+    // connection's sink, so subscribers are independently owned instead.
+    private final Object streamCallbackLock = new Object();
+    private final CopyOnWriteArraySet<StreamCallback> streamCallbacks =
+        new CopyOnWriteArraySet<>();
     
     // Recording state
     // volatile: read by isRecording() from RecordingModeManager,
@@ -1402,7 +1400,7 @@ public class HardwareEventRecorderGpu {
         //
         // Why it matters here specifically: the byd_apa HAL emits at its own fixed
         // low rate (~4.5 fps observed) and cannot be retimed — setCameraFps returns
-        // false for every value, and both the OEM app and DiPlus discard that
+        // false for every value, and both the OEM app and other players discard that
         // return. At 4.5 fps a 2-second interval is ~9 frames between keyframes, so
         // a viewer that joins late, drops a packet, or sees a run of near-empty
         // P-frames has no recovery point for two seconds and the picture appears
@@ -1982,26 +1980,44 @@ public class HardwareEventRecorderGpu {
      * @param callback Callback to receive H.264 packets
      */
     public void setStreamCallback(StreamCallback callback) {
-        this.streamCallback = callback;
-        this.streamHeadersSent = false;
-        
-        // If format already available, send SPS/PPS immediately
-        // This handles late-joining clients after encoder has started
-        if (callback != null && savedFormat != null) {
-            try {
-                ByteBuffer sps = savedFormat.getByteBuffer("csd-0");
-                ByteBuffer pps = savedFormat.getByteBuffer("csd-1");
-                if (sps != null && pps != null) {
-                    callback.onSpsPps(sps.duplicate(), pps.duplicate());
-                    streamHeadersSent = true;
-                    logger.info("SPS/PPS sent immediately to new callback (late join)");
-                }
-            } catch (Exception e) {
-                logger.error("Failed to send SPS/PPS to new callback", e);
-            }
+        synchronized (streamCallbackLock) {
+            streamCallbacks.clear();
+            addStreamCallbackLocked(callback);
         }
-        
         logger.info("Stream callback registered");
+    }
+
+    /** Add one independently removable stream sink without replacing others. */
+    public void addStreamCallback(StreamCallback callback) {
+        synchronized (streamCallbackLock) {
+            addStreamCallbackLocked(callback);
+        }
+    }
+
+    private void addStreamCallbackLocked(StreamCallback callback) {
+        if (callback == null || !streamCallbacks.add(callback) || savedFormat == null) return;
+        sendSpsPps(callback, savedFormat);
+    }
+
+    /** Remove only this client's sink; other clients continue receiving frames. */
+    public void removeStreamCallback(StreamCallback callback) {
+        if (callback == null) return;
+        synchronized (streamCallbackLock) {
+            streamCallbacks.remove(callback);
+        }
+    }
+
+    private void sendSpsPps(StreamCallback callback, MediaFormat format) {
+        try {
+            ByteBuffer sps = format.getByteBuffer("csd-0");
+            ByteBuffer pps = format.getByteBuffer("csd-1");
+            if (sps != null && pps != null) {
+                callback.onSpsPps(sps.duplicate(), pps.duplicate());
+                logger.info("SPS/PPS sent to stream callback");
+            }
+        } catch (Exception e) {
+            logger.error("Failed to send SPS/PPS", e);
+        }
     }
     
     /**
@@ -2390,8 +2406,9 @@ public class HardwareEventRecorderGpu {
      * Removes the streaming callback.
      */
     public void clearStreamCallback() {
-        this.streamCallback = null;
-        this.streamHeadersSent = false;
+        synchronized (streamCallbackLock) {
+            streamCallbacks.clear();
+        }
         logger.info("Stream callback cleared");
     }
     
@@ -2962,13 +2979,14 @@ public class HardwareEventRecorderGpu {
         // the hardware encoder time to finish encoding in-flight frames.
         try {
             for (int drainPass = 0; drainPass < 5; drainPass++) {
-                int framesBefore = recordedFrames;
-                drainEncoderInternal();
-                int framesWritten = recordedFrames - framesBefore;
-                if (framesWritten == 0 && drainPass > 0) {
+                // Count what this pass DEQUEUED, not what reached disk: recordedFrames is advanced
+                // only by the disk-writer thread, which stopDrainerThread() above already stopped,
+                // so measuring it here made every pass read 0 and the loop broke at pass 1.
+                int drained = drainEncoderInternal();
+                if (drained == 0 && drainPass > 0) {
                     break;  // Encoder is empty
                 }
-                if (framesWritten > 0 && drainPass < 4) {
+                if (drained > 0 && drainPass < 4) {
                     // More frames were available — give encoder a moment to finish any in-flight
                     try { Thread.sleep(20); } catch (InterruptedException ignored) {}
                 }
@@ -4489,18 +4507,12 @@ public class HardwareEventRecorderGpu {
                     }
                 }
                 
-                // Send SPS/PPS to streaming callback
-                if (streamCallback != null && !streamHeadersSent) {
-                    try {
-                        ByteBuffer sps = format.getByteBuffer("csd-0");
-                        ByteBuffer pps = format.getByteBuffer("csd-1");
-                        if (sps != null && pps != null) {
-                            streamCallback.onSpsPps(sps.duplicate(), pps.duplicate());
-                            streamHeadersSent = true;
-                            logger.info("SPS/PPS sent to stream");
-                        }
-                    } catch (Exception e) {
-                        logger.error("Failed to send SPS/PPS", e);
+                // Every connected sink receives the format before the next
+                // packet. The lock also prevents a just-added client from
+                // racing a packet dispatch ahead of its SPS/PPS.
+                synchronized (streamCallbackLock) {
+                    for (StreamCallback callback : streamCallbacks) {
+                        sendSpsPps(callback, format);
                     }
                 }
                 
@@ -4599,15 +4611,23 @@ public class HardwareEventRecorderGpu {
                     // of this iteration, so outputBuffer's mutation here is
                     // confined to the current thread and bounded to the
                     // stream-callback duration.
-                    if (streamCallback != null && streamHeadersSent) {
+                    StreamCallback[] callbacks;
+                    synchronized (streamCallbackLock) {
+                        callbacks = streamCallbacks.toArray(new StreamCallback[0]);
+                    }
+                    if (callbacks.length > 0) {
                         int savedPos = outputBuffer.position();
                         int savedLim = outputBuffer.limit();
                         try {
                             outputBuffer.position(bufferInfo.offset);
                             outputBuffer.limit(bufferInfo.offset + bufferInfo.size);
-                            streamCallback.onH264Packet(outputBuffer, bufferInfo);
-                        } catch (Exception e) {
-                            logger.error("Stream callback error", e);
+                            for (StreamCallback callback : callbacks) {
+                                try {
+                                    callback.onH264Packet(outputBuffer, bufferInfo);
+                                } catch (Exception e) {
+                                    logger.error("Stream callback error", e);
+                                }
+                            }
                         } finally {
                             outputBuffer.limit(savedLim);
                             outputBuffer.position(savedPos);

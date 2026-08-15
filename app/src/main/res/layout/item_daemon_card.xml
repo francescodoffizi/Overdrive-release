@@ -94,12 +94,12 @@
                 android:contentDescription="@string/cd_expand" />
 
             <!-- Configure button (only visible for configurable daemons like Zrok) -->
-            <ImageView
+            <ImageButton
                 android:id="@+id/ivConfigure"
-                android:layout_width="32dp"
-                android:layout_height="32dp"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
                 android:layout_marginEnd="8dp"
-                android:padding="4dp"
+                android:padding="12dp"
                 android:src="@drawable/ic_settings"
                 android:visibility="gone"
                 android:background="?attr/selectableItemBackgroundBorderless"
@@ -107,12 +107,12 @@
                 android:contentDescription="@string/cd_configure" />
 
             <!-- Download log button (only visible in debug builds) -->
-            <ImageView
+            <ImageButton
                 android:id="@+id/ivDownloadLog"
-                android:layout_width="32dp"
-                android:layout_height="32dp"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
                 android:layout_marginEnd="8dp"
-                android:padding="4dp"
+                android:padding="12dp"
                 android:src="@drawable/ic_download_log"
                 android:visibility="gone"
                 android:background="?attr/selectableItemBackgroundBorderless"

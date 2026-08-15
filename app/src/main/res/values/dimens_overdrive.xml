@@ -26,10 +26,10 @@
     <dimen name="card_gap_horizontal_half">6dp</dimen>   <!-- per-side margin in horizontal grids -->
 
     <!-- Card radii -->
-    <dimen name="card_radius_standard">20dp</dimen>     <!-- Dashboard metrics, Diagnostics tiles, Integrations cards, Settings sections -->
-    <dimen name="card_radius_hero">24dp</dimen>         <!-- Dashboard hero, Recordings preview pane -->
+    <dimen name="card_radius_standard">8dp</dimen>      <!-- Operational cards and grouped surfaces -->
+    <dimen name="card_radius_hero">8dp</dimen>          <!-- Large content surfaces remain restrained -->
     <dimen name="card_radius_dialog">28dp</dimen>       <!-- M3 dialog spec; already wired via theme -->
-    <dimen name="card_radius_accent">14dp</dimen>       <!-- pills inside cards, segmented-button corners -->
+    <dimen name="card_radius_accent">8dp</dimen>        <!-- buttons and segmented controls -->
 
     <!-- Card padding -->
     <dimen name="card_padding_standard">20dp</dimen>

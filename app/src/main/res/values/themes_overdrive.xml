@@ -14,64 +14,64 @@
 
     <style name="Theme.Overdrive.M3" parent="Theme.Material3.Light.NoActionBar">
         <!-- Primary -->
-        <item name="colorPrimary">@color/md_sys_color_primary_light</item>
-        <item name="colorOnPrimary">@color/md_sys_color_on_primary_light</item>
-        <item name="colorPrimaryContainer">@color/md_sys_color_primary_container_light</item>
-        <item name="colorOnPrimaryContainer">@color/md_sys_color_on_primary_container_light</item>
+        <item name="colorPrimary">@color/md_sys_color_primary</item>
+        <item name="colorOnPrimary">@color/md_sys_color_on_primary</item>
+        <item name="colorPrimaryContainer">@color/md_sys_color_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/md_sys_color_on_primary_container</item>
 
         <!-- Secondary -->
-        <item name="colorSecondary">@color/md_sys_color_secondary_light</item>
-        <item name="colorOnSecondary">@color/md_sys_color_on_secondary_light</item>
-        <item name="colorSecondaryContainer">@color/md_sys_color_secondary_container_light</item>
-        <item name="colorOnSecondaryContainer">@color/md_sys_color_on_secondary_container_light</item>
+        <item name="colorSecondary">@color/md_sys_color_secondary</item>
+        <item name="colorOnSecondary">@color/md_sys_color_on_secondary</item>
+        <item name="colorSecondaryContainer">@color/md_sys_color_secondary_container</item>
+        <item name="colorOnSecondaryContainer">@color/md_sys_color_on_secondary_container</item>
 
         <!-- Tertiary -->
-        <item name="colorTertiary">@color/md_sys_color_tertiary_light</item>
-        <item name="colorOnTertiary">@color/md_sys_color_on_tertiary_light</item>
-        <item name="colorTertiaryContainer">@color/md_sys_color_tertiary_container_light</item>
-        <item name="colorOnTertiaryContainer">@color/md_sys_color_on_tertiary_container_light</item>
+        <item name="colorTertiary">@color/md_sys_color_tertiary</item>
+        <item name="colorOnTertiary">@color/md_sys_color_on_tertiary</item>
+        <item name="colorTertiaryContainer">@color/md_sys_color_tertiary_container</item>
+        <item name="colorOnTertiaryContainer">@color/md_sys_color_on_tertiary_container</item>
 
         <!-- Error -->
-        <item name="colorError">@color/md_sys_color_error_light</item>
-        <item name="colorOnError">@color/md_sys_color_on_error_light</item>
-        <item name="colorErrorContainer">@color/md_sys_color_error_container_light</item>
-        <item name="colorOnErrorContainer">@color/md_sys_color_on_error_container_light</item>
+        <item name="colorError">@color/md_sys_color_error</item>
+        <item name="colorOnError">@color/md_sys_color_on_error</item>
+        <item name="colorErrorContainer">@color/md_sys_color_error_container</item>
+        <item name="colorOnErrorContainer">@color/md_sys_color_on_error_container</item>
 
         <!-- Background / surface -->
-        <item name="android:colorBackground">@color/md_sys_color_background_light</item>
-        <item name="colorOnBackground">@color/md_sys_color_on_background_light</item>
-        <item name="colorSurface">@color/md_sys_color_surface_light</item>
-        <item name="colorOnSurface">@color/md_sys_color_on_surface_light</item>
-        <item name="colorSurfaceVariant">@color/md_sys_color_surface_variant_light</item>
-        <item name="colorOnSurfaceVariant">@color/md_sys_color_on_surface_variant_light</item>
-        <item name="colorSurfaceDim">@color/md_sys_color_surface_dim_light</item>
-        <item name="colorSurfaceBright">@color/md_sys_color_surface_bright_light</item>
-        <item name="colorSurfaceContainerLowest">@color/md_sys_color_surface_container_lowest_light</item>
-        <item name="colorSurfaceContainerLow">@color/md_sys_color_surface_container_low_light</item>
-        <item name="colorSurfaceContainer">@color/md_sys_color_surface_container_light</item>
-        <item name="colorSurfaceContainerHigh">@color/md_sys_color_surface_container_high_light</item>
-        <item name="colorSurfaceContainerHighest">@color/md_sys_color_surface_container_highest_light</item>
+        <item name="android:colorBackground">@color/md_sys_color_background</item>
+        <item name="colorOnBackground">@color/md_sys_color_on_background</item>
+        <item name="colorSurface">@color/md_sys_color_surface</item>
+        <item name="colorOnSurface">@color/md_sys_color_on_surface</item>
+        <item name="colorSurfaceVariant">@color/md_sys_color_surface_variant</item>
+        <item name="colorOnSurfaceVariant">@color/md_sys_color_on_surface_variant</item>
+        <item name="colorSurfaceDim">@color/md_sys_color_surface_dim</item>
+        <item name="colorSurfaceBright">@color/md_sys_color_surface_bright</item>
+        <item name="colorSurfaceContainerLowest">@color/md_sys_color_surface_container_lowest</item>
+        <item name="colorSurfaceContainerLow">@color/md_sys_color_surface_container_low</item>
+        <item name="colorSurfaceContainer">@color/md_sys_color_surface_container</item>
+        <item name="colorSurfaceContainerHigh">@color/md_sys_color_surface_container_high</item>
+        <item name="colorSurfaceContainerHighest">@color/md_sys_color_surface_container_highest</item>
 
         <!-- Outline -->
-        <item name="colorOutline">@color/md_sys_color_outline_light</item>
-        <item name="colorOutlineVariant">@color/md_sys_color_outline_variant_light</item>
+        <item name="colorOutline">@color/md_sys_color_outline</item>
+        <item name="colorOutlineVariant">@color/md_sys_color_outline_variant</item>
 
         <!-- Inverse / scrim -->
-        <item name="colorSurfaceInverse">@color/md_sys_color_inverse_surface_light</item>
-        <item name="colorOnSurfaceInverse">@color/md_sys_color_inverse_on_surface_light</item>
-        <item name="colorPrimaryInverse">@color/md_sys_color_inverse_primary_light</item>
-        <item name="scrimBackground">@color/md_sys_color_scrim_light</item>
+        <item name="colorSurfaceInverse">@color/md_sys_color_inverse_surface</item>
+        <item name="colorOnSurfaceInverse">@color/md_sys_color_inverse_on_surface</item>
+        <item name="colorPrimaryInverse">@color/md_sys_color_inverse_primary</item>
+        <item name="scrimBackground">@color/md_sys_color_scrim</item>
 
         <!-- System bars -->
-        <item name="android:statusBarColor">@color/md_sys_color_surface_container_light</item>
-        <item name="android:navigationBarColor">@color/md_sys_color_surface_container_light</item>
+        <item name="android:statusBarColor">@color/md_sys_color_surface_container</item>
+        <item name="android:navigationBarColor">@color/md_sys_color_surface_container</item>
         <item name="android:windowLightStatusBar" tools:targetApi="m">true</item>
-        <item name="android:windowBackground">@color/md_sys_color_background_light</item>
+        <item name="android:windowBackground">@color/md_sys_color_background</item>
 
         <!-- Text colors driven by M3 roles -->
-        <item name="android:textColorPrimary">@color/md_sys_color_on_surface_light</item>
-        <item name="android:textColorSecondary">@color/md_sys_color_on_surface_variant_light</item>
-        <item name="android:textColorHint">@color/md_sys_color_outline_light</item>
+        <item name="android:textColorPrimary">@color/md_sys_color_on_surface</item>
+        <item name="android:textColorSecondary">@color/md_sys_color_on_surface_variant</item>
+        <item name="android:textColorHint">@color/md_sys_color_outline</item>
 
         <!-- Inherited component styles from themes.xml -->
         <item name="materialCardViewStyle">@style/Widget.Overdrive.M3.CardView</item>
@@ -84,14 +84,9 @@
         <item name="materialAlertDialogTheme">@style/ThemeOverlay.Overdrive.M3.MaterialAlertDialog</item>
         <item name="alertDialogTheme">@style/ThemeOverlay.Overdrive.M3.MaterialAlertDialog</item>
 
-        <!-- Typography overrides: tighten the M3 expressive scale for a
-             modern infotainment look. The default M3 type scale uses
-             generous tracking and weights tuned for phones; on a 1920×1080
-             head unit those defaults read as soft. We bias headlines and
-             display text to sans-serif-medium with negative tracking, and
-             sharpen labels with a small positive tracking for an
-             "expressive" rhythm. Body styles inherit defaults — they
-             render long-form text and don't benefit from tighter tracking. -->
+        <!-- App typography contract. Medium-weight display and label styles
+             improve scanability while zero tracking remains robust under font
+             scaling, long translations, and fallback fonts. -->
         <item name="textAppearanceDisplaySmall">@style/TextAppearance.Overdrive.DisplaySmall</item>
         <item name="textAppearanceHeadlineLarge">@style/TextAppearance.Overdrive.HeadlineLarge</item>
         <item name="textAppearanceHeadlineMedium">@style/TextAppearance.Overdrive.HeadlineMedium</item>
@@ -107,10 +102,7 @@
     <!-- They reference attrs (?attr/colorSurface etc.) so they auto-flip-->
     <!-- ============================================================== -->
 
-    <!-- Cards: tonal containers, no elevation shadows (cleaner on dark).
-         cardCornerRadius wired to @dimen/card_radius_standard so cards inheriting
-         this style automatically pick up the canonical 20dp radius. Layouts may
-         still override with @dimen/card_radius_hero (24dp) for hero cards. -->
+    <!-- Cards: restrained tonal containers without elevation shadows. -->
     <style name="Widget.Overdrive.M3.CardView" parent="Widget.Material3.CardView.Filled">
         <item name="cardBackgroundColor">?attr/colorSurfaceContainer</item>
         <item name="cardCornerRadius">@dimen/card_radius_standard</item>
@@ -123,10 +115,10 @@
         <item name="strokeWidth">1dp</item>
     </style>
 
-    <!-- Buttons. cornerRadius uses card_radius_accent (14dp) so pill buttons
-         match the in-card accent corner system. -->
+    <!-- Buttons share the 8dp component radius and a 48dp touch target. -->
     <style name="Widget.Overdrive.M3.Button" parent="Widget.Material3.Button">
         <item name="cornerRadius">@dimen/card_radius_accent</item>
+        <item name="android:minHeight">48dp</item>
         <item name="android:textAllCaps">false</item>
         <item name="android:fontFamily">sans-serif-medium</item>
     </style>
@@ -134,16 +126,19 @@
     <style name="Widget.Overdrive.M3.Button.Outlined" parent="Widget.Material3.Button.OutlinedButton">
         <item name="strokeColor">?attr/colorOutline</item>
         <item name="cornerRadius">@dimen/card_radius_accent</item>
+        <item name="android:minHeight">48dp</item>
         <item name="android:textAllCaps">false</item>
     </style>
 
     <style name="Widget.Overdrive.M3.Button.Tonal" parent="Widget.Material3.Button.TonalButton">
         <item name="cornerRadius">@dimen/card_radius_accent</item>
+        <item name="android:minHeight">48dp</item>
         <item name="android:textAllCaps">false</item>
     </style>
 
     <style name="Widget.Overdrive.M3.Button.Text" parent="Widget.Material3.Button.TextButton">
-        <item name="cornerRadius">10dp</item>
+        <item name="cornerRadius">@dimen/card_radius_accent</item>
+        <item name="android:minHeight">48dp</item>
         <item name="android:textAllCaps">false</item>
     </style>
 
@@ -264,8 +259,8 @@
          Includes minHeight + horizontal padding so the pill shape reads. -->
     <style name="Widget.Overdrive.M3.Button.Dialog.Primary" parent="Widget.Material3.Button.TonalButton">
         <item name="android:textAllCaps">false</item>
-        <item name="cornerRadius">20dp</item>
-        <item name="android:minHeight">40dp</item>
+        <item name="cornerRadius">@dimen/card_radius_accent</item>
+        <item name="android:minHeight">48dp</item>
         <item name="android:minWidth">88dp</item>
         <item name="android:insetTop">0dp</item>
         <item name="android:insetBottom">0dp</item>
@@ -278,6 +273,7 @@
          the primary CTA visually. M3 spec keeps these as TextButton. -->
     <style name="Widget.Overdrive.M3.Button.Dialog.Neutral" parent="Widget.Material3.Button.TextButton.Dialog">
         <item name="android:textColor">?attr/colorOnSurfaceVariant</item>
+        <item name="android:minHeight">48dp</item>
         <item name="android:textAllCaps">false</item>
         <item name="android:textAppearance">@style/TextAppearance.Material3.LabelLarge</item>
     </style>
@@ -318,6 +314,7 @@
     <style name="SettingsRow" />
 
     <style name="SettingsRow.Inner">
+        <item name="android:minHeight">56dp</item>
         <item name="android:gravity">center_vertical</item>
         <item name="android:orientation">horizontal</item>
         <item name="android:padding">20dp</item>
@@ -340,7 +337,7 @@
     </style>
 
     <!-- ============================================================== -->
-    <!-- M3 Expressive type scale — tighter tracking, medium weights.    -->
+    <!-- M3 type scale — medium weights with locale-safe zero tracking.  -->
     <!-- Each style inherits from the matching Material3 token so we     -->
     <!-- only override the bits we want to tighten; the rest (sizes,     -->
     <!-- line heights) come from the platform spec.                      -->
@@ -348,27 +345,27 @@
 
     <style name="TextAppearance.Overdrive.DisplaySmall" parent="TextAppearance.Material3.DisplaySmall">
         <item name="android:fontFamily">sans-serif-medium</item>
-        <item name="android:letterSpacing">-0.02</item>
+        <item name="android:letterSpacing">0</item>
     </style>
 
     <style name="TextAppearance.Overdrive.HeadlineLarge" parent="TextAppearance.Material3.HeadlineLarge">
         <item name="android:fontFamily">sans-serif-medium</item>
-        <item name="android:letterSpacing">-0.02</item>
+        <item name="android:letterSpacing">0</item>
     </style>
 
     <style name="TextAppearance.Overdrive.HeadlineMedium" parent="TextAppearance.Material3.HeadlineMedium">
         <item name="android:fontFamily">sans-serif-medium</item>
-        <item name="android:letterSpacing">-0.015</item>
+        <item name="android:letterSpacing">0</item>
     </style>
 
     <style name="TextAppearance.Overdrive.HeadlineSmall" parent="TextAppearance.Material3.HeadlineSmall">
         <item name="android:fontFamily">sans-serif-medium</item>
-        <item name="android:letterSpacing">-0.01</item>
+        <item name="android:letterSpacing">0</item>
     </style>
 
     <style name="TextAppearance.Overdrive.TitleLarge" parent="TextAppearance.Material3.TitleLarge">
         <item name="android:fontFamily">sans-serif-medium</item>
-        <item name="android:letterSpacing">-0.005</item>
+        <item name="android:letterSpacing">0</item>
     </style>
 
     <style name="TextAppearance.Overdrive.TitleMedium" parent="TextAppearance.Material3.TitleMedium">
@@ -378,12 +375,12 @@
 
     <style name="TextAppearance.Overdrive.LabelLarge" parent="TextAppearance.Material3.LabelLarge">
         <item name="android:fontFamily">sans-serif-medium</item>
-        <item name="android:letterSpacing">0.01</item>
+        <item name="android:letterSpacing">0</item>
     </style>
 
     <style name="TextAppearance.Overdrive.LabelMedium" parent="TextAppearance.Material3.LabelMedium">
         <item name="android:fontFamily">sans-serif-medium</item>
-        <item name="android:letterSpacing">0.04</item>
+        <item name="android:letterSpacing">0</item>
     </style>
 
 </resources>

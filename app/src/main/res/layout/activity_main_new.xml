@@ -56,7 +56,11 @@
                 android:orientation="vertical"
                 android:paddingBottom="16dp">
 
-                <!-- Accessible alternative to the horizontal expand/collapse swipe. -->
+                <!-- Accessible alternative to the horizontal expand/collapse swipe.
+                     MainActivity rotates this 0°→180° and translates it to the
+                     trailing edge as the rail expands, so it keeps a single
+                     chevron asset and a fixed centre gravity — swapping in
+                     ic_chevron_left mid-slide read as a blink. -->
                 <ImageButton
                     android:id="@+id/railExpandButton"
                     android:layout_width="48dp"
@@ -130,6 +134,11 @@
                     android:layout_height="wrap_content" />
                 <include
                     android:id="@+id/railDestMap"
+                    layout="@layout/item_rail_destination"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+                <include
+                    android:id="@+id/railDestNetwork"
                     layout="@layout/item_rail_destination"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content" />
@@ -220,6 +229,7 @@
                             android:clickable="true"
                             android:focusable="true"
                             android:gravity="center_vertical"
+                            android:minHeight="48dp"
                             android:orientation="horizontal"
                             android:paddingHorizontal="14dp"
                             android:paddingVertical="8dp"
@@ -253,8 +263,8 @@
 
                             <ImageButton
                                 android:id="@+id/btnCopyUrl"
-                                android:layout_width="32dp"
-                                android:layout_height="32dp"
+                                android:layout_width="48dp"
+                                android:layout_height="48dp"
                                 android:layout_marginStart="8dp"
                                 android:background="?attr/selectableItemBackgroundBorderless"
                                 android:contentDescription="@string/cd_copy_url"
@@ -265,8 +275,8 @@
 
                         <ImageButton
                             android:id="@+id/toolbarLanguageButton"
-                            android:layout_width="40dp"
-                            android:layout_height="40dp"
+                            android:layout_width="48dp"
+                            android:layout_height="48dp"
                             android:layout_marginStart="8dp"
                             android:background="?attr/selectableItemBackgroundBorderless"
                             android:contentDescription="@string/settings_language_label"
@@ -282,8 +292,8 @@
                     -->
                     <ImageButton
                         android:id="@+id/toolbarHelpButton"
-                        android:layout_width="40dp"
-                        android:layout_height="40dp"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
                         android:layout_gravity="end|center_vertical"
                         android:layout_marginEnd="12dp"
                         android:background="?attr/selectableItemBackgroundBorderless"

@@ -15,6 +15,7 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -777,6 +778,10 @@ public class AppUpdater {
     public void downloadAndInstall(InstallCallback callback) {
         cancelled = false;
         executor.execute(() -> {
+            boolean cameraRestartPrepared = false;
+            String preparedChannel = null;
+            String preparedPriorTimestamp = null;
+            String preparedPriorDisplayVersion = null;
             try {
                 if (latestDownloadUrl == null) {
                     postInstallError(callback, "No download URL");
@@ -902,6 +907,33 @@ public class AppUpdater {
                     return;
                 }
 
+                // The updater terminates CameraDaemon with SIGKILL below. Its
+                // shutdown hook cannot protect an active trip in that case, so
+                // require the daemon's restart contract to durably checkpoint
+                // and quiesce trip sampling before either kill path is armed.
+                // The endpoint intentionally succeeds without quiescing when
+                // trip recording is disabled, preserving the existing updater
+                // behavior for users who do not record trips.
+                postProgress(callback, "Preparing trip data...");
+                String prepareFailure = prepareCameraDaemonForUpdate();
+                if (prepareFailure != null) {
+                    // A transport failure can happen after the server prepared
+                    // successfully but before its response reached us. Abort is
+                    // therefore required even for an apparent prepare failure.
+                    abortPreparedCameraRestart();
+                    // The APK is deliberately KEPT. Preparation failures are
+                    // retryable conditions, and the download is the expensive
+                    // part — deleting it made every retry re-fetch the whole
+                    // package. cleanupLeftoverApk() at the start of the next
+                    // attempt still replaces it, and the constructor's cleanup
+                    // removes it if the user gives up.
+                    postInstallError(callback,
+                            "Update stopped safely: " + prepareFailure
+                                    + abortRestartWarning());
+                    return;
+                }
+                cameraRestartPrepared = true;
+
                 // Step 3: Save update info BEFORE we touch any daemon (the daemon
                 // process — if we're running inside it — is about to die, and the
                 // app process gets killed by `pm install -r`; either way the
@@ -928,6 +960,9 @@ public class AppUpdater {
                 // restore VERSION_FILE / PREF_UPDATED_VERSION — otherwise the
                 // About/web "current version" shows the build that DIDN'T land.
                 final String priorDisplayVersion = getDisplayVersion(context);
+                preparedChannel = channel;
+                preparedPriorTimestamp = priorUpdateTimestamp;
+                preparedPriorDisplayVersion = priorDisplayVersion;
                 // Set the just-updated MARKER. Only store remoteVersion as the
                 // label when it's canonical — a bare/version-less "unknown"
                 // must not clobber a prior valid label.
@@ -968,12 +1003,37 @@ public class AppUpdater {
                 //   on its own; our death is fine.
                 if (canWriteLocalTmp()) {
                     postProgress(callback, "Stopping daemons & installing...");
-                    runDetachedInstall(callback, channel, priorUpdateTimestamp, priorDisplayVersion);
+                    boolean detachedStarted = runDetachedInstall(
+                            callback, channel, priorUpdateTimestamp,
+                            priorDisplayVersion);
+                    if (!detachedStarted) {
+                        abortPreparedCameraRestart();
+                        rollbackPreparedUpdateMetadata(
+                                channel, priorUpdateTimestamp,
+                                priorDisplayVersion);
+                    }
+                    // On success the detached script owns the imminent kill.
+                    // On failure abortPreparedCameraRestart resumed sampling.
+                    cameraRestartPrepared = false;
                     return;
                 }
 
                 postProgress(callback, "Stopping daemons...");
-                stopAllDaemons();
+                boolean cameraStopped = stopAllDaemons();
+                if (!cameraStopped) {
+                    abortPreparedCameraRestart();
+                    rollbackPreparedUpdateMetadata(
+                            channel, priorUpdateTimestamp,
+                            priorDisplayVersion);
+                    cameraRestartPrepared = false;
+                    postInstallError(callback,
+                            "Update stopped safely: camera daemon did not stop"
+                                    + abortRestartWarning());
+                    return;
+                }
+                // stopAllDaemons has now issued both prepared camera kill
+                // sweeps; this process can no longer cancel that transition.
+                cameraRestartPrepared = false;
                 Thread.sleep(3000);
 
                 postProgress(callback, "Installing...");
@@ -1078,6 +1138,15 @@ public class AppUpdater {
                     runCallback(callback::onSuccess);
                 }
             } catch (Exception e) {
+                if (cameraRestartPrepared) {
+                    abortPreparedCameraRestart();
+                    if (preparedChannel != null) {
+                        rollbackPreparedUpdateMetadata(
+                                preparedChannel,
+                                preparedPriorTimestamp,
+                                preparedPriorDisplayVersion);
+                    }
+                }
                 Log.e(TAG, "Install error: " + e.getMessage());
                 postInstallError(callback, e.getMessage());
             }
@@ -1421,6 +1490,263 @@ public class AppUpdater {
         }
     }
 
+    static boolean isSuccessfulCameraPrepareStatus(int statusCode) {
+        return statusCode >= 200 && statusCode < 300;
+    }
+
+    /**
+     * Ask CameraDaemon to durably checkpoint active-trip state and stop its
+     * media pipeline before the updater launches any SIGKILL command.
+     *
+     * @return null on confirmed preparation, otherwise a user-facing reason
+     */
+    /** Attempts for a refusal the daemon reports as transient. */
+    private static final int CAMERA_PREPARE_MAX_ATTEMPTS = 6;
+    /** Matches the daemon's 1s pending-persistence drain cadence. */
+    private static final long CAMERA_PREPARE_RETRY_DELAY_MS = 1000;
+
+    /**
+     * Ask the daemon to prepare for the kill, retrying while it reports a
+     * transient reason.
+     *
+     * <p>Nearly every refusal is a few-second condition — a just-ended trip
+     * still draining to disk, trip analytics still starting on its own thread,
+     * or a final flush in progress. A single attempt turned those into a failed
+     * update, which is why this reported "rejected restart 503" so often when
+     * updating shortly after parking.
+     *
+     * @return null on confirmed preparation, otherwise a user-facing reason
+     */
+    private String prepareCameraDaemonForUpdate() {
+        String lastFailure = null;
+        for (int attempt = 1; attempt <= CAMERA_PREPARE_MAX_ATTEMPTS; attempt++) {
+            if (cancelled) return "Cancelled";
+            CameraPrepareAttempt result = attemptCameraDaemonPrepare();
+            if (result.prepared) {
+                if (attempt > 1) {
+                    Log.i(TAG, "Camera daemon prepared for restart on attempt "
+                            + attempt);
+                }
+                return null;
+            }
+            lastFailure = result.failure;
+            if (!result.retryable || attempt == CAMERA_PREPARE_MAX_ATTEMPTS) {
+                break;
+            }
+            Log.i(TAG, "Camera daemon not ready for restart (attempt " + attempt
+                    + "/" + CAMERA_PREPARE_MAX_ATTEMPTS + "): " + lastFailure
+                    + " — retrying");
+            try {
+                Thread.sleep(CAMERA_PREPARE_RETRY_DELAY_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return lastFailure;
+            }
+        }
+        return lastFailure;
+    }
+
+    /** Outcome of one prepare-restart round trip. */
+    private static final class CameraPrepareAttempt {
+        final boolean prepared;
+        final boolean retryable;
+        final String failure;
+
+        CameraPrepareAttempt(boolean prepared, boolean retryable, String failure) {
+            this.prepared = prepared;
+            this.retryable = retryable;
+            this.failure = failure;
+        }
+    }
+
+    private CameraPrepareAttempt attemptCameraDaemonPrepare() {
+        HttpURLConnection connection = null;
+        try {
+            connection = com.overdrive.app.util.DaemonHttpClient.open(
+                    "/api/surveillance/prepare-restart",
+                    "POST",
+                    3000,
+                    10000);
+            connection.setDoOutput(true);
+            try (java.io.OutputStream body = connection.getOutputStream()) {
+                body.write(new byte[0]);
+            }
+            int statusCode = connection.getResponseCode();
+            if (isSuccessfulCameraPrepareStatus(statusCode)) {
+                return new CameraPrepareAttempt(true, false, null);
+            }
+            // The body names the actual precondition AND whether waiting can
+            // clear it. Reporting only the status code made every distinct
+            // cause look like the same failure.
+            JSONObject error = readErrorBody(connection);
+            String detail = error != null
+                    ? error.optString("error", "").trim() : "";
+            // A failed pipeline teardown is a 503 that retrying cannot fix, so
+            // the daemon's own verdict decides — not the status code. An absent
+            // or unparseable verdict defaults to retryable so a body we cannot
+            // read never silently disables the retry.
+            boolean retryable = statusCode == 503
+                    && (error == null || error.optBoolean("retryable", true));
+            String reason = !detail.isEmpty()
+                    ? detail
+                    : "camera daemon rejected restart (HTTP " + statusCode + ")";
+            return new CameraPrepareAttempt(false, retryable, reason);
+        } catch (Exception e) {
+            String detail = e.getMessage();
+            if (detail == null || detail.trim().isEmpty()) {
+                detail = e.getClass().getSimpleName();
+            }
+            // A transport failure can mean the daemon prepared but the response
+            // was lost, so this is not retried blindly.
+            return new CameraPrepareAttempt(false, false,
+                    "camera daemon preparation failed: " + detail);
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    /**
+     * Parse a failed daemon response body. Returns null when there is no
+     * readable JSON object, so the caller can distinguish "no verdict" from
+     * an explicit one.
+     */
+    private static JSONObject readErrorBody(HttpURLConnection connection) {
+        InputStream stream = null;
+        try {
+            stream = connection.getErrorStream();
+            if (stream == null) return null;
+            java.io.ByteArrayOutputStream buffer =
+                    new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[2048];
+            int n;
+            // Bounded: a daemon error body is a short JSON object. Guard the
+            // WRITE, not the next read — testing after the read discarded the
+            // chunk that crossed the cap and left truncated, unparseable JSON.
+            while ((n = stream.read(chunk)) != -1) {
+                if (buffer.size() + n > 8192) break;
+                buffer.write(chunk, 0, n);
+            }
+            String body = buffer.toString("UTF-8").trim();
+            if (body.isEmpty()) return null;
+            return new JSONObject(body);
+        } catch (Exception ignored) {
+            return null;
+        } finally {
+            if (stream != null) {
+                try { stream.close(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Set when abort-restart could not resume trip sampling, so the caller can
+     * tell the user their trip is no longer recording. Null when the last abort
+     * succeeded or none was attempted.
+     */
+    private volatile String lastAbortRestartFailure;
+
+    /**
+     * Suffix warning the user that trip recording did not resume, or "" when it
+     * did. Appended to the safe-stop message so a frozen recorder is visible
+     * instead of hidden behind "stopped safely".
+     */
+    private String abortRestartWarning() {
+        String failure = lastAbortRestartFailure;
+        return failure == null ? ""
+                : " (warning: trip recording did not resume — " + failure
+                        + "; restart the camera daemon to resume)";
+    }
+
+    /**
+     * Best-effort cancellation for a prepare request whose subsequent install
+     * handoff failed. The endpoint is idempotent when trips are disabled or no
+     * active trip was quiesced.
+     */
+    private void abortPreparedCameraRestart() {
+        HttpURLConnection connection = null;
+        try {
+            connection = com.overdrive.app.util.DaemonHttpClient.open(
+                    "/api/surveillance/abort-restart",
+                    "POST",
+                    2000,
+                    3000);
+            connection.setDoOutput(true);
+            try (java.io.OutputStream body = connection.getOutputStream()) {
+                body.write(new byte[0]);
+            }
+            int statusCode = connection.getResponseCode();
+            if (!isSuccessfulCameraPrepareStatus(statusCode)) {
+                // A 503 here means trip sampling stayed FROZEN. The update
+                // stopped safely, but the live trip records nothing until the
+                // daemon restarts, so this must be loud rather than a warning
+                // buried in the log.
+                JSONObject error = readErrorBody(connection);
+                String detail = error != null
+                        ? error.optString("error", "").trim() : "";
+                Log.e(TAG, "abort-restart returned HTTP " + statusCode
+                        + (detail.isEmpty() ? "" : ": " + detail)
+                        + " — trip sampling may still be frozen");
+                lastAbortRestartFailure = detail.isEmpty()
+                        ? "camera daemon could not resume trip recording"
+                        : detail;
+            } else {
+                lastAbortRestartFailure = null;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not abort prepared camera restart: "
+                    + e.getMessage());
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    /**
+     * Restore state written immediately before a prepared kill when no kill
+     * handoff occurred. This keeps a safe abort from suppressing the same
+     * update on the next attempt.
+     */
+    private void rollbackPreparedUpdateMetadata(
+            String channel,
+            String priorUpdateTimestamp,
+            String priorDisplayVersion) {
+        try {
+            SharedPreferences.Editor editor =
+                    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                            .edit()
+                            .putBoolean(PREF_JUST_UPDATED, false)
+                            .putString(prefKeyForChannel(channel),
+                                    priorUpdateTimestamp != null
+                                            ? priorUpdateTimestamp : "");
+            if (priorDisplayVersion != null
+                    && !priorDisplayVersion.isEmpty()
+                    && !DISPLAY_VERSION_FALLBACK.equals(priorDisplayVersion)) {
+                editor.putString(PREF_UPDATED_VERSION, priorDisplayVersion);
+            } else {
+                editor.remove(PREF_UPDATED_VERSION);
+            }
+            editor.commit();
+
+            if (priorUpdateTimestamp != null
+                    && !priorUpdateTimestamp.isEmpty()) {
+                saveLastUpdateTimestamp(channel, priorUpdateTimestamp);
+            } else {
+                cleanup(timestampFileForChannel(channel));
+            }
+            cleanup(UPDATE_IN_PROGRESS_FILE + " " + POST_UPDATE_FILE + " "
+                    + APK_PATH + " /data/local/tmp/overdrive_install.sh "
+                    + "/data/local/tmp/overdrive_install.sh.tmp "
+                    + "/data/local/tmp/camera_daemon.disabled "
+                    + "/data/local/tmp/acc_sentry_daemon.disabled");
+        } catch (Exception e) {
+            Log.w(TAG, "Could not roll back aborted update metadata: "
+                    + e.getMessage());
+        }
+    }
+
     /**
      * Daemon-process install path: write a self-contained install script and
      * fire it off detached (setsid + null fds) so it survives our death.
@@ -1440,9 +1766,12 @@ public class AppUpdater {
      * The webapp tracks success via /api/update/progress + the app coming
      * back online; the SharedPreferences `PREF_JUST_UPDATED` flag we wrote
      * in step 3 is what the new MainActivity reads to confirm.
+     *
+     * @return true only after the detached script process was launched
      */
-    private void runDetachedInstall(InstallCallback callback, String channel, String priorUpdateTimestamp,
-                                    String priorDisplayVersion) {
+    private boolean runDetachedInstall(InstallCallback callback, String channel,
+                                       String priorUpdateTimestamp,
+                                       String priorDisplayVersion) {
         String scriptPath = "/data/local/tmp/overdrive_install.sh";
         String logPath = "/data/local/tmp/overdrive_install.log";
 
@@ -1745,9 +2074,11 @@ public class AppUpdater {
             // truth from this point. The original comment ("Just return
             // and let the script + webapp poller take it from here") was
             // correct; the runCallback below contradicted it. Removed.
+            return true;
         } catch (Exception e) {
             Log.e(TAG, "Detached install failed: " + e.getMessage());
             postInstallError(callback, "Detached install failed: " + e.getMessage());
+            return false;
         }
     }
 
@@ -1761,7 +2092,7 @@ public class AppUpdater {
         } catch (Exception ignored) {}
     }
 
-    private void stopAllDaemons() {
+    private boolean stopAllDaemons() {
         Log.i(TAG, "Stopping all daemons...");
 
         com.overdrive.app.launcher.AdbDaemonLauncher launcher = getAdbLauncher();
@@ -1925,12 +2256,19 @@ public class AppUpdater {
                 "killall -9 sing-box 2>/dev/null\n" +
                 "sleep 1\n" +
                 "rm -f /data/local/tmp/*_daemon.lock 2>/dev/null\n" +
+                "CAMERA_PIDS=$(ps -A -o PID,ARGS | grep -F 'cam_daemon' "
+                + "| grep -v grep | awk -v self=$$ '$1 != self {print $1}')\n" +
+                "if [ -n \"$CAMERA_PIDS\" ]; then "
+                + "echo \"camera daemon still running: $CAMERA_PIDS\" >&2; "
+                + "exit 1; fi\n" +
                 "echo done\n";
 
         final boolean[] sweepDone = {false};
+        final boolean[] cameraStopConfirmed = {false};
         runShellScript(sweepScript, new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
             @Override public void onLog(String m) {}
             @Override public void onLaunched() {
+                cameraStopConfirmed[0] = true;
                 sweepDone[0] = true;
                 synchronized (sweepDone) { sweepDone.notify(); }
             }
@@ -1944,9 +2282,16 @@ public class AppUpdater {
             synchronized (sweepDone) {
                 if (!sweepDone[0]) sweepDone.wait(5000);
             }
-        } catch (InterruptedException ignored) {}
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
 
-        Log.i(TAG, "All daemons and watchdogs stopped");
+        if (cameraStopConfirmed[0]) {
+            Log.i(TAG, "All daemons and watchdogs stopped");
+        } else {
+            Log.w(TAG, "Camera daemon stop was not confirmed; update aborted");
+        }
+        return cameraStopConfirmed[0];
     }
 
     /** Strict alpha tag allowlist: bare "alpha" or "alpha-v<semver>". */

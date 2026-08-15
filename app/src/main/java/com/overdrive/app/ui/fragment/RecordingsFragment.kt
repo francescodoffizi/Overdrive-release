@@ -26,6 +26,7 @@ import com.google.android.material.chip.ChipGroup
 import com.google.android.material.datepicker.CalendarConstraints
 import com.google.android.material.datepicker.DateValidatorPointBackward
 import com.google.android.material.datepicker.MaterialDatePicker
+import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.overdrive.app.R
 import com.overdrive.app.ui.model.RecordingFile
 import com.overdrive.app.ui.util.RecordingScanner
@@ -199,7 +200,12 @@ class RecordingsFragment : Fragment() {
             state.getStringArray(KEY_ACTORS)?.let { actorClassFilter.addAll(it) }
             state.getStringArray(KEY_SEVERITY)?.let { severityFilter.addAll(it) }
             state.getStringArray(KEY_DASHCAM_TYPES)?.let { dashcamTypes.addAll(it) }
-            state.getStringArray(KEY_PLACES)?.let { placeFilter.addAll(it) }
+            state.getStringArray(KEY_PLACES)
+                ?.firstOrNull()
+                ?.trim()
+                ?.lowercase()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(placeFilter::add)
             state.getStringArray(KEY_STORAGE)?.let { storageFilter.addAll(it) }
             val y = state.getInt(KEY_DATE_Y, -1)
             val m = state.getInt(KEY_DATE_M, -1)
@@ -240,6 +246,7 @@ class RecordingsFragment : Fragment() {
         setupChipFilters(view)
         setupPlaceSearch(view)
         setupResetButton(view)
+        setupLibraryActions(view)
 
         updateDateHeader(view)
         renderActiveFilterAffordances(view)
@@ -257,11 +264,14 @@ class RecordingsFragment : Fragment() {
             fullscreenBackCallback
         )
 
-        // If we're returning to a recreated view while a player still exists
-        // in the child manager (e.g. rotation), re-bind the host callback so
-        // its maximize button keeps working. The fragment's own state for
-        // isFullscreen survives because we mirror it on the fragment itself.
-        rebindActiveInlinePlayer()
+        if (isLandscape) {
+            // Re-bind a restored landscape player to its new host view.
+            rebindActiveInlinePlayer()
+        } else {
+            // Portrait deliberately closes inline playback. Removal is posted
+            // so child FragmentManager restoration can finish first.
+            closeRestoredInlinePlayerInPortrait(view)
+        }
     }
 
     override fun onResume() {
@@ -277,6 +287,16 @@ class RecordingsFragment : Fragment() {
         // Bounce the library so it re-scans (handles new clips captured while
         // the page was hidden).
         libraryFragment?.let { applyAllFiltersTo(it) }
+        if (!isLandscape) {
+            view?.let(::closeRestoredInlinePlayerInPortrait)
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (newConfig.orientation != Configuration.ORIENTATION_LANDSCAPE) {
+            view?.let(::closeRestoredInlinePlayerInPortrait)
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -362,6 +382,7 @@ class RecordingsFragment : Fragment() {
             severityFilter.clear()
             dashcamTypes.clear()
             placeFilter.clear()
+            storageFilter.clear()
             placeContainsQuery = ""
             dateNarrowed = false
             view?.let {
@@ -482,13 +503,13 @@ class RecordingsFragment : Fragment() {
         // playlist in chronological order (oldest->newest). "Next" then plays
         // the NEWER clip while the library RecyclerView stays newest-first.
         val ordered = currentPlaylist.asReversed()
-        val paths = ordered.map { it.path }.toTypedArray()
+        val paths = ordered.map { it.playbackSource }.toTypedArray()
         val titles = ordered.map { it.name }.toTypedArray()
         val playerIndex = ordered.indexOfFirst { it.path == recording.path }
 
         val player = VideoPlayerFragment().apply {
             arguments = Bundle().apply {
-                putString(VideoPlayerFragment.ARG_VIDEO_PATH, recording.path)
+                putString(VideoPlayerFragment.ARG_VIDEO_PATH, recording.playbackSource)
                 putString(VideoPlayerFragment.ARG_VIDEO_TITLE, recording.name)
                 putBoolean(VideoPlayerFragment.ARG_INLINE, true)
                 putStringArray(VideoPlayerFragment.ARG_PLAYLIST_PATHS, paths)
@@ -525,6 +546,45 @@ class RecordingsFragment : Fragment() {
         }
         // Re-apply the host-side layout to whatever state we restored into.
         view?.let { applyFullscreenLayout(it, playerFullscreen, animate = false) }
+        fullscreenBackCallback.isEnabled = playerFullscreen
+    }
+
+    /**
+     * Remove an inline player restored from a landscape child-fragment state
+     * after the parent recreates with the portrait layout.
+     *
+     * The portrait XML keeps a zero-size [R.id.previewContainer] so
+     * FragmentManager can complete restoration without throwing. The child
+     * player independently refuses to prepare media without [R.id.twoPaneBody],
+     * so this posted removal cannot produce hidden/background playback.
+     */
+    private fun closeRestoredInlinePlayerInPortrait(hostView: View) {
+        if (isLandscape) return
+        playerFullscreen = false
+        currentInlineIndex = -1
+        fullscreenBackCallback.isEnabled = false
+
+        hostView.post {
+            if (view !== hostView || isLandscape) return@post
+            val manager = childFragmentManager
+            val player = (manager.findFragmentByTag(TAG_INLINE_PLAYER)
+                ?: manager.findFragmentById(R.id.previewContainer)) as? VideoPlayerFragment
+                ?: return@post
+            player.onFullscreenToggle = null
+            runCatching {
+                manager.beginTransaction()
+                    .remove(player)
+                    .commitNowAllowingStateLoss()
+            }.onFailure {
+                // If FragmentManager is still executing its restore pass,
+                // enqueue removal for the next safe transaction boundary.
+                runCatching {
+                    manager.beginTransaction()
+                        .remove(player)
+                        .commitAllowingStateLoss()
+                }
+            }
+        }
     }
 
     /**
@@ -666,28 +726,179 @@ class RecordingsFragment : Fragment() {
     }
 
     /**
-     * Per-segment chip row visibility:
-     *  - Dashcam: only the Type row (Normal / Proximity) is visible. The
-     *    What + Severity rows make no sense for continuous-record cam_*
-     *    clips (no actor classification), so they're hidden.
-     *  - Surveillance: What + Severity rows are visible, Type row is hidden.
+     * Per-segment quick-chip visibility inside the single compact filter
+     * row (both orientations host the chip sections in one horizontal
+     * scroller on the date row / Row C):
+     *  - Dashcam: only the Type section (Normal / Proximity) is visible.
+     *    The What + Severity sections make no sense for continuous-record
+     *    cam_* clips (no actor classification), so they're hidden.
+     *  - Replays: no quick-filter chips (pre-record ring clips carry no
+     *    type/actor/severity metadata).
+     *  - Surveillance: What + Severity sections are visible, Type hidden.
      *
-     * On the landscape layout there is no separate `rowWhatFilter` — the
-     * What + Severity chips share a single combined row whose id is
-     * `rowSeverityFilter`. The null-safe `findViewById` handles both cases.
+     * The Place section ([R.id.rowPlaceFilter]) is owned by
+     * [renderPlaceChips] — visible only when geocoded clips exist.
+     *
+     * Storage narrowing stays sheet-only — it's an advanced, rarely-used
+     * dimension and the inline strip is deliberately compact so the
+     * library grid / player get the height.
      */
     private fun applyChipRowVisibility(view: View) {
         val isDashcam = currentSource == Source.DASHCAM
-        // Replays: single type, no actor/severity sidecars — every chip row
-        // is meaningless, so hide all three (place/storage/date still apply
-        // and live outside these rows).
-        val isReplays = currentSource == Source.REPLAYS
+        val isSurveillance = currentSource == Source.SURVEILLANCE
         view.findViewById<View>(R.id.rowTypeFilter)?.visibility =
             if (isDashcam) View.VISIBLE else View.GONE
         view.findViewById<View>(R.id.rowWhatFilter)?.visibility =
-            if (isDashcam || isReplays) View.GONE else View.VISIBLE
-        view.findViewById<View>(R.id.rowSeverityFilter)?.visibility =
-            if (isDashcam || isReplays) View.GONE else View.VISIBLE
+            if (isSurveillance) View.VISIBLE else View.GONE
+        view.findViewById<View>(R.id.scrollSeverityChips)?.visibility =
+            if (isSurveillance) View.VISIBLE else View.GONE
+        view.findViewById<View>(R.id.rowStorageFilter)?.visibility = View.GONE
+        // Place chips are segment-scoped; re-render so their section
+        // visibility tracks the availablePlaces set for the new segment.
+        renderPlaceChips(view)
+    }
+
+    private fun setupLibraryActions(view: View) {
+        view.findViewById<View>(R.id.btnSelectRecordings)?.setOnClickListener {
+            libraryFragment?.enterSelectionMode()
+        }
+        view.findViewById<View>(R.id.btnOpenRecordingFilters)?.setOnClickListener {
+            openRecordingFilters()
+        }
+    }
+
+    private fun openRecordingFilters() {
+        val ctx = context ?: return
+        val sheet = BottomSheetDialog(ctx, R.style.Theme_Overdrive_M3_BottomSheet)
+        val content = LayoutInflater.from(ctx)
+            .inflate(R.layout.sheet_recording_library_filters, null, false)
+        // M3 sheets are edge-to-edge: without this the Apply button sits
+        // behind the system navigation bar on the head unit.
+        com.overdrive.app.ui.util.SheetInsets.padForNavigationBar(content)
+        sheet.setContentView(content)
+
+        val localTypes = dashcamTypes.toMutableSet()
+        val localActors = actorClassFilter.toMutableSet()
+        val localSeverities = severityFilter.toMutableSet()
+        val localStorages = storageFilter.toMutableSet()
+        var localPlace = placeFilter.firstOrNull()
+        var clearSearchOnApply = false
+
+        val typeNormal = content.findViewById<Chip>(R.id.chipTypeNormal)
+        val typeProximity = content.findViewById<Chip>(R.id.chipTypeProximity)
+        val actorAny = content.findViewById<Chip>(R.id.chipActorAny)
+        val actorPerson = content.findViewById<Chip>(R.id.chipActorPerson)
+        val actorVehicle = content.findViewById<Chip>(R.id.chipActorVehicle)
+        val actorBike = content.findViewById<Chip>(R.id.chipActorBike)
+        val actorAnimal = content.findViewById<Chip>(R.id.chipActorAnimal)
+        val severityAny = content.findViewById<Chip>(R.id.chipSevAny)
+        val severityAlert = content.findViewById<Chip>(R.id.chipSevAlert)
+        val severityCritical = content.findViewById<Chip>(R.id.chipSevCritical)
+        val storageAny = content.findViewById<Chip>(R.id.chipStorageAny)
+        val storageInternal = content.findViewById<Chip>(R.id.chipStorageInternal)
+        val storageSd = content.findViewById<Chip>(R.id.chipStorageSd)
+        val storageUsb = content.findViewById<Chip>(R.id.chipStorageUsb)
+
+        fun syncChecks() {
+            typeNormal.isChecked = "NORMAL" in localTypes
+            typeProximity.isChecked = "PROXIMITY" in localTypes
+            actorAny.isChecked = localActors.isEmpty()
+            actorPerson.isChecked = "person" in localActors
+            actorVehicle.isChecked = "vehicle" in localActors
+            actorBike.isChecked = "bike" in localActors
+            actorAnimal.isChecked = "animal" in localActors
+            severityAny.isChecked = localSeverities.isEmpty()
+            severityAlert.isChecked = "ALERT" in localSeverities
+            severityCritical.isChecked = "CRITICAL" in localSeverities
+            storageAny.isChecked = localStorages.isEmpty()
+            storageInternal.isChecked = "INTERNAL" in localStorages
+            storageSd.isChecked = "SD_CARD" in localStorages
+            storageUsb.isChecked = "USB" in localStorages
+        }
+
+        fun toggle(set: MutableSet<String>, value: String) {
+            if (!set.add(value)) set.remove(value)
+            syncChecks()
+        }
+
+        typeNormal.setOnClickListener { toggle(localTypes, "NORMAL") }
+        typeProximity.setOnClickListener { toggle(localTypes, "PROXIMITY") }
+        actorAny.setOnClickListener { localActors.clear(); syncChecks() }
+        actorPerson.setOnClickListener { toggle(localActors, "person") }
+        actorVehicle.setOnClickListener { toggle(localActors, "vehicle") }
+        actorBike.setOnClickListener { toggle(localActors, "bike") }
+        actorAnimal.setOnClickListener { toggle(localActors, "animal") }
+        severityAny.setOnClickListener { localSeverities.clear(); syncChecks() }
+        severityAlert.setOnClickListener { toggle(localSeverities, "ALERT") }
+        severityCritical.setOnClickListener { toggle(localSeverities, "CRITICAL") }
+        storageAny.setOnClickListener { localStorages.clear(); syncChecks() }
+        storageInternal.setOnClickListener { toggle(localStorages, "INTERNAL") }
+        storageSd.setOnClickListener { toggle(localStorages, "SD_CARD") }
+        storageUsb.setOnClickListener { toggle(localStorages, "USB") }
+
+        content.findViewById<View>(R.id.sheetTypeSection).visibility =
+            if (currentSource == Source.DASHCAM) View.VISIBLE else View.GONE
+        val surveillanceVisibility =
+            if (currentSource == Source.SURVEILLANCE) View.VISIBLE else View.GONE
+        content.findViewById<View>(R.id.sheetActorSection).visibility = surveillanceVisibility
+        content.findViewById<View>(R.id.sheetSeveritySection).visibility = surveillanceVisibility
+
+        val placeSection = content.findViewById<View>(R.id.sheetPlaceSection)
+        val placeGroup = content.findViewById<ChipGroup>(R.id.sheetPlaceChipGroup)
+        placeSection.visibility = if (availablePlaces.isEmpty()) View.GONE else View.VISIBLE
+        val placeById = mutableMapOf<Int, String?>()
+        fun addPlaceChip(label: String, key: String?) {
+            val chip = Chip(ctx).apply {
+                id = View.generateViewId()
+                text = label
+                isCheckable = true
+                isChecked = key == localPlace || (key == null && localPlace == null)
+            }
+            placeById[chip.id] = key
+            placeGroup.addView(chip)
+        }
+        addPlaceChip(getString(R.string.recording_lib_chip_any), null)
+        availablePlaces.forEach { addPlaceChip(it, it.lowercase()) }
+        placeGroup.setOnCheckedStateChangeListener { _, checkedIds ->
+            localPlace = checkedIds.firstOrNull()?.let(placeById::get)
+        }
+
+        content.findViewById<View>(R.id.btnFilterReset).setOnClickListener {
+            localTypes.clear()
+            localActors.clear()
+            localSeverities.clear()
+            localStorages.clear()
+            localPlace = null
+            clearSearchOnApply = true
+            placeGroup.check(placeById.entries.first { it.value == null }.key)
+            syncChecks()
+        }
+        content.findViewById<View>(R.id.btnFilterApply).setOnClickListener {
+            dashcamTypes.clear()
+            dashcamTypes.addAll(localTypes)
+            actorClassFilter.clear()
+            actorClassFilter.addAll(localActors)
+            severityFilter.clear()
+            severityFilter.addAll(localSeverities)
+            storageFilter.clear()
+            storageFilter.addAll(localStorages)
+            placeFilter.clear()
+            localPlace?.let(placeFilter::add)
+            if (clearSearchOnApply) {
+                placeContainsQuery = ""
+                view?.let(::clearPlaceSearchInput)
+            }
+            view?.let {
+                syncChipChecks(it)
+                renderPlaceChips(it)
+                onFiltersChanged(it)
+            }
+            refreshCounts()
+            sheet.dismiss()
+        }
+
+        syncChecks()
+        sheet.show()
     }
 
     private fun setupSettingsAction(view: View) {
@@ -864,6 +1075,37 @@ class RecordingsFragment : Fragment() {
         val editText = view.findViewById<EditText>(R.id.etPlaceSearch) ?: return
         val clearBtn = view.findViewById<ImageButton>(R.id.btnClearPlaceSearch)
 
+        // Portrait collapses the search card behind a toggle icon so the
+        // library grid gets the height back; landscape hosts the card in
+        // the title row permanently and has no toggle (null-safe).
+        val searchCard = view.findViewById<View>(R.id.cardPlaceSearch)
+        view.findViewById<View>(R.id.btnTogglePlaceSearch)?.setOnClickListener {
+            val card = searchCard ?: return@setOnClickListener
+            if (card.visibility == View.VISIBLE) {
+                // Collapsing counts as "dismiss": kill any PENDING debounce
+                // unconditionally — a keystroke inside the 300ms window
+                // hasn't reached placeContainsQuery yet, but its runnable
+                // would otherwise fire after the card is gone and apply an
+                // invisible filter. Then drop any already-active query.
+                placeSearchRunnable?.let { mainHandler.removeCallbacks(it) }
+                placeSearchRunnable = null
+                if (!editText.text.isNullOrEmpty()) editText.setText("")
+                if (placeContainsQuery.isNotEmpty()) {
+                    placeContainsQuery = ""
+                    renderActiveFilterAffordances(view)
+                    libraryFragment?.let { applyAllFiltersTo(it) }
+                    refreshCounts()
+                }
+                card.visibility = View.GONE
+            } else {
+                card.visibility = View.VISIBLE
+                editText.requestFocus()
+            }
+        }
+        // Auto-expand when a query is active (e.g. restored after rotation
+        // or process death) so the narrowing is always visible.
+        if (placeContainsQuery.isNotEmpty()) searchCard?.visibility = View.VISIBLE
+
         // Restore from saved state if we got rotated mid-search.
         if (placeContainsQuery.isNotEmpty() && editText.text.toString() != placeContainsQuery) {
             editText.setText(placeContainsQuery)
@@ -940,6 +1182,7 @@ class RecordingsFragment : Fragment() {
         // on the date card.
         view.findViewById<MaterialButton>(R.id.btnFilterReset)?.visibility =
             if (chipsActive) View.VISIBLE else View.GONE
+        view.findViewById<View>(R.id.btnOpenRecordingFilters)?.isSelected = chipsActive
         // Toggle the inline clear-X button on the search card so the user
         // can wipe the search without manually backspacing every char.
         view.findViewById<ImageButton>(R.id.btnClearPlaceSearch)?.visibility =
@@ -1425,6 +1668,7 @@ class RecordingsFragment : Fragment() {
                 if (key in placeFilter) {
                     placeFilter.remove(key)
                 } else {
+                    placeFilter.clear()
                     placeFilter.add(key)
                 }
                 onPlaceFilterChanged(view)

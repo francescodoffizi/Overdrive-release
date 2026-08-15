@@ -10,6 +10,7 @@ import org.json.JSONObject;
 
 import java.io.OutputStream;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * RoadSense HTTP API — backs the road-sense.html settings page's destructive
@@ -49,6 +50,10 @@ public class RoadSenseApiHandler {
         }
         if (path.equals("/api/roadsense/delete-cloud") && method.equals("POST")) {
             handleDeleteCloud(out);
+            return true;
+        }
+        if (path.equals("/api/roadsense/test-chime") && method.equals("POST")) {
+            handleTestChime(out, body);
             return true;
         }
         // Map view: hazards in a viewport (path may carry a ?bbox= query string).
@@ -101,6 +106,136 @@ public class RoadSenseApiHandler {
         resp.put("hazardsDeleted", hazards);
         resp.put("labelsDeleted", labels);
         logger.info(TAG + ": deleted local — hazards=" + hazards + " labels=" + labels);
+        HttpResponse.sendJson(out, resp.toString());
+    }
+
+    /** The chime channels the UI offers — mirrors RoadSenseConfig's AUDIO_CHANNELS. */
+    private static boolean isSupportedChimeChannel(String ch) {
+        return com.overdrive.app.roadsense.config.RoadSenseAudioChannels.isSupported(ch);
+    }
+
+    /**
+     * POST /api/roadsense/test-chime — dispatch one approach chime NOW.
+     * Body: { "severity": "minor"|"moderate"|"severe",
+     *         "channel": "navigation"|"media"|…, "volumePercent": 10..100 }
+     *
+     * <p>Exists because the real chime only fires in the DRIVING regime while approaching
+     * an already-stored hazard. This invokes the SAME
+     * {@code AudioPlaybackController.playRawResource} call as the live cue, with identical
+     * resource names, volumes, and channel plumbing.
+     *
+     * <p><b>{@code success}/{@code dispatched} mean queued, not audible.</b> The cross-process
+     * {@code am} launch and MediaPlayer preparation are asynchronous, so this response cannot
+     * confirm that sound reached the speakers. {@code playbackConfirmed} is therefore always
+     * false; the control is an on-car hearing and volume check.
+     */
+    private static void handleTestChime(OutputStream out, String body) throws Exception {
+        handleTestChime(out, body,
+                com.overdrive.app.byd.AudioPlaybackController::playRawResource);
+    }
+
+    @FunctionalInterface
+    interface ChimeDispatcher {
+        boolean dispatch(String resourceName, String channel, int volumePercent);
+    }
+
+    static void handleTestChime(OutputStream out, String body, ChimeDispatcher dispatcher)
+            throws Exception {
+        JSONObject resp = new JSONObject();
+        // Guarded parse, mirroring handleAudioLibraryPlay. The try wraps ONLY the parse:
+        // sendJsonError writes a COMPLETE HTTP response (headers + body), so if a
+        // sendJsonError call sat inside this try and threw, the catch would write a SECOND
+        // response onto the same socket and corrupt it.
+        JSONObject req;
+        try {
+            req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
+        } catch (Exception e) {
+            HttpResponse.sendJsonError(out, "Invalid JSON");
+            return;
+        }
+        String severity = req.optString("severity", "moderate").trim().toLowerCase(Locale.ROOT);
+        if (!severity.equals("minor")
+                && !severity.equals("moderate")
+                && !severity.equals("severe")) {
+            HttpResponse.sendJsonError(out, "Unsupported severity: " + severity);
+            return;
+        }
+        String channel = null;
+        String ch = req.optString("channel", "").trim().toLowerCase(Locale.ROOT);
+        Object rawVolume = req.has("volumePercent")
+                ? req.opt("volumePercent")
+                : com.overdrive.app.roadsense.config.RoadSenseChimeLevels.DEFAULT_MASTER_PERCENT;
+        Integer masterVolume = com.overdrive.app.roadsense.config.RoadSenseChimeLevels
+                .validatedMasterPercent(rawVolume);
+        if (masterVolume == null) {
+            HttpResponse.sendJsonError(out,
+                    "RoadSense chime volume must be a whole number from 10 to 100");
+            return;
+        }
+        // REJECT an unknown channel rather than passing it through. An unrecognised name
+        // silently resolves to STREAM_MUSIC downstream, so a typo would play on media while
+        // reporting the channel asked for — exactly the false negative this button exists
+        // to rule out.
+        if (!ch.isEmpty()) {
+            if (!isSupportedChimeChannel(ch)) {
+                HttpResponse.sendJsonError(out, "Unsupported channel: " + ch);
+                return;
+            }
+            channel = ch;
+        }
+        // Same resource + per-severity level mapping as BridgedAudioCue.
+        String res;
+        int severityLevel;
+        switch (severity) {
+            case "minor":
+                res = "roadsense_chime_minor";
+                severityLevel = 1;
+                break;
+            case "severe":
+                res = "roadsense_chime_severe";
+                severityLevel = 3;
+                break;
+            case "moderate":
+                res = "roadsense_chime_moderate";
+                severityLevel = 2;
+                break;
+            default:
+                throw new IllegalStateException("validated severity became unsupported");
+        }
+        int vol = com.overdrive.app.roadsense.config.RoadSenseChimeLevels
+                .effectivePercent(masterVolume, severityLevel);
+        // No channel given → use the user's configured chime channel, so the button tests
+        // what the live cue would actually do. Read straight from the UCM section (the same
+        // way other Java callers read config) rather than through the Kotlin RoadSenseConfig
+        // object, whose snapshot() has a default argument and no @JvmStatic.
+        if (channel == null) {
+            try {
+                JSONObject sec = com.overdrive.app.config.UnifiedConfigManager
+                        .forceReload().optJSONObject("roadSense");
+                channel = (sec == null) ? "" : sec.optString("warnAudioChannel", "")
+                        .trim().toLowerCase(Locale.ROOT);
+            } catch (Throwable t) {
+                channel = "";
+            }
+            // Clamp exactly as RoadSenseAudioChannels.normalize does, so a stale or
+            // hand-edited value tests the SAME channel the live cue would use.
+            channel = com.overdrive.app.roadsense.config.RoadSenseAudioChannels.normalize(channel);
+        }
+        boolean ok = false;
+        try {
+            ok = dispatcher.dispatch(res, channel, vol);
+        } catch (Throwable t) {
+            logger.warn(TAG + ": test-chime failed: " + t.getMessage());
+        }
+        resp.put("success", ok);
+        resp.put("dispatched", ok);
+        resp.put("playbackConfirmed", false);
+        resp.put("severity", severity);
+        resp.put("channel", channel);
+        resp.put("masterVolumePercent", masterVolume);
+        resp.put("volumePercent", vol);
+        if (!ok) resp.put("error", "could not dispatch the chime");
+        logger.info(TAG + ": test-chime " + res + " channel=" + channel + " vol=" + vol + "% ok=" + ok);
         HttpResponse.sendJson(out, resp.toString());
     }
 

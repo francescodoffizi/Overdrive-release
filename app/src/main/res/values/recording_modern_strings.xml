@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="recording_library_loading">Loading recordings</string>
+    <string name="recording_library_refreshing">Refreshing recordings</string>
+    <string name="recording_library_loading_more">Loading more recordings</string>
+    <string name="recording_library_page_error">Couldn’t load more recordings.</string>
+    <string name="recording_library_page_unavailable">More recordings are temporarily unavailable.</string>
+    <string name="recording_library_refresh_error">Couldn’t refresh. Showing the recordings already loaded.</string>
+    <string name="recording_library_fatal_title">Couldn’t open recordings</string>
+    <string name="recording_library_fatal_body">Check the recording service and storage, then retry.</string>
+    <string name="recording_library_select">Select recordings</string>
+    <string name="recording_library_open_filters">Filter recordings</string>
+    <string name="recording_library_clear_search">Clear place search</string>
+    <string name="recording_item_description">%1$s, %2$s, %3$s. Open recording.</string>
+    <string name="recording_item_selection_description">%1$s, %2$s, %3$s. %4$s</string>
+    <string name="recording_item_selected_action">Selected. Double tap to deselect.</string>
+    <string name="recording_item_not_selected_action">Not selected. Double tap to select.</string>
+    <string name="recording_item_select">Select %1$s</string>
+    <string name="recording_item_deselect">Deselect %1$s</string>
+    <string name="cd_pause">Pause</string>
+    <string name="cd_player_unmute">Turn audio on</string>
+    <string name="cd_player_mute_audio">Mute audio</string>
+    <string name="video_player_buffering">Loading video</string>
+    <string name="video_player_error_title">Can’t play this recording</string>
+    <string name="video_player_error_body">The file may be unavailable or the storage device may have disconnected.</string>
+    <string name="video_player_retry">Retry</string>
+    <string name="video_player_next">Next recording</string>
+    <string name="video_timeline_empty">Event timeline. No detected events.</string>
+    <string name="video_timeline_events">Event timeline. %1$d detected events. Tap to seek to the nearest event.</string>
+    <string name="video_timeline_selected">%1$s event at %2$s</string>
+</resources>

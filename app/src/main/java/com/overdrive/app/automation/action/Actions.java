@@ -4,6 +4,7 @@ import com.overdrive.app.automation.type.AppType;
 import com.overdrive.app.automation.type.AudioType;
 import com.overdrive.app.automation.type.StringType;
 import com.overdrive.app.automation.type.ColourType;
+import com.overdrive.app.automation.type.DynamicIntType;
 import com.overdrive.app.automation.type.EnumType;
 import com.overdrive.app.automation.type.IntType;
 import com.overdrive.app.automation.value.Label;
@@ -42,6 +43,15 @@ public class Actions {
             new Label("60", "automation.ac_auto_off_60"),
             new Label("90", "automation.ac_auto_off_90"),
             new Label("120", "automation.ac_auto_off_120"));
+
+    /** The five fixed OPENAIR/BOOKINGAIR session lengths supported by BYD cloud. */
+    static final EnumType REMOTE_CLIMATE_DURATIONS = new EnumType(
+            new Label("remoteDurationMinutes", "automation.remote_climate_duration"),
+            new Label("10", "automation.remote_climate_duration_10"),
+            new Label("15", "automation.remote_climate_duration_15"),
+            new Label("20", "automation.remote_climate_duration_20"),
+            new Label("25", "automation.remote_climate_duration_25"),
+            new Label("30", "automation.remote_climate_duration_30"));
 
     /**
      * Initialize actions list with actions that can be selected
@@ -83,6 +93,15 @@ public class Actions {
         addAction(new VehicleControlAction(
                 new Label("mirror_fold", "automation.set_mirror_fold"), "automation.set_mirror_fold_description",
                 new EnumType(new Label("payload", "automation.action"), new Label("on", "automation.mirror_fold"), new Label("off", "automation.mirror_unfold"))));
+        // Persistent vehicle setting — enable it while the vehicle is awake and the OEM controls
+        // folding/unfolding at subsequent power transitions. This is deliberately not another
+        // immediate mirror-fold action, because that bodywork command is unavailable at ACC off.
+        addAction(new VehicleControlAction(
+                new Label("mirror_auto_follow_up", "automation.set_mirror_auto_follow_up"),
+                "automation.set_mirror_auto_follow_up_description",
+                new EnumType(new Label("payload", "automation.action"),
+                        new Label("on", "automation.on"),
+                        new Label("off", "automation.off"))));
         addAction(new ApiAction(
                 new Label("cpd", "automation.set_cpd"),
                 "automation.set_cpd_description",
@@ -293,6 +312,14 @@ public class Actions {
                         new Label("1", "automation.open"),
                         new Label("2", "automation.close"),
                         new Label("3", "automation.stop"))));
+        // OPENWINDOW is a cloud ventilation crack, not the local full-open operation above.
+        // Keep it distinct so an off-car rule never claims it fully opened the windows.
+        addAction(new ApiAction(
+                new Label("windowsVent", "automation.vent_windows"),
+                "automation.vent_windows_description",
+                "POST",
+                "/api/vehicle/window",
+                "{\"action\":\"vent\"}"));
         // Tailgate / trunk open/close/stop (parity with keymap tailgate).
         addAction(new ApiAction(
                 new Label("tailgate", "automation.tailgate"),
@@ -336,31 +363,90 @@ public class Actions {
                 "automation.set_ac_description",
                 "POST",
                 "/api/vehicle/climate",
-                "{\"action\":\"power_${action}\",\"autoOffMinutes\":${autoOffMinutes}}",
+                "{\"action\":\"power_${action}\",\"temp\":${temp},"
+                        + "\"remoteDurationMinutes\":${remoteDurationMinutes},"
+                        + "\"autoOffMinutes\":${autoOffMinutes}}",
                 new EnumType(new Label("action", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on")),
+                new IntType(new Label("temp", "automation.temperature"), 15, 33),
+                REMOTE_CLIMATE_DURATIONS,
                 AC_AUTO_OFF_MINUTES));
+        // BOOKINGAIR has no local SDK equivalent. This creates a cloud remote-climate booking
+        // for a known future epoch-second time; capability discovery and terminal confirmation
+        // remain in the normal router path behind the API handler.
+        addAction(new ApiAction(
+                new Label("remoteClimateSchedule", "automation.remote_climate_schedule"),
+                "automation.remote_climate_schedule_description",
+                "POST",
+                "/api/vehicle/climate-schedule",
+                "{\"action\":\"create\",\"bookingTime\":\"${bookingTime}\",\"temp\":${temp},"
+                        + "\"durationMinutes\":${durationMinutes}}",
+                new StringType(new Label("bookingTime", "automation.remote_climate_booking_time"), 10),
+                new IntType(new Label("temp", "automation.temperature"), 15, 31),
+                new EnumType(new Label("durationMinutes", "automation.remote_climate_duration"),
+                        new Label("10", "automation.remote_climate_duration_10"),
+                        new Label("15", "automation.remote_climate_duration_15"),
+                        new Label("20", "automation.remote_climate_duration_20"),
+                        new Label("25", "automation.remote_climate_duration_25"),
+                        new Label("30", "automation.remote_climate_duration_30"))));
+        // Booking IDs returned by BYD are 64-bit. Keep them as decimal text through the
+        // automation editor so JavaScript cannot round their low bits before the API parser.
+        addAction(new ApiAction(
+                new Label("remoteClimateScheduleUpdate", "automation.remote_climate_schedule_update"),
+                "automation.remote_climate_schedule_update_description",
+                "POST",
+                "/api/vehicle/climate-schedule",
+                "{\"action\":\"update\",\"bookingId\":\"${bookingId}\","
+                        + "\"bookingTime\":\"${bookingTime}\",\"temp\":${temp},"
+                        + "\"durationMinutes\":${durationMinutes}}",
+                new StringType(new Label("bookingId", "automation.remote_climate_booking_id"), 19),
+                new StringType(new Label("bookingTime", "automation.remote_climate_booking_time"), 10),
+                new IntType(new Label("temp", "automation.temperature"), 15, 31),
+                new EnumType(new Label("durationMinutes", "automation.remote_climate_duration"),
+                        new Label("10", "automation.remote_climate_duration_10"),
+                        new Label("15", "automation.remote_climate_duration_15"),
+                        new Label("20", "automation.remote_climate_duration_20"),
+                        new Label("25", "automation.remote_climate_duration_25"),
+                        new Label("30", "automation.remote_climate_duration_30"))));
+        addAction(new ApiAction(
+                new Label("remoteClimateScheduleDelete", "automation.remote_climate_schedule_delete"),
+                "automation.remote_climate_schedule_delete_description",
+                "POST",
+                "/api/vehicle/climate-schedule",
+                "{\"action\":\"delete\",\"bookingId\":\"${bookingId}\"}",
+                new StringType(new Label("bookingId", "automation.remote_climate_booking_id"), 19)));
+        // Zone: which dial the write targets. 0 = both, 1 = driver, 2 = passenger — values
+        // accepted directly by /api/vehicle/climate. Offered on both the
+        // absolute set and the relative step so a rule can warm just the driver's side.
         addAction(new ApiAction(
                 new Label("setAcTemp", "automation.set_ac_temp"),
                 "automation.set_ac_temp_description",
                 "POST",
                 "/api/vehicle/climate",
-                "{\"action\":\"set_temp\",\"temp\":${temperature}}",
-                new IntType(new Label("temperature", "automation.temperature"), 17, 33)));
+                "{\"action\":\"set_temp\",\"zone\":${zone},\"temp\":${temperature}}",
+                new IntType(new Label("temperature", "automation.temperature"), 17, 33),
+                new EnumType(new Label("zone", "automation.ac_zone"),
+                        new Label("0", "automation.ac_zone_both"),
+                        new Label("1", "automation.ac_zone_driver"),
+                        new Label("2", "automation.ac_zone_passenger"))));
         // RELATIVE temperature step — "one degree warmer/cooler than it is now", the thing an
-        // absolute setpoint can't express. Reads the driver dial, adds the delta, clamps to the
+        // absolute setpoint can't express. Reads the chosen dial, adds the delta, clamps to the
         // dial range for the CURRENT display unit (so ±1 is one notch on a °C or °F car alike).
-        // Enum rather than a signed IntType: the two values users actually want, and it keeps
-        // the stored value validated against a fixed set instead of an open numeric range.
+        // Only "zone" is sent; the handler derives which dial to READ from it (driver/both → the
+        // driver dial, passenger → the passenger dial), so a driver-only step reads the driver dial.
         addAction(new ApiAction(
                 new Label("stepAcTemp", "automation.step_ac_temp"),
                 "automation.step_ac_temp_description",
                 "POST",
                 "/api/vehicle/climate",
-                "{\"action\":\"step_temp\",\"delta\":${delta}}",
+                "{\"action\":\"step_temp\",\"delta\":${delta},\"zone\":${zone}}",
                 new EnumType(
                         new Label("delta", "automation.step_direction"),
                         new Label("1", "automation.step_warmer"),
-                        new Label("-1", "automation.step_cooler"))));
+                        new Label("-1", "automation.step_cooler")),
+                new EnumType(new Label("zone", "automation.ac_zone"),
+                        new Label("0", "automation.ac_zone_both"),
+                        new Label("1", "automation.ac_zone_driver"),
+                        new Label("2", "automation.ac_zone_passenger"))));
         addAction(new ApiAction(
                 new Label("setAcFan", "automation.set_ac_fan"),
                 "automation.set_ac_fan_description",
@@ -415,6 +501,13 @@ public class Actions {
         addAction(new VehicleControlAction(
                 new Label("wireless_charging", "automation.wireless_charging"), "automation.wireless_charging_description",
                 new EnumType(new Label("payload", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
+        // Per-pad wireless charger (dual-pad trims). label id MUST equal the catalog key.
+        addAction(new VehicleControlAction(
+                new Label("wireless_charging_left", "automation.wireless_charging_left"), "automation.wireless_charging_left_description",
+                new EnumType(new Label("payload", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
+        addAction(new VehicleControlAction(
+                new Label("wireless_charging_right", "automation.wireless_charging_right"), "automation.wireless_charging_right_description",
+                new EnumType(new Label("payload", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
         addAction(new ApiAction(
                 new Label("setAmbient", "automation.set_ambient"),
                 "automation.set_ambient_description",
@@ -432,7 +525,7 @@ public class Actions {
                 "POST",
                 "/api/vehicle/media",
                 "{\"target\":\"volume\",\"value\":${level}}",
-                new IntType(new Label("level", "automation.volume_level"), 0, 40)));
+                new DynamicIntType(new Label("level", "automation.volume_level"), 0, 40)));
         // Infotainment screen brightness as a 0-100 percentage (setting HAL).
         addAction(new ApiAction(
                 new Label("screenBrightness", "automation.set_screen_brightness"),
@@ -515,7 +608,7 @@ public class Actions {
                         new Label("alarm", "automation.channel_alarm")),
                 // Absolute step 0-40 (car's own volume scale), clamped to the chosen
                 // channel's real stream max daemon-side.
-                new IntType(new Label("level", "automation.volume_level"), 0, 40)));
+                new DynamicIntType(new Label("level", "automation.volume_level"), 0, 40)));
         // Brake feel (comfort vs sport/strong) — BYDAutoADASDevice brake foot-sense.
         // Catalog key "brake_feel" must match the VehicleControlCatalog entity.
         addAction(new VehicleControlAction(
@@ -609,22 +702,17 @@ public class Actions {
                         new Label("loop", "automation.audio_loop"),
                         new Label("false", "automation.audio_loop_off"),
                         new Label("true", "automation.audio_loop_on"))));
-        // Play an uploaded VIDEO (MP4) with its picture shown on the head-unit screen
-        // (audio on the chosen channel). Distinct action so video is discoverable,
-        // mirroring the keymap "Play video" entry. display=screen is baked in.
+        // Play an uploaded VIDEO (MP4) with its picture shown on the head-unit screen.
+        // Video audio is deliberately fixed to Media: this TextureView player must retain
+        // the default media attributes or this DiLink build can play audio without video
+        // frames. Play Audio remains available when a non-media channel is required.
         addAction(new ApiAction(
                 new Label("playVideo", "automation.play_video"),
                 "automation.play_video_description",
                 "POST",
                 "/api/vehicle/play-audio",
-                "{\"name\":\"${name}\",\"channel\":\"${channel}\",\"display\":\"screen\",\"loop\":${loop}}",
+                "{\"name\":\"${name}\",\"display\":\"screen\",\"loop\":${loop}}",
                 new AudioType(new Label("name", "automation.video_file")),
-                new EnumType(
-                        new Label("channel", "automation.audio_channel"),
-                        new Label("media", "automation.channel_media"),
-                        new Label("navigation", "automation.channel_navigation"),
-                        new Label("voice", "automation.channel_voice"),
-                        new Label("alarm", "automation.channel_alarm")),
                 new EnumType(
                         new Label("loop", "automation.audio_loop"),
                         new Label("false", "automation.audio_loop_off"),
@@ -701,28 +789,85 @@ public class Actions {
         // VehicleControlAction.trigger resolves it.
         addAction(new VehicleControlAction(
                 new Label("drive_mode", "automation.set_drive_mode"), "automation.set_drive_mode_description",
-                // Drive mode now routes through the setting-device "drive config" axis
-                // (NORMAL=1, ECO=2, SPORT=3, SNOW=4) which — unlike the old
-                // energy-device operation-mode path (eco/sport only) — supports NORMAL.
+                // Drive mode routes through the energy-device operation setter, whose public
+                // enum supports NORMAL/ECO/SPORT. OverDrive exposes those on its stable
+                // config axis (NORMAL=1, ECO=2, SPORT=3, SNOW=4).
                 // SNOW is left out of the picker (it interacts with a road-surface axis
                 // and is rarely a user automation), but the payload mapping accepts it.
                 new EnumType(new Label("payload", "automation.mode"),
                         new Label("normal", "automation.mode_normal"),
                         new Label("eco", "automation.mode_eco"),
                         new Label("sport", "automation.mode_sport"))));
+        // Only field-validated energy writes are offered. Conditions still decode the complete SDK
+        // enum so modes already reported by the vehicle remain observable.
         addAction(new VehicleControlAction(
                 new Label("powertrain_mode", "automation.set_powertrain_mode"), "automation.set_powertrain_mode_description",
                 new EnumType(new Label("payload", "automation.mode"),
                         new Label("ev", "automation.mode_ev"),
                         new Label("hev", "automation.mode_hev"))));
         // One-tap "switch to HEV". Does NOT actually hold the pack — on a SeaLion 6 DM-i
-        // the ICE starts and recharges it. The real SOC-hold pair (setSOCTarget +
-        // setSocSaveSwitch) is exposed as the charge cap instead; see the note on
-        // VehicleControlCatalog hold_battery.
+        // the ICE starts and recharges it. The separate battery_hold action
+        // below is the real SOC-hold pair.
         addAction(new VehicleControlAction(
                 new Label("hold_battery", "automation.hold_battery"), "automation.hold_battery_description",
                 new EnumType(new Label("payload", "automation.action"),
                         new Label("on", "automation.on"))));
+        // The REAL SOC hold, as a pair: the percent says WHERE to hold, the switch says whether
+        // to hold. Unlike hold_battery (an alias for energy-mode HEV, which starts the ICE and
+        // recharges the pack) this is the setSOCTarget + setSocSaveSwitch lever the OEM drives for
+        // its DM-i city / long-distance presets. Both have an off value, so a rule can undo it.
+        // One-tap battery hold — writes BOTH legs of the SOC pair (target + switch) the way the
+        // OEM does, so a preset needs no second action and no arithmetic in the rule:
+        //   at_current = hold min(SOC,50) → the "Highway" preset
+        //   at_floor   = deplete to the trim floor → the "City" preset
+        addAction(new VehicleControlAction(
+                new Label("battery_hold", "automation.battery_hold"),
+                "automation.battery_hold_description",
+                new EnumType(new Label("payload", "automation.mode"),
+                        new Label("at_current", "automation.battery_hold_at_current"),
+                        new Label("at_floor", "automation.battery_hold_at_floor"),
+                        new Label("off", "automation.off"))));
+        addAction(new VehicleControlAction(
+                new Label("charge_cap_percent", "automation.soc_hold_percent"),
+                "automation.soc_hold_percent_description",
+                new IntType(new Label("payload", "automation.percent"), 50, 100)));
+        addAction(new VehicleControlAction(
+                new Label("charge_cap_enabled", "automation.soc_hold_enabled"),
+                "automation.soc_hold_enabled_description",
+                new EnumType(new Label("payload", "automation.action"),
+                        new Label("1", "automation.on"),
+                        new Label("0", "automation.off"))));
+        // Smart-charge controls have no local SDK primitive and therefore deliberately use the
+        // capability-gated cloud endpoints. The master toggle remains separate from a schedule
+        // save so a rule can pause/resume the existing OEM schedule without overwriting it.
+        addAction(new ApiAction(
+                new Label("smartCharging", "automation.smart_charging"),
+                "automation.smart_charging_description",
+                "POST",
+                "/api/vehicle/charging-schedule",
+                "{\"enabled\":${enabled}}",
+                new EnumType(new Label("enabled", "automation.action"),
+                        new Label("true", "automation.on"),
+                        new Label("false", "automation.off"))));
+        addAction(new ApiAction(
+                new Label("chargingSchedule", "automation.charging_schedule"),
+                "automation.charging_schedule_description",
+                "POST",
+                "/api/vehicle/charging-schedule",
+                "{\"startChargeTime\":\"${startChargeTime}\",\"endChargeTime\":\"${endChargeTime}\","
+                        + "\"chargeWay\":\"${chargeWay}\",\"enabled\":${enabled}}",
+                new StringType(new Label("startChargeTime", "automation.charge_start_time"), 5),
+                new StringType(new Label("endChargeTime", "automation.charge_end_time"), 5),
+                new StringType(new Label("chargeWay", "automation.charge_schedule_days"), 13),
+                new EnumType(new Label("enabled", "automation.action"),
+                        new Label("true", "automation.on"),
+                        new Label("false", "automation.off"))));
+        addAction(new ApiAction(
+                new Label("startChargingNow", "automation.start_charging"),
+                "automation.start_charging_description",
+                "POST",
+                "/api/vehicle/start-charging",
+                ""));
         // regen / steering / brake feel expose a "toggle" option that CYCLES to the
         // next mode (the daemon tracks the last-commanded value — no HAL readback
         // exists), so an automation can flip the mode without knowing the current one.
@@ -789,8 +934,8 @@ public class Actions {
                 "{\"package\":\"${package}\",\"split\":true}",
                 new AppType(new Label("package", "automation.app"))));
         // ── System UI navigation + screenshot (daemon shell as UID 2000) ─────────
-        // Home / Back / Recents via `input keyevent`; screenshot via `screencap`
-        // (the a11y screenshot API is 30+, unavailable on this API-29 head unit).
+        // Home / Back / Recents use input keyevents. Screenshots route through the daemon's
+        // SurfaceControl capture so the virtual driver-cluster layer stack is included.
         addAction(new ApiAction(
                 new Label("uiNav", "automation.ui_nav"),
                 "automation.ui_nav_description",
@@ -812,6 +957,30 @@ public class Actions {
                         new Label("display", "automation.display"),
                         new Label("0", "automation.display_head_unit"),
                         new Label("1", "automation.display_cluster"))));
+        // Centre-screen orientation through the same catalog entity used by key mapping.
+        // Toggle alternates horizontal/vertical using the catalog's readback-less select cache.
+        addAction(new VehicleControlAction(
+                new Label("infotainment_rotation", "automation.rotate_infotainment"),
+                "automation.rotate_infotainment_description",
+                new EnumType(
+                        new Label("payload", "automation.orientation"),
+                        new Label("horizontal", "automation.orientation_horizontal"),
+                        new Label("vertical", "automation.orientation_vertical"),
+                        new Label("toggle", "automation.toggle"))));
+        // Switch the view inside the OEM native panorama application. These
+        // AUTO_VIDEO_BUTTON choices are distinct from OverDrive's camera overlay.
+        addAction(new VehicleControlAction(
+                new Label("native_camera_view", "automation.native_camera_view"),
+                "automation.native_camera_view_description",
+                new EnumType(
+                        new Label("payload", "automation.camera"),
+                        new Label("front", "automation.camera_front"),
+                        new Label("front_wide", "automation.camera_front_wide"),
+                        new Label("rear", "automation.camera_rear"),
+                        new Label("rear_wide", "automation.camera_rear_wide"),
+                        new Label("left", "automation.camera_left"),
+                        new Label("right", "automation.camera_right"),
+                        new Label("left_right", "automation.camera_left_right"))));
         // Move an app onto a chosen display (head-unit ↔ cluster). App from the live
         // picker; the daemon resolves its launcher component and `am start --display`s it.
         // For the CLUSTER (display 1) the daemon opens the OEM projection first (the
@@ -837,6 +1006,84 @@ public class Actions {
                 "POST",
                 "/api/vehicle/system",
                 "{\"target\":\"cluster_cast_stop\"}"));
+        // Intent-based camera actions. The normal on-demand feed uses the saved
+        // camera-view position/size and supports a bounded display duration.
+        addAction(new ApiAction(
+                new Label("showCameraFeed", "automation.show_camera_feed"),
+                "automation.show_camera_feed_description",
+                "POST",
+                "/api/camview/show?cam=${camera}&target=${target}&autoHide=${duration}",
+                "",
+                new EnumType(
+                        new Label("camera", "automation.camera_feed"),
+                        new Label("all", "automation.camera_all"),
+                        new Label("front", "automation.camera_front"),
+                        new Label("rear", "automation.camera_rear"),
+                        new Label("left", "automation.camera_left"),
+                        new Label("right", "automation.camera_right")),
+                new EnumType(
+                        new Label("target", "automation.display"),
+                        new Label("head_unit", "automation.display_headunit"),
+                        new Label("cluster", "automation.display_cluster")),
+                new EnumType(
+                        new Label("duration", "automation.camera_duration"),
+                        new Label("5", "automation.duration_5_seconds"),
+                        new Label("10", "automation.duration_10_seconds"),
+                        new Label("30", "automation.duration_30_seconds"),
+                        new Label("0", "automation.duration_until_hidden"))));
+        // Resize the ordinary on-demand camera view without changing its selected
+        // camera, display target, or saved corner. If it is currently visible on the
+        // chosen display, the native layer is resized live; otherwise this is used the
+        // next time a camera feed is shown there.
+        addAction(new ApiAction(
+                new Label("setCameraViewSize", "automation.set_camera_view_size"),
+                "automation.set_camera_view_size_description",
+                "POST",
+                "/api/camview/geometry/size/${size}?target=${target}",
+                "",
+                new IntType(new Label("size", "automation.camera_size"), 15, 90),
+                new EnumType(
+                        new Label("target", "automation.display"),
+                        new Label("head_unit", "automation.display_headunit"),
+                        new Label("cluster", "automation.display_cluster"))));
+        // The indicator-driven Blind Spot feature already shows and hides with the
+        // indicators through blindSpotEnable below. This action adjusts the same
+        // persistent RoadSense overlay size without changing its target or per-side
+        // positions, so an automation can choose a size for a driving context.
+        addAction(new ApiAction(
+                new Label("setBlindSpotOverlaySize", "automation.set_bs_overlay_size"),
+                "automation.set_bs_overlay_size_description",
+                "POST",
+                "/api/bs/geometry/size/${size}?target=${target}",
+                "",
+                new IntType(new Label("size", "automation.camera_size"), 15, 90),
+                new EnumType(
+                        new Label("target", "automation.display"),
+                        new Label("head_unit", "automation.display_headunit"),
+                        new Label("cluster", "automation.display_cluster"))));
+        // Kept for existing manual composite-camera automations. It is intentionally
+        // not the ordinary Blind Spot control: the latter is indicator-driven and is
+        // enabled/disabled with blindSpotEnable below.
+        addAction(new ApiAction(
+                new Label("showBlindSpotCameraFeed", "automation.show_blind_spot_camera_feed"),
+                "automation.show_blind_spot_camera_feed_description",
+                "POST",
+                "/api/camview/show?cam=side_rear_${side}&target=${target}&autoHide=${duration}",
+                "",
+                new EnumType(
+                        new Label("side", "automation.camera_side"),
+                        new Label("left", "automation.camera_left"),
+                        new Label("right", "automation.camera_right")),
+                new EnumType(
+                        new Label("target", "automation.display"),
+                        new Label("head_unit", "automation.display_headunit"),
+                        new Label("cluster", "automation.display_cluster")),
+                new EnumType(
+                        new Label("duration", "automation.camera_duration"),
+                        new Label("5", "automation.duration_5_seconds"),
+                        new Label("10", "automation.duration_10_seconds"),
+                        new Label("30", "automation.duration_30_seconds"),
+                        new Label("0", "automation.duration_until_hidden"))));
         // Show camera view — a native camera feed (front/rear/left/right/all-4) on
         // the SAME SurfaceControl lane the blind-spot feature uses, with position +
         // target. Routes through the allowlisted /api/camview/show; the query params
@@ -854,7 +1101,13 @@ public class Actions {
                         new Label("front", "automation.camera_front"),
                         new Label("rear", "automation.camera_rear"),
                         new Label("left", "automation.camera_left"),
-                        new Label("right", "automation.camera_right")),
+                        new Label("right", "automation.camera_right"),
+                        // Composite views: the same rear+side render the blind-spot card
+                        // uses, on demand and with no turn signal needed. They follow the
+                        // shared blind-spot settings (cameras shown, fisheye, rotation),
+                        // so "Side only"/"Rear only" there reshapes these too.
+                        new Label("side_rear_left", "automation.camera_side_rear_left"),
+                        new Label("side_rear_right", "automation.camera_side_rear_right")),
                 new EnumType(
                         new Label("target", "automation.display"),
                         new Label("head_unit", "automation.display_headunit"),
@@ -884,6 +1137,93 @@ public class Actions {
                 "POST",
                 "/api/camview/hide",
                 ""));
+        // ── Blind-spot card tweaks ───────────────────────────────────────────
+        // The side/rear view knobs from the Road Sense settings page, reachable from a
+        // rule so the card can adapt itself (straighten the fisheye on the motorway,
+        // swap to the rear camera when towing, rotate for a reversing manoeuvre).
+        // All three persist AND apply live to a showing card; /api/bs/tweak validates
+        // and rejects the whole call on a bad value.
+        //
+        // Fisheye: how hard to straighten the lens barrel on the SINGLE-camera views.
+        // Only shapes side/rear ("Cameras shown" below) — the merged rear+side view is
+        // dewarped by the projection itself and ignores this.
+        addAction(new ApiAction(
+                new Label("blindSpotFisheye", "automation.bs_fisheye"),
+                "automation.bs_fisheye_description",
+                "POST",
+                "/api/bs/tweak?fisheye=${level}",
+                "",
+                new IntType(new Label("level", "automation.bs_fisheye_level"), 0, 100)));
+        // Step the fisheye up/down by a fixed amount — for a rule (or key) that nudges
+        // it repeatedly rather than jumping to one absolute level. Clamped to 0..100.
+        addAction(new ApiAction(
+                new Label("blindSpotFisheyeStep", "automation.bs_fisheye_step"),
+                "automation.bs_fisheye_step_description",
+                "POST",
+                "/api/bs/tweak?fisheye=${direction}",
+                "",
+                new EnumType(
+                        new Label("direction", "automation.action"),
+                        new Label("up", "automation.bs_fisheye_more"),
+                        new Label("down", "automation.bs_fisheye_less"))));
+        // Which camera(s) fill the card: the merged rear+side panorama, or one camera
+        // on its own at full field of view.
+        addAction(new ApiAction(
+                new Label("blindSpotCameras", "automation.bs_cameras"),
+                "automation.bs_cameras_description",
+                "POST",
+                "/api/bs/tweak?cameras=${cameras}",
+                "",
+                new EnumType(
+                        new Label("cameras", "automation.bs_cameras_label"),
+                        new Label("both", "automation.bs_cameras_both"),
+                        new Label("side", "automation.bs_cameras_side"),
+                        new Label("rear", "automation.bs_cameras_rear"))));
+        // On-screen rotation of the card, per side. The left-turn and right-turn
+        // cameras are mirror-imaged, so an angle that reads upright on one reads wrong
+        // on the other — hence the side picker. "Auto" tracks direction of travel
+        // (flips 180° in reverse). Applies to the single-camera views only.
+        addAction(new ApiAction(
+                new Label("blindSpotRotation", "automation.bs_rotation"),
+                "automation.bs_rotation_description",
+                "POST",
+                "/api/bs/tweak?rotation=${rotation}&side=${side}",
+                "",
+                new EnumType(
+                        new Label("rotation", "automation.bs_rotation_label"),
+                        new Label("0", "automation.bs_rotation_0"),
+                        new Label("90", "automation.bs_rotation_90"),
+                        new Label("180", "automation.bs_rotation_180"),
+                        new Label("270", "automation.bs_rotation_270"),
+                        new Label("auto", "automation.bs_rotation_auto")),
+                new EnumType(
+                        new Label("side", "automation.bs_side"),
+                        new Label("both", "automation.bs_side_both"),
+                        new Label("left", "automation.bs_side_left"),
+                        new Label("right", "automation.bs_side_right"))));
+        // Turn the blind-spot feature itself on or off. Writes blindspot.enabled and
+        // arms/disarms the native lane, reconciling the camera profile either way —
+        // the same work the settings toggle does. Id is blindSpotEnable, NOT blindSpot:
+        // that id already belongs to the OEM ADAS blind-spot warning condition, and the
+        // two are unrelated features.
+        addAction(new ApiAction(
+                new Label("blindSpotEnable", "automation.bs_enable"),
+                "automation.bs_enable_description",
+                "POST",
+                "/api/bs/tweak?enabled=${enabled}",
+                "",
+                new EnumType(
+                        new Label("enabled", "automation.action"),
+                        new Label("true", "automation.on"),
+                        new Label("false", "automation.off"))));
+        // Dismiss a card that is showing right now, WITHOUT disabling the feature —
+        // the next turn signal shows it again.
+        addAction(new ApiAction(
+                new Label("blindSpotDismiss", "automation.bs_dismiss"),
+                "automation.bs_dismiss_description",
+                "POST",
+                "/api/bs/hide",
+                ""));
         // ── Control-flow steps ───────────────────────────────────────────
         // Pause N milliseconds before the next action. Blocks only this automation's
         // worker (sequential action chain), never telemetry/other automations.
@@ -912,6 +1252,11 @@ public class Actions {
         addAction(new ComputeVariableAction(
                 new Label("computeVariable", "automation.compute_variable"),
                 "automation.compute_variable_description"));
+        // Save a snapshot of a value that is useful to restore or compare later, such
+        // as media volume before ducking it or SOC at the start of a drive phase.
+        addAction(new CaptureVariableAction(
+                new Label("captureVariable", "automation.capture_variable"),
+                "automation.capture_variable_description"));
         // Loop — run nested actions N times, or while/until a signal condition holds.
         addAction(new LoopAction(
                 new Label("loop", "automation.loop"), "automation.loop_description"));
@@ -1016,7 +1361,15 @@ public class Actions {
         try {
             section.put("description", Messages.get(descriptionKey));
             JSONArray actionsList = new JSONArray();
+            boolean includeHybridOnly =
+                    com.overdrive.app.automation.AutomationCategories
+                            .supportsHybridOnlyItemsOnCurrentVehicle();
             for (Action action : this.actions.values()) {
+                if (!includeHybridOnly
+                        && com.overdrive.app.automation.AutomationCategories.isHybridOnly(
+                                action.getLabel().getId())) {
+                    continue;
+                }
                 JSONObject opt = action.toJson();
                 // Cosmetic grouping tag (see AutomationCategories). Never stored/resolved.
                 opt.put("category", com.overdrive.app.automation.AutomationCategories.forId(

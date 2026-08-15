@@ -39,26 +39,10 @@ class AdbShellExecutor(private val context: Context) {
         // Dedicated polling executor (separate from command executor)
         private val pollingExecutor = Executors.newSingleThreadExecutor()
 
-        /**
-         * Process-wide lifeboat for commands whose OWNING executor has been shut down.
-         *
-         * The per-instance [executor] dies with its DaemonStartupManager, and
-         * `initializeOnAppLaunch()` shuts down the previous manager's executor during the
-         * bootManager→Activity handoff. A chain already in flight at that moment — and the
-         * daemon-start paths are chains, each ADB reply driving the next command — loses
-         * every step after the handoff. `cleanup()` clears the pending Handler queue, so a
-         * not-yet-fired task is cancelled cleanly; this covers the other case, where the
-         * task already fired and is mid-chain.
-         *
-         * Ownership transfer is NOT process teardown, which is the distinction the original
-         * "remaining commands are moot" reasoning missed. Re-submitting here keeps the chain
-         * alive across the handoff.
-         *
-         * Daemon thread, deliberately: this executor is never shut down, and a non-daemon
-         * thread would keep the JVM alive after the last Activity finishes. It shares the
-         * process-wide [sharedDadb] that `cleanup()` intentionally leaves open, so a
-         * re-submitted command uses the same live transport the new owner is using.
-         */
+        // Process-wide lifeboat for commands whose OWNING executor was shut down mid-chain
+        // (the bootManager→Activity handoff). Daemon thread: never shut down, so a
+        // non-daemon one would hold the JVM alive after the last Activity finishes. Shares
+        // the sharedDadb that cleanup() deliberately leaves open.
         private val fallbackExecutor = Executors.newSingleThreadExecutor { r ->
             Thread(r, "AdbShellFallback").apply { isDaemon = true }
         }
@@ -101,26 +85,15 @@ class AdbShellExecutor(private val context: Context) {
         val exitCode: Int,
         val output: String
     )
-    
+
     private val cmdSeq = java.util.concurrent.atomic.AtomicInteger(0)
 
     /**
      * Submit [task] to this instance's executor, falling back to the process-wide
-     * [fallbackExecutor] if this one has been shut down.
-     *
-     * Every submit in this class goes through here. Two reasons:
-     *
-     * 1. **Never throw at the caller.** `execute()` is chained from inside onSuccess/onError
-     *    callbacks running on a worker thread, where an uncaught RejectedExecutionException
-     *    KILLS THE PROCESS (observed: app crash on startup when the Activity finished
-     *    mid-sequence). `executeScript` previously submitted with no guard at all and had
-     *    that same crash exposed.
-     * 2. **Never silently drop.** A rejection used to end the chain with one warn line.
-     *    During the bootManager→Activity handoff that is ownership transfer, not teardown,
-     *    and the dropped step is a daemon that then never starts.
-     *
-     * Returns false only if both executors refuse, which means the process really is going
-     * away — nothing can be done then, but it is logged distinctly from a reroute.
+     * [fallbackExecutor] if this one has been shut down. Every submit in this class goes
+     * through here so that a rejection can never throw at the caller — `execute()` is
+     * chained from inside onSuccess/onError on a worker thread, where an uncaught
+     * RejectedExecutionException kills the process.
      */
     private fun submit(seq: Int, command: String, task: Runnable): Boolean {
         return when (ExecutorFallback.submit(task, executor, fallbackExecutor)) {
@@ -139,23 +112,11 @@ class AdbShellExecutor(private val context: Context) {
 
     fun execute(command: String, callback: ShellCallback) {
         val seq = cmdSeq.incrementAndGet()
-        // DEBUG, and therefore off unless LogConfig.minLevel is lowered. The trio is a
-        // diagnostic instrument, not an operational signal: it exists so that "submitted
-        // but never ran" stops being indistinguishable from "ran fine" (both present as
-        // no log line), which is what made queue starvation and lock stalls inferable
-        // only from absent logs. But it fires three times per command on a path that runs
-        // continuously — the 30s daemon status refresh alone is one `ps -A | grep` per
-        // daemon — so leaving it on at INFO would churn the rotation window and evict the
-        // history it was added to preserve. Turn it on for a debug session, not for good.
-        // The failure paths stay at their own levels: those are rare and load-bearing —
-        // in particular REROUTED/REJECTED in submit() remain WARN, so an executor handoff
-        // is still visible with verbose logging off.
         logger.debug(TAG, "adb#$seq SUBMIT [${Thread.currentThread().name}]: $command")
-        // Return value deliberately ignored: on a double rejection we log and stop, we do NOT
-        // call callback.onError. ServiceLauncher chains the next command from inside onError,
-        // so an error callback raised on the CALLER's thread would re-enter execute(), be
-        // rejected again, and recurse — reintroducing the crash the guard exists to prevent.
-        // Unreachable in practice anyway: fallbackExecutor is never shut down.
+        // Return value ignored deliberately: on a double rejection we log and stop rather
+        // than call callback.onError, because ServiceLauncher chains the next command from
+        // inside onError — an error raised on the caller's thread would re-enter execute(),
+        // be rejected again, and recurse. Unreachable anyway: fallbackExecutor never dies.
         submit(seq, command) {
             val t0 = System.currentTimeMillis()
             try {
@@ -176,7 +137,7 @@ class AdbShellExecutor(private val context: Context) {
             }
         }
     }
-    
+
     fun executeSync(command: String): ShellResult {
         logger.debug(TAG, "Executing sync: $command")
         val dadb = getOrCreateConnection()
@@ -203,9 +164,9 @@ class AdbShellExecutor(private val context: Context) {
      * completion (best-effort).
      */
     fun executeScript(scriptBody: String, callback: ShellCallback) {
-        // Routed through submit() like execute(). This path previously submitted directly,
-        // so a rejection here propagated uncaught — the same process-killing crash execute()
-        // has guarded against all along, just never fixed on this path.
+        // Routed through submit() like execute(). This path submitted directly, so a
+        // rejection propagated uncaught — the same process-killing crash execute() has
+        // guarded against all along, just never fixed here.
         val seq = cmdSeq.incrementAndGet()
         submit(seq, "<script:${scriptBody.length}B>") {
             // Per-call nonce = nanoTime + atomic counter. nanoTime alone
@@ -304,10 +265,10 @@ class AdbShellExecutor(private val context: Context) {
     }
     
     fun getOrCreateConnection(): Dadb {
-        // sharedDadbLock is PROCESS-WIDE and the liveness probe below is an un-timed blocking
-        // round-trip. If that probe hangs on a half-dead connection every AdbShellExecutor in the
-        // process stalls behind this monitor — and a thread blocked on a monitor reports as
-        // S (sleeping), which is indistinguishable from idle in /proc. Time it explicitly.
+        // sharedDadbLock is PROCESS-WIDE and the liveness probe below is an un-timed
+        // blocking round-trip, so a hang on a half-dead connection stalls every
+        // AdbShellExecutor behind this monitor — and a thread blocked on a monitor reports
+        // as S (sleeping) in /proc, indistinguishable from idle. Time it explicitly.
         val tWait = System.currentTimeMillis()
         synchronized(sharedDadbLock) {
             val waited = System.currentTimeMillis() - tWait

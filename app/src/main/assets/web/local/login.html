@@ -6,20 +6,19 @@
     <title data-i18n="app.login_title">Login - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <script src="../shared/theme.js?v=5"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/design-tokens.css">
     <style>
         :root {
-            --brand-primary: #00D4AA;
-            --brand-secondary: #0EA5E9;
-            --bg-base: #0F0F12;
-            --bg-surface: #16161A;
-            --bg-elevated: #1E1E24;
-            --text-primary: #FFFFFF;
-            --text-secondary: #A1A1AA;
-            --text-muted: #71717A;
-            --danger: #EF4444;
-            --success: #22C55E;
+            --brand-primary: var(--primary);
+            --brand-secondary: var(--tertiary);
+            --bg-base: var(--background);
+            --bg-surface: var(--surface-container);
+            --bg-elevated: var(--surface-container-high);
+            --text-primary: var(--on-surface);
+            --text-secondary: var(--on-surface-variant);
+            --text-muted: var(--outline);
+            --danger: var(--status-danger);
+            --success: var(--status-success);
             --border-subtle: rgba(255, 255, 255, 0.06);
             --border-default: rgba(255, 255, 255, 0.1);
         }
@@ -28,16 +27,6 @@
            Android WebViewFragment sets [data-theme="light"] on every load
            when the app is in light mode. */
         :root[data-theme="light"] {
-            --brand-primary: #00876C;
-            --brand-secondary: #00658F;
-            --bg-base: #F7FAF7;
-            --bg-surface: #ECEFEC;
-            --bg-elevated: #E6E9E6;
-            --text-primary: #181C1A;
-            --text-secondary: #3F4944;
-            --text-muted: #6F7975;
-            --danger: #BA1A1A;
-            --success: #1F7A3F;
             --border-subtle: rgba(0, 0, 0, 0.06);
             --border-default: rgba(0, 0, 0, 0.10);
         }
@@ -48,7 +37,7 @@
         * { box-sizing: border-box; margin: 0; padding: 0; }
         
         body {
-            font-family: 'Inter', -apple-system, sans-serif;
+            font-family: var(--family-sans);
             background: var(--bg-base);
             color: var(--text-primary);
             min-height: 100vh;
@@ -67,7 +56,7 @@
         .login-card {
             background: var(--bg-surface);
             border: 1px solid var(--border-subtle);
-            border-radius: 16px;
+            border-radius: var(--radius-md);
             padding: 40px 32px;
             text-align: center;
         }
@@ -76,7 +65,7 @@
             width: 80px;
             height: 80px;
             margin: 0 auto 24px;
-            border-radius: 20px;
+            border-radius: var(--radius-md);
             overflow: hidden;
             display: flex;
             align-items: center;
@@ -143,7 +132,7 @@
         
         .form-input:focus {
             border-color: var(--brand-primary);
-            box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.1);
+            box-shadow: 0 0 0 3px var(--status-success-container);
         }
         
         .form-input.error {
@@ -171,9 +160,10 @@
         .btn {
             width: 100%;
             padding: 14px 24px;
+            min-height: 48px;
             font-size: 15px;
             font-weight: 600;
-            border-radius: 10px;
+            border-radius: var(--radius-md);
             cursor: pointer;
             transition: all 0.2s;
             display: flex;
@@ -183,8 +173,8 @@
         }
         
         .btn-primary {
-            background: linear-gradient(135deg, var(--brand-primary) 0%, var(--brand-secondary) 100%);
-            color: #000;
+            background: var(--brand-primary);
+            color: var(--on-primary);
             border: none;
         }
         
@@ -202,7 +192,7 @@
         /* Status Messages */
         .status-message {
             padding: 12px 16px;
-            border-radius: 10px;
+            border-radius: var(--radius-md);
             font-size: 13px;
             margin-bottom: 20px;
             display: none;
@@ -213,14 +203,14 @@
         }
         
         .status-message.error {
-            background: rgba(239, 68, 68, 0.1);
-            border: 1px solid rgba(239, 68, 68, 0.3);
+            background: var(--status-danger-container);
+            border: 1px solid var(--status-danger);
             color: var(--danger);
         }
         
         .status-message.success {
-            background: rgba(34, 197, 94, 0.1);
-            border: 1px solid rgba(34, 197, 94, 0.3);
+            background: var(--status-success-container);
+            border: 1px solid var(--status-success);
             color: var(--success);
         }
         
@@ -232,6 +222,20 @@
             border-top-color: currentColor;
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
+        }
+
+        button:focus,
+        input:focus {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 1ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 1ms !important;
+            }
         }
         
         @keyframes spin {
@@ -273,7 +277,7 @@
     <!-- Load i18n runtime so BYD.i18n.init() resolves. The login page has no
          sidebar/status polling so we don't need the rest of core.js, but
          loading it here keeps the dependency graph consistent. -->
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
 </head>
 <body>
     <div class="login-container">

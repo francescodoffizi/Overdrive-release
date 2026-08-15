@@ -69,9 +69,10 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
+            android:accessibilityHeading="true"
             android:gravity="center"
             android:text="@string/webview_camera_daemon_not_running"
-            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+            android:textAppearance="@style/TextAppearance.Overdrive.HeadlineSmall"
             android:textColor="?attr/colorOnSurface"
             android:textStyle="bold" />
 
@@ -86,11 +87,10 @@
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnRetry"
-            style="@style/Widget.Material3.Button.TonalButton"
+            style="@style/Widget.Overdrive.M3.Button.Tonal"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="24dp"
-            android:text="@string/action_retry"
-            app:cornerRadius="14dp" />
+            android:text="@string/action_retry" />
     </LinearLayout>
 </FrameLayout>

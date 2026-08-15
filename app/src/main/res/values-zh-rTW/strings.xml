@@ -681,7 +681,7 @@
     <string name="settings_language_label">語言</string>
     <!-- Recordings page (header + segmented control + page actions) -->
     <string name="recordings_title">錄影</string>
-    <string name="recordings_segment_dashcam">沒有任何樓盤符合您的搜尋</string>
+    <string name="recordings_segment_dashcam">行車記錄器</string>
     <string name="recordings_segment_surveillance">監控</string>
     <string name="recordings_action_settings">設定</string>
     <!-- Hero subtitle: "%1$d today · %2$d total · %3$s" where %3$s is a pre-formatted size like "42 GB". -->

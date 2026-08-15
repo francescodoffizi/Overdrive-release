@@ -32,6 +32,11 @@ import java.util.Set;
 public class MqttPublisherService implements MqttCallback {
 
     private static final String TAG = "MqttPublisher";
+    private static final String CHARGE_CAP_PERCENT_KEY = "charge_cap_percent";
+    private static final String CHARGE_CAP_ENABLED_KEY = "charge_cap_enabled";
+    private static final String CABIN_TEMP_KEY = "cabin_temp";
+    private static final String INSIDE_TEMP_KEY = "inside_temp";
+    private static final String[] NO_TOPICS = new String[0];
     private final DaemonLogger logger;
 
     // Backoff constants
@@ -47,10 +52,23 @@ public class MqttPublisherService implements MqttCallback {
     private final MqttConnectionConfig config;
     private final String deviceId;
 
-    // Paho MQTT client
-    private MqttClient client;
+    // Paho MQTT client. Volatile: mutated only under the instance lock (connect/
+    // disconnect), but read unsynchronized by status/IPC threads via isConnected()
+    // and getStatus() — those must see a current reference, and must read it ONCE
+    // into a local (two reads can NPE if disconnect() nulls the field in between).
+    private volatile MqttClient client;
     private volatile boolean running = false;
     private volatile boolean connected = false;
+
+    // Guards commandRouter creation/teardown. A dedicated lock — NOT the instance
+    // monitor — so the Paho callback thread (messageArrived → ensureCommandRouter)
+    // never blocks behind a scheduler thread holding the instance lock inside a
+    // blocking connect() (~10s) or disconnect() (~5s quiesce). The old synchronized
+    // ensureCommandRouter also created a bounded disconnect-vs-callback standoff:
+    // disconnect(5000) waits for the callback thread to quiesce while the callback
+    // thread waits for the instance lock. Lock ordering: instance lock → routerLock
+    // (disconnect takes both); routerLock never wraps the instance lock.
+    private final Object routerLock = new Object();
 
     // Stats
     private volatile long totalPublishes = 0;
@@ -86,6 +104,13 @@ public class MqttPublisherService implements MqttCallback {
     private volatile String haVin = null;
     private volatile String haModel = null;
     private volatile String haSwVersion = null;
+    // HA state topics are retained independently. Keep track of the ones we have actually
+    // published so a capability transition can remove only state this connection owns.
+    private boolean chargeCapPercentStatePublished = false;
+    private boolean chargeCapEnabledStatePublished = false;
+    // The HA device bundle is retained as one document. Track whether its last successful
+    // version exposed the dynamic charge-cap controls so a capability change replaces it.
+    private boolean chargeCapControlsAnnounced = false;
 
     public MqttPublisherService(MqttConnectionConfig config, String deviceId) {
         this.config = config;
@@ -188,6 +213,15 @@ public class MqttPublisherService implements MqttCallback {
             boolean isSsl = config.isSsl();
             boolean isWebSocket = brokerUri.startsWith("ws://") || brokerUri.startsWith("wss://");
 
+            // Whether this connect must SET the process-global SOCKS properties (WS/WSS +
+            // proxy, Paho bug workaround) or CLEAR them (direct connect on a default
+            // factory — leftover props would misroute it through a dead proxy). The actual
+            // set/clear is deferred to just before connect() under ProxyHelper.SOCKS_PROPS_LOCK
+            // so a sibling connection's connect can't stomp the props mid-window (see the
+            // lock's javadoc). Factory-proxied paths ignore the props and skip the lock.
+            boolean setSocksProps = false;
+            boolean clearSocksProps = false;
+
             if (ProxyHelper.isProxyAvailable()) {
                 if (isWebSocket && isSsl) {
                     // WSS + Proxy: Paho 1.2.0+ has a bug (eclipse/paho.mqtt.java#573) where
@@ -198,8 +232,7 @@ public class MqttPublisherService implements MqttCallback {
                     // Workaround: set JVM-level SOCKS proxy properties so that ALL sockets
                     // (including Paho's internal new Socket()) route through sing-box.
                     // Then provide the appropriate SSLSocketFactory for the TLS layer only.
-                    System.setProperty("socksProxyHost", "127.0.0.1");
-                    System.setProperty("socksProxyPort", String.valueOf(ProxyHelper.getProxyPort()));
+                    setSocksProps = true;
                     if (config.trustAllCerts) {
                         options.setSocketFactory(ProxyHelper.getTrustAllSslFactory());
                     } else {
@@ -212,17 +245,16 @@ public class MqttPublisherService implements MqttCallback {
                     options.setSocketFactory(ProxyHelper.getProxiedSslSocketFactory(config.trustAllCerts));
                 } else if (isWebSocket) {
                     // WS (plain) + Proxy: same Paho bug applies — use system SOCKS properties.
-                    System.setProperty("socksProxyHost", "127.0.0.1");
-                    System.setProperty("socksProxyPort", String.valueOf(ProxyHelper.getProxyPort()));
+                    setSocksProps = true;
                 } else {
                     // Plain TCP + Proxy: ProxiedSocketFactory works fine.
                     options.setSocketFactory(ProxyHelper.getMqttSocketFactory());
                 }
             } else {
-                // No proxy — clear any leftover system SOCKS properties from a previous
-                // connection attempt where the proxy was active.
-                System.clearProperty("socksProxyHost");
-                System.clearProperty("socksProxyPort");
+                // No proxy — leftover system SOCKS properties from a previous WS+proxy
+                // connect would misroute this DIRECT connection's default-factory socket,
+                // so clear them (under the shared lock, at connect time below).
+                clearSocksProps = true;
 
                 if (isSsl) {
                     if (config.trustAllCerts) {
@@ -250,7 +282,27 @@ public class MqttPublisherService implements MqttCallback {
                     + ", ws=" + isWebSocket
                     + ", trustAll=" + config.trustAllCerts + ")");
 
-            newClient.connect(options);
+            // Props-sensitive connects hold SOCKS_PROPS_LOCK from the property mutation
+            // through socket creation (inside connect()) so concurrent connects on other
+            // scheduler threads can't set/clear the props mid-window. The props are left
+            // in their asserted state after connect returns — same as before — because an
+            // established socket no longer reads them; only the creation window matters.
+            // Factory-proxied connects (neither flag) skip the lock entirely, so this
+            // serializes connect attempts only when the global props are actually in play.
+            if (setSocksProps || clearSocksProps) {
+                synchronized (ProxyHelper.SOCKS_PROPS_LOCK) {
+                    if (setSocksProps) {
+                        System.setProperty("socksProxyHost", "127.0.0.1");
+                        System.setProperty("socksProxyPort", String.valueOf(ProxyHelper.getProxyPort()));
+                    } else {
+                        System.clearProperty("socksProxyHost");
+                        System.clearProperty("socksProxyPort");
+                    }
+                    newClient.connect(options);
+                }
+            } else {
+                newClient.connect(options);
+            }
             client = newClient;
             connected = true;
             running = true;
@@ -346,9 +398,16 @@ public class MqttPublisherService implements MqttCallback {
         running = false;
         connected = false;
 
-        if (commandRouter != null) {
-            commandRouter.shutdown();
-            commandRouter = null;
+        // Router teardown under routerLock so it can't interleave with a concurrent
+        // ensureCommandRouter() on the Paho callback thread. running=false is already
+        // visible (volatile, set above), so a racing ensureCommandRouter() that enters
+        // routerLock after us sees !running and returns null instead of resurrecting
+        // a router for a connection that's shutting down.
+        synchronized (routerLock) {
+            if (commandRouter != null) {
+                commandRouter.shutdown();
+                commandRouter = null;
+            }
         }
 
         if (client != null) {
@@ -430,8 +489,16 @@ public class MqttPublisherService implements MqttCallback {
         // floors the result at minIntervalSeconds, so maxMs >= minMs always holds.
         long maxMs = config.effectiveMaxIntervalSeconds(carOn, charging) * 1000L;
 
-        Set<String> changed = differ.changedKeys(snapshot);
         boolean first = differ.lastSendTimeMs() == 0;
+        Set<String> changed = differ.changedKeys(snapshot);
+        boolean cabinTombstone = isChangedNull(snapshot, changed, CABIN_TEMP_KEY)
+                || isChangedNull(snapshot, changed, INSIDE_TEMP_KEY);
+        boolean verifiedChargeCapState = hasVerifiedChargeCapState(snapshot);
+        boolean advertiseChargeCapControls = config.isControlEnabled() && verifiedChargeCapState;
+        String[] chargeCapTombstones = config.isHomeAssistant()
+                ? chargeCapTombstoneKeys(chargeCapPercentStatePublished,
+                        chargeCapEnabledStatePublished, verifiedChargeCapState, first)
+                : NO_TOPICS;
         // Heartbeat: with heartbeatSendAll, fire on a fixed cadence since the last FULL sync
         // (immune to change-only partial publishes resetting the clock — the starvation bug).
         boolean heartbeat = (config.heartbeatSendAll ? differ.fullSyncElapsedMs(now)
@@ -448,7 +515,8 @@ public class MqttPublisherService implements MqttCallback {
 
         // Rate-limit floor: never transmit more often than the min interval, unless this is the
         // first publish, a heartbeat, or a state-transition flush.
-        if (!first && !heartbeat && !flushNow && differ.elapsedMs(now) < minMs) {
+        if (chargeCapTombstones.length == 0 && !cabinTombstone
+                && !first && !heartbeat && !flushNow && differ.elapsedMs(now) < minMs) {
             return true;
         }
 
@@ -459,10 +527,33 @@ public class MqttPublisherService implements MqttCallback {
             if (discoveryAnnounced && !announcedKeys.containsAll(discoverableKeys(snapshot))) {
                 discoveryAnnounced = false;
             }
+            if (chargeCapDiscoveryNeedsRefresh(discoveryAnnounced, chargeCapControlsAnnounced,
+                    advertiseChargeCapControls)) {
+                discoveryAnnounced = false;
+            }
             if (!discoveryAnnounced) announceDiscovery(snapshot);
 
+            if (chargeCapTombstones.length > 0) {
+                if (!clearChargeCapState(chargeCapTombstones)) return false;
+                // The differ cannot observe an omitted JSON key. Forget the complete snapshot
+                // after clearing retained cap state so an eventual verified reappearance is sent
+                // even when its values happen to match the earlier retained values.
+                differ.reset();
+                first = true;
+            }
+
             boolean sendAll = first || heartbeat || !config.changeOnly || flushNow;
-            Set<String> keys = sendAll ? discoverableKeys(snapshot) : changed;
+            Set<String> keys = sendAll ? publishableStateKeys(snapshot) : changed;
+            if (cabinTombstone) {
+                if (snapshot.opt(CABIN_TEMP_KEY) == JSONObject.NULL) keys.add(CABIN_TEMP_KEY);
+                if (snapshot.opt(INSIDE_TEMP_KEY) == JSONObject.NULL) keys.add(INSIDE_TEMP_KEY);
+            }
+            if (!verifiedChargeCapState) {
+                // The manager omits unverified cap values, but keep this defensive boundary at
+                // the publish point too: malformed/partial snapshots must never become HA state.
+                keys.remove(CHARGE_CAP_PERCENT_KEY);
+                keys.remove(CHARGE_CAP_ENABLED_KEY);
+            }
             if (flushNow && stateFlushCycles > 0) stateFlushCycles--;
             if (!sendAll && keys.isEmpty()) return true;
 
@@ -470,12 +561,13 @@ public class MqttPublisherService implements MqttCallback {
             for (String k : keys) {
                 if (!TelemetryFieldCatalog.isPublishable(k)) continue;
                 Object v = snapshot.opt(k);
-                if (v == null || v == JSONObject.NULL || v instanceof JSONArray) continue;
+                if (v == null || v instanceof JSONArray) continue;
                 if (!publishString(HomeAssistantDiscovery.stateTopic(config.topic, k),
-                        String.valueOf(v), true, config.qos)) {
+                        v == JSONObject.NULL ? "" : String.valueOf(v), true, config.qos)) {
                     ok = false;
                     break;
                 }
+                if (verifiedChargeCapState) recordChargeCapStatePublished(k);
             }
             if (ok && snapshot.has("lat") && snapshot.has("lon")
                     && (sendAll || changed.contains("lat") || changed.contains("lon"))) {
@@ -490,7 +582,7 @@ public class MqttPublisherService implements MqttCallback {
 
         // Aggregate mode — full snapshot. Honour the same full-sync triggers (heartbeat /
         // state-flush) so a parked snapshot still goes out even under changeOnly.
-        boolean shouldSend = first || heartbeat || flushNow
+        boolean shouldSend = first || heartbeat || flushNow || cabinTombstone
                 || differ.shouldPublish(!changed.isEmpty(), config.changeOnly, now, minMs, maxMs);
         if (flushNow && stateFlushCycles > 0) stateFlushCycles--;
         if (!shouldSend) return true;
@@ -611,6 +703,92 @@ public class MqttPublisherService implements MqttCallback {
         return keys;
     }
 
+    /** Include explicit nulls so a stale sensor can clear its retained Home Assistant state. */
+    private Set<String> publishableStateKeys(JSONObject snap) {
+        Set<String> keys = discoverableKeys(snap);
+        Iterator<String> it = snap.keys();
+        while (it.hasNext()) {
+            String key = it.next();
+            if (TelemetryFieldCatalog.isPublishable(key) && snap.opt(key) == JSONObject.NULL) {
+                keys.add(key);
+            }
+        }
+        return keys;
+    }
+
+    private static boolean isChangedNull(JSONObject snapshot, Set<String> changed, String key) {
+        return changed.contains(key) && snapshot.opt(key) == JSONObject.NULL;
+    }
+
+    /**
+     * Charge-cap telemetry is verified only when the collector placed a complete, integral pair
+     * into the normal telemetry snapshot. Do not accept strings or partial/raw register values.
+     */
+    static boolean hasVerifiedChargeCapState(JSONObject snapshot) {
+        if (snapshot == null) return false;
+        return isIntegralInRange(snapshot.opt(CHARGE_CAP_PERCENT_KEY), 50, 100)
+                && isIntegralInRange(snapshot.opt(CHARGE_CAP_ENABLED_KEY), 0, 1);
+    }
+
+    /**
+     * Return retained HA state topics that need clearing after verified charge-cap support
+     * disappears. The flags are per connection, preventing unrelated/never-published topics from
+     * being touched.
+     */
+    static String[] chargeCapTombstoneKeys(boolean percentPublished, boolean enabledPublished,
+                                           boolean hasVerifiedCapState) {
+        if (hasVerifiedCapState || (!percentPublished && !enabledPublished)) return NO_TOPICS;
+        if (percentPublished && enabledPublished) {
+            return new String[]{CHARGE_CAP_PERCENT_KEY, CHARGE_CAP_ENABLED_KEY};
+        }
+        return new String[]{percentPublished ? CHARGE_CAP_PERCENT_KEY : CHARGE_CAP_ENABLED_KEY};
+    }
+
+    /**
+     * On the first publish after a daemon restart the in-memory ownership flags are empty, while
+     * the broker can still retain this connection's previous charge-cap values. Clear both topics
+     * when current readback is not verified so an old limit cannot outlive a trim/configuration
+     * change merely because the process restarted before observing it.
+     */
+    static String[] chargeCapTombstoneKeys(boolean percentPublished, boolean enabledPublished,
+                                           boolean hasVerifiedCapState, boolean firstPublish) {
+        if (firstPublish && !hasVerifiedCapState
+                && !percentPublished && !enabledPublished) {
+            return new String[]{CHARGE_CAP_PERCENT_KEY, CHARGE_CAP_ENABLED_KEY};
+        }
+        return chargeCapTombstoneKeys(percentPublished, enabledPublished, hasVerifiedCapState);
+    }
+
+    static boolean chargeCapDiscoveryNeedsRefresh(boolean discoveryAnnounced,
+                                                  boolean announcedControls,
+                                                  boolean currentControls) {
+        return discoveryAnnounced && announcedControls != currentControls;
+    }
+
+    private static boolean isIntegralInRange(Object value, int min, int max) {
+        if (!(value instanceof Number)) return false;
+        double numeric = ((Number) value).doubleValue();
+        return !Double.isNaN(numeric) && !Double.isInfinite(numeric)
+                && numeric == Math.rint(numeric) && numeric >= min && numeric <= max;
+    }
+
+    private boolean clearChargeCapState(String[] topics) {
+        for (String key : topics) {
+            if (!publishString(HomeAssistantDiscovery.stateTopic(config.topic, key),
+                    "", true, config.qos)) {
+                return false;
+            }
+            if (CHARGE_CAP_PERCENT_KEY.equals(key)) chargeCapPercentStatePublished = false;
+            if (CHARGE_CAP_ENABLED_KEY.equals(key)) chargeCapEnabledStatePublished = false;
+        }
+        return true;
+    }
+
+    private void recordChargeCapStatePublished(String key) {
+        if (CHARGE_CAP_PERCENT_KEY.equals(key)) chargeCapPercentStatePublished = true;
+        if (CHARGE_CAP_ENABLED_KEY.equals(key)) chargeCapEnabledStatePublished = true;
+    }
+
     private void publishLocation(JSONObject snap) {
         try {
             JSONObject loc = new JSONObject();
@@ -631,6 +809,8 @@ public class MqttPublisherService implements MqttCallback {
                     config.topic, snapshot, announcedKeys, config.isControlEnabled());
             if (publishString(topic, bundle, true, 1)) {
                 discoveryAnnounced = true;
+                chargeCapControlsAnnounced = config.isControlEnabled()
+                        && hasVerifiedChargeCapState(snapshot);
                 announcedKeys.addAll(discoverableKeys(snapshot));
                 logger.info("Published HA discovery bundle to " + topic
                         + " (" + announcedKeys.size() + " keys)");
@@ -707,6 +887,21 @@ public class MqttPublisherService implements MqttCallback {
         // Inbound vehicle-control command: <base>/<key>/set or <base>/<key>/<sub>/set.
         if (config.isControlEnabled() && topic != null
                 && topic.startsWith(config.topic + "/") && topic.endsWith("/set")) {
+            // NEVER execute a RETAINED command. Command topics must not be retained,
+            // but if any client ever publishes one with retain=true (misconfigured HA
+            // automation, manual `mosquitto_pub -r`), the broker replays it on EVERY
+            // reconnect — and this connection reconnects at each network handoff /
+            // proxy flap. A retained "OPEN" on <base>/tailgate/set would physically
+            // open the tailgate after every reconnect. The automation branch above
+            // survives retained replay via delivered-value dedup; vehicle control has
+            // no such idempotence, so drop retained messages outright. Live commands
+            // (retained=false) are unaffected.
+            if (message.isRetained()) {
+                logger.warn("Ignoring RETAINED control command on " + topic
+                        + " — command topics must not be retained (clear it with an"
+                        + " empty retained publish)");
+                return;
+            }
             String inner = topic.substring(config.topic.length() + 1, topic.length() - "/set".length());
             String key, sub;
             int slash = inner.indexOf('/');
@@ -720,15 +915,34 @@ public class MqttPublisherService implements MqttCallback {
         }
     }
 
-    private synchronized MqttCommandRouter ensureCommandRouter() {
-        // Don't resurrect a router for a connection that's shutting down — a late
-        // inbound message racing disconnect() would otherwise leak a new executor.
-        if (!running) return null;
-        if (commandRouter == null) {
-            commandRouter = new MqttCommandRouter(config.id,
-                    (k, v) -> publishString(config.topic + "/" + k, v, true, config.qos));
+    private MqttCommandRouter ensureCommandRouter() {
+        // Runs on the Paho callback thread. Deliberately NOT synchronized on the
+        // instance monitor: a scheduler thread can hold that lock for seconds inside
+        // a blocking connect()/disconnect(), and stalling the callback thread here
+        // delayed HA birth handling, automation triggers, and control commands (and
+        // set up a bounded standoff with disconnect(5000)'s callback quiesce).
+        // Fast path: the volatile read suffices once the router exists.
+        MqttCommandRouter router = commandRouter;
+        if (router != null) return router;
+        synchronized (routerLock) {
+            // Don't resurrect a router for a connection that's shutting down — a late
+            // inbound message racing disconnect() would otherwise leak a new executor.
+            // disconnect() sets running=false BEFORE taking routerLock, so whichever
+            // side enters the lock second observes the other's effect.
+            if (!running) return null;
+            if (commandRouter == null) {
+                commandRouter = new MqttCommandRouter(config.id,
+                        this::publishVerifiedControlState);
+            }
+            return commandRouter;
         }
-        return commandRouter;
+    }
+
+    /** Publish a post-command readback and remember any retained charge-cap state it confirms. */
+    private synchronized void publishVerifiedControlState(String key, String value) {
+        if (publishString(config.topic + "/" + key, value, true, config.qos)) {
+            recordChargeCapStatePublished(key);
+        }
     }
 
     @Override
@@ -744,9 +958,14 @@ public class MqttPublisherService implements MqttCallback {
     public JSONObject getStatus() {
         JSONObject status = new JSONObject();
         try {
+            // Single read of the volatile client — disconnect()/connect() can null or
+            // swap the field concurrently (this runs unsynchronized on IPC threads),
+            // and a second read after the null check could NPE. The NPE was previously
+            // swallowed by the catch below, silently truncating the whole status blob.
+            MqttClient c = client;
             status.put("id", config.id);
             status.put("name", config.name);
-            status.put("connected", connected && client != null && client.isConnected());
+            status.put("connected", connected && c != null && c.isConnected());
             status.put("running", running);
             status.put("totalPublishes", totalPublishes);
             status.put("failedPublishes", failedPublishes);
@@ -805,7 +1024,11 @@ public class MqttPublisherService implements MqttCallback {
     // ==================== GETTERS ====================
 
     public MqttConnectionConfig getConfig() { return config; }
-    public boolean isConnected() { return connected && client != null && client.isConnected(); }
+    /** Single volatile read into a local — see the note on {@link #client}. */
+    public boolean isConnected() {
+        MqttClient c = client;
+        return connected && c != null && c.isConnected();
+    }
     public boolean isRunning() { return running; }
     public long getTotalPublishes() { return totalPublishes; }
     public long getFailedPublishes() { return failedPublishes; }

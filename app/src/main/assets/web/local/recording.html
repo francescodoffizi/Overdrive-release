@@ -6,7 +6,7 @@
     <title data-i18n="app.recordings_title">Recordings - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <!--
       Bottom-tab manifest. 5 tabs grouping the settings cards:
         Status      — live recording status pill
@@ -30,9 +30,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <script src="https://cdn.jsdelivr.net/npm/jmuxer@2.0.4/dist/jmuxer.min.js"></script>
     <script src="../shared/SotaPlayer.js?v=13"></script>
     <script src="../shared/Decoder.js"></script>
@@ -772,6 +770,14 @@
                             <span id="recLimitMin">100 MB</span>
                             <span id="recLimitMax">100 GB</span>
                         </div>
+                        <!-- Combined-limit advisory: this volume's Σ limits exceed
+                             what it can hold. Rendered by shared/storage-budget.js;
+                             text is set at runtime (no data-i18n — the key varies
+                             by severity and interpolates live numbers). -->
+                        <div class="storage-fallback-banner" id="recBudgetBanner" style="display:none;" role="status" aria-live="polite">
+                            <span class="sd-status-dot" style="background:#f0a020;"></span>
+                            <span data-budget-text></span>
+                        </div>
                     </div>
                 </div>
 
@@ -886,9 +892,10 @@
     <div id="toastContainer" class="toast-container"></div>
 
     <script src="../shared/auth.js"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/recording.js?v=telemetryfields1"></script>
+    <script src="../shared/storage-budget.js?v=8"></script>
+    <script src="../shared/recording.js?v=budget8"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

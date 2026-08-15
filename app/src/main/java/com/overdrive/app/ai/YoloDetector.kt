@@ -28,7 +28,14 @@ data class Detection(
 )
 
 /**
- * YOLO11n TensorFlow Lite Detector — CPU-only (XNNPACK).
+ * YOLO TensorFlow Lite Detector — CPU-only (XNNPACK).
+ *
+ * Model-agnostic across the Ultralytics family: init() probes the loaded
+ * asset's tensors and routes to the matching parser — legacy raw-anchor
+ * heads ([1,4+C,N], host NMS; yolo11n) or end-to-end NMS-free heads
+ * ([1,D,6]; YOLO26). Shipped asset: yolo26n dynamic-range-quantized
+ * (INT8 weights / float activations — full-integer quantization breaks
+ * the e2e decode head, see dev/export_yolo26_int8.py VALIDATED FINDINGS).
  *
  * **Why CPU and not GPU on this hardware.** The Snapdragon 662 / Adreno 610
  * is a unified-memory SoC: the H.265 hardware encoder, the Adreno GPU's
@@ -118,9 +125,20 @@ class YoloDetector(private val context: Context) {
     // a fresh List + lambda per call.
     private var nmsScratch: Array<Detection?>? = null
 
-    // Model configuration
-    private val modelPath = "models/yolo11n.tflite"
-    private val inputSize = 640
+    // Model configuration. Exactly ONE model ships in the APK; the first
+    // asset found in this list is loaded. Canonical name first (yolo26n —
+    // the deployed END2END DRQ model), legacy name second so a rollback
+    // (restoring the old yolo11n FP16 asset under its original name) needs
+    // no code change. The detector identifies the model's layout/dtype by
+    // probing its tensors in init(), never by filename.
+    private val modelPathCandidates = listOf(
+        "models/yolo26n.tflite",
+        "models/yolo11n.tflite",
+    )
+    // Probed from input tensor 0 in init() (Ultralytics NHWC [1,H,W,3]);
+    // 640 is the shipped asset's value and the fallback if the shape is
+    // unavailable. Square-enforced in init().
+    private var inputSize = 640
 
     // INT8 / FP32 model auto-detection. The Android side stays compatible
     // with both yolo11n.tflite variants (FP32 default, INT8 produced by
@@ -144,6 +162,28 @@ class YoloDetector(private val context: Context) {
     private var outputIsQuantized = false
     private var outputScale = 0f
     private var outputZeroPoint = 0
+
+    // Output LAYOUT auto-detection (sibling of the dtype auto-detection above).
+    // Two supported head formats, probed from output tensor 0's shape in init():
+    //
+    //   LEGACY   [1, 4+C, N]  (yolo11n: [1, 84, 8400]) — raw anchors, class-score
+    //            matrix, host-side NMS. This is the shipped model's format and
+    //            its code path below is UNCHANGED — with the current asset the
+    //            detector behaves byte-identically to before this field existed.
+    //
+    //   END2END  [1, D, 6]    (Ultralytics end-to-end exports, e.g. YOLO26:
+    //            [1, 300, 6]) — each row is (x1, y1, x2, y2, score, class),
+    //            already NMS-resolved inside the graph. Rows are padded with
+    //            score=0, which the caller's confThreshold naturally skips.
+    //
+    // Anything else fails init() loudly rather than parsing garbage — an
+    // unrecognized head must never silently produce zero detections forever
+    // (that would read downstream as "YOLO saw nothing" on every real event).
+    private var outputIsEndToEnd = false
+    private var e2eMaxDet = 0
+    private var legacyNumBoxes = 8400
+    private var legacyNumChannels = 84
+    private var outputElements = 84 * 8400
     private var int8OutputBuffer: ByteArray? = null  // raw output for int8 path
 
     // SOTA: Native C++ image processor (SIMD-accelerated bilinear resize
@@ -201,7 +241,25 @@ class YoloDetector(private val context: Context) {
                 return false
             }
 
-            val modelFile = FileUtil.loadMappedFile(context, modelPath)
+            // Load the first bundled model asset (canonical name first,
+            // legacy fallback — see modelPathCandidates).
+            var loaded: java.nio.MappedByteBuffer? = null
+            var loadedPath: String? = null
+            for (candidate in modelPathCandidates) {
+                try {
+                    loaded = FileUtil.loadMappedFile(context, candidate)
+                    loadedPath = candidate
+                    break
+                } catch (e: Exception) {
+                    // Asset absent under this name — try the next candidate.
+                }
+            }
+            if (loaded == null) {
+                logger.error("No model asset found (tried: $modelPathCandidates)")
+                return false
+            }
+            logger.info("Loading model asset: $loadedPath")
+            val modelFile = loaded
 
             // CPU XNNPACK, 4 threads. Worker pthreads inherit nice +10
             // from the calling aiExecutor thread; the 12-point CFS gradient
@@ -215,6 +273,12 @@ class YoloDetector(private val context: Context) {
                 interpreter!!.allocateTensors()
             } catch (e: Exception) {
                 logger.error("Failed to initialize TFLite CPU interpreter: ${e.message}", e)
+                // Audit fix: allocateTensors() can throw AFTER the native
+                // interpreter was created — close it so a failed init never
+                // leaks native memory or leaves a live interpreter on a
+                // half-initialized instance.
+                try { interpreter?.close() } catch (ignored: Exception) {}
+                interpreter = null
                 return false
             }
 
@@ -232,6 +296,44 @@ class YoloDetector(private val context: Context) {
                 val q = outputTensor.quantizationParams()
                 outputScale = q.scale
                 outputZeroPoint = q.zeroPoint
+            }
+
+            // Probe the model's INPUT size instead of assuming 640. Ultralytics
+            // TFLite exports are NHWC [1, H, W, 3]; the pipeline assumes a square
+            // input (single scale factor per axis derived from inputSize), so a
+            // non-square export is rejected loudly rather than silently skewing
+            // every box. With the shipped 640×640 asset this is a no-op.
+            val inShape = inputTensor.shape()
+            if (inShape.size == 4 && inShape[1] == inShape[2] && inShape[1] > 0) {
+                inputSize = inShape[1]
+            } else if (inShape.size == 4 && inShape[1] != inShape[2]) {
+                logger.error("Unsupported non-square model input ${inShape.contentToString()} — refusing to init")
+                interpreter?.close()
+                interpreter = null
+                return false
+            }
+
+            // Probe the model's OUTPUT layout (see field docs above):
+            //   [1, 4+C, N] (N > 4+C)  → LEGACY raw-anchor head + host NMS
+            //   [1, D, 6]              → END2END (already NMS-resolved rows)
+            // Unknown layouts fail init() loudly: a mis-parsed head would read
+            // downstream as "YOLO saw nothing" on every real event — the exact
+            // silent false-negative mode this pipeline treats as a defect.
+            val outShape = outputTensor.shape()
+            if (outShape.size == 3 && outShape[2] == 6 && outShape[1] > 0) {
+                outputIsEndToEnd = true
+                e2eMaxDet = outShape[1]
+                outputElements = e2eMaxDet * 6
+            } else if (outShape.size == 3 && outShape[1] >= 5 && outShape[2] > outShape[1]) {
+                outputIsEndToEnd = false
+                legacyNumChannels = outShape[1]
+                legacyNumBoxes = outShape[2]
+                outputElements = legacyNumChannels * legacyNumBoxes
+            } else {
+                logger.error("Unsupported model output layout ${outShape.contentToString()} — refusing to init")
+                interpreter?.close()
+                interpreter = null
+                return false
             }
 
             // Build the preprocessing pipeline that matches the model's
@@ -252,9 +354,9 @@ class YoloDetector(private val context: Context) {
                     .build()
             }
 
-            // Pre-allocate output buffer sized to the actual tensor dtype.
+            // Pre-allocate output buffer sized to the actual tensor layout+dtype
+            // (outputElements was computed from the probed shape above).
             // FP32: 4 bytes/element. INT8/UINT8: 1 byte/element.
-            val outputElements = 84 * 8400
             val outputBytes = outputElements * if (outputIsQuantized) 1 else 4
             outputBuffer = ByteBuffer.allocateDirect(outputBytes).order(ByteOrder.nativeOrder())
             if (outputIsQuantized) {
@@ -264,7 +366,9 @@ class YoloDetector(private val context: Context) {
             val mode = if (inputIsQuantized && outputIsQuantized) "INT8"
                        else if (!inputIsQuantized && !outputIsQuantized) "FP32"
                        else "MIXED($inputDtype/$outputDtype)"
-            logger.info("CPU XNNPACK initialized (4 threads, $mode model, " +
+            val layout = if (outputIsEndToEnd) "END2END[$e2eMaxDet,6]"
+                         else "LEGACY[$legacyNumChannels,$legacyNumBoxes]+hostNMS"
+            logger.info("CPU XNNPACK initialized (4 threads, $mode model, $layout, in=${inputSize}x$inputSize, " +
                     (if (outputIsQuantized) "outScale=$outputScale outZp=$outputZeroPoint, " else "") +
                     "encoder-isolated via nice gradient)")
 
@@ -272,6 +376,11 @@ class YoloDetector(private val context: Context) {
             return true
         } catch (e: Exception) {
             logger.error("Failed to load model: ${e.message}", e)
+            // Audit fix: any throw between interpreter creation and the
+            // successful return (tensor probes, ImageProcessor build) must
+            // not leak the live native interpreter.
+            try { interpreter?.close() } catch (ignored: Exception) {}
+            interpreter = null
             return false
         }
     }
@@ -352,8 +461,8 @@ class YoloDetector(private val context: Context) {
             outputBuffer!!.rewind()
 
             var fo = floatOutput
-            if (fo == null || fo.size != 84 * 8400) {
-                fo = FloatArray(84 * 8400)
+            if (fo == null || fo.size != outputElements) {
+                fo = FloatArray(outputElements)
                 floatOutput = fo
             }
 
@@ -415,10 +524,22 @@ class YoloDetector(private val context: Context) {
             // a ~250 ms inference that already holds the lock, and the only other
             // contender is close() — which happens on class-toggle or shutdown, and
             // whose whole purpose is to WAIT for in-flight work anyway.
-            return parseOutput(
-                fo, width, height, confThreshold,
-                detectPerson, detectCar, detectAnimal, detectBike, minRelativeHeight
-            )
+            return if (outputIsEndToEnd) {
+                // END2END head (e.g. YOLO26): rows are already NMS-resolved
+                // (x1,y1,x2,y2,score,class). Same post-gates as the legacy
+                // path (class mask, implausible-class floor, size gates,
+                // ghost cap, funnel diagnostics) — only the anchor decode +
+                // host NMS disappear because the graph did them.
+                parseOutputEndToEnd(
+                    fo, width, height, confThreshold,
+                    detectPerson, detectCar, detectAnimal, detectBike, minRelativeHeight
+                )
+            } else {
+                parseOutput(
+                    fo, width, height, confThreshold,
+                    detectPerson, detectCar, detectAnimal, detectBike, minRelativeHeight
+                )
+            }
         }
     }
     
@@ -440,8 +561,10 @@ class YoloDetector(private val context: Context) {
         minRelativeHeight: Float
     ): List<Detection> {
 
-        val numBoxes = 8400
-        val numClasses = 80
+        // Probed from the model in init() — 8400/80 for the shipped yolo11n
+        // asset, so this is behavior-identical to the previous hardcoding.
+        val numBoxes = legacyNumBoxes
+        val numClasses = legacyNumChannels - 4
 
         val scaleX = imgWidth.toFloat() / inputSize
         val scaleY = imgHeight.toFloat() / inputSize
@@ -469,15 +592,21 @@ class YoloDetector(private val context: Context) {
         // Class-membership bitmask. Every COCO class we care about has id < 24,
         // so a single Long bit-tests in O(1) without allocating an IntRange or
         // a List inside the per-detection loop.
+        // MOTORCYCLE belongs to the Bike toggle (audit R3b Ext-11): the API
+        // doc, the engine's classFilter taxonomy (Bike = {1 bicycle, 3
+        // motorcycle}), the size gates and the canonical-class collapse all
+        // put motorcycle under Bike — this mask was the single inconsistent
+        // site, so Bike ON + Car OFF silently dropped every motorcycle (and
+        // Car ON + Bike OFF leaked them).
         var wantedMask = 0L
         if (detectPerson) wantedMask = wantedMask or (1L shl CLASS_PERSON)
         if (detectCar) {
             wantedMask = wantedMask or (1L shl CLASS_CAR) or (1L shl CLASS_BUS) or
                     (1L shl CLASS_TRUCK) or (1L shl CLASS_TRAIN) or
-                    (1L shl CLASS_BOAT) or (1L shl CLASS_AIRPLANE) or
-                    (1L shl CLASS_MOTORCYCLE)
+                    (1L shl CLASS_BOAT) or (1L shl CLASS_AIRPLANE)
         }
-        if (detectBike) wantedMask = wantedMask or (1L shl CLASS_BICYCLE)
+        if (detectBike) wantedMask = wantedMask or (1L shl CLASS_BICYCLE) or
+                (1L shl CLASS_MOTORCYCLE)
         if (detectAnimal) {
             // 14..23 inclusive
             for (c in CLASS_BIRD..CLASS_GIRAFFE) wantedMask = wantedMask or (1L shl c)
@@ -660,18 +789,18 @@ class YoloDetector(private val context: Context) {
         var animalCount = 0
         var bestKeptConf = 0f
         var bestKeptClass = -1
-        // Mirrors the vehicle set in `wantedMask` above.
+        // Mirrors the vehicle set in `wantedMask` above (motorcycle counts
+        // under Bike — R3b Ext-11).
         val carMask = (1L shl CLASS_CAR) or (1L shl CLASS_BUS) or
                 (1L shl CLASS_TRUCK) or (1L shl CLASS_TRAIN) or
-                (1L shl CLASS_BOAT) or (1L shl CLASS_AIRPLANE) or
-                (1L shl CLASS_MOTORCYCLE)
+                (1L shl CLASS_BOAT) or (1L shl CLASS_AIRPLANE)
         var animalMask = 0L
         for (c in CLASS_BIRD..CLASS_GIRAFFE) animalMask = animalMask or (1L shl c)
         for (idx in final.indices) {
             val det = final[idx]
             val cid = det.classId
             if (cid == CLASS_PERSON) personCount++
-            if (cid == CLASS_BICYCLE) bikeCount++
+            if (cid == CLASS_BICYCLE || cid == CLASS_MOTORCYCLE) bikeCount++
             if (cid in 0..63) {
                 val bit = 1L shl cid
                 if ((bit and carMask) != 0L) carCount++
@@ -707,6 +836,218 @@ class YoloDetector(private val context: Context) {
         return final
     }
     
+    /**
+     * END2END output parsing (Ultralytics NMS-free exports, e.g. YOLO26).
+     *
+     * Output rows are (x1, y1, x2, y2, score, class), already NMS-resolved
+     * inside the graph; unused rows are zero-padded (score 0) and fall out of
+     * the confidence gate. This method applies EXACTLY the same post-model
+     * gates as the legacy [parseOutput] — class-membership mask,
+     * implausible-class confidence floor, quadrant-relative size gates,
+     * ghost cap, and the raw-funnel diagnostics — in the same order, so the
+     * two heads differ only in what the graph already did (anchor decode +
+     * NMS). Any change to a gate here must be mirrored in [parseOutput].
+     *
+     * Coordinate units: Ultralytics end-to-end TFLite exports have emitted
+     * both normalized [0,1] and input-pixel xyxy depending on version.
+     * Decided ONCE PER TENSOR (audit fix — a per-row probe could misroute a
+     * confident sub-2px-corner pixel-unit box into a large phantom that
+     * SURVIVES the size gate, the opposite of the earlier comment's claim):
+     * if ANY conf-passing row has a coordinate > 1.5, the whole tensor is in
+     * pixel units; otherwise normalized. A tensor cannot mix units, and the
+     * reverse misroute is impossible (normalized coords are ≤ 1.0 ≤ 1.5).
+     * Shipped-model ground truth: pixel units (validated offline).
+     */
+    private fun parseOutputEndToEnd(
+        output: FloatArray,
+        imgWidth: Int,
+        imgHeight: Int,
+        confThreshold: Float,
+        detectPerson: Boolean,
+        detectCar: Boolean,
+        detectAnimal: Boolean,
+        detectBike: Boolean,
+        minRelativeHeight: Float
+    ): List<Detection> {
+
+        val scaleX = imgWidth.toFloat() / inputSize
+        val scaleY = imgHeight.toFloat() / inputSize
+
+        // Size-gate reference frame: the crop IS the reference frame — see the
+        // rationale block in parseOutput (the /2 mosaic-era bug).
+        val quadrantHeight = imgHeight
+        val quadrantWidth = imgWidth
+
+        // Class-membership bitmask — mirrors parseOutput exactly (incl. the
+        // R3b Ext-11 motorcycle-under-Bike fix; see parseOutput's comment).
+        var wantedMask = 0L
+        if (detectPerson) wantedMask = wantedMask or (1L shl CLASS_PERSON)
+        if (detectCar) {
+            wantedMask = wantedMask or (1L shl CLASS_CAR) or (1L shl CLASS_BUS) or
+                    (1L shl CLASS_TRUCK) or (1L shl CLASS_TRAIN) or
+                    (1L shl CLASS_BOAT) or (1L shl CLASS_AIRPLANE)
+        }
+        if (detectBike) wantedMask = wantedMask or (1L shl CLASS_BICYCLE) or
+                (1L shl CLASS_MOTORCYCLE)
+        if (detectAnimal) {
+            for (c in CLASS_BIRD..CLASS_GIRAFFE) wantedMask = wantedMask or (1L shl c)
+        }
+
+        val carWidthThreshold = minRelativeHeight * 1.33f
+        val bikeHeightThreshold = minRelativeHeight * 0.7f
+
+        // Implausible-class floor — mirrors parseOutput exactly (see the full
+        // rationale there; the engine drops 4/6/8 downstream regardless).
+        val implausibleClassMask = (1L shl CLASS_TRAIN) or (1L shl CLASS_BOAT) or
+                (1L shl CLASS_AIRPLANE)
+        val implausibleClassMinConf = maxOf(confThreshold, 0.55f)
+
+        val detections = ArrayList<Detection>(16)
+
+        // Raw-funnel diagnostics — same contract as parseOutput. rejNms is
+        // structurally absent here (the graph resolved overlaps already).
+        var rawPeakConf = 0f
+        var rawPeakClass = -1
+        var rejConf = 0
+        var rejImplausible = 0
+        var rejUnwanted = 0
+        var rejSize = 0
+        var peakPersonConf = 0f
+
+        // Per-TENSOR coordinate-unit decision (see method doc): pixel units
+        // iff any conf-passing row has a coordinate beyond the normalized
+        // range. Zero-padded rows never pass the conf gate so they can't
+        // vote. If NO row passes conf, no coordinates are consumed and the
+        // verdict is irrelevant.
+        var tensorIsPixelUnits = false
+        run {
+            for (i in 0 until e2eMaxDet) {
+                val base = i * 6
+                if (output[base + 4] < confThreshold) continue
+                if (output[base + 2] > 1.5f || output[base + 3] > 1.5f) {
+                    tensorIsPixelUnits = true
+                }
+                // One conf-passing row with all coords ≤1.5 in a pixel-unit
+                // tensor is theoretically possible only for a sub-2px corner
+                // box, so keep scanning until a decisive row is found.
+                if (tensorIsPixelUnits) break
+            }
+        }
+
+        for (i in 0 until e2eMaxDet) {
+            val base = i * 6
+            val score = output[base + 4]
+            // Math.round, not toInt() (audit R2 #8): a quantized E2E head
+            // dequantizes class ids as (raw−zp)×scale, so an integral id can
+            // arrive as e.g. 1.9999 — truncation would silently decode
+            // car(2) as bicycle(1). Unreachable with the shipped float-output
+            // DRQ model, but the code structurally supports quantized+E2E.
+            val classId = Math.round(output[base + 5])
+
+            if (score > rawPeakConf) {
+                rawPeakConf = score
+                rawPeakClass = classId
+            }
+            if (classId == CLASS_PERSON && score > peakPersonConf) peakPersonConf = score
+
+            if (score < confThreshold) { rejConf++; continue }
+            if (classId < 0 || classId >= 64) continue
+            if ((implausibleClassMask and (1L shl classId)) != 0L
+                    && score < implausibleClassMinConf) { rejImplausible++; continue }
+            if ((wantedMask and (1L shl classId)) == 0L) { rejUnwanted++; continue }
+
+            var x1 = output[base]
+            var y1 = output[base + 1]
+            var x2 = output[base + 2]
+            var y2 = output[base + 3]
+            // Normalized tensor ⇒ scale to input pixels first so both
+            // branches share the crop-scale below (per-tensor verdict).
+            if (!tensorIsPixelUnits) {
+                x1 *= inputSize; y1 *= inputSize
+                x2 *= inputSize; y2 *= inputSize
+            }
+
+            val objX = (x1 * scaleX).toInt().coerceIn(0, imgWidth)
+            val objY = (y1 * scaleY).toInt().coerceIn(0, imgHeight)
+            val objW = ((x2 - x1) * scaleX).toInt().coerceIn(0, imgWidth - objX)
+            val objH = ((y2 - y1) * scaleY).toInt().coerceIn(0, imgHeight - objY)
+
+            // Quadrant-relative distance filter — mirrors parseOutput exactly.
+            val relH = if (quadrantHeight > 0) objH.toFloat() / quadrantHeight else 0f
+            val relW = if (quadrantWidth > 0) objW.toFloat() / quadrantWidth else 0f
+            val passes = when (classId) {
+                CLASS_PERSON -> relH >= minRelativeHeight
+                CLASS_CAR, CLASS_BUS, CLASS_TRUCK, CLASS_TRAIN -> relW >= carWidthThreshold
+                CLASS_BICYCLE, CLASS_MOTORCYCLE -> relH >= bikeHeightThreshold
+                else -> relH >= minRelativeHeight
+            }
+            if (!passes) {
+                rejSize++
+                if (classId == CLASS_PERSON) {
+                    logger.info("YOLO size-gate dropped PERSON conf=%.3f relH=%.3f (need %.3f) box=%dx%d quad=%dx%d"
+                        .format(score, relH, minRelativeHeight, objW, objH, quadrantWidth, quadrantHeight))
+                }
+                continue
+            }
+
+            detections.add(Detection(classId, score, objX, objY, objW, objH))
+        }
+
+        // No host NMS (resolved in-graph). Ghost cap retained: TRUNCATE, never
+        // clear — same insurance as the legacy path. E2E rows arrive in
+        // descending-score order from the export's TopK, so take() keeps the
+        // most probable ones.
+        val final = if (detections.size > 50) {
+            logger.warn("Ghost filter: ${detections.size} > 50, keeping top 50 by confidence")
+            detections.take(50)
+        } else {
+            detections
+        }
+
+        // Class-distribution counts — same log contract as parseOutput
+        // (motorcycle counts under Bike — R3b Ext-11).
+        var personCount = 0
+        var carCount = 0
+        var bikeCount = 0
+        var animalCount = 0
+        var bestKeptConf = 0f
+        var bestKeptClass = -1
+        val carMask = (1L shl CLASS_CAR) or (1L shl CLASS_BUS) or
+                (1L shl CLASS_TRUCK) or (1L shl CLASS_TRAIN) or
+                (1L shl CLASS_BOAT) or (1L shl CLASS_AIRPLANE)
+        var animalMask = 0L
+        for (c in CLASS_BIRD..CLASS_GIRAFFE) animalMask = animalMask or (1L shl c)
+        for (idx in final.indices) {
+            val det = final[idx]
+            val cid = det.classId
+            if (cid == CLASS_PERSON) personCount++
+            if (cid == CLASS_BICYCLE || cid == CLASS_MOTORCYCLE) bikeCount++
+            if (cid in 0..63) {
+                val bit = 1L shl cid
+                if ((bit and carMask) != 0L) carCount++
+                if ((bit and animalMask) != 0L) animalCount++
+            }
+            if (det.confidence > bestKeptConf) {
+                bestKeptConf = det.confidence
+                bestKeptClass = cid
+            }
+        }
+
+        logger.info("Detected ${final.size} objects: person=$personCount car=$carCount bike=$bikeCount animal=$animalCount (max_conf=${"%.3f".format(bestKeptConf)} class=$bestKeptClass) [e2e]")
+
+        if (final.isEmpty()) {
+            logger.info(("YOLO raw funnel [e2e]: raw=%.3f class=%d person=%.3f | " +
+                    "rej conf=%d implausible=%d unwanted=%d size=%d | " +
+                    "confThr=%.2f minRelH=%.3f in=%dx%d quad=%dx%d")
+                .format(rawPeakConf, rawPeakClass, peakPersonConf,
+                        rejConf, rejImplausible, rejUnwanted, rejSize,
+                        confThreshold, minRelativeHeight,
+                        imgWidth, imgHeight, quadrantWidth, quadrantHeight))
+        }
+
+        return final
+    }
+
     /**
      * Non-Maximum Suppression. In-place sort into the reused scratch array
      * + linear cull. Replaces a `sortedByDescending { ... }` allocation

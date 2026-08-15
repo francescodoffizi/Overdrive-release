@@ -22,6 +22,16 @@ public interface Action {
      */
     void trigger(AutomationAction automationAction);
 
+    /**
+     * Trigger an action and report whether it completed successfully when the implementation has
+     * an authoritative result. Most actions have no result channel, so returning from
+     * {@link #trigger(AutomationAction)} is their successful completion contract.
+     */
+    default boolean triggerWithResult(AutomationAction automationAction) {
+        trigger(automationAction);
+        return true;
+    }
+
 
     /**
      * Create a JSON object with the fields required for the frontend to display

@@ -9,6 +9,7 @@ import android.os.Looper
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityManager
 import android.widget.ImageButton
 import android.widget.SeekBar
 import android.widget.TextView
@@ -17,8 +18,11 @@ import androidx.navigation.fragment.findNavController
 import com.overdrive.app.R
 import com.overdrive.app.ui.view.EventTimelineView
 import com.overdrive.app.ui.view.ZoomableVideoView
+import com.google.android.material.button.MaterialButton
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /**
  * Native video player with event timeline overlay.
@@ -85,6 +89,14 @@ class VideoPlayerFragment : Fragment() {
     private var btnNext: ImageButton? = null
     private var btnFullscreen: ImageButton? = null
     private var btnMute: ImageButton? = null
+    private var playerLoadingContainer: View? = null
+    private var playerErrorContainer: View? = null
+    private var tvPlayerError: TextView? = null
+    private var btnPlayerRetry: MaterialButton? = null
+    private var btnPlayerErrorNext: MaterialButton? = null
+    private var currentPath: String = ""
+    private var currentTitle: String = ""
+    private var playbackInitialized: Boolean = false
 
     // Quadrant selector — null on layouts without the bar (none today, but
     // the host could legitimately strip it for an embedded preview surface).
@@ -138,6 +150,8 @@ class VideoPlayerFragment : Fragment() {
 
     private val handler = Handler(Looper.getMainLooper())
     private var isUserSeeking = false
+    private var timelineExecutor: ExecutorService? = null
+    private var timelineGeneration: Int = 0
 
     // Auto-hide overlay controls
     private var topBar: View? = null
@@ -169,6 +183,11 @@ class VideoPlayerFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        if (timelineExecutor == null || timelineExecutor?.isShutdown == true) {
+            timelineExecutor = Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "RecordingTimeline").apply { isDaemon = true }
+            }
+        }
 
         videoView = view.findViewById(R.id.videoView)
         seekBar = view.findViewById(R.id.seekBar)
@@ -183,6 +202,11 @@ class VideoPlayerFragment : Fragment() {
         btnNext = view.findViewById(R.id.btnNext)
         btnFullscreen = view.findViewById(R.id.btnFullscreen)
         btnMute = view.findViewById(R.id.btnMute)
+        playerLoadingContainer = view.findViewById(R.id.playerLoadingContainer)
+        playerErrorContainer = view.findViewById(R.id.playerErrorContainer)
+        tvPlayerError = view.findViewById(R.id.tvPlayerError)
+        btnPlayerRetry = view.findViewById(R.id.btnPlayerRetry)
+        btnPlayerErrorNext = view.findViewById(R.id.btnPlayerErrorNext)
         quadrantBar = view.findViewById(R.id.quadrantBar)
         btnQuadrantAll = view.findViewById(R.id.btnQuadrantAll)
         btnQuadrantFront = view.findViewById(R.id.btnQuadrantFront)
@@ -233,6 +257,20 @@ class VideoPlayerFragment : Fragment() {
         playlistTitles = arguments?.getStringArray(ARG_PLAYLIST_TITLES) ?: emptyArray()
         playlistIndex = arguments?.getInt(ARG_PLAYLIST_INDEX, -1) ?: -1
 
+        // A landscape inline player can be restored before its portrait host
+        // removes it. The portrait layout provides a zero-size container only
+        // to satisfy FragmentManager restoration; never prepare or start media
+        // unless the real landscape two-pane host exists.
+        if (inlineMode &&
+            parentFragment?.view?.findViewById<View>(R.id.twoPaneBody) == null) {
+            btnBack.visibility = View.GONE
+            playerLoadingContainer?.visibility = View.GONE
+            quadrantBar?.visibility = View.GONE
+            topBar?.visibility = View.GONE
+            bottomControls?.visibility = View.GONE
+            return
+        }
+
         val initialPath = arguments?.getString(ARG_VIDEO_PATH) ?: run {
             // In inline mode we must NOT pop the parent's nav stack — just
             // bail out quietly (the host can decide what to render instead).
@@ -272,6 +310,8 @@ class VideoPlayerFragment : Fragment() {
     }
 
     private fun loadVideo(path: String, title: String) {
+        currentPath = path
+        currentTitle = title
         tvTitle.text = title
         // File size meta
         val file = File(path)
@@ -458,9 +498,21 @@ class VideoPlayerFragment : Fragment() {
         val btn = btnMute ?: return
         if (userPrefMuted) {
             btn.setImageResource(R.drawable.ic_volume_off)
+            btn.contentDescription = getString(R.string.cd_player_unmute)
         } else {
             btn.setImageResource(R.drawable.ic_volume_on)
+            btn.contentDescription = getString(R.string.cd_player_mute_audio)
         }
+    }
+
+    private fun refreshPlayPauseButton(isPlaying: Boolean) {
+        btnPlayPause.setImageResource(
+            if (isPlaying) android.R.drawable.ic_media_pause
+            else android.R.drawable.ic_media_play
+        )
+        btnPlayPause.contentDescription = getString(
+            if (isPlaying) R.string.cd_pause else R.string.cd_play
+        )
     }
 
     private fun setupVideoPlayer(path: String) {
@@ -471,9 +523,15 @@ class VideoPlayerFragment : Fragment() {
         // prepare callback fires, which would route mute toggles to a dead
         // player.
         currentMediaPlayer = null
-        videoView.setVideoURI(Uri.fromFile(File(path)))
+        playbackInitialized = true
+        showBuffering()
+        val source = Uri.parse(path)
+        videoView.setVideoURI(
+            if (source.scheme == null) Uri.fromFile(File(path)) else source
+        )
 
         videoView.setOnPreparedListener { mp ->
+            hidePlaybackState()
             val duration = videoView.duration
             seekBar.max = duration
             tvDuration.text = formatTime(duration)
@@ -494,17 +552,17 @@ class VideoPlayerFragment : Fragment() {
             // intentional pauses.
             if (videoView.shouldAutoResume()) {
                 videoView.start()
-                btnPlayPause.setImageResource(android.R.drawable.ic_media_pause)
+                refreshPlayPauseButton(true)
                 handler.post(updateRunnable)
                 scheduleOverlayHide()
             } else {
-                btnPlayPause.setImageResource(android.R.drawable.ic_media_play)
+                refreshPlayPauseButton(false)
                 setOverlayVisible(true)
             }
         }
 
         videoView.setOnCompletionListener {
-            btnPlayPause.setImageResource(android.R.drawable.ic_media_play)
+            refreshPlayPauseButton(false)
             handler.removeCallbacks(updateRunnable)
             handler.removeCallbacks(hideOverlayRunnable)
             setOverlayVisible(true)
@@ -524,7 +582,7 @@ class VideoPlayerFragment : Fragment() {
 
         videoView.setOnErrorListener { _, what, extra ->
             android.util.Log.e("VideoPlayer", "Error: what=$what extra=$extra")
-            tvEventInfo.text = getString(R.string.video_player_playback_error)
+            showPlaybackError()
             true
         }
     }
@@ -537,12 +595,12 @@ class VideoPlayerFragment : Fragment() {
         btnPlayPause.setOnClickListener {
             if (videoView.isPlaying) {
                 videoView.pause()
-                btnPlayPause.setImageResource(android.R.drawable.ic_media_play)
+                refreshPlayPauseButton(false)
                 handler.removeCallbacks(hideOverlayRunnable)
                 handler.removeCallbacks(updateRunnable)
             } else {
                 videoView.start()
-                btnPlayPause.setImageResource(android.R.drawable.ic_media_pause)
+                refreshPlayPauseButton(true)
                 handler.removeCallbacks(updateRunnable)
                 handler.post(updateRunnable)
                 scheduleOverlayHide()
@@ -556,6 +614,13 @@ class VideoPlayerFragment : Fragment() {
             if (playlistIndex >= 0 && playlistIndex < playlistPaths.size - 1) {
                 jumpTo(playlistIndex + 1)
             }
+        }
+        btnPlayerRetry?.setOnClickListener {
+            if (currentPath.isNotEmpty()) loadVideo(currentPath, currentTitle)
+        }
+        btnPlayerErrorNext?.setOnClickListener {
+            val next = playlistIndex + 1
+            if (next in playlistPaths.indices) jumpTo(next)
         }
 
         btnQuadrantAll?.setOnClickListener { selectQuadrant(ZoomableVideoView.Quadrant.ALL) }
@@ -607,10 +672,20 @@ class VideoPlayerFragment : Fragment() {
             }
         })
 
-        eventTimeline.setOnClickListener { _ ->
+        eventTimeline.setOnSeekRequestedListener { positionMs ->
             if (videoView.duration > 0) {
-                // Not ideal for precise seeking but works for tap-to-seek
+                val target = positionMs.coerceIn(0L, videoView.duration.toLong()).toInt()
+                videoView.seekTo(target)
+                seekBar.progress = target
+                tvCurrentTime.text = formatTime(target)
             }
+        }
+        eventTimeline.setOnEventSelectedListener { event ->
+            tvEventInfo.text = getString(
+                R.string.video_timeline_selected,
+                event.type,
+                formatTime(event.startMs.toInt())
+            )
         }
     }
 
@@ -635,6 +710,7 @@ class VideoPlayerFragment : Fragment() {
     }
 
     private fun setOverlayVisible(visible: Boolean) {
+        if (!visible && isTouchExplorationEnabled()) return
         overlayVisible = visible
         val duration = 250L
         // Every chrome surface fades together — top bar, quadrant selector,
@@ -661,86 +737,137 @@ class VideoPlayerFragment : Fragment() {
 
     private fun scheduleOverlayHide() {
         handler.removeCallbacks(hideOverlayRunnable)
+        if (isTouchExplorationEnabled()) {
+            setOverlayVisible(true)
+            return
+        }
         handler.postDelayed(hideOverlayRunnable, OVERLAY_HIDE_DELAY)
+    }
+
+    private fun isTouchExplorationEnabled(): Boolean {
+        val manager = context?.getSystemService(Context.ACCESSIBILITY_SERVICE)
+            as? AccessibilityManager
+        return manager?.isTouchExplorationEnabled == true
+    }
+
+    private fun showBuffering() {
+        playerLoadingContainer?.visibility = View.VISIBLE
+        playerErrorContainer?.visibility = View.GONE
+    }
+
+    private fun hidePlaybackState() {
+        playerLoadingContainer?.visibility = View.GONE
+        playerErrorContainer?.visibility = View.GONE
+    }
+
+    private fun showPlaybackError() {
+        handler.removeCallbacks(updateRunnable)
+        handler.removeCallbacks(hideOverlayRunnable)
+        currentMediaPlayer = null
+        playerLoadingContainer?.visibility = View.GONE
+        playerErrorContainer?.visibility = View.VISIBLE
+        tvPlayerError?.text = getString(R.string.video_player_error_title)
+        val canAdvance = playlistIndex >= 0 && playlistIndex < playlistPaths.lastIndex
+        btnPlayerErrorNext?.visibility = if (canAdvance) View.VISIBLE else View.GONE
+        refreshPlayPauseButton(false)
+        setOverlayVisible(true)
     }
 
     /**
      * Load the JSON sidecar (event_YYYYMMDD_HHMMSS.json) for timeline markers.
      */
     private fun loadEventTimeline(videoPath: String) {
-        Thread {
-            try {
-                val jsonPath = videoPath.replace(".mp4", ".json")
-                val jsonFile = File(jsonPath)
-                if (!jsonFile.exists()) {
-                    activity?.runOnUiThread {
-                        // No sidecar → standard 2x2 composition. Resetting
-                        // here (not just defaulting) matters for playlists:
-                        // a dashcam clip followed by a sidecar-less standard
-                        // clip must drop back to the 2x2 zoom regions.
-                        videoView.setLayout(ZoomableVideoView.Layout.STANDARD)
-                        applyQuadrantLayoutIcons(ZoomableVideoView.Layout.STANDARD)
-                        eventTimeline.setEvents(emptyList(), 0L)
-                        tvEventInfo.text = getString(R.string.video_player_no_events)
-                    }
-                    return@Thread
+        val generation = ++timelineGeneration
+        val executor = timelineExecutor ?: return
+        executor.execute {
+            val result = try {
+                val jsonText = if (videoPath.startsWith("http://") ||
+                    videoPath.startsWith("https://")
+                ) {
+                    com.overdrive.app.ui.util.RecordingsApiClient
+                        .fetchTimelineForVideo(videoPath)
+                } else {
+                    val jsonFile = File(videoPath.replace(".mp4", ".json"))
+                    jsonFile.takeIf(File::exists)?.readText()
                 }
-
-                val json = JSONObject(jsonFile.readText())
-                // Composition layout drives the per-camera zoom regions. A
-                // dashcam clip's sidecar may carry ONLY this field (no events),
-                // so read + apply it BEFORE the events null-check below.
-                val clipLayout = if ("dashcam" == json.optString("layout", "standard"))
-                    ZoomableVideoView.Layout.DASHCAM else ZoomableVideoView.Layout.STANDARD
-                activity?.runOnUiThread {
-                    videoView.setLayout(clipLayout)
-                    applyQuadrantLayoutIcons(clipLayout)
-                }
-                val durationMs = json.optLong("durationMs", 0)
-                val eventsArray = json.optJSONArray("events")
-                if (eventsArray == null) {
-                    activity?.runOnUiThread {
-                        eventTimeline.setEvents(emptyList(), durationMs)
-                        tvEventInfo.text = getString(R.string.video_player_no_events)
-                    }
-                    return@Thread
-                }
-                val stats = json.optJSONObject("stats")
-
-                val events = mutableListOf<EventTimelineView.TimelineEvent>()
-                for (i in 0 until eventsArray.length()) {
-                    val ev = eventsArray.getJSONObject(i)
-                    events.add(EventTimelineView.TimelineEvent(
-                        startMs = ev.getLong("start"),
-                        endMs = ev.getLong("end"),
-                        type = ev.optString("type", "motion"),
-                        confidence = ev.optDouble("maxConf", 0.0).toFloat()
-                    ))
-                }
-
-                val legend = buildString {
-                    if (stats != null) {
-                        val p = stats.optInt("person", 0)
-                        val c = stats.optInt("car", 0)
-                        val b = stats.optInt("bike", 0)
-                        val m = stats.optInt("motion", 0)
-                        val parts = mutableListOf<String>()
-                        if (p > 0) parts.add("$p person")
-                        if (c > 0) parts.add("$c car")
-                        if (b > 0) parts.add("$b bike")
-                        if (m > 0) parts.add("$m motion")
-                        append(parts.joinToString(" · "))
-                    }
-                }
-
-                activity?.runOnUiThread {
-                    eventTimeline.setEvents(events, durationMs)
-                    tvEventInfo.text = if (legend.isNotEmpty()) legend else ""
-                }
+                parseTimeline(jsonText)
             } catch (e: Exception) {
                 android.util.Log.e("VideoPlayer", "Timeline load failed: ${e.message}")
+                TimelineResult.empty()
             }
-        }.start()
+
+            handler.post {
+                if (!isAdded ||
+                    view == null ||
+                    generation != timelineGeneration ||
+                    currentPath != videoPath
+                ) {
+                    return@post
+                }
+                videoView.setLayout(result.layout)
+                applyQuadrantLayoutIcons(result.layout)
+                eventTimeline.setEvents(result.events, result.durationMs)
+                tvEventInfo.text = if (result.legend.isNotEmpty()) {
+                    result.legend
+                } else {
+                    getString(R.string.video_player_no_events)
+                }
+            }
+        }
+    }
+
+    private fun parseTimeline(jsonText: String?): TimelineResult {
+        if (jsonText.isNullOrBlank()) return TimelineResult.empty()
+        val json = JSONObject(jsonText)
+        val layout = if ("dashcam" == json.optString("layout", "standard")) {
+            ZoomableVideoView.Layout.DASHCAM
+        } else {
+            ZoomableVideoView.Layout.STANDARD
+        }
+        val durationMs = json.optLong("durationMs", 0)
+        val eventsArray = json.optJSONArray("events")
+        val events = mutableListOf<EventTimelineView.TimelineEvent>()
+        if (eventsArray != null) {
+            for (i in 0 until eventsArray.length()) {
+                val event = eventsArray.getJSONObject(i)
+                events.add(
+                    EventTimelineView.TimelineEvent(
+                        startMs = event.getLong("start"),
+                        endMs = event.getLong("end"),
+                        type = event.optString("type", "motion"),
+                        confidence = event.optDouble("maxConf", 0.0).toFloat(),
+                    )
+                )
+            }
+        }
+        val stats = json.optJSONObject("stats")
+        val legend = buildString {
+            if (stats != null) {
+                val parts = mutableListOf<String>()
+                stats.optInt("person", 0).takeIf { it > 0 }?.let { parts.add("$it person") }
+                stats.optInt("car", 0).takeIf { it > 0 }?.let { parts.add("$it car") }
+                stats.optInt("bike", 0).takeIf { it > 0 }?.let { parts.add("$it bike") }
+                stats.optInt("motion", 0).takeIf { it > 0 }?.let { parts.add("$it motion") }
+                append(parts.joinToString(" · "))
+            }
+        }
+        return TimelineResult(layout, events, durationMs, legend)
+    }
+
+    private data class TimelineResult(
+        val layout: ZoomableVideoView.Layout,
+        val events: List<EventTimelineView.TimelineEvent>,
+        val durationMs: Long,
+        val legend: String,
+    ) {
+        companion object {
+            fun empty() = TimelineResult(
+                ZoomableVideoView.Layout.STANDARD,
+                emptyList(),
+                0L,
+                "",
+            )
+        }
     }
 
     private fun formatTime(ms: Int): String {
@@ -760,12 +887,29 @@ class VideoPlayerFragment : Fragment() {
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(updateRunnable)
+        if (!playbackInitialized) return
         // Snapshot playing-state BEFORE pausing so the resume-after-
         // background path knows whether to auto-start on re-prepare. Order
         // matters: pause() flips isPlaying to false, so a snapshot taken
         // after would always read false.
         videoView.snapshotPlayingState()
         if (videoView.isPlaying) videoView.pause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (!playbackInitialized ||
+            !::videoView.isInitialized ||
+            videoView.duration <= 0 ||
+            !videoView.shouldAutoResume() ||
+            videoView.isPlaying
+        ) {
+            return
+        }
+        videoView.start()
+        refreshPlayPauseButton(true)
+        handler.post(updateRunnable)
+        scheduleOverlayHide()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -782,16 +926,20 @@ class VideoPlayerFragment : Fragment() {
         // [shouldAutoResume] returns the value snapshotPlayingState()
         // captured in onPause BEFORE the pause() call, which is the
         // truthful pre-pause state.
-        if (videoView.duration > 0) {
+        if (playbackInitialized && videoView.duration > 0) {
             outState.putInt(STATE_POSITION_MS, videoView.currentPosition)
             outState.putBoolean(STATE_WAS_PLAYING, videoView.shouldAutoResume())
         }
     }
 
     override fun onDestroyView() {
+        timelineGeneration += 1
+        timelineExecutor?.shutdownNow()
+        timelineExecutor = null
         handler.removeCallbacks(updateRunnable)
         handler.removeCallbacks(hideOverlayRunnable)
-        videoView.stopPlayback()
+        if (playbackInitialized) videoView.stopPlayback()
+        playbackInitialized = false
         super.onDestroyView()
     }
 }

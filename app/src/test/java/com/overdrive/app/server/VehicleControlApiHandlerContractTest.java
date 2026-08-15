@@ -1,0 +1,237 @@
+package com.overdrive.app.server;
+
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+
+import java.io.IOException;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+import org.junit.Test;
+
+/** Contract checks for physical-control input validation that cannot use a live vehicle SDK. */
+public class VehicleControlApiHandlerContractTest {
+
+    @Test
+    public void physicalControlEndpointsUseStrictBooleanAndSeatStateValidation() throws IOException {
+        String source = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/server/VehicleControlApiHandler.java");
+
+        assertTrue(source.contains("private static Boolean jsonBoolean"));
+        assertTrue(source.contains("enabled must be boolean"));
+        assertTrue(source.contains("seat climate state must include all four levels (0-2)"));
+        assertTrue(source.contains("hasFreshCompleteSeatState"));
+        assertTrue(source.contains("snap.seatClimateAtMs"));
+        assertTrue(source.contains("boolean localSeatStateFresh = hasFreshCompleteSeatState(snap);"));
+        assertTrue(source.contains("seatStateWithTarget(snap.seatHeat, snap.seatCool,"));
+        assertTrue(source.contains("cloudSeatState[0], cloudSeatState[1]"));
+        assertTrue(source.contains("cloudSeatState[2], cloudSeatState[3]"));
+        assertTrue(source.contains("cloudSeatState[2], cloudSeatState[3], true,"));
+        assertTrue(source.contains("localSeatStateFresh ? snap.seatClimateAtMs : 0L"));
+        assertFalse(source.contains("complete current seat state is required for cloud fallback"));
+        assertTrue(source.contains("new VehicleCommandRouter.SeatHeatCommand(position, level,"));
+        assertTrue(source.contains("new VehicleCommandRouter.SeatVentCommand(position, level,"));
+        assertTrue(source.contains("laneAssist mode must be an integer from 0 to 3"));
+        assertTrue(source.contains("childPresenceDetection value must be 1, 2, or 3"));
+        assertTrue(source.contains("new VehicleCommandRouter.BatteryHeatCommand(enabled.booleanValue())"));
+        assertFalse(source.contains("req.optBoolean(\"enable\", true)"));
+        assertFalse(source.contains("new JSONObject(body).optBoolean(\"enabled\", false)"));
+    }
+
+    @Test
+    public void actuatorValidationUsesStrictTypesAndPreflightScheduleChecks() throws Exception {
+        String source = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/server/VehicleControlApiHandler.java");
+
+        assertTrue(source.contains("Integer areaValue = jsonInteger(req, \"area\")"));
+        assertTrue(source.contains("Integer targetValue = jsonInteger(req, \"targetPercent\")"));
+        assertTrue(source.contains("Integer commandValue = jsonInteger(req, \"command\")"));
+        assertFalse(source.contains("req.getInt(\"area\")"));
+        assertFalse(source.contains("req.getInt(\"targetPercent\")"));
+        assertFalse(source.contains("req.getInt(\"command\")"));
+        assertTrue(source.contains("Double suppliedTemp = jsonNumber(req, \"temp\")"));
+        assertTrue(source.contains("zone must be an integer from 0 to 2"));
+        assertTrue(source.contains("fan must be an integer from 1 to 7"));
+        assertTrue(source.contains("autoOffMinutes must be an integer from 0 to "));
+        assertTrue(source.contains("enabled must be boolean"));
+        assertTrue(source.contains("isValidChargingTime(start, false)"));
+        assertTrue(source.contains("isValidChargeWay(way)"));
+        assertTrue(source.contains("Integer requestedPercent = hasPercent ? jsonInteger(req, \"percent\") : null"));
+        assertTrue(source.contains("setChargeCapPercentAndEnabledWithResult(percent, enabled)"));
+        assertTrue(source.contains("if (hasEnabled && hasPercent)"));
+        assertTrue(source.contains("resp.put(\"partialApplied\", combinedResult.partiallyApplied("));
+        assertTrue(source.contains("boolean verified = Boolean.TRUE.equals(supported)"));
+        assertTrue(source.contains("resp.put(\"requestedEnabled\", enabled)"));
+        assertTrue(source.contains("resp.put(\"requestedStartChargeTime\", start)"));
+        assertTrue(source.contains("\"/api/vehicle/climate-schedule\""));
+        assertTrue(source.contains("new VehicleCommandRouter.ClimateScheduleCommand("));
+        assertTrue(source.contains("bookingTime must be an epoch-second time"));
+        assertTrue(source.contains("handleGetClimateSchedule"));
+        assertTrue(source.contains("emptyBookingsMayBeStale"));
+        assertTrue(source.contains("bookingIdsAsDecimalStrings(bookings)"));
+        assertTrue(source.contains("resp.put(\"bookingId\", String.valueOf(bookingId.longValue()))"));
+        assertTrue(source.contains(
+                "resp.put(\"requestedBookingId\", String.valueOf(bookingId.longValue()))"));
+        assertTrue(source.contains("new VehicleCommandRouter.VentAllWindowsCommand()"));
+        assertTrue(source.contains("ambientColour zone must be front, rear, or both"));
+        assertTrue(source.contains("volume_step value must be -1 or 1"));
+        assertTrue(source.contains("value must be an integer"));
+        assertTrue(source.contains("String volumeChannel = null;"));
+        assertTrue(source.contains("volumeChannel = optionalVolumeChannel(req);"));
+        assertTrue(source.contains("volume channel must be media, navigation, voice, phone, call, system, alarm, or ring"));
+        assertTrue(source.contains("String zone = optionalAmbientZone(req)"));
+        assertTrue(source.contains("climate.put(\"remoteClimateActive\", remoteClimateActive.booleanValue())"));
+
+        assertTrue((Boolean) invokePrivate("isValidChargingTime",
+                new Class<?>[] {String.class, boolean.class}, "00:00", false));
+        assertTrue((Boolean) invokePrivate("isValidChargingTime",
+                new Class<?>[] {String.class, boolean.class}, "full", true));
+        assertFalse((Boolean) invokePrivate("isValidChargingTime",
+                new Class<?>[] {String.class, boolean.class}, "24:00", false));
+        assertFalse((Boolean) invokePrivate("isValidChargingTime",
+                new Class<?>[] {String.class, boolean.class}, "12:60", false));
+        assertTrue((Boolean) invokePrivate("isValidChargeWay",
+                new Class<?>[] {String.class}, "0,2,6"));
+        assertFalse((Boolean) invokePrivate("isValidChargeWay",
+                new Class<?>[] {String.class}, "0,0"));
+        assertFalse((Boolean) invokePrivate("isValidChargeWay",
+                new Class<?>[] {String.class}, "0,7"));
+        assertTrue((Boolean) invokePrivate("isValidAmbientZone",
+                new Class<?>[] {String.class}, "front"));
+        assertTrue((Boolean) invokePrivate("isValidAmbientZone",
+                new Class<?>[] {String.class}, "both"));
+        assertFalse((Boolean) invokePrivate("isValidAmbientZone",
+                new Class<?>[] {String.class}, "all"));
+    }
+
+    @Test
+    public void strictNumericHelpersDoNotCoerceInvalidActuatorValues() throws Exception {
+        org.json.JSONObject request = new org.json.JSONObject()
+                .put("integer", 3.5)
+                .put("number", "22")
+                .put("boolean", "true");
+
+        assertNull(invokePrivate("jsonInteger", new Class<?>[] {
+                org.json.JSONObject.class, String.class}, request, "integer"));
+        assertNull(invokePrivate("jsonNumber", new Class<?>[] {
+                org.json.JSONObject.class, String.class}, request, "number"));
+        assertNull(invokePrivate("jsonBoolean", new Class<?>[] {
+                org.json.JSONObject.class, String.class}, request, "boolean"));
+        request.put("integer", 3);
+        assertEquals(Integer.valueOf(3), invokePrivate("jsonInteger", new Class<?>[] {
+                org.json.JSONObject.class, String.class}, request, "integer"));
+        org.json.JSONObject bookingRequest = new org.json.JSONObject(
+                "{\"bookingId\":1216038691305533440}");
+        assertEquals(Long.valueOf(1_216_038_691_305_533_440L),
+                invokePrivate("jsonLong", new Class<?>[] {
+                        org.json.JSONObject.class, String.class}, bookingRequest, "bookingId"));
+        org.json.JSONObject bookingIdText = new org.json.JSONObject(
+                "{\"bookingId\":\"1216038691305533440\"}");
+        assertEquals(Long.valueOf(1_216_038_691_305_533_440L),
+                invokePrivate("jsonLong", new Class<?>[] {
+                        org.json.JSONObject.class, String.class}, bookingIdText, "bookingId"));
+        bookingIdText.put("bookingId", "1216038691305533440.0");
+        assertNull(invokePrivate("jsonLong", new Class<?>[] {
+                org.json.JSONObject.class, String.class}, bookingIdText, "bookingId"));
+        org.json.JSONObject bookingList = new org.json.JSONObject()
+                .put("listInfo", new org.json.JSONArray().put(new org.json.JSONObject()
+                        .put("bookingId", 1_216_038_691_305_533_440L)));
+        org.json.JSONObject losslessBookingList = (org.json.JSONObject) invokePrivate(
+                "bookingIdsAsDecimalStrings", new Class<?>[] {org.json.JSONObject.class},
+                bookingList);
+        Object returnedBookingId = losslessBookingList.getJSONArray("listInfo")
+                .getJSONObject(0).get("bookingId");
+        assertTrue(returnedBookingId instanceof String);
+        assertEquals("1216038691305533440", returnedBookingId);
+        request.put("zone", "all");
+        assertNull(invokePrivate("optionalAmbientZone", new Class<?>[] {
+                org.json.JSONObject.class}, request));
+        request.remove("zone");
+        assertEquals("both", invokePrivate("optionalAmbientZone", new Class<?>[] {
+                org.json.JSONObject.class}, request));
+        assertTrue((Boolean) invokePrivate("isValidRemoteClimateDuration",
+                new Class<?>[] {int.class}, 20));
+        assertFalse((Boolean) invokePrivate("isValidRemoteClimateDuration",
+                new Class<?>[] {int.class}, 12));
+    }
+
+    @Test
+    public void seatFallbackSeedsFromCollectorOnlyWhenFreshAndVolumeChannelsAreStrict()
+            throws Exception {
+        org.json.JSONObject request = new org.json.JSONObject()
+                .put("driverHeat", 2)
+                .put("driverVent", 0)
+                .put("passengerHeat", 1)
+                .put("passengerVent", 0);
+        assertEquals(Integer.valueOf(2), invokePrivate("optionalSeatLevel", new Class<?>[] {
+                org.json.JSONObject.class, String.class}, request, "driverHeat"));
+        request.put("driverHeat", 2.5);
+        assertNull(invokePrivate("optionalSeatLevel", new Class<?>[] {
+                org.json.JSONObject.class, String.class}, request, "driverHeat"));
+
+        assertTrue((Boolean) invokePrivate("isValidVolumeChannel",
+                new Class<?>[] {String.class}, "media"));
+        assertTrue((Boolean) invokePrivate("isValidVolumeChannel",
+                new Class<?>[] {String.class}, "navigation"));
+        assertTrue((Boolean) invokePrivate("isValidVolumeChannel",
+                new Class<?>[] {String.class}, "call"));
+        assertFalse((Boolean) invokePrivate("isValidVolumeChannel",
+                new Class<?>[] {String.class}, "unknown"));
+        assertFalse((Boolean) invokePrivate("isValidVolumeChannel",
+                new Class<?>[] {String.class}, "MEDIA"));
+
+        org.json.JSONObject volumeRequest = new org.json.JSONObject();
+        assertEquals("media", invokePrivate("optionalVolumeChannel", new Class<?>[] {
+                org.json.JSONObject.class}, volumeRequest));
+        volumeRequest.put("channel", "phone");
+        assertEquals("phone", invokePrivate("optionalVolumeChannel", new Class<?>[] {
+                org.json.JSONObject.class}, volumeRequest));
+        volumeRequest.put("channel", 3);
+        assertNull(invokePrivate("optionalVolumeChannel", new Class<?>[] {
+                org.json.JSONObject.class}, volumeRequest));
+    }
+
+    @Test
+    public void seatCloudFallbackOverlaysOnlyItsRequestedField() throws Exception {
+        int[] heat = { 1, 2 };
+        int[] cool = { 2, 1 };
+
+        assertArrayEquals(new int[] { 2, 2, 2, 1 }, (int[]) invokePrivate(
+                "seatStateWithTarget",
+                new Class<?>[] { int[].class, int[].class, boolean.class, int.class, int.class },
+                heat, cool, false, 1, 2));
+        assertArrayEquals(new int[] { 1, 2, 2, 0 }, (int[]) invokePrivate(
+                "seatStateWithTarget",
+                new Class<?>[] { int[].class, int[].class, boolean.class, int.class, int.class },
+                heat, cool, true, 2, 0));
+    }
+
+    private static Object invokePrivate(String name, Class<?>[] parameterTypes, Object... args)
+            throws Exception {
+        Method method = VehicleControlApiHandler.class.getDeclaredMethod(name, parameterTypes);
+        method.setAccessible(true);
+        return method.invoke(null, args);
+    }
+
+    private static String readRepositoryFile(String relativePath) throws IOException {
+        Path current = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
+        while (current != null) {
+            Path candidate = current.resolve(relativePath);
+            if (Files.isRegularFile(candidate)) {
+                return new String(Files.readAllBytes(candidate), StandardCharsets.UTF_8);
+            }
+            Path fromModule = current.resolve(relativePath.replaceFirst("^app/", ""));
+            if (Files.isRegularFile(fromModule)) {
+                return new String(Files.readAllBytes(fromModule), StandardCharsets.UTF_8);
+            }
+            current = current.getParent();
+        }
+        throw new AssertionError("Could not locate repository file: " + relativePath);
+    }
+}

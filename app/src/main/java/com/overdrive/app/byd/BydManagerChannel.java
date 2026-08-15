@@ -6,7 +6,13 @@ import com.overdrive.app.logging.DaemonLogger;
 
 import java.lang.reflect.Method;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * MANAGER-LEVEL access channel to the BYD HAL — a fallback for reads that the per-device path
@@ -73,6 +79,20 @@ public final class BydManagerChannel {
     private static volatile boolean deviceManagerTried;
     private static volatile Object autoManager;        // BYDAutoManager (getSystemService("auto"))
     private static volatile boolean autoManagerTried;
+    /**
+     * One process-wide lane for manager Binder calls. A timed-out Binder invocation may ignore
+     * interruption, so recreating a scratch thread for every retry would leak one thread per call.
+     * This lane can strand at most one daemon thread; while it is occupied, later probes fail fast.
+     */
+    private static final ThreadPoolExecutor boundedCallExecutor = new ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1),
+            runnable -> {
+                Thread worker = new Thread(runnable, "BydHalCall");
+                worker.setDaemon(true);
+                return worker;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
+    private static final AtomicBoolean boundedCallStalled = new AtomicBoolean();
 
     /**
      * Resolved reflective lookups. A MISS is recorded in {@link #missCache} rather than as a null
@@ -190,6 +210,8 @@ public final class BydManagerChannel {
         long gen = invalidateGen;   // see invalidateGen — guards the publish below
         String emit = null;         // log message built under the lock, emitted after it
         Object resolved = null;
+        boolean acquisitionConclusive = true;
+        boolean permanentlyAbsent = false;
         try {
             Class<?> cls = Class.forName("android.hardware.bydauto.BYDAutoDeviceManager");
             Method gi = cls.getMethod("getInstance", Context.class);
@@ -199,10 +221,21 @@ public final class BydManagerChannel {
             // this untimed binder call — and BydDataPoll is a single-thread scheduler, so the entire
             // vehicle snapshot (SOC, 12 V, temps, charging) freezes for its duration. Moving the
             // call out of the monitor fixed the lock half of this; the bound fixes the stall half.
-            resolved = invokeBounded(gi, null, ctx, "BYDAutoDeviceManager.getInstance");
+            BoundedCallResult acquired =
+                    invokeBoundedResult(gi, null, ctx, "BYDAutoDeviceManager.getInstance");
+            resolved = acquired.value;
+            acquisitionConclusive = acquired.completed;
+        } catch (ClassNotFoundException | NoSuchMethodException absent) {
+            permanentlyAbsent = true;
+            logger.debug("BYDAutoDeviceManager unavailable: "
+                    + absent.getClass().getSimpleName());
         } catch (Throwable t) {
             logger.debug("BYDAutoDeviceManager unavailable: " + t.getClass().getSimpleName());
         }
+        // Cancellation is not an availability verdict. The app-process actuator deliberately
+        // bounds its wait; if that interrupt were published as `tried=true, manager=null`, every
+        // later command would permanently skip activation until process restart.
+        if (Thread.currentThread().isInterrupted() || !acquisitionConclusive) return null;
         synchronized (BydManagerChannel.class) {
             // Raced an invalidate while resolving: this handle predates it, so discard rather than
             // publish. Returning null also leaves the backoff intact for the next caller.
@@ -212,7 +245,9 @@ public final class BydManagerChannel {
             // tried==true while `deviceManager` was still null and wrongly conclude "unavailable"
             // for the rest of the process — a lost-capability race, not just a wasted probe.
             deviceManager = resolved;
-            deviceManagerTried = true;
+            // A completed null is common while the framework is still starting and is not proof
+            // that the manager is absent for this process. Structural absence is conclusive.
+            deviceManagerTried = resolved != null || permanentlyAbsent;
             // Latch only on a SUCCESS. A losing thread that resolved null would otherwise latch
             // "NOT available" and permanently suppress the winner's successful-acquisition line —
             // the capture would report the channel dead while it is live, and one decisive line is
@@ -245,19 +280,25 @@ public final class BydManagerChannel {
         if (backoffActive()) return null;
         long gen = invalidateGen;
         Object resolved = null;
+        boolean acquisitionConclusive = true;
         try {
             // Bounded for the same reason as getInstance above: reachable from the poll thread after
             // an invalidate. getSystemService can block on a binder during a framework restart.
             Method gss = Context.class.getMethod("getSystemService", String.class);
-            resolved = invokeBounded(gss, ctx, "auto", "getSystemService(auto)");
+            BoundedCallResult acquired =
+                    invokeBoundedResult(gss, ctx, "auto", "getSystemService(auto)");
+            resolved = acquired.value;
+            acquisitionConclusive = acquired.completed;
         } catch (Throwable t) {
             logger.debug("getSystemService(\"auto\") failed: " + t.getMessage());
         }
+        if (Thread.currentThread().isInterrupted() || !acquisitionConclusive) return null;
         synchronized (BydManagerChannel.class) {
             if (invalidateGen != gen) return null;   // raced an invalidate — see deviceManager()
             if (autoManager != null) return autoManager;
             autoManager = resolved;      // handle before latch — see deviceManager()
-            autoManagerTried = true;
+            // getSystemService("auto") can transiently return null during framework startup.
+            autoManagerTried = resolved != null;
             return resolved;
         }
     }
@@ -271,6 +312,17 @@ public final class BydManagerChannel {
         return until > 0 && android.os.SystemClock.elapsedRealtime() < until;
     }
 
+    /** Value plus whether the reflective call actually completed and produced that value. */
+    private static final class BoundedCallResult {
+        final Object value;
+        final boolean completed;
+
+        BoundedCallResult(Object value, boolean completed) {
+            this.value = value;
+            this.completed = completed;
+        }
+    }
+
     /**
      * Invoke a zero-or-one-arg reflective HAL call with a bounded wait, for the calls that run on
      * the daemon INIT thread. Same rationale as {@link #constructBounded}: an untimed binder call
@@ -280,27 +332,55 @@ public final class BydManagerChannel {
      */
     private static Object invokeBounded(final Method m, final Object target, final Object arg,
                                         String what) {
-        final Object[] out = new Object[1];
-        Thread t = new Thread(new Runnable() {
-            @Override public void run() {
-                try {
-                    out[0] = (arg == null) ? m.invoke(target) : m.invoke(target, arg);
-                } catch (Throwable ignored) { }
+        return invokeBoundedResult(m, target, arg, what).value;
+    }
+
+    /**
+     * A null value from a completed call is a real negative result; a null caused by lane
+     * contention, timeout, interruption, or invocation failure is inconclusive. Manager acquisition
+     * uses that distinction so a transient bounded-lane condition is never cached as permanent
+     * platform absence.
+     */
+    private static BoundedCallResult invokeBoundedResult(
+            final Method m, final Object target, final Object arg, String what) {
+        if (boundedCallStalled.get()) {
+            if (boundedCallExecutor.getActiveCount() != 0) {
+                logger.debug("HAL call " + what + " skipped while bounded lane is stalled");
+                return new BoundedCallResult(null, false);
             }
-        }, "BydHalCall");
-        t.setDaemon(true);
-        try {
-            t.start();
-            t.join(CONSTRUCT_TIMEOUT_MS);
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-        } catch (Throwable ignored) { }
-        if (t.isAlive()) {
-            logger.warn("HAL call " + what + " did not return in " + CONSTRUCT_TIMEOUT_MS
-                    + "ms — abandoning");
-            return null;
+            boundedCallStalled.set(false);
         }
-        return out[0];
+        final Future<Object> call;
+        try {
+            call = boundedCallExecutor.submit(
+                    () -> (arg == null) ? m.invoke(target) : m.invoke(target, arg));
+        } catch (Throwable unavailable) {
+            logger.debug("HAL call " + what + " skipped while bounded lane is occupied");
+            return new BoundedCallResult(null, false);
+        }
+        try {
+            Object result = call.get(CONSTRUCT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            boundedCallStalled.set(false);
+            return new BoundedCallResult(result, true);
+        } catch (TimeoutException timeout) {
+            call.cancel(true);
+            boundedCallExecutor.remove((Runnable) call);
+            boundedCallStalled.set(true);
+            logger.warn("HAL call " + what + " did not return in " + CONSTRUCT_TIMEOUT_MS
+                    + "ms — bounded lane remains capped while Binder unwinds");
+            return new BoundedCallResult(null, false);
+        } catch (InterruptedException ie) {
+            call.cancel(true);
+            boundedCallExecutor.remove((Runnable) call);
+            Thread.currentThread().interrupt();
+            return new BoundedCallResult(null, false);
+        } catch (Throwable failed) {
+            call.cancel(true);
+            boundedCallExecutor.remove((Runnable) call);
+            boundedCallStalled.set(false);
+            noteBinderDeath(failed);
+            return new BoundedCallResult(null, false);
+        }
     }
 
     /**
@@ -805,11 +885,9 @@ public final class BydManagerChannel {
     public static void allowImmediateReprobe() {
         synchronized (BydManagerChannel.class) {
             nextProbeAtMs = 0L;
-            // Allow ONE more attempt per re-init for a class whose constructor previously overran the
-            // bound. A 3 s overrun under boot-time binder contention — and init() runs at boot — is
-            // indistinguishable here from a permanent wedge, so refusing forever over-rejects. Bounded
-            // to one abandoned registration per re-init, the same exposure the first attempt accepts.
-            wedgedClasses.clear();
+            // Do not clear wedgedClasses. A constructor that ignored interruption may still own a
+            // Binder registration and thread; retrying it on every collector re-init accumulates one
+            // permanent leak per ACC cycle. Only process restart can safely reset that evidence.
             lastBinderDeathLogMs = 0L;   // a new Context deserves a fresh warning if it recurs
         }
     }

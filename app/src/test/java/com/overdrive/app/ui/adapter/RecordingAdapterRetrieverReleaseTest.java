@@ -18,7 +18,8 @@ public class RecordingAdapterRetrieverReleaseTest {
                 "app/src/main/java/com/overdrive/app/ui/adapter/RecordingAdapter.kt");
         String method = methodBody(source, "private fun extractThumbnail");
 
-        int extraction = method.indexOf("retriever.getFrameAtTime");
+        // Matches both getFrameAtTime and getScaledFrameAtTime.
+        int extraction = method.indexOf("FrameAtTime");
         int cleanup = method.indexOf("finally");
         int release = method.indexOf("retriever?.release()", cleanup);
         assertTrue("frame extraction must occur before cleanup", extraction >= 0 && extraction < cleanup);

@@ -349,9 +349,11 @@ object CommunityApiHandler {
         // Preserve the ORIGINAL group id so the reference still matches; skip an id that
         // already exists locally (never clobber the importer's own group of that id — and
         // if it's the same shared group re-imported, it's already present). Each group was
-        // validated + no-shell-checked at publish; re-validate here via ActionGroups.save
-        // (which re-parses + rejects a bad group) so a tampered Worker payload can't inject
-        // one. Best-effort: a group that fails to save just leaves its action a no-op,
+        // validated + no-shell-checked at publish, but re-check BOTH here: ActionGroups.save
+        // only re-parses (it has no shell scan of its own), and the shell check above sees
+        // only `rules` — so without the explicit scan below a tampered Worker payload could
+        // land a shell action in the user's permanent group library via a bundled group.
+        // Best-effort: a group that fails to save just leaves its action a no-op,
         // exactly the pre-bundling behaviour — never blocks the automation import.
         val groups = automation.optJSONObject("actionGroups")
         if (groups != null) {
@@ -361,6 +363,10 @@ object CommunityApiHandler {
                 try {
                     if (com.overdrive.app.automation.ActionGroups.exists(gid)) continue
                     val g = groups.optJSONObject(gid) ?: continue
+                    if (scanActionsForShell(g.optJSONArray("actions"))) {
+                        logger.warn("Import: bundled action group $gid contains a shell action — skipped")
+                        continue
+                    }
                     val saved = com.overdrive.app.automation.ActionGroups.save(gid, g)
                     if (saved == null) logger.warn("Import: bundled action group $gid rejected (invalid) — its action will no-op")
                 } catch (t: Throwable) {
@@ -384,6 +390,9 @@ object CommunityApiHandler {
         }
         // Import-as-disabled: the user reviews the rules before enabling.
         rules.put("disabled", true)
+        // A shared/manual marker must never turn import-as-disabled into an
+        // explicitly runnable rule. The user can choose Manual only after review.
+        rules.remove("manualOnly")
         // Never inherit the publisher's run stats — a fresh import has never fired here.
         rules.remove("triggerCount")
         rules.remove("lastTriggered")

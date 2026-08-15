@@ -251,7 +251,7 @@
             android:name="com.overdrive.app.ui.MainActivity"
             android:exported="true"
             android:screenOrientation="unspecified"
-            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:configChanges="keyboardHidden"
             android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -542,24 +542,66 @@
             android:foregroundServiceType="mediaPlayback"
             android:exported="true" />
 
+        <!-- Browser push-to-talk receiver. The shell daemon launches this
+             app-process service and streams authenticated PCM over a
+             loopback-only ephemeral socket. DUMP limits starts to shell/system;
+             the random session token prevents another local process from
+             attaching to an in-flight receiver. -->
+        <service
+            android:name="com.overdrive.app.services.RemoteVoiceService"
+            android:foregroundServiceType="mediaPlayback"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+
+        <!-- RoadSense one-shot chimes use a separate player so they can overlap
+             Automation Audio without replacing a loop or being replaced mid-prepare.
+             The shell-UID daemon launches it through the same exported-component bridge;
+             the service accepts only the three bundled RoadSense resource names. -->
+        <service
+            android:name="com.overdrive.app.services.RoadSenseChimePlaybackService"
+            android:foregroundServiceType="mediaPlayback"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+
         <!-- Vehicle Actuator Service - runs BYD SDK writes (mirror fold, HUD) in the REAL
              app process (UID 10xxx, real Context), as a SECOND attempt after the daemon's
              own write, in case this HAL only honours the call from a normal app process.
-             NOTE: this is a hypothesis, not a proven mechanism — the OEM vehicle-control app
+             NOTE: this is a hypothesis, not a proven mechanism — the OEM vehicle-control
              app never actually calls its own mirror-fold code (no callers anywhere; the
              DiLink-5 controller hard-returns false), so "it works there" is unsupported.
              Treat this service as a belt-and-braces path, not the fix. exported=true is REQUIRED: the
              CameraDaemon (shell uid 2000) reaches it via
              `am start-foreground-service -n com.overdrive.app/.services.VehicleActuatorService`
              — the same proven bridge as MediaPlaybackService. Inputs are Intent extras
-             (fold / level), so exporting carries no file/data surface. -->
+             (fold / level / mode), so exporting carries no file/data surface. It DOES carry command
+             authority, so the platform DUMP permission restricts starts to shell/system callers
+             (the uid-2000 daemon retains access through `am`) rather than every installed app.
+             Every action REFUSES (does not clamp) an out-of-domain value — energy_mode rejects
+             anything outside 1..5, so STOP=0 is unreachable through it. -->
         <service
             android:name="com.overdrive.app.services.VehicleActuatorService"
             android:foregroundServiceType="specialUse|dataSync"
-            android:exported="true">
+            android:exported="true"
+            android:permission="android.permission.DUMP">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Owner-initiated BYD vehicle control (mirror fold, HUD) from the app process" />
+                android:value="Owner-initiated BYD vehicle control (mirror fold, HUD, powertrain mode) from the app process" />
+        </service>
+
+        <!-- Hotspot Bridge Service - only a real app process can drive the
+             tethering binder, so the uid-2000 daemon reaches HotspotManager via
+             `am start-foreground-service -n com.overdrive.app/.services.HotspotBridgeService`.
+             Same proven bridge as VehicleActuatorService: inputs are a single
+             `action` string extra (no file/data surface) and the platform DUMP
+             permission restricts starts to shell/system callers. -->
+        <service
+            android:name="com.overdrive.app.services.HotspotBridgeService"
+            android:foregroundServiceType="specialUse|dataSync"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Owner-initiated WiFi hotspot control from the app process" />
         </service>
 
         <!-- Message Overlay Service - draws the "Show Toast" / "Show Dialog"

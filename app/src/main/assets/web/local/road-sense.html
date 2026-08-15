@@ -6,7 +6,7 @@
     <title data-i18n="app.road_sense_title">RoadSense - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <!--
       Bottom-tab manifest. Tabs grouping the RoadSense settings cards:
         General      — master enable + calibration mode
@@ -27,9 +27,50 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=24">
+    <style>
+        /* Blind-spot speed window: two narrow km/h fields on one row. .text-input is
+           built for full-width fields (width:100% + min-width:200px), so a narrow
+           reuse has to override BOTH — hence min-width:0 here rather than repeating
+           an inline override on every input. Sized like .notif-num in
+           notifications.html, the other numeric-pair row in this app. */
+        .bs-speed-range { display: flex; align-items: center; gap: 8px; }
+        .bs-speed-num {
+            width: 76px; min-width: 0; height: 38px;
+            box-sizing: border-box;
+            padding: 0 8px;
+            text-align: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            /* Precautionary, carried over from .notif-num: that rule records that
+               Chrome 58 in the head-unit WebView still paints spinner buttons on
+               number inputs, which crowd the digits in a field this narrow. Spinners
+               don't change the box width, so this only affects the painted interior. */
+            -moz-appearance: textfield;
+        }
+        .bs-speed-num::-webkit-outer-spin-button,
+        .bs-speed-num::-webkit-inner-spin-button {
+            -webkit-appearance: none; margin: 0;
+        }
+        .bs-speed-unit { color: var(--text-muted); font-size: 13px; white-space: nowrap; }
+        .bs-speed-dash { color: var(--text-muted); }
+        /* The live hint sits under the description. Give it its own top gap instead
+           of a &nbsp; placeholder line, so an empty hint adds no dead height. */
+        .bs-speed-hint { margin-top: 6px; }
+        /* Validation errors share the hint slot; colour them so they don't read as
+           just another muted description line (the JS toggles this class). */
+        .bs-speed-hint.is-error { color: var(--error); }
+        /* Apply sits immediately under the speed inputs it commits, so it gets no
+           divider above and a tightened top gap — two full 16px paddings back to back
+           read as a detached button floating between rows. */
+        .bs-speed-row { border-bottom: none; padding-bottom: 8px; }
+        .bs-apply-row {
+            justify-content: flex-end;
+            padding-top: 0;
+        }
+        /* No responsive override needed: the shared 768px rule already stacks
+           .setting-row and zeroes .setting-control's left margin. */
+    </style>
 </head>
 <body>
     <div class="app-layout">
@@ -334,6 +375,57 @@
                             </div>
                         </div>
 
+                        <!-- Chime audio channel -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="road_sense.warn_channel">Sound Channel</div>
+                                <div class="setting-desc" data-i18n="road_sense.warn_channel_desc">Which audio channel the warning chime plays on. Navigation uses the car's guidance channel, so the chime ducks your music instead of competing with it and follows the navigation volume.</div>
+                            </div>
+                            <div class="setting-control">
+                                <select id="rsWarnChannel" class="text-input" onchange="RoadSenseSettings.setWarnChannel(this.value)">
+                                    <option value="navigation" data-i18n="road_sense.warn_channel_navigation">Navigation</option>
+                                    <option value="media" data-i18n="road_sense.warn_channel_media">Media</option>
+                                    <option value="voice" data-i18n="road_sense.warn_channel_voice">Voice</option>
+                                    <option value="alarm" data-i18n="road_sense.warn_channel_alarm">Alarm</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Chime master volume. The severe cue uses this ceiling; minor
+                             and moderate remain proportionally gentler. -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" id="rsWarnVolumeLabel" data-i18n="road_sense.warn_volume">Chime Volume</div>
+                                <div class="setting-desc" data-i18n="road_sense.warn_volume_desc">Sets the loudest RoadSense warning level. Minor and moderate chimes stay gentler than severe warnings.</div>
+                            </div>
+                            <div class="setting-control">
+                                <div class="slider-control">
+                                    <span class="slider-value" id="rsWarnVolumeValue">75%</span>
+                                    <div class="slider-track-control">
+                                        <input type="range" class="slider" id="rsWarnVolumeSlider" min="10" max="100" step="5" value="75" aria-labelledby="rsWarnVolumeLabel rsWarnVolumeValue" oninput="RoadSenseSettings.updateWarnVolume(this.value)" onchange="RoadSenseSettings.commitWarnVolume(this.value)">
+                                        <div class="slider-range-labels">
+                                            <span data-i18n="road_sense.warn_volume_min">Quiet</span>
+                                            <span data-i18n="road_sense.warn_volume_max">Loud</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Play the chime now. The real chime only fires while DRIVING on
+                             approach to an already-stored hazard, so this is the only way to
+                             hear it without driving past a mapped bump. Uses the same audio
+                             path as the live cue. -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="road_sense.warn_test">Test the chime</div>
+                                <div class="setting-desc" data-i18n="road_sense.warn_test_desc">Plays the warning sound now on the channel above, so you can check you can hear it and set the volume. The real warning only sounds while driving towards a hazard RoadSense already knows about.</div>
+                            </div>
+                            <div class="setting-control">
+                                <button type="button" id="rsTestChimeBtn" class="btn btn-secondary" onclick="RoadSenseSettings.testChime()" data-i18n="road_sense.warn_test_btn">Play chime</button>
+                            </div>
+                        </div>
+
                         <!-- Lead time -->
                         <div class="setting-row">
                             <div class="setting-info">
@@ -608,6 +700,71 @@
                     </div>
                 </div>
 
+                <!-- Blind Spot: WHEN it appears (speed window + reverse suppression).
+                     Both default to off/any, so an untouched install behaves exactly as
+                     before. Speed is entered in km/h regardless of the display-unit
+                     preference — the daemon gate works in km/h, and the hint below
+                     echoes the mph equivalent for users on miles. -->
+                <div class="card" data-tab="blindspot">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                            <span data-i18n="road_sense.bs_when_title">When it appears</span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <!-- No divider: this row and the Apply button below it are one
+                             group (the staged speed pair). The divider goes after Apply
+                             instead, separating that group from the reverse toggle. -->
+                        <div class="setting-row bs-speed-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="road_sense.bs_speed_range_title">Speed range</div>
+                                <div class="setting-desc" data-i18n="road_sense.bs_speed_range_desc">Only show the blind-spot view while driving within this speed range. Leave both at 0 (Any) to show it at any speed. Useful to keep the view out of the way in slow traffic or at motorway speeds.</div>
+                                <div class="setting-desc bs-speed-hint" id="bsSpeedConv"></div>
+                            </div>
+                            <div class="setting-control bs-speed-range">
+                                <input class="text-input bs-speed-num" id="bsMinSpeed" type="number" inputmode="numeric"
+                                       min="0" max="300" step="1"
+                                       data-i18n-attr="aria-label:road_sense.bs_speed_min_aria"
+                                       aria-label="Minimum speed in km/h, 0 for any"
+                                       oninput="RoadSenseSettings.bsSpeedInput()">
+                                <span class="bs-speed-dash">–</span>
+                                <input class="text-input bs-speed-num" id="bsMaxSpeed" type="number" inputmode="numeric"
+                                       min="0" max="300" step="1"
+                                       data-i18n-attr="aria-label:road_sense.bs_speed_max_aria"
+                                       aria-label="Maximum speed in km/h, 0 for any"
+                                       oninput="RoadSenseSettings.bsSpeedInput()">
+                                <span class="bs-speed-unit">km/h</span>
+                            </div>
+                        </div>
+                        <!-- Apply belongs to the SPEED PAIR only (the two bounds are
+                             staged and committed together, so a half-typed pair can
+                             never be persisted as an inverted window). It therefore sits
+                             directly under those inputs — placing it after the toggle
+                             below would imply the toggle needs applying too, when that
+                             one saves immediately. bs-apply-row tightens the top gap so
+                             the button reads as part of the row above it. -->
+                        <div class="setting-row bs-apply-row">
+                            <button class="btn btn-primary" id="bsSpeedApplyBtn" disabled onclick="RoadSenseSettings.bsApplySpeedWindow()" data-i18n="common.apply_changes">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;"><polyline points="20 6 9 17 4 12"/></svg>
+                                Apply Changes
+                            </button>
+                        </div>
+                        <div class="setting-row" style="border-bottom:none;">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="road_sense.bs_reverse_title">Hide in reverse</div>
+                                <div class="setting-desc" data-i18n="road_sense.bs_reverse_desc">Keep the blind-spot view hidden while reverse gear is engaged, so it doesn't cover the reversing camera.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="bsSuppressReverse" onchange="RoadSenseSettings.bsToggleSuppressReverse()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Blind Spot: on-screen size + position (live, daemon rescales the
                      SurfaceControl layer). Placed ABOVE Alignment — size/position is
                      the common adjustment; the FOV/blend sliders are advanced tuning. -->
@@ -646,7 +803,7 @@
                         <div class="setting-row"><div class="setting-info"><div class="setting-name" data-i18n="road_sense.bs_size">Overlay size</div></div>
                             <div class="setting-control"><div class="slider-control">
                                 <span class="slider-value" id="bsSizeVal">40%</span>
-                                <input type="range" class="slider" id="bsSize" min="15" max="90" step="5" value="40" oninput="RoadSenseSettings.bsSetSize(this.value)">
+                                <input type="range" class="slider" id="bsSize" min="15" max="90" step="1" value="40" oninput="RoadSenseSettings.bsSetSize(this.value)">
                             </div></div>
                         </div>
                         <!-- Position is PER SIDE: bsSetCorner(side, corner) writes
@@ -776,9 +933,9 @@
     <div id="toastContainer" class="toast-container"></div>
 
     <script src="../shared/auth.js"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/road-sense.js?v=roadsensefix1"></script>
+    <script src="../shared/road-sense.js?v=chimevolume6"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

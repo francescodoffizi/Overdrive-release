@@ -16,6 +16,7 @@ import com.overdrive.app.byd.routing.VehicleCommandRouter.FrontDefrostCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.HazardCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.LightsCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.LockCommand;
+import com.overdrive.app.byd.routing.VehicleCommandRouter.MirrorAutoFollowUpCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.MirrorFoldCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.OperationModeCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.Outcome;
@@ -39,14 +40,18 @@ import org.junit.Test;
  * seats, charging, screen/media) is UNRESTRICTED and works while the car moves.
  *
  * <p>The default is UNRESTRICTED, so these tests guard two regressions:
- * (1) one of the 5 body commands silently losing its BLOCK_WHILE_MOVING override
- * (gate stops protecting), and (2) some unrelated command gaining a block (the
+ * (1) a gated command silently losing its BLOCK_WHILE_MOVING override (the gate
+ * stops protecting), and (2) some unrelated command gaining a block (the
  * over-broad gating we deliberately reverted). The base-default assertion pins
  * that a brand-new command ships UNRESTRICTED.
+ *
+ * <p>Two commands are gated DIRECTIONALLY — mirror fold and seat-memory recall move a physical
+ * part, while unfold and save are respectively the recovery and the no-op — so each is asserted in
+ * both polarities. Gating the recovery half would strand a moving driver.
  */
 public class VehicleCommandMotionSafetyTest {
 
-    // ── BLOCK_WHILE_MOVING: the entire blocklist — 5 body actuators ────────
+    // ── BLOCK_WHILE_MOVING: doors/trunk, plus the two directional body actuators ────────
 
     @Test public void lockIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new LockCommand().motionSafety()); }
     @Test public void unlockIsBlocked() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new UnlockCommand().motionSafety()); }
@@ -64,8 +69,11 @@ public class VehicleCommandMotionSafetyTest {
     @Test public void findCarIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new FindCarCommand().motionSafety()); }
     @Test public void flashLightsIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new FlashLightsCommand().motionSafety()); }
 
-    // Mirror fold — unrestricted per the doors/trunk-only scope.
-    @Test public void mirrorFoldIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new MirrorFoldCommand(true).motionSafety()); }
+    // Mirror FOLD is gated (it removes rear-quarter vision mid-manoeuvre, with no readback), but
+    // UNFOLD stays open — it is the recovery action, so blocking it would strand a moving driver.
+    @Test public void mirrorFoldIsBlockedWhileMoving() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new MirrorFoldCommand(true).motionSafety()); }
+    @Test public void mirrorUnfoldIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new MirrorFoldCommand(false).motionSafety()); }
+    @Test public void mirrorAutoFollowUpIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new MirrorAutoFollowUpCommand(true).motionSafety()); }
 
     // ADAS toggles — including safety systems — are NOT motion-gated.
     @Test public void adasEspIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new AdasEspCommand(false).motionSafety()); }
@@ -87,8 +95,10 @@ public class VehicleCommandMotionSafetyTest {
     @Test public void climateOnIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new ClimateOnCommand(22).motionSafety()); }
     @Test public void windowMoveIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new WindowMoveCommand(1, 1, null).motionSafety()); }
 
-    // Seat memory recall no longer gated (it moved the seat under the old design).
-    @Test public void seatMemoryRecallIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SeatMemoryCommand(1, false).motionSafety()); }
+    // Seat memory RECALL is gated: it drives the driver's seat rails/backrest at speed, moving the
+    // person operating the vehicle. SAVE only records the current position and moves nothing.
+    @Test public void seatMemoryRecallIsBlockedWhileMoving() { assertEquals(MotionSafety.BLOCK_WHILE_MOVING, new SeatMemoryCommand(1, false).motionSafety()); }
+    @Test public void seatMemorySaveIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new SeatMemoryCommand(1, true).motionSafety()); }
 
     // The generic CarSetting writer is no longer gated for any key — including the
     // former safety-key allowlist (esp/aeb/lane) — matching the doors/trunk-only scope.

@@ -39,7 +39,7 @@
     <string name="cd_copy_url">Copiar URL</string>
     <string name="cd_clear_logs">Limpar logs</string>
     <string name="cd_expand_collapse">Expandir/Recolher</string>
-    <string name="cd_recording_status">Status de gravação</string>
+    <string name="cd_recording_status">Sair da tela cheia</string>
     <string name="cd_trip_tracking_status">Status de rastreamento de viagens</string>
     <string name="cd_mic_status">Status de captura do microfone</string>
     <string name="cd_replay_status">Status de replay instantâneo</string>
@@ -102,7 +102,7 @@
     <string name="tailscale_generate_login_url">Gerar URL de login</string>
     <string name="tailscale_scan_to_login">Escanear para Login</string>
     <string name="tailscale_qr_waiting">Aguardando a URL de login…</string>
-    <string name="tailscale_enable_proxy">Ativar Proxy Tailscale</string>
+    <string name="tailscale_enable_proxy">Ativar Proxy Tailscale </string>
     <string name="tailscale_proxy_explainer">Roteia o MQTT via Tailscale para que você possa alcançar um broker privado na sua tailnet sem redirecionamento de portas.</string>
     <string name="tailscale_proxy_warning">Enquanto estiver ativado, o MQTT para brokers públicos (HiveMQ, AWS IoT, etc.) falhará — o Tailscale roteia apenas para a sua tailnet. Salvar reiniciará o daemon.</string>
     <!-- Camera ingestion mode selector (Default vs DiLink 4) -->
@@ -160,7 +160,7 @@
     <string name="camera_mapping_saved">Mapeamento de câmera salvo.</string>
     <string name="camera_mapping_cleared">Mapeamento das funções da câmera limpo.</string>
     <string name="camera_mapping_summary_format">Fluxo panorâmico: câmera %1$d · %2$dx%3$d</string>
-    <string name="camera_mapping_summary_probing">Transmissão panorâmica: Detecção automática / teste legado</string>
+    <string name="camera_mapping_summary_probing">Transmissão panorâmica: Detecção automática / teste legado </string>
     <string name="camera_mapping_current_format">Mapeamento atual: %1$s</string>
     <string name="camera_mapping_current_none">Mapeamento atual: automático / padrão</string>
     <string name="camera_mapping_hint">O OverDrive mantém o comportamento de inicialização legado por padrão, mas agora permite calibrar a transmissão panorâmica mesclada adequadamente. Visualize cada fatia bruta mesclada, mapeie as funções lógicas de 360° para a fatia que realmente exibe frente/direita/traseira/esquerda no seu veículo, e o daemon reutilizará esse layout para gravação, transmissão e IA após reiniciar.</string>
@@ -200,12 +200,12 @@
     <string name="onboarding_done_short">Entendi</string>
     <!-- Step 0: authorize the daemon (system ADB popup) -->
     <string name="onboarding_authorize_title">Despertar o Overdrive</string>
-    <string name="onboarding_authorize_body">O Overdrive executa suas câmeras por meio de um pequeno auxiliar no próprio dispositivo. O Android solicitará permissão para a depuração USB uma vez — toque em <b>Permitir</b> e marque <b>Sempre permitir a partir deste dispositivo</b> para que ela permaneça ativa após cada reinicialização.</string>
+    <string name="onboarding_authorize_body">O Overdrive opera as suas câmeras por meio de um pequeno auxiliar no dispositivo. O Android pedirá uma vez para permitir a depuração USB — toque em <b>Permitir</b> e marque <b>Sempre permitir a partir deste dispositivo</b> para que permaneça ativo após cada reinicialização.</string>
     <string name="onboarding_authorize_button">Permitir acesso</string>
     <string name="onboarding_authorize_waiting_title">Aguardando permissão…</string>
     <string name="onboarding_authorize_waiting_body">Aceite o pop-up do Android. Se você não vê-lo, pode já ser concedido — isto continuará por conta própria.</string>
     <string name="onboarding_authorize_retry_title">Ainda não conectado</string>
-    <string name="onboarding_authorize_retry_body">O auxiliar ainda não está em execução. A permissão do Android pode ter sido descartada. Tente novamente e lembre-se de marcar <b>Sempre permitir</b>.</string>
+    <string name="onboarding_authorize_retry_body">O auxiliar ainda não está sendo executado. A permissão do Android pode ter sido dispensada. Tente novamente e lembre-se de verificar <b>Sempre permitir</b>.</string>
     <string name="onboarding_authorize_retry_button">Tente novamente</string>
     <string name="onboarding_mode_title">Quando o Overdrive deve ser executado?</string>
     <string name="onboarding_mode_body">Escolha como o Overdrive se comporta após você desligar o carro. \n\n<b>Ligado &amp; Desligado</b> mantém o monitoramento enquanto estiver estacionado — a vigilância e o monitoramento em segundo plano permanecem ativos, fazendo com que o carro consuma um pouco de energia durante a noite.\n\n<b>Apenas Ligado</b>  desliga totalmente o Overdrive assim que você sai. A dashcam, o histórico de viagens e o monitoramento de recarga ainda funcionam enquanto você estiver dirigindo, e tudo é reiniciado automaticamente quando você liga o carro. Você pode alterar isso a qualquer momento nas Configurações.</string>
@@ -459,8 +459,8 @@
     <string name="soh_dialog_capacity_not_detected">Não detectado</string>
     <string name="soh_dialog_calibration_format">%1$.1f%% em %2$s</string>
     <string name="soh_dialog_frame_anchor_label">Carregamento total observado</string>
-    <string name="soh_dialog_frame_anchor_format">%1$.2f kWh observados a 100% (%2$d/\%3$d amostras)</string>
-    <string name="soh_dialog_frame_anchor_pending_format">%1$.2f kWh observado a 100% (coletando %2$d/%3$d amostras)</string>
+    <string name="soh_dialog_frame_anchor_format">%1$.2f kWh observados a 100%% (%2$d/%3$d amostras)</string>
+    <string name="soh_dialog_frame_anchor_pending_format">%1$.2f kWh observado a 100%% (coletando %2$d/%3$d amostras)</string>
     <string name="soh_dialog_frame_mismatch_title">Incompatibilidade de quadro de capacidade da bateria</string>
     <string name="soh_dialog_frame_mismatch_format">O veículo relata %1$.1f kWh com carga completa, mas a capacidade da bateria está definida em %2$.1f kWh. O número acima pode refletir uma divergência na unidade (nominal vs. utilizável) e não uma degradação real. Considere inserir %1$.1f kWh para corresponder ao que o veículo relata.</string>
     <string name="soh_dialog_use_observed_value">Usar valor observado</string>

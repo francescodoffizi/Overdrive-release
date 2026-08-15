@@ -193,10 +193,44 @@ class DaemonsFragment : Fragment() {
             val qrCodeText = dialogView.findViewById<TextView>(R.id.qrCodeURL)
             val qrCodeImage = dialogView.findViewById<ImageView>(R.id.qrCodeImage)
             val proxySwitch = dialogView.findViewById<SwitchMaterial>(R.id.switchTailscaleProxy)
+            val adbSwitch = dialogView.findViewById<SwitchMaterial>(R.id.switchTailscaleAdb)
+            val adbEndpoint = dialogView.findViewById<TextView>(R.id.tailscaleAdbEndpoint)
 
             daemonsViewModel.tailscaleController.isProxyEnabled { isEnabled ->
                 activity?.runOnUiThread {
                     proxySwitch.isChecked = isEnabled
+                }
+            }
+
+            daemonsViewModel.tailscaleController.isAdbEnabled { isEnabled ->
+                activity?.runOnUiThread {
+                    adbSwitch.isChecked = isEnabled
+                }
+            }
+
+            // Endpoint resolves only when ADB is on, the daemon is up and login is
+            // done — stays hidden otherwise rather than showing a dead address.
+            daemonsViewModel.tailscaleController.getAdbEndpoint { endpoint ->
+                activity?.runOnUiThread {
+                    // The probe is a multi-hop shell chain, so the fragment can
+                    // detach before it lands — re-check attachment, because
+                    // getString() routes through requireContext() and would throw.
+                    val ctx = context ?: return@runOnUiThread
+                    if (endpoint.isNullOrEmpty()) {
+                        adbEndpoint.visibility = View.GONE
+                    } else {
+                        val command = ctx.getString(R.string.tailscale_adb_endpoint, endpoint)
+                        adbEndpoint.text = command
+                        adbEndpoint.visibility = View.VISIBLE
+                        adbEndpoint.setOnClickListener {
+                            val tapCtx = context ?: return@setOnClickListener
+                            val clip = tapCtx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                                as? android.content.ClipboardManager
+                            // Copy what's displayed — the whole command, not just the address.
+                            clip?.setPrimaryClip(android.content.ClipData.newPlainText("adb", command))
+                            Toast.makeText(tapCtx, tapCtx.getString(R.string.tailscale_adb_endpoint_copied), Toast.LENGTH_SHORT).show()
+                        }
+                    }
                 }
             }
 
@@ -237,13 +271,34 @@ class DaemonsFragment : Fragment() {
                 .setView(dialogView)
                 .setPositiveButton(getString(R.string.dialog_save)) { _, _ ->
                     val enableProxy = proxySwitch.isChecked
-                    daemonsViewModel.tailscaleController.isProxyEnabled { wasEnabled ->
+                    val enableAdb = adbSwitch.isChecked
+                    // Settle the ADB toggle first, then the proxy. Both are
+                    // independent and each only acts on a real change; the proxy
+                    // step is deferred until any ADB confirm is dismissed so the
+                    // two warning dialogs can't stack on top of each other.
+                    val thenProxy = {
+                        daemonsViewModel.tailscaleController.isProxyEnabled { wasEnabled ->
+                            activity?.runOnUiThread {
+                                // Only confirm when *turning on* the proxy (going off→on). Disabling is always safe.
+                                if (enableProxy && !wasEnabled) {
+                                    confirmEnableTailscaleProxy()
+                                } else if (enableProxy != wasEnabled) {
+                                    saveTailscaleProxySettings(enableProxy)
+                                }
+                            }
+                        }
+                    }
+                    daemonsViewModel.tailscaleController.isAdbEnabled { adbWasEnabled ->
                         activity?.runOnUiThread {
-                            // Only confirm when *turning on* the proxy (going off→on). Disabling is always safe.
-                            if (enableProxy && !wasEnabled) {
-                                confirmEnableTailscaleProxy()
+                            if (enableAdb != adbWasEnabled) {
+                                // Confirm only off→on; withdrawing access is always safe.
+                                if (enableAdb) confirmEnableTailscaleAdb(thenProxy)
+                                else {
+                                    saveTailscaleAdbSettings(false)
+                                    thenProxy()
+                                }
                             } else {
-                                saveTailscaleProxySettings(enableProxy)
+                                thenProxy()
                             }
                         }
                     }
@@ -255,6 +310,46 @@ class DaemonsFragment : Fragment() {
                 .create()
 
             dialog.show()
+        }
+    }
+
+    /**
+     * Confirm before exposing ADB to the tailnet — this grants full shell access
+     * to any tailnet peer, so it must never be a silent one-tap change.
+     */
+    private fun confirmEnableTailscaleAdb(onDismissed: (() -> Unit)? = null) {
+        // Detached before the dialog could be built — still run the follow-up so a
+        // pending proxy change isn't silently dropped.
+        val context = context ?: run {
+            onDismissed?.invoke()
+            return
+        }
+
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(context, R.style.Theme_Overdrive_M3_Dialog)
+            .setIcon(R.drawable.ic_warning)
+            .setTitle(getString(R.string.dialog_tailscale_adb_enable_title))
+            .setMessage(getString(R.string.dialog_tailscale_adb_enable_message))
+            .setPositiveButton(getString(R.string.dialog_enable)) { _, _ ->
+                saveTailscaleAdbSettings(true)
+            }
+            .setNegativeButton(getString(R.string.action_cancel), null)
+            // Runs on accept AND cancel, so a queued follow-up step never strands.
+            .setOnDismissListener { onDismissed?.invoke() }
+            .show()
+    }
+
+    private fun saveTailscaleAdbSettings(enabled: Boolean) {
+        daemonsViewModel.tailscaleController.saveAdbSettings(enabled) { saved ->
+            activity?.runOnUiThread {
+                val ctx = context ?: return@runOnUiThread
+                if (!saved) {
+                    Toast.makeText(ctx, getString(R.string.toast_tailscale_adb_save_failed), Toast.LENGTH_SHORT).show()
+                    return@runOnUiThread
+                }
+                val msg = if (enabled) R.string.toast_tailscale_adb_enabled
+                          else R.string.toast_tailscale_adb_disabled
+                Toast.makeText(ctx, getString(msg), Toast.LENGTH_SHORT).show()
+            }
         }
     }
 

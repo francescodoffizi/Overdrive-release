@@ -6,7 +6,7 @@
     <title data-i18n="app.mqtt_title">MQTT - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <!--
       Bottom-tab manifest for MQTT — three task-based tabs:
         Connections — broker list (or empty-state with a CTA that switches to Add)
@@ -33,18 +33,16 @@
         };
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <style>
         .conn-card { margin-bottom: 12px; }
         .conn-header { display: flex; align-items: center; gap: 12px; padding: 14px 16px; cursor: pointer; }
         .conn-header:hover { background: var(--bg-elevated); border-radius: 8px; }
         .conn-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-        .conn-dot.connected { background: #22c55e; box-shadow: 0 0 6px rgba(34,197,94,0.4); }
-        .conn-dot.disconnected { background: #ef4444; }
-        .conn-dot.reconnecting { background: #eab308; animation: pulse 1.5s infinite; }
-        .conn-dot.stopped { background: #64748b; }
+        .conn-dot.connected { background: var(--status-success); box-shadow: 0 0 6px var(--status-success-container); }
+        .conn-dot.disconnected { background: var(--status-danger); }
+        .conn-dot.reconnecting { background: var(--status-warning); animation: pulse 1.5s infinite; }
+        .conn-dot.stopped { background: var(--outline); }
         @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
         /* The connection name + broker URL stack inside a flex middle cell.
            That cell needs `min-width:0` so its children can shrink + ellipsis
@@ -55,14 +53,14 @@
             display: flex; flex-direction: column;
         }
         .conn-name { font-weight: 600; font-size: 14px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .conn-broker { font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .conn-broker { font-size: 12px; color: var(--text-muted); font-family: var(--family-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .conn-actions { display: flex; gap: 6px; flex-shrink: 0; }
         .conn-detail { padding: 0 16px 16px; display: none; }
         .conn-detail.open { display: block; }
         .conn-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
         .conn-stat { background: var(--bg-elevated); border-radius: 8px; padding: 10px 12px; min-width: 0; }
         .conn-stat .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
-        .conn-stat .value { font-size: 16px; font-weight: 600; font-family: 'JetBrains Mono', monospace; color: var(--text-primary); margin-top: 2px; word-break: break-all; }
+        .conn-stat .value { font-size: 16px; font-weight: 600; font-family: var(--family-mono); color: var(--text-primary); margin-top: 2px; word-break: break-all; }
         .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
         .form-grid.full { grid-template-columns: 1fr; }
         @media (max-width: 540px) {
@@ -93,7 +91,7 @@
                 margin: 16px 0 4px;
                 align-items: stretch;
             }
-            .form-actions .btn { width: 100%; height: 44px; padding: 0 16px; justify-content: center; }
+            .form-actions .btn { width: 100%; height: 48px; padding: 0 16px; justify-content: center; }
             /* The bottom toggle row (connection enabled toggle) was using a
                `padding:0 16px 12px` that didn't track the conn-header's
                narrower mobile padding; align them. */
@@ -103,9 +101,9 @@
         .form-group label { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
         .form-group input, .form-group select {
             padding: 10px 12px; background: var(--bg-elevated); border: 1px solid var(--border-color);
-            border-radius: 8px; color: var(--text-primary); font-size: 14px; font-family: 'Inter', sans-serif;
+            border-radius: 8px; color: var(--text-primary); font-size: 14px; font-family: var(--family-sans);
         }
-        .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--brand-primary); }
+        .form-group input:focus, .form-group select:focus { outline: 2px solid var(--primary); outline-offset: 2px; border-color: var(--brand-primary); }
         .form-group input::placeholder { color: var(--text-muted); }
         /* Range sliders adopt the shared .slider look (themed track + brand
            thumb from styles.css). The generic `.form-group input` rule above
@@ -396,9 +394,9 @@
     <div id="toastContainer" class="toast-container"></div>
 
     <script src="../shared/auth.js"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/mqtt.js?v=2"></script>
+    <script src="../shared/mqtt.js?v=3"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

@@ -118,6 +118,11 @@ class GroundTruthStore private constructor() {
         autoAccepted: Boolean = false,
     ) {
         synchronized(lock) {
+            // Lazy open on the FIRST label write: the controller no longer init()s this
+            // store at RoadSense start (labels arrive at most a few times per drive, and
+            // an open H2 store costs idle CPU — its MVStore background writer/compaction
+            // threads run regardless of write volume). init() is idempotent on [lock].
+            if (!initialized) init()
             val c = connection ?: return
             try {
                 c.prepareStatement(
@@ -165,11 +170,21 @@ class GroundTruthStore private constructor() {
             // Lazy open: the controller no longer init()s this store at boot when RoadSense
             // is disabled, but delete-local must still wipe labels left by a prior enabled
             // session. init() is idempotent and reentrant on [lock].
-            if (!initialized) init()
+            val openedHere = !initialized
+            if (openedHere) init()
             val c = connection ?: return -1
             return try {
                 c.createStatement().use { st -> st.executeUpdate("DELETE FROM roadsense_labels;") }
-            } catch (e: Exception) { -1 }
+            } catch (e: Exception) {
+                -1
+            } finally {
+                // If THIS one-off call opened the store, close it again — otherwise a
+                // delete-local while RoadSense is disabled would leave the H2 store (and
+                // its MVStore background threads) running indefinitely for nothing.
+                // When the store was already open (RoadSense session wrote a label), it
+                // stays open for the session; the controller's stop() closes it.
+                if (openedHere) stop()
+            }
         }
     }
 
@@ -184,8 +199,11 @@ class GroundTruthStore private constructor() {
     companion object {
         private val logger = DaemonLogger.getInstance("RoadSense/GroundTruth")
         private const val DB_PATH = "/data/local/tmp/overdrive_roadsense_labels_h2"
+        // AUTO_COMPACT_FILL_RATE=50: idle-CPU tuning shared by all seven H2
+        // stores (see SocHistoryDatabase.JDBC_URL for the rationale).
         private const val JDBC_URL =
-            "jdbc:h2:file:$DB_PATH;FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE"
+            "jdbc:h2:file:$DB_PATH;FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE" +
+                ";AUTO_COMPACT_FILL_RATE=50"
 
         @Volatile private var instance: GroundTruthStore? = null
         @JvmStatic

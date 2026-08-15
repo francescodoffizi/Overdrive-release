@@ -75,7 +75,10 @@ public final class TelemetryFieldCatalog {
 
         // ---------- Core driving / energy ----------
         add("soc",        "State of Charge", SENSOR, "battery",     MEAS, "%",    "mdi:battery",            false, 0.1);
-        add("power",      "Power",           SENSOR, "power",       MEAS, "kW",   "mdi:flash",              false, 0.1);
+        // "Motor Power", not "Power": this is drive-motor kW. The automation signal named
+        // `power` is the IGNITION level (off/acc/on), published here as `power_level` —
+        // two unrelated facts that both read as "power". See SignalMqttMap.
+        add("power",      "Motor Power",     SENSOR, "power",       MEAS, "kW",   "mdi:flash",              false, 0.1);
         add("charge_power","Charge Power",   SENSOR, "power",       MEAS, "kW",   "mdi:battery-charging",   false, 0.1);
         add("speed",      "Speed",           SENSOR, "speed",       MEAS, "km/h", "mdi:speedometer",        false, 0.1);
         add("lat",        "Latitude",        SENSOR, null,          MEAS, "°",    "mdi:latitude",           true,  0.00001);
@@ -94,6 +97,10 @@ public final class TelemetryFieldCatalog {
         add("charging_eta_minutes", "Charging ETA (min)",  SENSOR, "duration",         null, "min","mdi:timer-sand",     false, 0);
         add("charging_capacity_kwh","Charging Capacity",   SENSOR, "energy",           TOTI, "kWh","mdi:battery-charging-high", false, 0.1);
         add("charging_v2l",         "V2L Active",          BINARY, null,               null, null, "mdi:home-lightning-bolt", false, 0);
+        // Published for the controllable charge-limit entities' state topics;
+        // do not also create duplicate read-only sensor entities.
+        add("charge_cap_enabled",   "Charge Limit State",   NONE, null,                 null, null, null,                 true,  0);
+        add("charge_cap_percent",   "Charge Limit Percent", NONE, null,                 null, null, null,                 true,  0);
         add("charging_state",       "Charging State",      SENSOR, "enum",             null, null, "mdi:battery-charging", true, 0);
         add("charger_state",        "Charger State",       SENSOR, "enum",             null, null, "mdi:ev-station",     true,  0);
         add("charging_mode",        "Charging Mode",       SENSOR, "enum",             null, null, "mdi:ev-station",     true,  0);
@@ -190,6 +197,9 @@ public final class TelemetryFieldCatalog {
         add("ac_wind",   "A/C Wind Mode",SENSOR, "enum", null, null, "mdi:air-conditioner", true, 0);
         add("ac_fan",    "A/C Fan Level",SENSOR, null,   MEAS, null, "mdi:fan",             true, 0);
         add("temp_unit", "Temp Unit",    SENSOR, "enum", null, null, "mdi:temperature-celsius", true, 0);
+        // Published (normalized 1/0) for the steering_heat control switch's state topic;
+        // do not also create a duplicate read-only sensor entity.
+        add("steering_wheel_heat", "Steering Wheel Heating State", NONE, null, null, null, null, true, 0);
 
         // ---------- Bodywork ----------
         add("wiper_state",   "Wipers",        SENSOR, "enum", null, null, "mdi:wiper",          true, 0);
@@ -210,7 +220,9 @@ public final class TelemetryFieldCatalog {
         // the speed_limit_warning pattern. No "problem" device_class — CPD-on is the desired state.
         add("child_presence_detection", "Child Presence Detection", BINARY, null, null, null, "mdi:car-child-seat", true, 0);
         add("emergency_alarm",     "Emergency Alarm",     SENSOR, "enum", null, null, "mdi:alarm-light",     true, 0);
-        add("power_level",         "Power Level",         SENSOR, "enum", null, null, "mdi:power",           true, 0);
+        // Ignition/accessory level (off/acc/on) — the twin of the automation `power` signal.
+        // Named "Vehicle Power State" to keep it distinct from `power` (drive-motor kW) above.
+        add("power_level",         "Vehicle Power State", SENSOR, "enum", null, null, "mdi:power",           true, 0);
         add("mcu_status",          "MCU Status",          SENSOR, "enum", null, null, "mdi:chip",            true, 0);
 
         // ---------- Air quality ----------

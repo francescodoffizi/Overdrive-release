@@ -10,11 +10,9 @@
     <title data-i18n="about.page_title">About — OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
+    <script src="../shared/app-shell.js?v=5"></script>
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <link rel="manifest" href="/manifest.json">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <style>
         .about-page-body { max-width: 720px; margin: 0 auto; }
 
@@ -44,8 +42,10 @@
             border-radius: 12px;
             padding: 6px 4px;
             /* Cap the list at ~6 rows so a long contributor/supporter list
-               scrolls inside the card instead of stretching the whole page. */
-            max-height: 360px;
+               scrolls inside the card instead of stretching the whole page.
+               Sized off the tallest row (patron, 56px avatar) so the cap still
+               shows ~6 rows once tiers enlarge some avatars. */
+            max-height: 440px;
             overflow-y: auto;
             -webkit-overflow-scrolling: touch;
         }
@@ -91,6 +91,156 @@
             font-size: 13px;
             color: var(--text-muted);
             text-align: center;
+        }
+
+        /* ── Supporter medals ─────────────────────────────────────────────
+           Gold / silver / bronze. Avatar size is untouched — the medal is a
+           ring on the avatar plus a labelled pip, so rows stay uniform.
+
+           These are NOT the classic metal hexes: #D4AF37/#C0C0C0/#CD7F32 put
+           gold and bronze at ΔE 12.2 (below the 15 normal-vision floor) and
+           collapse further under deuteranopia. The steps below are
+           lightness-separated (light gold / mid steel / dark bronze) so the
+           worst all-pairs distance is ΔE 17.5 dark / 20.7 light. Light mode
+           needs its own darker steps AND a rim: the gold and silver fills sit
+           at 2.0-3.0:1 on the light surface, so the rim (3.8:1 / 5.3:1)
+           carries the edge. Every medal also ships its name as text, so the
+           colour is never the only channel. */
+        :root {
+            --medal-diamond: #7FE0F5;
+            --medal-platinum: #D8E2EA;
+            --medal-gold: #F0C043;
+            --medal-silver: #AFBECC;
+            --medal-bronze: #B4602C;
+            --medal-diamond-rim: #7FE0F5;
+            --medal-platinum-rim: #D8E2EA;
+            --medal-gold-rim: #F0C043;
+            --medal-silver-rim: #AFBECC;
+            --medal-bronze-rim: #B4602C;
+        }
+        :root[data-theme="light"] {
+            --medal-diamond: #0E8FB0;
+            --medal-platinum: #5C6A78;
+            --medal-gold: #E0A81F;
+            --medal-silver: #8494A3;
+            --medal-bronze: #9A4A22;
+            --medal-diamond-rim: #0A6E88;
+            --medal-platinum-rim: #47535E;
+            --medal-gold-rim: #A87610;
+            --medal-silver-rim: #5C6A78;
+            --medal-bronze-rim: #7E3D1C;
+        }
+
+        /* The ring reads as a metal edge on the avatar. Two stacked shadows:
+           a surface gap, then the metal — so it never looks like a border
+           drawn on the photo. */
+        .credit-avatar.medal-diamond {
+            box-shadow: 0 0 0 2px var(--bg-elevated), 0 0 0 3.5px var(--medal-diamond);
+        }
+        .credit-avatar.medal-platinum {
+            box-shadow: 0 0 0 2px var(--bg-elevated), 0 0 0 3.5px var(--medal-platinum);
+        }
+        .credit-avatar.medal-gold {
+            box-shadow: 0 0 0 2px var(--bg-elevated), 0 0 0 3.5px var(--medal-gold);
+        }
+        .credit-avatar.medal-silver {
+            box-shadow: 0 0 0 2px var(--bg-elevated), 0 0 0 3.5px var(--medal-silver);
+        }
+        .credit-avatar.medal-bronze {
+            box-shadow: 0 0 0 2px var(--bg-elevated), 0 0 0 3.5px var(--medal-bronze);
+        }
+
+        /* Labelled medal pip. The polished look comes from a soft top-left
+           highlight in the gradient, not an animation — this sits in a static
+           list and a shimmer would be noise. */
+        .credit-medal {
+            display: inline-flex; align-items: center; gap: 5px;
+            flex-shrink: 0;
+            font-size: 11px; font-weight: 600;
+            letter-spacing: 0.04em; text-transform: uppercase;
+            color: var(--text-secondary);
+        }
+        .credit-medal-pip {
+            width: 11px; height: 11px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            /* Off-centre highlight = the "shiny" read. */
+            background-image: radial-gradient(circle at 32% 28%,
+                rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0) 58%);
+        }
+        /* Diamond and platinum are both pale and cool, and no hue pair survives
+           there: cyan↔violet collapses to ΔE 1.0 under deuteranopia. So the top
+           two tiers carry SHAPE as their primary channel — a rhombus and a
+           hollow ring — while the three metals stay filled circles. Shape is
+           the one channel CVD can't touch. */
+        .medal-diamond .credit-medal-pip {
+            background-color: var(--medal-diamond);
+            box-shadow: inset 0 0 0 1px var(--medal-diamond-rim);
+            border-radius: 2px;
+            transform: rotate(45deg) scale(0.86);
+        }
+        .medal-platinum .credit-medal-pip {
+            /* Hollow: a thick ring, no fill. Distinct at a glance from every
+               filled pip regardless of colour. */
+            background-color: transparent;
+            background-image: none;
+            box-shadow: inset 0 0 0 3px var(--medal-platinum);
+        }
+        .medal-gold .credit-medal-pip {
+            background-color: var(--medal-gold);
+            box-shadow: inset 0 0 0 1px var(--medal-gold-rim);
+        }
+        .medal-silver .credit-medal-pip {
+            background-color: var(--medal-silver);
+            box-shadow: inset 0 0 0 1px var(--medal-silver-rim);
+        }
+        .medal-bronze .credit-medal-pip {
+            background-color: var(--medal-bronze);
+            box-shadow: inset 0 0 0 1px var(--medal-bronze-rim);
+        }
+
+        .credit-text { flex: 1; min-width: 0; }
+        .credit-text .credit-name { display: block; }
+
+        /* ×N repeat badge. Tabular figures because these align vertically down
+           the list. Hidden at N=1 — "×1" reads as "only once". */
+        .credit-count {
+            flex-shrink: 0;
+            margin-left: 10px;
+            font-family: var(--family-mono);
+            font-variant-numeric: tabular-nums;
+            font-size: 11px; font-weight: 600;
+            padding: 3px 7px;
+            border-radius: var(--radius-full);
+            /* Neutral — the medal owns the colour on this row, so the count
+               doesn't compete with it. */
+            background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
+            color: var(--text-secondary);
+        }
+
+        /* Legend: tells the reader what the sizes and ×N mean. Required —
+           without it the encoding is a private joke. */
+        .credits-legend {
+            display: flex; flex-wrap: wrap;
+            align-items: center; gap: 8px 16px;
+            margin: 10px 2px 0;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .credits-legend-item {
+            display: inline-flex; align-items: center; gap: 6px;
+        }
+        /* Legend keys reuse the row pip so the mark is literally identical. */
+        .credits-legend-item .credit-medal-pip {
+            width: 12px; height: 12px;
+        }
+        /* Full-width so it wraps under the keys instead of beside them. */
+        .credits-legend-note {
+            flex-basis: 100%;
+            margin: 0;
+            font-size: 12px;
+            line-height: 1.5;
+            color: var(--text-muted);
         }
 
         /* Tiered support cards mirror the native About fragment: free → social
@@ -199,6 +349,9 @@
                         <h3 class="about-subhead" data-i18n="about.supporters_title">Supporters</h3>
                         <p class="about-section-sub" data-i18n="about.supporters_sub">Folks who've kept the late-night commits caffeinated.</p>
                         <div class="credits-card" id="supportersList"></div>
+                        <!-- Explains the ring/size + ×N encoding. Built by
+                             renderLegend() from the data that's actually present. -->
+                        <div class="credits-legend" id="supportersLegend"></div>
                     </section>
 
                     <!-- Backup & Restore: settings export/import (same device).
@@ -212,21 +365,6 @@
                         <h3 class="about-subhead" data-i18n="logs.section_title">Diagnostics</h3>
                         <p class="about-section-sub" data-i18n="logs.section_sub">Send a daemon log to the maintainer — you'll get a short code to share.</p>
                         <div class="credits-card" id="diagDaemonList"></div>
-                    </section>
-
-                    <!-- Third-party asset attributions (license obligations). The
-                         RoadSense approach-warning chimes are from the Google Sound
-                         Library under CC BY 4.0 — attribution is required by the
-                         license, so it is surfaced here in the shipped app. -->
-                    <section class="about-section">
-                        <h3 class="about-subhead" data-i18n="about.acknowledgements_title">Acknowledgements</h3>
-                        <p class="about-section-sub" data-i18n="about.acknowledgements_sub">Third-party assets used in OverDrive, with their licenses.</p>
-                        <div class="credits-card">
-                            <p class="about-ack-line">
-                                <span data-i18n="about.ack_chimes">RoadSense warning chimes — sounds from the Google Sound Library, licensed under</span>
-                                <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer">CC BY 4.0</a>.
-                            </p>
-                        </div>
                     </section>
 
                     <section class="about-section">
@@ -289,7 +427,7 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
     <script src="../shared/backup-flow.js"></script>
     <script src="../shared/send-logs.js"></script>
@@ -328,10 +466,23 @@
         // Build a single row as a real DOM element (avoids HTML-attribute
         // injection on names containing quotes/angle brackets and lets us bind
         // the avatar `error` handler programmatically).
+        // Medal order is also the display order — credits.json ships sorted
+        // gold → silver → bronze, so the list needs no client-side sort.
+        const MEDALS = ['diamond', 'platinum', 'gold', 'silver', 'bronze'];
+        const TIER_CLASS = {
+            diamond: 'medal-diamond', platinum: 'medal-platinum',
+            gold: 'medal-gold', silver: 'medal-silver', bronze: 'medal-bronze'
+        };
+
         function buildRow(entry) {
             const name = (entry.name || '').toString();
             if (!name) return null;
             const gh = (entry.github || '').toString().trim();
+            const tierClass = TIER_CLASS[String(entry.tier || '').toLowerCase()] || '';
+            // Guard against a malformed count: must be a finite integer > 1.
+            const rawCount = Number(entry.count);
+            const count = Number.isFinite(rawCount) && rawCount > 1
+                ? Math.floor(rawCount) : 0;
 
             const row = document.createElement(gh ? 'a' : 'div');
             row.className = 'credit-row';
@@ -351,17 +502,51 @@
                 avatar.alt = '';
                 avatar.src = 'https://github.com/' + encodeURIComponent(gh) + '.png?size=72';
                 avatar.addEventListener('error', () => {
-                    avatar.replaceWith(makeFallbackAvatar(name));
+                    // Preserve the tier class — replaceWith drops the old node.
+                    const fb = makeFallbackAvatar(name);
+                    if (tierClass) fb.classList.add(tierClass);
+                    avatar.replaceWith(fb);
                 }, { once: true });
             } else {
                 avatar = makeFallbackAvatar(name);
             }
+            if (tierClass) avatar.classList.add(tierClass);
             row.appendChild(avatar);
 
+            // Name + optional tier label share a column so the label sits
+            // directly under the name rather than pushing the row wider.
+            const textWrap = document.createElement('span');
+            textWrap.className = 'credit-text';
             const nameEl = document.createElement('span');
             nameEl.className = 'credit-name';
             nameEl.textContent = name;
-            row.appendChild(nameEl);
+            textWrap.appendChild(nameEl);
+            row.appendChild(textWrap);
+
+            // Medal pip + its name. The name is what makes the colour legible
+            // to everyone, so the two always ship together.
+            if (tierClass) {
+                const medal = document.createElement('span');
+                medal.className = 'credit-medal ' + tierClass;
+                const pip = document.createElement('span');
+                pip.className = 'credit-medal-pip';
+                medal.appendChild(pip);
+                const label = document.createElement('span');
+                label.textContent = tierLabel(entry.tier);
+                medal.appendChild(label);
+                row.appendChild(medal);
+            }
+
+            if (count) {
+                const badge = document.createElement('span');
+                badge.className = 'credit-count';
+                badge.textContent = '×' + count;
+                // The glyph alone reads as "times N" to sighted users; spell it
+                // out for screen readers.
+                badge.setAttribute('aria-label', tSafe('about.support_count', 'Supported {n} times')
+                    .replace('{n}', String(count)));
+                row.appendChild(badge);
+            }
 
             if (gh) {
                 // Chevron rendered via innerHTML — content is static, no user data.
@@ -370,6 +555,26 @@
                 row.appendChild(chev.firstChild);
             }
             return row;
+        }
+
+        // i18n lookup that survives the pre-hydration window: BYD.i18n.t()
+        // returns null until the catalog loads, so fall back to the English
+        // literal rather than rendering a raw key.
+        function tSafe(key, fallback) {
+            const t = window.BYD && window.BYD.i18n && window.BYD.i18n.t
+                ? window.BYD.i18n.t(key) : null;
+            return t || fallback;
+        }
+
+        const TIER_FALLBACK = {
+            diamond: 'Diamond', platinum: 'Platinum',
+            gold: 'Gold', silver: 'Silver', bronze: 'Bronze'
+        };
+
+        function tierLabel(tier) {
+            const k = String(tier || '').toLowerCase();
+            if (!TIER_FALLBACK[k]) return '';
+            return tSafe('about.tier_' + k, TIER_FALLBACK[k]);
         }
 
         function makeFallbackAvatar(name) {
@@ -399,20 +604,77 @@
             }
         }
 
-        async function loadCredits() {
+        // Build the size/×N legend. Only shows the rows that actually occur in
+        // the data, so a list with no patrons doesn't advertise a patron tier.
+        function renderLegend(entries) {
+            const host = document.getElementById('supportersLegend');
+            if (!host) return;
+            host.replaceChildren();
+            const hasCount = entries.some(e => Number(e.count) > 1);
+            const present = MEDALS.filter(m =>
+                entries.some(e => String(e.tier || '').toLowerCase() === m));
+            if (!present.length && !hasCount) return;
+
+            for (const m of present) {
+                const item = document.createElement('span');
+                item.className = 'credits-legend-item ' + TIER_CLASS[m];
+                const pip = document.createElement('span');
+                pip.className = 'credit-medal-pip';
+                item.appendChild(pip);
+                const txt = document.createElement('span');
+                txt.textContent = tierLabel(m);
+                item.appendChild(txt);
+                host.appendChild(item);
+            }
+            if (hasCount) {
+                const item = document.createElement('span');
+                item.className = 'credits-legend-item';
+                const badge = document.createElement('span');
+                badge.className = 'credit-count';
+                badge.textContent = '×2';
+                item.appendChild(badge);
+                const txt = document.createElement('span');
+                txt.textContent = tSafe('about.legend_count', 'Supported more than once');
+                item.appendChild(txt);
+                host.appendChild(item);
+            }
+
+            // Spell out what the encoding means, once, below the keys.
+            const note = document.createElement('p');
+            note.className = 'credits-legend-note';
+            note.textContent = tSafe('about.tiers_explainer',
+                'Bigger avatars and a teal ring mark larger lifetime contributions; ×N shows how many times someone has chipped in.');
+            host.appendChild(note);
+        }
+
+        // Cached so an i18n locale change can re-render tier labels + legend
+        // without re-fetching.
+        let creditsData = null;
+
+        function renderCredits() {
             const contribEl = document.getElementById('contributorsList');
             const supportEl = document.getElementById('supportersList');
+            const supporters = (creditsData && creditsData.supporters) || [];
+            renderList(contribEl, (creditsData && creditsData.contributors) || [], 'about.empty');
+            renderList(supportEl, supporters, 'about.empty');
+            renderLegend(supporters);
+        }
+
+        async function loadCredits() {
             try {
-                const resp = await fetch('/credits.json', { credentials: 'same-origin' });
+                // no-cache: the daemon serves /credits.json with
+                // `public, max-age=86400`, so without it a browser can hold a
+                // day-old copy and miss tier/count fields added by an update.
+                const resp = await fetch('/credits.json', {
+                    credentials: 'same-origin', cache: 'no-cache'
+                });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                const data = await resp.json();
-                renderList(contribEl, data.contributors || [], 'about.empty');
-                renderList(supportEl, data.supporters || [], 'about.empty');
+                creditsData = await resp.json();
             } catch (e) {
                 console.warn('[About] credits.json load failed:', e);
-                renderList(contribEl, [], 'about.empty');
-                renderList(supportEl, [], 'about.empty');
+                creditsData = null;
             }
+            renderCredits();
         }
 
         // Pull tier URLs from i18n catalog so they can be overridden per-locale
@@ -467,7 +729,13 @@
             // Re-bind on every i18n change so tier URLs/copy follow locale.
             bindSupportTiers();
             if (window.BYD?.i18n?.onChange) {
-                window.BYD.i18n.onChange(bindSupportTiers);
+                window.BYD.i18n.onChange(() => {
+                    bindSupportTiers();
+                    // Tier labels and the legend are imperative text with no
+                    // data-i18n attribute, so hydrate() can't repair them —
+                    // re-render from the cached data instead.
+                    if (creditsData) renderCredits();
+                });
             }
         });
     </script>

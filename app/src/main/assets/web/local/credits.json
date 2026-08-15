@@ -1,59 +1,245 @@
 {
   "contributors": [
-    { "name": "deboiph", "github": "deboiph" },
-    { "name": "Nicolas Grandchamp", "github": "grandchamp" },
-    { "name": "boredgamer542", "github": "boredgamer542" },
-    { "name": "Giovanni Mirulla", "github": "giovannimirulla" },
-    { "name": "Galalike", "github": "Galalike" },
-    { "name": "jkaberg", "github": "jkaberg" },
-    { "name": "Chiira", "github": "IOKernel" },
-    { "name": "tiagoclc", "github": "tiagoclc" },
-    { "name": "Marlon Chalegre", "github": "marlonchalegre" },
-    { "name": "Pål Kristensen", "github": "paalkr" },
-    { "name": "Thiago Costa", "github": "ThiagoCAltoe" },
-    { "name": "Saleh Ibrahim", "github": "Slh-Ibrahim" },
-    { "name": "Shaun Eccles-Smith", "github": "shauneccles" },
-    { "name": "Paul Hepple", "github": "MetalHepple" }
+    {
+      "name": "deboiph",
+      "github": "deboiph"
+    },
+    {
+      "name": "Nicolas Grandchamp",
+      "github": "grandchamp"
+    },
+    {
+      "name": "boredgamer542",
+      "github": "boredgamer542"
+    },
+    {
+      "name": "Giovanni Mirulla",
+      "github": "giovannimirulla"
+    },
+    {
+      "name": "Galalike",
+      "github": "Galalike"
+    },
+    {
+      "name": "jkaberg",
+      "github": "jkaberg"
+    },
+    {
+      "name": "Chiira",
+      "github": "IOKernel"
+    },
+    {
+      "name": "tiagoclc",
+      "github": "tiagoclc"
+    },
+    {
+      "name": "Marlon Chalegre",
+      "github": "marlonchalegre"
+    },
+    {
+      "name": "Pål Kristensen",
+      "github": "paalkr"
+    },
+    {
+      "name": "Thiago Costa",
+      "github": "ThiagoCAltoe"
+    },
+    {
+      "name": "Saleh Ibrahim",
+      "github": "Slh-Ibrahim"
+    },
+    {
+      "name": "Shaun Eccles-Smith",
+      "github": "shauneccles"
+    },
+    {
+      "name": "Paul Hepple",
+      "github": "MetalHepple"
+    },
+    {
+      "name": "Cedric Carre",
+      "github": "ccarrebdl"
+    }
   ],
   "supporters": [
-    { "name": "Oizopower" },
-    { "name": "Wajdi Bsoul" },
-    { "name": "DJorgio" },
-    { "name": "Jan" },
-    { "name": "MCox" },
-    { "name": "Tejas Isamaliya" },
-    { "name": "Hooi Jack" },
-    { "name": "James Cruz" },
-    { "name": "AllysonBraga" },
-    { "name": "priank10" },
-    { "name": "Gerald Montero" },
-    { "name": "김재환" },
-    { "name": "Aussadayut Ubonkan" },
-    { "name": "Carlos Medina" },
-    { "name": "Nicolas Vollmar" },
-    { "name": "John Shea" },
-    { "name": "José Carlos" },
-    { "name": "Xavier Colin" },
-    { "name": "Eugene Teo Jin Kiat" },
-    { "name": "Jan Bleckmann" },
-    { "name": "Syed Arslan Haider" },
-    { "name": "Simon Ling" },
-    { "name": "Cedric Carre" },
-    { "name": "Mauro Manco" },
-    { "name": "aa b" },
-    { "name": "Diogo Goncalves" },
-    { "name": "Stefano Ceccon" },
-    { "name": "Mars Zafra" },
-    { "name": "Felipe De Oliveira" },
-    { "name": "Patrick Sperling" },
-    { "name": "Alexander Rikmanis" },
-    { "name": "Toms Kinkel" },
-    { "name": "Muhammed AKYUZ" },
-    { "name": "Azham" },
-    { "name": "Federico Valsania" },
-    { "name": "Renato Veiga" },
-    { "name": "Werner Wagener" },
-    { "name": "Ioannis Kazakopoulos" },
-    { "name": "Adrian b" }
+    {
+      "name": "choyr",
+      "tier": "diamond"
+    },
+    {
+      "name": "MCox",
+      "tier": "platinum",
+      "count": 2
+    },
+    {
+      "name": "priank10",
+      "tier": "platinum"
+    },
+    {
+      "name": "Cedric Carre",
+      "tier": "platinum"
+    },
+    {
+      "name": "Adrian b",
+      "tier": "gold"
+    },
+    {
+      "name": "stevendegiorgio-star",
+      "tier": "gold"
+    },
+    {
+      "name": "James Cruz",
+      "tier": "gold"
+    },
+    {
+      "name": "Muhammed AKYUZ",
+      "tier": "gold",
+      "count": 2
+    },
+    {
+      "name": "Mauro Manco",
+      "tier": "gold"
+    },
+    {
+      "name": "Diogo Goncalves",
+      "tier": "gold"
+    },
+    {
+      "name": "Jan Bleckmann",
+      "tier": "silver",
+      "count": 2
+    },
+    {
+      "name": "Wajdi Bsoul",
+      "tier": "silver"
+    },
+    {
+      "name": "Tejas Isamaliya",
+      "tier": "silver"
+    },
+    {
+      "name": "AllysonBraga",
+      "tier": "silver"
+    },
+    {
+      "name": "Aussadayut Ubonkan",
+      "tier": "silver"
+    },
+    {
+      "name": "Nicolas Vollmar",
+      "tier": "silver"
+    },
+    {
+      "name": "John Shea",
+      "tier": "silver"
+    },
+    {
+      "name": "Xavier Colin",
+      "tier": "silver"
+    },
+    {
+      "name": "aa b",
+      "tier": "silver"
+    },
+    {
+      "name": "Amarildo Souza",
+      "tier": "silver"
+    },
+    {
+      "name": "Miguel Eiras Franco",
+      "tier": "silver"
+    },
+    {
+      "name": "Simon Ling",
+      "tier": "bronze"
+    },
+    {
+      "name": "Oizopower",
+      "tier": "bronze"
+    },
+    {
+      "name": "Eugene Teo Jin Kiat",
+      "tier": "bronze"
+    },
+    {
+      "name": "Syed Arslan Haider",
+      "tier": "bronze"
+    },
+    {
+      "name": "Mars Zafra",
+      "tier": "bronze"
+    },
+    {
+      "name": "Felipe De Oliveira",
+      "tier": "bronze"
+    },
+    {
+      "name": "Patrick Sperling",
+      "tier": "bronze"
+    },
+    {
+      "name": "Alexander Rikmanis",
+      "tier": "bronze"
+    },
+    {
+      "name": "Toms Kinkel",
+      "tier": "bronze"
+    },
+    {
+      "name": "Federico Valsania",
+      "tier": "bronze"
+    },
+    {
+      "name": "Alexandre Neves",
+      "tier": "bronze"
+    },
+    {
+      "name": "김재환",
+      "tier": "bronze"
+    },
+    {
+      "name": "Azham",
+      "tier": "bronze"
+    },
+    {
+      "name": "Werner Wagener",
+      "tier": "bronze"
+    },
+    {
+      "name": "Gerald Montero",
+      "tier": "bronze"
+    },
+    {
+      "name": "Carlos Medina",
+      "tier": "bronze"
+    },
+    {
+      "name": "José Carlos",
+      "tier": "bronze"
+    },
+    {
+      "name": "Stefano Ceccon",
+      "tier": "bronze"
+    },
+    {
+      "name": "Renato Veiga",
+      "tier": "bronze"
+    },
+    {
+      "name": "Hooi Jack",
+      "tier": "bronze"
+    },
+    {
+      "name": "Ioannis Kazakopoulos",
+      "tier": "bronze"
+    },
+    {
+      "name": "Isara Limpetngam",
+      "tier": "bronze"
+    },
+    {
+      "name": "Muhammad Azham Abu Rahman",
+      "tier": "bronze"
+    }
   ]
 }

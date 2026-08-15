@@ -206,10 +206,10 @@
     <string name="onboarding_authorize_retry_title">Noch nicht verbunden</string>
     <string name="onboarding_authorize_retry_body">Der Helfer wird noch nicht ausgeführt. Die Android-Berechtigung wurde möglicherweise entlassen. Versuchen Sie es erneut und überprüfen Sie bitte <b>Immer erlauben</b>.</string>
     <string name="onboarding_authorize_retry_button">Erneut versuchen</string>
-    <string name="onboarding_mode_title">Wann soll Overdrive laufen?</string>
-    <string name="onboarding_mode_body">Wählen Sie, wie sich Overdrive verhält, nachdem Sie das Auto ausgeschaltet haben.\n\n<b>An &amp; Aus</b> überwacht weiterhin, während das Auto geparkt ist — die Überwachung und die Aufzeichnung bleiben aktiv, sodass das Auto über Nacht etwas Strom verbraucht.\n\n<b>Nur an</b> lässt die Haupteinheit schlafen, sobald Sie aussteigen. Dashcam, Fahrten und Laden funktionieren weiterhin, während Sie fahren; nach dem Ausschalten des Autos läuft nichts mehr. Sie können dies jederzeit in den Einstellungen ändern.</string>
-    <string name="onboarding_mode_on_off_button">An &amp; Aus (empfohlen)</string>
-    <string name="onboarding_mode_on_only_button">Nur an</string>
+    <string name="onboarding_mode_title">Wann sollte Overdrive laufen?</string>
+    <string name="onboarding_mode_body">Wählen Sie, wie Overdrive sich verhält nachdem Sie das Auto ausgeschaltet haben.\n\n<b>Auf &amp; Off</b> beobachtet während geparkt – Überwachung und Hintergrundüberwachung bleiben aktiv, so zieht das Auto ein wenig Strom über Nacht.\n\n<b>Nur auf</b> schließt Overdrive nach dem Verlassen vollständig herunter. Dashcam, Trips und Ladevorgang funktionieren noch während des Fahrens, und alles startet automatisch, wenn Sie das Auto einschalten. Sie können dies jederzeit in den Einstellungen ändern.</string>
+    <string name="onboarding_mode_on_off_button">Bei &amp; aus</string>
+    <string name="onboarding_mode_on_only_button">Nur auf</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Kamera · Schritt %1$d von %2$d</string>
     <string name="onboarding_camera_intro_title">Kameras einrichten</string>
@@ -1327,17 +1327,17 @@
     <string name="toast_cloudflared_saved_settings">Cloudflared Einstellungen gespeichert</string>
     <!-- Projection feature -->
     <string name="projection_hero_title">Projektion</string>
-    <string name="projection_hero_subtitle">Übertragen Sie eine App auf das Fahrer-Kombiinstrument und spiegeln Sie sie hier.</string>
-    <string name="projection_pick_app">Wählen Sie eine App zum Projizieren</string>
-    <string name="projection_cast">Auf Kombiinstrument übertragen</string>
+    <string name="projection_hero_subtitle">Setzen Sie eine App zum Treibercluster und spiegeln Sie sie hier.</string>
+    <string name="projection_pick_app">Wähle eine App zum Projekt</string>
+    <string name="projection_cast">Zum Cluster übertragen</string>
     <string name="projection_stop">Stoppen</string>
-    <string name="projection_cast_failed">Diese App konnte nicht auf das Kombiinstrument übertragen werden.</string>
-    <string name="projection_status_idle">Keine Projektion aktiv.</string>
-    <string name="projection_status_live">Live-Spiegelung — tippen und wischen zum Steuern.</string>
-    <string name="projection_status_preview">Vorschaumodus (reduzierte Bildrate auf diesem Fahrzeug).</string>
-    <string name="projection_status_none">Noch nichts projiziert — wählen Sie eine App und übertragen Sie sie.</string>
-    <string name="projection_status_unsupported">Live-Spiegelung wird auf diesem Fahrzeug nicht unterstützt. Die App wird weiterhin auf dem Kombiinstrument projiziert.</string>
-    <string name="projection_note_single_app">Es kann jeweils nur eine App auf dem Kombiinstrument projiziert werden.</string>
+    <string name="projection_cast_failed">Konnte diese App nicht in den Cluster übertragen.</string>
+    <string name="projection_status_idle">Keine Projektierung.</string>
+    <string name="projection_status_live">Live-Spiegel — tippen und wischen um zu steuern.</string>
+    <string name="projection_status_preview">Vorschaumodus (reduzierte Bildrate für dieses Fahrzeug).</string>
+    <string name="projection_status_none">Noch ist nichts prognostiziert — wähle eine App aus und schreibe.</string>
+    <string name="projection_status_unsupported">Live-Spiegel wird von diesem Fahrzeug nicht unterstützt. Die App wird immer noch auf dem Cluster projiziert.</string>
+    <string name="projection_note_single_app">Eine App kann auf dem Cluster gleichzeitig projiziert werden.</string>
     <string name="projection_adjust_bounds">Bereich anpassen</string>
     <string name="projection_done_adjusting">Fertig</string>
     <string name="projection_bounds_hint_idle">Spiegelbereich</string>
@@ -1355,4 +1355,18 @@
     <string name="projection_autostart_conflict_confirm">Diese App verwenden</string>
     <string name="projection_app_uninstalled">Diese App ist nicht mehr installiert.</string>
     <string name="projection_status_service_down">Der Spiegeldienst ist nicht bereit – starte die App (oder den Kamera-Daemon) neu und versuche es erneut.</string>
+    <string name="cd_replay_status">Sofortige Wiedergabe Status</string>
+    <string name="recording_lib_type_replay">REPLAY</string>
+    <string name="settings_overlay_replay_title">Sofortige Wiedergabeanzeige</string>
+    <string name="settings_overlay_replay_subtitle">CLIP-Abzeichen anzeigen: grün während ein Replay-Aufzeichnung, blau für 5 Sekunden einmal gespeichert, rot wenn es fehlschlägt. Wird nur angezeigt, wenn eine Replay-Bindung oder Automatisierung existiert.</string>
+    <string name="recordings_segment_replays">Wiederholungen</string>
+    <string name="recordings_segment_replays_count">Wiederholungen · %d</string>
+    <string name="vehicle_model_seagull">BYD Seagull</string>
+    <string name="projection_window_title">Cluster-Fenster</string>
+    <string name="projection_window_desc">Positionieren Sie die cast-App auf dem Treibercluster. Die Voreinstellungen können Sie in gängigen Layouts einrasten. Die Größe des Fensters lässt Sie es frei verschieben.</string>
+    <string name="projection_preset_full">Voll</string>
+    <string name="projection_preset_left">Linke Hälfte</string>
+    <string name="projection_preset_right">Rechte Hälfte</string>
+    <string name="projection_preset_center">Zentriert</string>
+    <string name="projection_lock_aspect">Cluster-Aspekt behalten</string>
 </resources>

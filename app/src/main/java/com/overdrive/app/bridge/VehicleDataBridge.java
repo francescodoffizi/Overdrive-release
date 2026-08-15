@@ -129,6 +129,11 @@ public class VehicleDataBridge {
             json.put("isError", data.isError);
             json.put("errorType", data.errorType);
             json.put("chargingPowerKW", data.chargingPowerKW);
+            // isEstimated travels WITH the number. getChargingState() substitutes a nominal
+            // 3.3/7.0 kW placeholder (or an inferred engine-power figure) whenever nothing has
+            // resolved a real rate, so a consumer receiving the value alone cannot tell a
+            // measurement from a guess and will render the guess as measured power.
+            json.put("isEstimated", data.isEstimated);
             json.put("isDischarging", data.isDischarging);
             json.put("timestamp", data.timestamp);
             json.put("description", getChargingDescription(data));
@@ -158,6 +163,11 @@ public class VehicleDataBridge {
             JSONObject json = new JSONObject();
             json.put("available", true);
             json.put("chargingPowerKW", data.chargingPowerKW);
+            // isEstimated travels WITH the number. getChargingState() substitutes a nominal
+            // 3.3/7.0 kW placeholder (or an inferred engine-power figure) whenever nothing has
+            // resolved a real rate, so a consumer receiving the value alone cannot tell a
+            // measurement from a guess and will render the guess as measured power.
+            json.put("isEstimated", data.isEstimated);
             json.put("isDischarging", data.isDischarging);
             json.put("timestamp", data.timestamp);
             json.put("description", getPowerFlowDescription(data.chargingPowerKW, data.isDischarging));
@@ -219,7 +229,7 @@ public class VehicleDataBridge {
             return "Charging Error: " + data.stateName;
         } else if (data.isDischarging) {
             return "Discharging (" + String.format("%.1f", Math.abs(data.chargingPowerKW)) + " KW)";
-        } else if (data.status == ChargingStateData.ChargingStatus.CHARGING) {
+        } else if (data.status == ChargingStateData.ChargingStatus.CHARGING || data.isTaperCharging) {
             return "Charging (" + String.format("%.1f", data.chargingPowerKW) + " KW)";
         } else {
             return data.stateName;

@@ -277,6 +277,14 @@ class BootReceiver : BroadcastReceiver() {
             // chain if it was ever broken (force-stop, reboot, app data clear).
             ProcessRevivalReceiver.schedule(context.applicationContext)
 
+            // Hotspot "start at power-up": one-shot per process, and only from a
+            // recovery trigger — a passive broadcast must never bring the AP up
+            // (it would drop the station link the user is currently on).
+            if (isRecoveryTrigger(trigger)) {
+                com.overdrive.app.network.HotspotManager.armBootAutoStart(
+                    context.applicationContext)
+            }
+
             Log.d(TAG, "Daemon startup initiated successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start daemons: ${e.message}")

@@ -51,6 +51,12 @@ BYD.stream = {
     // Bumped by stopStream. An async start/view-switch compares its captured
     // value and abandons its remaining steps if it has been superseded.
     _startGeneration: 0,
+    // Every camera selection invalidates outstanding view-route responses and
+    // readiness polls. An older DVR completion must not override a newer pick.
+    _viewSelectionToken: 0,
+    _viewPollToken: 0,
+    _viewMutationTail: Promise.resolve(),
+    _viewRouteClientId: null,
     // A stream paused because the app was backgrounded should resume the
     // same camera. Manual stops intentionally clear this state.
     _backgroundResumeMode: null,
@@ -69,12 +75,14 @@ BYD.stream = {
     hasWebCodecs: typeof VideoDecoder !== 'undefined',
     
     /**
-     * Poll /api/stream/view/{mode} until the backend returns a terminal
-     * response (success=true, or success=false without starting=true).
-     * Cadence is geometric so the head-unit doesn't burn 12 sequential
-     * RTTs on a slow cellular link. Returns the final response object.
+     * Poll until the backend returns a terminal response (success=true, or
+     * success=false without starting=true). DVR uses the read-only status
+     * endpoint after its initial selection; AVM modes retain the legacy route
+     * retry because their cold-start completion is not backend-owned.
+     * Cadence is geometric so the head-unit doesn't burn 12 sequential RTTs
+     * on a slow cellular link. Returns the final response object.
      */
-    async _pollViewUntilSettled(mode, initialResponse) {
+    async _pollViewUntilSettled(mode, initialResponse, selectionToken) {
         // Token-based cancellation: if a second view-set is fired while
         // an earlier poll is still running, the older poll observes the
         // token mismatch and bails so the UI mutation race lands on the
@@ -84,20 +92,30 @@ BYD.stream = {
         const delays = [500, 1000, 2000, 3000, 4000];
         let data = initialResponse;
         let toastShown = false;
+        const cancelled = () => this._viewPollToken !== token
+            || (selectionToken !== undefined
+                && this._viewSelectionToken !== selectionToken);
         // Cancellation returns a {cancelled:true} sentinel, NOT the
         // last fetched data. Callers that don't recognise the sentinel
         // would otherwise read a stale {success:false,starting:true}
         // and fire a false error toast / clear UI for a click that's
         // no longer the user's intent.
         for (let i = 0; i < delays.length; i++) {
-            if (this._viewPollToken !== token) return { cancelled: true };
+            if (cancelled()) return { cancelled: true };
             await new Promise(r => setTimeout(r, delays[i]));
-            if (this._viewPollToken !== token) return { cancelled: true };
+            if (cancelled()) return { cancelled: true };
             try {
-                const res = await fetch('/api/stream/view/' + mode);
-                data = await res.json();
+                // DVR warm-up is completed by the daemon lifecycle worker.
+                // Polling the mutating route endpoint used to re-bind the OEM
+                // source every pass; on single-client HAL variants that could
+                // make the feed alternate between AVM and DVR. Observe mode 6
+                // through the read-only status endpoint after the first click.
+                data = mode === 6
+                    ? await this._requestViewStatus(mode, selectionToken)
+                    : await this._requestViewRoute(mode, selectionToken);
             } catch (e) { continue; }
-            if (this._viewPollToken !== token) return { cancelled: true };
+            if (data && data.cancelled) return data;
+            if (cancelled()) return { cancelled: true };
             if (data && data.success === true) break;
             // Terminal failure (no `starting` flag) — bail immediately so the
             // user sees the real error toast instead of waiting out the full
@@ -130,6 +148,84 @@ BYD.stream = {
             data = Object.assign({}, data, { exhausted: true });
         }
         return data;
+    },
+
+    /**
+     * Serialize view mutations from this page. Fetch cancellation cannot undo
+     * a request the backend has already received; the next selection therefore
+     * waits for an earlier route to settle, then applies its own route last.
+     */
+    _enqueueViewMutation(selectionToken, mutation) {
+        const run = async () => {
+            if (selectionToken !== undefined
+                    && this._viewSelectionToken !== selectionToken) {
+                return { cancelled: true };
+            }
+            return mutation();
+        };
+        const queued = this._viewMutationTail.then(run, run);
+        // Keep the tail usable after a rejected network request while
+        // returning the original result to the initiating caller.
+        this._viewMutationTail = queued.catch(() => {});
+        return queued;
+    },
+
+    _requestViewRoute(mode, selectionToken) {
+        return this._enqueueViewMutation(selectionToken, async () => {
+            const res = await fetch(this._viewRouteUrl(mode, selectionToken));
+            if (!res.ok) throw new Error('view route failed: ' + res.status);
+            const data = await res.json();
+            if (selectionToken !== undefined
+                    && this._viewSelectionToken !== selectionToken) {
+                return { cancelled: true };
+            }
+            return data;
+        });
+    },
+
+    _requestViewStatus(mode, selectionToken) {
+        return fetch(this._viewStatusUrl(mode, selectionToken)).then(async (res) => {
+            if (!res.ok) throw new Error('view status failed: ' + res.status);
+            const data = await res.json();
+            if (selectionToken !== undefined
+                    && this._viewSelectionToken !== selectionToken) {
+                return { cancelled: true };
+            }
+            return data;
+        });
+    },
+
+    _viewRouteUrl(mode, selectionToken) {
+        if (typeof selectionToken !== 'number') {
+            return '/api/stream/view/' + mode;
+        }
+        if (!this._viewRouteClientId) {
+            this._viewRouteClientId = 'live' + Date.now().toString(36)
+                + Math.random().toString(36).substring(2);
+        }
+        return '/api/stream/view/' + mode
+            + '?client=' + encodeURIComponent(this._viewRouteClientId)
+            + '&selection=' + selectionToken;
+    },
+
+    _viewStatusUrl(mode, selectionToken) {
+        let url = '/api/stream/view-status/' + mode;
+        if (typeof selectionToken !== 'number') return url;
+        if (!this._viewRouteClientId) {
+            this._viewRouteClientId = 'live' + Date.now().toString(36)
+                + Math.random().toString(36).substring(2);
+        }
+        return url
+            + '?client=' + encodeURIComponent(this._viewRouteClientId)
+            + '&selection=' + selectionToken;
+    },
+
+    _requestStreamDisable(selectionToken) {
+        return this._enqueueViewMutation(selectionToken, async () => {
+            const res = await fetch('/api/stream/disable', { method: 'POST' });
+            if (!res.ok) throw new Error('stream disable failed: ' + res.status);
+            return res.json();
+        });
     },
 
     /**
@@ -725,8 +821,7 @@ BYD.stream = {
         // the live-view.html flow which already validates first.
         if (this.currentViewMode >= 0) {
             try {
-                let res = await fetch('/api/stream/view/' + this.currentViewMode);
-                let data = await res.json();
+                let data = await this._requestViewRoute(this.currentViewMode);
                 if (data && data.success === false && data.starting) {
                     data = await this._pollViewUntilSettled(this.currentViewMode, data);
                 }
@@ -802,6 +897,8 @@ BYD.stream = {
     stopStream(options) {
         // Invalidate any start/view-switch still sitting in an await.
         this._startGeneration++;
+        this._viewSelectionToken = (this._viewSelectionToken || 0) + 1;
+        this._viewPollToken = (this._viewPollToken || 0) + 1;
         const preserveBackgroundResume = options && options.preserveBackgroundResume === true;
         if (!preserveBackgroundResume) {
             this._backgroundResumeMode = null;
@@ -985,8 +1082,7 @@ BYD.stream = {
         if (btn) btn.classList.add('loading');
 
         try {
-            let res = await fetch('/api/stream/view/' + mode);
-            let data = await res.json();
+            let data = await this._requestViewRoute(mode);
             if (data && data.success === false && data.starting) {
                 data = await this._pollViewUntilSettled(mode, data);
             }

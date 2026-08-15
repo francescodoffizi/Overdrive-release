@@ -23,23 +23,26 @@ import java.io.OutputStream;
  *   GET  /api/vehicle/state         — current door/window/trunk/lock state
  *   GET  /api/vehicle/cloud-status  — BYD Cloud connection status
  *   GET  /api/vehicle/cloud-lock    — cached cloud lock state (REST refresh if stale)
- *   POST /api/vehicle/lock          — CLOUD_FIRST
- *   POST /api/vehicle/unlock        — CLOUD_FIRST
- *   POST /api/vehicle/trunk         — open=cloud-unlock+SDK, close/stop=SDK
- *   POST /api/vehicle/window        — area=0+close=CLOUD_FIRST, others SDK_ONLY
- *   POST /api/vehicle/flash         — CLOUD_FIRST (cloud-only on this gen)
- *   POST /api/vehicle/find-car      — CLOUD_FIRST (cloud-only on this gen)
- *   POST /api/vehicle/climate       — power=CLOUD_FIRST, set_temp/set_fan=SDK_ONLY
- *   POST /api/vehicle/seat          — SDK_ONLY
+ *   POST /api/vehicle/lock          — CLOUD_ONLY, terminally confirmed
+ *   POST /api/vehicle/unlock        — CLOUD_ONLY, terminally confirmed
+ *   POST /api/vehicle/trunk         — SDK first with safe cloud fallback when parked
+ *   POST /api/vehicle/window        — area=0 open/close SDK_FIRST with cloud fallback
+ *   POST /api/vehicle/flash         — CLOUD_ONLY, terminally confirmed
+ *   POST /api/vehicle/find-car      — CLOUD_ONLY, terminally confirmed
+ *   POST /api/vehicle/climate       — power=SDK_FIRST with cloud fallback, set_temp/set_fan=SDK_ONLY
+ *   GET  /api/vehicle/climate-schedule — BOOKINGAIR booking list (cloud reported)
+ *   POST /api/vehicle/climate-schedule — BOOKINGAIR create/update/delete, CLOUD_ONLY
+ *   POST /api/vehicle/seat          — SDK_FIRST with guarded cloud fallback
  *   POST /api/vehicle/lights        — SDK_ONLY
  *   POST /api/vehicle/adas          — SDK_ONLY
  *   POST /api/vehicle/setting       — SDK_ONLY
  *   POST /api/vehicle/media         — media volume (AudioManager) + screen brightness (setting HAL)
  *   POST /api/vehicle/battery-heat  — CLOUD_ONLY
- *   GET  /api/vehicle/charging-schedule  — local mirror { enabled, startChargeTime, endChargeTime, chargeWay }
+ *   GET  /api/vehicle/charging-schedule  — cloud state with local last-known fallback
  *   POST /api/vehicle/charging-schedule  — { startChargeTime, endChargeTime, chargeWay, enabled } CLOUD_ONLY
- *   GET  /api/vehicle/charge-cap         — { percent, enabled, supported } SDK_ONLY (SOC-target getSOCTarget, legacy getChargeStopCapacityState fallback)
- *   POST /api/vehicle/charge-cap         — { percent? 15..100, enabled? } SDK_ONLY (setSOCTarget+setSocSaveSwitch, legacy setChargeStop* fallback)
+ *   POST /api/vehicle/start-charging      — CLOUD_ONLY, terminally confirmed
+ *   GET  /api/vehicle/charge-cap         — { percent, enabled, supported } SDK_ONLY (verified charge-stop backend)
+ *   POST /api/vehicle/charge-cap         — { percent? 50..100, enabled? } SDK_ONLY (verified charge-stop backend)
  */
 public class VehicleControlApiHandler {
 
@@ -99,6 +102,18 @@ public class VehicleControlApiHandler {
         // POST /api/vehicle/climate
         if (cleanPath.equals("/api/vehicle/climate") && method.equals("POST")) {
             handleClimate(out, body);
+            return true;
+        }
+
+        // GET /api/vehicle/climate-schedule
+        if (cleanPath.equals("/api/vehicle/climate-schedule") && method.equals("GET")) {
+            handleGetClimateSchedule(out);
+            return true;
+        }
+
+        // POST /api/vehicle/climate-schedule
+        if (cleanPath.equals("/api/vehicle/climate-schedule") && method.equals("POST")) {
+            handleClimateSchedule(out, body);
             return true;
         }
 
@@ -201,6 +216,12 @@ public class VehicleControlApiHandler {
         // POST /api/vehicle/charging-schedule
         if (cleanPath.equals("/api/vehicle/charging-schedule") && method.equals("POST")) {
             handleChargingSchedule(out, body);
+            return true;
+        }
+
+        // POST /api/vehicle/start-charging
+        if (cleanPath.equals("/api/vehicle/start-charging") && method.equals("POST")) {
+            handleStartCharging(out);
             return true;
         }
 
@@ -590,8 +611,9 @@ public class VehicleControlApiHandler {
         int cloudOverall = -1;
         boolean cloudAvailable = false;
 
-        // Layer 1: OTA LF fast-path. Reads via the same readLfLockStateFromOta
-        // contract used by the lock-gate poller — see CameraDaemon.readDoorLockStatus.
+        // PRIMARY: OTA LF fast-path — the same live SDK read the surveillance
+        // lock gate trusts (CameraDaemon.readDoorLockStatus). Works ACC=OFF
+        // with ~1.5s latency; this is the freshest signal we have.
         try {
             android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
             if (ctx != null) {
@@ -612,7 +634,15 @@ public class VehicleControlApiHandler {
             logger.debug("ota-lock overlay failed: " + t.getMessage());
         }
 
-        // Layer 2: cloud overlay (full 4-door).
+        // FALLBACK: cloud overlay (full 4-door), gated on freshness. A cloud
+        // snapshot older than LOCK_STATE_MAX_AGE_MS is skipped entirely —
+        // hasValidLockState() stays true forever once any door has ever
+        // reported, so without the isLockStateFresh() gate an hours-old
+        // snapshot kept painting all four pills AND won `overall` over the
+        // live OTA read (glance showed "Locked" while the driver door was
+        // open-and-unlocked). Every other lock consumer already pairs the
+        // two checks (BydCloudDataProvider.isLockStateFresh, the listener
+        // replay, refreshLockStateIfStale); this was the odd one out.
         try {
             com.overdrive.app.byd.cloud.BydCloudDataProvider provider =
                     com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance();
@@ -622,7 +652,7 @@ public class VehicleControlApiHandler {
             // this response, but the next request will see fresh data.
             new Thread(provider::refreshLockStateIfStale, "CloudLockRefresh").start();
             com.overdrive.app.byd.cloud.VehicleCloudSnapshot cs = provider.getSnapshot();
-            if (cs != null && cs.hasValidLockState()) {
+            if (cs != null && cs.isLockStateFresh() && cs.hasValidLockState()) {
                 cloudAvailable = true;
                 int lf = cloudLockToApi(cs.leftFrontDoorLock);
                 int rf = cloudLockToApi(cs.rightFrontDoorLock);
@@ -644,15 +674,49 @@ public class VehicleControlApiHandler {
             logger.debug("cloud-lock overlay failed: " + e.getMessage());
         }
 
-        // Layer 3 (top of stack): OTA LF wins for the LF cell. Computed
-        // last so it overrides both cloud and SDK.
+        // Merge: the live OTA read is the primary signal (same priority the
+        // surveillance lock gate uses — OTA first, cloud secondary), so it
+        // always wins the LF cell, and an OTA "unlocked" also wins `overall`:
+        // the driver door being unlocked makes the vehicle unlocked no matter
+        // what the (up to 5-min-old) cloud snapshot claims. Cloud keeps
+        // `overall` only for states OTA cannot see — e.g. all-locked
+        // confirmation or a REAR door left unlocked while LF is locked.
         if (otaLf != -1) {
             doors.put("lf", otaLf);
-            // If cloud was unavailable, an OTA reading describes the driver
-            // door only. Keep publishing it as `overall` for compatibility
-            // with the surveillance lock gate, but label the scope honestly
-            // so presentation layers never call it whole-vehicle state.
-            if (!cloudAvailable) {
+            if (cloudAvailable) {
+                // Derive `overall` from the MERGED per-door cells, not from
+                // cloud's own unmerged view: cloud's LF cell can lag the OTA
+                // read by seconds (MQTT) to minutes (REST snapshot), and
+                // deriving from cloud's cells let its stale LF flip `overall`
+                // to "unlocked" after the user had already locked up (payload
+                // read lf=locked, overall=unlocked — self-contradictory).
+                int mLf = doors.optInt("lf", -1);
+                int mRf = doors.optInt("rf", -1);
+                int mLr = doors.optInt("lr", -1);
+                int mRr = doors.optInt("rr", -1);
+                boolean anyUnlocked = mLf == 2 || mRf == 2 || mLr == 2 || mRr == 2;
+                boolean allLocked = mLf == 1 && mRf == 1 && mLr == 1 && mRr == 1;
+                if (anyUnlocked) {
+                    // Definitive even with some cells unknown: one unlocked
+                    // door makes the vehicle unlocked.
+                    doors.put("overall", 2);
+                    doors.put("scope", "vehicle");
+                } else if (allLocked) {
+                    doors.put("overall", 1);
+                    doors.put("scope", "vehicle");
+                } else {
+                    // Some doors unknown, none unlocked: OTA still knows the
+                    // driver door — publish that rather than nothing, scoped
+                    // honestly so the UI never claims whole-car state.
+                    doors.put("overall", otaLf);
+                    doors.put("scope", "driver_door");
+                }
+                doors.put("source", "ota+cloud");
+            } else {
+                // No fresh cloud: an OTA reading describes the driver door
+                // only. Keep publishing it as `overall` for compatibility
+                // with the surveillance lock gate, but label the scope
+                // honestly so presentation layers never call it whole-car.
                 if (sdkOverall == -1) {
                     doors.put("overall", otaLf);
                     doors.put("scope", "driver_door");
@@ -669,12 +733,6 @@ public class VehicleControlApiHandler {
                     doors.put("scope", "vehicle");
                     doors.put("source", "sdk+ota");
                 }
-            }
-            if (cloudAvailable) {
-                // Cloud sees all four doors, so its overall state remains the
-                // whole-vehicle answer even when the faster OTA LF cell differs.
-                doors.put("scope", "vehicle");
-                doors.put("source", "ota+cloud");
             }
         }
         response.put("doors", doors);
@@ -764,7 +822,39 @@ public class VehicleControlApiHandler {
         // and the BYD cloud returns 1001 on VENTILATIONHEATING. JS uses this
         // to grey out the cool buttons.
         seats.put("ventilatedSupported", BydDataCollector.getInstance().isSeatVentilationSupported());
+        // Steering-wheel heater. Local read first (2=on/1=off), then the cloud snapshot's
+        // own wire domain. The key is omitted entirely when neither source answered, so the
+        // UI shows an unknown toggle rather than asserting "off".
+        int wheelHeat = data.steeringWheelHeat;
+        if (wheelHeat == 1 || wheelHeat == 2) {
+            seats.put("steeringHeat", wheelHeat == 2);
+        } else {
+            try {
+                com.overdrive.app.byd.cloud.VehicleCloudSnapshot cs =
+                        com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance().getSnapshot();
+                if (cs != null && cs.isTelemetryFresh() && cs.hasSteeringWheelHeatState()) {
+                    // steeringWheelHeatWireState(): 1=on, 3=off.
+                    seats.put("steeringHeat", cs.steeringWheelHeatWireState() == 1);
+                }
+            } catch (Exception e) {
+                logger.debug("steering-heat cloud overlay failed: " + e.getMessage());
+            }
+        }
         response.put("seats", seats);
+
+        // Traction-battery preconditioning. Cloud-only in both directions — there is no
+        // SDK readback — so the key is omitted unless a fresh snapshot reported it. Without
+        // this the UI had no state at all: after a reload every tap re-sent "on", leaving
+        // no way to switch battery heat off.
+        try {
+            com.overdrive.app.byd.cloud.VehicleCloudSnapshot cs =
+                    com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance().getSnapshot();
+            if (cs != null && cs.isTelemetryFresh() && cs.hasBatteryHeatState()) {
+                response.put("batteryHeat", cs.batteryHeatState > 0);
+            }
+        } catch (Exception e) {
+            logger.debug("battery-heat cloud read failed: " + e.getMessage());
+        }
 
         // Climate — only report AC state if vehicle power is on (powerLevel >= 2)
         // Otherwise stale cached data shows AC on when car is actually off
@@ -773,9 +863,15 @@ public class VehicleControlApiHandler {
         if (data.acStartState != BydVehicleData.UNAVAILABLE) {
             climate.put("acOn", vehiclePoweredOn && data.acStartState == 1);
         }
-        if (!Double.isNaN(data.insideTempC)) climate.put("insideTempC", data.insideTempC);
+        if (data.hasFreshCabinTemperature() && !Double.isNaN(data.insideTempC)) {
+            climate.put("insideTempC", data.insideTempC);
+        }
         if (data.acWindMode != BydVehicleData.UNAVAILABLE) climate.put("windMode", data.acWindMode);
         if (data.acFanLevel != BydVehicleData.UNAVAILABLE && vehiclePoweredOn) climate.put("fanLevel", data.acFanLevel);
+        Boolean remoteClimateActive = remoteClimateActive();
+        if (remoteClimateActive != null) {
+            climate.put("remoteClimateActive", remoteClimateActive.booleanValue());
+        }
         response.put("climate", climate);
 
         // Tyres — per-corner pressure (kPa + PSI), temperature, and the three
@@ -885,7 +981,7 @@ public class VehicleControlApiHandler {
     }
 
     /**
-     * Lock the car via the routing layer (cloud-first → SDK fallback).
+     * Lock the car via the terminally confirmed cloud routing path.
      */
     private static void handleLock(OutputStream out) throws Exception {
         CommandResult r = VehicleCommandRouter.getInstance()
@@ -919,16 +1015,28 @@ public class VehicleControlApiHandler {
      * Body: { "enabled": bool }
      */
     private static void handleBatteryHeat(OutputStream out, String body) throws Exception {
-        boolean enabled = false;
-        if (body != null && !body.isEmpty()) {
-            try { enabled = new JSONObject(body).optBoolean("enabled", false); } catch (Exception ignored) {}
+        JSONObject response = new JSONObject();
+        try {
+            JSONObject req = new JSONObject(body);
+            Boolean enabled = jsonBoolean(req, "enabled");
+            if (enabled == null) {
+                response.put("success", false);
+                response.put("error", "enabled must be boolean");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            CommandResult r = VehicleCommandRouter.getInstance()
+                    .execute(new VehicleCommandRouter.BatteryHeatCommand(enabled.booleanValue()));
+            logger.info("BatteryHeat: routed result=" + r.outcome + " enabled=" + enabled);
+            JSONObject resp = routedResponse(r, "battery-heat");
+            resp.put("enabled", enabled.booleanValue());
+            HttpResponse.sendJson(out, resp.toString());
+        } catch (Exception e) {
+            logger.warn("BatteryHeat command failed: " + e.getMessage());
+            response.put("success", false);
+            response.put("error", e.getMessage());
+            HttpResponse.sendJson(out, response.toString());
         }
-        CommandResult r = VehicleCommandRouter.getInstance()
-                .execute(new VehicleCommandRouter.BatteryHeatCommand(enabled));
-        logger.info("BatteryHeat: routed result=" + r.outcome + " enabled=" + enabled);
-        JSONObject resp = routedResponse(r, "battery-heat");
-        try { resp.put("enabled", enabled); } catch (Exception ignored) {}
-        HttpResponse.sendJson(out, resp.toString());
     }
 
     /**
@@ -938,15 +1046,39 @@ public class VehicleControlApiHandler {
      * Body: { "action": "open" | "close" | "stop" }
      */
     private static void handleTrunk(OutputStream out, String body) throws Exception {
-        String action = "open";
-        if (body != null && !body.isEmpty()) {
-            try { action = new JSONObject(body).optString("action", "open"); }
-            catch (Exception ignored) {}
+        JSONObject response = new JSONObject();
+        if (body == null || body.isEmpty()) {
+            response.put("success", false);
+            response.put("error", "trunk action is required");
+            HttpResponse.sendJson(out, response.toString());
+            return;
+        }
+        String action;
+        try {
+            JSONObject req = new JSONObject(body);
+            if (!req.has("action") || req.isNull("action")) {
+                response.put("success", false);
+                response.put("error", "trunk action is required");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            action = req.getString("action").trim().toLowerCase();
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("error", "invalid trunk request");
+            HttpResponse.sendJson(out, response.toString());
+            return;
         }
         VehicleCommand cmd;
         if ("close".equals(action)) cmd = new VehicleCommandRouter.TrunkCloseCommand();
         else if ("stop".equals(action)) cmd = new VehicleCommandRouter.TrunkStopCommand();
-        else cmd = new VehicleCommandRouter.TrunkOpenCommand();
+        else if ("open".equals(action)) cmd = new VehicleCommandRouter.TrunkOpenCommand();
+        else {
+            response.put("success", false);
+            response.put("error", "unknown trunk action: " + action);
+            HttpResponse.sendJson(out, response.toString());
+            return;
+        }
 
         CommandResult r = VehicleCommandRouter.getInstance().execute(cmd);
         logger.info("Trunk: action=" + action + " routed result=" + r.outcome + " path=" + r.path);
@@ -957,18 +1089,52 @@ public class VehicleControlApiHandler {
     /**
      * Window control routed through the command router.
      * Body: one of:
+     *   { "action": "vent" }                         cloud OPENWINDOW ventilation crack
      *   { "area": 1-4 (LF/RF/LR/RR) or 0 for all, "command": 1=open, 2=close, 3=stop }
      *   { "area": 1-4,                              "targetPercent": 0..100 }
      *   { "area": 5-6, (Sunroof and Sunshade),      "targetPercent": 0..100 }
      *
-     * area=0 + command=2 routes through CloseAllWindowsCommand (CLOUD_FIRST,
-     * with cloud CLOSEWINDOW). All other paths are SDK_ONLY.
+     * Full opening stays SDK-only. The cloud's OPENWINDOW ventilation crack is
+     * exposed separately so a successful remote vent is never reported as full open.
      */
     private static void handleWindow(OutputStream out, String body) throws Exception {
         JSONObject response = new JSONObject();
         try {
             JSONObject req = new JSONObject(body);
-            int area = req.optInt("area", 0);
+            if (req.has("action")) {
+                String action = jsonString(req, "action");
+                if (!"vent".equals(action)) {
+                    response.put("success", false);
+                    response.put("error", "window action must be vent");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                CommandResult r = VehicleCommandRouter.getInstance()
+                        .execute(new VehicleCommandRouter.VentAllWindowsCommand());
+                logger.info("Window: vent " + r.outcome + " path=" + r.path);
+                HttpResponse.sendJson(out, routedResponse(r, "window-vent").toString());
+                return;
+            }
+            if (!req.has("area") || req.isNull("area")) {
+                response.put("success", false);
+                response.put("error", "window area is required");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            Integer areaValue = jsonInteger(req, "area");
+            if (areaValue == null) {
+                response.put("success", false);
+                response.put("error", "window area must be an integer");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            int area = areaValue.intValue();
+            if (area < 0 || area > 6) {
+                response.put("success", false);
+                response.put("error", "window area out of range (0-6): " + area);
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
 
             // targetPercent → SDK closed-loop positioning
             if (req.has("targetPercent")) {
@@ -978,7 +1144,20 @@ public class VehicleControlApiHandler {
                     HttpResponse.sendJson(out, response.toString());
                     return;
                 }
-                int target = req.getInt("targetPercent");
+                Integer targetValue = jsonInteger(req, "targetPercent");
+                if (targetValue == null) {
+                    response.put("success", false);
+                    response.put("error", "targetPercent must be an integer");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                int target = targetValue.intValue();
+                if (target < 0 || target > 100) {
+                    response.put("success", false);
+                    response.put("error", "targetPercent out of range (0-100): " + target);
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
                 CommandResult r = VehicleCommandRouter.getInstance()
                         .execute(new VehicleCommandRouter.WindowMoveCommand(area, 0, target));
                 logger.info("Window: area=" + areaName(area) + " target=" + target + "% " + r.outcome);
@@ -989,10 +1168,34 @@ public class VehicleControlApiHandler {
                 return;
             }
 
-            int command = req.optInt("command", 2); // default close
+            if (!req.has("command") || req.isNull("command")) {
+                response.put("success", false);
+                response.put("error", "window command is required");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            Integer commandValue = jsonInteger(req, "command");
+            if (commandValue == null) {
+                response.put("success", false);
+                response.put("error", "window command must be an integer");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            int command = commandValue.intValue();
+            // 1=open, 2=close, 3=stop. Nothing downstream bounds this: WindowMoveCommand does not
+            // validate and setAllWindowsCommand has no range check, so command=0 wrote the HAL's own
+            // "no command for this area" filler — a guaranteed no-op that still answered
+            // success:true — and an arbitrary int reached the 4-window write undefined.
+            if (command < 1 || command > 3) {
+                response.put("success", false);
+                response.put("error", "window command out of range (1=open, 2=close, 3=stop): " + command);
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
             VehicleCommand cmd;
-            // "Close all" gets the cloud CLOSEWINDOW path (works while car is asleep).
-            if (area == 0 && command == 2) {
+            if (area == 0 && command == 1) {
+                cmd = new VehicleCommandRouter.OpenAllWindowsCommand();
+            } else if (area == 0 && command == 2) {
                 cmd = new VehicleCommandRouter.CloseAllWindowsCommand();
             } else {
                 cmd = new VehicleCommandRouter.WindowMoveCommand(area, command, null);
@@ -1023,21 +1226,48 @@ public class VehicleControlApiHandler {
 
     /**
      * Climate control routed through the command router.
-     * power_on / power_off → CLOUD_FIRST (OPENAIR / CLOSEAIR with SDK fallback).
+     * power_on / power_off → SDK_FIRST (local HVAC, then OPENAIR / CLOSEAIR fallback).
      * set_temp / set_fan   → SDK_ONLY (no granular cloud command exposed).
      * Body: { "action": "power_on"|"power_off"|"set_temp"|"set_fan",
-     *         "zone": 1|2, "temp": 17-33, "fan": 1-7 }
+     *         "zone": 0|1|2, "temp": 15-33, "remoteDurationMinutes": 10|15|20|25|30,
+     *         "fan": 1-7 }
      */
     private static void handleClimate(OutputStream out, String body) throws Exception {
         JSONObject response = new JSONObject();
         try {
             JSONObject req = new JSONObject(body);
-            String action = req.optString("action", "");
+            String action = jsonString(req, "action");
+            if (action == null) action = "";
             VehicleCommand cmd;
+            Integer powerOnAutoOffMinutes = null;
             switch (action) {
                 case "power_on": {
-                    double t = req.optDouble("temp", 22);
-                    cmd = new VehicleCommandRouter.ClimateOnCommand(t);
+                    double t = 22;
+                    if (req.has("temp")) {
+                        Double suppliedTemp = jsonNumber(req, "temp");
+                        if (suppliedTemp == null
+                                || !isValidClimateStartTemperature(suppliedTemp.doubleValue())) {
+                            sendClimateInputError(out, response,
+                                    "temp must be a number in range 15..33 C");
+                            return;
+                        }
+                        t = suppliedTemp.doubleValue();
+                    }
+                    Integer remoteDuration = req.has("remoteDurationMinutes")
+                            ? jsonInteger(req, "remoteDurationMinutes") : Integer.valueOf(20);
+                    if (remoteDuration == null
+                            || !isValidRemoteClimateDuration(remoteDuration.intValue())) {
+                        sendClimateInputError(out, response,
+                                "remoteDurationMinutes must be 10, 15, 20, 25, or 30");
+                        return;
+                    }
+                    powerOnAutoOffMinutes = optionalAutoOffMinutes(req);
+                    if (req.has("autoOffMinutes") && powerOnAutoOffMinutes == null) {
+                        sendClimateInputError(out, response, "autoOffMinutes must be an integer from 0 to "
+                                + com.overdrive.app.byd.AcAutoOffTimer.MAX_MINUTES);
+                        return;
+                    }
+                    cmd = new VehicleCommandRouter.ClimateOnCommand(t, remoteDuration.intValue());
                     break;
                 }
                 case "power_off":
@@ -1045,10 +1275,16 @@ public class VehicleControlApiHandler {
                     break;
                 // Arm/cancel the "run for N minutes then switch off" timer WITHOUT touching
                 // the AC's current power state, so it can be set independently of the on
-                // command (from the UI, HA, or a second automation step). autoOffMinutes<=0
-                // cancels. See AcAutoOffTimer for the single-timer / last-write-wins rules.
+                // command (from the UI, HA, or a second automation step). Zero cancels; positive
+                // values arm a timer. See AcAutoOffTimer for the single-timer / last-write-wins rules.
                 case "auto_off_timer": {
-                    int minutes = req.optInt("autoOffMinutes", 0);
+                    Integer minutesValue = optionalAutoOffMinutes(req);
+                    if (minutesValue == null) {
+                        sendClimateInputError(out, response, "autoOffMinutes must be an integer from 0 to "
+                                + com.overdrive.app.byd.AcAutoOffTimer.MAX_MINUTES);
+                        return;
+                    }
+                    int minutes = minutesValue.intValue();
                     boolean armed = com.overdrive.app.byd.AcAutoOffTimer.arm(minutes);
                     // Log like every other climate action — this branch returns early and so
                     // never reaches the shared log line below, which previously left a
@@ -1067,8 +1303,20 @@ public class VehicleControlApiHandler {
                     return;
                 }
                 case "set_temp": {
-                    int zone = req.optInt("zone", 1);
-                    double t = req.optDouble("temp", 22);
+                    Integer zoneValue = jsonInteger(req, "zone");
+                    if (zoneValue == null || zoneValue.intValue() < 0 || zoneValue.intValue() > 2) {
+                        sendClimateInputError(out, response, "zone must be an integer from 0 to 2");
+                        return;
+                    }
+                    Double suppliedTemp = jsonNumber(req, "temp");
+                    if (suppliedTemp == null) {
+                        sendClimateInputError(out, response, "temp must be a number in range "
+                                + com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_C + ".."
+                                + com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_C + " C");
+                        return;
+                    }
+                    int zone = zoneValue.intValue();
+                    double t = suppliedTemp.doubleValue();
                     // Reject an out-of-range request rather than clamping it. setAcTemperature
                     // now clamps (it must, so a °F conversion lands in-band), which on this
                     // endpoint would turn "set 40" into a SUCCESS that actually set 33 — a
@@ -1080,14 +1328,10 @@ public class VehicleControlApiHandler {
                     // range test passes it through, Math.round(NaN) yields 0, and the clamp
                     // turns that into "AC set to minimum, success". Comparisons alone cannot
                     // catch this; only isNaN can.
-                    if (Double.isNaN(t)
-                            || t < com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_C
-                            || t > com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_C) {
-                        response.put("success", false);
-                        response.put("error", "temp out of range ("
+                    if (!isValidClimateTemperature(t)) {
+                        sendClimateInputError(out, response, "temp must be a number in range "
                                 + com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_C + ".."
-                                + com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_C + " C)");
-                        HttpResponse.sendJson(out, response.toString());
+                                + com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_C + " C");
                         return;
                     }
                     cmd = new VehicleCommandRouter.ClimateSetTempCommand(zone, t);
@@ -1096,11 +1340,38 @@ public class VehicleControlApiHandler {
                 // RELATIVE step: "delta" dial notches (±1 = one degree in whatever unit the
                 // head unit displays). Answers with the new setpoint so a caller can show it.
                 // "area" selects which dial is READ (1=driver, 2=passenger); "zone" is the
-                // write target (0 = both dials, matching DiPlus's own step).
+                // write target (0 = both dials, matching the OEM's own step).
                 case "step_temp": {
-                    int zone = req.optInt("zone", 0);
-                    int area = req.optInt("area", com.overdrive.app.byd.BydDataCollector.AC_TEMP_AREA_DRIVER);
-                    int delta = req.optInt("delta", 0);
+                    Integer zoneValue = req.has("zone") ? jsonInteger(req, "zone") : Integer.valueOf(0);
+                    if (zoneValue == null || zoneValue.intValue() < 0 || zoneValue.intValue() > 2) {
+                        sendClimateInputError(out, response, "zone must be an integer from 0 to 2");
+                        return;
+                    }
+                    int zone = zoneValue.intValue();
+                    // "area" is which dial to READ, and must be a real dial (1 or 2) — a step
+                    // reads the current setpoint before adding the delta. Default it from the
+                    // write zone: passenger writes read the passenger dial, and both driver and
+                    // "both" (zone 0) read the driver dial (the OEM's own choice). An explicitly
+                    // supplied area must still name a real dial, so invalid payloads never become
+                    // a write using a silently substituted source value.
+                    int areaDefault = (zone == 2)
+                            ? com.overdrive.app.byd.BydDataCollector.AC_TEMP_AREA_PASSENGER
+                            : com.overdrive.app.byd.BydDataCollector.AC_TEMP_AREA_DRIVER;
+                    Integer areaValue = req.has("area") ? jsonInteger(req, "area")
+                            : Integer.valueOf(areaDefault);
+                    if (areaValue == null
+                            || (areaValue.intValue() != com.overdrive.app.byd.BydDataCollector.AC_TEMP_AREA_DRIVER
+                            && areaValue.intValue() != com.overdrive.app.byd.BydDataCollector.AC_TEMP_AREA_PASSENGER)) {
+                        sendClimateInputError(out, response, "area must be an integer from 1 to 2");
+                        return;
+                    }
+                    int area = areaValue.intValue();
+                    Integer deltaValue = jsonInteger(req, "delta");
+                    if (deltaValue == null) {
+                        sendClimateInputError(out, response, "delta must be a non-zero integer");
+                        return;
+                    }
+                    int delta = deltaValue.intValue();
                     if (delta == 0) {
                         response.put("success", false);
                         response.put("error", "delta must be non-zero");
@@ -1132,7 +1403,12 @@ public class VehicleControlApiHandler {
                     return;
                 }
                 case "set_fan": {
-                    int fan = req.optInt("fan", 3);
+                    Integer fanValue = jsonInteger(req, "fan");
+                    if (fanValue == null || fanValue.intValue() < 1 || fanValue.intValue() > 7) {
+                        sendClimateInputError(out, response, "fan must be an integer from 1 to 7");
+                        return;
+                    }
+                    int fan = fanValue.intValue();
                     cmd = new VehicleCommandRouter.ClimateSetFanCommand(fan);
                     break;
                 }
@@ -1173,8 +1449,9 @@ public class VehicleControlApiHandler {
                     // armed from the UI. `req.has()` cannot tell "the user chose Stay on" from
                     // "this row defaulted to 0" — both arrive as 0. Use the dedicated
                     // AC Switch-off Timer action (or auto_off_timer with 0) to cancel.
-                    int minutes = req.optInt("autoOffMinutes", 0);
-                    if (minutes > 0) com.overdrive.app.byd.AcAutoOffTimer.arm(minutes);
+                    if (powerOnAutoOffMinutes != null && powerOnAutoOffMinutes.intValue() > 0) {
+                        com.overdrive.app.byd.AcAutoOffTimer.arm(powerOnAutoOffMinutes.intValue());
+                    }
                 }
                 // NOTE: power_off does NOT need to cancel the window here — VehicleCommandRouter
                 // retires it centrally on any successful ClimateOffCommand, so every surface (this
@@ -1191,15 +1468,187 @@ public class VehicleControlApiHandler {
     }
 
     /**
-     * Seat heating / ventilation / memory-recall — cloud-first (VENTILATIONHEATING)
-     * with SDK fallback. The cloud command is stateful, so heat+vent commands need
-     * the FULL state of driver+passenger seats. The JS keeps that state and sends
-     * it on every seat command.
+     * Schedule remote preconditioning through BYD cloud's BOOKINGAIR command.
+     *
+     * <p>Body: {@code { action: "create"|"update"|"delete", bookingId?,
+     * bookingTime?, temp?, durationMinutes? }}. Times are epoch seconds. Create/update require a
+     * future booking time, 15..31 C whole-degree temperature, and one of the OEM's duration
+     * values (10/15/20/25/30 minutes); delete requires only the booking id.
+     */
+    private static void handleClimateSchedule(OutputStream out, String body) throws Exception {
+        JSONObject response = new JSONObject();
+        try {
+            JSONObject req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
+            String action = jsonString(req, "action");
+            if (!"create".equals(action) && !"update".equals(action) && !"delete".equals(action)) {
+                response.put("success", false);
+                response.put("error", "action must be create, update, or delete");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+
+            Long bookingId = req.has("bookingId") ? jsonLong(req, "bookingId") : null;
+            if (("update".equals(action) || "delete".equals(action))
+                    && (bookingId == null || bookingId.longValue() <= 0L)) {
+                response.put("success", false);
+                response.put("error", "bookingId must be a positive integer for update or delete");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+
+            Long bookingTime = null;
+            Double temp = null;
+            Integer duration = null;
+            if (!"delete".equals(action)) {
+                bookingTime = jsonLong(req, "bookingTime");
+                long nowSeconds = System.currentTimeMillis() / 1000L;
+                if (bookingTime == null || bookingTime.longValue() <= nowSeconds + 30L) {
+                    response.put("success", false);
+                    response.put("error", "bookingTime must be an epoch-second time at least 30 seconds in the future");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                temp = req.has("temp") ? jsonNumber(req, "temp") : Double.valueOf(22D);
+                if (temp == null || temp.doubleValue() != Math.rint(temp.doubleValue())
+                        || temp.doubleValue() < 15D || temp.doubleValue() > 31D) {
+                    response.put("success", false);
+                    response.put("error", "temp must be a whole number from 15 to 31 C");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                duration = req.has("durationMinutes") ? jsonInteger(req, "durationMinutes")
+                        : Integer.valueOf(20);
+                if (duration == null || !isValidRemoteClimateDuration(duration.intValue())) {
+                    response.put("success", false);
+                    response.put("error", "durationMinutes must be 10, 15, 20, 25, or 30");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+            }
+
+            int mode = "create".equals(action) ? VehicleCommandRouter.ClimateScheduleCommand.CREATE
+                    : "update".equals(action) ? VehicleCommandRouter.ClimateScheduleCommand.MODIFY
+                    : VehicleCommandRouter.ClimateScheduleCommand.REMOVE;
+            CommandResult result = VehicleCommandRouter.getInstance().execute(
+                    new VehicleCommandRouter.ClimateScheduleCommand(
+                            mode, bookingId, bookingTime, temp, duration));
+            logger.info("ClimateSchedule: action=" + action + " bookingId=" + bookingId
+                    + " result=" + result.outcome + " path=" + result.path);
+            JSONObject resp = routedResponse(result, "climate-schedule-" + action);
+            if (result.outcome == VehicleCommandRouter.Outcome.SUCCESS) {
+                // Cloud booking IDs exceed JavaScript's precise integer range. Keep them
+                // decimal text on every response path so callers can safely reuse them.
+                if (bookingId != null) resp.put("bookingId", String.valueOf(bookingId.longValue()));
+                if (bookingTime != null) resp.put("bookingTime", bookingTime.longValue());
+                if (temp != null) resp.put("temp", temp.doubleValue());
+                if (duration != null) resp.put("durationMinutes", duration.intValue());
+            } else {
+                resp.put("requestedAction", action);
+                if (bookingId != null) {
+                    resp.put("requestedBookingId", String.valueOf(bookingId.longValue()));
+                }
+                if (bookingTime != null) resp.put("requestedBookingTime", bookingTime.longValue());
+            }
+            HttpResponse.sendJson(out, resp.toString());
+        } catch (Exception e) {
+            logger.warn("ClimateSchedule command failed: " + e.getMessage());
+            response.put("success", false);
+            response.put("error", e.getMessage());
+            HttpResponse.sendJson(out, response.toString());
+        }
+    }
+
+    /** Cloud-reported BOOKINGAIR schedules. An empty list is explicitly not a deletion proof. */
+    private static void handleGetClimateSchedule(OutputStream out) throws Exception {
+        JSONObject response = new JSONObject();
+        try {
+            com.overdrive.app.byd.cloud.BydCloudConfig cfg =
+                    com.overdrive.app.byd.cloud.BydCloudConfig.fromUnifiedConfig();
+            if (!cfg.isConfigured() || cfg.vin == null || cfg.vin.isEmpty()) {
+                response.put("success", true);
+                response.put("supported", false);
+                response.put("reason", "cloud_not_configured");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            com.overdrive.app.byd.cloud.BydCloudClient client =
+                    com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance().getSharedClient();
+            if (client == null) {
+                response.put("success", true);
+                response.put("supported", false);
+                response.put("reason", "cloud_client_unavailable");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            // Capability is decided by CONFIGURATION, not by this read succeeding. The list
+            // call needs the car reachable, so an asleep vehicle, a rate-limit or a network
+            // blip used to return success=false and leave the caller unable to tell
+            // "feature absent" from "couldn't ask right now" — which hid the scheduling UI
+            // outright. Report supported=true first, then attach the bookings if we got them.
+            response.put("success", true);
+            response.put("supported", true);
+            response.put("source", "cloud");
+            try {
+                JSONObject bookings = client.fetchClimateBookingList(cfg.vin);
+                response.put("bookings", bookingIdsAsDecimalStrings(bookings));
+                response.put("emptyBookingsMayBeStale", true);
+            } catch (Exception readFailed) {
+                // No booking list this time. Omit `bookings` entirely rather than sending an
+                // empty one, and keep the stale flag set so an absent list is never read as
+                // proof that no schedule exists.
+                logger.warn("ClimateSchedule list read failed: " + readFailed.getMessage());
+                response.put("bookingsUnavailable", true);
+                response.put("emptyBookingsMayBeStale", true);
+                response.put("reason", "vehicle_unreachable");
+            }
+        } catch (Exception e) {
+            logger.warn("ClimateSchedule read failed: " + e.getMessage());
+            response.put("success", false);
+            response.put("error", e.getMessage());
+        }
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    /**
+     * BYD booking IDs are 64-bit and commonly exceed JavaScript's exact-integer range. Return
+     * them as decimal text so a list response can be fed straight back into update/delete without
+     * losing low bits in a browser, Home Assistant template, or other JSON client.
+     */
+    private static JSONObject bookingIdsAsDecimalStrings(JSONObject bookings) {
+        if (bookings == null) return new JSONObject();
+        try {
+            JSONObject safe = new JSONObject(bookings.toString());
+            org.json.JSONArray entries = safe.optJSONArray("listInfo");
+            if (entries == null) return safe;
+            for (int i = 0; i < entries.length(); i++) {
+                Object entry = entries.opt(i);
+                if (!(entry instanceof JSONObject)) continue;
+                JSONObject booking = (JSONObject) entry;
+                Long bookingId = jsonLong(booking, "bookingId");
+                if (bookingId != null && bookingId.longValue() > 0L) {
+                    booking.put("bookingId", String.valueOf(bookingId.longValue()));
+                }
+            }
+            return safe;
+        } catch (Exception ignored) {
+            // Preserve the cloud payload if it is not in the expected list shape.
+            return bookings;
+        }
+    }
+
+    /**
+     * Seat heating / ventilation / memory-recall — SDK-first. The optional cloud
+     * fallback is stateful. The router dispatches it only after obtaining a
+     * fresh complete driver/passenger state from local telemetry or BYD cloud.
      *
      * Body: { "action": "heating"|"ventilation"|"position"|"save",
-     *         "position": 1-4, "level": 0-3,
+     *         "position": 1|2, "level": 0-2,
      *         "driverHeat": 0-2, "driverVent": 0-2,
      *         "passengerHeat": 0-2, "passengerVent": 0-2 }
+     *
+     * <p>{@code level} is 0=off / 1=low / 2=high — the HAL has three states. The doc previously
+     * advertised 0-3; a 3 was accepted, silently collapsed to 2, and echoed back as 3, so a caller
+     * was told a level the seat never reached. Out-of-range is now refused.
      *
      * <p>"position" recalls a stored driver-seat memory slot (1-2); "save" stores
      * the seat's current physical position into that slot. Both are driver-only,
@@ -1209,29 +1658,80 @@ public class VehicleControlApiHandler {
         JSONObject response = new JSONObject();
         try {
             JSONObject req = new JSONObject(body);
-            String action = req.optString("action", "heating");
-            int position = req.optInt("position", 1);
-            int level = req.optInt("level", 0);
-            int dh = req.optInt("driverHeat", 0);
-            int dv = req.optInt("driverVent", 0);
-            int ph = req.optInt("passengerHeat", 0);
-            int pv = req.optInt("passengerVent", 0);
+            Object actionValue = req.opt("action");
+            String action = actionValue instanceof String
+                    ? ((String) actionValue).trim().toLowerCase() : "";
+            if (!"heating".equals(action) && !"ventilation".equals(action)
+                    && !"position".equals(action) && !"save".equals(action)) {
+                response.put("success", false);
+                response.put("error", "seat action must be heating, ventilation, position, or save");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            Integer positionValue = jsonInteger(req, "position");
+            if (positionValue == null || positionValue.intValue() < 1 || positionValue.intValue() > 2) {
+                response.put("success", false);
+                response.put("error", "seat position must be 1 or 2");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            int position = positionValue.intValue();
             VehicleCommand cmd;
-            if ("ventilation".equals(action)) {
-                cmd = new VehicleCommandRouter.SeatVentCommand(position, level, dh, dv, ph, pv);
-            } else if ("position".equals(action)) {
+            Integer levelValue = jsonInteger(req, "level");
+            Integer driverHeat = optionalSeatLevel(req, "driverHeat");
+            Integer driverVent = optionalSeatLevel(req, "driverVent");
+            Integer passengerHeat = optionalSeatLevel(req, "passengerHeat");
+            Integer passengerVent = optionalSeatLevel(req, "passengerVent");
+            boolean hasAnySeatState = req.has("driverHeat") || req.has("driverVent")
+                    || req.has("passengerHeat") || req.has("passengerVent");
+            boolean hasCompleteSeatState = driverHeat != null && driverVent != null
+                    && passengerHeat != null && passengerVent != null;
+            if (hasAnySeatState && !hasCompleteSeatState) {
+                response.put("success", false);
+                response.put("error", "seat climate state must include all four levels (0-2)");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+
+            if ("position".equals(action)) {
                 cmd = new VehicleCommandRouter.SeatMemoryCommand(position, false);
             } else if ("save".equals(action)) {
                 cmd = new VehicleCommandRouter.SeatMemoryCommand(position, true);
             } else {
-                cmd = new VehicleCommandRouter.SeatHeatCommand(position, level, dh, dv, ph, pv);
+                if (levelValue == null || levelValue.intValue() < 0 || levelValue.intValue() > 2) {
+                    response.put("success", false);
+                    response.put("error", "level must be an integer from 0 to 2");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                int level = levelValue.intValue();
+                BydVehicleData snap = BydDataCollector.getInstance().getData();
+                // The SDK writes an individual seat, while the cloud command overwrites all
+                // four zones. Client state may be stale or merely a UI default, so it is
+                // validation-only and never authorizes a composite cloud fallback.
+                boolean localSeatStateFresh = hasFreshCompleteSeatState(snap);
+                int[] cloudSeatState = localSeatStateFresh
+                        ? seatStateWithTarget(snap.seatHeat, snap.seatCool,
+                                "ventilation".equals(action), position, level)
+                        : new int[] { 0, 0, 0, 0 };
+                if ("ventilation".equals(action)) {
+                    cmd = new VehicleCommandRouter.SeatVentCommand(position, level,
+                            cloudSeatState[0], cloudSeatState[1],
+                            cloudSeatState[2], cloudSeatState[3], true,
+                            localSeatStateFresh ? snap.seatClimateAtMs : 0L);
+                } else {
+                    cmd = new VehicleCommandRouter.SeatHeatCommand(position, level,
+                            cloudSeatState[0], cloudSeatState[1],
+                            cloudSeatState[2], cloudSeatState[3], true,
+                            localSeatStateFresh ? snap.seatClimateAtMs : 0L);
+                }
             }
             CommandResult r = VehicleCommandRouter.getInstance().execute(cmd);
             logger.info("Seat: action=" + action + " pos=" + seatPosName(position)
-                    + " level=" + level + " " + r.outcome);
+                    + " level=" + levelValue + " " + r.outcome);
             JSONObject resp = routedResponse(r, action);
             resp.put("position", position);
-            resp.put("level", level);
+            if (levelValue != null) resp.put("level", levelValue.intValue());
             HttpResponse.sendJson(out, resp.toString());
         } catch (Exception e) {
             logger.warn("Seat command failed: " + e.getMessage());
@@ -1253,21 +1753,70 @@ public class VehicleControlApiHandler {
             String target = req.optString("target", null);
             VehicleCommand cmd;
             if ("dayTimeLight".equals(target)) {
-                boolean enable = req.optBoolean("enable", true);
-                cmd = new VehicleCommandRouter.LightsCommand(enable);
+                Boolean enabled = jsonBoolean(req, "enable");
+                if (enabled == null) {
+                    response.put("success", false);
+                    response.put("error", "enable must be boolean");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                cmd = new VehicleCommandRouter.LightsCommand(enabled.booleanValue());
             } else if ("ambientColour".equals(target)) {
-                int value = req.optInt("value", 1);
+                Integer value = jsonInteger(req, "value");
+                if (value == null || value.intValue() < 1 || value.intValue() > 31) {
+                    response.put("success", false);
+                    response.put("error", "ambientColour value must be 1-31");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
                 // Optional zone (front/rear/both); default both keeps prior whole-cabin behaviour.
-                String zone = req.optString("zone", "both");
-                cmd = new VehicleCommandRouter.AmbientColourCommand(value, zone);
+                String zone = req.has("zone") ? jsonString(req, "zone") : "both";
+                if (!"front".equals(zone) && !"rear".equals(zone) && !"both".equals(zone)) {
+                    response.put("success", false);
+                    response.put("error", "ambientColour zone must be front, rear, or both");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                cmd = new VehicleCommandRouter.AmbientColourCommand(value.intValue(), zone);
             } else if ("welcomeLight".equals(target)) {
-                cmd = new VehicleCommandRouter.WelcomeLightCommand(req.optBoolean("enable", true));
+                Boolean enabled = jsonBoolean(req, "enable");
+                if (enabled == null) {
+                    response.put("success", false);
+                    response.put("error", "enable must be boolean");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                cmd = new VehicleCommandRouter.WelcomeLightCommand(enabled.booleanValue());
             } else if ("readingLight".equals(target)) {
-                cmd = new VehicleCommandRouter.ReadingLightCommand(req.optBoolean("enable", true));
+                Boolean enabled = jsonBoolean(req, "enable");
+                if (enabled == null) {
+                    response.put("success", false);
+                    response.put("error", "enable must be boolean");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                cmd = new VehicleCommandRouter.ReadingLightCommand(enabled.booleanValue());
             } else if ("ambientMusic".equals(target)) {
-                cmd = new VehicleCommandRouter.AmbientMusicModeCommand(req.optBoolean("enable", true));
+                Boolean enabled = jsonBoolean(req, "enable");
+                if (enabled == null) {
+                    response.put("success", false);
+                    response.put("error", "enable must be boolean");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                cmd = new VehicleCommandRouter.AmbientMusicModeCommand(enabled.booleanValue());
             } else if ("headlightLevel".equals(target)) {
-                cmd = new VehicleCommandRouter.HeadlightLevelCommand(req.optInt("value", 1));
+                // REJECT out of range rather than let the setter clamp it: a request for 50 was
+                // clamped to 11 and answered success:true, so the caller was told a level it never
+                // got. Same reject-not-clamp policy the AC temperature endpoint uses.
+                Integer value = jsonInteger(req, "value");
+                if (value == null || value.intValue() < 1 || value.intValue() > 11) {
+                    response.put("success", false);
+                    response.put("error", "headlightLevel value must be 1-11");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                cmd = new VehicleCommandRouter.HeadlightLevelCommand(value.intValue());
             } else {
                 response.put("success", false);
                 response.put("error", Messages.get("errors.vehicle_unsupported_target_with_target", target));
@@ -1298,18 +1847,36 @@ public class VehicleControlApiHandler {
         try {
             JSONObject req = new JSONObject(body);
             String target = req.optString("target", null);
-            boolean enable = req.optBoolean("enable", true);
             VehicleCommand cmd;
+            Boolean enabled = null;
+            Integer mode = null;
             if ("speedLimitWarning".equals(target)) {
-                cmd = new VehicleCommandRouter.AdasSpeedLimitWarningCommand(enable);
+                enabled = jsonBoolean(req, "enable");
+                if (enabled == null) {
+                    response.put("success", false);
+                    response.put("error", "enable must be boolean");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                cmd = new VehicleCommandRouter.AdasSpeedLimitWarningCommand(enabled.booleanValue());
             } else if ("esp".equals(target)) {
-                cmd = new VehicleCommandRouter.AdasEspCommand(enable);
+                enabled = jsonBoolean(req, "enable");
+                if (enabled == null) {
+                    response.put("success", false);
+                    response.put("error", "enable must be boolean");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                cmd = new VehicleCommandRouter.AdasEspCommand(enabled.booleanValue());
             } else if ("laneAssist".equals(target)) {
-                // Multi-mode (not on/off): 0=Off, 1=LDW, 2=LDP, 3=LDW+LDP. Accept an
-                // explicit "mode" int; fall back to mapping the on/off "enable" to
-                // Off(0) / LDW+LDP(3) so a plain toggle still does something sensible.
-                int mode = req.has("mode") ? req.optInt("mode", 0) : (enable ? 3 : 0);
-                cmd = new VehicleCommandRouter.AdasLaneAssistCommand(mode);
+                mode = jsonInteger(req, "mode");
+                if (mode == null || mode.intValue() < 0 || mode.intValue() > 3) {
+                    response.put("success", false);
+                    response.put("error", "laneAssist mode must be an integer from 0 to 3");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                cmd = new VehicleCommandRouter.AdasLaneAssistCommand(mode.intValue());
             } else {
                 response.put("success", false);
                 response.put("error", Messages.get("errors.vehicle_unsupported_target_with_target", target));
@@ -1317,10 +1884,12 @@ public class VehicleControlApiHandler {
                 return;
             }
             CommandResult r = VehicleCommandRouter.getInstance().execute(cmd);
-            logger.info("Adas: target=" + target + " enable=" + enable + " " + r.outcome);
+            logger.info("Adas: target=" + target + " enable=" + enabled + " mode=" + mode
+                    + " " + r.outcome);
             JSONObject resp = routedResponse(r, "adas");
             resp.put("target", target);
-            resp.put("enable", enable);
+            if (enabled != null) resp.put("enable", enabled.booleanValue());
+            if (mode != null) resp.put("mode", mode.intValue());
             HttpResponse.sendJson(out, resp.toString());
         } catch (Exception e) {
             logger.warn("Adas command failed: " + e.getMessage());
@@ -1376,19 +1945,25 @@ public class VehicleControlApiHandler {
         try {
             JSONObject req = new JSONObject(body);
             String target = req.optString("target", null);
-            int value = req.optInt("value", 1);
             if (!"childPresenceDetection".equals(target)) {
                 response.put("success", false);
                 response.put("error", Messages.get("errors.vehicle_unsupported_target_with_target", target));
                 HttpResponse.sendJson(out, response.toString());
                 return;
             }
+            Integer value = jsonInteger(req, "value");
+            if (value == null || value.intValue() < 1 || value.intValue() > 3) {
+                response.put("success", false);
+                response.put("error", "childPresenceDetection value must be 1, 2, or 3");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
             CommandResult r = VehicleCommandRouter.getInstance()
-                    .execute(new VehicleCommandRouter.SettingChildPresenceDetectionCommand(value));
+                    .execute(new VehicleCommandRouter.SettingChildPresenceDetectionCommand(value.intValue()));
             logger.info("Adas: target=childPresenceDetection value=" + value + " " + r.outcome);
             JSONObject resp = routedResponse(r, "setting");
             resp.put("target", target);
-            resp.put("value", value);
+            resp.put("value", value.intValue());
             HttpResponse.sendJson(out, resp.toString());
         } catch (Exception e) {
             logger.warn("Setting command failed: " + e.getMessage());
@@ -1418,8 +1993,7 @@ public class VehicleControlApiHandler {
         JSONObject response = new JSONObject();
         try {
             JSONObject req = new JSONObject(body);
-            String target = req.optString("target", null);
-            int value = req.optInt("value", -1);
+            String target = jsonString(req, "target");
             // Volume is an ABSOLUTE step index (0..stream max, ~40 for media on this head
             // unit — matching the car's own volume button), NOT a 0-100 percentage; its
             // upper bound is the real stream max, enforced by clamping in
@@ -1431,11 +2005,55 @@ public class VehicleControlApiHandler {
             boolean isMediaKey = "media_key".equals(target);
             boolean isVolumeStep = "volume_step".equals(target);
             boolean isVolume = "volume".equals(target);
+            boolean isAmbientBrightness = "ambient_brightness".equals(target);
+            boolean isAmbientPower = "ambient_power".equals(target);
+            boolean isBrightness = "brightness".equals(target);
+            boolean isClusterBrightness = "cluster_brightness".equals(target);
+            boolean isHudBrightness = "hud_brightness".equals(target);
+            boolean isHudPower = "hud_power".equals(target);
+            boolean isScreenPower = "screen_power".equals(target);
+            boolean isNumericTarget = isVolumeStep || isVolume || isAmbientBrightness
+                    || isAmbientPower || isBrightness || isClusterBrightness || isHudBrightness
+                    || isHudPower || isScreenPower;
+            if (!isMediaKey && !isNumericTarget) {
+                response.put("success", false);
+                response.put("error", Messages.get("errors.vehicle_unsupported_target_with_target", target));
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+
+            int value = -1;
+            if (isNumericTarget) {
+                Integer suppliedValue = jsonInteger(req, "value");
+                if (suppliedValue == null) {
+                    response.put("success", false);
+                    response.put("error", "value must be an integer");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
+                value = suppliedValue.intValue();
+            }
+            if (isVolumeStep && value != -1 && value != 1) {
+                response.put("success", false);
+                response.put("error", "volume_step value must be -1 or 1");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
             if (!isMediaKey && !isVolumeStep && (value < 0 || (!isVolume && value > 100))) {
                 response.put("success", false);
                 response.put("error", isVolume ? "value must be >= 0" : "value must be 0-100");
                 HttpResponse.sendJson(out, response.toString());
                 return;
+            }
+            String volumeChannel = null;
+            if (isVolume || isVolumeStep) {
+                volumeChannel = optionalVolumeChannel(req);
+                if (volumeChannel == null) {
+                    response.put("success", false);
+                    response.put("error", "volume channel must be media, navigation, voice, phone, call, system, alarm, or ring");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
             }
             boolean ok;
             if (isMediaKey) {
@@ -1445,38 +2063,47 @@ public class VehicleControlApiHandler {
                 ok = dispatchMediaKey(req.optString("key", ""));
             } else if (isVolumeStep) {
                 // Relative volume: read-modify-write ±1 step on the chosen channel.
-                String channel = req.optString("channel", "media");
-                int dir = req.optInt("value", 0); // +1 up, -1 down
-                ok = stepChannelVolume(channel, dir);
+                ok = stepChannelVolume(volumeChannel, value);
             } else if (isVolume) {
                 // Optional channel; default "media" keeps the pre-existing behaviour.
-                String channel = req.optString("channel", "media");
-                ok = setChannelVolumeIndex(channel, value);
-            } else if ("ambient_brightness".equals(target)) {
+                ok = setChannelVolumeIndex(volumeChannel, value);
+            } else if (isAmbientBrightness) {
                 // Optional zone (front/rear/both); default both preserves prior whole-cabin
                 // behaviour for callers that don't send a zone.
-                String zone = req.optString("zone", "both");
+                String zone = optionalAmbientZone(req);
+                if (zone == null) {
+                    response.put("success", false);
+                    response.put("error", "ambient zone must be front, rear, or both");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
                 ok = BydDataCollector.getInstance().setAmbientBrightnessZoned(zone, value);
-            } else if ("ambient_power".equals(target)) {
+            } else if (isAmbientPower) {
                 // Zoned interior-ambient on/off. value 0 → off, >0 → on. "both" uses the real
                 // global main switch (three-tier chain); a single zone has no dedicated switch, so
                 // "off" zeroes that zone and "on" restores its PRE-OFF level, not full — see
                 // setAmbientLightEnabledZoned.
-                String zone = req.optString("zone", "both");
+                String zone = optionalAmbientZone(req);
+                if (zone == null) {
+                    response.put("success", false);
+                    response.put("error", "ambient zone must be front, rear, or both");
+                    HttpResponse.sendJson(out, response.toString());
+                    return;
+                }
                 ok = BydDataCollector.getInstance().setAmbientLightEnabledZoned(zone, value > 0);
-            } else if ("brightness".equals(target)) {
+            } else if (isBrightness) {
                 ok = BydDataCollector.getInstance().setInfotainmentBrightness(value);
-            } else if ("cluster_brightness".equals(target)) {
+            } else if (isClusterBrightness) {
                 ok = BydDataCollector.getInstance().setDriverDisplayBrightness(value);
-            } else if ("hud_brightness".equals(target)) {
+            } else if (isHudBrightness) {
                 ok = BydDataCollector.getInstance().setHudBrightness(value);
-            } else if ("hud_power".equals(target)) {
+            } else if (isHudPower) {
                 // HUD on/off: value 0 → off, any value > 0 → on. This is the DEDICATED HUD
                 // power switch (SET_HUD_SWITCH_SET, 1=on/2=off), NOT brightness — driving
                 // brightness to 0 does not turn the HUD off. setHudPower actuates via the
                 // app-process VehicleActuatorService. The action sends value=0 / value=100.
                 ok = BydDataCollector.getInstance().setHudPower(value > 0);
-            } else if ("screen_power".equals(target)) {
+            } else if (isScreenPower) {
                 // Turn the infotainment (centre) screen fully on/off via the proven
                 // backlight path (PowerManager.turnBacklightOn/Off → BYDAutoSettingDevice
                 // → shell WAKEUP/SLEEP keyevent). NOT goToSleep — the car's ACC-on
@@ -1541,9 +2168,28 @@ public class VehicleControlApiHandler {
         JSONObject response = new JSONObject();
         try {
             JSONObject req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
-            String kind = req.optString("kind", "toast");
             String message = req.optString("message", "");
-            String severity = req.optString("severity", "info");
+            String validation =
+                    com.overdrive.app.communication.RemoteCommunicationPolicy
+                            .validateMessage(message);
+            if (validation != null) {
+                response.put("success", false);
+                response.put("error", validation);
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            String requestedKind =
+                    com.overdrive.app.communication.RemoteCommunicationPolicy
+                            .normalizeKind(req.optString("kind", "toast"));
+            String kind =
+                    com.overdrive.app.communication.RemoteCommunicationPolicy
+                            .effectiveKind(
+                                    requestedKind,
+                                    com.overdrive.app.communication
+                                            .VehicleCommunicationSafety.isParked());
+            String severity =
+                    com.overdrive.app.communication.RemoteCommunicationPolicy
+                            .normalizeSeverity(req.optString("severity", "info"));
             boolean ok;
             if ("dialog".equalsIgnoreCase(kind)) {
                 ok = com.overdrive.app.byd.MessageOverlayController.showDialog(
@@ -1560,6 +2206,9 @@ public class VehicleControlApiHandler {
                         severity);
             }
             response.put("success", ok);
+            response.put("renderedKind", kind);
+            response.put("downgraded",
+                    "dialog".equals(requestedKind) && !"dialog".equals(kind));
             if (!ok) response.put("error", "message is required");
             HttpResponse.sendJson(out, response.toString());
         } catch (Exception e) {
@@ -1570,8 +2219,8 @@ public class VehicleControlApiHandler {
         }
     }
 
-    /** Where screenshots are written (world-readable, same tree as other daemon files). */
-    private static final String SCREENSHOT_DIR = "/data/local/tmp/.overdrive/screenshots";
+    /** User-visible screenshot folder; the daemon runs as shell and can write shared storage. */
+    private static final String SCREENSHOT_DIR = "/storage/sdcard/OverDrive/screenshots";
 
     /**
      * UI navigation + screenshot + move-to-display, run as the UID-2000 daemon via
@@ -1598,10 +2247,9 @@ public class VehicleControlApiHandler {
                     // with no physical token — could never be captured that way. Both reported
                     // failures. DisplayScreenshot addresses displays by SurfaceFlinger layer stack,
                     // the mechanism the cluster mirror already proves on this device.
-                    // Uptime-based name (no wall clock needed) keeps successive shots unique.
                     int display = req.optInt("display", 0);
                     java.io.File shot = new java.io.File(SCREENSHOT_DIR,
-                            "shot_" + android.os.SystemClock.uptimeMillis() + ".png");
+                            "shot_d" + display + "_" + android.os.SystemClock.uptimeMillis() + ".png");
                     android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
                     com.overdrive.app.surveillance.DisplayScreenshot.Result shotResult =
                             (display == 1)
@@ -1611,6 +2259,18 @@ public class VehicleControlApiHandler {
                     response.put("target", target);
                     if (shotResult.ok) {
                         response.put("path", shotResult.path);
+                        if (ctx != null) {
+                            try {
+                                android.media.MediaScannerConnection.scanFile(
+                                        ctx,
+                                        new String[] { shotResult.path },
+                                        new String[] { "image/png" },
+                                        null);
+                            } catch (Throwable scanError) {
+                                logger.debug("screenshot media scan failed: "
+                                        + scanError.getMessage());
+                            }
+                        }
                         logger.info("screenshot: display=" + display + " -> " + shotResult.path);
                     } else {
                         response.put("error", shotResult.error);
@@ -1713,12 +2373,14 @@ public class VehicleControlApiHandler {
         JSONObject response = new JSONObject();
         try {
             JSONObject req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
-            String channel = req.optString("channel", "media");
-            boolean loop = req.optBoolean("loop", false);
             // "display": "screen" shows an MP4's picture fullscreen via the app-process
-            // VideoPlaybackActivity (a TextureView-backed player); anything else (default) is
-            // audio-only (speakers). Audio files ignore it.
+            // VideoPlaybackActivity (a TextureView-backed player). Its MediaPlayer must keep
+            // the default Media attributes or this DiLink build can play audio with no video
+            // frames, so screen playback deliberately ignores any supplied channel and uses
+            // Media. Anything else (default) is audio-only and honours its chosen channel.
             boolean onScreen = "screen".equalsIgnoreCase(req.optString("display", "speakers"));
+            String channel = onScreen ? "media" : req.optString("channel", "media");
+            boolean loop = req.optBoolean("loop", false);
             // Prefer a library "name"; fall back to an explicit "path".
             String name = req.optString("name", null);
             String path = req.optString("path", null);
@@ -1753,7 +2415,7 @@ public class VehicleControlApiHandler {
                 return;
             }
             boolean ok = onScreen
-                    ? com.overdrive.app.byd.AudioPlaybackController.playVideoOnScreen(resolved, channel, loop)
+                    ? com.overdrive.app.byd.AudioPlaybackController.playVideoOnScreen(resolved, loop)
                     : com.overdrive.app.byd.AudioPlaybackController.play(resolved, channel, loop);
             response.put("success", ok);
             response.put("path", resolved);
@@ -1954,33 +2616,69 @@ public class VehicleControlApiHandler {
                 HttpResponse.sendJson(out, response.toString());
                 return;
             }
+            Boolean requestedEnabled = hasEnabled ? jsonBoolean(req, "enabled") : Boolean.TRUE;
+            if (requestedEnabled == null) {
+                response.put("success", false);
+                response.put("error", "enabled must be boolean");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
 
             // Toggle-only request — just hit changeChargeStatue.
             if (!scheduleFields) {
-                boolean enabled = req.getBoolean("enabled");
+                boolean enabled = requestedEnabled.booleanValue();
                 CommandResult r = VehicleCommandRouter.getInstance()
                         .execute(new VehicleCommandRouter.SmartChargingToggleCommand(enabled));
                 logger.info("ChargingSchedule: toggle enabled=" + enabled + " " + r.outcome);
                 JSONObject resp = routedResponse(r, "smart-charging-toggle");
-                resp.put("enabled", enabled);
+                if (r.outcome == VehicleCommandRouter.Outcome.SUCCESS) {
+                    resp.put("enabled", enabled);
+                } else {
+                    resp.put("requestedEnabled", enabled);
+                }
                 HttpResponse.sendJson(out, resp.toString());
                 return;
             }
 
             // Full save — saveOrUpdate carries its own status, no pre-toggle needed.
-            String start = req.getString("startChargeTime");
-            String end = req.getString("endChargeTime");
-            String way = req.getString("chargeWay");
-            boolean enabled = hasEnabled ? req.getBoolean("enabled") : true;
+            String start = jsonString(req, "startChargeTime");
+            String end = jsonString(req, "endChargeTime");
+            String way = jsonString(req, "chargeWay");
+            if (!isValidChargingTime(start, false)) {
+                response.put("success", false);
+                response.put("error", "startChargeTime must be an exact HH:mm time");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            if (!isValidChargingTime(end, true)) {
+                response.put("success", false);
+                response.put("error", "endChargeTime must be an exact HH:mm time or full");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            if (!isValidChargeWay(way)) {
+                response.put("success", false);
+                response.put("error", "chargeWay must be s, e, or a unique comma-separated weekday set (0-6)");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            boolean enabled = requestedEnabled.booleanValue();
             CommandResult r = VehicleCommandRouter.getInstance()
                     .execute(new VehicleCommandRouter.ChargeScheduleCommand(start, end, way, enabled));
             logger.info("ChargingSchedule: save start=" + start + " end=" + end
                     + " way=" + way + " enabled=" + enabled + " " + r.outcome);
             JSONObject resp = routedResponse(r, "charge-schedule");
-            resp.put("startChargeTime", start);
-            resp.put("endChargeTime", end);
-            resp.put("chargeWay", way);
-            resp.put("enabled", enabled);
+            if (r.outcome == VehicleCommandRouter.Outcome.SUCCESS) {
+                resp.put("startChargeTime", start);
+                resp.put("endChargeTime", end);
+                resp.put("chargeWay", way);
+                resp.put("enabled", enabled);
+            } else {
+                resp.put("requestedStartChargeTime", start);
+                resp.put("requestedEndChargeTime", end);
+                resp.put("requestedChargeWay", way);
+                resp.put("requestedEnabled", enabled);
+            }
             HttpResponse.sendJson(out, resp.toString());
         } catch (Exception e) {
             logger.warn("ChargingSchedule command failed: " + e.getMessage());
@@ -1990,11 +2688,18 @@ public class VehicleControlApiHandler {
         }
     }
 
+    /** Start charging immediately through BYD cloud's confirmed status="1" flow. */
+    private static void handleStartCharging(OutputStream out) throws Exception {
+        CommandResult result = VehicleCommandRouter.getInstance()
+                .execute(new VehicleCommandRouter.StartChargingNowCommand());
+        logger.info("StartCharging: routed result=" + result.outcome + " path=" + result.path);
+        HttpResponse.sendJson(out, routedResponse(result, "start-charging").toString());
+    }
+
     /**
-     * Charging-schedule state. BYD's smartCharge/homePage endpoint returns
-     * telemetry only (no echo of the configured schedule), so our source of
-     * truth is {@link SmartChargeCache}, a local mirror updated on every
-     * successful saveOrUpdate / changeChargeStatue.
+     * Charging-schedule state. homePage's smartChargeDto/smartJourneyDto are
+     * authoritative when available. The persisted cache is only a last-known
+     * fallback for a temporarily unavailable cloud connection.
      */
     private static void handleGetChargingSchedule(OutputStream out) throws Exception {
         JSONObject resp = new JSONObject();
@@ -2016,19 +2721,38 @@ public class VehicleControlApiHandler {
                 HttpResponse.sendJson(out, resp.toString());
                 return;
             }
-            Boolean enabled = com.overdrive.app.byd.cloud.SmartChargeCache.getEnabled();
-            String start = com.overdrive.app.byd.cloud.SmartChargeCache.getStartChargeTime();
-            String end = com.overdrive.app.byd.cloud.SmartChargeCache.getEndChargeTime();
-            String way = com.overdrive.app.byd.cloud.SmartChargeCache.getChargeWay();
+            boolean cloudRead = false;
+            try {
+                JSONObject homePage = client.fetchSmartChargingStatus(cfg.vin);
+                com.overdrive.app.byd.cloud.SmartChargeCache.updateFromCloud(cfg.vin, homePage);
+                cloudRead = true;
+            } catch (com.overdrive.app.byd.cloud.BydCloudClient.SmartChargeNotSupportedException e) {
+                resp.put("success", true);
+                resp.put("supported", false);
+                resp.put("reason", "smart_charge_unsupported");
+                HttpResponse.sendJson(out, resp.toString());
+                return;
+            } catch (Exception e) {
+                logger.info("ChargingSchedule homePage unavailable; using cache: " + e.getMessage());
+            }
+            JSONObject cached = com.overdrive.app.byd.cloud.SmartChargeCache.getSnapshot(cfg.vin);
+            Boolean enabled = cached.has("enabled") && !cached.isNull("enabled")
+                    ? Boolean.valueOf(cached.optBoolean("enabled")) : null;
+            String start = cached.optString("startChargeTime", null);
+            String end = cached.optString("endChargeTime", null);
+            String way = cached.optString("chargeWay", null);
             resp.put("success", true);
             resp.put("supported", true);
+            resp.put("source", cloudRead ? "cloud" : "cache");
             if (enabled == null) resp.put("enabled", JSONObject.NULL);
             else resp.put("enabled", enabled.booleanValue());
             resp.put("startChargeTime", start == null ? JSONObject.NULL : start);
             resp.put("endChargeTime", end == null ? JSONObject.NULL : end);
             resp.put("chargeWay", way == null ? JSONObject.NULL : way);
-            logger.info("ChargingSchedule GET (local cache) → enabled=" + enabled
-                    + " start=" + start + " end=" + end + " way=" + way);
+            JSONObject journey = cached.optJSONObject("smartJourneyDto");
+            if (journey != null) resp.put("smartJourneyDto", journey);
+            logger.info("ChargingSchedule GET source=" + (cloudRead ? "cloud" : "cache")
+                    + " enabled=" + enabled + " start=" + start + " end=" + end + " way=" + way);
         } catch (Exception e) {
             logger.warn("ChargingSchedule read failed: " + e.getMessage());
             resp.put("success", false);
@@ -2041,12 +2765,12 @@ public class VehicleControlApiHandler {
      * BEV charge cap — SDK_ONLY via BYDAutoChargingDevice
      * setChargeStopCapacityState + setChargeStopSwitchState. The Seal HAL
      * historically reports getChargeStopSupportConfig=0; the collector probes
-     * via write-then-read-back on the first successful POST and the GET
+     * via write-then-read-back on every successful POST and the GET
      * returns supported=false on no-op trims so the UI can hide the section.
      *
      * <p>Body: {@code { percent?: 50..100, enabled?: bool }}.
-     * When both are present the toggle runs first so a freshly-enabled cap
-     * picks up the new percent.
+     * When both are present the verified capacity write runs first, then the
+     * master switch is changed only if that write succeeded.
      */
     private static void handleChargeCap(OutputStream out, String body) throws Exception {
         JSONObject response = new JSONObject();
@@ -2060,56 +2784,96 @@ public class VehicleControlApiHandler {
                 HttpResponse.sendJson(out, response.toString());
                 return;
             }
+            Boolean requestedEnabled = hasEnabled ? jsonBoolean(req, "enabled") : null;
+            if (hasEnabled && requestedEnabled == null) {
+                response.put("success", false);
+                response.put("error", "enabled must be boolean");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            Integer requestedPercent = hasPercent ? jsonInteger(req, "percent") : null;
+            if (hasPercent && (requestedPercent == null
+                    || requestedPercent.intValue() < 50 || requestedPercent.intValue() > 100)) {
+                response.put("success", false);
+                response.put("error", "percent must be an integer from 50 to 100");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
 
             CommandResult last = null;
             String action = null;
+            BydDataCollector.ChargeCapUpdateResult combinedResult = null;
 
-            if (hasEnabled) {
-                boolean enabled = req.getBoolean("enabled");
+            // A genuine charge-stop backend must be capacity-verified before
+            // its master switch is used. A dual-field request owns one
+            // collector transaction, preventing another API or MQTT update
+            // from interleaving its capacity or switch write between these legs.
+            if (hasEnabled && hasPercent) {
+                int percent = requestedPercent.intValue();
+                boolean enabled = requestedEnabled.booleanValue();
+                long startedAt = System.currentTimeMillis();
+                combinedResult = BydDataCollector.getInstance()
+                        .setChargeCapPercentAndEnabledWithResult(percent, enabled);
+                long elapsed = System.currentTimeMillis() - startedAt;
+                last = combinedResult.fullyApplied
+                        ? CommandResult.success(VehicleCommandRouter.Path.SDK,
+                                Messages.get("vehicle_control.local_sent"), elapsed)
+                        : CommandResult.failed(VehicleCommandRouter.Path.SDK,
+                                Messages.get("vehicle_control.not_supported"), elapsed, null);
+                logger.info("ChargeCap: combined percent=" + percent + " enabled=" + enabled
+                        + " " + last.outcome);
+                action = "charge-cap-toggle";
+            }
+
+            if (hasEnabled && !hasPercent) {
+                boolean enabled = requestedEnabled.booleanValue();
                 CommandResult r = VehicleCommandRouter.getInstance()
                         .execute(new VehicleCommandRouter.ChargeCapToggleCommand(enabled));
                 logger.info("ChargeCap: toggle enabled=" + enabled + " " + r.outcome);
                 last = r;
                 action = "charge-cap-toggle";
-                if (r.outcome != VehicleCommandRouter.Outcome.SUCCESS && hasPercent) {
-                    JSONObject resp = routedResponse(r, action);
-                    resp.put("enabled", enabled);
-                    HttpResponse.sendJson(out, resp.toString());
-                    return;
-                }
             }
 
-            if (hasPercent) {
-                int percent = req.getInt("percent");
-                // Accept 15..100: the primary SOC-target path floors at 15/25 and
-                // caps at 70; the legacy fallback covers 50..100. The collector
-                // clamps to whichever path applies.
-                if (percent < 15 || percent > 100) {
-                    response.put("success", false);
-                    response.put("error", "percent must be 15..100 (got " + percent + ")");
-                    HttpResponse.sendJson(out, response.toString());
-                    return;
-                }
+            if (hasPercent && !hasEnabled) {
+                int percent = requestedPercent.intValue();
                 CommandResult r = VehicleCommandRouter.getInstance()
                         .execute(new VehicleCommandRouter.ChargeCapPercentCommand(percent));
                 logger.info("ChargeCap: percent=" + percent + " " + r.outcome);
                 last = r;
                 action = "charge-cap-percent";
+                if (r.outcome != VehicleCommandRouter.Outcome.SUCCESS) {
+                    JSONObject resp = routedResponse(r, action);
+                    Boolean supported = BydDataCollector.getInstance().isChargeCapSupported();
+                    if (supported != null) resp.put("supported", supported.booleanValue());
+                    appendChargeCapConstraints(resp, BydDataCollector.getInstance());
+                    HttpResponse.sendJson(out, resp.toString());
+                    return;
+                }
             }
 
             JSONObject resp = routedResponse(last, action);
             if (hasPercent) {
-                // Echo the EFFECTIVE value the vehicle actually holds — the primary
-                // SOC-target path caps at 70, so a requested 90 applies as 70. Use
-                // the value the collector recorded as applied (race-free; avoids a
-                // stale immediate SDK read-back).
-                int effective = BydDataCollector.getInstance().getLastAppliedCapPercent();
-                resp.put("percent", (effective >= 15 && effective <= 100) ? effective : req.getInt("percent"));
+                // Report a direct charge-stop register read, not the request
+                // body or a PHEV SOC-hold value. A combined request exposes
+                // the sample read while it still held the transaction lock.
+                int effective = combinedResult != null ? combinedResult.capacityPercent
+                        : BydDataCollector.getInstance().getChargeCapPercent();
+                resp.put("percent", (effective >= 50 && effective <= 100) ? effective : JSONObject.NULL);
             }
-            if (hasEnabled) resp.put("enabled", req.getBoolean("enabled"));
+            if (hasEnabled) {
+                int effectiveEnabled = combinedResult != null ? combinedResult.enabledState
+                        : BydDataCollector.getInstance().getChargeCapEnabled();
+                resp.put("enabled", effectiveEnabled == 1 ? true
+                        : effectiveEnabled == 0 ? false : JSONObject.NULL);
+            }
+            if (combinedResult != null && !combinedResult.fullyApplied) {
+                resp.put("partialApplied", combinedResult.partiallyApplied(
+                        requestedPercent.intValue(), requestedEnabled.booleanValue()));
+            }
             // Surface the probe result so the UI can hide on the next paint.
             Boolean supported = BydDataCollector.getInstance().isChargeCapSupported();
             if (supported != null) resp.put("supported", supported.booleanValue());
+            appendChargeCapConstraints(resp, BydDataCollector.getInstance());
             HttpResponse.sendJson(out, resp.toString());
         } catch (Exception e) {
             logger.warn("ChargeCap command failed: " + e.getMessage());
@@ -2132,18 +2896,23 @@ public class VehicleControlApiHandler {
             int enabled = collector.getChargeCapEnabled();
             Boolean supported = collector.isChargeCapSupported();
             resp.put("success", true);
-            // A valid BEV cap is 15..100 % (primary SOC-target path floors at
-            // 15/25 and caps at 70; legacy fallback covers 50..100). Anything
+            // A valid generic charge-stop limit is 50..100 %. Anything
             // outside that window is a HAL sentinel (the Seal getter returns
             // 0xFFFF=65535) — surface null so the UI shows "--", not "65535%".
-            resp.put("percent", (percent >= 15 && percent <= 100) ? percent : JSONObject.NULL);
-            if (enabled == 0) resp.put("enabled", false);
-            else if (enabled == 1) resp.put("enabled", true);
+            // Getter values are hints until a capacity write has proved that
+            // this trim applies them. Do not publish a plausible no-op trim
+            // value as vehicle state before that probe succeeds.
+            boolean verified = Boolean.TRUE.equals(supported);
+            resp.put("percent", verified && percent >= 50 && percent <= 100
+                    ? percent : JSONObject.NULL);
+            if (verified && enabled == 0) resp.put("enabled", false);
+            else if (verified && enabled == 1) resp.put("enabled", true);
             else resp.put("enabled", JSONObject.NULL);
             // Tri-state: null = not yet probed (show optimistically),
             //           true/false = probe result from last write.
             if (supported == null) resp.put("supported", JSONObject.NULL);
             else resp.put("supported", supported.booleanValue());
+            appendChargeCapConstraints(resp, collector);
             logger.info("ChargeCap GET → percent=" + percent + " enabled=" + enabled
                     + " supported=" + supported);
         } catch (Exception e) {
@@ -2152,6 +2921,19 @@ public class VehicleControlApiHandler {
             resp.put("error", e.getMessage());
         }
         HttpResponse.sendJson(out, resp.toString());
+    }
+
+    /** Attach only verified SDK constraints so the UI never advertises an unproven range. */
+    private static void appendChargeCapConstraints(JSONObject response, BydDataCollector collector)
+            throws Exception {
+        int min = collector.getChargeCapMinimumPercent();
+        int max = collector.getChargeCapMaximumPercent();
+        if (min >= 50 && max >= min && max <= 100) {
+            response.put("minimumPercent", min);
+            response.put("maximumPercent", max);
+        }
+        String kind = collector.getChargeCapControlKind();
+        if (kind != null && !"unknown".equals(kind)) response.put("controlKind", kind);
     }
 
     // ==================== LOG HELPERS ====================
@@ -2176,6 +2958,221 @@ public class VehicleControlApiHandler {
             case 3: return "stop";
             default: return "?(" + cmd + ")";
         }
+    }
+
+    /** Strict JSON boolean: missing, string, number, and null are all rejected. */
+    private static Boolean jsonBoolean(JSONObject request, String key) {
+        if (request == null || !request.has(key) || request.isNull(key)) return null;
+        Object value = request.opt(key);
+        return value instanceof Boolean ? (Boolean) value : null;
+    }
+
+    /** Strict JSON string: missing, non-string, and null are all rejected. */
+    private static String jsonString(JSONObject request, String key) {
+        if (request == null || !request.has(key) || request.isNull(key)) return null;
+        Object value = request.opt(key);
+        return value instanceof String ? (String) value : null;
+    }
+
+    /** Strict finite JSON number: no strings, nulls, NaN, or infinities. */
+    private static Double jsonNumber(JSONObject request, String key) {
+        if (request == null || !request.has(key) || request.isNull(key)) return null;
+        Object value = request.opt(key);
+        if (!(value instanceof Number)) return null;
+        double raw = ((Number) value).doubleValue();
+        return Double.isNaN(raw) || Double.isInfinite(raw) ? null : Double.valueOf(raw);
+    }
+
+    /** Strict JSON integer: numeric JSON only, with no coercion or fractional values. */
+    private static Integer jsonInteger(JSONObject request, String key) {
+        if (request == null || !request.has(key) || request.isNull(key)) return null;
+        Object value = request.opt(key);
+        if (!(value instanceof Number)) return null;
+        double raw = ((Number) value).doubleValue();
+        if (Double.isNaN(raw) || Double.isInfinite(raw)
+                || raw != Math.rint(raw)
+                || raw < Integer.MIN_VALUE || raw > Integer.MAX_VALUE) {
+            return null;
+        }
+        return Integer.valueOf((int) raw);
+    }
+
+    /**
+     * Strict JSON long: integral JSON values or canonical decimal strings only.
+     *
+     * <p>Automation form fields are strings, and a 64-bit BOOKINGAIR id cannot safely pass
+     * through a browser JSON number. Accepting a digits-only string preserves every bit without
+     * permitting coercion, fractions, exponent notation, whitespace, or a JavaScript double.
+     */
+    private static Long jsonLong(JSONObject request, String key) {
+        if (request == null || !request.has(key) || request.isNull(key)) return null;
+        Object value = request.opt(key);
+        if (value instanceof String) {
+            String decimal = (String) value;
+            if (!decimal.matches("-?(0|[1-9][0-9]*)")) return null;
+            try {
+                return Long.valueOf(decimal);
+            } catch (NumberFormatException invalid) {
+                return null;
+            }
+        }
+        if (!(value instanceof Number)) return null;
+        // JSONObject parses integer JSON literals as integral Number types. Preserve those values
+        // directly: booking ids are 64-bit and routing them through double would round their low
+        // bits before a create/update/delete request ever reaches BYD.
+        if (value instanceof Byte || value instanceof Short
+                || value instanceof Integer || value instanceof Long) {
+            return Long.valueOf(((Number) value).longValue());
+        }
+        double raw = ((Number) value).doubleValue();
+        if (Double.isNaN(raw) || Double.isInfinite(raw) || raw != Math.rint(raw)
+                || raw < Long.MIN_VALUE || raw > Long.MAX_VALUE
+                // A JSON floating point value above 2^53 cannot represent every integer exactly.
+                || Math.abs(raw) > 9_007_199_254_740_991D) {
+            return null;
+        }
+        return Long.valueOf((long) raw);
+    }
+
+    /**
+     * Optional ambient zones default to both only when absent. A malformed value must never map
+     * to the collector's catch-all area, which would unexpectedly control the entire cabin.
+     */
+    private static String optionalAmbientZone(JSONObject request) {
+        if (request == null || !request.has("zone")) return "both";
+        String zone = jsonString(request, "zone");
+        return isValidAmbientZone(zone) ? zone : null;
+    }
+
+    private static boolean isValidAmbientZone(String zone) {
+        return "front".equals(zone) || "rear".equals(zone) || "both".equals(zone);
+    }
+
+    /**
+     * Volume controls default to media only when channel is absent. Unknown channels must not
+     * reach streamForChannel's legacy media default, which would control the wrong stream.
+     */
+    private static String optionalVolumeChannel(JSONObject request) {
+        if (request == null || !request.has("channel")) return "media";
+        String channel = jsonString(request, "channel");
+        return isValidVolumeChannel(channel) ? channel : null;
+    }
+
+    private static boolean isValidVolumeChannel(String channel) {
+        return "media".equals(channel) || "navigation".equals(channel)
+                || "voice".equals(channel) || "phone".equals(channel)
+                || "call".equals(channel) || "system".equals(channel)
+                || "alarm".equals(channel) || "ring".equals(channel);
+    }
+
+    /**
+     * The router may expose this optional state while server and router artifacts are updated
+     * independently. It is read-only and omitted when unavailable.
+     */
+    private static Boolean remoteClimateActive() {
+        for (String methodName : new String[] { "isRemoteClimateActive", "getRemoteClimateActive" }) {
+            try {
+                java.lang.reflect.Method accessor = VehicleCommandRouter.class.getMethod(methodName);
+                Object value = accessor.invoke(VehicleCommandRouter.getInstance());
+                return value instanceof Boolean ? (Boolean) value : null;
+            } catch (NoSuchMethodException ignored) {
+                // The router build does not expose this optional state yet.
+            } catch (Exception e) {
+                logger.debug("remote climate state unavailable: " + e.getMessage());
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /** Return a valid 0..2 seat level only when the field is supplied and valid. */
+    private static Integer optionalSeatLevel(JSONObject request, String key) {
+        if (request == null || !request.has(key) || request.isNull(key)) return null;
+        Integer value = jsonInteger(request, key);
+        return value != null && value.intValue() >= 0 && value.intValue() <= 2 ? value : null;
+    }
+
+    private static boolean isValidClimateTemperature(double temp) {
+        return !Double.isNaN(temp) && !Double.isInfinite(temp)
+                && temp >= com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_C
+                && temp <= com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MAX_C;
+    }
+
+    /**
+     * Remote OPENAIR reaches 15/16 C while the local dial starts at 17 C.
+     * The union lets an explicit 15/16 request route cloud-only and 32/33 route
+     * SDK-only, without ever silently clamping the caller's target.
+     */
+    private static boolean isValidClimateStartTemperature(double temp) {
+        return !Double.isNaN(temp) && !Double.isInfinite(temp) && temp >= 15D && temp <= 33D;
+    }
+
+    private static boolean isValidRemoteClimateDuration(int minutes) {
+        return minutes == 10 || minutes == 15 || minutes == 20
+                || minutes == 25 || minutes == 30;
+    }
+
+    /** Returns a valid supplied timer value, or null for missing/invalid input. */
+    private static Integer optionalAutoOffMinutes(JSONObject request) {
+        Integer value = jsonInteger(request, "autoOffMinutes");
+        return value != null && value.intValue() >= 0
+                && value.intValue() <= com.overdrive.app.byd.AcAutoOffTimer.MAX_MINUTES
+                ? value : null;
+    }
+
+    private static void sendClimateInputError(OutputStream out, JSONObject response, String error)
+            throws Exception {
+        response.put("success", false);
+        response.put("error", error);
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    private static boolean isValidChargingTime(String value, boolean allowFull) {
+        if (allowFull && "full".equals(value)) return true;
+        if (value == null || !value.matches("\\d{2}:\\d{2}")) return false;
+        int hour = (value.charAt(0) - '0') * 10 + value.charAt(1) - '0';
+        int minute = (value.charAt(3) - '0') * 10 + value.charAt(4) - '0';
+        return hour <= 23 && minute <= 59;
+    }
+
+    private static boolean isValidChargeWay(String value) {
+        if ("s".equals(value) || "e".equals(value)) return true;
+        if (value == null || value.isEmpty()) return false;
+        String[] days = value.split(",", -1);
+        boolean[] seen = new boolean[7];
+        for (String day : days) {
+            if (day.length() != 1 || day.charAt(0) < '0' || day.charAt(0) > '6') return false;
+            int index = day.charAt(0) - '0';
+            if (seen[index]) return false;
+            seen[index] = true;
+        }
+        return true;
+    }
+
+    /**
+     * The cloud seat command writes all four zones in one request. A partial or
+     * stale snapshot would turn untouched zones off, so it is never a cloud
+     * fallback source. Client-supplied levels are input-validated but are not a
+     * fallback source.
+     */
+    private static boolean hasFreshCompleteSeatState(BydVehicleData snapshot) {
+        return VehicleCommandRouter.hasFreshCompleteSeatState(snapshot);
+    }
+
+    /**
+     * Start from the collector's full state and change exactly the requested zone. Callers use
+     * this only after {@link #hasFreshCompleteSeatState(BydVehicleData)} succeeds; request-body
+     * sibling fields deliberately never enter the composite cloud payload.
+     */
+    private static int[] seatStateWithTarget(int[] heat, int[] cool, boolean ventilation,
+                                             int position, int level) {
+        int[] state = {
+                heat[0], cool[0],
+                heat[1], cool[1]
+        };
+        int index = position == 1 ? (ventilation ? 1 : 0) : (ventilation ? 3 : 2);
+        state[index] = level;
+        return state;
     }
 
     private static String seatPosName(int pos) {

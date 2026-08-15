@@ -14,7 +14,6 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.provider.Settings;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -25,6 +24,10 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+
+import java.io.DataOutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 
 /**
  * App-process on-screen message overlay for the "Show Toast" / "Show Dialog"
@@ -91,20 +94,27 @@ public final class MessageOverlayService extends Service {
         if (intent == null) { stopSelf(); return START_NOT_STICKY; }
         // A running-app can't render an overlay without the permission; a shell `am`
         // launch bypasses the in-app grant flow, so guard here and cleanly no-op.
-        if (!Settings.canDrawOverlays(this)) {
+        if (!OverlayPermissionChecker.isGranted(this)) {
             Log.w(TAG, "SYSTEM_ALERT_WINDOW not granted — cannot show message");
+            sendAcknowledgement(intent, false,
+                    "Display-over-other-apps permission is not granted in the car");
             stopSelf();
             return START_NOT_STICKY;
         }
         try {
             String kind = orDefault(intent.getStringExtra("kind"), "toast");
+            boolean displayed;
             if ("dialog".equalsIgnoreCase(kind)) {
-                showDialog(intent);
+                displayed = showDialog(intent);
             } else {
-                showToast(intent);
+                displayed = showToast(intent);
             }
+            sendAcknowledgement(intent, displayed,
+                    displayed ? "" : "The car could not add the message overlay");
         } catch (Throwable t) {
             Log.w(TAG, "show failed: " + t.getMessage());
+            sendAcknowledgement(intent, false,
+                    t.getMessage() == null ? "Message display failed" : t.getMessage());
             stopSelf();
         }
         return START_NOT_STICKY;
@@ -112,9 +122,9 @@ public final class MessageOverlayService extends Service {
 
     // ── Toast ────────────────────────────────────────────────────────────────
 
-    private void showToast(Intent intent) {
+    private boolean showToast(Intent intent) {
         String message = orDefault(intent.getStringExtra("message"), "");
-        if (message.isEmpty()) { stopSelf(); return; }
+        if (message.isEmpty()) { stopSelf(); return false; }
         String position = orDefault(intent.getStringExtra("position"), "bottom");
         long dur = "long".equalsIgnoreCase(orDefault(intent.getStringExtra("duration"), "short"))
                 ? TOAST_LONG_MS : TOAST_SHORT_MS;
@@ -132,23 +142,26 @@ public final class MessageOverlayService extends Service {
 
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0xF2202124);                 // near-opaque charcoal
-        bg.setCornerRadius(dp(ctx, 14));
+        bg.setCornerRadius(dp(ctx, 8));
         bg.setStroke(dp(ctx, 2), accent);         // severity edge
         tv.setBackground(bg);
 
-        replaceOverlay(tv, toastLayoutParams(gravityFor(position)));
+        if (!replaceOverlay(tv, toastLayoutParams(gravityFor(position)))) {
+            return false;
+        }
         scheduleDismiss(dur);
+        return true;
     }
 
     // ── Dialog ───────────────────────────────────────────────────────────────
 
-    private void showDialog(Intent intent) {
+    private boolean showDialog(Intent intent) {
         String title = orDefault(intent.getStringExtra("title"), "");
         String message = orDefault(intent.getStringExtra("message"), "");
         String buttonLabel = orDefault(intent.getStringExtra("button"), "OK");
         int accent = accentFor(intent.getStringExtra("severity"));
         int timeoutSec = intent.getIntExtra("timeoutSec", 0);
-        if (title.isEmpty() && message.isEmpty()) { stopSelf(); return; }
+        if (title.isEmpty() && message.isEmpty()) { stopSelf(); return false; }
 
         Context ctx = themedContext();
         int pad = dp(ctx, 20);
@@ -209,24 +222,61 @@ public final class MessageOverlayService extends Service {
         clp.gravity = Gravity.CENTER;
         scrim.addView(card, clp);
 
-        replaceOverlay(scrim, dialogLayoutParams());
+        if (!replaceOverlay(scrim, dialogLayoutParams())) return false;
         // A dialog holds until OK/scrim tap, unless the user set an auto-dismiss.
         cancelDismiss();
         if (timeoutSec > 0) scheduleDismiss(timeoutSec * 1000L);
+        return true;
     }
 
     // ── Overlay plumbing ───────────────────────────────────────────────────────
 
-    private void replaceOverlay(View view, WindowManager.LayoutParams lp) {
+    private boolean replaceOverlay(View view, WindowManager.LayoutParams lp) {
         removeOverlay();
         overlayView = view;
         try {
             windowManager.addView(overlayView, lp);
+            return true;
         } catch (Throwable t) {
             Log.e(TAG, "addView failed: " + t.getMessage());
             overlayView = null;
             stopSelf();
+            return false;
         }
+    }
+
+    /**
+     * Report the real addView outcome to the daemon over a one-use loopback
+     * callback. Legacy automation calls omit these extras and remain
+     * fire-and-forget.
+     */
+    private void sendAcknowledgement(Intent intent, boolean displayed, String reason) {
+        String portValue = intent.getStringExtra("ackPort");
+        String token = intent.getStringExtra("ackToken");
+        if (portValue == null || token == null || token.isEmpty()) return;
+        final int port;
+        try {
+            port = Integer.parseInt(portValue);
+        } catch (NumberFormatException invalid) {
+            return;
+        }
+        if (port <= 0 || port > 65535) return;
+
+        Thread callback = new Thread(() -> {
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress("127.0.0.1", port), 1000);
+                DataOutputStream output =
+                        new DataOutputStream(socket.getOutputStream());
+                output.writeUTF(token);
+                output.writeUTF(displayed ? "DISPLAYED" : "FAILED");
+                output.writeUTF(reason == null ? "" : reason);
+                output.flush();
+            } catch (Throwable error) {
+                Log.w(TAG, "acknowledgement callback failed: " + error.getMessage());
+            }
+        }, "MessageOverlayAck");
+        callback.setDaemon(true);
+        callback.start();
     }
 
     private void removeOverlay() {

@@ -153,7 +153,7 @@ public class GpuDownscaler {
         1.0f, 1.0f
     };
     
-    // Vertex shader. esco-parity: applies the SurfaceTexture transform
+    // Vertex shader. oem-parity: applies the SurfaceTexture transform
     // matrix so AI-lane samples land inside the HAL's "live" sub-region
     // even when the producer surface contains chrome/letterbox. Identity
     // by default — legacy ImageReader path is unaffected.
@@ -1045,7 +1045,7 @@ public class GpuDownscaler {
     /**
      * Selects between layouts:
      *   0 = legacy 4-strip → 2x2 rearrangement (Seal/Atto)
-     *   3 = esco-parity passthrough (HAL emits final framing natively)
+     *   3 = oem-parity passthrough (HAL emits final framing natively)
      * Other values fall through to layout 0 in the shader.
      */
     public void setCameraLayout(int layout) { this.cameraLayout = layout; }
@@ -1095,7 +1095,7 @@ public class GpuDownscaler {
      * Mirrors GpuMosaicRecorder.setRedMaskEnabled. Off by default; pipeline
      * pulls dilink4RedMask from unified config and pushes it through.
      */
-    /** APA center inset (esco APACropFilter parity). See {@link
+    /** APA center inset (oem APACropFilter parity). See {@link
      *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
     public void setApaCenterInset(float inset) {
         this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));

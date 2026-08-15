@@ -5,12 +5,13 @@ import com.overdrive.app.logging.DaemonLogger;
 
 import org.json.JSONObject;
 
-import java.io.InputStream;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
+import com.overdrive.app.byd.routing.VehicleCommandRouter;
+import com.overdrive.app.byd.routing.VehicleCommandRouter.CommandResult;
 /**
  * BYD Cloud Deterrent — fire-and-forget cloud commands on motion detection.
  * 
@@ -19,7 +20,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * 1. Checks if a deterrent action is configured (not "silent")
  * 2. Enforces a cooldown period (default 60s)
  * 3. Dispatches the cloud command on a background thread
- * 4. Handles login, session refresh, and PIN verification lazily
+ * 4. Routes commands through the shared cloud router
  * 5. Never throws exceptions back to the caller
  * 
  * Deterrent actions:
@@ -48,9 +49,6 @@ public final class BydCloudDeterrent {
     // State
     private final AtomicLong lastCommandTimeMs = new AtomicLong(0);
     private final AtomicBoolean commandInFlight = new AtomicBoolean(false);
-    private volatile BydCloudClient client;
-    private volatile String resolvedVin;
-
     private BydCloudDeterrent() {}
 
     public static BydCloudDeterrent getInstance() {
@@ -109,119 +107,28 @@ public final class BydCloudDeterrent {
         logger.info("Executing deterrent action: " + action);
 
         try {
-            BydCloudClient c = ensureClient();
-            if (c == null) {
-                logger.warn("BYD Cloud not configured — skipping deterrent");
-                return;
-            }
-
-            String vin = ensureVin(c);
-            if (vin == null || vin.isEmpty()) {
-                logger.warn("No VIN available — skipping deterrent");
-                return;
-            }
-
-            boolean success;
+            VehicleCommandRouter.VehicleCommand command;
             switch (action) {
                 case "flash_lights":
-                    success = c.flashLights(vin);
+                    command = new VehicleCommandRouter.FlashLightsCommand();
                     break;
                 case "find_car":
-                    success = c.findCar(vin);
+                    command = new VehicleCommandRouter.FindCarCommand();
                     break;
                 default:
                     logger.warn("Unknown deterrent action: " + action);
                     return;
             }
 
+            // The router owns capability discovery, remote-command
+            // serialization, terminal confirmation, and timeout cancellation.
+            CommandResult result = VehicleCommandRouter.getInstance().execute(command);
             lastCommandTimeMs.set(System.currentTimeMillis());
-            logger.info("Deterrent " + action + " " + (success ? "succeeded" : "dispatched"));
+            logger.info("Deterrent " + action + " result=" + result.outcome
+                    + " path=" + result.pathString());
 
         } catch (Exception e) {
             logger.warn("Deterrent execution failed: " + e.getMessage());
-            // Reset client on auth failures so next attempt re-authenticates
-            if (e.getMessage() != null && e.getMessage().contains("Login failed")) {
-                client = null;
-                resolvedVin = null;
-            }
-        }
-    }
-
-    /**
-     * Get the BYD cloud client. Reuses BydCloudDataProvider's shared client
-     * to avoid racing with the running MQTT subscriber on login() — separate
-     * client instances invalidate each other's session tokens, which surfaces
-     * as code=1005 from /app/emqAuth/getEmqBrokerIp.
-     */
-    private BydCloudClient ensureClient() {
-        if (client != null && client.isReady()) {
-            return client;
-        }
-
-        BydCloudConfig config = BydCloudConfig.fromUnifiedConfig();
-        if (!config.isConfigured()) {
-            return null;
-        }
-
-        try {
-            BydCloudClient shared = BydCloudDataProvider.getInstance().getSharedClient();
-            if (shared != null) {
-                String vin = !config.vin.isEmpty() ? config.vin : shared.fetchFirstVin();
-                shared.verifyControlPassword(vin);
-                resolvedVin = vin;
-                client = shared;
-                return shared;
-            }
-
-            // Fallback: BydCloudDataProvider hasn't been started yet (e.g. surveillance
-            // fired before subscriber init). Use a one-shot client. This is the only
-            // path that should ever spawn a new client outside the provider.
-            BydCloudClient c = new BydCloudClient(config);
-            InputStream tablesStream = getTablesStream(config);
-            if (tablesStream == null) {
-                logger.warn("Transport tables not available");
-                return null;
-            }
-            try {
-                c.init(tablesStream);
-            } finally {
-                try { tablesStream.close(); } catch (Exception ignored) {}
-            }
-            c.login();
-            String vin = config.vin;
-            if (vin.isEmpty()) {
-                vin = c.fetchFirstVin();
-            }
-            c.verifyControlPassword(vin);
-            resolvedVin = vin;
-            client = c;
-            return c;
-        } catch (Exception e) {
-            logger.warn("Failed to initialize BYD cloud client: " + e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Get the VIN, using cached value or fetching from API.
-     */
-    private String ensureVin(BydCloudClient c) {
-        if (resolvedVin != null && !resolvedVin.isEmpty()) {
-            return resolvedVin;
-        }
-
-        BydCloudConfig config = BydCloudConfig.fromUnifiedConfig();
-        if (!config.vin.isEmpty()) {
-            resolvedVin = config.vin;
-            return resolvedVin;
-        }
-
-        try {
-            resolvedVin = c.fetchFirstVin();
-            return resolvedVin;
-        } catch (Exception e) {
-            logger.warn("Failed to fetch VIN: " + e.getMessage());
-            return null;
         }
     }
 
@@ -242,15 +149,7 @@ public final class BydCloudDeterrent {
      * Force reset (for testing or credential changes).
      */
     public void reset() {
-        client = null;
-        resolvedVin = null;
         lastCommandTimeMs.set(0);
         commandInFlight.set(false);
-    }
-
-    private InputStream getTablesStream(BydCloudConfig config) {
-        return com.overdrive.app.byd.cloud.crypto.EnvelopeCodecFactory.openTablesStream(
-                config.isChinaRegion(),
-                com.overdrive.app.daemon.DaemonBootstrap.getContext());
     }
 }

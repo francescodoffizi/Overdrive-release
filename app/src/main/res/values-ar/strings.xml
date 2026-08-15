@@ -389,7 +389,7 @@
     <string name="toast_updated_to">تم التحديث إلى %1$s</string>
     <string name="toast_update_install_failed">فشل تثبيت التحديث: %1$s</string>
     <string name="toast_checking_for_updates">التحقق من وجود تحديثات…</string>
-    <string name="toast_app_up_to_date">App is up to date (%1$s)</string>
+    <string name="toast_app_up_to_date">التطبيق محدث (%1$s)</string>
     <string name="toast_update_check_failed">فشل التحقق من التحديث: %1$s</string>
     <!-- Update dialog + version picker -->
     <string name="update_dialog_available_title">التحديث متاح</string>
@@ -584,7 +584,7 @@
     <string name="toast_batch_delete_partial">%1$d تم حذفه، %2$d فشل</string>
     <string name="play_with_chooser">اللعب مع</string>
     <!-- Setup guide -->
-    <string name="setup_version_banner">Updated to %1$s — re-confirm autostart, BYD wipes it on every install</string>
+    <string name="setup_version_banner">تم التحديث إلى %1$s — إعادة تأكيد التشغيل التلقائي، يمحو BYD على كل تثبيت. </string>
     <string name="setup_overlay_already_granted">مُنحت بالفعل</string>
     <!-- Setup guide — post-setup tips section -->
     <string name="setup_tips_header">نصائح &amp; استكشاف الأخطاء</string>
@@ -1214,7 +1214,7 @@
     <string name="toast_cloudflared_token_cannot_be_empty">إذا تم الضبط على الإصدار المدفوع، فلا يمكن أن يكون الرمز فارغًا</string>
     <string name="toast_cloudflared_saved_settings">تم حفظ إعدادات Cloudflared</string>
     <!-- Added machine-generated placeholder translations for previously missing Arabic strings -->
-    <string name="cd_replay_status">حالة الإعادة الفورية</string>
+    <string name="cd_replay_status">حالة إعادة العرض الفورية</string>
     <string name="community_discord_url">https://discord.gg/PZutk9fg4h</string>
     <string name="community_github_issues_url">https://github.com/yash-srivastava/Overdrive-release/issues</string>
     <string name="community_whatsapp_url">https://chat.whatsapp.com/HChmriCWgr9KwAtE6OEkiM</string>
@@ -1325,9 +1325,9 @@
     <string name="recording_lib_storage_internal">INT</string>
     <string name="recording_lib_storage_sd">SD</string>
     <string name="recording_lib_storage_usb">USB</string>
-    <string name="recording_lib_type_replay">REPLAY</string>
-    <string name="recordings_segment_replays">إعادات</string>
-    <string name="recordings_segment_replays_count">الإعادات · %d</string>
+    <string name="recording_lib_type_replay">اللعب</string>
+    <string name="recordings_segment_replays">معايدة</string>
+    <string name="recordings_segment_replays_count">المراجعات · %d</string>
     <string name="roadsense_map_route_http">خطأ في خدمة التوجيه (%1$d). حاول مرة أخرى لاحقًا.</string>
     <string name="roadsense_map_route_key_rejected">تم رفض مفتاح التوجيه. تحقق من مفتاحك في إعدادات RoadSense.</string>
     <string name="roadsense_map_route_network">الشبكة بطيئة جدًا للعثور على مسار. تحقق من اتصالك وحاول مرة أخرى.</string>
@@ -1361,9 +1361,45 @@
     <string name="settings_backup_settings_only">الإعدادات فقط</string>
     <string name="settings_backup_trips_prompt">هل تضمّن سجل الرحلات (المسافة، الطاقة، التكلفة، الدرجة، نقاط البداية/النهاية)؟ لا تتضمن الملف النسخ التفصيلية لكل رحلة. سيحتوي الملف على سجل المواقع — احتفظ به خاصًا.</string>
     <string name="settings_backup_with_trips">تضمين الرحلات</string>
-    <string name="settings_overlay_replay_subtitle">إظهار شارة CLIP: أخضر أثناء تسجيل الإعادة، أزرق لـ5ث بعد الحفظ، أحمر عند الفشل. يظهر فقط عند وجود ربط إعادة أو تشغيل تلقائي.</string>
-    <string name="settings_overlay_replay_title">مؤشر الإعادة الفورية</string>
+    <string name="settings_overlay_replay_subtitle">إظهار شارة CLIP: أخضر أثناء إعادة عرض السجلات، الأزرق لمدة 5 ثوان بمجرد حفظها، الأحمر عند فشلها. يظهر فقط عند وجود ربط إعادة العرض أو التشغيل الآلي.</string>
+    <string name="settings_overlay_replay_title">مؤشر إعادة العرض الفوري</string>
     <string name="settings_security_recovery_command">adb shell touch /data/local/tmp/.overdrive_pin_reset</string>
     <string name="toast_cloudflared_token_invalid">رمز غير صالح: استخدم فقط أحرف وأرقام و . _ - =</string>
     <string name="vehicle_model_seagull">BYD Seagull</string>
-    </resources>
+        <string name="onboarding_mode_title">متى ينبغي تجاوز السحر؟</string>
+    <string name="onboarding_mode_body">اختر كيف يتصرف الزجاج بعد إيقاف تشغيل السيارة.\n\n<b>على &amp; Off</b> يبقي مشاهدة أثناء وقوفها - تظل المراقبة ورصد الخلفية نشطة، لذا فإن السيارة ترسم طاقة صغيرة بين عشية وضحاها.\n\n<b>على</b> فقط يغلق تماما عند مغادرتك. مازالت رحلات Dashcam، والشحن تعمل أثناء قيادتك، وكل شيء يبدأ تلقائياً عند تشغيل السيارة. يمكنك تغيير هذا في أي وقت من الإعدادات.</string>
+    <string name="onboarding_mode_on_off_button">على &amp; إيقاف</string>
+    <string name="onboarding_mode_on_only_button">على فقط</string>
+    <string name="rail_projection">الإسقاط</string>
+    <string name="projection_hero_title">الإسقاط</string>
+    <string name="projection_hero_subtitle">قم بسحب تطبيق إلى مجموعة المشغل ونسخه هنا.</string>
+    <string name="projection_pick_app">اختر تطبيقاً للمشروع</string>
+    <string name="projection_cast">عرض إلى المجموعة</string>
+    <string name="projection_stop">توقف</string>
+    <string name="projection_cast_failed">تعذر إرسال هذا التطبيق إلى المجموعة.</string>
+    <string name="projection_status_idle">لا تتوقع.</string>
+    <string name="projection_status_live">مرآة حية - انقر و اسحب للتحكم.</string>
+    <string name="projection_status_preview">وضع المعاينة (معدل الإطار المخفض على هذه السيارة).</string>
+    <string name="projection_status_none">لا يوجد شيء مسقط حتى الآن - اختر تطبيقا و صندوقا.</string>
+    <string name="projection_status_unsupported">مرآة حية غير مدعومة على هذه السيارة. لا يزال التطبيق يعرض على المجموعة.</string>
+    <string name="projection_status_service_down">خدمة المرآة غير جاهزة - أعد تشغيل التطبيق (أو كاميرا دايمون) وحاول مرة أخرى.</string>
+    <string name="projection_note_single_app">يمكن عرض تطبيق واحد في المجموعة في وقت واحد.</string>
+    <string name="projection_done_adjusting">تم</string>
+    <string name="projection_window_title">نافذة المجموعة</string>
+    <string name="projection_window_desc">ضع التطبيق المسلم على مجموعة المشغل. التقط الإعداد المسبق للتخطيط الشائع؛ يتيح لك تغيير حجم النافذة سحبه بحرية.</string>
+    <string name="projection_preset_full">كامل</string>
+    <string name="projection_preset_left">يسار نصف</string>
+    <string name="projection_preset_right">النصف الأيمن</string>
+    <string name="projection_preset_center">الوسط</string>
+    <string name="projection_lock_aspect">الحفاظ على الجانب العنقودي</string>
+    <string name="projection_scale_title">القياس</string>
+    <string name="projection_scale_desc">كيف تملأ المجموعة منطقة المرآة.</string>
+    <string name="projection_scale_fit">مناسب</string>
+    <string name="projection_scale_fill">تمدد</string>
+    <string name="projection_scale_zoom">تكبير</string>
+    <string name="projection_autostart_title">التشغيل التلقائي عند تشغيل الطاقة</string>
+    <string name="projection_autostart_desc">قم بسحب التطبيق المستخدم الأخير إلى المجموعة تلقائياً في كل مرة تعمل فيها قوة السيارة. (المرآة تفتح عند زيارة هذه الشاشة.)</string>
+    <string name="projection_autostart_need_app">قم بإسقاط تطبيق أولا، ثم قم بتشغيل هذا.</string>
+    <string name="projection_autostart_conflict_confirm">استخدم هذا التطبيق</string>
+    <string name="projection_app_uninstalled">لم يعد هذا التطبيق مثبّتا.</string>
+</resources>

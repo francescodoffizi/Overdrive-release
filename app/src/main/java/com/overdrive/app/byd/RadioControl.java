@@ -19,8 +19,11 @@ import java.util.concurrent.TimeUnit;
  * turn it back on. So a WiFi-OFF here first sets a persisted suppression flag
  * ({@link UnifiedConfigManager#setWifiKeepAliveSuppressed}) that every keep-alive site
  * checks BEFORE re-enabling; a WiFi-ON clears it so keep-alive resumes normally. With no
- * radio rule the flag stays false (default) and keep-alive is unchanged. Bluetooth and
- * mobile-data have no keep-alive in this app, so they toggle directly with no flag.
+ * radio rule the flag stays false (default) and keep-alive is unchanged. Mobile data
+ * gained the same parked keep-alive (AccSentryDaemon.ensureMobileDataEnabled, issue
+ * #209), so it carries the analogous flag
+ * ({@link UnifiedConfigManager#setDataKeepAliveSuppressed}). Bluetooth has no
+ * keep-alive and toggles directly with no flag.
  *
  * <p>Ordering matters for WiFi-off: the flag is committed BEFORE {@code svc wifi disable}
  * runs, so the next keep-alive tick already sees the suppression and won't race the
@@ -47,14 +50,21 @@ public final class RadioControl {
      */
     public static boolean set(Radio radio, boolean enable) {
         if (radio == null) return false;
-        // WiFi: keep the suppression flag in lock-step with the user's intent. Set it
-        // BEFORE disabling so the ~10s keep-alive tick already sees "user wants off" and
-        // does not race our disable; clear it when enabling so keep-alive resumes.
-        if (radio == Radio.WIFI) {
+        // WiFi / mobile data: keep the suppression flag in lock-step with the user's
+        // intent. Set it BEFORE disabling so the ~10s keep-alive tick already sees
+        // "user wants off" and does not race our disable; clear it when enabling so
+        // keep-alive resumes. (Data gained a parked keep-alive with issue #209, so it
+        // now needs the same flag WiFi always had. Bluetooth has no keep-alive.)
+        if (radio == Radio.WIFI || radio == Radio.DATA) {
             try {
-                UnifiedConfigManager.setWifiKeepAliveSuppressed(!enable);
+                if (radio == Radio.WIFI) {
+                    UnifiedConfigManager.setWifiKeepAliveSuppressed(!enable);
+                } else {
+                    UnifiedConfigManager.setDataKeepAliveSuppressed(!enable);
+                }
             } catch (Throwable t) {
-                logger.warn("RadioControl: could not persist WiFi suppression flag: " + t.getMessage());
+                logger.warn("RadioControl: could not persist " + radio
+                        + " suppression flag: " + t.getMessage());
                 // Continue: even if the flag write failed, honour the immediate toggle.
                 // Worst case the keep-alive re-enables later — never worse than today.
             }

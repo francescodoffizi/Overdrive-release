@@ -132,10 +132,9 @@ public class TripScoreEngine {
         MOUNTAIN_DESCENT  // > 15 m loss per km — steep sustained descents (regen territory)
     }
 
-    // Minimum altitude delta to count (filters GPS noise, ~2m accuracy)
-    private static final double ALT_NOISE_THRESHOLD = 2.0;
-    // Smoothing: minimum distance between altitude samples to reduce GPS jitter
-    private static final int ALT_SAMPLE_INTERVAL = 5; // Every 5th sample at 5Hz = 1 second
+    // Elevation gain/loss estimation (smoothing, noise threshold, accuracy gate,
+    // source-flip resets) lives in ElevationEstimator — SHARED with the recovery
+    // path (TripDatabase.reconstructTripFromTelemetry) so the two can't drift.
 
     // ==================== Public API ====================
 
@@ -171,10 +170,8 @@ public class TripScoreEngine {
         int maxSpeed = 0;
 
         // ── Accumulators: elevation (gradient profile) ──
-        double elevationGain = 0;
-        double elevationLoss = 0;
-        double lastValidAlt = Double.NaN;
-        int altSampleCounter = 0;
+        // Shared gated/smoothed/hysteresis pipeline — see ElevationEstimator.
+        final ElevationEstimator elevation = new ElevationEstimator();
 
         // ── Accumulators: pedal jerk (smoothness score) ──
         // Only sums jerk between two consecutive DRIVING samples, each sample's
@@ -264,25 +261,15 @@ public class TripScoreEngine {
             }
 
             // ── 3b. Elevation tracking (gradient profile) ──
-            // Sample every ALT_SAMPLE_INTERVAL to smooth GPS altitude noise
-            altSampleCounter++;
-            if (altSampleCounter >= ALT_SAMPLE_INTERVAL) {
-                altSampleCounter = 0;
-                double alt = s.altitude;
-                if (alt != 0.0 && !Double.isNaN(alt)) {
-                    if (!Double.isNaN(lastValidAlt)) {
-                        double delta = alt - lastValidAlt;
-                        // Only count if above noise threshold
-                        if (Math.abs(delta) >= ALT_NOISE_THRESHOLD) {
-                            if (delta > 0) elevationGain += delta;
-                            else elevationLoss += Math.abs(delta);
-                            lastValidAlt = alt;
-                        }
-                    } else {
-                        lastValidAlt = alt;
-                    }
-                }
-            }
+            // Every sample feeds the shared estimator: it gates on movement
+            // (gear P / unknown-at-standstill excluded, so the park-debounce
+            // tail and idle noise can't accumulate), gates on reported vertical
+            // accuracy, median-smooths over 10 s, resets on MSL/ellipsoid source
+            // flips and long gaps, and banks movement through a hysteresis band
+            // so sub-threshold noise contributes exactly zero.
+            elevation.addSample(s.timestampMs, s.altitude, s.verticalAccuracyM,
+                    s.altitudeIsMsl,
+                    ElevationEstimator.isElevationEligible(s.gearMode, speed));
 
             final boolean driving = speed > MIN_DRIVING_SPEED;
             final boolean wasDriving = lastSpeed > MIN_DRIVING_SPEED;
@@ -507,6 +494,8 @@ public class TripScoreEngine {
         // Elevation gain/loss per km — standard metric for terrain difficulty.
         // Climb and descent are separate profiles because the physics and
         // optimal driving behavior are fundamentally different.
+        final double elevationGain = elevation.getGainM();
+        final double elevationLoss = elevation.getLossM();
         double gainPerKm = trip.distanceKm > 0 ? elevationGain / trip.distanceKm : 0;
         double lossPerKm = trip.distanceKm > 0 ? elevationLoss / trip.distanceKm : 0;
         GradientProfile gradProfile;

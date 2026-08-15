@@ -54,6 +54,12 @@ public class AccSentryDaemon {
     private static String SERVICE_BG_DATACACHE() { return Safe.s("m84QJmAGTQpH+XP36MaDpA=="); }
     /** svc wifi enable */
     private static String CMD_WIFI_ENABLE() { return Safe.s("GzzLDvODRsKARkPOXEZeIA=="); }
+    /** svc data enable */
+    private static String CMD_DATA_ENABLE() { return Safe.s("IyVVEc3FpTCbWAn/AlxUnA=="); }
+    /** settings put global mobile_data_always_on 1 */
+    private static String CMD_DATA_ALWAYS_ON() { return Safe.s("kSl507BgPZXbv0JUusGzZofsus1EHyUHZji5UFGB7WLLwoz58e3wRdD6/xbXC307"); }
+    /** settings get global mobile_data */
+    private static String CMD_DATA_GET() { return Safe.s("4/qqmGNE2vhiGGggG70n0sRfHtz6gZempQZl+6FiiZk="); }
     /** /data/local/tmp */
     private static String PATH_DATA_LOCAL_TMP() { return Safe.s("vuaMjrmBGBFh07qqnUuL8w=="); }
     /** /data/local/tmp/telegram_config.properties */
@@ -73,6 +79,31 @@ public class AccSentryDaemon {
 
     private static volatile boolean running = true;
     private static volatile boolean inSentryMode = false;
+    private static final Object shutdownLock = new Object();
+    private static boolean shutdownComplete;
+    private static final Object sentryTransitionLock = new Object();
+    private static final java.util.concurrent.atomic.AtomicLong sentryTransitionGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static volatile SentryTransitionState latestSentryTransition =
+            new SentryTransitionState(0L, false, false);
+    private static long panelDeterrentResetGeneration = -1L;
+    private static final Object accObservationLock = new Object();
+    private static final java.util.concurrent.atomic.AtomicLong accCallbackSequence =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final Object powerListenerRegistrationLock = new Object();
+    private static long powerListenerLifecycleGeneration;
+    private static long powerListenerAttemptGeneration;
+    private static long activePowerListenerAttempt = -1L;
+    private static boolean powerListenerRegistered;
+    private static Thread powerListenerRegistrationThread;
+    private static final Object bodyworkRegistrationLock = new Object();
+    private static long bodyworkLifecycleGeneration;
+    private static long bodyworkAttemptGeneration;
+    private static long activeBodyworkAttempt = -1L;
+    private static Thread bodyworkRegistrationThread;
+    private static final java.util.concurrent.atomic.AtomicBoolean
+            controlledRecoveryRequested =
+            new java.util.concurrent.atomic.AtomicBoolean();
     private static int lastPowerLevel = -1;
     private static int lastMcuStatus = -1;
     // Set to true once a bodywork listener has been successfully registered
@@ -93,6 +124,7 @@ public class AccSentryDaemon {
     // prior-audit "Heartbeat triggers full CameraDaemon.onAccStateChanged
     // side-effects every 30s".
     private static volatile int lastHeartbeatPublishedAccOff = -1;
+    private static final Object heartbeatPublishLock = new Object();
     // Counter of consecutive heartbeat ticks that hit the dedup
     // short-circuit (state unchanged since last publish). When this
     // reaches HEARTBEAT_FORCE_REPUBLISH_TICKS we publish anyway, so a
@@ -113,19 +145,10 @@ public class AccSentryDaemon {
     // instead of 5min — pano stays armed for at most one extra minute
     // of staleness before the heartbeat force-republishes.
     private static final int HEARTBEAT_FORCE_REPUBLISH_TICKS = 2;
-    // Dedicated single-thread executor for IPC dispatch — keeps
-    // sendSurveillanceCommandRaw retry sleeps off the BYD HAL listener
-    // thread (callbacks are single-threaded and a stalled listener
-    // would drop subsequent ACC edges). See prior-audit "notifyAccState
-    // blocks BYD HAL listener thread up to 11s on retry".
-    private static final java.util.concurrent.ExecutorService accNotifyExecutor =
-        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "AccSentryNotifyIPC");
-            t.setDaemon(true);
-            return t;
-        });
     // Thread for the 10-second loop
-    private static Thread systemKeepAliveThread = null;
+    private static volatile Thread systemKeepAliveThread = null;
+    private static volatile long systemKeepAliveGeneration = -1L;
+    private static final Object systemKeepAliveLock = new Object();
     // Interval from  (C0004a0)
     private static final long SYSTEM_KEEPALIVE_INTERVAL_MS = 10000;
 
@@ -135,7 +158,7 @@ public class AccSentryDaemon {
 
     // MCU wake timestamp (for voltage-triggered wake cooldown)
     private static volatile long lastMcuWakeTime = 0;
-    
+
     // ==================== ACTIVE VOLTAGE RECOVERY (REPLACED) ====================
     //
     // Replaced by com.overdrive.app.power.BatteryVoltageMonitorV2 +
@@ -151,6 +174,29 @@ public class AccSentryDaemon {
 
     // Context for BYD device access
     private static Context appContext;
+    private static final String BOOT_IDENTITY = readBootIdentity();
+    private static final String PROCESS_START_IDENTITY =
+            readProcessStartIdentity(android.os.Process.myPid());
+    private static final String PROCESS_INSTANCE_NONCE =
+            createProcessInstanceNonce();
+    private static final String PARK_REAPER_PATH =
+            "/data/local/tmp/overdrive_park_reaper.sh";
+    private static final String PARK_REAPER_CONTROL_PATH =
+            "/data/local/tmp/overdrive_park_reaper.control";
+    private static final String PARK_REAPER_STATE_PATH =
+            "/data/local/tmp/overdrive_park_reaper.state";
+    private static final String PARK_REAPER_LEASE_PATH =
+            "/data/local/tmp/overdrive_park_reaper.lease";
+    private static final String PARK_REAPER_LEASE_OWNER_PATH =
+            PARK_REAPER_LEASE_PATH + "/owner";
+    private static final String PARK_REAPER_RUN_PATH =
+            "/data/local/tmp/overdrive_park_reaper.running";
+    private static final String PARK_REAPER_RUN_OWNER_PATH =
+            PARK_REAPER_RUN_PATH + "/owner";
+    private static final String PARK_REAPER_ACK_PREFIX =
+            "/data/local/tmp/overdrive_park_reaper.ack.";
+    private static final String PARK_REAPER_DONE_PREFIX =
+            "/data/local/tmp/overdrive_park_reaper.done.";
 
     /** Process-local app context. Returns null before main() initialises it. */
     public static Context getAppContext() { return appContext; }
@@ -164,7 +210,7 @@ public class AccSentryDaemon {
 
     // Original screen timeout (saved before sentry mode)
     private static String originalScreenTimeout = "60000";
-    
+
     // Daemon start time for uptime tracking
     private static long startTime = 0;
     
@@ -198,7 +244,7 @@ public class AccSentryDaemon {
     private static BYDAutoPowerDevice getPowerDevice() {
         if (cachedPowerDevice != null) return cachedPowerDevice;
         if (appContext == null) return null;
-        
+
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
             cachedPowerDevice = BYDAutoPowerDevice.getInstance(permissiveContext);
@@ -211,8 +257,8 @@ public class AccSentryDaemon {
     /**
      * Candidate FQNs for BYDAutoSpecialDevice, probed in order.
      *
-     * <p>TWO PACKAGES EXIST IN THE WILD. The Escort reference app
-     * (com.yrdata.escort_auto, flavor bydSofaPro) imports the BARE
+     * <p>TWO PACKAGES EXIST IN THE WILD. The reference OEM dashcam app
+     * (flavor bydSofaPro) imports the BARE
      * {@code android.hardware.special.BYDAutoSpecialDevice} — confirmed in its
      * raw dex string table, not just a decompiler artifact:
      * <pre>
@@ -225,7 +271,7 @@ public class AccSentryDaemon {
      * <p>We previously hardcoded ONLY the {@code .bydauto.special.} variant. When
      * that FQN is absent, {@code Class.forName} throws, this resolver returns null,
      * and EVERY {@link #setSpecialConfig} write becomes a silent no-op — which
-     * silently disabled the esco sentry keep-alive pair (1901/1902) AND the OEM 409
+     * silently disabled the oem sentry keep-alive pair (1901/1902) AND the OEM 409
      * camera/ISP power vote on any trim using the bare package. That is exactly the
      * "pano cameras unreachable with ACC off" symptom: the AVM/ISP rail is never
      * actually held, so post-ACC-OFF AVMCamera frames come back all-zero.
@@ -236,7 +282,7 @@ public class AccSentryDaemon {
      * <p><b>The bare fallback is gated to DiLink 4.</b> It would be wrong to call the
      * extra candidate "strictly additive because the old path already returned null":
      * {@link #setSpecialConfig} is also reached from the FLEET-WIDE writes in
-     * {@link #configurePeripheralPower} (782237711 / 782237728) and
+     * {@link #applyPeripheralPowerBatch} (782237711 / 782237728) and
      * {@link #applySentryIspPowerVote} (the 409 pair), which run on every variant. On
      * a legacy trim that ships only the bare class, all of those are currently inert
      * no-ops; making them start landing would newly drive BCM peripheral-power and
@@ -247,7 +293,7 @@ public class AccSentryDaemon {
         // Tried first: preserves bit-exact behaviour on every trim that already
         // resolved this class (the 90% legacy fleet).
         "android.hardware.bydauto.special.BYDAutoSpecialDevice",
-        // Escort/DiLink4 reality — verified in raw dex (see above). DiLink 4 ONLY.
+        // DiLink4 reality — verified in raw dex (see above). DiLink 4 ONLY.
         "android.hardware.special.BYDAutoSpecialDevice",
     };
 
@@ -311,26 +357,26 @@ public class AccSentryDaemon {
     /**
      * Sets a hidden BYD configuration value via BYDAutoSpecialDevice.
      * Used to keep USB/Peripherals powered during Sleep.
-     * 
+     *
      * @param configId The magic config ID (e.g., 782237711)
      * @param value The value to set (typically 0=OFF, 1=ON)
      */
-    private static void setSpecialConfig(int configId, int value) {
+    private static boolean setSpecialConfig(int configId, int value) {
         Object device = getSpecialDevice();
         if (device == null) {
             log("Cannot set Special Config - device unavailable");
-            return;
+            return false;
         }
         
         try {
             // 1. Create the Value Object (BYDAutoEventValue)
             Class<?> valueClass = Class.forName("android.hardware.bydauto.BYDAutoEventValue");
             Object valueObj = valueClass.newInstance();
-            
+
             // 2. Set the integer value
             java.lang.reflect.Field intValueField = valueClass.getField("intValue");
             intValueField.setInt(valueObj, value);
-            
+
             // 3. Set the value type (1 = Integer) - may be needed on some models
             try {
                 java.lang.reflect.Field typeField = valueClass.getField("valueType");
@@ -345,21 +391,24 @@ public class AccSentryDaemon {
             int[] ids = { configId };
             Object rc = setMethod.invoke(device, ids, valueObj);
 
-            // Log the RAW result code, not just "set to: N". BYD's contract is
-            // rc==0 for success; a non-zero code means the HAL REJECTED the write.
-            // The previous log line was emitted unconditionally after a
-            // no-exception invoke, so a rejected write was indistinguishable from
-            // an applied one — which is how a completely inert sentry keep-alive
-            // could look healthy in a field log.
-            if (rc instanceof Integer && ((Integer) rc) != 0) {
+            boolean success;
+            if (setMethod.getReturnType() == Void.TYPE) {
+                success = true;
+            } else {
+                success = rc instanceof Number
+                        && ((Number) rc).intValue() == 0;
+            }
+            if (!success) {
                 log("Special Config [" + configId + "] <- " + value
                     + " REJECTED by HAL (rc=" + rc + ")");
             } else {
                 log("Special Config [" + configId + "] set to: " + value
                     + " (rc=" + rc + ")");
             }
+            return success;
         } catch (Exception e) {
             log("Failed to set Special Config [" + configId + "]: " + e.getMessage());
+            return false;
         }
     }
     
@@ -370,11 +419,11 @@ public class AccSentryDaemon {
      * @param configId The power config ID
      * @param value The value to set
      */
-    private static void setPowerConfig(int configId, int value) {
+    private static boolean setPowerConfig(int configId, int value) {
         BYDAutoPowerDevice device = getPowerDevice();
         if (device == null) {
             log("Cannot set Power Config - device unavailable");
-            return;
+            return false;
         }
         
         try {
@@ -391,11 +440,25 @@ public class AccSentryDaemon {
             
             Method setMethod = device.getClass().getMethod("set", int[].class, valueClass);
             int[] ids = { configId };
-            setMethod.invoke(device, ids, valueObj);
-            
-            log("Power Config [" + configId + "] set to: " + value);
+            Object rc = setMethod.invoke(device, ids, valueObj);
+            boolean success;
+            if (setMethod.getReturnType() == Void.TYPE) {
+                success = true;
+            } else {
+                success = rc instanceof Number
+                        && ((Number) rc).intValue() == 0;
+            }
+            if (success) {
+                log("Power Config [" + configId + "] set to: " + value
+                        + " (rc=" + rc + ")");
+            } else {
+                log("Power Config [" + configId + "] <- " + value
+                        + " REJECTED by HAL (rc=" + rc + ")");
+            }
+            return success;
         } catch (Exception e) {
             log("Failed to set Power Config [" + configId + "]: " + e.getMessage());
+            return false;
         }
     }
 
@@ -411,7 +474,7 @@ public class AccSentryDaemon {
      * ENABLE path (MCU status 1 or 10):
      *   - SpecialDevice 782237711 = 1 (sentry keep-alive ON)
      *   - SpecialDevice 782237728 = 1 (Modem/USB rail ON)
-     *   - PowerDevice  -1442840502 = 1 ON dilink4 ONLY — esco kh/C6861d.java:344
+     *   - PowerDevice  -1442840502 = 1 ON dilink4 ONLY — oem kh/C6861d.java:344
      *     writes this on its sentry wake path. Without it the byd_apa MCU
      *     drops the AVM/ISP rail seconds after ACC OFF and any subsequent
      *     AVMCamera frames are all-zero. Legacy secondary-reference path skips this write
@@ -429,87 +492,738 @@ public class AccSentryDaemon {
      *
      * @param enable true to keep peripherals powered, false to restore stock behavior
      */
-    private static void configurePeripheralPower(boolean enable) {
-        log("Configuring Peripheral Power (USB/Data): " + (enable ? "ON" : "OFF"));
+    private static boolean isPeripheralPowerRequestCurrent(
+            long generation, boolean enabled) {
+        SentryTransitionState latest = latestSentryTransition;
+        return latest.generation == generation
+                && latest.keepAwakeEnabled() == enabled
+                && peripheralPowerReconciler.isDesired(
+                        generation, enabled);
+    }
 
-        if (!enable) {
-            // DISABLE — restore stock, allow MCU to cut power
-            setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 0);  // Sentry keep-alive OFF
-            setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 2);  // Allow sleep (value=2, NOT 0)
-            setPowerConfig(-1442840502, 0);                         // Release power hold (PowerDevice, not SpecialDevice)
-            applyEscoSentrySpecialConfig(false);                    // dilink4-only esco-parity disable
-            applySentryIspPowerVote(false);                         // release OEM 409 camera/ISP power vote (fleet-wide)
-        } else {
-            // ENABLE — check MCU state first. ALL peripheral rail writes below are
-            // UNCONDITIONAL and identical regardless of the "Keep USB powered" toggle.
-            // The toggle's ONLY effect is gating performSystemWakeUp() in enterSentryMode
-            // (the AP wake state is the real USB lever on DiLink 3.0; the SpecialDevice
-            // rail writes do NOT gate USB-port power here — proven on-device).
-            int mcuStatus = getMcuStatus();
-            log("MCU status for peripheral power: " + mcuStatus);
+    private static void requestPeripheralPowerCompensation() {
+        SentryTransitionState latest = latestSentryTransition;
+        peripheralPowerReconciler.requestReapply(
+                latest.generation, latest.keepAwakeEnabled());
+    }
 
-            if (mcuStatus == 1 || mcuStatus == 10) {
-                // MCU is in normal standby — use signal-based path
-                setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);  // Sentry keep-alive ON
-                setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);  // Modem/USB rail ON
-                applyEscoSentrySpecialConfig(true);                    // dilink4-only esco-parity enable
-                applyEscoMcuPowerHold(true);                           // dilink4-only McuStatus=1
-                applySentryIspPowerVote(true);                         // OEM 409 camera/ISP power vote (fleet-wide)
-            } else {
-                // MCU needs active wake — use wakeUpMcu() then retry
-                log("MCU not ready (status=" + mcuStatus + "), waking up and retrying...");
-                wakeUpMcu();
-                // Retry after 1 second to allow MCU to stabilize
-                new Thread(() -> {
-                    try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-                    int retryStatus = getMcuStatus();
-                    log("MCU status after wake: " + retryStatus);
-                    if (retryStatus == 1 || retryStatus == 10) {
-                        setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);
-                        setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);
-                        applyEscoSentrySpecialConfig(true);
-                        applyEscoMcuPowerHold(true);
-                        applySentryIspPowerVote(true);
-                    } else {
-                        // One more attempt
-                        wakeUpMcu();
-                        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-                        setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);
-                        setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);
-                        applyEscoSentrySpecialConfig(true);
-                        applyEscoMcuPowerHold(true);
-                        applySentryIspPowerVote(true);
-                        log("Forced peripheral power enable after second wake attempt");
+    private interface BoundedCall<T> {
+        T run() throws Exception;
+    }
+
+    private static final class BoundedCallResult<T> {
+        final boolean completed;
+        final T value;
+        final Throwable failure;
+
+        BoundedCallResult(boolean completed, T value, Throwable failure) {
+            this.completed = completed;
+            this.value = value;
+            this.failure = failure;
+        }
+    }
+
+    /**
+     * Serial primary lane plus one compensation slot. The compensation slot is
+     * opened only after the primary exceeded its deadline, so a non-returning
+     * Binder call cannot cause an unbounded replacement-thread cascade.
+     */
+    private static final class BoundedLatestCallLane {
+        private final Object lock = new Object();
+        private final String name;
+        private Thread primary;
+        private Thread compensation;
+        private boolean primaryAbandoned;
+        private long callSequence;
+
+        BoundedLatestCallLane(String name) {
+            this.name = name;
+        }
+
+        <T> BoundedCallResult<T> invoke(
+                String label,
+                long timeoutMs,
+                ShellOwnership ownership,
+                BoundedCall<T> call,
+                Runnable staleCompensation) {
+            final boolean useCompensation;
+            final CallHolder<T> holder = new CallHolder<>();
+            final Thread worker;
+            synchronized (lock) {
+                clearFinishedLocked();
+                if (primary == null && compensation == null) {
+                    useCompensation = false;
+                } else if (primary != null
+                        && primaryAbandoned
+                        && compensation == null) {
+                    useCompensation = true;
+                } else {
+                    return new BoundedCallResult<>(false, null, null);
+                }
+
+                long sequence = ++callSequence;
+                worker = new Thread(() -> {
+                    try {
+                        if (isShellOwnershipCurrent(ownership)) {
+                            holder.value = call.run();
+                        }
+                    } catch (Throwable failure) {
+                        holder.failure = failure;
+                    } finally {
+                        holder.completed = true;
+                        synchronized (lock) {
+                            if (useCompensation) {
+                                if (compensation == Thread.currentThread()) {
+                                    compensation = null;
+                                }
+                            } else if (primary == Thread.currentThread()) {
+                                primary = null;
+                                primaryAbandoned = false;
+                            }
+                            lock.notifyAll();
+                        }
+                        if (!isShellOwnershipCurrent(ownership)
+                                && staleCompensation != null) {
+                            try {
+                                staleCompensation.run();
+                            } catch (Throwable ignored) {}
+                        }
                     }
-                }).start();
+                }, name + (useCompensation ? "-Comp-" : "-Primary-")
+                        + sequence);
+                worker.setDaemon(true);
+                if (useCompensation) {
+                    compensation = worker;
+                } else {
+                    primary = worker;
+                }
+                try {
+                    worker.start();
+                } catch (Throwable startFailure) {
+                    if (useCompensation) {
+                        compensation = null;
+                    } else {
+                        primary = null;
+                        primaryAbandoned = false;
+                    }
+                    return new BoundedCallResult<>(
+                            false, null, startFailure);
+                }
+            }
+
+            long deadline = android.os.SystemClock.elapsedRealtime()
+                    + Math.max(1L, timeoutMs);
+            boolean interrupted = false;
+            while (worker.isAlive()) {
+                long remaining = deadline
+                        - android.os.SystemClock.elapsedRealtime();
+                if (remaining <= 0L) {
+                    break;
+                }
+                try {
+                    worker.join(Math.min(remaining, 100L));
+                } catch (InterruptedException interruption) {
+                    interrupted = true;
+                    break;
+                }
+            }
+            if (worker.isAlive()) {
+                worker.interrupt();
+                synchronized (lock) {
+                    if (!useCompensation && primary == worker) {
+                        primaryAbandoned = true;
+                    }
+                }
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+                log(name + " call timed out or was interrupted: " + label);
+                return new BoundedCallResult<>(false, null, null);
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return new BoundedCallResult<>(
+                    holder.completed, holder.value, holder.failure);
+        }
+
+        private void clearFinishedLocked() {
+            if (primary != null && !primary.isAlive()) {
+                primary = null;
+                primaryAbandoned = false;
+            }
+            if (compensation != null && !compensation.isAlive()) {
+                compensation = null;
+            }
+        }
+
+        boolean hasTwoStuckCalls() {
+            synchronized (lock) {
+                clearFinishedLocked();
+                return primary != null
+                        && primaryAbandoned
+                        && compensation != null;
+            }
+        }
+
+        private static final class CallHolder<T> {
+            volatile boolean completed;
+            volatile T value;
+            volatile Throwable failure;
+        }
+    }
+
+    private static final long HARDWARE_CALL_TIMEOUT_MS = 5000L;
+    private static final BoundedLatestCallLane boundedHardwareLane =
+            new BoundedLatestCallLane("SentryHardware");
+    private static final BoundedLatestCallLane boundedDiagnosticHardwareLane =
+            new BoundedLatestCallLane("SentryHardwareStatus");
+    private static final BoundedLatestCallLane boundedAccPowerQueryLane =
+            new BoundedLatestCallLane("AccPowerQuery");
+    private static final BoundedLatestCallLane
+            boundedPowerListenerRegistrationLane =
+            new BoundedLatestCallLane("PowerListenerRegistration");
+    private static final BoundedLatestCallLane
+            boundedBodyworkRegistrationLane =
+            new BoundedLatestCallLane("BodyworkRegistration");
+    private static final Object accPowerQueryLock = new Object();
+    private static long accPowerQueryRevision;
+    private static long accPowerQuerySequence;
+    private static Integer accPowerQueryDeliveredLevel;
+    private static String accPowerQuerySource;
+    private static boolean accPowerQueryHeartbeat;
+    private static Thread accPowerQueryWorker;
+
+    private static final class PowerLevelQueryRequest {
+        final long revision;
+        final long observationSequence;
+        final Integer deliveredLevel;
+        final String source;
+        final boolean heartbeat;
+
+        PowerLevelQueryRequest(
+                long revision,
+                long observationSequence,
+                Integer deliveredLevel,
+                String source,
+                boolean heartbeat) {
+            this.revision = revision;
+            this.observationSequence = observationSequence;
+            this.deliveredLevel = deliveredLevel;
+            this.source = source;
+            this.heartbeat = heartbeat;
+        }
+    }
+
+    private static void requestPowerLevelSnapshot(
+            long observationSequence,
+            Integer deliveredLevel,
+            String source,
+            boolean heartbeat) {
+        if (!running) {
+            return;
+        }
+        Throwable startFailure = null;
+        synchronized (accPowerQueryLock) {
+            accPowerQueryRevision++;
+            accPowerQuerySequence = observationSequence;
+            accPowerQueryDeliveredLevel = deliveredLevel;
+            accPowerQuerySource = source;
+            accPowerQueryHeartbeat = heartbeat;
+            if (accPowerQueryWorker == null) {
+                startFailure = startAccPowerQueryWorkerLocked();
+            }
+            accPowerQueryLock.notifyAll();
+        }
+        if (startFailure != null) {
+            log("ACC power-query worker could not start: "
+                    + startFailure.getMessage());
+            scheduleAccPowerQueryWorkerRestart();
+        }
+    }
+
+    private static Throwable startAccPowerQueryWorkerLocked() {
+        Thread worker = new Thread(
+                AccSentryDaemon::runAccPowerQueryLoop,
+                "AccPowerQuerySupervisor");
+        worker.setDaemon(true);
+        accPowerQueryWorker = worker;
+        try {
+            worker.start();
+            return null;
+        } catch (Throwable failure) {
+            accPowerQueryWorker = null;
+            return failure;
+        }
+    }
+
+    private static void scheduleAccPowerQueryWorkerRestart() {
+        android.os.Handler handler = statusHandler;
+        if (handler == null) {
+            return;
+        }
+        try {
+            handler.postDelayed(() -> {
+                Throwable startFailure = null;
+                synchronized (accPowerQueryLock) {
+                    if (running && accPowerQueryWorker == null) {
+                        startFailure =
+                                startAccPowerQueryWorkerLocked();
+                    }
+                }
+                if (startFailure != null) {
+                    log("ACC power-query worker restart failed: "
+                            + startFailure.getMessage());
+                    scheduleAccPowerQueryWorkerRestart();
+                }
+            }, 500L);
+        } catch (Throwable failure) {
+            log("ACC power-query restart could not be scheduled: "
+                    + failure.getMessage());
+        }
+    }
+
+    private static void runAccPowerQueryLoop() {
+        long retryDelayMs = 100L;
+        try {
+            while (running
+                    && !Thread.currentThread().isInterrupted()) {
+                PowerLevelQueryRequest request;
+                synchronized (accPowerQueryLock) {
+                    request = new PowerLevelQueryRequest(
+                            accPowerQueryRevision,
+                            accPowerQuerySequence,
+                            accPowerQueryDeliveredLevel,
+                            accPowerQuerySource,
+                            accPowerQueryHeartbeat);
+                }
+
+                ShellOwnership ownership = () ->
+                        isPowerLevelQueryCurrent(request);
+                BoundedCallResult<Integer> result =
+                        boundedAccPowerQueryLane.invoke(
+                                request.source,
+                                5000L,
+                                ownership,
+                                AccSentryDaemon::readPowerLevel,
+                                null);
+
+                if (!isPowerLevelQueryCurrent(request)) {
+                    retryDelayMs = 100L;
+                    continue;
+                }
+
+                Integer level = result.completed
+                        && result.failure == null
+                        ? result.value : null;
+                if (level != null
+                        && level >= POWER_LEVEL_OFF
+                        && level <= POWER_LEVEL_OK) {
+                    applyPowerLevelQueryResult(request, level);
+                    synchronized (accPowerQueryLock) {
+                        if (request.revision
+                                == accPowerQueryRevision) {
+                            accPowerQueryWorker = null;
+                            return;
+                        }
+                    }
+                    retryDelayMs = 100L;
+                    continue;
+                }
+
+                if (request.deliveredLevel != null
+                        && request.deliveredLevel >= POWER_LEVEL_OFF
+                        && request.deliveredLevel <= POWER_LEVEL_OK
+                        && isPowerLevelQueryCurrent(request)) {
+                    log("ACC HAL validation unavailable for "
+                            + request.source + "; applying current callback "
+                            + powerLevelToString(
+                                    request.deliveredLevel));
+                    applyObservedPowerLevelIfCurrent(
+                            request.deliveredLevel,
+                            request.source + " validation fallback",
+                            request.observationSequence);
+                    synchronized (accPowerQueryLock) {
+                        if (request.revision
+                                == accPowerQueryRevision) {
+                            accPowerQueryWorker = null;
+                            return;
+                        }
+                    }
+                    retryDelayMs = 100L;
+                    continue;
+                }
+
+                if (result.failure != null) {
+                    log("ACC HAL snapshot failed for "
+                            + request.source + ": "
+                            + result.failure.getMessage());
+                } else {
+                    log("ACC HAL snapshot unavailable for "
+                            + request.source + "; retrying");
+                }
+
+                synchronized (accPowerQueryLock) {
+                    if (!running) {
+                        return;
+                    }
+                    if (request.revision
+                            != accPowerQueryRevision) {
+                        retryDelayMs = 100L;
+                        continue;
+                    }
+                    try {
+                        accPowerQueryLock.wait(retryDelayMs);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    if (request.revision
+                            == accPowerQueryRevision) {
+                        retryDelayMs = Math.min(
+                                retryDelayMs * 2L, 5000L);
+                    } else {
+                        retryDelayMs = 100L;
+                    }
+                }
+            }
+        } finally {
+            boolean restart = false;
+            synchronized (accPowerQueryLock) {
+                if (accPowerQueryWorker
+                        == Thread.currentThread()) {
+                    accPowerQueryWorker = null;
+                    restart = running;
+                }
+                accPowerQueryLock.notifyAll();
+            }
+            if (restart) {
+                scheduleAccPowerQueryWorkerRestart();
             }
         }
     }
 
-    // ==================== ESCO-PARITY MCU POWER HOLD (DILINK 4) ====================
+    private static boolean isPowerLevelQueryCurrent(
+            PowerLevelQueryRequest request) {
+        synchronized (accPowerQueryLock) {
+            return running
+                    && request.revision == accPowerQueryRevision
+                    && request.observationSequence
+                        == accPowerQuerySequence;
+        }
+    }
+
+    private static void applyPowerLevelQueryResult(
+            PowerLevelQueryRequest request, int currentLevel) {
+        if (request.heartbeat) {
+            applyHeartbeatPowerLevel(
+                    currentLevel, request.observationSequence);
+            return;
+        }
+        if (request.deliveredLevel != null
+                && currentLevel
+                    != request.deliveredLevel) {
+            log("Replacing stale " + request.source + " "
+                    + powerLevelToString(
+                            request.deliveredLevel)
+                    + " with current HAL state "
+                    + powerLevelToString(currentLevel));
+        }
+        applyObservedPowerLevelIfCurrent(
+                currentLevel,
+                request.source,
+                request.observationSequence);
+    }
+
+    private static void stopAccPowerQuerySupervisor() {
+        Thread worker;
+        synchronized (accPowerQueryLock) {
+            accPowerQueryRevision++;
+            accPowerQuerySource = null;
+            worker = accPowerQueryWorker;
+            accPowerQueryWorker = null;
+            accPowerQueryLock.notifyAll();
+        }
+        if (worker != null && worker != Thread.currentThread()) {
+            worker.interrupt();
+        }
+    }
+
+    private static boolean runBoundedHardwareBoolean(
+            String label,
+            ShellOwnership ownership,
+            BoundedCall<Boolean> call,
+            Runnable staleCompensation) {
+        BoundedCallResult<Boolean> result = boundedHardwareLane.invoke(
+                label,
+                HARDWARE_CALL_TIMEOUT_MS,
+                ownership,
+                call,
+                staleCompensation);
+        if (result.failure != null) {
+            log(label + " failed: " + result.failure.getMessage());
+        }
+        return result.completed
+                && result.failure == null
+                && Boolean.TRUE.equals(result.value);
+    }
+
+    private static final class PeripheralBatchContext {
+        final long generation;
+        final boolean enabled;
+        boolean stale;
+
+        PeripheralBatchContext(long generation, boolean enabled) {
+            this.generation = generation;
+            this.enabled = enabled;
+        }
+
+        boolean ensureCurrent(String stage) {
+            if (isPeripheralPowerRequestCurrent(generation, enabled)) {
+                return true;
+            }
+            if (!stale) {
+                stale = true;
+                log("Peripheral batch became stale around " + stage
+                        + " (generation=" + generation
+                        + ", enabled=" + enabled + "); compensating latest state");
+                requestPeripheralPowerCompensation();
+            }
+            return false;
+        }
+
+        boolean writeSpecial(int configId, int value) {
+            if (!ensureCurrent("SpecialDevice[" + configId + "] pre-write")) {
+                return false;
+            }
+            // Best-effort: a HAL rejection (unsupported key on this trim) is logged
+            // and discarded, never fed back as batch failure. Continue the batch so
+            // one absent key can't skip the writes after it.
+            runBoundedHardwareBoolean(
+                    "SpecialDevice[" + configId + "]=" + value,
+                    () -> isPeripheralPowerRequestCurrent(
+                            generation, enabled),
+                    () -> setSpecialConfig(configId, value),
+                    AccSentryDaemon::requestPeripheralPowerCompensation);
+            return ensureCurrent(
+                    "SpecialDevice[" + configId + "] post-write");
+        }
+
+        boolean writePower(int configId, int value) {
+            if (!ensureCurrent("PowerDevice[" + configId + "] pre-write")) {
+                return false;
+            }
+            // Best-effort, same as writeSpecial above.
+            runBoundedHardwareBoolean(
+                    "PowerDevice[" + configId + "]=" + value,
+                    () -> isPeripheralPowerRequestCurrent(
+                            generation, enabled),
+                    () -> setPowerConfig(configId, value),
+                    AccSentryDaemon::requestPeripheralPowerCompensation);
+            return ensureCurrent(
+                    "PowerDevice[" + configId + "] post-write");
+        }
+
+        Integer readMcuStatus() {
+            if (!ensureCurrent("MCU status pre-read")) {
+                return null;
+            }
+            BoundedCallResult<Integer> result = boundedHardwareLane.invoke(
+                    "MCU status",
+                    HARDWARE_CALL_TIMEOUT_MS,
+                    () -> isPeripheralPowerRequestCurrent(
+                            generation, enabled),
+                    AccSentryDaemon::getMcuStatus,
+                    AccSentryDaemon::requestPeripheralPowerCompensation);
+            if (!result.completed || result.failure != null) {
+                return null;
+            }
+            return ensureCurrent("MCU status post-read")
+                    ? result.value : null;
+        }
+
+        boolean wakeMcu() {
+            if (!ensureCurrent("MCU wake pre-call")) {
+                return false;
+            }
+            // The wake result still drives control flow (the status re-read below),
+            // but a failed wake does not fail the batch — the writes are attempted
+            // regardless, matching the reference behaviour.
+            runBoundedHardwareBoolean(
+                    "MCU wake",
+                    () -> isPeripheralPowerRequestCurrent(
+                            generation, enabled),
+                    AccSentryDaemon::wakeUpMcu,
+                    AccSentryDaemon::requestPeripheralPowerCompensation);
+            return ensureCurrent("MCU wake post-call");
+        }
+
+        Boolean readDilink4Mode() {
+            if (!ensureCurrent("camera-mode pre-read")) {
+                return null;
+            }
+            boolean dilink4 = isDilink4CameraMode();
+            return ensureCurrent("camera-mode post-read")
+                    ? dilink4 : null;
+        }
+
+        boolean sleep(long delayMs) {
+            long deadline =
+                    android.os.SystemClock.elapsedRealtime() + delayMs;
+            while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                if (!ensureCurrent("retry delay")) {
+                    return false;
+                }
+                long remaining = deadline
+                        - android.os.SystemClock.elapsedRealtime();
+                try {
+                    Thread.sleep(Math.min(remaining, 50L));
+                } catch (InterruptedException interrupted) {
+                    Thread.interrupted();
+                    if (!ensureCurrent("interrupted retry delay")) {
+                        return false;
+                    }
+                }
+            }
+            return ensureCurrent("retry delay completion");
+        }
+
+        // The batch is fire-and-forget: reaching the end counts as applied even if
+        // individual keys were rejected, so the reconciler never re-runs it. A trim
+        // that permanently lacks a key would otherwise be retried forever (250ms-5s
+        // backoff, re-armed by every periodic re-assert) and never idle while parked.
+        boolean finish() {
+            ensureCurrent("batch completion");
+            return true;
+        }
+
+        // Never ask the reconciler to re-run: a stale batch is already superseded by
+        // the compensation request, and an aborted one (e.g. the MCU status read
+        // timing out) is picked up by the next periodic re-assert instead of a
+        // tight retry.
+        boolean abortResult() {
+            return true;
+        }
+    }
+
+    private static boolean applyPeripheralPowerBatch(
+            long generation, boolean enable) {
+        PeripheralBatchContext batch =
+                new PeripheralBatchContext(generation, enable);
+        if (!batch.ensureCurrent("batch start")) {
+            return batch.abortResult();
+        }
+        log("Configuring Peripheral Power (USB/Data): "
+                + (enable ? "ON" : "OFF")
+                + " generation=" + generation);
+
+        Boolean dilink4Value = batch.readDilink4Mode();
+        if (dilink4Value == null) {
+            return batch.abortResult();
+        }
+        boolean dilink4 = dilink4Value;
+
+        if (!enable) {
+            if (!batch.writeSpecial(
+                    SPECIAL_CONFIG_REMOTE_POWER_MODE, 0)) {
+                return batch.abortResult();
+            }
+            if (!batch.writeSpecial(
+                    SPECIAL_CONFIG_DATA_MODULE_POWER, 2)) {
+                return batch.abortResult();
+            }
+            if (!batch.writePower(OEM_MCU_POWER_HOLD_ID, 0)) {
+                return batch.abortResult();
+            }
+            if (dilink4) {
+                if (!batch.writeSpecial(OEM_SENTRY_KEY_1, 0)
+                        || !batch.writeSpecial(OEM_SENTRY_KEY_2, 2)) {
+                    return batch.abortResult();
+                }
+            }
+            if (!batch.writeSpecial(SENTRY_ISP_NEED_409_SET, 0)
+                    || !batch.writeSpecial(SENTRY_ISP_WORK_STATE_SET, 0)) {
+                return batch.abortResult();
+            }
+            return batch.finish();
+        }
+
+        if (dilink4
+                && !batch.writePower(OEM_MCU_POWER_HOLD_ID, 1)) {
+            return batch.abortResult();
+        }
+
+        Integer mcuStatusValue = batch.readMcuStatus();
+        if (mcuStatusValue == null) {
+            return batch.abortResult();
+        }
+        int mcuStatus = mcuStatusValue;
+        log("MCU status for peripheral power: " + mcuStatus);
+        if (mcuStatus != 1 && mcuStatus != 10) {
+            log("MCU not ready (status=" + mcuStatus
+                    + "), waking up and retrying...");
+            if (!batch.wakeMcu() || !batch.sleep(1000L)) {
+                return batch.abortResult();
+            }
+            mcuStatusValue = batch.readMcuStatus();
+            if (mcuStatusValue == null) {
+                return batch.abortResult();
+            }
+            mcuStatus = mcuStatusValue;
+            log("MCU status after wake: " + mcuStatus);
+            if (mcuStatus != 1 && mcuStatus != 10) {
+                if (!batch.wakeMcu() || !batch.sleep(1000L)) {
+                    return batch.abortResult();
+                }
+                log("Forcing peripheral power enable after second wake attempt");
+            }
+        }
+
+        if (!batch.writeSpecial(
+                SPECIAL_CONFIG_REMOTE_POWER_MODE, 1)
+                || !batch.writeSpecial(
+                        SPECIAL_CONFIG_DATA_MODULE_POWER, 1)) {
+            return batch.abortResult();
+        }
+        if (dilink4) {
+            if (!batch.writeSpecial(OEM_SENTRY_KEY_1, 1)
+                    || !batch.writeSpecial(OEM_SENTRY_KEY_2, 1)
+                    || !batch.writePower(OEM_MCU_POWER_HOLD_ID, 1)) {
+                return batch.abortResult();
+            }
+        }
+        if (!batch.writeSpecial(SENTRY_ISP_NEED_409_SET, 1)
+                || !batch.writeSpecial(SENTRY_ISP_WORK_STATE_SET, 1)) {
+            return batch.abortResult();
+        }
+        return batch.finish();
+    }
+
+    // ==================== OEM-PARITY MCU POWER HOLD (DILINK 4) ====================
 
     // PowerDevice eventId 0xAA00004A = -1442840502. On byd_apa firmware the
     // MCU governs the AVM/ISP power rail; without this set=1 write on the
     // sentry-wake path the rail collapses post ACC OFF and the AVMCamera
     // handle delivers all-zero buffers (size <= 1.9 KB encoded H.264).
     //
-    // Esco kh/C6861d.java m30178I (line 344) writes intValue=1 on wake and
+    // Oem kh/C6861d.java m30178I (line 344) writes intValue=1 on wake and
     // m30176G writes intValue=0 on sleep. We already write 0 on disable
-    // (configurePeripheralPower DISABLE branch). The matching set=1 was
+    // (applyPeripheralPowerBatch DISABLE branch). The matching set=1 was
     // missing on the enable branches, by mistake.
     //
     // Gated to dilink4 — legacy secondary-reference path stays bit-exact unchanged.
-    private static final int ESCO_MCU_POWER_HOLD_ID = -1442840502;
+    private static final int OEM_MCU_POWER_HOLD_ID = -1442840502;
 
-    private static void applyEscoMcuPowerHold(boolean enable) {
-        if (!isDilink4CameraMode()) return;
+    private static boolean applyOemMcuPowerHold(boolean enable) {
+        if (!isDilink4CameraMode()) return true;
         if (enable) {
-            log("[esco-parity] McuStatus = ON (PowerDevice -1442840502 = 1)");
-            setPowerConfig(ESCO_MCU_POWER_HOLD_ID, 1);
+            log("[oem-parity] McuStatus = ON (PowerDevice -1442840502 = 1)");
+            return setPowerConfig(OEM_MCU_POWER_HOLD_ID, 1);
         }
-        // Disable path is already covered in configurePeripheralPower's
+        // Disable path is already covered in applyPeripheralPowerBatch's
         // DISABLE branch via setPowerConfig(-1442840502, 0); no separate
         // call needed here. Kept symmetric for future callers.
+        return true;
     }
 
     // ==================== V1-PARITY UNCONDITIONAL POWER HOLD (DILINK 4) ====================
@@ -534,8 +1248,8 @@ public class AccSentryDaemon {
      * and it <b>never sleeps the MCU at all</b> — no voltage hysteresis, no
      * 15-minute deferred sleep, no {@code getMcuStatus} gate.
      *
-     * <p>Our equivalent write ({@link #applyEscoMcuPowerHold}) only fires from
-     * inside {@link #configurePeripheralPower}'s branches, all of which are
+     * <p>Our equivalent write ({@link #applyOemMcuPowerHold}) only fires from
+     * inside {@link #applyPeripheralPowerBatch}'s branches, all of which are
      * predicated on {@code getMcuStatus()} reading 1 or 10 (or on a wake-retry
      * succeeding). When the MCU reports any other status the hold was never
      * written, so on DiLink 4 the AVM/ISP rail could collapse right after ACC OFF
@@ -545,11 +1259,11 @@ public class AccSentryDaemon {
      * does run), cheap (one binder write), and gated to
      * {@code cameraMode=dilink4} so the legacy fleet's sequence is byte-identical.
      */
-    private static void applyV1ParityMcuPowerHold() {
-        if (!isDilink4CameraMode()) return;
+    private static boolean applyV1ParityMcuPowerHold() {
+        if (!isDilink4CameraMode()) return true;
         log("[v1-parity] unconditional MCU power hold (PowerDevice -1442840502 = 1) "
             + "— no MCU-status precondition, mirrors reference-app default mode 0 (V1)");
-        setPowerConfig(ESCO_MCU_POWER_HOLD_ID, 1);
+        return setPowerConfig(OEM_MCU_POWER_HOLD_ID, 1);
     }
 
     // NOTE: the matching "never sleep the MCU on dilink4" gate lives in
@@ -558,33 +1272,35 @@ public class AccSentryDaemon {
     // (it must work in whichever process boots it), exactly as it already does
     // for isKeepUsbPowerOnAccOff().
 
-    // ==================== ESCO-PARITY SENTRY KEYS (DILINK 4) ====================
+    // ==================== OEM-PARITY SENTRY KEYS (DILINK 4) ====================
 
-    // Esco's BatteryVoltageMonitorV2 sentry keep-alive IDs. Different magic
+    // Oem's BatteryVoltageMonitorV2 sentry keep-alive IDs. Different magic
     // numbers from our 782237711 / 782237728 (which are secondary-reference-derived, kept
     // additive and unchanged for legacy fleet). On byd_apa firmware the
     // AVMCamera HAL gates frame production on these specific BYD-internal
     // peripheral-power flags being held active; without them the producer
     // surface delivers all-zero pixels post ACC OFF.
     //
-    // ENABLE  (esco kh/C6861d.java m30171B "sentry wakeUp"): [1901]=1, [1902]=1
-    // DISABLE (esco kh/C6861d.java m30170A "sentry sleep"):  [1901]=0, [1902]=2
+    // ENABLE  (oem kh/C6861d.java m30171B "sentry wakeUp"): [1901]=1, [1902]=1
+    // DISABLE (oem kh/C6861d.java m30170A "sentry sleep"):  [1901]=0, [1902]=2
     //
     // Gated to cameraMode=dilink4. Legacy cars don't read or write these.
-    private static final int ESCO_SENTRY_KEY_1 = 1901;
-    private static final int ESCO_SENTRY_KEY_2 = 1902;
+    private static final int OEM_SENTRY_KEY_1 = 1901;
+    private static final int OEM_SENTRY_KEY_2 = 1902;
 
-    private static void applyEscoSentrySpecialConfig(boolean enable) {
-        if (!isDilink4CameraMode()) return;
+    private static boolean applyOemSentrySpecialConfig(boolean enable) {
+        if (!isDilink4CameraMode()) return true;
+        boolean success = true;
         if (enable) {
-            log("[esco-parity] sentry wakeUp: SpecialDevice [1901]=1, [1902]=1");
-            setSpecialConfig(ESCO_SENTRY_KEY_1, 1);
-            setSpecialConfig(ESCO_SENTRY_KEY_2, 1);
+            log("[oem-parity] sentry wakeUp: SpecialDevice [1901]=1, [1902]=1");
+            success &= setSpecialConfig(OEM_SENTRY_KEY_1, 1);
+            success &= setSpecialConfig(OEM_SENTRY_KEY_2, 1);
         } else {
-            log("[esco-parity] sentry sleep: SpecialDevice [1901]=0, [1902]=2");
-            setSpecialConfig(ESCO_SENTRY_KEY_1, 0);
-            setSpecialConfig(ESCO_SENTRY_KEY_2, 2);
+            log("[oem-parity] sentry sleep: SpecialDevice [1901]=0, [1902]=2");
+            success &= setSpecialConfig(OEM_SENTRY_KEY_1, 0);
+            success &= setSpecialConfig(OEM_SENTRY_KEY_2, 2);
         }
+        return success;
     }
 
     // ==================== SENTRY ISP / CAMERA POWER VOTE (409) ====================
@@ -592,7 +1308,7 @@ public class AccSentryDaemon {
     // The OEM BYD Sentry Mode app (com.byd.sentrymode) casts a dedicated
     // camera/ISP power vote on its sentry-arm path that NONE of our existing
     // keep-alive writes cover. The secondary-reference keys (782237711/782237728) hold the
-    // 5V/modem/USB rails; the esco keys (1901/1902) and MCU hold (-1442840502)
+    // 5V/modem/USB rails; the oem keys (1901/1902) and MCU hold (-1442840502)
     // hold the byd_apa AVM rail on dilink4. But the OEM's "409" pair is the
     // sentry-mode CAMERA/ISP power request specifically. Without it, on certain
     // trims the AVM ISP rail power-gates after ~30-35 min of inactivity and
@@ -607,7 +1323,7 @@ public class AccSentryDaemon {
     //   SentryModeFuncRequest:451   set409Value(1); set409SentryState(1);  (arm)
     //   AutoApiManager:976-977      set409Value(0); set409SentryState(0);  (exit)
     //   The OEM gates set409Value on isMcuWake()/wakeUpMcu(); our callers
-    //   (configurePeripheralPower / keep-alive) only fire this after the MCU is
+    //   (applyPeripheralPowerBatch / keep-alive) only fire this after the MCU is
     //   already confirmed awake, so no extra wake is needed here.
     //
     // Applied FLEET-WIDE (NOT gated to dilink4): the OEM writes these from the
@@ -619,12 +1335,13 @@ public class AccSentryDaemon {
     private static final int SENTRY_ISP_NEED_409_SET   = 0x4090103E;
     private static final int SENTRY_ISP_WORK_STATE_SET = 0x4090103C;
 
-    private static void applySentryIspPowerVote(boolean enable) {
+    private static boolean applySentryIspPowerVote(boolean enable) {
         int v = enable ? 1 : 0;
         log("[sentry-isp] 409 camera/ISP power vote " + (enable ? "ON" : "OFF")
             + ": SpecialDevice[0x4090103E]=" + v + " [0x4090103C]=" + v);
-        setSpecialConfig(SENTRY_ISP_NEED_409_SET, v);
-        setSpecialConfig(SENTRY_ISP_WORK_STATE_SET, v);
+        boolean success = setSpecialConfig(SENTRY_ISP_NEED_409_SET, v);
+        success &= setSpecialConfig(SENTRY_ISP_WORK_STATE_SET, v);
+        return success;
     }
     
     /**
@@ -684,6 +1401,9 @@ public class AccSentryDaemon {
             System.exit(1);
             return;
         }
+        if (!publishParkReaperBootCancellation()) {
+            log("WARNING: could not invalidate detached reapers from an older process");
+        }
 
         log("=== ACC Sentry Daemon Starting ===");
         log("UID: " + myUid + " (expected: 2000 shell)");
@@ -729,6 +1449,7 @@ public class AccSentryDaemon {
 
         // Create handler for periodic status checks
         statusHandler = new android.os.Handler(Looper.myLooper());
+        pumpFallbackReconcilerRetries();
 
         try {
             Context context = createAppContext();
@@ -748,7 +1469,7 @@ public class AccSentryDaemon {
                 //dumpPowerManagerMethods();
                 //dumpBydPowerDeviceMethods();
                 //dumpBydSettingDeviceMethods();
-                
+
                 // Dump all BYD device methods for discovery
                 //dumpAllBydDeviceMethods();
                 
@@ -787,7 +1508,7 @@ public class AccSentryDaemon {
                 // screen already reads on, so this is a no-op on a normal boot.
                 try {
                     if (!com.overdrive.app.monitor.AccMonitor.probeAccState(appContext)) {
-                        com.overdrive.app.power.StealthPanel.turnOn(appContext);
+                        requestPanelForLatestTransition();
                     }
                 } catch (Throwable t) {
                     log("Stealth panel boot recovery failed: " + t.getMessage());
@@ -820,43 +1541,14 @@ public class AccSentryDaemon {
                 log("WARNING: Running without context");
             }
 
-            // Register bodywork listener for ACC state changes. On cold boot
-            // BYD's bodywork service may not be up yet — historically this
-            // failed silently and the daemon ran as a wakelock-holding zombie
-            // forever (no ACC events ever delivered). Retry with backoff so
-            // a slow service-startup window doesn't strand us.
-            boolean registered = registerBodyworkListener(context);
-            if (!registered && context != null) {
-                final int maxRetries = 5;
-                final long retryDelayMs = 5000L;
-                for (int attempt = 1; attempt <= maxRetries && !registered; attempt++) {
-                    log("Bodywork listener registration failed — retry "
-                        + attempt + "/" + maxRetries + " in " + (retryDelayMs / 1000) + "s");
-                    try {
-                        Thread.sleep(retryDelayMs);
-                    } catch (InterruptedException ie) {
-                        log("Bodywork-listener retry interrupted — proceeding without listener");
-                        break;
-                    }
-                    registered = registerBodyworkListener(context);
-                }
-            }
-            if (registered) {
-                bodyworkRegistered = true;
-                // Periodic ACC state heartbeat — repairs the wedge where
-                // CameraDaemon restarts mid-drive and never receives an
-                // edge-only ACC IPC. Cheap (~1 HAL probe / 30 s).
-                startAccStateHeartbeat();
-            } else {
-                log("Bodywork listener failed after retries — starting slow-retry every 60s "
-                    + "(daemon should never run without a listener if one can be eventually established)");
-                startBodyworkSlowRetry(context);
-            }
+            // Registration can enter a vendor Binder call that never returns.
+            // Keep startup moving while a bounded supervisor retries it.
+            startBodyworkListenerRegistrationSupervisor(context);
 
-            // Esco-parity: ALSO register BYDAutoPowerDevice
+            // Oem-parity: ALSO register BYDAutoPowerDevice
             // onPowerCtlStatusChanged listener for event id 0x99000037
-            // (= -1728053193). Esco's sentry/camera pipeline gates on this
-            // signal (esco bk/C1478c.java:71-75 and p111dh/C4995i.java
+            // (= -1728053193). Oem's sentry/camera pipeline gates on this
+            // signal (oem bk/C1478c.java:71-75 and p111dh/C4995i.java
             // FlameoutService). The bodywork onPowerLevelChanged signal is
             // different in timing/state from the power-ctl signal on
             // byd_apa firmware. Both listeners fan into the same
@@ -866,11 +1558,7 @@ public class AccSentryDaemon {
             // Gated to dilink4 — legacy fleet keeps the bodywork-only
             // path bit-exact unchanged.
             if (isDilink4CameraMode()) {
-                try {
-                    registerPowerListener(context);
-                } catch (Throwable t) {
-                    log("BYDAutoPowerDevice listener registration failed: " + t.getMessage());
-                }
+                startPowerListenerRegistrationSupervisor(context);
             }
 
             log("Daemon running, entering persistence loop...");
@@ -1120,7 +1808,7 @@ public class AccSentryDaemon {
      * SDK ≥ 31 → byd_datacached.setAppStartupData(uid, 0)
      * SDK < 31 → bg_datacache.setAppOpsData(uid, 0)
      *
-     * Threshold matches esco's C0241c.m941c() — earlier we used >= 32, but
+     * Threshold matches oem's C0241c.m941c() — earlier we used >= 32, but
      * BYD DiLink 4 ROMs that ship Android 12 (API 31) base have the new
      * byd_datacached service available, and the old bg_datacache.setAppOpsData
      * gates on ACCESS_APPOPSDATA (denied to shell UID 2000 → frames all-black
@@ -1144,7 +1832,7 @@ public class AccSentryDaemon {
         log("Applying data-cache whitelist for " + pkg + " (uid=" + appUid + ")");
 
         Context permissiveContext = new PermissionBypassContext(appContext);
-        // Probe both services — esco gates on SDK_INT >= 31, but some BYD
+        // Probe both services — oem gates on SDK_INT >= 31, but some BYD
         // ROMs (DiLink 4 on Android 11 base, build markers report SDK 30
         // even though the BYD branding says "DiLink 4") expose
         // byd_datacached without bumping SDK_INT. Try the new service
@@ -1189,7 +1877,8 @@ public class AccSentryDaemon {
 
     // ==================== ACC STATE DETECTION ====================
 
-    private static boolean registerBodyworkListener(Context context) {
+    private static boolean registerBodyworkListener(
+            Context context, AccListener listener) {
         if (context == null) return false;
 
         try {
@@ -1209,47 +1898,15 @@ public class AccSentryDaemon {
             Class<?> listenerClass = Class.forName("android.hardware.bydauto.bodywork.AbsBYDAutoBodyworkListener");
             Method registerListener = deviceClass.getMethod("registerListener", listenerClass);
 
-            AccListener listener = new AccListener();
             registerListener.invoke(device, listener);
 
             log("Bodywork listener registered!");
 
-            // Get initial power level
-            try {
-                Method getPowerLevel = deviceClass.getMethod("getPowerLevel");
-                int level = (Integer) getPowerLevel.invoke(device);
-                log("Initial power level: " + powerLevelToString(level));
-
-                if (level < 0 || level > 3) {
-                    // HAL is bluffing on first probe (FAKE_OK=4, INVALID=255,
-                    // or anything else). Don't seed lastPowerLevel with
-                    // garbage and don't push a misleading IPC. The first
-                    // real onPowerLevelChanged event will set the correct
-                    // initial value; until then the daemon defers to its
-                    // own conservative defaults (no sentry, no notify).
-                    // lastPowerLevel stays at its class-default (-1, see
-                    // field declaration above). On the first real event:
-                    //   - real OFF(0) → 0 != -1 → enterSentryMode (correct)
-                    //   - real ON(2/3) → 2 >= 2 && -1 < 2 → exitSentryMode,
-                    //     which is a no-op because !inSentryMode (correct)
-                    // Both branches converge on the right state via the
-                    // existing idempotency guards in enter/exitSentryMode.
-                    log("Initial power level is sentinel — deferring state seed; "
-                            + "first real onPowerLevelChanged event will initialize");
-                } else {
-                    lastPowerLevel = level;
-                    if (level == POWER_LEVEL_OFF) {
-                        log("Started with ACC OFF - entering sentry mode");
-                        enterSentryMode();
-                    } else {
-                        // ACC is ON - notify CameraDaemon so AccMonitor has correct state
-                        log("Started with ACC ON - notifying CameraDaemon");
-                        notifyAccState(false);  // accOff=false means ACC is ON
-                    }
-                }
-            } catch (Exception e) {
-                log("Could not get initial power level: " + e.getMessage());
-            }
+            requestPowerLevelSnapshot(
+                    currentAccObservationSequence(),
+                    null,
+                    "initial bodywork snapshot",
+                    false);
 
             return true;
 
@@ -1259,19 +1916,224 @@ public class AccSentryDaemon {
         }
     }
 
-    // ==================== ESCO-PARITY POWER LISTENER ====================
+    private static void startBodyworkListenerRegistrationSupervisor(
+            Context context) {
+        if (context == null) {
+            return;
+        }
+        synchronized (bodyworkRegistrationLock) {
+            if (!running || bodyworkRegistered
+                    || bodyworkRegistrationThread != null) {
+                return;
+            }
+            long lifecycleGeneration =
+                    ++bodyworkLifecycleGeneration;
+            Thread worker = new Thread(
+                    () -> runBodyworkRegistrationSupervisor(
+                            context, lifecycleGeneration),
+                    "BodyworkRegistration-" + lifecycleGeneration);
+            worker.setDaemon(true);
+            bodyworkRegistrationThread = worker;
+            try {
+                worker.start();
+            } catch (Throwable failure) {
+                bodyworkRegistrationThread = null;
+                log("Bodywork registration supervisor could not start: "
+                        + failure.getMessage());
+                requestControlledDaemonRecovery(
+                        "bodywork registration supervisor start failure");
+            }
+        }
+    }
+
+    private static void runBodyworkRegistrationSupervisor(
+            Context context, long lifecycleGeneration) {
+        long retryDelayMs = 1000L;
+        try {
+            while (isBodyworkLifecycleCurrent(
+                    lifecycleGeneration)) {
+                final long attemptGeneration;
+                synchronized (bodyworkRegistrationLock) {
+                    attemptGeneration =
+                            ++bodyworkAttemptGeneration;
+                }
+                AccListener listener = new AccListener(
+                        lifecycleGeneration, attemptGeneration);
+                ShellOwnership ownership = () ->
+                        isBodyworkAttemptCurrent(
+                                lifecycleGeneration,
+                                attemptGeneration);
+                BoundedCallResult<Boolean> result =
+                        boundedBodyworkRegistrationLane.invoke(
+                                "register attempt " + attemptGeneration,
+                                5000L,
+                                ownership,
+                                () -> registerBodyworkListener(
+                                        context, listener),
+                                null);
+                if (!result.completed
+                        && result.failure == null
+                        && boundedBodyworkRegistrationLane
+                            .hasTwoStuckCalls()) {
+                    requestControlledDaemonRecovery(
+                            "both bodywork registration lanes wedged");
+                    return;
+                }
+                if (result.failure != null) {
+                    log("Bodywork registration attempt "
+                            + attemptGeneration + " failed: "
+                            + result.failure.getMessage());
+                }
+                if (result.completed
+                        && result.failure == null
+                        && Boolean.TRUE.equals(result.value)) {
+                    synchronized (bodyworkRegistrationLock) {
+                        if (running
+                                && lifecycleGeneration
+                                    == bodyworkLifecycleGeneration
+                                && attemptGeneration
+                                    == bodyworkAttemptGeneration) {
+                            activeBodyworkAttempt =
+                                    attemptGeneration;
+                            bodyworkRegistered = true;
+                            startAccStateHeartbeat();
+                            return;
+                        }
+                    }
+                }
+                if (!sleepForBodyworkRetry(
+                        lifecycleGeneration, retryDelayMs)) {
+                    return;
+                }
+                retryDelayMs = Math.min(
+                        retryDelayMs * 2L, 60_000L);
+            }
+        } finally {
+            synchronized (bodyworkRegistrationLock) {
+                if (bodyworkRegistrationThread
+                        == Thread.currentThread()) {
+                    bodyworkRegistrationThread = null;
+                }
+            }
+        }
+    }
+
+    private static boolean sleepForBodyworkRetry(
+            long lifecycleGeneration, long delayMs) {
+        long deadline = android.os.SystemClock.elapsedRealtime()
+                + Math.max(1L, delayMs);
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            if (!isBodyworkLifecycleCurrent(
+                    lifecycleGeneration)) {
+                return false;
+            }
+            try {
+                long remaining = deadline
+                        - android.os.SystemClock.elapsedRealtime();
+                if (remaining <= 0L) {
+                    break;
+                }
+                Thread.sleep(Math.min(100L, remaining));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return isBodyworkLifecycleCurrent(
+                lifecycleGeneration);
+    }
+
+    private static boolean isBodyworkLifecycleCurrent(
+            long lifecycleGeneration) {
+        synchronized (bodyworkRegistrationLock) {
+            return running
+                    && !bodyworkRegistered
+                    && lifecycleGeneration
+                        == bodyworkLifecycleGeneration;
+        }
+    }
+
+    private static boolean isBodyworkAttemptCurrent(
+            long lifecycleGeneration, long attemptGeneration) {
+        synchronized (bodyworkRegistrationLock) {
+            return running
+                    && !bodyworkRegistered
+                    && lifecycleGeneration
+                        == bodyworkLifecycleGeneration
+                    && attemptGeneration
+                        == bodyworkAttemptGeneration;
+        }
+    }
+
+    private static boolean isBodyworkCallbackCurrent(
+            long lifecycleGeneration, long attemptGeneration) {
+        synchronized (bodyworkRegistrationLock) {
+            return running
+                    && bodyworkRegistered
+                    && lifecycleGeneration
+                        == bodyworkLifecycleGeneration
+                    && attemptGeneration
+                        == activeBodyworkAttempt;
+        }
+    }
+
+    private static void stopBodyworkRegistrationSupervisor() {
+        Thread worker;
+        synchronized (bodyworkRegistrationLock) {
+            bodyworkLifecycleGeneration++;
+            bodyworkAttemptGeneration++;
+            activeBodyworkAttempt = -1L;
+            bodyworkRegistered = false;
+            worker = bodyworkRegistrationThread;
+            bodyworkRegistrationThread = null;
+        }
+        if (worker != null && worker != Thread.currentThread()) {
+            worker.interrupt();
+        }
+    }
+
+    private static void requestControlledDaemonRecovery(
+            String reason) {
+        if (!controlledRecoveryRequested.compareAndSet(
+                false, true)) {
+            return;
+        }
+        log("FATAL: requesting controlled daemon recovery: "
+                + reason);
+        try {
+            Thread recovery = new Thread(() -> {
+                try {
+                    Thread.sleep(250L);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+                android.os.Process.killProcess(
+                        android.os.Process.myPid());
+            }, "AccSentryControlledRecovery");
+            recovery.setDaemon(false);
+            recovery.start();
+        } catch (Throwable failure) {
+            log("Controlled recovery worker failed: "
+                    + failure.getMessage());
+            android.os.Process.killProcess(
+                    android.os.Process.myPid());
+        }
+    }
+
+    // ==================== OEM-PARITY POWER LISTENER ====================
 
     /** BYD power-ctl event id 0x99000037 = -1728053193, value 0=ACC OFF,
-     *  value 1=ACC ON. Source: esco bk/C1478c.java:71-75. */
+     *  value 1=ACC ON. Source: oem bk/C1478c.java:71-75. */
     private static final int POWER_CTL_EVENT_ACC = -1728053193;
 
-    /** Register esco-style BYDAutoPowerDevice.onPowerCtlStatusChanged
+    /** Register oem-style BYDAutoPowerDevice.onPowerCtlStatusChanged
      *  listener via reflection. Runs in parallel with the bodywork
      *  listener; whichever fires first wins. */
-    private static boolean registerPowerListener(Context context) {
+    private static boolean registerPowerListener(
+            Context context, OemStylePowerListener listener) {
         if (context == null) return false;
         try {
-            log("Registering BYDAutoPowerDevice listener (esco-parity)...");
+            log("Registering BYDAutoPowerDevice listener (oem-parity)...");
 
             Class<?> deviceClass = Class.forName(
                 "android.hardware.bydauto.power.BYDAutoPowerDevice");
@@ -1292,8 +2154,8 @@ public class AccSentryDaemon {
             // — at runtime BYD's bmmcamera.jar provides the real class.
             // Subclass directly; if the runtime class signature differs
             // we'll catch via the outer try/catch.
-            registerListener.invoke(device, new EscoStylePowerListener());
-            log("BYDAutoPowerDevice listener registered (esco-parity)");
+            registerListener.invoke(device, listener);
+            log("BYDAutoPowerDevice listener registered (oem-parity)");
             return true;
         } catch (ClassNotFoundException cnf) {
             log("BYDAutoPowerDevice classes not on this ROM: " + cnf.getMessage());
@@ -1304,80 +2166,374 @@ public class AccSentryDaemon {
         }
     }
 
+    private static void startPowerListenerRegistrationSupervisor(
+            Context context) {
+        if (context == null) {
+            return;
+        }
+        synchronized (powerListenerRegistrationLock) {
+            if (!running || powerListenerRegistered
+                    || (powerListenerRegistrationThread != null
+                        && powerListenerRegistrationThread.isAlive())) {
+                return;
+            }
+            long lifecycleGeneration =
+                    ++powerListenerLifecycleGeneration;
+            startPowerListenerRegistrationWorkerLocked(
+                    context, lifecycleGeneration);
+        }
+    }
+
+    private static void startPowerListenerRegistrationWorkerLocked(
+            Context context, long lifecycleGeneration) {
+        Thread worker = new Thread(
+                () -> runPowerListenerRegistrationSupervisor(
+                        context, lifecycleGeneration),
+                "PowerListenerRegistration-" + lifecycleGeneration);
+        worker.setDaemon(true);
+        powerListenerRegistrationThread = worker;
+        try {
+            worker.start();
+        } catch (Throwable startFailure) {
+            powerListenerRegistrationThread = null;
+            log("Power-listener registration supervisor could not start: "
+                    + startFailure.getMessage());
+            schedulePowerListenerRegistrationRestart(
+                    context, lifecycleGeneration);
+        }
+    }
+
+    private static void schedulePowerListenerRegistrationRestart(
+            Context context, long lifecycleGeneration) {
+        android.os.Handler handler = statusHandler;
+        if (handler == null) {
+            return;
+        }
+        try {
+            handler.postDelayed(() -> {
+                synchronized (powerListenerRegistrationLock) {
+                    if (!running
+                            || powerListenerRegistered
+                            || lifecycleGeneration
+                                != powerListenerLifecycleGeneration
+                            || powerListenerRegistrationThread != null) {
+                        return;
+                    }
+                    startPowerListenerRegistrationWorkerLocked(
+                            context, lifecycleGeneration);
+                }
+            }, 1000L);
+        } catch (Throwable failure) {
+            log("Power-listener supervisor restart could not be scheduled: "
+                    + failure.getMessage());
+        }
+    }
+
+    private static void runPowerListenerRegistrationSupervisor(
+            Context context, long lifecycleGeneration) {
+        long retryDelayMs = 1000L;
+        try {
+            while (isPowerListenerLifecycleCurrent(
+                    lifecycleGeneration)) {
+                final long attemptGeneration;
+                synchronized (powerListenerRegistrationLock) {
+                    if (!running
+                            || lifecycleGeneration
+                                != powerListenerLifecycleGeneration
+                            || powerListenerRegistered) {
+                        return;
+                    }
+                    attemptGeneration =
+                            ++powerListenerAttemptGeneration;
+                }
+
+                OemStylePowerListener listener =
+                        new OemStylePowerListener(
+                                lifecycleGeneration,
+                                attemptGeneration);
+                ShellOwnership ownership = () ->
+                        isPowerListenerAttemptCurrent(
+                                lifecycleGeneration,
+                                attemptGeneration);
+                BoundedCallResult<Boolean> result =
+                        boundedPowerListenerRegistrationLane.invoke(
+                                "register attempt "
+                                        + attemptGeneration,
+                                5000L,
+                                ownership,
+                                () -> registerPowerListener(
+                                        context, listener),
+                                null);
+                if (!result.completed
+                        && result.failure == null
+                        && boundedPowerListenerRegistrationLane
+                            .hasTwoStuckCalls()) {
+                    requestControlledDaemonRecovery(
+                            "both power-listener registration lanes wedged");
+                    return;
+                }
+                if (result.failure != null) {
+                    log("Power-listener registration attempt "
+                            + attemptGeneration + " failed: "
+                            + result.failure.getMessage());
+                }
+                if (result.completed
+                        && result.failure == null
+                        && Boolean.TRUE.equals(result.value)) {
+                    synchronized (powerListenerRegistrationLock) {
+                        if (running
+                                && lifecycleGeneration
+                                    == powerListenerLifecycleGeneration
+                                && attemptGeneration
+                                    == powerListenerAttemptGeneration) {
+                            activePowerListenerAttempt =
+                                    attemptGeneration;
+                            powerListenerRegistered = true;
+                            log("Power-listener registration supervisor "
+                                    + "succeeded on attempt "
+                                    + attemptGeneration);
+                            return;
+                        }
+                    }
+                }
+
+                if (!sleepForPowerListenerRetry(
+                        lifecycleGeneration, retryDelayMs)) {
+                    return;
+                }
+                retryDelayMs = Math.min(
+                        retryDelayMs * 2L, 60_000L);
+            }
+        } finally {
+            boolean restart = false;
+            synchronized (powerListenerRegistrationLock) {
+                if (powerListenerRegistrationThread
+                        == Thread.currentThread()) {
+                    powerListenerRegistrationThread = null;
+                    restart = running
+                            && !powerListenerRegistered
+                            && lifecycleGeneration
+                                == powerListenerLifecycleGeneration;
+                }
+            }
+            if (restart) {
+                schedulePowerListenerRegistrationRestart(
+                        context, lifecycleGeneration);
+            }
+        }
+    }
+
+    private static boolean sleepForPowerListenerRetry(
+            long lifecycleGeneration, long delayMs) {
+        long deadline = android.os.SystemClock.elapsedRealtime()
+                + Math.max(1L, delayMs);
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            if (!isPowerListenerLifecycleCurrent(
+                    lifecycleGeneration)) {
+                return false;
+            }
+            long remaining = deadline
+                    - android.os.SystemClock.elapsedRealtime();
+            try {
+                Thread.sleep(Math.min(remaining, 100L));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return isPowerListenerLifecycleCurrent(
+                lifecycleGeneration);
+    }
+
+    private static boolean isPowerListenerLifecycleCurrent(
+            long lifecycleGeneration) {
+        synchronized (powerListenerRegistrationLock) {
+            return running
+                    && lifecycleGeneration
+                        == powerListenerLifecycleGeneration
+                    && !powerListenerRegistered;
+        }
+    }
+
+    private static boolean isPowerListenerAttemptCurrent(
+            long lifecycleGeneration, long attemptGeneration) {
+        synchronized (powerListenerRegistrationLock) {
+            return running
+                    && !powerListenerRegistered
+                    && lifecycleGeneration
+                        == powerListenerLifecycleGeneration
+                    && attemptGeneration
+                        == powerListenerAttemptGeneration;
+        }
+    }
+
+    private static boolean isPowerListenerCallbackCurrent(
+            long lifecycleGeneration, long attemptGeneration) {
+        synchronized (powerListenerRegistrationLock) {
+            return running
+                    && powerListenerRegistered
+                    && lifecycleGeneration
+                        == powerListenerLifecycleGeneration
+                    && attemptGeneration
+                        == activePowerListenerAttempt;
+        }
+    }
+
+    private static void stopPowerListenerRegistrationSupervisor() {
+        Thread worker;
+        synchronized (powerListenerRegistrationLock) {
+            powerListenerLifecycleGeneration++;
+            powerListenerAttemptGeneration++;
+            activePowerListenerAttempt = -1L;
+            powerListenerRegistered = false;
+            worker = powerListenerRegistrationThread;
+            powerListenerRegistrationThread = null;
+        }
+        if (worker != null && worker != Thread.currentThread()) {
+            worker.interrupt();
+        }
+    }
+
     /** Concrete subclass of AbsBYDAutoPowerListener that drives the
      *  same enterSentryMode/exitSentryMode as the bodywork listener.
-     *  Mirrors esco bk/C1478c.java:65-77. The bytecode is loaded by the
+     *  Mirrors oem bk/C1478c.java:65-77. The bytecode is loaded by the
      *  daemon process against BYD's runtime class via the SDK stub. */
-    private static class EscoStylePowerListener
+    private static class OemStylePowerListener
         extends AbsBYDAutoPowerListener {
+        private final long lifecycleGeneration;
+        private final long attemptGeneration;
+
+        OemStylePowerListener(
+                long lifecycleGeneration, long attemptGeneration) {
+            this.lifecycleGeneration = lifecycleGeneration;
+            this.attemptGeneration = attemptGeneration;
+        }
+
         @Override
         public void onPowerCtlStatusChanged(int eventId, int value) {
+            if (!isPowerListenerCallbackCurrent(
+                    lifecycleGeneration, attemptGeneration)) {
+                return;
+            }
             if (eventId == POWER_CTL_EVENT_ACC) {
                 log(">>> POWER CTL: " + (value == 0 ? "ACC OFF" : "ACC ON")
                     + " (event=0x" + Integer.toHexString(eventId)
                     + ", value=" + value + ")");
-                if (value == 0) {
-                    enterSentryMode();
-                } else if (value == 1) {
-                    exitSentryMode();
+                if (value == 0 || value == 1) {
+                    int level = value == 0 ? POWER_LEVEL_OFF : POWER_LEVEL_ON;
+                    applyValidatedPowerEvent(level, "power-ctl listener");
+                } else {
+                    log("Ignoring invalid power-ctl ACC value " + value);
                 }
             }
         }
     }
 
+    private static long nextAccObservationSequence() {
+        synchronized (accObservationLock) {
+            return accCallbackSequence.incrementAndGet();
+        }
+    }
+
+    private static long currentAccObservationSequence() {
+        synchronized (accObservationLock) {
+            return accCallbackSequence.get();
+        }
+    }
+
+    private static boolean applyObservedPowerLevelIfCurrent(
+            int level, String source, long observationSequence) {
+        synchronized (accObservationLock) {
+            long currentSequence = accCallbackSequence.get();
+            if (observationSequence != currentSequence) {
+                log("Discarding stale " + source + " observation "
+                        + powerLevelToString(level) + " (sequence="
+                        + observationSequence + ", current="
+                        + currentSequence + ")");
+                return false;
+            }
+            return applyObservedPowerLevelLocked(
+                    level, source, observationSequence);
+        }
+    }
+
+    private static void applyValidatedPowerEvent(
+            int deliveredLevel, String source) {
+        long observationSequence = nextAccObservationSequence();
+        requestPowerLevelSnapshot(
+                observationSequence, deliveredLevel, source, false);
+    }
+
+    private static boolean applyObservedPowerLevelLocked(
+            int level, String source, long observationSequence) {
+        log("ACC observation from " + source + ": "
+                + powerLevelToString(level) + " (sequence="
+                + observationSequence + ")");
+        handlePowerLevelChanged(level);
+        return true;
+    }
+
+    private static void handlePowerLevelChanged(int level) {
+        log(">>> POWER LEVEL: " + powerLevelToString(level) + " (was: "
+                + powerLevelToString(lastPowerLevel) + ")");
+
+        // Reject sentinel readings without changing the prior definitive state.
+        if (level < 0 || level > 3) {
+            log("Sentinel power level " + powerLevelToString(level)
+                    + " — ignoring (lastPowerLevel stays "
+                    + powerLevelToString(lastPowerLevel) + ")");
+            return;
+        }
+
+        if (level == POWER_LEVEL_OFF && lastPowerLevel != POWER_LEVEL_OFF) {
+            log("ACC OFF detected");
+            enterSentryMode();
+        } else if (level >= POWER_LEVEL_ON && lastPowerLevel < POWER_LEVEL_ON) {
+            log("ACC ON detected");
+            exitSentryMode();
+        } else if (level == POWER_LEVEL_ACC && lastPowerLevel >= POWER_LEVEL_ON) {
+            log("ACC level dropped from ON to ACC — treating as ACC OFF "
+                    + "(BYD app shutdown)");
+            enterSentryMode();
+        }
+
+        lastPowerLevel = level;
+    }
+
     private static class AccListener extends AbsBYDAutoBodyworkListener {
+        private final long lifecycleGeneration;
+        private final long attemptGeneration;
+
+        AccListener(
+                long lifecycleGeneration, long attemptGeneration) {
+            this.lifecycleGeneration = lifecycleGeneration;
+            this.attemptGeneration = attemptGeneration;
+        }
+
         @Override
         public void onPowerLevelChanged(int level) {
-            log(">>> POWER LEVEL: " + powerLevelToString(level) + " (was: " + powerLevelToString(lastPowerLevel) + ")");
-
-            // Reject sentinel readings (FAKE_OK=4, INVALID=255, or any
-            // value outside the documented 0..3 range). The HAL emits
-            // these when state is transiently unreliable. Treating them
-            // as ACC=ON (because they satisfy `>= POWER_LEVEL_ON`) would:
-            //   1. Falsely exit sentry mode on a HAL bluff → trigger
-            //      surveillance teardown + IPC to AccMonitor saying
-            //      "ACC ON" → false recording activation downstream.
-            //   2. Cache 255 into `lastPowerLevel` → the NEXT legitimate
-            //      ACC=ON event would silently fail because
-            //      `level >= 2 && lastPowerLevel < 2` evaluates false
-            //      (255 is not < 2). The daemon would stay stuck in
-            //      sentry until the next OFF/ON cycle.
-            // So we drop the event entirely — don't fire any transition,
-            // don't update lastPowerLevel. The next legitimate reading
-            // will compare against the actual prior state.
-            if (level < 0 || level > 3) {
-                log("Sentinel power level " + powerLevelToString(level)
-                        + " — ignoring (lastPowerLevel stays "
-                        + powerLevelToString(lastPowerLevel) + ")");
+            if (!isBodyworkCallbackCurrent(
+                    lifecycleGeneration, attemptGeneration)) {
                 return;
             }
-
-            if (level == POWER_LEVEL_OFF && lastPowerLevel != POWER_LEVEL_OFF) {
-                log("ACC OFF detected");
-                enterSentryMode();
-            } else if (level >= POWER_LEVEL_ON && lastPowerLevel < POWER_LEVEL_ON) {
-                log("ACC ON detected");
-                exitSentryMode();
-            } else if (level == POWER_LEVEL_ACC && lastPowerLevel >= POWER_LEVEL_ON) {
-                // BYD app scenario: car was ON (level 2+) and dropped to ACC (level 1)
-                // This is a "turning off" transition — treat as ACC OFF for sentry purposes.
-                // Without this, a brief BYD app wake (OFF→ON→ACC→OFF) leaves AccMonitor
-                // stuck showing ACC ON because exitSentryMode fired but enterSentryMode
-                // only triggers on level 0.
-                log("ACC level dropped from ON to ACC — treating as ACC OFF (BYD app shutdown)");
-                enterSentryMode();
-            }
-
-            lastPowerLevel = level;
+            applyValidatedPowerEvent(level, "bodywork listener");
         }
 
         @Override
         public void onAutoSystemStateChanged(int state) {
+            if (!isBodyworkCallbackCurrent(
+                    lifecycleGeneration, attemptGeneration)) {
+                return;
+            }
             log("System state: " + state);
         }
 
         @Override
         public void onBatteryVoltageLevelChanged(int level) {
+            if (!isBodyworkCallbackCurrent(
+                    lifecycleGeneration, attemptGeneration)) {
+                return;
+            }
             // Discrete level callback (0=LOW, 1=NORMAL)
             // Actual voltage monitoring is done via polling in manageMcuPowerState()
             String levelName = (level == 0) ? "LOW" : (level == 1) ? "NORMAL" : "INVALID";
@@ -1394,39 +2550,287 @@ public class AccSentryDaemon {
             // initVehicleDataMonitor / BatteryVoltageMonitorV2), so this emergency wake is
             // suppressed too — the system is meant to sleep and rely on the vehicle's own
             // BMS for low-SoC protection, consistent with the mode's contract.
-            if (level == 0 && inSentryMode
-                    && !com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()) {
-                log("CRITICAL: Battery level LOW - triggering emergency wake");
-                forceMcuWakeUp();
+            if (level == 0) {
+                SentryTransitionState transition = latestSentryTransition;
+                if (transition.sentryMode) {
+                    log("LOW BATTERY - scheduling authoritative surveillance stop");
+                    lowBatteryStopReconciler.requestReapply(
+                            transition.generation, true);
 
-                if (surveillanceEnabled) {
-                    // Dispatch disableSurveillance off the BYD HAL listener thread
-                    // — it does an IPC with up to ~11s of retry sleep
-                    // (sendSurveillanceCommandRaw 2× attempts × 5s SoTimeout +
-                    // 1s backoff). Stalling the listener here drops subsequent
-                    // ACC edges. FIFO single-thread accNotifyExecutor preserves
-                    // ordering against any in-flight notifyAccState. See
-                    // prior-audit "AccListener.onBatteryVoltageLevelChanged
-                    // calls disableSurveillance inline".
-                    log("LOW BATTERY - Dispatching surveillance disable off HAL listener thread");
-                    try {
-                        accNotifyExecutor.execute(() -> {
-                            try {
-                                disableSurveillance();
-                            } catch (Throwable t) {
-                                log("WARN: low-battery disableSurveillance failed: " + t.getMessage());
-                            }
-                        });
-                    } catch (java.util.concurrent.RejectedExecutionException ree) {
-                        // Executor shut down (process tearing down). Run inline as
-                        // last-chance attempt; we'd rather block briefly than
-                        // miss the disable on shutdown.
-                        log("WARN: accNotifyExecutor rejected low-battery disable, running inline: "
-                            + ree.getMessage());
-                        disableSurveillance();
+                    if (!transition.vehicleOnOnly) {
+                        log("CRITICAL: Battery level LOW - scheduling emergency wake");
+                        lowBatteryWakeReconciler.requestReapply(
+                                transition.generation, true);
                     }
                 }
             }
+        }
+    }
+
+    private static boolean isLowBatteryStopCurrent(long generation) {
+        SentryTransitionState latest = latestSentryTransition;
+        return latest.generation == generation
+                && latest.sentryMode
+                && lowBatteryStopReconciler.isDesired(generation, true);
+    }
+
+    private static boolean isLowBatteryWakeCurrent(long generation) {
+        SentryTransitionState latest = latestSentryTransition;
+        return latest.generation == generation
+                && latest.sentryMode
+                && !latest.vehicleOnOnly
+                && lowBatteryWakeReconciler.isDesired(generation, true);
+    }
+
+    private static boolean sleepForLowBatteryWake(
+            long generation, long delayMs) {
+        long deadline = android.os.SystemClock.elapsedRealtime() + delayMs;
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            if (!isLowBatteryWakeCurrent(generation)) {
+                return false;
+            }
+            long remaining =
+                    deadline - android.os.SystemClock.elapsedRealtime();
+            try {
+                Thread.sleep(Math.min(remaining, 50L));
+            } catch (InterruptedException interrupted) {
+                Thread.interrupted();
+                if (!isLowBatteryWakeCurrent(generation)) {
+                    return false;
+                }
+            }
+        }
+        return isLowBatteryWakeCurrent(generation);
+    }
+
+    private static boolean applyLowBatteryWake(long generation) {
+        if (!isLowBatteryWakeCurrent(generation)) {
+            return true;
+        }
+        return runBoundedHardwareBoolean(
+                "Low-battery emergency wake",
+                () -> isLowBatteryWakeCurrent(generation),
+                () -> {
+                    if (!isLowBatteryWakeCurrent(generation)) {
+                        return true;
+                    }
+                    lastMcuWakeTime = System.currentTimeMillis();
+                    boolean success = true;
+                    if (isKeepUsbPowerOnAccOff()) {
+                        success = performSystemWakeUp();
+                    }
+                    if (!isLowBatteryWakeCurrent(generation)) {
+                        return true;
+                    }
+                    boolean mcuWoke = wakeUpMcu();
+                    if (!sleepForLowBatteryWake(generation, 500L)) {
+                        return true;
+                    }
+                    mcuWoke |= wakeUpMcu();
+                    return success && mcuWoke;
+                },
+                AccSentryDaemon::requestPanelForLatestTransition);
+    }
+
+    private static void requestLatestSurveillanceIntentReconciliation() {
+        SentryTransitionState latest = latestSentryTransition;
+        notifyAccState(latest.generation, latest.sentryMode, true);
+        surveillanceIntentReconciler.requestReapply(
+                latest.generation, latest.sentryMode);
+    }
+
+    private static boolean isSurveillanceIntentRequestCurrent(
+            long generation, boolean expectedParked) {
+        SentryTransitionState latest = latestSentryTransition;
+        return latest.generation == generation
+                && latest.sentryMode == expectedParked
+                && surveillanceIntentReconciler.isDesired(
+                        generation, expectedParked);
+    }
+
+    private static Boolean desiredSurveillanceState(boolean parked) {
+        if (!parked) {
+            return false;
+        }
+        try {
+            if (!com.overdrive.app.config.UnifiedConfigManager
+                    .isSurveillanceEnabled()) {
+                return false;
+            }
+        } catch (Throwable failure) {
+            log("Surveillance intent config unavailable: "
+                    + failure.getMessage());
+            return null;
+        }
+        try {
+            com.overdrive.app.surveillance.SafeLocationManager safeLocation =
+                    com.overdrive.app.surveillance.SafeLocationManager
+                            .getInstance();
+            if (safeLocation.isFeatureEnabled()
+                    && safeLocation.isInSafeZone()) {
+                return false;
+            }
+        } catch (Throwable failure) {
+            log("Surveillance intent safe-zone check failed; preserving "
+                    + "normal fail-open behavior: " + failure.getMessage());
+        }
+        try {
+            com.overdrive.app.surveillance.SurveillanceSchedule schedule =
+                    com.overdrive.app.config.UnifiedConfigManager
+                            .getSurveillanceSchedule();
+            if (schedule != null
+                    && schedule.isEnabled()
+                    && !schedule.isActiveNow()) {
+                return false;
+            }
+        } catch (Throwable failure) {
+            log("Surveillance intent schedule check failed; preserving "
+                    + "normal fail-open behavior: " + failure.getMessage());
+        }
+        return true;
+    }
+
+    private static boolean applySurveillanceIntentReconciliation(
+            long generation, boolean expectedParked) {
+        if (!isSurveillanceIntentRequestCurrent(
+                generation, expectedParked)) {
+            requestLatestSurveillanceIntentReconciliation();
+            return true;
+        }
+        Boolean desired = desiredSurveillanceState(expectedParked);
+        if (desired == null) {
+            return false;
+        }
+
+        try {
+            JSONObject statusCommand = new JSONObject();
+            statusCommand.put("command", "STATUS");
+            JSONObject status = sendSurveillanceCommandRaw(statusCommand);
+            if (!isSurveillanceIntentRequestCurrent(
+                    generation, expectedParked)) {
+                requestLatestSurveillanceIntentReconciliation();
+                return true;
+            }
+            if (status == null
+                    || !status.optBoolean("success", false)) {
+                return false;
+            }
+            boolean active = status.optBoolean("active", false);
+            if (active == desired) {
+                surveillanceEnabled = active;
+                return true;
+            }
+
+            if (!isSurveillanceIntentRequestCurrent(
+                    generation, expectedParked)) {
+                requestLatestSurveillanceIntentReconciliation();
+                return true;
+            }
+            JSONObject command = new JSONObject();
+            command.put("command", "SET_CONFIG");
+            JSONObject config = new JSONObject();
+            if (desired) {
+                config.put("enabled", true);
+            } else {
+                config.put("stopSurveillance", true);
+            }
+            command.put("config", config);
+            JSONObject response = sendSurveillanceCommandRaw(command);
+            if (!isSurveillanceIntentRequestCurrent(
+                    generation, expectedParked)) {
+                requestLatestSurveillanceIntentReconciliation();
+                return true;
+            }
+            if (response == null
+                    || !response.optBoolean("success", false)) {
+                return false;
+            }
+
+            JSONObject confirmation =
+                    sendSurveillanceCommandRaw(statusCommand);
+            if (!isSurveillanceIntentRequestCurrent(
+                    generation, expectedParked)) {
+                requestLatestSurveillanceIntentReconciliation();
+                return true;
+            }
+            if (confirmation == null
+                    || !confirmation.optBoolean("success", false)
+                    || confirmation.optBoolean("active", !desired)
+                            != desired) {
+                return false;
+            }
+            surveillanceEnabled = desired;
+            return true;
+        } catch (Throwable failure) {
+            log("Surveillance intent reconciliation failed: "
+                    + failure.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean applyLowBatteryStop(long generation) {
+        if (!isLowBatteryStopCurrent(generation)) {
+            return true;
+        }
+        try {
+            JSONObject statusCommand = new JSONObject();
+            statusCommand.put("command", "STATUS");
+            JSONObject status = sendSurveillanceCommandRaw(statusCommand);
+            if (!isLowBatteryStopCurrent(generation)) {
+                return true;
+            }
+            if (status == null
+                    || !status.optBoolean("success", false)) {
+                log("LOW BATTERY: STATUS failed; retrying until confirmed");
+                return false;
+            }
+            if (!status.optBoolean("active", false)) {
+                surveillanceEnabled = false;
+                log("LOW BATTERY: surveillance confirmed stopped");
+                return true;
+            }
+
+            log("LOW BATTERY: active surveillance confirmed; disabling");
+            JSONObject stopCommand = new JSONObject();
+            stopCommand.put("command", "SET_CONFIG");
+            JSONObject config = new JSONObject();
+            config.put("stopSurveillance", true);
+            stopCommand.put("config", config);
+            JSONObject stopResponse =
+                    sendSurveillanceCommandRaw(stopCommand);
+            if (!isLowBatteryStopCurrent(generation)) {
+                requestLatestSurveillanceIntentReconciliation();
+                return true;
+            }
+            if (stopResponse == null
+                    || !stopResponse.optBoolean("success", false)) {
+                log("LOW BATTERY: STOP was not acknowledged; retrying");
+                return false;
+            }
+
+            JSONObject confirmation =
+                    sendSurveillanceCommandRaw(statusCommand);
+            if (!isLowBatteryStopCurrent(generation)) {
+                requestLatestSurveillanceIntentReconciliation();
+                return true;
+            }
+            if (confirmation == null
+                    || !confirmation.optBoolean("success", false)
+                    || confirmation.optBoolean("active", true)) {
+                log("LOW BATTERY: STOP not yet confirmed; retrying");
+                return false;
+            }
+            surveillanceEnabled = false;
+            log("LOW BATTERY: surveillance stop confirmed");
+            return true;
+        } catch (Throwable t) {
+            if (!isLowBatteryStopCurrent(generation)) {
+                requestLatestSurveillanceIntentReconciliation();
+                return true;
+            }
+            log("LOW BATTERY: stop reconciliation failed: "
+                    + t.getMessage() + "; retrying");
+            return false;
         }
     }
 
@@ -1438,9 +2842,38 @@ public class AccSentryDaemon {
     // private static volatile boolean isVoltageChargingCycle = false;
     // private static final double LOW_VOLTAGE_THRESHOLD = 12.1;      // Wake Trigger (Volts)
     // private static final double HEALTHY_VOLTAGE_THRESHOLD = 12.8;  // Sleep Trigger (Volts)
-    
+
     // VehicleDataMonitor listener for voltage-based MCU control
     private static VehicleDataListener vehicleDataListener = null;
+    private static final Object monitorIoLock = new Object();
+    private static final Object batteryVoltageScheduleLock = new Object();
+    private static final java.util.concurrent.ScheduledExecutorService
+            batteryVoltageScheduler =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread thread = new Thread(r, "BatteryV2-Schedule");
+                thread.setDaemon(true);
+                return thread;
+            });
+    private static java.util.concurrent.ScheduledFuture<?> batteryVoltageFuture;
+    private static long batteryVoltageFutureGeneration = -1L;
+    private static long batteryVoltageRetryDelayMs = 1000L;
+    private static final long BATTERY_VOLTAGE_START_DELAY_MS = 35_000L;
+    private static final long BATTERY_VOLTAGE_RETRY_MAX_MS = 30_000L;
+    private static long batteryVoltageMonitorOwnerGeneration = -1L;
+    private static long vehicleDataMonitorOwnerGeneration = -1L;
+    private static long socMonitorOwnerGeneration = -1L;
+    private static final java.util.concurrent.ScheduledExecutorService
+            sentryReconcilerRetryScheduler =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread thread = new Thread(r, "SentryReconcileRetry");
+                thread.setDaemon(true);
+                return thread;
+            });
+    private static final java.util.Set<LatestBooleanReconciler>
+            fallbackReconcilerRetries =
+            java.util.Collections.newSetFromMap(
+                    new java.util.concurrent.ConcurrentHashMap<
+                            LatestBooleanReconciler, Boolean>());
 
     private static String powerLevelToString(int level) {
         switch (level) {
@@ -1454,9 +2887,541 @@ public class AccSentryDaemon {
 
     // ==================== SENTRY MODE ====================
 
+    private static final class SentryTransitionState {
+        final long generation;
+        final boolean sentryMode;
+        final boolean vehicleOnOnly;
+
+        SentryTransitionState(long generation, boolean sentryMode, boolean vehicleOnOnly) {
+            this.generation = generation;
+            this.sentryMode = sentryMode;
+            this.vehicleOnOnly = vehicleOnOnly;
+        }
+
+        boolean keepAwakeEnabled() {
+            return sentryMode && !vehicleOnOnly;
+        }
+    }
+
+    private static final class ReconcileRequest {
+        final long generation;
+        final boolean state;
+        final long revision;
+
+        ReconcileRequest(long generation, boolean state, long revision) {
+            this.generation = generation;
+            this.state = state;
+            this.revision = revision;
+        }
+    }
+
+    /**
+     * One running worker and one coalesced latest request per side-effect family.
+     * I/O never runs under {@link #lock}; if desired state changes during an
+     * uninterruptible operation, the loop applies the newest full state next.
+     */
+    private abstract static class LatestBooleanReconciler {
+        private static final long INITIAL_RETRY_DELAY_MS = 250L;
+        private static final long MAX_RETRY_DELAY_MS = 5000L;
+
+        private final Object lock = new Object();
+        private final String workerName;
+        private long desiredGeneration = -1L;
+        private boolean desiredState;
+        private long desiredRevision;
+        private long appliedGeneration = -1L;
+        private boolean appliedState;
+        private boolean appliedValid;
+        private long appliedRevision = -1L;
+        private boolean workerRunning;
+        private Thread activeWorker;
+        private boolean startRetryScheduled;
+        private long startRetryDelayMs = INITIAL_RETRY_DELAY_MS;
+
+        LatestBooleanReconciler(String workerName) {
+            this.workerName = workerName;
+        }
+
+        final void request(long generation, boolean state) {
+            requestInternal(generation, state, false);
+        }
+
+        final void requestReapply(long generation, boolean state) {
+            requestInternal(generation, state, true);
+        }
+
+        private void requestInternal(long generation, boolean state, boolean force) {
+            Throwable startFailure = null;
+            synchronized (lock) {
+                if (generation < desiredGeneration) {
+                    return;
+                }
+                if (!force
+                        && generation == desiredGeneration
+                        && state == desiredState
+                        && (workerRunning
+                            || isDesiredAppliedLocked())) {
+                    return;
+                }
+                desiredGeneration = generation;
+                desiredState = state;
+                desiredRevision++;
+                if (!workerRunning) {
+                    startFailure = startWorkerLocked();
+                }
+                lock.notifyAll();
+            }
+            if (startFailure != null) {
+                log(workerName + " could not start: "
+                        + startFailure.getMessage());
+            }
+        }
+
+        private boolean isDesiredAppliedLocked() {
+            return appliedValid
+                    && appliedGeneration == desiredGeneration
+                    && appliedState == desiredState
+                    && appliedRevision == desiredRevision;
+        }
+
+        private Throwable startWorkerLocked() {
+            workerRunning = true;
+            try {
+                Thread worker = new Thread(this::runLoop, workerName);
+                worker.setDaemon(true);
+                activeWorker = worker;
+                worker.start();
+                startRetryDelayMs = INITIAL_RETRY_DELAY_MS;
+                fallbackReconcilerRetries.remove(this);
+                return null;
+            } catch (Throwable failure) {
+                activeWorker = null;
+                workerRunning = false;
+                scheduleStartRetryLocked();
+                return failure;
+            }
+        }
+
+        private void scheduleStartRetryLocked() {
+            if (startRetryScheduled
+                    || workerRunning
+                    || isDesiredAppliedLocked()) {
+                return;
+            }
+
+            long delayMs = startRetryDelayMs;
+            startRetryDelayMs = Math.min(
+                    startRetryDelayMs * 2L, MAX_RETRY_DELAY_MS);
+            startRetryScheduled = true;
+            try {
+                sentryReconcilerRetryScheduler.schedule(
+                        this::retryWorkerStart,
+                        delayMs,
+                        java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (Throwable scheduleFailure) {
+                startRetryScheduled = false;
+                registerFallbackReconcilerRetry(this, delayMs);
+                log(workerName + " could not schedule worker retry: "
+                        + scheduleFailure.getMessage());
+            }
+        }
+
+        private void retryWorkerStart() {
+            Throwable startFailure = null;
+            synchronized (lock) {
+                startRetryScheduled = false;
+                if (!workerRunning && !isDesiredAppliedLocked()) {
+                    startFailure = startWorkerLocked();
+                }
+                lock.notifyAll();
+            }
+            if (startFailure != null) {
+                log(workerName + " retry worker could not start: "
+                        + startFailure.getMessage());
+            }
+        }
+
+        private void retryWorkerStartFromFallback() {
+            fallbackReconcilerRetries.remove(this);
+            retryWorkerStart();
+        }
+
+        final ReconcileRequest desiredSnapshot() {
+            synchronized (lock) {
+                return new ReconcileRequest(
+                        desiredGeneration, desiredState, desiredRevision);
+            }
+        }
+
+        final boolean isDesired(long generation, boolean state) {
+            synchronized (lock) {
+                return desiredGeneration == generation && desiredState == state;
+            }
+        }
+
+        final boolean awaitApplied(
+                long generation, boolean state, long timeoutMs) {
+            long deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs;
+            synchronized (lock) {
+                while (desiredGeneration == generation && desiredState == state) {
+                    if (appliedValid
+                            && appliedGeneration == generation
+                            && appliedState == state
+                            && appliedRevision == desiredRevision) {
+                        return true;
+                    }
+                    long remaining = deadline - android.os.SystemClock.elapsedRealtime();
+                    if (remaining <= 0L) {
+                        return false;
+                    }
+                    try {
+                        lock.wait(remaining);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+                return false;
+            }
+        }
+
+        private void runLoop() {
+            long applyRetryDelayMs = INITIAL_RETRY_DELAY_MS;
+            try {
+                while (true) {
+                    ReconcileRequest request;
+                    synchronized (lock) {
+                        request = new ReconcileRequest(
+                                desiredGeneration, desiredState, desiredRevision);
+                    }
+
+                    boolean success = false;
+                    try {
+                        success = apply(request.generation, request.state);
+                    } catch (Throwable failure) {
+                        log(workerName + " reconciliation failed: "
+                                + failure.getMessage());
+                    }
+
+                    synchronized (lock) {
+                        if (success) {
+                            appliedGeneration = request.generation;
+                            appliedState = request.state;
+                            appliedRevision = request.revision;
+                            appliedValid = true;
+                        } else if (appliedValid
+                                && appliedGeneration == request.generation
+                                && appliedState == request.state) {
+                            appliedValid = false;
+                        }
+                        lock.notifyAll();
+
+                        if (desiredRevision != request.revision) {
+                            applyRetryDelayMs = INITIAL_RETRY_DELAY_MS;
+                            continue;
+                        }
+                        if (success) {
+                            activeWorker = null;
+                            workerRunning = false;
+                            return;
+                        }
+
+                        long delayMs = applyRetryDelayMs;
+                        applyRetryDelayMs = Math.min(
+                                applyRetryDelayMs * 2L, MAX_RETRY_DELAY_MS);
+                        try {
+                            lock.wait(delayMs);
+                        } catch (InterruptedException interrupted) {
+                            // Interruption is only a wake-up signal here. The latest
+                            // desired revision remains authoritative.
+                            Thread.interrupted();
+                        }
+                        if (desiredRevision != request.revision) {
+                            applyRetryDelayMs = INITIAL_RETRY_DELAY_MS;
+                        }
+                    }
+                }
+            } finally {
+                synchronized (lock) {
+                    if (activeWorker == Thread.currentThread()) {
+                        activeWorker = null;
+                        workerRunning = false;
+                        scheduleStartRetryLocked();
+                        lock.notifyAll();
+                    }
+                }
+            }
+        }
+
+        protected abstract boolean apply(long generation, boolean state) throws Exception;
+    }
+
+    private static void registerFallbackReconcilerRetry(
+            LatestBooleanReconciler reconciler, long delayMs) {
+        fallbackReconcilerRetries.add(reconciler);
+        android.os.Handler handler = statusHandler;
+        if (handler == null) {
+            return;
+        }
+        try {
+            handler.postDelayed(
+                    AccSentryDaemon::pumpFallbackReconcilerRetries,
+                    Math.max(1L, delayMs));
+        } catch (Throwable ignored) {}
+    }
+
+    private static void pumpFallbackReconcilerRetries() {
+        for (LatestBooleanReconciler reconciler :
+                fallbackReconcilerRetries.toArray(
+                        new LatestBooleanReconciler[0])) {
+            if (reconciler != null) {
+                reconciler.retryWorkerStartFromFallback();
+            }
+        }
+    }
+
+    private static final LatestBooleanReconciler peripheralPowerReconciler =
+            new LatestBooleanReconciler("SentryRails") {
+                @Override
+                protected boolean apply(long generation, boolean enabled) {
+                    return applyPeripheralPowerBatch(generation, enabled);
+                }
+            };
+
+    private static final LatestBooleanReconciler sentrySetupReconciler =
+            new LatestBooleanReconciler("SentrySetup") {
+                @Override
+                protected boolean apply(long generation, boolean enabled) {
+                    return applySentrySetupState(generation, enabled);
+                }
+            };
+
+    private static final LatestBooleanReconciler lowBatteryStopReconciler =
+            new LatestBooleanReconciler("LowBatteryStop") {
+                @Override
+                protected boolean apply(long generation, boolean active) {
+                    return !active || applyLowBatteryStop(generation);
+                }
+            };
+
+    private static final LatestBooleanReconciler lowBatteryWakeReconciler =
+            new LatestBooleanReconciler("LowBatteryWake") {
+                @Override
+                protected boolean apply(long generation, boolean active) {
+                    return !active || applyLowBatteryWake(generation);
+                }
+            };
+
+    private static final LatestBooleanReconciler
+            surveillanceIntentReconciler =
+            new LatestBooleanReconciler("SurveillanceIntent") {
+                @Override
+                protected boolean apply(
+                        long generation, boolean expectedParked) {
+                    return applySurveillanceIntentReconciliation(
+                            generation, expectedParked);
+                }
+            };
+
+    private static final LatestBooleanReconciler monitorReconciler =
+            new LatestBooleanReconciler("SentryMonitors") {
+                @Override
+                protected boolean apply(long generation, boolean enabled) {
+                    return applyMonitorState(generation, enabled);
+                }
+            };
+
+    private static final LatestBooleanReconciler
+            parkReaperTokenReconciler =
+            new LatestBooleanReconciler("ParkReaperToken") {
+                @Override
+                protected boolean apply(long generation, boolean active) {
+                    return publishParkReaperTransition(
+                            generation, active);
+                }
+            };
+
+    private static final LatestBooleanReconciler parkReaperReconciler =
+            new LatestBooleanReconciler("ParkReaperState") {
+                @Override
+                protected boolean apply(long generation, boolean active) {
+                    return active
+                            ? launchParkReaper(generation)
+                            : cancelParkReaperForAccOn(generation);
+                }
+            };
+
+    private static final LatestBooleanReconciler keepAliveReconciler =
+            new LatestBooleanReconciler("KeepAliveState") {
+                @Override
+                protected boolean apply(long generation, boolean enabled) {
+                    return enabled
+                            ? startSystemKeepAlive(generation)
+                            : stopSystemKeepAlive(generation);
+                }
+            };
+
+    private static final LatestBooleanReconciler telegramReconciler =
+            new LatestBooleanReconciler("TelegramState") {
+                @Override
+                protected boolean apply(long generation, boolean enabled) {
+                    return enabled
+                            ? startTelegramDaemonIfEnabled(generation)
+                            : stopTelegramDaemonIfAutoStarted(generation);
+                }
+            };
+
+    private static final LatestBooleanReconciler panelReconciler =
+            new LatestBooleanReconciler("PanelState") {
+                @Override
+                protected boolean apply(long generation, boolean panelOn) {
+                    return applyPanelStateBounded(generation, panelOn);
+                }
+            };
+
+    private static final LatestBooleanReconciler accNotifyReconciler =
+            new LatestBooleanReconciler("AccStateIPC") {
+                @Override
+                protected boolean apply(long generation, boolean accOff) {
+                    return applyAccStateNotification(generation, accOff);
+                }
+            };
+
+    /**
+     * Atomically accepts a real ACC transition and invalidates work owned by
+     * every older transition. Duplicate reports from the two HAL listeners do
+     * not advance the generation, so they cannot cancel the active transition.
+     */
+    private static long beginSentryTransition(boolean entering, boolean vehicleOnOnly) {
+        final long generation;
+        synchronized (sentryTransitionLock) {
+            if (inSentryMode == entering) {
+                SentryTransitionState latest = latestSentryTransition;
+                parkReaperTokenReconciler.requestReapply(
+                        latest.generation,
+                        latest.sentryMode && latest.vehicleOnOnly);
+                return -1L;
+            }
+
+            inSentryMode = entering;
+            if (!entering) {
+                surveillanceEnabled = false;
+            }
+            generation = sentryTransitionGeneration.incrementAndGet();
+            latestSentryTransition = new SentryTransitionState(
+                    generation, entering, entering && vehicleOnOnly);
+            parkReaperTokenReconciler.request(
+                    generation, entering && vehicleOnOnly);
+            Thread keepAlive = systemKeepAliveThread;
+            if (keepAlive != null && keepAlive != Thread.currentThread()) {
+                keepAlive.interrupt();
+            }
+        }
+        lowBatteryStopReconciler.request(generation, false);
+        lowBatteryWakeReconciler.request(generation, false);
+        return generation;
+    }
+
+    private static void requestTransitionReconciliation(SentryTransitionState state) {
+        boolean keepAwake = state.keepAwakeEnabled();
+        parkReaperTokenReconciler.request(
+                state.generation,
+                state.sentryMode && state.vehicleOnOnly);
+        peripheralPowerReconciler.request(state.generation, keepAwake);
+        sentrySetupReconciler.request(state.generation, keepAwake);
+        parkReaperReconciler.request(
+                state.generation, state.sentryMode && state.vehicleOnOnly);
+        notifyAccState(state.generation, state.sentryMode, false);
+        monitorReconciler.request(state.generation, keepAwake);
+        keepAliveReconciler.request(state.generation, keepAwake);
+        telegramReconciler.request(state.generation, keepAwake);
+        panelReconciler.request(state.generation, !state.sentryMode);
+    }
+
+    private static void requestPanelForLatestTransition() {
+        SentryTransitionState latest = latestSentryTransition;
+        panelReconciler.requestReapply(latest.generation, !latest.sentryMode);
+    }
+
+    private static boolean isSentryTransitionGenerationCurrent(long generation) {
+        return latestSentryTransition.generation == generation;
+    }
+
+    private static boolean isSentryTransitionCurrent(
+            long generation, boolean expectedSentryMode) {
+        SentryTransitionState latest = latestSentryTransition;
+        return generation == latest.generation
+                && latest.sentryMode == expectedSentryMode;
+    }
+
+    private static boolean isSentrySetupRequestCurrent(
+            long generation, boolean enabled) {
+        SentryTransitionState latest = latestSentryTransition;
+        return latest.generation == generation
+                && latest.keepAwakeEnabled() == enabled
+                && sentrySetupReconciler.isDesired(generation, enabled);
+    }
+
+    private static boolean sleepForSentrySetup(
+            long generation, long delayMs) {
+        long deadline = android.os.SystemClock.elapsedRealtime() + delayMs;
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            if (!isSentrySetupRequestCurrent(generation, true)) {
+                return false;
+            }
+            long remaining =
+                    deadline - android.os.SystemClock.elapsedRealtime();
+            try {
+                Thread.sleep(Math.min(remaining, 50L));
+            } catch (InterruptedException interrupted) {
+                Thread.interrupted();
+                if (!isSentrySetupRequestCurrent(generation, true)) {
+                    return false;
+                }
+            }
+        }
+        return isSentrySetupRequestCurrent(generation, true);
+    }
+
+    private static boolean applySentrySetupState(
+            long generation, boolean enabled) {
+        if (!enabled || !isSentrySetupRequestCurrent(generation, true)) {
+            return true;
+        }
+        if (!sleepForSentrySetup(generation, 300L)) {
+            return true;
+        }
+
+        boolean keepUsbPowered = isKeepUsbPowerOnAccOff();
+        if (!isSentrySetupRequestCurrent(generation, true)) {
+            return true;
+        }
+        if (!keepUsbPowered) {
+            log("Keep-USB-power OFF: skipping forced system wake so AP can sleep "
+                    + "(USB drops). HAL events still wake on demand.");
+            return true;
+        }
+
+        boolean wakeCommitted = runBoundedHardwareBoolean(
+                "Sentry setup system wake",
+                () -> isSentrySetupRequestCurrent(generation, true),
+                AccSentryDaemon::performSystemWakeUp,
+                AccSentryDaemon::requestPanelForLatestTransition);
+        if (!isSentrySetupRequestCurrent(generation, true)) {
+            requestPanelForLatestTransition();
+            return true;
+        }
+        if (!wakeCommitted) {
+            log("Sentry mode setup wake was not confirmed; retrying");
+            return false;
+        }
+        log("Sentry mode setup complete");
+        return true;
+    }
+
     /**
      * Enter Sentry Mode - The "car is off but watching" state.
-     * 
+     *
      * CRITICAL SEQUENCE (order matters for power stability):
      * 1. Initialize voltage monitoring FIRST
      * 2. Wake MCU immediately (triggers DC-DC converter)
@@ -1465,70 +3430,19 @@ public class AccSentryDaemon {
      * 5. Enable surveillance AFTER power is stable
      */
     private static void enterSentryMode() {
-        if (inSentryMode) {
+        final boolean vehicleOnOnly =
+                com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode();
+        final long transitionGeneration =
+                beginSentryTransition(true, vehicleOnOnly);
+        if (transitionGeneration < 0L) {
             log("Already in sentry mode");
+            requestTransitionReconciliation(latestSentryTransition);
             return;
         }
 
-        inSentryMode = true;
         log("=== ENTERING SENTRY MODE ===");
-
-        // ORDERING FIX (DiLink 4 only): cast the MCU/AVM power hold BEFORE the IPC
-        // that makes CameraDaemon (re)open AVMCamera.
-        //
-        // The reference app's FlameoutService orders ACC-OFF strictly as
-        // "hold power, THEN start the sentry camera consumer" (dh/i.q(): y() →
-        // MCU wake at delay 0, then w(60000) → sentry camera start).
-        //
-        // Ours had no such ordering guarantee. notifyAccState(true) below hands the
-        // IPC to a single-thread executor, and CameraDaemon then runs
-        // startSentryPipeline → gpuPipeline.start() → AVMCamera open in ITS process.
-        // Meanwhile our rail writes only began after this method spawned the
-        // SentrySetup worker, behind ~300ms + 500ms of sleeps. The two sequences are
-        // concurrent and unsynchronised, so the camera could — and on byd_apa
-        // evidently did — get opened against an AVM/ISP rail that had not been held
-        // yet, after which the HAL hands back all-zero buffers for the whole park.
-        //
-        // Casting the hold here — inline, before the IPC is even queued — makes the
-        // rail live before CameraDaemon can possibly receive the ACC-OFF edge, which
-        // is the ordering the reference app gets for free by holding power first. It
-        // adds NO delay to the arm path (the deliberate "no 60s gate on dilink4"
-        // decision in CameraDaemon.onAccStateChanged stays intact — this is a
-        // reorder, not a delay). The SentrySetup worker still re-applies the full
-        // rail set afterwards; every write involved is idempotent.
-        //
-        // COST: this runs on the BYD HAL listener thread, which is single-threaded —
-        // stalling it makes the HAL drop later ACC edges. Five binder writes (MCU
-        // hold, 1901/1902, the 409 pair) plus a one-time device resolution on first
-        // call. No sleeps, no shell, no disk, no config writes. That is the same
-        // order of work the listener already does elsewhere on this path.
-        // No-op on every non-dilink4 variant.
-        //
-        // GATE (G1 parity): ALSO skipped in "Vehicle ON only" mode. That mode's whole
-        // contract is that nothing keeps the head unit awake after vehicle-OFF, and
-        // holding the MCU / AVM / ISP rails is precisely such a keep-awake. The G1
-        // check below (and the one in the SentrySetup worker) would otherwise be
-        // defeated by these writes, because they execute BEFORE it. Read here rather
-        // than relying on the later gate — same mtime-cached read, fail-open to
-        // "not onOnly" so a read glitch can never silently suppress the fix.
-        if (isDilink4CameraMode()
-                && !com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()) {
-            try {
-                applyV1ParityMcuPowerHold();         // PowerDevice -1442840502 = 1
-                applyEscoSentrySpecialConfig(true);  // SpecialDevice 1901=1, 1902=1
-                applySentryIspPowerVote(true);       // SpecialDevice 409 camera/ISP vote
-                log("[dilink4] pre-IPC rail hold cast before camera arm");
-            } catch (Throwable t) {
-                log("[dilink4] pre-IPC rail hold failed: " + t.getMessage());
-            }
-        }
-
-        // CRITICAL: Always notify CameraDaemon that ACC is OFF immediately.
-        // enableSurveillance() may skip the IPC if surveillanceEnabled is already true
-        // or if the user has surveillance disabled in config, which would leave
-        // AccMonitor stuck showing ACC ON (e.g. when parked in a safe zone).
-        // This mirrors exitSentryMode() which also calls notifyAccState() first.
-        notifyAccState(true);  // accOff=true → ACC is OFF
+        SentryTransitionState transition = latestSentryTransition;
+        requestTransitionReconciliation(transition);
 
         // GATE (G4c): in onOnly, release the core wakelock HERE — inline on the BYD HAL
         // listener thread — not on the SentrySetup worker below. exitSentryMode()'s
@@ -1540,158 +3454,12 @@ public class AccSentryDaemon {
         // worker would clobber the lock for the whole ON session. Guarded on inSentryMode
         // (still true here — we set it above and the listener is single-threaded) purely
         // for symmetry with the onAndOff path. onAndOff never enters this branch.
-        if (com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()) {
+        if (vehicleOnOnly) {
             releaseWakeLock();
             log("onOnly mode: released core wakelock on ACC-OFF (inline) — letting head unit sleep");
-            // TERMINATE-ON-PARK: launch the detached reaper that plants the parked marker,
-            // removes the watchdog start-scripts, waits a grace window for CameraDaemon's
-            // own graceful self-terminate (parkTerminate closes its H2 cleanly) and for the
-            // watchdogs to gate-exit on the marker, then backstop-kills any survivor and
-            // self-deletes. The reaper reparents to init (nohup &) so it outlives THIS
-            // acc_sentry_daemon, which it will also kill. We do NOT run the keep-awake
-            // SentrySetup worker below in onOnly. notifyAccState(true) above already told
-            // CameraDaemon to finalize + self-terminate; the reaper handles everything else.
-            launchParkReaper();
             return;
         }
 
-        // Background thread for setup
-        new Thread(() -> {
-            try {
-                // 0. Clear any stale screen-deterrent stop flag from the previous
-                // sentry session. exitSentryMode sets it; the ScreenWake worker
-                // clears it on its way out, but if the daemon was killed mid-exit
-                // the flag may linger. Without this clear, the first motion in
-                // this session would see screenDeterrentForceStop=true and refuse
-                // to render. Coalesced into a single updateValues call (full-JSON
-                // write) and dispatched off the BYD HAL listener thread per
-                // prior-audit "enterSentryMode does two inline UnifiedConfig
-                // .updateValues writes on BYD HAL listener thread".
-                try {
-                    java.util.Map<String, Object> deterrentClear = new java.util.HashMap<>();
-                    deterrentClear.put("screenDeterrentForceStop", false);
-                    deterrentClear.put("screenDeterrentActiveUntilMs", 0L);
-                    com.overdrive.app.config.UnifiedConfigManager.updateValues(
-                        "surveillance", deterrentClear);
-                    log("Cleared stale screen-deterrent flags on SentrySetup worker (coalesced)");
-                } catch (Throwable t) {
-                    log("WARN: failed to clear stale screen-deterrent flags: " + t.getMessage());
-                }
-
-                // GATE (G1): "Vehicle ON only" operating mode. When the user selected
-                // onOnly, EVERYTHING below this point is post-vehicle-OFF keep-awake and
-                // must NOT run — the head unit is allowed to sleep normally when the car
-                // is off. We still ran notifyAccState(true) inline above (line ~1287) so
-                // CameraDaemon finalises the last drive segment, stops pollers, and
-                // mounts the SD card for playback; only the keep-awake stack
-                // (MCU wake, peripheral/USB/AP wake, keep-alive loop, voltage + SoC
-                // monitors, Telegram auto-start) is skipped. Read fresh (mtime-gated) so
-                // a Settings toggle applies on this next ACC-OFF without a daemon restart.
-                // Fail-open: a read glitch returns false → full keep-awake, never a
-                // silent battery-drain suppression for an on-and-off user.
-                if (com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()) {
-                    // The core wakelock was already released inline on the listener thread
-                    // (G4c, in enterSentryMode before this worker was spawned) so it can't
-                    // race a concurrent ACC-ON re-acquire. Here the worker just skips the
-                    // entire post-OFF keep-awake stack so the head unit can sleep.
-                    log("onOnly mode: skipping post-OFF keep-awake stack — letting head unit sleep");
-                    return;
-                }
-
-                // 1. Initialize voltage monitoring FIRST (for battery protection)
-                initVehicleDataMonitor();
-
-                // 1a. DiLink 4 only: V1-parity unconditional MCU power hold, cast
-                // BEFORE anything that can early-return or depend on MCU status.
-                // The reference app's DEFAULT flameout mode (0 → V1) does exactly
-                // this one write and nothing else; our status-gated equivalent
-                // inside configurePeripheralPower could skip it entirely when
-                // getMcuStatus() reported an unexpected value, letting the AVM/ISP
-                // rail collapse. No-op on every other variant.
-                applyV1ParityMcuPowerHold();
-
-                // 2. Wake MCU immediately (triggers DC-DC converter for stable power)
-                immediateWakeUpMcu();
-
-                // 3. Configure peripheral power to keep camera/ISP/AVM rails active.
-                // ALWAYS enabled and identical in both toggle states — all rail writes
-                // (esco AVM keys, MCU hold, 409 ISP vote, 5V sentry keep-alive, USB/modem
-                // rail) are unconditional so cameras never go dark. The "Keep USB powered"
-                // toggle does NOT touch these; it only gates performSystemWakeUp() below.
-                configurePeripheralPower(true);
-
-                // 4. Small delay to let MCU stabilize power rails
-                try { Thread.sleep(300); } catch (InterruptedException ignored) {}
-
-                // 4. THEN wake the system (screen/CPU) — GATED ON THE "Keep USB powered"
-                // TOGGLE. On DiLink 3.0 the USB-port VBUS follows the AP wake state, not
-                // the SpecialDevice rail registers (rail writes proven ineffective
-                // on-device). Forcing wakefulness=Awake here is what keeps USB powered
-                // while parked. When the user turns "Keep USB powered" OFF we SKIP the
-                // forced wake so the AP can sleep on ACC-OFF and USB drops, saving the
-                // 12 V battery. Default ON → identical to the pre-toggle behaviour.
-                boolean keepUsbPowered = isKeepUsbPowerOnAccOff();
-                if (keepUsbPowered) {
-                    performSystemWakeUp();
-                } else {
-                    log("Keep-USB-power OFF: skipping forced system wake so AP can sleep "
-                        + "(USB drops). HAL events still wake on demand.");
-                }
-
-                // 5. Start the keep-alive loop. Still started even when USB-power is OFF:
-                // it re-asserts the OEM 409 camera/ISP vote and (dilink4) the AVC
-                // keep-alive that surveillance needs. Its userActivity() injection,
-                // which resets the AP sleep timer, is itself gated on the toggle inside
-                // the loop, so when USB-power is OFF the loop maintains the camera rail
-                // without re-forcing the AP awake — letting the AP sleep and USB drop.
-                startSystemKeepAlive();
-
-                // 5a. Schedule the V2 voltage monitor to start 35 s after ACC=OFF.
-                // Sibling-app trace: gives the head unit time to settle before
-                // we start polling MCU sleep/wake decisions. The monitor
-                // owns the new "RemoteMonitorWakeLock" + 12.0/12.5 V hysteresis
-                // model that replaces our old 45 s pulse loop.
-                scheduleBatteryVoltageMonitorV2();
-
-                // 5b. Start the SoC-based voluntary cutoff watcher. Listens
-                // to BYDAutoStatisticDevice.onElecPercentageChanged and
-                // self-shuts-down at <=10% SoC after a 60 s grace.
-                // Wrap appContext in PermissionBypassContext per the same
-                // pattern the rest of the daemon uses for BYD HAL access.
-                try {
-                    Context socCtx = new PermissionBypassContext(appContext);
-                    com.overdrive.app.power.SocCutoffMonitor.startMonitor(socCtx);
-                } catch (Throwable t) {
-                    log("SocCutoffMonitor start failed: " + t.getMessage());
-                }
-
-                // 6. Another small delay to let power stabilize before surveillance
-                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-                
-                // 7. Register door lock listener and wait for lock before arming surveillance.
-                // When ACC goes OFF and you exit the car, motion detection would pick you up
-                // Door lock gate is now handled by CameraDaemon (which has the cloud MQTT
-                // subscriber running in-process). CameraDaemon arms/disarms surveillance
-                // based on lock/unlock events after receiving the ACC OFF notification above.
-                // AccSentryDaemon no longer needs to manage lock detection or surveillance IPC.
-                log("Door lock gate delegated to CameraDaemon (cloud MQTT in-process)");
-                
-                // 8. Optional: Telegram daemon (in separate try-catch so surveillance failure doesn't block it)
-                try {
-                    startTelegramDaemonIfEnabled();
-                } catch (Throwable t) {
-                    log("Telegram daemon start failed: " + t.getMessage());
-                }
-                
-                log("Sentry mode setup complete");
-                
-            } catch (Throwable t) {
-                log("CRITICAL: Sentry setup failed: " + t.getMessage());
-                t.printStackTrace();
-                // Don't exit sentry mode - keep-alive may still work
-            }
-        }, "SentrySetup").start();
-        
         log("Sentry mode ACTIVE");
     }
 
@@ -1706,14 +3474,7 @@ public class AccSentryDaemon {
      * inline; everything heavy runs on SentryTeardown.
      */
     private static void exitSentryMode() {
-        // GATE (G4b): re-acquire the core wakelock on the ACC-ON edge. In onOnly mode
-        // G4a may have skipped the acquisition at daemon start (ACC was OFF), so the ON
-        // session needs it back for reliable CPU cycles. Placed BEFORE the !inSentryMode
-        // early-return on purpose: on a respawn-while-parked (ACC OFF at boot → sentry
-        // was never entered → inSentryMode is false), the subsequent ACC-ON still calls
-        // exitSentryMode() and must re-arm here. acquireWakeLock() is idempotent (guards
-        // isHeld) so this is a harmless no-op on the onAndOff path and when already held.
-        acquireWakeLock();
+        final long transitionGeneration = beginSentryTransition(false, false);
 
         // Stamp the ACC-ON edge FIRST (cheap volatile write, no I/O). From here
         // until the trust window lapses, StealthPanel.turnOff() refuses to darken
@@ -1725,200 +3486,169 @@ public class AccSentryDaemon {
             com.overdrive.app.power.StealthPanel.noteAccOnObserved();
         } catch (Throwable ignored) {}
 
-        // GATE (G4c): wake the panel BEFORE the !inSentryMode early-return, for
-        // exactly the reason G4b above sits here. Respawn-while-parked: a
-        // previous daemon instance turned the backlight off and was killed; the
-        // replacement never saw an ACC-OFF edge, so enterSentryMode() never ran
-        // and inSentryMode is false. The real ACC-ON then lands here and would
-        // bail below — leaving a dark panel on a car the driver just started,
-        // which the user cannot recover from (nothing visible to interact with).
-        // The backlight is DEVICE state, not in-memory state, so it outlives the
-        // process that set it and must be undone independently of inSentryMode.
-        //
-        // turnOn() self-skips when the screen already reads on, so this is
-        // effectively free on the normal path and on the whole DiLink 3 fleet.
-        //
-        // Dispatched OFF this thread per the listener-thread contract in the
-        // javadoc above: turnOn() does up to five binder reflection round-trips,
-        // and stalling the BYD HAL callback would queue the next ACC edge behind
-        // us. A dedicated short-lived thread (not the shared teardown worker,
-        // which is only spawned past the gate) keeps this correct on the respawn
-        // path too.
-        new Thread(() -> {
-            try {
-                com.overdrive.app.power.StealthPanel.turnOn(appContext);
-            } catch (Throwable t) {
-                log("Stealth panel wake (pre-gate) failed: " + t.getMessage());
-            }
-        }, "StealthPanelWake").start();
+        // Duplicate ON reports and real transitions publish into the same bounded
+        // reconcilers, so wake/cancel/IPC work cannot overlap another copy.
+        requestTransitionReconciliation(latestSentryTransition);
 
-        if (!inSentryMode) {
+        // GATE (G4b): re-acquire the core wakelock on every ACC-ON report. This
+        // remains after state publication so a slow Binder call cannot delay the
+        // generation-owned teardown and ACC notification.
+        acquireWakeLock();
+
+        if (transitionGeneration < 0L) {
             log("Not in sentry mode");
             return;
         }
 
         log("=== EXITING SENTRY MODE ===");
 
-        // CRITICAL: Set inSentryMode=false FIRST, before stopping the keep-alive thread.
+        // CRITICAL: beginSentryTransition set inSentryMode=false FIRST, before
+        // any teardown work or keep-alive interruption.
         // The keep-alive loop checks `while (running && inSentryMode)` and its interrupt
         // handler also checks `if (!running || !inSentryMode)`. If we stop the thread
         // while inSentryMode is still true, the interrupt handler sees inSentryMode=true
         // and CONTINUES the loop instead of exiting — racing with the screen-wake thread
         // below and calling setBacklightState(false) after we've already turned the screen on.
         // This race caused intermittent 20-30 second screen blackouts after vehicle ON.
-        inSentryMode = false;
-        surveillanceEnabled = false;
-
-        // CRITICAL: Always notify CameraDaemon that ACC is ON.
-        // CameraDaemon handles all surveillance cleanup (door lock gate, unlock poll,
-        // cloud listener, pipeline stop) in its ACC ON path. notifyAccState already
-        // dispatches the IPC onto accNotifyExecutor so it doesn't block the listener.
-        notifyAccState(false);  // accOff=false → ACC is ON
-
         // Clear safe zone suppression flag (clean slate for next sentry session) —
         // simple in-memory volatile flip in CameraDaemon, safe inline.
         try { CameraDaemon.setSafeZoneSuppressed(false); } catch (Exception ignored) {}
 
-        // Background thread for teardown — symmetric to enterSentryMode's
-        // SentrySetup worker. Heavy work (UnifiedConfig writes, peripheral
-        // power binder chain, Telegram shell stop with Process.waitFor,
-        // keep-alive Thread.join, monitor teardown) MUST NOT run on the
-        // BYD HAL listener thread; a 5-30 s stall there would queue any
-        // subsequent ACC edge and the second OFF/ON transition would land
-        // late, leaving CONTINUOUS / DRIVE_MODE recording on stale ACC
-        // state until the 30 s heartbeat resyncs.
-        log("Dispatching sentry teardown off BYD HAL listener thread");
-        new Thread(() -> {
-            try {
-                // Tear down any in-progress screen deterrent. ScreenDeterrent.fire()
-                // runs in byd_cam_daemon's process (different JVM), so we signal it
-                // via unified config: screenDeterrentForceStop=true. The render loop
-                // polls this every tick and exits its draw loop, which lets its
-                // finally block release the surface and turn the backlight off
-                // BEFORE our setBacklightState(true) below — otherwise our wake
-                // would land while the deterrent surface still occluded the panel.
-                try {
-                    com.overdrive.app.config.UnifiedConfigManager.updateValues(
-                        "surveillance",
-                        java.util.Collections.singletonMap("screenDeterrentForceStop", true));
-                } catch (Throwable t) {
-                    log("Failed to signal screen deterrent stop: " + t.getMessage());
-                }
-
-                // Restore stock peripheral power behavior (allow MCU to cut power)
-                configurePeripheralPower(false);
-
-                // Stop Telegram daemon if it was auto-started
-                stopTelegramDaemonIfAutoStarted();
-
-                // Stop active charging maintenance (NO-OP — kept for symmetry).
-                stopChargingMaintenance();
-
-                // Stop the V2 voltage monitor that owns the new MCU sleep/wake loop.
-                try {
-                    com.overdrive.app.power.BatteryVoltageMonitorV2.stopMonitor();
-                } catch (Throwable t) {
-                    log("BatteryVoltageMonitorV2 stop failed: " + t.getMessage());
-                }
-
-                // Stop the SoC-based cutoff monitor.
-                try {
-                    com.overdrive.app.power.SocCutoffMonitor.stopMonitor();
-                } catch (Throwable t) {
-                    log("SocCutoffMonitor stop failed: " + t.getMessage());
-                }
-
-                // Stop VehicleDataMonitor listener
-                stopVehicleDataMonitor();
-
-                // Stop system keep-alive (thread will exit cleanly since inSentryMode is already false)
-                stopSystemKeepAlive();
-            } catch (Throwable t) {
-                log("WARN: sentry teardown worker failed: " + t.getMessage());
-                t.printStackTrace();
-            }
-        }, "SentryTeardown").start();
-
-        // Restore backlight — retry a few times with delay.
-        // The keep-alive thread should be fully stopped by now (inSentryMode=false
-        // ensures it exits on interrupt), but retry in case the BYD system overrides
-        // our first attempt during its own ACC ON boot sequence. Brief delay at
-        // the start gives ScreenDeterrent (in byd_cam_daemon process) time to
-        // pick up the screenDeterrentForceStop flag, release its SurfaceControl
-        // layer, and turn the backlight off — otherwise our wake here lands
-        // while the deterrent surface still covers the screen.
-        new Thread(() -> {
-            try { Thread.sleep(300); } catch (InterruptedException ignored) {}
-            // dilink4: wake via the reference app's verified two-tier path
-            // BEFORE the legacy retry loop below. setBacklightState(true) only
-            // has tier 1 (PowerManager.turnBacklightOn) — on firmware where the
-            // panel was darkened by TurnBacklightOffWithLock, tier 1 alone can
-            // be silently ignored and the driver gets a black screen. turnOn()
-            // escalates to TurnBacklightOnWithLock and verifies with
-            // getPowerScreenStatus(). Deliberately not mode-gated (see
-            // StealthPanel.turnOn) so a cameraMode change made while parked can
-            // never strand the panel dark.
-            try {
-                com.overdrive.app.power.StealthPanel.turnOn(appContext);
-            } catch (Throwable t) {
-                log("Stealth panel wake failed: " + t.getMessage());
-            }
-            for (int attempt = 1; attempt <= 3; attempt++) {
-                setBacklightState(true);
-                try { Thread.sleep(1000); } catch (InterruptedException ignored) { break; }
-            }
-            // Once we've finished the wake sequence, clear the cross-process
-            // force-stop flag so the next sentry session can run deterrents
-            // again. Done last so any belated ScreenDeterrent tick still sees
-            // the stop signal. Coalesced into a single updateValues call
-            // (full-JSON write) per prior-audit pattern.
-            try {
-                java.util.Map<String, Object> deterrentClear = new java.util.HashMap<>();
-                deterrentClear.put("screenDeterrentForceStop", false);
-                deterrentClear.put("screenDeterrentActiveUntilMs", 0L);
-                com.overdrive.app.config.UnifiedConfigManager.updateValues(
-                    "surveillance", deterrentClear);
-            } catch (Throwable ignored) {}
-        }, "ScreenWake").start();
-
         log("Sentry mode DEACTIVATED");
     }
-    
+
     /**
      * Cleanup and shutdown the daemon gracefully.
      * Called on process termination or manual shutdown.
      */
     private static void shutdownDaemon() {
-        log("=== DAEMON SHUTDOWN INITIATED ===");
-        
-        running = false;
-        
-        // Exit sentry mode if active
-        if (inSentryMode) {
-            exitSentryMode();
+        synchronized (shutdownLock) {
+            if (shutdownComplete) {
+                return;
+            }
+            log("=== DAEMON SHUTDOWN INITIATED ===");
+
+            running = false;
+            stopPowerListenerRegistrationSupervisor();
+            stopBodyworkRegistrationSupervisor();
+            stopAccPowerQuerySupervisor();
+            Thread heartbeat = accHeartbeatThread;
+            accHeartbeatThread = null;
+            if (heartbeat != null
+                    && heartbeat != Thread.currentThread()) {
+                heartbeat.interrupt();
+            }
+
+            SentryTransitionState shutdownTransition =
+                    beginShutdownAccOnTransition();
+            boolean safeToReleaseSingleton =
+                    awaitEssentialShutdownReconciliation(
+                    shutdownTransition);
+
+            stopStatusMonitoring();
+            releaseWakeLock();
+            if (safeToReleaseSingleton) {
+                releaseSingletonLock();
+            } else {
+                log("WARNING: retaining singleton lock because park-reaper "
+                        + "cancellation could not be made authoritative");
+            }
+            shutdownComplete = true;
+
+            log("=== DAEMON SHUTDOWN COMPLETE ===");
         }
-        
-        // Stop status monitoring
-        stopStatusMonitoring();
-        
-        // Release wake lock
-        releaseWakeLock();
-        
-        // Release singleton lock
-        releaseSingletonLock();
-        
-        log("=== DAEMON SHUTDOWN COMPLETE ===");
+    }
+
+    private static SentryTransitionState
+            beginShutdownAccOnTransition() {
+        if (inSentryMode) {
+            beginSentryTransition(false, false);
+            try {
+                com.overdrive.app.power.StealthPanel
+                        .noteAccOnObserved();
+            } catch (Throwable ignored) {}
+            try {
+                CameraDaemon.setSafeZoneSuppressed(false);
+            } catch (Throwable ignored) {}
+        }
+
+        SentryTransitionState transition =
+                latestSentryTransition;
+        requestTransitionReconciliation(transition);
+        parkReaperTokenReconciler.requestReapply(
+                transition.generation, false);
+        parkReaperReconciler.requestReapply(
+                transition.generation, false);
+        accNotifyReconciler.requestReapply(
+                transition.generation, false);
+        return transition;
+    }
+
+    private static boolean awaitEssentialShutdownReconciliation(
+            SentryTransitionState transition) {
+        final long deadline =
+                android.os.SystemClock.elapsedRealtime()
+                        + 20_000L;
+        boolean tokenCanceled = awaitReconcilerUntil(
+                parkReaperTokenReconciler,
+                transition.generation,
+                false,
+                deadline);
+        if (!tokenCanceled) {
+            log("WARNING: shutdown timed out publishing the "
+                    + "park-reaper cancellation token");
+        }
+
+        boolean reaperCanceled = awaitReconcilerUntil(
+                parkReaperReconciler,
+                transition.generation,
+                false,
+                deadline);
+        if (!reaperCanceled) {
+            log("WARNING: shutdown timed out clearing the "
+                    + "park-reaper state");
+        }
+
+        boolean reaperMadeSafe = tokenCanceled
+                || terminateIdentityOwnedParkReaper();
+        if (!reaperMadeSafe) {
+            log("WARNING: shutdown could not persist cancellation or "
+                    + "terminate the identity-owned park reaper");
+        }
+
+        boolean accOnPublished = awaitReconcilerUntil(
+                accNotifyReconciler,
+                transition.generation,
+                false,
+                deadline);
+        if (!accOnPublished) {
+            log("WARNING: shutdown timed out publishing "
+                    + "the final ACC-ON IPC");
+        }
+        return reaperMadeSafe;
+    }
+
+    private static boolean awaitReconcilerUntil(
+            LatestBooleanReconciler reconciler,
+            long generation,
+            boolean state,
+            long deadline) {
+        long remaining = deadline
+                - android.os.SystemClock.elapsedRealtime();
+        return remaining > 0L
+                && reconciler.awaitApplied(
+                        generation, state, remaining);
     }
 
     // ==================== DEBUG TOOLS ====================
-    
+
     /**
      * DEBUG TOOL: Dumps the values of all known Sleep Reason constants.
      * Use this to verify which magic number (9, 13, etc.) your specific car firmware uses.
      */
     private static void logAllSleepReasonFields() {
         log("=== DUMPING SLEEP REASON CONSTANTS ===");
-        
+
         String[] possibleFieldNames = {
             "GO_TO_SLEEP_REASON_ACCOFF",       // Primary BYD constant
             "GO_TO_SLEEP_REASON_ACC_OFF",      // Alternative naming
@@ -1927,7 +3657,7 @@ public class AccSentryDaemon {
             "GO_TO_SLEEP_REASON_TIMEOUT",      // Standard Android (usually 2)
             "GO_TO_SLEEP_REASON_POWER_BUTTON"  // Standard Android (usually 4)
         };
-        
+
         for (String fieldName : possibleFieldNames) {
             try {
                 java.lang.reflect.Field field = PowerManager.class.getDeclaredField(fieldName);
@@ -1940,7 +3670,7 @@ public class AccSentryDaemon {
                 log("  [ERROR] " + fieldName + ": " + e.getMessage());
             }
         }
-        
+
         // Also dump the standard SDK version for context
         log("  [INFO] Android SDK Version: " + android.os.Build.VERSION.SDK_INT);
         log("=== END DUMP ===");
@@ -1958,7 +3688,7 @@ public class AccSentryDaemon {
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
             PowerManager pm = (PowerManager) permissiveContext.getSystemService(Context.POWER_SERVICE);
-            
+
             for (Method m : pm.getClass().getMethods()) {
                 StringBuilder params = new StringBuilder();
                 for (Class<?> p : m.getParameterTypes()) {
@@ -1967,7 +3697,7 @@ public class AccSentryDaemon {
                 }
                 log("  PM: " + m.getName() + "(" + params + ") -> " + m.getReturnType().getSimpleName());
             }
-            
+
             // Also try to get current screen power status if method exists
             try {
                 Method getStatus = PowerManager.class.getMethod("getPowerScreenStatus");
@@ -1976,7 +3706,7 @@ public class AccSentryDaemon {
             } catch (NoSuchMethodException e) {
                 log("  >> getPowerScreenStatus() not found");
             }
-            
+
         } catch (Exception e) {
             log("PowerManager dump error: " + e.getMessage());
         }
@@ -1991,12 +3721,12 @@ public class AccSentryDaemon {
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
             BYDAutoPowerDevice powerDevice = BYDAutoPowerDevice.getInstance(permissiveContext);
-            
+
             if (powerDevice == null) {
                 log("  BYDAutoPowerDevice.getInstance() returned null");
                 return;
             }
-            
+
             for (Method m : powerDevice.getClass().getMethods()) {
                 StringBuilder params = new StringBuilder();
                 for (Class<?> p : m.getParameterTypes()) {
@@ -2005,7 +3735,7 @@ public class AccSentryDaemon {
                 }
                 log("  BYD: " + m.getName() + "(" + params + ") -> " + m.getReturnType().getSimpleName());
             }
-            
+
         } catch (Exception e) {
             log("BYDAutoPowerDevice dump error: " + e.getMessage());
         }
@@ -2022,12 +3752,12 @@ public class AccSentryDaemon {
             Class<?> clazz = Class.forName("android.hardware.bydauto.setting.BYDAutoSettingDevice");
             Method getInstance = clazz.getMethod("getInstance", Context.class);
             Object settingDevice = getInstance.invoke(null, permissiveContext);
-            
+
             if (settingDevice == null) {
                 log("  BYDAutoSettingDevice.getInstance() returned null");
                 return;
             }
-            
+
             for (Method m : clazz.getMethods()) {
                 StringBuilder params = new StringBuilder();
                 for (Class<?> p : m.getParameterTypes()) {
@@ -2036,7 +3766,7 @@ public class AccSentryDaemon {
                 }
                 log("  SETTING: " + m.getName() + "(" + params + ") -> " + m.getReturnType().getSimpleName());
             }
-            
+
         } catch (Exception e) {
             log("BYDAutoSettingDevice dump error: " + e.getMessage());
         }
@@ -2053,12 +3783,12 @@ public class AccSentryDaemon {
             Class<?> clazz = Class.forName("android.hardware.bydauto.location.BYDAutoLocationDevice");
             Method getInstance = clazz.getMethod("getInstance", Context.class);
             Object device = getInstance.invoke(null, permissiveContext);
-            
+
             if (device == null) {
                 log("  BYDAutoLocationDevice.getInstance() returned null");
                 return;
             }
-            
+
             for (Method m : clazz.getMethods()) {
                 StringBuilder params = new StringBuilder();
                 for (Class<?> p : m.getParameterTypes()) {
@@ -2067,7 +3797,7 @@ public class AccSentryDaemon {
                 }
                 log("  LOCATION: " + m.getName() + "(" + params + ") -> " + m.getReturnType().getSimpleName());
             }
-            
+
         } catch (Exception e) {
             log("BYDAutoLocationDevice dump error: " + e.getMessage());
         }
@@ -2084,12 +3814,12 @@ public class AccSentryDaemon {
             Class<?> clazz = Class.forName("android.hardware.bydauto.adas.BYDAutoADASDevice");
             Method getInstance = clazz.getMethod("getInstance", Context.class);
             Object device = getInstance.invoke(null, permissiveContext);
-            
+
             if (device == null) {
                 log("  BYDAutoADASDevice.getInstance() returned null");
                 return;
             }
-            
+
             for (Method m : clazz.getMethods()) {
                 StringBuilder params = new StringBuilder();
                 for (Class<?> p : m.getParameterTypes()) {
@@ -2098,7 +3828,7 @@ public class AccSentryDaemon {
                 }
                 log("  ADAS: " + m.getName() + "(" + params + ") -> " + m.getReturnType().getSimpleName());
             }
-            
+
         } catch (Exception e) {
             log("BYDAutoADASDevice dump error: " + e.getMessage());
         }
@@ -2115,12 +3845,12 @@ public class AccSentryDaemon {
             Class<?> clazz = Class.forName("android.hardware.bydauto.bodywork.BYDAutoBodyworkDevice");
             Method getInstance = clazz.getMethod("getInstance", Context.class);
             Object device = getInstance.invoke(null, permissiveContext);
-            
+
             if (device == null) {
                 log("  BYDAutoBodyworkDevice.getInstance() returned null");
                 return;
             }
-            
+
             for (Method m : clazz.getMethods()) {
                 StringBuilder params = new StringBuilder();
                 for (Class<?> p : m.getParameterTypes()) {
@@ -2129,7 +3859,7 @@ public class AccSentryDaemon {
                 }
                 log("  BODYWORK: " + m.getName() + "(" + params + ") -> " + m.getReturnType().getSimpleName());
             }
-            
+
         } catch (Exception e) {
             log("BYDAutoBodyworkDevice dump error: " + e.getMessage());
         }
@@ -2146,12 +3876,12 @@ public class AccSentryDaemon {
             Class<?> clazz = Class.forName("android.hardware.bydauto.charging.BYDAutoChargingDevice");
             Method getInstance = clazz.getMethod("getInstance", Context.class);
             Object device = getInstance.invoke(null, permissiveContext);
-            
+
             if (device == null) {
                 log("  BYDAutoChargingDevice.getInstance() returned null");
                 return;
             }
-            
+
             for (Method m : clazz.getMethods()) {
                 StringBuilder params = new StringBuilder();
                 for (Class<?> p : m.getParameterTypes()) {
@@ -2160,7 +3890,7 @@ public class AccSentryDaemon {
                 }
                 log("  CHARGING: " + m.getName() + "(" + params + ") -> " + m.getReturnType().getSimpleName());
             }
-            
+
         } catch (Exception e) {
             log("BYDAutoChargingDevice dump error: " + e.getMessage());
         }
@@ -2177,12 +3907,12 @@ public class AccSentryDaemon {
             Class<?> clazz = Class.forName("android.hardware.bydauto.statistic.BYDAutoStatisticDevice");
             Method getInstance = clazz.getMethod("getInstance", Context.class);
             Object device = getInstance.invoke(null, permissiveContext);
-            
+
             if (device == null) {
                 log("  BYDAutoStatisticDevice.getInstance() returned null");
                 return;
             }
-            
+
             for (Method m : clazz.getMethods()) {
                 StringBuilder params = new StringBuilder();
                 for (Class<?> p : m.getParameterTypes()) {
@@ -2191,7 +3921,7 @@ public class AccSentryDaemon {
                 }
                 log("  STATISTIC: " + m.getName() + "(" + params + ") -> " + m.getReturnType().getSimpleName());
             }
-            
+
         } catch (Exception e) {
             log("BYDAutoStatisticDevice dump error: " + e.getMessage());
         }
@@ -2208,12 +3938,12 @@ public class AccSentryDaemon {
             Class<?> clazz = Class.forName("android.hardware.bydauto.tyre.BYDAutoTyreDevice");
             Method getInstance = clazz.getMethod("getInstance", Context.class);
             Object device = getInstance.invoke(null, permissiveContext);
-            
+
             if (device == null) {
                 log("  BYDAutoTyreDevice.getInstance() returned null");
                 return;
             }
-            
+
             for (Method m : clazz.getMethods()) {
                 StringBuilder params = new StringBuilder();
                 for (Class<?> p : m.getParameterTypes()) {
@@ -2222,7 +3952,7 @@ public class AccSentryDaemon {
                 }
                 log("  TYRE: " + m.getName() + "(" + params + ") -> " + m.getReturnType().getSimpleName());
             }
-            
+
         } catch (Exception e) {
             log("BYDAutoTyreDevice dump error: " + e.getMessage());
         }
@@ -2249,9 +3979,9 @@ public class AccSentryDaemon {
      * Dynamically retrieves the correct sleep reason code from the PowerManager.
      * This ensures compatibility across different Android versions (SDK 28 vs 29+)
      * and different BYD car models (Atto 3, Seal, etc.).
-     * 
+     *
      * Tries multiple field names that BYD might use across firmware versions.
-     * 
+     *
      * @return The correct GO_TO_SLEEP_REASON code (9 for older, 13 for SDK 32+).
      */
     private static int getSystemSleepReasonCode() {
@@ -2274,19 +4004,24 @@ public class AccSentryDaemon {
      * Performs a validated wake-up call using the correct context ID and details string.
      * This mimics a legitimate ignition event to bypass the ACC lock.
      * Uses "Double-Key" logic (Correct ID + "ACC_ON") to pass security check.
-     * 
+     *
      * CRITICAL: This is the initial wake call when entering sentry mode.
      * The keep-alive thread maintains this state via userActivity().
      */
     // Cached 3-arg PowerManager.wakeUp(long, int, String), resolved once.
     private static volatile Method pmWakeUp3ArgMethod;
 
-    private static void performSystemWakeUp() {
+    private static boolean performSystemWakeUp() {
+        return performSystemWakeUp(-1L);
+    }
+
+    private static boolean performSystemWakeUp(long keepAliveGeneration) {
         if (appContext == null) {
             log("performSystemWakeUp: No context available");
-            return;
+            return false;
         }
 
+        boolean committed = false;
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
             PowerManager pm = (PowerManager) permissiveContext.getSystemService(Context.POWER_SERVICE);
@@ -2297,14 +4032,216 @@ public class AccSentryDaemon {
                 pmWakeUp3ArgMethod = PowerManager.class.getMethod(
                         "wakeUp", Long.TYPE, Integer.TYPE, String.class);
             }
+            if (keepAliveGeneration >= 0L
+                    && !isKeepAliveGenerationCurrent(keepAliveGeneration)) {
+                return false;
+            }
             pmWakeUp3ArgMethod.invoke(pm, android.os.SystemClock.uptimeMillis(), reasonID, "ACC_ON");
             log("System wake-up sent (reason: " + reasonID + ")");
+            committed = true;
         } catch (Throwable t) {
             log("Wake-up failed: " + t.getMessage());
         }
+        requestPanelForLatestTransition();
+        return committed;
     }
 
-    private static void setBacklightState(boolean on) {
+    private static boolean isPanelRequestCurrent(
+            long generation, boolean panelOn) {
+        SentryTransitionState latest = latestSentryTransition;
+        return latest.generation == generation
+                && latest.sentryMode != panelOn
+                && panelReconciler.isDesired(generation, panelOn);
+    }
+
+    private static boolean sleepForPanelRequest(
+            long generation, boolean panelOn, long delayMs) {
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return isPanelRequestCurrent(generation, panelOn);
+    }
+
+    /**
+     * Owns every transition-driven panel write. If a Binder call completes
+     * after ownership changes, LatestBooleanReconciler immediately applies the
+     * newer complete state.
+     */
+    private static boolean applyPanelStateBounded(
+            long generation, boolean panelOn) {
+        ShellOwnership ownership =
+                () -> isPanelRequestCurrent(generation, panelOn);
+        BoundedCallResult<Boolean> result = boundedHardwareLane.invoke(
+                "Panel state " + (panelOn ? "ON" : "OFF"),
+                15_000L,
+                ownership,
+                () -> applyPanelState(generation, panelOn),
+                AccSentryDaemon::requestPanelForLatestTransition);
+        if (result.failure != null) {
+            log("Panel state reconciliation failed: "
+                    + result.failure.getMessage());
+        }
+        return result.completed
+                && result.failure == null
+                && Boolean.TRUE.equals(result.value);
+    }
+
+    private static boolean applyPanelState(long generation, boolean panelOn) {
+        if (!isPanelRequestCurrent(generation, panelOn)) {
+            return true;
+        }
+
+        if (panelOn) {
+            boolean configCommitted = true;
+            try {
+                if (!isPanelRequestCurrent(generation, true)) {
+                    return true;
+                }
+                com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                        "surveillance",
+                        java.util.Collections.singletonMap(
+                                "screenDeterrentForceStop", true));
+            } catch (Throwable t) {
+                log("Failed to signal screen deterrent stop: " + t.getMessage());
+                configCommitted = false;
+            }
+            if (!sleepForPanelRequest(generation, true, 300L)) {
+                return !isPanelRequestCurrent(generation, true);
+            }
+
+            boolean panelWriteCommitted = false;
+            try {
+                if (!isPanelRequestCurrent(generation, true)) {
+                    return true;
+                }
+                panelWriteCommitted =
+                        com.overdrive.app.power.StealthPanel
+                                .turnOn(appContext);
+                if (!panelWriteCommitted) {
+                    log("Stealth panel wake was not confirmed");
+                }
+            } catch (Throwable t) {
+                log("Stealth panel wake failed: " + t.getMessage());
+            }
+
+            for (int attempt = 1;
+                    attempt <= 3 && isPanelRequestCurrent(generation, true);
+                    attempt++) {
+                if (!isPanelRequestCurrent(generation, true)) {
+                    return true;
+                }
+                panelWriteCommitted |= setBacklightState(
+                        generation, true);
+                if (attempt < 3
+                        && !sleepForPanelRequest(generation, true, 1000L)) {
+                    return !isPanelRequestCurrent(generation, true);
+                }
+            }
+
+            if (isPanelRequestCurrent(generation, true)) {
+                try {
+                    if (!isPanelRequestCurrent(generation, true)) {
+                        return true;
+                    }
+                    java.util.Map<String, Object> deterrentClear =
+                            new java.util.HashMap<>();
+                    deterrentClear.put("screenDeterrentForceStop", false);
+                    deterrentClear.put("screenDeterrentActiveUntilMs", 0L);
+                    com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                            "surveillance", deterrentClear);
+                } catch (Throwable t) {
+                    log("Failed to clear screen deterrent stop: " + t.getMessage());
+                    configCommitted = false;
+                }
+            }
+            return configCommitted && panelWriteCommitted;
+        }
+
+        boolean configCommitted = true;
+        if (panelDeterrentResetGeneration != generation) {
+            try {
+                if (!isPanelRequestCurrent(generation, false)) {
+                    return true;
+                }
+                java.util.Map<String, Object> deterrentClear =
+                        new java.util.HashMap<>();
+                deterrentClear.put("screenDeterrentForceStop", false);
+                deterrentClear.put("screenDeterrentActiveUntilMs", 0L);
+                com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                        "surveillance", deterrentClear);
+                panelDeterrentResetGeneration = generation;
+            } catch (Throwable t) {
+                log("Failed to clear stale screen deterrent flags: "
+                        + t.getMessage());
+                configCommitted = false;
+            }
+        }
+        if (!isPanelRequestCurrent(generation, false)) {
+            return true;
+        }
+
+        boolean dilink4 = isDilink4CameraMode();
+        if (!dilink4) {
+            if (!isScreenDeterrentActive() && !isCameraPipelineActive()) {
+                if (!isPanelRequestCurrent(generation, false)) {
+                    return true;
+                }
+                return setBacklightState(
+                        generation, false) && configCommitted;
+            }
+            if (!isPanelRequestCurrent(generation, false)) {
+                return true;
+            }
+            log("Legacy panel darkening temporarily gated; reconciliation remains pending");
+            return false;
+        }
+
+        PanelDarkenDecision decision = panelDarkenDecision();
+        if (!isPanelRequestCurrent(generation, false)) {
+            return true;
+        }
+        if (decision == PanelDarkenDecision.ALREADY_DARK) {
+            return configCommitted;
+        }
+        if (decision == PanelDarkenDecision.RETRY_LATER) {
+            return false;
+        }
+        if (decision == PanelDarkenDecision.DARKEN) {
+            try {
+                if (!isPanelRequestCurrent(generation, false)) {
+                    return true;
+                }
+                boolean darkened =
+                        com.overdrive.app.power.StealthPanel
+                                .turnOff(appContext);
+                if (!darkened) {
+                    log("WARN: parked panel did not darken after both tiers");
+                }
+                return darkened && configCommitted;
+            } catch (Throwable t) {
+                log("Stealth panel turnOff failed: " + t.getMessage());
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static boolean setBacklightState(boolean on) {
+        return setBacklightState(on, null);
+    }
+
+    private static boolean setBacklightState(
+            long generation, boolean on) {
+        ShellOwnership ownership =
+                () -> isPanelRequestCurrent(generation, on);
+        return setBacklightState(on, ownership);
+    }
+
+    private static boolean setBacklightState(
+            boolean on, ShellOwnership ownership) {
         log("Setting backlight: " + (on ? "ON" : "OFF"));
 
         // Try PowerManager reflection
@@ -2319,9 +4256,12 @@ public class AccSentryDaemon {
                 // them propagate naturally.
                 Method lower = getPmBacklightLowerMethod(on, pmClass);
                 if (lower != null) {
+                    if (!isShellOwnershipCurrent(ownership)) {
+                        return false;
+                    }
                     lower.invoke(pm, android.os.SystemClock.uptimeMillis());
                     log("Backlight: PowerManager." + (on ? "turnBacklightOn" : "turnBacklightOff") + " SUCCESS");
-                    return;
+                    return true;
                 }
 
                 // Lowercase missing — try PascalCase variant. Original
@@ -2333,9 +4273,12 @@ public class AccSentryDaemon {
                 Method pascal = getPmBacklightPascalMethod(on, pmClass);
                 if (pascal != null) {
                     try {
+                        if (!isShellOwnershipCurrent(ownership)) {
+                            return false;
+                        }
                         pascal.invoke(pm, android.os.SystemClock.uptimeMillis());
                         log("Backlight: PowerManager." + (on ? "TurnBacklightOn" : "TurnBacklightOff") + " SUCCESS");
-                        return;
+                        return true;
                     } catch (Exception e2) {
                         // Fall through to BYD path
                     }
@@ -2351,9 +4294,12 @@ public class AccSentryDaemon {
                     Method bydMethod = getBydSettingBacklightMethod(on);
                     if (bydMethod != null) {
                         Object device = bydSettingGetInstanceMethod.invoke(null, appContext);
+                        if (!isShellOwnershipCurrent(ownership)) {
+                            return false;
+                        }
                         bydMethod.invoke(device);
                         log("Backlight: BYDAutoSettingDevice." + (on ? "turnBacklightOn" : "turnBacklightOff") + " SUCCESS");
-                        return;
+                        return true;
                     }
                 }
             } catch (Exception e) {
@@ -2363,12 +4309,28 @@ public class AccSentryDaemon {
 
         // Fallback: Settings brightness
         int brightness = on ? 128 : 0;
-        execShell("settings put system screen_brightness " + brightness);
-        if (on) {
-            execShell("input keyevent 224");  // KEYCODE_WAKEUP
-        } else {
-            execShell("input keyevent 223");  // KEYCODE_SLEEP
+        ShellResult brightnessResult = execShellResult(
+                "settings put system screen_brightness " + brightness,
+                DEFAULT_SHELL_TIMEOUT_MS, ownership);
+        ShellResult keyResult;
+        if (!brightnessResult.success) {
+            return false;
         }
+        if (on) {
+            keyResult = execShellResult(
+                    "input keyevent 224",
+                    DEFAULT_SHELL_TIMEOUT_MS, ownership);
+        } else {
+            keyResult = execShellResult(
+                    "input keyevent 223",
+                    DEFAULT_SHELL_TIMEOUT_MS, ownership);
+        }
+        if (!brightnessResult.success || !keyResult.success) {
+            log("Backlight shell fallback failed: brightness="
+                    + brightnessResult.describeFailure()
+                    + ", keyevent=" + keyResult.describeFailure());
+        }
+        return brightnessResult.success && keyResult.success;
     }
 
     /**
@@ -2432,23 +4394,26 @@ public class AccSentryDaemon {
     }
 
     // ==================== SYSTEM PERSISTENCE SERVICE ====================
-    
+
     /**
      * Starts the System Persistence Service (10-second maintenance loop).
      * Implements the "Refresh & Enforce" pattern:
-     * 1. Maintains network interface stability (WiFi)
+     * 1. Maintains network interface stability (WiFi always; cellular when armed —
+     *    i.e. mobile data was ON at sentry entry, issue #209)
      * 2. Refreshes CPU wake timer (fake user activity)
      * 3. Enforces stealth power state (screen off, CPU active)
-     * 
+     *
      * CRITICAL: Uses Throwable catch to survive OutOfMemoryError and other Errors.
      * Thread is NOT a daemon so it survives if main thread has issues.
      */
-    private static void startSystemKeepAlive() {
-        if (systemKeepAliveThread != null && systemKeepAliveThread.isAlive()) {
-            return;
+    private static boolean startSystemKeepAlive(final long transitionGeneration) {
+        if (!isSentryTransitionGenerationCurrent(transitionGeneration)
+                || !keepAliveReconciler.isDesired(
+                        transitionGeneration, true)) {
+            return true;
         }
 
-        systemKeepAliveThread = new Thread(() -> {
+        final Thread keepAliveThread = new Thread(() -> {
             log("System Persistence Service started");
 
             // Re-assert cadence for the OEM 409 camera/ISP power vote. The
@@ -2456,12 +4421,10 @@ public class AccSentryDaemon {
             // gate that black-frames the AVM feed fires at ~30-35 min of
             // inactivity, so re-asserting every ~5 min (30 ticks) is a 6-7x
             // safety margin while keeping binder/log churn negligible. The
-            // initial vote is already cast by configurePeripheralPower(true)
+            // initial vote is already cast by applyPeripheralPowerBatch(true)
             // in enterSentryMode; this only defends against the MCU/BCM
             // silently dropping the flag mid-session.
             final long ISP_VOTE_REASSERT_EVERY_TICKS = 30;  // 30 * 10s = 5 min
-            // Cadence for re-reporting a panel that refuses to darken (~5 min).
-            final long PANEL_FAILURE_REPORT_EVERY_TICKS = 30;
             // Periodic MCU re-wake + peripheral-rail re-assert cadence. On some
             // models the BCM drifts the MCU back to sleep mid-park after the
             // one-shot enterSentryMode wake, which collapses the USB-bridged SD
@@ -2495,12 +4458,38 @@ public class AccSentryDaemon {
             // a negative value and the backoff gate would never open. Seeding
             // one backoff below zero makes the first eligible tick pass exactly.
             long lastSdRecoveryTick = -SD_RECOVERY_BASE_BACKOFF_TICKS;
+            // Cellular keep-alive arming snapshot (issue #209). The sentry rail hold
+            // keeps the modem POWERED across ACC-OFF, but on some firmware (reported
+            // on Seal 2025 / system 2506) the system still flips the mobile-data
+            // master switch off at park, so WiFi survives and cellular doesn't.
+            // OPT-IN (default OFF): holding the bearer up costs battery and data on
+            // firmware that doesn't need it, so the probe only runs when the user
+            // enabled it. Then snapshot the switch ONCE at session start: only when
+            // the user had data ON do we re-assert it each tick, mirroring
+            // ensureWifiEnabled. A user who deliberately keeps data off (no plan /
+            // roaming cost) is never force-enabled — unlike WiFi, turning data on can
+            // cost money, so this keep-alive preserves state rather than imposing it.
+            final boolean cellularKeepAliveEnabled =
+                    com.overdrive.app.config.UnifiedConfigManager
+                            .isMobileDataKeepAliveEnabled();
+            final boolean cellularKeepAliveArmed = cellularKeepAliveEnabled
+                    && isMobileDataOnAtSentryEntry(transitionGeneration);
+            log("Cellular keep-alive " + (!cellularKeepAliveEnabled
+                    ? "disabled (setting off — default)"
+                    : cellularKeepAliveArmed
+                    ? "armed (mobile data was ON at sentry entry)"
+                    : "not armed (mobile data OFF/unknown at sentry entry)"));
             long tick = 0;
 
-            while (running && inSentryMode) {  // Check BOTH flags
+            while (running && isKeepAliveCommitCurrent(transitionGeneration)) {
                 try {
                     // 1. Maintain Network Interface Stability
-                    ensureWifiEnabled();
+                    if (!isKeepAliveCommitCurrent(transitionGeneration)) break;
+                    ensureWifiEnabled(transitionGeneration);
+                    if (cellularKeepAliveArmed) {
+                        if (!isKeepAliveCommitCurrent(transitionGeneration)) break;
+                        ensureMobileDataEnabled(transitionGeneration);
+                    }
                     // Fake-activity injection resets the AP sleep timer using the
                     // 2-arg stealth userActivity(uptime, noChangeLights=true), which
                     // holds the AP awake (USB VBUS follows wakefulness) WITHOUT
@@ -2510,8 +4499,17 @@ public class AccSentryDaemon {
                     // and USB drop to save the 12 V battery. The ISP/AVM camera vote
                     // and AVC keep-alive below stay unconditional — they're the camera
                     // rail, not the AP wake, and surveillance needs them either way.
-                    if (isKeepUsbPowerOnAccOff()) {
-                        injectFakeUserActivity();
+                    if (isKeepAliveCommitCurrent(transitionGeneration)
+                            && isKeepUsbPowerOnAccOff()) {
+                        if (!isKeepAliveCommitCurrent(transitionGeneration)) break;
+                        runBoundedHardwareBoolean(
+                                "KeepAlive user activity",
+                                () -> isKeepAliveGenerationCurrent(
+                                        transitionGeneration),
+                                () -> injectFakeUserActivity(
+                                        transitionGeneration),
+                                AccSentryDaemon::requestPanelForLatestTransition);
+                        requestPanelForLatestTransition();
                     }
 
                     // ScreenDeterrent gate: if a screen deterrent is currently
@@ -2538,7 +4536,7 @@ public class AccSentryDaemon {
                     // timer. So dilink4 parked with a fully-lit screen.
                     //
                     // The fix is NOT to suppress display power. Verified against
-                    // the byd_apa reference app (Escort_Auto.apk,
+                    // the byd_apa reference app (
                     // BacklightController + DeviceWakeupMonitor): it turns the
                     // backlight genuinely OFF at park entry WHILE its
                     // AVMCameraRecordAgent is recording, so backlight-off is not
@@ -2587,7 +4585,6 @@ public class AccSentryDaemon {
                     // when the cheap read says "inactive" — see its javadoc: a
                     // same-second stale read here would darken the panel out from
                     // under a deterrent that is actively rendering.
-                    final boolean dilink4Tick = isDilink4CameraMode();
                     // NOTE ON EVALUATION ORDER — this is deliberate, not stylistic.
                     // The legacy branch keeps the ORIGINAL cheap mtime-gated read
                     // (isScreenDeterrentActive()), so the pano_h/pano_l fleet pays
@@ -2598,40 +4595,9 @@ public class AccSentryDaemon {
                     // local (the obvious-looking cleanup) would force a ~10 KB JSON
                     // re-parse every 10 s on EVERY unit — the ≈3.6 MB/hour churn
                     // that isScreenDeterrentActive's own javadoc exists to avoid.
-                    if (!isScreenDeterrentActive()
-                            && !dilink4Tick
-                            && !isCameraPipelineActive()) {
-                        setBacklightState(false);
-                    } else if (dilink4Tick && shouldDarkenPanelNow()) {
-                        // dilink4: real backlight-off, via the reference app's
-                        // two-tier + verify path. Deliberately NOT gated on
-                        // isCameraPipelineActive(): the reference app darkens the
-                        // panel while its AVM agent records, and on dilink4 the
-                        // pipeline runs for essentially the whole park, so
-                        // honouring that gate would mean never darkening at all.
-                        //
-                        // turnOff() self-skips when getPowerScreenStatus()
-                        // already reads off, so the steady-state cost on the
-                        // remaining ~8600 ticks of an overnight park is a single
-                        // status read — and it re-darkens automatically if
-                        // anything (the 8-min wakeUp, a deterrent) relit the
-                        // panel, which is why it is called every tick rather
-                        // than once.
-                        try {
-                            // Surface a persistent failure. StealthPanel de-dups its
-                            // own logging to one line per transition, so a panel that
-                            // refuses to darken would otherwise be a single line at
-                            // the start of the park and silence for the next ~8600
-                            // ticks. Report on a slow cadence so the symptom is
-                            // visible in a log pull without becoming the log.
-                            if (!com.overdrive.app.power.StealthPanel.turnOff(appContext)
-                                    && tick % PANEL_FAILURE_REPORT_EVERY_TICKS == 0) {
-                                log("WARN: parked panel still not dark after both tiers "
-                                    + "(tick " + tick + ") — screen may be lit while parked");
-                            }
-                        } catch (Throwable t) {
-                            log("Stealth panel turnOff failed: " + t.getMessage());
-                        }
+                    if (isKeepAliveCommitCurrent(transitionGeneration)) {
+                        panelReconciler.requestReapply(
+                                transitionGeneration, false);
                     }
 
                     // DiLink 4 AVC keep-alive (June 2026 reversal). The
@@ -2643,9 +4609,12 @@ public class AccSentryDaemon {
                     // is a cheap pidof + (only if absent) am start. No-op
                     // when AVC is already running. Red overlay is masked
                     // cosmetically by the GL red-mask shader.
-                    if (isDilink4CameraMode()) {
+                    if (isKeepAliveCommitCurrent(transitionGeneration)
+                            && isDilink4CameraMode()) {
                         try {
-                            com.overdrive.app.camera.AvcHalWarmup.ensureAvcAlive();
+                            if (isKeepAliveCommitCurrent(transitionGeneration)) {
+                                com.overdrive.app.camera.AvcHalWarmup.ensureAvcAlive();
+                            }
                         } catch (Throwable t) {
                             log("AVC keep-alive tick failed: " + t.getMessage());
                         }
@@ -2659,12 +4628,10 @@ public class AccSentryDaemon {
                     // (tick==0) as a belt-and-suspenders re-cast after the
                     // enterSentryMode vote. ALWAYS on — this is the CAMERA/ISP
                     // rail, not the USB rail; the USB toggle never gates it.
-                    if (tick % ISP_VOTE_REASSERT_EVERY_TICKS == 0) {
-                        try {
-                            applySentryIspPowerVote(true);
-                        } catch (Throwable t) {
-                            log("ISP power vote re-assert failed: " + t.getMessage());
-                        }
+                    if (tick % ISP_VOTE_REASSERT_EVERY_TICKS == 0
+                            && isKeepAliveCommitCurrent(transitionGeneration)) {
+                        peripheralPowerReconciler.requestReapply(
+                                transitionGeneration, true);
                     }
 
                     // Periodic MCU re-wake + peripheral-rail re-assert (every
@@ -2673,7 +4640,7 @@ public class AccSentryDaemon {
                     // byte-unchanged — when the user opted to let the AP/USB
                     // sleep we must NOT re-wake the MCU here. Skipped on tick 0
                     // because enterSentryMode just ran the same sequence seconds
-                    // ago. configurePeripheralPower(true) is idempotent and
+                    // ago. applyPeripheralPowerBatch(true) is idempotent and
                     // already self-checks MCU status (re-waking it if asleep)
                     // before re-writing the rails, so this is the exact same
                     // proven entry-path call, just re-run on a slow cadence to
@@ -2699,7 +4666,8 @@ public class AccSentryDaemon {
                         }
                     }
                     if ((sdRecoveryTick || (tick > 0 && tick % MCU_REWAKE_EVERY_TICKS == 0))
-                            && isKeepUsbPowerOnAccOff()) {
+                            && isKeepUsbPowerOnAccOff()
+                            && isKeepAliveCommitCurrent(transitionGeneration)) {
                         try {
                             log("Periodic MCU re-wake + rail re-assert ("
                                 + (sdRecoveryTick
@@ -2708,8 +4676,12 @@ public class AccSentryDaemon {
                                     : "8-min cadence") + ")");
                             // Re-assert the MCU + peripheral rails (idempotent;
                             // self-wakes the MCU if the BCM slept it).
-                            configurePeripheralPower(true);
-                            // ALSO re-establish AP wakefulness. configurePeripheralPower
+                            peripheralPowerReconciler.requestReapply(
+                                    transitionGeneration, true);
+                            if (!isKeepAliveCommitCurrent(transitionGeneration)) {
+                                break;
+                            }
+                            // ALSO re-establish AP wakefulness. applyPeripheralPowerBatch
                             // only drives the MCU/DC-DC rail, NOT the AP wake state —
                             // and on DiLink 3.0 USB VBUS follows AP wakefulness. The
                             // per-tick injectFakeUserActivity() pump self-skips once the
@@ -2727,7 +4699,16 @@ public class AccSentryDaemon {
                             // actively consuming frames). The AP wakefulness set by
                             // wakeUp() persists with the panel dark — exactly the desired
                             // state. Gated on the same toggle so the OFF path is untouched.
-                            performSystemWakeUp();
+                            if (!isKeepAliveCommitCurrent(transitionGeneration)) {
+                                break;
+                            }
+                            boolean wakeCommitted = runBoundedHardwareBoolean(
+                                    "KeepAlive system wake",
+                                    () -> isKeepAliveGenerationCurrent(
+                                            transitionGeneration),
+                                    () -> performSystemWakeUp(
+                                            transitionGeneration),
+                                    AccSentryDaemon::requestPanelForLatestTransition);
                             // wakeUp() just relit the panel. On firmware with no
                             // getPowerScreenStatus() that relight is invisible to
                             // StealthPanel, so declare it — otherwise its
@@ -2742,35 +4723,18 @@ public class AccSentryDaemon {
                             // mtime-gated loadConfig() cache in every daemon process
                             // and forcing a ~10 KB re-parse on their next read — the
                             // churn the gates here are carefully written to avoid.
-                            if (isDilink4CameraMode()) {
+                            if (wakeCommitted
+                                    && isKeepAliveCommitCurrent(transitionGeneration)
+                                    && isDilink4CameraMode()) {
                                 try {
-                                    com.overdrive.app.power.StealthPanel
-                                        .notePanelStateChangedExternally();
+                                    if (isKeepAliveCommitCurrent(
+                                            transitionGeneration)) {
+                                        com.overdrive.app.power.StealthPanel
+                                            .notePanelStateChangedExternally();
+                                    }
                                 } catch (Throwable ignored) {}
                             }
-                            if (!isScreenDeterrentActive()
-                                    && !isDilink4CameraMode()
-                                    && !isCameraPipelineActive()) {
-                                setBacklightState(false);
-                            } else if (isDilink4CameraMode()
-                                    && !isScreenDeterrentActive(true)
-                                    && !com.overdrive.app.power.StealthPanel
-                                            .isUserOverrideActive()) {
-                                // Same rationale as the per-tick gate above, and the
-                                // same two guards (fresh-read deterrent check so we
-                                // can't darken a rendering warning; user-override
-                                // grace so an explicit screen-on survives). This call
-                                // is load-bearing rather than merely idempotent:
-                                // performSystemWakeUp() just relit the panel, so the
-                                // status now reads ON and turnOff() genuinely
-                                // re-darkens instead of self-skipping. Without it the
-                                // panel stays lit until the next 10 s tick.
-                                try {
-                                    com.overdrive.app.power.StealthPanel.turnOff(appContext);
-                                } catch (Throwable t) {
-                                    log("Stealth panel re-darken failed: " + t.getMessage());
-                                }
-                            }
+                            requestPanelForLatestTransition();
                         } catch (Throwable t) {
                             log("Periodic MCU re-wake / rail re-assert failed: " + t.getMessage());
                         }
@@ -2779,10 +4743,11 @@ public class AccSentryDaemon {
 
                     // 4. Maintenance Cycle Interval (10 seconds)
                     Thread.sleep(SYSTEM_KEEPALIVE_INTERVAL_MS);
-                    
+
                 } catch (InterruptedException e) {
                     log("KeepAlive interrupted - checking if should continue...");
-                    if (!running || !inSentryMode) {
+                    if (!running
+                            || !isKeepAliveCommitCurrent(transitionGeneration)) {
                         break;  // Exit cleanly
                     }
                     // Otherwise continue the loop
@@ -2793,17 +4758,129 @@ public class AccSentryDaemon {
                     try {
                         Thread.sleep(1000);  // Brief pause before retry
                     } catch (InterruptedException ignored) {
-                        if (!running || !inSentryMode) break;
+                        if (!running
+                                || !isKeepAliveCommitCurrent(transitionGeneration)) {
+                            break;
+                        }
                     }
                 }
             }
 
             log("System Persistence Service stopped");
+            boolean requestReplacement = false;
+            synchronized (systemKeepAliveLock) {
+                if (systemKeepAliveThread == Thread.currentThread()) {
+                    systemKeepAliveThread = null;
+                    systemKeepAliveGeneration = -1L;
+                    SentryTransitionState latest = latestSentryTransition;
+                    requestReplacement = running
+                            && latest.generation == transitionGeneration
+                            && latest.keepAwakeEnabled()
+                            && keepAliveReconciler.isDesired(
+                                    transitionGeneration, true);
+                }
+            }
+            if (requestReplacement) {
+                keepAliveReconciler.requestReapply(
+                        transitionGeneration, true);
+            }
         }, "SystemKeepAlive");
 
-        // CRITICAL: Not a daemon thread! Survives if main thread has issues.
-        systemKeepAliveThread.setDaemon(false);
-        systemKeepAliveThread.start();
+        final Thread previous;
+        synchronized (systemKeepAliveLock) {
+            if (!isSentryTransitionGenerationCurrent(transitionGeneration)
+                    || !keepAliveReconciler.isDesired(
+                            transitionGeneration, true)) {
+                return true;
+            }
+            if (systemKeepAliveThread != null
+                    && systemKeepAliveThread.isAlive()
+                    && systemKeepAliveGeneration == transitionGeneration) {
+                return true;
+            }
+            if (systemKeepAliveThread != null
+                    && systemKeepAliveGeneration > transitionGeneration) {
+                return true;
+            }
+            previous = systemKeepAliveThread;
+        }
+
+        if (previous != null && previous.isAlive()) {
+            previous.interrupt();
+            if (!joinThreadBounded(previous, 2000L)) {
+                log("WARN: prior KeepAlive generation "
+                        + systemKeepAliveGeneration
+                        + " is still terminating; deferring generation "
+                        + transitionGeneration);
+                return false;
+            }
+        }
+
+        try {
+            // CRITICAL: Not a daemon thread! Survives if main thread has issues.
+            keepAliveThread.setDaemon(false);
+        } catch (Throwable configurationFailure) {
+            log("System Persistence Service thread setup failed: "
+                    + configurationFailure.getMessage());
+            return false;
+        }
+
+        synchronized (systemKeepAliveLock) {
+            if (systemKeepAliveThread == previous
+                    && (previous == null || !previous.isAlive())) {
+                systemKeepAliveThread = null;
+                systemKeepAliveGeneration = -1L;
+            }
+            if (!isSentryTransitionGenerationCurrent(transitionGeneration)
+                    || !keepAliveReconciler.isDesired(
+                            transitionGeneration, true)) {
+                return true;
+            }
+            if (systemKeepAliveThread != null
+                    && systemKeepAliveThread.isAlive()) {
+                return systemKeepAliveGeneration >= transitionGeneration;
+            }
+            systemKeepAliveThread = keepAliveThread;
+            systemKeepAliveGeneration = transitionGeneration;
+        }
+
+        try {
+            keepAliveThread.start();
+            return true;
+        } catch (Throwable startFailure) {
+            synchronized (systemKeepAliveLock) {
+                if (systemKeepAliveThread == keepAliveThread) {
+                    systemKeepAliveThread = null;
+                    systemKeepAliveGeneration = -1L;
+                }
+            }
+            log("System Persistence Service failed to start: "
+                    + startFailure.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean isKeepAliveGenerationCurrent(long generation) {
+        synchronized (systemKeepAliveLock) {
+            SentryTransitionState latest = latestSentryTransition;
+            return latest.generation == generation
+                    && latest.keepAwakeEnabled()
+                    && keepAliveReconciler.isDesired(generation, true)
+                    && systemKeepAliveGeneration == generation
+                    && systemKeepAliveThread != null
+                    && systemKeepAliveThread.isAlive();
+        }
+    }
+
+    private static boolean isKeepAliveCommitCurrent(long generation) {
+        synchronized (systemKeepAliveLock) {
+            SentryTransitionState latest = latestSentryTransition;
+            return latest.generation == generation
+                    && latest.keepAwakeEnabled()
+                    && keepAliveReconciler.isDesired(generation, true)
+                    && systemKeepAliveGeneration == generation
+                    && systemKeepAliveThread == Thread.currentThread();
+        }
     }
 
     /**
@@ -2837,7 +4914,13 @@ public class AccSentryDaemon {
      * FIRST because it is the cheap common case (~99.9% of ticks) and short-
      * circuits the two expensive guards, both of which do a full config re-parse.
      */
-    private static boolean shouldDarkenPanelNow() {
+    private enum PanelDarkenDecision {
+        DARKEN,
+        ALREADY_DARK,
+        RETRY_LATER
+    }
+
+    private static PanelDarkenDecision panelDarkenDecision() {
         String reason;
         try {
             if (com.overdrive.app.power.StealthPanel.isAlreadyDark(appContext)) {
@@ -2848,11 +4931,11 @@ public class AccSentryDaemon {
                 reason = "user-override";
             } else {
                 logPanelGate(null);
-                return true;
+                return PanelDarkenDecision.DARKEN;
             }
         } catch (Throwable t) {
             log("Panel-darken gate failed, skipping this tick: " + t.getMessage());
-            return false;
+            return PanelDarkenDecision.RETRY_LATER;
         }
         // Log WHY we declined, on state change only. Without this a park that
         // stayed lit produced no log line at all from either file: all three
@@ -2861,7 +4944,9 @@ public class AccSentryDaemon {
         // four possible causes of "my screen stayed on all night" indistinguishable
         // in a customer log pull.
         logPanelGate(reason);
-        return false;
+        return "already-dark".equals(reason)
+                ? PanelDarkenDecision.ALREADY_DARK
+                : PanelDarkenDecision.RETRY_LATER;
     }
 
     private static volatile String lastPanelGateReason = "";
@@ -2967,7 +5052,7 @@ public class AccSentryDaemon {
      *
      * <p><b>Trade-off:</b> skipping the forced wake means features that need the AP
      * continuously awake while parked may not run when the toggle is OFF. The MCU/AVM
-     * power writes in {@link #configurePeripheralPower} still fire, and HAL events still
+     * power writes in {@link #applyPeripheralPowerBatch} still fire, and HAL events still
      * wake the AP on demand, but a continuously-awake assumption (e.g. some keep-alive
      * cadence) won't hold. The toggle defaults ON so this only applies when the user
      * explicitly opts out.
@@ -3098,40 +5183,132 @@ public class AccSentryDaemon {
         }
     }
 
-    private static void stopSystemKeepAlive() {
-        if (systemKeepAliveThread != null) {
-            log("Stopping System Persistence Service...");
-            systemKeepAliveThread.interrupt();
-            
-            // Wait briefly for clean shutdown
-            try {
-                systemKeepAliveThread.join(2000);
-            } catch (InterruptedException ignored) {}
-            
-            if (systemKeepAliveThread.isAlive()) {
-                log("WARN: KeepAlive thread did not stop cleanly");
+    private static boolean stopSystemKeepAlive(long transitionGeneration) {
+        final Thread target;
+        synchronized (systemKeepAliveLock) {
+            target = systemKeepAliveThread;
+            if (target != null
+                    && systemKeepAliveGeneration > transitionGeneration) {
+                return true;
             }
-            
-            systemKeepAliveThread = null;
         }
+
+        if (target != null) {
+            log("Stopping System Persistence Service...");
+            target.interrupt();
+            if (!joinThreadBounded(target, 2000L)) {
+                log("WARN: KeepAlive thread is still terminating; ownership retained");
+                return false;
+            }
+
+            synchronized (systemKeepAliveLock) {
+                if (systemKeepAliveThread == target && !target.isAlive()) {
+                    systemKeepAliveThread = null;
+                    systemKeepAliveGeneration = -1L;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static boolean joinThreadBounded(Thread target, long timeoutMs) {
+        if (target == null || !target.isAlive()) {
+            return true;
+        }
+        try {
+            target.join(timeoutMs);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return !target.isAlive();
     }
 
     /**
      * Checks if Wi-Fi is enabled and forces it ON if not.
      * Equivalent to: Runtime.getRuntime().exec("svc wifi enable");
      */
-    private static void ensureWifiEnabled() {
+    private static void ensureWifiEnabled(long transitionGeneration) {
         // Respect a user's explicit "WiFi off" automation / key-mapping: when the radio
         // action set the suppression flag, the keep-alive stands down so the deliberate
         // off state isn't clobbered every 10s tick. With no such rule the flag is false
         // (default) and keep-alive behaves exactly as before. Fail-open (read returns
         // false on error → we re-enable), so a config glitch can never strand WiFi off.
         if (com.overdrive.app.config.UnifiedConfigManager.isWifiKeepAliveSuppressed()) {
+            // A HOTSPOT-owned suppression is only valid while the access point is
+            // actually up. If the app process that owns the hotspot died with the
+            // AP down, nothing else would ever clear the flag and WiFi would stay
+            // stranded off — so reconcile it here and fall through to re-enable.
+            if (!reconcileStrandedHotspotSuppression()) {
+                return;
+            }
+        }
+        if (!isKeepAliveCommitCurrent(transitionGeneration)) {
             return;
         }
         // We use a lightweight check to avoid spamming the shell log
         // running it blindly is safer for persistence.
-        execShell(CMD_WIFI_ENABLE());
+        ShellResult result = execShellResult(
+                CMD_WIFI_ENABLE(),
+                DEFAULT_SHELL_TIMEOUT_MS,
+                () -> isKeepAliveCommitCurrent(transitionGeneration));
+        if (!result.success && !result.canceled) {
+            log("Wi-Fi keepalive command failed: " + result.describeFailure());
+        }
+    }
+
+    /**
+     * Cellular counterpart of {@link #ensureWifiEnabled} (issue #209). On some firmware
+     * (reported on Seal 2025 / system 2506) the system flips the mobile-data master
+     * switch off at ACC-OFF even though the sentry rail hold keeps the modem powered —
+     * so parked recording works but cellular connectivity (Tailscale etc.) drops while
+     * WiFi survives. Re-asserts each tick:
+     *   svc data enable                                — repair the master switch
+     *   settings put global mobile_data_always_on 1   — keep the bearer up even when
+     *                                                    the framework would drop it
+     * Both are idempotent and cheap; they run as one shell invocation to keep the
+     * per-tick process spawn count identical to the WiFi path (one each).
+     *
+     * <p>Only called when the session was ARMED — the user opted in via the
+     * "Keep mobile data awake while parked" setting AND mobile data was ON at sentry
+     * entry (see the snapshot in the persistence loop). Within an armed session, a user
+     * radio rule that turns data off mid-park is honoured via the same suppression-flag
+     * pattern as WiFi.
+     */
+    private static void ensureMobileDataEnabled(long transitionGeneration) {
+        // Respect a user's explicit "data off" automation / key-mapping, exactly like
+        // the WiFi flag above. Fail-open (read error → false → we re-enable).
+        if (com.overdrive.app.config.UnifiedConfigManager.isDataKeepAliveSuppressed()) {
+            return;
+        }
+        if (!isKeepAliveCommitCurrent(transitionGeneration)) {
+            return;
+        }
+        ShellResult result = execShellResult(
+                CMD_DATA_ENABLE() + "; " + CMD_DATA_ALWAYS_ON(),
+                DEFAULT_SHELL_TIMEOUT_MS,
+                () -> isKeepAliveCommitCurrent(transitionGeneration));
+        if (!result.success && !result.canceled) {
+            log("Mobile-data keepalive command failed: " + result.describeFailure());
+        }
+    }
+
+    /**
+     * One-shot arming probe for the cellular keep-alive: was the mobile-data master
+     * switch ON when the parked session began? Reads {@code settings get global
+     * mobile_data}. Conservative on ambiguity — a missing/null key reads as OFF, so we
+     * never force-enable data on firmware whose state we can't read (unlike WiFi,
+     * enabling data can have real cost for the user).
+     */
+    private static boolean isMobileDataOnAtSentryEntry(long transitionGeneration) {
+        ShellResult result = execShellResult(
+                CMD_DATA_GET(),
+                DEFAULT_SHELL_TIMEOUT_MS,
+                () -> isKeepAliveCommitCurrent(transitionGeneration));
+        if (!result.success) {
+            return false;
+        }
+        return "1".equals(result.output.trim());
     }
 
     // ==================== REFLECTION CACHES ====================
@@ -3338,8 +5515,8 @@ public class AccSentryDaemon {
      * CRITICAL: Checks screen status FIRST to avoid exceptions on some BYD firmware
      * where calling userActivity() when screen is OFF causes issues.
      */
-    private static void injectFakeUserActivity() {
-        if (appContext == null) return;
+    private static boolean injectFakeUserActivity(long transitionGeneration) {
+        if (appContext == null) return false;
 
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
@@ -3355,7 +5532,7 @@ public class AccSentryDaemon {
                         // Screen is OFF - userActivity may fail or be ignored
                         // Skip it - the wakeUp call in performSystemWakeUp() handles keeping CPU alive
                         log("Screen OFF - skipping userActivity");
-                        return;
+                        return true;
                     }
                 } catch (Exception e) {
                     // Per-call invocation failure (transient binder/access issue);
@@ -3388,10 +5565,13 @@ public class AccSentryDaemon {
             if (isDilink4CameraMode()) {
                 resolvePmUserActivity2Arg();
                 if (pmUserActivity2ArgResolved) {
+                    if (!isKeepAliveGenerationCurrent(transitionGeneration)) {
+                        return true;
+                    }
                     pmUserActivity2ArgMethod.invoke(
                         pm, android.os.SystemClock.uptimeMillis(), true);
                     log("userActivity(long, noChangeLights=true) called [dilink4 stealth]");
-                    return;
+                    return true;
                 }
             }
 
@@ -3403,9 +5583,12 @@ public class AccSentryDaemon {
             // any invoke-time exception propagate.
             resolvePmUserActivity1Arg();
             if (pmUserActivity1ArgResolved) {
+                if (!isKeepAliveGenerationCurrent(transitionGeneration)) {
+                    return true;
+                }
                 pmUserActivity1ArgMethod.invoke(pm, android.os.SystemClock.uptimeMillis());
                 log("userActivity(long) called");
-                return;
+                return true;
             } else {
                 // Preserved verbatim from the original ordering: on firmware with
                 // no 1-arg overload this line fired BEFORE the 2-arg fallback was
@@ -3418,18 +5601,24 @@ public class AccSentryDaemon {
             // noChangeLights = true means "Reset the sleep timer, but don't turn on the screen"
             resolvePmUserActivity2Arg();
             if (pmUserActivity2ArgResolved) {
+                if (!isKeepAliveGenerationCurrent(transitionGeneration)) {
+                    return true;
+                }
                 pmUserActivity2ArgMethod.invoke(pm, android.os.SystemClock.uptimeMillis(), true);
                 log("userActivity(long, boolean) called");
+                return true;
             }
+            return false;
 
         } catch (Exception e) {
             log("userActivity error: " + e.getMessage());
+            return false;
         }
     }
 
     private static void immediateWakeUpMcu() {
         log("IMMEDIATE MCU WAKE-UP...");
-        
+
         if (wakeUpMcu()) {
             log("  MCU wake: OK");
         } else {
@@ -3464,7 +5653,7 @@ public class AccSentryDaemon {
         if (wakeUpMcu()) {
             log("  MCU wake: OK");
         }
-        
+
         // Double-tap for reliability
         try {
             Thread.sleep(500);
@@ -3473,7 +5662,7 @@ public class AccSentryDaemon {
     }
 
     // ==================== ACTIVE VOLTAGE RECOVERY ====================
-    
+
     /**
      * Schedule the V2 voltage monitor to start 35 s after ACC=OFF.
      * 35 s mirrors the sibling-app entry timer — gives the head unit time
@@ -3486,27 +5675,255 @@ public class AccSentryDaemon {
      * {@code Looper.getMainLooper()} returns null and the Handler
      * constructor NPE'd. The executor is a single-shot, daemon thread.
      */
-    private static void scheduleBatteryVoltageMonitorV2() {
-        java.util.concurrent.ScheduledExecutorService exec =
-            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "BatteryV2-Schedule");
-                t.setDaemon(true);
-                return t;
-            });
-        exec.schedule(() -> {
-            try {
-                if (!inSentryMode) {
-                    log("scheduleBatteryVoltageMonitorV2: exited sentry before delay — abort");
-                    return;
+    private static boolean applyMonitorState(long generation, boolean enabled) {
+        synchronized (monitorIoLock) {
+            SentryTransitionState latest = latestSentryTransition;
+            if (latest.generation != generation
+                    || latest.keepAwakeEnabled() != enabled
+                    || !monitorReconciler.isDesired(generation, enabled)) {
+                return true;
+            }
+
+            boolean success = true;
+            if (enabled) {
+                if (vehicleDataListener == null) {
+                    success &= initVehicleDataMonitor();
                 }
+                if (vehicleDataListener != null) {
+                    vehicleDataMonitorOwnerGeneration = generation;
+                } else {
+                    success = false;
+                }
+                if (!isMonitorRequestCurrent(generation, true)) {
+                    return true;
+                }
+
+                try {
+                    if (socMonitorOwnerGeneration < 0L) {
+                        Context socCtx = new PermissionBypassContext(appContext);
+                        com.overdrive.app.power.SocCutoffMonitor.startMonitor(socCtx);
+                    }
+                    socMonitorOwnerGeneration = generation;
+                } catch (Throwable t) {
+                    log("SocCutoffMonitor start failed: " + t.getMessage());
+                    success = false;
+                }
+                if (!isMonitorRequestCurrent(generation, true)) {
+                    return true;
+                }
+
+                if (batteryVoltageMonitorOwnerGeneration >= 0L) {
+                    if (batteryVoltageMonitorOwnerGeneration == generation) {
+                        cancelBatteryVoltageFutureUpTo(generation);
+                    } else {
+                        try {
+                            com.overdrive.app.power.BatteryVoltageMonitorV2.stopMonitor();
+                            batteryVoltageMonitorOwnerGeneration = -1L;
+                        } catch (Throwable t) {
+                            log("BatteryVoltageMonitorV2 prior-owner stop failed: "
+                                    + t.getMessage());
+                            success = false;
+                        }
+                    }
+                }
+                if (batteryVoltageMonitorOwnerGeneration < 0L) {
+                    success &= scheduleBatteryVoltageMonitorV2(generation);
+                }
+                return success;
+            }
+
+            cancelBatteryVoltageFutureUpTo(generation);
+            if (batteryVoltageMonitorOwnerGeneration >= 0L
+                    && batteryVoltageMonitorOwnerGeneration <= generation) {
+                try {
+                    com.overdrive.app.power.BatteryVoltageMonitorV2.stopMonitor();
+                    batteryVoltageMonitorOwnerGeneration = -1L;
+                } catch (Throwable t) {
+                    log("BatteryVoltageMonitorV2 stop failed: " + t.getMessage());
+                    success = false;
+                }
+            }
+            if (!isMonitorRequestCurrent(generation, false)) {
+                return true;
+            }
+
+            if (socMonitorOwnerGeneration >= 0L
+                    && socMonitorOwnerGeneration <= generation) {
+                try {
+                    com.overdrive.app.power.SocCutoffMonitor.stopMonitor();
+                    socMonitorOwnerGeneration = -1L;
+                } catch (Throwable t) {
+                    log("SocCutoffMonitor stop failed: " + t.getMessage());
+                    success = false;
+                }
+            }
+            if (!isMonitorRequestCurrent(generation, false)) {
+                return true;
+            }
+
+            if (vehicleDataMonitorOwnerGeneration >= 0L
+                    && vehicleDataMonitorOwnerGeneration <= generation) {
+                if (stopVehicleDataMonitor()) {
+                    vehicleDataMonitorOwnerGeneration = -1L;
+                } else {
+                    success = false;
+                }
+            }
+            return success;
+        }
+    }
+
+    private static boolean isMonitorRequestCurrent(
+            long generation, boolean enabled) {
+        SentryTransitionState latest = latestSentryTransition;
+        return latest.generation == generation
+                && latest.keepAwakeEnabled() == enabled
+                && monitorReconciler.isDesired(generation, enabled);
+    }
+
+    private static boolean scheduleBatteryVoltageMonitorV2(
+            final long transitionGeneration) {
+        boolean scheduled = scheduleBatteryVoltageMonitorStart(
+                transitionGeneration,
+                BATTERY_VOLTAGE_START_DELAY_MS,
+                true);
+        if (scheduled) {
+            log("scheduleBatteryVoltageMonitorV2: in 35 s for generation "
+                    + transitionGeneration);
+        }
+        return scheduled;
+    }
+
+    private static boolean scheduleBatteryVoltageMonitorStart(
+            final long transitionGeneration,
+            long delayMs,
+            boolean resetRetryDelay) {
+        synchronized (batteryVoltageScheduleLock) {
+            if (!isMonitorRequestCurrent(transitionGeneration, true)) {
+                return true;
+            }
+            if (batteryVoltageFuture != null) {
+                if (batteryVoltageFutureGeneration == transitionGeneration) {
+                    return true;
+                }
+                batteryVoltageFuture.cancel(false);
+            }
+            if (resetRetryDelay) {
+                batteryVoltageRetryDelayMs = 1000L;
+            }
+            try {
+                batteryVoltageFutureGeneration = transitionGeneration;
+                batteryVoltageFuture = batteryVoltageScheduler.schedule(
+                        () -> startDelayedBatteryVoltageMonitor(
+                                transitionGeneration),
+                        delayMs,
+                        java.util.concurrent.TimeUnit.MILLISECONDS);
+                return true;
+            } catch (Throwable scheduleFailure) {
+                batteryVoltageFuture = null;
+                batteryVoltageFutureGeneration = -1L;
+                log("BatteryVoltageMonitorV2 scheduling failed: "
+                        + scheduleFailure.getMessage());
+                return false;
+            }
+        }
+    }
+
+    private static void cancelBatteryVoltageFutureUpTo(long generation) {
+        synchronized (batteryVoltageScheduleLock) {
+            if (batteryVoltageFuture != null
+                    && batteryVoltageFutureGeneration <= generation) {
+                batteryVoltageFuture.cancel(false);
+                batteryVoltageFuture = null;
+                batteryVoltageFutureGeneration = -1L;
+                batteryVoltageRetryDelayMs = 1000L;
+            }
+        }
+    }
+
+    private static void startDelayedBatteryVoltageMonitor(long scheduledGeneration) {
+        boolean requestReapply = false;
+        synchronized (monitorIoLock) {
+            if (!isDelayedBatteryVoltageStartCurrent(scheduledGeneration)) {
+                clearBatteryVoltageFutureIfOwned(scheduledGeneration);
+                return;
+            }
+
+            try {
                 com.overdrive.app.power.BatteryVoltageMonitorV2.startMonitor(appContext);
             } catch (Throwable t) {
                 log("BatteryVoltageMonitorV2 start failed: " + t.getMessage());
-            } finally {
-                exec.shutdown();
+                clearBatteryVoltageFutureIfOwned(scheduledGeneration);
+                if (isMonitorRequestCurrent(scheduledGeneration, true)) {
+                    long retryDelay;
+                    synchronized (batteryVoltageScheduleLock) {
+                        retryDelay = batteryVoltageRetryDelayMs;
+                        batteryVoltageRetryDelayMs = Math.min(
+                                batteryVoltageRetryDelayMs * 2L,
+                                BATTERY_VOLTAGE_RETRY_MAX_MS);
+                    }
+                    if (!scheduleBatteryVoltageMonitorStart(
+                            scheduledGeneration, retryDelay, false)) {
+                        requestReapply = true;
+                    } else {
+                        log("BatteryVoltageMonitorV2 retry scheduled in "
+                                + retryDelay + " ms for generation "
+                                + scheduledGeneration);
+                    }
+                }
+                if (requestReapply) {
+                    monitorReconciler.requestReapply(
+                            scheduledGeneration, true);
+                }
+                return;
             }
-        }, 35_000L, java.util.concurrent.TimeUnit.MILLISECONDS);
-        log("scheduleBatteryVoltageMonitorV2: in 35 s");
+
+            // startMonitor can be uninterruptible. It may only commit for the
+            // exact generation whose full 35-second delay elapsed.
+            if (!isDelayedBatteryVoltageStartCurrent(scheduledGeneration)) {
+                try {
+                    com.overdrive.app.power.BatteryVoltageMonitorV2.stopMonitor();
+                    batteryVoltageMonitorOwnerGeneration = -1L;
+                } catch (Throwable t) {
+                    log("BatteryVoltageMonitorV2 stale-start rollback failed: "
+                            + t.getMessage());
+                    batteryVoltageMonitorOwnerGeneration = scheduledGeneration;
+                    requestReapply = true;
+                }
+                clearBatteryVoltageFutureIfOwned(scheduledGeneration);
+            } else {
+                batteryVoltageMonitorOwnerGeneration = scheduledGeneration;
+                clearBatteryVoltageFutureIfOwned(scheduledGeneration);
+                synchronized (batteryVoltageScheduleLock) {
+                    batteryVoltageRetryDelayMs = 1000L;
+                }
+            }
+        }
+        if (requestReapply) {
+            ReconcileRequest desired = monitorReconciler.desiredSnapshot();
+            monitorReconciler.requestReapply(
+                    desired.generation, desired.state);
+        }
+    }
+
+    private static boolean isDelayedBatteryVoltageStartCurrent(
+            long scheduledGeneration) {
+        if (!isMonitorRequestCurrent(scheduledGeneration, true)) {
+            return false;
+        }
+        synchronized (batteryVoltageScheduleLock) {
+            return batteryVoltageFuture != null
+                    && batteryVoltageFutureGeneration == scheduledGeneration;
+        }
+    }
+
+    private static void clearBatteryVoltageFutureIfOwned(long generation) {
+        synchronized (batteryVoltageScheduleLock) {
+            if (batteryVoltageFutureGeneration == generation) {
+                batteryVoltageFuture = null;
+                batteryVoltageFutureGeneration = -1L;
+            }
+        }
     }
 
     /**
@@ -3536,33 +5953,33 @@ public class AccSentryDaemon {
     }
 
     // ==================== VEHICLE DATA MONITOR INTEGRATION ====================
-    
+
     /**
      * Initialize VehicleDataMonitor and register listener for voltage-based MCU control.
      * Only initializes the 12V battery power monitor (not all monitors) for sentry mode.
      */
-    private static void initVehicleDataMonitor() {
+    private static boolean initVehicleDataMonitor() {
         if (appContext == null) {
             log("Cannot init VehicleDataMonitor: no context");
-            return;
+            return false;
         }
-        
+
         try {
             log("Initializing VehicleDataMonitor for voltage monitoring (battery power only)...");
-            
+
             VehicleDataMonitor monitor = VehicleDataMonitor.getInstance();
-            
+
             // Initialize with our permissive context - ONLY battery power monitor
             Context permissiveContext = new PermissionBypassContext(appContext);
             monitor.initBatteryPowerOnly(permissiveContext);
-            
+
             // Create and register our listener for voltage-based MCU control
             vehicleDataListener = new VehicleDataListener() {
                 @Override
                 public void onBatteryVoltageChanged(BatteryVoltageData data) {
                     // Discrete level changes (0=LOW, 1=NORMAL) - handled by AccListener
                 }
-                
+
                 @Override
                 public void onBatteryPowerChanged(BatteryPowerData data) {
                     // REPLACED — voltage hysteresis is now owned by
@@ -3587,53 +6004,58 @@ public class AccSentryDaemon {
                                 + "V (handled by BatteryVoltageMonitorV2)");
                     }
                 }
-                
+
                 @Override
                 public void onChargingStateChanged(ChargingStateData data) {
                     // Not used in sentry mode (battery power only)
                 }
-                
+
                 @Override
                 public void onChargingPowerChanged(double powerKW) {
                     // Not used in sentry mode (battery power only)
                 }
-                
+
                 @Override
                 public void onDataUnavailable(String monitorName, String reason) {
                     log("VehicleData unavailable: " + monitorName + " - " + reason);
                 }
             };
-            
+
             monitor.addListener(vehicleDataListener);
             monitor.startBatteryPowerOnly();
-            
+
             log("VehicleDataMonitor initialized (battery power only)");
-            
+            return true;
+
         } catch (Exception e) {
             log("VehicleDataMonitor init failed: " + e.getMessage());
+            vehicleDataListener = null;
+            return false;
         }
     }
-    
+
     /**
      * Stop listening to VehicleDataMonitor (battery power only).
      */
-    private static void stopVehicleDataMonitor() {
+    private static boolean stopVehicleDataMonitor() {
         try {
             log("Removing VehicleDataMonitor listener...");
-            
+
             if (vehicleDataListener != null) {
                 VehicleDataMonitor monitor = VehicleDataMonitor.getInstance();
                 monitor.removeListener(vehicleDataListener);
                 monitor.stopBatteryPowerOnly();
                 vehicleDataListener = null;
             }
-            
+
             // isVoltageChargingCycle = false;  // (state replaced — see V2 monitor)
 
             log("VehicleDataMonitor listener removed");
-            
+            return true;
+
         } catch (Exception e) {
             log("VehicleDataMonitor cleanup failed: " + e.getMessage());
+            return false;
         }
     }
 
@@ -3678,7 +6100,7 @@ public class AccSentryDaemon {
         // Check safe zone — don't start surveillance if parked in a safe zone.
         // Mark as suppressed so onLeftSafeZone() can re-arm if the car is towed out.
         try {
-            com.overdrive.app.surveillance.SafeLocationManager safeLocMgr = 
+            com.overdrive.app.surveillance.SafeLocationManager safeLocMgr =
                 com.overdrive.app.surveillance.SafeLocationManager.getInstance();
             if (safeLocMgr.isFeatureEnabled() && safeLocMgr.isInSafeZone()) {
                 log("In safe zone '" + safeLocMgr.getCurrentZoneName() + "' — skipping surveillance");
@@ -3782,8 +6204,14 @@ public class AccSentryDaemon {
             JSONObject config = new JSONObject();
             config.put("stopSurveillance", true);
             cmd.put("config", config);
-            
-            sendSurveillanceCommandRaw(cmd);
+
+            JSONObject response = sendSurveillanceCommandRaw(cmd);
+            if (response == null
+                    || !response.optBoolean("success", false)) {
+                log("WARN: Surveillance stop was not acknowledged: "
+                        + (response == null ? "null" : response.toString()));
+                return;
+            }
             surveillanceEnabled = false;
             log("Surveillance STOPPED via IPC (user preference preserved)");
         } catch (Exception e) {
@@ -3794,15 +6222,15 @@ public class AccSentryDaemon {
     /**
      * Notify CameraDaemon of ACC state change.
      * This updates AccMonitor so HTTP API returns correct acc status.
-     * 
+     *
      * @param accOff true if ACC is OFF, false if ACC is ON
      */
-    
+
     // ==================== DOOR LOCK GATED SURVEILLANCE — DELETED ====================
     // Door-lock gating is owned by CameraDaemon (it has the cloud MQTT subscriber
     // in-process and BydDataCollector's typed HAL listener). AccSentryDaemon
     // delegates by calling notifyAccState() — see enterSentryMode() / exitSentryMode().
-    
+
     /**
      * Read the current bodywork power level via reflection.
      *
@@ -3830,6 +6258,89 @@ public class AccSentryDaemon {
         }
     }
 
+    private static void applyHeartbeatPowerLevel(
+            int level, long callbackSequenceBeforeRead) {
+        if (level == POWER_LEVEL_ACC) {
+            log("ACC heartbeat: level=ACC (1) is a transient; "
+                    + "skipping publish");
+            return;
+        }
+        if (level != POWER_LEVEL_OFF
+                && level != POWER_LEVEL_ON
+                && level != POWER_LEVEL_OK) {
+            return;
+        }
+
+        boolean isAccOff = level < POWER_LEVEL_ON;
+        int desiredFlag = isAccOff ? 1 : 0;
+        synchronized (accObservationLock) {
+            if (accCallbackSequence.get()
+                    != callbackSequenceBeforeRead) {
+                log("ACC heartbeat: callback arrived during HAL "
+                        + "snapshot; discarding stale observation");
+                return;
+            }
+            long heartbeatObservationSequence =
+                    accCallbackSequence.incrementAndGet();
+            log("ACC observation from heartbeat snapshot: "
+                    + powerLevelToString(level)
+                    + " (sequence="
+                    + heartbeatObservationSequence + ")");
+
+            SentryTransitionState latest =
+                    latestSentryTransition;
+            if (latest.sentryMode != isAccOff) {
+                log("ACC heartbeat: HAL state disagrees with "
+                        + "generation " + latest.generation
+                        + "; reconciling full transition");
+                lastPowerLevel = level;
+                if (isAccOff) {
+                    enterSentryMode();
+                } else {
+                    exitSentryMode();
+                }
+                return;
+            }
+
+            lastPowerLevel = level;
+            boolean publish = false;
+            boolean forced = false;
+            synchronized (heartbeatPublishLock) {
+                if (desiredFlag
+                        == lastHeartbeatPublishedAccOff) {
+                    heartbeatDedupRunLength++;
+                    if (heartbeatDedupRunLength
+                            >= HEARTBEAT_FORCE_REPUBLISH_TICKS) {
+                        heartbeatDedupRunLength = 0;
+                        publish = true;
+                        forced = true;
+                    }
+                } else {
+                    heartbeatDedupRunLength = 0;
+                    publish = true;
+                }
+            }
+
+            if (publish) {
+                notifyAccState(
+                        latest.generation, isAccOff, true);
+                if (forced) {
+                    log("ACC heartbeat: forced republish after "
+                            + HEARTBEAT_FORCE_REPUBLISH_TICKS
+                            + " dedup ticks (~1min) accOff="
+                            + isAccOff
+                            + "; covers CameraDaemon process restart");
+                } else {
+                    log("ACC heartbeat: level="
+                            + powerLevelToString(level)
+                            + " accOff=" + isAccOff
+                            + " (state changed since last "
+                            + "successful publish)");
+                }
+            }
+        }
+    }
+
     /**
      * Periodic ACC state heartbeat — runs every 30s while the daemon is up
      * and a bodywork listener has been registered. Republishes the current
@@ -3847,79 +6358,22 @@ public class AccSentryDaemon {
         }
         accHeartbeatThread = new Thread(() -> {
             log("ACC state heartbeat started (30s interval)");
-            while (!Thread.currentThread().isInterrupted()) {
+            while (running
+                    && !Thread.currentThread().isInterrupted()) {
                 try {
                     Thread.sleep(30_000L);
                 } catch (InterruptedException ie) {
                     return;
                 }
                 try {
-                    int level = readPowerLevel();
-                    // Gate on definitive levels only. 4 = FAKE_OK and
-                    // 255 = INVALID are HAL bluffs; -1 is our reflection
-                    // failure sentinel. Any of these → no publish.
-                    //
-                    // Also skip level=1 (ACC). During ignition there is a
-                    // 200-500ms transient where the HAL emits level=1
-                    // before settling at 2/3; a heartbeat tick landing in
-                    // that window would publish accOff=true mid-startup
-                    // and falsely flip CameraDaemon into the ACC OFF path.
-                    // Edge handler in onPowerLevelChanged already maps
-                    // level=1 correctly (drop-from-ON treated as OFF, no
-                    // transition otherwise) — heartbeat doesn't need to
-                    // duplicate that. See prior-audit "Heartbeat publishes
-                    // during transient level=1 ACC-edge blip".
-                    if (level == POWER_LEVEL_ACC) {
-                        log("ACC heartbeat: level=ACC (1) is a transient — skipping publish");
-                    } else if (level == POWER_LEVEL_OFF
-                            || level == POWER_LEVEL_ON
-                            || level == POWER_LEVEL_OK) {
-                        boolean isAccOff = level < POWER_LEVEL_ON;
-                        int desiredFlag = isAccOff ? 1 : 0;
-                        // Equality short-circuit. CameraDaemon.onAccStateChanged
-                        // runs cleanupDoorLockGate, surveillanceEnabled reset,
-                        // DB write, OEM recalc on every IPC; none are
-                        // unconditionally idempotent, so a 30s heartbeat
-                        // republishing the same state churns those side
-                        // effects forever. Only publish on actual change
-                        // since last heartbeat publish (edge handler still
-                        // owns transitions). See prior-audit
-                        // "Heartbeat triggers full CameraDaemon
-                        // .onAccStateChanged side-effects every 30s".
-                        if (desiredFlag == lastHeartbeatPublishedAccOff) {
-                            // No-op: state unchanged since last publish.
-                            // Do not log every tick to avoid log flood —
-                            // 2880 lines/day at 30s otherwise.
-                            //
-                            // EXCEPT: if we've been deduping for
-                            // HEARTBEAT_FORCE_REPUBLISH_TICKS ticks (~1 min at
-                            // 30s tick × 2 — was ~5min, dropped per prior-audit
-                            // "Heartbeat dedup creates 5-minute pano wedge on
-                            // CameraDaemon mid-drive restart"),
-                            // republish anyway so a CameraDaemon process
-                            // restart mid-drive (which resets its
-                            // lastDispatchedAccIsOff cache to null) resyncs
-                            // without waiting for the next bodywork edge.
-                            // CameraDaemon's onAccStateChanged dedup drops
-                            // the no-op IPC when state already matches, so
-                            // this is a cheap heartbeat in steady state.
-                            heartbeatDedupRunLength++;
-                            if (heartbeatDedupRunLength >= HEARTBEAT_FORCE_REPUBLISH_TICKS) {
-                                notifyAccState(isAccOff);
-                                heartbeatDedupRunLength = 0;
-                                log("ACC heartbeat: forced republish after "
-                                    + HEARTBEAT_FORCE_REPUBLISH_TICKS
-                                    + " dedup ticks (~1min) accOff=" + isAccOff
-                                    + " — covers CameraDaemon process restart");
-                            }
-                        } else {
-                            notifyAccState(isAccOff);
-                            lastHeartbeatPublishedAccOff = desiredFlag;
-                            heartbeatDedupRunLength = 0;
-                            log("ACC heartbeat: level=" + powerLevelToString(level)
-                                + " accOff=" + isAccOff + " (state changed since last heartbeat)");
-                        }
-                    }
+                    pumpFallbackReconcilerRetries();
+                    long callbackSequenceBeforeRead =
+                            currentAccObservationSequence();
+                    requestPowerLevelSnapshot(
+                            callbackSequenceBeforeRead,
+                            null,
+                            "heartbeat snapshot",
+                            true);
                 } catch (Throwable th) {
                     log("ACC heartbeat error: " + th.getMessage());
                 }
@@ -3930,160 +6384,104 @@ public class AccSentryDaemon {
     }
 
     /**
-     * Slow-retry for bodywork listener registration — never gives up.
-     *
-     * Called when the initial 5×5s retry budget is exhausted. We can't run
-     * as a wakelock-holding zombie with no event source forever, so we keep
-     * trying every 60s. If/when registration eventually succeeds, the
-     * heartbeat starts and the daemon recovers without any external
-     * intervention. Per memory `feedback_watchdog_no_retry_cap.md` —
-     * sentinel-only stop, no retry cap.
-     */
-    private static void startBodyworkSlowRetry(final Context context) {
-        Thread slow = new Thread(() -> {
-            while (!Thread.currentThread().isInterrupted() && !bodyworkRegistered) {
-                try {
-                    Thread.sleep(60_000L);
-                } catch (InterruptedException ie) {
-                    return;
-                }
-                try {
-                    if (registerBodyworkListener(context)) {
-                        bodyworkRegistered = true;
-                        log("Bodywork slow-retry succeeded — heartbeat starting");
-                        startAccStateHeartbeat();
-                        return;
-                    }
-                } catch (Throwable th) {
-                    log("Bodywork slow-retry error: " + th.getMessage());
-                }
-            }
-        }, "AccSentrySlowRetry");
-        slow.setDaemon(true);
-        slow.start();
-    }
-
-    /**
      * Notify CameraDaemon of ACC state change.
      * This updates AccMonitor so HTTP API returns correct acc status.
      *
      * @param accOff true if ACC is OFF, false if ACC is ON
      */
-    private static void notifyAccState(final boolean accOff) {
-        // Dispatch onto the dedicated single-thread executor so the IPC
-        // (with its 1s ConnectException retry sleep + up-to-2× 5s socket
-        // timeout = ~11s worst case) never blocks the BYD HAL listener
-        // thread. BYD's bodywork callbacks are single-threaded; if we
-        // stall the listener inside onPowerLevelChanged the HAL drops
-        // subsequent ACC edges. The executor is FIFO single-thread so
-        // ordering of accOff transitions is preserved end-to-end. See
-        // prior-audit "notifyAccState blocks BYD HAL listener thread up
-        // to 11s on retry".
-        try {
-            accNotifyExecutor.execute(() -> {
-                try {
-                    JSONObject cmd = new JSONObject();
-                    cmd.put("command", "SET_CONFIG");
-                    JSONObject config = new JSONObject();
-                    config.put("accOff", accOff);
-                    cmd.put("config", config);
+    private static void notifyAccState(
+            long transitionGeneration, boolean accOff, boolean force) {
+        if (force) {
+            accNotifyReconciler.requestReapply(transitionGeneration, accOff);
+        } else {
+            accNotifyReconciler.request(transitionGeneration, accOff);
+        }
+    }
 
-                    JSONObject resp = sendSurveillanceCommandRaw(cmd);
-                    if (resp == null) {
-                        // IPC failed (CameraDaemon not running, port not bound,
-                        // socket timeout, etc). Reset heartbeat dedup state so
-                        // the next heartbeat tick republishes unconditionally
-                        // — covers the case where CameraDaemon was mid-restart
-                        // and the heartbeat would otherwise wait
-                        // HEARTBEAT_FORCE_REPUBLISH_TICKS to force-republish.
-                        // Per prior-audit "Heartbeat dedup creates 5-minute
-                        // pano wedge on CameraDaemon mid-drive restart".
-                        lastHeartbeatPublishedAccOff = -1;
-                        heartbeatDedupRunLength = 0;
-                        log("WARN: ACC state IPC returned null — reset heartbeat dedup state for next tick");
-                    } else if (!resp.optBoolean("success", false)) {
-                        // Non-null reply but consumer reports partial-apply
-                        // failure (CameraDaemon caught a side-effect throw
-                        // and returned {success:false,error:...}). Treating
-                        // this as success previously seeded dedup against a
-                        // partial-apply consumer state, with CameraDaemon's
-                        // own lastDispatchedAccIsOff cache then suppressing
-                        // subsequent heartbeats. Keep dedup unseeded so the
-                        // next heartbeat tick republishes unconditionally
-                        // and lets the consumer rebuild correctly. Per
-                        // prior-audit "notifyAccState treats {success:false}
-                        // IPC reply as success → seeds dedup against a
-                        // partial-apply on consumer side".
-                        lastHeartbeatPublishedAccOff = -1;
-                        heartbeatDedupRunLength = 0;
-                        String err = resp.optString("error", "<no-error-field>");
-                        log("WARN: ACC state IPC reply success=false (error="
-                            + err + ") — kept heartbeat dedup unseeded so next tick republishes");
-                    } else {
-                        // Seed heartbeat dedup so the first heartbeat tick
-                        // after startup / edge-driven notify is a true no-op
-                        // rather than a redundant republish. Per prior-audit
-                        // "lastHeartbeatPublishedAccOff not seeded by initial
-                        // -state seed or edge handler" — collapses one extra
-                        // IPC per startup and per ACC edge.
-                        lastHeartbeatPublishedAccOff = accOff ? 1 : 0;
-                        heartbeatDedupRunLength = 0;
-                        log("ACC state notified to CameraDaemon: accOff=" + accOff
-                            + " (seeded heartbeat dedup=" + lastHeartbeatPublishedAccOff + ")");
-                    }
-                } catch (Exception e) {
-                    // Same dedup reset on exception path so a transient HAL
-                    // / IPC fault doesn't silently delay resync by 5 min.
-                    lastHeartbeatPublishedAccOff = -1;
-                    heartbeatDedupRunLength = 0;
-                    log("WARN: Failed to notify ACC state: " + e.getMessage()
-                        + " — reset heartbeat dedup state");
-                }
-            });
-        } catch (java.util.concurrent.RejectedExecutionException ree) {
-            // Executor shut down (process tearing down) — fall back to
-            // direct call so a final state update during shutdown still
-            // makes it across the wire if at all possible.
-            log("WARN: notifyAccState executor rejected (likely shutdown), running inline: "
-                + ree.getMessage());
-            try {
-                JSONObject cmd = new JSONObject();
-                cmd.put("command", "SET_CONFIG");
-                JSONObject config = new JSONObject();
-                config.put("accOff", accOff);
-                cmd.put("config", config);
-                JSONObject resp = sendSurveillanceCommandRaw(cmd);
-                if (resp == null) {
-                    lastHeartbeatPublishedAccOff = -1;
-                    heartbeatDedupRunLength = 0;
-                    log("WARN: inline ACC state IPC returned null — reset heartbeat dedup state");
-                } else if (!resp.optBoolean("success", false)) {
-                    // Mirror the executor path: a non-null {success:false}
-                    // reply means the consumer caught a partial-apply throw
-                    // and may be holding a stale lastDispatchedAccIsOff.
-                    // Don't seed dedup — let the next heartbeat republish
-                    // unconditionally. Per prior-audit "notifyAccState
-                    // treats {success:false} IPC reply as success".
-                    lastHeartbeatPublishedAccOff = -1;
-                    heartbeatDedupRunLength = 0;
-                    String err = resp.optString("error", "<no-error-field>");
-                    log("WARN: inline ACC state IPC reply success=false (error="
-                        + err + ") — kept heartbeat dedup unseeded");
-                } else {
-                    // Seed dedup on inline-fallback success path too. Per
-                    // prior-audit "lastHeartbeatPublishedAccOff not seeded
-                    // by initial-state seed or edge handler".
-                    lastHeartbeatPublishedAccOff = accOff ? 1 : 0;
-                    heartbeatDedupRunLength = 0;
-                    log("inline ACC state notified to CameraDaemon: accOff=" + accOff
-                        + " (seeded heartbeat dedup=" + lastHeartbeatPublishedAccOff + ")");
-                }
-            } catch (Exception e) {
-                lastHeartbeatPublishedAccOff = -1;
-                heartbeatDedupRunLength = 0;
-                log("WARN: inline notifyAccState fallback failed: " + e.getMessage()
-                    + " — reset heartbeat dedup state");
+    private static boolean applyAccStateNotification(
+            long transitionGeneration, boolean accOff) {
+        SentryTransitionState transition = latestSentryTransition;
+        if (transition.generation != transitionGeneration
+                || transition.sentryMode != accOff
+                || !accNotifyReconciler.isDesired(transitionGeneration, accOff)) {
+            log("Discarding stale queued ACC IPC for generation "
+                    + transitionGeneration + " accOff=" + accOff);
+            return true;
+        }
+
+        // Preserve the established camera-arm ordering: for normal parked
+        // operation, let the complete rail-enable batch finish first. The wait
+        // is bounded so an unavailable HAL cannot suppress the ACC edge.
+        if (accOff && !transition.vehicleOnOnly
+                && !peripheralPowerReconciler.awaitApplied(
+                        transitionGeneration, true, 5000L)) {
+            log("ACC OFF IPC proceeding after bounded rail reconciliation wait");
+        }
+
+        transition = latestSentryTransition;
+        if (transition.generation != transitionGeneration
+                || transition.sentryMode != accOff
+                || !accNotifyReconciler.isDesired(transitionGeneration, accOff)) {
+            log("Discarding stale ACC IPC before socket send for generation "
+                    + transitionGeneration);
+            return true;
+        }
+
+        try {
+            JSONObject cmd = new JSONObject();
+            cmd.put("command", "SET_CONFIG");
+            JSONObject config = new JSONObject();
+            config.put("accOff", accOff);
+            cmd.put("config", config);
+
+            JSONObject response = sendSurveillanceCommandRaw(cmd);
+            SentryTransitionState afterSend = latestSentryTransition;
+            boolean stillCurrent =
+                    afterSend.generation == transitionGeneration
+                    && afterSend.sentryMode == accOff
+                    && accNotifyReconciler.isDesired(
+                            transitionGeneration, accOff);
+            if (!stillCurrent) {
+                log("ACC IPC completed for stale generation "
+                        + transitionGeneration
+                        + "; newest state will be sent by reconciler");
+                return true;
             }
+
+            if (response == null) {
+                resetHeartbeatPublication();
+                log("WARN: ACC state IPC returned null — heartbeat will retry");
+                return false;
+            }
+            if (!response.optBoolean("success", false)) {
+                resetHeartbeatPublication();
+                log("WARN: ACC state IPC reply success=false (error="
+                        + response.optString("error", "<no-error-field>")
+                        + ") — heartbeat will retry");
+                return false;
+            }
+
+            synchronized (heartbeatPublishLock) {
+                lastHeartbeatPublishedAccOff = accOff ? 1 : 0;
+                heartbeatDedupRunLength = 0;
+            }
+            log("ACC state notified to CameraDaemon: generation="
+                    + transitionGeneration + " accOff=" + accOff);
+            return true;
+        } catch (Exception e) {
+            if (latestSentryTransition.generation == transitionGeneration) {
+                resetHeartbeatPublication();
+            }
+            log("WARN: Failed to notify ACC state for generation "
+                    + transitionGeneration + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static void resetHeartbeatPublication() {
+        synchronized (heartbeatPublishLock) {
+            lastHeartbeatPublishedAccOff = -1;
+            heartbeatDedupRunLength = 0;
         }
     }
 
@@ -4162,11 +6560,11 @@ public class AccSentryDaemon {
     }
 
     // ==================== TELEGRAM DAEMON AUTO-START ====================
-    
+
     private static final String TELEGRAM_CONFIG_FILE = null; // Lazy init
     private static String getTelegramConfigFile() { return PATH_TELEGRAM_CONFIG(); }
     private static final String TELEGRAM_DAEMON_PROCESS = "telegram_bot_daemon";
-    
+
     /**
      * Check if Telegram daemon auto-start on ACC off is enabled.
      *
@@ -4176,7 +6574,7 @@ public class AccSentryDaemon {
      * daemon" survive a park: the app-side SharedPreferences that used to be
      * the only record of it is unreadable from this shell-UID process.
      */
-    private static boolean isTelegramAutoStartEnabled() {
+    private static Boolean isTelegramAutoStartEnabled() {
         try {
             // Force-reload so a toggle the user just flipped from the app UI
             // (different UID, different mtime tick) is visible immediately
@@ -4189,7 +6587,7 @@ public class AccSentryDaemon {
             return enabled;
         } catch (Exception e) {
             log("Error reading telegram config: " + e.getMessage());
-            return false;
+            return null;
         }
     }
 
@@ -4199,7 +6597,7 @@ public class AccSentryDaemon {
      * the vehicle starts". A daemon the user switched on from the Daemons
      * screen must keep running across ACC-on.
      */
-    private static boolean isTelegramParkedOnlyMode() {
+    private static Boolean isTelegramParkedOnlyMode() {
         try {
             com.overdrive.app.config.UnifiedConfigManager.forceReload();
             boolean parkedOnly = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isAutoStartAccOff()
@@ -4208,30 +6606,124 @@ public class AccSentryDaemon {
             return parkedOnly;
         } catch (Exception e) {
             log("Error reading telegram config: " + e.getMessage());
-            return false;
+            return null;
         }
     }
-    
-    /**
-     * Check if Telegram daemon is running.
-     */
-    private static boolean isTelegramDaemonRunning() {
-        String output = execShell("ps -A | grep " + TELEGRAM_DAEMON_PROCESS + " | grep -v grep");
-        return output != null && !output.trim().isEmpty();
+
+    private static final class TelegramProcessState {
+        final boolean daemonRunning;
+        final boolean watchdogRunning;
+
+        TelegramProcessState(boolean daemonRunning, boolean watchdogRunning) {
+            this.daemonRunning = daemonRunning;
+            this.watchdogRunning = watchdogRunning;
+        }
+
+        boolean fullySupervised() {
+            return daemonRunning && watchdogRunning;
+        }
+
+        boolean fullyStopped() {
+            return !daemonRunning && !watchdogRunning;
+        }
     }
-    
+
+    /** Query daemon and watchdog from one successful ps snapshot. */
+    private static TelegramProcessState queryTelegramProcessState(
+            long generation, boolean enabled) {
+        ShellResult result = runTelegramShell(
+                generation,
+                enabled,
+                "SELF=$$; T=/data/local/tmp/telegram_probe.$$; "
+                + "trap 'rm -f \"$T\" 2>/dev/null' 0 HUP INT TERM; "
+                + "ps -A -o PID,ARGS > \"$T\" 2>/dev/null || exit 41; "
+                + "D=$(awk -v self=\"$SELF\" "
+                + "'$1 != self && ($2 == \"telegram_bot_daemon\" "
+                + "|| index($0,\"--nice-name=telegram_bot_daemon\") > 0) "
+                + "{print 1; exit}' \"$T\") || exit 42; "
+                + "W=$(awk -v self=\"$SELF\" "
+                + "'$1 != self && index($0,\"/data/local/tmp/start_telegram.sh\") > 0 "
+                + "{print 1; exit}' \"$T\") || exit 43; "
+                + "printf 'daemon=%s watchdog=%s\\n' \"${D:-0}\" \"${W:-0}\" "
+                + "|| exit 44");
+        if (!result.success) {
+            if (!result.canceled) {
+                log("Telegram process query failed: "
+                        + result.describeFailure());
+            }
+            return null;
+        }
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                "^daemon=([01]) watchdog=([01])$")
+                .matcher(result.output.trim());
+        if (!matcher.matches()) {
+            log("Telegram process query returned malformed output: "
+                    + result.output);
+            return null;
+        }
+        return new TelegramProcessState(
+                "1".equals(matcher.group(1)),
+                "1".equals(matcher.group(2)));
+    }
+
+    private static ShellResult runTelegramShell(
+            long generation, boolean enabled, String command) {
+        return execShellResult(
+                command,
+                DEFAULT_SHELL_TIMEOUT_MS,
+                () -> isSentryTransitionGenerationCurrent(generation)
+                        && telegramReconciler.isDesired(
+                                generation, enabled));
+    }
+
+    private static boolean shouldAbortTelegramReconciliation(
+            long generation, boolean enabled, String nextStage) {
+        if (!Thread.currentThread().isInterrupted()
+                && isSentryTransitionGenerationCurrent(generation)
+                && telegramReconciler.isDesired(generation, enabled)) {
+            return false;
+        }
+        log("Telegram reconciliation canceled before " + nextStage
+                + " (generation=" + generation + ", enabled=" + enabled + ")");
+        return true;
+    }
+
+    private static boolean sleepForTelegramReconciliation(
+            long generation, boolean enabled, long delayMs, String nextStage) {
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        return !shouldAbortTelegramReconciliation(
+                generation, enabled, nextStage);
+    }
+
     /**
      * Start Telegram daemon if auto-start is enabled.
      * Retries once if first attempt fails (APK path detection can be flaky when ACC is off).
      */
-    private static void startTelegramDaemonIfEnabled() {
-        log("Checking if Telegram daemon should auto-start...");
-        
-        if (!isTelegramAutoStartEnabled()) {
-            log("Telegram auto-start not enabled, skipping");
-            return;
+    private static boolean startTelegramDaemonIfEnabled(
+            long transitionGeneration) {
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, true, "auto-start check")) {
+            return true;
         }
-        
+        log("Checking if Telegram daemon should auto-start...");
+
+        Boolean autoStartEnabled = isTelegramAutoStartEnabled();
+        if (autoStartEnabled == null) {
+            return false;
+        }
+        if (!autoStartEnabled) {
+            log("Telegram auto-start not enabled, skipping");
+            return true;
+        }
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, true, "user-stop check")) {
+            return true;
+        }
+
         // Check if the user explicitly stopped it. Two signals:
         //  (1) the durable disable sentinel — written by BOTH the UI stop and
         //      the Telegram stop, the single cross-UID source of truth. We're
@@ -4262,6 +6754,10 @@ public class AccSentryDaemon {
             new java.io.File("/data/local/tmp/telegram_bot_daemon.disabled");
         if (telegramSentinel.exists()) {
             String reason = readSentinelReason(telegramSentinel);
+            if (reason == null) {
+                log("Telegram disable sentinel could not be read; retrying reconciliation");
+                return false;
+            }
             boolean machineStop = reason != null
                     && (reason.contains("ACC-on") || reason.contains("stopAllDaemons"));
             if (machineStop) {
@@ -4269,53 +6765,104 @@ public class AccSentryDaemon {
                     + "), not a user stop; proceeding to auto-start");
             } else {
                 log("Telegram daemon disable sentinel present (user-stopped), not auto-starting");
-                return;
+                return true;
             }
         }
         try {
             if (com.overdrive.app.daemon.telegram.DaemonCommandHandler.isDaemonStoppedViaTelegram("telegram")) {
                 log("Telegram daemon was stopped via Telegram command, not auto-starting");
-                return;
+                return true;
             }
         } catch (Exception e) {
             // State file not available, proceed with auto-start
         }
-        
-        if (isTelegramDaemonRunning()) {
-            log("Telegram daemon already running");
-            return;
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, true, "process check")) {
+            return true;
         }
-        
+
+        TelegramProcessState runningNow = queryTelegramProcessState(
+                transitionGeneration, true);
+        if (runningNow == null) {
+            return shouldAbortTelegramReconciliation(
+                    transitionGeneration, true, "process query retry");
+        }
+        if (runningNow.fullySupervised()) {
+            log("Telegram daemon and watchdog already running");
+            return true;
+        }
+        if (runningNow.daemonRunning || runningNow.watchdogRunning) {
+            log("Telegram supervision is partial; rebuilding daemon and watchdog");
+        }
+
         // Try up to 2 times (APK path detection can fail when system is still waking up)
         for (int attempt = 1; attempt <= 2; attempt++) {
-            log("Starting Telegram daemon (attempt " + attempt + "/2)...");
-            
-            if (attempt > 1) {
-                try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+            if (shouldAbortTelegramReconciliation(
+                    transitionGeneration, true, "launch attempt " + attempt)) {
+                return true;
             }
-            
+            log("Starting Telegram daemon (attempt " + attempt + "/2)...");
+
+            if (attempt > 1) {
+                if (!sleepForTelegramReconciliation(
+                        transitionGeneration, true, 3000L,
+                        "launch retry " + attempt)) {
+                    return true;
+                }
+            }
+
             try {
-                launchTelegramDaemon();
-                
+                if (!launchTelegramDaemon(transitionGeneration)) {
+                    if (shouldAbortTelegramReconciliation(
+                            transitionGeneration, true,
+                            "launch failure reconciliation")) {
+                        return true;
+                    }
+                    continue;
+                }
+
                 // Verify it started
-                try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-                
-                if (isTelegramDaemonRunning()) {
-                    log("Telegram daemon started successfully (attempt " + attempt + ")");
-                    return;
+                if (!sleepForTelegramReconciliation(
+                        transitionGeneration, true, 2000L,
+                        "launch verification")) {
+                    return true;
+                }
+
+                TelegramProcessState started = queryTelegramProcessState(
+                        transitionGeneration, true);
+                if (started == null) {
+                    if (shouldAbortTelegramReconciliation(
+                            transitionGeneration, true,
+                            "launch verification retry")) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (started.fullySupervised()) {
+                    log("Telegram daemon and watchdog started successfully (attempt "
+                            + attempt + ")");
+                    return true;
                 } else {
-                    log("Telegram daemon not running after attempt " + attempt);
-                    String logContent = execShell("tail -20 /data/local/tmp/telegrambotdaemon.log 2>/dev/null");
-                    if (logContent != null && !logContent.isEmpty()) {
-                        log("Telegram daemon log: " + logContent);
+                    log("Telegram launch incomplete after attempt " + attempt
+                            + " (daemon=" + started.daemonRunning
+                            + ", watchdog=" + started.watchdogRunning + ")");
+                    ShellResult logResult = runTelegramShell(
+                            transitionGeneration,
+                            true,
+                            "tail -20 /data/local/tmp/telegrambotdaemon.log "
+                                    + "2>/dev/null || true");
+                    if (logResult.success
+                            && !logResult.output.isEmpty()) {
+                        log("Telegram daemon log: " + logResult.output);
                     }
                 }
             } catch (Exception e) {
                 log("Telegram daemon launch error (attempt " + attempt + "): " + e.getMessage());
             }
         }
-        
+
         log("WARN: Telegram daemon failed to start after 2 attempts");
+        return false;
     }
 
     /**
@@ -4335,34 +6882,77 @@ public class AccSentryDaemon {
     /**
      * Launch the Telegram daemon process.
      */
-    private static void launchTelegramDaemon() {
-        
+    private static boolean launchTelegramDaemon(long transitionGeneration) {
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, true, "APK discovery")) {
+            return true;
+        }
+
         // SOTA: Use pm path to get current APK path (most reliable method)
         // This ensures we always use the correct path even after app updates
-        String apkPath = execShell("pm path com.overdrive.app 2>/dev/null | head -1 | cut -d: -f2");
-        
+        ShellResult pathResult = runTelegramShell(
+                transitionGeneration,
+                true,
+                "pm path com.overdrive.app 2>/dev/null "
+                        + "| head -1 | cut -d: -f2");
+        if (pathResult.canceled) {
+            return true;
+        }
+        String apkPath = pathResult.success ? pathResult.output : "";
+
         // Fallback to ls if pm path fails
-        if (apkPath == null || apkPath.trim().isEmpty()) {
+        if (apkPath.trim().isEmpty()) {
             log("pm path failed, using ls fallback");
-            apkPath = execShell("ls /data/app/*/com.overdrive.app*/base.apk 2>/dev/null | head -1");
-            if (apkPath == null || apkPath.trim().isEmpty()) {
-                apkPath = execShell("ls /data/app/com.overdrive.app*/base.apk 2>/dev/null | head -1");
+            pathResult = runTelegramShell(
+                    transitionGeneration,
+                    true,
+                    "ls /data/app/*/com.overdrive.app*/base.apk "
+                            + "2>/dev/null | head -1");
+            if (pathResult.canceled) {
+                return true;
+            }
+            apkPath = pathResult.success ? pathResult.output : "";
+            if (apkPath.trim().isEmpty()) {
+                pathResult = runTelegramShell(
+                        transitionGeneration,
+                        true,
+                        "ls /data/app/com.overdrive.app*/base.apk "
+                                + "2>/dev/null | head -1");
+                if (pathResult.canceled) {
+                    return true;
+                }
+                apkPath = pathResult.success ? pathResult.output : "";
             }
         }
-        
-        if (apkPath == null || apkPath.trim().isEmpty()) {
+
+        if (apkPath.trim().isEmpty()) {
             log("ERROR: Could not find APK path for com.overdrive.app");
-            return;
+            return false;
         }
-        
+
         apkPath = apkPath.trim();
         log("Using APK path: " + apkPath);
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, true, "sentinel clear")) {
+            return true;
+        }
 
         // Clear the disable sentinel — ACC OFF path is explicitly starting
         // the daemon. Without this, the watchdog we're about to deploy
         // would gate-1 → exit 0 immediately because a previous ACC-on
         // stop left the sentinel on disk.
-        execShell("rm -f /data/local/tmp/telegram_bot_daemon.disabled 2>/dev/null");
+        ShellResult shellResult = runTelegramShell(
+                transitionGeneration,
+                true,
+                "rm -f /data/local/tmp/telegram_bot_daemon.disabled "
+                        + "2>/dev/null");
+        if (!shellResult.success) {
+            return shellResult.canceled;
+        }
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, true, "old process cleanup")) {
+            return true;
+        }
 
         // Kill any prior watchdog shells before deploying a fresh one. On
         // boot, this path can race the UI's DaemonStartupManager launch
@@ -4388,15 +6978,33 @@ public class AccSentryDaemon {
         // Use the ps+awk+kill pattern instead — it filters by PID list
         // and explicitly excludes the calling shell's own PID. This is
         // the same pattern TelegramBotDaemon.killOldInstances uses.
-        execShell(
+        shellResult = runTelegramShell(
+            transitionGeneration,
+            true,
             "MY_PID=$$; "
             + "ps -A -o PID,ARGS | grep -F start_telegram.sh | grep -v grep | awk '{print $1}' "
             + "| while read pid; do if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done; "
             + "ps -A -o PID,ARGS | grep -F " + TELEGRAM_DAEMON_PROCESS + " | grep -v grep | awk '{print $1}' "
             + "| while read pid; do if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done"
         );
-        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-        execShell("rm -f /data/local/tmp/telegram_bot_daemon.lock 2>/dev/null");
+        if (!shellResult.success) {
+            return shellResult.canceled;
+        }
+        if (!sleepForTelegramReconciliation(
+                transitionGeneration, true, 500L, "lock cleanup")) {
+            return true;
+        }
+        shellResult = runTelegramShell(
+                transitionGeneration,
+                true,
+                "rm -f /data/local/tmp/telegram_bot_daemon.lock 2>/dev/null");
+        if (!shellResult.success) {
+            return shellResult.canceled;
+        }
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, true, "watchdog deployment")) {
+            return true;
+        }
 
         // Deploy the SAME shell watchdog script the UI uses
         // (DaemonLauncher.Companion.buildTelegramWatchdogScript). Without
@@ -4416,52 +7024,99 @@ public class AccSentryDaemon {
             // Write line-by-line — heredoc through execShell isn't reliable
             // across all toybox builds. Same pattern as
             // DaemonCommandHandler.startCameraDaemonWithWatchdog.
-            execShell("rm -f " + scriptPath + " 2>/dev/null");
+            shellResult = runTelegramShell(
+                    transitionGeneration,
+                    true,
+                    "rm -f " + scriptPath + " 2>/dev/null");
+            if (!shellResult.success) {
+                return shellResult.canceled;
+            }
             boolean first = true;
             for (String line : lines) {
+                if (shouldAbortTelegramReconciliation(
+                        transitionGeneration, true, "watchdog write")) {
+                    return true;
+                }
                 String escaped = line
                     .replace("\\", "\\\\")
                     .replace("\"", "\\\"")
                     .replace("$", "\\$")
                     .replace("`", "\\`");
                 String redirect = first ? " > " : " >> ";
-                execShell("echo \"" + escaped + "\"" + redirect + scriptPath);
+                shellResult = runTelegramShell(
+                        transitionGeneration,
+                        true,
+                        "echo \"" + escaped + "\""
+                                + redirect + scriptPath);
+                if (!shellResult.success) {
+                    return shellResult.canceled;
+                }
                 first = false;
             }
-            execShell("chmod 755 " + scriptPath);
+            if (shouldAbortTelegramReconciliation(
+                    transitionGeneration, true, "watchdog chmod")) {
+                return true;
+            }
+            shellResult = runTelegramShell(
+                    transitionGeneration,
+                    true,
+                    "chmod 755 " + scriptPath);
+            if (!shellResult.success) {
+                return shellResult.canceled;
+            }
         } catch (Throwable t) {
+            if (shouldAbortTelegramReconciliation(
+                    transitionGeneration, true, "watchdog deploy failure")) {
+                return true;
+            }
             log("Failed to deploy Telegram watchdog: " + t.getMessage()
-                + " — falling back to bare nohup launch (no supervision)");
-            String innerCmd = "CLASSPATH=" + apkPath + " "
-                + "app_process /system/bin "
-                + "--nice-name=" + TELEGRAM_DAEMON_PROCESS + " "
-                + "com.overdrive.app.daemon.TelegramBotDaemon";
-            String cmd = "nohup sh -c '" + innerCmd
-                + "' > /data/local/tmp/telegrambotdaemon.log 2>&1 &";
-            log("Telegram launch command (fallback): " + cmd);
-            execShell(cmd);
-            return;
+                + " — supervised launch remains pending");
+            return false;
+        }
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, true, "watchdog launch")) {
+            return true;
         }
 
         // Run the watchdog. nohup so it survives the AccSentry shell's
         // exit; it execs the daemon binary in a loop.
         String launchCmd = "nohup sh " + scriptPath + " > /dev/null 2>&1 &";
         log("Telegram launch command (watchdog-supervised): " + launchCmd);
-        execShell(launchCmd);
+        shellResult = runTelegramShell(
+                transitionGeneration, true, launchCmd);
+        return shellResult.success || shellResult.canceled;
     }
-    
+
     /**
      * Stop Telegram daemon if it was auto-started.
      */
-    private static void stopTelegramDaemonIfAutoStarted() {
-        if (!isTelegramParkedOnlyMode()) {
+    private static boolean stopTelegramDaemonIfAutoStarted(
+            long transitionGeneration) {
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, false, "parked-only check")) {
+            return true;
+        }
+        Boolean parkedOnlyMode = isTelegramParkedOnlyMode();
+        if (parkedOnlyMode == null) {
+            return false;
+        }
+        if (!parkedOnlyMode) {
             log("Telegram not in parked-only mode, not stopping");
-            return;
+            return true;
+        }
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, false, "process check")) {
+            return true;
         }
 
-        if (!isTelegramDaemonRunning()) {
-            log("Telegram daemon not running");
-            return;
+        TelegramProcessState runningNow = queryTelegramProcessState(
+                transitionGeneration, false);
+        if (runningNow == null) {
+            return shouldAbortTelegramReconciliation(
+                    transitionGeneration, false, "process query retry");
+        }
+        if (!runningNow.daemonRunning) {
+            log("Telegram daemon not running; stopping watchdog state anyway");
         }
 
         // ACC-driven stop must plant the disable sentinel BEFORE pkill,
@@ -4475,12 +7130,27 @@ public class AccSentryDaemon {
         // Also rm the watchdog script so any orphan watchdog dies; lock
         // rm comes AFTER pkill+settle to prevent the lockfile resurrection
         // race. Mirrors DaemonLauncher.stopTelegramDaemon pattern.
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, false, "stop sentinel")) {
+            return true;
+        }
         log("Stopping Telegram daemon (vehicle on)...");
-        execShell(
-            "echo \"disabled by ACC-on at $(date)\" > /data/local/tmp/telegram_bot_daemon.disabled; " +
-            "chmod 666 /data/local/tmp/telegram_bot_daemon.disabled 2>/dev/null; " +
-            "rm -f /data/local/tmp/start_telegram.sh 2>/dev/null"
+        ShellResult shellResult = runTelegramShell(
+            transitionGeneration,
+            false,
+            "S=/data/local/tmp/telegram_bot_daemon.disabled; T=\"$S.tmp.$$\"; "
+            + "printf 'disabled by ACC-on at %s\\n' \"$(date)\" > \"$T\" "
+            + "&& chmod 666 \"$T\" "
+            + "&& mv -f \"$T\" \"$S\" "
+            + "&& rm -f /data/local/tmp/start_telegram.sh"
         );
+        if (!shellResult.success) {
+            return shellResult.canceled;
+        }
+        if (shouldAbortTelegramReconciliation(
+                transitionGeneration, false, "process stop")) {
+            return true;
+        }
         // Kill the watchdog shell first so it can't respawn the daemon
         // between our pkill and the lock-rm. The sentinel-gate on its
         // next iteration would also stop it, but the watchdog's outer
@@ -4493,19 +7163,46 @@ public class AccSentryDaemon {
         // PID via $$ — the same pattern TelegramBotDaemon's
         // killOldInstances uses. Mirror of the launchTelegramDaemon
         // path (line 2620) that we already fixed.
-        execShell(
+        shellResult = runTelegramShell(
+            transitionGeneration,
+            false,
             "MY_PID=$$; "
             + "ps -A -o PID,ARGS | grep -F start_telegram.sh | grep -v grep | awk '{print $1}' "
             + "| while read pid; do if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done; "
             + "ps -A -o PID,ARGS | grep -F " + TELEGRAM_DAEMON_PROCESS + " | grep -v grep | awk '{print $1}' "
             + "| while read pid; do if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done"
         );
+        if (!shellResult.success) {
+            return shellResult.canceled;
+        }
         // Settle so SIGKILL'd daemon releases its lockfile before we rm
         // it (otherwise the daemon's still-flushing JVM rewrites the
         // lock between our rm and its actual death).
-        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-        execShell("rm -f /data/local/tmp/telegram_bot_daemon.lock 2>/dev/null");
+        if (!sleepForTelegramReconciliation(
+                transitionGeneration, false, 1000L, "lock cleanup")) {
+            return true;
+        }
+        shellResult = runTelegramShell(
+                transitionGeneration,
+                false,
+                "rm -f /data/local/tmp/telegram_bot_daemon.lock 2>/dev/null");
+        if (!shellResult.success) {
+            return shellResult.canceled;
+        }
+        TelegramProcessState stillRunning = queryTelegramProcessState(
+                transitionGeneration, false);
+        if (stillRunning == null) {
+            return shouldAbortTelegramReconciliation(
+                    transitionGeneration, false, "stop verification retry");
+        }
+        if (!stillRunning.fullyStopped()) {
+            log("WARN: Telegram processes remain after stop (daemon="
+                    + stillRunning.daemonRunning + ", watchdog="
+                    + stillRunning.watchdogRunning + ")");
+            return false;
+        }
         log("Telegram daemon stopped (sentinel-disabled)");
+        return true;
     }
 
     // ==================== CONTEXT HELPERS ====================
@@ -4540,7 +7237,7 @@ public class AccSentryDaemon {
             String packageName = APP_PACKAGE_NAME();
             Context appContext = systemContext.createPackageContext(packageName,
                     Context.CONTEXT_INCLUDE_CODE | Context.CONTEXT_IGNORE_SECURITY);
-            
+
             return new PermissionBypassContext(appContext);
 
         } catch (Exception e) {
@@ -4598,10 +7295,10 @@ public class AccSentryDaemon {
 
         return null;
     }
-    
+
     private static class PermissionBypassContext extends android.content.ContextWrapper {
         public PermissionBypassContext(Context base) { super(base); }
-        
+
         @Override public void enforceCallingOrSelfPermission(String permission, String message) {}
         @Override public void enforcePermission(String permission, int pid, int uid, String message) {}
         @Override public void enforceCallingPermission(String permission, String message) {}
@@ -4638,27 +7335,27 @@ public class AccSentryDaemon {
     }
 
     // ==================== INSTRUMENT DEVICE TEST ====================
-    
+
     /**
      * Tests BYDAutoInstrumentDevice and BYDAutoStatisticDevice for charging data.
      */
     private static void testInstrumentDevice() {
         log("=== TESTING CHARGING DATA SOURCES ===");
-        
+
         if (appContext == null) {
             log("ERROR: No context available");
             return;
         }
-        
+
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
-            
+
             // Test InstrumentDevice
             log("--- BYDAutoInstrumentDevice ---");
             Class<?> instrClazz = Class.forName("android.hardware.bydauto.instrument.BYDAutoInstrumentDevice");
             Method getInstrInstance = instrClazz.getMethod("getInstance", Context.class);
             Object instrDevice = getInstrInstance.invoke(null, permissiveContext);
-            
+
             if (instrDevice != null) {
                 String[] instrGetters = {
                     "getExternalChargingPower",
@@ -4667,18 +7364,18 @@ public class AccSentryDaemon {
                     "getChargeRestTime",
                     "getOutCarTemperature"
                 };
-                
+
                 for (String methodName : instrGetters) {
                     testGetter(instrClazz, instrDevice, methodName);
                 }
             }
-            
+
             // Test StatisticDevice ( uses this for SOC)
             log("--- BYDAutoStatisticDevice ---");
             Class<?> statClazz = Class.forName("android.hardware.bydauto.statistic.BYDAutoStatisticDevice");
             Method getStatInstance = statClazz.getMethod("getInstance", Context.class);
             Object statDevice = getStatInstance.invoke(null, permissiveContext);
-            
+
             if (statDevice != null) {
                 String[] statGetters = {
                     "getElecPercentageValue",      // SOC % ( uses this!)
@@ -4688,11 +7385,11 @@ public class AccSentryDaemon {
                     "getEVMileageValue",           // EV range
                     "getWaterTemperature"          // Coolant temp
                 };
-                
+
                 for (String methodName : statGetters) {
                     testGetter(statClazz, statDevice, methodName);
                 }
-                
+
                 // Test getMileageNumber(int type)
                 try {
                     Method m = statClazz.getMethod("getMileageNumber", int.class);
@@ -4704,13 +7401,13 @@ public class AccSentryDaemon {
                     log("  getMileageNumber(int) = [ERROR]");
                 }
             }
-            
+
             // Test EnergyDevice
             log("--- BYDAutoEnergyDevice ---");
             Class<?> energyClazz = Class.forName("android.hardware.bydauto.energy.BYDAutoEnergyDevice");
             Method getEnergyInstance = energyClazz.getMethod("getInstance", Context.class);
             Object energyDevice = getEnergyInstance.invoke(null, permissiveContext);
-            
+
             if (energyDevice != null) {
                 String[] energyGetters = {
                     "getElecPercentageValue",
@@ -4718,24 +7415,24 @@ public class AccSentryDaemon {
                     "getOperationMode",
                     "getEVMileageValue"
                 };
-                
+
                 for (String methodName : energyGetters) {
                     testGetter(energyClazz, energyDevice, methodName);
                 }
             }
-            
+
             log("=== END CHARGING DATA TEST ===");
-            
+
         } catch (Exception e) {
             log("ERROR testing devices: " + e.getMessage());
         }
     }
-    
+
     private static void testGetter(Class<?> clazz, Object device, String methodName) {
         try {
             Method method = clazz.getMethod(methodName);
             Object result = method.invoke(device);
-            
+
             String resultStr;
             if (result == null) {
                 resultStr = "null";
@@ -4746,7 +7443,7 @@ public class AccSentryDaemon {
             } else {
                 resultStr = result.toString();
             }
-            
+
             log("  " + methodName + "() = " + resultStr);
         } catch (NoSuchMethodException e) {
             log("  " + methodName + "() = [NOT FOUND]");
@@ -4788,99 +7485,1443 @@ public class AccSentryDaemon {
      * This mirrors UpdateLifecycle.hardResetDaemons's proven kill cascade, swapped to the
      * parked marker and with no end-of-run marker clear.
      */
-    private static void launchParkReaper() {
-        final String marker = com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH;
-        final String reaperPath = "/data/local/tmp/overdrive_park_reaper.sh";
-        // psAwkKill helper line: kill by argv match, excluding our own PID; SIGKILL.
-        StringBuilder sb = new StringBuilder();
-        sb.append("#!/system/bin/sh\n");
-        // 1. (Re-)assert the marker with the park timestamp (epoch millis), world rw.
-        sb.append("echo ").append(System.currentTimeMillis()).append(" > ").append(marker).append(" 2>/dev/null\n");
-        sb.append("chmod 666 ").append(marker).append(" 2>/dev/null\n");
-        // 2. Remove re-exec ability immediately — core daemon watchdogs AND the optional
-        //    tunnel/proxy watchdogs (start_zrok.sh etc.), or a surviving tunnel watchdog
-        //    loop would re-exec its daemon during/after the grace window and keep the AP
-        //    awake (sentry_proxy holds a /sys/power/wake_lock; zrok/tailscale loop-respawn).
-        sb.append("rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/start_acc_sentry.sh ")
-          .append("/data/local/tmp/start_telegram.sh /data/local/tmp/cam_watchdog.pid ")
-          .append("/data/local/tmp/start_zrok.sh /data/local/tmp/start_singbox.sh ")
-          .append("/data/local/tmp/start_cloudflared.sh /data/local/tmp/start_tailscale.sh 2>/dev/null\n");
-        // 3. Grace window: let CameraDaemon.parkTerminate finish its graceful close (it
-        //    owns the H2 recordings/trips DBs — a SIGKILL mid-close risks corruption) and
-        //    let watchdog loops gate-exit on the marker. Instead of a blind fixed sleep,
-        //    POLL for CameraDaemon's absence up to a ceiling and break the instant it's
-        //    gone, so a graceful self-terminate that legitimately takes ~15-18s (slow SD
-        //    force-remount: 8s sm-mount + 10s FUSE poll, all BEFORE the H2 close) is never
-        //    clobbered. Ceiling comfortably exceeds the code's own worst case (~30s). Only
-        //    survivors past the ceiling get the backstop kill below.
-        sb.append("i=0\n");
-        sb.append("while [ $i -lt 40 ]; do\n");
-        sb.append("  if ! ps -A -o ARGS 2>/dev/null | grep -F 'byd_cam_daemon' | grep -qv grep; then break; fi\n");
-        sb.append("  sleep 1\n");
-        sb.append("  i=$((i+1))\n");
-        sb.append("done\n");
-        // Small settle so the other daemons/watchdogs also observe the marker and exit.
-        sb.append("sleep 2\n");
-        // 4. Backstop kill of any survivor: core daemon watchdogs + daemon app_process
-        //    children, AND the optional tunnel/proxy stack (sentry_proxy holds a wakelock;
-        //    the others hold the network / loop-respawn). Mirrors the UpdateLifecycle /
-        //    AppUpdater kill lists, which include these exact process names.
-        String[] patterns = {
-            "start_cam_daemon", "start_acc_sentry", "start_telegram",
-            "byd_cam_daemon", "cam_daemon", "sentry_daemon", "acc_sentry_daemon", "telegram_bot_daemon",
-            "start_zrok", "start_singbox", "start_cloudflared", "start_tailscale",
-            "sentry_proxy", "sing-box", "cloudflared", "zrok", "tailscaled"
-        };
-        for (String p : patterns) {
-            sb.append("MY_PID=$$; ps -A -o PID,ARGS | grep -F '").append(p).append("' | grep -v grep")
-              .append(" | awk '{print $1}' | while read pid; do")
-              .append(" if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done\n");
-        }
-        // 4b. Explicitly release sentry_proxy's KERNEL wakelock. GlobalProxyDaemon acquires
-        //     a userspace sysfs wakelock via `echo GlobalProxyDaemon > /sys/power/wake_lock`
-        //     (+ `svc power stayon true` fallback). That is a NAMED GLOBAL wakeup source not
-        //     bound to the process — kill -9 above does NOT run its JVM shutdown hook, so the
-        //     kernel wakelock (and stayon) would persist and pin the AP awake for the whole
-        //     park, defeating onOnly. Release it directly here, matching
-        //     GlobalProxyDaemon.releaseWakeLock (tag "GlobalProxyDaemon"). Harmless no-op if
-        //     the proxy was never running / the sysfs node is absent.
-        sb.append("echo GlobalProxyDaemon > /sys/power/wake_unlock 2>/dev/null\n");
-        sb.append("svc power stayon false 2>/dev/null\n");
-        // 5. Clean stale locks, then self-delete. Do NOT clear the marker.
-        sb.append("sleep 1\n");
-        sb.append("rm -f /data/local/tmp/*_daemon.lock 2>/dev/null\n");
-        sb.append("rm -f ").append(reaperPath).append(" 2>/dev/null\n");
+    private static String readBootIdentity() {
         try {
-            java.io.FileWriter fw = new java.io.FileWriter(reaperPath);
-            fw.write(sb.toString());
-            fw.close();
-            try { new java.io.File(reaperPath).setReadable(true, false);
-                  new java.io.File(reaperPath).setExecutable(true, false); } catch (Exception ignored) {}
-            // Detached launch: reparent to init so it survives our imminent death.
-            Runtime.getRuntime().exec(new String[]{"sh", "-c",
-                "nohup sh " + reaperPath + " >/dev/null 2>&1 &"});
-            log("Park reaper launched (detached): " + reaperPath);
-        } catch (Exception e) {
-            log("WARNING: failed to launch park reaper: " + e.getMessage());
-            // Fallback: at least plant the marker inline so watchdogs stand down even if the
-            // detached reaper couldn't launch. The app-side standdown still runs off ACC_OFF.
-            execShell("echo " + System.currentTimeMillis() + " > " + marker + " 2>/dev/null; chmod 666 " + marker + " 2>/dev/null");
+            byte[] raw = java.nio.file.Files.readAllBytes(
+                    java.nio.file.Paths.get("/proc/sys/kernel/random/boot_id"));
+            String value = new String(
+                    raw, java.nio.charset.StandardCharsets.US_ASCII).trim();
+            if (!value.isEmpty()) {
+                return value.replaceAll("[^A-Za-z0-9_-]", "");
+            }
+        } catch (Throwable ignored) {}
+        try {
+            java.util.List<String> statLines = java.nio.file.Files.readAllLines(
+                    java.nio.file.Paths.get("/proc/stat"),
+                    java.nio.charset.StandardCharsets.US_ASCII);
+            for (String line : statLines) {
+                if (line != null && line.startsWith("btime ")) {
+                    return ("btime-" + line.substring(6).trim())
+                            .replaceAll("[^A-Za-z0-9_-]", "");
+                }
+            }
+        } catch (Throwable ignored) {}
+        return "unknown-boot";
+    }
+
+    private static String createProcessInstanceNonce() {
+        return BOOT_IDENTITY + "-" + android.os.Process.myPid() + "-"
+                + Long.toUnsignedString(System.nanoTime(), 36) + "-"
+                + java.util.UUID.randomUUID().toString();
+    }
+
+    private static String readProcessStartIdentity(int pid) {
+        if (pid <= 0) {
+            return null;
+        }
+        try {
+            String stat = new String(
+                    java.nio.file.Files.readAllBytes(
+                            java.nio.file.Paths.get(
+                                    "/proc/" + pid + "/stat")),
+                    java.nio.charset.StandardCharsets.US_ASCII);
+            int commandEnd = stat.lastIndexOf(')');
+            if (commandEnd < 0 || commandEnd + 2 >= stat.length()) {
+                return null;
+            }
+            String[] fields = stat.substring(commandEnd + 2)
+                    .trim().split("\\s+");
+            // The suffix starts at field 3; starttime is field 22.
+            return fields.length > 19 ? fields[19] : null;
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
-    private static String execShell(String cmd) {
+    private static String parkReaperStateToken(SentryTransitionState state) {
+        String kind = state.sentryMode
+                ? (state.vehicleOnOnly ? "OFF" : "DISARMED")
+                : "ON";
+        return kind + ":" + PROCESS_INSTANCE_NONCE + ":" + state.generation;
+    }
+
+    private static String parkReaperArmToken(String stateToken) {
+        return "ARM:" + stateToken;
+    }
+
+    private static String parkReaperCancelToken(String stateToken) {
+        return "CANCEL:" + stateToken;
+    }
+
+    private static final BoundedLatestCallLane boundedParkReaperIoLane =
+            new BoundedLatestCallLane("ParkReaperIo");
+
+    private static boolean isParkReaperTokenRequestCurrent(
+            long generation, boolean active) {
+        SentryTransitionState latest = latestSentryTransition;
+        return latest.generation == generation
+                && (latest.sentryMode && latest.vehicleOnOnly) == active
+                && parkReaperTokenReconciler.isDesired(
+                        generation, active);
+    }
+
+    private static void requestLatestParkReaperTokenWrite() {
+        SentryTransitionState latest = latestSentryTransition;
+        parkReaperTokenReconciler.requestReapply(
+                latest.generation,
+                latest.sentryMode && latest.vehicleOnOnly);
+    }
+
+    /**
+     * Token publication runs outside ACC observation locks. The same lease is
+     * used by the detached reaper for every destructive action, making a token
+     * change and an action linearisable: whichever acquires the lease first
+     * completes before the other can validate ownership.
+     */
+    private static boolean publishParkReaperTransition(
+            long generation, boolean active) {
+        if (!isParkReaperTokenRequestCurrent(generation, active)) {
+            return true;
+        }
+        ShellOwnership ownership =
+                () -> isParkReaperTokenRequestCurrent(
+                        generation, active);
+        return runBoundedParkReaperIo(
+                "publish generation " + generation,
+                ownership,
+                () -> publishParkReaperTransitionUnderLease(
+                        generation, active),
+                AccSentryDaemon::requestLatestParkReaperTokenWrite);
+    }
+
+    private static boolean runBoundedParkReaperIo(
+            String label,
+            ShellOwnership ownership,
+            BoundedCall<Boolean> call,
+            Runnable staleCompensation) {
+        BoundedCallResult<Boolean> result =
+                boundedParkReaperIoLane.invoke(
+                        label, 5000L, ownership, call,
+                        staleCompensation);
+        if (result.failure != null) {
+            log("Park-reaper I/O failed for " + label + ": "
+                    + result.failure.getMessage());
+        }
+        return result.completed
+                && result.failure == null
+                && Boolean.TRUE.equals(result.value);
+    }
+
+    private static boolean publishParkReaperTransitionUnderLease(
+            long generation, boolean active) {
+        ParkReaperLease lease = acquireParkReaperLease();
+        if (lease == null) {
+            return false;
+        }
         try {
-            Process process = Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd});
-            process.waitFor();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            StringBuilder output = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append("\n");
+            if (!isParkReaperTokenRequestCurrent(
+                    generation, active)) {
+                return true;
             }
-            return output.toString().trim();
+            SentryTransitionState latest = latestSentryTransition;
+            String stateToken = parkReaperStateToken(latest);
+            if (active) {
+                boolean stateWritten = writeParkReaperToken(
+                        PARK_REAPER_STATE_PATH, stateToken);
+                return stateWritten && writeParkReaperToken(
+                        PARK_REAPER_CONTROL_PATH,
+                        parkReaperArmToken(stateToken));
+            }
+            boolean canceled = writeParkReaperToken(
+                    PARK_REAPER_CONTROL_PATH,
+                    parkReaperCancelToken(stateToken));
+            boolean stateWritten = writeParkReaperToken(
+                    PARK_REAPER_STATE_PATH, stateToken);
+            return canceled && stateWritten;
+        } finally {
+            lease.close();
+        }
+    }
+
+    private static boolean publishParkReaperBootCancellation() {
+        SentryTransitionState latest = latestSentryTransition;
+        parkReaperTokenReconciler.requestReapply(
+                latest.generation, false);
+        return parkReaperTokenReconciler.awaitApplied(
+                latest.generation, false, 5000L);
+    }
+
+    private static boolean ensureParkReaperTransitionPublished(long generation) {
+        SentryTransitionState latest = latestSentryTransition;
+        if (latest.generation != generation) {
+            return true;
+        }
+        boolean active = latest.sentryMode && latest.vehicleOnOnly;
+        parkReaperTokenReconciler.request(
+                generation, active);
+        return parkReaperTokenReconciler.awaitApplied(
+                generation, active, 5000L);
+    }
+
+    private static boolean isParkReaperRequestCurrent(
+            long generation, boolean active) {
+        SentryTransitionState latest = latestSentryTransition;
+        return latest.generation == generation
+                && (latest.sentryMode && latest.vehicleOnOnly) == active
+                && parkReaperReconciler.isDesired(generation, active);
+    }
+
+    private static boolean writeParkReaperToken(String path, String token) {
+        java.io.File target = new java.io.File(path);
+        java.io.File temporary = new java.io.File(
+                path + ".tmp." + PROCESS_INSTANCE_NONCE + "."
+                        + Thread.currentThread().getId() + "."
+                        + System.nanoTime());
+        try {
+            byte[] bytes = (token + "\n").getBytes(
+                    java.nio.charset.StandardCharsets.US_ASCII);
+            try (java.io.FileOutputStream output =
+                         new java.io.FileOutputStream(temporary, false)) {
+                output.write(bytes);
+                output.flush();
+            }
+            temporary.setReadable(true, false);
+            temporary.setWritable(true, false);
+            try {
+                java.nio.file.Files.move(
+                        temporary.toPath(),
+                        target.toPath(),
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
+                java.nio.file.Files.move(
+                        temporary.toPath(),
+                        target.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            target.setReadable(true, false);
+            target.setWritable(true, false);
+            return token.equals(readSmallAsciiFile(target));
+        } catch (Throwable t) {
+            try { java.nio.file.Files.deleteIfExists(temporary.toPath()); }
+            catch (Throwable ignored) {}
+            log("WARNING: failed to write park-reaper token " + path
+                    + ": " + t.getMessage());
+            return false;
+        }
+    }
+
+    private static final class ParkReaperLease implements AutoCloseable {
+        private final String ownerToken;
+        private boolean closed;
+
+        ParkReaperLease(String ownerToken) {
+            this.ownerToken = ownerToken;
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                java.io.File owner =
+                        new java.io.File(PARK_REAPER_LEASE_OWNER_PATH);
+                String current = readSmallAsciiFile(owner);
+                if (!ownerToken.equals(current)) {
+                    return;
+                }
+                owner.delete();
+                new java.io.File(PARK_REAPER_LEASE_PATH).delete();
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private static ParkReaperLease acquireParkReaperLease() {
+        long deadline = android.os.SystemClock.elapsedRealtime() + 2000L;
+        String ownerToken = "v3|java|" + android.os.Process.myPid()
+                + "|" + (PROCESS_START_IDENTITY == null
+                        ? "unknown" : PROCESS_START_IDENTITY)
+                + "|" + BOOT_IDENTITY
+                + "|" + PROCESS_INSTANCE_NONCE
+                + "|" + System.nanoTime();
+        java.io.File leaseDir = new java.io.File(PARK_REAPER_LEASE_PATH);
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            try {
+                java.nio.file.Files.createDirectory(leaseDir.toPath());
+                if (!writeParkReaperToken(
+                        PARK_REAPER_LEASE_OWNER_PATH, ownerToken)) {
+                    leaseDir.delete();
+                    return null;
+                }
+                return new ParkReaperLease(ownerToken);
+            } catch (java.nio.file.FileAlreadyExistsException exists) {
+                reclaimDeadParkReaperLease();
+            } catch (Throwable failure) {
+                log("WARNING: park-reaper lease acquisition failed: "
+                        + failure.getMessage());
+                return null;
+            }
+            try {
+                Thread.sleep(25L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        log("WARNING: timed out acquiring park-reaper lease");
+        return null;
+    }
+
+    private static void reclaimDeadParkReaperLease() {
+        try {
+            java.io.File leaseDir =
+                    new java.io.File(PARK_REAPER_LEASE_PATH);
+            java.io.File ownerFile =
+                    new java.io.File(PARK_REAPER_LEASE_OWNER_PATH);
+            String owner = readSmallAsciiFile(ownerFile);
+            long leaseAgeMs = Math.max(
+                    0L, System.currentTimeMillis()
+                            - leaseDir.lastModified());
+            if (owner == null || owner.isEmpty()) {
+                if (leaseAgeMs < 30_000L) {
+                    return;
+                }
+            } else {
+                String[] parts = owner.split("\\|", -1);
+                boolean recognized = false;
+                boolean sameBoot = false;
+                int ownerPid = -1;
+                String expectedStart = "";
+                if (parts.length >= 6 && "v3".equals(parts[0])) {
+                    recognized = true;
+                    ownerPid = parsePositiveInt(parts[2]);
+                    expectedStart = parts[3];
+                    sameBoot = BOOT_IDENTITY.equals(parts[4]);
+                } else if (parts.length >= 5 && "v2".equals(parts[0])) {
+                    recognized = true;
+                    ownerPid = parsePositiveInt(parts[2]);
+                    expectedStart = parts[3];
+                    // v2 embedded the boot id in its process nonce/state.
+                    sameBoot = !"unknown-boot".equals(BOOT_IDENTITY)
+                            && parts[4].contains(BOOT_IDENTITY);
+                }
+
+                if (recognized && sameBoot && ownerPid > 0) {
+                    String actualStart =
+                            readProcessStartIdentity(ownerPid);
+                    boolean expectedKnown = expectedStart != null
+                            && !expectedStart.isEmpty()
+                            && !"unknown".equals(expectedStart);
+                    if (expectedKnown
+                            && expectedStart.equals(actualStart)) {
+                        return;
+                    }
+                    if ((!expectedKnown || actualStart == null)
+                            && new java.io.File(
+                                    "/proc/" + ownerPid).exists()
+                            && leaseAgeMs < 30_000L) {
+                        return;
+                    }
+                } else if (!recognized && leaseAgeMs < 30_000L) {
+                    // Unknown legacy owners get one bounded action window.
+                    return;
+                }
+                if (!owner.equals(readSmallAsciiFile(ownerFile))) {
+                    return;
+                }
+            }
+            ownerFile.delete();
+            leaseDir.delete();
+        } catch (Throwable ignored) {}
+    }
+
+    private static int parsePositiveInt(String value) {
+        try {
+            int parsed = Integer.parseInt(value);
+            return parsed > 0 ? parsed : -1;
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    private static String readSmallAsciiFile(java.io.File file) {
+        try {
+            byte[] bytes = java.nio.file.Files.readAllBytes(file.toPath());
+            return new String(
+                    bytes,
+                    java.nio.charset.StandardCharsets.US_ASCII).trim();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean deleteFileIfPresent(String path) {
+        try {
+            java.io.File file = new java.io.File(path);
+            return !file.exists() || file.delete();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean hasLiveParkReaperExecution() {
+        java.io.File runDir = new java.io.File(PARK_REAPER_RUN_PATH);
+        java.io.File ownerFile =
+                new java.io.File(PARK_REAPER_RUN_OWNER_PATH);
+        String owner = readSmallAsciiFile(ownerFile);
+        if (owner != null && !owner.isEmpty()) {
+            String[] parts = owner.split("\\|", -1);
+            if (parts.length >= 6 && "v1".equals(parts[0])) {
+                int ownerPid = parsePositiveInt(parts[1]);
+                String expectedStart = parts[2];
+                String ownerBoot = parts[3];
+                if (BOOT_IDENTITY.equals(ownerBoot) && ownerPid > 0) {
+                    String actualStart =
+                            readProcessStartIdentity(ownerPid);
+                    long now = System.currentTimeMillis();
+                    long modifiedAt = runDir.lastModified();
+                    long ageMs = modifiedAt > now
+                            ? Long.MAX_VALUE : Math.max(
+                                    0L, now - modifiedAt);
+                    if (expectedStart != null
+                            && !expectedStart.isEmpty()
+                            && !"unknown".equals(expectedStart)
+                            && expectedStart.equals(actualStart)) {
+                        return true;
+                    }
+                    if ((expectedStart == null
+                                    || expectedStart.isEmpty()
+                                    || "unknown".equals(expectedStart)
+                                    || actualStart == null)
+                            && new java.io.File(
+                                    "/proc/" + ownerPid).exists()
+                            && ageMs < 95_000L) {
+                        return true;
+                    }
+                }
+            } else {
+                // An unknown owner is treated as active for one hard-deadline
+                // window rather than risking concurrent destructive workers.
+                long now = System.currentTimeMillis();
+                long modifiedAt = runDir.lastModified();
+                long ageMs = modifiedAt > now
+                        ? Long.MAX_VALUE : Math.max(
+                                0L, now - modifiedAt);
+                if (ageMs < 95_000L) {
+                    return true;
+                }
+            }
+            if (!owner.equals(readSmallAsciiFile(ownerFile))) {
+                return true;
+            }
+            ownerFile.delete();
+            runDir.delete();
+        } else if (runDir.exists()) {
+            // mkdir precedes owner publication by one bounded operation.
+            long now = System.currentTimeMillis();
+            long modifiedAt = runDir.lastModified();
+            long ageMs = modifiedAt > now
+                    ? Long.MAX_VALUE : Math.max(
+                            0L, now - modifiedAt);
+            if (ageMs < 30_000L) {
+                return true;
+            }
+            runDir.delete();
+        }
+        return runDir.exists();
+    }
+
+    private static boolean terminateIdentityOwnedParkReaper() {
+        java.io.File ownerFile =
+                new java.io.File(PARK_REAPER_RUN_OWNER_PATH);
+        String owner = readSmallAsciiFile(ownerFile);
+        if (owner == null || owner.isEmpty()) {
+            ProcessIdentity pending =
+                    findIdentityOwnedParkReaperProcess();
+            if (pending != null) {
+                return terminatePendingParkReaper(pending);
+            }
+            return !new java.io.File(
+                    PARK_REAPER_RUN_PATH).exists();
+        }
+        String[] parts = owner.split("\\|", -1);
+        if (parts.length < 6 || !"v1".equals(parts[0])) {
+            return false;
+        }
+        int pid = parsePositiveInt(parts[1]);
+        String expectedStart = parts[2];
+        String expectedBoot = parts[3];
+        String expectedState = parts[4];
+        if (pid <= 0
+                || pid == android.os.Process.myPid()
+                || !BOOT_IDENTITY.equals(expectedBoot)
+                || expectedStart == null
+                || expectedStart.isEmpty()
+                || "unknown".equals(expectedStart)
+                || expectedState == null
+                || !expectedState.contains(
+                        ":" + PROCESS_INSTANCE_NONCE + ":")) {
+            return false;
+        }
+
+        String observedStart = readProcessStartIdentity(pid);
+        if (observedStart == null) {
+            return !new java.io.File(
+                            "/proc/" + pid).exists()
+                    && owner.equals(
+                            readSmallAsciiFile(ownerFile));
+        }
+        if (!expectedStart.equals(observedStart)) {
+            return owner.equals(readSmallAsciiFile(ownerFile));
+        }
+
+        // Revalidate both the owner token and kernel process identity at the
+        // destructive boundary so PID reuse cannot target another process.
+        if (!owner.equals(readSmallAsciiFile(ownerFile))
+                || !expectedStart.equals(
+                        readProcessStartIdentity(pid))) {
+            return false;
+        }
+        try {
+            android.os.Process.killProcess(pid);
+        } catch (Throwable failure) {
+            log("WARNING: failed to terminate owned park reaper: "
+                    + failure.getMessage());
+            return false;
+        }
+
+        long deadline = android.os.SystemClock.elapsedRealtime()
+                + 2000L;
+        while (android.os.SystemClock.elapsedRealtime()
+                < deadline) {
+            String currentStart =
+                    readProcessStartIdentity(pid);
+            if (!expectedStart.equals(currentStart)) {
+                if (owner.equals(readSmallAsciiFile(ownerFile))) {
+                    ownerFile.delete();
+                    new java.io.File(
+                            PARK_REAPER_RUN_PATH).delete();
+                }
+                return true;
+            }
+            try {
+                Thread.sleep(25L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return !expectedStart.equals(
+                readProcessStartIdentity(pid));
+    }
+
+    private static final class ProcessIdentity {
+        final int pid;
+        final String start;
+
+        ProcessIdentity(int pid, String start) {
+            this.pid = pid;
+            this.start = start;
+        }
+    }
+
+    private static ProcessIdentity
+            findIdentityOwnedParkReaperProcess() {
+        String commandMarker = PARK_REAPER_PATH + "."
+                + PROCESS_INSTANCE_NONCE + ".";
+        java.io.File[] processes =
+                new java.io.File("/proc").listFiles();
+        if (processes == null) {
+            return null;
+        }
+        for (java.io.File process : processes) {
+            int pid = parsePositiveInt(process.getName());
+            if (pid <= 0
+                    || pid == android.os.Process.myPid()) {
+                continue;
+            }
+            String cmdline = readProcessCmdline(pid);
+            if (cmdline == null
+                    || !cmdline.contains(commandMarker)) {
+                continue;
+            }
+            String start = readProcessStartIdentity(pid);
+            if (start != null && !start.isEmpty()) {
+                return new ProcessIdentity(pid, start);
+            }
+        }
+        return null;
+    }
+
+    private static String readProcessCmdline(int pid) {
+        try {
+            byte[] bytes = java.nio.file.Files.readAllBytes(
+                    java.nio.file.Paths.get(
+                            "/proc/" + pid + "/cmdline"));
+            return new String(
+                    bytes,
+                    java.nio.charset.StandardCharsets.US_ASCII)
+                    .replace('\0', ' ');
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean terminatePendingParkReaper(
+            ProcessIdentity identity) {
+        String commandMarker = PARK_REAPER_PATH + "."
+                + PROCESS_INSTANCE_NONCE + ".";
+        if (!identity.start.equals(
+                    readProcessStartIdentity(identity.pid))) {
+            return false;
+        }
+        String currentCmdline =
+                readProcessCmdline(identity.pid);
+        if (currentCmdline == null
+                || !currentCmdline.contains(commandMarker)
+                || !identity.start.equals(
+                        readProcessStartIdentity(identity.pid))) {
+            return false;
+        }
+        try {
+            android.os.Process.killProcess(identity.pid);
+        } catch (Throwable failure) {
+            return false;
+        }
+        long deadline = android.os.SystemClock.elapsedRealtime()
+                + 2000L;
+        while (android.os.SystemClock.elapsedRealtime()
+                < deadline) {
+            if (!identity.start.equals(
+                    readProcessStartIdentity(identity.pid))) {
+                return true;
+            }
+            try {
+                Thread.sleep(25L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return !identity.start.equals(
+                readProcessStartIdentity(identity.pid));
+    }
+
+    private static boolean launchParkReaper(long transitionGeneration) {
+        if (!isParkReaperRequestCurrent(transitionGeneration, true)) {
+            return true;
+        }
+        if (!ensureParkReaperTransitionPublished(transitionGeneration)) {
+            return false;
+        }
+
+        final String marker = com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH;
+        final String expectedState =
+                parkReaperStateToken(latestSentryTransition);
+        final String expectedControl = parkReaperArmToken(expectedState);
+        if (!expectedState.equals(readSmallAsciiFile(
+                        new java.io.File(PARK_REAPER_STATE_PATH)))
+                || !expectedControl.equals(readSmallAsciiFile(
+                        new java.io.File(PARK_REAPER_CONTROL_PATH)))) {
+            return false;
+        }
+        final String ackPath = PARK_REAPER_ACK_PREFIX
+                + PROCESS_INSTANCE_NONCE + "." + transitionGeneration;
+        final String donePath = PARK_REAPER_DONE_PREFIX
+                + PROCESS_INSTANCE_NONCE + "." + transitionGeneration;
+        if (expectedState.equals(readSmallAsciiFile(
+                        new java.io.File(donePath)))
+                && new java.io.File(marker).isFile()) {
+            return true;
+        }
+        final boolean executionAlreadyActive =
+                hasLiveParkReaperExecution();
+        if (!executionAlreadyActive) {
+            deleteFileIfPresent(ackPath);
+            deleteFileIfPresent(donePath);
+        }
+        final String reaperPath = PARK_REAPER_PATH + "."
+                + PROCESS_INSTANCE_NONCE + "." + transitionGeneration + "."
+                + Long.toUnsignedString(System.nanoTime(), 36);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("#!/system/bin/sh\n");
+        sb.append("EXPECTED_STATE='").append(expectedState).append("'\n");
+        sb.append("EXPECTED_CONTROL='").append(expectedControl).append("'\n");
+        sb.append("BOOT_ID='").append(BOOT_IDENTITY).append("'\n");
+        sb.append("STATE_PATH='").append(PARK_REAPER_STATE_PATH).append("'\n");
+        sb.append("CONTROL_PATH='").append(PARK_REAPER_CONTROL_PATH).append("'\n");
+        sb.append("ACK_PATH='").append(ackPath).append("'\n");
+        sb.append("DONE_PATH='").append(donePath).append("'\n");
+        sb.append("MARKER_PATH='").append(marker).append("'\n");
+        sb.append("MARKER_VALUE='").append(System.currentTimeMillis()).append("'\n");
+        sb.append("LEASE_PATH='").append(PARK_REAPER_LEASE_PATH).append("'\n");
+        sb.append("LEASE_OWNER=\"$LEASE_PATH/owner\"\n");
+        sb.append("RUN_PATH='").append(PARK_REAPER_RUN_PATH).append("'\n");
+        sb.append("RUN_OWNER=\"$RUN_PATH/owner\"\n");
+        sb.append("SELF='").append(reaperPath).append("'\n");
+        sb.append("WORK_PREFIX=\"$SELF.work\"\n");
+        sb.append("RUN_CANDIDATE=\"$SELF.run-owner\"\n");
+        sb.append("proc_start() {\n");
+        sb.append("  IFS= read -r ps_stat < \"/proc/$1/stat\" 2>/dev/null || return 1\n");
+        sb.append("  ps_rest=\"${ps_stat##*) }\"\n");
+        sb.append("  [ \"$ps_rest\" != \"$ps_stat\" ] || return 1\n");
+        sb.append("  ps_old_ifs=\"$IFS\"; IFS=' '; set -- $ps_rest; IFS=\"$ps_old_ifs\"\n");
+        sb.append("  [ \"$#\" -ge 20 ] || return 1\n");
+        sb.append("  printf '%s' \"${20}\"\n");
+        sb.append("}\n");
+        sb.append("OWNER_START=\"$(proc_start $$)\"\n");
+        sb.append("OWNER_TOKEN=\"v3|shell|$$|$OWNER_START|$BOOT_ID|$EXPECTED_STATE\"\n");
+        sb.append("RUN_TOKEN=\"v1|$$|$OWNER_START|$BOOT_ID|$EXPECTED_STATE|shell\"\n");
+        sb.append("LEASE_HELD=0\n");
+        sb.append("RUN_HELD=0\n");
+        sb.append("file_value() { IFS= read -r value < \"$1\" 2>/dev/null || return 1; printf '%s' \"$value\"; }\n");
+        sb.append("owns_state() { ")
+          .append("[ \"$(file_value \"$STATE_PATH\")\" = \"$EXPECTED_STATE\" ] && ")
+          .append("[ \"$(file_value \"$CONTROL_PATH\")\" = \"$EXPECTED_CONTROL\" ]; }\n");
+        sb.append("run_bounded() {\n");
+        sb.append("  ticks=\"$1\"; shift; \"$@\" & child=$!; i=0\n");
+        sb.append("  while kill -0 \"$child\" 2>/dev/null; do\n");
+        sb.append("    [ \"$i\" -lt \"$ticks\" ] || { kill -9 \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; return 124; }\n");
+        sb.append("    sleep 0.1; i=$((i+1))\n");
+        sb.append("  done\n");
+        sb.append("  wait \"$child\"\n");
+        sb.append("}\n");
+        sb.append("run_bounded_capture() {\n");
+        sb.append("  output=\"$1\"; ticks=\"$2\"; shift 2\n");
+        sb.append("  \"$@\" > \"$output\" 2>/dev/null & child=$!; i=0\n");
+        sb.append("  while kill -0 \"$child\" 2>/dev/null; do\n");
+        sb.append("    [ \"$i\" -lt \"$ticks\" ] || { kill -9 \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; return 124; }\n");
+        sb.append("    sleep 0.1; i=$((i+1))\n");
+        sb.append("  done\n");
+        sb.append("  wait \"$child\"\n");
+        sb.append("}\n");
+        sb.append("release_run() {\n");
+        sb.append("  rm -f \"$RUN_CANDIDATE\" 2>/dev/null\n");
+        sb.append("  [ \"$RUN_HELD\" = 1 ] || return\n");
+        sb.append("  if [ \"$(file_value \"$RUN_OWNER\")\" = \"$RUN_TOKEN\" ]; then\n");
+        sb.append("    rm -f \"$RUN_OWNER\" 2>/dev/null\n");
+        sb.append("    rmdir \"$RUN_PATH\" 2>/dev/null\n");
+        sb.append("  elif [ ! -e \"$RUN_OWNER\" ]; then\n");
+        sb.append("    rmdir \"$RUN_PATH\" 2>/dev/null\n");
+        sb.append("  fi\n");
+        sb.append("  RUN_HELD=0\n");
+        sb.append("}\n");
+        sb.append("acquire_run() {\n");
+        sb.append("  printf '%s\\n' \"$RUN_TOKEN\" > \"$RUN_CANDIDATE\" 2>/dev/null || return 1\n");
+        sb.append("  mkdir \"$RUN_PATH\" 2>/dev/null || { rm -f \"$RUN_CANDIDATE\"; return 2; }\n");
+        sb.append("  RUN_HELD=1\n");
+        sb.append("  run_bounded 20 mv -f \"$RUN_CANDIDATE\" \"$RUN_OWNER\" || { release_run; return 1; }\n");
+        sb.append("  [ \"$(file_value \"$RUN_OWNER\")\" = \"$RUN_TOKEN\" ] || { release_run; return 1; }\n");
+        sb.append("}\n");
+        sb.append("atomic_write() {\n");
+        sb.append("  target=\"$1\"; value=\"$2\"; tmp=\"$target.tmp.$$\"\n");
+        sb.append("  printf '%s\\n' \"$value\" > \"$tmp\" 2>/dev/null || return 1\n");
+        sb.append("  run_bounded 20 chmod 666 \"$tmp\" || { rm -f \"$tmp\"; return 1; }\n");
+        sb.append("  run_bounded 20 mv -f \"$tmp\" \"$target\"\n");
+        sb.append("}\n");
+        sb.append("release_lease() {\n");
+        sb.append("  [ \"$LEASE_HELD\" = 1 ] || return\n");
+        sb.append("  if [ \"$(file_value \"$LEASE_OWNER\")\" = \"$OWNER_TOKEN\" ]; then\n");
+        sb.append("    rm -f \"$LEASE_OWNER\" 2>/dev/null\n");
+        sb.append("    rmdir \"$LEASE_PATH\" 2>/dev/null\n");
+        sb.append("  fi\n");
+        sb.append("  LEASE_HELD=0\n");
+        sb.append("}\n");
+        sb.append("reclaim_dead_lease() {\n");
+        sb.append("  owner=\"$(file_value \"$LEASE_OWNER\")\"\n");
+        sb.append("  [ -n \"$owner\" ] || return\n");
+        sb.append("  old_ifs=\"$IFS\"; IFS='|'; set -- $owner; IFS=\"$old_ifs\"\n");
+        sb.append("  [ \"$1\" = v3 ] || return\n");
+        sb.append("  owner_pid=\"$3\"; owner_start=\"$4\"; owner_boot=\"$5\"\n");
+        sb.append("  if [ \"$owner_boot\" = \"$BOOT_ID\" ]; then\n");
+        sb.append("    actual_start=\"$(proc_start \"$owner_pid\")\"\n");
+        sb.append("    [ -n \"$owner_start\" ] && [ \"$owner_start\" != unknown ] ")
+          .append("&& [ \"$actual_start\" = \"$owner_start\" ] && return\n");
+        sb.append("    if [ -d \"/proc/$owner_pid\" ]; then\n");
+        sb.append("      [ -z \"$owner_start\" ] && return\n");
+        sb.append("      [ \"$owner_start\" = unknown ] && return\n");
+        sb.append("      [ -z \"$actual_start\" ] && return\n");
+        sb.append("    fi\n");
+        sb.append("  fi\n");
+        sb.append("  [ \"$(file_value \"$LEASE_OWNER\")\" = \"$owner\" ] || return\n");
+        sb.append("  rm -f \"$LEASE_OWNER\" 2>/dev/null\n");
+        sb.append("  rmdir \"$LEASE_PATH\" 2>/dev/null\n");
+        sb.append("}\n");
+        sb.append("acquire_lease() {\n");
+        sb.append("  i=0\n");
+        sb.append("  while ! mkdir \"$LEASE_PATH\" 2>/dev/null; do\n");
+        sb.append("    owns_state || return 1\n");
+        sb.append("    reclaim_dead_lease\n");
+        sb.append("    i=$((i+1))\n");
+        sb.append("    [ $i -lt 20 ] || return 1\n");
+        sb.append("    sleep 0.1\n");
+        sb.append("  done\n");
+        sb.append("  echo \"$OWNER_TOKEN\" > \"$LEASE_OWNER\" 2>/dev/null || { ")
+          .append("rmdir \"$LEASE_PATH\" 2>/dev/null; return 1; }\n");
+        sb.append("  LEASE_HELD=1\n");
+        sb.append("}\n");
+        sb.append("owned_begin() {\n");
+        sb.append("  acquire_lease || return 1\n");
+        sb.append("  owns_state || { release_lease; return 1; }\n");
+        sb.append("}\n");
+        sb.append("cleanup_work() { [ -n \"$DEADLINE_PID\" ] && kill \"$DEADLINE_PID\" 2>/dev/null; rm -f \"$WORK_PREFIX\".* 2>/dev/null; }\n");
+        sb.append("stale_exit() { release_lease; release_run; cleanup_work; rm -f \"$SELF\" 2>/dev/null; exit 0; }\n");
+        sb.append("failed_exit() { release_lease; release_run; cleanup_work; rm -f \"$SELF\" 2>/dev/null; exit 1; }\n");
+        sb.append("trap 'release_lease; release_run; cleanup_work' EXIT\n");
+        sb.append("trap 'release_lease; release_run; cleanup_work; exit 1' HUP INT TERM\n");
+        sb.append("MAIN_PID=$$; (sleep 90; kill -TERM \"$MAIN_PID\" 2>/dev/null) & DEADLINE_PID=$!\n");
+        sb.append("acquire_run\n");
+        sb.append("run_rc=$?\n");
+        sb.append("[ \"$run_rc\" -eq 0 ] || { cleanup_work; rm -f \"$SELF\" 2>/dev/null; [ \"$run_rc\" -eq 2 ] && exit 0; exit 1; }\n");
+        sb.append("sleep 1\n");
+        sb.append("owned_begin || stale_exit\n");
+        sb.append("atomic_write \"$MARKER_PATH\" \"$MARKER_VALUE\" || stale_exit\n");
+        sb.append("owns_state || stale_exit\n");
+        sb.append("atomic_write \"$ACK_PATH\" \"$EXPECTED_STATE\" || stale_exit\n");
+        sb.append("owns_state || stale_exit\n");
+        sb.append("release_lease\n");
+        sb.append("i=0\n");
+        sb.append("while [ $i -lt 20 ]; do\n");
+        sb.append("  owns_state || stale_exit\n");
+        sb.append("  sleep 1\n");
+        sb.append("  i=$((i+1))\n");
+        sb.append("done\n");
+        sb.append("owns_state || stale_exit\n");
+
+        String[] patterns = {
+            "start_cam_daemon", "start_telegram",
+            "byd_cam_daemon", "cam_daemon",
+            "telegram_bot_daemon",
+            "start_zrok", "start_singbox", "start_cloudflared",
+            "start_tailscale", "sentry_proxy", "sing-box",
+            "cloudflared", "zrok", "tailscaled"
+        };
+        for (int patternIndex = 0;
+                patternIndex < patterns.length;
+                patternIndex++) {
+            String pattern = patterns[patternIndex];
+            String targetSuffix = Integer.toString(patternIndex);
+            sb.append("owns_state || stale_exit\n");
+            sb.append("TARGETS=\"$WORK_PREFIX.targets.")
+              .append(targetSuffix).append("\"\n");
+            sb.append("run_bounded_capture \"$TARGETS\" 30 sh -c '")
+              .append("P=\"$(ps -A -o PID,ARGS 2>/dev/null)\" || exit 41; ")
+              .append("printf \"%s\\n\" \"$P\" | awk -v self=\"$$\" ")
+              .append("-v pat=\"").append(pattern).append("\" ")
+              .append("'\"'\"'$1 != self && index($0,pat) > 0 {print $1; if (++n >= 32) exit}'\"'\"''")
+              .append(" || failed_exit\n");
+            sb.append("while IFS= read -r pid; do\n");
+            sb.append("  case \"$pid\" in ''|*[!0-9]*) continue;; esac\n");
+            sb.append("  [ \"$pid\" != \"$$\" ] || continue\n");
+            sb.append("  owned_begin || stale_exit\n");
+            sb.append("  pid_start=\"$(proc_start \"$pid\")\"\n");
+            sb.append("  [ -n \"$pid_start\" ] || { release_lease; failed_exit; }\n");
+            sb.append("  CMDLINE=\"$WORK_PREFIX.cmd.$pid\"\n");
+            sb.append("  run_bounded_capture \"$CMDLINE\" 20 sh -c '")
+              .append("tr \"\\\\000\" \" \" < \"/proc/$1/cmdline\" 2>/dev/null; printf \"\\n\"")
+              .append("' sh \"$pid\" || { release_lease; failed_exit; }\n");
+            sb.append("  cmdline=\"$(file_value \"$CMDLINE\")\"\n");
+            sb.append("  case \"$cmdline\" in *'")
+              .append(pattern)
+              .append("'*) current_start=\"$(proc_start \"$pid\")\"; ")
+              .append("[ \"$current_start\" = \"$pid_start\" ] ")
+              .append("|| { release_lease; continue; }; ")
+              .append("kill_rc=0; run_bounded 10 kill -9 \"$pid\" ")
+              .append(">/dev/null 2>&1 || kill_rc=$?; ")
+              .append("[ \"$kill_rc\" -ne 124 ] || { release_lease; failed_exit; }; ")
+              .append("if [ \"$kill_rc\" -eq 0 ]; then ")
+              .append("wait_i=0; ")
+              .append("while [ \"$(proc_start \"$pid\")\" = \"$pid_start\" ]; do ")
+              .append("[ \"$wait_i\" -lt 20 ] ")
+              .append("|| { release_lease; failed_exit; }; ")
+              .append("sleep 0.1; wait_i=$((wait_i+1)); done; ")
+              .append("elif [ \"$(proc_start \"$pid\")\" = \"$pid_start\" ]; then ")
+              .append("release_lease; failed_exit; fi;; esac\n");
+            sb.append("  release_lease\n");
+            sb.append("done < \"$TARGETS\"\n");
+            sb.append("owned_begin || stale_exit\n");
+            sb.append("atomic_write \"$ACK_PATH\" \"$EXPECTED_STATE\" || { release_lease; failed_exit; }\n");
+            sb.append("release_lease\n");
+        }
+        sb.append("owned_begin || stale_exit\n");
+        sb.append("run_bounded 20 sh -c 'echo GlobalProxyDaemon > /sys/power/wake_unlock 2>/dev/null' || true\n");
+        sb.append("release_lease\n");
+        sb.append("owned_begin || stale_exit\n");
+        sb.append("run_bounded 30 sh -c 'svc power stayon false 2>/dev/null' || true\n");
+        sb.append("release_lease\n");
+        sb.append("sleep 1\n");
+        sb.append("owned_begin || stale_exit\n");
+        sb.append("run_bounded 20 rm -f /data/local/tmp/camera_daemon.lock ")
+          .append("/data/local/tmp/telegram_bot_daemon.lock || true\n");
+        sb.append("owns_state || { release_lease; stale_exit; }\n");
+        sb.append("atomic_write \"$DONE_PATH\" \"$EXPECTED_STATE\" || { release_lease; failed_exit; }\n");
+        sb.append("release_lease\n");
+        sb.append("cleanup_work\n");
+        sb.append("rm -f \"$SELF\" 2>/dev/null\n");
+
+        try {
+            if (!executionAlreadyActive) {
+                java.io.FileWriter writer =
+                        new java.io.FileWriter(reaperPath);
+                try {
+                    writer.write(sb.toString());
+                } finally {
+                    writer.close();
+                }
+                try {
+                    new java.io.File(reaperPath).setReadable(true, false);
+                    new java.io.File(reaperPath).setExecutable(true, false);
+                } catch (Exception ignored) {}
+                if (!isParkReaperRequestCurrent(
+                        transitionGeneration, true)) {
+                    new java.io.File(reaperPath).delete();
+                    return true;
+                }
+                ShellResult launchResult = execShellResult(
+                        "nohup sh " + reaperPath + " >/dev/null 2>&1 &",
+                        DEFAULT_SHELL_TIMEOUT_MS,
+                        () -> isParkReaperRequestCurrent(
+                                transitionGeneration, true));
+                if (!launchResult.success) {
+                    if (launchResult.canceled) {
+                        new java.io.File(reaperPath).delete();
+                        return true;
+                    }
+                    log("WARNING: failed to launch park reaper: "
+                            + launchResult.describeFailure());
+                    writeParkedShutdownMarkerIfOwned(
+                            transitionGeneration, marker,
+                            expectedState, expectedControl);
+                    return false;
+                }
+                log("Park reaper launched for generation "
+                        + transitionGeneration + " (detached): "
+                        + reaperPath);
+            } else {
+                log("Park reaper execution already active; waiting for generation "
+                        + transitionGeneration + " acknowledgement");
+            }
+            if (!awaitParkReaperAcknowledgement(
+                    transitionGeneration, expectedState,
+                    ackPath, marker, 5000L)) {
+                log("WARNING: detached park reaper did not acknowledge marker commit");
+                writeParkedShutdownMarkerIfOwned(
+                        transitionGeneration, marker,
+                        expectedState, expectedControl);
+                return false;
+            }
+            if (!awaitParkReaperCompletion(
+                    transitionGeneration, expectedState,
+                    donePath, 95_000L)) {
+                log("WARNING: detached park reaper did not acknowledge completion");
+                return false;
+            }
         } catch (Exception e) {
-            return "ERROR: " + e.getMessage();
+            log("WARNING: failed to launch park reaper: " + e.getMessage());
+            writeParkedShutdownMarkerIfOwned(
+                    transitionGeneration, marker,
+                    expectedState, expectedControl);
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean awaitParkReaperCompletion(
+            long generation,
+            String expectedState,
+            String donePath,
+            long timeoutMs) {
+        long deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs;
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            if (!isParkReaperRequestCurrent(generation, true)) {
+                return true;
+            }
+            if (expectedState.equals(readSmallAsciiFile(
+                    new java.io.File(donePath)))) {
+                return true;
+            }
+            try {
+                Thread.sleep(100L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static boolean awaitParkReaperAcknowledgement(
+            long generation,
+            String expectedState,
+            String ackPath,
+            String markerPath,
+            long timeoutMs) {
+        long deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs;
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            if (!isParkReaperRequestCurrent(generation, true)) {
+                return true;
+            }
+            if (expectedState.equals(readSmallAsciiFile(
+                            new java.io.File(ackPath)))
+                    && new java.io.File(markerPath).isFile()) {
+                return true;
+            }
+            try {
+                Thread.sleep(25L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static boolean writeParkedShutdownMarkerIfOwned(
+            long transitionGeneration,
+            String markerPath,
+            String expectedState,
+            String expectedControl) {
+        ParkReaperLease lease = acquireParkReaperLease();
+        if (lease == null) {
+            return false;
+        }
+        try {
+            if (!isParkReaperRequestCurrent(
+                    transitionGeneration, true)) {
+                return true;
+            }
+            if (!expectedState.equals(readSmallAsciiFile(
+                            new java.io.File(PARK_REAPER_STATE_PATH)))
+                    || !expectedControl.equals(readSmallAsciiFile(
+                            new java.io.File(PARK_REAPER_CONTROL_PATH)))) {
+                return false;
+            }
+            return writeParkReaperToken(
+                    markerPath, Long.toString(System.currentTimeMillis()));
+        } catch (Throwable failure) {
+            log("WARNING: failed to write parked shutdown marker: "
+                    + failure.getMessage());
+            return false;
+        } finally {
+            lease.close();
+        }
+    }
+
+    /** Cancel a detached parked reaper without creating a second worker. */
+    private static boolean cancelParkReaperForAccOn(long transitionGeneration) {
+        if (!isParkReaperRequestCurrent(transitionGeneration, false)) {
+            return true;
+        }
+        if (!ensureParkReaperTransitionPublished(transitionGeneration)) {
+            return false;
+        }
+        String stateToken = parkReaperStateToken(latestSentryTransition);
+        String cancelToken = parkReaperCancelToken(stateToken);
+        ParkReaperLease lease = acquireParkReaperLease();
+        if (lease == null) {
+            return false;
+        }
+        try {
+            if (!isParkReaperRequestCurrent(
+                    transitionGeneration, false)) {
+                return true;
+            }
+            if (!stateToken.equals(readSmallAsciiFile(
+                            new java.io.File(PARK_REAPER_STATE_PATH)))
+                    || !cancelToken.equals(readSmallAsciiFile(
+                            new java.io.File(PARK_REAPER_CONTROL_PATH)))) {
+                return false;
+            }
+            boolean markerDeleted = deleteFileIfPresent(
+                    com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH);
+            log("Canceled detached parked reaper for generation "
+                    + transitionGeneration);
+            return markerDeleted;
+        } catch (Throwable t) {
+            log("WARNING: could not clear parked reaper marker: "
+                    + t.getMessage());
+            return false;
+        } finally {
+            lease.close();
+        }
+    }
+
+    private static final long DEFAULT_SHELL_TIMEOUT_MS = 10_000L;
+    private static final int MAX_SHELL_OUTPUT_BYTES = 64 * 1024;
+
+    private interface ShellOwnership {
+        boolean isCurrent();
+    }
+
+    private static final class ShellResult {
+        final boolean success;
+        final boolean canceled;
+        final boolean timedOut;
+        final int exitCode;
+        final String output;
+        final String error;
+
+        ShellResult(
+                boolean success,
+                boolean canceled,
+                boolean timedOut,
+                int exitCode,
+                String output,
+                String error) {
+            this.success = success;
+            this.canceled = canceled;
+            this.timedOut = timedOut;
+            this.exitCode = exitCode;
+            this.output = output == null ? "" : output;
+            this.error = error;
+        }
+
+        String describeFailure() {
+            if (success) {
+                return "none";
+            }
+            if (canceled) {
+                return "canceled";
+            }
+            if (timedOut) {
+                return "timed out";
+            }
+            if (error != null && !error.isEmpty()) {
+                return error;
+            }
+            return "exit=" + exitCode
+                    + (output.isEmpty() ? "" : " output=" + output);
+        }
+    }
+
+    private static ShellResult execShellResult(
+            String cmd, long timeoutMs, ShellOwnership ownership) {
+        if (Thread.currentThread().isInterrupted()
+                || !isShellOwnershipCurrent(ownership)) {
+            return new ShellResult(
+                    false, true, false, -1, "", "ownership changed");
+        }
+
+        Process process = null;
+        java.io.InputStream processOutput = null;
+        java.io.ByteArrayOutputStream output =
+                new java.io.ByteArrayOutputStream();
+        try {
+            ProcessBuilder builder =
+                    new ProcessBuilder(new String[]{"sh", "-c", cmd});
+            builder.redirectErrorStream(true);
+            process = builder.start();
+            processOutput = process.getInputStream();
+            long deadline = android.os.SystemClock.elapsedRealtime()
+                    + Math.max(1L, timeoutMs);
+
+            while (true) {
+                if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+                    destroyShellProcessTree(process);
+                    return new ShellResult(
+                            false, false, true, -1,
+                            shellOutputString(output),
+                            "timeout after " + timeoutMs + " ms");
+                }
+                drainShellOutput(processOutput, output);
+                if (Thread.currentThread().isInterrupted()
+                        || !isShellOwnershipCurrent(ownership)) {
+                    destroyShellProcessTree(process);
+                    return new ShellResult(
+                            false, true, false, -1,
+                            shellOutputString(output),
+                            "ownership changed");
+                }
+
+                long remaining = deadline
+                        - android.os.SystemClock.elapsedRealtime();
+                if (remaining <= 0L) {
+                    destroyShellProcessTree(process);
+                    return new ShellResult(
+                            false, false, true, -1,
+                            shellOutputString(output),
+                            "timeout after " + timeoutMs + " ms");
+                }
+                if (process.waitFor(
+                        Math.min(100L, remaining),
+                        java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    break;
+                }
+            }
+
+            // Never block waiting for EOF here. A detached descendant can
+            // inherit stdout after the shell exits and keep the pipe open.
+            drainShellOutput(processOutput, output);
+            int exitCode = process.exitValue();
+            String outputText = shellOutputString(output);
+            return new ShellResult(
+                    exitCode == 0,
+                    false,
+                    false,
+                    exitCode,
+                    outputText,
+                    exitCode == 0 ? null : "exit=" + exitCode);
+        } catch (InterruptedException interrupted) {
+            if (process != null) {
+                destroyShellProcessTree(process);
+            }
+            Thread.currentThread().interrupt();
+            return new ShellResult(
+                    false, true, false, -1,
+                    shellOutputString(output), "interrupted");
+        } catch (Throwable failure) {
+            if (process != null) {
+                destroyShellProcessTree(process);
+            }
+            return new ShellResult(
+                    false, false, false, -1,
+                    shellOutputString(output), failure.getMessage());
+        } finally {
+            if (processOutput != null) {
+                try {
+                    processOutput.close();
+                } catch (Exception ignored) {}
+            }
+            if (process != null && process.isAlive()) {
+                destroyShellProcessTree(process);
+            }
+        }
+    }
+
+    private static boolean isShellOwnershipCurrent(
+            ShellOwnership ownership) {
+        if (ownership == null) {
+            return true;
+        }
+        try {
+            return ownership.isCurrent();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void drainShellOutput(
+            java.io.InputStream input,
+            java.io.ByteArrayOutputStream output) throws java.io.IOException {
+        byte[] buffer = new byte[4096];
+        // A noisy child can keep available() positive forever. Bound each
+        // drain pass so the caller always regains control to enforce deadline
+        // and ownership checks.
+        for (int reads = 0; reads < 8; reads++) {
+            int available = input.available();
+            if (available <= 0) {
+                return;
+            }
+            int read = input.read(
+                    buffer,
+                    0,
+                    Math.min(buffer.length, available));
+            if (read < 0) {
+                return;
+            }
+            int remaining = MAX_SHELL_OUTPUT_BYTES - output.size();
+            if (remaining > 0) {
+                output.write(buffer, 0, Math.min(read, remaining));
+            }
+            if (input.available() <= 0) {
+                return;
+            }
+        }
+    }
+
+    private static String shellOutputString(
+            java.io.ByteArrayOutputStream output) {
+        try {
+            return output.toString("UTF-8").trim();
+        } catch (Exception ignored) {
+            return output.toString().trim();
+        }
+    }
+
+    private static void destroyShellProcessTree(Process process) {
+        if (process == null) {
+            return;
+        }
+        int rootPid = getProcessPid(process);
+        java.util.List<Integer> descendants =
+                new java.util.ArrayList<>();
+        if (rootPid > 0) {
+            collectProcessDescendants(
+                    rootPid,
+                    descendants,
+                    new java.util.HashSet<Integer>());
+        }
+        for (Integer pid : descendants) {
+            if (pid != null
+                    && pid > 0
+                    && pid != android.os.Process.myPid()) {
+                try {
+                    android.os.Process.killProcess(pid);
+                } catch (Throwable ignored) {}
+            }
+        }
+        try {
+            process.destroy();
+            if (!process.waitFor(
+                    250L, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                process.destroyForcibly();
+                process.waitFor(
+                        250L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
+        } catch (InterruptedException interrupted) {
+            try {
+                process.destroyForcibly();
+            } catch (Throwable ignored) {}
+            Thread.currentThread().interrupt();
+        } catch (Throwable ignored) {
+            try {
+                process.destroyForcibly();
+            } catch (Throwable ignoredAgain) {}
+        }
+    }
+
+    private static int getProcessPid(Process process) {
+        try {
+            Method pidMethod = Process.class.getMethod("pid");
+            Object value = pidMethod.invoke(process);
+            if (value instanceof Number) {
+                long pid = ((Number) value).longValue();
+                if (pid > 0L && pid <= Integer.MAX_VALUE) {
+                    return (int) pid;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    private static void collectProcessDescendants(
+            int parentPid,
+            java.util.List<Integer> output,
+            java.util.Set<Integer> visited) {
+        if (!visited.add(parentPid)) {
+            return;
+        }
+        try {
+            java.nio.file.Path childrenPath = java.nio.file.Paths.get(
+                    "/proc/" + parentPid + "/task/" + parentPid + "/children");
+            String children = new String(
+                    java.nio.file.Files.readAllBytes(childrenPath),
+                    java.nio.charset.StandardCharsets.US_ASCII).trim();
+            if (children.isEmpty()) {
+                return;
+            }
+            for (String token : children.split("\\s+")) {
+                int childPid = Integer.parseInt(token);
+                collectProcessDescendants(
+                        childPid, output, visited);
+                output.add(childPid);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static String execShell(String cmd) {
+        ShellResult result = execShellResult(
+                cmd, DEFAULT_SHELL_TIMEOUT_MS, null);
+        return result.success
+                ? result.output
+                : "ERROR: " + result.describeFailure();
+    }
+
+    /**
+     * Clear a hotspot-owned WiFi suppression that outlived its access point.
+     * The hotspot owner lives in the app process; if that process dies while the
+     * flag is set and the AP is already down, no one is left to clear it and WiFi
+     * would never come back. Returns true when the flag was stale and cleared
+     * (caller should proceed to re-enable WiFi).
+     *
+     * <p>Only touches HOTSPOT-owned suppressions — a deliberate user "WiFi off"
+     * rule sets the same flag without the hotspot marker and must survive.
+     */
+    /**
+     * Consecutive keep-alive ticks spent honouring a published "AP coming up".
+     * Counted in ticks rather than milliseconds so no clock can distort it; the
+     * keep-alive runs every ~10s, so 6 ticks comfortably covers the worst-case
+     * ~27s enable while still releasing WiFi if the owner dies mid-startup.
+     */
+    private static int enablingHoldOffTicks = 0;
+    private static final int MAX_ENABLING_HOLD_OFF_TICKS = 6;
+
+    private static boolean reconcileStrandedHotspotSuppression() {
+        try {
+            if (!com.overdrive.app.config.UnifiedConfigManager
+                    .didHotspotSuppressWifiKeepAlive()) {
+                return false;
+            }
+            // The AP takes up to ~27s to come up (shell + tether latch) and does not
+            // report SoftApState for part of that, so an owner that has published
+            // ENABLING gets the benefit of the doubt. This is the marker the app
+            // writes before it blocks; without this hold-off the probe below would
+            // read "not up" mid-startup and clear the suppression, letting the
+            // keep-alive re-enable the station link and kill the AP being started.
+            // Bounded by a tick count, not a clock: if the owner dies mid-enable the
+            // ENABLING marker would otherwise persist and strand WiFi off forever.
+            int declared = com.overdrive.app.config.UnifiedConfigManager
+                    .getHotspotState().optInt("apState", 11);
+            if (declared == 12) {
+                if (enablingHoldOffTicks < MAX_ENABLING_HOLD_OFF_TICKS) {
+                    enablingHoldOffTicks++;
+                    return false;
+                }
+                log("Hotspot has claimed ENABLING for " + enablingHoldOffTicks
+                        + " ticks — no longer holding off the keep-alive");
+            }
+            enablingHoldOffTicks = 0;
+            // Otherwise ask the RADIO, not a stored snapshot. Earlier revisions
+            // inferred liveness from published timestamps, but every variant broke on
+            // some clock-step or short-reboot combination: an owner that looked dead
+            // got its AP torn down, or a dead one looked alive and stranded WiFi off.
+            // The framework's own AP state is ground truth and needs no clock.
+            // `; echo` keeps the exit status at 0: grep exits 1 when it counts zero
+            // matches, and execShell reports any non-zero exit as "ERROR", which the
+            // unusable-probe branch below would read as "can't tell" — stranding WiFi
+            // off on every ordinary AP-down case, the exact failure this method exists
+            // to prevent. The marker text is what we test, not the exit code.
+            String apDump = execShell(
+                    "dumpsys wifi 2>/dev/null | grep -c curState=SoftApState"
+                            + "; echo PROBE_OK");
+            boolean apUp = false;
+            boolean probeWorked = false;
+            if (apDump != null && apDump.contains("PROBE_OK")) {
+                for (String line : apDump.split("\\r?\\n")) {
+                    String t = line.trim();
+                    if (t.isEmpty() || t.equals("PROBE_OK")) continue;
+                    try {
+                        apUp = Integer.parseInt(t) > 0;
+                        probeWorked = true;
+                    } catch (NumberFormatException ignored) {
+                        // Not the count line; keep looking.
+                    }
+                }
+            }
+            if (!probeWorked) {
+                // Can't see the radio, so we can't prove the owner is gone. Leaving
+                // the suppression costs connectivity until the next tick; clearing it
+                // could kill a live AP. Prefer the recoverable option.
+                log("Hotspot suppression reconcile skipped — AP state probe failed");
+                return false;
+            }
+            if (apUp) {
+                return false;
+            }
+            log("Hotspot WiFi suppression is stale (AP is not up)"
+                    + " — clearing so WiFi keep-alive can resume");
+            com.overdrive.app.config.UnifiedConfigManager
+                    .setWifiKeepAliveSuppressed(false);
+            java.util.Map<String, Object> clear = new java.util.HashMap<>();
+            clear.put("suppressedByHotspot", false);
+            com.overdrive.app.config.UnifiedConfigManager.updateHotspot(clear);
+            return true;
+        } catch (Throwable t) {
+            log("Hotspot suppression reconcile failed: " + t.getMessage());
+            return false;
         }
     }
     
@@ -4976,6 +9017,7 @@ public class AccSentryDaemon {
             @Override
             public void run() {
                 try {
+                    pumpFallbackReconcilerRetries();
                     long uptimeSeconds = (System.currentTimeMillis() - startTime) / 1000;
                     long uptimeMinutes = uptimeSeconds / 60;
                     
@@ -4992,9 +9034,19 @@ public class AccSentryDaemon {
                     log("  Last MCU status: " + lastMcuStatus);
                     
                     // Check MCU status
-                    int currentMcuStatus = getMcuStatus();
-                    if (currentMcuStatus != -1) {
-                        log("  Current MCU status: " + currentMcuStatus);
+                    BoundedCallResult<Integer> currentMcuStatus =
+                            boundedDiagnosticHardwareLane.invoke(
+                                    "Status MCU read",
+                                    HARDWARE_CALL_TIMEOUT_MS,
+                                    null,
+                                    AccSentryDaemon::getMcuStatus,
+                                    null);
+                    if (currentMcuStatus.completed
+                            && currentMcuStatus.failure == null
+                            && currentMcuStatus.value != null
+                            && currentMcuStatus.value != -1) {
+                        log("  Current MCU status: "
+                                + currentMcuStatus.value);
                     }
                     
                     // Log memory every 5 minutes

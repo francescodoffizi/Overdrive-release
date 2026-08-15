@@ -45,7 +45,118 @@ public class StreamingApiHandler {
     private static volatile int lastDesiredViewMode = -1;
     public static int getLastDesiredViewMode() { return lastDesiredViewMode; }
     public static void setLastDesiredViewMode(int mode) {
-        if (mode >= 0 && mode <= 6) lastDesiredViewMode = mode;
+        if (mode >= -1 && mode <= 6) lastDesiredViewMode = mode;
+    }
+
+    /*
+     * A browser can send a newer camera choice before an older request has
+     * reached the daemon. Keep a small per-page sequence ledger so that an
+     * out-of-order DVR request cannot re-route a newer AVM selection.
+     */
+    private static final Object viewSelectionLock = new Object();
+    private static final int MAX_VIEW_SELECTION_CLIENTS = 32;
+    private static final java.util.LinkedHashMap<String, Long> latestViewSelections =
+        new java.util.LinkedHashMap<String, Long>(MAX_VIEW_SELECTION_CLIENTS, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(java.util.Map.Entry<String, Long> eldest) {
+                return size() > MAX_VIEW_SELECTION_CLIENTS;
+            }
+        };
+
+    private static final class ViewRequest {
+        private final String clientId;
+        private final long selection;
+
+        ViewRequest(String clientId, long selection) {
+            this.clientId = clientId;
+            this.selection = selection;
+        }
+
+        private boolean isSequenced() {
+            return clientId != null;
+        }
+
+        boolean applyIntent(int mode) {
+            if (!isSequenced()) {
+                setLastDesiredViewMode(mode);
+                return true;
+            }
+            synchronized (viewSelectionLock) {
+                Long latest = latestViewSelections.get(clientId);
+                if (latest == null || latest.longValue() != selection) return false;
+                setLastDesiredViewMode(mode);
+                return true;
+            }
+        }
+
+        boolean isCurrent() {
+            if (!isSequenced()) return true;
+            synchronized (viewSelectionLock) {
+                Long latest = latestViewSelections.get(clientId);
+                return latest != null && latest.longValue() == selection;
+            }
+        }
+    }
+
+    private static ViewRequest parseViewRequest(String path) {
+        int queryStart = path.indexOf('?');
+        if (queryStart < 0) return new ViewRequest(null, 0L);
+        String clientId = null;
+        String selectionValue = null;
+        String query = path.substring(queryStart + 1);
+        for (String parameter : query.split("&")) {
+            int equals = parameter.indexOf('=');
+            if (equals <= 0) continue;
+            String name = parameter.substring(0, equals);
+            String value = parameter.substring(equals + 1);
+            if ("client".equals(name)) clientId = value;
+            else if ("selection".equals(name)) selectionValue = value;
+        }
+        if (clientId == null || selectionValue == null || clientId.length() > 48
+                || !clientId.matches("[A-Za-z0-9_-]+")) {
+            return new ViewRequest(null, 0L);
+        }
+        try {
+            long selection = Long.parseLong(selectionValue);
+            if (selection <= 0L) return new ViewRequest(null, 0L);
+            synchronized (viewSelectionLock) {
+                Long latest = latestViewSelections.get(clientId);
+                if (latest == null || selection >= latest.longValue()) {
+                    latestViewSelections.put(clientId, selection);
+                    return new ViewRequest(clientId, selection);
+                }
+            }
+        } catch (NumberFormatException ignored) {
+            // Fall through to the stale marker below.
+        }
+        return new ViewRequest(clientId, -1L);
+    }
+
+    private static void sendSupersededViewResponse(OutputStream out, int viewMode) throws Exception {
+        JSONObject response = new JSONObject();
+        response.put("success", false);
+        response.put("cancelled", true);
+        response.put("viewMode", viewMode);
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    private static boolean ensureCurrentViewRequest(
+            OutputStream out, int viewMode, ViewRequest request) throws Exception {
+        if (request.isCurrent()) return true;
+        sendSupersededViewResponse(out, viewMode);
+        return false;
+    }
+
+    private static void restoreLatestViewAfterSupersededOemRoute(
+            GpuSurveillancePipeline pipeline) {
+        int latestMode = getLastDesiredViewMode();
+        if (pipeline == null || latestMode == 6) return;
+        try {
+            pipeline.reattachOwnStreamCallback();
+            if (latestMode >= 0) pipeline.setStreamViewMode(latestMode);
+        } catch (Throwable t) {
+            CameraDaemon.log("restoreLatestViewAfterSupersededOemRoute: " + t.getMessage());
+        }
     }
 
     // ── Blind-spot dedicated stream profile ─────────────────────────────────
@@ -70,6 +181,141 @@ public class StreamingApiHandler {
      * pipeline is already warm; false signals "starting" and the caller
      * should respond with starting=true so the client polls.
      */
+    // ── Camera-view arm retry ────────────────────────────────────────────────────
+    // Bounded, self-converging retry for a /api/camview/show that arrived before the
+    // lane could be armed. Mirrors BlindSpotControl.armWithRetry's discipline:
+    //   * a monotonic generation token so a newer show/hide supersedes an older loop
+    //     (no two loops fighting, and a hide is never undone by a stale arm);
+    //   * a hard deadline so it always terminates;
+    //   * re-reads the persisted intent each pass and bails the moment camview.enabled
+    //     goes false, so a user cancel wins immediately.
+    private static final java.util.concurrent.atomic.AtomicInteger camViewArmGen =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+    // 30s, matching BlindSpotControl.REARM_DEADLINE_MS: the retry has to outlast a full
+    // pano cold start (AvcHalWarmup + camera open), not just a brief in-flight lane build.
+    private static final long CAMVIEW_ARM_DEADLINE_MS = 30_000L;
+    private static final long CAMVIEW_ARM_BACKOFF_MAX_MS = 1_500L;
+
+    /** Bump the arm generation, invalidating any in-flight retry loop. Called by the hide
+     *  path so an explicit cancel can't be undone by a pending arm, and by the pipeline's
+     *  own teardown paths (disableCamView / stop) so an ACC-off or blind-spot takeover
+     *  likewise can't be undone. Public + static so the surveillance package can call it
+     *  without a compile-time dependency back into the server package's internals. */
+    public static void cancelCamViewArmRetry() { camViewArmGen.incrementAndGet(); }
+
+    /** Current value of the pipeline's sticky auto-hide latch, or false when there is no
+     *  pipeline. Snapshotted at retry start so the loop can tell "MY session timed out"
+     *  from "some earlier session did". */
+    private static boolean camViewAutoHideLatched() {
+        try {
+            GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
+            return p != null && p.camViewAutoHideConsumed();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Is the deferred camera-view arm captured by generation {@code gen} still wanted?
+     * Every bail condition in one cheap, side-effect-free predicate, so the retry loop can
+     * re-check it immediately before arming as well as at the top of a pass.
+     *
+     * <p>Deliberately does NO config file I/O. An earlier version called
+     * {@code forceReload()} every pass, which (a) bought nothing — {@code camview.enabled}
+     * is only ever written by this same process — and (b) took the global config monitor,
+     * and on a self-heal branch blocked on the cross-process file lock WHILE holding it,
+     * stalling the 250ms blind-spot arbiter tick behind a peer daemon's write.
+     */
+    private static boolean camViewArmStillWanted(int gen, boolean autoHideAtStart) {
+        // Superseded by a newer show, or cancelled by a hide / real teardown.
+        if (camViewArmGen.get() != gen) return false;
+        try {
+            // In-memory read (no forceReload — see above): an explicit hide clears this.
+            if (!com.overdrive.app.config.UnifiedConfigManager.isCamViewEnabled()) return false;
+        } catch (Throwable ignored) {}
+        GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
+        if (p == null) return false;
+        if (p.isCamViewActive()) return false;          // already armed by someone else
+        // Auto-hide: bail only when the flag flipped DURING this loop. It is a sticky
+        // process-wide latch cleared only inside enableCamView, so an absolute test would
+        // read a PREVIOUS session's timeout — and the pano-cold-start deferral never
+        // enters enableCamView, so that stale true would kill the retry on pass 1 and
+        // silently drop the key press this whole mechanism exists to rescue.
+        try {
+            if (!autoHideAtStart && p.camViewAutoHideConsumed()) return false;
+        } catch (Throwable ignored) {}
+        try {
+            // A camera view is only meaningful with ACC on — RMM's own
+            // camViewKeepWarmActive() requires accIsOn, so this matches the existing
+            // contract rather than inventing one. Parked (sentry) counts as off, because
+            // the authoritative flag is set only by AccSentryDaemon IPC while the hardware
+            // probe sets accOn/inSentryMode WITHOUT it — an authoritative-only guard would
+            // let this loop cold-start the camera while parked.
+            //
+            // BUT inSentryMode is a LATCHED derivative with no "unknown": the
+            // untrustworthy-probe path returns "ACC ON, safe default" WITHOUT rewriting
+            // it, so a stale true can survive into a genuine ignition-on before the first
+            // IPC — and bailing on that would abandon exactly the cold-start key press
+            // this retry exists to rescue. Honour the sentry latch only when a real signal
+            // backs it: an authoritative IPC, or a clean (trustworthy) hardware probe.
+            // wasLastProbeTrustworthy() is the flag AccMonitor already maintains for this
+            // distinction — the ACC-ON disarm watchdog gates on it for the same reason.
+            boolean accKnown = com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative()
+                || com.overdrive.app.monitor.AccMonitor.wasLastProbeTrustworthy();
+            if (accKnown && !com.overdrive.app.monitor.AccMonitor.isAccOn()) return false;
+        } catch (Throwable ignored) {}
+        return true;
+    }
+
+    private static void startCamViewArmRetry(int mode, String target, int autoHide) {
+        final int gen = camViewArmGen.incrementAndGet();
+        // Snapshot the sticky auto-hide latch AT START. The loop then bails only if it
+        // flips during our wait — an absolute test would inherit a previous session's
+        // timeout (the latch is cleared only inside enableCamView, which the pano
+        // cold-start deferral never reaches) and kill this request on pass 1.
+        final boolean autoHideAtStart = camViewAutoHideLatched();
+        Thread t = new Thread(() -> {
+            // elapsedRealtime, NOT currentTimeMillis: the head unit syncs wall clock from
+            // GPS/network after boot, and a backward jump would extend this loop by the
+            // size of the correction — thousands of extra passes re-driving the camera
+            // cold start. Every other deadline in this feature uses the monotonic clock.
+            long deadline = android.os.SystemClock.elapsedRealtime() + CAMVIEW_ARM_DEADLINE_MS;
+            long delay = 300L;
+            while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                try { Thread.sleep(delay); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+                delay = Math.min(delay * 2, CAMVIEW_ARM_BACKOFF_MAX_MS);
+                if (!camViewArmStillWanted(gen, autoHideAtStart)) return;
+                GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
+                if (p == null) return;
+                // Keep driving the pano cold start ONLY while it is legitimately coming up.
+                // ensurePanoStartedNonBlocking is async + deduped, so re-calling is cheap;
+                // without it the loop would spin against a pipeline nobody is starting.
+                if (!ensurePanoStartedNonBlocking(p)) continue;
+                // FINAL re-check immediately before arming. The gate above is separated
+                // from the arm by ensurePanoStartedNonBlocking, and a hide/newer-show
+                // landing in that window would otherwise be overridden — resurrecting a
+                // view the user just dismissed, or arming the PREVIOUS camera. Cheap
+                // (atomic + volatile reads), so re-checking costs nothing.
+                if (!camViewArmStillWanted(gen, autoHideAtStart)) return;
+                try {
+                    p.enableCamView(mode, target, autoHide);
+                    CameraDaemon.log("camview arm retry: armed after deferral");
+                    return;
+                } catch (GpuSurveillancePipeline.BlindSpotNotReadyException nr) {
+                    // still not ready — keep trying until the deadline
+                } catch (Throwable other) {
+                    CameraDaemon.log("camview arm retry aborted: " + other.getMessage());
+                    return;
+                }
+            }
+            CameraDaemon.log("camview arm retry: gave up after "
+                + CAMVIEW_ARM_DEADLINE_MS + "ms (lane never became armable)");
+        }, "CamViewArmRetry");
+        t.setDaemon(true);
+        t.start();
+    }
+
     private static boolean ensurePanoStartedNonBlocking(GpuSurveillancePipeline pano) {
         if (pano == null) return false;
         if (pano.isRunning()) return true;
@@ -146,9 +392,22 @@ public class StreamingApiHandler {
             handleSetStreamQuality(out, quality);
             return true;
         }
+        if (path.startsWith("/api/stream/view-status/") && method.equals("GET")) {
+            String statusPath = path.substring(24);
+            int queryStart = statusPath.indexOf('?');
+            String modeString = queryStart >= 0
+                ? statusPath.substring(0, queryStart)
+                : statusPath;
+            int viewMode = Integer.parseInt(modeString);
+            handleStreamViewStatus(out, viewMode, parseViewRequest(path));
+            return true;
+        }
         if (path.startsWith("/api/stream/view/")) {
-            int viewMode = Integer.parseInt(path.substring(17));
-            handleStreamViewMode(out, viewMode);
+            String viewPath = path.substring(17);
+            int queryStart = viewPath.indexOf('?');
+            String modeString = queryStart >= 0 ? viewPath.substring(0, queryStart) : viewPath;
+            int viewMode = Integer.parseInt(modeString);
+            handleStreamViewMode(out, viewMode, parseViewRequest(path));
             return true;
         }
         // Blind-spot (view 7/8) LIVE stitch tuning, used by the RoadSense Blind
@@ -191,6 +450,10 @@ public class StreamingApiHandler {
             handleBsDisable(out);
             return true;
         }
+        if (path.equals("/api/bs/hide")) {
+            handleBsHide(out);
+            return true;
+        }
         if (path.equals("/api/bs/status")) {
             handleBsStatus(out);
             return true;
@@ -210,6 +473,10 @@ public class StreamingApiHandler {
             handleBsTarget(out, path.substring("/api/bs/target/".length()));
             return true;
         }
+        if (path.startsWith("/api/bs/tweak")) {
+            handleBsTweak(out, path);
+            return true;
+        }
         // ── Camera-view (shares the BS lane; blind-spot priority) ──────────────
         if (path.startsWith("/api/camview/")) {
             return handleCamView(path, out);
@@ -223,6 +490,8 @@ public class StreamingApiHandler {
      *   POST /api/camview/show?cam=front&target=head_unit&preset=60/center&autoHide=0
      *     (cam ∈ all|front|right|rear|left OR a raw int 0-4; target ∈ head_unit|cluster;
      *      preset=sizePct/corner OR geometry=x/y/w/h; autoHide seconds, 0=until hidden)
+     *   POST /api/camview/geometry/size/{sizePct}?target=head_unit|cluster
+     *     (updates only the saved size; preserves the camera view's corner)
      *   POST /api/camview/hide
      *   GET  /api/camview/status
      */
@@ -239,8 +508,20 @@ public class StreamingApiHandler {
             if (pipeline != null) {
                 r.put("mode", pipeline.getCamViewMode());
                 r.put("target", pipeline.getCamViewTargetString());
+                // `active` means REQUESTED, not on-screen: blind-spot can hold the shared
+                // lane (calibration preview, or a turn signal its gate allows) while a
+                // camview request stands. Report both so an automation polling this can
+                // tell "up" from "waiting behind blind-spot" instead of assuming success.
+                r.put("rendering", pipeline.isCamViewRendering());
+                r.put("maskedByBlindSpot", pipeline.isCamViewMaskedByBlindSpot());
             }
             HttpResponse.sendJson(out, r.toString());
+            return true;
+        }
+        if (clean.startsWith("/api/camview/geometry/")) {
+            // Geometry is persisted configuration, so it remains useful while the
+            // pipeline is down. The next normal camera-view session then picks it up.
+            handleCamViewGeometry(clean, query, pipeline, out);
             return true;
         }
         if (pipeline == null) {
@@ -248,6 +529,9 @@ public class StreamingApiHandler {
             return true;
         }
         if (clean.equals("/api/camview/hide")) {
+            // Invalidate any in-flight arm retry FIRST, so a pending deferred arm can
+            // never resurrect the view the user just dismissed.
+            cancelCamViewArmRetry();
             pipeline.disableCamView();
             // Persist enabled=false so a daemon restart doesn't re-show it.
             try { com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(
@@ -257,19 +541,17 @@ public class StreamingApiHandler {
             return true;
         }
         if (clean.equals("/api/camview/show")) {
-            // Cold-start pano if needed (same dedup as BS); caller re-polls.
-            if (!ensurePanoStartedNonBlocking(pipeline)) {
-                JSONObject pending = new JSONObject();
-                pending.put("success", false); pending.put("starting", true);
-                pending.put("error", "Pipeline starting — try again in a few seconds");
-                pending.put("errorCode", "pano_starting");
-                HttpResponse.sendJson(out, pending.toString());
-                return true;
-            }
             java.util.Map<String, String> p = parseQuery(query);
             int mode = parseCamMode(p.get("cam"));
             String target = "cluster".equals(p.get("target")) ? "cluster" : "head_unit";
+            // Fall back to the PERSISTED autoHideSec when the caller doesn't pass one.
+            // The automation action and every key-mapping binding build their URL without
+            // an autoHide param, so an explicit-query-only read meant the user's configured
+            // auto-hide was ignored on exactly the paths that matter and the view stayed up
+            // forever. 0 (either source) still means "until explicitly hidden".
             int autoHide = 0;
+            try { autoHide = com.overdrive.app.config.UnifiedConfigManager.getCamViewAutoHideSec(); }
+            catch (Throwable ignored) {}
             try { if (p.containsKey("autoHide")) autoHide = Integer.parseInt(p.get("autoHide")); }
             catch (NumberFormatException ignored) {}
             // Persist geometry (preset or absolute) + selection BEFORE enabling so
@@ -283,13 +565,45 @@ public class StreamingApiHandler {
                 if (autoHide > 0) cvVals.put("autoHideSec", autoHide);
                 com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(cvVals);
             } catch (Throwable ignored) {}
+            // EVERY show supersedes any pending retry — including one that goes on to
+            // succeed immediately. A success used to leave an older loop valid, so after a
+            // later blind-spot takeover cleared camViewActive that loop could re-arm the
+            // PREVIOUS camera (or target), resurrecting a view the user had replaced.
+            // startCamViewArmRetry bumps the generation itself, so the deferral paths below
+            // are already covered; this handles the straight-through success path.
+            cancelCamViewArmRetry();
+            // Cold-start pano if needed (same async dedup as BS). Moved BELOW the intent
+            // persist and wired to the SAME retry as the deferral case below: this branch
+            // used to return "pano_starting" with the identical never-honoured re-poll
+            // contract, so a key press during a cold start was the very same silent
+            // no-op. Now the request converges once the pipeline comes up.
+            if (!ensurePanoStartedNonBlocking(pipeline)) {
+                startCamViewArmRetry(mode, target, autoHide);
+                JSONObject pending = new JSONObject();
+                pending.put("success", false); pending.put("starting", true);
+                pending.put("error", "Pipeline starting — retrying");
+                pending.put("errorCode", "pano_starting");
+                pending.put("retrying", true);
+                HttpResponse.sendJson(out, pending.toString());
+                return true;
+            }
             try {
                 pipeline.enableCamView(mode, target, autoHide);
             } catch (GpuSurveillancePipeline.BlindSpotNotReadyException nr) {
+                // The lane isn't armable YET (pano still cold-starting, or another
+                // program's build is in flight). The contract was "caller must re-poll",
+                // but NO caller does: the automation action and every key-mapping binding
+                // are single-shot API calls, so a key press landing in this window did
+                // nothing at all — silently, with no view, no ✕ and no toast. Since the
+                // request is already persisted above, converge it here on a bounded
+                // background retry so a single fire-and-forget call still lands.
+                startCamViewArmRetry(mode, target, autoHide);
                 JSONObject pending = new JSONObject();
                 pending.put("success", false); pending.put("starting", true);
-                pending.put("error", "Camera-view lane arming — try again");
+                pending.put("error", "Camera-view lane arming — retrying");
                 pending.put("errorCode", "camview_starting");
+                // Tell callers a retry is already running so they don't need to poll.
+                pending.put("retrying", true);
                 HttpResponse.sendJson(out, pending.toString());
                 return true;
             }
@@ -297,6 +611,11 @@ public class StreamingApiHandler {
             r.put("success", pipeline.isCamViewActive());
             r.put("active", pipeline.isCamViewActive());
             r.put("mode", mode); r.put("target", target);
+            // A camera request remains active while an allowed blind-spot card owns the
+            // shared lane. Return the immediate render state so callers can distinguish
+            // a valid deferred request from a failed request without polling first.
+            r.put("rendering", pipeline.isCamViewRendering());
+            r.put("maskedByBlindSpot", pipeline.isCamViewMaskedByBlindSpot());
             HttpResponse.sendJson(out, r.toString());
             return true;
         }
@@ -304,8 +623,96 @@ public class StreamingApiHandler {
         return true;
     }
 
+    /**
+     * Persist a size-only normal camera-view geometry update, retaining the existing
+     * corner (or the centered default). This is deliberately separate from
+     * {@code /api/camview/show}: a resize binding must not select a new camera, reset
+     * its timeout, or re-show a view the user has hidden.
+     */
+    private static void handleCamViewGeometry(String clean, String query,
+                                               GpuSurveillancePipeline pipeline,
+                                               OutputStream out) throws Exception {
+        final String prefix = "/api/camview/geometry/size/";
+        if (!clean.startsWith(prefix) || clean.length() == prefix.length()) {
+            HttpResponse.sendJsonError(out, "geometry must be /size/{percent}");
+            return;
+        }
+        String rawSize = clean.substring(prefix.length());
+        if (rawSize.indexOf('/') >= 0) {
+            HttpResponse.sendJsonError(out, "geometry must be /size/{percent}");
+            return;
+        }
+        int sizePct;
+        try {
+            sizePct = Integer.parseInt(rawSize);
+        } catch (NumberFormatException e) {
+            HttpResponse.sendJsonError(out, "size must be a whole number between 15 and 90");
+            return;
+        }
+        if (sizePct < 15 || sizePct > 90) {
+            HttpResponse.sendJsonError(out, "size must be between 15 and 90 percent");
+            return;
+        }
+
+        java.util.Map<String, String> params = parseQuery(query);
+        String target;
+        try {
+            target = com.overdrive.app.config.UnifiedConfigManager.getCamViewTarget();
+        } catch (Throwable ignored) {
+            target = "head_unit";
+        }
+        if (!"cluster".equals(target)) target = "head_unit";
+        if (params.containsKey("target")) {
+            String requested = params.get("target");
+            if (!"head_unit".equals(requested) && !"cluster".equals(requested)) {
+                HttpResponse.sendJsonError(out, "target must be head_unit or cluster");
+                return;
+            }
+            target = requested;
+        }
+
+        String geometryKey = "cluster".equals(target) ? "geometryCluster" : "geometry";
+        org.json.JSONObject geometry;
+        try {
+            org.json.JSONObject camView =
+                    com.overdrive.app.config.UnifiedConfigManager.getCamView();
+            org.json.JSONObject existing =
+                    camView != null ? camView.optJSONObject(geometryKey) : null;
+            geometry = existing != null
+                    ? new org.json.JSONObject(existing.toString()) : new org.json.JSONObject();
+            geometry.put("sizePct", sizePct);
+        } catch (Exception e) {
+            HttpResponse.sendJsonError(out, "failed to prepare camera-view geometry");
+            return;
+        }
+
+        if (!com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(
+                java.util.Collections.singletonMap(geometryKey, (Object) geometry))) {
+            HttpResponse.sendJsonError(out, "failed to persist camera-view geometry");
+            return;
+        }
+
+        // A size-only update is safe to apply immediately only for the normal camera
+        // program on this target. The pipeline leaves blind-spot's shared rect alone
+        // while it owns the lane, then adopts the persisted size on handoff.
+        if (pipeline != null) pipeline.setCamViewGeometrySize(sizePct, target);
+
+        org.json.JSONObject response = new org.json.JSONObject();
+        response.put("success", true);
+        response.put("sizePct", sizePct);
+        response.put("target", target);
+        HttpResponse.sendJson(out, response.toString());
+    }
+
     /** Map a cam token to a scaler view mode: all/mosaic=0, front=1, right=2,
-     *  rear=3, left=4; a raw int 0-4 is accepted; default 0 (all-4). */
+     *  rear=3, left=4, plus the blind-spot composite views 7 (left) / 8 (right).
+     *  A raw int 0-4 or 7-8 is accepted; default 0 (all-4).
+     *
+     *  <p>7/8 render through the SAME shader path the blind-spot card uses, so they
+     *  honour blindspot.mergeMode (rear+side stitch / side-only / rear-only), the
+     *  fisheye dewarp and the per-side rotation — one shared settings set, no camview
+     *  duplicates. View 5/6 stay unreachable here: 5 is a debug raw passthrough and 6
+     *  is the OEM-dashcam texture, neither of which is a camera view. */
     private static int parseCamMode(String cam) {
         if (cam == null) return 0;
         String c = cam.trim().toLowerCase();
@@ -315,9 +722,55 @@ public class StreamingApiHandler {
             case "right": case "2": return 2;
             case "rear": case "3": return 3;
             case "left": case "4": return 4;
+            // Blind-spot composite, explicit side (no turn-signal dependency).
+            case "side_rear_left": case "bs_left": case "7": return 7;
+            case "side_rear_right": case "bs_right": case "8": return 8;
             default:
-                try { int v = Integer.parseInt(c); return (v >= 0 && v <= 4) ? v : 0; }
+                try {
+                    int v = Integer.parseInt(c);
+                    return isCamViewMode(v) ? v : 0;
+                }
                 catch (NumberFormatException e) { return 0; }
+        }
+    }
+
+    /** Scaler view modes a camera view may select: the plain feeds (0-4) and the
+     *  blind-spot composites (7/8). Single source of truth for every clamp. */
+    public static boolean isCamViewMode(int mode) {
+        return (mode >= 0 && mode <= 4) || mode == 7 || mode == 8;
+    }
+
+    /**
+     * The on-screen anchors a preset may name. Anything else is not a position, and must be
+     * REJECTED rather than stored: the corner decoders derive left/right and top/bottom by
+     * {@code endsWith("r")} / {@code startsWith("b")}, so an unrecognised string silently reads as
+     * neither-right-nor-bottom — i.e. TOP-LEFT. That is how a "top right" selection rendered top
+     * left (field report, fixed 2026-08). Kept as the single source of truth for every ingest path.
+     */
+    private static final java.util.Set<String> VALID_CORNERS =
+        java.util.Set.of("center", "tl", "tr", "bl", "br");
+
+    /**
+     * Normalise a corner token from a query/path, or null when it names no known anchor.
+     * Tolerant of case and surrounding whitespace (a hand-written URL or an automation payload may
+     * carry "TR"); strict about the vocabulary itself, so a typo can't become a silent top-left.
+     */
+    static String normalizeCorner(String raw) {
+        if (raw == null) return null;
+        String c = raw.trim().toLowerCase();
+        return VALID_CORNERS.contains(c) ? c : null;
+    }
+
+    /** The corner currently persisted under {@code geomKey} in the camview section, canonicalised,
+     *  or null when none is stored. Used to carry a position forward across a preset write that
+     *  replaces the whole geometry object. */
+    private static String storedCamViewCorner(String geomKey) {
+        try {
+            JSONObject cv = com.overdrive.app.config.UnifiedConfigManager.getCamView();
+            JSONObject g = (cv != null) ? cv.optJSONObject(geomKey) : null;
+            return (g != null) ? normalizeCorner(g.optString("corner", null)) : null;
+        } catch (Throwable t) {
+            return null;
         }
     }
 
@@ -332,7 +785,29 @@ public class StreamingApiHandler {
                 if (parts.length >= 1) {
                     geo = new JSONObject();
                     geo.put("sizePct", Integer.parseInt(parts[0].trim()));
-                    if (parts.length >= 2) geo.put("corner", parts[1].trim());
+                    // Store only a RECOGNISED corner — an unknown token would later decode as
+                    // top-left (see VALID_CORNERS).
+                    //
+                    // On an unknown token we must CARRY FORWARD the stored corner, not omit the
+                    // key: `geo` is a fresh object and setCamViewValues replaces the whole
+                    // geometry object, so omitting it DELETES the user's saved position. That
+                    // showed up as a delayed, unattributable move — the view kept its place this
+                    // boot (from the in-memory field) and silently jumped to centre after the
+                    // next daemon restart.
+                    if (parts.length >= 2) {
+                        String corner = normalizeCorner(parts[1]);
+                        if (corner == null) {
+                            CameraDaemon.log("camview preset: unknown corner '"
+                                + parts[1].trim() + "' (expected center|tl|tr|bl|br) — keeping"
+                                + " the stored position");
+                            corner = storedCamViewCorner(geomKey);
+                        }
+                        if (corner != null) geo.put("corner", corner);
+                    } else {
+                        // Size-only preset: preserve the stored corner for the same reason.
+                        String kept = storedCamViewCorner(geomKey);
+                        if (kept != null) geo.put("corner", kept);
+                    }
                 }
             } else if (p.containsKey("geometry")) {
                 String[] parts = p.get("geometry").split("/");
@@ -342,6 +817,13 @@ public class StreamingApiHandler {
                     geo.put("y", Integer.parseInt(parts[1].trim()));
                     geo.put("w", Integer.parseInt(parts[2].trim()));
                     geo.put("h", Integer.parseInt(parts[3].trim()));
+                    // Keep the stored corner even though this write is absolute: the object is
+                    // REPLACED wholesale, so dropping it meant a later size-only write resolved
+                    // with no corner and fell back to the centred default, silently moving a card
+                    // the user had placed. sizePct is deliberately not carried — an absolute rect
+                    // supersedes the preset, and the resolver prefers sizePct when present.
+                    String kept = storedCamViewCorner(geomKey);
+                    if (kept != null) geo.put("corner", kept);
                 }
             }
             if (geo != null) {
@@ -353,7 +835,10 @@ public class StreamingApiHandler {
         }
     }
 
-    /** Minimal query-string parser (k=v&k2=v2) → map. */
+    /** Minimal query-string parser (k=v&k2=v2) → map, percent-decoding each value.
+     *  Decoding matters for {@code preset=25%2Ftr}: a client that correctly escapes the
+     *  separator would otherwise leave the corner glued to the size and lose the position.
+     *  A malformed escape is kept verbatim rather than dropping the pair. */
     private static java.util.Map<String, String> parseQuery(String query) {
         java.util.Map<String, String> m = new java.util.HashMap<>();
         if (query == null || query.isEmpty()) return m;
@@ -362,6 +847,11 @@ public class StreamingApiHandler {
             if (eq > 0) {
                 String k = pair.substring(0, eq);
                 String v = pair.substring(eq + 1);
+                if (v.indexOf('%') >= 0 || v.indexOf('+') >= 0) {
+                    try {
+                        v = java.net.URLDecoder.decode(v, java.nio.charset.StandardCharsets.UTF_8);
+                    } catch (Throwable ignored) { /* not a valid escape — use the raw value */ }
+                }
                 m.put(k, v);
             }
         }
@@ -388,6 +878,249 @@ public class StreamingApiHandler {
         response.put("target", t);
         HttpResponse.sendJson(out, response.toString());
     }
+
+    /**
+     * POST /api/bs/tweak?fisheye=40&cameras=side&rotation=90&side=left — adjust the
+     * blind-spot card's view knobs from an automation or a hardware key.
+     *
+     * <p>Every parameter is optional and applied independently, so one call can set any
+     * subset. All of them persist to the {@code blindspot} UCM section AND push live to
+     * the running lane, exactly as the settings page does — the card changes mid-signal
+     * with no ACC cycle.
+     * <ul>
+     *   <li>{@code fisheye} 0..100 — lens dewarp for the single-camera views. Also
+     *       accepts {@code up}/{@code down} to step by {@link #BS_FISHEYE_STEP}, so one
+     *       button can nudge it repeatedly.</li>
+     *   <li>{@code cameras} both|side|rear — which camera(s) fill the card.</li>
+     *   <li>{@code rotation} 0|90|180|270|auto — on-screen quarter turn, with
+     *       {@code side} = left|right|both choosing which mirror-imaged camera it
+     *       applies to (default both). Only honoured in the single-camera modes; the
+     *       daemon gates that, same as the settings UI.</li>
+     *   <li>{@code enabled} true|false — the feature master switch. Persists
+     *       {@code blindspot.enabled} and arms/disarms the native lane, reconciling the
+     *       camera profile either way (an enable that makes BS the sole consumer drops
+     *       to the BS-only profile; a disable restores the no-owner baseline).</li>
+     * </ul>
+     *
+     * <p>Rejects the WHOLE request on an unparseable value rather than silently
+     * applying the half it understood — a binding that sets "side + 90°" must not land
+     * as a bare mode switch and leave the card sideways.
+     */
+    private static void handleBsTweak(OutputStream out, String path) throws Exception {
+        int q = path.indexOf('?');
+        java.util.Map<String, String> p = parseQuery(q >= 0 ? path.substring(q + 1) : "");
+        java.util.Map<String, Object> delta = new java.util.LinkedHashMap<>();
+
+        // ── Fisheye: absolute 0..100, or a relative up/down step off the STORED value ──
+        // A relative step is resolved LATER, inside the config lock, so two fast presses
+        // can't both read the same value and lose a step. 0 = absolute, ±1 = step.
+        int fisheyeStepDir = 0;
+        Integer fisheye = null;
+        String rawFish = p.get("fisheye");
+        if (rawFish != null) {
+            String f = rawFish.trim().toLowerCase();
+            if ("up".equals(f) || "down".equals(f)) {
+                fisheyeStepDir = "up".equals(f) ? 1 : -1;
+            } else {
+                try { fisheye = Integer.parseInt(f); }
+                catch (NumberFormatException e) {
+                    HttpResponse.sendJsonError(out, "fisheye must be 0-100, 'up' or 'down'");
+                    return;
+                }
+                if (fisheye < 0 || fisheye > 100) {
+                    HttpResponse.sendJsonError(out, "fisheye must be 0-100, 'up' or 'down'");
+                    return;
+                }
+                delta.put("rectifyStrength", fisheye);
+            }
+        }
+
+        // ── Cameras shown (merge mode) ──
+        String cameras = p.get("cameras");
+        if (cameras != null) {
+            cameras = cameras.trim().toLowerCase();
+            if (!"both".equals(cameras) && !"side".equals(cameras) && !"rear".equals(cameras)) {
+                HttpResponse.sendJsonError(out, "cameras must be both, side or rear");
+                return;
+            }
+            delta.put("mergeMode", cameras);
+        }
+
+        // ── Per-side card rotation. "auto" stores the string the daemon's resolver
+        //    already understands; a fixed angle must be an exact quarter turn. ──
+        String rotation = p.get("rotation");
+        if (rotation != null) {
+            String r = rotation.trim().toLowerCase();
+            String sideSel = p.containsKey("side") ? p.get("side").trim().toLowerCase() : "both";
+            if (!"left".equals(sideSel) && !"right".equals(sideSel) && !"both".equals(sideSel)) {
+                HttpResponse.sendJsonError(out, "side must be left, right or both");
+                return;
+            }
+            Object rotVal;
+            if ("auto".equals(r)) {
+                rotVal = "auto";
+            } else {
+                int deg;
+                try { deg = Integer.parseInt(r); }
+                catch (NumberFormatException e) {
+                    HttpResponse.sendJsonError(out, "rotation must be 0, 90, 180, 270 or 'auto'");
+                    return;
+                }
+                if (deg != 0 && deg != 90 && deg != 180 && deg != 270) {
+                    HttpResponse.sendJsonError(out, "rotation must be 0, 90, 180, 270 or 'auto'");
+                    return;
+                }
+                rotVal = deg;
+            }
+            // Write the PER-SIDE keys only. The legacy global "rotation" is just the
+            // fallback resolveBsRotation uses when a side key is absent, so touching it
+            // would silently change the other side too.
+            if (!"right".equals(sideSel)) delta.put("rotationLeft", rotVal);
+            if (!"left".equals(sideSel))  delta.put("rotationRight", rotVal);
+        }
+
+        // ── Feature master switch ──
+        Boolean enable = null;
+        String rawEnabled = p.get("enabled");
+        if (rawEnabled != null) {
+            String e = rawEnabled.trim().toLowerCase();
+            // Strict parse: Boolean.parseBoolean maps every typo to false, which would
+            // silently DISABLE a safety view a binding meant to turn on.
+            if ("true".equals(e) || "1".equals(e) || "on".equals(e)) enable = Boolean.TRUE;
+            else if ("false".equals(e) || "0".equals(e) || "off".equals(e)) enable = Boolean.FALSE;
+            else {
+                HttpResponse.sendJsonError(out, "enabled must be true or false");
+                return;
+            }
+            delta.put("enabled", enable);
+        }
+
+        if (delta.isEmpty() && fisheyeStepDir == 0) {
+            HttpResponse.sendJsonError(out,
+                "no recognised parameter (fisheye, cameras, rotation, enabled)");
+            return;
+        }
+
+        // Persist first (single merge on the section), then push live. Persisting first
+        // means a lane that isn't up yet still picks the values up on its next enable
+        // via applyBlindSpotCalibration.
+        //
+        // A relative fisheye step reads-and-writes INSIDE the config lock (the lock is
+        // per-thread reentrant, so setBlindSpotValues' own acquire just nests), so two
+        // overlapping presses serialise into two real steps instead of both reading the
+        // same value and landing on one. The resolved value is published for the response
+        // and the live push below.
+        final int stepDir = fisheyeStepDir;
+        final Integer[] resolvedFisheye = new Integer[1];
+        boolean saved;
+        if (stepDir != 0) {
+            saved = Boolean.TRUE.equals(
+                com.overdrive.app.config.UnifiedConfigManager.runUnderConfigLock(() -> {
+                    int cur = 0;
+                    try {
+                        cur = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot()
+                                .optInt("rectifyStrength", 0);
+                    } catch (Throwable ignored) {}
+                    int stepped = Math.max(0, Math.min(100,
+                        cur + stepDir * BS_FISHEYE_STEP));
+                    resolvedFisheye[0] = stepped;
+                    delta.put("rectifyStrength", stepped);
+                    return com.overdrive.app.config.UnifiedConfigManager.setBlindSpotValues(delta);
+                }));
+        } else {
+            saved = com.overdrive.app.config.UnifiedConfigManager.setBlindSpotValues(delta);
+        }
+        if (!saved) {
+            HttpResponse.sendJsonError(out, "failed to persist blind-spot settings");
+            return;
+        }
+
+        // Each push is independently guarded, mirroring the unified-settings dispatch: a
+        // shared try would let one knob's failure skip the remaining pushes. A knob that
+        // throws is NAMED in pushFailed and reported, so the caller never reads "applied"
+        // for a value that only reached the config file.
+        java.util.List<String> pushFailed = new java.util.ArrayList<>();
+        GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
+        if (pipeline != null) {
+            if (delta.containsKey("rectifyStrength")) {
+                try {
+                    pipeline.setBlindSpotRectifyStrength((Integer) delta.get("rectifyStrength"));
+                } catch (Throwable t) {
+                    CameraDaemon.log("handleBsTweak fisheye push: " + t.getMessage());
+                    pushFailed.add("fisheye");
+                }
+            }
+            if (delta.containsKey("mergeMode")) {
+                try {
+                    pipeline.setBlindSpotMergeMode(
+                        "side".equals(cameras) ? 1 : ("rear".equals(cameras) ? 2 : 0));
+                } catch (Throwable t) {
+                    CameraDaemon.log("handleBsTweak merge-mode push: " + t.getMessage());
+                    pushFailed.add("cameras");
+                }
+            }
+            // A merge-mode flip changes whether the stored angle applies at all, so
+            // refresh rotation for that too — not just for an explicit rotation edit.
+            if (delta.containsKey("mergeMode") || delta.containsKey("rotationLeft")
+                    || delta.containsKey("rotationRight")) {
+                try {
+                    pipeline.refreshBlindSpotRotation();
+                } catch (Throwable t) {
+                    CameraDaemon.log("handleBsTweak rotation push: " + t.getMessage());
+                    pushFailed.add("rotation");
+                }
+            }
+        }
+
+        // Arm/disarm LAST, so a call that both enables the feature and sets its view
+        // knobs has the knobs already persisted when the lane comes up and reads them.
+        // Mirrors the unified-settings enable dispatch: resolveBlindSpotLifecycle() to
+        // arm (idempotent; cold-starts pano itself), disableBlindSpot() to tear down,
+        // then reconcile the camera profile either way so the camera isn't stranded at
+        // a lane-OFF/~1fps profile with no owner.
+        if (enable != null) {
+            try {
+                if (enable) {
+                    resolveBlindSpotLifecycle();
+                } else if (pipeline != null) {
+                    pipeline.disableBlindSpot();
+                }
+            } catch (Throwable t) {
+                CameraDaemon.log("handleBsTweak enable dispatch: " + t.getMessage());
+                pushFailed.add("enabled");
+            }
+            // Camera-profile reconcile is a SEPARATE try and never marks the request
+            // failed: the arm/disarm above is what the caller asked for, and reporting
+            // "could not apply" for a lane that is up would have the UI refuse to paint
+            // a state that did take effect (and any retry re-toggle a working lane).
+            try {
+                com.overdrive.app.recording.RecordingModeManager rmm =
+                    CameraDaemon.getRecordingModeManager();
+                if (rmm != null) rmm.onPipelineStartedExternally();
+            } catch (Throwable t) {
+                CameraDaemon.log("handleBsTweak reconcile: " + t.getMessage());
+            }
+        }
+
+        // Values are persisted either way (they apply on the lane's next enable), but a
+        // failed live push is NOT "applied" — report it so a binding/rule and the web UI
+        // don't paint a change the running view never took.
+        JSONObject response = new JSONObject();
+        response.put("success", pushFailed.isEmpty());
+        for (java.util.Map.Entry<String, Object> e : delta.entrySet()) {
+            response.put(e.getKey(), e.getValue());
+        }
+        if (!pushFailed.isEmpty()) {
+            response.put("persisted", true);
+            response.put("pushFailed", new JSONArray(pushFailed));
+            response.put("error", "saved, but could not apply live: "
+                + String.join(", ", pushFailed));
+        }
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    /** Step size for the relative {@code fisheye=up|down} tweak, in slider units. */
+    private static final int BS_FISHEYE_STEP = 10;
 
     private static void handleBsEnable(OutputStream out) throws Exception {
         GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
@@ -488,6 +1221,29 @@ public class StreamingApiHandler {
         HttpResponse.sendJson(out, response.toString());
     }
 
+    /**
+     * POST /api/bs/hide — DISMISS the currently-showing blind-spot card (the floating
+     * ✕ tap). Unlike {@link #handleBsDisable} this does NOT disable the feature: the
+     * lane stays armed and the next turn signal shows the card again. Scoped to the
+     * current display session; a calibration preview is turned off instead.
+     *
+     * <p>{@code dismissed} reports whether a card was actually showing. The overlay uses
+     * it to decide whether to restore its ✕ (a tap that raced the card auto-hiding gets
+     * dismissed:false and the reconcile removes the button on the next poll anyway).
+     */
+    private static void handleBsHide(OutputStream out) throws Exception {
+        GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
+        boolean dismissed = false;
+        if (pipeline != null) {
+            try { dismissed = pipeline.dismissBlindSpotCard(); }
+            catch (Throwable t) { CameraDaemon.log("handleBsHide: " + t.getMessage()); }
+        }
+        JSONObject response = new JSONObject();
+        response.put("success", true);
+        response.put("dismissed", dismissed);
+        HttpResponse.sendJson(out, response.toString());
+    }
+
     // ── Blind-spot daemon-side self-arm ─────────────────────────────────────
     // The app arms the BS lane by POSTing /api/bs/enable (BlindSpotControl.sync,
     // fired from MainActivity / BootReceiver on the com.byd.action.ACC_ON
@@ -578,6 +1334,13 @@ public class StreamingApiHandler {
         // forceReload honors cross-UID freshness (web/app write, daemon reads).
         com.overdrive.app.config.UnifiedConfigManager.forceReload();
         response.put("target", com.overdrive.app.config.UnifiedConfigManager.getBlindSpotTarget());
+        // Conditional-display gate (speed window / reverse). "gateAllowed" is the live
+        // verdict as of the last turn tick; "gateReason" names the blocking condition so
+        // the settings page can explain a card that legitimately isn't appearing.
+        if (pipeline != null) {
+            response.put("gateAllowed", pipeline.isBsGateAllowed());
+            response.put("gateReason", pipeline.getBsGateReason());
+        }
         HttpResponse.sendJson(out, response.toString());
     }
 
@@ -590,7 +1353,8 @@ public class StreamingApiHandler {
     private static void handleBsGeometry(OutputStream out, String path) throws Exception {
         GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
         // Forms: /api/bs/geometry/{x}/{y}/{w}/{h}  (absolute px)
-        //   or:  /api/bs/geometry/preset/{sizePct}/{corner}  (daemon does panel math)
+        //   or:  /api/bs/geometry/preset/{sizePct}/{corner}  (size + position)
+        //   or:  /api/bs/geometry/size/{sizePct}  (size only; preserves positions)
         // Optional ?target=head_unit|cluster scopes which target's geometry is set;
         // defaults to the currently-active target.
         String target = com.overdrive.app.config.UnifiedConfigManager.getBlindSpotTarget();
@@ -605,11 +1369,47 @@ public class StreamingApiHandler {
         String geomKey = cluster ? "geometryCluster" : "geometry";
         String tail = path.length() > 16 ? path.substring(16) : "";
         if (tail.startsWith("/")) tail = tail.substring(1);
-        if (tail.startsWith("preset/")) {
+        if (tail.startsWith("size/")) {
+            try {
+                String[] p = tail.substring("size/".length()).split("/");
+                if (p.length != 1) throw new IllegalArgumentException("only a percentage is allowed");
+                int pct = Integer.parseInt(p[0]);
+                if (pct < 15 || pct > 90) {
+                    HttpResponse.sendJsonError(out, "size must be between 15 and 90 percent");
+                    return;
+                }
+                // Keep the RoadSense-selected per-side corners intact. A size-only
+                // automation must not unexpectedly move the left/right cards.
+                org.json.JSONObject bs = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+                org.json.JSONObject existing = bs != null ? bs.optJSONObject(geomKey) : null;
+                org.json.JSONObject geometry = existing != null
+                    ? new org.json.JSONObject(existing.toString()) : new org.json.JSONObject();
+                geometry.put("sizePct", pct);
+                if (!com.overdrive.app.config.UnifiedConfigManager.updateSection("blindspot",
+                        new org.json.JSONObject().put(geomKey, geometry))) {
+                    HttpResponse.sendJsonError(out, "failed to persist blind-spot geometry");
+                    return;
+                }
+                if (pipeline != null) pipeline.setBsGeometrySize(pct, target);
+            } catch (Exception e) {
+                HttpResponse.sendJsonError(out, "size must be a whole number between 15 and 90");
+                return;
+            }
+        } else if (tail.startsWith("preset/")) {
             try {
                 String[] p = tail.substring("preset/".length()).split("/");
                 int pct = Integer.parseInt(p[0]);
-                String corner = p.length > 1 ? p[1] : "tr";
+                // Reject an unknown corner instead of letting it decode as top-left (see
+                // VALID_CORNERS). Absent is still the documented "tr" default.
+                String corner = "tr";
+                if (p.length > 1) {
+                    corner = normalizeCorner(p[1]);
+                    if (corner == null) {
+                        HttpResponse.sendJsonError(out,
+                            "corner must be one of center, tl, tr, bl, br");
+                        return;
+                    }
+                }
                 if (pipeline != null) pipeline.setBsGeometryPreset(pct, corner, target);
             } catch (Exception e) {
                 HttpResponse.sendJsonError(out, "preset must be /preset/{pct}/{corner}: " + e.getMessage());
@@ -625,7 +1425,26 @@ public class StreamingApiHandler {
                 // Persist to the target's geometry key so the daemon restores it on
                 // the next enable. Shallow per-key merge — never clobbers the other
                 // target's key.
-                org.json.JSONObject g = new org.json.JSONObject();
+                //
+                // CARRY FORWARD the existing keys. updateSection replaces this whole geometry
+                // object, so writing a bare {x,y,w,h} DELETED the stored corner*/sizePct. The
+                // resolver prefers sizePct, so a later size-only write (which re-adds sizePct)
+                // then found no corner and fell back to "tr": a user who chose bottom-left,
+                // dragged the card, then nudged the size slider got a top-right card.
+                org.json.JSONObject g;
+                try {
+                    org.json.JSONObject bsNow =
+                        com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+                    org.json.JSONObject existing =
+                        (bsNow != null) ? bsNow.optJSONObject(geomKey) : null;
+                    g = (existing != null)
+                        ? new org.json.JSONObject(existing.toString()) : new org.json.JSONObject();
+                } catch (Throwable t) {
+                    g = new org.json.JSONObject();
+                }
+                // An absolute rect supersedes the preset: drop sizePct so resolveBsGeometry takes
+                // the absolute branch, but KEEP the corner choices for the next preset write.
+                g.remove("sizePct");
                 g.put("x", x); g.put("y", y); g.put("w", w); g.put("h", h);
                 com.overdrive.app.config.UnifiedConfigManager.updateSection("blindspot",
                     new org.json.JSONObject().put(geomKey, g));
@@ -826,6 +1645,7 @@ public class StreamingApiHandler {
         // (This path covers BOTH the HTTP DELETE here and the WS idle auto-close
         // inside the pipeline — neither strands the fps at the stream rate.)
         pipeline.disableStreaming();
+        setLastDesiredViewMode(-1);
 
         // Once the WS pipe goes dark, the OEM-stream "keep warm" reason
         // disappears. Re-evaluate so we tear down OEM if no recording
@@ -955,14 +1775,8 @@ public class StreamingApiHandler {
         HttpResponse.sendJson(out, ok.toString());
     }
 
-    private static void handleStreamViewMode(OutputStream out, int viewMode) throws Exception {
-        GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
-        
-        if (pipeline == null) {
-            HttpResponse.sendJsonError(out, Messages.get("errors.streaming_pipeline_not_available"));
-            return;
-        }
-        
+    private static void handleStreamViewMode(
+            OutputStream out, int viewMode, ViewRequest request) throws Exception {
         // Live-view stream accepts only modes 0-6. Blind-spot views 7/8 are
         // NOT valid here — they belong to the dedicated BS pipeline on port
         // 8889 and must route through /api/bs/view/{mode} (validated at
@@ -973,7 +1787,20 @@ public class StreamingApiHandler {
             HttpResponse.sendJsonError(out, Messages.get("errors.streaming_invalid_view_mode"));
             return;
         }
+        int previousDesiredView = getLastDesiredViewMode();
+        if (!request.applyIntent(viewMode)) {
+            sendSupersededViewResponse(out, viewMode);
+            return;
+        }
+        GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
+        if (pipeline == null) {
+            HttpResponse.sendJsonError(out, Messages.get("errors.streaming_pipeline_not_available"));
+            return;
+        }
 
+        // The requested mode is persisted before any cold-start work. A
+        // reconnect or lifecycle callback must see the newer intent even when
+        // this request returns starting=true.
         // View mode 6 = OEM Dashcam (separate forward sensor pipeline).
         // View 5 stays the legacy raw passthrough (pano strip debug) so
         // existing tooling that pokes /api/stream/view/5 keeps working.
@@ -984,7 +1811,7 @@ public class StreamingApiHandler {
         // oemDashcamCameraId, and (b) on single-AVM-client HALs starting
         // it would yield the pano pipeline.
         if (viewMode == 6) {
-            handleOemDashcamView(out);
+            handleOemDashcamView(out, request);
             return;
         }
 
@@ -995,9 +1822,6 @@ public class StreamingApiHandler {
         // poll loop should be cheap.
         if (pipeline.isRunning() && pipeline.isStreamingEnabled()
                 && pipeline.getStreamViewMode() == viewMode) {
-            // Defensive: refresh the static so a daemon-restart-then-idempotent-hit
-            // can't leave lastDesiredViewMode out of sync with the live scaler.
-            setLastDesiredViewMode(viewMode);
             String[] modeNamesIdem = {"Mosaic", "Front", "Right", "Rear", "Left", "Raw", "OEM Dashcam",
                                       "BlindSpot L", "BlindSpot R"};
             JSONObject ok = new JSONObject();
@@ -1021,6 +1845,7 @@ public class StreamingApiHandler {
             HttpResponse.sendJson(out, pending.toString());
             return;
         }
+        if (!ensureCurrentViewRequest(out, viewMode, request)) return;
 
         // Enable streaming first if not enabled. enableStreaming is
         // synchronous (allocates encoder + scaler on the GL thread) and
@@ -1035,6 +1860,7 @@ public class StreamingApiHandler {
                 return;
             }
         }
+        if (!ensureCurrentViewRequest(out, viewMode, request)) return;
 
         // Capture the prior view BEFORE we change it so the OEM lifecycle
         // recalc only fires on transitions in/out of view 6. Pre-fix every
@@ -1043,11 +1869,6 @@ public class StreamingApiHandler {
         int prevView = pipeline.getStreamViewMode();
 
         pipeline.setStreamViewMode(viewMode);
-        // Persist across scaler teardown so a future WS reconnect after
-        // idle-shutdown can re-apply the user's pick. See lastDesiredViewMode
-        // doc above.
-        setLastDesiredViewMode(viewMode);
-
         // Blind-spot views (7=Rear+Left, 8=Right+Rear): apply the user's SAVED
         // panorama calibration from the 'blindspot' UCM section so the stitch
         // looks right without the debug editor open. forceReload first — the web
@@ -1097,7 +1918,7 @@ public class StreamingApiHandler {
         // Switching from view 0 → view 1 doesn't change OEM's required
         // state (no streaming viewer either way) and used to spuriously
         // boot the pipeline when smart mode was armed.
-        if (prevView == 6 || viewMode == 6) {
+        if (prevView == 6 || previousDesiredView == 6 || viewMode == 6) {
             com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
         }
 
@@ -1126,13 +1947,62 @@ public class StreamingApiHandler {
     }
 
     /**
+     * Read-only readiness check used after the initial mutating DVR selection.
+     * The OEM lifecycle worker owns camera start, source binding and first-frame
+     * activation; browser polling must never repeat those mutations.
+     */
+    private static void handleStreamViewStatus(
+            OutputStream out, int viewMode, ViewRequest request) throws Exception {
+        if (viewMode != 6) {
+            HttpResponse.sendJsonError(out, Messages.get("errors.streaming_invalid_view_mode"));
+            return;
+        }
+        if (!request.isCurrent() || getLastDesiredViewMode() != 6) {
+            sendSupersededViewResponse(out, viewMode);
+            return;
+        }
+
+        GpuSurveillancePipeline pano = CameraDaemon.getGpuPipeline();
+        if (pano == null) {
+            HttpResponse.sendJsonError(out, Messages.get("errors.streaming_pipeline_not_available"));
+            return;
+        }
+        if (!pano.isRunning()) {
+            sendOemViewPending(out, "pano_starting",
+                    "Pipeline starting - try again in a few seconds");
+            return;
+        }
+        if (!pano.isStreamingEnabled()) {
+            sendOemViewPending(out, "stream_starting",
+                    "Streaming starting - try again in a few seconds");
+            return;
+        }
+        if (pano.getStreamViewMode() == 6 && pano.isOemStreamSourceActive()) {
+            sendOemViewSuccess(out);
+            return;
+        }
+        if (sendOemTerminalErrorIfAny(out)) return;
+
+        com.overdrive.app.camera.OemDashcamPipeline oem =
+            CameraDaemon.getOemDashcamPipeline();
+        if (oem == null || !oem.isRouteReady() || !pano.isOemStreamSourceActive()) {
+            sendOemViewPending(out, "oem_starting",
+                    "OEM Dashcam starting - try again in a few seconds");
+            return;
+        }
+        sendOemViewPending(out, "oem_starting",
+                "OEM Dashcam waiting for its first frame - try again in a few seconds");
+    }
+
+    /**
      * Handle a stream view mode = 6 request: route the WebSocket stream to
      * the OEM Dashcam pipeline's encoder bitstream. Returns starting=true
      * while the pano + OEM pipelines come up so the JS poll loop just
      * waits — no blocking on the HTTP worker thread. View 5 stays the
      * legacy raw debug passthrough.
      */
-    private static void handleOemDashcamView(OutputStream out) throws Exception {
+    private static void handleOemDashcamView(
+            OutputStream out, ViewRequest request) throws Exception {
         GpuSurveillancePipeline pano = CameraDaemon.getGpuPipeline();
         // Async-warm pano if needed; return starting=true while it's coming up.
         if (!ensurePanoStartedNonBlocking(pano)) {
@@ -1145,6 +2015,7 @@ public class StreamingApiHandler {
             HttpResponse.sendJson(out, pending.toString());
             return;
         }
+        if (!ensureCurrentViewRequest(out, 6, request)) return;
         // Pano is up but streaming isn't enabled yet. enableStreaming is
         // synchronous + cheap (~100-200ms), so inline is fine.
         if (pano != null && !pano.isStreamingEnabled()) {
@@ -1156,6 +2027,7 @@ public class StreamingApiHandler {
                 CameraDaemon.log("handleOemDashcamView: pano.enableStreaming failed: " + e.getMessage());
             }
         }
+        if (!ensureCurrentViewRequest(out, 6, request)) return;
         // Defensive — if streaming still didn't come up (enableStreaming
         // threw, or a concurrent disable just nulled the scaler), the route
         // call below will fail opaquely. Surface it as starting=true so the
@@ -1172,6 +2044,14 @@ public class StreamingApiHandler {
             return;
         }
 
+        // Repeated view-6 requests are a no-op once the source and shader view
+        // are both active. This is intentionally before any route/lifecycle
+        // work so reconnect noise cannot re-bind a healthy DVR feed.
+        if (pano.getStreamViewMode() == 6 && pano.isOemStreamSourceActive()) {
+            sendOemViewSuccess(out);
+            return;
+        }
+
         com.overdrive.app.camera.OemDashcamPipeline oem = CameraDaemon.getOemDashcamPipeline();
         // Gate on isRouteReady (camera texture + SurfaceTexture allocated)
         // not just isRunning. The pipeline's running flag flips true at the
@@ -1182,16 +2062,7 @@ public class StreamingApiHandler {
         // surfaces "OEM Dashcam stream routing not yet available" — which
         // the user can't recover from without retrying.
         if (oem == null || !oem.isRouteReady()) {
-            int resolved = com.overdrive.app.config.UnifiedConfigManager.resolveOemDashcamId();
-            if (resolved < 0) {
-                JSONObject err = new JSONObject();
-                err.put("success", false);
-                err.put("viewMode", 6);
-                err.put("errorCode", "oem_disabled");
-                err.put("error", "OEM Dashcam disabled on this vehicle");
-                HttpResponse.sendJson(out, err.toString());
-                return;
-            }
+            if (sendOemTerminalErrorIfAny(out)) return;
             // NOTE: the "warm but on an independent GL context while recording" case is
             // no longer surfaced as a terminal error. startPipeline() now ACTIVELY brings
             // pano up and waits for its EGLCore before creating OEM's context, so OEM
@@ -1210,36 +2081,12 @@ public class StreamingApiHandler {
             // the user sits on an "OEM Dashcam starting…" toast for ~30s
             // until the poll geometric backoff exhausts, and even then
             // gets the original opaque message.
-            try {
-                org.json.JSONObject oemCfg = com.overdrive.app.config.UnifiedConfigManager.getOemDashcam();
-                if (oemCfg.has("lastStartError") && !oemCfg.isNull("lastStartError")) {
-                    String reason = oemCfg.optString("lastStartError", "");
-                    long lastAt = oemCfg.optLong("lastStartErrorAt", 0L);
-                    long ageMs = System.currentTimeMillis() - lastAt;
-                    // Honor the sticky error only while it's recent (60 s) —
-                    // beyond that, treat it as stale (transient HAL warmup
-                    // failures shouldn't lock out streaming forever; the
-                    // user's only recovery is currently an APK reinstall).
-                    // Past the TTL, fall through to the normal lifecycle
-                    // recalc path so a fresh start can clear it via
-                    // startPipeline's lastStartError reset.
-                    if (!reason.isEmpty() && lastAt > 0 && ageMs < 60_000L) {
-                        JSONObject err = new JSONObject();
-                        err.put("success", false);
-                        err.put("viewMode", 6);
-                        err.put("errorCode", "oem_unsupported");
-                        err.put("error", "OEM Dashcam unavailable: " + reason);
-                        HttpResponse.sendJson(out, err.toString());
-                        return;
-                    }
-                }
-            } catch (Throwable ignored) {}
             // Streaming-only kick — we never flip recordingMode in UCM.
             // applyTriggerLifecycleFromUcm sees isAnyStreamingViewerActive()
             // (view 6 intent persisted just below) and brings the camera + EGL up
-            // without flipping recording on. Only schedule a recalc when
-            // the pipeline isn't already started — re-kicking an in-flight
-            // start() is wasted lifecycle churn.
+            // without flipping recording on. Re-run lifecycle even when an
+            // existing pipeline is unshared: its guarded EGL self-heal needs
+            // this wakeup to rebuild in pano's share group.
             //
             // DO NOT set the scaler to view 6 here. The shader's OEM branch is gated
             // on `uViewMode == 6 && uOemActive == 1`; uOemActive only goes 1 after
@@ -1249,17 +2096,11 @@ public class StreamingApiHandler {
             // the "DVR shows the 4-cam strip" bug. Leaving the view mode alone keeps
             // the previous (correct) feed on screen while OEM warms; view 6 is applied
             // only on the success path below, once the bind actually landed.
-            // isAnyStreamingViewerActive() reads the PERSISTED intent
-            // (setLastDesiredViewMode(6) below), not the scaler, so the lifecycle kick
-            // still sees the view-6 request.
-            // Persist intent now (not only on the success branch). A WS
-            // reconnect during the OEM warmup window would otherwise read
-            // lastDesiredViewMode=-1, fall back to scaler-state, and miss
-            // the user's pick if a teardown lands in that gap.
-            setLastDesiredViewMode(6);
-            if (oem == null || !oem.isRunning()) {
-                com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
-            }
+            // isAnyStreamingViewerActive() reads the persisted intent rather
+            // than the scaler, so the lifecycle kick still sees view 6 while
+            // the source warms.
+            if (!ensureCurrentViewRequest(out, 6, request)) return;
+            com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
             JSONObject pending = new JSONObject();
             pending.put("success", false);
             pending.put("viewMode", 6);
@@ -1278,41 +2119,96 @@ public class StreamingApiHandler {
         // take effect, otherwise the UI flips to "OEM Dashcam" while the
         // WS continues to deliver AVM mosaic frames.
         boolean routed = CameraDaemon.routeStreamToOemDashcam();
+        if (!ensureCurrentViewRequest(out, 6, request)) {
+            if (routed) restoreLatestViewAfterSupersededOemRoute(pano);
+            return;
+        }
+        boolean viewActivated = routed && pano.activateOemStreamViewWhenReady();
+        if (!ensureCurrentViewRequest(out, 6, request)) {
+            if (routed) restoreLatestViewAfterSupersededOemRoute(pano);
+            return;
+        }
         JSONObject response = new JSONObject();
-        if (!routed) {
+        if (!routed || !viewActivated) {
             // Re-kick the lifecycle so a missed-edge race between
             // isRouteReady() flipping true and attachExternalStreamCallback's
             // own gates (streamingEnabled / streamScaler / oemTextureId)
             // gets retried on the next poll instead of stranding the user
             // on a permanent toast.
             try {
-                if (oem == null || !oem.isRunning()) {
-                    com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
-                }
+                com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
             } catch (Throwable ignored) {}
             response.put("success", false);
             response.put("viewMode", 6);
             response.put("starting", true);
             response.put("errorCode", "oem_starting");
-            response.put("error", "OEM Dashcam starting — try again in a few seconds");
+            response.put("error", routed
+                ? "OEM Dashcam waiting for its first frame — try again in a few seconds"
+                : "OEM Dashcam starting — try again in a few seconds");
             HttpResponse.sendJson(out, response.toString());
             return;
         }
-        // Tell the scaler to switch its sample shader branch to the OEM
-        // path (view 6). Without this the scaler keeps rendering the AVM
-        // mosaic even though the OEM texture has been bound.
-        try {
-            pano.setStreamViewMode(6);
-        } catch (Throwable t) {
-            CameraDaemon.log("setStreamViewMode(6) failed: " + t.getMessage());
-        }
-        // Persist user's pick across scaler teardown so a WS reconnect
-        // after idle-shutdown re-applies view 6 + OEM re-route.
-        setLastDesiredViewMode(6);
         response.put("success", true);
         response.put("viewMode", 6);
         response.put("viewName", "OEM Dashcam");
         HttpResponse.sendJson(out, response.toString());
+    }
+
+    private static void sendOemViewSuccess(OutputStream out) throws Exception {
+        JSONObject response = new JSONObject();
+        response.put("success", true);
+        response.put("viewMode", 6);
+        response.put("viewName", "OEM Dashcam");
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    private static void sendOemViewPending(
+            OutputStream out, String errorCode, String error) throws Exception {
+        JSONObject pending = new JSONObject();
+        pending.put("success", false);
+        pending.put("viewMode", 6);
+        pending.put("starting", true);
+        pending.put("errorCode", errorCode);
+        pending.put("error", error);
+        HttpResponse.sendJson(out, pending.toString());
+    }
+
+    /**
+     * Surface configuration and recent HAL-start failures consistently from
+     * both the mutating selection and the read-only readiness endpoint.
+     */
+    private static boolean sendOemTerminalErrorIfAny(OutputStream out) throws Exception {
+        int resolved = com.overdrive.app.config.UnifiedConfigManager.resolveOemDashcamId();
+        if (resolved < 0) {
+            JSONObject err = new JSONObject();
+            err.put("success", false);
+            err.put("viewMode", 6);
+            err.put("errorCode", "oem_disabled");
+            err.put("error", "OEM Dashcam disabled on this vehicle");
+            HttpResponse.sendJson(out, err.toString());
+            return true;
+        }
+        try {
+            org.json.JSONObject oemCfg =
+                com.overdrive.app.config.UnifiedConfigManager.getOemDashcam();
+            if (oemCfg.has("lastStartError") && !oemCfg.isNull("lastStartError")) {
+                String reason = oemCfg.optString("lastStartError", "");
+                long lastAt = oemCfg.optLong("lastStartErrorAt", 0L);
+                long ageMs = System.currentTimeMillis() - lastAt;
+                // Recent failures are terminal for this selection. Older ones
+                // are retried because transient HAL warm-up errors can recover.
+                if (!reason.isEmpty() && lastAt > 0 && ageMs < 60_000L) {
+                    JSONObject err = new JSONObject();
+                    err.put("success", false);
+                    err.put("viewMode", 6);
+                    err.put("errorCode", "oem_unsupported");
+                    err.put("error", "OEM Dashcam unavailable: " + reason);
+                    HttpResponse.sendJson(out, err.toString());
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
     }
     
     // Static getters/setters for cross-component access

@@ -362,19 +362,23 @@ public class TripTelemetryRecorder {
                 }
             }
 
-            // Read GPS from GpsMonitor
+            // Read GPS from GpsMonitor — ONE immutable snapshot so all fields
+            // (position, altitude, both accuracies, source flag) belong to the
+            // SAME fix rather than mixing two IPC publications.
             GpsMonitor gps = GpsMonitor.getInstance();
-            double lat = gps.getLatitude();
-            double lon = gps.getLongitude();
-            double altitude = gps.getAltitude();
-            float gpsAccuracy = gps.getAccuracy();
+            GpsMonitor.GpsFixSnapshot fix = gps.getFixSnapshot();
+            double lat = fix.latitude;
+            double lon = fix.longitude;
+            double altitude = fix.altitude;
+            float gpsAccuracy = fix.accuracy;
 
             // Read gear from GearMonitor
             int gearMode = GearMonitor.getInstance().getCurrentGear();
 
             TelemetrySample sample = new TelemetrySample(
                     now, speedKmh, accelPedal, brakePedal,
-                    brakePedalPressed, gearMode, lat, lon, altitude);
+                    brakePedalPressed, gearMode, lat, lon, altitude,
+                    fix.verticalAccuracy, fix.altitudeIsMsl);
 
             // ── Distance fusion (CAN-speed primary, accuracy-gated GPS fallback) ──
             // dt since the previous sample, clamped so a scheduler stall or a

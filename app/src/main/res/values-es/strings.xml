@@ -206,10 +206,10 @@
     <string name="onboarding_authorize_retry_title">Aún no conectado</string>
     <string name="onboarding_authorize_retry_body">El ayudante aún no se está ejecutando. El permiso de Android puede haber sido descartado. Inténtalo de nuevo y recuerda marcar <b>Permitir siempre</b>.</string>
     <string name="onboarding_authorize_retry_button">Inténtalo de nuevo</string>
-    <string name="onboarding_mode_title">¿Cuándo debe ejecutarse Overdrive?</string>
-    <string name="onboarding_mode_body">Elige cómo se comporta Overdrive después de apagar el coche.\n\n<b>Encendido &amp; apagado</b> sigue vigilando mientras está estacionado — la vigilancia y la supervisión en segundo plano permanecen activas, por lo que el coche consume un poco de energía durante la noche.\n\n<b>Solo encendido</b> apaga Overdrive por completo en cuanto te vas. La dashcam, los viajes y la carga siguen funcionando mientras conduces, y todo se vuelve a iniciar automáticamente cuando enciendes el coche. Puedes cambiar esto en cualquier momento en Ajustes.</string>
-    <string name="onboarding_mode_on_off_button">Encendido &amp; apagado</string>
-    <string name="onboarding_mode_on_only_button">Solo encendido</string>
+    <string name="onboarding_mode_title">¿Cuándo debería ejecutarse la sobreimpulsión?</string>
+    <string name="onboarding_mode_body">Elija cómo se comporta la sobreconducción después de apagar el coche.\n\n<b>On &amp; Off</b> sigue viendo mientras está aparcado: la vigilancia y el monitoreo en segundo plano permanecen activos, por lo que el coche saca un poco de energía de noche.\n\n<b>En sólo</b> cierra completamente la descarga una vez que sales. Dashcam, los viajes y la carga todavía funcionan mientras conduces, y todo se reinicia automáticamente al encender el coche. Puedes cambiar esto en cualquier momento en Configuración.</string>
+    <string name="onboarding_mode_on_off_button">En &amp; Apagado</string>
+    <string name="onboarding_mode_on_only_button">Sólo en</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Cámara · paso %1$d de %2$d</string>
     <string name="onboarding_camera_intro_title">Configura tus cámaras</string>
@@ -1327,19 +1327,19 @@
     <string name="toast_cloudflared_saved_settings">Configuración de Cloudflared guardada</string>
     <!-- Projection feature -->
     <string name="projection_hero_title">Proyección</string>
-    <string name="projection_hero_subtitle">Proyecta una app en el cuadro de instrumentos del conductor y refléjala aquí.</string>
-    <string name="projection_pick_app">Elige una app para proyectar</string>
-    <string name="projection_cast">Proyectar al cuadro de instrumentos</string>
-    <string name="projection_stop">Detener</string>
-    <string name="projection_cast_failed">No se pudo proyectar esa app en el cuadro de instrumentos.</string>
-    <string name="projection_status_idle">No se está proyectando.</string>
-    <string name="projection_status_live">Reflejo en vivo — toca y desliza para controlar.</string>
-    <string name="projection_status_preview">Modo de vista previa (frecuencia de fotogramas reducida en este vehículo).</string>
-    <string name="projection_status_none">Aún no se proyecta nada — elige una app y proyéctala.</string>
-    <string name="projection_status_unsupported">El reflejo en vivo no es compatible con este vehículo. La app sigue proyectándose en el cuadro de instrumentos.</string>
-    <string name="projection_note_single_app">Solo se puede proyectar una app en el cuadro de instrumentos a la vez.</string>
+    <string name="projection_hero_subtitle">Enviar una aplicación al clúster de controladores y reflejarla aquí.</string>
+    <string name="projection_pick_app">Elija una aplicación para el proyecto</string>
+    <string name="projection_cast">Transmitir al clúster</string>
+    <string name="projection_stop">Parar</string>
+    <string name="projection_cast_failed">No se pudo enviar esa aplicación al clúster.</string>
+    <string name="projection_status_idle">No proyectando.</string>
+    <string name="projection_status_live">Espejo en vivo — toca y desliza para controlar.</string>
+    <string name="projection_status_preview">Modo de vista previa (velocidad reducida de fotograma en este vehículo).</string>
+    <string name="projection_status_none">Aún no se ha proyectado nada, elija una aplicación y envíela.</string>
+    <string name="projection_status_unsupported">El espejo en vivo no está soportado en este vehículo. La aplicación todavía se proyecta en el clúster.</string>
+    <string name="projection_note_single_app">Una aplicación puede proyectarse en el clúster a la vez.</string>
     <string name="projection_adjust_bounds">Ajustar área</string>
-    <string name="projection_done_adjusting">Listo</string>
+    <string name="projection_done_adjusting">Hecho</string>
     <string name="projection_bounds_hint_idle">Área de reflejo</string>
     <string name="projection_status_adjust">Arrastra para mover · arrastra una esquina para cambiar el tamaño.</string>
     <string name="projection_scale_title">Escalado</string>
@@ -1355,4 +1355,18 @@
     <string name="projection_autostart_conflict_confirm">Usar esta app</string>
     <string name="projection_app_uninstalled">Esa app ya no está instalada.</string>
     <string name="projection_status_service_down">El servicio de reflejo no está listo: reinicia la app (o el daemon de la cámara) e inténtalo de nuevo.</string>
+    <string name="cd_replay_status">Estado de repetición instantánea</string>
+    <string name="recording_lib_type_replay">REJUGAR</string>
+    <string name="settings_overlay_replay_title">Indicador de repetición instantánea</string>
+    <string name="settings_overlay_replay_subtitle">Mostrar la insignia CLIP: verde mientras que una repetición de registros, azul por 5 una vez guardada, rojo cuando falla. Aparece sólo cuando existe un enlace de repetición o automatización.</string>
+    <string name="recordings_segment_replays">Repeticiones</string>
+    <string name="recordings_segment_replays_count">Reproducciones · %d</string>
+    <string name="vehicle_model_seagull">BYD Seagull</string>
+    <string name="projection_window_title">Ventana del clúster</string>
+    <string name="projection_window_desc">Posiciona la aplicación de lanzamiento en el clúster del controlador. Ajustarla a diseños comunes; Redimensionar la ventana le permite arrastrarla libremente.</string>
+    <string name="projection_preset_full">Lleno</string>
+    <string name="projection_preset_left">mitad izquierda</string>
+    <string name="projection_preset_right">Mitad derecha</string>
+    <string name="projection_preset_center">Centrar</string>
+    <string name="projection_lock_aspect">Mantener aspecto del clúster</string>
 </resources>

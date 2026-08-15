@@ -11,11 +11,24 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="stylesheet" href="../shared/vehicle-control.css?v=16">
-    <!-- Web fonts loaded async + non-blocking. WebView falls back to system sans-serif if offline. -->
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" media="print" onload="this.media='all'">
+    <!-- View-mode bootstrap. Runs before first paint so the lite/immersive
+         chrome renders without flicker. 'lite' (default) boots controls-only:
+         no three.js/gsap/loaders/SotaPlayer, no GLB download, no WebGL
+         context — the ~2.4 MB immersive stack loads only when the saved
+         preference is 'immersive' (persisted via the view-mode toggle in the
+         status bar). html.vc-mode-* scopes the CSS for each mode. -->
+    <script>
+        (function () {
+            var mode = null;
+            try { mode = localStorage.getItem('vc.viewMode'); } catch (e) {}
+            window.VC_LITE = (mode !== 'immersive');
+            document.documentElement.className +=
+                window.VC_LITE ? ' vc-mode-lite' : ' vc-mode-immersive';
+        })();
+    </script>
+    <script src="../shared/app-shell.js?v=5"></script>
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
+    <link rel="stylesheet" href="../shared/vehicle-control.css?v=19">
 </head>
 <body>
     <div class="app-layout">
@@ -34,6 +47,18 @@
                         <div class="vc-loading-spinner"></div>
                         <div class="vc-loading-text" data-i18n="vehicle.loading_model">Loading model...</div>
                         <button class="vc-loading-retry" id="vcLoadingRetry" style="display:none" data-i18n="common.retry">Retry</button>
+                    </div>
+
+                    <!-- Lite-mode hero: static car silhouette shown instead of
+                         the 3D canvas (html.vc-mode-lite CSS swaps them). Pure
+                         markup — no model, no GL, no script dependency. -->
+                    <div class="vc-lite-hero" id="vcLiteHero" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/>
+                            <circle cx="7" cy="17" r="2"/>
+                            <circle cx="17" cy="17" r="2"/>
+                            <path d="M9 17h6"/>
+                        </svg>
                     </div>
 
                     <!-- Floating mobile nav button -->
@@ -65,6 +90,14 @@
                         <button class="vc-3d-btn" id="btn3dView" title="Toggle 3D Surround View">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/><path d="M2 12h20"/></svg>
                             <span>3D</span>
+                        </button>
+                        <!-- View-mode toggle: lite ↔ immersive. Label + title
+                             set by VC.initViewModeToggle; persists the choice
+                             to localStorage 'vc.viewMode' and reloads so the
+                             target mode boots cleanly. -->
+                        <button class="vc-3d-btn" id="btnViewMode" title="Switch view mode">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg>
+                            <span id="btnViewModeLabel">3D</span>
                         </button>
                     </div>
 
@@ -148,7 +181,7 @@
                         </div>
                         <!-- Trunk controls -->
                         <div class="vc-panel-row" id="panelTrunk" style="display:none;">
-                            <button class="vc-tile" id="btnTrunkOpen" title="Open Trunk" data-requires-cloud="true">
+                            <button class="vc-tile" id="btnTrunkOpen" title="Open Trunk">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2z"/><polyline points="12 11 12 6"/><polyline points="9 8 12 5 15 8"/></svg>
                                 <span data-i18n="vehicle.open">Open</span>
                             </button>
@@ -191,6 +224,48 @@
                             <button class="vc-mini" id="btnFanUp" title="Fan Up">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                             </button>
+                            <!-- ── Remote preconditioning (cloud BOOKINGAIR) ──
+                                 One scheduled remote-AC session: time, temperature and one of
+                                 the OEM's five session lengths. Cloud-only — there is no local
+                                 equivalent. A single booking is edited in place; Clear removes
+                                 it. Hidden until the cloud reports the feature. -->
+                            <section class="vc-charging-section vc-charging-divider vc-climate-schedule" id="climateScheduleSection" style="display:none;">
+                                <div class="vc-schedule-grid">
+                                    <div class="vc-schedule-bar">
+                                        <span class="vc-schedule-label" data-i18n="vehicle.precondition">Precondition</span>
+                                        <input type="time" id="climateBookingTime" class="vc-time" value="07:30" aria-label="Preconditioning time" />
+                                        <!-- Session length. BYD carries this on one timeSpan field
+                                             for both the booking and an immediate remote AC start,
+                                             so this control governs both. -->
+                                        <div class="vc-segmented" id="climateDurationSegmented" title="Remote session length" data-i18n-attr="title:vehicle.remote_session_length">
+                                            <button class="vc-seg" data-duration="10">10</button>
+                                            <button class="vc-seg" data-duration="15">15</button>
+                                            <button class="vc-seg" data-duration="20">20</button>
+                                            <button class="vc-seg" data-duration="25">25</button>
+                                            <button class="vc-seg" data-duration="30">30</button>
+                                        </div>
+                                        <span class="vc-schedule-unit" data-i18n="vehicle.minutes_short">min</span>
+                                        <button class="vc-mini" id="btnBookingTempDown" title="Lower preconditioning temperature" data-i18n-attr="title:vehicle.precondition_temp_down">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                        </button>
+                                        <span class="vc-readout" id="climateBookingTemp">22&deg;</span>
+                                        <button class="vc-mini" id="btnBookingTempUp" title="Raise preconditioning temperature" data-i18n-attr="title:vehicle.precondition_temp_up">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                        </button>
+                                        <button class="vc-tile" id="btnClimateScheduleSave" title="Save preconditioning schedule" data-i18n-attr="title:vehicle.precondition_save" data-requires-cloud="true">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                                            <span data-i18n="vehicle_control.save">Save</span>
+                                        </button>
+                                        <button class="vc-tile" id="btnClimateScheduleClear" title="Clear preconditioning schedule" data-i18n-attr="title:vehicle.precondition_clear" data-requires-cloud="true" style="display:none;">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+                                            <span data-i18n="common.clear">Clear</span>
+                                        </button>
+                                    </div>
+                                    <!-- Live booking summary. Never claims "no schedule": BYD can
+                                         report an empty list while a booking exists. -->
+                                    <div class="vc-schedule-note" id="climateScheduleNote" style="display:none;"></div>
+                                </div>
+                            </section>
                         </div>
                         <!-- Exterior speaker (AVAS) controls — factory tone
                              patterns + engine-sound simulator presets. These
@@ -281,6 +356,21 @@
                                 </svg>
                                 <span data-i18n="vehicle.passenger_cool">P.Cool</span>
                             </button>
+                            <!-- Steering-wheel heater — SDK-first with a composite cloud
+                                 fallback. Deliberately NOT cloud-marked: the local write is
+                                 the preferred path and works without an account, exactly like
+                                 the seat tiles beside it. Marking it would dash the tile out
+                                 as unavailable on a car where it works fine. -->
+                            <button class="vc-tile heat" id="btnSteeringHeat" title="Steering wheel heater" data-i18n-attr="title:vehicle.steering_heat">
+                                <!-- Steering wheel + heat waves. -->
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="14" r="7.5"/>
+                                    <circle cx="12" cy="14" r="2.4"/>
+                                    <path d="M4.7 12.6h14.6M12 16.4V21"/>
+                                    <path d="M8 5.2c0-1 1-1.6 1-2.6M12 5.2c0-1 1-1.6 1-2.6M16 5.2c0-1 1-1.6 1-2.6" stroke-width="1.5"/>
+                                </svg>
+                                <span data-i18n="vehicle.steering_heat_short">Wheel</span>
+                            </button>
                             <button class="vc-tile memory" id="btnSeatMemory1" title="Position 1 — tap to recall, hold to save" data-i18n-attr="title:vehicle.seat_pos_1_title">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M9 19 5 7m4 12h9" stroke-width="2.5"/><path d="M9.5 6a8 8 0 0 1 9 9"/><path d="M12 4 9.5 6 12 8.5m4 4.5 2.5 2 2.5-2"/></svg>
                                 <span data-i18n="vehicle.seat_pos_1">Pos 1</span>
@@ -291,9 +381,7 @@
                             </button>
                             <div class="vc-hold-hint" data-i18n="vehicle.seat_memory_hint">Tap to recall · hold to save</div>
                         </div>
-                        <!-- Windows controls — per-window presets; the "All Windows → 0"
-                             row at the bottom routes through CLOUD_FIRST CLOSEWINDOW so it
-                             works even when the car is asleep, with SDK fallback. -->
+                        <!-- Windows controls — per-window presets plus a distinct remote vent. -->
                         <div class="vc-panel-row vc-window-grid" id="panelWindows" style="display:none;">
                             <div class="vc-window-row" data-area="lf" data-area-num="1">
                                 <div class="vc-window-label"><span class="label-area">LF</span><span class="label-pct" id="winLabel_lf">--%</span></div>
@@ -340,6 +428,9 @@
                                 <div class="vc-window-presets">
                                     <button class="vc-preset" id="btnWinAllClose" title="All Windows Closed">0</button>
                                     <button class="vc-preset" id="btnWinAllOpen" title="All Windows Open">100</button>
+                                    <!-- Cloud-only: BYD's OPENWINDOW has no SDK equivalent, so this
+                                         preset carries the cloud marker its neighbours don't. -->
+                                    <button class="vc-preset" id="btnWinAllVent" title="Vent all windows" data-i18n-attr="title:vehicle.vent_all_windows" data-requires-cloud="true" data-i18n="vehicle.vent">Vent</button>
                                 </div>
                             </div>
                             <div class="vc-window-row" data-area="sunroof" data-area-num="5">
@@ -401,6 +492,10 @@
                                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h7l-1 5h4l-7 9 1-7H7z"/><rect x="3" y="3" width="18" height="18" rx="3"/></svg>
                                                 <span data-i18n="vehicle_control.smart_charging">Smart charging</span>
                                             </button>
+                                            <button class="vc-tile" id="btnStartCharging" title="Start charging now" data-requires-cloud="true">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg>
+                                                <span>Start charge</span>
+                                            </button>
                                             <input type="time" id="chargeStartTime" class="vc-time" value="22:00" aria-label="Start" />
                                             <span class="vc-schedule-arrow">→</span>
                                             <input type="time" id="chargeEndTime" class="vc-time" value="06:00" aria-label="End" />
@@ -436,8 +531,8 @@
                                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="14" height="10" rx="1"/><path d="M17 10h2a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1h-2"/><line x1="7" y1="12" x2="13" y2="12"/></svg>
                                                 <span data-i18n="vehicle_control.section_charge_cap">Charge limit</span>
                                             </button>
-                                            <input type="range" id="chargeCapSlider" class="vc-soc-slider" min="15" max="100" step="5" value="70" aria-label="Charge limit" />
-                                            <span class="vc-readout" id="chargeCapReadout">70%</span>
+                                            <input type="range" id="chargeCapSlider" class="vc-soc-slider" min="50" max="100" step="5" value="50" aria-label="Charge limit" />
+                                            <span class="vc-readout" id="chargeCapReadout">--</span>
                                         </div>
                                     </div>
                                 </section>
@@ -520,18 +615,37 @@
          token (works through tunnels where cookies are stripped). -->
     <script src="../shared/auth.js?v=12"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/SotaPlayer.js?v=13"></script>
     <!-- core.js polls /status every 5s and populates the sidebar status card
          (12V, ACC, SOC, range, SOH, fuel, network). Without it those values
          all stay at "--" since vehicle-control.js only manages the 3D scene. -->
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/vendor/three.min.js?v=12"></script>
-    <script src="../shared/vendor/DRACOLoader.js?v=12"></script>
-    <script src="../shared/vendor/GLTFLoader.js?v=12"></script>
-    <script src="../shared/vendor/OrbitControls.js?v=12"></script>
-    <script src="../shared/vendor/gsap.min.js?v=12"></script>
-    <script src="../shared/vehicle-control.js?v=vcfix1"></script>
+    <!-- Mode-gated loader. In immersive mode this injects the heavy stack
+         (SotaPlayer + three.js + Draco/GLTF/Orbit + gsap ≈ 820 KB of script,
+         plus the 1.6 MB GLB the scene then fetches) in strict order via
+         async=false, exactly matching the old static tag order. In lite mode
+         only vehicle-control.js loads — its boot detects VC_LITE and skips
+         the 3D scene entirely. NOTE: dynamically injected scripts don't block
+         DOMContentLoaded, so vehicle-control.js boots readyState-aware. -->
+    <script>
+        (function () {
+            var chain = window.VC_LITE ? [] : [
+                '../shared/SotaPlayer.js?v=13',
+                '../shared/vendor/three.min.js?v=12',
+                '../shared/vendor/DRACOLoader.js?v=12',
+                '../shared/vendor/GLTFLoader.js?v=12',
+                '../shared/vendor/OrbitControls.js?v=12',
+                '../shared/vendor/gsap.min.js?v=12'
+            ];
+            chain.push('../shared/vehicle-control.js?v=vclite4');
+            for (var i = 0; i < chain.length; i++) {
+                var s = document.createElement('script');
+                s.src = chain[i];
+                s.async = false;   // preserve execution order
+                document.body.appendChild(s);
+            }
+        })();
+    </script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

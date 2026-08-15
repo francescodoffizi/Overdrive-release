@@ -136,6 +136,15 @@
       "severity": "info",
       "defaultClickUrl": "/automations.html",
       "note": "Can be sent by creating an automation action to send a notification."
+    },
+    {
+      "id": "network.hotspot.limit",
+      "label": "Hotspot data limit reached",
+      "group": "Network",
+      "defaultEnabled": true,
+      "severity": "warn",
+      "defaultClickUrl": "/network.html",
+      "note": "Fires when the hotspot passes its configured total data limit; the hotspot is turned off at the same time. Raise or reset the limit to use it again."
     }
   ]
 }

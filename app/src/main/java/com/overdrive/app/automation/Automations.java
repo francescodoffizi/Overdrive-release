@@ -2,12 +2,14 @@ package com.overdrive.app.automation;
 
 import com.overdrive.app.automation.action.Action;
 import com.overdrive.app.automation.action.Actions;
+import com.overdrive.app.automation.action.VehicleControlAction;
 import com.overdrive.app.automation.condition.Conditions;
 import com.overdrive.app.automation.condition.EventCondition;
 import com.overdrive.app.automation.condition.EventData;
 import com.overdrive.app.automation.condition.TimeEvent;
 import com.overdrive.app.automation.type.IntType;
 import com.overdrive.app.automation.type.Type;
+import com.overdrive.app.automation.value.BaseValue;
 import com.overdrive.app.automation.value.IntValue;
 import com.overdrive.app.automation.value.Label;
 import com.overdrive.app.automation.value.StringValue;
@@ -42,6 +44,43 @@ public class Automations {
     // their FileOutputStreams and produce a mangled file.
     private static final Object SAVE_LOCK = new Object();
     private static final Map<EventData, Value> state = new ConcurrentHashMap<>();
+    // Expiration is a read/condition overlay: the raw value remains in state so a recovered
+    // sensor can still compare against its last observation without manufacturing an edge.
+    // All access to this map, and state mutations that add/remove an expiration, use STATE_LOCK.
+    private static final Object STATE_LOCK = new Object();
+    private static final Map<EventData, Long> stateExpiresAt = new java.util.HashMap<>();
+    // Per key: the last value actually DELIVERED to trigger evaluation (stateChanged), as
+    // opposed to merely stored. A silent seed stores without delivering; a fired transition
+    // does both. This is what makes cross-publisher delivery exactly-once: an OBSERVED edge
+    // (updateObservedEdge) fires only when its value has not already been delivered — so a
+    // sampled snapshot winning the race to deliver the same transition suppresses the edge's
+    // re-fire, a silent same-value seed does not, and a duplicate edge publish is a no-op
+    // even if the caller's own dedup slips. All access under {@link #STATE_LOCK}; the
+    // decision to fire and the delivery mark are committed atomically, so exactly one
+    // publisher claims delivery of any given value.
+    private static final Map<EventData, Value> stateDelivered = new java.util.HashMap<>();
+    // Automation and nested-group condition evaluation only calls Map.get. Keep that read live
+    // so a value that expires while no telemetry is arriving becomes unavailable immediately.
+    private static final Map<EventData, Value> conditionState = new java.util.AbstractMap<EventData, Value>() {
+        @Override
+        public Value get(Object key) {
+            return key instanceof EventData ? getStateValue((EventData) key) : null;
+        }
+
+        @Override
+        public java.util.Set<Map.Entry<EventData, Value>> entrySet() {
+            Map<EventData, Value> visible = new java.util.HashMap<>();
+            synchronized (STATE_LOCK) {
+                long now = System.currentTimeMillis();
+                for (Map.Entry<EventData, Value> entry : state.entrySet()) {
+                    if (!isStateExpired(entry.getKey(), now)) {
+                        visible.put(entry.getKey(), entry.getValue());
+                    }
+                }
+            }
+            return java.util.Collections.unmodifiableMap(visible).entrySet();
+        }
+    };
     // The schema object graph (~200 Label/EnumType/EventCondition/Action objects) is built lazily on
     // first use rather than at class-load. A daemon with zero configured automations touches Automations
     // on every telemetry snapshot (via BydEvent.isDisabled()) but never needs the schema, so this keeps
@@ -56,22 +95,37 @@ public class Automations {
     // hot path) is a field read instead of a full stream scan of the map. Maintained under SAVE_LOCK
     // alongside every mutation. volatile for cross-thread visibility from the telemetry thread.
     private static volatile int enabledCount = 0;
+    // Bumped whenever the automation feature crosses the enabled/disabled boundary. A publisher
+    // samples this before and after its callback so a complete disable -> enable cycle cannot hide
+    // between two identical isDisabled() reads and silently drop the observed vehicle state.
+    private static volatile long enabledStateGeneration = 0L;
+    // Memo for isEventReferenced, which active fast pollers call several times a second.
+    // The answer only changes when the automation config changes, so cache per key and invalidate
+    // on mutation by bumping configGeneration. Unreferenced pollers are cancelled completely.
+    //
+    // Each entry CARRIES the generation it was computed under, and a read ignores any entry from
+    // an older one. A plain map + clear() is not enough: a walk that starts before a mutation can
+    // finish after the clear and reinsert its stale answer, which would then be served forever —
+    // a stale "false" silently parks a poller so the rule never fires. Stamping makes that
+    // reinsertion harmless (the entry is rejected on read) instead of permanent.
+    private static final Map<EventData, RefEntry> referenceCache = new ConcurrentHashMap<>();
+    private static volatile int configGeneration = 0;
+    private static volatile boolean pollersReady = false;
+
+    /** A memoized {@link #isEventReferenced} answer plus the config generation it was computed under. */
+    private static final class RefEntry {
+        final int generation;
+        final boolean referenced;
+
+        RefEntry(int generation, boolean referenced) {
+            this.generation = generation;
+            this.referenced = referenced;
+        }
+    }
 
     static {
-        // Load config from the file at startup
-        loadFromFile();
-        // Load reusable action groups too (separate file). Order doesn't matter — an
-        // actionGroup action resolves its group by id lazily at run time — but loading
-        // here makes them ready before the first automation fires.
-        ActionGroups.loadFromFile();
-
-        // Start publishing the current time-of-day / day-of-week into the state so
-        // time and day conditions can be evaluated.
-        TimeEvent.scheduleTimeEvent();
-
-        // Start the low-cadence WiFi/system-boot poll (self-gating: does nothing while
-        // no automation is enabled). Feeds wifiState / wifiSsid / boot events.
-        com.overdrive.app.automation.condition.NetworkEvent.scheduleNetworkEvent();
+        runIsolatedStartupStep("saved automation load", Automations::loadFromFile);
+        runIsolatedStartupStep("action-group load", ActionGroups::loadFromFile);
 
         // NOTE: btState / btDeviceName are NOT polled here. Bluetooth can't be read
         // reliably from the daemon (UID 2000) — Bluetooth is only readable from a normal
@@ -80,60 +134,65 @@ public class Automations {
         // watches ACL connect/disconnect and relays those events to the daemon via
         // Automations.publishExternalEvent, exactly like callState.
 
-        // Start the FAST turn-indicator poll. Self-gates one level tighter than the
-        // others (isEventReferenced): it reads the lamps at 500ms ONLY while an enabled
-        // automation actually triggers on a turn signal, otherwise it's a parked thread
-        // ticking a cheap map check. Publishes turnSignal on/off far more promptly than
-        // the ~5s stationary snapshot cadence used to.
-        com.overdrive.app.automation.condition.TurnSignalEvent.scheduleTurnSignalEvent();
+        // Door callbacks are event-driven and stay subscribed. Every periodic source below is
+        // configuration-driven: no enabled reference means no scheduled task and no parked
+        // thread waking just to discover that it has nothing to read.
+        pollersReady = true;
+        refreshConditionalPollers();
+    }
 
-        // Start the FAST drive-mode poll. Same self-gating as TurnSignalEvent: reads the
-        // drive-config axis at 1s ONLY while an enabled automation actually triggers on
-        // driveMode, otherwise a parked thread ticking a cheap map check. Publishes the
-        // drive mode far more promptly than the ~5s stationary snapshot cadence used to.
-        com.overdrive.app.automation.condition.DriveModeEvent.scheduleDriveModeEvent();
+    private static void refreshConditionalPollers() {
+        if (!pollersReady) return;
+        // Every source is an optional integration boundary. A missing OEM class or a source
+        // initializer failure must disable only that source, never poison Automations.<clinit>
+        // and take down the complete API with NoClassDefFoundError.
+        runIsolatedStartupStep("door subscription",
+                () -> com.overdrive.app.automation.condition.DoorEvent.start());
+        runIsolatedStartupStep("boot event",
+                () -> com.overdrive.app.automation.condition.NetworkEvent.start());
+        runIsolatedStartupStep("time poller", () -> TimeEvent.refresh());
+        runIsolatedStartupStep("network poller",
+                () -> com.overdrive.app.automation.condition.NetworkEvent.refresh());
+        runIsolatedStartupStep("turn-signal poller",
+                () -> com.overdrive.app.automation.condition.TurnSignalEvent.refresh());
+        runIsolatedStartupStep("drive-mode poller",
+                () -> com.overdrive.app.automation.condition.DriveModeEvent.refresh());
+        runIsolatedStartupStep("blind-spot poller",
+                () -> com.overdrive.app.automation.condition.BlindSpotEvent.refresh());
+        runIsolatedStartupStep("seatbelt poller",
+                () -> com.overdrive.app.automation.condition.SeatbeltEvent.refresh());
+        runIsolatedStartupStep("dynamics poller",
+                () -> com.overdrive.app.automation.condition.DynamicsEvent.refresh());
+        runIsolatedStartupStep("energy-regen poller",
+                () -> com.overdrive.app.automation.condition.EnergyRegenEvent.refresh());
+        runIsolatedStartupStep("gear poller",
+                () -> com.overdrive.app.automation.condition.GearEvent.refresh());
+        runIsolatedStartupStep("climate poller",
+                () -> com.overdrive.app.automation.condition.ClimateEvent.refresh());
+        runIsolatedStartupStep("door fallback poller",
+                () -> com.overdrive.app.automation.condition.DoorEvent.refresh());
+    }
 
-        // Start the FAST blind-spot poll. Same self-gating as TurnSignalEvent: reads the
-        // radar warning registers at 250ms ONLY while an enabled automation references
-        // blindSpot. The ADAS event callback also pushes alerts instantly; this poll covers
-        // trims that don't deliver those events, and expires the alert hold. See
-        // BlindSpotEvent.
-        com.overdrive.app.automation.condition.BlindSpotEvent.scheduleBlindSpotEvent();
-
-        // Start the FAST seatbelt poll. Identical self-gating to TurnSignalEvent: reads the
-        // belts at 500ms ONLY while an enabled automation actually triggers on a seatbelt,
-        // otherwise a parked thread ticking a cheap map check. Cuts a buckle trigger's lag
-        // from the ~5s stationary snapshot cadence (the reported "2-3s") to near-real-time.
-        com.overdrive.app.automation.condition.SeatbeltEvent.scheduleSeatbeltEvent();
-
-        // Start the FAST dynamic-input poll (accelerator / brake / steering). Same
-        // self-gating as TurnSignalEvent — reads a signal at 250ms ONLY while an enabled
-        // automation actually references it, otherwise a parked thread ticking cheap map
-        // checks. Fixes the up-to-5s lag those triggers had on the stationary snapshot.
-        com.overdrive.app.automation.condition.DynamicsEvent.scheduleDynamicsEvent();
-
-        // Start the FAST energy-recuperation (regen) poll. Same self-gating: reads the
-        // regen level at 1s ONLY while an enabled automation references energyRegen,
-        // otherwise a parked thread. Fixes the 2-4s lag regen had on the ~5s snapshot.
-        com.overdrive.app.automation.condition.EnergyRegenEvent.scheduleEnergyRegenEvent();
-
-        // Start the FAST gear poll. Same self-gating as TurnSignalEvent: reads gear at 500ms
-        // ONLY while an enabled automation triggers on gear, otherwise a parked thread ticking
-        // a cheap map check. Gear otherwise rode the 5s (ACC-on) snapshot; the gearbox HAL
-        // listener can't be used (its learningEPB() path crashes the daemon), so this fast poll
-        // is how a gear trigger becomes prompt. See GearEvent.
-        com.overdrive.app.automation.condition.GearEvent.scheduleGearEvent();
-
-        // Start the FAST climate poll (seat heat/cool per seat + high/low beam). Same
-        // self-gating: reads at 1s ONLY while an enabled automation references one of those
-        // six signals, otherwise a parked thread. These otherwise rode the ~5s snapshot (their
-        // HAL callbacks refresh only a subset — DRL / pushed seat events), so this closes the
-        // lag for the reported seat-cooling ELSE and for beam triggers. See ClimateEvent.
-        com.overdrive.app.automation.condition.ClimateEvent.scheduleClimateEvent();
-
-        // Subscribe to raw door open/close edges (event-driven, no poll) so door-state
-        // triggers fire the instant a door/lid opens. Self-gates on isDisabled().
-        com.overdrive.app.automation.condition.DoorEvent.start();
+    /**
+     * Run one optional startup integration without allowing it to poison this class.
+     *
+     * <p>Linkage errors are included intentionally: OEM framework classes vary by vehicle and
+     * firmware, and a missing class must make only its signal unavailable. VM-fatal conditions
+     * still propagate because continuing after them is not safe.
+     */
+    static void runIsolatedStartupStep(String name, Runnable step) {
+        try {
+            step.run();
+        } catch (ThreadDeath | VirtualMachineError fatal) {
+            throw fatal;
+        } catch (Throwable failure) {
+            try {
+                logger.error("Automation startup step '" + name + "' failed: "
+                        + failure.getClass().getName() + ": " + failure.getMessage(), failure);
+            } catch (Throwable ignored) {
+                // Logging is diagnostic only; it must not recreate the initializer failure.
+            }
+        }
     }
 
     /**
@@ -183,10 +242,38 @@ public class Automations {
      * mutation of the automations map or an automation's disabled flag.
      */
     private static void refreshEnabledCount() {
+        boolean wasDisabled = enabledCount == 0;
         int n = 0;
         for (Automation a : automations.values()) if (!a.isDisabled()) n++;
         enabledCount = n;
+        if (wasDisabled != (n == 0)) {
+            enabledStateGeneration++;
+        }
+        // Invalidate the memo. The bump alone is what invalidates (entries stamped with the old
+        // generation are ignored on read); the clear just reclaims the few stale entries so they
+        // don't sit until the next lookup overwrites them. Always called under SAVE_LOCK, so the
+        // non-atomic ++ has a single writer.
+        configGeneration++;
+        referenceCache.clear();
         seedReferencedVariables();
+        refreshConditionalPollers();
+    }
+
+    /**
+     * Invalidate the {@link #isEventReferenced} memo after an ACTION GROUP changed.
+     *
+     * <p>The reference walk expands an {@code actionGroup} into its group body, so a group edit can
+     * change the answer for a key even though no automation was touched — and a stale cached
+     * {@code false} silently parks that key's poller, leaving the signal null forever. Group
+     * mutations do not affect the enabled count, so this bumps only the generation.
+     */
+    static void invalidateReferenceCacheForGroupChange() {
+        synchronized (SAVE_LOCK) {
+            configGeneration++;
+            referenceCache.clear();
+            seedReferencedVariables();
+            refreshConditionalPollers();
+        }
     }
 
     /**
@@ -225,12 +312,13 @@ public class Automations {
     }
 
     private static void seedVariablesDefinedByActions(java.util.List<AutomationAction> actions) {
-        // Recurse into nested children so a setVariable INSIDE a loop/if/group is still
-        // seeded — otherwise its variable would read null (not "") on first run and a
+        // Recurse into nested children so every variable-writing action inside a loop/if/group
+        // is seeded — otherwise its variable would read null (not "") on first run and a
         // "!= true" guard would never pass. forEachAction walks the whole tree.
         forEachAction(actions, action -> {
             if (!"setVariable".equals(action.getType()) && !"incrementVariable".equals(action.getType())
-                    && !"computeVariable".equals(action.getType())) return;
+                    && !"computeVariable".equals(action.getType())
+                    && !"captureVariable".equals(action.getType())) return;
             Object name = action.getVariables() == null ? null : action.getVariables().get("name");
             if (name == null) return;
             String n = name.toString().trim();
@@ -260,19 +348,20 @@ public class Automations {
 
     /**
      * Largest manual-replay total window (beforeSeconds + afterSeconds) across
-     * every ENABLED automation's actions and else-actions. Consumed by
+     * every automation that may run automatically or explicitly. Consumed by
      * {@link com.overdrive.app.recording.ManualClipService#getConfiguredRetentionSeconds()}
      * so the pre-record ring is sized for automation-triggered replays too — a
      * clip bound only in an automation (never in Key Mapping) must still fit.
      *
-     * <p>Cheap and side-effect-free: iterates the in-memory automation map (a
-     * disabled automation contributes 0). Bounded to the manual-clip max so a
-     * hand-edited config can never request an oversized ring.
+     * <p>Cheap and side-effect-free: iterates the in-memory automation map (a fully
+     * disabled automation contributes 0). Manual-only rules are included because a
+     * key-mapped explicit run still needs its requested pre-record window. Bounded to
+     * the manual-clip max so a hand-edited config can never request an oversized ring.
      */
     public static int getMaxManualClipRetentionSeconds() {
         int max = 0;
         for (Automation automation : automations.values()) {
-            if (automation.isDisabled()) continue;
+            if (automation.isFullyDisabled()) continue;
             max = Math.max(max, maxManualClipRetention(automation.getActions()));
             max = Math.max(max, maxManualClipRetention(automation.getElseActions()));
         }
@@ -347,6 +436,28 @@ public class Automations {
     // fires on a genuine runaway/cycle. 16 = 8 (static cap) + generous action-group headroom.
     private static final int MAX_RUN_DEPTH = 16;
     private static final ThreadLocal<Integer> RUN_DEPTH = ThreadLocal.withInitial(() -> 0);
+    private static final ThreadLocal<Boolean> ACTION_CHAIN_SUCCEEDED =
+            ThreadLocal.withInitial(() -> true);
+    // Manual/Test chains may legitimately mutate automation state (Set/Increment/
+    // Compute/Capture Variable) while there are zero automatic rules. The global
+    // disabled hot-path normally drops such writes before touching the state map.
+    // This thread-local opens STORE permission only for the explicit action thread;
+    // update() still suppresses trigger delivery while enabledCount == 0.
+    private static final ThreadLocal<Boolean> EXPLICIT_RUN =
+            ThreadLocal.withInitial(() -> false);
+    private static final ThreadLocal<Boolean> SILENT_SEED =
+            ThreadLocal.withInitial(() -> false);
+    private static final ThreadLocal<QueueActionCursor> QUEUE_ACTION_CURSOR = new ThreadLocal<>();
+    private static final ThreadLocal<java.util.IdentityHashMap<AutomationAction, Integer>>
+            QUEUE_ACTION_OCCURRENCES = new ThreadLocal<>();
+    private static final ThreadLocal<Automation> ACTIVE_QUEUED_DEFINITION = new ThreadLocal<>();
+    private static final ThreadLocal<String> ACTIVE_QUEUED_AUTOMATION_ID = new ThreadLocal<>();
+    private static final ThreadLocal<Long> ACTIVE_QUEUED_DEFINITION_REVISION =
+            new ThreadLocal<>();
+    /** Retained/latest-state reconciliation may navigate control flow but execute only allowlisted
+     * vehicle state setters. The flag is inherited by nested runActionList calls. */
+    private static final ThreadLocal<Boolean> STATE_SETTER_ONLY =
+            ThreadLocal.withInitial(() -> false);
 
     // Set by a Wait Until whose condition never became true, to STOP the rest of the chain.
     // Previously a timed-out wait just fell through and every following action ran anyway, so
@@ -366,6 +477,27 @@ public class Automations {
     public static boolean chainAborted() { return CHAIN_ABORTED.get(); }
 
     /**
+     * Run a live sampler as a baseline observation. Values are stored, but transitions observed
+     * during this call never run automation actions. Conditional pollers use this for their first
+     * sample after a rule is enabled so stale state cannot make saving the rule look like a
+     * physical vehicle edge.
+     */
+    public static void runSilentSeed(Runnable sampler) {
+        if (sampler == null) return;
+        boolean previous = SILENT_SEED.get();
+        SILENT_SEED.set(true);
+        try {
+            sampler.run();
+        } finally {
+            if (previous) {
+                SILENT_SEED.set(true);
+            } else {
+                SILENT_SEED.remove();
+            }
+        }
+    }
+
+    /**
      * Run a list of actions in order, re-entrantly: a control-flow action's
      * {@code trigger} calls back here with its child list, so loops / if-branches /
      * action groups all execute through one path with a shared depth guard. A flat list
@@ -373,32 +505,78 @@ public class Automations {
      * are skipped (defense-in-depth for a hand-edited config), and the depth guard stops
      * runaway nesting without killing the worker.
      */
-    public static void runActionList(java.util.List<AutomationAction> actionList) {
-        if (actionList == null) return;
+    public static boolean runActionList(java.util.List<AutomationAction> actionList) {
+        if (actionList == null || Thread.currentThread().isInterrupted()) return false;
         int depth = RUN_DEPTH.get();
         if (depth >= MAX_RUN_DEPTH) {
             logger.warn("Action nesting depth cap (" + MAX_RUN_DEPTH + ") hit — stopping to avoid runaway/cycle");
-            return;
+            ACTION_CHAIN_SUCCEEDED.set(false);
+            return false;
         }
         // Depth 0 = the start of an independent run (the queue worker or /test). Clear any
         // abort left by a previous run on this same pooled/worker thread, so one timed-out
         // wait can never suppress the NEXT automation's actions.
-        if (depth == 0) resetChain();
+        if (depth == 0) {
+            resetChain();
+            ACTION_CHAIN_SUCCEEDED.set(true);
+        }
         RUN_DEPTH.set(depth + 1);
+        boolean successful = true;
         try {
             for (AutomationAction automationAction : actionList) {
+                if (!activeQueuedDefinitionIsCurrent()) {
+                    ACTION_CHAIN_SUCCEEDED.set(false);
+                    abortChain();
+                    break;
+                }
                 // A timed-out wait aborts the rest of the chain, including the outer levels
                 // it returns into (a wait inside an If/Loop body stops the whole run, not just
                 // that body) — the precondition it was guarding never came true.
-                if (chainAborted()) break;
+                if (chainAborted() || Thread.currentThread().isInterrupted()) break;
                 if (automationAction == null) continue;
                 Action action = getAction(automationAction.getType());
                 if (action == null) continue;
-                action.trigger(automationAction);
+                boolean stateSetterOnly = STATE_SETTER_ONLY.get();
+                boolean stateSetter = action instanceof VehicleControlAction;
+                boolean controlFlow = action.hasChildActions()
+                        || "actionGroup".equals(automationAction.getType());
+                if (stateSetterOnly && !stateSetter && !controlFlow) {
+                    continue;
+                }
+                QueueActionCursor queueCursor = QUEUE_ACTION_CURSOR.get();
+                java.util.IdentityHashMap<AutomationAction, Integer> occurrences =
+                        QUEUE_ACTION_OCCURRENCES.get();
+                int occurrence = 0;
+                if (queueCursor != null && occurrences != null) {
+                    occurrence = occurrences.getOrDefault(automationAction, 0) + 1;
+                    occurrences.put(automationAction, occurrence);
+                    if (occurrence <= queueCursor.completedOccurrences.getOrDefault(
+                            automationAction, 0)) {
+                        continue;
+                    }
+                }
+                boolean actionSucceeded = stateSetterOnly && stateSetter
+                        ? ((VehicleControlAction) action)
+                                .triggerLatestStateSetterWithResult(automationAction)
+                        : action.triggerWithResult(automationAction);
+                successful &= actionSucceeded;
+                if (!actionSucceeded) {
+                    ACTION_CHAIN_SUCCEEDED.set(false);
+                }
+                if (queueCursor != null && occurrence != 0
+                        && actionSucceeded
+                        && ACTION_CHAIN_SUCCEEDED.get()
+                        && !chainAborted()
+                        && (!Thread.currentThread().isInterrupted() || !controlFlow)) {
+                    queueCursor.completedOccurrences.merge(
+                            automationAction, 1, Integer::sum);
+                }
             }
         } finally {
             RUN_DEPTH.set(depth);
         }
+        return successful && ACTION_CHAIN_SUCCEEDED.get() && !chainAborted()
+                && !Thread.currentThread().isInterrupted();
     }
 
     /**
@@ -422,6 +600,16 @@ public class Automations {
         return enabledCount == 0;
     }
 
+    /** Package-local generation used by {@link AutomationQueue} to detect hidden disable cycles. */
+    static long enabledStateGeneration() {
+        return enabledStateGeneration;
+    }
+
+    /** Package-local generation used to replay a publication across any config mutation. */
+    static int configGeneration() {
+        return configGeneration;
+    }
+
     /**
      * Whether an automation with this id currently exists.
      *
@@ -441,14 +629,36 @@ public class Automations {
      * global. Conditions are included because a turn signal can gate a DIFFERENT
      * trigger (e.g. "when speed &gt; 60 AND left indicator on"); if we polled only for
      * triggers, that condition would evaluate against a stale/unseeded turn state.
-     * Cheap: a short walk of the (typically tiny) automation map, only called from a
-     * low/aperiodic scheduler, never the telemetry hot path.
+     *
+     * <p>Memoized per key, because this IS a hot path while relevant rules are enabled: the fast
+     * pollers can call it several times a second, and the walk below is
+     * O(enabled x (conditions + whole action tree)) with per-node string scans. The memo is
+     * cleared on every config mutation via {@link #refreshEnabledCount}, so a rule added or
+     * disabled mid-session takes effect on the next tick.
      *
      * @param key the event to test
      * @return true if at least one enabled automation references it (trigger or condition)
      */
     public static boolean isEventReferenced(EventData key) {
         if (key == null || enabledCount == 0) return false;
+        // Read the generation FIRST, then the entry: an entry stamped with this generation was
+        // necessarily computed against the current config. Entries from an older generation are
+        // ignored (and overwritten below), which is what makes a stale reinsertion by a slow
+        // concurrent walk harmless rather than permanent.
+        int gen = configGeneration;
+        RefEntry cached = referenceCache.get(key);
+        if (cached != null && cached.generation == gen) return cached.referenced;
+        boolean referenced = computeEventReferenced(key);
+        referenceCache.put(key, new RefEntry(gen, referenced));
+        return referenced;
+    }
+
+    /**
+     * The uncached walk behind {@link #isEventReferenced}. Kept as the single source of truth
+     * for "what counts as a reference" — see Invariant 2b in
+     * docs/AUTOMATION-PUBLISH-INVARIANTS.md. Extend THIS when adding a reference syntax.
+     */
+    private static boolean computeEventReferenced(EventData key) {
         for (Automation a : automations.values()) {
             if (a.isDisabled()) continue;
             if (a.isTriggered(key)) return true;
@@ -457,6 +667,14 @@ public class Automations {
             // would stay parked and the group condition would read stale state.
             for (AutomationCondition c : a.getAllConditions()) {
                 if (key.equals(c.getEventData())) return true;
+                // A condition's dynamic RIGHT-HAND SIDE can name a signal too
+                // (${signal:TYPE[:k=v,…]} — AutomationCondition.resolveDynamic reads it from
+                // this same state map at compare time). Without this, a key referenced ONLY as
+                // an RHS keeps its self-gated poller parked, resolveDynamic reads null and the
+                // condition silently evaluates false forever — e.g.
+                // "temperature > ${signal:acSetpoint}". Mirrors the action-side "value" scan
+                // below, including the allocation-free pre-filter.
+                if (conditionValueReferences(c, key)) return true;
             }
             // ACTION-side references too. The flow actions (if/else, wait-until,
             // wait-until-signal, loop) test a signal from their own variables, NOT via a
@@ -489,8 +707,39 @@ public class Automations {
      */
     private static final String[] ADDRESS_FIELDS = { "event", "value" };
 
+    /**
+     * The composite "either indicator" address (WaitUntilStateAction's sentinel). It is not a real
+     * signal id, so it resolves to no key — the reference scan special-cases it to TURN_LEFT and
+     * TURN_RIGHT, which is what it actually reads.
+     */
+    private static final String TURN_ANY_ID = "turnAny";
+
     private static boolean actionsReference(List<AutomationAction> actions, EventData key) {
         return actionsReference(actions, key, MAX_RUN_DEPTH);
+    }
+
+    /**
+     * Does this condition's stored RHS name {@code key} as a dynamic signal reference?
+     *
+     * <p>Only a {@code ${signal:…}} token can; a plain constant (int, enum word) never does, and
+     * a {@code ${var:…}} token addresses a user variable, not a vehicle signal. Same
+     * conservative pre-filter as the action scan so this stays allocation-free on the common
+     * path — the fast pollers call {@link #isEventReferenced} several times a second.
+     */
+    private static boolean conditionValueReferences(AutomationCondition c, EventData key) {
+        if (c == null) return false;
+        Object v = c.getValue();
+        if (!(v instanceof String)) return false;
+        String s = ((String) v).trim();
+        // Only a dynamic reference can be an address; a plain constant never is. Deliberately
+        // does NOT require the "signal" kind here — resolveSignalAddress trims inside the braces
+        // and also accepts ${var:…} (→ a variable key, which simply won't equal a vehicle-signal
+        // key). Pre-filtering on the exact "${signal:" prefix would reject "${ signal:x}", which
+        // the resolver accepts — leaving the poller parked for a token that DOES resolve at
+        // compare time. Matching the resolver's tolerance keeps the gate and the read in step.
+        if (!s.startsWith("${") || !s.endsWith("}")) return false;
+        if (!mightAddress(s, key.getType())) return false;
+        return key.equals(AutomationCondition.resolveSignalAddress(s));
     }
 
     /**
@@ -509,8 +758,61 @@ public class Automations {
         return AutomationCondition.isLegacySignalId(value.trim());
     }
 
+    /** The token that unambiguously names a live signal inside interpolated free text. */
+    private static final String SIGNAL_TOKEN = "${signal:";
+
+    /**
+     * Does any variable of this action embed a {@code ${signal:…}} token naming {@code key}?
+     *
+     * <p>Covers the interpolated free-text fields ({@code message}, {@code topic},
+     * {@code payload}, API body values) that {@link TextInterpolator} resolves from the shared
+     * state map. Scans every variable, but matches only the literal {@code ${signal:} prefix, so
+     * a free-text word that merely coincides with a legacy signal alias can never wake a poller.
+     *
+     * <p>Allocation-free until a token is actually present: the {@code indexOf} pre-checks reject
+     * ordinary text before anything is parsed, which matters because the fast pollers call
+     * {@link #isEventReferenced} several times a second.
+     */
+    private static boolean anyValueEmbedsSignal(Map<String, Object> vars, EventData key) {
+        if (vars == null || vars.isEmpty()) return false;
+        String type = key.getType();
+        if (type == null || type.isEmpty()) return false;
+        for (Object v : vars.values()) {
+            if (!(v instanceof String)) continue;
+            String s = (String) v;
+            // Both pre-checks are pure scans. A token for THIS key must contain the marker and
+            // the type name; anything else can't match, so we never parse ordinary prose.
+            int from = s.indexOf(SIGNAL_TOKEN);
+            if (from < 0 || !s.contains(type)) continue;
+            while (from >= 0) {
+                int end = s.indexOf('}', from);
+                if (end < 0) break;                       // unterminated token — nothing to match
+                if (key.equals(AutomationCondition.resolveSignalAddress(s.substring(from, end + 1)))) {
+                    return true;
+                }
+                from = s.indexOf(SIGNAL_TOKEN, end + 1);  // several tokens can share one string
+            }
+        }
+        return false;
+    }
+
     private static boolean actionsReference(List<AutomationAction> actions, EventData key, int depthLeft) {
-        if (actions == null || actions.isEmpty() || depthLeft <= 0) return false;
+        return actionsReference(actions, key, depthLeft, new java.util.HashSet<>());
+    }
+
+    private static boolean actionsReference(List<AutomationAction> actions, EventData key,
+                                           int depthLeft, java.util.Set<String> visitedGroups) {
+        if (actions == null || actions.isEmpty()) return false;
+        // FAIL OPEN when the budget runs out. Returning "not referenced" here would park the key's
+        // poller, so the signal reads null forever and every condition on it silently evaluates
+        // false — a dead rule. Claiming "referenced" instead costs at most one unnecessary HAL poll.
+        // Unreachable for childActions (parse caps those at MAX_ACTION_DEPTH < MAX_RUN_DEPTH), but
+        // group chains are parsed independently and are not bounded, so this is a real path.
+        if (depthLeft <= 0) {
+            logger.warn("Signal reference scan hit the depth cap for " + key.getType()
+                    + " — treating it as referenced so its poller keeps running");
+            return true;
+        }
         for (AutomationAction a : actions) {
             if (a == null) continue;
             // ONLY the two fields that can hold a signal address are considered: "event" (a
@@ -524,6 +826,15 @@ public class Automations {
                 Object v = vars.get(field);
                 if (!(v instanceof String)) continue;
                 String s = (String) v;
+                // The "turnAny" sentinel is a COMPOSITE address: WaitUntilStateAction reads both
+                // TURN_LEFT and TURN_RIGHT for it, but the string resolves to neither, so the
+                // resolver below cannot see it. Both keys are FAST_POLL_OWNED, so missing this
+                // parks their only publisher and the wait reads null on both sides forever.
+                if (TURN_ANY_ID.equals(s.trim())
+                        && (com.overdrive.app.automation.condition.BydEvent.TURN_LEFT.equals(key)
+                            || com.overdrive.app.automation.condition.BydEvent.TURN_RIGHT.equals(key))) {
+                    return true;
+                }
                 // Cheap reject before allocating. This runs on the fast pollers (the dynamics
                 // poll calls isEventReferenced 3x every 250ms), and parsing an address builds a
                 // fresh EventData plus a HashMap for the attributed case — avoid that for the
@@ -531,8 +842,39 @@ public class Automations {
                 if (!mightAddress(s, key.getType())) continue;
                 if (key.equals(AutomationCondition.resolveSignalAddress(s))) return true;
             }
-            if (actionsReference(a.getChildActions(), key, depthLeft - 1)) return true;
-            if (actionsReference(a.getElseChildActions(), key, depthLeft - 1)) return true;
+            // FREE-TEXT fields (notification message, MQTT topic/payload, API body) are
+            // interpolated by TextInterpolator, which resolves an EMBEDDED ${signal:…} token out
+            // of this same state map. Those field names aren't in ADDRESS_FIELDS, so without this
+            // an owned key referenced only from message text would keep its poller parked and
+            // interpolate to the literal placeholder. Unlike the bare-address case above this
+            // scans every variable — safe here because we match only the unambiguous
+            // "${signal:" token, never a loose word that happens to be a legacy alias.
+            if (anyValueEmbedsSignal(vars, key)) return true;
+            // An actionGroup is call-by-reference: its body lives in ActionGroups, not in this
+            // tree, so without expanding it a signal referenced ONLY inside a group keeps its
+            // self-gated poller parked — the key then reads null forever and the group's
+            // "if <signal> …" silently never holds.
+            //
+            // Groups are NOT depth-bounded at parse time the way childActions are (each group is
+            // parsed independently), and a cycle A→B→A is only broken at run time by
+            // ActionGroupAction's per-thread stack, which this walk does not have. So carry a
+            // visited-id set: it terminates a cycle, and re-entering a group already on the path
+            // adds no new references. If the walk still cannot finish, fail OPEN (below) — a gate
+            // that fails closed silently parks the poller and kills the rule outright.
+            if ("actionGroup".equals(a.getType())) {
+                Object gidObj = vars.get("groupId");
+                String gid = gidObj == null ? null : gidObj.toString().trim();
+                if (gid != null && !gid.isEmpty() && visitedGroups.add(gid)) {
+                    boolean found = actionsReference(
+                            ActionGroups.getActions(gid), key, depthLeft - 1, visitedGroups);
+                    visitedGroups.remove(gid);
+                    if (found) return true;
+                }
+            }
+            if (actionsReference(a.getChildActions(), key, depthLeft - 1, visitedGroups)) return true;
+            if (actionsReference(a.getElseChildActions(), key, depthLeft - 1, visitedGroups)) {
+                return true;
+            }
         }
         return false;
     }
@@ -543,15 +885,24 @@ public class Automations {
      *
      * @param id         The id of an existing automation or null if a new automation is needed
      * @param automation The automation to add to the map
+     * @return true if the change was also PERSISTED; false when the in-memory map was updated but
+     *         the write failed (full filesystem, read-only mount), so a caller can report the
+     *         failure instead of confirming a save that will vanish at the next boot
      */
-    public static void updateAutomation(String id, Automation automation) {
+    public static boolean updateAutomation(String id, Automation automation) {
         if (id == null || id.isBlank()) id = UUID.randomUUID().toString();
-        automations.put(id, automation);
-        synchronized (SAVE_LOCK) { refreshEnabledCount(); }
-        saveToFile();
+        final String automationId = id;
+        AutomationQueue.runConfigurationMutation(() -> {
+            synchronized (SAVE_LOCK) {
+                automations.put(automationId, automation);
+                refreshEnabledCount();
+            }
+        });
+        boolean persisted = saveToFile();
         AutomationQueue.checkWorkerState();
         applyManualClipRetention();
-        logger.info("Updated automation: " + id);
+        logger.info("Updated automation: " + id + (persisted ? "" : " (NOT PERSISTED)"));
+        return persisted;
     }
 
     /**
@@ -559,7 +910,10 @@ public class Automations {
      *
      * @param id   The id for this automation or null if a new automation is needed
      * @param json The JSON representation of this automation
-     * @return true if successfully created/updated, false otherwise
+     * @return true if successfully created/updated, false when the JSON is invalid. NOTE: this
+     *         reports REGISTRATION, not durability — a caller that must distinguish a failed
+     *         write should use {@link #updateAutomation(String, Automation)}, whose result is
+     *         the persistence outcome.
      */
     public static boolean updateAutomation(String id, JSONObject json) {
         Automation automation = Automation.fromJson(json);
@@ -594,11 +948,13 @@ public class Automations {
             }
         }
         if (parsed.isEmpty()) return 0;
-        synchronized (SAVE_LOCK) {
-            if (replace) automations.clear();
-            automations.putAll(parsed);
-            refreshEnabledCount();
-        }
+        AutomationQueue.runConfigurationMutation(() -> {
+            synchronized (SAVE_LOCK) {
+                if (replace) automations.clear();
+                automations.putAll(parsed);
+                refreshEnabledCount();
+            }
+        });
         saveToFile();
         AutomationQueue.checkWorkerState();
         applyManualClipRetention();
@@ -616,8 +972,14 @@ public class Automations {
      * @return true if an automation was actually removed, false if no mapping existed for this id
      */
     public static boolean deleteAutomation(String id) {
-        if (automations.remove(id) == null) return false;
-        synchronized (SAVE_LOCK) { refreshEnabledCount(); }
+        final boolean[] removed = {false};
+        AutomationQueue.runConfigurationMutation(() -> {
+            synchronized (SAVE_LOCK) {
+                removed[0] = automations.remove(id) != null;
+                if (removed[0]) refreshEnabledCount();
+            }
+        });
+        if (!removed[0]) return false;
         saveToFile();
         AutomationQueue.checkWorkerState();
         applyManualClipRetention();
@@ -633,15 +995,55 @@ public class Automations {
      * @return true if successfully disabled, false otherwise
      */
     public static boolean disableAutomation(String id, boolean disabled) {
-        Automation automation = automations.get(id);
-        if (automation == null) return false;
-        automation.setDisabled(disabled);
-        synchronized (SAVE_LOCK) { refreshEnabledCount(); }
+        final boolean[] updated = {false};
+        AutomationQueue.runConfigurationMutation(() -> {
+            synchronized (SAVE_LOCK) {
+                Automation automation = automations.get(id);
+                if (automation == null) return;
+                automation.setDisabled(disabled);
+                refreshEnabledCount();
+                updated[0] = true;
+            }
+        });
+        if (!updated[0]) return false;
         saveToFile();
         AutomationQueue.checkWorkerState();
         applyManualClipRetention();
         logger.info((disabled ? "Disabled" : "Enabled") + " automation: " + id);
         return true;
+    }
+
+    /**
+     * Set an automation's execution mode without changing its rule definition.
+     * Automatic participates in event monitoring; manual participates only in
+     * explicit Run now / key-mapping calls; disabled participates in neither.
+     *
+     * @return true when the id exists and the mode was applied
+     */
+    public static boolean setAutomationMode(String id, String mode) {
+        if (!Automation.isValidMode(mode)) return false;
+        final boolean[] updated = {false};
+        AutomationQueue.runConfigurationMutation(() -> {
+            synchronized (SAVE_LOCK) {
+                Automation automation = automations.get(id);
+                if (automation == null) return;
+                automation.setMode(mode);
+                refreshEnabledCount();
+                updated[0] = true;
+            }
+        });
+        if (!updated[0]) return false;
+        saveToFile();
+        AutomationQueue.checkWorkerState();
+        applyManualClipRetention();
+        logger.info("Set automation mode to " + mode + ": " + id);
+        return true;
+    }
+
+    /** Whether the id currently names a manual-only automation. */
+    public static boolean isManualOnly(String id) {
+        Automation automation = automations.get(id);
+        return automation != null && automation.isManualOnly();
     }
 
     /**
@@ -739,7 +1141,7 @@ public class Automations {
      * {@code .bak} last-known-good. A crash therefore leaves at most a stale-but-valid live file or a
      * recoverable {@code .bak}; it can never leave a half-written live file that wipes all automations.
      */
-    public static void saveToFile() {
+    public static boolean saveToFile() {
         synchronized (SAVE_LOCK) {
             if (!AUTOMATION_HOME.exists()) AUTOMATION_HOME.mkdirs();
             // Snapshot to bytes under the lock so the persisted content is internally consistent.
@@ -749,16 +1151,34 @@ public class Automations {
                 fos.getFD().sync();
             } catch (IOException e) {
                 logger.error("Failed to write automations scratch file");
-                return;
+                return false;
             }
             // Promote the existing good file to the backup before replacing it, so a failure while the
-            // live file is momentarily gone still leaves a recoverable copy.
-            if (AUTOMATION_CONFIG.exists()) copyFile(AUTOMATION_CONFIG, AUTOMATION_BACKUP);
+            // live file is momentarily gone still leaves a recoverable copy. Only a file that PARSES
+            // may become the backup: the live file is the thing suspected of being corrupt (that is
+            // why .bak exists), and copying it blind destroys the last known good — after which a
+            // second interruption loses every automation.
+            if (AUTOMATION_CONFIG.exists() && isParseable(AUTOMATION_CONFIG)) {
+                copyFile(AUTOMATION_CONFIG, AUTOMATION_BACKUP);
+            }
             if (!AUTOMATION_TMP.renameTo(AUTOMATION_CONFIG)) {
                 logger.error("Failed to promote automations scratch file to live config");
-                return;
+                return false;
             }
             logger.info("Saved " + automations.size() + " Automations to " + AUTOMATION_CONFIG);
+            return true;
+        }
+    }
+
+    /** Whether a file holds parseable JSON, so it is fit to become the last-known-good backup. */
+    private static boolean isParseable(File file) {
+        try {
+            byte[] bytes = java.nio.file.Files.readAllBytes(file.toPath());
+            new JSONObject(new String(bytes, StandardCharsets.UTF_8));
+            return true;
+        } catch (Exception e) {
+            logger.warn("Live automation config is unparseable — keeping the existing backup");
+            return false;
         }
     }
 
@@ -789,7 +1209,12 @@ public class Automations {
             // Live file missing/corrupt — recover from the backup rather than silently starting empty.
             if (AUTOMATION_BACKUP.exists()) {
                 if (tryLoadFrom(AUTOMATION_BACKUP)) {
-                    logger.info("Recovered automations from backup after live config was unreadable");
+                    // Repair the live file NOW. Leaving it corrupt keeps the system one
+                    // interruption away from total loss, and until it is repaired every save
+                    // must decline to refresh the backup, so the .bak ages indefinitely.
+                    copyFile(AUTOMATION_BACKUP, AUTOMATION_CONFIG);
+                    logger.info("Recovered automations from backup after live config was "
+                            + "unreadable; restored the live config from it");
                     return;
                 }
                 logger.error("Both live and backup automation configs were unreadable");
@@ -813,10 +1238,29 @@ public class Automations {
             // half-populated on top of what was already loaded.
             Map<String, Automation> loaded = new java.util.HashMap<>();
             Iterator<String> keys = json.keys();
+            int rejected = 0;
             while (keys.hasNext()) {
                 String key = keys.next();
                 Automation automation = Automation.fromJson(json.optJSONObject(key));
-                if (automation != null) loaded.put(key, automation);
+                if (automation != null) {
+                    loaded.put(key, automation);
+                } else {
+                    // NAME the rejection. A rejected automation is dropped from the live
+                    // map, and the next stats save rewrites the file without it — so a
+                    // config written by a NEWER build (an action id or enum option this
+                    // build lacks) loses that automation permanently. Silent before, which
+                    // made it undiagnosable after the fact.
+                    rejected++;
+                    JSONObject bad = json.optJSONObject(key);
+                    logger.warn("Rejected automation '" + key + "'"
+                        + (bad != null ? " (name=" + bad.optString("name", "?") + ")" : "")
+                        + " — unknown action/trigger/condition or invalid value."
+                        + " It will be dropped from automations.json on the next save.");
+                }
+            }
+            if (rejected > 0) {
+                logger.warn("Dropped " + rejected + " automation(s) on load from " + file
+                    + " — back up automations.json before this is overwritten.");
             }
             // Replace, don't merge: the file is the source of truth. Merging would resurrect an
             // automation deleted since the last load if this is ever wired to a runtime reload
@@ -854,7 +1298,7 @@ public class Automations {
                     // time in triggerActions, so a condition that flips during the
                     // delay window is honoured. Only when conditions currently fail
                     // AND there is no else branch do we remove any pending item.
-                    if (a.conditionsMet(state) || a.hasElseActions()) {
+                    if (a.conditionsMet(conditionState) || a.hasElseActions()) {
                         logger.info("Adding automation to queue: " + automation.getKey());
                         AutomationQueue.addToQueue(automation.getKey(), a.getDelay());
                     } else {
@@ -874,10 +1318,118 @@ public class Automations {
      * evaluation sees, so it reads this shared map rather than a private copy.
      *
      * @param key the event to read
-     * @return the current {@link Value}, or null if unseen
+     * @return the current {@link Value}, or null if unseen or expired
      */
+    /**
+     * Whether {@code value} is exactly what was last DELIVERED to triggers for {@code key} — i.e.
+     * the user's rules have already run for it and nothing else has been delivered since.
+     *
+     * <p>Exists so an edge publisher can make a REPLAY idempotent without keeping its own shadow
+     * copy of delivery state. A private latch cannot work here: the snapshot path can deliver a
+     * different value in between (a grace-window yield delivering {@code off} after an {@code on}
+     * edge), which strands the shadow copy and swallows the next genuine edge — the engine's mark
+     * is the only thing that sees both publishers (audit 2026-08).
+     *
+     * @return true when the key's last delivered value equals {@code value}
+     */
+    public static boolean isLastDelivered(EventData key, String value) {
+        if (key == null || value == null) return false;
+        synchronized (STATE_LOCK) {
+            Value delivered = stateDelivered.get(key);
+            return delivered != null
+                    && !Boolean.TRUE.equals(delivered.compare(new StringValue(value), "neq"));
+        }
+    }
+
     public static Value getStateValue(EventData key) {
-        return key == null ? null : state.get(key);
+        if (key == null) return null;
+        synchronized (STATE_LOCK) {
+            if (isStateExpired(key, System.currentTimeMillis())) return null;
+            return state.get(key);
+        }
+    }
+
+    // Wall-clock deadline (0 = never) until which the snapshot path force-stores its values so the
+    // editor can show live readings. Set by the /api/automations/state endpoint, which the editor
+    // polls only while a signal picker is on screen; it lapses on its own so a closed editor
+    // costs nothing.
+    private static volatile long editorSeedUntilMs = 0L;
+
+    /** How long one editor poll keeps the seed window open — a few poll periods of slack. */
+    private static final long EDITOR_SEED_WINDOW_MS = 15_000L;
+
+    /**
+     * Open (or extend) the seed window. Called by the live-state endpoint before it reads, so the
+     * next telemetry snapshot stores its values even with no automation enabled.
+     */
+    public static void markEditorSeedActive() {
+        editorSeedUntilMs = System.currentTimeMillis() + EDITOR_SEED_WINDOW_MS;
+    }
+
+    /**
+     * Whether the editor is currently asking for live values. Publishers consult this to decide
+     * whether to force-store while {@link #isDisabled()} — see {@code BydEvent.bydEvent}. It is
+     * ONLY a store permission: firing still obeys Invariant 0, so seeding can never run a rule.
+     */
+    public static boolean editorSeedActive() {
+        long until = editorSeedUntilMs;
+        return until != 0L && System.currentTimeMillis() < until;
+    }
+
+    /**
+     * A READ-ONLY snapshot of the live signal state, for the editor's "what does this read right
+     * now?" hints. Keyed by the same {@code ${signal:…}} address the UI already emits — bare
+     * {@code type} when the event has no variables, {@code type:k=v,…} when it does — so the
+     * client can look a signal up by the exact token it stores, with no key-shape translation.
+     *
+     * <p>Expired entries are OMITTED rather than reported stale: an expiring signal that has aged
+     * out reads null for conditions (see {@link #getStateValue}), so showing its last number would
+     * tell the user a rule will match when it cannot.
+     *
+     * <p>Values are emitted with their natural JSON type (int stays a number, string stays a
+     * string) so the UI can format without parsing. Variable keys are sorted so the token is
+     * stable across calls.
+     */
+    public static JSONObject stateSnapshotJson() {
+        JSONObject json = new JSONObject();
+        long now = System.currentTimeMillis();
+        synchronized (STATE_LOCK) {
+            for (Map.Entry<EventData, Value> e : state.entrySet()) {
+                EventData key = e.getKey();
+                if (key == null || e.getValue() == null) continue;
+                if (isStateExpired(key, now)) continue;
+                Object raw = (e.getValue() instanceof BaseValue)
+                        ? ((BaseValue<?>) e.getValue()).getValue()
+                        : e.getValue().toString();
+                if (raw == null) continue;
+                try {
+                    json.put(signalAddress(key), raw);
+                } catch (Exception ignored) {
+                    // JSONObject.put only throws on a null key, which signalAddress can't return.
+                }
+            }
+        }
+        return json;
+    }
+
+    /** The {@code ${signal:…}} inner address for an event key: {@code type} or {@code type:k=v,…}. */
+    private static String signalAddress(EventData key) {
+        Map<String, String> vars = key.getVariables();
+        if (vars == null || vars.isEmpty()) return key.getType();
+        StringBuilder sb = new StringBuilder(key.getType()).append(':');
+        boolean first = true;
+        for (String k : new java.util.TreeSet<>(vars.keySet())) {
+            if (!first) sb.append(',');
+            sb.append(k).append('=').append(vars.get(k));
+            first = false;
+        }
+        return sb.toString();
+    }
+
+    /** Must be called with {@link #STATE_LOCK} held. */
+    private static boolean isStateExpired(EventData key, long now) {
+        Long expiresAt = stateExpiresAt.get(key);
+        return expiresAt != null && now > expiresAt;
     }
 
     /**
@@ -910,27 +1462,237 @@ public class Automations {
      *     {@code false} so the hot-path {@link #isDisabled()} short-circuit is preserved.
      */
     public static void update(EventData key, Value value, boolean forceStore) {
+        update(key, value, forceStore, null);
+    }
+
+    /**
+     * Publish an integer state whose visibility expires at an absolute wall-clock time.
+     * Expiration hides the value from conditions and state readers without deleting the raw
+     * observation, so a later changed reading still produces the normal transition.
+     */
+    public static void updateExpiring(EventData key, Integer value, long expiresAtMs) {
+        if (value == null) return;
+        update(key, new IntValue(value), false, expiresAtMs);
+    }
+
+    /**
+     * Hide a previously stored state without deleting its transition history. A later valid
+     * publication clears this expiration normally, so capability discovery cannot manufacture
+     * a trigger edge merely by changing from unknown to supported.
+     */
+    public static void expireState(EventData key) {
+        if (key == null) return;
+        synchronized (STATE_LOCK) {
+            if (state.containsKey(key)) stateExpiresAt.put(key, 0L);
+        }
+    }
+
+    /**
+     * Publish a value for an OBSERVED transition — the caller is an edge handler that
+     * witnessed the state change happen (e.g. the ACC IPC edge), not a poller sampling
+     * current state. Identical to {@link #update(EventData, String)} except in two cases
+     * that only exist right after a daemon start:
+     *
+     * <ul>
+     *   <li>the key is UNSEEDED — a sampled first value is a seed and stays silent, but an
+     *       observed first value is a real transition and fires;</li>
+     *   <li>the key was already seeded with the SAME value by a racing snapshot — a sampled
+     *       repeat dedups, but the observed edge still fires (the snapshot merely beat the
+     *       edge handler to the map; the transition still happened).</li>
+     * </ul>
+     *
+     * Without this, whether a boot-time edge fired depended on a startup race between the
+     * telemetry seed and the edge handler (2026-08-09 field log: ACC ON at 15:20 fired the
+     * power rules because a junk zero-snapshot seeded "off" first; the identical ACC ON at
+     * 16:19 was silent because the probe won the race and the edge became a seed).
+     *
+     * <p><b>Exactly-once across publishers:</b> the fire decision is atomic with the store
+     * (see {@code stateDelivered}), so an observed edge fires only when its value has not
+     * already been DELIVERED to triggers — a sampled transition that beat this handler to the
+     * same value suppresses the re-fire, a silent same-value seed does not, and a duplicate
+     * edge publish (a heartbeat that slipped the caller's dedup) is a no-op. A publisher that
+     * merely samples state (pollers, snapshots, relays that re-push current state) must keep
+     * using {@link #update(EventData, String)} — routing a sampler through here would turn
+     * its first post-restart sample into a fire.
+     *
+     * <p>Stores even while no automation is enabled (same rationale as forceStore in
+     * {@link #update(EventData, Value, boolean)}): the edge will not be re-delivered, so the
+     * map must stay truthful for conditions evaluated after the user enables a rule. Trigger
+     * evaluation remains gated on enabled-ness.
+     */
+    public static void updateObservedEdge(EventData key, String value) {
+        update(key, new StringValue(value), true, null, true);
+    }
+
+    /**
+     * Re-state a value that an observed edge ALREADY delivered for this same physical event:
+     * store it (so conditions and the editor read the precise level) without running triggers,
+     * and — critically — WITHOUT moving the delivery mark off the edge's value.
+     *
+     * <p>Needed because the two {@code power} publishers have different vocabulary widths. The ACC
+     * edge says only {@code off}/{@code on}; the bodywork snapshot also reports {@code acc}. While
+     * an edge latch is live the snapshot keeps re-publishing the edge's own word, and letting that
+     * take the ordinary path is harmless on its own — but once a genuine {@code acc} has been
+     * delivered in between (a driver sitting in accessory mode), the later re-publish of
+     * {@code off} is a real transition against a mark that now reads {@code acc}, so
+     * "when power turns off" ran a SECOND time for one key turn. Keeping the mark pinned to the
+     * edge's value is what makes that idempotent.
+     *
+     * <p>Not a general-purpose entry point: it is correct only when a DIFFERENT publisher is
+     * guaranteed to have already delivered this exact value. Routing an ordinary signal through
+     * here would silence its real edges.
+     */
+    public static void updateEdgeRestatement(EventData key, String value) {
+        update(key, new StringValue(value), true, null, false, true);
+    }
+
+    /**
+     * Atomic raw-state and expiration-overlay update. A null expiration makes the value
+     * non-expiring and clears any prior overlay even when the raw value is unchanged.
+     */
+    private static void update(EventData key, Value value, boolean forceStore, Long expiresAtMs) {
+        update(key, value, forceStore, expiresAtMs, false, false);
+    }
+
+    private static void update(EventData key, Value value, boolean forceStore, Long expiresAtMs,
+                               boolean observedEdge) {
+        update(key, value, forceStore, expiresAtMs, observedEdge, false);
+    }
+
+    private static void update(EventData key, Value value, boolean forceStore, Long expiresAtMs,
+                               boolean observedEdge, boolean edgeRestatement) {
         if (key == null || value == null) return;
         boolean disabled = isDisabled();
+        boolean silentSeed = SILENT_SEED.get();
+        boolean forceLatestStateReplay = AutomationQueue.forceLatestStateReplay();
         // Hot path: a telemetry update with nothing listening does no work at all.
-        if (disabled && !forceStore) return;
+        //
+        // ...EXCEPT while the editor is asking for live values. This early return is THE reason
+        // every signal in the automation editor read "not reported yet on this car" whenever no
+        // automation was enabled — which is exactly the state a user is in while building their
+        // FIRST rule. 71 of the 94 publish sites across the daemon call plain update(), so gating
+        // here (rather than teaching each caller to force-store) is the only complete fix.
+        //
+        // This is a STORE permission only, never a firing one: `disabled` still forces
+        // `fire = false` below, so seeding can never run an action. Guarded by
+        // AutomationSeedInvariantTest.
+        if (disabled && !forceStore && !forceLatestStateReplay
+                && !editorSeedActive() && !EXPLICIT_RUN.get() && !silentSeed) return;
 
-        // Atomic compare-and-set: replace only if the current value differs; the winning thread gets the
-        // previous value back and is the only one that runs stateChanged for this transition.
+        // Atomic commit: store the value AND decide delivery under one lock, so exactly one
+        // publisher can claim delivery of any given value (see stateDelivered). Only the
+        // stateChanged call itself runs outside the lock — it enqueues into AutomationQueue,
+        // whose own monitor must never nest inside STATE_LOCK.
         Value[] previous = new Value[1];
-        Value committed = state.compute(key, (k, current) -> {
-            previous[0] = current;
-            if (current == null || Boolean.TRUE.equals(current.compare(value, "neq"))) {
-                return value; // transition — store the new value
+        boolean fire;
+        Value oldForEdge;
+        synchronized (STATE_LOCK) {
+            Value committed = state.compute(key, (k, current) -> {
+                previous[0] = current;
+                if (current == null || Boolean.TRUE.equals(current.compare(value, "neq"))) {
+                    return value; // transition — store the new value
+                }
+                return current; // unchanged — leave as-is
+            });
+            if (expiresAtMs == null) {
+                stateExpiresAt.remove(key);
+            } else {
+                stateExpiresAt.put(key, expiresAtMs);
             }
-            return current; // unchanged — leave as-is
-        });
-        // We transitioned iff the stored value is now the new value AND it differs from what was there.
-        // Only EVALUATE triggers/conditions when automations are enabled — a forced store while
-        // disabled just seeds the map (there is nothing enabled to run, and triggers are edge-based
-        // so the seed can't misfire once a rule is later enabled).
-        if (!disabled && committed == value && previous[0] != value) {
-            stateChanged(key, previous[0]);
+            // We transitioned iff the stored value is now the new value AND it differs from what
+            // was there. The delivery rules:
+            //
+            // SEED INVARIANT (do not weaken): a SAMPLED first value (previous == null) is a
+            // startup seed, not an edge — stored, marked undelivered, and silent. Firing seeds
+            // made every signal's first publish after a daemon start run trigger evaluation,
+            // which fired a burst of unrelated automations (WiFi/Bluetooth/gear/…) on every car
+            // power-on (v37 field reports).
+            //
+            // OBSERVED EDGE (updateObservedEdge): the caller witnessed the transition, so it
+            // fires even when it is the first value, or when a racing sampler already SEEDED the
+            // same value — but NOT when this exact value was already DELIVERED (a sampled
+            // transition beat the edge handler to it, or a duplicate edge publish slipped the
+            // caller's dedup). That makes delivery exactly-once per logical edge across both
+            // publishers, in every ordering.
+            //
+            // RETAINED REPLAY (forceLatestStateReplay) has NO independent firing power — it only
+            // widens the disabled-store guard above so a replayed publication can seed the map.
+            // A replay re-RUNS its original publish calls, and only those that are OBSERVED
+            // edges (publishPowerEdge → updateObservedEdge) may fire without a transition; a
+            // replayed SAMPLED publication (lock is poll-derived) seeds/dedups exactly like the
+            // original would have. Letting a replay fire sampled values violated Invariant 0:
+            // the queue retains a publication on any config change mid-publication, so CREATING
+            // a rule could replay a seeded, never-delivered lock value straight into the new
+            // rule — actuating it the moment it was saved, with no lock event having happened.
+            // The delivered-value dedup then makes observed-edge delivery exactly-once: a
+            // replay of an edge that never reached triggers (published while disabled) fires,
+            // a replay of an already-delivered edge is a no-op instead of double-running the
+            // user's actions.
+            boolean transitioned = committed == value && previous[0] != value;
+            // Whether this exact value is ALREADY the one delivered to triggers. Checked for BOTH
+            // publisher kinds, and for transitions as well as repeats — not just for a repeat of
+            // an observed edge as it used to be.
+            //
+            // Why a TRANSITION must consult it too: a publisher can move the stored value away
+            // and back within one physical event (`power` settles off→acc→off as the key
+            // rotates), which makes the return leg look like a fresh transition even though
+            // triggers already ran for that value. Keying delivery off the VALUE rather than off
+            // "did the stored value move" is what makes it exactly-once per logical value in every
+            // ordering — including a broker-retained replay, a heartbeat, and a racing sampler.
+            //
+            // This cannot mute a toggling signal: the mark holds only the LAST delivered value, so
+            // any alternation (open→closed→open, d→n→d) clears and re-arms it on each leg.
+            //
+            // The net effect versus the previous rule, verified exhaustively over every sequence of
+            // (value × sampled/edge × enabled/disabled) up to length 4: delivery is IDENTICAL except
+            // that a CONSECUTIVE repeat of the same delivered value is now collapsed to one. No
+            // distinct value is ever lost. That collapse is the fix — a rule cannot meaningfully
+            // act on "power became off" twice with no other value delivered in between.
+            Value delivered = stateDelivered.get(key);
+            boolean alreadyDelivered = delivered != null
+                    && !Boolean.TRUE.equals(delivered.compare(value, "neq"));
+            if (disabled || silentSeed) {
+                fire = false; // store-only (forceStore/replay seeding); nothing enabled to run
+            } else if (edgeRestatement) {
+                // The edge already delivered this exact value for this event — store the level,
+                // run nothing, and leave the mark pinned (see updateEdgeRestatement).
+                fire = false;
+            } else if (alreadyDelivered) {
+                fire = false; // exactly-once: triggers have already seen this value
+            } else if (transitioned) {
+                fire = previous[0] != null || observedEdge;
+            } else if (observedEdge) {
+                fire = true; // repeat publish of a value never delivered (e.g. seeded silently)
+            } else {
+                fire = false;
+            }
+            if (fire) {
+                stateDelivered.put(key, value);
+            } else if (edgeRestatement) {
+                // PRESERVE the existing mark rather than writing one. The point of a restatement is
+                // that the stored value moves back to the edge's value without disturbing delivery
+                // bookkeeping — so a later re-publish of it cannot read as a fresh transition and
+                // re-run the rule.
+                //
+                // Deliberately NOT `put(key, value)`: that would ASSERT a delivery, and the edge
+                // may never have delivered this value (it was published while automations were
+                // disabled, or the feature was enabled only afterwards). Claiming it would suppress
+                // the next genuine edge of that value for good. The map must never claim an
+                // undelivered value — the same rule the branch below enforces. Falling through
+                // without touching stateDelivered keeps whatever the truth already was.
+            } else if (transitioned && !alreadyDelivered) {
+                // The stored value moved to something genuinely UNdelivered (a seed, or a
+                // disabled store): clear the stale mark so it can't suppress a later edge of a
+                // different value, and so the map never claims an undelivered value.
+                //
+                // A move BACK to the already-delivered value is excluded: clearing there would
+                // re-arm the very duplicate the check above exists to stop.
+                stateDelivered.remove(key);
+            }
+            oldForEdge = previous[0] != null ? previous[0] : value;
+        }
+        if (fire) {
+            stateChanged(key, oldForEdge);
         }
     }
 
@@ -957,6 +1719,11 @@ public class Automations {
      */
     public static void update(EventData key, Integer value) {
         update(key, new IntValue(value));
+    }
+
+    /** Integer update that also seeds the state map while disabled (editor live-value seeding). */
+    public static void update(EventData key, Integer value, boolean forceStore) {
+        update(key, new IntValue(value), forceStore);
     }
 
     /**
@@ -1039,7 +1806,14 @@ public class Automations {
             return false;
         }
         mqttChannelsSeen.add(channel);
-        update(com.overdrive.app.automation.condition.BydEvent.mqttTrigger(channel), value);
+        // OBSERVED-EDGE semantics: a broker message physically ARRIVED — this is a witnessed
+        // event, not a sampled state. Routing it through the sampled path made the FIRST
+        // message on a channel after a daemon restart a silent seed, so an MQTT-triggered
+        // automation missed exactly one message per restart per channel. Paho delivers each
+        // message once (per QoS contract), and the delivered-value dedup keeps a broker
+        // RETAINED message replayed on reconnect from re-firing the same payload.
+        updateObservedEdge(com.overdrive.app.automation.condition.BydEvent.mqttTrigger(channel),
+                value);
         return true;
     }
 
@@ -1064,29 +1838,282 @@ public class Automations {
     }
 
     /**
-     * Run the actions for a specific automation
-     * Can run the actions without checking the conditions for testing the actions
-     * A disabled automation never fires from this choke point: both the queue worker
-     * (checkConditions=true) and the /test endpoint (checkConditions=false) flow through here, and a
-     * disabled automation that was queued with a delay before being disabled must not auto-fire when
-     * the delay elapses. The disabled guard is therefore applied regardless of checkConditions.
-     * The returned boolean reports only whether the automation EXISTS (so the API can answer 404 for
-     * unknown ids); a known automation that was skipped because it is disabled or its conditions are
-     * no longer met still returns true — testing a disabled automation is an accepted edge case that
-     * reports success without firing. A known automation whose action throws also returns true (it
-     * exists): the throw is swallowed here so the API never confuses an action failure with a 404.
-     *
-     * @param id              The id of the automation to run the actions for
-     * @param checkConditions Whether to check that the conditions match before running the actions
-     * @return true if an automation with this id exists, false if the id is unknown
+     * Cursor state for resumable automatic queue execution. Explicit Run now/keymap
+     * execution intentionally does not use this cursor; it runs on the separate
+     * serialized explicit worker.
+     */
+    static final class QueueActionCursor {
+        private Automation automation;
+        private long automationRevision;
+        private java.util.List<AutomationAction> actions;
+        private final java.util.IdentityHashMap<AutomationAction, Integer>
+                completedOccurrences = new java.util.IdentityHashMap<>();
+        private int nextAction;
+        private boolean recorded;
+
+        boolean hasStarted() {
+            return actions != null;
+        }
+    }
+
+    /**
+     * Re-evaluate the current branch but execute only allowlisted idempotent vehicle state setters.
+     * This is the sole retained/reconciliation replay path; notifications, API calls, shell
+     * commands, variable mutations, pauses, and other arbitrary prefixes are skipped.
+     */
+    static boolean triggerQueuedStateSetters(String id) {
+        Automation automation = automations.get(id);
+        if (automation == null || automation.isDisabled()) return true;
+        long automationRevision = automation.enabledStateRevision();
+        boolean met = automation.conditionsMet(conditionState);
+        java.util.List<AutomationAction> selected = met
+                ? automation.getActions()
+                : automation.hasElseActions()
+                        ? automation.getElseActions()
+                        : java.util.Collections.emptyList();
+        if (!ownsEnabledDefinition(id, automation, automationRevision)) return true;
+        boolean previous = STATE_SETTER_ONLY.get();
+        Automation previousDefinition = ACTIVE_QUEUED_DEFINITION.get();
+        String previousAutomationId = ACTIVE_QUEUED_AUTOMATION_ID.get();
+        Long previousDefinitionRevision =
+                ACTIVE_QUEUED_DEFINITION_REVISION.get();
+        STATE_SETTER_ONLY.set(true);
+        ACTIVE_QUEUED_DEFINITION.set(automation);
+        ACTIVE_QUEUED_AUTOMATION_ID.set(id);
+        ACTIVE_QUEUED_DEFINITION_REVISION.set(automationRevision);
+        boolean successful = true;
+        try {
+            resetChain();
+            for (AutomationAction automationAction : selected) {
+                if (Thread.currentThread().isInterrupted()) return false;
+                if (!ownsEnabledDefinition(
+                        id, automation, automationRevision)) return true;
+                try {
+                    successful &= runActionList(
+                            java.util.Collections.singletonList(automationAction));
+                } catch (Throwable failure) {
+                    logger.error("State-setter reconciliation threw: " + id);
+                    successful = false;
+                }
+                if (!ownsEnabledDefinition(
+                        id, automation, automationRevision)) return true;
+                if (chainAborted()) break;
+            }
+            return successful && !Thread.currentThread().isInterrupted();
+        } finally {
+            STATE_SETTER_ONLY.set(previous);
+            if (previousDefinition == null) {
+                ACTIVE_QUEUED_DEFINITION.remove();
+            } else {
+                ACTIVE_QUEUED_DEFINITION.set(previousDefinition);
+            }
+            if (previousAutomationId == null) {
+                ACTIVE_QUEUED_AUTOMATION_ID.remove();
+            } else {
+                ACTIVE_QUEUED_AUTOMATION_ID.set(previousAutomationId);
+            }
+            if (previousDefinitionRevision == null) {
+                ACTIVE_QUEUED_DEFINITION_REVISION.remove();
+            } else {
+                ACTIVE_QUEUED_DEFINITION_REVISION.set(
+                        previousDefinitionRevision);
+            }
+        }
+    }
+
+    static Object activeQueuedDefinitionIdentity() {
+        return ACTIVE_QUEUED_DEFINITION.get();
+    }
+
+    static long activeQueuedDefinitionRevision() {
+        Long revision = ACTIVE_QUEUED_DEFINITION_REVISION.get();
+        return revision == null ? -1L : revision.longValue();
+    }
+
+    static boolean ownsEnabledDefinition(
+            String id, Object expected, long expectedRevision) {
+        if (id == null || !(expected instanceof Automation)) return false;
+        Automation current = automations.get(id);
+        return current == expected
+                && !current.isDisabled()
+                && current.enabledStateRevision() == expectedRevision;
+    }
+
+    private static boolean activeQueuedDefinitionIsCurrent() {
+        Automation expected = ACTIVE_QUEUED_DEFINITION.get();
+        if (expected == null) return true;
+        Long expectedRevision = ACTIVE_QUEUED_DEFINITION_REVISION.get();
+        return expectedRevision != null
+                && ownsEnabledDefinition(
+                        ACTIVE_QUEUED_AUTOMATION_ID.get(),
+                        expected,
+                        expectedRevision.longValue());
+    }
+
+    private static boolean ownsQueuedDefinition(String id, QueueActionCursor cursor) {
+        return cursor != null
+                && ownsEnabledDefinition(
+                        id, cursor.automation, cursor.automationRevision);
+    }
+
+    /**
+     * Queue-only resumable execution. A cancellation advances past every action that returned,
+     * then reports incomplete so the queue can re-drive only the unvisited suffix.
+     */
+    static boolean triggerQueuedActions(String id, QueueActionCursor cursor) {
+        if (cursor == null) return triggerActions(id, true);
+        if (cursor.actions == null) {
+            Automation automation = automations.get(id);
+            if (automation == null) return true;
+            if (automation.isDisabled()) {
+                logger.info("Skipping disabled automation actions: " + id);
+                return true;
+            }
+            long automationRevision = automation.enabledStateRevision();
+            boolean met = automation.conditionsMet(conditionState);
+            boolean runElse = !met && automation.hasElseActions();
+            cursor.automation = automation;
+            cursor.automationRevision = automationRevision;
+            cursor.actions = met
+                    ? automation.getActions()
+                    : runElse ? automation.getElseActions() : java.util.Collections.emptyList();
+            if (!ownsQueuedDefinition(id, cursor)) return true;
+            if (!cursor.actions.isEmpty()) {
+                logger.info("Triggering automation " + (runElse ? "else-" : "")
+                        + "actions: " + id);
+                automation.recordTriggered(System.currentTimeMillis());
+                cursor.recorded = true;
+            }
+        } else if (!ownsQueuedDefinition(id, cursor)) {
+            // Disable, deletion, or replacement cancels a partially executed old definition.
+            return true;
+        }
+
+        resetChain();
+        QUEUE_ACTION_CURSOR.set(cursor);
+        QUEUE_ACTION_OCCURRENCES.set(new java.util.IdentityHashMap<>());
+        ACTIVE_QUEUED_DEFINITION.set(cursor.automation);
+        ACTIVE_QUEUED_AUTOMATION_ID.set(id);
+        ACTIVE_QUEUED_DEFINITION_REVISION.set(cursor.automationRevision);
+        try {
+            while (cursor.nextAction < cursor.actions.size()) {
+                if (Thread.currentThread().isInterrupted()) return false;
+                if (!ownsQueuedDefinition(id, cursor)) return true;
+                AutomationAction automationAction = cursor.actions.get(cursor.nextAction);
+                Action action = automationAction == null
+                        ? null : getAction(automationAction.getType());
+                if (action == null) {
+                    cursor.nextAction++;
+                    continue;
+                }
+                int completedBefore =
+                        cursor.completedOccurrences.getOrDefault(automationAction, 0);
+                boolean actionSucceeded;
+                try {
+                    actionSucceeded = runActionList(
+                            java.util.Collections.singletonList(automationAction));
+                } catch (Throwable t) {
+                    // The chain stops here and the item is treated as done (retrying would re-run a
+                    // throwing action forever). Name the action and the actions that will therefore
+                    // NEVER run: the old message gave only the automation id, so a half-applied
+                    // chain — doors unlocked, tailgate never opened — looked like a clean run.
+                    int skipped = cursor.actions.size() - cursor.nextAction - 1;
+                    logger.error("Automation " + id + " aborted: action #"
+                            + (cursor.nextAction + 1) + " (" + automationAction.getType()
+                            + ") threw " + t.getClass().getSimpleName() + ": " + t.getMessage()
+                            + (skipped > 0
+                                    ? " — the remaining " + skipped + " action(s) were NOT run"
+                                    : " — it was the last action"), t);
+                    return true;
+                }
+                boolean actionBoundaryCompleted =
+                        cursor.completedOccurrences.getOrDefault(automationAction, 0)
+                                > completedBefore;
+                if (!ownsQueuedDefinition(id, cursor)) return true;
+                if (chainAborted()) {
+                    cursor.nextAction = cursor.actions.size();
+                    break;
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    // A control-flow action may have returned with an unvisited nested suffix.
+                    // Re-enter it; runActionList will skip its completed child occurrences.
+                    if (actionBoundaryCompleted
+                            && !action.hasChildActions()
+                            && !"actionGroup".equals(automationAction.getType())) {
+                        cursor.nextAction++;
+                    }
+                    return false;
+                }
+                if (!actionSucceeded) {
+                    // A REFUSED action is not an aborted chain. Vehicle-control and HTTP-backed
+                    // actions report routine failures honestly: unsupported hardware, a driving
+                    // safety block, an endpoint refusal, rate limiting, or an unreachable vehicle.
+                    //
+                    // Returning here left the cursor parked and treated the item as done, so every
+                    // LATER action in the chain was silently dropped — a rule whose first step was
+                    // an unsupported control never sent its notification or ran its other steps,
+                    // with nothing logged. It also diverged from the /test and non-queue paths,
+                    // which run the whole list (runActionList only records the failure), so the
+                    // same automation behaved differently under Test than in production.
+                    //
+                    // Advance past the refused action and keep going: that preserves the old
+                    // whole-chain behaviour AND still can't hot-loop, because the cursor moves.
+                    // ACTION_CHAIN_SUCCEEDED is already false, so the run is still reported failed.
+                    int remaining = cursor.actions.size() - cursor.nextAction - 1;
+                    logger.warn("Automation " + id + " action #" + (cursor.nextAction + 1)
+                            + " (" + automationAction.getType() + ") did not succeed"
+                            + (remaining > 0
+                                    ? " — continuing with the remaining " + remaining + " action(s)"
+                                    : " — it was the last action"));
+                    cursor.nextAction++;
+                    continue;
+                }
+                cursor.nextAction++;
+            }
+        } finally {
+            ACTIVE_QUEUED_DEFINITION_REVISION.remove();
+            ACTIVE_QUEUED_AUTOMATION_ID.remove();
+            ACTIVE_QUEUED_DEFINITION.remove();
+            QUEUE_ACTION_OCCURRENCES.remove();
+            QUEUE_ACTION_CURSOR.remove();
+        }
+        if (cursor.recorded
+                && (cursor.automation.getTriggerCount() % STATS_PERSIST_EVERY) == 0) {
+            saveToFile();
+        }
+        return true;
+    }
+
+    /**
+     * Automatic/queue execution entry point. Manual-only automations remain blocked
+     * here exactly like disabled ones, so event delivery can never execute them.
      */
     public static boolean triggerActions(String id, boolean checkConditions) {
+        return triggerActionsInternal(id, checkConditions, checkConditions, false);
+    }
+
+    /**
+     * Explicit user execution entry point for Run now and manual-only key mappings.
+     * Runs the primary branch without evaluating conditions, because the user action
+     * itself is the trigger. Fully disabled rules remain inert.
+     *
+     * @param recordStats true for a real manual invocation (key mapping), false for Test
+     */
+    public static boolean triggerExplicitActions(String id, boolean recordStats) {
+        return triggerActionsInternal(id, false, recordStats, true);
+    }
+
+    private static boolean triggerActionsInternal(
+            String id, boolean checkConditions, boolean recordStats, boolean explicit) {
         Automation automation = automations.get(id);
         if (automation == null) return false;
 
-        // A disabled automation must never run its actions, even if it was queued before being disabled
-        if (automation.isDisabled()) {
-            logger.info("Skipping disabled automation actions: " + id);
+        // Automatic work accepts only automatic mode. Explicit work additionally
+        // accepts manual-only mode, but never a fully disabled automation.
+        boolean blocked = explicit ? automation.isFullyDisabled() : automation.isDisabled();
+        if (blocked) {
+            logger.info("Skipping " + (explicit ? "fully disabled" : "non-automatic")
+                    + " automation actions: " + id);
             return true;
         }
 
@@ -1095,7 +2122,7 @@ public class Automations {
         // worker (checkConditions=true) runs the primary branch when conditions are
         // met, otherwise the else branch (if any). Conditions are re-checked HERE, at
         // fire time, so a value that changed during the delay window is honoured.
-        boolean met = !checkConditions || automation.conditionsMet(state);
+        boolean met = !checkConditions || automation.conditionsMet(conditionState);
         boolean runElse = checkConditions && !met && automation.hasElseActions();
         if (met || runElse) {
             logger.info("Triggering automation " + (runElse ? "else-" : "") + "actions: " + id);
@@ -1113,17 +2140,21 @@ public class Automations {
             // in-memory count + timestamp for the list "last fired / N times"; the value
             // is persisted lazily (below) rather than on every fire to avoid a disk
             // write per trigger on a hot automation.
-            if (checkConditions) automation.recordTriggered(System.currentTimeMillis());
+            if (recordStats) automation.recordTriggered(System.currentTimeMillis());
+            boolean previousExplicit = EXPLICIT_RUN.get();
+            if (explicit) EXPLICIT_RUN.set(true);
             try {
                 if (runElse) automation.triggerElseActions();
                 else automation.triggerActions();
             } catch (Throwable t) {
                 logger.error("Automation action threw while triggering: " + id);
+            } finally {
+                EXPLICIT_RUN.set(previousExplicit);
             }
             // Persist the bumped stats opportunistically: only every STATS_PERSIST_EVERY
             // fires (per automation) so a busy rule doesn't hammer the disk, while the
             // count still survives a restart with at most a few lost increments.
-            if (checkConditions && (automation.getTriggerCount() % STATS_PERSIST_EVERY) == 0) {
+            if (recordStats && (automation.getTriggerCount() % STATS_PERSIST_EVERY) == 0) {
                 saveToFile();
             }
         }

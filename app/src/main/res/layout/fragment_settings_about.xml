@@ -566,6 +566,19 @@
                         android:layout_height="wrap_content"
                         android:orientation="vertical" />
                 </ScrollView>
+
+                <!-- Explains the avatar-size / ring / ×N encoding. Hidden by
+                     SettingsAboutFragment when no supporter carries a tier or a
+                     count, so it never advertises absent tiers. -->
+                <TextView
+                    android:id="@+id/textSupportersLegend"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="@string/settings_about_tiers_explainer"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:textColor="?attr/colorOutline"
+                    android:visibility="gone" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

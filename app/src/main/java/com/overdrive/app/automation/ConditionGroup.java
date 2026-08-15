@@ -141,6 +141,10 @@ public final class ConditionGroup {
                 for (int i = 0; i < groupsJson.length(); i++) {
                     ConditionGroup g = fromJson(groupsJson.getJSONObject(i), depthLeft - 1);
                     if (g == null) return null;
+                    // Same rule as Automation.fromJson: a term-less child group evaluates to true
+                    // and would vacuously satisfy an OR at this level. Drop it rather than keep a
+                    // gate that isn't one.
+                    if (g.conditions.isEmpty() && g.groups.isEmpty()) continue;
                     subs.add(g);
                 }
             }

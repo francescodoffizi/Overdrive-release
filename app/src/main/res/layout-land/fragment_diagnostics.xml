@@ -55,8 +55,9 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:accessibilityHeading="true"
                 android:text="@string/diagnostics_hero_title"
-                android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+                android:textAppearance="@style/TextAppearance.Overdrive.HeadlineSmall"
                 android:textColor="?attr/colorOnSurface"
                 android:textStyle="bold" />
 
@@ -163,7 +164,7 @@
                             android:ellipsize="end"
                             android:maxLines="1"
                             android:text="@string/diagnostics_metric_online"
-                            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+                            android:textAppearance="@style/TextAppearance.Overdrive.HeadlineSmall"
                             android:textColor="?attr/colorOnSurface"
                             android:textStyle="bold" />
 
@@ -245,7 +246,7 @@
                             android:ellipsize="end"
                             android:maxLines="1"
                             android:text="@string/diagnostics_metric_pending"
-                            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+                            android:textAppearance="@style/TextAppearance.Overdrive.HeadlineSmall"
                             android:textColor="?attr/colorOnSurface"
                             android:textStyle="bold" />
 
@@ -334,7 +335,7 @@
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
                             android:text="@string/diagnostics_metric_pending"
-                            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+                            android:textAppearance="@style/TextAppearance.Overdrive.HeadlineSmall"
                             android:textColor="?attr/colorOnSurfaceVariant"
                             android:textStyle="bold" />
                     </LinearLayout>
@@ -374,10 +375,22 @@
                                 android:src="@drawable/ic_battery_health"
                                 app:tint="?attr/colorOnSurfaceVariant" />
 
-                            <View
+                            <TextView
+                                android:id="@+id/tvBatteryReviewBadge"
                                 android:layout_width="0dp"
-                                android:layout_height="0dp"
-                                android:layout_weight="1" />
+                                android:layout_height="wrap_content"
+                                android:layout_marginHorizontal="8dp"
+                                android:layout_weight="1"
+                                android:background="@drawable/bg_battery_review_pill"
+                                android:ellipsize="end"
+                                android:gravity="center"
+                                android:maxLines="1"
+                                android:paddingHorizontal="6dp"
+                                android:paddingVertical="2dp"
+                                android:text="@string/diagnostics_battery_needs_review"
+                                android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+                                android:textColor="?attr/colorOnSecondaryContainer"
+                                android:visibility="gone" />
 
                             <View
                                 android:id="@+id/viewBatteryDot"
@@ -402,7 +415,7 @@
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
                             android:text="@string/diagnostics_metric_pending"
-                            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+                            android:textAppearance="@style/TextAppearance.Overdrive.HeadlineSmall"
                             android:textColor="?attr/colorOnSurfaceVariant"
                             android:textStyle="bold" />
                     </LinearLayout>

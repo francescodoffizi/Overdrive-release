@@ -154,11 +154,39 @@ public class CrossQuadrantTracker {
      * @return List of TrackResult with trackId assigned
      */
     public List<TrackResult> processDetections(List<Detection> detections, int quadrant) {
-        long now = System.currentTimeMillis();
+        return processDetections(detections, quadrant, System.currentTimeMillis());
+    }
+
+    /**
+     * Observation-time-aware variant (audit R13-7 / ExtE-8). {@code nowMs} is
+     * the CAPTURE-anchored wall time of the detections — for foveated crops
+     * the engine back-dates it by the ring-lag/slot-dwell age so recency
+     * ranking and lastSeen bookkeeping describe when the subject was actually
+     * at that position, not when inference finished. lastSeenMs is clamped
+     * monotonic (max) so an out-of-order stale batch can never rewind a
+     * track's clock below what a fresher batch already established.
+     */
+    public List<TrackResult> processDetections(List<Detection> detections, int quadrant, long nowMs) {
+        final long now = nowMs;
         pruneStale(now);
 
         List<TrackResult> results = new ArrayList<>();
         if (detections == null || detections.isEmpty()) return results;
+
+        // ONE-TO-ONE WITHIN A BATCH (audit R11-9 / ExtD-10). The per-detection
+        // loop used to leave a matched (or just-created) track fully eligible
+        // for the NEXT detection of the same batch — and the in-place update
+        // made the second match EASIER (timeDelta becomes 0 → the generous
+        // adaptive radius, measured against the first detection's just-written
+        // centroid). Two people walking together in one quadrant then both
+        // received the same trackId; ActorTracker's Path A (xqTrackId hint,
+        // matched regardless of quadrant) faithfully merged them into ONE
+        // actor: undercounted personCount in notifications/sidecars and a
+        // centroid oscillating between the two bodies. Greedy order-of-arrival
+        // assignment: once a track is claimed by a detection in this batch, it
+        // is invisible to the rest of the batch, so the second subject mints
+        // its own track. Single-subject behavior is unchanged.
+        boolean[] claimedInBatch = new boolean[MAX_TRACKS];
 
         for (Detection det : detections) {
             int classId = det.getClassId();
@@ -173,13 +201,31 @@ public class CrossQuadrantTracker {
             boolean nearTop = y < EDGE_MARGIN_PX;
             boolean nearBottom = (y + h) > (Q_HEIGHT - EDGE_MARGIN_PX);
 
-            // Try to match to an existing track
+            // Try to match to an existing track.
+            //
+            // RANKING (audit R13-9 / ExtE-10): same-quadrant candidates are
+            // ranked by SPATIAL DISTANCE, not recency. The old
+            // timeDelta-ranked selection broke down inside one batch: tracks
+            // updated in the same previous batch share (nearly) one
+            // lastSeenMs, so ranking by time collapsed to detection-order —
+            // two nearby same-class people could swap identities whenever
+            // YOLO emitted them in a different order. Distance is the signal
+            // that actually discriminates the two bodies. Handoff (Case 2)
+            // candidates keep recency ranking (there is no meaningful
+            // distance across cameras), and a same-quadrant spatial match
+            // always outranks a handoff guess.
             int matchIdx = -1;
-            long bestTimeDelta = Long.MAX_VALUE;
+            long bestTimeDelta = Long.MAX_VALUE;   // handoff ranking + log
+            float bestDist = Float.MAX_VALUE;      // same-quadrant ranking
+            boolean bestIsSameQuadrant = false;
 
             for (int i = 0; i < MAX_TRACKS; i++) {
                 Track t = tracks[i];
                 if (!t.active) continue;
+                // Already claimed by an earlier detection of THIS batch — a
+                // physical track can host at most one detection per frame
+                // (audit R11-9 / ExtD-10).
+                if (claimedInBatch[i]) continue;
                 // Compare CANONICAL classes: YOLO flips car(2)↔truck(7)↔bus(5)
                 // and bicycle(1)↔motorcycle(3) between frames on the same object.
                 // Strict equality split one physical actor into twin tracks, each
@@ -267,9 +313,18 @@ public class CrossQuadrantTracker {
                             ? adaptiveThreshold
                             : STALE_MATCH_RADIUS_PX;
 
-                    if (dist < matchRadius && timeDelta < bestTimeDelta) {
+                    // Spatial ranking (audit R13-9 / ExtE-10): nearest
+                    // in-radius candidate wins; recency only breaks exact
+                    // distance ties. A same-quadrant match always displaces
+                    // a handoff candidate.
+                    if (dist < matchRadius
+                            && (!bestIsSameQuadrant
+                                || dist < bestDist
+                                || (dist == bestDist && timeDelta < bestTimeDelta))) {
                         matchIdx = i;
+                        bestDist = dist;
                         bestTimeDelta = timeDelta;
+                        bestIsSameQuadrant = true;
                     }
                 }
                 // Case 2: Adjacent quadrant — cross-camera handoff
@@ -278,7 +333,9 @@ public class CrossQuadrantTracker {
                     // and the previous track should have been near the edge facing this quadrant.
                     if (isHandoffEdgeMatch(quadrant, nearLeft, nearRight, nearTop, nearBottom,
                             t.lastQuadrant, t.nearLeftEdge, t.nearRightEdge, t.nearTopEdge, t.nearBottomEdge)) {
-                        if (timeDelta < bestTimeDelta) {
+                        // Handoffs rank by recency, and never displace a
+                        // same-quadrant spatial match (audit R13-9).
+                        if (!bestIsSameQuadrant && timeDelta < bestTimeDelta) {
                             matchIdx = i;
                             bestTimeDelta = timeDelta;
                         }
@@ -291,6 +348,7 @@ public class CrossQuadrantTracker {
                 // Update existing track
                 Track t = tracks[matchIdx];
                 trackId = t.trackId;
+                claimedInBatch[matchIdx] = true; // audit R11-9 / ExtD-10
                 if (t.lastQuadrant != quadrant) {
                     logger.info(String.format("Track #%d HANDOFF: %s → %s (class=%d, gap=%dms)",
                             trackId,
@@ -300,7 +358,9 @@ public class CrossQuadrantTracker {
                 }
                 t.lastQuadrant = quadrant;
                 t.lastX = x; t.lastY = y; t.lastW = w; t.lastH = h;
-                t.lastSeenMs = now;
+                // Monotonic clamp (audit R13-7): a back-dated stale batch
+                // must not rewind a fresher batch's clock.
+                t.lastSeenMs = Math.max(t.lastSeenMs, now);
                 t.nearLeftEdge = nearLeft;
                 t.nearRightEdge = nearRight;
                 t.nearTopEdge = nearTop;
@@ -311,6 +371,10 @@ public class CrossQuadrantTracker {
                 int slot = findFreeSlot();
                 if (slot >= 0) {
                     Track t = tracks[slot];
+                    // A track CREATED by an earlier detection of this batch is
+                    // claimed too — it must not absorb the next detection
+                    // (audit R11-9 / ExtD-10).
+                    claimedInBatch[slot] = true;
                     t.trackId = trackId;
                     t.classId = classId;
                     t.lastQuadrant = quadrant;

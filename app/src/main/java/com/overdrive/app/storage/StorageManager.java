@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Executors;
@@ -123,6 +124,85 @@ public class StorageManager {
             Log.d(TAG, msg);
         }
     }
+
+    /** Result of {@link #readProcessLinesBounded}: drained output lines,
+     *  whether the drain reached EOF before the deadline (complete), and the
+     *  child's exit code ({@code -1} on drain timeout / reap timeout /
+     *  interrupt). {@code complete == false} means {@code lines} may be a
+     *  PREFIX of the real output — callers must not treat absence of a line
+     *  as evidence of absence of a volume. */
+    private static final class ProcessLines {
+        final java.util.List<String> lines;
+        final boolean complete;
+        final int exitCode;
+
+        ProcessLines(java.util.List<String> lines, boolean complete, int exitCode) {
+            this.lines = lines;
+            this.complete = complete;
+            this.exitCode = exitCode;
+        }
+    }
+
+    /**
+     * Drain a child process's stdout (and optionally stderr) with a HARD
+     * deadline on the whole read, then reap the child.
+     *
+     * <p>FIX (audit: SD-outage review, subprocess bounding): the `sm
+     * list-volumes` / `sm mount` call sites used to run a bare
+     * {@code readLine()} loop and only then call {@link #waitForBounded} —
+     * so the timeout bounded the post-EOF wait, NOT the read. A vendored
+     * {@code sm} that hangs mid-write without closing its pipe (observed on
+     * BYD ROMs with a wedged vold) blocked the caller forever, and every one
+     * of those callers holds {@code mountLock}. Same drain-thread idiom as
+     * {@link #listFilesViaShellChecked}: on deadline we kill the child
+     * (which EOFs the reader) and return whatever was drained, flagged
+     * incomplete.
+     *
+     * @param drainTimeoutMs deadline for the whole output read. For commands
+     *        whose output only appears at completion (sm mount) this must
+     *        cover the command's own runtime.
+     */
+    private static ProcessLines readProcessLinesBounded(Process p, boolean includeStderr,
+            long drainTimeoutMs, String label) {
+        final java.util.List<String> lines =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<String>());
+        Thread drain = new Thread(() -> {
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) lines.add(line);
+            } catch (Exception ignored) {
+                // Stream closed by destroyForcibly on timeout, or read error.
+            }
+            if (includeStderr) {
+                try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getErrorStream()))) {
+                    String line;
+                    while ((line = r.readLine()) != null) lines.add("ERR: " + line);
+                } catch (Exception ignored) {}
+            }
+        }, label + "-drain");
+        drain.setDaemon(true);
+        drain.start();
+        boolean complete = false;
+        try {
+            drain.join(drainTimeoutMs);
+            complete = !drain.isAlive();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        int exit;
+        if (!complete) {
+            logWarn(label + ": output drain exceeded " + drainTimeoutMs
+                + "ms — killing child (partial output, " + lines.size() + " lines)");
+            try { p.destroyForcibly(); } catch (Exception ignored) {}
+            try { drain.join(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            exit = -1;
+        } else {
+            exit = waitForBounded(p, 2_000, label);
+        }
+        synchronized (lines) {
+            return new ProcessLines(new java.util.ArrayList<>(lines), complete, exit);
+        }
+    }
     
     // Base directories for Overdrive files
     private static final String INTERNAL_BASE_DIR = "/storage/emulated/0/Overdrive";
@@ -186,10 +266,6 @@ public class StorageManager {
     
     // Periodic cleanup interval (30 seconds)
     private static final long CLEANUP_INTERVAL_SECONDS = 30;
-    // Out-of-band edits and missed events still need an integrity backstop, but
-    // an idle daemon does not need to walk every recording directory every 30s.
-    private static final long PERIODIC_INTEGRITY_INTERVAL_MS = TimeUnit.HOURS.toMillis(1);
-    private volatile long lastPeriodicIntegrityAtMs = 0L;
 
     // Max anchor files to delete in a single BOUNDED-TRIM pass that runs WHILE the
     // encoder is writing. This caps SD-card I/O contention against the muxer's disk
@@ -207,6 +283,10 @@ public class StorageManager {
     // tick or two, while staying ~5× under the known-bad burst size. Larger over-runs
     // (>5 %%, e.g. a big limit drop) bypass this and take the unbounded HARD reap.
     private static final int RECORDING_TRIM_MAX_FILES = 4;
+    // Boot-reap budget. Large enough to converge a real migration backlog on its own
+    // (the ticker may never start if daemon init throws), small enough that a
+    // pathological volume can't turn startup into a multi-minute lock-held delete walk.
+    private static final int STARTUP_TRIM_MAX_FILES = 64;
     // Sentinel for ensureSpace's delete budget: no per-pass cap. Used by idle reaps,
     // the boot reap, and the HARD over-limit emergency path (full reap down to limit).
     private static final int UNLIMITED_REAP = 0;
@@ -239,8 +319,33 @@ public class StorageManager {
     // it around the 200 MB boundary every segment rotation. Both are additionally
     // clamped to a fraction of the volume total (see runPhysicalFreeSpaceEmergencyReap)
     // so a genuinely tiny card can never be reaped empty chasing an unreachable target.
-    private static final long PHYSICAL_FREE_EMERGENCY_FLOOR_BYTES = 512L * 1024 * 1024;   // act below 512 MB free
-    private static final long PHYSICAL_FREE_EMERGENCY_TARGET_BYTES = 1024L * 1024 * 1024; // reap down to ~1 GB free
+    //
+    // FIX (audit: SD-outage review, retention dead zone): the floor was a flat
+    // 512 MB, and the field incident sat at 569 MB free — pinned in the dead
+    // zone ABOVE the emergency floor while the per-category reaps had nothing
+    // eligible (every category under its own oversubscribed cap), so nothing
+    // ever freed space. The floor now scales with the volume: ~2 GB on the
+    // ~119 GB fleet cards (a stalled card is caught while several full
+    // segments of room remain, not 2.5 segments from ENOSPC), clamped to
+    // [flat 512 MB … total/8] so a tiny card keeps the old behaviour and the
+    // floor can never chase a large fraction of a small volume. TARGET keeps
+    // a fixed 2:1 ratio above the floor (hysteresis — same reasoning as the
+    // old 512 MB/1 GB pair, and still re-clamped to total/4 at the call site).
+    private static final long PHYSICAL_FREE_EMERGENCY_FLOOR_BYTES = 512L * 1024 * 1024;   // minimum floor (tiny cards)
+    private static final long PHYSICAL_FREE_EMERGENCY_FLOOR_FRACTION_DIVISOR = 60;        // ~1/60 of volume ≈ 2 GB on 119 GB
+    private static final long PHYSICAL_FREE_EMERGENCY_FLOOR_MAX_DIVISOR = 8;              // floor never exceeds total/8
+
+    /** Volume-scaled emergency floor: max(512 MB, total/60), capped at total/8.
+     *  With total unreadable (0), degrades to the flat 512 MB minimum. */
+    private static long physicalFreeEmergencyFloorBytes(long totalBytes) {
+        long floor = PHYSICAL_FREE_EMERGENCY_FLOOR_BYTES;
+        if (totalBytes > 0) {
+            floor = Math.max(floor, totalBytes / PHYSICAL_FREE_EMERGENCY_FLOOR_FRACTION_DIVISOR);
+            floor = Math.min(floor, totalBytes / PHYSICAL_FREE_EMERGENCY_FLOOR_MAX_DIVISOR);
+            floor = Math.max(floor, PHYSICAL_FREE_EMERGENCY_FLOOR_BYTES);
+        }
+        return floor;
+    }
     // Media categories the physical-free reaper evicts from. Trips (.jsonl.gz,
     // DB-backed, KB-to-low-MB scale) is intentionally excluded — it cannot
     // meaningfully relieve a full volume and would drag TripDatabase row
@@ -367,10 +472,8 @@ public class StorageManager {
     private final AtomicBoolean recordingActive = new AtomicBoolean(false);
     private final AtomicBoolean surveillanceActive = new AtomicBoolean(false);
 
-    // Absolute path of the currently-recording trip telemetry file (.jsonl.gz)
-    // or null when no trip is active. Path-based instead of a boolean so a
-    // limit-change cleanup mid-trip can still reap older trip files; only the
-    // in-flight file is protected. Read by ensureSpace before each delete.
+    // Telemetry file of the trip currently being recorded, or null when no
+    // trip is active. Cleanup and recovery both skip this exact path.
     private volatile String activeTripFilePath = null;
 
     // SOTA: Authoritative "encoder is mid-write" probe.
@@ -433,6 +536,7 @@ public class StorageManager {
     // forever and storage would grow past the limit.
     private final java.util.Set<String> deferredCleanupDirs =
         java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     private static final String DEFERRED_RECORDINGS = "recordings";
     private static final String DEFERRED_SURVEILLANCE = "surveillance";
     private static final String DEFERRED_PROXIMITY = "proximity";
@@ -508,7 +612,25 @@ public class StorageManager {
     // updateActiveDirectories() (which takes the cleanup locks) while holding
     // mountLock, and no cleanup-lock holder ever calls back into the mount path,
     // so the ordering is one-way and deadlock-free.
-    private final Object mountLock = new Object();
+    //
+    // ReentrantLock, not an intrinsic monitor (audit: daemon-restart loop —
+    // "make the cancel real"). Monitor entry is NOT interruptible: a thread
+    // parked on `synchronized` ignores interrupt() forever, which is exactly
+    // how the probe-edge revocation's cancel could never land and escalated
+    // to process recovery. ReentrantLock keeps the same reentrancy semantics
+    // but lets the two high-traffic entry wrappers use BOUNDED, interruptible
+    // acquisition (tryLock with timeout): a caller queued behind a slow mount
+    // now gives up predictably instead of stacking 281s serial waits, and an
+    // interrupt genuinely cancels the wait.
+    private final java.util.concurrent.locks.ReentrantLock mountLock =
+            new java.util.concurrent.locks.ReentrantLock();
+    // Lock-acquisition budgets for the two wrappers. A mount pass's own
+    // internals are bounded (~30-40s pathological worst case), so 30s of
+    // queueing means one full predecessor pass — beyond that, report current
+    // state and let the caller's retry machinery (watchdog / next tick) come
+    // back. Discovery is cheaper and non-critical per-call: 10s.
+    private static final long MOUNT_LOCK_ACQUIRE_TIMEOUT_MS = 30_000L;
+    private static final long DISCOVERY_LOCK_ACQUIRE_TIMEOUT_MS = 10_000L;
     private static final int SD_WATCHDOG_MAX_VERBOSE_FAILURES = 5;  // Log verbosely for first 5 failures
     private static final int SD_WATCHDOG_QUIET_LOG_INTERVAL = 20;   // Then log every 20th attempt (~5 min)
 
@@ -636,14 +758,39 @@ public class StorageManager {
         asyncCleanupExecutor.execute(() -> {
             try {
                 sweepOrphanTempFiles();
-                ensureRecordingsSpace(0);
+                // Bounded: on the boot after proximity joined the recordings pool, a
+                // device that was legally under BOTH old caps can be far over the
+                // single new one, and an unbounded reap would delete that whole
+                // backlog in one burst while the daemon is still starting. The budget
+                // is generous rather than per-tick-sized because this must still
+                // converge on its own — if a throw later in daemon main() prevents
+                // startPeriodicCleanup(), there is no ticker to finish the job.
+                ensureRecordingsSpaceBounded(STARTUP_TRIM_MAX_FILES);
                 ensureSurveillanceSpace(0);
-                ensureProximitySpace(0);
+                // NOT ensureProximitySpace: it now reaps the shared recordings pool
+                // UNBOUNDED, which would undo the pacing above. Proximity's dirs are
+                // already covered by the bounded recordings call.
                 ensureTripsSpace(0);
             } catch (Exception e) {
                 logWarn("Startup reap failed: " + e.getMessage());
             }
         });
+    }
+
+    /**
+     * True when the candidate is the in-flight trip telemetry file. Also
+     * matches the ".tmp" sibling so an interrupted atomic write of the same
+     * trip is never reaped.
+     */
+    private boolean isProtectedTripFile(File candidate) {
+        String protectedPath = activeTripFilePath;
+        if (protectedPath == null || candidate == null) {
+            return false;
+        }
+        String candidatePath = candidate.getAbsolutePath();
+        return protectedPath.equals(candidatePath)
+                || protectedPath.equals(candidatePath + ".tmp")
+                || candidatePath.equals(protectedPath + ".tmp");
     }
 
     /**
@@ -714,9 +861,7 @@ public class StorageManager {
                         // Don't unlink a still-being-written trip file in case
                         // the recorder uses an atomic ".jsonl.gz.tmp → .jsonl.gz"
                         // rename and the in-flight file is the .tmp.
-                        if (activeTripFilePath != null
-                                && (activeTripFilePath.equals(f.getAbsolutePath())
-                                    || activeTripFilePath.equals(f.getAbsolutePath() + ".tmp"))) {
+                        if (isProtectedTripFile(f)) {
                             continue;
                         }
                         if (f.lastModified() > cutoff) continue;  // grace window
@@ -801,8 +946,96 @@ public class StorageManager {
         // watchdog / ACC-OFF / ACC-ON / constructor entrants (see mountLock).
         // Reentrant: the body calls discoverVolumes(), whose wrapper re-acquires
         // the same intrinsic lock — Java monitors are reentrant, so that's safe.
-        synchronized (mountLock) {
-            return ensureVolumeMountedLocked(targetClass, force);
+        boolean sdBeforeLive, usbBeforeLive, result;
+        String sdPathBefore, usbPathBefore;
+        // BOUNDED + INTERRUPTIBLE acquisition (audit: make the cancel real).
+        // Queued entrants used to park uninterruptibly behind a slow mount
+        // — serial stacking produced the observed 281s worst case, and an
+        // interrupt() from the probe-edge revocation could never land.
+        //
+        // On timeout/interrupt, return FALSE — never the cached availability
+        // flag. The cache can be stale-true (the canonical failure state:
+        // system unmounted the card, flag never cleared), and this method's
+        // contract is "the volume IS mounted now"; a caller acting on a
+        // stale true would point work at a dead volume. False is the
+        // conservative truth ("not confirmed mounted"), and every caller
+        // already handles it: the watchdog re-ticks, ensureStorageReady
+        // falls back to internal, the setters refuse the type change.
+        boolean lockHeld = false;
+        try {
+            lockHeld = mountLock.tryLock(
+                MOUNT_LOCK_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logWarn("ensureVolumeMounted(" + targetClass + "): interrupted while waiting for"
+                + " mountLock — cancelled, reporting not-mounted");
+            return false;
+        }
+        if (!lockHeld) {
+            logWarn("ensureVolumeMounted(" + targetClass + "): mountLock not acquired within "
+                + MOUNT_LOCK_ACQUIRE_TIMEOUT_MS + "ms (another mount/discovery pass in"
+                + " progress) — reporting not-mounted");
+            return false;
+        }
+        try {
+            // LIVE pre-call accessibility, NOT the cached flag (audit:
+            // stale-true remounts missed notification). In the canonical
+            // failure state the system unmounted the card while
+            // sdCardAvailable stayed true — a flag-based before/after sees a
+            // successful remount as true→true and never notifies. The
+            // bounded probe (circuit-broken when wedged) captures the truth:
+            // stale-true + dead path reads as "was offline", so the remount
+            // registers as a recovery.
+            sdPathBefore = sdCardPath;
+            usbPathBefore = usbPath;
+            sdBeforeLive = sdCardAvailable && sdCardPath != null && isPathLikelyMounted(sdCardPath);
+            usbBeforeLive = usbAvailable && usbPath != null && isPathLikelyMounted(usbPath);
+            result = ensureVolumeMountedLocked(targetClass, force);
+        } finally {
+            mountLock.unlock();
+        }
+        // Centralized unavailable→mounted transition notify (audit: mount
+        // notification not comprehensive). Every mount path — startup
+        // StorageMountInit, watchdog, ACC-OFF/ON remounts, on-demand
+        // ensureStorageReady, proximity/surveillance trigger mounts,
+        // refreshSdCard — funnels through this wrapper or discoverVolumes(),
+        // so detecting the availability flip HERE covers them all without
+        // per-call-site plumbing. Fired OUTSIDE mountLock: the watcher
+        // refresh does I/O and requestReconcile is coalesced+async, neither
+        // belongs inside the mount critical section.
+        notifyIfVolumeCameOnline(sdBeforeLive, usbBeforeLive, sdPathBefore, usbPathBefore,
+            "ensureVolumeMounted(" + targetClass + ")");
+        return result;
+    }
+
+    /**
+     * Fire the recordings-index storage-change hook iff SD or USB
+     * transitioned offline→online across a mount/discovery pass, OR its
+     * mount path CHANGED (uuid swap across a remount — same flag, different
+     * content root; the index must rescan either way). "Before" is the
+     * caller's LIVE pre-pass accessibility snapshot; "after" reads the
+     * just-committed volatile fields, which every commit point verified with
+     * an accessibility probe. Transitions are rare (physical insert /
+     * remount / vold catch-up), so this stays silent on the overwhelmingly
+     * common no-change paths — the 15s watchdog tick and per-request
+     * discovery refreshes cost nothing extra.
+     */
+    private void notifyIfVolumeCameOnline(boolean sdBeforeLive, boolean usbBeforeLive,
+                                          String sdPathBefore, String usbPathBefore,
+                                          String reason) {
+        boolean sdCameOnline = !sdBeforeLive && sdCardAvailable;
+        boolean usbCameOnline = !usbBeforeLive && usbAvailable;
+        boolean sdMoved = sdBeforeLive && sdCardAvailable
+                && sdCardPath != null && !sdCardPath.equals(sdPathBefore);
+        boolean usbMoved = usbBeforeLive && usbAvailable
+                && usbPath != null && !usbPath.equals(usbPathBefore);
+        if (sdCameOnline || usbCameOnline || sdMoved || usbMoved) {
+            StringBuilder what = new StringBuilder();
+            if (sdCameOnline) what.append("SD came online");
+            if (sdMoved) what.append(what.length() > 0 ? ", " : "").append("SD path changed");
+            if (usbCameOnline) what.append(what.length() > 0 ? ", " : "").append("USB came online");
+            if (usbMoved) what.append(what.length() > 0 ? ", " : "").append("USB path changed");
+            notifyRecordingsIndexOfStorageChange(reason + ": " + what);
         }
     }
 
@@ -875,16 +1108,20 @@ public class StorageManager {
         // shows "SD card mount failed" with no clue WHICH failure mode.
         StringBuilder rawSmOutput = new StringBuilder();
         try {
+            // Bounded drain (4s covers a healthy list-volumes many times
+            // over): a hung `sm` can no longer block this thread — which
+            // holds mountLock — on a bare readLine(). See
+            // readProcessLinesBounded.
             Process listProcess = Runtime.getRuntime().exec(new String[]{"sm", "list-volumes", "all"});
-            BufferedReader reader = new BufferedReader(new InputStreamReader(listProcess.getInputStream()));
-            String line;
+            ProcessLines smList = readProcessLinesBounded(
+                listProcess, false, 4_000, "sm list-volumes (ensureVolumeMounted)");
             String volumeId = null;
             String volumeUuid = null;
             int volMajor = -1, volMinor = -1;
             int publicRowCount = 0;
             int matchedRowCount = 0;
 
-            while ((line = reader.readLine()) != null) {
+            for (String line : smList.lines) {
                 line = line.trim();
                 rawSmOutput.append(line).append('\n');
                 logDebug("sm list-volumes: " + line);
@@ -922,8 +1159,6 @@ public class StorageManager {
                             usbAvailable = true;
                         }
                         logInfo(targetClass + " already mounted at: " + mountPath);
-                        reader.close();
-                        waitForBounded(listProcess, 2_000, "sm list-volumes (already-mounted)");
                         if (isSd) initSdCardDirectories(); else initUsbDirectories();
                         updateActiveDirectories();
                         reclampLimitsToMountedCeilings();
@@ -939,8 +1174,13 @@ public class StorageManager {
                 volMinor = minor;
                 break;
             }
-            reader.close();
-            waitForBounded(listProcess, 2_000, "sm list-volumes (ensureVolumeMounted)");
+            if (!smList.complete && volumeId == null) {
+                // The listing was cut off before we saw a matching row —
+                // don't log the "no match" diagnostic as if the enumeration
+                // were authoritative.
+                logWarn("sm list-volumes output incomplete (drain timeout) — "
+                    + "treating this pass as inconclusive for " + targetClass);
+            }
 
             // Diagnostic: capture the WHY of an `sm list-volumes` miss. On
             // affected BYD models at ACC OFF this often shows publicRows>0
@@ -961,25 +1201,31 @@ public class StorageManager {
             }
 
             if (volumeId != null) {
-                Process mountProcess = Runtime.getRuntime().exec(new String[]{"sm", "mount", volumeId});
-                BufferedReader outReader = new BufferedReader(new InputStreamReader(mountProcess.getInputStream()));
-                BufferedReader errReader = new BufferedReader(new InputStreamReader(mountProcess.getErrorStream()));
-                StringBuilder output = new StringBuilder();
-                String outLine;
-                while ((outLine = outReader.readLine()) != null) output.append(outLine).append("\n");
-                while ((outLine = errReader.readLine()) != null) output.append("ERR: ").append(outLine).append("\n");
-                outReader.close();
-                errReader.close();
-
                 // 8s ceiling for the actual mount. Healthy SD/USB mounts on
                 // BYD finish in <1s; anything past 8s is a stuck vold and
                 // we'd rather fall back to internal than wedge the daemon.
-                int exitCode = waitForBounded(mountProcess, 8_000, "sm mount " + volumeId);
+                // The drain deadline covers the whole command (sm mount only
+                // emits output at completion) — previously the readLine()
+                // loops ran UNBOUNDED before waitForBounded, so a vold that
+                // hung without closing its pipe blocked here forever while
+                // holding mountLock.
+                Process mountProcess = Runtime.getRuntime().exec(new String[]{"sm", "mount", volumeId});
+                ProcessLines mountOut = readProcessLinesBounded(
+                    mountProcess, true, 8_000, "sm mount " + volumeId);
+                StringBuilder output = new StringBuilder();
+                for (String outLine : mountOut.lines) output.append(outLine).append("\n");
+
+                int exitCode = mountOut.exitCode;
                 logInfo("sm mount " + volumeId + " exit code: " + exitCode +
                     (output.length() > 0 ? ", output: " + output.toString().trim() : ""));
 
                 if (exitCode == 0 && volumeUuid != null) {
                     String mountPath = "/storage/" + volumeUuid;
+                    // A clean remount supersedes any open probe circuit for
+                    // this path (the wedge that opened it was the pre-mount
+                    // state) — otherwise the poll below would short-circuit
+                    // false for up to 60s and report the fresh mount failed.
+                    pathProbeWedgedUntilMs.remove(mountPath);
                     // Lengthened from 10 to 20 iterations (5s → 10s budget).
                     // On affected BYD models the FUSE bridge is published
                     // ~3-6s after `sm mount` returns 0 — the prior 5s budget
@@ -1420,6 +1666,23 @@ public class StorageManager {
                     updateActiveDirectories();
                     return true;
                 }
+                // Index notification for this freshly-mounted volume happens
+                // centrally in the ensureVolumeMounted wrapper (which
+                // ensureSdCardMounted just delegated to) — it detects the
+                // unavailable→mounted transition for EVERY mount path, not
+                // just this one. See notifyIfVolumeCameOnline.
+                initSdCardDirectories();
+                updateActiveDirectories();
+                // Pre-reserve space on SD card by cleaning BYD dashcam files if needed
+                try {
+                    ExternalStorageCleaner cleaner = ExternalStorageCleaner.getInstance();
+                    if (cleaner.isEnabled() && cleaner.isSdCardAvailable()) {
+                        cleaner.ensureReservedSpace();
+                    }
+                } catch (Exception e) {
+                    logWarn("Pre-recording CDR cleanup failed: " + e.getMessage());
+                }
+                return true;
             }
             initSdCardDirectories();
             updateActiveDirectories();
@@ -1445,6 +1708,11 @@ public class StorageManager {
                     updateActiveDirectories();
                     return true;
                 }
+                // Symmetric to the SD branch above — index notification is
+                // centralized in the ensureVolumeMounted wrapper.
+                initUsbDirectories();
+                updateActiveDirectories();
+                return true;
             }
             initUsbDirectories();
             updateActiveDirectories();
@@ -1665,9 +1933,45 @@ public class StorageManager {
         // interleave with another pass into a torn commit. Reentrant: reached both
         // directly and from inside ensureVolumeMountedLocked (already holding the
         // lock) — Java intrinsic locks are reentrant, so both paths are safe.
-        synchronized (mountLock) {
-            discoverVolumesLocked();
+        boolean sdBeforeLive, usbBeforeLive;
+        String sdPathBefore, usbPathBefore;
+        // Bounded + interruptible acquisition — see ensureVolumeMounted.
+        // Discovery is a refresh, not a mutation request: if someone else
+        // holds the lock they are ALREADY refreshing state, so skipping this
+        // pass loses nothing.
+        boolean lockHeld = false;
+        try {
+            lockHeld = mountLock.tryLock(
+                DISCOVERY_LOCK_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logWarn("discoverVolumes: interrupted while waiting for mountLock — skipping pass");
+            return;
         }
+        if (!lockHeld) {
+            logWarn("discoverVolumes: mountLock not acquired within "
+                + DISCOVERY_LOCK_ACQUIRE_TIMEOUT_MS + "ms (mount/discovery in progress)"
+                + " — skipping pass, state will be fresh from the current holder");
+            return;
+        }
+        try {
+            // Live pre-pass accessibility — same stale-true rationale as the
+            // ensureVolumeMounted wrapper (a system-side remount picked up by
+            // discovery must register as a recovery even when the cached flag
+            // never went false).
+            sdPathBefore = sdCardPath;
+            usbPathBefore = usbPath;
+            sdBeforeLive = sdCardAvailable && sdCardPath != null && isPathLikelyMounted(sdCardPath);
+            usbBeforeLive = usbAvailable && usbPath != null && isPathLikelyMounted(usbPath);
+            discoverVolumesLocked();
+        } finally {
+            mountLock.unlock();
+        }
+        // Discovery-only entrants (API refresh, refreshSdCard, system-side
+        // remount pickup) can ALSO flip availability — same centralized
+        // transition notify as ensureVolumeMounted, outside the lock.
+        notifyIfVolumeCameOnline(sdBeforeLive, usbBeforeLive, sdPathBefore, usbPathBefore,
+            "discoverVolumes");
     }
 
     private void discoverVolumesLocked() {
@@ -1694,12 +1998,21 @@ public class StorageManager {
         java.util.List<String[]> ambiguousMounts = new java.util.ArrayList<>();
 
         // Method 1: sm list-volumes all
+        // Conclusive = the drain reached EOF AND sm exited 0. An incomplete
+        // or failed enumeration can only prove PRESENCE (rows we did see),
+        // never ABSENCE — the commit block below uses this flag to retain
+        // previous state instead of clearing it on an inconclusive pass.
+        boolean smEnumerationConclusive = false;
         try {
+            // Bounded drain — see readProcessLinesBounded. This runs under
+            // mountLock; an sm that hangs without closing its pipe used to
+            // block the whole mount/discovery path on a bare readLine().
             Process listProcess = Runtime.getRuntime().exec(new String[]{"sm", "list-volumes", "all"});
-            BufferedReader reader = new BufferedReader(new InputStreamReader(listProcess.getInputStream()));
-            String line;
+            ProcessLines smList = readProcessLinesBounded(
+                listProcess, false, 4_000, "sm list-volumes (discoverVolumes)");
+            smEnumerationConclusive = smList.complete && smList.exitCode == 0;
 
-            while ((line = reader.readLine()) != null) {
+            for (String line : smList.lines) {
                 // Parse lines like: "public:8,97 mounted 3661-3064"
                 line = line.trim();
                 if (!line.startsWith("public:") || !line.contains("mounted")) continue;
@@ -1739,8 +2052,6 @@ public class StorageManager {
                 }
                 // Keep iterating — both kinds may be present.
             }
-            reader.close();
-            waitForBounded(listProcess, 2_000, "sm list-volumes (discoverVolumes)");
         } catch (Exception e) {
             logDebug("Could not check sm list-volumes: " + e.getMessage());
         }
@@ -1916,6 +2227,30 @@ public class StorageManager {
             }
         }
 
+        // INCONCLUSIVE-ENUMERATION retention (audit: incomplete sm output
+        // must not clear valid state). The staging protects a found volume
+        // from a later transient failure, but a volume NOT found this pass
+        // still gets committed as gone — correct when the enumeration was
+        // conclusive (card really pulled), wrong when `sm` timed out or
+        // exited non-zero and Methods 2/3/4 happened to miss too. Retain the
+        // previous state in that case, but ONLY if the old path still proves
+        // live via the bounded StatFs probe — a genuinely pulled card fails
+        // the probe and clears exactly as before, regardless of sm's exit.
+        if (!foundSdAvail && sdCardAvailable && !smEnumerationConclusive
+                && sdCardPath != null && isPathLikelyMounted(sdCardPath)) {
+            foundSdPath = sdCardPath;
+            foundSdAvail = true;
+            logWarn("discoverVolumes: sm enumeration inconclusive and SD not re-found — "
+                + "retaining previous live state at " + sdCardPath);
+        }
+        if (!foundUsbAvail && usbAvailable && !smEnumerationConclusive
+                && usbPath != null && isPathLikelyMounted(usbPath)) {
+            foundUsbPath = usbPath;
+            foundUsbAvail = true;
+            logWarn("discoverVolumes: sm enumeration inconclusive and USB not re-found — "
+                + "retaining previous live state at " + usbPath);
+        }
+
         // Commit results atomically. Volumes that disappeared since the last
         // detection do go from non-null → null here; that's correct behavior
         // (the card was actually pulled). What we avoid is the transient-
@@ -1931,22 +2266,267 @@ public class StorageManager {
 
         if (!sdCardAvailable) logDebug("No writable SD card found");
         if (!usbAvailable) logDebug("No writable USB drive found");
+
+        // Shadow-mode framework classifier — log-only, never alters the
+        // verdict committed above. Hands the cascade verdict to a
+        // SINGLE-FLIGHT background worker: the getVolumes() Binder call is
+        // unbounded and this method runs under mountLock (including
+        // synchronously in the constructor), so the enumeration must never
+        // execute inline here. See logShadowVolumeClassification.
+        logShadowVolumeClassification(foundSdPath, foundUsbPath);
     }
+
+    // ============= Shadow-mode framework volume classifier =============
+    // (audit: SD-outage review, recommendation 1 — land shadow-mode first.)
+    //
+    // Reads the platform's OWN volume classification via reflection:
+    //   android.os.storage.StorageManager.getVolumes()
+    //     → VolumeInfo (TYPE_PUBLIC=0, STATE_MOUNTED=2)
+    //     → getDisk() → DiskInfo.isSd() / isUsb()
+    // DiskInfo's flags are set by vold from the real sysfs topology — the
+    // single discriminator this class's 3-signal cascade + Method 4/4b +
+    // learned-uuid file exist to approximate, and the same source BYD's own
+    // sentry recorder (com.byd.sentrymode) trusts. It classifies the
+    // SCSI/USB-bridged SD reader (major 8, DEVNAME=sd*) correctly by
+    // construction.
+    //
+    // This is STRICTLY an observer: it logs the framework verdict next to the
+    // shell-cascade verdict committed by discoverVolumesLocked, so one drive
+    // cycle of logs shows whether they agree — the promotion decision to make
+    // it the primary detector happens only after that evidence, never here.
+    // Also logs the two vendor presence props (sys.byd.isSDExist /
+    // sys.byd.isUSBExist) for the same evidence trail. NOTE deliberately NOT
+    // used as a gate: on the affected fleet isSDExist reads 'false' for a
+    // seated bridged card during the ACC-OFF rail collapse (see
+    // AccSentryDaemon's reactive SD-rail recovery), which is exactly the
+    // window where detection must still run.
+    //
+    // Hidden-API: getVolumes/VolumeInfo/DiskInfo are @hide. bypass() rides
+    // the existing HiddenApiBypass (already used by CarPropertyBridge /
+    // AutoServiceBridge in this process). Every reflective step is inside a
+    // catch-all; on any failure the shadow log degrades to a single debug
+    // line and the real detector is untouched.
+
+    // Rate limit + change detection for the shadow log: full verdict at most
+    // once per minute, but ALWAYS when it changed (agreement flips are the
+    // interesting events).
+    private static final long SHADOW_CLASSIFY_INTERVAL_MS = 60_000L;
+    private volatile long lastShadowClassifyAtMs = 0;
+    private volatile String lastShadowVerdict = null;
+    // Single-flight latch (audit: shadow detection is not zero-risk). The
+    // getVolumes() Binder call is unbounded; if it wedges, the latch stays
+    // held and NO further worker threads spawn — discovery keeps running
+    // untouched, we just stop producing shadow logs until it returns.
+    private final java.util.concurrent.atomic.AtomicBoolean shadowClassifyInFlight =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Fire-and-forget dispatcher — safe to call under mountLock. */
+    private void logShadowVolumeClassification(String cascadeSdPath, String cascadeUsbPath) {
+        if (!shadowClassifyInFlight.compareAndSet(false, true)) return;
+        try {
+            Thread t = new Thread(() -> {
+                try {
+                    shadowClassifyWorker(cascadeSdPath, cascadeUsbPath);
+                } catch (Throwable th) {
+                    logDebug("shadow-classify unavailable: " + th.getMessage());
+                } finally {
+                    shadowClassifyInFlight.set(false);
+                }
+            }, "ShadowVolClassify");
+            t.setDaemon(true);
+            t.start();
+        } catch (Throwable spawnFailure) {
+            shadowClassifyInFlight.set(false);
+        }
+    }
+
+    private void shadowClassifyWorker(String cascadeSdPath, String cascadeUsbPath) {
+        try {
+            long now = System.currentTimeMillis();
+            android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            if (ctx == null) return;  // UI process / early boot — no shadow data.
+
+            try { com.overdrive.app.shell.HiddenApiBypass.INSTANCE.bypass(); }
+            catch (Throwable ignored) {}
+
+            Object smSvc = ctx.getSystemService(android.content.Context.STORAGE_SERVICE);
+            if (smSvc == null) return;
+            java.util.List<?> volumes = (java.util.List<?>)
+                    smSvc.getClass().getMethod("getVolumes").invoke(smSvc);
+            if (volumes == null) return;
+
+            String fwSdPath = null;
+            String fwUsbPath = null;
+            // Classification independent of mount state (audit: unmounted SD
+            // produced a false "agree"): an UNMOUNTED SD volume leaves
+            // fwSdPath null, and a cascade that also found nothing compared
+            // null == null as agreement — masking exactly the ACC-OFF
+            // unmount window the shadow test exists to observe. Track "the
+            // framework sees an SD/USB-classified volume AT ALL" (any state)
+            // separately from "…and it is mounted at this path".
+            String fwSdAnyId = null;   // volume id of an SD-disk volume in ANY state
+            String fwUsbAnyId = null;
+            StringBuilder rows = new StringBuilder();
+            for (Object vi : volumes) {
+                int type = (Integer) vi.getClass().getMethod("getType").invoke(vi);
+                if (type != 0) continue;  // TYPE_PUBLIC only
+                int state = (Integer) vi.getClass().getMethod("getState").invoke(vi);
+                // getId() is the "public:M,N" handle `sm mount` needs, and
+                // getFsUuid() survives while the volume is UNMOUNTED (when
+                // getPath() is null) — both are logged for every public row
+                // so the evidence trail covers the unmounted/ejected states,
+                // not just the happy path.
+                String id = String.valueOf(vi.getClass().getMethod("getId").invoke(vi));
+                Object fsUuidObj = vi.getClass().getMethod("getFsUuid").invoke(vi);
+                String fsUuid = fsUuidObj != null ? String.valueOf(fsUuidObj) : null;
+                Object pathObj = vi.getClass().getMethod("getPath").invoke(vi);
+                String path = pathObj != null ? String.valueOf(pathObj) : null;
+                Object disk = vi.getClass().getMethod("getDisk").invoke(vi);
+                boolean fwIsSd = disk != null
+                        && (Boolean) disk.getClass().getMethod("isSd").invoke(disk);
+                boolean fwIsUsb = disk != null
+                        && (Boolean) disk.getClass().getMethod("isUsb").invoke(disk);
+                rows.append(" [").append(id).append(" state=").append(state)
+                        .append(disk == null ? " disk=null" : (fwIsSd ? " SD" : (fwIsUsb ? " USB" : " ?")))
+                        .append(" fsUuid=").append(fsUuid)
+                        .append(" path=").append(path).append(']');
+                if (fwIsSd && fwSdAnyId == null) fwSdAnyId = id + "@state" + state;
+                if (fwIsUsb && fwUsbAnyId == null) fwUsbAnyId = id + "@state" + state;
+                if (state == 2 && path != null) {  // STATE_MOUNTED
+                    if (fwIsSd && fwSdPath == null) fwSdPath = path;
+                    else if (fwIsUsb && fwUsbPath == null) fwUsbPath = path;
+                }
+            }
+
+            String sdExist = getSystemProperty("sys.byd.isSDExist");
+            String usbExist = getSystemProperty("sys.byd.isUSBExist");
+            String sdCompare = compareShadowVerdict(fwSdPath, fwSdAnyId, cascadeSdPath);
+            String usbCompare = compareShadowVerdict(fwUsbPath, fwUsbAnyId, cascadeUsbPath);
+            boolean anyDisagree = sdCompare.startsWith("DIS") || usbCompare.startsWith("DIS");
+            String verdict = "shadow-classify:"
+                    + " fwSd=" + fwSdPath + " fwSdAny=" + fwSdAnyId
+                    + " cascadeSd=" + cascadeSdPath + " (" + sdCompare + ")"
+                    + " | fwUsb=" + fwUsbPath + " fwUsbAny=" + fwUsbAnyId
+                    + " cascadeUsb=" + cascadeUsbPath + " (" + usbCompare + ")"
+                    + " | isSDExist=" + sdExist + " isUSBExist=" + usbExist
+                    + " | volumes:" + rows;
+
+            boolean changed = !verdict.equals(lastShadowVerdict);
+            if (changed || (now - lastShadowClassifyAtMs) >= SHADOW_CLASSIFY_INTERVAL_MS) {
+                if (anyDisagree) logWarn(verdict);
+                else logInfo(verdict);
+                lastShadowVerdict = verdict;
+                lastShadowClassifyAtMs = now;
+            }
+        } catch (Throwable t) {
+            logDebug("shadow-classify unavailable: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Three-state comparison of framework vs cascade for one volume class:
+     * "agree" only when both produced the same affirmative answer or both
+     * saw NO volume of the class at all; "inconclusive-unmounted" when the
+     * framework sees a volume of the class in a non-mounted state and the
+     * cascade found nothing (null == null here is NOT agreement — the
+     * classifiers were never actually tested against each other);
+     * "DISAGREE-*" otherwise.
+     */
+    private static String compareShadowVerdict(String fwMountedPath, String fwAnyId, String cascadePath) {
+        if (fwMountedPath != null && fwMountedPath.equals(cascadePath)) return "agree";
+        if (fwMountedPath == null && cascadePath == null) {
+            return fwAnyId == null ? "agree-absent" : "inconclusive-unmounted";
+        }
+        if (fwMountedPath == null) return "DISAGREE-cascade-only";
+        if (cascadePath == null) return "DISAGREE-fw-only";
+        return "DISAGREE-different-paths";
+    }
+
+    // Budget for a single isPathLikelyMounted probe. A healthy mount answers
+    // stat/statfs in microseconds; only a wedged FUSE volume takes longer, and
+    // for that case "not mounted" is the correct verdict anyway.
+    private static final long PATH_MOUNT_PROBE_TIMEOUT_MS = 2_000L;
+
+    // Circuit breaker for wedged paths (audit: timed-out probes leak
+    // threads). A probe thread blocked in the kernel is uninterruptible;
+    // spawning a fresh one per call (watchdog tick + several per discovery
+    // pass) accumulates an unbounded pile of stuck threads against the same
+    // dead volume. After a timeout the path is marked wedged for this window
+    // and probes short-circuit to false; additionally at most ONE probe
+    // thread may be outstanding per path — while it's stuck, callers get an
+    // immediate false instead of a sibling thread.
+    private static final long PATH_PROBE_CIRCUIT_OPEN_MS = 60_000L;
+    private final java.util.concurrent.ConcurrentHashMap<String, Thread> pathProbeInFlight =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> pathProbeWedgedUntilMs =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Cheap mount-liveness check for any path. Same layered logic as
      * {@link #isSdCardLikelyMounted} but for arbitrary mount points.
-     * StatFs + canWrite, no shell fork. */
+     * StatFs + canWrite, no shell fork.
+     *
+     * <p>FIX (audit: SD-outage review): every syscall in this probe —
+     * exists(), isDirectory(), the StatFs constructor, canWrite() — can block
+     * INDEFINITELY in the kernel on a wedged FUSE-bridged SD/USB volume, and
+     * this method is called from ensureVolumeMounted while holding mountLock.
+     * A single stuck probe then wedges the entire mount/discovery path (the
+     * 15s watchdog, ACC remounts, storage-type changes all serialize on
+     * mountLock). Run the probe on a bounded daemon thread instead — same
+     * idiom as GpuSurveillancePipeline.ensureStorageReadyBounded. On timeout
+     * the volume is treated as not mounted (correct: a mount that can't
+     * answer statfs in {@link #PATH_MOUNT_PROBE_TIMEOUT_MS} isn't usable),
+     * and the abandoned probe thread holds no locks, so it is harmless and
+     * reaped when the volume recovers. */
     private boolean isPathLikelyMounted(String path) {
         if (path == null) return false;
-        File d = new File(path);
-        if (!d.exists() || !d.isDirectory()) return false;
+        long now = System.currentTimeMillis();
+
+        // Circuit open? Short-circuit without touching the filesystem.
+        Long wedgedUntil = pathProbeWedgedUntilMs.get(path);
+        if (wedgedUntil != null) {
+            if (now < wedgedUntil) return false;
+            pathProbeWedgedUntilMs.remove(path, wedgedUntil);
+        }
+
+        // Previous probe for this path still stuck in the kernel? Don't add
+        // a sibling — report unmounted until it either completes or the
+        // volume recovers. (Benign race: two callers can both pass this
+        // check and spawn twice; the count is bounded by concurrent callers,
+        // not by time, which is what matters for the leak.)
+        Thread prior = pathProbeInFlight.get(path);
+        if (prior != null && prior.isAlive()) return false;
+
+        final boolean[] ok = {false};
+        Thread probe = new Thread(() -> {
+            try {
+                File d = new File(path);
+                if (!d.exists() || !d.isDirectory()) return;
+                android.os.StatFs s = new android.os.StatFs(path);
+                if (s.getTotalBytes() <= 0) return;
+                ok[0] = d.canWrite();
+            } catch (Throwable ignored) {
+                // ok stays false
+            } finally {
+                pathProbeInFlight.remove(path, Thread.currentThread());
+            }
+        }, "PathMountProbe");
+        probe.setDaemon(true);
+        pathProbeInFlight.put(path, probe);
+        probe.start();
         try {
-            android.os.StatFs s = new android.os.StatFs(path);
-            if (s.getTotalBytes() <= 0) return false;
-        } catch (Throwable t) {
+            probe.join(PATH_MOUNT_PROBE_TIMEOUT_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             return false;
         }
-        return d.canWrite();
+        if (probe.isAlive()) {
+            pathProbeWedgedUntilMs.put(path, now + PATH_PROBE_CIRCUIT_OPEN_MS);
+            logWarn("isPathLikelyMounted(" + path + "): probe exceeded "
+                + PATH_MOUNT_PROBE_TIMEOUT_MS + "ms (volume likely wedged) — treating as"
+                + " unmounted and opening circuit for " + (PATH_PROBE_CIRCUIT_OPEN_MS / 1000) + "s");
+            return false;
+        }
+        return ok[0];
     }
     
     /**
@@ -2073,7 +2653,8 @@ public class StorageManager {
         // null the derived dirs — leaving the recorder pointed at internal even
         // after the card is back. Serializing here keeps the derived dirs coherent
         // with the same critical section that commits their source-of-truth pair.
-        synchronized (mountLock) {
+        mountLock.lock();
+        try {
             if (!sdCardAvailable || sdCardPath == null) {
                 sdCardRecordingsDir = null;
                 sdCardSurveillanceDir = null;
@@ -2088,6 +2669,8 @@ public class StorageManager {
                 sdCardProximityDir    = dirs[2];
                 sdCardTripsDir        = dirs[3];
             }
+        } finally {
+            mountLock.unlock();
         }
     }
 
@@ -2098,7 +2681,8 @@ public class StorageManager {
         // Under mountLock — same rationale as initSdCardDirectories (keep the
         // derived usb*Dir fields coherent with the locked (usbAvailable, usbPath)
         // commit; reentrant for the in-lock callers).
-        synchronized (mountLock) {
+        mountLock.lock();
+        try {
             if (!usbAvailable || usbPath == null) {
                 usbRecordingsDir = null;
                 usbSurveillanceDir = null;
@@ -2113,15 +2697,53 @@ public class StorageManager {
                 usbProximityDir    = dirs[2];
                 usbTripsDir        = dirs[3];
             }
+        } finally {
+            mountLock.unlock();
         }
     }
+
+    // Budget for the whole mkdirs+chmod walk of one volume's directory tree.
+    // Healthy mounts finish in single-digit milliseconds; only a wedged FUSE
+    // bridge blocks, and for that case giving up (keep previous dir fields,
+    // watchdog retries) beats holding mountLock indefinitely.
+    private static final long VOLUME_DIR_INIT_TIMEOUT_MS = 5_000L;
 
     /**
      * Build {@code <volumePath>/Overdrive/{recordings,surveillance,proximity,trips}}
      * with world rwx so the app UID can read them. Returns the four dirs in
-     * order, or null if the base couldn't be created.
+     * order, or null if the base couldn't be created — or if the walk didn't
+     * finish within {@link #VOLUME_DIR_INIT_TIMEOUT_MS}.
+     *
+     * <p>FIX (audit: FUSE wedge under mountLock): every mkdirs / setReadable /
+     * exists here is an uninterruptible kernel call on the target volume, and
+     * both callers hold {@code mountLock}. Bounded-join idiom: the worker does
+     * ONLY filesystem work and hands back the computed dirs; the caller (still
+     * under the lock) commits fields only on an in-time result. A timed-out
+     * worker holds no locks — if it eventually finishes, it created some
+     * directories (idempotent, harmless) and its result is discarded.
      */
     private File[] initVolumeDirectories(String volumePath, String label) {
+        final File[][] result = new File[1][];
+        Thread worker = new Thread(() -> {
+            result[0] = initVolumeDirectoriesUnbounded(volumePath, label);
+        }, "VolumeDirInit-" + label.replace(' ', '_'));
+        worker.setDaemon(true);
+        worker.start();
+        try {
+            worker.join(VOLUME_DIR_INIT_TIMEOUT_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+        if (worker.isAlive()) {
+            logWarn("initVolumeDirectories(" + label + "): directory walk exceeded "
+                + VOLUME_DIR_INIT_TIMEOUT_MS + "ms (volume likely wedged) — keeping previous dirs");
+            return null;
+        }
+        return result[0];
+    }
+
+    private File[] initVolumeDirectoriesUnbounded(String volumePath, String label) {
         File base = new File(volumePath, "Overdrive");
         boolean baseCreated = base.mkdirs();
         if (!base.exists()) {
@@ -2947,8 +3569,13 @@ public class StorageManager {
         return surveillanceLimitMb;
     }
 
+    /**
+     * The cap proximity clips are actually reaped against — the recordings limit,
+     * which their bytes share. Returns the ENFORCED number, not the legacy
+     * {@code proximityLimitMb} field, which nothing enforces any more.
+     */
     public long getProximityLimitMb() {
-        return proximityLimitMb;
+        return recordingsLimitMb;
     }
 
     public long getTripsLimitMb() {
@@ -2993,10 +3620,17 @@ public class StorageManager {
         }
     }
 
+    /**
+     * Retained so an existing {@code proximityLimitMb} in the config round-trips, but
+     * the value is NOT enforced: proximity is reaped against the recordings cap. Set
+     * that instead via {@link #setRecordingsLimitMb}.
+     */
     public void setProximityLimitMb(long limitMb) {
         synchronized (configChangeLock) {
             proximityLimitMb = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(recordingsStorageType), limitMb));  // proximity follows recordings (ACC-ON) volume
             saveConfig();
+            logInfo("setProximityLimitMb(" + limitMb + "): stored but NOT enforced —"
+                + " proximity shares the recordings cap (" + recordingsLimitMb + " MB)");
         }
     }
 
@@ -3051,6 +3685,25 @@ public class StorageManager {
     public StorageType getActiveTripsStorageType() {
         return normalizeStorageType(tripsStorageType);
     }
+
+    /**
+     * Recovery callers use this to keep removable-volume reconciliation
+     * retryable across the asynchronous startup/remount window.
+     */
+    public boolean isConfiguredTripsVolumeUnavailable() {
+        StorageType configured = tripsStorageType;
+        if (configured == StorageType.SD_CARD) {
+            return !sdCardAvailable
+                    || sdCardTripsDir == null
+                    || !isSdCardLikelyMounted();
+        }
+        if (configured == StorageType.USB) {
+            return !usbAvailable
+                    || usbTripsDir == null
+                    || !isUsbLikelyMounted();
+        }
+        return false;
+    }
     
     /**
      * Set recordings storage type (INTERNAL or SD_CARD).
@@ -3073,7 +3726,8 @@ public class StorageManager {
         // (mountLock → configChangeLock) so those two can't deadlock. Both locks
         // are reentrant, so the nested ensureVolumeMounted re-acquires mountLock
         // harmlessly.
-        synchronized (mountLock) {
+        mountLock.lock();  // lock order mountLock -> configChangeLock
+        try {
         synchronized (configChangeLock) {
         if (!ensureExternalAvailable(type, "recordings")) return false;
 
@@ -3106,7 +3760,12 @@ public class StorageManager {
             // the card. volumeCeilingMb(liveTotal) is exactly the transform
             // getEffectiveMaxLimitMb applies for a positive total (mirrors the
             // converged reclampCeilingMb path).
-            recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(volumeCeilingMb(liveTotal), recordingsLimitMb));
+            long ceilingMb = volumeCeilingMb(liveTotal);
+            recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(ceilingMb, recordingsLimitMb));
+            // Proximity follows THIS volume (see configuredTypeForCategory), so it
+            // clamps here — the surveillance setter used to do it against the wrong
+            // volume's ceiling while this one skipped it entirely.
+            proximityLimitMb  = Math.max(MIN_LIMIT_MB, Math.min(ceilingMb, proximityLimitMb));
         }
         updateActiveDirectories();
         saveConfig();
@@ -3227,7 +3886,7 @@ public class StorageManager {
         }
         return true;
         } // end synchronized(configChangeLock) — FIX audit R8 LOW
-        } // end synchronized(mountLock) — lock order mountLock → configChangeLock
+        } finally { mountLock.unlock(); } // lock order mountLock -> configChangeLock
     }
 
     /**
@@ -3239,7 +3898,8 @@ public class StorageManager {
         // FIX (audit R8, LOW): peer setter — share configChangeLock with
         // setRecordingsStorageType / setTripsStorageType.
         // LOCK ORDER (mountLock → configChangeLock): see setRecordingsStorageType.
-        synchronized (mountLock) {
+        mountLock.lock();  // lock order mountLock -> configChangeLock
+        try {
         synchronized (configChangeLock) {
         if (!ensureExternalAvailable(type, "surveillance")) return false;
 
@@ -3255,7 +3915,13 @@ public class StorageManager {
             // internal's ~8GB ceiling (see setRecordingsStorageType).
             long ceilingMb = volumeCeilingMb(liveTotal);
             surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(ceilingMb, surveillanceLimitMb));
-            proximityLimitMb    = Math.max(MIN_LIMIT_MB, Math.min(ceilingMb, proximityLimitMb));
+            // NOT proximity: it rides RECORDINGS' volume (configuredTypeForCategory /
+            // activeTypeForCategory both map proximity → recordingsStorageType), so
+            // clamping it here shrank it to the ceiling of a volume it never writes to.
+            // Pointing surveillance at a small USB stick permanently cut proximity's
+            // limit on internal — and reclamp only ever grows back toward a ceiling,
+            // never restores the user's original number. Its own clamp lives in
+            // setRecordingsStorageType alongside recordingsLimitMb.
         }
         updateActiveDirectories();
         saveConfig();
@@ -3289,7 +3955,7 @@ public class StorageManager {
         }
         return true;
         } // end synchronized(configChangeLock) — FIX audit R8 LOW
-        } // end synchronized(mountLock) — lock order mountLock → configChangeLock
+        } finally { mountLock.unlock(); } // lock order mountLock -> configChangeLock
     }
 
     /**
@@ -3302,7 +3968,8 @@ public class StorageManager {
         // FIX (audit R8, LOW): peer setter — share configChangeLock with
         // setRecordingsStorageType / setSurveillanceStorageType.
         // LOCK ORDER (mountLock → configChangeLock): see setRecordingsStorageType.
-        synchronized (mountLock) {
+        mountLock.lock();  // lock order mountLock -> configChangeLock
+        try {
         synchronized (configChangeLock) {
         if (!ensureExternalAvailable(type, "trips")) return false;
 
@@ -3341,7 +4008,7 @@ public class StorageManager {
         }
         return true;
         } // end synchronized(configChangeLock) — FIX audit R8 LOW
-        } // end synchronized(mountLock) — lock order mountLock → configChangeLock
+        } finally { mountLock.unlock(); } // lock order mountLock -> configChangeLock
     }
 
     /**
@@ -3552,25 +4219,6 @@ public class StorageManager {
         return getAllDirsForType(tripsDir, internalTripsDir, sdCardTripsDir, usbTripsDir);
     }
 
-    /** Active-first rank used only to resolve legacy filename-only requests. */
-    public int getRecordingRootRank(File file) {
-        if (file == null) return 100;
-        String path = file.getAbsolutePath();
-        List<File> roots = new ArrayList<>();
-        Set<String> seen = new HashSet<>();
-        for (List<File> category : java.util.Arrays.asList(
-                getAllRecordingsDirs(), getAllSurveillanceDirs(), getAllProximityDirs())) {
-            for (File root : category) {
-                if (root != null && seen.add(root.getAbsolutePath())) roots.add(root);
-            }
-        }
-        for (int rank = 0; rank < roots.size(); rank++) {
-            String root = roots.get(rank).getAbsolutePath();
-            if (path.equals(root) || path.startsWith(root + File.separator)) return rank;
-        }
-        return 100;
-    }
-
     /**
      * Bounded directory listing for callers (e.g. trip recovery) that walk a
      * possibly-FUSE-bridged SD/USB trips dir. Runs the in-process
@@ -3618,8 +4266,17 @@ public class StorageManager {
      */
     private List<File> getReapableDirs(String category) {
         switch (category) {
-            case "recordings":
-                return new ArrayList<>(getAllRecordingsDirs());
+            case "recordings": {
+                // Proximity shares the recordings limit, so its dirs join the
+                // recordings pool. proximity_ is an auxiliary anchor prefix, so
+                // the prefix gate still keeps cam_/dvr_/replay_/proximity_ in
+                // and every other category's files out.
+                List<File> dirs = new ArrayList<>(getAllRecordingsDirs());
+                for (File d : getAllProximityDirs()) {
+                    if (d != null && !containsPath(dirs, d)) dirs.add(d);
+                }
+                return dirs;
+            }
             case "surveillance":
                 return new ArrayList<>(getAllSurveillanceDirs());
             case "proximity":
@@ -3629,6 +4286,14 @@ public class StorageManager {
             default:
                 return new ArrayList<>();
         }
+    }
+
+    private static boolean containsPath(List<File> dirs, File candidate) {
+        String path = candidate.getAbsolutePath();
+        for (File d : dirs) {
+            if (d != null && d.getAbsolutePath().equals(path)) return true;
+        }
+        return false;
     }
 
     /**
@@ -3664,8 +4329,10 @@ public class StorageManager {
             // OEM Dashcam and manual replay clips share the recordings
             // directory with cam_*. The primary prefix gate is "cam", so both
             // dedicated prefixes need to be first-class anchors for size
-            // accounting and loop-recording cleanup.
-            case "recordings":   return new String[]{"dvr_", "replay_"};
+            // accounting and loop-recording cleanup. Proximity clips live in
+            // their own dir but follow the ACC-ON recordings volume, so they
+            // share the recordings pool and limit rather than a hidden cap.
+            case "recordings":   return new String[]{"dvr_", "replay_", "proximity_"};
             // Per-actor JPGs are named `thumb_<anchorStem>_a<id>_<rel>.jpg`,
             // where anchorStem already includes the `event_` prefix
             // (SurveillanceEngineGpu:4815-4824 derives tmpBase from the
@@ -4138,8 +4805,12 @@ public class StorageManager {
     // These let the single chokepoint in ensureSpace() resolve, for any category,
     // (a) the volume writes are CURRENTLY landing on, (b) the user's CONFIGURED
     // volume, and (c) the configured MB limit — without each of the ~16 reap call
-    // sites needing to know about fallback. Proximity rides SURVEILLANCE's storage
-    // type (see the proximity clamp sites) but keeps its own proximityLimitMb.
+    // sites needing to know about fallback. Proximity rides RECORDINGS' storage type
+    // AND its MB limit (it is an ACC-ON capture, like the dashcam), so its clips are
+    // accounted and reaped inside the recordings pool rather than a separate budget.
+    // This comment used to say SURVEILLANCE, which contradicted the two resolvers
+    // directly below it and matched a clamp in setSurveillanceStorageType that was
+    // shrinking proximity against the wrong volume's ceiling.
 
     private StorageType activeTypeForCategory(String category) {
         switch (category) {
@@ -4165,7 +4836,9 @@ public class StorageManager {
         switch (category) {
             case "recordings":   return recordingsLimitMb;
             case "surveillance": return surveillanceLimitMb;
-            case "proximity":    return proximityLimitMb;
+            // Proximity bytes are accounted inside the recordings pool, so it
+            // reports the recordings cap rather than a second hidden budget.
+            case "proximity":    return recordingsLimitMb;
             case "trips":        return tripsLimitMb;
             default:             return DEFAULT_RECORDINGS_LIMIT_MB;
         }
@@ -4290,6 +4963,472 @@ public class StorageManager {
      */
     public long getMaxLimitMb(StorageType type) {
         return getEffectiveMaxLimitMb(type);
+    }
+
+    // ==================== Combined-Limit Budget (overcommit advisory) ====================
+    //
+    // Every category's slider tops out at the FULL volume (the per-category /N share
+    // was removed 2026-06 — see the note where PER_CATEGORY_SHARE used to live), and
+    // each category picks its volume independently. So Σ(limits landing on one volume)
+    // can exceed that volume's capacity, and nothing told the user. Runtime stays safe
+    // (each category reaps to its own cap; runPhysicalFreeSpaceEmergencyReap cross-evicts
+    // below PHYSICAL_FREE_EMERGENCY_FLOOR_BYTES) but the configured retention silently
+    // stops being honoured — surfacing as "recordings on internal even though SD is
+    // configured" + "cleanup never frees space". This computes the advisory so the UI
+    // can warn BEFORE that happens. Advisory only: never clamps, never blocks a save.
+    //
+    // Grouped by the CONFIGURED volume, not the active one: the warning is about the
+    // user's configuration, and a transient unmount shouldn't retarget the message at
+    // internal (that would make the banner flap with the card).
+    /**
+     * How stale a trips size may be when it's only feeding the overcommit ADVISORY.
+     * Comfortably above the ~10s UI poll so the lock-free read in {@link #peekTripsBytes}
+     * actually hits — a 5s window (the reaper's own TTL) expired before every poll and
+     * put a DB round-trip plus {@code StorageManager.this} on the HTTP path each time.
+     * Enforcement never reads through this; only the banner does.
+     */
+    private static final long ADVISORY_TRIPS_SIZE_MAX_AGE_MS = 30_000;
+
+    /**
+     * Categories that consume a per-category MB budget on a volume. Proximity is
+     * absent on purpose: its bytes are accounted inside the recordings pool, so
+     * listing it here would bill the same cap twice in the overcommit advisory.
+     */
+    private static final String[] BUDGETED_CATEGORIES =
+        { "recordings", "surveillance", "trips" };
+
+    /**
+     * Categories with no storage-type picker of their own that follow another
+     * category's volume: {@code {follower, leader}} pairs. Proximity has no UI at all
+     * (see {@link #setProximityLimitMb}) and rides recordings' ACC-ON volume, so
+     * repointing recordings silently moves proximity's budget too. Published in the
+     * advisory payload so the UI can account for the coupling instead of hardcoding
+     * a policy that lives here.
+     */
+    private static final String[][] CATEGORY_FOLLOWS = { { "proximity", "recordings" } };
+
+    /**
+     * Combined-limit budget for one volume: how much retention the user has
+     * configured to land there versus what the volume can actually hold.
+     *
+     * <p>Two ceilings, because they answer different questions:
+     * <ul>
+     *   <li>{@code usableMb} — the volume's full capacity minus
+     *       {@link #VOLUME_HEADROOM_MB}. Exceeding it means the configuration is
+     *       impossible on ANY empty card of this size.
+     *   <li>{@code reachableMb} — usable minus whatever foreign data already sits on
+     *       the volume (BYD's own CDR dashcam files, other apps, user media). Exceeding
+     *       this means the configuration is impossible on THIS card as it is right now,
+     *       which is the case users actually hit. Derived from free space rather than a
+     *       directory walk so it costs two StatFs reads, not a FUSE tree scan.
+     * </ul>
+     *
+     * <p>{@code ourUsedMb} comes from the TTL-cached WHOLE-POOL category sizes, which
+     * span every volume a category has files on (the inactive mirror + legacy paths).
+     * For a category with a stale cross-volume mirror that slightly overstates what
+     * sits on this volume, so {@code reachableMb} reads slightly high and the advisory
+     * under-warns. That is the correct direction to be wrong in for a non-blocking
+     * hint — a false "you're fine" costs a late reap, a false alarm costs trust — and
+     * it keeps this off the uncached-walk path the reaper owns.
+     */
+    public static class VolumeBudget {
+        public StorageType type;
+        /** Σ configured limits (MB) of categories assigned to this volume. */
+        public long configuredMb;
+        /** Σ configured limits (MB) of only those categories whose CURRENT byte usage
+         *  is known (see {@link #measureVolumeUsage}). Equals {@code configuredMb}
+         *  once every category on the volume has a measured size. {@code overReachable}
+         *  compares THIS against {@code reachableMb} so both sides of that inequality
+         *  cover the same category set; {@code overCapacity} uses the full sum. */
+        public long measuredConfiguredMb;
+        /** Volume total − VOLUME_HEADROOM_MB, in MB. 0 when unreadable/unmounted. */
+        public long usableMb;
+        /** usableMb − foreign bytes already on the volume. Floored at 0. */
+        public long reachableMb;
+        /** Live free space (MB). 0 when unreadable/unmounted. */
+        public long freeMb;
+        /** Bytes our own categories currently occupy on this volume, in MB. */
+        public long ourUsedMb;
+        /** True when the volume is mounted and StatFs returned a positive total. */
+        public boolean measurable;
+        /** True when the volume's SIZE is known and its ceiling is a real derived value —
+         *  the only fact {@code overCapacity} needs. Distinct from {@code measurable},
+         *  which additionally requires a trustworthy free-space reading: a 100%-full card
+         *  reports 0 free, and gating the size-based claim on that silenced it for exactly
+         *  the user investigating why cleanup never frees space. */
+        public boolean capacityKnown;
+        /** configuredMb > usableMb — impossible on a card of this size, empty or not. */
+        public boolean overCapacity;
+        /** configuredMb > reachableMb — impossible given what's already on this card. */
+        public boolean overReachable;
+        /** Category keys contributing to configuredMb, in BUDGETED_CATEGORIES order. */
+        public final List<String> categories = new ArrayList<>();
+        /** The subset of {@link #categories} whose current byte usage is KNOWN, i.e. the
+         *  ones summed into {@link #measuredConfiguredMb} and {@link #ourUsedMb}.
+         *  Published explicitly because a client cannot infer it: measurability depends
+         *  on cache presence, not on anything else in this payload. A client adjusting
+         *  the sums for an unsaved slider must only move the measured sum when its own
+         *  category is in here, or it compares a demand figure against a supply figure
+         *  that never included that category's bytes. */
+        public final List<String> measuredCategories = new ArrayList<>();
+        /** Per-category configured limit (MB), parallel to {@link #categories}. Lets a
+         *  client recompute the sum with an unsaved slider value substituted for its own
+         *  category — without it, live feedback would have to guess the stored value it
+         *  is replacing (the page's own field is already mutated by the slider handler). */
+        public final List<Long> categoryLimitsMb = new ArrayList<>();
+    }
+
+    /**
+     * Compute the {@link VolumeBudget} for EVERY volume, including ones no category
+     * currently targets (those carry {@code configuredMb == 0} and an empty
+     * {@code categories} list). Untargeted volumes are included so the UI can evaluate
+     * a PENDING storage-type switch against the destination's real capacity before the
+     * user commits it; a client picking the entry for its own category must therefore
+     * skip empty ones rather than assume every entry has contributors.
+     *
+     * <p>Cost: two StatFs reads per targeted volume plus the TTL-cached category sizes
+     * (never an uncached walk) — safe to call on the /api/settings/storage poll path.
+     * Reads the limit fields under {@code configChangeLock} so the sum can't mix a
+     * pre-update and post-update value while a peer setter or
+     * {@link #reclampLimitsToMountedCeilings} is mid-write.
+     */
+    public List<VolumeBudget> computeVolumeBudgets() {
+        // Snapshot limits + types atomically; all StatFs/size work happens after the
+        // lock is dropped so we never hold the config monitor across volume I/O.
+        long[] limits = new long[BUDGETED_CATEGORIES.length];
+        StorageType[] types = new StorageType[BUDGETED_CATEGORIES.length];
+        synchronized (configChangeLock) {
+            for (int i = 0; i < BUDGETED_CATEGORIES.length; i++) {
+                limits[i] = configuredLimitMbForCategory(BUDGETED_CATEGORIES[i]);
+                types[i]  = configuredTypeForCategory(BUDGETED_CATEGORIES[i]);
+            }
+        }
+
+        List<VolumeBudget> out = new ArrayList<>(3);
+        for (StorageType type : StorageType.values()) {
+            // Emit an entry for EVERY volume, including ones no category currently
+            // targets (configuredMb 0). Omitting the untargeted ones starved the UI of
+            // capacity data for exactly the riskiest action: repointing a 100 GB limit
+            // onto a fresh ~8 GB internal volume produced no entry, so the client had
+            // nothing to compare against and stayed silent until one poll AFTER Apply.
+            VolumeBudget b = new VolumeBudget();
+            b.type = type;
+            for (int i = 0; i < BUDGETED_CATEGORIES.length; i++) {
+                if (types[i] != type) continue;
+                b.configuredMb += limits[i];
+                b.categories.add(BUDGETED_CATEGORIES[i]);
+                b.categoryLimitsMb.add(limits[i]);
+            }
+
+            // Availability FIRST, then the StatFs pair — mirrors getEffectiveMaxLimitMb's
+            // `sdCardAvailable ? getSdCardTotalSpace() : 0` gate. Probing an absent volume
+            // first widened the window in which total and free come from different mount
+            // epochs: a card pulled between them yields total>0 with free==0, and a 0 free
+            // drives reachableMb to 0 → a FALSE "impossible on this card" banner. A false
+            // alarm is the one direction this advisory must not err in.
+            boolean mounted = (type == StorageType.INTERNAL)
+                || (type == StorageType.SD_CARD ? sdCardAvailable : usbAvailable);
+            long totalBytes = mounted ? liveVolumeTotalBytes(type) : 0;
+            long freeBytes  = mounted ? volumeFreeBytes(type) : 0;
+            // TWO independent knowledge gates, because the two claims need different
+            // facts. overCapacity ("Σ limits exceed this card's size") is a pure
+            // configuration statement that needs ONLY the total; gating it on free space
+            // silenced it on a genuinely 100%-full FAT/exFAT card, where
+            // getAvailableBytes() legitimately returns 0 — exactly the user who is
+            // investigating why cleanup never frees space. overReachable additionally
+            // needs a trustworthy free reading: a 0 free on a positive total is either a
+            // full volume or a mid-pull tear between the two probes, and those are
+            // indistinguishable here, so that claim stays suppressed and the next poll
+            // (10s) decides.
+            //
+            // volumeCeilingMb floors at MIN_LIMIT_MB, so usableMb is FABRICATED until the
+            // volume exceeds headroom + that floor (a 300MB volume reports 100 usable when
+            // the truth is 44). Mirror the floor exactly; a fabricated ceiling can't
+            // support the over-capacity claim in either direction.
+            boolean ceilingIsReal =
+                ((totalBytes / 1024L / 1024L) - VOLUME_HEADROOM_MB) > MIN_LIMIT_MB;
+            b.capacityKnown = mounted && totalBytes > 0 && ceilingIsReal;
+            b.measurable    = mounted && totalBytes > 0 && freeBytes > 0;
+
+            if (mounted && totalBytes > 0) {
+                b.usableMb = volumeCeilingMb(totalBytes);
+                // overCapacity uses the FULL configured sum: it compares configuration
+                // against physical size and needs no usage measurement, so it stays exact
+                // for every category including the unmeasurable ones.
+                b.overCapacity = b.capacityKnown && b.configuredMb > b.usableMb;
+            }
+            if (b.measurable) {
+                b.freeMb = freeBytes / 1024L / 1024L;
+                // ONE measurability snapshot drives both sides — see measureVolumeUsage.
+                long[] usage =
+                    measureVolumeUsage(b.categories, b.categoryLimitsMb, b.measuredCategories);
+                b.ourUsedMb = usage[0] / 1024L / 1024L;
+                b.measuredConfiguredMb = usage[1];
+                // Reachable = what we could grow into: current free space plus what we
+                // already occupy (our own files are reclaimable by our own reaper), minus
+                // the ENOSPC headroom we must never consume. Foreign data is excluded by
+                // construction — it is neither free nor ours.
+                long reachable = b.freeMb + b.ourUsedMb - VOLUME_HEADROOM_MB;
+                b.reachableMb = Math.max(0, Math.min(reachable, b.usableMb));
+                b.overReachable = b.measuredConfiguredMb > b.reachableMb;
+            }
+            out.add(b);
+        }
+        return out;
+    }
+
+    /** Live free bytes for a volume; 0 when unreadable. Mirrors {@link #liveVolumeTotalBytes}. */
+    private long volumeFreeBytes(StorageType type) {
+        switch (type) {
+            case SD_CARD: return getSdCardFreeSpace();
+            case USB:     return getUsbFreeSpace();
+            case INTERNAL:
+            default:      return getInternalFreeSpace();
+        }
+    }
+
+    /**
+     * Fill both sides of the reachable comparison from ONE measurability snapshot.
+     *
+     * <p>MUST NOT trigger a directory walk. This runs on the HTTP thread serving
+     * /api/settings/storage, which the web UI polls every ~10s, and the public size
+     * getters can BLOCK:
+     * <ul>
+     *   <li>{@link #categoryStatCached}'s cold branch (no value yet for a category)
+     *       walks INLINE under a per-category gate. Nothing else in the codebase reads
+     *       {@code categorySizeCached("proximity")} and the boot primer only warms
+     *       recordings + surveillance, so proximity's entry is permanently cold —
+     *       every poll would have paid a full walk of every proximity dir. {@code
+     *       getDirectoriesTotalSize} uses bare {@code listFiles()} with no deadline,
+     *       and a flaky FUSE mount blocks inside native readdir indefinitely, so one
+     *       wedged walk would park every later poll on the gate and drain the HTTP pool.
+     *   <li>{@link #getTripsSize}'s fallback ({@code getTripsSizeWithCache}) is
+     *       {@code synchronized(this)} and walks while holding that monitor —
+     *       the same monitor {@link #saveConfig()} needs, which the storage-type
+     *       setters call from inside {@code mountLock → configChangeLock}. A
+     *       10-20 minute full-storage walk there convoys the mount path.
+     * </ul>
+     * So this reads only figures already available cheaply ({@link #peekCategoryBytes}),
+     * and a category whose bytes are UNKNOWN is dropped from BOTH sides — substituting 0
+     * for its bytes while still counting its limit produced a permanent false alarm. The
+     * reaper's uncached path ({@link #scopedSizeForCategory}) is deliberately untouched.
+     *
+     * <p>Reading the predicate twice (once for the bytes, once for the limits) let a
+     * concurrent cold walk publish a category's entry BETWEEN the two passes: the
+     * supply side would then exclude that category's bytes while the demand side
+     * included its limit, guaranteeing a spurious warning for that poll. Entries only
+     * ever go absent→present (nothing removes from the cache; markStale only backdates
+     * the timestamp), so the race is strictly one-way over-warn — but a single pass
+     * removes it for free.
+     *
+     * @return {@code {ourBytes, measuredConfiguredMb}}, and appends the measured
+     *         category keys to {@code outMeasured}.
+     */
+    private long[] measureVolumeUsage(List<String> categories, List<Long> limitsMb,
+                                      List<String> outMeasured) {
+        long ourBytes = 0;
+        long demandMb = 0;
+        for (int i = 0; i < categories.size(); i++) {
+            String category = categories.get(i);
+            long bytes = peekCategoryBytes(category);
+            if (bytes < 0) continue;                      // unmeasurable → drop from BOTH
+            ourBytes += bytes;
+            if (i < limitsMb.size() && limitsMb.get(i) != null) demandMb += limitsMb.get(i);
+            if (outMeasured != null) outMeasured.add(category);
+        }
+        return new long[] { ourBytes, demandMb };
+    }
+
+    /**
+     * Non-blocking current byte usage for {@code category}, or {@code -1} when it can't
+     * be known cheaply. THE single measurability predicate — both the supply side
+     * (the bytes) and the demand side (the limits) — both computed by
+     * {@link #measureVolumeUsage} — must ask this same question, or they compare
+     * different category sets.
+     *
+     * <p>{@code trips} does not live in the category stat cache (its size is DB-backed),
+     * so a cache-only peek reported it unmeasurable forever — and a volume hosting ONLY
+     * trips then had {@code measuredConfiguredMb == 0}, which silently disabled the
+     * free-space warning entirely for that volume. Use the DB aggregate instead, but
+     * ONLY on the path that is genuinely cheap: {@code getTripsSizeFromDbCached} is an
+     * indexed SUM behind a 5s TTL. It is gated on {@code isBackfillComplete()} so we
+     * never fall through to {@code getTripsSizeWithCache}, whose FUSE walk under
+     * {@code synchronized(this)} is exactly what must stay off this poll path.
+     */
+    private long peekCategoryBytes(String category) {
+        if ("trips".equals(category)) return peekTripsBytes();
+        return peekCachedCategorySize(category);
+    }
+
+    /**
+     * Trips bytes without blocking, or {@code -1} when not cheaply knowable.
+     *
+     * <p>Prefers the already-populated 5s TTL value, read WITHOUT taking
+     * {@code StorageManager.this}. That matters because this runs on the ~10s
+     * /api/settings/storage poll (up to three pages open) and {@code this} is the same
+     * monitor {@link #saveConfig()} needs — and saveConfig is called from inside
+     * {@code mountLock → configChangeLock} by the storage-type setters, so every
+     * acquisition here is a chance to convoy the mount path behind a DB round-trip.
+     * A warm read costs nothing and skips both that monitor and the
+     * {@code isBackfillComplete()} query.
+     *
+     * <p>On a cold/expired entry it does take the slower path once. That path can never
+     * reach {@code getTripsSizeWithCache}'s FUSE walk for a STRUCTURAL reason — this
+     * method never calls {@code getTripsSize()}, which is the walk's only caller — and
+     * NOT because of any {@code isBackfillComplete()} gate (see the body: that gate was
+     * deliberately removed because a restored backup pins it false forever).
+     * Ordering is one-way ({@code StorageManager.this → TripDatabase.this});
+     * TripDatabase only calls back into StorageManager from its recovery path, which is
+     * guarded by an AtomicBoolean rather than its monitor, so there is no cycle.
+     */
+    private long peekTripsBytes() {
+        // Fast path: recent-enough value, no monitors, no queries. Read the TIMESTAMP
+        // first, then the size — the writer publishes size before timestamp, so this
+        // order can only pair a timestamp with a size at least as new as it, i.e. the
+        // staleness check is conservative. (Reading size first could pair a pre-write
+        // size with the post-write timestamp and serve a stale figure as fresh.)
+        //
+        // ADVISORY_TRIPS_SIZE_MAX_AGE_MS, not the reaper's 5s TTL: at a ~10s poll a 5s
+        // window ALWAYS expires, so the fast path never fired and every poll paid
+        // StorageManager.this + two DB round-trips — on the same monitor saveConfig()
+        // needs from inside mountLock→configChangeLock. A banner tolerates a
+        // half-minute-old size; the reaper's own TTL is untouched.
+        // `> 0`, not `>= 0`: a cached 0 is the ambiguous failure/empty value discussed
+        // below and must not short-circuit as a measured figure.
+        long now = System.currentTimeMillis();
+        long stamp = cachedTripsDbSizeAt;
+        long cached = cachedTripsDbSize;
+        if (cached > 0 && (now - stamp) < ADVISORY_TRIPS_SIZE_MAX_AGE_MS) {
+            return cached;
+        }
+        // Negative-result coalescing. Without this, a cached 0 — an empty trips store, or a
+        // persistently failing DB — fails the `> 0` test on EVERY poll and falls through to
+        // the synchronized slow path, re-acquiring StorageManager.this (the monitor
+        // saveConfig() needs from inside mountLock→configChangeLock) 6x/min per open page.
+        // That is exactly the convoy the fast path exists to prevent, reinstated in the one
+        // state where it's stickiest. Remember WHEN we last tried, not just what we got, so
+        // an unmeasurable answer coalesces on the same window as a measurable one.
+        if ((now - advisoryTripsUnknownAt) < ADVISORY_TRIPS_SIZE_MAX_AGE_MS) {
+            return -1L;
+        }
+        try {
+            com.overdrive.app.trips.TripAnalyticsManager tam =
+                    com.overdrive.app.daemon.CameraDaemon.getTripAnalyticsManager();
+            if (tam != null) {
+                com.overdrive.app.trips.TripDatabase db = tam.getDatabase();
+                if (db != null) {
+                    // A 0 from the DB is AMBIGUOUS — getTotalSizeBytes() returns 0 both
+                    // for "no trips" and for any failure (bad connection, query error).
+                    // Reporting a failure as "measured 0 bytes" shrinks reachableMb and
+                    // pushes toward a FALSE ALARM, the one direction this advisory must
+                    // not err in. Treat 0 as unmeasurable instead: trips drops out of both
+                    // sides, which merely under-states demand. The cost is that a genuinely
+                    // empty trips store is also treated as unknown — harmless, since 0
+                    // bytes contributes nothing to either side anyway.
+                    // Deliberately NOT gated on isBackfillComplete(). That flag means
+                    // "every row has a stat'ed size", which a RESTORED BACKUP makes
+                    // permanently false: import inserts rows with size_bytes = 0, the
+                    // backfill skips any row whose stat yields 0 (imported rows have no
+                    // telemetry file to stat), and the orphan sweep deliberately spares
+                    // imported rows so a restore isn't wiped. Gating on it meant one
+                    // restore silently disabled the trips free-space warning for the life
+                    // of the install — the exact defect this measurability path exists to
+                    // fix. The SUM is an approximation in that state (imported rows
+                    // contribute 0), which under-states demand: the accepted direction.
+                    long bytes = getTripsSizeFromDbCached(db);
+                    if (bytes > 0) return bytes;
+                }
+            }
+        } catch (Throwable ignored) {
+            // No daemon / no DB in this process — unmeasurable, same as a cold cache.
+        }
+        // Stamp the unmeasurable answer so the next ADVISORY_TRIPS_SIZE_MAX_AGE_MS of
+        // polls short-circuit above instead of re-taking the monitor. `now` predates the
+        // DB work, so the window is measured conservatively from the attempt's start.
+        advisoryTripsUnknownAt = now;
+        return -1L;   // NEVER the walking fallback from here
+    }
+
+    /** When peekTripsBytes last concluded "trips size unknown". Coalesces the negative
+     *  result on the same window as a positive one; see peekTripsBytes. volatile for the
+     *  same lock-free-read reason as the size/timestamp pair. */
+    private volatile long advisoryTripsUnknownAt = 0;
+
+    /**
+     * Last known cached size (bytes) for {@code category}, or {@code -1} when there is
+     * no entry — callers MUST distinguish "measured 0 bytes" from "never measured".
+     * Never walks, never spawns a refresh, never blocks on anything but the short
+     * {@code categoryStatCacheLock} critical section — deliberately NOT a
+     * {@link #categorySizeCached} call, whose cold branch walks inline.
+     *
+     * <p>Stale entries are returned as-is: the regular getters elsewhere on this
+     * response already kick the stale-while-revalidate refresh for the categories they
+     * read. Note {@link #markStale} backdates the timestamp (index 1) and never writes
+     * a negative size, so a present entry always has a usable figure.
+     */
+    private long peekCachedCategorySize(String category) {
+        synchronized (categoryStatCacheLock) {
+            long[] e = cachedCategorySize.get(category);
+            return (e != null && e[0] >= 0) ? e[0] : -1L;
+        }
+    }
+
+    /** Human label for a storage type, used in budget log lines. */
+    private static String volumeLabel(StorageType type) {
+        switch (type) {
+            case SD_CARD: return "SD card";
+            case USB:     return "USB";
+            case INTERNAL:
+            default:      return "Internal";
+        }
+    }
+
+    /**
+     * The combined-limit advisory as a JSON array, one object per targeted volume.
+     * Emitted verbatim by /api/settings/storage AND /api/trips/storage so both
+     * settings pages render the same warning from one computation — a per-page
+     * re-derivation would drift the moment one page learns about a new category.
+     *
+     * <p>Never throws: on any failure it returns an empty array so a broken advisory
+     * degrades to "no warning" instead of failing the settings response that carries
+     * the sliders. Entries are emitted for every volume regardless of overcommit —
+     * the {@code overCapacity}/{@code overReachable} flags, not the array's presence,
+     * are what a client renders on.
+     */
+    public org.json.JSONArray getStorageBudgetJson() {
+        org.json.JSONArray arr = new org.json.JSONArray();
+        try {
+            // Volume-coupling map, repeated on each entry so a client that reads a
+            // single entry still sees it. Small and fixed-size.
+            org.json.JSONArray follows = new org.json.JSONArray();
+            for (String[] pair : CATEGORY_FOLLOWS) {
+                follows.put(new JSONObject().put("category", pair[0]).put("followsVolumeOf", pair[1]));
+            }
+            for (VolumeBudget b : computeVolumeBudgets()) {
+                JSONObject o = new JSONObject();
+                o.put("storageType", b.type.name());
+                o.put("label", volumeLabel(b.type));
+                o.put("configuredMb", b.configuredMb);
+                o.put("measuredConfiguredMb", b.measuredConfiguredMb);
+                o.put("usableMb", b.usableMb);
+                o.put("reachableMb", b.reachableMb);
+                o.put("freeMb", b.freeMb);
+                o.put("ourUsedMb", b.ourUsedMb);
+                o.put("measurable", b.measurable);
+                o.put("capacityKnown", b.capacityKnown);
+                o.put("overCapacity", b.overCapacity);
+                o.put("overReachable", b.overReachable);
+                o.put("categories", new org.json.JSONArray(b.categories));
+                o.put("measuredCategories", new org.json.JSONArray(b.measuredCategories));
+                o.put("categoryLimitsMb", new org.json.JSONArray(b.categoryLimitsMb));
+                o.put("categoryFollows", follows);
+                arr.put(o);
+            }
+        } catch (Throwable t) {
+            logWarn("Could not build storage budget advisory: " + t.getMessage());
+            return new org.json.JSONArray();
+        }
+        return arr;
     }
     
     // ==================== Storage Stats ====================
@@ -4819,8 +5958,13 @@ public class StorageManager {
     // calls under tripsCleanupLock would each pay the round-trip while
     // holding the lock, deferring peer cleanup. 5s is short enough that
     // storage bookkeeping stays accurate but long enough to coalesce bursts.
-    private long cachedTripsDbSize = -1;
-    private long cachedTripsDbSizeAt = 0;
+    // volatile: peekTripsBytes reads these OUTSIDE synchronized(this) to keep the
+    // advisory's poll path off that monitor (see its javadoc). Without volatile a write
+    // published under the monitor establishes no happens-before for that lock-free read,
+    // so it could see a stale size paired with a fresh timestamp (long tearing is also
+    // permitted for non-volatile longs on 32-bit VMs). Writers still hold the monitor.
+    private volatile long cachedTripsDbSize = -1;
+    private volatile long cachedTripsDbSizeAt = 0;
     private static final long TRIPS_DB_SIZE_CACHE_MS = 5_000;
 
     private synchronized long getTripsSizeFromDbCached(
@@ -4886,25 +6030,49 @@ public class StorageManager {
     }
 
     /**
-     * SOTA: List files via shell command when direct access fails.
-     * This handles the case where UI app owns the directory but daemon needs to list files.
-     * Returns every file in the directory regardless of extension.
+     * Result of a directory enumeration that records whether the listing is
+     * AUTHORITATIVE (complete) or merely best-effort (partial / failed).
+     *
+     * <p>{@code complete} is true only when the enumeration provably saw the
+     * whole directory: a non-null Java {@code listFiles()} return, or a shell
+     * {@code ls} whose stdout drain finished AND whose child exited 0. A
+     * timed-out drain (partial list), a non-zero exit, an exception, or a
+     * missing/unreadable directory all yield {@code complete == false}.
+     *
+     * <p>Consumers that DELETE based on absence (RecordingsIndex reconcile
+     * Phase 2) must only treat a directory's contents as ground truth when
+     * {@code complete} is true — a partial or failed listing looks identical
+     * to "files deleted" otherwise, and can authorize destructive pruning of
+     * rows whose files are actually still on disk (audit finding: exists() +
+     * isDirectory() alone does not prove enumeration succeeded). Additive
+     * consumers (upsert paths) can always use {@code files}: acting on a
+     * partial list only under-adds, which self-corrects on the next pass.
      */
-    static final class FileListResult {
-        final File[] files;
-        final boolean complete;
+    public static final class DirListing {
+        public final File[] files;
+        public final boolean complete;
 
-        FileListResult(File[] files, boolean complete) {
-            this.files = files;
+        DirListing(File[] files, boolean complete) {
+            this.files = files != null ? files : new File[0];
             this.complete = complete;
         }
     }
 
+    /**
+     * SOTA: List files via shell command when direct access fails.
+     * This handles the case where UI app owns the directory but daemon needs to list files.
+     * Returns every file in the directory regardless of extension.
+     */
     private File[] listFilesViaShell(File dir) {
-        return listFilesViaShellWithStatus(dir).files;
+        return listFilesViaShellChecked(dir).files;
     }
 
-    private FileListResult listFilesViaShellWithStatus(File dir) {
+    /**
+     * Same as {@link #listFilesViaShell(File)} but reports completeness —
+     * see {@link DirListing}. The listing is complete only when the stdout
+     * drain finished before the deadline AND the child exited 0.
+     */
+    private DirListing listFilesViaShellChecked(File dir) {
         Process p = null;
         try {
             p = Runtime.getRuntime().exec(new String[]{"ls", dir.getAbsolutePath()});
@@ -4947,24 +6115,35 @@ public class StorageManager {
                 // Give the kernel a moment to close the stream so the drain
                 // thread unblocks and stops touching `files` before we snapshot.
                 drain.join(500);
+                // complete stays false — the list is (potentially) partial.
             } else {
                 // Drain finished; reap the (now-exited or about-to-exit) child.
-                complete = waitForBounded(
-                        p, 1_000, "listFilesViaShell(" + dir.getName() + ")") == 0;
+                // The listing is authoritative only on a clean 0 exit — a
+                // non-zero `ls` (EIO on a dying FUSE mount, permission fault)
+                // can have emitted a prefix of the directory before failing,
+                // which is indistinguishable from a complete listing without
+                // the exit code.
+                int exit = waitForBounded(p, 1_000, "listFilesViaShell(" + dir.getName() + ")");
+                complete = (exit == 0);
+                if (!complete) {
+                    logWarn("listFilesViaShell(" + dir.getName() + "): `ls` exited " + exit
+                        + " — treating listing as non-authoritative (" + files.size() + " entries)");
+                }
             }
 
             File[] snapshot;
             synchronized (files) {
                 snapshot = files.toArray(new File[0]);
             }
-            logDebug("listFilesViaShell: found " + snapshot.length + " files in " + dir.getName());
-            return new FileListResult(snapshot, complete);
+            logDebug("listFilesViaShell: found " + snapshot.length + " files in " + dir.getName()
+                + (complete ? "" : " (INCOMPLETE)"));
+            return new DirListing(snapshot, complete);
         } catch (Exception e) {
             logWarn("listFilesViaShell failed: " + e.getMessage());
             if (p != null) {
                 try { p.destroyForcibly(); } catch (Exception ignored) {}
             }
-            return new FileListResult(new File[0], false);
+            return new DirListing(new File[0], false);
         }
     }
 
@@ -4999,66 +6178,40 @@ public class StorageManager {
         return listFilesWithFallback(dir, ".mp4");
     }
 
-    public static final class Mp4Listing {
-        public final File[] files;
-        public final boolean available;
-        public final boolean complete;
-
-        Mp4Listing(File[] files, boolean available, boolean complete) {
-            this.files = files;
-            this.available = available;
-            this.complete = complete;
-        }
-    }
-
     /**
-     * MP4 listing with enough status for destructive reconciliation. A partial
-     * shell result may add/update rows, but callers must delete missing rows
-     * only when {@link Mp4Listing#complete} is true.
+     * Completeness-aware variant of {@link #listMp4Files(File)} for callers
+     * that DELETE based on absence (RecordingsIndex reconcile). See
+     * {@link DirListing} for the contract.
+     *
+     * <p>Completeness rules:
+     * <ul>
+     *   <li>dir null / missing / not a directory → empty + NOT complete. A
+     *       missing dir is ambiguous — it can mean "volume unmounted", not
+     *       "files gone" — so it must never authorize pruning.</li>
+     *   <li>Java {@code listFiles()} non-null → complete (the kernel
+     *       enumerated the whole dir).</li>
+     *   <li>Java returns null (FUSE under daemon UID 2000) → shell fallback;
+     *       complete only if the shell listing was complete
+     *       (drain finished + exit 0).</li>
+     * </ul>
      */
-    public Mp4Listing listMp4FilesWithStatus(File dir) {
+    public DirListing listMp4FilesChecked(File dir) {
         if (dir == null || !dir.exists() || !dir.isDirectory()) {
-            return new Mp4Listing(new File[0], false, false);
+            return new DirListing(new File[0], false);
         }
-        java.io.FileFilter mp4Filter = file -> file.getName().endsWith(".mp4");
-        FileListResult direct = listFilesDirectWithStatus(dir, mp4Filter, 4_000L);
-        if (direct.complete) {
-            return new Mp4Listing(direct.files, true, true);
+        java.io.FileFilter filter = f -> f.getName().endsWith(".mp4");
+        File[] files = dir.listFiles(filter);
+        if (files != null) {
+            return new DirListing(files, true);
         }
-        FileListResult shell = listFilesViaShellWithStatus(dir);
-        java.util.List<File> mp4 = new java.util.ArrayList<>();
-        for (File file : shell.files) {
-            if (file.getName().endsWith(".mp4")) mp4.add(file);
+        // FUSE returned null — shell ls, filter in-process, propagate the
+        // shell listing's completeness verdict.
+        DirListing all = listFilesViaShellChecked(dir);
+        java.util.List<File> matched = new java.util.ArrayList<>();
+        for (File f : all.files) {
+            if (filter.accept(f)) matched.add(f);
         }
-        return new Mp4Listing(mp4.toArray(new File[0]), true, shell.complete);
-    }
-
-    static FileListResult listFilesDirectWithStatus(
-            File dir, java.io.FileFilter filter, long timeoutMs) {
-        java.util.concurrent.atomic.AtomicReference<File[]> files =
-                new java.util.concurrent.atomic.AtomicReference<>();
-        java.util.concurrent.atomic.AtomicBoolean finished =
-                new java.util.concurrent.atomic.AtomicBoolean(false);
-        Thread worker = new Thread(() -> {
-            try {
-                files.set(dir.listFiles(filter));
-            } catch (Throwable ignored) {
-                files.set(null);
-            } finally {
-                finished.set(true);
-            }
-        }, "StorageDirectList-" + dir.getName());
-        worker.setDaemon(true);
-        worker.start();
-        try {
-            worker.join(Math.max(1L, timeoutMs));
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            return new FileListResult(new File[0], false);
-        }
-        File[] result = files.get();
-        return new FileListResult(result != null ? result : new File[0],
-                finished.get() && result != null);
+        return new DirListing(matched.toArray(new File[0]), all.complete);
     }
 
     /**
@@ -5109,27 +6262,82 @@ public class StorageManager {
         return files != null ? files : new File[0];
     }
 
-    /**
-     * Notify {@link com.overdrive.app.server.RecordingsIndex} that the
-     * active recordings/surveillance/proximity dir set has changed —
-     * either via user-driven storage-type switch (settings page) or via
-     * volume hot-plug detected by the SD/USB watchdogs.
-     *
-     * <p>Two-step recovery:
-     *  1. Re-arm FileObservers against the new dir set so future writes
-     *     reach the index.
-     *  2. Reconcile so existing files on the new volume populate the
-     *     index immediately. Without this, hot-mounted SD/USB sticks
-     *     stay invisible to events.html and the native fragment until
-     *     the 1-hour periodic reconcile.
-     *
-     * <p>Step 2 runs on a background thread so we don't block the
-     * caller (the SD/USB watchdog tick is on a single-thread executor;
-     * blocking it would delay the next health probe).
-     *
-     * <p>Best-effort: any failure here is logged and swallowed. The
-     * periodic reconcile is the absolute backstop.
-     */
+
+
+
+
+    // ==================== Event-driven volume refresh ====================
+    // (audit: event-driven refresh missing — recovery depended solely on the
+    // 15s watchdog.) BEST-EFFORT by design: this daemon's manually-constructed
+    // ActivityThread is known to hit "Unable to find app for caller" on some
+    // AMS entry points (see CarPropertyBridge), though runtime receivers DO
+    // register successfully elsewhere in this process (BydDataCollector's
+    // plug-edge receiver). So: try, log the outcome loudly either way, and
+    // change nothing else — the watchdog remains the backstop, this only
+    // shortens the mount→discovery latency from ≤15s to immediate when it
+    // works.
+    private final java.util.concurrent.atomic.AtomicBoolean mediaReceiverRegistered =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Idempotent; called from startSdCardWatchdog (daemon lifecycle hook). */
+    private void registerMediaEventReceiverIfPossible() {
+        if (!mediaReceiverRegistered.compareAndSet(false, true)) return;
+        try {
+            android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            if (ctx == null) {
+                // UI process / early boot — retry on a later watchdog re-arm.
+                mediaReceiverRegistered.set(false);
+                return;
+            }
+            android.content.IntentFilter filter = new android.content.IntentFilter();
+            filter.addAction(android.content.Intent.ACTION_MEDIA_MOUNTED);
+            filter.addAction(android.content.Intent.ACTION_MEDIA_EJECT);
+            filter.addAction(android.content.Intent.ACTION_MEDIA_UNMOUNTED);
+            filter.addAction(android.content.Intent.ACTION_MEDIA_REMOVED);
+            filter.addAction(android.content.Intent.ACTION_MEDIA_BAD_REMOVAL);
+            filter.addDataScheme("file");
+            ctx.registerReceiver(new android.content.BroadcastReceiver() {
+                @Override
+                public void onReceive(android.content.Context c, android.content.Intent intent) {
+                    logInfo("Media event: " + intent.getAction() + " " + intent.getData()
+                        + " — scheduling volume refresh");
+                    // Never do mount/discovery work on the broadcast thread —
+                    // the refresh takes mountLock and probes the FS.
+                    //
+                    // Full refreshSdCard(), NOT bare discoverVolumes() (audit:
+                    // media events updated detection but not usable
+                    // directories). Discovery alone commits only
+                    // paths/availability — the per-volume dir fields and the
+                    // active-directory resolution are separate steps, so a
+                    // hot-mount landed as available=true with null dir fields
+                    // (active storage stuck on internal, and the watchdog sees
+                    // a healthy mount so it never re-initializes), and an
+                    // eject left active dirs pointing at the removed volume.
+                    // refreshSdCard = discovery (with the centralized
+                    // transition notify) + initSd/UsbDirectories +
+                    // updateActiveDirectories + limit reclamp.
+                    Thread t = new Thread(() -> {
+                        try {
+                            refreshSdCard();
+                        } catch (Throwable th) {
+                            logWarn("Media-event volume refresh failed: " + th.getMessage());
+                        }
+                    }, "MediaEventRefresh");
+                    t.setDaemon(true);
+                    t.start();
+                }
+            }, filter);
+            logInfo("Media event receiver registered — event-driven volume refresh active"
+                + " (15s watchdog remains the backstop)");
+        } catch (Throwable t) {
+            // Expected on ROMs where AMS rejects our manual ActivityThread.
+            // Leave the latch SET — re-registering would fail identically
+            // every watchdog re-arm and spam the log.
+            logWarn("Media event receiver registration failed (" + t.getMessage()
+                + ") — event-driven refresh unavailable, relying on 15s watchdog");
+        }
+    }
+
     private void notifyRecordingsIndexOfStorageChange(String reason) {
         try {
             com.overdrive.app.daemon.RecordingsIndexFileWatcher.getInstance().refresh();
@@ -5285,6 +6493,20 @@ public class StorageManager {
     }
 
     /**
+     * Boot-reap variant: same enforcement as {@link #ensureRecordingsSpace(long, File)}
+     * but capped at {@code maxDeletes} anchor deletions so a large one-time backlog
+     * (e.g. the boot after proximity joined the recordings pool) is paced instead of
+     * burst-deleted during daemon startup. The 30s periodic tick finishes the job.
+     */
+    private boolean ensureRecordingsSpaceBounded(int maxDeletes) {
+        synchronized (recordingsCleanupLock) {
+            return ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
+                namePrefixForCategory("recordings"),
+                recordingsLimitMb * 1024 * 1024, 0, maxDeletes);
+        }
+    }
+
+    /**
      * Recorder-critical-path variant of {@link #ensureRecordingsSpace(long, File)}.
      *
      * <p>WHY THIS EXISTS — the ~9-10 min "recording doesn't start after ACC ON"
@@ -5427,22 +6649,27 @@ public class StorageManager {
     }
 
     /**
-     * Ensure proximity storage is within size limit.
-     * Deletes oldest files (across active + inactive + legacy locations)
-     * until the total falls under the limit.
+     * Ensure space for a proximity clip. Proximity shares the recordings pool and
+     * limit, so this reaps the WHOLE pool: measuring only the proximity dirs against
+     * the recordings cap would leave the reserve unenforceable (a 20 MB proximity dir
+     * is always "under" a 500 MB cap, even with the recordings dir at 495 MB).
      *
      * @param reserveBytes Additional bytes to reserve for new file
      * @return true if cleanup was successful and space is available
      */
     public boolean ensureProximitySpace(long reserveBytes) {
-        synchronized (proximityCleanupLock) {
-            if (deferIfEncoderBusy(DEFERRED_PROXIMITY, scopedSizeForCategory("proximity"),
-                    scopedLimitBytesForCategory("proximity"))) {
+        synchronized (recordingsCleanupLock) {
+            if (deferIfEncoderBusy(DEFERRED_RECORDINGS, scopedSizeForCategory("recordings"),
+                    scopedLimitBytesForCategory("recordings"))) {
                 return true;
             }
-            return ensureSpace("proximity", getReapableDirs("proximity"), proximityDir,
-                namePrefixForCategory("proximity"),
-                proximityLimitMb * 1024 * 1024, reserveBytes);
+            // activeDir must be recordingsDir, not proximityDir: ensureSpace uses it
+            // for the CDR-fallback volume test and the reapedFromInactive flag, and
+            // proximityDir resolves without the recordings ENOSPC redirect — so
+            // passing it could reap OEM CDR files off a card we no longer write to.
+            return ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
+                namePrefixForCategory("recordings"),
+                rawLimitBytesForCategory("recordings"), reserveBytes);
         }
     }
 
@@ -5537,6 +6764,18 @@ public class StorageManager {
     }
 
     /**
+     * True only when a pinned trip telemetry destination is currently safe to
+     * write. Emergency tails use this to wait for their original removable
+     * volume instead of creating an incomplete same-name file on fallback
+     * storage.
+     */
+    public boolean isTripTelemetryPathAvailable(File telemetryFile) {
+        return telemetryFile != null
+                && isTelemetryVolumeAvailable(
+                        telemetryFile.getAbsolutePath());
+    }
+
+    /**
      * Primary file extension for a category. Cleanup walks files matching
      * this extension as the "anchor" rows; sidecars are pulled in via
      * {@link #sidecarExtensionsForCategory(String)}.
@@ -5570,7 +6809,11 @@ public class StorageManager {
             // .json.tmp / .srt.tmp: LocationSidecarWriter.writeJsonAtomic and
             // SrtWriter.write both write a <base>.<ext>.tmp then rename; an abnormal
             // exit between write and rename orphans the .tmp next to a cam_/dvr_ clip.
-            case "recordings":   return new String[]{".mp4.tmp", ".broken", ".json.tmp", ".srt.tmp"};
+            // .jpg.tmp is in this list because the recordings pool now owns the
+            // proximity dirs too (getReapableDirs), and proximity events write a
+            // hero thumb. sweepOrphanTempFiles claims each dir once, recordings
+            // first, so a partial this list omits would be swept by nothing.
+            case "recordings":   return new String[]{".mp4.tmp", ".broken", ".json.tmp", ".srt.tmp", ".jpg.tmp"};
             case "surveillance": return new String[]{".mp4.tmp", ".broken", ".jpg.tmp", ".json.tmp", ".srt.tmp"};
             // .json.tmp added so the geo-backfill sidecar rewrite (SidecarGeoUpdater,
             // which sweeps proximity dirs too) leaves no unreaped orphan on a
@@ -5605,7 +6848,15 @@ public class StorageManager {
                 // must be in this list or the .srt (and, for dvr_, the .json) leak
                 // forever — one per recorded segment — counted by nothing and reaped
                 // by nothing. .srt was entirely absent here.
-                return new String[]{".json", ".srt"};
+                // .jpg mirrors the surveillance list so a <stem>.jpg hero sibling is
+                // accounted and reaped with its anchor. Today only event_* clips get one
+                // (ThumbnailBuffer.writeHeroFromSnapshot is called solely from
+                // SurveillanceEngineGpu), so for cam_/dvr_/replay_/proximity_ this is
+                // inert — kept because proximity is reaped under THIS category, and a
+                // hero appearing there later must not become an uncounted orphan. Safe:
+                // the prefix gate excludes thumb_*, and the thumbnail CACHE is a
+                // subdirectory, which the isFile() walk never descends into.
+                return new String[]{".json", ".srt", ".jpg"};
             case "surveillance":
                 // event_*: timeline JSON, hero JPG, overlay SRT.
                 return new String[]{".json", ".jpg", ".srt"};
@@ -5864,8 +7115,17 @@ public class StorageManager {
             return true;
         }
 
-        // Oldest first (global ordering across all dirs).
-        Collections.sort(allFiles, Comparator.comparingLong(File::lastModified));
+        // Oldest first (global ordering across all dirs). In the recordings pool,
+        // proximity clips are event evidence rather than routine loop footage, so they
+        // sort AFTER every cam_/dvr_/replay_ anchor and are only reached once the loop
+        // footage is exhausted. Oldest-first within each tier.
+        Comparator<File> reapOrder = Comparator.comparingLong(File::lastModified);
+        if ("recordings".equals(category)) {
+            reapOrder = Comparator.<File>comparingInt(
+                    f -> f.getName().startsWith("proximity_") ? 1 : 0)
+                .thenComparingLong(File::lastModified);
+        }
+        Collections.sort(allFiles, reapOrder);
 
         int deletedCount = 0;
         long deletedSize = 0;
@@ -5926,8 +7186,8 @@ public class StorageManager {
                 // only knows about .mp4 filenames.
                 if (file.getName().endsWith(".mp4")) {
                     try {
-                            com.overdrive.app.server.RecordingsIndex
-                                .getInstance().removeByPath(file.getAbsolutePath());
+                        com.overdrive.app.server.RecordingsIndex
+                                .getInstance().remove(file.getName());
                     } catch (Throwable ignored) {}
                 }
 
@@ -6473,22 +7733,28 @@ public class StorageManager {
         // FIX: Removed broadcastRecentFiles() — specific file already broadcast by onFileSaved()
 
         if (isEncoderWriting()) {
-            deferredCleanupDirs.add(DEFERRED_PROXIMITY);
+            // Queue the RECORDINGS key: proximity's bytes are in that pool, and both
+            // keys' drains now reap it — enqueuing DEFERRED_PROXIMITY as well would
+            // just run the same pass twice.
+            deferredCleanupDirs.add(DEFERRED_RECORDINGS);
             logDebug("Proximity file saved during active write — deferring cleanup");
             return;
         }
 
         asyncCleanupExecutor.execute(() -> {
-            synchronized (proximityCleanupLock) {
+            // Measure and reap the SHARED recordings pool. Comparing the proximity
+            // dirs alone against the recordings cap can essentially never fire, which
+            // would make post-save proximity cleanup dead code.
+            synchronized (recordingsCleanupLock) {
                 try {
-                    long currentSize = scopedSizeForCategory("proximity");
-                    long limitBytes = scopedLimitBytesForCategory("proximity");
+                    long currentSize = scopedSizeForCategory("recordings");
+                    long limitBytes = scopedLimitBytesForCategory("recordings");
 
                     if (currentSize > limitBytes) {
                         logInfo("Proximity file saved - triggering cleanup (current=" +
                             formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
-                        ensureSpace("proximity", getReapableDirs("proximity"), proximityDir,
-                            namePrefixForCategory("proximity"),
+                        ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
+                            namePrefixForCategory("recordings"),
                             limitBytes, 0);
                     } else {
                         logDebug("Proximity file saved - within limits (" +
@@ -6698,8 +7964,7 @@ public class StorageManager {
     
     /**
      * Start periodic cleanup for long recording sessions.
-      * Runs every 30 seconds while storage work is active and performs an
-      * hourly full integrity pass while idle.
+     * Runs every 30 seconds while recording is active.
      */
     public void startPeriodicCleanup() {
         if (cleanupScheduler != null && !cleanupScheduler.isShutdown()) {
@@ -6720,13 +7985,8 @@ public class StorageManager {
             t.setPriority(Thread.MIN_PRIORITY);
             return t;
         });
-
-        // The constructor already queued a startup reap. Start the idle
-        // integrity clock here so the first 30-second tick does not duplicate
-        // that whole-library work while daemon initialization is still busy.
-        lastPeriodicIntegrityAtMs = statClockMs();
-
-        cleanupScheduler.scheduleWithFixedDelay(() -> {
+        
+        cleanupScheduler.scheduleAtFixedRate(() -> {
             try {
                 // Don't run un-gated cleanup before the encoder probe is wired.
                 // Daemon-init ordering: startPeriodicCleanup() fires early
@@ -6737,25 +7997,6 @@ public class StorageManager {
                 if (!probeWired.get()) {
                     logDebug("Periodic cleanup tick skipped — encoder probe not wired yet");
                     return;
-                }
-                final long tickNowMs = statClockMs();
-                final boolean encoderWriting = isEncoderWriting();
-                final boolean activeSession = recordingActive.get()
-                    || surveillanceActive.get()
-                    || activeTripFilePath != null
-                    || encoderWriting;
-                final boolean deferredWork = !deferredCleanupDirs.isEmpty();
-                final boolean fallbackWasActive = recordingsEnospcFallbackActive;
-                final boolean integrityDue = isPeriodicIntegrityDue(
-                    tickNowMs, lastPeriodicIntegrityAtMs);
-                if (!shouldRunPeriodicMaintenance(activeSession, deferredWork,
-                        fallbackWasActive, integrityDue)) {
-                    return;
-                }
-                if (integrityDue) {
-                    // Advance before I/O so a failed or degraded-volume pass
-                    // cannot retry continuously on every 30-second tick.
-                    lastPeriodicIntegrityAtMs = tickNowMs;
                 }
                 // Self-clear a stale ENOSPC fallback. recordingsEnospcFallbackActive
                 // latches true when a mounted-but-full external volume redirects a
@@ -6807,8 +8048,8 @@ public class StorageManager {
                 // to run the whole-tree idle-only work (deferred drain + orphan
                 // tmp sweep) — kept OUT of the steady-state recording path to
                 // hold tick I/O low, but still run during a genuine emergency.
+                boolean encoderWriting = isEncoderWriting();
                 boolean diskCritical = false;
-                boolean emergencyMaintenance = false;
 
                 // Scoped size/limit snapshot for recordings/surveillance/proximity,
                 // measured ONCE per tick in the recording branch and reused by the
@@ -6816,8 +8057,10 @@ public class StorageManager {
                 // a second uncached FUSE directory walk per category per tick while
                 // recording. Trips is excluded: it's reconciled (orphan-row drop)
                 // right before its pass and is DB-SUM-cached, so it re-reads there.
-                long recBytesSnap = -1, survBytesSnap = -1, proxBytesSnap = -1;
-                long recLimSnap = -1, survLimSnap = -1, proxLimSnap = -1;
+                // Proximity has no snapshot of its own: its bytes are inside the
+                // recordings measurement now, so a separate walk would be pure cost.
+                long recBytesSnap = -1, survBytesSnap = -1;
+                long recLimSnap = -1, survLimSnap = -1;
 
                 if (encoderWriting) {
                     // Per-dir over-limit ratio (per-category, not MAX(limits)/20),
@@ -6826,19 +8069,15 @@ public class StorageManager {
                     long recBytes = scopedSizeForCategory("recordings");
                     long survBytes = scopedSizeForCategory("surveillance");
                     long tripsBytes = scopedSizeForCategory("trips");
-                    long proxBytes = scopedSizeForCategory("proximity");
                     long recLim = scopedLimitBytesForCategory("recordings");
                     long survLim = scopedLimitBytesForCategory("surveillance");
                     long tripsLim = scopedLimitBytesForCategory("trips");
-                    long proxLim = scopedLimitBytesForCategory("proximity");
                     // Hand these same measurements to the per-category passes.
                     recBytesSnap = recBytes;   recLimSnap = recLim;
                     survBytesSnap = survBytes; survLimSnap = survLim;
-                    proxBytesSnap = proxBytes; proxLimSnap = proxLim;
                     boolean recHard  = recLim   > 0 && recBytes   > recLim   * 21 / 20;  // >5% over OWN limit
                     boolean survHard = survLim  > 0 && survBytes  > survLim  * 21 / 20;
                     boolean tripsHard= tripsLim > 0 && tripsBytes > tripsLim * 21 / 20;
-                    boolean proxHard = proxLim  > 0 && proxBytes  > proxLim  * 21 / 20;
 
                     // Free-disk emergency: if ANY active volume is critically
                     // low, continuing to write is going to fail anyway. The min
@@ -6877,8 +8116,7 @@ public class StorageManager {
                     diskCritical = activeExternalDown
                         || (sdFree > 0 && sdFree < 200L * 1024 * 1024);  // <200MB free
 
-                    boolean hardOverlimit = recHard || survHard || tripsHard || proxHard || diskCritical;
-                    emergencyMaintenance = hardOverlimit;
+                    boolean hardOverlimit = recHard || survHard || tripsHard || diskCritical;
                     if (hardOverlimit) {
                         // Emergency: log it AND run the idle-only whole-tree work
                         // (orphan tmp sweep) right now — the disk is about to
@@ -6889,8 +8127,8 @@ public class StorageManager {
                             + "rec=" + formatSize(recBytes) + "/" + formatSize(recLim) + (recHard ? " HARD" : "")
                             + " surv=" + formatSize(survBytes) + "/" + formatSize(survLim) + (survHard ? " HARD" : "")
                             + " trips=" + formatSize(tripsBytes) + "/" + formatSize(tripsLim) + (tripsHard ? " HARD" : "")
-                            + " prox=" + formatSize(proxBytes) + "/" + formatSize(proxLim) + (proxHard ? " HARD" : "")
                             + " sdFree=" + formatSize(sdFree) + (diskCritical ? " CRITICAL" : ""));
+                        sweepOrphanTempFiles();
                     }
                     // Soft state (over cap ≤5%, disk healthy): fall through to the
                     // per-category passes, which run a BOUNDED trim. We intentionally
@@ -6898,22 +8136,10 @@ public class StorageManager {
                     // keep steady-state recording-tick I/O low; both run at idle.
                 } else {
                     // Encoder idle: drain any deferred work first so storage limits
-                    // re-converge after a long recording. Sweep orphan partials only
-                    // on the hourly integrity pass; startup and hard-emergency paths
-                    // retain their immediate sweeps.
+                    // re-converge after a long recording, then sweep orphan
+                    // .mp4.tmp / .broken / .jpg.tmp partials (whole-tree walk, safe
+                    // when idle; otherwise partials only get reaped at daemon boot).
                     drainDeferredCleanupIfDue();
-                    boolean fallbackRecovered = fallbackWasActive
-                        && !recordingsEnospcFallbackActive;
-                    if (!shouldRunFullPeriodicMaintenance(
-                            activeSession, integrityDue, fallbackRecovered)) {
-                        // A deferred-only tick already drained its categories. An
-                        // unresolved fallback-only tick already performed the cheap
-                        // free-space probe. Neither needs the four full scans below.
-                        return;
-                    }
-                }
-
-                if (shouldSweepOrphanTempFiles(integrityDue, emergencyMaintenance)) {
                     sweepOrphanTempFiles();
                 }
 
@@ -6978,46 +8204,17 @@ public class StorageManager {
                     runPeriodicCategoryCleanup("trips", DEFERRED_TRIPS, tripsDir, forceFull, -1, -1);
                 }
 
-                // Proximity must be swept here too. It was historically reaped
-                // ONLY reactively — on the next proximity recording start
-                // (ProximityRecordingHandler) or an explicit limit change
-                // (runCleanup). Once proximity events stop, the dir parks above
-                // its limit forever (field: 476/500 MB = 95%, well over the 90%
-                // threshold) because nothing periodic ever revisits it. Mirror
-                // the other three categories so the limit converges regardless
-                // of whether new proximity clips are still being written.
-                synchronized (proximityCleanupLock) {
-                    runPeriodicCategoryCleanup("proximity", DEFERRED_PROXIMITY, proximityDir,
-                        forceFull, proxBytesSnap, proxLimSnap);
-                }
+                // No separate proximity pass: the recordings pass above already owns
+                // the proximity dirs and enforces the shared cap over the whole pool.
+                // A proximity-only pass would measure the narrow dir set against that
+                // same wide cap — never firing — while paying two uncached FUSE walks
+                // per tick for the privilege.
             } catch (Exception e) {
                 logWarn("Periodic cleanup error: " + e.getMessage());
             }
         }, CLEANUP_INTERVAL_SECONDS, CLEANUP_INTERVAL_SECONDS, TimeUnit.SECONDS);
         
         logInfo("Started periodic storage cleanup (interval=" + CLEANUP_INTERVAL_SECONDS + "s)");
-    }
-
-    static boolean shouldRunPeriodicMaintenance(boolean activeSession,
-                                                boolean deferredWork,
-                                                boolean fallbackActive,
-                                                boolean integrityDue) {
-        return activeSession || deferredWork || fallbackActive || integrityDue;
-    }
-
-    static boolean isPeriodicIntegrityDue(long nowMs, long lastRunMs) {
-        return lastRunMs <= 0L || (nowMs - lastRunMs) >= PERIODIC_INTEGRITY_INTERVAL_MS;
-    }
-
-    static boolean shouldRunFullPeriodicMaintenance(boolean activeSession,
-                                                    boolean integrityDue,
-                                                    boolean fallbackRecovered) {
-        return activeSession || integrityDue || fallbackRecovered;
-    }
-
-    static boolean shouldSweepOrphanTempFiles(boolean integrityDue,
-                                              boolean emergencyMaintenance) {
-        return integrityDue || emergencyMaintenance;
     }
     
     /**
@@ -7072,12 +8269,16 @@ public class StorageManager {
                 deferredCleanupDirs.add(DEFERRED_SURVEILLANCE);
             }
         }
+        // Legacy key: nothing enqueues DEFERRED_PROXIMITY any more (onProximityFileSaved
+        // queues DEFERRED_RECORDINGS, whose drain reaps the shared pool). Kept only to
+        // drain a key left in the set by a build that predates the merge.
         if (toRun.contains(DEFERRED_PROXIMITY)) {
             try {
-                synchronized (proximityCleanupLock) {
-                    if (scopedSizeForCategory("proximity") > scopedLimitBytesForCategory("proximity")) {
-                        ensureSpace("proximity", getReapableDirs("proximity"), proximityDir,
-                            namePrefixForCategory("proximity"), proximityLimitMb * 1024 * 1024, 0);
+                synchronized (recordingsCleanupLock) {
+                    if (scopedSizeForCategory("recordings") > scopedLimitBytesForCategory("recordings")) {
+                        ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
+                            namePrefixForCategory("recordings"),
+                            rawLimitBytesForCategory("recordings"), 0);
                     }
                 }
             } catch (Exception e) {
@@ -7109,7 +8310,8 @@ public class StorageManager {
         switch (category) {
             case "recordings":   return recordingsLimitMb   * 1024 * 1024;
             case "surveillance": return surveillanceLimitMb * 1024 * 1024;
-            case "proximity":    return proximityLimitMb    * 1024 * 1024;
+            // Shares the recordings cap — see configuredLimitMbForCategory.
+            case "proximity":    return recordingsLimitMb    * 1024 * 1024;
             case "trips":        return tripsLimitMb         * 1024 * 1024;
             default:             return 0;
         }
@@ -7181,8 +8383,9 @@ public class StorageManager {
         }
     }
 
-    /** Filesystem path prefix that identifies files physically residing on {@code type}.
-     *  Null when an external volume isn't currently mounted (no path resolved). */
+
+
+
     private String volumeRootForType(StorageType type) {
         switch (type) {
             case SD_CARD: return sdCardPath;
@@ -7243,7 +8446,6 @@ public class StorageManager {
         }
         final String protEncoderPath = activeEncoderPath;
         final String protEncoderTmpPath = (activeEncoderPath != null) ? activeEncoderPath + ".tmp" : null;
-        final String protectedTripPath = activeTripFilePath;  // belt-and-suspenders; trips excluded anyway
         final long tmpGraceCutoff = System.currentTimeMillis() - (10L * 60L * 1000L);
 
         // Pool finalized anchors physically on this volume, tagged with their
@@ -7343,8 +8545,7 @@ public class StorageManager {
                 continue;
             }
             // Never the in-flight trip file (defensive; trips not in the pool).
-            if (protectedTripPath != null
-                    && (protectedTripPath.equals(absPath) || protectedTripPath.equals(absPath + ".tmp"))) {
+            if (isProtectedTripFile(c.file)) {
                 continue;
             }
             // Never a fresh .tmp partial a writer may still hold open.
@@ -7442,8 +8643,7 @@ public class StorageManager {
 
         if (file.getName().endsWith(".mp4")) {
             try {
-                com.overdrive.app.server.RecordingsIndex.getInstance()
-                    .removeByPath(file.getAbsolutePath());
+                com.overdrive.app.server.RecordingsIndex.getInstance().remove(file.getName());
             } catch (Throwable ignored) {}
         }
         if (sidecarExts.length > 0) {
@@ -7566,19 +8766,27 @@ public class StorageManager {
         boolean freedAny = false;
         for (StorageType volume : volumes) {
             long free = freeBytesForType(volume);
+            // Volume-scaled floor (see physicalFreeEmergencyFloorBytes): ~2 GB
+            // on the ~119 GB fleet cards, 512 MB minimum on tiny/unreadable
+            // volumes — closes the dead zone where 569 MB free sat above the
+            // old flat 512 MB floor while every category was under its own
+            // oversubscribed cap and nothing reaped.
+            long total = liveVolumeTotalBytes(volume);
+            long floor = physicalFreeEmergencyFloorBytes(total);
             // free <= 0 on INTERNAL is a transient StatFs hiccup (don't act); on an
             // external volume it means unmounted/inaccessible (no safe scope) — skip
             // either way, the per-category passes + watchdog handle those.
-            if (free <= 0 || free >= PHYSICAL_FREE_EMERGENCY_FLOOR_BYTES) continue;
+            if (free <= 0 || free >= floor) continue;
 
-            // Clamp the target to a fraction of the volume so a tiny card is never
-            // reaped toward an unreachable 1 GB. Never below the floor (else a reap
-            // that can't reach target would loop every tick deleting one clip).
-            long total = liveVolumeTotalBytes(volume);
-            long target = PHYSICAL_FREE_EMERGENCY_TARGET_BYTES;
+            // Target = 2× floor (hysteresis, same 2:1 ratio as the old fixed
+            // 512 MB/1 GB pair), clamped to a fraction of the volume so a tiny
+            // card is never reaped toward an unreachable target. Never below
+            // the floor (else a reap that can't reach target would loop every
+            // tick deleting one clip).
+            long target = floor * 2;
             if (total > 0) {
                 long quarter = total / 4;
-                if (target > quarter) target = Math.max(quarter, PHYSICAL_FREE_EMERGENCY_FLOOR_BYTES);
+                if (target > quarter) target = Math.max(quarter, floor);
             }
 
             // MEDIA-FOOTPRINT gate (data-loss guard): only reap when deleting media
@@ -7606,7 +8814,7 @@ public class StorageManager {
             }
 
             logWarn("Physical-free emergency: " + volume + " at " + formatSize(free)
-                + " free (< " + formatSize(PHYSICAL_FREE_EMERGENCY_FLOOR_BYTES)
+                + " free (< " + formatSize(floor)
                 + ") — cross-category oldest-first reap to " + formatSize(target));
 
             // Fixed lock order: recordings → surveillance → proximity. No other path
@@ -7665,6 +8873,10 @@ public class StorageManager {
             logDebug("Volume watchdog not needed - no storage type uses SD or USB");
             return;
         }
+
+        // Best-effort event-driven refresh alongside the polling watchdog —
+        // idempotent, and a no-op on ROMs where registration is rejected.
+        registerMediaEventReceiverIfPossible();
 
         stopSdCardWatchdog();  // Stop any existing watchdog first
 
@@ -8323,14 +9535,9 @@ public class StorageManager {
     }
 
     /**
-     * Mark a trip telemetry file as in-flight so {@link #ensureSpace} skips
-     * it during cleanup. The recorder still writes through a buffered
-     * GZIPOutputStream; if cleanup were to delete and unlink the file mid-write
-     * on Linux, subsequent writes go to a still-open fd whose bytes are lost
-     * once close() runs (the inode is reaped at fd-close, not at unlink).
-     *
-     * Pass {@code null} on stop. Path-based rather than a boolean so older
-     * trip files can still be reaped during an active trip.
+     * Mark the telemetry file of the trip being recorded, or pass {@code null}
+     * on stop. Path-based rather than a boolean so older trip files can still
+     * be reaped during an active trip.
      */
     public void setActiveTripFile(File file) {
         activeTripFilePath = (file != null) ? file.getAbsolutePath() : null;
@@ -8346,7 +9553,7 @@ public class StorageManager {
     public String getActiveTripFilePath() {
         return activeTripFilePath;
     }
-    
+
     /**
      * Check if recording is active.
      */
@@ -8382,6 +9589,27 @@ public class StorageManager {
             case "proximity":   dirs = getAllProximityDirs(); break;
             case "trips":       dirs = getAllTripsDirs(); break;
             default: return -1;
+        }
+        final String wipePrefix = namePrefixForCategory(category);
+        // Anchor prefixes this wipe owns. Two deltas from the RETENTION aux set:
+        // proximity_ is excluded (the UI offers "reset proximity" separately, so a
+        // recordings reset must not consume those clips), and per-actor thumbs are
+        // added as COMPOSED prefixes (thumb_ + each owned anchor prefix) because they
+        // are written next to their segment. Composed rather than a bare "thumb_" so a
+        // thumb_event_* that landed in a shared dir stays surveillance's to delete.
+        final String[] wipeAuxPrefixes;
+        switch (category) {
+            case "recordings":
+                wipeAuxPrefixes = new String[]{
+                    "dvr_", "replay_", "thumb_cam", "thumb_dvr_", "thumb_replay_"};
+                break;
+            case "surveillance":
+                // Composed, not the retention set's bare "thumb_": that would also
+                // match thumb_cam_*/thumb_dvr_* if a shared dir holds both.
+                wipeAuxPrefixes = new String[]{"thumb_event_"};
+                break;
+            default:
+                wipeAuxPrefixes = auxiliaryPrefixesForCategory(category);
         }
 
         // FIX (audit R4): protect the in-flight encoder output and any *.tmp
@@ -8449,7 +9677,6 @@ public class StorageManager {
                 logWarn("wipeMediaCategory: encoder-path probe threw: " + t.getMessage());
             }
         }
-        final String protectedTripPath = "trips".equals(category) ? activeTripFilePath : null;
         final String protEncoderPath = activeEncoderPath;
         final String protEncoderTmpPath = activeEncoderTmpPath;
         final long tmpGraceCutoff = System.currentTimeMillis() - (10L * 60L * 1000L);
@@ -8472,6 +9699,17 @@ public class StorageManager {
                     if (f.isFile()) {
                         String name = f.getName();
                         String absPath = f.getAbsolutePath();
+                        // Category gate. The dir list can contain roots shared with
+                        // other categories — the flat legacy base, and (for
+                        // recordings) the proximity dirs — so an ungated wipe would
+                        // delete a sibling category's clips. Anchors, sidecars and
+                        // .tmp partials all carry the anchor's prefix, so one
+                        // prefix test covers every shape. Null prefix (trips) keeps
+                        // the old wipe-everything behaviour for its dedicated dirs.
+                        if (wipePrefix != null
+                                && !nameMatchesCategoryPrefix(name, wipePrefix, wipeAuxPrefixes)) {
+                            continue;
+                        }
                         // Skip the encoder's currently-open output path and
                         // its .tmp companion.
                         if (protEncoderPath != null
@@ -8481,9 +9719,8 @@ public class StorageManager {
                             continue;
                         }
                         // Skip in-flight trip file (mirrors sweepOrphanTempFiles).
-                        if (protectedTripPath != null
-                                && (protectedTripPath.equals(absPath)
-                                    || protectedTripPath.equals(absPath + ".tmp"))) {
+                        if ("trips".equals(category)
+                                && isProtectedTripFile(f)) {
                             skippedActive++;
                             continue;
                         }

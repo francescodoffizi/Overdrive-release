@@ -24,6 +24,10 @@ object PreferencesManager {
     private const val KEY_ZROK_UNIQUE_NAME = "zrok_unique_name"
     private const val KEY_ZROK_ENABLE_TOKEN = "zrok_enable_token"
     private const val KEY_LOGS_EXPANDED = "logs_expanded"
+    private const val KEY_NAVIGATION_VISIBLE_V1 = "navigation_visible_v1"
+    /** Rail keys the user has already been offered, so a NEW one can default to
+     *  visible without un-hiding something they deliberately switched off. */
+    private const val KEY_NAVIGATION_SEEN_V1 = "navigation_seen_v1"
 
     private var prefs: SharedPreferences? = null
     // Held so theme-mode changes can poke the floating overlay service —
@@ -219,6 +223,49 @@ object PreferencesManager {
     
     fun setLogsExpanded(expanded: Boolean) {
         requirePrefs().edit().putBoolean(KEY_LOGS_EXPANDED, expanded).apply()
+    }
+
+    /**
+     * Missing preference means the complete current catalog, preserving the
+     * navigation users had before customization existed. Once customized, new
+     * optional destinations remain available in Settings but are not pinned
+     * automatically.
+     */
+    fun getVisibleNavigationKeys(knownKeys: Set<String>): Set<String> {
+        val p = requirePrefs()
+        val stored = if (p.contains(KEY_NAVIGATION_VISIBLE_V1)) {
+            p.getStringSet(KEY_NAVIGATION_VISIBLE_V1, emptySet())?.toSet()
+        } else {
+            null
+        }
+        // A key the user has never been offered is NEW: show it rather than leaving
+        // a shipped feature invisible on every existing install. Record the offer so
+        // this only ever happens once per key.
+        val seen = p.getStringSet(KEY_NAVIGATION_SEEN_V1, emptySet())?.toSet() ?: emptySet()
+        val resolved = NavigationVisibilityPolicy.resolveWithNewDefaults(stored, knownKeys, seen)
+        if (!seen.containsAll(knownKeys)) {
+            p.edit().putStringSet(KEY_NAVIGATION_SEEN_V1, seen + knownKeys).apply()
+        }
+        return resolved
+    }
+
+    fun setNavigationItemVisible(key: String, visible: Boolean, knownKeys: Set<String>) {
+        val updated = NavigationVisibilityPolicy.setVisible(
+            getVisibleNavigationKeys(knownKeys),
+            key,
+            visible,
+            knownKeys,
+        )
+        requirePrefs().edit()
+            .putStringSet(KEY_NAVIGATION_VISIBLE_V1, updated)
+            .apply()
+    }
+
+    fun resetNavigationVisibility() {
+        requirePrefs().edit()
+            .remove(KEY_NAVIGATION_VISIBLE_V1)
+            .remove(KEY_NAVIGATION_SEEN_V1)
+            .apply()
     }
 
     /** Current access URL — always the last tunnel URL we saw. */

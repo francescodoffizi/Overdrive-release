@@ -130,7 +130,7 @@ public class GpuMosaicRecorder {
     private final Object producerCornerMapLock = new Object();
 
     // Last SurfaceTexture transform matrix published by the camera thread.
-    // Initialised to identity so non-esco paths keep working as before.
+    // Initialised to identity so non-oem paths keep working as before.
     // Volatile because the camera thread writes via setTextureMatrix and
     // the encoder GL thread reads in drawFrame.
     private final float[] currentTexMatrix = {
@@ -169,7 +169,7 @@ public class GpuMosaicRecorder {
     // startRecording. Null = no override (default behaviour).
     private volatile java.io.File pendingOutputDirOverride = null;
     private volatile boolean apaMode = false;  // APA mode: passthrough instead of mosaic split
-    private volatile int cameraLayout = 0;  // 0=4-cam, 1=APA passthrough, 2=3-cam, 3=esco-parity passthrough
+    private volatile int cameraLayout = 0;  // 0=4-cam, 1=APA passthrough, 2=3-cam, 3=oem-parity passthrough
     // Set when setCameraLayout flips on a non-GL thread; consumed inside
     // drawFrame on the encoder GL thread to push the new uniform exactly
     // once. Per GLES2 spec, uniform values are part of the program object,
@@ -369,7 +369,7 @@ public class GpuMosaicRecorder {
         1.0f, 1.0f   // Top-right vertex → top of texture
     };
     
-    // Vertex shader. esco-parity: applies the SurfaceTexture transform
+    // Vertex shader. oem-parity: applies the SurfaceTexture transform
     // matrix (uTexMatrix) so the consumer samples whatever sub-region the
     // BYD HAL marked as "live frame" — without it we sample the whole
     // producer surface including any HAL chrome (calibration text, letter-
@@ -1103,6 +1103,16 @@ public class GpuMosaicRecorder {
                 return true;
             }
 
+            // OWNERSHIP PRE-CHECK (audit R11-1 / ExtD-2): same guard as
+            // triggerEventRecordingExclusive — the encoder's already-writing
+            // no-op leg must not be reported as a successful start of OUR
+            // outputPath (the file would never get a muxer).
+            if (encoder != null && encoder.isWritingToFile()) {
+                logger.warn("Encoder busy with a non-GMR session — refusing start for "
+                        + outputPath);
+                return false;
+            }
+
             // Start encoder recording (with pre-record buffer flush)
             if (encoder != null && encoder.triggerEventRecording(outputPath, 5000)) {  // Default 5 sec post-record
                 recording = true;
@@ -1136,10 +1146,50 @@ public class GpuMosaicRecorder {
      *         existing recording satisfies the caller's intent.
      */
     public boolean triggerEventRecording(String outputPath, long postRecordDurationMs) {
+        return triggerEventRecordingExclusive(outputPath, postRecordDurationMs)
+                != TriggerResult.REFUSED;
+    }
+
+    /** Ownership-explicit result of {@link #triggerEventRecordingExclusive}. */
+    public enum TriggerResult { STARTED, ALREADY_RECORDING, REFUSED }
+
+    /**
+     * Ownership-explicit variant of {@link #triggerEventRecording} (audit R6
+     * lifecycle #1). The boolean form reports "already recording" as TRUE —
+     * fine for fire-and-forget callers, but a caller that must UNWIND on a
+     * failed commit (SurveillanceEngineGpu's epoch-checked start commits)
+     * then believes it OWNS a session another caller opened, and its unwind
+     * stop kills the other session's live recording (worst case: a stale
+     * pre-bounce start stopping the successor arm session's recorder while
+     * the engine reports recording — whole-session silent video loss).
+     *
+     * @return STARTED iff THIS call opened the recorder session (caller owns
+     *         it and may stop it); ALREADY_RECORDING when another session
+     *         owns it (caller must neither commit nor unwind); REFUSED on
+     *         encoder refusal (savedFormat barrier / null encoder).
+     */
+    public TriggerResult triggerEventRecordingExclusive(String outputPath, long postRecordDurationMs) {
         synchronized (recordingLock) {
             if (recording) {
                 logger.warn("Already recording");
-                return true;
+                return TriggerResult.ALREADY_RECORDING;
+            }
+
+            // OWNERSHIP PRE-CHECK (audit R11-1 / ExtD-2, defense-in-depth
+            // under the stop-path locking above). The encoder's trigger has
+            // an "already writing → return true" no-op leg that this wrapper
+            // cannot distinguish from a genuine open — the false STARTED it
+            // produced meant a session that never got a muxer. With GMR's
+            // stops now serialized on recordingLock, wrapper recording==false
+            // with the encoder still writing can only mean a NON-GMR session
+            // owns the encoder (e.g. a driving-mode file still mid-close on
+            // a mode transition). REFUSE rather than adopt: the caller's
+            // retry paths (continuous retry chain; next motion tick in smart
+            // mode) re-attempt against a settled encoder.
+            if (encoder != null && encoder.isWritingToFile()) {
+                logger.warn("Encoder busy with a non-GMR session — refusing trigger for "
+                        + outputPath);
+                return TriggerResult.REFUSED;
             }
 
             // Start encoder recording (with pre-record buffer flush)
@@ -1147,10 +1197,10 @@ public class GpuMosaicRecorder {
                 recording = true;
                 frameCount = 0;
                 logger.info("Recording started: " + outputPath);
-                return true;
+                return TriggerResult.STARTED;
             }
             logger.error("Failed to start encoder recording");
-            return false;
+            return TriggerResult.REFUSED;
         }
     }
     
@@ -1331,24 +1381,47 @@ public class GpuMosaicRecorder {
     
     /**
      * Stops recording.
+     *
+     * <p>LOCK (audit R11-1 / ExtD-2): the whole body runs under
+     * {@code recordingLock} — the SAME lock the start paths hold. Both stop
+     * paths used to flip {@code recording=false} and close the encoder
+     * lock-free; a concurrent {@code triggerEventRecordingExclusive} could
+     * then pass its {@code recording==false} check, win the encoder's
+     * {@code startStopLock} BEFORE the stop's close, hit the encoder's
+     * "already writing → return true" no-op leg, and report a false STARTED
+     * for a session that never got a muxer (the stop then closed the
+     * encoder): one event silently unrecorded behind a success signal.
+     * Serializing stops with starts makes the flag flip + encoder close
+     * atomic against a start — a start now sees either recording==true
+     * (ALREADY_RECORDING) or a fully-closed encoder (genuine open). Lock
+     * order recordingLock → startStopLock matches the start paths; the
+     * encoder's callbacks (fileClosedCallback / writer-abort) never take
+     * recordingLock, so no inversion. Holding the lock across the encoder
+     * close (drainer join, ≤2s finalizer wait) intentionally blocks a
+     * racing start for the duration — that start would have been a false
+     * STARTED before; now it waits and opens against clean state.
      */
     public void stopRecording() {
         if (!recording) {
             return;
         }
-        
-        recording = false;
-        
-        // SOTA: Notify StorageManager that recording is inactive
-        try {
-            com.overdrive.app.storage.StorageManager.getInstance().setRecordingActive(false);
-        } catch (Exception e) {
-            logger.warn("Could not set recording inactive state: " + e.getMessage());
-        }
-        
-        // Stop encoder recording
-        if (encoder != null) {
-            encoder.stopRecording();
+        synchronized (recordingLock) {
+            if (!recording) {
+                return; // lost the race to another stop — nothing to do
+            }
+            recording = false;
+
+            // SOTA: Notify StorageManager that recording is inactive
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance().setRecordingActive(false);
+            } catch (Exception e) {
+                logger.warn("Could not set recording inactive state: " + e.getMessage());
+            }
+
+            // Stop encoder recording
+            if (encoder != null) {
+                encoder.stopRecording();
+            }
         }
     }
     
@@ -1361,22 +1434,29 @@ public class GpuMosaicRecorder {
         if (!recording) {
             return;
         }
-        
-        recording = false;
-        
-        // SOTA: Notify StorageManager that recording is inactive
-        try {
-            com.overdrive.app.storage.StorageManager.getInstance().setRecordingActive(false);
-        } catch (Exception e) {
-            logger.warn("Could not set recording inactive state: " + e.getMessage());
+        // LOCK (audit R11-1 / ExtD-2): serialized with the start paths —
+        // see stopRecording()'s doc for the false-STARTED interleave this
+        // closes and the lock-order/deadlock analysis.
+        synchronized (recordingLock) {
+            if (!recording) {
+                return; // lost the race to another stop — nothing to do
+            }
+            recording = false;
+
+            // SOTA: Notify StorageManager that recording is inactive
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance().setRecordingActive(false);
+            } catch (Exception e) {
+                logger.warn("Could not set recording inactive state: " + e.getMessage());
+            }
+
+            // Stop encoder recording
+            if (encoder != null) {
+                encoder.stopEventRecording(immediate, postRecordDurationMs);
+            }
+
+            logger.info(String.format("Recording stopped. Total frames: %d", frameCount));
         }
-        
-        // Stop encoder recording
-        if (encoder != null) {
-            encoder.stopEventRecording(immediate, postRecordDurationMs);
-        }
-        
-        logger.info(String.format("Recording stopped. Total frames: %d", frameCount));
     }
     
     /**
@@ -1538,7 +1618,7 @@ public class GpuMosaicRecorder {
      * 0 = 4-camera mosaic (Seal: pano_h/pano_l, surfaceMode=0)
      * 1 = APA passthrough (single pre-composited image, surfaceMode=1 with apa/byd_apa tag)
      * 2 = 3-camera mosaic (Atto 3 default: Rear, Side, Front)
-     * 3 = esco-parity passthrough — sample camera as-is, no rearrangement;
+     * 3 = oem-parity passthrough — sample camera as-is, no rearrangement;
      *     pairs with uTexMatrix from SurfaceTexture.getTransformMatrix().
      */
     public void setCameraLayout(int layout) {
@@ -1553,7 +1633,7 @@ public class GpuMosaicRecorder {
         this.uniformsDirty.set(true);
         String[] names = {
             "4-camera mosaic", "APA passthrough", "3-camera mosaic",
-            "esco-parity passthrough"
+            "oem-parity passthrough"
         };
         logger.info("Camera layout: " + (layout < names.length ? names[layout] : "unknown(" + layout + ")"));
     }
@@ -1649,7 +1729,7 @@ public class GpuMosaicRecorder {
      *  don't appear in recordings. Cosmetic only — doesn't fix the
      *  underlying calibration. Off by default. */
     /**
-     * Sets the APA center inset (esco APACropFilter parity).
+     * Sets the APA center inset (oem APACropFilter parity).
      *
      * <p><b>What it actually does — read this before tuning it.</b> The shader
      * applies a GLOBAL remap of the final sample x, AFTER the per-role corner
@@ -1946,10 +2026,10 @@ public class GpuMosaicRecorder {
         //   1.0  APA passthrough: sample camera surface as-is.
         //   2.0  3-camera mosaic (Atto 3): rear=left half, front=top-right,
         //        left+right=bottom-right.
-        //   3.0  esco-parity passthrough: HAL emits the final 2x2 layout
+        //   3.0  oem-parity passthrough: HAL emits the final 2x2 layout
         //        natively; we sample with uTexMatrix in the vertex shader.
         //        Per-quadrant 180° rotation on TR (Right) and BL (Rear)
-        //        mirrors esco's APARotateFilter (C7610c quadrantAngles
+        //        mirrors oem's APARotateFilter (C7610c quadrantAngles
         //        {0, 180, 180, 0}). Toggle via uRotateNonZeroQuads:
         //          1.0 → rotate TR+BL by 180°
         //          0.0 → no rotation (debug / variant fallback)

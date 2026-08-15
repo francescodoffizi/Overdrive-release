@@ -17,7 +17,7 @@ import java.lang.reflect.Method;
  * DiLink 4 parked-panel control: turn the screen genuinely OFF and verify it.
  *
  * <h3>Provenance — this mirrors the reference app</h3>
- * Reverse-engineered from {@code Escort_Auto.apk} (the byd_apa / AVMCamera
+ * Reverse-engineered from the OEM dashcam app (the byd_apa / AVMCamera
  * reference app, {@code app_bydSofaProRelease}), classes
  * {@code BacklightController} and {@code DeviceWakeupMonitor}. The behaviour
  * copied here, verified against its decompiled bytecode:

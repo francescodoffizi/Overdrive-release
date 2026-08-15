@@ -99,6 +99,7 @@ class ZoomableVideoView @JvmOverloads constructor(
     private var pendingUri: Uri? = null
     private var surfaceReady: Boolean = false
     private var prepared: Boolean = false
+    private var playbackVolume: Float = 1f
 
     // Snapshot of the last-known playback position. Captured before the
     // SurfaceTexture is destroyed (on background, rotation, etc.) so the
@@ -302,6 +303,21 @@ class ZoomableVideoView @JvmOverloads constructor(
         firstFrameSeen = false
     }
 
+    /**
+     * Set this view's MediaPlayer gain without changing its audio attributes or stream.
+     * The value is retained across player/surface recreation. While prepareAsync is in
+     * flight only the field changes; the latest value is applied once PREPARED, before
+     * the host can start playback.
+     */
+    fun setPlaybackVolume(volume: Float) {
+        playbackVolume = if (volume.isFinite()) volume.coerceIn(0f, 1f) else 1f
+        if (!prepared) return
+        try {
+            mediaPlayer?.setVolume(playbackVolume, playbackVolume)
+        } catch (_: Throwable) {
+        }
+    }
+
     val isPlaying: Boolean
         get() = try { mediaPlayer?.isPlaying == true } catch (_: IllegalStateException) { false }
 
@@ -450,6 +466,7 @@ class ZoomableVideoView @JvmOverloads constructor(
     private fun startPreparing() {
         val uri = pendingUri ?: return
         val texture = surfaceTexture ?: return
+        prepared = false
         val mp = MediaPlayer()
         mediaPlayer = mp
         try {
@@ -461,6 +478,10 @@ class ZoomableVideoView @JvmOverloads constructor(
             // logcat) which on the BYD/DiLink audio stack stalled the
             // codec — playback "stuck" with audio system registered but
             // no frames delivered.
+            try {
+                mp.setVolume(playbackVolume, playbackVolume)
+            } catch (_: Throwable) {
+            }
             mp.setDataSource(context, uri)
             // Hold a strong ref so the GC doesn't collect this Surface
             // while MediaPlayer is using it (see producerSurface field
@@ -470,6 +491,12 @@ class ZoomableVideoView @JvmOverloads constructor(
             mp.setSurface(surface)
             mp.setOnPreparedListener { player ->
                 prepared = true
+                // A RoadSense duck transition may have happened during prepareAsync.
+                // Apply the latest retained gain in PREPARED before the host starts.
+                try {
+                    player.setVolume(playbackVolume, playbackVolume)
+                } catch (_: Throwable) {
+                }
                 videoWidth = player.videoWidth
                 videoHeight = player.videoHeight
                 Log.d(TAG, "onPrepared: dims=${videoWidth}x${videoHeight} viewSize=${width}x${height}")
@@ -532,6 +559,7 @@ class ZoomableVideoView @JvmOverloads constructor(
     }
 
     private fun releasePlayer() {
+        prepared = false
         transformAnimator?.cancel()
         transformAnimator = null
         val mp = mediaPlayer

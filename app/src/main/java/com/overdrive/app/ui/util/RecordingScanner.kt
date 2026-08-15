@@ -95,7 +95,10 @@ object RecordingScanner {
         // row — so on success we only need to mop up any sibling thumbs
         // that live under directories the daemon's StorageManager view
         // doesn't enumerate (rare, but harmless to do).
-        val apiOk = RecordingsApiClient.deleteRecording(recording)
+        val apiOk = RecordingsApiClient.deleteRecording(
+            recording.file.name,
+            recording.file.absolutePath,
+        )
         if (apiOk) {
             cleanupLocalSidecars(recording)
             invalidateCache()
@@ -264,9 +267,7 @@ object RecordingScanner {
         // Seed `seen` with the names the NORMAL/OEM passes already claimed:
         // parseFallbackRecording tags an UNKNOWN-prefixed .mp4 with whatever
         // type the pass asked for, so without the seed a foo.mp4 in these
-        // shared dirs would be claimed a third time here. Well-formed
-        // replay_* names are prefix-rejected by those passes and so are
-        // never in the seed.
+        // shared dirs would be claimed a third time here.
         val replay = mutableListOf<RecordingFile>()
         val seenReplay = (seenNormal + seenOemDashcam).toMutableSet()
         for (dir in sm.allRecordingsDirs) {

@@ -4,7 +4,10 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.util.AttributeSet
+import android.view.MotionEvent
 import android.view.View
+import android.view.accessibility.AccessibilityNodeInfo
+import com.overdrive.app.R
 
 /**
  * Custom view that renders event detection markers on a video timeline.
@@ -27,6 +30,9 @@ class EventTimelineView @JvmOverloads constructor(
     private var events: List<TimelineEvent> = emptyList()
     private var durationMs: Long = 0
     private var playheadMs: Long = 0
+    private var pendingTapMs: Long? = null
+    private var onSeekRequested: ((Long) -> Unit)? = null
+    private var onEventSelected: ((TimelineEvent) -> Unit)? = null
 
     private val paintMotion = Paint().apply { color = 0x99888888.toInt(); isAntiAlias = true }
     private val paintPerson = Paint().apply { color = 0xCCFF4444.toInt(); isAntiAlias = true }
@@ -37,12 +43,106 @@ class EventTimelineView @JvmOverloads constructor(
     fun setEvents(events: List<TimelineEvent>, durationMs: Long) {
         this.events = events
         this.durationMs = durationMs
+        contentDescription = if (events.isEmpty()) {
+            context.getString(R.string.video_timeline_empty)
+        } else {
+            context.getString(R.string.video_timeline_events, events.size)
+        }
         invalidate()
     }
 
     fun setPlayhead(positionMs: Long) {
         this.playheadMs = positionMs
         invalidate()
+    }
+
+    fun setOnSeekRequestedListener(listener: ((Long) -> Unit)?) {
+        onSeekRequested = listener
+    }
+
+    fun setOnEventSelectedListener(listener: ((TimelineEvent) -> Unit)?) {
+        onEventSelected = listener
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (durationMs <= 0 || width <= 0) return super.onTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                isPressed = true
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                isPressed = false
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                isPressed = false
+                pendingTapMs = ((event.x / width).coerceIn(0f, 1f) * durationMs).toLong()
+                return performClick()
+            }
+        }
+        return true
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        val requested = pendingTapMs ?: playheadMs
+        pendingTapMs = null
+        selectNearest(requested)
+        return true
+    }
+
+    override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(info)
+        info.className = android.widget.SeekBar::class.java.name
+        info.isClickable = true
+        if (durationMs > 0) {
+            info.rangeInfo = AccessibilityNodeInfo.RangeInfo.obtain(
+                AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_INT,
+                0f,
+                durationMs.toFloat(),
+                playheadMs.coerceIn(0L, durationMs).toFloat()
+            )
+            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD)
+            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD)
+        }
+    }
+
+    override fun performAccessibilityAction(action: Int, arguments: android.os.Bundle?): Boolean {
+        if (events.isNotEmpty() && action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) {
+            val next = events.firstOrNull { it.startMs > playheadMs } ?: events.last()
+            selectEvent(next)
+            return true
+        }
+        if (events.isNotEmpty() && action == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) {
+            val previous = events.lastOrNull { it.startMs < playheadMs } ?: events.first()
+            selectEvent(previous)
+            return true
+        }
+        return super.performAccessibilityAction(action, arguments)
+    }
+
+    private fun selectNearest(requestedMs: Long) {
+        val nearest = events.minByOrNull { kotlin.math.abs(it.startMs - requestedMs) }
+        val thresholdMs = if (width > 0) (durationMs * 32L / width).coerceAtLeast(500L) else 500L
+        if (nearest != null && kotlin.math.abs(nearest.startMs - requestedMs) <= thresholdMs) {
+            selectEvent(nearest)
+        } else {
+            onSeekRequested?.invoke(requestedMs.coerceIn(0L, durationMs))
+        }
+    }
+
+    private fun selectEvent(event: TimelineEvent) {
+        playheadMs = event.startMs.coerceIn(0L, durationMs)
+        onSeekRequested?.invoke(playheadMs)
+        onEventSelected?.invoke(event)
+        announceForAccessibility("${event.type}, ${formatTime(playheadMs)}")
+        invalidate()
+    }
+
+    private fun formatTime(ms: Long): String {
+        val seconds = ms / 1000
+        return "${seconds / 60}:${(seconds % 60).toString().padStart(2, '0')}"
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -65,6 +165,17 @@ class EventTimelineView @JvmOverloads constructor(
                 else -> paintMotion
             }
             canvas.drawRect(left, barTop, right, barBottom, paint)
+            // Shape cues keep event classes distinguishable without color.
+            val centerY = (barTop + barBottom) / 2f
+            when (ev.type) {
+                "person" -> canvas.drawCircle(left + 4f, centerY, 4f, paintPlayhead)
+                "car" -> canvas.drawRect(left, centerY - 2f, left + 8f, centerY + 2f, paintPlayhead)
+                "bike" -> {
+                    canvas.drawCircle(left + 2f, centerY, 2f, paintPlayhead)
+                    canvas.drawCircle(left + 7f, centerY, 2f, paintPlayhead)
+                }
+                else -> canvas.drawRect(left, barTop, left + 2f, barBottom, paintPlayhead)
+            }
         }
 
         // Draw playhead

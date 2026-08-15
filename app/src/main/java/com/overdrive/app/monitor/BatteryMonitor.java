@@ -20,10 +20,16 @@ import org.json.JSONObject;
  */
 public class BatteryMonitor {
 
+    private static final long BATTERY_FETCH_INTERVAL_MS = 30_000L;
+    private static final long BATTERY_VOLTAGE_STALE_MS = 60_000L;
+
     private static volatile double lastBatteryVoltage = 0.0;
     private static volatile String lastBatteryLevel = "UNKNOWN";
     private static volatile double lastBatterySoc = 0.0;
+    /** Wall-clock time of the last valid voltage sample. */
     private static volatile long lastBatteryUpdate = 0;
+    /** Wall-clock time of the last attempted vehicle-data poll. */
+    private static volatile long lastBatteryPoll = 0;
 
     /**
      * Derive battery level from actual voltage when BYD API returns INVALID.
@@ -43,6 +49,8 @@ public class BatteryMonitor {
      * Fetch battery info from SurveillanceIpcServer.
      */
     public static void fetchBatteryInfo() {
+        long now = System.currentTimeMillis();
+        lastBatteryPoll = now;
         try {
             // Direct same-process read — VehicleDataMonitor is the singleton the
             // SurveillanceIpcServer's GET_VEHICLE_DATA handler delegates to, and
@@ -54,7 +62,13 @@ public class BatteryMonitor {
                 // Get battery power voltage (actual volts)
                 JSONObject batteryPower = data.optJSONObject("batteryPower");
                 if (batteryPower != null) {
-                    lastBatteryVoltage = batteryPower.optDouble("voltageVolts", 0.0);
+                    double voltage = batteryPower.optDouble("voltageVolts", Double.NaN);
+                    long observedAtMs = batteryPower.optLong("observedAtMs", 0L);
+                    if (Double.isFinite(voltage) && voltage > 0.0
+                            && observedAtMs > 0L) {
+                        lastBatteryVoltage = voltage;
+                        lastBatteryUpdate = observedAtMs;
+                    }
                 }
 
                 // Get battery voltage level (LOW/NORMAL/INVALID)
@@ -78,7 +92,6 @@ public class BatteryMonitor {
                     lastBatterySoc = batterySoc.optDouble("socPercent", 0.0);
                 }
 
-                lastBatteryUpdate = System.currentTimeMillis();
                 CameraDaemon.log("Battery updated: " + lastBatteryVoltage + "V (" + lastBatteryLevel + "), SOC: " + lastBatterySoc + "%");
             }
         } catch (Exception e) {
@@ -91,19 +104,41 @@ public class BatteryMonitor {
      * Fetches fresh data if stale (> 30 seconds).
      */
     public static JSONObject getBatteryInfo() {
-        if (System.currentTimeMillis() - lastBatteryUpdate > 30000) {
+        long now = System.currentTimeMillis();
+        if (now - lastBatteryPoll > BATTERY_FETCH_INTERVAL_MS) {
             fetchBatteryInfo();
+            now = System.currentTimeMillis();
         }
-        
+
+        boolean voltageFresh = isVoltageFresh(
+                lastBatteryVoltage, lastBatteryUpdate, now);
+        long voltageAgeMs = lastBatteryUpdate > 0
+                ? Math.max(0L, now - lastBatteryUpdate) : -1L;
+
         JSONObject battery = new JSONObject();
         try {
-            battery.put("voltage", lastBatteryVoltage);
-            battery.put("level", lastBatteryLevel);
+            battery.put("voltage",
+                    voltageFresh ? lastBatteryVoltage : JSONObject.NULL);
+            battery.put("available", voltageFresh);
+            battery.put("isStale", !voltageFresh);
+            battery.put("ageMs",
+                    voltageAgeMs >= 0 ? voltageAgeMs : JSONObject.NULL);
+            battery.put("level",
+                    voltageFresh ? lastBatteryLevel : "UNKNOWN");
             battery.put("soc", lastBatterySoc);
             battery.put("lastUpdate", lastBatteryUpdate);
         } catch (Exception e) {
             // Ignore
         }
         return battery;
+    }
+
+    static boolean isVoltageFresh(
+            double voltage, long observedAtMs, long nowMs) {
+        return Double.isFinite(voltage)
+                && voltage > 0.0
+                && observedAtMs > 0L
+                && nowMs >= observedAtMs
+                && nowMs - observedAtMs <= BATTERY_VOLTAGE_STALE_MS;
     }
 }

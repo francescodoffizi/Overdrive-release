@@ -1,10 +1,13 @@
 package com.overdrive.app.byd;
 
 import android.content.Context;
+import android.content.ContextWrapper;
+import android.content.pm.PackageManager;
 
 import com.overdrive.app.logging.DaemonLogger;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
 /**
@@ -14,6 +17,8 @@ import java.lang.reflect.Method;
 public final class BydDeviceHelper {
 
     private static final DaemonLogger logger = DaemonLogger.getInstance("BydDeviceHelper");
+    private static final java.util.Map<Object, Object> safetyBeltListeners =
+            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
 
     /**
      * Get a BYD device singleton via reflection.
@@ -33,9 +38,138 @@ public final class BydDeviceHelper {
         } catch (ClassNotFoundException e) {
             logger.debug("Device class not found: " + className);
         } catch (Exception e) {
-            logger.debug("Device init failed: " + className + " — " + e.getMessage());
+            Throwable cause = e instanceof InvocationTargetException && e.getCause() != null
+                    ? e.getCause() : e;
+            logger.debug("Device init failed: " + className + " — "
+                    + cause.getClass().getSimpleName() + ": " + cause.getMessage());
         }
         return null;
+    }
+
+    /**
+     * Wrap an app context so BYD's SDK-side permission checks see the BYD permissions as granted.
+     *
+     * <p>Some OEM SDK clients use a custom {@code Application}: BYD device
+     * {@code getInstance(Context)} methods enforce signature permissions directly on the supplied
+     * Context before they create their singleton. OverDrive is not platform-signed, so a raw app
+     * context fails before any Binder/HAL call is attempted. The wrapper is opt-in and grants only
+     * {@code android.permission.BYD*}; every unrelated Android permission still delegates to the
+     * real context. Returning the wrapper from {@link Context#getApplicationContext()} prevents
+     * the SDK from normalizing back to the unwrapped context before a later permission check.
+     */
+    public static Context withBydPermissionBypass(Context context) {
+        if (context == null || context instanceof BydPermissionContext) return context;
+        return new BydPermissionContext(context);
+    }
+
+    static boolean isBydPermissionName(String permission) {
+        return permission != null && permission.startsWith("android.permission.BYD");
+    }
+
+    private static final class BydPermissionContext extends ContextWrapper {
+        BydPermissionContext(Context base) {
+            super(base);
+        }
+
+        @Override
+        public Context getApplicationContext() {
+            return this;
+        }
+
+        @Override
+        public int checkPermission(String permission, int pid, int uid) {
+            return isBydPermissionName(permission)
+                    ? PackageManager.PERMISSION_GRANTED
+                    : super.checkPermission(permission, pid, uid);
+        }
+
+        @Override
+        public int checkCallingPermission(String permission) {
+            return isBydPermissionName(permission)
+                    ? PackageManager.PERMISSION_GRANTED
+                    : super.checkCallingPermission(permission);
+        }
+
+        @Override
+        public int checkCallingOrSelfPermission(String permission) {
+            return isBydPermissionName(permission)
+                    ? PackageManager.PERMISSION_GRANTED
+                    : super.checkCallingOrSelfPermission(permission);
+        }
+
+        @Override
+        public int checkSelfPermission(String permission) {
+            return isBydPermissionName(permission)
+                    ? PackageManager.PERMISSION_GRANTED
+                    : super.checkSelfPermission(permission);
+        }
+
+        @Override
+        public void enforcePermission(
+                String permission, int pid, int uid, String message) {
+            if (!isBydPermissionName(permission)) {
+                super.enforcePermission(permission, pid, uid, message);
+            }
+        }
+
+        @Override
+        public void enforceCallingPermission(String permission, String message) {
+            if (!isBydPermissionName(permission)) {
+                super.enforceCallingPermission(permission, message);
+            }
+        }
+
+        @Override
+        public void enforceCallingOrSelfPermission(String permission, String message) {
+            if (!isBydPermissionName(permission)) {
+                super.enforceCallingOrSelfPermission(permission, message);
+            }
+        }
+    }
+
+    /**
+     * Invoke the manager-level integer setter without requiring a per-device singleton.
+     *
+     * <p>The connected framework's protected
+     * {@code AbsBYDAutoDevice.set(deviceType, featureId, value)} implementation is exactly this:
+     * {@code BYDAutoDeviceManager.setInt(...)}. This fallback is therefore useful when a device's
+     * constructor fails before returning a handle, while preserving the same HAL command.
+     */
+    public static int callManagerSetInt(
+            Context context, int deviceType, int featureId, int value) {
+        if (context == null) return Integer.MIN_VALUE;
+        try {
+            Class<?> managerClass =
+                    Class.forName("android.hardware.bydauto.BYDAutoDeviceManager");
+            Method getInstance = managerClass.getMethod("getInstance", Context.class);
+            Object manager = getInstance.invoke(null, context);
+            if (manager == null) {
+                logger.debug("callManagerSetInt: BYDAutoDeviceManager unavailable");
+                return Integer.MIN_VALUE;
+            }
+            Method setInt = findMethodCached(
+                    manager,
+                    "setInt",
+                    managerSetIntMethodCache,
+                    int.class,
+                    int.class,
+                    int.class);
+            if (setInt == null) {
+                logger.debug("callManagerSetInt: setInt(int,int,int) unavailable");
+                return Integer.MIN_VALUE;
+            }
+            Object result = setInt.invoke(manager, deviceType, featureId, value);
+            return result instanceof Number
+                    ? ((Number) result).intValue() : Integer.MIN_VALUE;
+        } catch (Exception e) {
+            Throwable cause = e instanceof InvocationTargetException && e.getCause() != null
+                    ? e.getCause() : e;
+            logger.debug("callManagerSetInt failed for device=" + deviceType
+                    + ", feature=0x" + Integer.toHexString(featureId)
+                    + ", value=" + value + " — " + cause.getClass().getSimpleName()
+                    + ": " + cause.getMessage());
+            return Integer.MIN_VALUE;
+        }
     }
 
     /**
@@ -351,6 +485,13 @@ public final class BydDeviceHelper {
             if (eventValue instanceof Double) return (Double) eventValue;
             if (eventValue instanceof Number) return ((Number) eventValue).doubleValue();
         }
+        // Some feature ids are carried as a 32-bit float rather than a double. Without this the
+        // read returned NaN and the channel looked absent on those trims — indistinguishable from
+        // a dead getter, which is exactly the ambiguity that makes a missing value hard to diagnose.
+        try {
+            Field ff = eventValue.getClass().getField("floatValue");
+            return ff.getFloat(eventValue);
+        } catch (Exception ignored) { /* not a float-carrying event */ }
         return Double.NaN;
     }
 
@@ -927,6 +1068,77 @@ public final class BydDeviceHelper {
     }
 
     /**
+     * Register the typed safety-belt listener. Passenger occupancy is delivered through
+     * {@code onPassengerStatusChanged}, which is not a method on the generic
+     * {@code IBYDAutoListener} marker interface.
+     */
+    public static boolean registerSafetyBeltListener(Object device, ListenerCallback callback) {
+        if (device == null) return false;
+        synchronized (safetyBeltListeners) {
+            // The caller should already avoid duplicate registration, but retaining only one
+            // listener makes a second helper-level registration a leak: the first callback can
+            // no longer be unregistered. Treat the existing typed listener as success.
+            if (safetyBeltListeners.containsKey(device)) return true;
+            try {
+                android.hardware.bydauto.safetybelt.AbsBYDAutoSafetyBeltListener listener =
+                        new android.hardware.bydauto.safetybelt.AbsBYDAutoSafetyBeltListener() {
+                            @Override
+                            public void onSafetyBeltStatusChanged(int seat, int state) {
+                                invokeCallback(callback, "onSafetyBeltStatusChanged",
+                                        new Object[]{seat, state});
+                            }
+
+                            @Override
+                            public void onPassengerStatusChanged(int area, int state) {
+                                invokeCallback(callback, "onPassengerStatusChanged",
+                                        new Object[]{area, state});
+                            }
+                        };
+                Method register = findRegisterMethod(device.getClass(),
+                        android.hardware.bydauto.safetybelt.AbsBYDAutoSafetyBeltListener.class);
+                if (register != null) {
+                    register.invoke(device, listener);
+                    safetyBeltListeners.put(device, listener);
+                    return true;
+                }
+                logger.debug("registerSafetyBeltListener: no registerListener method on "
+                        + device.getClass().getName());
+            } catch (LinkageError e) {
+                logger.debug("registerSafetyBeltListener: class not available on this firmware");
+            } catch (Exception e) {
+                logger.debug("registerSafetyBeltListener failed: " + e.getMessage());
+            }
+        }
+        return false;
+    }
+
+    /** Unregister and release the retained typed safety-belt listener for one device handle. */
+    public static boolean unregisterSafetyBeltListener(Object device) {
+        if (device == null) return false;
+        synchronized (safetyBeltListeners) {
+            Object listener = safetyBeltListeners.get(device);
+            if (listener == null) return false;
+            try {
+                Method unregister = findUnregisterMethod(device.getClass(),
+                        android.hardware.bydauto.safetybelt.AbsBYDAutoSafetyBeltListener.class);
+                if (unregister == null) {
+                    logger.debug("unregisterSafetyBeltListener: no unregisterListener method on "
+                            + device.getClass().getName());
+                    return false;
+                }
+                unregister.invoke(device, listener);
+                safetyBeltListeners.remove(device);
+                return true;
+            } catch (LinkageError e) {
+                logger.debug("unregisterSafetyBeltListener: class not available on this firmware");
+            } catch (Exception e) {
+                logger.debug("unregisterSafetyBeltListener failed: " + e.getMessage());
+            }
+        }
+        return false;
+    }
+
+    /**
      * Register a typed statistic listener. onElecPercentageChanged(double) — the
      * DECIMAL display SoC — is a concrete method on AbsBYDAutoStatisticListener, NOT
      * on the bare IBYDAutoListener marker interface, so the generic Proxy path can
@@ -1149,8 +1361,29 @@ public final class BydDeviceHelper {
     }
 
     /**
-     * Call set(int deviceType, int featureId, int value) on a BYD device.
-     * Returns the SDK result code, or -1 on any failure.
+     * OEM-strict variant for commands whose contract requires an actual Integer result.
+     * Returns null when the invocation did not produce one; unlike {@link #sendSetCommandRaw},
+     * a void, Boolean, or other non-Integer result is never manufactured into success.
+     */
+    public static Integer sendSetCommandIntegerResult(Object device, int featureId, int value) {
+        if (device == null) return null;
+        try {
+            Class<?> eventValueClass = Class.forName("android.hardware.bydauto.BYDAutoEventValue");
+            Object eventValue = eventValueClass.getConstructor(new Class[0]).newInstance(new Object[0]);
+            eventValueClass.getField("intValue").setInt(eventValue, value);
+            Method setMethod = device.getClass().getMethod("set", int[].class, eventValueClass);
+            Object result = setMethod.invoke(device, new int[]{featureId}, eventValue);
+            return result instanceof Integer ? (Integer) result : null;
+        } catch (Exception e) {
+            logger.debug("sendSetCommandIntegerResult failed for featureId=0x"
+                    + Integer.toHexString(featureId) + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Call set(int deviceType, int featureId, int value) on a BYD device, including a protected
+     * declaration inherited from an OEM base class. Returns the SDK result code, or -1 on failure.
      */
     public static int callSetSingle(Object device, int featureId, int value) {
         if (device == null) return -1;
@@ -1226,6 +1459,7 @@ public final class BydDeviceHelper {
     private static final java.util.Map<Class<?>, Method> getDoubleArrayMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.Map<Class<?>, Method> getBufferMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.Map<Class<?>, Method> setSingleMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<Class<?>, Method> managerSetIntMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.Map<Class<?>, Method> setBatchMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.Map<Class<?>, Method> setBufferMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
     /**
@@ -1495,6 +1729,19 @@ public final class BydDeviceHelper {
         while (walk != null && walk != Object.class) {
             try {
                 Method m = walk.getDeclaredMethod("registerListener", listenerInterface);
+                m.setAccessible(true);
+                return m;
+            } catch (NoSuchMethodException ignored) {}
+            walk = walk.getSuperclass();
+        }
+        return null;
+    }
+
+    private static Method findUnregisterMethod(Class<?> cls, Class<?> listenerInterface) {
+        Class<?> walk = cls;
+        while (walk != null && walk != Object.class) {
+            try {
+                Method m = walk.getDeclaredMethod("unregisterListener", listenerInterface);
                 m.setAccessible(true);
                 return m;
             } catch (NoSuchMethodException ignored) {}

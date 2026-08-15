@@ -357,10 +357,15 @@ class DiagnosticsFragment : Fragment() {
             try {
                 val recordingsDir = RecordingScanner.getRecordingsDir(ctx)
                 val sentryDir = RecordingScanner.getSentryEventsDir(ctx)
+                // Proximity too: those clips share the recordings quota, so omitting
+                // them under-reported both the clip count and bytes used.
+                val proximityDir = RecordingScanner.getProximityEventsDir(ctx)
                 clipCount += countMp4(recordingsDir)
                 clipCount += countMp4(sentryDir)
+                clipCount += countMp4(proximityDir)
                 usedBytes += sumMp4Sizes(recordingsDir)
                 usedBytes += sumMp4Sizes(sentryDir)
+                usedBytes += sumMp4Sizes(proximityDir)
 
                 // Free space on the filesystem holding the recordings dir.
                 val statFsTarget = when {

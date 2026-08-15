@@ -40,8 +40,8 @@ public class GlUtil {
      * as-is — the goal is the overall translucent wash, not the banner.
      */
     /**
-     * GLSL fragment-shader fragment that mirrors esco's
-     * {@code APACropFilter(240, 0)} (esco {@code ml/C7609b.java}): trims
+     * GLSL fragment-shader fragment that mirrors oem's
+     * {@code APACropFilter(240, 0)} (oem {@code ml/C7609b.java}): trims
      * {@code uApaCenterInset} of producer-UV off the LEFT and RIGHT outer
      * edges of the full producer, leaves the vertical axis untouched.
      *
@@ -50,12 +50,12 @@ public class GlUtil {
      * UV {@code [0, 1]^2}. The snippet linearly remaps
      * {@code samplePos.x: [0, 1] -> [inset, 1 - inset]} so the consumer
      * sees the byd_apa producer's middle band stretched horizontally to
-     * its full output rect, exactly like esco. Default uniform 0 → no-op
+     * its full output rect, exactly like oem. Default uniform 0 → no-op
      * (legacy path bit-exact).
      *
-     * <p>Esco's filter cropped the FULL producer surface (the unstitched
+     * <p>Oem's filter cropped the FULL producer surface (the unstitched
      * 4-up byd_apa frame) before its per-role lens-select. Our pipeline
-     * skips esco's intermediate FBOs and samples directly from the OES
+     * skips oem's intermediate FBOs and samples directly from the OES
      * texture, so we apply the same horizontal remap right before the
      * {@code texture2D} sample — algebraically identical effect.
      */

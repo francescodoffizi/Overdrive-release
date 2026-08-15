@@ -31,7 +31,7 @@ import com.overdrive.app.monitor.AccMonitor;
  * when ANOTHER consumer is attached to the same vendor.byd.avm daemon —
  * com.byd.avc is exactly that consumer. Killing AVC made post-ACC-OFF frames
  * go all-zero (Frame 1 size dropped from ~80 KB to ~350 B). We now COOPERATE
- * with AVC on dilink4 like esco does: warm it on entry AND keep-alive ticks
+ * with AVC on dilink4 like oem does: warm it on entry AND keep-alive ticks
  * keep it propped up. The red "calibration failed" chrome that AVC paints
  * is suppressed cosmetically by the GL red-mask shader (already in place),
  * so we no longer need to evict AVC at all. Legacy cars (90% of fleet)
@@ -82,7 +82,14 @@ public class AvcHalWarmup {
     };
 
     private volatile Thread keepAliveThread;
-    private volatile boolean active = false;
+    private boolean keepAliveDesired;
+    private long keepAliveGeneration;
+    private static final long KEEP_ALIVE_STOP_TIMEOUT_MS = 7000L;
+    private static final long KEEP_ALIVE_RETRY_INITIAL_MS = 250L;
+    private static final long KEEP_ALIVE_RETRY_MAX_MS = 5000L;
+    private long keepAliveRetryDelayMs = KEEP_ALIVE_RETRY_INITIAL_MS;
+    private boolean keepAliveHandoffScheduled;
+    private Thread keepAliveHandoffOwner;
 
     /**
      * Tracks consecutive failed launch attempts (instance scope — warmupAndWait
@@ -105,6 +112,16 @@ public class AvcHalWarmup {
 
     /** Threshold for escalating to force-stop + restart. */
     private static final int LAUNCH_FAILURE_ESCALATE_THRESHOLD = 3;
+    private static final long AVC_COMMAND_TIMEOUT_SECONDS = 5L;
+    private static final long AVC_PROBE_TIMEOUT_SECONDS = 2L;
+    private static final Object AVC_PROCESS_LANE = new Object();
+    private static final java.util.concurrent.ScheduledExecutorService
+            KEEP_ALIVE_HANDOFF_SCHEDULER =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread thread = new Thread(r, "AvcKeepAliveHandoff");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     /**
      * Minimum interval between consecutive force-stop + restart escalations
@@ -138,16 +155,16 @@ public class AvcHalWarmup {
     public boolean warmupAndWait() {
         boolean dilink4 = isDilink4Mode();
         if (dilink4) {
-            // ESCO-PARITY: esco does NOT launch com.byd.avc anywhere in its
+            // OEM-PARITY: oem does NOT launch com.byd.avc anywhere in its
             // panorama-camera flow. The 4 s blocking sleep + `am start
             // com.byd.avc/.MainActivity` was OverDrive-specific and
             // suspected of stealing the HAL's mosaic mode (PANORAMA_OUTPUT_STATE=7).
             // Skip the warmup entirely on dilink4. ensureAvcAlive() (pidof +
             // conditional am start, no sleep) still runs separately for the
             // multi-consumer keep-alive case; that's the closest behaviour
-            // esco's environment naturally provides without an explicit
+            // oem's environment naturally provides without an explicit
             // launch.
-            logger.info("dilink4: skipping warmupAndWait (esco-parity — esco never launches com.byd.avc explicitly)");
+            logger.info("dilink4: skipping warmupAndWait (oem-parity — oem never launches com.byd.avc explicitly)");
             return true;
         }
 
@@ -187,110 +204,243 @@ public class AvcHalWarmup {
      * Call this after the pipeline has started successfully.
      */
     public synchronized void startKeepAlive() {
-        if (active) {
+        if (keepAliveDesired
+                && keepAliveThread != null
+                && keepAliveThread.isAlive()) {
             logger.info("Keep-alive already running");
             return;
         }
 
-        active = true;
-        keepAliveThread = new Thread(() -> {
+        keepAliveDesired = true;
+        keepAliveGeneration++;
+        if (keepAliveThread != null && keepAliveThread.isAlive()) {
+            keepAliveThread.interrupt();
+            logger.info("Keep-alive restart queued behind prior worker termination");
+            return;
+        }
+        keepAliveThread = null;
+        tryStartKeepAliveWorkerLocked(keepAliveGeneration);
+    }
+
+    private void tryStartKeepAliveWorkerLocked(final long generation) {
+        try {
+            startKeepAliveWorkerLocked(generation);
+        } catch (Throwable constructionFailure) {
+            keepAliveThread = null;
+            logger.warn("AVC keep-alive worker construction failed: "
+                + constructionFailure.getMessage());
+            scheduleKeepAliveHandoffLocked(null);
+        }
+    }
+
+    private void startKeepAliveWorkerLocked(final long generation) {
+        final Thread worker = new Thread(() -> {
             logger.info("AVC keep-alive watchdog started (interval=" +
                 KEEP_ALIVE_INTERVAL_MS / 1000 + "s)");
 
-            while (active && !Thread.currentThread().isInterrupted()) {
-                try {
-                    Thread.sleep(KEEP_ALIVE_INTERVAL_MS);
-                } catch (InterruptedException e) {
-                    break;
-                }
-
-                // Double-check conditions before poking
-                if (!active) break;
-
-                // ESCO-PARITY: on dilink4 do NOT launch com.byd.avc.
-                // esco never launches AVC. ensureAvcAlive() (pidof check +
-                // optional non-launching am start) is sufficient as a
-                // presence probe; an explicit launch is suspected of
-                // stealing the HAL's mosaic mode.
-                if (isDilink4Mode()) {
-                    // Periodic panorama-viewpoint re-assert. Substitutes for the
-                    // reference app's IProcessObserver, which re-issues
-                    // setViewpoint(2012) within 50ms of com.byd.avc leaving the
-                    // foreground — we can't register one (SET_ACTIVITY_WATCHER is
-                    // signature-level and PACKAGE_USAGE_STATS isn't granted), so this
-                    // 60s poll is the bounded-recovery equivalent. See
-                    // BydApaViewpointHelper.reassertIfHeld() for the full rationale.
-                    //
-                    // Self-gating and idempotent: a no-op unless something currently
-                    // holds the viewpoint, so it can never flip the HAL into mosaic
-                    // mode with no consumer attached. This whole branch is dilink4-only,
-                    // so legacy pano_h/pano_l keep-alive behaviour is unchanged.
+            try {
+                while (isKeepAliveWorkerCurrent(
+                        Thread.currentThread(), generation)
+                        && !Thread.currentThread().isInterrupted()) {
                     try {
-                        BydApaViewpointHelper.reassertIfHeld();
-                    } catch (Throwable t) {
-                        logger.warn("Keep-alive viewpoint re-assert failed: " + t.getMessage());
+                        Thread.sleep(KEEP_ALIVE_INTERVAL_MS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
                     }
-                    logger.info("Keep-alive tick (dilink4): skipping AVC re-launch (esco-parity)");
-                    continue;
-                }
-                // pidof-first: only fork `am start` when AVC is actually dead.
-                // The legacy loop previously relaunched UNCONDITIONALLY every
-                // 60s — each relaunch is a zygote-forked app_process issuing a
-                // binder startActivity into AMS (+ up to 5s waitFor), a per-
-                // minute system-wide hitch on the shared SoC for what is a
-                // no-op when AVC is already running. A toybox `pidof` is far
-                // cheaper (no framework link) and is the same presence-probe
-                // the dilink4 ensureAvcAlive() path already uses. When AVC IS
-                // alive we treat the tick as a success for the escalation
-                // counter (it's healthy — nothing to recover).
-                int avcPid = probeAvcPid();
-                if (avcPid > 0) {
-                    consecutiveLaunchFailures = 0;
-                    continue;
-                }
-                logger.info("Keep-alive: com.byd.avc not running (pidof miss) — re-launching (accOn=" +
-                    AccMonitor.isAccOn() + ")");
-                boolean launched = launchAvc();
-                if (launched) {
-                    consecutiveLaunchFailures = 0;
-                } else {
-                    consecutiveLaunchFailures++;
-                    if (consecutiveLaunchFailures >= LAUNCH_FAILURE_ESCALATE_THRESHOLD) {
-                        logger.warn("Keep-alive: " + consecutiveLaunchFailures
-                            + " consecutive AVC launch failures — escalating to force-stop+restart");
-                        forceRestartAvc();
+
+                    if (!isKeepAliveWorkerCurrent(
+                            Thread.currentThread(), generation)) {
+                        break;
+                    }
+
+                    // OEM-PARITY: on dilink4 do NOT launch com.byd.avc.
+                    if (isDilink4Mode()) {
+                        try {
+                            BydApaViewpointHelper.reassertIfHeld();
+                        } catch (Throwable t) {
+                            logger.warn("Keep-alive viewpoint re-assert failed: "
+                                + t.getMessage());
+                        }
+                        logger.info("Keep-alive tick (dilink4): skipping AVC re-launch (oem-parity)");
+                        continue;
+                    }
+
+                    int avcPid = probeAvcPid();
+                    if (!isKeepAliveWorkerCurrent(
+                            Thread.currentThread(), generation)) {
+                        break;
+                    }
+                    if (avcPid > 0) {
                         consecutiveLaunchFailures = 0;
+                        continue;
+                    }
+                    logger.info("Keep-alive: com.byd.avc not running (pidof miss) — re-launching (accOn=" +
+                        AccMonitor.isAccOn() + ")");
+                    boolean launched = launchAvc();
+                    if (!isKeepAliveWorkerCurrent(
+                            Thread.currentThread(), generation)) {
+                        break;
+                    }
+                    if (launched) {
+                        consecutiveLaunchFailures = 0;
+                    } else {
+                        consecutiveLaunchFailures++;
+                        if (consecutiveLaunchFailures >= LAUNCH_FAILURE_ESCALATE_THRESHOLD) {
+                            logger.warn("Keep-alive: " + consecutiveLaunchFailures
+                                + " consecutive AVC launch failures — escalating to force-stop+restart");
+                            forceRestartAvc();
+                            consecutiveLaunchFailures = 0;
+                        }
+                    }
+                }
+            } finally {
+                logger.info("AVC keep-alive watchdog stopped");
+                synchronized (AvcHalWarmup.this) {
+                    if (keepAliveThread == Thread.currentThread()) {
+                        scheduleKeepAliveHandoffLocked(
+                            Thread.currentThread());
                     }
                 }
             }
-
-            logger.info("AVC keep-alive watchdog stopped");
         }, "AvcKeepAlive");
 
-        keepAliveThread.setDaemon(true);
-        keepAliveThread.start();
+        worker.setDaemon(true);
+        keepAliveThread = worker;
+        try {
+            worker.start();
+            keepAliveRetryDelayMs = KEEP_ALIVE_RETRY_INITIAL_MS;
+        } catch (Throwable failure) {
+            logger.warn("AVC keep-alive worker failed to start: "
+                + failure.getMessage());
+            if (keepAliveThread == worker) {
+                scheduleKeepAliveHandoffLocked(worker);
+            }
+        }
+    }
+
+    private void scheduleKeepAliveHandoffLocked(Thread owner) {
+        keepAliveHandoffOwner = owner;
+        if (keepAliveHandoffScheduled) {
+            return;
+        }
+
+        final long delayMs = keepAliveRetryDelayMs;
+        keepAliveRetryDelayMs = Math.min(
+            keepAliveRetryDelayMs * 2L, KEEP_ALIVE_RETRY_MAX_MS);
+        keepAliveHandoffScheduled = true;
+        try {
+            KEEP_ALIVE_HANDOFF_SCHEDULER.schedule(
+                this::completeKeepAliveHandoff,
+                delayMs,
+                java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Throwable schedulingFailure) {
+            logger.warn("AVC keep-alive handoff scheduling failed: "
+                + schedulingFailure.getMessage());
+            startKeepAliveHandoffFallbackLocked(delayMs);
+        }
+    }
+
+    private void startKeepAliveHandoffFallbackLocked(long delayMs) {
+        final Thread fallback;
+        try {
+            fallback = new Thread(() -> {
+                try {
+                    Thread.sleep(delayMs);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+                completeKeepAliveHandoff();
+            }, "AvcKeepAliveHandoffFallback");
+            fallback.setDaemon(true);
+            fallback.start();
+        } catch (Throwable fallbackFailure) {
+            keepAliveHandoffScheduled = false;
+            logger.warn("AVC keep-alive handoff fallback failed to start: "
+                + fallbackFailure.getMessage());
+        }
+    }
+
+    private void completeKeepAliveHandoff() {
+        synchronized (this) {
+            Thread owner = keepAliveHandoffOwner;
+            keepAliveHandoffOwner = null;
+            keepAliveHandoffScheduled = false;
+            if (owner == null) {
+                if (keepAliveDesired && keepAliveThread == null) {
+                    tryStartKeepAliveWorkerLocked(keepAliveGeneration);
+                }
+                return;
+            }
+            if (keepAliveThread != owner) {
+                return;
+            }
+            if (owner.isAlive()) {
+                scheduleKeepAliveHandoffLocked(owner);
+                return;
+            }
+
+            keepAliveThread = null;
+            if (keepAliveDesired) {
+                tryStartKeepAliveWorkerLocked(keepAliveGeneration);
+            } else {
+                keepAliveRetryDelayMs = KEEP_ALIVE_RETRY_INITIAL_MS;
+            }
+        }
     }
 
     /**
      * Stops the keep-alive watchdog.
      * Call when pipeline stops, ACC goes OFF, or daemon shuts down.
      */
-    public synchronized void stopKeepAlive() {
-        if (!active) return;
+    public void stopKeepAlive() {
+        final Thread target;
+        synchronized (this) {
+            if (!keepAliveDesired && keepAliveThread == null) return;
+            keepAliveDesired = false;
+            keepAliveGeneration++;
+            keepAliveRetryDelayMs = KEEP_ALIVE_RETRY_INITIAL_MS;
+            target = keepAliveThread;
+            if (target != null) {
+                target.interrupt();
+            }
+        }
 
-        active = false;
-        if (keepAliveThread != null) {
-            keepAliveThread.interrupt();
-            keepAliveThread = null;
+        if (target != null && target != Thread.currentThread()) {
+            try {
+                target.join(KEEP_ALIVE_STOP_TIMEOUT_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        synchronized (this) {
+            if (keepAliveThread == target
+                    && (target == null || !target.isAlive())) {
+                keepAliveThread = null;
+            } else if (target != null && target.isAlive()) {
+                logger.warn("AVC keep-alive worker still terminating; "
+                    + "ownership retained and replacement suppressed");
+            }
         }
         logger.info("AVC keep-alive stopped");
+    }
+
+    private synchronized boolean isKeepAliveWorkerCurrent(
+            Thread worker, long generation) {
+        return keepAliveDesired
+                && keepAliveGeneration == generation
+                && keepAliveThread == worker;
     }
 
     /**
      * Whether the keep-alive watchdog is currently running.
      */
-    public boolean isActive() {
-        return active;
+    public synchronized boolean isActive() {
+        return keepAliveDesired
+                || keepAliveHandoffScheduled
+                || keepAliveHandoffOwner != null
+                || (keepAliveThread != null
+                    && keepAliveThread.isAlive());
     }
 
     // ==================== Internal ====================
@@ -307,6 +457,7 @@ public class AvcHalWarmup {
      *         co-consumer state.
      */
     private boolean launchAvc() {
+        synchronized (AVC_PROCESS_LANE) {
         // audit avc-yield (round 7, finding stuck-warmup-pins-warmupInFlight):
         // Process.waitFor() with no timeout can block forever if system_server /
         // ActivityManagerService is wedged or binder is back-pressured under
@@ -340,12 +491,18 @@ public class AvcHalWarmup {
                 return false;
             }
             return true;
+        } catch (InterruptedException interrupted) {
+            terminateProcess(process);
+            Thread.currentThread().interrupt();
+            logger.warn("AVC launch interrupted");
+            return false;
         } catch (Exception e) {
             logger.warn("Failed to launch com.byd.avc: " + e.getMessage());
             if (process != null) {
                 try { process.destroyForcibly(); } catch (Throwable ignored) {}
             }
             return false;
+        }
         }
     }
 
@@ -362,6 +519,7 @@ public class AvcHalWarmup {
      * helper safe to call from any context.
      */
     private void forceRestartAvc() {
+        synchronized (AVC_PROCESS_LANE) {
         boolean isDilink4 = false;
         try {
             isDilink4 = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
@@ -383,14 +541,26 @@ public class AvcHalWarmup {
         }
         lastForceRestartMs = now;
         logger.warn("forceRestartAvc: force-stopping com.byd.avc and restarting");
+        Process forceStop = null;
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", "am force-stop com.byd.avc"});
-            p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+            forceStop = Runtime.getRuntime().exec(
+                new String[]{"sh", "-c", "am force-stop com.byd.avc"});
+            if (!forceStop.waitFor(
+                    AVC_PROBE_TIMEOUT_SECONDS,
+                    java.util.concurrent.TimeUnit.SECONDS)) {
+                terminateProcess(forceStop);
+                logger.warn("forceRestartAvc: force-stop timed out");
+            }
             Thread.sleep(500);
         } catch (Throwable t) {
+            terminateProcess(forceStop);
+            if (t instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             logger.warn("force-stop com.byd.avc failed: " + t.getMessage());
         }
         launchAvc();  // restart
+        }
     }
 
     /**
@@ -399,6 +569,7 @@ public class AvcHalWarmup {
      * {@link #ensureAvcAlive()} keep-alive path.
      */
     private static void forceRestartAvcStatic() {
+        synchronized (AVC_PROCESS_LANE) {
         boolean isDilink4 = false;
         try {
             isDilink4 = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
@@ -418,21 +589,45 @@ public class AvcHalWarmup {
         }
         lastForceRestartStaticMs = now;
         logger.warn("forceRestartAvcStatic: force-stopping com.byd.avc and restarting");
+        Process forceStop = null;
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", "am force-stop com.byd.avc"});
-            p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+            forceStop = Runtime.getRuntime().exec(
+                new String[]{"sh", "-c", "am force-stop com.byd.avc"});
+            if (!forceStop.waitFor(
+                    AVC_PROBE_TIMEOUT_SECONDS,
+                    java.util.concurrent.TimeUnit.SECONDS)) {
+                terminateProcess(forceStop);
+                logger.warn("forceRestartAvcStatic: force-stop timed out");
+            }
             Thread.sleep(500);
         } catch (Throwable t) {
+            terminateProcess(forceStop);
+            if (t instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             logger.warn("force-stop com.byd.avc failed: " + t.getMessage());
         }
+        Process relaunch = null;
         try {
-            Process p = Runtime.getRuntime().exec(AVC_LAUNCH_CMD);
-            int rc = p.waitFor();
+            relaunch = Runtime.getRuntime().exec(AVC_LAUNCH_CMD);
+            if (!relaunch.waitFor(
+                    AVC_COMMAND_TIMEOUT_SECONDS,
+                    java.util.concurrent.TimeUnit.SECONDS)) {
+                terminateProcess(relaunch);
+                logger.warn("forceRestartAvcStatic: relaunch timed out");
+                return;
+            }
+            int rc = relaunch.exitValue();
             if (rc != 0) {
                 logger.warn("forceRestartAvcStatic: am start exited rc=" + rc);
             }
         } catch (Exception e) {
+            terminateProcess(relaunch);
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             logger.warn("forceRestartAvcStatic: relaunch failed: " + e.getMessage());
+        }
         }
     }
 
@@ -457,15 +652,19 @@ public class AvcHalWarmup {
      * we've seen; falls back to -1 silently on parse failure.
      */
     private static int probeAvcPid() {
+        synchronized (AVC_PROCESS_LANE) {
         Process p = null;
         try {
             p = Runtime.getRuntime().exec(new String[] { "pidof", "com.byd.avc" });
+            if (!p.waitFor(
+                    AVC_PROBE_TIMEOUT_SECONDS,
+                    java.util.concurrent.TimeUnit.SECONDS)) {
+                terminateProcess(p);
+                return -1;
+            }
             java.io.BufferedReader r = new java.io.BufferedReader(
                 new java.io.InputStreamReader(p.getInputStream()));
             String line = r.readLine();
-            try { p.waitFor(); } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
-            }
             if (line == null) return -1;
             String trimmed = line.trim();
             if (trimmed.isEmpty()) return -1;
@@ -475,10 +674,14 @@ public class AvcHalWarmup {
             } catch (NumberFormatException e) {
                 return -1;
             }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return -1;
         } catch (Exception e) {
             return -1;
         } finally {
-            if (p != null) try { p.destroy(); } catch (Exception ignored) {}
+            terminateProcess(p);
+        }
         }
     }
 
@@ -491,7 +694,8 @@ public class AvcHalWarmup {
      * method assumes you've decided AVC must stay up.
      */
     public static boolean ensureAvcAlive() {
-        // ESCO-PARITY: esco never launches com.byd.avc. On dilink4 we make
+        synchronized (AVC_PROCESS_LANE) {
+        // OEM-PARITY: oem never launches com.byd.avc. On dilink4 we make
         // this a presence-check-only — no `am start`, no relaunch. If AVC
         // is dead, it's dead; we report state and move on. The HAL on
         // calibrated dilink4 firmware delivers mosaic frames without AVC
@@ -503,7 +707,7 @@ public class AvcHalWarmup {
             if (pid > 0) {
                 return false;
             }
-            logger.info("AVC keep-alive (dilink4): pidof returned 0 — NOT relaunching (esco-parity)");
+            logger.info("AVC keep-alive (dilink4): pidof returned 0 — NOT relaunching (oem-parity)");
             return false;
         }
 
@@ -517,17 +721,30 @@ public class AvcHalWarmup {
             return false;
         }
         boolean launched = false;
+        Process launch = null;
         try {
-            Process p = Runtime.getRuntime().exec(AVC_LAUNCH_CMD);
-            int rc = p.waitFor();
-            if (rc == 0) {
-                logger.info("AVC keep-alive: re-launched com.byd.avc "
-                    + "(was not running)");
-                launched = true;
+            launch = Runtime.getRuntime().exec(AVC_LAUNCH_CMD);
+            if (!launch.waitFor(
+                    AVC_COMMAND_TIMEOUT_SECONDS,
+                    java.util.concurrent.TimeUnit.SECONDS)) {
+                terminateProcess(launch);
+                logger.warn("AVC keep-alive: am start timed out");
             } else {
-                logger.warn("AVC keep-alive: am start exited rc=" + rc);
+                int rc = launch.exitValue();
+                if (rc == 0) {
+                    logger.info("AVC keep-alive: re-launched com.byd.avc "
+                        + "(was not running)");
+                    launched = true;
+                } else {
+                    logger.warn("AVC keep-alive: am start exited rc=" + rc);
+                }
             }
+        } catch (InterruptedException interrupted) {
+            terminateProcess(launch);
+            Thread.currentThread().interrupt();
+            logger.warn("AVC keep-alive interrupted");
         } catch (Exception e) {
+            terminateProcess(launch);
             logger.warn("AVC keep-alive: " + e.getMessage());
         }
 
@@ -544,5 +761,24 @@ public class AvcHalWarmup {
             staticConsecutiveLaunchFailures = 0;
         }
         return false;
+        }
+    }
+
+    private static void terminateProcess(Process process) {
+        if (process == null || !process.isAlive()) return;
+        try {
+            process.destroy();
+            if (!process.waitFor(
+                    250L, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                process.destroyForcibly();
+                process.waitFor(
+                    250L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
+        } catch (InterruptedException interrupted) {
+            try { process.destroyForcibly(); } catch (Throwable ignored) {}
+            Thread.currentThread().interrupt();
+        } catch (Throwable ignored) {
+            try { process.destroyForcibly(); } catch (Throwable ignoredAgain) {}
+        }
     }
 }

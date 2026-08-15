@@ -112,6 +112,18 @@ public class EventTimelineCollector {
     // State
     private long recordingStartTimeMs = 0;
     private volatile boolean collecting = false;
+    // COLLECTION GENERATION (audit R11-4 / ExtD-5). Bumped by every
+    // startCollecting* call. A stopAndWrite carrying an expected generation
+    // no-ops when a NEWER collection has started — without this, an old
+    // event's stop tail racing a successor's startCollecting could find
+    // collecting==true (the successor's fresh session), flip it false
+    // (killing the successor's timeline collection for its whole event) and
+    // write the OLD event's sidecar from the successor's just-reset state
+    // (zero spans, wrong origin). With the token the stale stop no-ops: the
+    // old sidecar is skipped (its span data was already destroyed by the
+    // successor's reset — there is nothing correct left to write) and the
+    // successor's collection survives intact.
+    private int collectionGen = 0;
 
     /**
      * Wall-clock timestamp (ms) of the start of the current recording (with
@@ -159,17 +171,21 @@ public class EventTimelineCollector {
     // LIFECYCLE
     // ========================================================================
 
-    public synchronized void startCollecting() {
-        startCollecting(0);
+    public synchronized int startCollecting() {
+        return startCollecting(0);
     }
 
     /**
      * Start collecting with a pre-record offset.
      * Flushes the pre-trigger ring buffer into the active span array,
      * shifting timestamps to align with the video's pre-record window.
+     *
+     * @return the new collection generation (audit R11-4) — pass it to the
+     *         generation-checked {@code stopAndWrite} overload so a stale
+     *         stop cannot corrupt a successor's collection.
      */
-    public synchronized void startCollecting(long preRecordMs) {
-        startCollecting(preRecordMs, /*flushPreRing=*/true);
+    public synchronized int startCollecting(long preRecordMs) {
+        return startCollecting(preRecordMs, /*flushPreRing=*/true);
     }
 
     /**
@@ -180,11 +196,12 @@ public class EventTimelineCollector {
      * already appeared in segment 1's sidecar. Used by SurveillanceEngineGpu
      * when rotateSegment fires.
      */
-    public synchronized void startCollectingNoPreRing() {
-        startCollecting(0L, /*flushPreRing=*/false);
+    public synchronized int startCollectingNoPreRing() {
+        return startCollecting(0L, /*flushPreRing=*/false);
     }
 
-    private synchronized void startCollecting(long preRecordMs, boolean flushPreRing) {
+    private synchronized int startCollecting(long preRecordMs, boolean flushPreRing) {
+        collectionGen++; // audit R11-4 / ExtD-5 — invalidates stale stops
         spanCount = 0;
         inflightStart = -1;
 
@@ -232,7 +249,8 @@ public class EventTimelineCollector {
         collecting = true;
         logger.info("Timeline collection started (preRecord=" + preRecordMs +
                 "ms, origin shifted, flushed " + flushed + " pre-trigger spans"
-                + (flushPreRing ? "" : ", preRing skipped") + ")");
+                + (flushPreRing ? "" : ", preRing skipped") + ", gen=" + collectionGen + ")");
+        return collectionGen;
     }
 
     /**
@@ -275,6 +293,36 @@ public class EventTimelineCollector {
                                           com.overdrive.app.geo.GeoSnapshot startGeo,
                                           com.overdrive.app.geo.GeoSnapshot peakGeo,
                                           com.overdrive.app.geo.GeoSnapshot endGeo) {
+        // Legacy (un-tokened) form: no generation check. Kept for callers
+        // that cannot know their generation; new code should use the
+        // generation-checked overload (audit R11-4).
+        stopAndWrite(mp4File, actors, heroThumbnail, startGeo, peakGeo, endGeo,
+                /* expectedGen = */ -1);
+    }
+
+    /**
+     * Generation-checked stop (audit R11-4 / ExtD-5). No-ops — leaving the
+     * live collection UNTOUCHED — when {@code expectedGen} is non-negative
+     * and a newer {@code startCollecting*} has run since the caller's
+     * collection began. This is what makes an old event's stop tail safe
+     * against a successor event that has already restarted collection: the
+     * stale stop can neither flip the successor's {@code collecting} gate
+     * nor consume its just-reset span state. {@code expectedGen < 0} skips
+     * the check (legacy behavior).
+     */
+    public synchronized void stopAndWrite(File mp4File,
+                                          java.util.List<Actor> actors,
+                                          String heroThumbnail,
+                                          com.overdrive.app.geo.GeoSnapshot startGeo,
+                                          com.overdrive.app.geo.GeoSnapshot peakGeo,
+                                          com.overdrive.app.geo.GeoSnapshot endGeo,
+                                          int expectedGen) {
+        if (expectedGen >= 0 && expectedGen != collectionGen) {
+            logger.info("stopAndWrite skipped — stale collection gen "
+                    + expectedGen + " (current " + collectionGen + ") for "
+                    + (mp4File != null ? mp4File.getName() : "null"));
+            return;
+        }
         if (!collecting) return;
         collecting = false;
 

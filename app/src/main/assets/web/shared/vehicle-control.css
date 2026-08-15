@@ -88,8 +88,8 @@
     display: none;
     -webkit-align-items: center; align-items: center;
     -webkit-justify-content: center; justify-content: center;
-    width: 40px; height: 40px;
-    border-radius: 12px;
+    width: 48px; height: 48px;
+    border-radius: var(--radius-sm);
     border: none;
     background: var(--vc-pill-bg);
     color: var(--vc-text-primary);
@@ -141,15 +141,15 @@
     white-space: nowrap; -webkit-flex-shrink: 0; flex-shrink: 0;
 }
 .vc-pill .dot { width: 6px; height: 6px; border-radius: 50%; }
-.dot.green { background: #22C55E; box-shadow: 0 0 5px #22C55E; }
-.dot.red { background: #EF4444; box-shadow: 0 0 5px #EF4444; }
-.dot.amber { background: #F59E0B; box-shadow: 0 0 5px #F59E0B; }
+.dot.green { background: var(--status-success); box-shadow: 0 0 5px var(--status-success); }
+.dot.red { background: var(--status-danger); box-shadow: 0 0 5px var(--status-danger); }
+.dot.amber { background: var(--status-warning); box-shadow: 0 0 5px var(--status-warning); }
 .dot.grey { background: #71717A; box-shadow: 0 0 5px #71717A; }
 /* Partial reading (driver door only, no whole-vehicle confirmation): keep the
    lock colour but hollow the dot so it doesn't read as a full-car state. */
 .dot.partial { background: transparent; box-shadow: none; border: 1.5px solid currentColor; }
-.dot.green.partial { color: #22C55E; }
-.dot.amber.partial { color: #F59E0B; }
+.dot.green.partial { color: var(--status-success); }
+.dot.amber.partial { color: var(--status-warning); }
 
 .vc-colors {
     display: -webkit-flex; display: flex; -webkit-align-items: center; align-items: center;
@@ -157,9 +157,10 @@
     border-radius: 20px; padding: 3px 8px;
 }
 .vc-swatch { width: 24px; height: 24px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; margin: 0 3px; -webkit-transition: all .15s; transition: all .15s; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
-.vc-swatch:hover { -webkit-transform: scale(1.15); transform: scale(1.15); }
+.vc-swatch { min-width: 48px; min-height: 48px; }
+.vc-swatch:hover { -webkit-transform: scale(1.05); transform: scale(1.05); }
 .vc-swatch.active { border-color: var(--vc-text-primary); box-shadow: 0 0 6px currentColor; -webkit-transform: scale(1.1); transform: scale(1.1); }
-.vc-swatch-custom { width: 24px; height: 24px; border-radius: 50%; border: 2px dashed var(--vc-text-muted); position: relative; overflow: hidden; cursor: pointer; margin: 0 3px; touch-action: manipulation; }
+.vc-swatch-custom { width: 24px; height: 24px; min-width: 48px; min-height: 48px; border-radius: 50%; border: 2px dashed var(--vc-text-muted); position: relative; overflow: hidden; cursor: pointer; margin: 0 3px; touch-action: manipulation; }
 .vc-swatch-custom input { position: absolute; top: -4px; left: -4px; width: 32px; height: 32px; opacity: 0; cursor: pointer; }
 
 .vc-model-select {
@@ -173,8 +174,9 @@
     cursor: pointer; touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
     max-width: 140px; text-overflow: ellipsis;
+    min-height: 48px;
 }
-.vc-model-select:focus { outline: none; border-color: rgba(0,212,170,0.5); }
+.vc-model-select:focus { outline: 2px solid var(--primary); outline-offset: 2px; border-color: var(--primary); }
 
 /* Stale indicator — most recent manifest refresh failed (network, GitHub, parse).
    The select itself stays fully usable; this dot just signals "newly released
@@ -191,7 +193,7 @@
 }
 
 .vc-loading { position: absolute; top: 40%; left: 50%; -webkit-transform: translate(-50%,-50%); transform: translate(-50%,-50%); text-align: center; z-index: 20; }
-.vc-loading-spinner { width: 36px; height: 36px; margin: 0 auto 10px; border: 3px solid var(--vc-border-subtle); border-top-color: #00D4AA; border-radius: 50%; -webkit-animation: spin .7s linear infinite; animation: spin .7s linear infinite; }
+.vc-loading-spinner { width: 36px; height: 36px; margin: 0 auto 10px; border: 3px solid var(--vc-border-subtle); border-top-color: var(--primary); border-radius: 50%; -webkit-animation: spin .7s linear infinite; animation: spin .7s linear infinite; }
 @-webkit-keyframes spin { to { -webkit-transform: rotate(360deg); } }
 @keyframes spin { to { transform: rotate(360deg); } }
 .vc-loading-text { font-size: 12px; color: var(--vc-text-secondary); max-width: 280px; }
@@ -199,11 +201,12 @@
 .vc-loading-retry {
     display: none;
     margin-top: 14px;
+    min-height: 48px;
     padding: 8px 22px;
     border-radius: 10px;
     border: 1px solid rgba(0,212,170,0.4);
     background: rgba(0,212,170,0.08);
-    color: #00D4AA;
+    color: var(--primary);
     font-size: 12px;
     font-weight: 600;
     letter-spacing: .3px;
@@ -218,9 +221,9 @@
 
 .vc-toast { position: absolute; top: 44px; left: 50%; -webkit-transform: translateX(-50%) translateY(-12px); transform: translateX(-50%) translateY(-12px); background: var(--vc-pill-bg-strong); border: 1px solid var(--vc-border); border-radius: 8px; padding: 6px 14px; font-size: 11px; font-weight: 500; color: var(--vc-text-primary); z-index: 100; opacity: 0; pointer-events: none; -webkit-transition: all .2s; transition: all .2s; }
 .vc-toast.show { opacity: 1; -webkit-transform: translateX(-50%) translateY(0); transform: translateX(-50%) translateY(0); }
-.vc-toast.success { border-color: #22C55E; color: #22C55E; }
-.vc-toast.error { border-color: #EF4444; color: #EF4444; }
-.vc-toast.info { border-color: #0EA5E9; color: #0EA5E9; }
+.vc-toast.success { border-color: var(--status-success); color: var(--status-success); }
+.vc-toast.error { border-color: var(--status-danger); color: var(--status-danger); }
+.vc-toast.info { border-color: var(--status-info); color: var(--status-info); }
 
 /* 3D Surround View button — laid out as a flex item inside .vc-status-bar-secondary
    so vertical alignment is automatic, no manual top:50px to keep in sync with the row. */
@@ -229,7 +232,7 @@
     -webkit-flex-direction: column; flex-direction: column;
     -webkit-align-items: center; align-items: center;
     -webkit-justify-content: center; justify-content: center;
-    width: 44px; height: 44px;
+    width: 48px; height: 48px;
     -webkit-flex-shrink: 0; flex-shrink: 0;
     -webkit-flex-grow: 0; flex-grow: 0;
     margin-left: auto;  /* push to far right within the secondary row */
@@ -242,8 +245,8 @@
 }
 .vc-3d-btn svg { width: 18px; height: 18px; }
 .vc-3d-btn span { font-size: 7px; font-weight: 700; text-transform: uppercase; margin-top: 1px; }
-.vc-3d-btn:hover { border-color: #00D4AA; color: #00D4AA; }
-.vc-3d-btn.on { border-color: #00D4AA; background: rgba(0,212,170,0.15); color: #00D4AA; box-shadow: 0 0 12px rgba(0,212,170,0.3); }
+.vc-3d-btn:hover { border-color: var(--primary); color: var(--primary); }
+.vc-3d-btn.on { border-color: var(--primary); background: rgba(0,212,170,0.15); color: var(--primary); box-shadow: 0 0 12px rgba(0,212,170,0.3); }
 
 /* ===== TYRE PRESSURE CALLOUTS =====
    Four floating cards, one per wheel, connected to the rendered car by SVG
@@ -280,7 +283,7 @@
     border-radius: 14px;
     box-shadow: 0 4px 12px rgba(0,0,0,0.14);
     color: var(--vc-text-strong);
-    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-family: var(--family-mono);
     pointer-events: auto;
     -webkit-transition: border-color .2s, box-shadow .2s, opacity .2s;
     transition: border-color .2s, box-shadow .2s, opacity .2s;
@@ -324,7 +327,7 @@
 .vc-tyre-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
-    background: #00D4AA;
+    background: var(--primary);
     box-shadow: 0 0 7px rgba(0,212,170,0.82);
     -webkit-flex-shrink: 0; flex-shrink: 0;
     -webkit-transition: background .2s, box-shadow .2s;
@@ -336,7 +339,7 @@
     font-size: 10px;
     font-weight: 700;
     letter-spacing: .6px;
-    color: #00D4AA;
+    color: var(--primary);
     -webkit-transition: color .2s; transition: color .2s;
 }
 .vc-tyre-psi {
@@ -400,23 +403,23 @@
    colour shift so a low-pressure tyre is unmistakable from across
    the cabin without reading the state label. */
 .vc-tyre-callout[data-state="normal"]                   { border-color: rgba(0, 212, 170, 0.28); }
-.vc-tyre-callout[data-state="normal"]  .vc-tyre-dot     { background: #00D4AA; box-shadow: 0 0 7px rgba(0,212,170,0.82); }
-.vc-tyre-callout[data-state="normal"]  .vc-tyre-state   { color: #00D4AA; }
-.vc-tyre-callout[data-state="normal"]  .vc-tyre-psi-val { color: #00D4AA; }
+.vc-tyre-callout[data-state="normal"]  .vc-tyre-dot     { background: var(--primary); box-shadow: 0 0 7px rgba(0,212,170,0.82); }
+.vc-tyre-callout[data-state="normal"]  .vc-tyre-state   { color: var(--primary); }
+.vc-tyre-callout[data-state="normal"]  .vc-tyre-psi-val { color: var(--primary); }
 
-.vc-tyre-callout[data-state="caution"] .vc-tyre-dot     { background: #FBBF24; box-shadow: 0 0 6px #FBBF24; }
-.vc-tyre-callout[data-state="caution"] .vc-tyre-state   { color: #FBBF24; }
-.vc-tyre-callout[data-state="caution"] .vc-tyre-psi-val { color: #FBBF24; }
+.vc-tyre-callout[data-state="caution"] .vc-tyre-dot     { background: var(--status-warning); box-shadow: 0 0 6px var(--status-warning); }
+.vc-tyre-callout[data-state="caution"] .vc-tyre-state   { color: var(--status-warning); }
+.vc-tyre-callout[data-state="caution"] .vc-tyre-psi-val { color: var(--status-warning); }
 .vc-tyre-callout[data-state="caution"]                  { border-color: rgba(251, 191, 36, 0.40); }
 
-.vc-tyre-callout[data-state="warn"]    .vc-tyre-dot     { background: #F59E0B; box-shadow: 0 0 6px #F59E0B; }
-.vc-tyre-callout[data-state="warn"]    .vc-tyre-state   { color: #F59E0B; }
-.vc-tyre-callout[data-state="warn"]    .vc-tyre-psi-val { color: #F59E0B; }
+.vc-tyre-callout[data-state="warn"]    .vc-tyre-dot     { background: var(--status-warning); box-shadow: 0 0 6px var(--status-warning); }
+.vc-tyre-callout[data-state="warn"]    .vc-tyre-state   { color: var(--status-warning); }
+.vc-tyre-callout[data-state="warn"]    .vc-tyre-psi-val { color: var(--status-warning); }
 .vc-tyre-callout[data-state="warn"]                     { border-color: rgba(245, 158, 11, 0.55); }
 
-.vc-tyre-callout[data-state="alert"]   .vc-tyre-dot     { background: #EF4444; box-shadow: 0 0 8px #EF4444; -webkit-animation: vcTyrePulse 1.4s ease-in-out infinite; animation: vcTyrePulse 1.4s ease-in-out infinite; }
-.vc-tyre-callout[data-state="alert"]   .vc-tyre-state   { color: #EF4444; }
-.vc-tyre-callout[data-state="alert"]   .vc-tyre-psi-val { color: #EF4444; }
+.vc-tyre-callout[data-state="alert"]   .vc-tyre-dot     { background: var(--status-danger); box-shadow: 0 0 8px var(--status-danger); -webkit-animation: vcTyrePulse 1.4s ease-in-out infinite; animation: vcTyrePulse 1.4s ease-in-out infinite; }
+.vc-tyre-callout[data-state="alert"]   .vc-tyre-state   { color: var(--status-danger); }
+.vc-tyre-callout[data-state="alert"]   .vc-tyre-psi-val { color: var(--status-danger); }
 .vc-tyre-callout[data-state="alert"]                    { border-color: rgba(239, 68, 68, 0.65); box-shadow: 0 0 16px rgba(239, 68, 68, 0.22); }
 
 .vc-tyre-callout[data-state="muted"]   .vc-tyre-dot     { background: #71717A; box-shadow: 0 0 4px #71717A; }
@@ -502,9 +505,17 @@
 .vc-panel.open {
     max-height: 200px;
     padding: 14px 12px;
+    /* Scroll rather than clip. `overflow: hidden` above is required for the
+       max-height transition, but while OPEN it silently swallowed any content
+       past the ceiling — the Windows panel's 7 rows need ~360px, so Sunroof and
+       Sunshade were unreachable behind the preset rows. */
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
 }
 .vc-panel.open.vc-panel-tall {
-    max-height: 320px;
+    /* Fits the Windows panel's 7 rows (7×48 + 6×4 gap = 360) plus padding, so the
+       common case needs no scrolling at all; the rule above covers the rest. */
+    max-height: 390px;
 }
 .vc-panel-row {
     display: -webkit-flex; display: flex;
@@ -552,7 +563,7 @@
     -webkit-justify-content: center; justify-content: center;
     width: 48px;
     -webkit-flex-shrink: 0; flex-shrink: 0;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--family-mono);
 }
 .vc-window-label .label-area {
     font-size: 10px; font-weight: 700; color: var(--vc-text-soft);
@@ -575,19 +586,20 @@
     -webkit-align-items: center; align-items: center;
     -webkit-justify-content: center; justify-content: center;
     width: 38px; height: 32px;
+    min-width: 48px; min-height: 48px;
     border-radius: 8px;
     border: 1px solid var(--vc-border-subtle);
     background: var(--vc-tile-bg);
     color: var(--vc-text-soft);
     font-size: 11px; font-weight: 700;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--family-mono);
     cursor: pointer;
     -webkit-flex-shrink: 0; flex-shrink: 0;
     -webkit-transition: all .15s; transition: all .15s;
 }
 .vc-preset:hover { border-color: rgba(0,212,170,.3); color: var(--vc-text-primary); background: rgba(0,212,170,.06); }
 .vc-preset:active { -webkit-transform: scale(.9); transform: scale(.9); }
-.vc-preset.active { border-color: #00D4AA; background: rgba(0,212,170,.12); color: #00D4AA; }
+.vc-preset.active { border-color: var(--primary); background: rgba(0,212,170,.12); color: var(--primary); }
 .vc-preset.pending { opacity: .4; pointer-events: none; }
 
 /* Tab bar — always visible.
@@ -608,7 +620,7 @@
     background: var(--vc-bar-bg);
     -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
     border: 1px solid var(--vc-border-subtle);
-    border-radius: 16px;
+    border-radius: var(--radius-sm);
     padding: 6px 10px;
     width: 100%;
     overflow-x: auto;
@@ -625,6 +637,7 @@
     -webkit-flex: 1; flex: 1;
     -webkit-flex-shrink: 0; flex-shrink: 0;
     min-width: 56px;
+    min-height: 48px;
     height: 52px;
     border-radius: 12px;
     border: 1px solid transparent;
@@ -639,12 +652,12 @@
 .vc-tab svg { width: 20px; height: 20px; margin-bottom: 2px; }
 .vc-tab span { font-size: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: .3px; }
 .vc-tab:active { -webkit-transform: scale(.92); transform: scale(.92); }
-.vc-tab.active { border-color: rgba(0,212,170,0.4); background: rgba(0,212,170,0.08); color: #00D4AA; }
+.vc-tab.active { border-color: rgba(0,212,170,0.4); background: rgba(0,212,170,0.08); color: var(--primary); }
 .vc-tab.has-active { color: var(--vc-text-secondary); }
 .vc-tab .tab-dot {
     position: absolute; top: 6px; right: 6px;
     width: 5px; height: 5px; border-radius: 50%;
-    background: #00D4AA; box-shadow: 0 0 4px #00D4AA;
+    background: var(--primary); box-shadow: 0 0 4px var(--primary);
     display: none;
 }
 .vc-tab.has-active .tab-dot { display: block; }
@@ -672,6 +685,7 @@
     -webkit-align-items: center; align-items: center;
     -webkit-justify-content: center; justify-content: center;
     width: 56px; height: 58px;
+    min-width: 48px; min-height: 48px;
     border-radius: 10px;
     /* Always-visible neutral background tier — tiles never disappear against
        the canvas (the body paint flash effect could otherwise wash them out). */
@@ -686,15 +700,17 @@
 .vc-tile span { font-size: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: .3px; color: inherit; }
 .vc-tile:hover { border-color: rgba(0,212,170,.3); color: var(--vc-text-primary); background: rgba(0,212,170,.06); }
 .vc-tile:active { -webkit-transform: scale(.9); transform: scale(.9); }
-.vc-tile.on { border-color: #00D4AA; background: rgba(0,212,170,.12); color: #00D4AA; box-shadow: 0 0 12px rgba(0,212,170,.2); }
-.vc-tile.active { border-color: #00D4AA; background: rgba(0,212,170,.10); color: #00D4AA; }
+.vc-tile.on { border-color: var(--primary); background: rgba(0,212,170,.12); color: var(--primary); box-shadow: 0 0 12px rgba(0,212,170,.2); }
+.vc-tile.active { border-color: var(--primary); background: rgba(0,212,170,.10); color: var(--primary); }
 /* Disable highlight stays readable: outline grey, not greyed-out invisible. */
 .vc-tile:disabled, .vc-tile[disabled] { color: var(--vc-text-muted); border-color: var(--vc-border-faint); background: var(--vc-tile-bg-disabled); cursor: not-allowed; }
 /* Cloud-only controls stay tappable so they can explain how to connect an
    account, but carry an explicit cloud marker. A dashed outline means the
    capability is currently unavailable; local SDK controls remain unchanged. */
-.vc-tile[data-requires-cloud="true"] { position: relative; }
-.vc-tile[data-requires-cloud="true"]::after {
+.vc-tile[data-requires-cloud="true"],
+.vc-preset[data-requires-cloud="true"] { position: relative; }
+.vc-tile[data-requires-cloud="true"]::after,
+.vc-preset[data-requires-cloud="true"]::after {
     /* Draw the cloud from CSS primitives. Android 7 otherwise forces U+2601
        through its blue colour-emoji font and ignores the state colour. */
     content: '';
@@ -709,24 +725,34 @@
     color: var(--vc-text-muted);
     pointer-events: none;
 }
+/* The vent preset is narrower than a tile — tuck its badge into the top-left so
+   it never overlaps the centred label. */
+.vc-preset[data-requires-cloud="true"]::after { top: 5px; right: auto; left: 5px; }
 [dir="rtl"] .vc-tile[data-requires-cloud="true"]::after {
     right: auto; left: 5px;
 }
-.vc-tile[data-cloud-state="connected"]::after { color: #00D4AA; }
-.vc-tile[data-cloud-state="checking"]::after { color: #F59E0B; }
+[dir="rtl"] .vc-preset[data-requires-cloud="true"]::after { left: auto; right: 5px; }
+.vc-tile[data-cloud-state="connected"]::after,
+.vc-preset[data-cloud-state="connected"]::after { color: var(--primary); }
+.vc-tile[data-cloud-state="checking"]::after,
+.vc-preset[data-cloud-state="checking"]::after { color: var(--status-warning); }
 .vc-tile[data-cloud-state="not_configured"],
-.vc-tile[data-cloud-state="unavailable"] {
+.vc-tile[data-cloud-state="unavailable"],
+.vc-preset[data-cloud-state="not_configured"],
+.vc-preset[data-cloud-state="unavailable"] {
     border-style: dashed;
     background: var(--vc-tile-bg-disabled);
 }
-.vc-tile[data-cloud-state="not_configured"]::after { color: var(--vc-text-muted); }
-.vc-tile[data-cloud-state="unavailable"]::after { color: #EF4444; }
-.vc-tile.heat:hover { border-color: rgba(239,68,68,.3); color: #EF4444; }
-.vc-tile.heat.on1 { border-color: #EF4444AA; background: rgba(239,68,68,.12); color: #EF4444AA; box-shadow: 0 0 12px rgba(239,68,68,.2); }
-.vc-tile.heat.on2 { border-color: #EF4444; background: rgba(239,68,68,.12); color: #EF4444; box-shadow: 0 0 12px rgba(239,68,68,.2); }
-.vc-tile.cool:hover { border-color: rgba(56,189,248,.3); color: #38BDF8; }
-.vc-tile.cool.on1 { border-color: #38BDF8AA; background: rgba(56,189,248,.12); color: #38BDF8AA; box-shadow: 0 0 12px rgba(56,189,248,.2); }
-.vc-tile.cool.on2 { border-color: #38BDF8; background: rgba(56,189,248,.12); color: #38BDF8; box-shadow: 0 0 12px rgba(56,189,248,.2); }
+.vc-tile[data-cloud-state="not_configured"]::after,
+.vc-preset[data-cloud-state="not_configured"]::after { color: var(--vc-text-muted); }
+.vc-tile[data-cloud-state="unavailable"]::after,
+.vc-preset[data-cloud-state="unavailable"]::after { color: var(--status-danger); }
+.vc-tile.heat:hover { border-color: rgba(239,68,68,.3); color: var(--status-danger); }
+.vc-tile.heat.on1 { border-color: var(--status-danger); background: rgba(239,68,68,.12); color: var(--status-danger); box-shadow: 0 0 12px rgba(239,68,68,.2); }
+.vc-tile.heat.on2 { border-color: var(--status-danger); background: rgba(239,68,68,.12); color: var(--status-danger); box-shadow: 0 0 12px rgba(239,68,68,.2); }
+.vc-tile.cool:hover { border-color: rgba(56,189,248,.3); color: var(--status-info); }
+.vc-tile.cool.on1 { border-color: var(--status-info); background: rgba(56,189,248,.12); color: var(--status-info); box-shadow: 0 0 12px rgba(56,189,248,.2); }
+.vc-tile.cool.on2 { border-color: var(--status-info); background: rgba(56,189,248,.12); color: var(--status-info); box-shadow: 0 0 12px rgba(56,189,248,.2); }
 .vc-tile.pending { opacity: .4; pointer-events: none; }
 
 /* Seat-memory tap-and-hold: TAP recalls, LONG-PRESS saves. The `.arming` class
@@ -743,7 +769,7 @@
     -webkit-transition: height var(--vc-hold-ms, 650ms) linear;
     transition: height var(--vc-hold-ms, 650ms) linear;
 }
-.vc-tile.memory.armed { border-color: #00D4AA; color: #00D4AA; box-shadow: 0 0 14px rgba(0,212,170,.35); }
+.vc-tile.memory.armed { border-color: var(--primary); color: var(--primary); box-shadow: 0 0 14px rgba(0,212,170,.35); }
 .vc-tile.memory.armed::after { height: 0; }
 
 /* "Hold to save" helper line under the seat-memory tiles. */
@@ -759,6 +785,7 @@
     -webkit-align-items: center; align-items: center;
     -webkit-justify-content: center; justify-content: center;
     width: 34px; height: 34px;
+    min-width: 48px; min-height: 48px;
     border-radius: 8px;
     border: 1px solid var(--vc-border-subtle);
     background: transparent;
@@ -768,7 +795,7 @@
     -webkit-transition: all .12s; transition: all .12s;
 }
 .vc-mini svg { width: 16px; height: 16px; }
-.vc-mini:hover { border-color: #00D4AA; color: #00D4AA; }
+.vc-mini:hover { border-color: var(--primary); color: var(--primary); }
 .vc-mini:active { -webkit-transform: scale(.88); transform: scale(.88); }
 
 /* Value readout */
@@ -779,7 +806,7 @@
     min-width: 40px; height: 34px;
     padding: 0 4px;
     font-size: 15px; font-weight: 700; color: var(--vc-text-primary);
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--family-mono);
     -webkit-flex-shrink: 0; flex-shrink: 0;
 }
 
@@ -816,7 +843,7 @@
     width: 15px; height: 15px;
     border: 1px solid black;
     border-radius: 50%;
-    background: var(--color, #00D4AA);
+    background: var(--color, var(--primary));
     cursor: pointer;
     box-shadow: 0 0 8px rgba(0,212,170,0.4);
 }
@@ -824,7 +851,7 @@
     width: 15px; height: 15px;
     border: 1px solid black;
     border-radius: 50%;
-    background: var(--color, #00D4AA);
+    background: var(--color, var(--primary));
     cursor: pointer;
     box-shadow: 0 0 8px rgba(0,212,170,0.4);
 }
@@ -868,7 +895,7 @@
     -webkit-appearance: none; appearance: none;
     width: 18px; height: 18px;
     border-radius: 50%;
-    background: #00D4AA;
+    background: var(--primary);
     cursor: pointer;
     box-shadow: 0 0 8px rgba(0,212,170,0.4);
 }
@@ -876,7 +903,7 @@
     width: 18px; height: 18px;
     border: none;
     border-radius: 50%;
-    background: #00D4AA;
+    background: var(--primary);
     cursor: pointer;
     box-shadow: 0 0 8px rgba(0,212,170,0.4);
 }
@@ -923,17 +950,18 @@
 }
 .vc-time {
     height: 34px; min-width: 92px;
+    min-height: 48px;
     border: 1px solid var(--vc-border-subtle);
     border-radius: 8px;
     background: var(--vc-tile-bg);
     color: var(--vc-text-primary);
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--family-mono);
     font-size: 14px; font-weight: 600;
     padding: 0 8px;
     outline: none;
     text-align: center;
 }
-.vc-time:focus { border-color: #00D4AA; }
+.vc-time:focus { border-color: var(--primary); }
 .vc-time:disabled { opacity: .45; cursor: not-allowed; }
 
 /* Segmented control — Once / Every day / Custom. Three-pill group sized to
@@ -941,7 +969,7 @@
 .vc-segmented {
     display: -webkit-inline-flex; display: inline-flex;
     -webkit-align-items: center; align-items: center;
-    height: 34px;
+    min-height: 48px;
     background: var(--vc-tile-bg);
     border: 1px solid var(--vc-border-subtle);
     border-radius: 10px;
@@ -950,6 +978,7 @@
 }
 .vc-seg {
     height: 28px;
+    min-height: 48px;
     padding: 0 12px;
     border: none; border-radius: 8px;
     background: transparent;
@@ -962,15 +991,46 @@
 .vc-seg:hover { color: var(--vc-text-primary); }
 .vc-seg.on {
     background: rgba(0,212,170,.16);
-    color: #00D4AA;
+    color: var(--primary);
     box-shadow: inset 0 0 0 1px rgba(0,212,170,.35);
 }
 .vc-seg:active { -webkit-transform: scale(.96); transform: scale(.96); }
+
+/* Remote preconditioning row inside the Climate panel. Reuses the charging panel's
+   schedule primitives (.vc-schedule-bar / .vc-time / .vc-segmented) so both schedules
+   read as one system; only the full-width break is new.
+   Full-width via flex-basis only — NOT width:100%. `.vc-panel-row > *` adds 2px of
+   horizontal margin, so an explicit 100% width would overflow the row by 4px. Matches
+   how .vc-sound-engine / .vc-hold-hint claim their own line. */
+.vc-climate-schedule {
+    -webkit-flex-basis: 100%; -ms-flex-preferred-size: 100%; flex-basis: 100%;
+    margin-top: 8px;
+}
+.vc-climate-schedule .vc-schedule-grid { padding: 0; }
+/* Duration is a 5-way pick; keep each segment narrow so the row still fits. */
+#climateDurationSegmented .vc-seg { padding: 0 8px; min-width: 34px; }
+.vc-schedule-label {
+    font-size: 9px; font-weight: 700; letter-spacing: .3px;
+    text-transform: uppercase; color: var(--vc-text-muted);
+    -webkit-flex-shrink: 0; flex-shrink: 0;
+}
+.vc-schedule-unit {
+    font-size: 10px; font-weight: 600; color: var(--vc-text-muted);
+    -webkit-flex-shrink: 0; flex-shrink: 0;
+}
+/* Booking summary line under the preconditioning row. A plain block, not a
+   .vc-schedule-bar: it holds one text node, so flex centring would be redundant
+   and text-align is what actually centres wrapped lines. */
+.vc-schedule-note {
+    font-size: 10px; font-weight: 600; letter-spacing: .2px; line-height: 1.4;
+    color: var(--vc-text-soft); text-align: center;
+}
 
 /* Day chips — only shown when repeat=custom. */
 .vc-day-chips { gap: 4px; }
 .vc-day {
     height: 30px; min-width: 36px;
+    min-height: 48px; min-width: 48px;
     padding: 0 8px;
     border: 1px solid var(--vc-border-subtle);
     border-radius: 8px;
@@ -981,7 +1041,7 @@
     cursor: pointer;
 }
 .vc-day:hover { border-color: rgba(0,212,170,.3); color: var(--vc-text-primary); }
-.vc-day.on { border-color: #00D4AA; background: rgba(0,212,170,.12); color: #00D4AA; }
+.vc-day.on { border-color: var(--primary); background: rgba(0,212,170,.12); color: var(--primary); }
 .vc-day:active { -webkit-transform: scale(.92); transform: scale(.92); }
 
 /* Reuse .vc-pill as a clickable chip in the schedule row.
@@ -992,9 +1052,9 @@ button.vc-pill {
     background: var(--vc-tile-bg);
 }
 /* Inside the schedule bar, match the row's 34px baseline. */
-.vc-schedule-bar button.vc-pill { height: 34px; padding: 0 12px; }
+.vc-schedule-bar button.vc-pill { height: 48px; min-height: 48px; padding: 0 12px; }
 button.vc-pill:hover { border-color: rgba(0,212,170,.3); color: var(--vc-text-primary); }
-button.vc-pill.on { border-color: #00D4AA; background: rgba(0,212,170,.12); color: #00D4AA; }
+button.vc-pill.on { border-color: var(--primary); background: rgba(0,212,170,.12); color: var(--primary); }
 button.vc-pill:active { -webkit-transform: scale(.95); transform: scale(.95); }
 
 /* ===== MOBILE RESPONSIVE ===== */
@@ -1021,15 +1081,32 @@ button.vc-pill:active { -webkit-transform: scale(.95); transform: scale(.95); }
     .vc-3d-btn svg { width: 16px; height: 16px; }
 
     /* Charging panel — keep the centered cluster, just shrink controls to fit. */
-    .vc-panel.open.vc-panel-tall { max-height: 380px; }
+    .vc-panel.open.vc-panel-tall { max-height: 390px; }
     .vc-charging-grid { padding: 0 8px; gap: 6px; }
     .vc-schedule-bar { gap: 6px; }
     .vc-time { min-width: 80px; height: 32px; font-size: 13px; }
     .vc-seg { padding: 0 10px; height: 26px; font-size: 10px; }
+    #climateDurationSegmented .vc-seg { padding: 0 6px; min-width: 30px; }
     .vc-day { height: 28px; min-width: 32px; font-size: 9px; padding: 0 6px; }
     .vc-day-chips { gap: 3px; }
     .vc-soc-slider { width: 160px; }
     .vc-charging-divider { padding-top: 6px; }
+}
+
+/* Physical-position fallbacks for the Chrome 58 WebView. */
+[dir="rtl"] .vc-nav-btn { left: auto; right: 10px; }
+[dir="rtl"] .vc-status-bar { left: 10px; right: 66px; }
+[dir="rtl"] .vc-status-bar-secondary { left: 10px; right: 66px; }
+[dir="rtl"] .vc-3d-btn { margin-left: 0; margin-right: auto; }
+[dir="rtl"] .vc-model-select {
+    padding-right: 12px;
+    padding-left: 26px;
+    background-position: left 9px center;
+}
+
+@media (max-width: 768px) {
+    [dir="rtl"] .vc-status-bar { left: 10px; right: 66px; }
+    [dir="rtl"] .vc-status-bar-secondary { left: 10px; right: 66px; }
 }
 
 @media (max-width: 480px) {
@@ -1076,10 +1153,17 @@ button.vc-pill:active { -webkit-transform: scale(.95); transform: scale(.95); }
 @media (max-height: 560px) {
     .vc-tyre-callout { width: 132px; min-width: 132px; padding: 7px 9px 8px; }
     .vc-tyre-psi-val { font-size: 20px; }
+    /* Clear the floating chrome instead of sliding under it:
+       - Rear pair must start BELOW the appearance row (.vc-status-bar-secondary
+         top:56px + 48px touch-target swatches ≈ 112px bottom edge), which also
+         clears the view-mode (LITE) toggle pinned at that row's right end.
+       - Front pair must end ABOVE the tab bar (bottom:12px + ~66px bar height
+         ≈ 78px top edge). The old 96px/72px values left both pairs partially
+         hidden behind the chrome on 1024×5xx viewports. */
     .vc-tyre-callout[data-corner="rl"],
-    .vc-tyre-callout[data-corner="rr"] { top: 96px; }
+    .vc-tyre-callout[data-corner="rr"] { top: 120px; }
     .vc-tyre-callout[data-corner="fl"],
-    .vc-tyre-callout[data-corner="fr"] { bottom: 72px; }
+    .vc-tyre-callout[data-corner="fr"] { bottom: 86px; }
 }
 
 @media (max-height: 500px) {
@@ -1139,7 +1223,7 @@ button.vc-pill:active { -webkit-transform: scale(.95); transform: scale(.95); }
 }
 .vc-modal-icon svg {
     width: 28px; height: 28px;
-    color: #EF4444;
+    color: var(--status-danger);
 }
 .vc-modal-title {
     font-size: 16px;
@@ -1159,7 +1243,8 @@ button.vc-pill:active { -webkit-transform: scale(.95); transform: scale(.95); }
 .vc-modal-btn {
     display: inline-block;
     padding: 10px 28px;
-    border-radius: 10px;
+    min-height: 48px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--vc-border);
     background: var(--vc-tile-bg);
     color: var(--vc-text-primary);
@@ -1169,11 +1254,46 @@ button.vc-pill:active { -webkit-transform: scale(.95); transform: scale(.95); }
     -webkit-transition: all .15s; transition: all .15s;
 }
 .vc-modal-btn:hover {
-    border-color: #00D4AA;
+    border-color: var(--primary);
     background: rgba(0,212,170,0.08);
-    color: #00D4AA;
+    color: var(--primary);
 }
 .vc-modal-btn:active {
     -webkit-transform: scale(0.95); transform: scale(0.95);
 }
 
+/* ==================== LITE MODE ====================
+   html.vc-mode-lite is set by the inline bootstrap in vehicle-control.html
+   BEFORE first paint (localStorage 'vc.viewMode'; default lite). Lite never
+   loads three.js / gsap / SotaPlayer or the GLB — the viewport shows a
+   static silhouette instead of the canvas. The tyre callouts are already
+   pure-CSS corner-pinned in both modes, so they need no lite overrides.
+   The appearance controls (paint swatches, model picker, 3D surround
+   toggle) act on the 3D scene and hide with it; VC.initLiteMode() also
+   hides them inline as belt-and-braces. */
+html.vc-mode-lite #vehicleCanvas,
+html.vc-mode-lite .vc-loading,
+html.vc-mode-lite .vc-colors,
+html.vc-mode-lite .vc-model-select,
+html.vc-mode-lite #btn3dView {
+    display: none;
+}
+
+.vc-lite-hero { display: none; }
+html.vc-mode-lite .vc-lite-hero {
+    display: -webkit-flex;
+    display: flex;
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    -webkit-align-items: center; align-items: center;
+    -webkit-justify-content: center; justify-content: center;
+    pointer-events: none;
+    /* Inherits the themed text colour; heavy fade so it reads as a
+       backdrop, not content. */
+    opacity: 0.35;
+}
+.vc-lite-hero svg {
+    width: 46%;
+    max-width: 430px;
+    height: auto;
+}

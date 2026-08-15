@@ -31,7 +31,7 @@
             android:layout_marginStart="14dp"
             android:layout_weight="1"
             android:text="@string/logs_uploaded_title"
-            android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
+            android:textAppearance="@style/TextAppearance.Overdrive.HeadlineSmall"
             android:textColor="?attr/colorOnSurface" />
     </LinearLayout>
 

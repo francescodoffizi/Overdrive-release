@@ -2,10 +2,11 @@ package com.overdrive.app.server;
 
 import com.overdrive.app.byd.cloud.BydCloudClient;
 import com.overdrive.app.byd.cloud.BydCloudConfig;
-import com.overdrive.app.byd.cloud.BydCloudDataProvider;
 import com.overdrive.app.byd.cloud.BydCloudDeterrent;
 import com.overdrive.app.byd.cloud.BydCloudRegionCatalog;
 import com.overdrive.app.byd.cloud.crypto.BydCryptoUtils;
+import com.overdrive.app.byd.routing.VehicleCommandRouter;
+import com.overdrive.app.byd.routing.VehicleCommandRouter.CommandResult;
 import com.overdrive.app.config.UnifiedConfigManager;
 import com.overdrive.app.daemon.CameraDaemon;
 import com.overdrive.app.logging.DaemonLogger;
@@ -210,6 +211,10 @@ public class BydCloudApiHandler {
             logger.info("  loginKey derived: [redacted]");
             logger.info("  commandPwd derived: [redacted]");
 
+            // A pending OPENAIR session belongs to the previous cloud identity.
+            // Clear it before replacing the stored account/VIN configuration.
+            VehicleCommandRouter.getInstance().clearRemoteClimateSession();
+
             // Save credentials first (so BydCloudClient can read them)
             BydCloudConfig.saveCredentials(username, loginKey, signPassword,
                     commandPwd, rawPasswordForSave, "", countryCode, language, region);
@@ -312,6 +317,7 @@ public class BydCloudApiHandler {
             BydCloudConfig config = BydCloudConfig.fromUnifiedConfig();
             if (!config.isConfigured()) {
                 response.put("success", false);
+                response.put("confirmed", false);
                 response.put("error", Messages.get("errors.bydcloud_not_configured_setup_required"));
                 HttpResponse.sendJson(out, response.toString());
                 return;
@@ -322,49 +328,44 @@ public class BydCloudApiHandler {
                 JSONObject req = new JSONObject(body);
                 action = req.optString("action", "flash_lights");
             }
-
-            // Reuse the shared client to avoid racing with the running MQTT
-            // subscriber. Falls back to a one-shot client only if the
-            // shared one isn't initialized (e.g. credential setup just completed
-            // and the subscriber hasn't started yet).
-            BydCloudClient client = BydCloudDataProvider.getInstance().getSharedClient();
-            if (client == null) {
-                client = new BydCloudClient(config);
-                InputStream tablesStream = getTablesStream(config);
-                if (tablesStream == null) {
-                    response.put("success", false);
-                    response.put("error", Messages.get("errors.bydcloud_bangcle_tables_missing"));
-                    HttpResponse.sendJson(out, response.toString());
-                    return;
-                }
-                try {
-                    client.init(tablesStream);
-                } finally {
-                    try { tablesStream.close(); } catch (Exception ignored) {}
-                }
-                client.login();
+            if (!"find_car".equals(action) && !"flash_lights".equals(action)) {
+                response.put("success", false);
+                response.put("confirmed", false);
+                response.put("error", "Unsupported cloud test action");
+                HttpResponse.sendJson(out, response.toString());
+                return;
             }
-            client.verifyControlPassword(config.vin);
 
-            boolean success;
+            VehicleCommandRouter.VehicleCommand command;
             switch (action) {
                 case "find_car":
-                    success = client.findCarNoWait(config.vin);
+                    command = new VehicleCommandRouter.FindCarCommand();
                     break;
                 case "flash_lights":
-                default:
-                    success = client.flashLightsNoWait(config.vin);
+                    command = new VehicleCommandRouter.FlashLightsCommand();
                     break;
+                default:
+                    throw new IllegalStateException("validated cloud test action was not dispatched");
             }
 
-            response.put("success", true);
-            response.put("commandSuccess", success);
+            // The router owns capability discovery, serialization, terminal
+            // confirmation, and timeout cancellation for every cloud action.
+            CommandResult result = VehicleCommandRouter.getInstance().execute(command);
+            boolean confirmed = result.outcome == VehicleCommandRouter.Outcome.SUCCESS;
+            response.put("success", confirmed);
+            response.put("confirmed", confirmed);
+            response.put("commandSuccess", confirmed);
             response.put("action", action);
-            response.put("message", Messages.get(success ? "messages.bydcloud_command_executed" : "messages.bydcloud_command_dispatched"));
+            response.put("path", result.pathString());
+            response.put("message", confirmed
+                    ? Messages.get("messages.bydcloud_command_executed")
+                    : (result.displayMessage.isEmpty()
+                            ? "Command was not confirmed" : result.displayMessage));
 
         } catch (Exception e) {
             logger.warn("BYD Cloud test failed: " + e.getMessage());
             response.put("success", false);
+            response.put("confirmed", false);
             response.put("error", e.getMessage());
         }
 
@@ -375,6 +376,7 @@ public class BydCloudApiHandler {
      * POST /api/bydcloud/clear — clear stored credentials.
      */
     private static void handleClear(OutputStream out) throws Exception {
+        VehicleCommandRouter.getInstance().clearRemoteClimateSession();
         BydCloudConfig.clearCredentials();
         BydCloudDeterrent.getInstance().reset();
         // Tear down a live MQTT subscriber too — clearCredentials() flips the

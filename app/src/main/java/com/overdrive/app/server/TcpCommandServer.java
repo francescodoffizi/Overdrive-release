@@ -258,9 +258,16 @@ public class TcpCommandServer {
 
             // ==================== SURVEILLANCE COMMANDS ====================
             
-            case "enableSurveillance":
-                com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true);
-                if (!com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+            case "enableSurveillance": {
+                // Persist result is load-bearing: the ACC-OFF arm dispatch re-reads
+                // it, so a failed write means surveillance never arms. Report it.
+                boolean accOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
+                if (!com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true)) {
+                    response.put("status", "error");
+                    response.put("message", "Failed to save the surveillance setting");
+                    break;
+                }
+                if (!accOn) {
                     CameraDaemon.enableSurveillance();   // fires OEM recalc
                 } else {
                     // OEM resolver: survSuppressed depends on master toggle.
@@ -268,18 +275,32 @@ public class TcpCommandServer {
                     catch (Throwable ignored) {}
                 }
                 response.put("status", "ok");
+                response.put("deferred", accOn);
                 response.put("surveillance", CameraDaemon.getSurveillanceStatus());
                 break;
+            }
 
-            case "disableSurveillance":
-                CameraDaemon.disableSurveillance();   // fires OEM recalc
-                com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false);
+            case "disableSurveillance": {
+                // ACC-gated teardown — nothing is armed while ACC is ON, and the
+                // pipeline call would re-apply the dashcam layout under a live
+                // recording. See SurveillanceApiHandler.handleDisable.
+                boolean accOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
+                if (!accOn) {
+                    CameraDaemon.disableSurveillance();   // fires OEM recalc
+                }
+                if (!com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false)) {
+                    response.put("status", "error");
+                    response.put("message", "Failed to save the surveillance setting");
+                    break;
+                }
                 // Second recalc post-write so resolver sees the new master toggle.
                 try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
                 catch (Throwable ignored) {}
                 response.put("status", "ok");
+                response.put("deferred", accOn);
                 response.put("surveillance", CameraDaemon.getSurveillanceStatus());
                 break;
+            }
 
             case "surveillanceStatus":
                 response.put("status", "ok");

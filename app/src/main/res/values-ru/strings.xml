@@ -206,10 +206,10 @@
     <string name="onboarding_authorize_retry_title">Все еще не подключен</string>
     <string name="onboarding_authorize_retry_body">Помощник еще не запущен. Возможно, разрешение Android было отклонено. Попробуйте еще раз и не забудьте проверить <b>всегда разрешить</b>.</string>
     <string name="onboarding_authorize_retry_button">Попробовать еще раз</string>
-    <string name="onboarding_mode_title">Когда должен работать Overdrive?</string>
-    <string name="onboarding_mode_body">Выберите, как Overdrive ведёт себя после выключения автомобиля.\n\n<b>Вкл. &amp; выкл.</b> продолжает наблюдать во время стоянки — наблюдение и фоновый мониторинг остаются активными, поэтому за ночь автомобиль расходует немного заряда.\n\n<b>Только вкл.</b> полностью выключает Overdrive, как только вы уходите. Видеорегистратор, поездки и зарядка по-прежнему работают во время движения, а при включении автомобиля всё запускается автоматически. Вы можете изменить это в любой момент в Настройках.</string>
-    <string name="onboarding_mode_on_off_button">Вкл. &amp; выкл.</string>
-    <string name="onboarding_mode_on_only_button">Только вкл.</string>
+    <string name="onboarding_mode_title">Когда должно выполняться переключение?</string>
+    <string name="onboarding_mode_body">Выберите, как перегрузка ведет себя после отключения автомобиля.\n\n<b>On &amp; Off</b> держит наблюдение во время парковки — слежение и фоновый мониторинг активны, Таким образом, автомобиль тянет немного электроэнергии.\n\n<b>Только</b> полностью выключает перегрузку после выхода. Dashcam, поездки и зарядка всё ещё работают во время вождения, и при включении автомобиля все начинается автоматически. Вы можете изменить это в любое время в настройках.</string>
+    <string name="onboarding_mode_on_off_button">При &amp; выкл</string>
+    <string name="onboarding_mode_on_only_button">Только на</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Камера · шаг %1$d из %2$d</string>
     <string name="onboarding_camera_intro_title">Настройка камер</string>
@@ -1347,17 +1347,17 @@
     <string name="toast_cloudflared_saved_settings">Настройки Cloudflared сохранены</string>
     <!-- Projection screen -->
     <string name="projection_hero_title">Проекция</string>
-    <string name="projection_hero_subtitle">Транслируйте приложение на приборную панель и отображайте его здесь.</string>
-    <string name="projection_pick_app">Выберите приложение для проекции</string>
+    <string name="projection_hero_subtitle">Добавляет приложение в кластер драйвера и зеркалирует его здесь.</string>
+    <string name="projection_pick_app">Выберите приложение для проекта</string>
     <string name="projection_cast">Транслировать на панель</string>
     <string name="projection_stop">Остановить</string>
-    <string name="projection_cast_failed">Не удалось транслировать это приложение на приборную панель.</string>
-    <string name="projection_status_idle">Проекция не выполняется.</string>
-    <string name="projection_status_live">Живое зеркало — нажимайте и проводите для управления.</string>
-    <string name="projection_status_preview">Режим предпросмотра (сниженная частота кадров на этом автомобиле).</string>
-    <string name="projection_status_none">Пока ничего не проецируется — выберите приложение и транслируйте.</string>
-    <string name="projection_status_unsupported">Живое зеркало не поддерживается на этом автомобиле. Приложение всё равно проецируется на приборную панель.</string>
-    <string name="projection_note_single_app">На приборную панель одновременно можно проецировать только одно приложение.</string>
+    <string name="projection_cast_failed">Не удалось выбросить приложение в кластер.</string>
+    <string name="projection_status_idle">Не проектируется.</string>
+    <string name="projection_status_live">Живое зеркало — нажмите и проведите пальцем для управления.</string>
+    <string name="projection_status_preview">Режим предварительного просмотра (пониженная скорость рамы на этом транспортном средстве).</string>
+    <string name="projection_status_none">Пока ничего не прогнозируется — выберите приложение и транслируйте.</string>
+    <string name="projection_status_unsupported">Живое зеркало не поддерживается на этом автомобиле. Приложение все еще прогнозируется на кластере.</string>
+    <string name="projection_note_single_app">Одно приложение может быть спроектировано на кластере одновременно.</string>
     <string name="projection_adjust_bounds">Настроить область</string>
     <string name="projection_done_adjusting">Готово</string>
     <string name="projection_bounds_hint_idle">Область зеркала</string>
@@ -1375,4 +1375,18 @@
     <string name="projection_autostart_conflict_confirm">Использовать это приложение</string>
     <string name="projection_app_uninstalled">Это приложение больше не установлено.</string>
     <string name="projection_status_service_down">Служба зеркала не готова — перезапустите приложение (или демон камеры) и повторите попытку.</string>
+    <string name="cd_replay_status">Статус мгновенного повтора</string>
+    <string name="recording_lib_type_replay">ПОВТОРИТЬ</string>
+    <string name="settings_overlay_replay_title">Индикатор мгновенного повтора</string>
+    <string name="settings_overlay_replay_subtitle">Показать значок CLIP: зеленый во время повтора, синий для 5 после сохранения, красный при сбое. Появляется только тогда, когда существует привязка или автоматизация повтора.</string>
+    <string name="recordings_segment_replays">Повторы</string>
+    <string name="recordings_segment_replays_count">Повторы · %d</string>
+    <string name="vehicle_model_seagull">BYD Seagull</string>
+    <string name="projection_window_title">Окно кластера</string>
+    <string name="projection_window_desc">Перемещение приложения на кластере драйверов. Пресет его привязку к общим макетам; Изменение размера окна позволяет перетащить его свободно.</string>
+    <string name="projection_preset_full">Полностью</string>
+    <string name="projection_preset_left">Левая половина</string>
+    <string name="projection_preset_right">Правая половина</string>
+    <string name="projection_preset_center">По центру</string>
+    <string name="projection_lock_aspect">Сохранять аспект кластера</string>
 </resources>

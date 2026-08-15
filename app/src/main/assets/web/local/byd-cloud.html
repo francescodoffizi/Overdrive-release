@@ -11,7 +11,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <!--
       Bottom-tab manifest. Three task-based tabs:
         Account  — credential form (region, email, password, PIN, Save / Test)
@@ -26,9 +26,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
 </head>
 <body>
     <div class="app-layout">
@@ -285,10 +283,10 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
     <!-- BydCloud module + SurvSettings stubs live in surveillance.js. -->
-    <script src="../shared/surveillance.js?v=survfix1"></script>
+    <script src="../shared/surveillance.js?v=survtoggle1"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

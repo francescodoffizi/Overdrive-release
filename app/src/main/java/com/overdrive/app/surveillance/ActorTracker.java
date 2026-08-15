@@ -116,6 +116,39 @@ public final class ActorTracker {
     private static final int STATIC_CENTROID_DRIFT_PX = 10;
 
     /**
+     * Normalized-space equivalents of {@link #STATIC_CENTROID_DRIFT_PX} (10 px in
+     * the 320×240 mosaic quadrant → per-axis fractions of the frame).
+     * (audit R5-6) Cross-observation comparisons now run uniformly in QUADRANT
+     * space (constant 320×240 reference frame — the engine affine-maps foveated
+     * boxes through the window transform before update()), so these fractions are
+     * exact pixel-threshold equivalents on every frame, not just pure-mosaic
+     * sequences. The per-own-dims normalization is kept as the minimal diff: it
+     * is an exact identity for constant-dims inputs and still guards legacy
+     * callers that pass no quadrant-space list (audit R3b Ext-8 heritage).
+     */
+    private static final float STATIC_CENTROID_DRIFT_NX = STATIC_CENTROID_DRIFT_PX / 320f;
+    private static final float STATIC_CENTROID_DRIFT_NY = STATIC_CENTROID_DRIFT_PX / 240f;
+
+    /**
+     * Coherent vertical centroid motion required by computeTrend, NORMALIZED
+     * (was a raw 5 px in the 240-high mosaic quadrant → 5/240 of frame height).
+     * (audit R5-6) Trend history now stores quadrant-space centroids normalized
+     * by the quadrant dims (uniformly 320×240 from the engine), so the threshold
+     * is exactly the old 5 px in quadrant space on every frame.
+     */
+    private static final float TREND_DCY_NORM = 5f / 240f;
+
+    /**
+     * (audit R5-6) Reference frame dims of the engine's quadrant space — the
+     * constant 320×240 coordinate system cqtDetections are affine-mapped into
+     * (matches CrossQuadrantTracker's hardcoded Q_WIDTH/Q_HEIGHT). Used to
+     * normalize the parallel quadrant-space list; legacy callers that pass no
+     * such list fall back to the native frame dims.
+     */
+    private static final int QUAD_SPACE_W = 320;
+    private static final int QUAD_SPACE_H = 240;
+
+    /**
      * Centroid drift (pixels) above which a non-person track is deemed to have
      * "ever moved" — the latch that makes a genuinely parked car read static for
      * TIMELINE purposes even when it never accrued the consecutive stable frames
@@ -160,7 +193,7 @@ public final class ActorTracker {
                                            int quadrantH,
                                            long recordingStartWallMs,
                                            long wallNowMs) {
-        return update(detections, null, quadrant, quadrantW, quadrantH,
+        return update(detections, null, null, quadrant, quadrantW, quadrantH,
                       recordingStartWallMs, wallNowMs);
     }
 
@@ -185,13 +218,59 @@ public final class ActorTracker {
                                            int quadrantH,
                                            long recordingStartWallMs,
                                            long wallNowMs) {
+        return update(detections, null, xqTrackIdHints, quadrant, quadrantW,
+                      quadrantH, recordingStartWallMs, wallNowMs);
+    }
+
+    /**
+     * (audit R5-6) Variant that additionally accepts a parallel QUADRANT-SPACE
+     * copy of the detections ({@code quadDetections}, same size and order as
+     * {@code detections}, boxes affine-mapped into the constant 320×240 quadrant
+     * frame — the engine already builds this list for CrossQuadrantTracker).
+     *
+     * Rationale: {@code detections} arrive in the crop's NATIVE space (640×640
+     * foveated window or 320×240 mosaic). The foveated window is a moving
+     * ~160×160 SUB-REGION of the quadrant, so even per-own-dims normalization
+     * (audit R3b Ext-8) leaves a ~3× normalized-area step across every
+     * mosaic↔foveated flip: stableFrames reset on every flip, computeTrend could
+     * manufacture APPROACHING, and Path-B IoU failed off-center. All
+     * CROSS-OBSERVATION comparisons (hint-rejection IoU, Path-B matching IoU,
+     * stability, trend history, everMoved) therefore use the quadrant-space box,
+     * which lives in one constant physical reference frame. Native boxes are
+     * still stored/reported unchanged (lastX/Y/W/H, peakBbox*) so ThumbnailBuffer
+     * bbox↔pixels coherence is untouched, and per-frame proximity stays
+     * dimension-aware on the native box.
+     *
+     * {@code quadDetections == null} → each detection falls back to itself
+     * (legacy behaviour for callers without a quadrant-space copy).
+     */
+    public synchronized List<Actor> update(List<Detection> detections,
+                                           List<Detection> quadDetections,
+                                           int[] xqTrackIdHints,
+                                           int quadrant,
+                                           int quadrantW,
+                                           int quadrantH,
+                                           long recordingStartWallMs,
+                                           long wallNowMs) {
         pruneStale(wallNowMs);
+
+        // (audit R5-6) Reference dims of the quadrant-space boxes: constant
+        // 320×240 when the caller supplies the parallel quadrant-space list;
+        // the native frame dims otherwise (legacy — qd falls back to d below).
+        final int qSpaceW = (quadDetections != null) ? QUAD_SPACE_W : quadrantW;
+        final int qSpaceH = (quadDetections != null) ? QUAD_SPACE_H : quadrantH;
 
         if (detections != null && !detections.isEmpty()) {
             for (int i = 0; i < detections.size(); i++) {
                 Detection d = detections.get(i);
                 ClassGroup group = Actor.groupOf(d.getClassId());
                 if (group == ClassGroup.UNKNOWN) continue;
+
+                // (audit R5-6) Quadrant-space twin of d for all cross-observation
+                // comparisons; the lists are parallel by construction (engine
+                // builds cqtDetections from the same list, same order).
+                Detection qd = (quadDetections != null && i < quadDetections.size())
+                        ? quadDetections.get(i) : d;
 
                 int hint = (xqTrackIdHints != null && i < xqTrackIdHints.length)
                         ? xqTrackIdHints[i] : 0;
@@ -233,8 +312,11 @@ public final class ActorTracker {
                                     t.quadrant == quadrant
                                     && (wallNowMs - t.lastSeenWallMs) > HINT_IOU_CHECK_MIN_GAP_MS;
                             if (staleSameQuadrant
-                                    && iou(t.lastX, t.lastY, t.lastW, t.lastH,
-                                           d.getX(), d.getY(), d.getW(), d.getH()) <= 0f) {
+                                    // (audit R5-6) compare in QUADRANT space (constant
+                                    // 320×240 frame) — per-own-dims normalization alone
+                                    // (audit R3b Ext-8) couldn't make the moving foveated
+                                    // window commensurable with mosaic frames.
+                                    && iouNorm(t, qd, qSpaceW, qSpaceH) <= 0f) {
                                 // This hint describes a DIFFERENT physical object that
                                 // happened to reuse the id. Remember the rejection so
                                 // the id is not re-stamped below onto whatever Track we
@@ -263,8 +345,11 @@ public final class ActorTracker {
                     for (Track t : tracks) {
                         if (t.quadrant != quadrant) continue;
                         if (t.classGroup != group) continue;
-                        float iou = iou(t.lastX, t.lastY, t.lastW, t.lastH,
-                                        d.getX(), d.getY(), d.getW(), d.getH());
+                        // (audit R5-6) match in QUADRANT space — a crop-mode flip is a
+                        // no-op there, so an off-center subject no longer fragments
+                        // (the R3b Ext-8 per-own-dims form failed off-center because
+                        // the foveated window is a moving sub-region of the quadrant).
+                        float iou = iouNorm(t, qd, qSpaceW, qSpaceH);
                         if (iou > bestIou) {
                             bestIou = iou;
                             best = t;
@@ -288,7 +373,8 @@ public final class ActorTracker {
                 if (hint != 0 && !hintRejected && best.xqTrackId == 0) {
                     best.xqTrackId = hint;
                 }
-                best.observe(d, quadrant, quadrantW, quadrantH, recordingStartWallMs, wallNowMs);
+                best.observe(d, qd, quadrant, quadrantW, quadrantH,
+                             qSpaceW, qSpaceH, recordingStartWallMs, wallNowMs);
             }
         }
 
@@ -349,6 +435,44 @@ public final class ActorTracker {
         return union > 0 ? (float) inter / union : 0f;
     }
 
+    /**
+     * Space-aware IoU between a Track's last stored QUADRANT-SPACE bbox and an
+     * incoming detection's quadrant-space box (audit R5-6, completing audit R3b
+     * Ext-8): with the engine passing affine-mapped quadrant-space boxes, both
+     * sides live in the same constant 320×240 physical reference frame, so a
+     * mosaic↔foveated flip is a genuine no-op here (the R3b per-own-dims form
+     * still broke across flips because the foveated window is a moving
+     * sub-region of the quadrant). The per-own-dims normalization is kept as
+     * the minimal diff — an exact identity for constant-dims inputs, and the
+     * correct legacy behaviour for callers without a quadrant-space list
+     * (qd==d, dims=native).
+     */
+    private static float iouNorm(Track t, Detection qd, int qQuadW, int qQuadH) {
+        if (t.qLastQuadW <= 0 || t.qLastQuadH <= 0 || qQuadW <= 0 || qQuadH <= 0) {
+            // Missing dims — fall back to raw-space IoU (legacy behaviour).
+            return iou(t.qLastX, t.qLastY, t.qLastW, t.qLastH,
+                       qd.getX(), qd.getY(), qd.getW(), qd.getH());
+        }
+        return iouF((float) t.qLastX / t.qLastQuadW, (float) t.qLastY / t.qLastQuadH,
+                    (float) t.qLastW / t.qLastQuadW, (float) t.qLastH / t.qLastQuadH,
+                    (float) qd.getX() / qQuadW, (float) qd.getY() / qQuadH,
+                    (float) qd.getW() / qQuadW, (float) qd.getH() / qQuadH);
+    }
+
+    /** Float-precision IoU for normalized [0,1] boxes (audit R3b Ext-8). */
+    private static float iouF(float ax, float ay, float aw, float ah,
+                              float bx, float by, float bw, float bh) {
+        float x1 = Math.max(ax, bx);
+        float y1 = Math.max(ay, by);
+        float x2 = Math.min(ax + aw, bx + bw);
+        float y2 = Math.min(ay + ah, by + bh);
+        float interW = Math.max(0f, x2 - x1);
+        float interH = Math.max(0f, y2 - y1);
+        float inter = interW * interH;
+        float union = aw * ah + bw * bh - inter;
+        return union > 0f ? inter / union : 0f;
+    }
+
     /** Per-Actor mutable state. */
     private static final class Track {
         final long actorId;
@@ -368,12 +492,23 @@ public final class ActorTracker {
 
         int lastX, lastY, lastW, lastH;
         int lastQuadW = 0, lastQuadH = 0;
+        // (audit R5-6) QUADRANT-SPACE twin of lastX/Y/W/H + its reference frame
+        // dims (constant 320×240 from the engine; native dims for legacy
+        // callers). All cross-observation comparisons (matching IoU, stability,
+        // trend, everMoved) read these; the native lastX/Y/W/H stay paired with
+        // lastQuadW/H for ThumbnailBuffer/toActor coherence.
+        int qLastX, qLastY, qLastW, qLastH;
+        int qLastQuadW = 0, qLastQuadH = 0;
         int cameraMask = 0;
 
-        // History for trend / static
+        // History for trend / static — stored NORMALIZED in QUADRANT space
+        // (narea = qArea/(qQuadW*qQuadH), ncx = qcx/qQuadW, ncy = qcy/qQuadH)
+        // so a mosaic↔foveated crop flip inside the window can't manufacture a
+        // trend (audit R5-6, was per-own-native-dims under audit R3b Ext-8).
+        // Same representation the everMoved anchor uses.
         final float[] areaHistory = new float[TREND_WINDOW];
-        final int[] cxHistory = new int[TREND_WINDOW];
-        final int[] cyHistory = new int[TREND_WINDOW];
+        final float[] cxHistory = new float[TREND_WINDOW];
+        final float[] cyHistory = new float[TREND_WINDOW];
         int historyCount = 0;
         int stableFrames = 0;
         // True once this track ever showed real translation (coherent trend or a
@@ -434,8 +569,24 @@ public final class ActorTracker {
             this.peakCamera = quadrant;
         }
 
-        void observe(Detection d, int newQuadrant, int quadW, int quadH,
+        void observe(Detection d, Detection qd, int newQuadrant,
+                     int quadW, int quadH, int qQuadW, int qQuadH,
                      long recordingStartWallMs, long wallNowMs) {
+            // (audit R5-6) CROSS-CAMERA HANDOFF RESET. A Path-A cross-quadrant
+            // hint match re-points this Track to a DIFFERENT physical camera;
+            // the trend/stability histories then span two incomparable lens
+            // geometries, and the first cross-camera dCy/area step manufactures
+            // APPROACHING (or resets/holds stableFrames on noise). Clear them
+            // before observing — mirrors the everMoved anchor's quadrant-change
+            // re-seed idiom below. historyCount=0 is sufficient to retire the
+            // ring buffers (computeTrend never reads slots >= historyCount, and
+            // post-reset writes start at slot 0 before any wrap).
+            final boolean handoff = lastSeenWallMs != 0 && newQuadrant != quadrant;
+            if (handoff) {
+                historyCount = 0;
+                stableFrames = 0;
+            }
+
             if (firstSeenWallMs == 0) {
                 firstSeenWallMs = wallNowMs;
                 if (recordingStartWallMs > 0) {
@@ -449,26 +600,59 @@ public final class ActorTracker {
             cameraMask |= (1 << (newQuadrant & 0x03));
             lastQuadW = quadW;
             lastQuadH = quadH;
+            // (audit R5-6) Snapshot the PREVIOUS observation's quadrant-space
+            // frame dims before overwriting — the stability check below must
+            // normalize the previous box by ITS OWN reference dims (constant
+            // 320×240 from the engine; native for legacy callers).
+            int prevQQuadW = qLastQuadW, prevQQuadH = qLastQuadH;
+            qLastQuadW = qQuadW;
+            qLastQuadH = qQuadH;
 
             int x = d.getX();
             int y = d.getY();
             int w = d.getW();
             int h = d.getH();
 
-            float prevArea = lastW > 0 ? (float)(lastW * lastH) : 0f;
-            float curArea = (float)(w * h);
+            // (audit R5-6) Quadrant-space geometry — the single constant
+            // reference frame ALL cross-observation math below uses (stability,
+            // trend history, everMoved). The native x/y/w/h above are only
+            // stored/latched for consumers that pair them with their own dims
+            // (lastX/Y/W/H, peakBbox*) and for per-frame proximity.
+            int qx = qd.getX();
+            int qy = qd.getY();
+            int qw = qd.getW();
+            int qh = qd.getH();
 
-            int cx = x + w / 2;
-            int cy = y + h / 2;
+            float prevQArea = qLastW > 0 ? (float)(qLastW * qLastH) : 0f;
+            float curQArea = (float)(qw * qh);
 
-            // Stability check (against previous observation, not full history)
-            if (lastW > 0) {
-                float drift = prevArea > 0 ? Math.abs(curArea - prevArea) / prevArea : 1f;
-                int dCx = Math.abs(cx - (lastX + lastW / 2));
-                int dCy = Math.abs(cy - (lastY + lastH / 2));
+            int qcx = qx + qw / 2;
+            int qcy = qy + qh / 2;
+
+            // Stability check (against previous observation, not full history).
+            // (audit R5-6) Compared in QUADRANT space: the engine affine-maps
+            // foveated boxes into the constant 320×240 quadrant frame before
+            // update(), so a mosaic↔foveated crop flip is a genuine no-op here.
+            // (The R3b Ext-8 per-own-dims normalization was NOT flip-immune: the
+            // foveated window is a moving ~160×160 sub-region of the quadrant,
+            // so normalized area still stepped ~3× on every flip and reset
+            // stableFrames on a genuinely still object.) The normalized-space
+            // formulation is kept as the minimal diff — with constant 320×240
+            // inputs the thresholds are exactly the original 10 px, and legacy
+            // callers (qd==d, dims=native) keep the R3b behaviour. Skipped on a
+            // cross-camera handoff: the previous box is another lens's geometry.
+            if (!handoff && qLastW > 0
+                    && prevQQuadW > 0 && prevQQuadH > 0 && qQuadW > 0 && qQuadH > 0) {
+                float prevNarea = prevQArea / ((float) prevQQuadW * prevQQuadH);
+                float curNarea = curQArea / ((float) qQuadW * qQuadH);
+                float drift = prevNarea > 0 ? Math.abs(curNarea - prevNarea) / prevNarea : 1f;
+                float dNcx = Math.abs((float) qcx / qQuadW
+                        - (float) (qLastX + qLastW / 2) / prevQQuadW);
+                float dNcy = Math.abs((float) qcy / qQuadH
+                        - (float) (qLastY + qLastH / 2) / prevQQuadH);
                 if (drift < STATIC_AREA_DRIFT_FRAC
-                        && dCx < STATIC_CENTROID_DRIFT_PX
-                        && dCy < STATIC_CENTROID_DRIFT_PX) {
+                        && dNcx < STATIC_CENTROID_DRIFT_NX
+                        && dNcy < STATIC_CENTROID_DRIFT_NY) {
                     if (stableFrames < Integer.MAX_VALUE - 1) stableFrames++;
                 } else {
                     stableFrames = 0;
@@ -495,23 +679,27 @@ public final class ActorTracker {
             //    net area stays within the band → never latches.
             // Latch-once, never cleared. Severity path (computeTrend) untouched.
             //
-            // MOSAIC-ONLY: this latch (and the timeline-static inference it feeds)
-            // is valid only for full-quadrant MOSAIC frames (quadW<=320). The
-            // foveated 640×640 crop is a window RE-CENTERED on the motion centroid
-            // every frame, so an object's window-local centroid stays ~fixed even
-            // while it physically moves — net-displacement in that space is
-            // meaningless and would mis-infer a real lateral mover as static.
-            // Mosaic frames reference the stable full quadrant, where a parked
-            // car's centroid/area genuinely don't move. mosaicFrameCount records
-            // how many valid (mosaic) frames we had; toActor() requires >=2 (so the
-            // net-displacement test actually ran) and otherwise fails OPEN (never
-            // infers static) for a track seen only foveated or with one anchor.
-            boolean mosaicFrame = quadW > 0 && quadW <= 320 && quadH > 0 && quadH <= 320;
+            // QUADRANT-FRAME-ONLY: this latch (and the timeline-static inference
+            // it feeds) needs coords that reference the STABLE full quadrant —
+            // net-displacement in the moving foveated window's own space is
+            // meaningless (the window re-centers on the motion centroid, so a
+            // real mover's window-local centroid stays ~fixed).
+            // (audit R5-6) The gate tests the quadrant-space reference dims: with
+            // the engine's affine-mapped list every frame is quadrant-referenced
+            // (320×240), so foveated frames now legitimately feed the test too —
+            // an improvement over the old mosaic-only sampling (more evidence per
+            // track, same physical meaning). Legacy callers without the parallel
+            // list keep the old behaviour exactly (qQuadW=native, 640 foveated
+            // frames still excluded). The anchor re-seed on quadrant change and
+            // the >=2-test-frames gating semantics (everMovedTestFrames /
+            // toActor) are unchanged. mosaicFrameCount keeps its name but now
+            // counts quadrant-referenced frames.
+            boolean mosaicFrame = qQuadW > 0 && qQuadW <= 320 && qQuadH > 0 && qQuadH <= 320;
             if (mosaicFrame) {
                 mosaicFrameCount++;
-                float ncx = (float) cx / quadW;
-                float ncy = (float) cy / quadH;
-                float narea = curArea / ((float) quadW * quadH);
+                float ncx = (float) qcx / qQuadW;
+                float ncy = (float) qcy / qQuadH;
+                float narea = curQArea / ((float) qQuadW * qQuadH);
                 if (!haveAnchor || newQuadrant != anchorQuadrant) {
                     // (Re)seed the anchor in THIS quadrant's local [0,1] space. A
                     // cross-quadrant-bound Track (same xqTrackId across cameras)
@@ -568,21 +756,42 @@ public final class ActorTracker {
             }
 
             lastX = x; lastY = y; lastW = w; lastH = h;
+            // (audit R5-6) quadrant-space twin — read by iouNorm + next frame's
+            // stability check.
+            qLastX = qx; qLastY = qy; qLastW = qw; qLastH = qh;
 
-            // Roll history
+            // Roll history — QUADRANT-SPACE, normalized by the quadrant reference
+            // dims (audit R5-6; was per-own-native-dims under R3b Ext-8, which
+            // still let a crop flip inside the 6-slot window read as a ~3× area
+            // step + a window-origin dCy in computeTrend, manufacturing
+            // APPROACHING/RECEDING on a stationary object — pinning ALERT via the
+            // lifetime severity latch and blocking isStaticForTimeline). With the
+            // engine's affine-mapped inputs all six slots share one physical
+            // reference frame, so a flip contributes zero artificial step.
             int slot = historyCount % TREND_WINDOW;
-            areaHistory[slot] = curArea;
-            cxHistory[slot] = cx;
-            cyHistory[slot] = cy;
+            areaHistory[slot] = (qQuadW > 0 && qQuadH > 0)
+                    ? curQArea / ((float) qQuadW * qQuadH) : 0f;
+            cxHistory[slot] = qQuadW > 0 ? (float) qcx / qQuadW : 0f;
+            cyHistory[slot] = qQuadH > 0 ? (float) qcy / qQuadH : 0f;
             historyCount++;
 
             // Compute proximity from bbox dimension relative to quadrant dim.
             // For people use height (taller-than-wide); for vehicles use width.
+            // (audit R7 ExtC-7) QUADRANT-SPACE ratio, matching the threshold
+            // constants' own doc ("foveated path is rescaled to quadrant
+            // first"): the native-dims ratio was self-consistent within a
+            // frame but MAGNIFICATION-biased — the foveated window covers a
+            // ~160×160 sub-region of the 320×240 quadrant, inflating the
+            // person ratio 1.5× and the vehicle ratio 2×, crossing proximity
+            // tiers (MID→CLOSE, CLOSE→VERY_CLOSE) and lifetime-latching
+            // escalated severity via peakProximity. Mosaic frames are
+            // byte-identical (qd==d, dims equal); legacy callers without the
+            // quadrant-space list likewise unchanged.
             float ratio;
             if (classGroup == ClassGroup.VEHICLE) {
-                ratio = quadW > 0 ? (float) w / quadW : 0f;
+                ratio = qQuadW > 0 ? (float) qw / qQuadW : 0f;
             } else {
-                ratio = quadH > 0 ? (float) h / quadH : 0f;
+                ratio = qQuadH > 0 ? (float) qh / qQuadH : 0f;
             }
             Proximity prox = ratioToProximity(ratio);
 
@@ -732,10 +941,15 @@ public final class ActorTracker {
             // walking past a parked car). Real approach: bbox grows AND its
             // bottom edge drifts down (or its centroid drifts down for ground
             // objects). Occlusion noise: bbox grows but centroid jitters with
-            // no net direction. We require coherent vertical motion >= 5 px.
-            int dCy = cyHistory[newest] - cyHistory[oldest];
-            if (change > 0.10f && dCy >= 5) return Trend.APPROACHING;
-            if (change < -0.10f && dCy <= -5) return Trend.RECEDING;
+            // no net direction. We require coherent vertical motion >= 5 px
+            // (of the 240-high mosaic quadrant).
+            // (audit R5-6) History is stored in QUADRANT space normalized by the
+            // constant 320×240 reference dims, so the ±10% area RATIO and the dCy
+            // threshold (old 5 px → 5/240 of quadrant height) compare like with
+            // like across every mosaic↔foveated flip — no window-origin artifact.
+            float dCy = cyHistory[newest] - cyHistory[oldest];
+            if (change > 0.10f && dCy >= TREND_DCY_NORM) return Trend.APPROACHING;
+            if (change < -0.10f && dCy <= -TREND_DCY_NORM) return Trend.RECEDING;
             return Trend.STABLE;
         }
 
@@ -749,11 +963,13 @@ public final class ActorTracker {
 
         Actor toActor() {
             // current proximity = recompute from last frame so toActor is internally consistent
+            // (audit R7 ExtC-7) quadrant-space, mirroring observe()'s ratio —
+            // the native-dims form inflated foveated frames' proximity.
             float ratio;
             if (classGroup == ClassGroup.VEHICLE) {
-                ratio = lastQuadW > 0 ? (float) lastW / lastQuadW : 0f;
+                ratio = qLastQuadW > 0 ? (float) qLastW / qLastQuadW : 0f;
             } else {
-                ratio = lastQuadH > 0 ? (float) lastH / lastQuadH : 0f;
+                ratio = qLastQuadH > 0 ? (float) qLastH / qLastQuadH : 0f;
             }
             Proximity lastProx = ratioToProximity(ratio);
             int staticThreshold = (classGroup == ClassGroup.VEHICLE)

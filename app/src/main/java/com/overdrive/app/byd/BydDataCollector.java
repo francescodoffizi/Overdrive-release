@@ -1,6 +1,8 @@
 package com.overdrive.app.byd;
 
 import android.content.Context;
+import android.content.Intent;
+import android.os.SystemClock;
 
 import com.overdrive.app.logging.DaemonLogger;
 import com.overdrive.app.server.Messages;
@@ -23,15 +25,99 @@ public class BydDataCollector {
     private static final String TAG = "BydDataCollector";
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
 
+    /** Connected-unit BYDAutoSettingDevice.setPadRotation enum. */
+    public static final int PAD_ROTATION_HORIZONTAL = 1;
+    public static final int PAD_ROTATION_VERTICAL = 2;
+
+    /** OEM panorama-view event codes used by the native camera application. */
+    public static final int NATIVE_CAMERA_VIEW_FRONT = 3001;
+    public static final int NATIVE_CAMERA_VIEW_REAR = 3002;
+    public static final int NATIVE_CAMERA_VIEW_LEFT = 3003;
+    public static final int NATIVE_CAMERA_VIEW_RIGHT = 3004;
+    public static final int NATIVE_CAMERA_VIEW_FRONT_WIDE = 3006;
+    public static final int NATIVE_CAMERA_VIEW_REAR_WIDE = 3007;
+    public static final int NATIVE_CAMERA_VIEW_LEFT_RIGHT = 3008;
     private static BydDataCollector instance;
     private static final Object lock = new Object();
 
     private final AtomicReference<BydVehicleData> snapshot = new AtomicReference<>();
+    /**
+     * Serializes BMS/gun callback publication against a poll's final snapshot write. The version
+     * lets a poll preserve a newer edge instead of overwriting FINISHED/DISCONNECTED with the state
+     * it read before that callback arrived.
+     */
+    private final Object chargingEdgePublishLock = new Object();
+    /**
+     * Serializes raw BMS transition publication through listener delivery. Lock order is always
+     * this monitor before {@link #chargingEdgePublishLock}.
+     */
+    private final Object chargingStateTransitionLock = new Object();
+    private final java.util.concurrent.atomic.AtomicLong bmsEdgeVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong gunEdgeVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong chargingTypeVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong capacityEdgeVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong devicePowerEdgeVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong externalPowerEdgeVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong enginePowerEdgeVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong chargingRateClearVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong chargingPollGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    /**
+     * Invalidates callback work that began before an init/stop publication barrier. Listener
+     * generations identify a registered HAL handle; this epoch additionally distinguishes two
+     * lifetimes of the same still-registered singleton handle.
+     */
+    private final java.util.concurrent.atomic.AtomicLong callbackLifecycleGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    /**
+     * Identifies the currently installed periodic poll lane. A task checks this only after acquiring
+     * the collector monitor, so shutdown also fences a runnable already blocked at monitor entry.
+     */
+    private final java.util.concurrent.atomic.AtomicLong pollSchedulerGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final ChargingObservationOrder chargingObservationOrder =
+            new ChargingObservationOrder();
+    /** Guarded by {@link #chargingEdgePublishLock}. */
+    private long lastPublishedChargingPollGeneration = 0L;
     private Context context;
     private volatile boolean initialized = false;
+    private final java.util.concurrent.atomic.AtomicLong safetyBeltListenerGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    private volatile Object activeSafetyBeltListenerDevice;
+    private volatile long activeSafetyBeltListenerGeneration = -1L;
+    private final java.util.concurrent.atomic.AtomicLong passengerOccupancySampleGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final Object passengerOccupancyPublishLock = new Object();
+    private final java.util.concurrent.atomic.AtomicLong chargingListenerGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong instrumentListenerGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong engineListenerGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    private volatile Object activeChargingListenerDevice;
+    private volatile Object activeInstrumentListenerDevice;
+    private volatile Object activeEngineListenerDevice;
+    private volatile long activeChargingListenerGeneration = -1L;
+    private volatile long activeInstrumentListenerGeneration = -1L;
+    private volatile long activeEngineListenerGeneration = -1L;
+    /**
+     * Serializes the complete drivetrain probe/establishment transaction. This is deliberately not
+     * the collector monitor: charging callbacks may probe while holding chargingEdgePublishLock,
+     * whereas collectAll holds the collector monitor before that lock.
+     */
+    private final Object drivetrainProbeLock = new Object();
 
     // Device references (all nullable)
     private Object bodyworkDevice;
+    private Object rearViewMirrorDevice;
     // Volatile: read by the cluster speed overlay's 2 Hz thread in readCurrentSpeedKmh()
     // without the monitor, while init() (synchronized) may reassign it on an ACC-on
     // re-init. Volatile gives the happens-before so the overlay never sees a stale ref
@@ -49,7 +135,13 @@ public class BydDataCollector {
     private Object gearboxDevice;
     private Object safetyBeltDevice;
     private Object acDevice;
+    // PM2.5 air-quality device. A DEDICATED HAL device (the reference apps use exactly this
+    // class + getPM2p5Value); the values are not on the bodywork/AC devices, which is why our
+    // only PM2.5 source used to be the BYD cloud snapshot — leaving the local reading, and the
+    // pm25 automation signal, permanently empty offline.
+    private Object pm25Device;
     private Object lightDevice;
+    private Object wiperDevice;
     private Object adasDevice;
     private Object radarDevice;
     private Object powerDevice;
@@ -192,6 +284,517 @@ public class BydDataCollector {
         return snapshot.get();
     }
 
+    static BydVehicleData preserveNewerChargingEdge(BydVehicleData collected,
+                                                     BydVehicleData latest,
+                                                     long versionAtStart,
+                                                     long versionNow) {
+        return preserveNewerChargingEdges(collected, latest,
+                versionAtStart, versionNow, versionAtStart, versionNow);
+    }
+
+    static BydVehicleData preserveNewerChargingEdges(BydVehicleData collected,
+                                                      BydVehicleData latest,
+                                                      long bmsVersionAtRead,
+                                                      long bmsVersionNow,
+                                                      long gunVersionAtRead,
+                                                      long gunVersionNow) {
+        return preserveNewerChargingEdges(collected, latest,
+                bmsVersionAtRead, bmsVersionNow,
+                gunVersionAtRead, gunVersionNow, 0L, 0L);
+    }
+
+    static BydVehicleData preserveNewerChargingEdges(BydVehicleData collected,
+                                                      BydVehicleData latest,
+                                                      long bmsVersionAtRead,
+                                                      long bmsVersionNow,
+                                                      long gunVersionAtRead,
+                                                      long gunVersionNow,
+                                                      long typeVersionAtRead,
+                                                      long typeVersionNow) {
+        if (collected == null || latest == null) return collected;
+        boolean newerBms = bmsVersionAtRead != bmsVersionNow;
+        boolean newerGun = gunVersionAtRead != gunVersionNow;
+        boolean newerType = typeVersionAtRead != typeVersionNow;
+        if (!newerBms && !newerGun && !newerType) return collected;
+        BydVehicleData.Builder merged = collected.toBuilder();
+        if (newerBms) {
+            merged.chargingState(latest.chargingState)
+                    .chargingStateAtMs(latest.chargingStateAtMs);
+        }
+        if (newerGun) {
+            merged.chargingGunState(latest.chargingGunState);
+        }
+        if (newerType) {
+            merged.chargingType(latest.chargingType);
+        }
+        int effectiveGun = newerGun ? latest.chargingGunState : collected.chargingGunState;
+        int effectiveType = newerType ? latest.chargingType : collected.chargingType;
+        merged.vtolCharging(effectiveGun == 5 || effectiveType == 3);
+        return merged.build();
+    }
+
+    static void refreshChargingLifecycleContext(BydVehicleData.Builder target,
+                                                BydVehicleData latest) {
+        refreshChargingLifecycleContext(target, latest, true, true, true);
+    }
+
+    static void refreshChargingLifecycleContext(BydVehicleData.Builder target,
+                                                BydVehicleData latest,
+                                                boolean refreshBms,
+                                                boolean refreshGun,
+                                                boolean refreshType) {
+        if (target == null || latest == null) return;
+        if (refreshBms) {
+            target.chargingState(latest.chargingState)
+                    .chargingStateAtMs(latest.chargingStateAtMs);
+        }
+        if (refreshGun) target.chargingGunState(latest.chargingGunState);
+        if (refreshType) target.chargingType(latest.chargingType);
+        target.vtolCharging(target.chargingGunState == 5 || target.chargingType == 3);
+    }
+
+    static BydVehicleData clearChargingRateFields(BydVehicleData current,
+                                                  boolean preserveExternalCounter) {
+        return clearChargingRateFields(current, preserveExternalCounter, false);
+    }
+
+    static BydVehicleData clearChargingRateFields(BydVehicleData current,
+                                                  boolean preserveExternalCounter,
+                                                  boolean preserveFinishedMovementBaselines) {
+        if (current == null) return null;
+        BydVehicleData.Builder cleared = current.toBuilder()
+                .chargingPowerKw(Double.NaN)
+                .chargePowerKw(Double.NaN)
+                .clusterChargePowerKw(Double.NaN)
+                .enginePowerKw(Double.NaN);
+        if (!preserveExternalCounter) {
+            cleared.externalChargingPowerKw(Double.NaN);
+        }
+        if (!preserveFinishedMovementBaselines) {
+            cleared.clearChargingRateMovement();
+        }
+        return cleared.build();
+    }
+
+    static BydVehicleData preserveNewerChargingRateClear(BydVehicleData collected,
+                                                         BydVehicleData latest,
+                                                         long versionAtStart,
+                                                         long versionNow) {
+        if (collected == null || latest == null || versionAtStart == versionNow) {
+            return collected;
+        }
+        return collected.toBuilder()
+                .chargingPowerKw(latest.chargingPowerKw)
+                .chargingPowerAtMs(latest.chargingPowerAtMs)
+                .chargingPowerChangedAtMs(latest.chargingPowerChangedAtMs)
+                .chargingPowerLastObservedKw(latest.chargingPowerLastObservedKw)
+                .externalChargingPowerKw(latest.externalChargingPowerKw)
+                .externalChargingPowerAtMs(latest.externalChargingPowerAtMs)
+                .externalChargingPowerChangedAtMs(latest.externalChargingPowerChangedAtMs)
+                .externalChargingPowerLastObservedKw(
+                        latest.externalChargingPowerLastObservedKw)
+                .chargePowerKw(latest.chargePowerKw)
+                .chargePowerAtMs(latest.chargePowerAtMs)
+                .chargePowerChangedAtMs(latest.chargePowerChangedAtMs)
+                .chargePowerLastObservedKw(latest.chargePowerLastObservedKw)
+                .clusterChargePowerKw(latest.clusterChargePowerKw)
+                .clusterChargePowerAtMs(latest.clusterChargePowerAtMs)
+                .clusterChargePowerChangedAtMs(latest.clusterChargePowerChangedAtMs)
+                .clusterChargePowerLastObservedKw(latest.clusterChargePowerLastObservedKw)
+                .enginePowerKw(latest.enginePowerKw)
+                .enginePowerAtMs(latest.enginePowerAtMs)
+                .build();
+    }
+
+    static final class CounterCallbackReservation {
+        final long observation;
+        final long lifecycleGeneration;
+        final String source;
+        final double raw;
+        final long observedAtMs;
+        volatile boolean settledByTerminal;
+
+        CounterCallbackReservation(long observation, long lifecycleGeneration,
+                                   String source, double raw, long observedAtMs) {
+            this.observation = observation;
+            this.lifecycleGeneration = lifecycleGeneration;
+            this.source = source;
+            this.raw = raw;
+            this.observedAtMs = observedAtMs;
+        }
+    }
+
+    private static final class CounterReservationBatch {
+        boolean hasCapacity;
+        double capacityKwh = Double.NaN;
+        long capacityAtMs;
+        long capacityObservation;
+        boolean hasExternal;
+        double externalKwh = Double.NaN;
+        long externalAtMs;
+        long externalObservation;
+
+        void include(CounterCallbackReservation reservation) {
+            if (ChargeSourceClassifier.SRC_CAPACITY.equals(reservation.source)) {
+                if (!hasCapacity || reservation.observation > capacityObservation) {
+                    capacityKwh = reservation.raw;
+                    capacityAtMs = reservation.observedAtMs;
+                    capacityObservation = reservation.observation;
+                }
+                hasCapacity = true;
+            } else if (ChargeSourceClassifier.SRC_EXTERNAL.equals(reservation.source)) {
+                if (!hasExternal || reservation.observation > externalObservation) {
+                    externalKwh = reservation.raw;
+                    externalAtMs = reservation.observedAtMs;
+                    externalObservation = reservation.observation;
+                }
+                hasExternal = true;
+            }
+        }
+    }
+
+    /**
+     * Orders charging observations by when their hardware read or callback dispatch begins, not by
+     * when a callback eventually acquires {@link #chargingEdgePublishLock}.
+     */
+    static final class ChargingObservationOrder {
+        private final java.util.concurrent.atomic.AtomicLong sequence =
+                new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.ArrayList<CounterCallbackReservation> counterReservations =
+                new java.util.ArrayList<>();
+        private long latestBms;
+        private long latestGun;
+
+        long begin() {
+            return sequence.incrementAndGet();
+        }
+
+        synchronized CounterCallbackReservation reserveCounterCallback(
+                long lifecycleGeneration, String source, double raw) {
+            CounterCallbackReservation reservation = new CounterCallbackReservation(
+                    sequence.incrementAndGet(), lifecycleGeneration, source, raw,
+                    System.currentTimeMillis());
+            counterReservations.add(reservation);
+            return reservation;
+        }
+
+        synchronized void completeCounterCallback(CounterCallbackReservation reservation) {
+            if (reservation == null || reservation.settledByTerminal) return;
+            counterReservations.remove(reservation);
+        }
+
+        synchronized CounterReservationBatch settleCounterCallbacks(
+                long terminalObservation, long lifecycleGeneration, boolean account) {
+            CounterReservationBatch batch = new CounterReservationBatch();
+            java.util.Iterator<CounterCallbackReservation> iterator =
+                    counterReservations.iterator();
+            while (iterator.hasNext()) {
+                CounterCallbackReservation reservation = iterator.next();
+                if (reservation.lifecycleGeneration != lifecycleGeneration
+                        || reservation.observation > terminalObservation) {
+                    continue;
+                }
+                reservation.settledByTerminal = true;
+                if (account) batch.include(reservation);
+                iterator.remove();
+            }
+            return batch;
+        }
+
+        synchronized void discardCounterCallbacks() {
+            for (CounterCallbackReservation reservation : counterReservations) {
+                reservation.settledByTerminal = true;
+            }
+            counterReservations.clear();
+        }
+
+        synchronized void recordBmsPoll(long observation) {
+            if (observation > latestBms) latestBms = observation;
+        }
+
+        synchronized void recordGunPoll(long observation) {
+            if (observation > latestGun) latestGun = observation;
+        }
+
+        synchronized boolean claimBmsCallback(long observation) {
+            if (observation < latestBms) return false;
+            latestBms = observation;
+            return true;
+        }
+
+        synchronized boolean claimGunCallback(long observation) {
+            if (observation < latestGun) return false;
+            latestGun = observation;
+            return true;
+        }
+
+        synchronized long latestBms() {
+            return latestBms;
+        }
+
+        synchronized long latestGun() {
+            return latestGun;
+        }
+    }
+
+    private static final class ChargingObservationVersions {
+        final long bms;
+        final long gun;
+        final long bmsObservation;
+        final long gunObservation;
+        final long type;
+        final long capacity;
+        final long devicePower;
+        final long rateClear;
+        long externalPower;
+        long enginePower;
+        boolean externalPowerObserved;
+        boolean enginePowerObserved;
+        final boolean connectionObserved;
+        final boolean typeObserved;
+        final Boolean powerIsCharging;
+        final boolean bmsObserved;
+        final int observedBmsState;
+        final boolean terminalRateBarrier;
+        ChargingObservationVersions(long bms, long gun,
+                                    long bmsObservation, long gunObservation,
+                                    long type,
+                                    long capacity, long devicePower, long rateClear,
+                                    boolean connectionObserved,
+                                    boolean typeObserved,
+                                    Boolean powerIsCharging,
+                                    boolean bmsObserved,
+                                    int observedBmsState,
+                                    boolean terminalRateBarrier) {
+            this.bms = bms;
+            this.gun = gun;
+            this.bmsObservation = bmsObservation;
+            this.gunObservation = gunObservation;
+            this.type = type;
+            this.capacity = capacity;
+            this.devicePower = devicePower;
+            this.rateClear = rateClear;
+            this.connectionObserved = connectionObserved;
+            this.typeObserved = typeObserved;
+            this.powerIsCharging = powerIsCharging;
+            this.bmsObserved = bmsObserved;
+            this.observedBmsState = observedBmsState;
+            this.terminalRateBarrier = terminalRateBarrier;
+        }
+    }
+
+    private static final class ChargingPollEvidence {
+        boolean connectionObserved;
+        boolean typeObserved;
+        Boolean powerIsCharging;
+        boolean bmsObserved;
+        int observedBmsState = BydVehicleData.UNAVAILABLE;
+        long bmsObservation;
+        long gunObservation;
+        boolean terminalCapacityObserved;
+    }
+
+    private static final class ChargingCapacityReading {
+        final double kwh;
+        final String source;
+
+        ChargingCapacityReading(double kwh, String source) {
+            this.kwh = kwh;
+            this.source = source;
+        }
+
+        boolean isValid() {
+            return Double.isFinite(kwh) && kwh >= 0.0 && kwh <= 65.534;
+        }
+    }
+
+    static final class ChargingPowerReading {
+        final double raw;
+        final String getter;
+
+        ChargingPowerReading(double raw, String getter) {
+            this.raw = raw;
+            this.getter = getter;
+        }
+
+        boolean answered() {
+            return getter != null;
+        }
+    }
+
+    private BydVehicleData publishCollectedSnapshot(BydVehicleData collected,
+                                                     ChargingObservationVersions observed,
+                                                     long pollGeneration) {
+        synchronized (chargingEdgePublishLock) {
+            if (pollGeneration < lastPublishedChargingPollGeneration) {
+                return snapshot.get(); // a newer concurrent poll already won
+            }
+            BydVehicleData previous = snapshot.get();
+            BydVehicleData merged = preserveNewerChargingEdges(
+                    collected, previous,
+                    observed.bmsObservation, chargingObservationOrder.latestBms(),
+                    observed.gunObservation, chargingObservationOrder.latestGun(),
+                    observed.type, chargingTypeVersion.get());
+            boolean newerCapacity = observed.capacity != capacityEdgeVersion.get();
+            // A terminal poll is newer lifecycle evidence than any live-rate callback admitted
+            // after its hardware read but before this final publication. Counters remain eligible
+            // for their final tail, but live device/external/engine rates must not cross that fence.
+            boolean newerDevicePower = !observed.terminalRateBarrier
+                    && observed.devicePower != devicePowerEdgeVersion.get();
+            boolean newerExternalPower =
+                    (!observed.terminalRateBarrier
+                            || ChargeSourceClassifier.isCounter(
+                                    ChargeSourceClassifier.SRC_EXTERNAL))
+                    && (!observed.externalPowerObserved
+                            || observed.externalPower != externalPowerEdgeVersion.get());
+            boolean newerEnginePower = !observed.terminalRateBarrier
+                    && (!observed.enginePowerObserved
+                            || observed.enginePower != enginePowerEdgeVersion.get());
+            boolean newerRateClear =
+                    observed.rateClear != chargingRateClearVersion.get();
+            if (newerRateClear) {
+                merged = preserveNewerChargingRateClear(
+                        merged, previous, observed.rateClear, chargingRateClearVersion.get());
+            }
+            if (previous != null && (newerCapacity || newerDevicePower
+                    || newerExternalPower || newerEnginePower)) {
+                BydVehicleData.Builder latestValues = merged.toBuilder();
+                if (newerCapacity) {
+                    latestValues.chargingCapacityKwh(previous.chargingCapacityKwh);
+                }
+                if (newerDevicePower) {
+                    latestValues.chargingPowerKw(previous.chargingPowerKw)
+                            .chargingPowerAtMs(previous.chargingPowerAtMs)
+                            .chargingPowerChangedAtMs(previous.chargingPowerChangedAtMs)
+                            .chargingPowerLastObservedKw(
+                                    previous.chargingPowerLastObservedKw);
+                }
+                if (newerExternalPower) {
+                    latestValues.externalChargingPowerKw(previous.externalChargingPowerKw)
+                            .externalChargingPowerAtMs(previous.externalChargingPowerAtMs)
+                            .externalChargingPowerChangedAtMs(
+                                    previous.externalChargingPowerChangedAtMs)
+                            .externalChargingPowerLastObservedKw(
+                                    previous.externalChargingPowerLastObservedKw);
+                }
+                if (newerEnginePower) {
+                    latestValues.enginePowerKw(previous.enginePowerKw)
+                            .enginePowerAtMs(previous.enginePowerAtMs);
+                }
+                merged = latestValues.build();
+            }
+            BydVehicleData published;
+            try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation ignored =
+                         com.overdrive.app.monitor.ChargingDetector.beginPublicationMutation()) {
+                snapshot.set(merged);
+                lastPublishedChargingPollGeneration = pollGeneration;
+                // Confirm every successful hardware read, not only a snapshot edge. A positive
+                // callback publishes into the snapshot before the next poll, so edge-only delivery
+                // skipped the very poll that was supposed to corroborate a genuine reconnect.
+                boolean stableGunObservation = observed.connectionObserved
+                        && observed.gunObservation == chargingObservationOrder.latestGun()
+                        && merged != null;
+                boolean stableTypeObservation = observed.typeObserved
+                        && observed.type == chargingTypeVersion.get() && merged != null;
+                boolean stableBmsObservation = observed.bmsObserved
+                        && observed.bmsObservation == chargingObservationOrder.latestBms();
+                boolean cohesivePowerObservation =
+                        observed.bmsObservation == chargingObservationOrder.latestBms()
+                        && observed.gunObservation == chargingObservationOrder.latestGun()
+                        && observed.type == chargingTypeVersion.get();
+                // Snapshot publication and detector delivery are one externally fenced handoff.
+                pushChargingEvidence(merged, observed,
+                        stableGunObservation, stableTypeObservation,
+                        stableBmsObservation, cohesivePowerObservation);
+                published = snapshot.get();
+                com.overdrive.app.monitor.ChargingDetector detector =
+                        com.overdrive.app.monitor.ChargingDetector.getInstance();
+                if (published != null && isPhev(published)
+                        && detector.isCharging()
+                        && !detector.isTerminalSessionBarrierActive()) {
+                    // Resolver proof state is part of the same externally-observable charging
+                    // publication. Keep it inside this mutation so a terminal callback cannot
+                    // publish a stable stop between detector delivery and proof installation.
+                    com.overdrive.app.monitor.VehicleDataMonitor.observePhevSessionRateProofs(
+                            published, detector.getLastSessionStartedAtMs(),
+                            System.currentTimeMillis());
+                }
+            }
+            publishAutomationSnapshot(published);
+            return published;
+        }
+    }
+
+    /**
+     * Publish a callback that does not own charging fields without restoring an older charging
+     * snapshot. Most HAL listeners build from a snapshot before acquiring any shared lock; a
+     * FINISHED/gun-out/power callback can land in between that read and write.
+     */
+    private BydVehicleData publishNonChargingSnapshot(BydVehicleData candidate) {
+        if (candidate == null) return null;
+        synchronized (chargingEdgePublishLock) {
+            BydVehicleData latest = snapshot.get();
+            if (latest == null) {
+                snapshot.set(candidate);
+                publishAutomationSnapshot(candidate);
+                return candidate;
+            }
+            // This callback owns no charging field. Always merge the complete charging surface from
+            // the current snapshot; comparing only the primary power fields allowed a stale callback
+            // candidate to roll back mode, percent, remaining time, or charger/wireless state.
+            candidate = candidate.toBuilder()
+                    .chargingState(latest.chargingState)
+                    .chargingStateAtMs(latest.chargingStateAtMs)
+                    .chargingGunState(latest.chargingGunState)
+                    .chargerWorkState(latest.chargerWorkState)
+                    .chargingMode(latest.chargingMode)
+                    .chargingType(latest.chargingType)
+                    .vtolCharging(latest.vtolCharging)
+                    .chargingPowerKw(latest.chargingPowerKw)
+                    .chargingPowerAtMs(latest.chargingPowerAtMs)
+                    .chargingPowerChangedAtMs(latest.chargingPowerChangedAtMs)
+                    .chargingPowerLastObservedKw(latest.chargingPowerLastObservedKw)
+                    .externalChargingPowerKw(latest.externalChargingPowerKw)
+                    .externalChargingPowerAtMs(latest.externalChargingPowerAtMs)
+                    .externalChargingPowerChangedAtMs(
+                            latest.externalChargingPowerChangedAtMs)
+                    .externalChargingPowerLastObservedKw(
+                            latest.externalChargingPowerLastObservedKw)
+                    .chargingCapacityKwh(latest.chargingCapacityKwh)
+                    .chargePowerKw(latest.chargePowerKw)
+                    .chargePowerAtMs(latest.chargePowerAtMs)
+                    .chargePowerChangedAtMs(latest.chargePowerChangedAtMs)
+                    .chargePowerLastObservedKw(latest.chargePowerLastObservedKw)
+                    .clusterChargePowerKw(latest.clusterChargePowerKw)
+                    .clusterChargePowerAtMs(latest.clusterChargePowerAtMs)
+                    .clusterChargePowerChangedAtMs(latest.clusterChargePowerChangedAtMs)
+                    .clusterChargePowerLastObservedKw(
+                            latest.clusterChargePowerLastObservedKw)
+                    .enginePowerKw(latest.enginePowerKw)
+                    .enginePowerAtMs(latest.enginePowerAtMs)
+                    .chargingRestTimeHours(latest.chargingRestTimeHours)
+                    .chargingRestTimeMinutes(latest.chargingRestTimeMinutes)
+                    .chargingPercent(latest.chargingPercent)
+                    .wirelessChargingLeftState(latest.wirelessChargingLeftState)
+                    .wirelessChargingRightState(latest.wirelessChargingRightState)
+                    .wirelessChargingStatus(latest.wirelessChargingStatus)
+                    .insideTempC(latest.insideTempC, latest.insideTempReadAt)
+                    .build();
+            snapshot.set(candidate);
+            publishAutomationSnapshot(candidate);
+            return candidate;
+        }
+    }
+
+    private void publishAutomationSnapshot(BydVehicleData published) {
+        if (published == null) return;
+        try {
+            com.overdrive.app.automation.condition.BydEvent.bydEvent(published);
+        } catch (Throwable t) {
+            logger.debug("Automation snapshot publish error: " + t.getMessage());
+        }
+    }
+
     /** Check if the collector has been initialized. */
     public boolean isInitialized() {
         return initialized;
@@ -206,6 +809,13 @@ public class BydDataCollector {
         if (initialized && this.context == context) {
             return;
         }
+        // A callback queued from the previous context must not publish while its devices are
+        // being replaced. Take the same lock hierarchy as stop(): a callback that already passed
+        // its optimistic check either finishes before this barrier or carries the prior lifecycle
+        // epoch and fails its final validation after reactivation.
+        deactivateCallbackPublication();
+        pollSchedulerGeneration.incrementAndGet();
+        cancelPersistedDaemonEnergyReconciliation(false);
         this.context = context;
         logger.info("=== BYD Data Collector Initializing ===");
         long start = System.currentTimeMillis();
@@ -229,17 +839,39 @@ public class BydDataCollector {
             pollScheduler = null;
         }
 
-        // Initialize each device type
+        // Initialize each device type. Charging-critical listeners are identity/generation-fenced:
+        // an old HAL handle can remain registered after re-init, but it must never remain an
+        // authorized publisher once a replacement handle is installed.
+        Object previousEngineDevice = engineDevice;
+        Object previousChargingDevice = chargingDevice;
+        Object previousInstrumentDevice = instrumentDevice;
         bodyworkDevice = initDevice("android.hardware.bydauto.bodywork.BYDAutoBodyworkDevice", "Bodywork");
+        rearViewMirrorDevice = initDevice(
+                BydConstants.REAR_VIEW_MIRROR_DEVICE_CLASS, "RearViewMirror");
         speedDevice = initDevice("android.hardware.bydauto.speed.BYDAutoSpeedDevice", "Speed");
         engineDevice = initDevice("android.hardware.bydauto.engine.BYDAutoEngineDevice", "Engine");
         statisticDevice = initDevice("android.hardware.bydauto.statistic.BYDAutoStatisticDevice", "Statistic");
         chargingDevice = initDevice("android.hardware.bydauto.charging.BYDAutoChargingDevice", "Charging");
+        if (chargingDevice != previousChargingDevice) {
+            resetChargeCapVerification();
+            activeChargingListenerDevice = null;
+            activeChargingListenerGeneration = chargingListenerGeneration.incrementAndGet();
+        }
         instrumentDevice = initDevice("android.hardware.bydauto.instrument.BYDAutoInstrumentDevice", "Instrument");
+        if (instrumentDevice != previousInstrumentDevice) {
+            activeInstrumentListenerDevice = null;
+            activeInstrumentListenerGeneration = instrumentListenerGeneration.incrementAndGet();
+        }
+        if (engineDevice != previousEngineDevice) {
+            activeEngineListenerDevice = null;
+            activeEngineListenerGeneration = engineListenerGeneration.incrementAndGet();
+        }
         otaDevice = initDevice("android.hardware.bydauto.ota.BYDAutoOtaDevice", "OTA");
         gearboxDevice = initDevice("android.hardware.bydauto.gearbox.BYDAutoGearboxDevice", "Gearbox");
         acDevice = initDevice("android.hardware.bydauto.ac.BYDAutoAcDevice", "AC");
+        pm25Device = initDevice("android.hardware.bydauto.pm2p5.BYDAutoPM2p5Device", "PM2.5");
         lightDevice = initDevice("android.hardware.bydauto.light.BYDAutoLightDevice", "Light");
+        wiperDevice = initDevice("android.hardware.bydauto.wiper.BYDAutoWiperDevice", "Wiper");
         adasDevice = initDevice("android.hardware.bydauto.adas.BYDAutoADASDevice", "ADAS");
         // Drop the blind-spot counter baselines on every (re-)init. init() re-runs
         // on the ACC-ON edge, and if the firmware zeroes these per-drive counters
@@ -256,7 +888,20 @@ public class BydDataCollector {
         // honest at the cost of a few polls per drive.
         bsEventProvenIds.clear();
         powerDevice = initDevice("android.hardware.bydauto.power.BYDAutoPowerDevice", "Power");
-        safetyBeltDevice = initDevice("android.hardware.bydauto.safetybelt.BYDAutoSafetyBeltDevice", "SafetyBelt");
+        Object previousSafetyBeltDevice = safetyBeltDevice;
+        Object nextSafetyBeltDevice = initDevice(
+                "android.hardware.bydauto.safetybelt.BYDAutoSafetyBeltDevice", "SafetyBelt");
+        if (previousSafetyBeltDevice != null && previousSafetyBeltDevice != nextSafetyBeltDevice) {
+            if (BydDeviceHelper.unregisterSafetyBeltListener(previousSafetyBeltDevice)) {
+                registeredHandles.remove(previousSafetyBeltDevice);
+            }
+            activeSafetyBeltListenerDevice = null;
+            activeSafetyBeltListenerGeneration = safetyBeltListenerGeneration.incrementAndGet();
+        }
+        safetyBeltDevice = nextSafetyBeltDevice;
+        if (previousSafetyBeltDevice != nextSafetyBeltDevice) {
+            resetPassengerSeatbeltCallbackState();
+        }
         tyreDevice = initDevice("android.hardware.bydauto.tyre.BYDAutoTyreDevice", "Tyre");
         doorLockDevice = initDevice("android.hardware.bydauto.doorlock.BYDAutoDoorLockDevice", "DoorLock");
         sensorDevice = initDevice("android.hardware.bydauto.sensor.BYDAutoSensorDevice", "Sensor");
@@ -305,6 +950,12 @@ public class BydDataCollector {
 
         // Read initial values (full collection including display-only devices)
         collectAllFull();
+        // A daemon restart loses the process-local charge-stop proof although
+        // the vehicle keeps its configured limit. Reapply the currently-read
+        // limit and require matching capacity and switch readback before
+        // exposing the controls again; never persist a prior positive result.
+        reprobeChargeCapFromCurrentState();
+        reconcilePersistedDaemonEnergyState();
 
         // Dump all battery/energy related getter methods on key devices
         // to discover the correct remaining kWh API at runtime
@@ -353,12 +1004,68 @@ public class BydDataCollector {
         com.overdrive.app.notifications.DoorEventNotifier.start();
         com.overdrive.app.notifications.ChargingEventNotifier.start();
 
-        // Start periodic polling to keep data fresh (listeners may not fire for all values)
+        // Callbacks are active before the final charging read. A FINISHED edge delivered while
+        // listeners were being registered may have been intentionally dropped while initialized=false;
+        // this narrow reconciliation closes that handoff without repeating every display-only getter.
+        activateCallbackPublication();
+        reconcileChargingAfterCallbackActivation();
+
+        // Start periodic polling to keep data fresh (listeners may not fire for all values).
         startPolling();
 
         long elapsed = System.currentTimeMillis() - start;
         logger.info("=== BYD Data Collector Ready (" + elapsed + "ms) ===");
-        initialized = true;
+    }
+
+    /**
+     * Publication lock order for lifecycle transitions:
+     * collector monitor -> chargingStateTransitionLock -> chargingEdgePublishLock
+     * -> passengerOccupancyPublishLock.
+     *
+     * Callback paths never acquire the collector monitor, and BMS callbacks take transition before
+     * edge, so this matches stop() and does not introduce an edge/transition inversion.
+     */
+    private void deactivateCallbackPublication() {
+        synchronized (chargingStateTransitionLock) {
+            synchronized (chargingEdgePublishLock) {
+                synchronized (passengerOccupancyPublishLock) {
+                    initialized = false;
+                    callbackLifecycleGeneration.incrementAndGet();
+                    chargingObservationOrder.discardCounterCallbacks();
+                }
+            }
+        }
+    }
+
+    private void activateCallbackPublication() {
+        synchronized (chargingStateTransitionLock) {
+            synchronized (chargingEdgePublishLock) {
+                synchronized (passengerOccupancyPublishLock) {
+                    initialized = true;
+                }
+            }
+        }
+    }
+
+    private boolean isCallbackLifecycleCurrent(long lifecycleGeneration) {
+        return initialized && lifecycleGeneration == callbackLifecycleGeneration.get();
+    }
+
+    /**
+     * Re-read only the charging device after callback activation. The builder starts from the latest
+     * published snapshot, and the normal ordered publication path supplies detector reconciliation.
+     */
+    private synchronized void reconcileChargingAfterCallbackActivation() {
+        if (!initialized) return;
+        try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation ignored =
+                     com.overdrive.app.monitor.ChargingDetector.beginPublicationMutation()) {
+            long pollGeneration = chargingPollGeneration.incrementAndGet();
+            BydVehicleData current = snapshot.get();
+            BydVehicleData.Builder b =
+                    current != null ? current.toBuilder() : new BydVehicleData.Builder();
+            ChargingObservationVersions observed = collectChargingOrdered(b);
+            publishCollectedSnapshot(b.build(), observed, pollGeneration);
+        }
     }
 
     /**
@@ -452,6 +1159,16 @@ public class BydDataCollector {
         return hwUnitDetected ? speedHwFactor : distanceToKmFactor;
     }
 
+    /** Convert one raw speed reading to km/h, rejecting every non-reading consistently. */
+    static double convertRawSpeedToKmh(double raw, double factor) {
+        if (raw == BydFeatureIds.SDK_NOT_AVAILABLE
+                || Double.isNaN(raw) || Double.isInfinite(raw) || raw < 0.0
+                || Double.isNaN(factor) || Double.isInfinite(factor) || factor <= 0.0) {
+            return Double.NaN;
+        }
+        return raw * factor;
+    }
+
     /**
      * Override the distance unit from user settings. Called when the user
      * explicitly selects km or miles in the Trip Settings UI. This fixes the
@@ -482,6 +1199,19 @@ public class BydDataCollector {
     }
 
     private java.util.concurrent.ScheduledExecutorService pollScheduler;
+    /**
+     * Upper bound on a RAW charging-rate reading whose unit is not yet known, in raw units.
+     *
+     * <p>500 kW is the resolved-rate ceiling, but a raw reading may be in hectowatts — so the same
+     * physical rate arrives as a number 100x larger. Bounding the raw value at 500 therefore discarded
+     * every hectowatt reading above 5 kW, including ordinary three-phase AC (raw 700 = 7.0 kW), before
+     * {@link com.overdrive.app.monitor.ChargeRateResolver} could calibrate it. The resolved figure is
+     * still bounded at 500 kW downstream, so widening here cannot let an implausible rate through.
+     */
+    private static final double RAW_RATE_ENVELOPE_MAX = 500.0 * 100.0;
+    /** Must match VehicleDataMonitor's resolver key for InstrumentDevice.getChargePower(). */
+    static final String SRC_PACK_SIDE_DIRECT = "__packSideDirect";
+
     private static final long POLL_INTERVAL_MS = 5000; // 5 seconds when ACC on
     private static final long POLL_INTERVAL_PARKED_MS = 90000; // 90 seconds when ACC off — listener callbacks keep the snapshot fresh between polls
     private String lastSummaryHash = "";
@@ -568,9 +1298,7 @@ public class BydDataCollector {
                 Object sp = BydDeviceHelper.callGetter(speedDevice, "getCurrentSpeed");
                 if (sp instanceof Number) {
                     double v = ((Number) sp).doubleValue();
-                    if (v != BydFeatureIds.SDK_NOT_AVAILABLE && !Double.isNaN(v)) {
-                        return v * speedHwFactor;
-                    }
+                    return convertRawSpeedToKmh(v, speedHwFactor);
                 }
             }
         } catch (Throwable ignored) {}
@@ -601,7 +1329,7 @@ public class BydDataCollector {
                     Object sp = BydDeviceHelper.callGetter(speedDevice, "getCurrentSpeed");
                     if (sp instanceof Number) {
                         double v = ((Number) sp).doubleValue();
-                        if (v != BydFeatureIds.SDK_NOT_AVAILABLE) speedKmh = v * distanceToKmFactor;
+                        speedKmh = convertRawSpeedToKmh(v, getSpeedToKmhFactor());
                     }
                     Object ac = BydDeviceHelper.callGetter(speedDevice, "getAccelerateDeepness");
                     if (ac instanceof Number) accel = ((Number) ac).intValue();
@@ -661,8 +1389,14 @@ public class BydDataCollector {
         if (lightDevice == null) return -1;
         try {
             Object fs = BydDeviceHelper.callGetter(lightDevice, "getTurnLightFlashState");
-            if (!(fs instanceof Number)) return 0;
+            // -1, not 0: the device exists but the getter is absent on this trim (or threw), and 0
+            // means "no indicator lit" — a definite answer the callers act on. Returning it would
+            // cancel a live turn state and make the snapshot fallback unreachable.
+            if (!(fs instanceof Number)) return -1;
             int flashState = ((Number) fs).intValue();
+            // A sentinel is not a flash state. Falling through would leave every side false and
+            // publish a confident "no indicator" from an unset rail. Both 16-bit rails.
+            if (flashState < 0 || flashState == 65535 || flashState == 65534) return -1;
             boolean left = (flashState == 2 || flashState == 3);
             boolean right = (flashState == 4 || flashState == 5);
             if (flashState == 6 || flashState == 7) { left = true; right = true; }  // hazard
@@ -695,6 +1429,13 @@ public class BydDataCollector {
         BydFeatureIds.ADAS_RCTA_WARNING_RIGHT,
         BydFeatureIds.ADAS_DOW_WARN_RIGHT,
     };
+    // Parked subset: door-open warning is the ONE blind-spot alert that legitimately fires with
+    // the key out (it warns an occupant opening a door into traffic). LCA/RCTA/FL/FR need a
+    // moving car and a powered radar, so polling them while parked can never assert. Keeping DOW
+    // armed preserves the parked exit-warning on trims whose ADAS event callback isn't honoured,
+    // which is the only reason this poll exists at all.
+    private static final int[] BS_COUNTER_IDS_LEFT_PARKED = { BydFeatureIds.ADAS_DOW_WARN_LEFT };
+    private static final int[] BS_COUNTER_IDS_RIGHT_PARKED = { BydFeatureIds.ADAS_DOW_WARN_RIGHT };
 
     /** Feature ids the ADAS listener subscribes to. SLW is included so the
      *  pre-existing speed-limit-warning event keeps arriving unchanged. */
@@ -771,22 +1512,44 @@ public class BydDataCollector {
      * alert the moment it happens. Polling them is the fallback for firmware that
      * doesn't honour the filtered registration, so once an event has actually
      * arrived the poll drops to two reads and the events carry the rest.
+     *
+     * <p>While PARKED the radar is unpowered and only the door-open warning can fire, so the
+     * read narrows to that one counter per side (2 reads/tick instead of 8) — the level alarms
+     * and LCA/RCTA all need a moving car. That keeps the parked exit-warning working while
+     * removing the bulk of this signal's parked cost; the ADAS event path stays fully armed
+     * either way, and the next tick after ACC returns reads everything again.
      */
     public int readBlindSpotNow() {
         // ensureAdasDevice (not the raw field) so a boot-race null self-heals
         // instead of leaving the signal permanently dead.
         Object device = ensureAdasDevice();
         if (device == null) return -1;
+        // Read once: a mid-method ACC edge would otherwise mix the two register sets.
+        boolean accOn = accIsOn;
         try {
             int packed = 0;
-            if (anyLevelActive(device, BS_LEVEL_IDS_LEFT)
-                    || anyCounterAdvanced(device, BS_COUNTER_IDS_LEFT)) {
-                packed |= BS_LEFT_BIT;
-            }
-            if (anyLevelActive(device, BS_LEVEL_IDS_RIGHT)
-                    || anyCounterAdvanced(device, BS_COUNTER_IDS_RIGHT)) {
-                packed |= BS_RIGHT_BIT;
-            }
+            // Tracks whether ANY register answered a real value this tick. Without it an ADAS
+            // device that answers nothing at all (every read a sentinel) yields packed=0, which the
+            // caller cannot tell from a genuine "no vehicle in the blind spot" — a safety signal
+            // reporting a confident, permanent "clear". Every id being unreadable must report
+            // unavailable (-1) so the caller expires its holds instead of publishing "clear".
+            boolean[] readOk = new boolean[1];
+            // Each half is evaluated into its own local FIRST, deliberately avoiding a short-circuit
+            // ||: the counter read is not just a test, it ADVANCES each counter's baseline. Skipping
+            // it whenever the level alarm was already asserting froze those baselines for as long as
+            // a car sat in the blind spot, so the next genuine counter step was measured against a
+            // stale value and re-fired as a phantom alert once the level alarm cleared.
+            boolean leftLevel = accOn && anyLevelActive(device, BS_LEVEL_IDS_LEFT, readOk);
+            boolean leftCounter = anyCounterAdvanced(device,
+                    accOn ? BS_COUNTER_IDS_LEFT : BS_COUNTER_IDS_LEFT_PARKED, readOk);
+            if (leftLevel || leftCounter) packed |= BS_LEFT_BIT;
+            boolean rightLevel = accOn && anyLevelActive(device, BS_LEVEL_IDS_RIGHT, readOk);
+            boolean rightCounter = anyCounterAdvanced(device,
+                    accOn ? BS_COUNTER_IDS_RIGHT : BS_COUNTER_IDS_RIGHT_PARKED, readOk);
+            if (rightLevel || rightCounter) packed |= BS_RIGHT_BIT;
+            // Exception: when every polled id is event-proven the poll deliberately reads nothing,
+            // and that is a healthy state, not a dead device — the callback carries the alerts.
+            if (!readOk[0] && !allBsIdsEventProven(accOn)) return -1;
             return packed;
         } catch (Throwable t) {
             logger.debug("readBlindSpotNow error: " + t.getMessage());
@@ -794,29 +1557,104 @@ public class BydDataCollector {
         }
     }
 
-    /** True when any level-encoded alarm in {@code ids} reads >= 1. */
-    private boolean anyLevelActive(Object device, int[] ids) {
+    /** The subscribable subset of {@code ids} — an id this SDK does not publish must not be sent in
+     *  a registration filter, since a HAL that rejects one unknown id can refuse the whole call. */
+    private static int[] resolvedIds(int[] ids) {
+        int n = 0;
+        for (int id : ids) if (BydFeatureIds.isResolved(id)) n++;
+        if (n == ids.length) return ids;
+        int[] out = new int[n];
+        int i = 0;
+        for (int id : ids) if (BydFeatureIds.isResolved(id)) out[i++] = id;
+        return out;
+    }
+
+    /**
+     * Whether every id this tick WOULD have polled is already event-proven, i.e. the poll
+     * legitimately read nothing because the ADAS callback is delivering these alerts instead.
+     * Distinguishes that healthy case from an ADAS device answering only sentinels.
+     */
+    private boolean allBsIdsEventProven(boolean accOn) {
+        // Level ids are never event-proven-skipped by anyLevelActive, so if they were polled at all
+        // (ACC on) a total read failure is genuine unavailability.
+        if (accOn) return false;
+        for (int id : BS_COUNTER_IDS_LEFT_PARKED) if (!bsEventProvenIds.contains(id)) return false;
+        for (int id : BS_COUNTER_IDS_RIGHT_PARKED) if (!bsEventProvenIds.contains(id)) return false;
+        return true;
+    }
+
+    /** True when any level-encoded alarm in {@code ids} reads as a real, active alert.
+     *  {@code readOk[0]} is set whenever ANY id in this call answered a real value — the caller
+     *  uses it to tell a genuine "clear" from an ADAS device that answered nothing at all. */
+    private boolean anyLevelActive(Object device, int[] ids, boolean[] readOk) {
+        boolean active = false;
         for (int id : ids) {
-            // callGetSingle returns -1 both for a read failure and for a genuine
-            // sentinel, so only a clearly-positive value counts as alerting.
-            if (BydDeviceHelper.callGetSingle(device, id) >= 1) return true;
+            int raw = readAdasAlertRaw(device, id);
+            if (raw == BydVehicleData.UNAVAILABLE) continue;
+            readOk[0] = true;
+            if (raw >= 1) active = true;
         }
-        return false;
+        return active;
+    }
+
+    /**
+     * Read one ADAS alert register through the {@code get(int[], Class)} overload — the form the
+     * OEM's own ADAS code uses for these ids. The {@code get(int deviceType, int featureId)}
+     * overload answers the {@code -10011} unavailable sentinel for this family, which is why every
+     * blind-spot read looked permanently dead.
+     *
+     * <p>Tries BOTH read overloads and takes whichever answers a real value. Which one a given
+     * register honours is firmware-dependent and not knowable from here: sibling ADAS reads
+     * (speed-limit warning, ISLA) demonstrably work through {@code get(int deviceType, int
+     * featureId)}, while the OEM's own ADAS code reads the blind-spot registers through
+     * {@code get(int[], Class)} — and a register that answers only through the other form reads as
+     * a permanent sentinel, which is indistinguishable from "no alert". Trying both costs one extra
+     * reflective call only when the first form fails.
+     *
+     * <p>The array form answers a {@code BYDAutoEventValue}, NOT a boxed int, so its result must go
+     * through {@link BydDeviceHelper#getIntValue}; testing it for {@code Number} would discard every
+     * real reading.
+     *
+     * <p>Returns {@link BydVehicleData#UNAVAILABLE} for a failed read or a known sentinel, so
+     * callers can tell "no data" from a genuine value. Negatives (the {@code -10011} family) and
+     * {@code 65535} are this HAL's unset/unsupported markers and must never be read as an alert
+     * level or a counter step.
+     */
+    private int readAdasAlertRaw(Object device, int id) {
+        // An id this SDK does not publish is not sendable — the HAL would answer a sentinel that a
+        // magnitude test could read as a real alert level.
+        if (!BydFeatureIds.isResolved(id)) return BydVehicleData.UNAVAILABLE;
+        int single = sanitizeAdasAlert(BydDeviceHelper.callGetSingle(device, id));
+        if (single != BydVehicleData.UNAVAILABLE) return single;
+        return sanitizeAdasAlert(
+                BydDeviceHelper.getIntValue(BydDeviceHelper.callGet(device, id, Integer.TYPE)));
+    }
+
+    /** Map a raw ADAS alert reading to itself, or UNAVAILABLE for a failure/unset sentinel. */
+    private static int sanitizeAdasAlert(int raw) {
+        // Both 16-bit rails, not just 0xFFFF: 65534 is filtered everywhere else in this file, and a
+        // level register resting on it would satisfy `>= 1` on every tick — asserting the side
+        // permanently so the hold never expires and a blind-spot automation latches on.
+        if (raw < 0 || raw == 65535 || raw == 65534) return BydVehicleData.UNAVAILABLE;
+        return raw;
     }
 
     /**
      * True when any counter-encoded warning in {@code ids} has INCREASED since the
      * last observed value.
      */
-    private boolean anyCounterAdvanced(Object device, int[] ids) {
+    private boolean anyCounterAdvanced(Object device, int[] ids, boolean[] readOk) {
         boolean advanced = false;
         for (int id : ids) {
             // Skip ids whose events are proven to arrive — the callback already
             // reports those, so polling them is pure duplicate HAL traffic. Per id,
             // so an id that never fires an event keeps being polled.
             if (bsEventProvenIds.contains(id)) continue;
-            int raw = BydDeviceHelper.callGetSingle(device, id);
-            if (raw < 0) continue; // unreadable this tick — leave the baseline alone
+            int raw = readAdasAlertRaw(device, id);
+            // Unreadable or a sentinel this tick — leave the baseline alone. Feeding a sentinel in
+            // would either fake an increment or park the baseline at a value no real count reaches.
+            if (raw == BydVehicleData.UNAVAILABLE) continue;
+            readOk[0] = true;
             if (counterAdvanced(id, raw)) advanced = true;
         }
         return advanced;
@@ -859,12 +1697,29 @@ public class BydDataCollector {
         return prev != null && raw > prev;
     }
 
-    // ── Fast dynamic-input reads (accelerator / brake / steering) ─────────────
+    // ── Fast dynamic-input reads (speed / accelerator / brake / steering) ─────
     // Single live SDK reads mirroring readTurnNow(), for the self-gated DynamicsEvent
     // fast poll so an "accelerator > X%" / "steering past Y°" automation fires promptly
     // (the 5s telemetry snapshot lagged it by up to that long). Each guards the
-    // SDK_NOT_AVAILABLE sentinel so a miss returns UNAVAILABLE (the caller skips the
+    // SDK_NOT_AVAILABLE sentinel so a miss returns NaN/UNAVAILABLE (the caller skips the
     // publish) rather than a bogus value. Only called while a matching automation exists.
+
+    /** Live vehicle speed in canonical km/h, or NaN on a miss/sentinel. Speed uses the
+     * hardware-derived factor when available: the app's distance-display override can differ from
+     * the cluster's real raw-speed unit and must not scale an automation threshold by 1.6x. */
+    public double readSpeedNowKmh() {
+        if (speedDevice == null) return Double.NaN;
+        try {
+            Object speed = BydDeviceHelper.callGetter(speedDevice, "getCurrentSpeed");
+            if (speed instanceof Number) {
+                double raw = ((Number) speed).doubleValue();
+                return convertRawSpeedToKmh(raw, getSpeedToKmhFactor());
+            }
+        } catch (Throwable t) {
+            logger.debug("readSpeedNowKmh error: " + t.getMessage());
+        }
+        return Double.NaN;
+    }
 
     /** Live accelerator deepness 0-100, or UNAVAILABLE on a miss/sentinel. */
     public int readAccelNow() {
@@ -948,6 +1803,21 @@ public class BydDataCollector {
         return BydVehicleData.UNAVAILABLE;
     }
 
+    /** Live AC power state: 0=off, 1=on, or UNAVAILABLE for every other SDK value. */
+    public int readAcPowerNow() {
+        if (acDevice == null) return BydVehicleData.UNAVAILABLE;
+        try {
+            Object v = BydDeviceHelper.callGetter(acDevice, "getAcStartState");
+            if (v instanceof Number) {
+                int raw = ((Number) v).intValue();
+                if (raw == 0 || raw == 1) return raw;
+            }
+        } catch (Throwable t) {
+            logger.debug("readAcPowerNow error: " + t.getMessage());
+        }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
     /** Live headlamp beam state: {@code high=true} reads high-beam, else low-beam. Returns 1
      *  (on) / 0 (off), or UNAVAILABLE on a miss. Shares collectLight's light-TYPE constants
      *  ({@link #LIGHT_TYPE_LOW_BEAM}/{@link #LIGHT_TYPE_HIGH_BEAM}; status 1 = that beam is
@@ -956,14 +1826,138 @@ public class BydDataCollector {
     public int readBeamNow(boolean high) {
         if (lightDevice == null) return BydVehicleData.UNAVAILABLE;
         try {
-            Object val = BydDeviceHelper.callGetter(lightDevice, "getLightStatus",
-                    high ? LIGHT_TYPE_HIGH_BEAM : LIGHT_TYPE_LOW_BEAM);
-            if (val instanceof Number) return (((Number) val).intValue() == 1) ? 1 : 0;
+            return getLightStatus(high ? LIGHT_TYPE_HIGH_BEAM : LIGHT_TYPE_LOW_BEAM);
         } catch (Throwable t) { logger.debug("readBeamNow error: " + t.getMessage()); }
         return BydVehicleData.UNAVAILABLE;
     }
 
+    /** Daytime-running-light switch: SDK 1=on, 2=off. */
+    public int readDrlNow() {
+        if (lightDevice == null) return BydVehicleData.UNAVAILABLE;
+        try {
+            Object value = BydDeviceHelper.callGetter(lightDevice, "getDayTimeLightState");
+            if (value instanceof Number) {
+                return normalizeDrlState(((Number) value).intValue());
+            }
+        } catch (Throwable t) {
+            logger.debug("readDrlNow error: " + t.getMessage());
+        }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    /** AUTO-headlight mode switch: SDK 0=off, 1=on. This is not a darkness sensor. */
+    public int readAutoHeadlightNow() {
+        if (lightDevice == null) return BydVehicleData.UNAVAILABLE;
+        try {
+            Object value = BydDeviceHelper.callGetter(lightDevice, "getLightAutoStatus");
+            if (value instanceof Number) {
+                return normalizeAutoHeadlightState(((Number) value).intValue());
+            }
+        } catch (Throwable t) {
+            logger.debug("readAutoHeadlightNow error: " + t.getMessage());
+        }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    /**
+     * Automatic rain-wiper mode, normalized to 0/1.
+     *
+     * <p>The connected-model SDK exposes this on Setting as 1=on, 2=off. An older Bodywork getter
+     * uses 1=on, 0=off and is retained only as a compatibility fallback. Every other value is
+     * unavailable.
+     */
+    public int readAutoWiperNow() {
+        if (settingDevice != null) {
+            try {
+                Object value = BydDeviceHelper.callGetter(settingDevice, "getAutoRainWiperState");
+                if (value instanceof Number) {
+                    int normalized = normalizeAutoWiperSettingState(
+                            ((Number) value).intValue());
+                    if (normalized != BydVehicleData.UNAVAILABLE) return normalized;
+                }
+            } catch (Throwable t) {
+                logger.debug("readAutoWiperNow setting error: " + t.getMessage());
+            }
+        }
+        if (bodyworkDevice != null) {
+            try {
+                Object value = BydDeviceHelper.callGetter(bodyworkDevice, "getAutoWiperState");
+                if (value instanceof Number) {
+                    int normalized = normalizeAutoWiperBodyworkState(
+                            ((Number) value).intValue());
+                    if (normalized != BydVehicleData.UNAVAILABLE) return normalized;
+                }
+            } catch (Throwable t) {
+                logger.debug("readAutoWiperNow bodywork error: " + t.getMessage());
+            }
+        }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    /**
+     * Front-wiper activity, normalized to 0/1 from the two available rails: dedicated Wiper front
+     * level 8/9 is active, or Setting rain-wiper speed above 1 is active.
+     */
+    public int readWiperActiveNow() {
+        int wiperLevel = BydVehicleData.UNAVAILABLE;
+        int settingSpeed = BydVehicleData.UNAVAILABLE;
+        if (wiperDevice != null) {
+            try {
+                Object event = BydDeviceHelper.callGet(
+                        wiperDevice, BydFeatureIds.WIPER_FRONT_LEVEL, Integer.class);
+                wiperLevel = BydDeviceHelper.getIntValue(event);
+            } catch (Throwable t) {
+                logger.debug("readWiperActiveNow wiper error: " + t.getMessage());
+            }
+        }
+        if (settingDevice != null) {
+            try {
+                Object event = BydDeviceHelper.callGet(
+                        settingDevice, BydFeatureIds.SETTING_RAIN_WIPER_SPEED, Integer.class);
+                settingSpeed = BydDeviceHelper.getIntValue(event);
+            } catch (Throwable t) {
+                logger.debug("readWiperActiveNow setting error: " + t.getMessage());
+            }
+        }
+        return normalizeWiperActivity(wiperLevel, settingSpeed);
+    }
+
+    static int normalizeDrlState(int raw) {
+        if (raw == 1) return 1;
+        if (raw == 2) return 0;
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    static int normalizeAutoHeadlightState(int raw) {
+        return raw == 0 || raw == 1 ? raw : BydVehicleData.UNAVAILABLE;
+    }
+
+    static int normalizeAutoWiperSettingState(int raw) {
+        if (raw == 1) return 1;
+        if (raw == 2) return 0;
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    static int normalizeAutoWiperBodyworkState(int raw) {
+        return raw == 0 || raw == 1 ? raw : BydVehicleData.UNAVAILABLE;
+    }
+
+    static int normalizeWiperActivity(int wiperLevel, int settingSpeed) {
+        boolean levelValid = wiperLevel >= 0 && wiperLevel <= 9;
+        boolean speedValid = settingSpeed >= 0 && settingSpeed <= 255;
+        if ((levelValid && (wiperLevel == 8 || wiperLevel == 9))
+                || (speedValid && settingSpeed > 1)) {
+            return 1;
+        }
+        return levelValid || speedValid ? 0 : BydVehicleData.UNAVAILABLE;
+    }
+
     private void startPolling() {
+        // Honour the CURRENT ACC state. This used to hard-code the 5s ACC-on interval, so a
+        // re-init while parked (context recovery / watchdog) left the poll at 5s for the whole
+        // park — 18x the intended rate — with no ACC edge left to correct it.
+        long interval = accIsOn ? POLL_INTERVAL_MS : POLL_INTERVAL_PARKED_MS;
+        long schedulerGeneration = pollSchedulerGeneration.incrementAndGet();
         pollScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "BydDataPoll");
             t.setDaemon(true);
@@ -971,7 +1965,7 @@ public class BydDataCollector {
         });
         pollScheduler.scheduleAtFixedRate(() -> {
             try {
-                collectAll();
+                if (!collectAllFromScheduler(schedulerGeneration)) return;
                 // Log when data actually changes
                 BydVehicleData d = snapshot.get();
                 if (d != null) {
@@ -988,17 +1982,32 @@ public class BydDataCollector {
             } catch (Throwable t) {
                 logger.debug("Poll error: " + t.getMessage());
             }
-        }, POLL_INTERVAL_MS, POLL_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }, interval, interval, java.util.concurrent.TimeUnit.MILLISECONDS);
+        logger.info("BydDataPoll started at " + (interval / 1000) + "s (ACC "
+                + (accIsOn ? "ON" : "OFF") + ")");
     }
 
-    public void stop() {
+    public synchronized void stop() {
+        // Make shutdown a publication barrier for charging transitions, charging-rate callbacks,
+        // and occupancy samples. A callback that already passed its optimistic outer check either
+        // finishes before these locks are acquired or fails its final check after initialized=false.
+        deactivateCallbackPublication();
+        pollSchedulerGeneration.incrementAndGet();
         if (pollScheduler != null) {
             pollScheduler.shutdownNow();
             pollScheduler = null;
         }
+        cancelPersistedDaemonEnergyReconciliation(true);
+        if (safetyBeltDevice != null) {
+            if (BydDeviceHelper.unregisterSafetyBeltListener(safetyBeltDevice)) {
+                registeredHandles.remove(safetyBeltDevice);
+                activeSafetyBeltListenerDevice = null;
+                activeSafetyBeltListenerGeneration = safetyBeltListenerGeneration.incrementAndGet();
+            }
+        }
+        resetPassengerSeatbeltCallbackState();
         stopFastDynamicsPoll();
         unregisterPlugEdgeReceiver();
-        initialized = false;
     }
 
     private android.content.BroadcastReceiver plugEdgeReceiver;
@@ -1011,14 +2020,20 @@ public class BydDataCollector {
             @Override
             public void onReceive(android.content.Context ctx, android.content.Intent intent) {
                 if (intent == null || intent.getAction() == null) return;
-                com.overdrive.app.monitor.ChargingDetector det =
-                    com.overdrive.app.monitor.ChargingDetector.getInstance();
+                long lifecycleGeneration = callbackLifecycleGeneration.get();
+                if (!isCallbackLifecycleCurrent(lifecycleGeneration)) return;
                 switch (intent.getAction()) {
                     case android.content.Intent.ACTION_POWER_CONNECTED:
-                        det.onPowerConnected();
+                        synchronized (chargingEdgePublishLock) {
+                            if (!isCallbackLifecycleCurrent(lifecycleGeneration)) return;
+                            com.overdrive.app.monitor.ChargingDetector.getInstance()
+                                    .onPowerConnected();
+                        }
                         break;
                     case android.content.Intent.ACTION_POWER_DISCONNECTED:
-                        det.onPowerDisconnected();
+                        publishChargingGunEdge(
+                                null, -1L, lifecycleGeneration,
+                                1, chargingObservationOrder.begin());
                         break;
                 }
             }
@@ -1301,6 +2316,8 @@ public class BydDataCollector {
      * {@code BydVehicleData.enginePowerAtMs}, so no separate per-writer marker is needed.
      */
     private static final long ENGINE_POWER_LIVE_TTL_MS = 15_000L;
+    /** Maximum age/skew for the moving-rate proof that can reopen a connected FINISHED taper. */
+    private static final long POST_FINISHED_RATE_PROOF_FRESHNESS_MS = 15_000L;
 
     /** Throttle for the pre-gate cluster charge-power raw-value capture (1/min). Separate from
      *  {@link #loggedClusterChargePowerScale}, which only fires on an ACCEPTED value and so says
@@ -1311,36 +2328,48 @@ public class BydDataCollector {
     private volatile long lastClusterRawLogMs = 0;
 
     /** Called by CameraDaemon when ACC state changes. Adjusts poll rate accordingly. */
-    public void setAccState(boolean isOn) {
+    public synchronized void setAccState(boolean isOn) {
         boolean wasOn = this.accIsOn;
         this.accIsOn = isOn;
 
-        // Notify the fused charging detector first so it can invalidate
-        // ACC-dependent signals (enginePowerKw goes stale once ACC is off
-        // and must not be reused as charging evidence).
-        com.overdrive.app.monitor.ChargingDetector.getInstance().updateAccState(isOn);
+        if (wasOn != isOn) {
+            try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation ignored =
+                         com.overdrive.app.monitor.ChargingDetector.beginPublicationMutation()) {
+                // Notify the fused detector first so it can invalidate ACC-dependent signals
+                // before the corresponding collector value becomes externally stable.
+                com.overdrive.app.monitor.ChargingDetector.getInstance().updateAccState(isOn);
 
-        // ACC just transitioned OFF: also clear the snapshot's enginePowerKw
-        // so any consumer reading the snapshot directly (not through the
-        // detector) doesn't see a stale value from the last drive while the
-        // car sits parked. Other ACC-gated fields (speedKmh, brake/accel, gear)
-        // are refreshed by the next poll cycle which already skips collectSpeed
-        // / collectGearbox when ACC is off — only enginePower needs an
-        // explicit wipe because we *deliberately* keep collecting it on the
-        // ACC-off "possibly charging" branch and a stale value there would
-        // confuse the detector's inference layer.
-        if (wasOn && !isOn) {
-            BydVehicleData current = snapshot.get();
-            if (current != null && !Double.isNaN(current.enginePowerKw)) {
-                snapshot.set(current.toBuilder().enginePowerKw(Double.NaN).build());
-                logger.info("ACC OFF: invalidated stale enginePowerKw");
+                // ACC just transitioned OFF: also clear the snapshot's enginePowerKw so direct
+                // snapshot consumers cannot retain the last drive's value while parked.
+                if (!isOn) {
+                    synchronized (chargingEdgePublishLock) {
+                        BydVehicleData current = snapshot.get();
+                        if (current != null && !Double.isNaN(current.enginePowerKw)) {
+                            BydVehicleData published = current.toBuilder()
+                                    .enginePowerKw(Double.NaN).build();
+                            snapshot.set(published);
+                            enginePowerEdgeVersion.incrementAndGet();
+                            publishAutomationSnapshot(published);
+                            logger.info("ACC OFF: invalidated stale enginePowerKw");
+                        }
+                    }
+                }
             }
+        } else {
+            com.overdrive.app.monitor.ChargingDetector.getInstance().updateAccState(isOn);
         }
 
+        // NOTE: the snapshot's powerLevel is deliberately NOT rewritten here. It is only
+        // refreshed by collectBodywork, so it can carry a stale value across this edge and fight
+        // the instant "power" publish (Invariant 1) — but correcting it would need a
+        // snapshot rewrite. BydEvent itself suppresses a power value that contradicts this flag,
+        // so the next committed publication cannot strobe an unrelated AC rule.
+
         // Restart poll scheduler at the appropriate rate
-        if (pollScheduler != null && !pollScheduler.isShutdown()) {
+        if (initialized && pollScheduler != null && !pollScheduler.isShutdown()) {
             pollScheduler.shutdownNow();
             long interval = isOn ? POLL_INTERVAL_MS : POLL_INTERVAL_PARKED_MS;
+            long schedulerGeneration = pollSchedulerGeneration.incrementAndGet();
             pollScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "BydDataPoll");
                 t.setDaemon(true);
@@ -1348,7 +2377,7 @@ public class BydDataCollector {
             });
             pollScheduler.scheduleAtFixedRate(() -> {
                 try {
-                    collectAll();
+                    if (!collectAllFromScheduler(schedulerGeneration)) return;
                     BydVehicleData d = snapshot.get();
                     if (d != null) {
                         String hash = String.format("%.1f|%.2f|%.1f/%.1f/%.1f|%.3f/%.3f",
@@ -1370,12 +2399,29 @@ public class BydDataCollector {
     }
 
     /**
+     * Scheduled entry point. The generation/lifecycle check intentionally runs after this method has
+     * acquired the collector monitor; shutdownNow cannot interrupt a thread blocked on that monitor.
+     */
+    private synchronized boolean collectAllFromScheduler(long schedulerGeneration) {
+        if (!initialized || schedulerGeneration != pollSchedulerGeneration.get()) {
+            return false;
+        }
+        collectAll();
+        return true;
+    }
+
+    /**
      * Current ACC (ignition) state as last set by {@link #setAccState} on the ACC edge.
      * Defaults to {@code true} (fail toward polling) until the first edge is observed.
-     * Used by the fast dynamics/turn-signal pollers to skip their live SDK reads while
-     * parked — accelerator / brake / steering / turn-signal are all inert with the key
-     * removed, so reading them 2–4×/sec on a parked car is pure waste. The reads resume
-     * on the very next 250/500ms tick once ACC returns, so trigger latency is unchanged.
+     * Used by the fast automation pollers to skip their live SDK reads while parked —
+     * accelerator / brake / steering / gear / drive mode / regen are all inert with the key
+     * removed, so reading them 1–4x/sec on a parked car is pure waste. The reads resume on the
+     * very next tick once ACC returns, so trigger latency is unchanged.
+     *
+     * <p><b>Do NOT gate the turn signal on this.</b> {@link #readTurnNow} folds the HAZARD
+     * flash state into both side bits, and hazards are used on a parked car — gating it would
+     * silently kill a hazard-driven rule and could strand a side latched "on". Blind spot is
+     * likewise only NARROWED while parked (door-open warning stays armed), never gated off.
      */
     public boolean isAccOn() {
         return accIsOn;
@@ -1427,24 +2473,28 @@ public class BydDataCollector {
         return !beamDemand.isEmpty();
     }
 
-    public void collectAll() {
+    public synchronized void collectAll() {
         long now = System.currentTimeMillis();
 
         // Hard throttle: skip if called within MIN_COLLECT_INTERVAL_MS of last poll.
         if (now - lastCoreCollectTime < MIN_COLLECT_INTERVAL_MS) {
             return;
         }
-        lastCoreCollectTime = now;
+        try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation ignored =
+                     com.overdrive.app.monitor.ChargingDetector.beginPublicationMutation()) {
+            lastCoreCollectTime = now;
 
-        BydVehicleData.Builder b = (snapshot.get() != null) ? snapshot.get().toBuilder() : new BydVehicleData.Builder();
-        b.availableDevices(availableDevices.toArray(new String[0]));
-        b.unavailableDevices(unavailableDevices.toArray(new String[0]));
+            long pollGeneration = chargingPollGeneration.incrementAndGet();
+            BydVehicleData.Builder b = (snapshot.get() != null) ? snapshot.get().toBuilder() : new BydVehicleData.Builder();
+            b.availableDevices(availableDevices.toArray(new String[0]));
+            b.unavailableDevices(unavailableDevices.toArray(new String[0]));
 
         // ALWAYS needed: battery, SOC, charging, temperature, 12V
         collectBodywork(b);     // SOC, 12V, remainKwh, powerLevel
         collectStatistic(b);    // SOC, mileage, range, cellTemps, cellVoltages
-        collectCharging(b);     // chargingState, gunState, chargingPower
-        collectInstrument(b);   // outsideTemp, externalChargingPower
+        collectSocTarget(b);    // configured SOC target/hold percentage
+        ChargingObservationVersions chargingObserved = collectChargingOrdered(b);
+        collectInstrumentOrdered(b, chargingObserved); // outsideTemp, externalChargingPower
         collectOta(b);          // 12V voltage (precise)
         collectTyre(b);         // pressure (kPa), pressure/leak/signal state per wheel
 
@@ -1458,36 +2508,48 @@ public class BydDataCollector {
         // values populated from typed callbacks even while ACC is off.
         if (accIsOn) {
             collectSpeed(b);        // speed, accel, brake
-            collectEngine(b);       // enginePower, motorSpeed/torque
+            collectEngineOrdered(b, chargingObserved); // enginePower, motorSpeed/torque
             collectGearbox(b);      // gearMode
             collectSteeringAngle(b);// live steering angle (init-only otherwise → dead trigger)
         } else {
+            // NB the power terms here read fields the admission gate populates, so on a trim whose
+            // gun state is UNAVAILABLE and whose BMS sits at IDLE they can both be NaN even during a
+            // real charge. The detector's own ungated observation is the reliable signal in that
+            // case, so consult it too — otherwise engine power (the most authoritative charging
+            // evidence on such a PHEV) is never collected and the detector is starved of the one
+            // input that could resolve the session.
+            boolean rawSignalActive = false;
+            try {
+                rawSignalActive = com.overdrive.app.monitor.ChargingDetector.getInstance()
+                        .hasRecentRawChargingSignal();
+            } catch (Throwable rawSignalError) {}
             boolean possiblyCharging =
                 (!Double.isNaN(b.chargingPowerKw) && Math.abs(b.chargingPowerKw) > 0.1)
                 || (!Double.isNaN(b.externalChargingPowerKw) && b.externalChargingPowerKw > 0.1)
+                || rawSignalActive
                 || b.chargingState == 1   // BMS explicitly says CHARGING
                 || b.chargingGunState == 2 || b.chargingGunState == 3
                 || b.chargingGunState == 4 || b.chargingGunState == 5;
             if (possiblyCharging) {
-                collectEngine(b);   // adds enginePowerKw → confirms direction
+                collectEngineOrdered(b, chargingObserved); // adds enginePowerKw → confirms direction
             }
         }
 
+        // Read AC_TEMP_INSIDE exactly once for this poll. Both legacy cabin fields consume this
+        // one observation, and the result tells cloud fallback whether the HAL answered now
+        // rather than merely leaving a carried-forward value in the builder.
+        boolean cabinTempHalSucceeded = collectCabinTemperature(b);
+
         // Extended data consumed by ABRP/MQTT/trips
         collectStatisticExtended(b);   // SOH, driving time, key battery
-        collectInstrumentExtended(b);  // cabin temp, trip data, consumption
-        // AC device: insideTempC + acStartState/fan. Normally a "display-only,
+        collectInstrumentExtended(b);  // trip data, consumption
+        // AC device: acStartState/fan. Normally a "display-only,
         // listener-driven" device, but its listener (onDisplayCallback) is a
-        // deliberate no-op, so without polling here insideTempC/acStartState were
+        // deliberate no-op, so without polling here acStartState was
         // read exactly once at init (collectAllFull) and then carried forward
-        // unchanged on every toBuilder() poll. That froze the cabin-temp value:
-        // the "temperature" and "ac" automation events (BydEvent.update) never saw
-        // a transition, so a temperature-threshold automation could never fire, and
-        // the climate API / MQTT inside_temp showed the boot-time value forever.
-        // Poll it every cycle (ACC on AND off — cabin temp matters most when parked,
-        // e.g. child/pet temperature alerts). ~6 cheap HAL getters, self-guarded and
-        // wrapped in try/catch. Runs before mergeCloudData so the cloud temp
-        // fallback (Double.isNaN(insideTempC)) still fills in on a HAL read miss.
+        // unchanged on every toBuilder() poll. Poll it every cycle (ACC on AND off).
+        // The cabin read above remains separate so this method cannot read the same
+        // AC_TEMP_INSIDE channel a second time.
         collectAc(b);
         // Charging rest time (time-to-full) HAL fallback. The primary feature-ID
         // read lives in collectInstrument() above, but many trims/firmware leave
@@ -1507,7 +2569,7 @@ public class BydDataCollector {
         // pushing onDoorStateChanged callbacks when parked, so a door automation only
         // fired with the car on; polling getDoorState(area) here keeps it working parked.
         // Self-guards on "no door listeners" so it's a true no-op without a door rule.
-        collectDoorStates(b);
+        pollDoorStatesNow();
 
         // ── Display-only device polls, self-gated per automation event ──────────────
         // These devices were polled ONLY in collectAllFull() (daemon init + on-demand
@@ -1573,6 +2635,14 @@ public class BydDataCollector {
         // lightDevice, since the provider tier needs no Light device.
         int ambientOn = getAmbientLightEnabled();
         if (ambientOn != BydVehicleData.UNAVAILABLE) b.ambientEnabled(ambientOn);
+        // Steering-wheel heater — UNGATED, every poll, for the same reason as the ambient
+        // switch above: its producer collectSettings() runs only in collectAllFull() at
+        // daemon init, and no settings-HAL callback covers this id (onSettingsCallback
+        // handles only CPD, ambient, and the four seat channels). Left init-only, the
+        // value would latch at its boot state forever — the /api/vehicle/state tile would
+        // then keep reverting the user's own successful toggle on the next poll.
+        int wheelHeat = getSteeringWheelHeatingState();
+        if (wheelHeat != BydVehicleData.UNAVAILABLE) b.steeringWheelHeat(wheelHeat);
         // Slope (incline degrees) — sensor device.
         if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.SLOPE)) {
             collectSensor(b);
@@ -1591,13 +2661,23 @@ public class BydDataCollector {
         if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.RADAR_NEAREST)) {
             collectRadar(b);
         }
+        // Air quality PM2.5 — dedicated pm2p5 device. MUST be on this periodic path, not only
+        // in collectAllFull(): that runs at daemon init / the ACC-ON edge only, so a value read
+        // there is carried forward by toBuilder() unchanged for the whole drive. Cabin PM2.5
+        // climbing in a tunnel would never reach a "PM2.5 above X" rule, and — because
+        // mergeCloudData below only fills when the field is still UNAVAILABLE — a stale local
+        // value would also block the cloud value that used to refresh every poll.
+        if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.PM25_INSIDE,
+                com.overdrive.app.automation.condition.BydEvent.PM25_OUTSIDE)) {
+            collectPm25(b);
+        }
 
         // Cloud data merge (when toggle enabled and data is fresh)
-        mergeCloudData(b);
+        mergeCloudData(b, cabinTempHalSucceeded);
 
-        BydVehicleData built = b.build();
-        snapshot.set(built);
-        pushChargingEvidence(built);
+            BydVehicleData built = b.build();
+            built = publishCollectedSnapshot(built, chargingObserved, pollGeneration);
+        }
     }
 
     /**
@@ -1605,22 +2685,30 @@ public class BydDataCollector {
      * Bypasses the 5-second throttle. Called by the HTTP API when a client
      * explicitly requests the full vehicle data, or during init().
      */
-    public void collectAllFull() {
-        lastCoreCollectTime = 0;  // Bypass throttle
+    public synchronized void collectAllFull() {
+        try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation ignored =
+                     com.overdrive.app.monitor.ChargingDetector.beginPublicationMutation()) {
+            lastCoreCollectTime = 0;  // Bypass throttle
 
-        BydVehicleData.Builder b = (snapshot.get() != null) ? snapshot.get().toBuilder() : new BydVehicleData.Builder();
-        b.availableDevices(availableDevices.toArray(new String[0]));
-        b.unavailableDevices(unavailableDevices.toArray(new String[0]));
+            long pollGeneration = chargingPollGeneration.incrementAndGet();
+            BydVehicleData.Builder b = (snapshot.get() != null) ? snapshot.get().toBuilder() : new BydVehicleData.Builder();
+            b.availableDevices(availableDevices.toArray(new String[0]));
+            b.unavailableDevices(unavailableDevices.toArray(new String[0]));
 
         // Core devices
         collectBodywork(b);
         collectSpeed(b);
-        collectEngine(b);
         collectStatistic(b);
-        collectCharging(b);
-        collectInstrument(b);
+        collectSocTarget(b);
+        ChargingObservationVersions chargingObserved = collectChargingOrdered(b);
+        collectInstrumentOrdered(b, chargingObserved);
+        collectEngineOrdered(b, chargingObserved);
         collectOta(b);
         collectGearbox(b);
+
+        // Read AC_TEMP_INSIDE exactly once for this poll and publish that one observation to
+        // both legacy cabin fields.
+        boolean cabinTempHalSucceeded = collectCabinTemperature(b);
 
         // Display-only devices (normally listener-driven, polled here on-demand)
         collectAc(b);
@@ -1642,18 +2730,22 @@ public class BydDataCollector {
 
         // Extended data — core + display-only
         collectStatisticExtended(b);   // SOH, driving time, key battery
-        collectInstrumentExtended(b);  // cabin temp, trip data, consumption
+        collectInstrumentExtended(b);  // trip data, consumption
         collectChargingExtended(b);    // charging rest time
-        collectBodyworkExtended(b);    // steering, auto system, 12V level, sunroof, sunshade
+        collectBodyworkExtended(b);
+        // PM2.5 independently of the bodywork device: collectBodyworkExtended early-returns when
+        // bodyworkDevice is null, which would silently skip air quality on a trim that HAS the
+        // pm2p5 device but no bodywork one. collectPm25 self-guards on its own null device.
+        collectPm25(b);                // air quality, inside + outside (µg/m³)
         collectEngineExtended(b);      // coolant, oil, engine code
 
         // Cloud data merge (when toggle enabled and data is fresh)
-        mergeCloudData(b);
+        mergeCloudData(b, cabinTempHalSucceeded);
 
-        BydVehicleData built = b.build();
-        snapshot.set(built);
-        pushChargingEvidence(built);
-        lastCoreCollectTime = System.currentTimeMillis();
+            BydVehicleData built = b.build();
+            built = publishCollectedSnapshot(built, chargingObserved, pollGeneration);
+            lastCoreCollectTime = System.currentTimeMillis();
+        }
     }
 
     /**
@@ -1663,7 +2755,12 @@ public class BydDataCollector {
      * from listener callbacks and the explicit poll above; this method
      * supplies L3 evidence.
      */
-    private void pushChargingEvidence(BydVehicleData built) {
+    private void pushChargingEvidence(BydVehicleData built,
+                                      ChargingObservationVersions observed,
+                                      boolean connectionObserved,
+                                      boolean typeObserved,
+                                      boolean bmsObserved,
+                                      boolean powerObserved) {
         if (built == null) return;
         // AGE-OUT A CARRIED-FORWARD ENGINE-POWER VALUE before the detector sees it.
         //
@@ -1678,8 +2775,21 @@ public class BydDataCollector {
         if (!Double.isNaN(built.enginePowerKw)
                 && built.enginePowerAtMs > 0
                 && (System.currentTimeMillis() - built.enginePowerAtMs) >= ENGINE_POWER_LIVE_TTL_MS) {
-            built = built.toBuilder().enginePowerKw(Double.NaN).build();
-            snapshot.set(built);
+            synchronized (chargingEdgePublishLock) {
+                BydVehicleData current = snapshot.get();
+                // Clear only the exact stale sample this poll evaluated. A live engine callback may
+                // have published a newer timestamp while the poll was being assembled.
+                if (current != null
+                        && current.enginePowerAtMs == built.enginePowerAtMs
+                        && current.enginePowerAtMs > 0
+                        && (System.currentTimeMillis() - current.enginePowerAtMs)
+                                >= ENGINE_POWER_LIVE_TTL_MS) {
+                    built = current.toBuilder().enginePowerKw(Double.NaN).build();
+                    snapshot.set(built);
+                } else if (current != null) {
+                    built = current;
+                }
+            }
         }
         // Resolve gear from authoritative GearMonitor (returns last-known
         // value even when its monitor stops on ACC OFF). On a parked car
@@ -1695,8 +2805,11 @@ public class BydDataCollector {
                 : com.overdrive.app.monitor.GearMonitor.GEAR_P;
         }
         com.overdrive.app.monitor.ChargingDetector.getInstance()
-            .updatePollEvidence(built, gearNow,
-                com.overdrive.app.monitor.GearMonitor.GEAR_P);
+            .updatePollObservation(
+                built, gearNow, com.overdrive.app.monitor.GearMonitor.GEAR_P,
+                connectionObserved, typeObserved,
+                bmsObserved, observed.observedBmsState,
+                powerObserved, observed.powerIsCharging);
 
         // Feed the ring-buffer power estimator (FALLBACK power source for models
         // that report no direct/external charging power). It accumulates ONLY
@@ -1735,25 +2848,34 @@ public class BydDataCollector {
                 try {
                     com.overdrive.app.abrp.SohEstimator soh =
                         com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
-                    double nominal = (soh != null) ? soh.getNominalCapacityKwh() : 0;
+                    com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                            soh != null ? soh.getCapacitySohSnapshot() : null;
+                    double nominal = capacitySoh != null
+                            ? capacitySoh.getNominalCapacityKwh() : 0;
                     if (nominal > 0) {
-                        // getDisplaySoh() ONCE. hasDisplaySoh() is literally
-                        // `return getDisplaySoh() > 0`, so the old `hasDisplaySoh() ? getDisplaySoh()`
-                        // shape ran the whole priority chain twice — including a synchronized
-                        // frame-anchor block and a cross-subsystem isPhev() call — for one value.
-                        double dSoh = (soh != null) ? soh.getDisplaySoh() : 0;
+                        double dSoh = capacitySoh.hasDisplaySoh()
+                                ? capacitySoh.getDisplaySoh() : 0;
                         double sohFrac = (dSoh > 0) ? dSoh / 100.0 : 1.0;
                         if (sohFrac <= 0) sohFrac = 1.0;
                         socScaleKwh = nominal * sohFrac;
                     }
                 } catch (Throwable ignored) { /* leave NaN → estimator uses remain/cap */ }
             }
+            long estimatorSampleAtMs = System.currentTimeMillis();
             com.overdrive.app.monitor.ChargingPowerEstimator.getInstance().sample(
-                System.currentTimeMillis(),
+                estimatorSampleAtMs,
                 built.chargingCapacityKwh,
                 built.remainKwh,
                 socPctForEst, socScaleKwh,
                 fusedCharging, inPark);
+            // Calibrate the charged-energy counter's UNIT against remaining pack energy. Both are read
+            // on this same tick, which is what makes the pair comparable; remainKwh is a separate
+            // register the charging counter does not feed, which is what makes it independent.
+            if (fusedCharging && inPark) {
+                com.overdrive.app.charging.CounterScaleCalibrator.observePaired(
+                    com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY,
+                    built.chargingCapacityKwh, built.remainKwh, estimatorSampleAtMs);
+            }
         } catch (Exception e) {
             logger.info("ChargingPowerEstimator.sample failed: " + e.getMessage());
         }
@@ -1783,32 +2905,37 @@ public class BydDataCollector {
      * within tolerance, return NaN so the caller skips it and keeps the last
      * known-good value rather than writing a wrong one.
      *
-     * <p>Fallback when no nominal anchor is available yet (cold boot, before
-     * capacity detection): apply the historical ×2, since the primary getter is
-     * the one that fills remainKwh first and it is the half-frame source. BEV
-     * never calls this (callers gate on {@code isPhevForKwh}).
+     * <p>When no nominal anchor is available yet, only a getter with a known half-frame contract may
+     * use the historical ×2. Ambiguous fallback getters are kept raw; otherwise an already-gross
+     * series is doubled and its derivative publishes exactly twice the real charging power.
      *
      * @param rawKwh the raw HAL reading (already in kWh, e.g. rawVal/10 for the
      *               0.1-kWh-unit getters)
      * @param socPercent current display SOC, or NaN if unknown this cycle
+     * @param assumeHalfWithoutNominal true only for a getter known to use the half frame
      * @return the gross-frame kWh, or NaN if the reading is frame-ambiguous and
      *         should be skipped
      */
-    private double phevGrossRemainKwh(double rawKwh, double socPercent) {
-        if (Double.isNaN(rawKwh) || rawKwh <= 0) return rawKwh;
-
+    private double phevGrossRemainKwh(double rawKwh, double socPercent,
+                                      boolean assumeHalfWithoutNominal) {
         double nominal = 0;
         try {
             com.overdrive.app.abrp.SohEstimator sohEst =
                 com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
             if (sohEst != null) nominal = sohEst.getNominalCapacityKwh();
-        } catch (Throwable ignored) { /* nominal stays 0 → ×2 fallback below */ }
+        } catch (Throwable ignored) { /* nominal stays 0 */ }
+        return resolvePhevGrossRemainKwh(
+                rawKwh, socPercent, nominal, assumeHalfWithoutNominal);
+    }
 
-        // No anchor (or no SOC) → can't disambiguate frames. Apply the historical
-        // ×2: the primary half-frame getter is what seeds remainKwh first, and a
-        // doubled value is what downstream capacity detection then anchors on.
+    static double resolvePhevGrossRemainKwh(double rawKwh, double socPercent, double nominal,
+                                            boolean assumeHalfWithoutNominal) {
+        if (Double.isNaN(rawKwh) || rawKwh <= 0) return rawKwh;
+        // No anchor (or no SOC) means the frame cannot be inferred from the value. Preserve ambiguous
+        // fallbacks as reported; apply ×2 only where the getter contract supplies that missing fact.
         if (nominal <= 0 || Double.isNaN(socPercent) || socPercent <= 5) {
-            return rawKwh * PHEV_ENERGY_HALF_SCALE_CORRECTION;
+            return assumeHalfWithoutNominal
+                    ? rawKwh * PHEV_ENERGY_HALF_SCALE_CORRECTION : rawKwh;
         }
 
         // The discriminator is the IMPLIED CAPACITY = remainKwh / SOC, NOT the
@@ -1902,7 +3029,7 @@ public class BydDataCollector {
                 double rawVal = ((Number) battPowerRaw).doubleValue();
                 double voltage12v = rawVal > 100 ? rawVal / 10.0 : rawVal;
                 // Only treat as 12V voltage if it's in a plausible range (8-16V)
-                if (voltage12v >= 8.0 && voltage12v <= 16.0 && Double.isNaN(b.voltage12v)) {
+                if (voltage12v >= 8.0 && voltage12v <= 16.0) {
                     b.voltage12v(voltage12v);
                 }
             }
@@ -1932,13 +3059,10 @@ public class BydDataCollector {
 
             // PHEV: read getBatteryPowerHEV ONLY to populate socHevPercent (telemetry)
             // and STASH it as a last-resort remainKwh fallback — it is not the
-            // PHEV-primary energy source. Like every PHEV energy getter it reports at
-            // HALF the true gross scale (see PHEV_ENERGY_HALF_SCALE_CORRECTION), so the
-            // stashed value is ×2-corrected to the gross frame below — matching the
-            // Priority 1/2 sources. getBatteryRemainPowerEV (Priority 1 below) is the
-            // preferred PHEV source; HEV is retained only as a fallback so firmwares
-            // where the EV getter genuinely echoes SOC% (the SOC-as-kWh bug) still get
-            // *some* reading rather than none.
+            // PHEV-primary energy source. Its frame varies across firmware, so it is resolved
+            // against nominal capacity when available and otherwise preserved raw rather than
+            // blindly doubled. getBatteryRemainPowerEV (Priority 1 below) remains preferred;
+            // HEV is retained so firmwares where that getter echoes SOC% still get some reading.
             double phevHevKwh = Double.NaN;
             boolean phevHevKwhUsable = false;
             if (isPhevForKwh && bodyworkDevice != null) {
@@ -1958,7 +3082,7 @@ public class BydDataCollector {
                             double soc = b.socPercent;
                             boolean looksLikeSocPercent = !Double.isNaN(soc)
                                     && soc > 0 && Math.abs(hevVal - soc) < 3.0;
-                            double hevKwh = phevGrossRemainKwh(hevVal, soc);
+                            double hevKwh = phevGrossRemainKwh(hevVal, soc, false);
                             if (!looksLikeSocPercent && !Double.isNaN(hevKwh)
                                     && hevKwh > 1 && hevKwh < 120) {
                                 phevHevKwh = hevKwh;
@@ -1993,7 +3117,7 @@ public class BydDataCollector {
                         // the ICE-running fallback wins). NaN = frame-ambiguous → the
                         // `evVal > 1` guard below skips it, keeping the last good value.
                         double evVal = isPhevForKwh
-                                ? phevGrossRemainKwh(evRaw, b.socPercent) : evRaw;
+                                ? phevGrossRemainKwh(evRaw, b.socPercent, true) : evRaw;
                         if (evVal > 1 && evVal < 120) {
                             // Validate: implied capacity should be within 50-150% of any BYD pack
                             double soc = b.socPercent;
@@ -2066,7 +3190,7 @@ public class BydDataCollector {
                             // BEV unchanged. NaN = ambiguous → skipped by the impliedCap
                             // gate below, keeping the last good value.
                             double kwh = isPhevForKwh
-                                    ? phevGrossRemainKwh(kwhRaw, b.socPercent) : kwhRaw;
+                                    ? phevGrossRemainKwh(kwhRaw, b.socPercent, false) : kwhRaw;
                             // Validate against SOC
                             double soc = b.socPercent;
                             if (!Double.isNaN(soc) && soc > 5) {
@@ -2176,7 +3300,7 @@ public class BydDataCollector {
                     // BEV unchanged. NaN (frame-ambiguous) is excluded by the
                     // 1-120 window below, keeping the last good value.
                     double kwhFromCap = isPhevForKwh
-                            ? phevGrossRemainKwh(capVal / 10.0, b.socPercent)
+                            ? phevGrossRemainKwh(capVal / 10.0, b.socPercent, false)
                             : (capVal / 10.0);
                     // Plausible remaining energy range for any BYD model: 1-120 kWh
                     if (kwhFromCap > 1.0 && kwhFromCap < 120.0) {
@@ -2262,11 +3386,12 @@ public class BydDataCollector {
                 if (rangeVal > 0 && rangeVal <= 1016) b.bodyworkRangeKm((int) Math.round(rangeVal * distanceToKmFactor));
             }
 
-            // Window open percent (positions 1-6)
+            // Window open percent (positions 1-6). Via readWindowPercent so the 0..100 domain check
+            // is applied here too — a rail (65535) or any out-of-domain value published verbatim
+            // renders as a window position in the UI and over MQTT. -1 = no reading.
             int[] windows = new int[6];
             for (int i = 0; i < 6; i++) {
-                Object wp = BydDeviceHelper.callGetter(bodyworkDevice, "getWindowOpenPercent", i + 1);
-                windows[i] = (wp instanceof Number) ? ((Number) wp).intValue() : -1;
+                windows[i] = readWindowPercent(i + 1);
             }
             b.windowOpenPercent(windows);
 
@@ -2303,7 +3428,8 @@ public class BydDataCollector {
             Object speed = BydDeviceHelper.callGetter(speedDevice, "getCurrentSpeed");
             if (speed instanceof Number) {
                 double v = ((Number) speed).doubleValue();
-                if (v != BydFeatureIds.SDK_NOT_AVAILABLE) b.speedKmh(v * distanceToKmFactor);
+                double speedKmh = convertRawSpeedToKmh(v, getSpeedToKmhFactor());
+                if (!Double.isNaN(speedKmh)) b.speedKmh(speedKmh);
             }
             // Guard the SDK_NOT_AVAILABLE sentinel exactly like getCurrentSpeed above:
             // getAccelerateDeepness/getBrakeDeepness can return it, and it is NOT the
@@ -2382,13 +3508,16 @@ public class BydDataCollector {
             String powerSource = "carry-forward";
             double powerRaw = Double.NaN;
             try {
+                long powerObservedAtMs = System.currentTimeMillis();
                 Object val = BydDeviceHelper.callGet(engineDevice, BydFeatureIds.ENGINE_POWER, Double.class);
                 if (val != null) {
                     double raw = BydDeviceHelper.getDoubleValue(val);
-                    double kw = (Math.abs(raw) > 100.0) ? raw * 0.1 : raw;
+                    double kw = scaleEnginePowerKw(raw);
                     if (!Double.isNaN(raw) && raw >= -200.0 && raw <= 400.0
-                            && !isEnginePowerSentinel(kw)) {
-                        b.enginePowerKw(kw);
+                            && !isEnginePowerSentinel(kw)
+                            && allowsEnginePowerObservation(
+                                    b, kw, powerObservedAtMs)) {
+                        b.enginePowerKw(kw).enginePowerAtMs(powerObservedAtMs);
                         powerWritten = true;
                         powerSource = "featureId";
                         powerRaw = raw;
@@ -2401,6 +3530,7 @@ public class BydDataCollector {
             // fresh value THIS cycle — a live re-read that keeps the value tracking
             // instead of freezing on the carried-forward number.
             if (!powerWritten) {
+                long powerObservedAtMs = System.currentTimeMillis();
                 Object power = BydDeviceHelper.callGetter(engineDevice, "getEnginePower");
                 if (power instanceof Number) {
                     double kw = ((Number) power).doubleValue();
@@ -2411,8 +3541,10 @@ public class BydDataCollector {
                     // feed the ChargingDetector a spurious "engine running" value.
                     boolean accOffReject = !accIsOn && kw > -ENGINE_POWER_CHARGING_DEADBAND;
                     if (kw >= -200.0 && kw <= 400.0 && !accOffReject
-                            && !isEnginePowerSentinel(kw)) {
-                        b.enginePowerKw(kw);
+                            && !isEnginePowerSentinel(kw)
+                            && allowsEnginePowerObservation(
+                                    b, kw, powerObservedAtMs)) {
+                        b.enginePowerKw(kw).enginePowerAtMs(powerObservedAtMs);
                         powerWritten = true;
                         powerSource = "getter";
                         powerRaw = kw;
@@ -2455,7 +3587,8 @@ public class BydDataCollector {
             if (!powerWritten) {
                 long liveAt = b.enginePowerAtMs;
                 boolean listenerFresh = liveAt > 0
-                        && (System.currentTimeMillis() - liveAt) < ENGINE_POWER_LIVE_TTL_MS;
+                        && (System.currentTimeMillis() - liveAt) < ENGINE_POWER_LIVE_TTL_MS
+                        && allowsEnginePowerObservation(b, b.enginePowerKw, liveAt);
                 if (!listenerFresh) {
                     b.enginePowerKw(Double.NaN);   // also zeroes enginePowerAtMs (see the setter)
                     powerSource = "cleared-stale";
@@ -2507,6 +3640,17 @@ public class BydDataCollector {
         } catch (Exception e) {
             logger.debug("collectEngine error: " + e.getMessage());
         }
+    }
+
+    private boolean allowsEnginePowerObservation(BydVehicleData.Builder context,
+                                                 double powerKw,
+                                                 long observedAtMs) {
+        BydVehicleData current = context.build();
+        return allowsEnginePowerObservation(
+                current.chargingState, current.chargingGunState, current.vtolCharging,
+                powerKw, accIsOn, isTerminalChargingBarrierActive(),
+                current.chargingStateAtMs, observedAtMs,
+                hasCoherentPostFinishedRateProof(current, observedAtMs));
     }
 
     /**
@@ -2898,52 +4042,6 @@ public class BydDataCollector {
     }
 
     /**
-     * Resolve the cluster charge-power raw reading to kW, deciding between the two scales this
-     * feature id is reported in across firmware families.
-     *
-     * <p>Package-visible so {@link com.overdrive.app.byd.ClusterChargePowerScaleTest} can pin
-     * the boundary behaviour — the failure mode here is silent (a wrong-but-plausible number),
-     * and this value is the top-priority charging-power source, so the thresholds need a test
-     * rather than a comment.
-     *
-     * <ul>
-     *   <li>raw &gt; {@value #CLUSTER_AC_KW_CEILING} → above the AC/onboard-charger ceiling, so
-     *       hectowatts (divide by 100). This is where our PHEV field captures landed (189.5 raw
-     *       for a ~1.8 kW charge), and a PHEV onboard charger cannot physically deliver more
-     *       than ~7 kW, so a literal kW reading in this band is impossible on the drivetrain
-     *       that consumes this value. It also covers raw values past any plausible kW rate —
-     *       nothing charges beyond ~500 kW, so those can only be a smaller unit.</li>
-     *   <li>otherwise → already kW (at or below the AC ceiling, hectowatts would imply a
-     *       sub-0.22 kW rate, which is not a real charge).</li>
-     * </ul>
-     *
-     * <p><b>Why a scale decision at all — the two sources of evidence disagree.</b> The OEM app
-     * reads this EXACT feature id, accepts {@code 0 < v <= 500}, and applies NO division: it
-     * treats the value as kW outright (verified in its bytecode — there is not a single
-     * {@code div-double} in the whole method, and 500.0 is its only constant). The other
-     * reference app likewise forwards its charging-power reading unscaled. So on the firmware
-     * those apps target, raw IS kW.
-     *
-     * <p>But our own field capture on a Seal U DM-i PHEV recorded ~221.7 raw for a real ~1.9 kW
-     * charger and 189.5 raw for a ~1.8 kW one — i.e. hectowatts on that trim. Both observations
-     * are credible and they cannot both be a single unit, so this is genuinely a per-firmware
-     * difference rather than one of them being wrong.
-     *
-     * <p>The split above honours both: at or below the AC/onboard-charger ceiling the value is
-     * taken as kW (matching the OEM app for every AC charge, which is all a PHEV can do), and
-     * only ABOVE that ceiling — where a kW reading would exceed what AC charging can deliver,
-     * and where our PHEV captures actually landed — is it read as hectowatts.
-     *
-     * <p><b>The residual ambiguity is contained by the CONSUMER, not by this function.</b> A BEV
-     * DC fast charge of 22-500 kW on a kW-reporting trim would read ~1/100th here. That is why
-     * {@code VehicleDataMonitor.getChargingState()} consumes this value on PHEV ONLY — a PHEV
-     * onboard charger cannot reach the ambiguous band, so the guess can never be wrong there,
-     * while BEV keeps using {@code chargePowerKw} (getChargePower), which needs no guessing.
-     * Anyone widening that gate to BEV must first make this function's scale unambiguous;
-     * otherwise a 150 kW session displays as 1.5 kW. The one-shot log records the raw value and
-     * the chosen scale, so one device capture settles which family a trim belongs to.
-     */
-    /**
      * True when an ENGINE_POWER reading is the HAL's "no data" placeholder rather than a real
      * power flow, so it must not reach {@code enginePowerKw}.
      *
@@ -2973,19 +4071,31 @@ public class BydDataCollector {
         return kw == -1.0;
     }
 
-    static double scaleClusterChargePowerKw(double raw) {
-        // One threshold, not two: an earlier version tested CLUSTER_KW_MAX_PLAUSIBLE (500) first
-        // and then CLUSTER_AC_KW_CEILING (22) with the SAME division, so the first test could
-        // never change an outcome. Anything above the AC ceiling is hectowatts.
-        return (Math.abs(raw) > CLUSTER_AC_KW_CEILING) ? raw / 100.0 : raw;
+    /**
+     * Apply the OEM engine-power register's signed scaling rule. Only positive raw values above 100
+     * use the 0.1 multiplier; a negative value is already kW and may legitimately be below -100.
+     */
+    static double scaleEnginePowerKw(double raw) {
+        return raw > 100.0 ? raw * 0.1 : raw;
     }
 
     /**
-     * AC / onboard-charger ceiling in kW. At or below this a raw reading is taken as kW; above
-     * it, as hectowatts — which also covers raw values past any plausible kW rate (nothing
-     * charges past ~500 kW, so those can only be a smaller unit).
+     * Identity. The cluster charge readout is stored RAW.
+     *
+     * <p>This used to divide anything above 22 by 100, inferring the unit from the magnitude.
+     * That guess is unsound in both directions: the ambiguous band contains both a genuine
+     * DC-charging rate (60-500 kW) and a plausible counter value, so no threshold separates
+     * them. It was contained by consuming the field on one drivetrain only, which meant the
+     * other drivetrain simply lost access to the vehicle's own dash figure.
+     *
+     * <p>The unit question is now answered by {@link ChargeSourceClassifier} from how the value
+     * MOVES across a charge, which is drivetrain-independent and needs no per-trim table. Kept as
+     * a named identity function so the intent — "deliberately unscaled" — stays explicit at the
+     * call site and in the pinned test.
      */
-    private static final double CLUSTER_AC_KW_CEILING = 22.0;
+    static double scaleClusterChargePowerKw(double raw) {
+        return raw;
+    }
 
     /** @return the cell voltage in V, or NaN if unavailable/out-of-range. */
     private double collectStatVoltage(BydVehicleData.Builder b, int featureId, String which) {
@@ -3006,69 +4116,1156 @@ public class BydDataCollector {
         return volts;
     }
 
-    private void collectCharging(BydVehicleData.Builder b) {
-        if (chargingDevice == null) return;
+    /** True when the gun reports DISCONNECTED — a counter's value then stops belonging to this session. */
+    private static boolean gunOutForSource(BydVehicleData.Builder b) {
+        return b.chargingGunState == 1;
+    }
+
+    static boolean isPowerExportContext(int gunState, boolean vtolCharging) {
+        return vtolCharging || gunState == 5;
+    }
+
+    /**
+     * Whether a raw charging channel may be offered to the detector.
+     *
+     * <p>The builder can contain a current synchronous gun-out observation before that same poll is
+     * atomically delivered to ChargingDetector. Rejecting here prevents stale source reads later in
+     * the poll from briefly reviving L3 against the detector's previous connected-gun snapshot.
+     */
+    static boolean allowsRawChargingEvidence(int gunState, boolean vtolCharging) {
+        return gunState != 1 && !isPowerExportContext(gunState, vtolCharging);
+    }
+
+    static boolean isChargingCallbackLifecycleCurrent(
+            long bmsVersionAtDispatch, long bmsVersionNow,
+            long gunVersionAtDispatch, long gunVersionNow,
+            long typeVersionAtDispatch, long typeVersionNow) {
+        return bmsVersionAtDispatch == bmsVersionNow
+                && gunVersionAtDispatch == gunVersionNow
+                && typeVersionAtDispatch == typeVersionNow;
+    }
+
+    static boolean allowsEnginePowerCallback(BydVehicleData current, double powerKw,
+                                             boolean accOn,
+                                             long gunVersionAtDispatch, long gunVersionNow,
+                                             long rateClearVersionAtDispatch,
+                                             long rateClearVersionNow) {
+        return allowsEnginePowerCallback(
+                current, powerKw, accOn,
+                0L, 0L,
+                gunVersionAtDispatch, gunVersionNow,
+                0L, 0L,
+                rateClearVersionAtDispatch, rateClearVersionNow);
+    }
+
+    static boolean allowsEnginePowerCallback(
+            BydVehicleData current, double powerKw, boolean accOn,
+            long bmsVersionAtDispatch, long bmsVersionNow,
+            long gunVersionAtDispatch, long gunVersionNow,
+            long typeVersionAtDispatch, long typeVersionNow,
+            long rateClearVersionAtDispatch, long rateClearVersionNow) {
+        return allowsEnginePowerCallback(
+                current, powerKw, accOn,
+                bmsVersionAtDispatch, bmsVersionNow,
+                gunVersionAtDispatch, gunVersionNow,
+                typeVersionAtDispatch, typeVersionNow,
+                rateClearVersionAtDispatch, rateClearVersionNow,
+                0L, false);
+    }
+
+    static boolean allowsEnginePowerCallback(
+            BydVehicleData current, double powerKw, boolean accOn,
+            long bmsVersionAtDispatch, long bmsVersionNow,
+            long gunVersionAtDispatch, long gunVersionNow,
+            long typeVersionAtDispatch, long typeVersionNow,
+            long rateClearVersionAtDispatch, long rateClearVersionNow,
+            long observedAtMs, boolean coherentPostFinishedRateProof) {
+        if (current == null) return false;
+        if (powerKw >= 0.0) return true;
+        if (!isChargingCallbackLifecycleCurrent(
+                    bmsVersionAtDispatch, bmsVersionNow,
+                    gunVersionAtDispatch, gunVersionNow,
+                    typeVersionAtDispatch, typeVersionNow)
+                || rateClearVersionAtDispatch != rateClearVersionNow) {
+            return false;
+        }
+        return allowsEnginePowerObservation(
+                current.chargingState, current.chargingGunState, current.vtolCharging,
+                powerKw, accOn, isTerminalChargingBarrierActive(),
+                current.chargingStateAtMs, observedAtMs,
+                coherentPostFinishedRateProof);
+    }
+
+    /**
+     * A negative engine-power level is charging evidence only while the matching charging lifecycle
+     * is still live. FINISHED with the gun left connected is especially important: affected PHEVs
+     * keep returning the final -3 kW register level, and writing it through the builder would give it
+     * a new timestamp on every poll even though no new power observation occurred.
+     */
+    static boolean allowsEnginePowerObservation(
+            int chargingState, int chargingGunState, boolean vtolCharging,
+            double powerKw, boolean accOn, boolean terminalBarrierActive) {
+        return allowsEnginePowerObservation(
+                chargingState, chargingGunState, vtolCharging,
+                powerKw, accOn, terminalBarrierActive,
+                0L, 0L, false);
+    }
+
+    static boolean allowsEnginePowerObservation(
+            int chargingState, int chargingGunState, boolean vtolCharging,
+            double powerKw, boolean accOn, boolean terminalBarrierActive,
+            long chargingStateAtMs, long observedAtMs,
+            boolean coherentPostFinishedRateProof) {
+        if (powerKw >= 0.0) return true;
+        boolean chargingConnection = chargingGunState == 2
+                || chargingGunState == 3 || chargingGunState == 4;
+        boolean chargingContext = chargingConnection || !accOn;
+        if (chargingContext
+                && (terminalBarrierActive || isTerminalChargingState(chargingState))) {
+            // FINISHED can precede the physical end of a connected PHEV taper. The terminal edge
+            // clears every pre-FINISHED rate first; only an engine observation that began strictly
+            // afterward and has a separate fresh post-FINISHED rate observation may re-enter.
+            return chargingState == 2
+                    && chargingConnection
+                    && !vtolCharging
+                    && powerKw < -ENGINE_POWER_CHARGING_DEADBAND
+                    && chargingStateAtMs > 0L
+                    && observedAtMs > chargingStateAtMs
+                    && coherentPostFinishedRateProof;
+        }
+        // Negative power with ACC on and no charging connection is ordinary regenerative driving.
+        // With ACC off it must still have a non-disconnected, non-export charging context.
+        return accOn || allowsRawChargingEvidence(chargingGunState, vtolCharging);
+    }
+
+    static boolean isCoherentPostFinishedRateProof(
+            double rate, long rateObservedAtMs,
+            long finishedAtMs, long engineObservedAtMs, long nowMs) {
+        return Double.isFinite(rate) && rate > 0.1
+                && finishedAtMs > 0L
+                && rateObservedAtMs > finishedAtMs
+                && engineObservedAtMs > finishedAtMs
+                && nowMs >= rateObservedAtMs
+                && nowMs >= engineObservedAtMs
+                && nowMs - rateObservedAtMs <= POST_FINISHED_RATE_PROOF_FRESHNESS_MS
+                && nowMs - engineObservedAtMs <= POST_FINISHED_RATE_PROOF_FRESHNESS_MS
+                && Math.abs(engineObservedAtMs - rateObservedAtMs)
+                        <= POST_FINISHED_RATE_PROOF_FRESHNESS_MS;
+    }
+
+    private static boolean hasCoherentPostFinishedRateProof(
+            BydVehicleData current, long engineObservedAtMs) {
+        if (current == null || current.chargingState != 2
+                || current.chargingStateAtMs <= 0L) {
+            return false;
+        }
+        long nowMs = System.currentTimeMillis();
+        return ChargeSourceClassifier.isRate(ChargeSourceClassifier.SRC_CLUSTER)
+                        && isCoherentPostFinishedRateProof(
+                                current.clusterChargePowerKw,
+                                current.clusterChargePowerAtMs,
+                                current.chargingStateAtMs, engineObservedAtMs, nowMs)
+                || ChargeSourceClassifier.isRate(ChargeSourceClassifier.SRC_DEVICE)
+                        && isCoherentPostFinishedRateProof(
+                                current.chargingPowerKw,
+                                current.chargingPowerAtMs,
+                                current.chargingStateAtMs, engineObservedAtMs, nowMs)
+                || ChargeSourceClassifier.isRate(ChargeSourceClassifier.SRC_EXTERNAL)
+                        && isCoherentPostFinishedRateProof(
+                                current.externalChargingPowerKw,
+                                current.externalChargingPowerAtMs,
+                                current.chargingStateAtMs, engineObservedAtMs, nowMs)
+                || isCoherentPostFinishedRateProof(
+                        current.chargePowerKw,
+                        current.chargePowerAtMs,
+                        current.chargingStateAtMs, engineObservedAtMs, nowMs);
+    }
+
+    /** Explicit BMS states during which source behavior must not train the rate/counter classifier. */
+    static boolean shouldClassifyChargingSource(int chargingState) {
+        return chargingState != 0
+                && chargingState != 2
+                && chargingState != 3
+                && chargingState != 4
+                && chargingState != 5
+                && chargingState != 6
+                && chargingState != 7
+                && chargingState != 8
+                && chargingState != 10
+                && chargingState != 11
+                && chargingState != 12;
+    }
+
+    static boolean shouldClassifyChargingSource(int chargingState,
+                                                boolean terminalBarrierActive) {
+        return !terminalBarrierActive && shouldClassifyChargingSource(chargingState);
+    }
+
+    /** Shared raw-domain validation for every ambiguous charging rate/counter accessor. */
+    static boolean isRawChargingSourceValueAdmissible(double raw) {
+        return Double.isFinite(raw)
+                && raw >= 0
+                && raw <= RAW_RATE_ENVELOPE_MAX
+                && !isChargePowerSentinel(raw);
+    }
+
+    /** Drivetrain-aware admission applied before detector/classifier/resolver state can be mutated. */
+    static boolean isRawChargingSourceValueAdmissible(double raw, boolean phev) {
+        return isRawChargingSourceValueAdmissible(raw)
+                && !com.overdrive.app.monitor.ChargeRateResolver
+                        .isKnownPhevRawPowerJunk(raw, phev);
+    }
+
+    /**
+     * Tri-state drivetrain admission for captured PHEV junk signatures. UNKNOWN is intentionally
+     * treated like PHEV, not BEV: during startup a PHEV fuel HAL can return BEV sentinels for the
+     * entire 60-second cache window, and a persisted RATE/divisor would otherwise turn 359.4 into a
+     * plausible measured 3.594 kW before the drivetrain is recognized.
+     */
+    static boolean isRawChargingSourceValueAdmissible(double raw, int establishedDrivetrain) {
+        boolean signatureMustRemainUntrusted =
+                establishedDrivetrain != DRIVETRAIN_BEV;
+        return isRawChargingSourceValueAdmissible(raw)
+                && !com.overdrive.app.monitor.ChargeRateResolver
+                        .isKnownPhevRawPowerJunk(raw, signatureMustRemainUntrusted);
+    }
+
+    boolean isRawChargingSourceValueAdmissibleForCurrentDrivetrain(double raw) {
+        // Refresh/probe first, then consult only the independently established verdict. The ordinary
+        // cached boolean can be a provisional startup BEV result and is not sufficient for this gate.
+        computeIsPhev();
+        return isRawChargingSourceValueAdmissible(raw, establishedDrivetrain);
+    }
+
+    static boolean isValidChargingBmsState(int raw) {
+        return raw >= 0 && raw <= 15
+                && raw != BydFeatureIds.BMS_UNAVAILABLE
+                && raw != BydFeatureIds.INVALID_VALUE
+                && raw != BydFeatureIds.INVALID_VALUE_2;
+    }
+
+    /**
+     * Callback-only BMS levels cannot create a new lifecycle epoch after an authoritative stop.
+     * A versioned synchronous poll owns the evidence needed to release that detector barrier.
+     */
+    static boolean shouldPublishBmsCallbackTransition(
+            int previousState, int nextState, boolean terminalBarrierActive) {
+        return previousState == nextState || !terminalBarrierActive;
+    }
+
+    static boolean isValidChargingGunState(int raw) {
+        return raw >= 1 && raw <= 5;
+    }
+
+    /** Decode only the documented boolean encodings; non-zero HAL sentinels are unavailable. */
+    static Boolean decodePowerIsCharging(Object value) {
+        if (value instanceof Boolean) return (Boolean) value;
+        if (!(value instanceof Number)) return null;
+        double numeric = ((Number) value).doubleValue();
+        if (!Double.isFinite(numeric)) return null;
+        if (numeric == 0.0) return Boolean.FALSE;
+        if (numeric == 1.0) return Boolean.TRUE;
+        return null;
+    }
+
+    static boolean isChargingPowerCallbackPayload(double power) {
+        return Double.isFinite(power)
+                && Math.abs(power) <= RAW_RATE_ENVELOPE_MAX
+                && !isChargePowerSentinel(power);
+    }
+
+    static boolean isExplicitExternalRateStop(
+            double power, ChargeSourceClassifier.Kind sourceKind) {
+        return sourceKind == ChargeSourceClassifier.Kind.RATE
+                && isChargingPowerCallbackPayload(power)
+                && power <= 0.1;
+    }
+
+    static boolean canPreserveFinishedConnectedRate(String source) {
+        return SRC_PACK_SIDE_DIRECT.equals(source) || ChargeSourceClassifier.isRate(source);
+    }
+
+    private static boolean isTerminalChargingState(int chargingState) {
+        return !shouldClassifyChargingSource(chargingState);
+    }
+
+    static boolean allowsTerminalCounterTail(int chargingState) {
+        return chargingState == 0 || chargingState == 2 || chargingState == 4;
+    }
+
+    static boolean shouldObserveRawChargingSignal(int chargingState,
+                                                  boolean finishedConnectedRate) {
+        return !isTerminalChargingState(chargingState) || finishedConnectedRate;
+    }
+
+    static boolean shouldObserveClusterRawChargingSignal(
+            int chargingState, int gunState, ChargeSourceClassifier.Kind sourceKind) {
+        boolean gunCharging = gunState == 2 || gunState == 3 || gunState == 4;
+        boolean finishedConnectedRate = chargingState == 2
+                && gunCharging
+                && sourceKind == ChargeSourceClassifier.Kind.RATE;
+        return shouldObserveRawChargingSignal(chargingState, finishedConnectedRate);
+    }
+
+    private static boolean isFinalEnergyCounterSource(String source) {
+        return ChargeSourceClassifier.SRC_CAPACITY.equals(source)
+                || (ChargeSourceClassifier.SRC_EXTERNAL.equals(source)
+                    && ChargeSourceClassifier.isCounter(source));
+    }
+
+    /**
+     * Narrow post-unplug admission for the manager's bounded final-counter drain.
+     *
+     * <p>This is accounting-only. Callers must return immediately after forwarding so the value
+     * cannot reach detector evidence, source classification, or the generic rate slope.
+     */
+    static boolean allowsFinalCounterDuringLifecycleHold(String source, double raw,
+                                                         int gunState, boolean vtolCharging,
+                                                         boolean lifecycleHoldActive) {
+        ChargeSourceClassifier.Kind sourceKind =
+                ChargeSourceClassifier.SRC_CAPACITY.equals(source)
+                        ? ChargeSourceClassifier.Kind.COUNTER
+                        : ChargeSourceClassifier.kindOf(source);
+        return allowsFinalCounterDuringLifecycleHold(
+                source, sourceKind, raw, gunState, vtolCharging, lifecycleHoldActive);
+    }
+
+    /** Pure overload for pinning source-kind boundaries without persisted classifier state. */
+    static boolean allowsFinalCounterDuringLifecycleHold(
+            String source, ChargeSourceClassifier.Kind sourceKind, double raw,
+            int gunState, boolean vtolCharging, boolean lifecycleHoldActive) {
+        boolean finalCounter = ChargeSourceClassifier.SRC_CAPACITY.equals(source)
+                || (ChargeSourceClassifier.SRC_EXTERNAL.equals(source)
+                    && sourceKind == ChargeSourceClassifier.Kind.COUNTER);
+        if (!lifecycleHoldActive || gunState != 1 || vtolCharging
+                || !finalCounter) {
+            return false;
+        }
+        if (!Double.isFinite(raw) || raw < 0 || isChargePowerSentinel(raw)) return false;
+        if (ChargeSourceClassifier.SRC_CAPACITY.equals(source)) {
+            return raw <= 65.534;
+        }
+        // The external counter has a wider captured register, but values above 500 are outside the
+        // DB/resolver counter domain and must not enter an open row merely because a hold exists.
+        return raw <= 500.0;
+    }
+
+    private static boolean isChargingLifecycleHoldActive() {
+        try {
+            return com.overdrive.app.monitor.SocHistoryDatabase.getInstance()
+                    .isChargingLifecycleHoldActive();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isTerminalChargingBarrierActive() {
+        try {
+            return com.overdrive.app.monitor.ChargingDetector.getInstance()
+                    .isTerminalSessionBarrierActive();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** Feed an accounting-only final counter directly to the open DB row. */
+    private static void forwardFinalEnergyCounterToDatabase(String source, double raw) {
+        try {
+            com.overdrive.app.monitor.SocHistoryDatabase.getInstance()
+                    .onChargeCounterObserved(source, raw);
+        } catch (Throwable ignored) {}
+    }
+
+    private static boolean forwardFinalCounterAfterGunOut(String source, double raw,
+                                                          int gunState, boolean vtolCharging) {
+        if (!allowsFinalCounterDuringLifecycleHold(
+                source, raw, gunState, vtolCharging, isChargingLifecycleHoldActive())) {
+            return false;
+        }
+        forwardFinalEnergyCounterToDatabase(source, raw);
+        return true;
+    }
+
+    /** Feed a known kWh counter to the scale yardstick and the open session, without classification. */
+    private static void forwardEnergyCounterObservation(String source, double raw) {
+        try {
+            com.overdrive.app.monitor.ChargeRateResolver.observeCounterForScale(source, raw);
+        } catch (Throwable ignored) {}
+        forwardFinalEnergyCounterToDatabase(source, raw);
+    }
+
+    enum CounterObservationRoute {
+        NONE,
+        DATABASE_ONLY,
+        SCALE_AND_DATABASE
+    }
+
+    static CounterObservationRoute counterObservationRoute(
+            String source, ChargeSourceClassifier.Kind sourceKind) {
+        if (ChargeSourceClassifier.SRC_CAPACITY.equals(source)) {
+            return CounterObservationRoute.SCALE_AND_DATABASE;
+        }
+        if (!ChargeSourceClassifier.SRC_EXTERNAL.equals(source)) {
+            return CounterObservationRoute.NONE;
+        }
+        // UNKNOWN is provisional only, and RATE must reach the DB once so it can discard any held
+        // provisional baseline. Neither may enter the counter scale/energy path.
+        return sourceKind == ChargeSourceClassifier.Kind.COUNTER
+                ? CounterObservationRoute.SCALE_AND_DATABASE
+                : CounterObservationRoute.DATABASE_ONLY;
+    }
+
+    private static void forwardCounterObservation(
+            String source, ChargeSourceClassifier.Kind sourceKind, double raw) {
+        CounterObservationRoute route = counterObservationRoute(source, sourceKind);
+        if (route == CounterObservationRoute.SCALE_AND_DATABASE) {
+            forwardEnergyCounterObservation(source, raw);
+        } else if (route == CounterObservationRoute.DATABASE_ONLY) {
+            forwardFinalEnergyCounterToDatabase(source, raw);
+        }
+    }
+
+    /** Sink for a validated charging-source value. */
+    interface ChargeSourceSink { void accept(double value); }
+
+    /**
+     * Single entry point for storing any charging power/energy source.
+     *
+     * <p>Every such source now passes through here so that the admission gate and the unit
+     * interpretation are defined exactly once. Previously the poll path and the listener path
+     * for the SAME accessor applied different rules — one divided by 100, the other did not —
+     * so the value the rest of the daemon saw depended on which fired last.
+     *
+     * <p>The gate is the load-bearing part. A charging value is only meaningful while a cable is
+     * actually delivering, so we require either a charging-direction gun assertion or a live
+     * fused verdict, and refuse a terminal BMS state. Without this a counter that keeps its
+     * value with the gun out is admitted as a live reading and never ages out — the exact
+     * mechanism behind phantom charging power and phantom sessions.
+     *
+     * @param raw the RAW getter value, with no scaling applied
+     */
+    private void storeChargingSource(BydVehicleData.Builder b, String source, double raw,
+                                     ChargeSourceSink sink) {
+        if (!isRawChargingSourceValueAdmissibleForCurrentDrivetrain(raw)) return;
+        // BREAK THE CIRCULARITY. The gate below consults ChargingDetector, and the detector's own
+        // L3 inference reads the very fields this gate controls — so on the case L3 exists to catch
+        // (PHEV parked, BMS stuck at IDLE, gunState UNAVAILABLE, no plug broadcast) nothing would
+        // ever be admitted, L3 could never fire, and a real charge would record nothing at all.
+        //
+        // The detector is given the raw reading through a channel the gate does NOT control. It is
+        // evidence for the "is a charge happening" question only; it never becomes a published rate
+        // or persisted energy, so a stale or wrong-unit value cannot reach a number the user sees.
+        // SENTINELS AND OUT-OF-ENVELOPE VALUES ARE FILTERED FIRST — including before the detector's
+        // movement channel below. A getter that flaps between a failure code and a real reading
+        // "moves" on every poll, and feeding that to the detector would manufacture charging evidence
+        // out of a broken accessor. Only plausible readings may count as movement.
+        // 104857.5 and the large negatives are the documented BYD failure codes; 65535 is
+        // BMS-unavailable. The bound admits a HECTOWATT reading's full range, because the unit is not
+        // known here: a raw 700 is either an impossible 700 kW or an ordinary 7.0 kW three-phase AC
+        // charge, and bounding at 500 silently discarded the latter before it could be calibrated
+        // against the counter slope. Downstream still bounds the RESOLVED rate at 500 kW.
+        if (!allowsRawChargingEvidence(b.chargingGunState, b.vtolCharging)) {
+            if (forwardFinalCounterAfterGunOut(
+                    source, raw, b.chargingGunState, b.vtolCharging)) {
+                // Keep the final value available to the close path, but do not execute any normal
+                // source pipeline below this branch.
+                sink.accept(raw);
+            }
+            return;
+        }
+
+        boolean gunCharging = b.chargingGunState == 2
+                || b.chargingGunState == 3 || b.chargingGunState == 4;
+        boolean dischargingState = b.chargingState == 3 || b.chargingState == 11;
+        boolean terminalState = isTerminalChargingState(b.chargingState);
+        boolean finishedConnected = b.chargingState == 2 && gunCharging;
+        boolean finishedConnectedRate =
+                finishedConnected && canPreserveFinishedConnectedRate(source);
+        if (shouldObserveRawChargingSignal(b.chargingState, finishedConnectedRate)) {
+            try {
+                com.overdrive.app.monitor.ChargingDetector.getInstance()
+                        .observeRawChargingSignal(source, raw);
+            } catch (Throwable ignored) { /* detector not up yet */ }
+        }
+        boolean terminalBarrierActive = isTerminalChargingBarrierActive();
+        boolean sessionLive = false;
+        try {
+            sessionLive = com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging();
+        } catch (Throwable ignored) { /* detector not up yet -> treat as idle */ }
+
+        // ONE EXEMPTION: a confirmed-COUNTER energy total at a TERMINAL state. The gate exists to stop a
+        // stale RATE being published, but an energy total read as the session ends is the session's final
+        // figure — and the close path runs on a slower thread, so refusing it left the tail between the
+        // last accepted observation and the end uncounted. Still refused when the gun is OUT, which is
+        // where a counter's value stops belonging to this session.
+        // Applies to EITHER energy counter. Restricting it to the external source was arbitrary — the
+        // capacity counter is the DOCUMENTED per-session total and uses this same gate, so its final
+        // callback was still dropped and its tail lost. The test is "is this an energy total", not "which
+        // accessor is it".
+        boolean terminalCounterTail = allowsTerminalCounterTail(b.chargingState)
+                && !dischargingState && !gunOutForSource(b)
+                && isFinalEnergyCounterSource(source);
+        if (terminalState) {
+            if (terminalCounterTail) {
+                // Final kWh is accounting data, not another behavioral sample. Forward it without
+                // letting a frozen post-FINISHED value train either classifier or generic slope.
+                if (terminalBarrierActive) {
+                    forwardFinalEnergyCounterToDatabase(source, raw);
+                } else {
+                    forwardEnergyCounterObservation(source, raw);
+                }
+                sink.accept(raw);
+            } else if (finishedConnectedRate) {
+                // Preserve a previously-classified live rate for the independently corroborated taper
+                // path, but do not let post-FINISHED repeats or jitter mutate classification/resolution.
+                sink.accept(raw);
+            }
+            return;
+        }
+        if (!shouldClassifyChargingSource(b.chargingState, terminalBarrierActive)) {
+            if (isFinalEnergyCounterSource(source)) {
+                forwardFinalEnergyCounterToDatabase(source, raw);
+                sink.accept(raw);
+            }
+            return;
+        }
+        if (!(gunCharging || sessionLive)) {
+            return;
+        }
+
+        // Let the source declare what it is from how it moves. Only observed inside the gate,
+        // so a value read with the gun out can never shape the verdict.
+        ChargeSourceClassifier.observeWhileCharging(source, raw);
+        ChargeSourceClassifier.Kind sourceKind = ChargeSourceClassifier.kindOf(source);
+        // The DB buffers UNKNOWN external values provisionally and clears them if this source becomes
+        // RATE. Only a confirmed counter is also admitted to scale calibration and session energy.
+        forwardCounterObservation(source, sourceKind, raw);
+        // Advance this source's slope HERE, at observation time. getChargingState() is a read path
+        // hit by HTTP/MQTT/ABRP/the sampler, so letting it advance the slope made the derived kW a
+        // function of poll cadence rather than of the telemetry.
+        try {
+            com.overdrive.app.monitor.ChargeRateResolver.observe(source, raw);
+        } catch (Throwable ignored) {}
+        sink.accept(raw);
+    }
+
+    /**
+     * Listener-path twin of {@link #storeChargingSource}. The HAL callbacks write straight into
+     * the published snapshot rather than into a Builder, so they need the same gate applied
+     * against the CURRENT snapshot's gun/BMS state.
+     *
+     * <p>This exists because the listener path used to admit values the poll path would have
+     * rejected — same accessor, different rules, last writer wins. A callback is not evidence
+     * that a cable is delivering: the HAL keeps firing them with the gun out on some firmware.
+     *
+     * @param raw the RAW callback value, with no scaling applied
+     * @return the accepted value, or NaN when the gate refused it
+     */
+    private double admitChargingCallback(BydVehicleData current, String source, double raw) {
+        if (current == null
+                || !isRawChargingSourceValueAdmissibleForCurrentDrivetrain(raw)) {
+            return Double.NaN;
+        }
+        if (!allowsRawChargingEvidence(current.chargingGunState, current.vtolCharging)) {
+            return forwardFinalCounterAfterGunOut(
+                    source, raw, current.chargingGunState, current.vtolCharging)
+                    ? raw : Double.NaN;
+        }
+
+        boolean gunCharging = current.chargingGunState == 2
+                || current.chargingGunState == 3 || current.chargingGunState == 4;
+        boolean dischargingState = current.chargingState == 3 || current.chargingState == 11;
+        boolean terminalState = isTerminalChargingState(current.chargingState);
+        boolean finishedConnected = current.chargingState == 2 && gunCharging;
+        boolean finishedConnectedRate =
+                finishedConnected && canPreserveFinishedConnectedRate(source);
+        // Feed L3's movement channel before the live-session gate, exactly as the poll path does.
+        // Terminal counters and fault/timeout values are excluded; only a classified connected
+        // FINISHED rate may supply the post-finish movement required by the taper proof.
+        if (shouldObserveRawChargingSignal(current.chargingState, finishedConnectedRate)) {
+            try {
+                com.overdrive.app.monitor.ChargingDetector.getInstance()
+                        .observeRawChargingSignal(source, raw);
+            } catch (Throwable ignored) { /* detector not up yet */ }
+        }
+        boolean terminalBarrierActive = isTerminalChargingBarrierActive();
+        boolean sessionLive = false;
+        try {
+            sessionLive = com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging();
+        } catch (Throwable ignored) {}
+
+        // Same terminal exemption as the poll path: a confirmed-COUNTER energy total arriving as the
+        // session ends is that session's final figure, and the close path runs on a slower thread. Having
+        // it only on the poll path meant a trim that reports by CALLBACK still lost its tail. Refused once
+        // the gun is OUT, where a counter's value stops belonging to this session.
+        boolean terminalCounterTail = allowsTerminalCounterTail(current.chargingState)
+                && !dischargingState
+                && current.chargingGunState != 1 && isFinalEnergyCounterSource(source);
+        if (terminalState) {
+            if (terminalCounterTail) {
+                if (terminalBarrierActive) {
+                    forwardFinalEnergyCounterToDatabase(source, raw);
+                } else {
+                    forwardEnergyCounterObservation(source, raw);
+                }
+                return raw;
+            }
+            return finishedConnectedRate ? raw : Double.NaN;
+        }
+        if (!shouldClassifyChargingSource(current.chargingState, terminalBarrierActive)) {
+            if (isFinalEnergyCounterSource(source)) {
+                forwardFinalEnergyCounterToDatabase(source, raw);
+                return raw;
+            }
+            return Double.NaN;
+        }
+        if (!(gunCharging || sessionLive)) {
+            return Double.NaN;
+        }
+
+        ChargeSourceClassifier.observeWhileCharging(source, raw);
+        ChargeSourceClassifier.Kind sourceKind = ChargeSourceClassifier.kindOf(source);
+        forwardCounterObservation(source, sourceKind, raw);
+        // Same reason as the poll path: the slope is advanced at observation time only.
+        try {
+            com.overdrive.app.monitor.ChargeRateResolver.observe(source, raw);
+        } catch (Throwable ignored) {}
+        return raw;
+    }
+
+    /** True for the documented BYD failure/unavailable codes that share the numeric channel. */
+    private static boolean isChargePowerSentinel(double v) {
+        return v == 104857.5
+                || v == 65535.0
+                || v == -10011.0
+                || v == BydFeatureIds.INVALID_VALUE
+                || v == BydFeatureIds.INVALID_VALUE_2
+                || v == Integer.MIN_VALUE;
+    }
+
+    /**
+     * DiLink 3 exposes this charging-device signal under two SDK names. Prefer the name present in
+     * its compile-time stub, and use the newer alias only when the first getter is unavailable.
+     * A numeric zero is an answered reading and must not fall through to another potentially stale
+     * alias.
+     */
+    static ChargingPowerReading readChargingDevicePower(Object device) {
+        Object value = BydDeviceHelper.callGetter(device, "getChargePower");
+        if (value instanceof Number) {
+            return new ChargingPowerReading(
+                    ((Number) value).doubleValue(), "getChargePower");
+        }
+        value = BydDeviceHelper.callGetter(device, "getChargingPower");
+        if (value instanceof Number) {
+            return new ChargingPowerReading(
+                    ((Number) value).doubleValue(), "getChargingPower");
+        }
+        return new ChargingPowerReading(Double.NaN, null);
+    }
+
+    private ChargingCapacityReading readChargingCapacity() {
+        if (chargingDevice == null) {
+            return new ChargingCapacityReading(Double.NaN, null);
+        }
+        try {
+            Object value = BydDeviceHelper.callGetter(chargingDevice, "getChargingCapacity");
+            if (value instanceof Number) {
+                return new ChargingCapacityReading(
+                        ((Number) value).doubleValue(), "getChargingCapacity");
+            }
+        } catch (Exception e) {
+            logger.debug("getChargingCapacity error: " + e.getMessage());
+        }
+        try {
+            Object value = BydDeviceHelper.callGetProbing(
+                    chargingDevice, BydFeatureIds.CHARGING_CHARGE_CAPACITY);
+            if (value != null) {
+                return new ChargingCapacityReading(
+                        BydDeviceHelper.getDoubleValue(value), "featureId(0x27C00018)");
+            }
+        } catch (Exception e) {
+            logger.debug("charging-capacity feature ID error: " + e.getMessage());
+        }
+        return new ChargingCapacityReading(Double.NaN, null);
+    }
+
+    private void logChargingCapacityOutcome(ChargingCapacityReading reading) {
+        if (reading.isValid()) {
+            if (!loggedChargeCapacitySource) {
+                loggedChargeCapacitySource = true;
+                logger.info("Charged-energy counter alive via " + reading.source
+                        + ": " + reading.kwh + " kWh");
+            }
+            return;
+        }
+        if (loggedChargeCapacityAbsent) return;
+        loggedChargeCapacityAbsent = true;
+        logger.info(reading.source == null
+                ? "Charged-energy counter unavailable (getter and feature id both silent)"
+                  + " — session energy falls back to integration/SOC"
+                : "Charged-energy counter answered OUT OF DOMAIN via " + reading.source
+                  + ": " + reading.kwh + " (expected 0..65.534 kWh) — rejected, falling back");
+    }
+
+    private static boolean isValidFinalCounterValue(String source, double raw) {
+        if (!Double.isFinite(raw) || raw < 0.0 || isChargePowerSentinel(raw)) return false;
+        if (ChargeSourceClassifier.SRC_CAPACITY.equals(source)) {
+            return raw <= 65.534;
+        }
+        return ChargeSourceClassifier.SRC_EXTERNAL.equals(source) && raw <= 500.0;
+    }
+
+    static double reconcileTerminalCounterObservation(
+            String source, double existing, double observed) {
+        if (!isValidFinalCounterValue(source, observed)) return existing;
+        // Counter order comes from the serialized observation path, not numeric magnitude. A valid
+        // lower reading can be the first sample after a register wrap or BMS/session reset.
+        return observed;
+    }
+
+    /**
+     * Read only known energy counters while a terminal edge owns the publication lock. The detector
+     * is notified after this returns, so its five-second authoritative-stop drain cannot expire before
+     * a getter-only counter is observed. These values bypass behavioral training and raw movement:
+     * they are final accounting observations, never evidence that charging is still active.
+     */
+    private BydVehicleData collectFinalChargeCountersLocked(BydVehicleData current) {
+        if (current == null) return null;
+
+        BydVehicleData.Builder finalValues = current.toBuilder();
+        boolean updated = false;
+
+        ChargingCapacityReading capacity = readChargingCapacity();
+        logChargingCapacityOutcome(capacity);
+        if (capacity.isValid()) {
+            double finalCapacity = reconcileTerminalCounterObservation(
+                    ChargeSourceClassifier.SRC_CAPACITY,
+                    current.chargingCapacityKwh, capacity.kwh);
+            forwardEnergyCounterObservation(
+                    ChargeSourceClassifier.SRC_CAPACITY, finalCapacity);
+            finalValues.chargingCapacityKwh(finalCapacity);
+            capacityEdgeVersion.incrementAndGet();
+            updated = true;
+        }
+
+        if (instrumentDevice != null
+                && ChargeSourceClassifier.isCounter(ChargeSourceClassifier.SRC_EXTERNAL)) {
+            try {
+                Object value = BydDeviceHelper.callGetter(
+                        instrumentDevice, "getExternalChargingPower");
+                if (value instanceof Number) {
+                    double raw = ((Number) value).doubleValue();
+                    if (isValidFinalCounterValue(
+                            ChargeSourceClassifier.SRC_EXTERNAL, raw)) {
+                        double finalExternal = reconcileTerminalCounterObservation(
+                                ChargeSourceClassifier.SRC_EXTERNAL,
+                                current.externalChargingPowerKw, raw);
+                        forwardEnergyCounterObservation(
+                                ChargeSourceClassifier.SRC_EXTERNAL, finalExternal);
+                        finalValues.externalChargingPowerKw(finalExternal)
+                                .externalChargingPowerAtMs(System.currentTimeMillis());
+                        externalPowerEdgeVersion.incrementAndGet();
+                        updated = true;
+                    }
+                }
+            } catch (Exception e) {
+                logger.debug("final external charge-counter read error: " + e.getMessage());
+            }
+        }
+
+        if (!updated) return current;
+        BydVehicleData published = finalValues.build();
+        snapshot.set(published);
+        return published;
+    }
+
+    /**
+     * Settle counter callbacks that linearized before an accepted terminal observation. This path is
+     * accounting-only: it never invokes the normal callback admission path, raw detector evidence,
+     * source classification, or the generic rate resolver.
+     */
+    private BydVehicleData reconcileReservedFinalCountersLocked(
+            BydVehicleData current, long terminalObservation,
+            long lifecycleGeneration, boolean sessionWasLive) {
+        CounterReservationBatch batch = chargingObservationOrder.settleCounterCallbacks(
+                terminalObservation, lifecycleGeneration, sessionWasLive);
+        if (!sessionWasLive || (!batch.hasCapacity && !batch.hasExternal)) return current;
+
+        BydVehicleData.Builder finalValues = current != null ? current.toBuilder() : null;
+        if (batch.hasCapacity) {
+            double existing = current != null
+                    ? current.chargingCapacityKwh : Double.NaN;
+            double finalCapacity = reconcileTerminalCounterObservation(
+                    ChargeSourceClassifier.SRC_CAPACITY, existing, batch.capacityKwh);
+            forwardEnergyCounterObservation(
+                    ChargeSourceClassifier.SRC_CAPACITY, finalCapacity);
+            if (finalValues != null) finalValues.chargingCapacityKwh(finalCapacity);
+            capacityEdgeVersion.incrementAndGet();
+        }
+        if (batch.hasExternal) {
+            double existing = current != null
+                    ? current.externalChargingPowerKw : Double.NaN;
+            double finalExternal = reconcileTerminalCounterObservation(
+                    ChargeSourceClassifier.SRC_EXTERNAL, existing, batch.externalKwh);
+            forwardEnergyCounterObservation(
+                    ChargeSourceClassifier.SRC_EXTERNAL, finalExternal);
+            if (finalValues != null) {
+                finalValues.externalChargingPowerKw(finalExternal)
+                        .externalChargingPowerAtMs(batch.externalAtMs);
+            }
+            externalPowerEdgeVersion.incrementAndGet();
+        }
+
+        if (finalValues == null) return current;
+        BydVehicleData published = finalValues.build();
+        snapshot.set(published);
+        return published;
+    }
+
+    private ChargingObservationVersions collectChargingOrdered(BydVehicleData.Builder b) {
+        synchronized (chargingEdgePublishLock) {
+            // The builder may have been created before a callback updated the snapshot. Refresh the
+            // edge-owned fields before reading hardware so a failed getter cannot restore that older
+            // seed. Callbacks cannot interleave until both hardware observations are complete.
+            BydVehicleData latest = snapshot.get();
+            refreshChargingLifecycleContext(b, latest);
+            ChargingPollEvidence pollEvidence = collectCharging(b);
+            boolean terminalRateBarrier = publishTerminalPollFence(b, pollEvidence);
+            return new ChargingObservationVersions(
+                    bmsEdgeVersion.get(), gunEdgeVersion.get(),
+                    pollEvidence.bmsObserved
+                            ? pollEvidence.bmsObservation
+                            : chargingObservationOrder.latestBms(),
+                    pollEvidence.connectionObserved
+                            ? pollEvidence.gunObservation
+                            : chargingObservationOrder.latestGun(),
+                    chargingTypeVersion.get(),
+                    capacityEdgeVersion.get(), devicePowerEdgeVersion.get(),
+                    chargingRateClearVersion.get(),
+                    pollEvidence.connectionObserved, pollEvidence.typeObserved,
+                    pollEvidence.powerIsCharging,
+                    pollEvidence.bmsObserved, pollEvidence.observedBmsState,
+                    terminalRateBarrier);
+        }
+    }
+
+    /**
+     * Publish only the lifecycle portion of a terminal hardware poll before releasing the charging
+     * publication lock. Power callbacks capture lifecycle versions before waiting for this lock; a
+     * callback already queued is rejected by the version advance, while one dispatched afterward
+     * sees the terminal snapshot and fails the live-rate admission gate.
+     */
+    private boolean publishTerminalPollFence(BydVehicleData.Builder b,
+                                             ChargingPollEvidence evidence) {
+        boolean authoritativeGun = evidence.connectionObserved
+                && (b.chargingGunState == 1 || b.chargingGunState == 5);
+        boolean authoritativeBms = evidence.bmsObserved
+                && isTerminalChargingState(evidence.observedBmsState);
+        // chargingType=3 is an independent V2L assertion. A power callback can be dispatched after
+        // this getter advances chargingTypeVersion but before the poll publishes its final snapshot;
+        // without a fence it sees matching versions plus the old non-V2L snapshot and is retained
+        // as newer live charging power. Publish export context and clear rates before releasing the
+        // lock so type-derived V2L dominates that callback exactly like gunState=5.
+        boolean authoritativeTypeExport =
+                evidence.typeObserved && b.chargingType == 3;
+        if (!authoritativeGun && !authoritativeBms && !authoritativeTypeExport) return false;
+
+        if (authoritativeGun) gunEdgeVersion.incrementAndGet();
+        if (authoritativeBms) bmsEdgeVersion.incrementAndGet();
+        chargingRateClearVersion.incrementAndGet();
+
+        boolean preserveExternalCounter =
+                ChargeSourceClassifier.isCounter(ChargeSourceClassifier.SRC_EXTERNAL);
+        b.chargingPowerKw(Double.NaN)
+                .chargePowerKw(Double.NaN)
+                .clusterChargePowerKw(Double.NaN)
+                .enginePowerKw(Double.NaN);
+        if (!preserveExternalCounter) {
+            b.externalChargingPowerKw(Double.NaN);
+        }
+
+        try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation ignored =
+                     com.overdrive.app.monitor.ChargingDetector.beginPublicationMutation()) {
+            BydVehicleData current = snapshot.get();
+            BydVehicleData published = current;
+            boolean sessionWasLive = current != null
+                    && (current.chargingState == 1
+                        || com.overdrive.app.monitor.ChargingDetector
+                                .getInstance().isCharging());
+            if (current != null) {
+                BydVehicleData.Builder fenced = current.toBuilder();
+                if (evidence.connectionObserved) {
+                    fenced.chargingGunState(b.chargingGunState);
+                }
+                if (evidence.typeObserved) {
+                    fenced.chargingType(b.chargingType);
+                }
+                if (evidence.bmsObserved) {
+                    fenced.chargingState(evidence.observedBmsState)
+                            .chargingStateAtMs(b.chargingStateAtMs);
+                }
+                fenced.vtolCharging(b.chargingGunState == 5 || b.chargingType == 3);
+                boolean preserveFinishedMovementBaselines = authoritativeBms
+                        && evidence.observedBmsState == 2
+                        && !authoritativeGun && !authoritativeTypeExport;
+                published = clearChargingRateFields(
+                        fenced.build(), preserveExternalCounter,
+                        preserveFinishedMovementBaselines);
+                snapshot.set(published);
+            }
+
+            long terminalObservation = 0L;
+            if (authoritativeBms) {
+                terminalObservation = evidence.bmsObservation;
+            }
+            if (authoritativeGun && b.chargingGunState == 1) {
+                terminalObservation = Math.max(
+                        terminalObservation, evidence.gunObservation);
+            }
+            if (terminalObservation > 0L) {
+                published = reconcileReservedFinalCountersLocked(
+                        published, terminalObservation,
+                        callbackLifecycleGeneration.get(), sessionWasLive);
+            }
+            if (evidence.terminalCapacityObserved
+                    && isValidFinalCounterValue(
+                            ChargeSourceClassifier.SRC_CAPACITY,
+                            b.chargingCapacityKwh)) {
+                // The poll read occurs after every callback reservation settled above. Preserve that
+                // chronology even when the newer value is lower because the register wrapped/reset.
+                double finalCapacity = reconcileTerminalCounterObservation(
+                        ChargeSourceClassifier.SRC_CAPACITY,
+                        published != null
+                                ? published.chargingCapacityKwh : Double.NaN,
+                        b.chargingCapacityKwh);
+                forwardEnergyCounterObservation(
+                        ChargeSourceClassifier.SRC_CAPACITY, finalCapacity);
+                if (published != null) {
+                    published = published.toBuilder()
+                            .chargingCapacityKwh(finalCapacity)
+                            .build();
+                    snapshot.set(published);
+                }
+                capacityEdgeVersion.incrementAndGet();
+            }
+
+            // Close the detector half of the terminal handoff before exposing a stable collector
+            // generation. The complete poll below will deliver the same observation atomically
+            // again; these idempotent calls exist to eliminate the early terminal-snapshot gap.
+            com.overdrive.app.monitor.ChargingDetector detector =
+                    com.overdrive.app.monitor.ChargingDetector.getInstance();
+            if (authoritativeGun) {
+                detector.confirmConnectionState(
+                        b.chargingGunState, b.chargingGunState == 5);
+            } else if (authoritativeTypeExport) {
+                detector.confirmV2lState(true);
+            } else if (authoritativeBms) {
+                detector.confirmBmsState(evidence.observedBmsState);
+            }
+        }
+        return true;
+    }
+
+    private void collectInstrumentOrdered(BydVehicleData.Builder b,
+                                          ChargingObservationVersions observed) {
+        synchronized (chargingEdgePublishLock) {
+            BydVehicleData latest = snapshot.get();
+            refreshChargingLifecycleContext(
+                    b, latest,
+                    observed.bms != bmsEdgeVersion.get(),
+                    observed.gun != gunEdgeVersion.get(),
+                    observed.type != chargingTypeVersion.get());
+            if (latest != null) {
+                b.externalChargingPowerKw(latest.externalChargingPowerKw)
+                        .externalChargingPowerAtMs(latest.externalChargingPowerAtMs)
+                        .externalChargingPowerChangedAtMs(
+                                latest.externalChargingPowerChangedAtMs)
+                        .externalChargingPowerLastObservedKw(
+                                latest.externalChargingPowerLastObservedKw)
+                        .chargePowerKw(latest.chargePowerKw)
+                        .chargePowerAtMs(latest.chargePowerAtMs)
+                        .chargePowerChangedAtMs(latest.chargePowerChangedAtMs)
+                        .chargePowerLastObservedKw(latest.chargePowerLastObservedKw)
+                        .clusterChargePowerKw(latest.clusterChargePowerKw)
+                        .clusterChargePowerAtMs(latest.clusterChargePowerAtMs)
+                        .clusterChargePowerChangedAtMs(
+                                latest.clusterChargePowerChangedAtMs)
+                        .clusterChargePowerLastObservedKw(
+                                latest.clusterChargePowerLastObservedKw);
+            }
+            collectInstrument(b);
+            observed.externalPower = externalPowerEdgeVersion.get();
+            observed.externalPowerObserved = true;
+        }
+    }
+
+    private void collectEngineOrdered(BydVehicleData.Builder b,
+                                      ChargingObservationVersions observed) {
+        synchronized (chargingEdgePublishLock) {
+            BydVehicleData latest = snapshot.get();
+            refreshChargingLifecycleContext(
+                    b, latest,
+                    observed.bms != bmsEdgeVersion.get(),
+                    observed.gun != gunEdgeVersion.get(),
+                    observed.type != chargingTypeVersion.get());
+            if (latest != null) {
+                b.enginePowerKw(latest.enginePowerKw)
+                        .enginePowerAtMs(latest.enginePowerAtMs);
+            }
+            collectEngine(b);
+            observed.enginePower = enginePowerEdgeVersion.get();
+            observed.enginePowerObserved = true;
+        }
+    }
+
+    private ChargingPollEvidence collectCharging(BydVehicleData.Builder b) {
+        ChargingPollEvidence evidence = new ChargingPollEvidence();
+        int observedChargingState = BydVehicleData.UNAVAILABLE;
+        boolean chargingStateApplied = false;
+        // Power.isCharging belongs to a different HAL device and remains usable even when the
+        // ChargingDevice handle disappears during a manager restart.
+        if (powerDevice != null) {
+            try {
+                Object pic = BydDeviceHelper.callGetter(powerDevice, "isCharging");
+                evidence.powerIsCharging = decodePowerIsCharging(pic);
+            } catch (Exception e) {
+                logger.debug("collectCharging Power.isCharging error: " + e.getMessage());
+            }
+        }
+
+        // These are per-read values. A missing handle must not turn the previous CHARGING/rate
+        // snapshot into a fresh observation on every poll.
+        b.chargingPowerKw(Double.NaN);
+        if (chargingDevice == null) {
+            b.chargingState(BydVehicleData.UNAVAILABLE)
+                    .chargingGunState(BydVehicleData.UNAVAILABLE)
+                    .chargingType(BydVehicleData.UNAVAILABLE)
+                    .vtolCharging(false);
+            return evidence;
+        }
         try {
             // Named getters for init read
+            long gunObservation = chargingObservationOrder.begin();
             Object gunState = BydDeviceHelper.callGetter(chargingDevice, "getChargingGunState");
-            if (gunState instanceof Number) b.chargingGunState(((Number) gunState).intValue());
+            if (gunState instanceof Number) {
+                int observedGun = ((Number) gunState).intValue();
+                if (observedGun >= 1 && observedGun <= 5) {
+                    chargingObservationOrder.recordGunPoll(gunObservation);
+                    b.chargingGunState(observedGun);
+                    evidence.connectionObserved = true;
+                    evidence.gunObservation = gunObservation;
+                }
+            }
 
             Object charger = BydDeviceHelper.callGetter(chargingDevice, "getChargerWorkState");
             if (charger instanceof Number) b.chargerWorkState(((Number) charger).intValue());
+
+            // Resolve V2L before reading any positive charging source. Otherwise this same poll can
+            // feed export-period values into the classifier/resolver before the mode flag is known.
+            Object type = BydDeviceHelper.callGetter(chargingDevice, "getChargingType");
+            if (type instanceof Number) {
+                int observedType = ((Number) type).intValue();
+                int previousType = b.chargingType;
+                b.chargingType(observedType);
+                evidence.typeObserved = true;
+                if (observedType != previousType) {
+                    chargingTypeVersion.incrementAndGet();
+                }
+            }
+            boolean isVtol = b.chargingGunState == 5 || b.chargingType == 3;
+            b.vtolCharging(isVtol);
 
             // BYDAutoPowerDevice.isCharging() — independent ground truth from
             // the power MCU. Used by ChargingDetector as the L2 cross-check
             // that catches the PHEV "BMS stuck at 15 IDLE while charging" bug.
             // Tri-state: null when the device is unavailable or the call fails.
-            Boolean powerIsCharging = null;
-            if (powerDevice != null) {
-                try {
-                    Object pic = BydDeviceHelper.callGetter(powerDevice, "isCharging");
-                    if (pic instanceof Boolean) {
-                        powerIsCharging = (Boolean) pic;
-                    } else if (pic instanceof Number) {
-                        powerIsCharging = ((Number) pic).intValue() != 0;
-                    }
-                } catch (Exception e) {
-                    logger.debug("collectCharging Power.isCharging error: " + e.getMessage());
-                }
-            }
-            com.overdrive.app.monitor.ChargingDetector.getInstance()
-                .updatePowerIsCharging(powerIsCharging);
+            if (isVtol) evidence.powerIsCharging = Boolean.FALSE;
 
+            // Read into a local before publishing it to the builder. Both the feature-id and the
+            // named-getter fallback below can fail,
+            // and toBuilder() carries the previous poll's value forward — so a BMS that stops
+            // answering left chargingState pinned at whatever it last said. Pinned at CHARGING(1) that
+            // is worse than a blank: it is L1, the authoritative fusion layer, so the detector keeps a
+            // finished session alive indefinitely on a dead accessor. UNAVAILABLE is the honest input
+            // (the detector treats it as ambiguous and falls through to L2/L3), and it is what
+            // powerIsCharging above already does by resetting to null each poll.
             // Feature ID for battery device state, fallback to named getter
             try {
+                long bmsObservation = chargingObservationOrder.begin();
                 Object val = BydDeviceHelper.callGet(chargingDevice, BydFeatureIds.CHARGING_BATTERY_DEVICE_STATE, Integer.class);
                 if (val != null) {
                     int raw = BydDeviceHelper.getIntValue(val);
-                    if (raw != BydFeatureIds.BMS_UNAVAILABLE && raw != BydFeatureIds.INVALID_VALUE
-                        && raw != BydFeatureIds.INVALID_VALUE_2 && raw >= 0) {
-                        b.chargingState(raw);
+                    if (isValidChargingBmsState(raw)) {
+                        observedChargingState = raw;
+                        evidence.bmsObservation = bmsObservation;
                     }
                 }
             } catch (Exception e) {
                 logger.debug("collectCharging batteryState feature ID error: " + e.getMessage());
             }
-            if (b.chargingState == BydVehicleData.UNAVAILABLE) {
+            if (observedChargingState == BydVehicleData.UNAVAILABLE) {
+                long bmsObservation = chargingObservationOrder.begin();
                 Object battState = BydDeviceHelper.callGetter(chargingDevice, "getBatteryManagementDeviceState");
                 if (battState instanceof Number) {
-                    b.chargingState(((Number) battState).intValue());
+                    int raw = ((Number) battState).intValue();
+                    if (isValidChargingBmsState(raw)) {
+                        observedChargingState = raw;
+                        evidence.bmsObservation = bmsObservation;
+                    }
                 }
             }
+            // The setter stamps only a real transition. Avoiding an intermediate UNAVAILABLE write is
+            // what makes chargingStateAtMs the actual FINISHED boundary instead of "this poll".
+            b.chargingState(observedChargingState);
+            chargingStateApplied = true;
+            if (observedChargingState != BydVehicleData.UNAVAILABLE) {
+                chargingObservationOrder.recordBmsPoll(evidence.bmsObservation);
+                evidence.bmsObserved = true;
+                evidence.observedBmsState = observedChargingState;
+            }
 
-            // Charging power from the BYD ChargingDevice SDK getter.
+            // Charging power from the BYD ChargingDevice SDK getter. DiLink 3 names this
+            // getChargePower(); other SDK generations expose the getChargingPower() alias.
             // Sentinel filter: SDK reports up to ±500 kW; reject anything beyond.
             // Listener callbacks (onChargingPowerChanged) keep this fresh between polls.
-            Object power = BydDeviceHelper.callGetter(chargingDevice, "getChargingPower");
-            if (power instanceof Number) {
-                double kw = ((Number) power).doubleValue();
-                if (Math.abs(kw) > 0.01 && Math.abs(kw) < 500) {
-                    b.chargingPowerKw(kw);
+            // Reset BEFORE the read, like its siblings. A null/failed getter left toBuilder() carrying
+            // the previous poll's value forward with nothing to age it out — and on a PHEV whose rate
+            // arrives by callback that stale figure stayed selected and sampled. The callback re-populates
+            // it within the same cycle when the device is genuinely alive, so a working trim loses nothing.
+            ChargingPowerReading power = readChargingDevicePower(chargingDevice);
+            if (power.answered()) {
+                double kw = power.raw;
+                if (!loggedChargingPowerGetterSource) {
+                    loggedChargingPowerGetterSource = true;
+                    logger.info("Charging-device power getter answered via "
+                            + power.getter + ": raw=" + kw);
+                }
+                // Signed by contract: negative is discharge (V2L), which is not charging.
+                // Keep the sign here; the consumer rejects negatives rather than abs()-ing them.
+                if (Math.abs(kw) > 0.01) {
+                    storeChargingSource(b, ChargeSourceClassifier.SRC_DEVICE, kw,
+                            v -> b.chargingPowerKw(v)
+                                    .chargingPowerAtMs(System.currentTimeMillis()));
+                } else {
+                    // A ZERO READING IS INFORMATION: the device is answering and says no power is
+                    // flowing. Skipping it left toBuilder() carrying the last non-zero value forward,
+                    // and on a PHEV that reported its rate by CALLBACK the stale figure then had no way
+                    // to expire — the gun-out clear below needs a terminal BMS state or gun-out, which
+                    // is exactly what a BMS stuck at IDLE with the cable in does not provide. So the
+                    // last real rate stayed published and priceable after charging stopped.
+                    b.chargingPowerKw(Double.NaN);
+                    if (allowsRawChargingEvidence(b.chargingGunState, b.vtolCharging)) {
+                        try {
+                            com.overdrive.app.monitor.ChargingDetector.getInstance()
+                                    .observeRawChargingSignal(
+                                            ChargeSourceClassifier.SRC_DEVICE, 0.0);
+                        } catch (Throwable ignored) {}
+                    }
                 }
             }
 
             // Targeted clear: when the BMS reports an EXPLICIT non-charging
-            // terminal state (READY=0, FINISHED=2, TERMINATED=4, DISCHARG_FINISH=12),
+            // terminal state (including fault and timeout states),
             // we know the previous charging session is over. Clear sticky listener-
             // delivered power so the inference layer in VehicleDataMonitor can't
             // false-trigger from leftover values. We do NOT clear on IDLE (15)
@@ -3076,10 +5273,44 @@ public class BydDataCollector {
             // actually charging — clearing there would break detection again.
             // We do NOT clear on disconnect-only signals (gunState==1) without a
             // BMS state agreeing, because PHEVs often leave gunState UNAVAILABLE.
-            if (b.chargingState == 0 || b.chargingState == 2
-                    || b.chargingState == 4 || b.chargingState == 12) {
+            // CLEAR ON ABSENCE OF EVIDENCE, not on a specific state code. The old condition
+            // listed only the terminal BMS codes (0/2/4/12), so a trim whose BMS parks at an
+            // idle code the list did not name never cleared at all and carried a stale value for
+            // the whole daemon uptime. That idle code is NOT drivetrain-specific — it has been
+            // observed on both a PHEV and a BEV parked with the gun out — so the old condition
+            // leaked phantom power on both.
+            //
+            // Gun-out (state 1) is unambiguous physical proof that nothing is delivering, and it
+            // does not depend on the BMS agreeing. Clear when the gun is out, or on any terminal
+            // code, EXCEPT while the fused detector still asserts a live session (which is the
+            // firmware case where the BMS lies about an in-progress charge).
+            boolean gunOut = b.chargingGunState == 1;
+            boolean dischargingBms = b.chargingState == 3 || b.chargingState == 11;
+            boolean terminalBms = isTerminalChargingState(b.chargingState);
+            boolean detectorLive = false;
+            try {
+                detectorLive = com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging();
+            } catch (Throwable ignored) {}
+            if (gunOut || dischargingBms || (terminalBms && !detectorLive)) {
                 b.chargingPowerKw(Double.NaN);
-                b.externalChargingPowerKw(Double.NaN);
+                // externalChargingPowerKw is cleared ONLY while it is a RATE. Once the classifier has
+                // ruled it a COUNTER it is an ENERGY TOTAL serving the same role as the capacity
+                // counter below, and the reasoning there applies identically: the close path runs on a
+                // slower thread, so clearing at the gun-out edge discards whatever was delivered
+                // between the last tick and the unplug. A stale rate must not survive; a stale energy
+                // total is still this session's true figure.
+                if (!ChargeSourceClassifier.isCounter(ChargeSourceClassifier.SRC_EXTERNAL)) {
+                    b.externalChargingPowerKw(Double.NaN);
+                }
+                // The charged-energy counter is deliberately NOT cleared here. It is an ENERGY
+                // total, not a rate, so a value read after the gun comes out is still the true
+                // amount this session delivered — and the session-close path runs on a different,
+                // slower thread. Clearing it at the gun-out edge dropped whatever was delivered
+                // between the last SoC tick and the unplug (at 150 kW, a 90 s tail is 3.75 kWh of
+                // real, paid-for energy).
+                //
+                // It cannot go stale into the NEXT session: the accumulator re-baselines at SESSION
+                // START, and the counter itself resets per session.
                 // chargePowerKw is now the TOP priority in getChargingState()'s
                 // cascade, so a leftover value would surface a phantom power after
                 // the session ends. Clear it with its siblings. (getChargePower()
@@ -3128,22 +5359,44 @@ public class BydDataCollector {
                 }
             }
 
-            // Charging type (0=DEFAULT, 3=VTOG)
-            Object type = BydDeviceHelper.callGetter(chargingDevice, "getChargingType");
-            if (type instanceof Number) b.chargingType(((Number) type).intValue());
-
-            // VTOL detection — gunState==5 OR chargingType==3
-            boolean isVtol = false;
-            if (b.chargingGunState == 5) isVtol = true;
-            if (b.chargingType == 3) isVtol = true;
-            b.vtolCharging(isVtol);
-
-            // Charging capacity (kWh)
-            Object cap = BydDeviceHelper.callGetter(chargingDevice, "getChargingCapacity");
-            if (cap instanceof Number) {
-                double capKwh = ((Number) cap).doubleValue();
-                if (capKwh > 0) b.chargingCapacityKwh(capKwh);
+            // PER-SESSION CHARGED-ENERGY COUNTER (kWh). This is the vehicle's own metered figure
+            // for "energy added", so when it is alive it outranks anything we could integrate or
+            // derive from the SOC gauge: no unit guess, no pack-capacity divisor, and none of the
+            // 1%-SOC quantisation. Session energy is simply end - start.
+            //
+            // Read via the typed getter first, then the feature id, because the getter is absent
+            // on some trims while the id still answers. The id is read DOUBLE-first to match the
+            // HAL's float accessor width — requesting the wrong width returns null silently.
+            ChargingCapacityReading capacity = readChargingCapacity();
+            double capKwh = capacity.kwh;
+            // Bound to the SDK's documented counter domain [0, 65.534] kWh. A value outside it is
+            // not this counter, whatever else it may be.
+            //
+            // ZERO IS ADMITTED. It is a legitimate — in fact the ideal — reading: a counter the
+            // vehicle has just reset for a new session reads exactly 0, and that is the only value
+            // that makes a perfect baseline. Rejecting it meant the baseline could only be taken from
+            // the first POSITIVE reading, so on a DC session everything delivered between the reset
+            // and that reading was absorbed into the baseline and never counted. The domain is
+            // inclusive of 0 by the SDK's own definition, so the filter now matches it.
+            if (capacity.isValid()) {
+                boolean terminalPollObservation =
+                        isTerminalChargingState(b.chargingState)
+                        || b.chargingGunState == 1
+                        || b.chargingGunState == 5
+                        || b.vtolCharging;
+                if (terminalPollObservation) {
+                    // Publish/forward this only after the terminal fence has settled callbacks whose
+                    // observation sequence precedes this synchronous getter.
+                    b.chargingCapacityKwh(capKwh);
+                    evidence.terminalCapacityObserved = true;
+                } else {
+                    storeChargingSource(b, ChargeSourceClassifier.SRC_CAPACITY, capKwh,
+                            v -> b.chargingCapacityKwh(v));
+                }
             }
+            // Distinguish "nothing answered" from "answered out-of-domain": the second means the
+            // accessor exists but reports in another unit or a sentinel, not simply that it is absent.
+            logChargingCapacityOutcome(capacity);
 
             // Charging percent from chargingDevice
             Object pct = BydDeviceHelper.callGetter(chargingDevice, "getChargingPercent");
@@ -3173,7 +5426,10 @@ public class BydDataCollector {
                 Object wlLeft = BydDeviceHelper.callGet(chargingDevice, BydFeatureIds.CHARGING_WIRELESS_LEFT_STATE, Integer.class);
                 if (wlLeft != null) {
                     int raw = BydDeviceHelper.getIntValue(wlLeft);
-                    if (raw != BydFeatureIds.BMS_UNAVAILABLE && raw != BydFeatureIds.INVALID_VALUE) {
+                    if (raw >= 0
+                            && raw != BydFeatureIds.BMS_UNAVAILABLE
+                            && raw != BydFeatureIds.INVALID_VALUE
+                            && raw != BydFeatureIds.INVALID_VALUE_2) {
                         b.wirelessChargingLeftState(raw);
                     }
                 }
@@ -3184,7 +5440,10 @@ public class BydDataCollector {
                 Object wlRight = BydDeviceHelper.callGet(chargingDevice, BydFeatureIds.CHARGING_WIRELESS_RIGHT_STATE, Integer.class);
                 if (wlRight != null) {
                     int raw = BydDeviceHelper.getIntValue(wlRight);
-                    if (raw != BydFeatureIds.BMS_UNAVAILABLE && raw != BydFeatureIds.INVALID_VALUE) {
+                    if (raw >= 0
+                            && raw != BydFeatureIds.BMS_UNAVAILABLE
+                            && raw != BydFeatureIds.INVALID_VALUE
+                            && raw != BydFeatureIds.INVALID_VALUE_2) {
                         b.wirelessChargingRightState(raw);
                     }
                 }
@@ -3195,7 +5454,10 @@ public class BydDataCollector {
                 Object wlState = BydDeviceHelper.callGet(chargingDevice, BydFeatureIds.CHARGING_WIRELESS_STATE, Integer.class);
                 if (wlState != null) {
                     int raw = BydDeviceHelper.getIntValue(wlState);
-                    if (raw != BydFeatureIds.BMS_UNAVAILABLE && raw != BydFeatureIds.INVALID_VALUE) {
+                    if (raw >= 0
+                            && raw != BydFeatureIds.BMS_UNAVAILABLE
+                            && raw != BydFeatureIds.INVALID_VALUE
+                            && raw != BydFeatureIds.INVALID_VALUE_2) {
                         b.wirelessChargingStatus(raw);
                     }
                 }
@@ -3205,6 +5467,12 @@ public class BydDataCollector {
         } catch (Exception e) {
             logger.debug("collectCharging error: " + e.getMessage());
         }
+        if (!chargingStateApplied) {
+            // A failure before the BMS read is still an unavailable observation, but it must be one
+            // semantic write rather than UNAVAILABLE followed by a restoration of the old state.
+            b.chargingState(observedChargingState);
+        }
+        return evidence;
     }
 
     private void collectInstrument(BydVehicleData.Builder b) {
@@ -3216,6 +5484,10 @@ public class BydDataCollector {
         // stick indefinitely and surface as phantom charging power. Resetting up front makes
         // the field genuinely per-poll on every exit path.
         b.clusterChargePowerKw(Double.NaN);
+        b.chargePowerKw(Double.NaN);
+        if (!ChargeSourceClassifier.isCounter(ChargeSourceClassifier.SRC_EXTERNAL)) {
+            b.externalChargingPowerKw(Double.NaN);
+        }
         if (instrumentDevice == null) return;
         try {
             // Named getter for outside temperature
@@ -3225,54 +5497,68 @@ public class BydDataCollector {
                 if (isPlausibleOutsideTempC(t)) b.outsideTempC(t);
             }
 
-            // External charging power. Two scaling regimes seen across BYD firmware:
-            //
-            //   - Listener path (onExternalChargingPowerChanged) — SDK pre-scales
-            //     to kW. This matches the OEM firmware convention, which
-            //     treats the listener arg as kW directly.
-            //   - Polled getter — some firmware (Seal U DM-i PHEV, build 1124xxx)
-            //     returns the raw CAN value in hectowatts (centiKW). Observed:
-            //     221.7 raw for a real ~1.9 kW charger (221.7/100 = 2.217 kW,
-            //     which is the wall-side handshake before AC→DC conversion loss).
-            //     Same firmware family is the one that has the feature ID
-            //     fallback below also delivering hectowatts (189.5 raw → 1.8 kW
-            //     charger, per the comment on that path).
-            //
-            // Heuristic: kW values are bounded by physical reality (AC charging
-            // tops at ~22 kW 3-phase, PHEV onboard charger maxes at 7 kW).
-            // Anything above 50 from a getter that's supposed to be kW is the
-            // hectowatt scale — divide. Below 50, trust the value as-is.
-            // The 104857.5 BYD sentinel falls cleanly above the 50000 cap.
+            // External charging power. STORED RAW — no scaling, on either the listener or the polled
+            // path. The old "above 50 means hectowatts, divide" heuristic is deleted: it rested on
+            // asserted captures (221.7 for ~1.9 kW, 189.5 for ~1.8 kW) that exist nowhere in this repo
+            // as a log or device record, and a magnitude split is unsound regardless, since the
+            // ambiguous band holds both a real DC rate and a plausible hectowatt reading. Worse, this
+            // same accessor answers a cumulative kWh COUNTER on some firmware — a captured sample read
+            // 119.0 with the gun physically out — so a divide here silently turned an energy total into
+            // a believable rate. The unit is decided at runtime from movement (ChargeSourceClassifier)
+            // and converted by ChargeRateResolver against the kWh-grounded counter slope.
 
-            // Charge power into the pack (kW), direct from the instrument cluster.
-            // getChargePower() reads the real DC charge rate (e.g. 2.9 kW on a 15 A/230 V AC
-            // charge, matches the BYD app / cloud battery_power), unlike getExternalChargingPower()
-            // which returns the 104857.5 sentinel on this trim. Returns 0 / sentinel when idle —
-            // bound to a plausible kW range so a sentinel can't leak.
+            // Pack-side charge power from getChargePower(). Store the RAW value: some firmware
+            // exposes hectowatts (650/700 means 6.5/7.0 kW), while another exposes plain kW, and no
+            // magnitude split can distinguish that from a real DC rate. The shared source pipeline
+            // classifies behavior and lets ChargeRateResolver corroborate scale independently.
+            // Reset before the read, exactly as clusterChargePowerKw is. toBuilder() carries the
+            // previous poll's value forward, so a FAILING read (callGetter returns null, or the value
+            // falls outside the envelope) silently republished the last good rate — and this field is
+            // a priceable cascade tier, so a stale in-band value becomes persisted energy on a car
+            // that has stopped charging. The gun-out clear does not cover this: it only fires when the
+            // gun/BMS says the session ended, whereas a dead accessor says nothing at all.
             Object chgPower = BydDeviceHelper.callGetter(instrumentDevice, "getChargePower");
             if (chgPower instanceof Number) {
-                double kw = ((Number) chgPower).doubleValue();
-                if (kw >= 0 && kw <= 500) b.chargePowerKw(kw);
+                double raw = ((Number) chgPower).doubleValue();
+                if (Math.abs(raw) > 0.01) {
+                    storeChargingSource(b, SRC_PACK_SIDE_DIRECT, raw,
+                            v -> b.chargePowerKw(v)
+                                    .chargePowerAtMs(System.currentTimeMillis()));
+                } else if (allowsRawChargingEvidence(
+                        b.chargingGunState, b.vtolCharging)) {
+                    try {
+                        com.overdrive.app.monitor.ChargingDetector.getInstance()
+                                .observeRawChargingSignal(SRC_PACK_SIDE_DIRECT, 0.0);
+                    } catch (Throwable ignored) {}
+                }
             }
 
+            // Reset before the read, exactly as clusterChargePowerKw is. toBuilder() carries the previous
+            // poll's value forward, so a FAILED getter silently republished the last rate with nothing to
+            // age it out — and a RATE source has no freshness bound in the resolver, so it stayed
+            // publishable and priceable indefinitely. The gun-out clear does not cover a dead accessor,
+            // which reports no terminal state at all.
+            // Reset unconditionally while this source is a RATE. Once it is a confirmed COUNTER, HOLD
+            // the previous value instead: the admission gate refuses everything at a terminal BMS state,
+            // so resetting here left the close path with NaN and the session lost its final energy tail.
+            // An energy total does not go stale the way a rate does — it remains this session's figure —
+            // and it cannot leak into the next session, which re-baselines at SESSION START.
+            // getExternalChargingPower is NOT reliably an instantaneous rate. On some firmware
+            // families it answers a cumulative charged-energy counter (kWh) that keeps its value
+            // with the gun out — a captured sample read 119.0 while gunState=1 (unplugged) and
+            // the BMS was idle, which no live rate can be. Its meaning is therefore decided by
+            // ChargeSourceClassifier from how the value MOVES, not by its magnitude.
+            //
+            // The previous `raw > 50 -> raw/100` rule is deleted: it is a magnitude guess with no
+            // basis in the API, it silently turned that 119.0 counter into a plausible-looking
+            // "1.19 kW", and it would divide a genuine 60-500 kW DC session by 100 on a BEV.
+            // Store the RAW value and let the consumer interpret it.
             Object extPower = BydDeviceHelper.callGetter(instrumentDevice, "getExternalChargingPower");
             if (extPower instanceof Number) {
                 double raw = ((Number) extPower).doubleValue();
-                double kw;
-                if (raw > 50.0 && raw < 50000.0) {
-                    kw = raw / 100.0; // hectowatts → kW
-                } else {
-                    kw = raw;         // already kW (BEV firmware default)
-                }
-                if (kw > 0.1 && kw <= 500) {
-                    b.externalChargingPowerKw(kw);
-                    if (!loggedExtChargePowerScale) {
-                        loggedExtChargePowerScale = true;
-                        logger.info("getExternalChargingPower: raw=" + raw + " → " + kw
-                                + " kW (scale=" + (raw > 50.0 && raw < 50000.0 ? "hectowatts/100" : "kW")
-                                + "). Cross-check against the cluster's charging readout to confirm.");
-                    }
-                }
+                storeChargingSource(b, ChargeSourceClassifier.SRC_EXTERNAL, raw,
+                        v -> b.externalChargingPowerKw(v)
+                                .externalChargingPowerAtMs(System.currentTimeMillis()));
             }
 
             // CLUSTER charge power — feature ID 842006552 (0x32300018,
@@ -3293,11 +5579,17 @@ public class BydDataCollector {
             // consumer can prefer it explicitly without this read clobbering the device-getter
             // value that BEV logic still uses.
             //
-            // Scaling: see scaleClusterChargePowerKw() — the raw value is hectowatts on the
-            // firmware family we captured (a 1.8 kW charger reports ~189.5 raw) and plain kW on
-            // the family the OEM app targets, with no unit flag to tell them apart, so the scale
-            // is INFERRED from the magnitude. At or below the 22 kW AC ceiling the value is taken
-            // as kW; above it, as hectowatts.
+            // Scaling: NONE. scaleClusterChargePowerKw() is an identity, and the magnitude-inferred
+            // "/100 above 22 kW" rule it used to apply is deleted. That rule rested on a single
+            // asserted capture (a "1.8 kW charger reports 189.5 raw") for which no log or device
+            // record exists anywhere in this repo — only the assertion itself, restated in comments.
+            // Meanwhile a magnitude split cannot work even in principle: the ambiguous band holds
+            // both a genuine 60-500 kW DC rate and a plausible hectowatt reading, so any threshold
+            // is a 100x error on one firmware family or the other. The unit is decided at runtime
+            // from how the value MOVES (ChargeSourceClassifier) and converted by ChargeRateResolver,
+            // which corroborates a rate against the kWh-grounded counter slope instead of guessing.
+            // Do not reintroduce a divide here without a device capture that shows the raw value
+            // alongside the dash reading DURING a charge.
             //
             // That inference is not decidable for raw 22..500: it is either a 22-500 kW DC fast
             // charge or a 0.22-5 kW AC charge, and it is resolved as the latter (our field
@@ -3388,14 +5680,23 @@ public class BydDataCollector {
                     if (chargingContext && rawNow - lastClusterRawLogMs > 60_000L) {
                         lastClusterRawLogMs = rawNow;
                         logger.info(String.format(java.util.Locale.US,
-                            "CHARGING_CHARGE_POWER_DD raw=%.3f → wouldScaleTo=%.3fkW src=%s"
-                            + " (bmsState=%d gunState=%d) — compare raw against the DASH reading"
-                            + " to confirm kW vs hectowatts on this trim",
-                            raw, scaleClusterChargePowerKw(raw),
-                            fromManager ? "manager" : "device",
+                            "CHARGING_CHARGE_POWER_DD raw=%.3f src=%s kind=%s"
+                            + " (bmsState=%d gunState=%d)",
+                            raw, fromManager ? "manager" : "device",
+                            ChargeSourceClassifier.kindOf(ChargeSourceClassifier.SRC_CLUSTER),
                             b.chargingState, b.chargingGunState));
                     }
-                    if (!Double.isNaN(raw) && Math.abs(raw) > 1.0 && Math.abs(raw) < 35000) {
+                    // Floor matches the CONSUMERS (>0.1), not a separate 1.0. A kW-reporting trim
+                    // tapering at 0.9 kW had its cluster reading dropped here while the taper gate
+                    // still accepted >0.1 — so the source vanished exactly when the taper needed it,
+                    // ending taper accounting and losing the tail energy. Two thresholds for one
+                    // field is the bug; there is now one.
+                    // Ceiling is the shared raw envelope, not a separate 35000. The two disagreed, and
+                    // the smaller one won: a 350-500 kW DC session reported in hectowatts (raw
+                    // 35000-50000) was rejected here before the resolver could calibrate it.
+                    if (!Double.isNaN(raw) && Math.abs(raw) > 0.1
+                            && Math.abs(raw) <= RAW_RATE_ENVELOPE_MAX
+                            && isRawChargingSourceValueAdmissibleForCurrentDrivetrain(raw)) {
                         double kw = scaleClusterChargePowerKw(raw);
                         // Band matches every CONSUMER of this field exactly (VehicleDataMonitor's
                         // cascade gate and the diagnostic JSON both use >0.1 && <=300, the same
@@ -3430,9 +5731,8 @@ public class BydDataCollector {
                         // feature-id value must not survive them.
                         boolean gunCharging = b.chargingGunState == 2
                                 || b.chargingGunState == 3 || b.chargingGunState == 4;
-                        boolean terminalState = b.chargingState == 0
-                                || (b.chargingState == 2 && !gunCharging)
-                                || b.chargingState == 4 || b.chargingState == 12;
+                        boolean terminalState = isTerminalChargingState(b.chargingState);
+                        boolean finishedConnected = b.chargingState == 2 && gunCharging;
                         // ALSO require the fused detector to agree a session is live. Device
                         // capture (boot, ACC off, gun out): this feature id emitted raw=359.4 →
                         // 3.594 kW — the same "~359 garbage when idle" signature getChargePower
@@ -3465,14 +5765,63 @@ public class BydDataCollector {
                         // NB: no `&& !terminalState` here — the accept condition below already
                         // requires it, so repeating it was pure boolean noise.
                         boolean plugAsserted = gunCharging;
-                        if (kw > 0.1 && kw <= 300 && !terminalState && (sessionLive || plugAsserted)) {
+                        // Movement evidence for L3, fed BEFORE the gate below — the same ungated
+                        // channel the other sources get in storeChargingSource. On a trim where the
+                        // cluster feature id is the only live charging signal, this is the only
+                        // evidence L3 can bootstrap from, and the gate consults the detector, so a
+                        // gated-only feed deadlocks. Bounded to the SDK envelope first so idle junk
+                        // and sentinels cannot register as movement. The bound is the RAW envelope, not
+                        // the kW ceiling: this channel only reports that a value MOVED, which is
+                        // unit-agnostic, and capping at 500 excluded every hectowatt reading above 5 kW
+                        // from detection — so a 7 kW session (raw 700) was stored but could never start.
+                        boolean rawEvidenceAllowed = allowsRawChargingEvidence(
+                                b.chargingGunState, b.vtolCharging);
+                        ChargeSourceClassifier.Kind clusterKind =
+                                ChargeSourceClassifier.kindOf(
+                                        ChargeSourceClassifier.SRC_CLUSTER);
+                        boolean finishedTaperRate = terminalState
+                                && finishedConnected
+                                && clusterKind == ChargeSourceClassifier.Kind.RATE;
+                        boolean rawMovementAllowed = shouldObserveClusterRawChargingSignal(
+                                b.chargingState, b.chargingGunState, clusterKind);
+                        if (rawEvidenceAllowed && rawMovementAllowed
+                                && kw > 0.1 && kw <= RAW_RATE_ENVELOPE_MAX) {
+                            try {
+                                com.overdrive.app.monitor.ChargingDetector.getInstance()
+                                        .observeRawChargingSignal(
+                                                ChargeSourceClassifier.SRC_CLUSTER, kw);
+                            } catch (Throwable ignored) { /* detector not up yet */ }
+                        }
+                        boolean terminalBarrierActive = isTerminalChargingBarrierActive();
+                        boolean liveTrainingAllowed =
+                                !terminalState && !terminalBarrierActive;
+                        // Envelope must admit a HECTOWATT reading's full range, not just a kW one.
+                        // The unit is unknown at this point — that is the whole premise — so a raw 700
+                        // is either an impossible 700 kW or a perfectly ordinary 7.0 kW three-phase AC
+                        // charge. Capping at 500 discarded the latter before ChargeRateResolver ever got
+                        // the chance to calibrate it against the counter slope, which is precisely the
+                        // trim this pipeline exists to serve. The ceiling is therefore the kW ceiling
+                        // scaled by the candidate unit factor; the resolver still bounds the RESOLVED
+                        // rate at 500 kW, so nothing implausible can reach a consumer.
+                        // Direction still matters — a negative reading is discharge, not charging.
+                        if (rawEvidenceAllowed && kw > 0.1 && kw <= RAW_RATE_ENVELOPE_MAX
+                                && (sessionLive || plugAsserted)
+                                && (liveTrainingAllowed || finishedTaperRate)) {
                             clusterKw = kw;
+                            if (liveTrainingAllowed) {
+                                ChargeSourceClassifier.observeWhileCharging(
+                                        ChargeSourceClassifier.SRC_CLUSTER, kw);
+                                // FINISHED values may refresh a known taper RATE snapshot, but frozen
+                                // post-stop data must not train classification or resolver state.
+                                try {
+                                    com.overdrive.app.monitor.ChargeRateResolver.observe(
+                                            ChargeSourceClassifier.SRC_CLUSTER, kw);
+                                } catch (Throwable ignored) {}
+                            }
                             if (!loggedClusterChargePowerScale) {
                                 loggedClusterChargePowerScale = true;
-                                logger.info("CHARGING_CHARGE_POWER_DD: raw=" + raw + " → " + kw
-                                        + " kW (scale=" + (kw == raw ? "kW" : "hectowatts/100")
-                                        + "). This is the cluster's own charge readout — cross-check"
-                                        + " it against the dash to confirm the scale.");
+                                logger.info("CHARGING_CHARGE_POWER_DD accepted raw=" + raw
+                                        + " (stored unscaled; kind decided by observed movement)");
                             }
                         }
                     }
@@ -3565,8 +5914,8 @@ public class BydDataCollector {
     private void collectAc(BydVehicleData.Builder b) {
         if (acDevice == null) return;
         try {
-            Object acState = BydDeviceHelper.callGetter(acDevice, "getAcStartState");
-            if (acState instanceof Number) b.acStartState(((Number) acState).intValue());
+            int acState = readAcPowerNow();
+            if (acState != BydVehicleData.UNAVAILABLE) b.acStartState(acState);
             Object cycle = BydDeviceHelper.callGetter(acDevice, "getAcCycleMode");
             if (cycle instanceof Number) b.acCycleMode(((Number) cycle).intValue());
             Object wind = BydDeviceHelper.callGetter(acDevice, "getAcWindMode");
@@ -3578,20 +5927,8 @@ public class BydDataCollector {
             }
             Object unit = BydDeviceHelper.callGetter(acDevice, "getTemperatureUnit");
             if (unit instanceof Number) b.tempUnit(((Number) unit).intValue());
-            // Sensed cabin temperature — the MEASURED cabin value, NOT a climate setpoint.
-            //
-            // Source of truth: the AC_TEMP_INSIDE feature id (0x3D800030). The SDK javadoc's
-            // getTemprature(area) accepts ONLY areas 0..4 (AC_TEMPERATURE_MAIN_DEPUTY=0,
-            // MAIN=1 and DEPUTY=2 = the driver/passenger SETPOINT dials, REAR=3, OUT=4) —
-            // there is no area 5, and the documented return range is the setpoint range
-            // (17..33 C). So the previous getTemprature(5) primary read was outside the
-            // documented API; the reference app (reference app C) never calls area 5 either — it calls
-            // only 4 (outside) and 1 (driver setpoint), and reads the CABIN value through this
-            // same AC_TEMP_INSIDE feature id. Reading the feature id first matches that.
-            int sensed = readCabinTempC();
-            if (sensed != Integer.MIN_VALUE) b.insideTempC(sensed);
             // Dial SETPOINTS (areas 1/2) — the value the user asked for, as opposed to the
-            // sensed cabin air above. Written only when the read answered, so a miss leaves the
+            // sensed cabin air. Written only when the read answered, so a miss leaves the
             // carried-forward value rather than fabricating one.
             int spDriver = readAcSetpointNow(AC_TEMP_AREA_DRIVER);
             if (spDriver != BydVehicleData.UNAVAILABLE) b.acSetpointDriver(spDriver);
@@ -3634,26 +5971,15 @@ public class BydDataCollector {
             if (frontFogRaw != BydVehicleData.UNAVAILABLE) b.frontFog(frontFogRaw == 1);
             int rearFogRaw = getLightStatus(LIGHT_TYPE_REAR_FOG);
             if (rearFogRaw != BydVehicleData.UNAVAILABLE) b.rearFog(rearFogRaw == 1);
-            // Hazard: KNOWN-SUSPECT. The SDK type list has NO hazard entry — position 8 is
-            // LIGHT_FOOT (the footwell/courtesy lamp), so on a car whose footwell lamps come up
-            // with the doors, this reports hazard=on every time a door opens in the dark. It is
-            // kept because it is the ONLY hazard readback available and some firmware does
-            // expose undocumented behaviour here, but do NOT treat it as confirmed: everything
-            // downstream (MQTT light_hazard, the HA hazard switch state, and the
-            // lights:area=hazard trigger/condition) inherits the doubt.
-            //
-            // Verifying it needs an actual getLightStatus capture on the vehicle — compare
-            // position 8 against the physical hazard switch. /api/debug/light/* cannot do this:
-            // it only resolves/fires WRITE feature ids and never calls getLightStatus.
-            int hazardRaw = getLightStatus(LIGHT_TYPE_FOOT_UNVERIFIED_HAZARD);
-            if (hazardRaw != BydVehicleData.UNAVAILABLE) b.hazard(hazardRaw == 1);
-            Object dayTime = BydDeviceHelper.callGetter(lightDevice, "getDayTimeLightState");
-            if (dayTime instanceof Number) b.dayTimeLight(((Number) dayTime).intValue() == 1);
-            // Auto-headlight (light-sensor) mode: 1=on, 0=off. The usable "it's dark"
-            // proxy — no lux value exists on this platform. Named getter on the light
-            // device, matching the OEM firmware's getLightAutoStatus.
-            Object autoLight = BydDeviceHelper.callGetter(lightDevice, "getLightAutoStatus");
-            if (autoLight instanceof Number) b.lightAutoStatus(((Number) autoLight).intValue());
+            // Hazard comes from getTurnLightFlashState (states 6/7), not getLightStatus(8):
+            // light type 8 is the footwell lamp. The live automation path reads the combined
+            // turn enum directly; the snapshot retains the raw current phase for telemetry.
+            int turn = readTurnNow();
+            if (turn >= 0) b.hazard((turn & 0x3) == 0x3);
+            int drl = readDrlNow();
+            if (drl != BydVehicleData.UNAVAILABLE) b.dayTimeLight(drl == 1);
+            int autoLight = readAutoHeadlightNow();
+            if (autoLight != BydVehicleData.UNAVAILABLE) b.lightAutoStatus(autoLight);
         } catch (Exception e) {
             logger.debug("collectLight error: " + e.getMessage());
         }
@@ -3667,10 +5993,6 @@ public class BydDataCollector {
     static final int LIGHT_TYPE_HIGH_BEAM  = 3;
     static final int LIGHT_TYPE_FRONT_FOG  = 6;
     static final int LIGHT_TYPE_REAR_FOG   = 7;
-    /** Position 8 is LIGHT_FOOT in the SDK table — NOT hazard. Named to make the mismatch
-     *  impossible to miss at the (single, deliberately kept) call site; see collectLight. */
-    static final int LIGHT_TYPE_FOOT_UNVERIFIED_HAZARD = 8;
-
     /**
      * Whether a raw AC_TEMP_INSIDE reading is a usable CABIN temperature in Celsius.
      *
@@ -3727,9 +6049,8 @@ public class BydDataCollector {
 
     /**
      * Read the measured cabin temperature in whole degrees Celsius, or {@link Integer#MIN_VALUE}
-     * when unavailable. THE single reader for this signal — both {@code collectAc} (insideTempC)
-     * and {@code collectInstrumentExtended} (insideTempCelsius) call here, so the two fields can
-     * never again disagree about the channel, the decode, or the validity rule.
+     * when unavailable. The poll path calls this single reader once and publishes that observation
+     * to both cabin fields, so they cannot disagree about the channel, decode, or validity rule.
      *
      * <p>Guards the {@code intValue == 0} type-mismatch signature the same way
      * {@code collectStatTemp} does: {@link BydDeviceHelper#callGet}'s {@code (int,int)} overload
@@ -3756,12 +6077,29 @@ public class BydDataCollector {
         return isPlausibleCabinTempC(raw) ? raw : Integer.MIN_VALUE;
     }
 
+    /**
+     * Read and publish the current poll's one cabin-temperature observation.
+     *
+     * @return true only when AC_TEMP_INSIDE answered with a valid raw whole-degree Celsius value
+     */
+    private boolean collectCabinTemperature(BydVehicleData.Builder b) {
+        try {
+            int raw = readCabinTempC();
+            if (raw == Integer.MIN_VALUE) return false;
+            b.insideTempC(raw, System.currentTimeMillis());
+            return true;
+        } catch (Exception e) {
+            logger.debug("collectCabinTemperature error: " + e.getMessage());
+            return false;
+        }
+    }
+
     // ── AC temperature SETPOINT (the dial), distinct from the measured cabin temp ────
 
     /** {@code getTemprature(area)} areas — MAIN=1 / DEPUTY=2 are the driver / passenger dials. */
     public static final int AC_TEMP_AREA_DRIVER = 1;
     public static final int AC_TEMP_AREA_PASSENGER = 2;
-    /** {@code getTemperatureUnit()}: 0 = Fahrenheit, non-zero = Celsius (proven from DiPlus). */
+    /** {@code getTemperatureUnit()}: 0 = Fahrenheit, non-zero = Celsius (proven against the OEM implementation). */
     public static final int TEMP_UNIT_FAHRENHEIT = 0;
     /** Setpoint clamps per display unit — the SDK's own documented dial ranges. */
     public static final int AC_SETPOINT_MIN_C = 17, AC_SETPOINT_MAX_C = 33;
@@ -3776,7 +6114,7 @@ public class BydDataCollector {
      * 22 and a cold cabin reading 12, stepping from the sensed value would slam the dial to 13.
      *
      * <p>Area 1 = driver (MAIN), 2 = passenger (DEPUTY) — the mapping both reference apps use
-     * (DiPlus reads area 1 for the dial; Commander caches 1/2/4 as driver/passenger/outside).
+     * (the OEM reads area 1 for the dial and treats 1/2/4 as driver/passenger/outside).
      *
      * <p>Returns {@link BydVehicleData#UNAVAILABLE} on a miss rather than a plausible-looking
      * default. Both reference apps fall back to a hardcoded 24, which is exactly the fabricated
@@ -3837,7 +6175,7 @@ public class BydDataCollector {
         return BydVehicleData.UNAVAILABLE;
     }
 
-    /** Clamp a setpoint into the dial range for [unit] (mirrors DiPlus's own clamp). */
+    /** Clamp a setpoint into the dial range for [unit] (mirrors the OEM's own clamp). */
     public static int clampSetpoint(int value, int unit) {
         boolean f = unit == TEMP_UNIT_FAHRENHEIT;
         int min = f ? AC_SETPOINT_MIN_F : AC_SETPOINT_MIN_C;
@@ -3853,7 +6191,9 @@ public class BydDataCollector {
      */
     private int getLightStatus(int position) {
         Object val = BydDeviceHelper.callGetter(lightDevice, "getLightStatus", position);
-        return (val instanceof Number) ? ((Number) val).intValue() : BydVehicleData.UNAVAILABLE;
+        if (!(val instanceof Number)) return BydVehicleData.UNAVAILABLE;
+        int raw = ((Number) val).intValue();
+        return (raw == 0 || raw == 1) ? raw : BydVehicleData.UNAVAILABLE;
     }
 
     private void collectAdas(BydVehicleData.Builder b) {
@@ -3862,12 +6202,22 @@ public class BydDataCollector {
             // Read the SLW state id first (raw 2 = on); if this trim doesn't expose it,
             // fall back to the reference-confirmed ISLA status id (raw 1 = on). Each id
             // has its OWN on-value convention, so we compare against the right one.
+            // A bare `>= 0` admitted the 65535 not-available rail, which is neither "on" value and so
+            // published a confident "speed-limit warning OFF" from an unset register — and
+            // speedLimitWarning is a plain boolean with no unavailable state to fall back to.
+            //
+            // SLW is 1=off / 2=on, matching the event handler's `iVal > 0 && iVal < 3`.
             int slw = BydDeviceHelper.callGetSingle(adasDevice, BydFeatureIds.ADAS_SLW_FUNC_SWITCH_STATE);
-            if (slw >= 0) {
+            if (slw == 1 || slw == 2) {
                 b.speedLimitWarning(slw == 2);
             } else {
+                // ISLA's encoding is UNSETTLED and deliberately left as-is: this read treats 1 as
+                // "on", while setSpeedLimitWarning writes 1=off/2=on to the same axis. Only the rail
+                // filter is added here (0..2 keeps every value the old `>= 0` accepted as
+                // meaningful) — changing the 1/2 interpretation on a guess would silently invert a
+                // working trim. Settle it on-device by reading this id after toggling in the OEM UI.
                 int isla = BydDeviceHelper.callGetSingle(adasDevice, BydFeatureIds.ADAS_ISLA_SWITCH_STATUS);
-                if (isla >= 0) b.speedLimitWarning(isla == 1);
+                if (isla >= 0 && isla <= 2) b.speedLimitWarning(isla == 1);
             }
         } catch (Exception e) {
             logger.debug("collectAdas error: " + e.getMessage());
@@ -3879,23 +6229,33 @@ public class BydDataCollector {
         try {
             int[] seatHeat = new int[2];
             int[] seatCool = new int[2];
+            boolean completeSeatClimateRead = true;
             // SDK returns 1=off, 2=low, 3=high — normalize to 0/1/2 for the wire format.
-            // On unsupported firmwares the getter returns null/throws → leave entry as 0.
+            // On unsupported firmwares the display remains backward-compatible
+            // at zero, but the composite cloud fallback is never marked fresh.
             for (int i = 0; i < 2; i++) {
                 Object heat = BydDeviceHelper.callGetter(settingDevice, "getSeatHeatingState", i + 1);
                 if (heat instanceof Number) {
                     int v = ((Number) heat).intValue() - 1;
-                    seatHeat[i] = (v >= 0 && v <= 2) ? v : 0;
-                }
+                    if (v >= 0 && v <= 2) seatHeat[i] = v;
+                    else completeSeatClimateRead = false;
+                } else completeSeatClimateRead = false;
                 Object cool = BydDeviceHelper.callGetter(settingDevice, "getSeatVentilatingState", i + 1);
                 if (cool instanceof Number) {
                     int v = ((Number) cool).intValue() - 1;
-                    seatCool[i] = (v >= 0 && v <= 2) ? v : 0;
-                }
+                    if (v >= 0 && v <= 2) seatCool[i] = v;
+                    else completeSeatClimateRead = false;
+                } else completeSeatClimateRead = false;
             }
             b.seatHeat(seatHeat).seatCool(seatCool);
+            b.seatClimateAtMs(completeSeatClimateRead ? System.currentTimeMillis() : 0L);
+            int wheelHeat = getSteeringWheelHeatingState();
+            if (wheelHeat != BydVehicleData.UNAVAILABLE) b.steeringWheelHeat(wheelHeat);
             int childPresenceDetection = BydDeviceHelper.callGetSingle(settingDevice, BydFeatureIds.SETTING_CPD_SWITCH_STATUS);
-            if (childPresenceDetection >= 0) {
+            // Domain 1=on, 2=off, 3=delay — the SAME range the event handler for this id enforces.
+            // A bare `>= 0` also admitted 0 (unpopulated) and 65535 (the not-available rail), and
+            // the API then reports "detection disabled" for a car that never answered.
+            if (childPresenceDetection >= 1 && childPresenceDetection <= 3) {
                 b.childPresenceDetection(childPresenceDetection);
             }
             // Interior ambient colour. The "all area" query does not report reliably;
@@ -3911,6 +6271,15 @@ public class BydDataCollector {
             // such a trim.
         } catch (Exception e) {
             logger.debug("collectSettings error: " + e.getMessage());
+        }
+    }
+
+    /** Read the SOC target without polling the rest of the display-only settings. */
+    private void collectSocTarget(BydVehicleData.Builder b) {
+        if (settingDevice == null) return;
+        int target = readSocTarget();
+        if (target >= 15 && target <= 100) {
+            b.socTargetPercent(target);
         }
     }
 
@@ -3947,7 +6316,16 @@ public class BydDataCollector {
      *
      * Cached after first successful probe to avoid hammering reflection.
      */
-    private volatile int cachedDrivetrain = 0;  // 0=unknown, 1=BEV, 2=PHEV/HEV
+    static final int DRIVETRAIN_UNKNOWN = 0;
+    static final int DRIVETRAIN_BEV = 1;
+    static final int DRIVETRAIN_PHEV = 2;
+
+    private volatile int cachedDrivetrain = DRIVETRAIN_UNKNOWN;
+    /**
+     * Conservative verdict used only for ambiguous raw charging-power signatures. PHEV evidence
+     * establishes immediately; BEV needs two sentinel-only probes separated by the cache window.
+     */
+    private volatile int establishedDrivetrain = DRIVETRAIN_UNKNOWN;
     private volatile long lastDrivetrainProbeMs = 0;
     private static final long DRIVETRAIN_REPROBE_MS = 60_000;
 
@@ -3969,10 +6347,31 @@ public class BydDataCollector {
         return computeIsPhev();
     }
 
+    /** Accurate capability name for new callers; HEV and PHEV are intentionally one bucket. */
+    public boolean isFuelCapableHybridPublic() {
+        return computeIsPhev();
+    }
+
     private boolean computeIsPhev() {
+        // The cache check and the establishment write are one transaction. Without this lock, two
+        // startup callers can both pass the UNKNOWN check, perform the same sentinel-only probe,
+        // and let the second caller mistake the first caller's provisional BEV write for an
+        // independent confirmation. Keep this off the collector monitor: engine callbacks can
+        // probe while holding chargingEdgePublishLock, whereas collectAll takes the collector
+        // monitor before that lock.
+        synchronized (drivetrainProbeLock) {
+            return computeIsPhevLocked();
+        }
+    }
+
+    private boolean computeIsPhevLocked() {
         long now = System.currentTimeMillis();
-        if (cachedDrivetrain != 0 && (now - lastDrivetrainProbeMs) < DRIVETRAIN_REPROBE_MS) {
-            return cachedDrivetrain == 2;
+        if (cachedDrivetrain != DRIVETRAIN_UNKNOWN
+                && (now - lastDrivetrainProbeMs) < DRIVETRAIN_REPROBE_MS) {
+            if (cachedDrivetrain == DRIVETRAIN_PHEV) {
+                establishedDrivetrain = DRIVETRAIN_PHEV;
+            }
+            return cachedDrivetrain == DRIVETRAIN_PHEV;
         }
 
         // ── Pre-probe: capacity-based PHEV gate ────────────────────────────
@@ -3997,7 +6396,8 @@ public class BydDataCollector {
             if (sohEst != null) knownNominal = sohEst.getNominalCapacityKwh();
         } catch (Exception ignored) {}
         if (knownNominal > 0 && knownNominal < 30.0) {
-            cachedDrivetrain = 2;
+            cachedDrivetrain = DRIVETRAIN_PHEV;
+            establishedDrivetrain = DRIVETRAIN_PHEV;
             lastDrivetrainProbeMs = now;
             logger.info("computeIsPhev → PHEV (capacity-gate, nominal="
                 + String.format("%.1f", knownNominal) + " kWh)");
@@ -4041,17 +6441,25 @@ public class BydDataCollector {
         // BEV: both signals at sentinel.
         // Otherwise: defer to capacity heuristic, don't cache.
         if (fuelPctReal && fuelRangeReal) {
-            cachedDrivetrain = 2;
+            cachedDrivetrain = DRIVETRAIN_PHEV;
+            establishedDrivetrain = DRIVETRAIN_PHEV;
             lastDrivetrainProbeMs = now;
             logger.info("computeIsPhev → PHEV (fuelPct=" + fuelPctRaw
                 + ", fuelRange=" + fuelRangeRaw + ")");
             return true;
         }
         if (fuelPctSentinel && fuelRangeSentinel) {
-            cachedDrivetrain = 1;
+            boolean repeatedBevProbe = cachedDrivetrain == DRIVETRAIN_BEV
+                    && lastDrivetrainProbeMs > 0L;
+            cachedDrivetrain = DRIVETRAIN_BEV;
+            if (establishedDrivetrain != DRIVETRAIN_PHEV && repeatedBevProbe) {
+                establishedDrivetrain = DRIVETRAIN_BEV;
+            }
             lastDrivetrainProbeMs = now;
             logger.info("computeIsPhev → BEV (both fuel signals at sentinel: pct="
-                + fuelPctRaw + ", range=" + fuelRangeRaw + ")");
+                + fuelPctRaw + ", range=" + fuelRangeRaw + "; raw-power verdict="
+                + (establishedDrivetrain == DRIVETRAIN_BEV
+                    ? "established" : "provisional") + ")");
             return false;
         }
         // One real + one sentinel is the "PHEV with empty tank or 0 km" case.
@@ -4059,7 +6467,8 @@ public class BydDataCollector {
         // quickly. Without the cache, every isPhev() call re-runs both
         // reflection probes — onFuelPercentageChanged fires at HAL rate.
         if ((fuelPctReal && fuelRangeSentinel) || (fuelRangeReal && fuelPctSentinel)) {
-            cachedDrivetrain = 2;
+            cachedDrivetrain = DRIVETRAIN_PHEV;
+            establishedDrivetrain = DRIVETRAIN_PHEV;
             // 5s TTL via lastDrivetrainProbeMs offset trick: pretend the probe
             // happened (DRIVETRAIN_REPROBE_MS - 5000) ms ago, so the next call
             // in >5s will re-probe.
@@ -4139,15 +6548,21 @@ public class BydDataCollector {
             java.util.Arrays.asList(-2147482647, -2147482648, -2147482645, -2147482646,
                     -10011, Integer.MIN_VALUE, -1, -10013));
 
-    // Passenger-belt de-glitch latch (mirrors the OEM firmware's per-seat
-    // seatbeltEverUnlatched map): the front-passenger belt sensor reports "buckled" from
-    // boot until a genuine unlatch (0) is seen at least once, so we treat its 1 as
-    // unbuckled until the first real 0. Only the passenger seat needs this; the driver
-    // belt reads truthfully from boot. Accessed from BOTH the BydDataPoll thread
-    // (collectSafetyBelt) AND the fast SeatbeltEvent poll thread (readSeatbeltsNow), so it
-    // is volatile for cross-thread visibility. A benign read-modify-write race only affects
-    // the one-time first-unlatch heuristic, never correctness — no lock needed.
+    // Getter-only passenger-belt de-glitch latch. The front-passenger getter reports "buckled"
+    // from boot until a genuine unlatch (0) is seen, so its 1 is unknown until that first 0.
+    // Field logs also show the getter returning to 1 after an unbuckled passenger exits, even
+    // though the belt remains physically open. Once the typed belt listener supplies a documented
+    // 0/1 edge, passengerBeltCallbackState below therefore remains authoritative over the getter
+    // until the listener lifecycle is reset.
     private volatile boolean passengerBeltEverUnlatched = false;
+
+    private static final int SEATBELT_AREA_FRONT_PASSENGER = 2;
+
+    /**
+     * Last documented front-passenger state delivered by the typed safety-belt listener.
+     * UNAVAILABLE means the callback has not established a state in this listener lifecycle.
+     */
+    private volatile int passengerBeltCallbackState = BydVehicleData.UNAVAILABLE;
 
     // Debounce thresholds for two safety-adjacent, on-device-unverified inferences in
     // readSeatbeltPair: (1) the driver INVALID(2)→unbuckled best-effort mapping and (2) the
@@ -4166,6 +6581,32 @@ public class BydDataCollector {
     // never mis-report a state — the same benign-race stance as the latch, so no lock is needed.
     private volatile int driverInvalidStreak = 0;
     private volatile int passengerEmptyStreak = 0;
+
+    // Very-short-lived memo of the last readSeatbeltPair result, so the several callers that can
+    // run within one poll tick share ONE set of HAL reads.
+    //
+    // Two reasons, the second being the important one:
+    //  1. Cost — with both a seatbelt rule and a driver-occupancy rule enabled, the 500ms poller
+    //     called readSeatbeltPair twice per tick (pollSeatbelts, then again inside
+    //     readDriverOccupancyNow) = 3 wasted HAL reads/tick, paid 24/7 because this poller is
+    //     deliberately not ACC-gated (parked entry/exit is its whole purpose).
+    //  2. Correctness — the two de-glitch streaks above advance once per CALL, so that second
+    //     call made a "2 consecutive reads" debounce complete in ONE tick. The debounce interval
+    //     silently depended on which rules the user had enabled. Sharing one read per tick makes
+    //     it exactly N ticks in every configuration.
+    //
+    // TTL is far below the 500ms fast-poll period, so a fresh tick always re-reads; it only
+    // collapses calls made back-to-back within the same tick.
+    private static final long SEATBELT_PAIR_MEMO_TTL_MS = 100;
+    private final Object seatbeltPairLock = new Object();
+    /** Sentinel stored in the memo to mean "the read returned null", so a memoized null is not
+     *  mistaken for "nothing memoized yet". Never handed to a caller. */
+    private static final int[] EMPTY_SEATBELT_PAIR = new int[0];
+    private long seatbeltPairMemoAtMs = 0;
+    private int[] seatbeltPairMemo = null;
+    /** Bumped by every invalidation so an in-flight read can detect that its sample was
+     *  superseded and decline to store it. All access under {@link #seatbeltPairLock}. */
+    private long seatbeltPairGeneration = 0;
 
     // Throttle (30s) for the diagnostic raw-seatbelt log emitted by readSeatbeltPair — so a
     // future on-device log pins the EXACT raw code the driver channel returns on unbuckle,
@@ -4320,6 +6761,99 @@ public class BydDataCollector {
      * correctness — so no lock is needed on this hot path.
      */
     public int[] readSeatbeltPair() {
+        // The lock covers ONLY the memo check and the store — never the HAL read. Three threads
+        // reach here (the 5s/90s BydDataPoll, the 500ms SeatbeltEvent poll, and the belt-status
+        // binder callback); holding a monitor across three reflective binder calls would let one
+        // wedged HAL read stall the fast safety poll, and risks lock inversion against the SDK's
+        // own monitors on the callback thread. Two threads racing the same expiry can therefore
+        // both read and each advance a de-glitch streak once — the pre-existing benign race these
+        // counters are already documented to tolerate (a one-tick skew, never a wrong state).
+        // What the memo removes is the SAME-THREAD double read (pollSeatbelts then
+        // pollDriverOccupant within one tick), which is the actual waste and the actual
+        // double-advance. The store is guarded so the loser of such a race can never overwrite
+        // the newer sample.
+        long startedAtMs;
+        long startedGen;
+        synchronized (seatbeltPairLock) {
+            int[] memo = memoIfFresh(System.currentTimeMillis());
+            // Copy out: callers must not be able to mutate the shared memo. null is a real
+            // result ("no reading") and is memoized as such.
+            if (memo != null) return memo.length == 0 ? null : memo.clone();
+            // Stamp taken BEFORE the read so the store below can tell whose sample is newer.
+            // Stamping after would let a slow reader overwrite a newer sample with its older
+            // one, serving stale belt state for a further TTL.
+            startedAtMs = System.currentTimeMillis();
+            startedGen = seatbeltPairGeneration;
+        }
+        int[] fresh = readSeatbeltPairUncached();
+        synchronized (seatbeltPairLock) {
+            // Store only if (a) no invalidation happened while we were reading — otherwise a read
+            // that began before an edge-driven invalidate would resurrect its pre-edge value —
+            // and (b) our sample started no earlier than the one already held.
+            if (startedGen == seatbeltPairGeneration && startedAtMs >= seatbeltPairMemoAtMs) {
+                // EMPTY_SEATBELT_PAIR encodes a memoized null so "no entry" and "null was read"
+                // stay distinguishable without a second flag.
+                seatbeltPairMemo = (fresh == null) ? EMPTY_SEATBELT_PAIR : fresh;
+                seatbeltPairMemoAtMs = startedAtMs;
+            }
+        }
+        return fresh == null ? null : fresh.clone();
+    }
+
+    /** The memoized pair when still inside the TTL, else null. Caller must hold
+     *  {@link #seatbeltPairLock}. A zero-length array means "null was memoized". */
+    private int[] memoIfFresh(long now) {
+        if (seatbeltPairMemoAtMs == 0 || seatbeltPairMemo == null) return null;
+        // now < stamp guards a backwards clock jump (NTP/RTC set), which would otherwise freeze
+        // the memo until wall-clock caught up.
+        if (now < seatbeltPairMemoAtMs) return null;
+        return (now - seatbeltPairMemoAtMs < SEATBELT_PAIR_MEMO_TTL_MS) ? seatbeltPairMemo : null;
+    }
+
+    /**
+     * Drop the seatbelt memo so the next {@link #readSeatbeltPair} does a real HAL read.
+     *
+     * <p>For the belt-status binder callback, whose entire purpose is to beat the 500ms poll: an
+     * edge landing just after a poll read would otherwise be served the pre-edge memo and wait
+     * for the next tick, losing the instant path.
+     */
+    public void invalidateSeatbeltPairMemo() {
+        synchronized (seatbeltPairLock) {
+            seatbeltPairMemoAtMs = 0;
+            seatbeltPairMemo = null;
+            // Bump so an in-flight read that started before this cannot store its pre-edge value.
+            seatbeltPairGeneration++;
+        }
+    }
+
+    /** Accept only the documented passenger area and 0=unbuckled / 1=buckled states. */
+    static int normalizePassengerSeatbeltCallback(Object areaValue, Object stateValue) {
+        if (!(areaValue instanceof Number) || !(stateValue instanceof Number)) {
+            return BydVehicleData.UNAVAILABLE;
+        }
+        double area = ((Number) areaValue).doubleValue();
+        double state = ((Number) stateValue).doubleValue();
+        if (area != SEATBELT_AREA_FRONT_PASSENGER || (state != 0.0d && state != 1.0d)) {
+            return BydVehicleData.UNAVAILABLE;
+        }
+        return (int) state;
+    }
+
+    /** A real typed callback outranks the passenger getter's empty-seat default. */
+    static int selectPassengerSeatbeltState(int getterState, int callbackState) {
+        return callbackState == 0 || callbackState == 1 ? callbackState : getterState;
+    }
+
+    private void resetPassengerSeatbeltCallbackState() {
+        passengerBeltCallbackState = BydVehicleData.UNAVAILABLE;
+        passengerBeltEverUnlatched = false;
+        passengerEmptyStreak = 0;
+        invalidateSeatbeltPairMemo();
+    }
+
+    /** The real HAL read behind {@link #readSeatbeltPair}. Call that, not this — it applies the
+     *  per-tick memo that keeps the de-glitch streaks advancing once per tick. */
+    private int[] readSeatbeltPairUncached() {
         if (instrumentDevice == null) return null;
         try {
             int driverRaw = readInstrumentSeatbelt(1, BydFeatureIds.INSTRUMENT_DD_MAIN_SAFETYBELT_STATE);
@@ -4343,30 +6877,50 @@ public class BydDataCollector {
                 driverInvalidStreak = 0;
                 driver = driverStrict;
             }
-            int passenger = sanitizeSeatbelt(passengerRaw, false);     // passenger strict
+            // Preserve the strict raw belt result for the occupancy fallback below. A buckled
+            // reading is useful only after this process has seen the belt unlatch once; before
+            // then the firmware can report 1 for an empty passenger seat.
+            int callbackPassenger = passengerBeltCallbackState;
+            int passengerBelt = selectPassengerSeatbeltState(
+                    sanitizeSeatbelt(passengerRaw, false), callbackPassenger);
+            int passenger = passengerBelt;
+            boolean passengerCallbackAuthoritative =
+                    callbackPassenger == 0 || callbackPassenger == 1;
 
-            // Passenger de-glitch FIRST, on the sanitized sensor reading — treat a never-unlatched
-            // 1 as unbuckled until the first genuine 0. Kept before the occupancy gate so the latch
-            // reflects real sensor observations only (byte-identical to the pre-gate behaviour); the
-            // occupancy gate below is a pure override that never trips the latch.
+            // Apply the boot de-glitch only while polling is the source. A typed callback is an
+            // actual state-change value and must not be discarded merely because this process did
+            // not observe an earlier unlatch.
             if (passenger == 0) {
                 passengerBeltEverUnlatched = true;
-            } else if (passenger == 1 && !passengerBeltEverUnlatched) {
-                passenger = 0;
+            } else if (passenger == 1 && !passengerCallbackAuthoritative
+                    && !passengerBeltEverUnlatched) {
+                // A never-unlatched 1 is AMBIGUOUS on this trim: it is what an EMPTY seat's
+                // sensor idles at, and equally what a genuinely buckled passenger reads after a
+                // daemon restart (their unbuckle edge is in the past, and this flag resets on
+                // restart). Reporting either guess is wrong — an empty-seat 1 re-triggers the
+                // strobe a passenger rule was already suffering, and a restart-buckled 1 read as
+                // unbuckled fires a spurious "unbuckled" action.
+                //
+                // So report NEITHER: UNAVAILABLE leaves the event unseeded, which publishSeatbelt
+                // skips, so no edge is published from an ambiguous reading. The ambiguity is
+                // resolved permanently by the first genuine 0 (above) — which the field log shows
+                // does occur — after which the sensor is trusted for the rest of the process.
+                //
+                // The occupancy gate below uses the physical sensor when available, otherwise
+                // the disclosed passenger belt/reminder estimate.
+                passenger = BydVehicleData.UNAVAILABLE;
             }
 
-            // Passenger occupancy gate: force UNBUCKLED when the seat is CONFIDENTLY empty so an
-            // unoccupied seat's floating belt sensor can't oscillate the automation (the reported
-            // "goes crazy on/off"). occupantOf only returns 0 on a firm NOBODY reading — an absent
-            // getter or INVALID reads UNAVAILABLE (not 0), so a trim without real occupancy data
-            // fails OPEN here and behaves exactly as before (no gate, belt drives directly). This
-            // is intentionally the confirmed-empty case, which is precisely the reported bug.
-            // Debounced: require PASSENGER_EMPTY_STREAK consecutive firm NOBODY(0) reads before
-            // forcing the belt off, so a single spurious/uninitialised 0 from getPassengerStatus
-            // can't suppress a real buckled-passenger reading. A NOBODY read advances the streak;
-            // anything else (SOMEBODY or UNAVAILABLE from an absent getter/INVALID) resets it and
-            // fails OPEN — a trim without real occupancy data never gates, exactly as before.
-            int passengerOccupant = frontPassengerOccupancy();
+            // Passenger occupancy gate: force UNBUCKLED when the seat is empty so an unoccupied
+            // seat's floating belt sensor cannot oscillate the automation. The physical occupancy
+            // sensor remains authoritative. On trims where it is unavailable, the user-selected
+            // heuristic treats an active reminder or an established buckled belt as occupied,
+            // otherwise empty; its UI description makes the resulting false-positive risk
+            // explicit.
+            //
+            // Debounce every empty source, including the heuristic, so one transient belt read
+            // cannot suppress a real buckled-passenger reading.
+            int passengerOccupant = frontPassengerOccupancy(passengerBelt);
             if (passengerOccupant == 0) {
                 if (passengerEmptyStreak < PASSENGER_EMPTY_STREAK) passengerEmptyStreak++;
                 if (passengerEmptyStreak >= PASSENGER_EMPTY_STREAK) {
@@ -4383,7 +6937,8 @@ public class BydDataCollector {
                 lastSeatbeltRawLogMs = nowMs;
                 logger.info("seatbelt raw: driver=" + driverRaw + " (masked=" + (driverRaw & 0xFFFF)
                         + " → " + driver + "), passenger=" + passengerRaw + " (masked="
-                        + (passengerRaw & 0xFFFF) + " → " + passenger + "), passengerOccupant="
+                        + (passengerRaw & 0xFFFF) + ", callback=" + callbackPassenger + " → "
+                        + passenger + "), passengerOccupant="
                         + passengerOccupant + " (driverInvalidStreak=" + driverInvalidStreak
                         + ", passengerEmptyStreak=" + passengerEmptyStreak + ")");
             }
@@ -4435,16 +6990,21 @@ public class BydDataCollector {
      */
     private int occupantOf(int area) {
         Object s = BydDeviceHelper.callGetter(safetyBeltDevice, "getPassengerStatus", area);
-        if (!(s instanceof Number)) return BydVehicleData.UNAVAILABLE;
-        int v = ((Number) s).intValue();
-        if (v == 1) return 1;
-        if (v == 0) return 0;
+        return normalizePassengerStatus(s);
+    }
+
+    /** Map the documented passenger-state domain to an automation-safe occupancy value. */
+    static int normalizePassengerStatus(Object value) {
+        if (!(value instanceof Number)) return BydVehicleData.UNAVAILABLE;
+        double raw = ((Number) value).doubleValue();
+        if (raw == 1.0d) return 1;
+        if (raw == 0.0d) return 0;
         return BydVehicleData.UNAVAILABLE;
     }
 
     /**
-     * Front-passenger occupancy: 1 = someone, 0 = nobody, {@link BydVehicleData#UNAVAILABLE}
-     * when the seat's own sensor gave no real reading.
+     * Direct front-passenger occupancy sensor: 1 = someone, 0 = nobody,
+     * {@link BydVehicleData#UNAVAILABLE} when it gives no real reading.
      *
      * <p>Reads ONLY {@code getPassengerStatus(}{@link #OCCUPANT_AREA_FRONT_PASSENGER}{@code )} —
      * see that constant for why probing any other area is wrong rather than a fallback.
@@ -4463,13 +7023,89 @@ public class BydDataCollector {
      * sentinel can never publish a spurious occupied/empty edge — the property both the
      * automation events and the passenger seatbelt gate depend on.
      */
-    private int frontPassengerOccupancy() {
-        return occupantOf(OCCUPANT_AREA_FRONT_PASSENGER);
+    private int directFrontPassengerOccupancy() {
+        if (safetyBeltDevice == null) return BydVehicleData.UNAVAILABLE;
+        int direct = occupantOf(OCCUPANT_AREA_FRONT_PASSENGER);
+        noteOccupancySensorReading(direct);
+        return direct;
+    }
+
+    // One-shot dead-sensor diagnostic for the front-passenger occupancy getter. On some trims
+    // getPassengerStatus(1) returns Integer.MIN_VALUE on EVERY call (2026-08 field log: 274/274
+    // reads invalid), which silently disables the occupant{seat:passenger} automation event AND
+    // the passenger-belt occupancy gate — the user just sees "seat occupancy doesn't work" with
+    // nothing in the log naming the cause. After a sustained run of invalid reads, say so once,
+    // with the automation-facing consequence spelled out. A later real 0/1 resets the streak
+    // (but not the once-only flag — one line per process is enough).
+    private static final int OCCUPANCY_DEAD_SENSOR_STREAK = 60; // ≈30s at the 500ms fast poll
+    private volatile int occupancyInvalidStreak = 0;
+    private volatile boolean occupancyDeadSensorLogged = false;
+
+    private void noteOccupancySensorReading(int direct) {
+        if (direct == BydVehicleData.UNAVAILABLE) {
+            if (occupancyInvalidStreak < OCCUPANCY_DEAD_SENSOR_STREAK) {
+                occupancyInvalidStreak++;
+            } else if (!occupancyDeadSensorLogged) {
+                occupancyDeadSensorLogged = true;
+                logger.warn("Front-passenger occupancy sensor returns no valid reading ("
+                        + OCCUPANCY_DEAD_SENSOR_STREAK + " consecutive invalid reads) — this trim "
+                        + "does not expose getPassengerStatus. 'Seat occupancy (passenger)' "
+                        + "automations cannot fire, and passenger seatbelt automations only work "
+                        + "after the belt reports one genuine unbuckle in this session.");
+            }
+        } else {
+            occupancyInvalidStreak = 0;
+        }
     }
 
     /**
-     * Bit index into {@code SAFETYBELT_REMINDER_MASK} per seat, mirroring the reference app's
-     * {@code mapPassengerArea}: driver/main → bit 0, front passenger → bit 1.
+     * Resolve front-passenger occupancy. The dedicated sensor is authoritative; the belt/reminder
+     * estimate is used only on trims that expose no direct 0/1 result.
+     */
+    private int frontPassengerOccupancy(int passengerBelt) {
+        int direct = directFrontPassengerOccupancy();
+        if (direct != BydVehicleData.UNAVAILABLE) return direct;
+        return resolvePassengerOccupancy(
+                direct,
+                seatbeltReminderActive(REMINDER_BIT_PASSENGER),
+                passengerBelt,
+                passengerBelt == 0 || passengerBeltEverUnlatched
+                        || passengerBeltCallbackState == 0
+                        || passengerBeltCallbackState == 1);
+    }
+
+    /** Read the passenger belt without applying its publication-only boot de-glitch. */
+    private int readPassengerBeltForOccupancy() {
+        if (instrumentDevice == null) return BydVehicleData.UNAVAILABLE;
+        int raw = readInstrumentSeatbelt(
+                2, BydFeatureIds.INSTRUMENT_DD_DEPUTY_SAFETYBELT_STATE);
+        return selectPassengerSeatbeltState(
+                sanitizeSeatbelt(raw, false), passengerBeltCallbackState);
+    }
+
+    /**
+     * User-selected passenger estimate for trims lacking a real occupancy sensor.
+     *
+     * <p>An active reminder means an unbelted passenger is present. A buckled belt is also
+     * treated as present once it has first reported an unbuckled state in this process; before
+     * then the firmware can leave an empty passenger seat at a false buckled value. When neither
+     * is true, a valid unbuckled belt reports empty. An unknown belt remains unknown so a missing
+     * instrument signal cannot manufacture an empty edge.
+     */
+    static int resolvePassengerOccupancy(int direct, boolean reminderActive, int passengerBelt,
+                                         boolean beltEstablished) {
+        if (direct != BydVehicleData.UNAVAILABLE) return direct;
+        if (reminderActive || (passengerBelt == 1 && beltEstablished)) return 1;
+        if (passengerBelt == 0) return 0;
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    private int frontPassengerOccupancy() {
+        return frontPassengerOccupancy(readPassengerBeltForOccupancy());
+    }
+
+    /**
+     * Bit index into {@code SAFETYBELT_REMINDER_MASK} for the driver/main seat.
      *
      * <p>This is the ONLY route to a driver-seat signal. {@code getPassengerStatus}'s area set
      * has no main-seat entry (see {@link #OCCUPANT_AREA_FRONT_PASSENGER}), but the reminder mask
@@ -4478,6 +7114,7 @@ public class BydDataCollector {
      * {@code getPassengerStatus} call. Do not confuse these numbers with either area set.
      */
     private static final int REMINDER_BIT_DRIVER = 0;
+    private static final int REMINDER_BIT_PASSENGER = 1;
 
     /**
      * Is the seatbelt-not-fastened reminder ACTIVE for this seat? A firing reminder means the
@@ -4515,11 +7152,21 @@ public class BydDataCollector {
             logger.info("seatbelt reminder mask: raw=" + mask
                     + (mask < 0 ? " (unreadable)" : " bits=0b" + Integer.toBinaryString(mask))
                     + " driverBit" + REMINDER_BIT_DRIVER + "="
-                    + (mask >= 0 ? ((mask >> REMINDER_BIT_DRIVER) & 1) : -1));
+                    + (mask >= 0 ? ((mask >> REMINDER_BIT_DRIVER) & 1) : -1)
+                    + " passengerBit" + REMINDER_BIT_PASSENGER + "="
+                    + (mask >= 0 ? ((mask >> REMINDER_BIT_PASSENGER) & 1) : -1));
         }
         // Negative == unreadable/failure (callGetSingle's -1, or a raw SDK failure code). Never
         // bit-test it: Integer.MIN_VALUE and friends would light up arbitrary seat bits.
-        if (mask < 0 || SEATBELT_FAILURE_CODES.contains(mask)) return false;
+        //
+        // 65535/65534 must be rejected EXPLICITLY: they are the CAN not-available rails, they are
+        // POSITIVE (so `mask < 0` misses them) and they are absent from SEATBELT_FAILURE_CODES.
+        // Bit-testing 0xFFFF sets every seat bit, so an unset rail would report the driver present
+        // and belted forever — and driver occupancy is positive-only, so nothing retracts it. The
+        // belt-status path and readKeyInt already filter this rail; only this mask did not.
+        if (mask < 0 || mask == 65535 || mask == 65534 || SEATBELT_FAILURE_CODES.contains(mask)) {
+            return false;
+        }
         return ((mask >> bitIndex) & 1) == 1;
     }
 
@@ -4537,12 +7184,13 @@ public class BydDataCollector {
 
     /**
      * Live seat-occupancy read — shared by the 5s telemetry poll ({@link #collectSafetyBelt})
-     * and the fast occupancy poll, so both publish identical edges. Delegates to
-     * {@link #frontPassengerOccupancy()} (NOBODY=0, SOMEBODY=1; INVALID=2, failure codes and
-     * any sentinel → no reading).
+     * and the fast occupancy poll, so both publish identical edges. Uses the direct passenger
+     * sensor when it supplies 0/1; otherwise the passenger belt/reminder estimate selected for
+     * this vehicle (unbuckled=empty, buckled/reminder=occupied).
      *
-     * <p><b>SHAPE IS FROZEN AT ONE SLOT.</b> Index 0 = front passenger, from that seat's own
-     * occupancy sensor. The driver seat has no sensor and is NOT added here even though
+     * <p><b>SHAPE IS FROZEN AT ONE SLOT.</b> Index 0 = front passenger, from its physical sensor
+     * when available or the disclosed belt/reminder estimate otherwise. The driver seat has no
+     * sensor and is NOT added here even though
      * {@link #readDriverOccupancyNow()} can now infer it: this array is serialized POSITIONALLY
      * and wholesale by two external consumers — {@code BydVehicleData.toJson}'s
      * {@code extendedSafety.passengerDetection} and the MQTT {@code passenger_detection} topic —
@@ -4551,13 +7199,13 @@ public class BydDataCollector {
      * automation event ({@code BydEvent.OCCUPANT_DRIVER}), which is additive.
      *
      * @return a 1-slot array {index 0 = front passenger}, {@code 1=occupied / 0=empty}, or
-     *         {@code null} when the device is absent or gave no real reading (the caller then
-     *         leaves the events untouched — no false edge). Never contains a sentinel: an
-     *         unreadable seat yields null rather than an UNAVAILABLE slot, so the serializers
-     *         that dump this array wholesale cannot publish Integer.MIN_VALUE as a seat state.
+     *         {@code null} when neither the direct sensor nor belt fallback can read a valid
+     *         state. Never contains a sentinel: an unreadable seat yields null rather than an
+     *         UNAVAILABLE slot, so the serializers that dump this array wholesale cannot publish
+     *         Integer.MIN_VALUE as a seat state.
      */
     public int[] readOccupantsNow() {
-        if (safetyBeltDevice == null) return null;
+        if (safetyBeltDevice == null && instrumentDevice == null) return null;
         try {
             int passenger = frontPassengerOccupancy();
             if (passenger == BydVehicleData.UNAVAILABLE) {
@@ -4567,6 +7215,24 @@ public class BydDataCollector {
         } catch (Throwable t) {
             logger.debug("readOccupantsNow error: " + t.getMessage());
             return null;
+        }
+    }
+
+    /**
+     * Sample and publish the front-passenger occupancy event from the direct getter.
+     *
+     * <p>The getter and the typed listener callback share one publication lock. This makes their
+     * order explicit: a callback cannot finish after a later direct sample and republish its
+     * older value. An unavailable getter remains a no-op, preserving the typed callback as the
+     * fallback on trims where the synchronous API only returns INVALID.
+     */
+    public void pollPassengerOccupancyEvent() {
+        synchronized (passengerOccupancyPublishLock) {
+            if (!initialized) return;
+            int[] occupants = readOccupantsNow();
+            if (occupants == null || occupants.length == 0) return;
+            long sampleGeneration = passengerOccupancySampleGeneration.incrementAndGet();
+            publishPassengerOccupancySample(sampleGeneration, occupants[0]);
         }
     }
 
@@ -4893,6 +7559,39 @@ public class BydDataCollector {
     }
 
     /**
+     * Format a tyre pressure reading in the user's display unit for
+     * notification text (push, Telegram, persisted history — they all share
+     * the composed string). The measured/compared unit remains kPa
+     * throughout; this converts at the last render step only, mirroring what
+     * the web UI does via {@code BYD.units.pressure}.
+     *
+     * <p>Decimals per unit match the web UI: kPa integer (the TPMS step is
+     * ~3 kPa), PSI one decimal ({@code VehicleControlApiHandler} rounds the
+     * API's psi field the same way), bar two decimals. The unit label comes
+     * from the message catalog so locales that localise it (ru: "кПа") stay
+     * correct.
+     */
+    private static String formatTyrePressure(int kPa) {
+        String unit;
+        try {
+            unit = com.overdrive.app.config.UnifiedConfigManager.getTyrePressureUnit();
+        } catch (Throwable t) {
+            unit = "psi"; // config unreadable — fall back to the shipped default
+        }
+        switch (unit) {
+            case "kpa":
+                return kPa + " " + Messages.get("units.kpa");
+            case "bar":
+                return String.format(java.util.Locale.US, "%.2f", kPa / 100.0)
+                        + " " + Messages.get("units.bar");
+            case "psi":
+            default:
+                return String.format(java.util.Locale.US, "%.1f", kPa * 0.1450377)
+                        + " " + Messages.get("units.psi");
+        }
+    }
+
+    /**
      * Per-corner latched tyre-alarm evaluator. Called on every tyre read (poll
      * or async listener), it fires a push at most ONCE per severity step and
      * re-arms only after the corner returns to normal — so a persisting alarm
@@ -5073,7 +7772,7 @@ public class BydDataCollector {
         // — stay silent.
         if (fireLevel > tyrePressureLatchedLevel[i]) {
             tyrePressureLatchedLevel[i] = fireLevel;
-            String kPaText = kPaValid ? (kPa + " kPa")
+            String kPaText = kPaValid ? formatTyrePressure(kPa)
                     : Messages.get("notifications.tyre_no_reading");
             String title = fireLevel >= 2
                     ? Messages.get("notifications.tyre_critically_low")
@@ -5146,7 +7845,7 @@ public class BydDataCollector {
                                         : "notifications.tyre_slow_leak"),
                                 kPaValid
                                         ? Messages.get("notifications.tyre_wheel_pressure",
-                                                tyreWheelLabel(i), kPa)
+                                                tyreWheelLabel(i), formatTyrePressure(kPa))
                                         : tyreWheelLabel(i),
                                 "tyre-leak-" + i,
                                 null,
@@ -5438,7 +8137,8 @@ public class BydDataCollector {
                 }
                 BydVehicleData current = snapshot.get();
                 if (current != null) {
-                    snapshot.set(current.toBuilder().tyreTemperature(snapshotTyreTemperatures()).build());
+                    publishNonChargingSnapshot(current.toBuilder()
+                            .tyreTemperature(snapshotTyreTemperatures()).build());
                 }
                 return;
             }
@@ -5477,7 +8177,8 @@ public class BydDataCollector {
                 }
                 BydVehicleData current = snapshot.get();
                 if (current != null) {
-                    snapshot.set(current.toBuilder().tyreTemperature(snapshotTyreTemperatures()).build());
+                    publishNonChargingSnapshot(current.toBuilder()
+                            .tyreTemperature(snapshotTyreTemperatures()).build());
                 }
                 return;
             }
@@ -5493,7 +8194,7 @@ public class BydDataCollector {
                 if (current == null) return;
                 BydVehicleData.Builder b = current.toBuilder();
                 collectTyre(b);
-                snapshot.set(b.build());
+                publishNonChargingSnapshot(b.build());
             }
         } catch (Exception e) {
             logger.debug("onTyreCallback error (" + method + "): " + e.getMessage());
@@ -5502,7 +8203,7 @@ public class BydDataCollector {
 
     // Last door-open state seen by the POLL fallback, per raw bodywork area (1..7).
     // Distinct from the event path: this lets the poll synthesize an edge only on a real
-    // change. -1 = not yet read. Written only from the single BydDataPoll thread.
+    // change. -1 = not yet read. Accessed by the telemetry and DoorEvent poll threads.
     private final java.util.Map<Integer, Integer> lastPolledDoorState = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
@@ -5511,19 +8212,22 @@ public class BydDataCollector {
      * stops pushing them, so a "when a door opens" automation never fired once the car was
      * off (the reported bug). The reference app reads door state on-demand via
      * {@code bodyworkDevice.getDoorState(area)} (area 1..7; 1=open, 0=closed, 255=unavailable),
-     * which keeps working parked — so we poll it here every collect cycle and synthesize the
+     * which keeps working parked — so the self-gated DoorEvent poll reads it every second and
+     * the core collect retains a fallback call; both synthesize the
      * same {@link #notifyDoorStateListeners} edges the callback would, but only on a real
      * transition. The callback path stays primary (instant while awake); this only covers the
      * gap. Both feed {@link com.overdrive.app.automation.condition.DoorEvent}, whose
      * {@code Automations.update} is transition-gated, so an overlap can't double-fire.
      *
-     * <p>Zero-cost when unused: skipped entirely unless at least one door-state listener is
-     * registered (i.e. a door automation exists), so a car with no door rule pays nothing.
+     * <p>Zero-cost when unused: skipped unless a door signal is referenced by an enabled rule
+     * (or the automation editor is requesting live state).
      */
-    private void collectDoorStates(BydVehicleData.Builder b) {
+    public void pollDoorStatesNow() {
         if (bodyworkDevice == null) return;
-        // Only poll when something actually consumes door edges (a door automation).
-        if (doorStateListeners.isEmpty()) return;
+        // DoorEvent is always registered as a callback listener. Gate on an actual rule/editor
+        // reference instead, otherwise this fallback would perform seven HAL reads every core
+        // telemetry cycle even on cars that never use door automations.
+        if (!com.overdrive.app.automation.condition.DoorEvent.shouldPoll()) return;
         for (int area = 1; area <= 7; area++) {
             try {
                 Object v = BydDeviceHelper.callMethod(bodyworkDevice, "getDoorState", area);
@@ -5536,11 +8240,9 @@ public class BydDataCollector {
                 Integer prev = lastPolledDoorState.get(area);
                 if (prev != null && prev == raw) continue; // no change
                 lastPolledDoorState.put(area, raw);
-                // Suppress the very first observed value (prev == null) ONLY when it's
-                // "closed" — publishing a boot-time "closed" is a non-event and matches
-                // the callback path's transition semantics; a first-seen "open" IS worth
-                // delivering (a door left open while parked).
-                if (prev == null && raw == com.overdrive.app.byd.bodywork.BodyworkConstants.STATE_CLOSED) continue;
+                // Publish the first definite value too. Automations.update silently seeds a first
+                // sample, so suppressing "closed" here only left the condition uninitialized and
+                // caused the first later close/open transition to be lost as that silent seed.
                 notifyDoorStateListeners(area, raw);
             } catch (Exception ignored) {
                 // Getter absent on this trim → nothing to poll; leave to the callback path.
@@ -5587,32 +8289,25 @@ public class BydDataCollector {
         if (energyDevice == null) return;
         try {
             Object mode = BydDeviceHelper.callGetter(energyDevice, "getEnergyMode");
-            if (mode instanceof Number) b.energyMode(((Number) mode).intValue());
-            // Drive mode is published on the SETTING-device "drive config" axis
-            // (1=normal/2=eco/3=sport/4=snow) so read and write share one axis and
-            // NORMAL is representable. Prefer getDriveConfig; if that HAL getter is
-            // absent, fall back to the energy-device getOperationMode (ECO=1/SPORT=2)
-            // mapped UP to the config axis (1→2 eco, 2→3 sport) so eco/sport still
-            // display correctly on builds without the drive-config getter.
+            if (mode instanceof Number) {
+                int em = ((Number) mode).intValue();
+                b.energyMode(em);
+                // Throttled 1/min. EV/HEV was field-reported broken with NOTHING in the log to
+                // show what the car reports, so a device run couldn't distinguish "the HAL
+                // refuses our write" from "we mis-decode what it answers".
+                long now = System.currentTimeMillis();
+                if (now - lastEnergyModeLogMs > 60000) {
+                    lastEnergyModeLogMs = now;
+                    logger.info("getEnergyMode raw=" + em + " (" + energyModeName(em) + ")");
+                }
+            }
+            // Drive mode is published from the ENERGY operation axis
+            // (raw 1=normal/2=eco/3=sport), which is the same HAL axis used by the working
+            // setter. The setting-device drive-config getter is only a last fallback: on this
+            // unit it remained 3 (sport) after the energy axis had changed to 1 (normal).
             int driveConfig = getDriveConfigMode();
-            // Only accept the valid config axis (1=normal..4=snow). Some firmwares
-            // may return 0 as an "unset" sentinel; treat that (and the -1 read-fail)
-            // as "no drive-config getter" and fall back to the energy getter, rather
-            // than publishing a meaningless op_mode:0.
             if (driveConfig >= 1 && driveConfig <= 4) {
                 b.operationMode(driveConfig);
-            } else {
-                Object opMode = BydDeviceHelper.callGetter(energyDevice, "getOperationMode");
-                if (opMode instanceof Number) {
-                    int energyAxis = ((Number) opMode).intValue();
-                    // Energy axis → config axis: 0(normal)→1, 1(eco)→2, 2(sport)→3. Mapping
-                    // 0→1 is what makes NORMAL readable on trims lacking getDriveConfig (the
-                    // field report: eco/sport read fine via this fallback, but NORMAL never
-                    // did because 0 was passed through as an out-of-band value that
-                    // driveModeToString drops). Anything else passes through unchanged.
-                    int mapped = energyAxis == 0 ? 1 : energyAxis == 1 ? 2 : energyAxis == 2 ? 3 : energyAxis;
-                    b.operationMode(mapped);
-                }
             }
             
             // SOC fallback: EnergyDevice.getElecPercentageValue() — try if statistic didn't provide SOC
@@ -5793,26 +8488,8 @@ public class BydDataCollector {
         }
     }
 
-    /**
-     * Extended instrument data: cabin temp, trip data, consumption.
-     * Called from collectAll() (ABRP/MQTT/trips consume these).
-     */
+    /** Extended instrument trip and consumption data consumed by ABRP/MQTT/trips. */
     private void collectInstrumentExtended(BydVehicleData.Builder b) {
-        // Inside cabin temperature from AC device
-        try {
-            if (acDevice != null) {
-                // Same channel as collectAc's insideTempC, so share the one reader (decode +
-                // zero-mismatch guard + validity band). This used to inline its own -40..60
-                // band, so the two fields could disagree about whether an identical reading was
-                // valid — a hot parked cabin above 60 C was published by one and dropped by the
-                // other.
-                int raw = readCabinTempC();
-                if (raw != Integer.MIN_VALUE) b.insideTempCelsius(raw);
-            }
-        } catch (Exception e) {
-            logger.debug("collectInstrumentExtended insideTemp error: " + e.getMessage());
-        }
-
         // Per-tyre temperature from InstrumentDevice via feature ID get() calls.
         // Slot mapping from BYDAutoFeatureIds.Instrument:
         //   LF_TYRE_TEMPERATURE, RF_TYRE_TEMPERATURE, LB_TYRE_TEMPERATURE, RB_TYRE_TEMPERATURE
@@ -6149,6 +8826,32 @@ public class BydDataCollector {
      * Extended engine data: coolant level, oil level, engine code.
      * Called from collectAllFull() only (display-only, on-demand).
      */
+    /**
+     * Air quality PM2.5 (µg/m³) from {@code BYDAutoPM2p5Device.getPM2p5Value()}, which returns
+     * an {@code int[]} of {inside, outside} — the same call the reference apps make.
+     *
+     * <p>Previously PM2.5 came ONLY from the BYD cloud snapshot, so the local reading (and the
+     * {@code pm25} automation signal) were empty whenever the car was offline or no cloud
+     * account was configured. The cloud merge already defers to the SDK value when present
+     * ("only if SDK returned UNAVAILABLE"), so populating it here makes local the primary
+     * source and leaves cloud as the fallback, with no change to that merge.
+     *
+     * <p>Negative slots are left UNAVAILABLE rather than published: the HAL fills an unreadable
+     * sensor with a sentinel, and 0 µg/m³ is a legitimate reading that must not be invented.
+     */
+    private void collectPm25(BydVehicleData.Builder b) {
+        if (pm25Device == null) return;
+        try {
+            Object raw = BydDeviceHelper.callGetter(pm25Device, "getPM2p5Value");
+            if (!(raw instanceof int[])) return;
+            int[] pm = (int[]) raw;
+            if (pm.length > 0 && pm[0] >= 0) b.pm25Inside(pm[0]);
+            if (pm.length > 1 && pm[1] >= 0) b.pm25Outside(pm[1]);
+        } catch (Exception e) {
+            logger.debug("collectPm25 error: " + e.getMessage());
+        }
+    }
+
     private void collectEngineExtended(BydVehicleData.Builder b) {
         if (engineDevice == null) return;
 
@@ -6262,7 +8965,7 @@ public class BydDataCollector {
      * Merge cloud data as FALLBACK — only fills fields where SDK returned no value.
      * SDK is always primary (real-time 5s poll). Cloud fills gaps only.
      */
-    private void mergeCloudData(BydVehicleData.Builder b) {
+    private void mergeCloudData(BydVehicleData.Builder b, boolean cabinTempHalSucceeded) {
         try {
             com.overdrive.app.byd.cloud.BydCloudConfig config =
                     com.overdrive.app.byd.cloud.BydCloudConfig.fromUnifiedConfig();
@@ -6297,7 +9000,9 @@ public class BydDataCollector {
             if (b.chargingRestTimeMinutes == BydVehicleData.UNAVAILABLE && cs.hasRemainingMinutes())
                 b.chargingRestTimeMinutes(cs.remainingMinutes);
 
-            // Temperatures — only if SDK returned NaN.
+            // Temperatures — cabin cloud data may replace a carried-forward HAL value when this
+            // poll's HAL read failed. Presence alone is insufficient because toBuilder() carries
+            // the previous value and observation timestamp forward.
             // The cloud cabin value gets the SAME validity band as the HAL one
             // (isPlausibleCabinTempC): hasInsideTemp() only rejects a low sentinel and has no
             // UPPER bound, so a cloud tempInCar of 255/65535 would otherwise be published
@@ -6305,16 +9010,17 @@ public class BydDataCollector {
             // event — where it latches and permanently satisfies every "cabin above X" rule.
             // Validating here (rather than re-adding a clip at each consumer) keeps ONE definition
             // of a plausible cabin temperature for both sources.
-            if (Double.isNaN(b.insideTempC) && cs.hasInsideTemp()
+            if (!cabinTempHalSucceeded && cs.insideTempObservedAt > b.insideTempReadAt
+                    && cs.hasFreshInsideTemp()
                     && isPlausibleCabinTempC((int) Math.round(cs.insideTempC))) {
-                b.insideTempC(cs.insideTempC);
+                b.insideTempC(cs.insideTempC, cs.insideTempObservedAt);
             }
             // Same band for the cloud OUTSIDE value, for exactly the reason above: hasOutsideTemp()
             // has no bounds at all, and tempOutCar is parsed two lines from tempInCar in the very
             // same payload — so the sentinel the cabin gate blocks would otherwise walk in here.
-            // A latched 255 would drive OUTSIDE_TEMPERATURE *and* the TEMPERATURE event (which
-            // still uses ambient as its fallback tail when the cabin sensor stops answering),
-            // permanently satisfying every "outside above X" rule, plus HA's ext_temp.
+            // A latched 255 would drive OUTSIDE_TEMPERATURE and permanently satisfy every
+            // "outside above X" rule, plus HA's ext_temp. Cabin temperature remains separate
+            // and is never synthesized from ambient data.
             if (Double.isNaN(b.outsideTempC) && cs.hasOutsideTemp()
                     && isPlausibleOutsideTempC((int) Math.round(cs.outsideTempC))) {
                 b.outsideTempC(cs.outsideTempC);
@@ -6368,6 +9074,8 @@ public class BydDataCollector {
         Object radarDevice = alreadyRegistered(this.radarDevice) ? null : this.radarDevice;
         Object powerDevice = alreadyRegistered(this.powerDevice) ? null : this.powerDevice;
         Object settingDevice = alreadyRegistered(this.settingDevice) ? null : this.settingDevice;
+        Object safetyBeltDevice = alreadyRegistered(this.safetyBeltDevice)
+                ? null : this.safetyBeltDevice;
 
         // Bodywork: use the typed listener so onDoorStateChanged /
         // onWindowStateChanged / onWindowOpenPercentChanged actually dispatch.
@@ -6399,22 +9107,46 @@ public class BydDataCollector {
         // on some PHEV firmwares, which is the root of the inconsistent
         // charging-detection bug (BMS state would freeze at 15 IDLE while
         // charging). Typed listener guarantees AC-charging start is seen.
-        if (noteRegisterOk(chargingDevice, BydDeviceHelper.registerChargingListener(chargingDevice, this::onChargingCallback))) {
-            logger.info("  Charging listener registered (typed)");
-            count++;
-        } else if (noteRegisterOk(chargingDevice, BydDeviceHelper.registerListener(chargingDevice, this::onChargingCallback))) {
-            logger.info("  Charging listener registered (generic fallback)");
-            count++;
+        if (chargingDevice != null) {
+            final Object listenerDevice = chargingDevice;
+            final long listenerGeneration = chargingListenerGeneration.incrementAndGet();
+            BydDeviceHelper.ListenerCallback callback = (method, args) ->
+                    onChargingCallback(listenerDevice, listenerGeneration, method, args);
+            if (noteRegisterOk(chargingDevice,
+                    BydDeviceHelper.registerChargingListener(chargingDevice, callback))) {
+                activeChargingListenerDevice = listenerDevice;
+                activeChargingListenerGeneration = listenerGeneration;
+                logger.info("  Charging listener registered (typed)");
+                count++;
+            } else if (noteRegisterOk(chargingDevice,
+                    BydDeviceHelper.registerListener(chargingDevice, callback))) {
+                activeChargingListenerDevice = listenerDevice;
+                activeChargingListenerGeneration = listenerGeneration;
+                logger.info("  Charging listener registered (generic fallback)");
+                count++;
+            }
         }
         // Engine listener: typed for onEngineCoolantLevelChanged /
         // onOilLevelChanged. Without this, engine fluid status is only
         // refreshed by the one-shot collectAllFull at init.
-        if (noteRegisterOk(engineDevice, BydDeviceHelper.registerEngineListener(engineDevice, this::onEngineCallback))) {
-            logger.info("  Engine listener registered (typed)");
-            count++;
-        } else if (noteRegisterOk(engineDevice, BydDeviceHelper.registerListener(engineDevice, this::onEngineCallback))) {
-            logger.info("  Engine listener registered (generic fallback)");
-            count++;
+        if (engineDevice != null) {
+            final Object listenerDevice = engineDevice;
+            final long listenerGeneration = engineListenerGeneration.incrementAndGet();
+            BydDeviceHelper.ListenerCallback callback = (method, args) ->
+                    onEngineCallback(listenerDevice, listenerGeneration, method, args);
+            if (noteRegisterOk(engineDevice,
+                    BydDeviceHelper.registerEngineListener(engineDevice, callback))) {
+                activeEngineListenerDevice = listenerDevice;
+                activeEngineListenerGeneration = listenerGeneration;
+                logger.info("  Engine listener registered (typed)");
+                count++;
+            } else if (noteRegisterOk(engineDevice,
+                    BydDeviceHelper.registerListener(engineDevice, callback))) {
+                activeEngineListenerDevice = listenerDevice;
+                activeEngineListenerGeneration = listenerGeneration;
+                logger.info("  Engine listener registered (generic fallback)");
+                count++;
+            }
         }
         // Instrument listener: MUST be typed. onExternalChargingPowerChanged
         // (live charging power in kW) is a concrete method on
@@ -6424,12 +9156,38 @@ public class BydDataCollector {
         // so charging power silently never arrived and the UI fell back to a
         // nominal estimate. Typed first; generic fallback kept for any firmware
         // that only exposes the bare 1-arg registerListener.
-        if (noteRegisterOk(instrumentDevice, BydDeviceHelper.registerInstrumentListener(instrumentDevice, this::onInstrumentCallback))) {
-            logger.info("  Instrument listener registered (typed — external charging power)");
-            count++;
-        } else if (noteRegisterOk(instrumentDevice, BydDeviceHelper.registerListener(instrumentDevice, this::onInstrumentCallback))) {
-            logger.info("  Instrument listener registered (generic fallback)");
-            count++;
+        if (instrumentDevice != null) {
+            final Object listenerDevice = instrumentDevice;
+            final long listenerGeneration = instrumentListenerGeneration.incrementAndGet();
+            BydDeviceHelper.ListenerCallback callback = (method, args) ->
+                    onInstrumentCallback(listenerDevice, listenerGeneration, method, args);
+            if (noteRegisterOk(instrumentDevice,
+                    BydDeviceHelper.registerInstrumentListener(instrumentDevice, callback))) {
+                activeInstrumentListenerDevice = listenerDevice;
+                activeInstrumentListenerGeneration = listenerGeneration;
+                logger.info("  Instrument listener registered (typed — external charging power)");
+                count++;
+            } else if (noteRegisterOk(instrumentDevice,
+                    BydDeviceHelper.registerListener(instrumentDevice, callback))) {
+                activeInstrumentListenerDevice = listenerDevice;
+                activeInstrumentListenerGeneration = listenerGeneration;
+                logger.info("  Instrument listener registered (generic fallback)");
+                count++;
+            }
+        }
+        // Passenger occupancy is a concrete SafetyBelt listener callback, not a method on the
+        // generic IBYDAutoListener interface. It remains useful on trims where the synchronous
+        // getPassengerStatus getter returns INVALID.
+        final Object listenerDevice = safetyBeltDevice;
+        if (listenerDevice != null) {
+            final long listenerGeneration = safetyBeltListenerGeneration.incrementAndGet();
+            if (noteRegisterOk(listenerDevice, BydDeviceHelper.registerSafetyBeltListener(listenerDevice,
+                    (method, args) -> onSafetyBeltCallback(listenerDevice, listenerGeneration, method, args)))) {
+                activeSafetyBeltListenerDevice = listenerDevice;
+                activeSafetyBeltListenerGeneration = listenerGeneration;
+                logger.info("  SafetyBelt listener registered (typed — passenger occupancy)");
+                count++;
+            }
         }
         // Statistic listener MUST be typed to receive onElecPercentageChanged(double)
         // — the DECIMAL display SoC. It's a concrete method on
@@ -6456,7 +9214,7 @@ public class BydDataCollector {
         // is unaffected. registerListener(ids,…) falls back internally to the
         // unfiltered form on firmware lacking the 2-arg overload, so a trim that
         // only supports the old path behaves exactly as before.
-        if (noteRegisterOk(adasDevice, BydDeviceHelper.registerListener(adasDevice, ADAS_EVENT_FILTER, this::onAdasCallback))) {
+        if (noteRegisterOk(adasDevice, BydDeviceHelper.registerListener(adasDevice, resolvedIds(ADAS_EVENT_FILTER), this::onAdasCallback))) {
             logger.info("  Adas listener registered (filtered — blind-spot warnings)");
             count++;
         }
@@ -6537,8 +9295,123 @@ public class BydDataCollector {
         markRegistered(this.radarDevice, radarDevice);
         markRegistered(this.powerDevice, powerDevice);
         markRegistered(this.settingDevice, settingDevice);
+        markRegistered(this.safetyBeltDevice, safetyBeltDevice);
         logger.info("Listeners registered: " + count
                 + " (tracked handles: " + registeredHandles.size() + ")");
+    }
+
+    private void onSafetyBeltCallback(Object sourceDevice, long generation, String method, Object[] args) {
+        long lifecycleGeneration = callbackLifecycleGeneration.get();
+        if (!isActiveSafetyBeltListener(sourceDevice, generation, lifecycleGeneration)) {
+            return;
+        }
+
+        if ("onSafetyBeltStatusChanged".equals(method)) {
+            int passengerState = args != null && args.length >= 2
+                    ? normalizePassengerSeatbeltCallback(args[0], args[1])
+                    : BydVehicleData.UNAVAILABLE;
+            if (passengerState != BydVehicleData.UNAVAILABLE) {
+                int previous = passengerBeltCallbackState;
+                passengerBeltCallbackState = passengerState;
+                if (passengerState == 0) passengerBeltEverUnlatched = true;
+                invalidateSeatbeltPairMemo();
+                if (previous != passengerState) {
+                    logger.info("onSafetyBeltStatusChanged: front passenger="
+                            + (passengerState == 1 ? "buckled" : "unbuckled"));
+                }
+                try {
+                    if (anyReferenced(
+                            com.overdrive.app.automation.condition.BydEvent.SEATBELT_PASSENGER)) {
+                        com.overdrive.app.automation.condition.BydEvent.pollSeatbelts();
+                    }
+                } catch (Throwable t) {
+                    logger.debug("passenger seatbelt callback publish error: " + t.getMessage());
+                }
+            }
+            return;
+        }
+
+        if (!"onPassengerStatusChanged".equals(method) || args == null || args.length < 2
+                || !(args[0] instanceof Number) || !(args[1] instanceof Number)) {
+            return;
+        }
+        double area = ((Number) args[0]).doubleValue();
+        int state = normalizePassengerStatus(args[1]);
+        if (area != OCCUPANT_AREA_FRONT_PASSENGER || state == BydVehicleData.UNAVAILABLE) {
+            return;
+        }
+
+        synchronized (passengerOccupancyPublishLock) {
+            if (!isActiveSafetyBeltListener(
+                    sourceDevice, generation, lifecycleGeneration)) return;
+
+            // Prefer a live direct-sensor read when this trim exposes it, but keep the documented
+            // callback state when the getter returns INVALID/UNAVAILABLE. Do NOT replace a
+            // callback with the belt/reminder estimate: the callback is an actual sensor value.
+            try {
+                int live = directFrontPassengerOccupancy();
+                if (live != BydVehicleData.UNAVAILABLE) state = live;
+            } catch (Throwable t) {
+                logger.debug("onPassengerStatusChanged live re-read failed: " + t.getMessage());
+            }
+
+            if (!isActiveSafetyBeltListener(
+                    sourceDevice, generation, lifecycleGeneration)) return;
+            long sampleGeneration = passengerOccupancySampleGeneration.incrementAndGet();
+            logger.info("onPassengerStatusChanged: front passenger="
+                    + (state == 1 ? "occupied" : "empty"));
+            publishPassengerOccupancySample(sampleGeneration, state);
+        }
+    }
+
+    /**
+     * Publish one ordered, validated passenger sample. The caller may already hold this
+     * reentrant lock; keeping the guard here makes future sources safe by default.
+     */
+    private void publishPassengerOccupancySample(long sampleGeneration, int state) {
+        synchronized (passengerOccupancyPublishLock) {
+            if (sampleGeneration != passengerOccupancySampleGeneration.get()
+                    || !anyReferenced(com.overdrive.app.automation.condition.BydEvent.OCCUPANT_PASSENGER)) {
+                return;
+            }
+            try {
+                com.overdrive.app.automation.condition.BydEvent.publishPassengerOccupancy(state);
+            } catch (Throwable t) {
+                logger.debug("passenger occupancy publish error: " + t.getMessage());
+            }
+        }
+    }
+
+    private boolean isActiveSafetyBeltListener(Object sourceDevice, long generation,
+                                               long lifecycleGeneration) {
+        return isCallbackLifecycleCurrent(lifecycleGeneration)
+                && sourceDevice != null && sourceDevice == safetyBeltDevice
+                && sourceDevice == activeSafetyBeltListenerDevice
+                && generation == activeSafetyBeltListenerGeneration;
+    }
+
+    private boolean isActiveChargingListener(Object sourceDevice, long generation,
+                                             long lifecycleGeneration) {
+        return isCallbackLifecycleCurrent(lifecycleGeneration)
+                && sourceDevice != null && sourceDevice == chargingDevice
+                && sourceDevice == activeChargingListenerDevice
+                && generation == activeChargingListenerGeneration;
+    }
+
+    private boolean isActiveInstrumentListener(Object sourceDevice, long generation,
+                                               long lifecycleGeneration) {
+        return isCallbackLifecycleCurrent(lifecycleGeneration)
+                && sourceDevice != null && sourceDevice == instrumentDevice
+                && sourceDevice == activeInstrumentListenerDevice
+                && generation == activeInstrumentListenerGeneration;
+    }
+
+    private boolean isActiveEngineListener(Object sourceDevice, long generation,
+                                           long lifecycleGeneration) {
+        return isCallbackLifecycleCurrent(lifecycleGeneration)
+                && sourceDevice != null && sourceDevice == engineDevice
+                && sourceDevice == activeEngineListenerDevice
+                && generation == activeEngineListenerGeneration;
     }
 
     private void onBodyworkCallback(String method, Object[] args) {
@@ -6552,8 +9425,7 @@ public class BydDataCollector {
         // means consumers see consistent state regardless of which side fires.
         collectBodywork(b);
         collectDoorLock(b);
-        BydVehicleData updated = b.build();
-        snapshot.set(updated);
+        BydVehicleData updated = publishNonChargingSnapshot(b.build());
 
         // If a typed onDoorStateChanged event arrived, fan it out specifically
         // so consumers that want raw door-open events (not lock state) can
@@ -6582,8 +9454,7 @@ public class BydDataCollector {
         if (current == null) return;
         BydVehicleData.Builder b = current.toBuilder();
         collectDoorLock(b);
-        BydVehicleData updated = b.build();
-        snapshot.set(updated);
+        BydVehicleData updated = publishNonChargingSnapshot(b.build());
 
         if ("onDoorLockStatusChanged".equals(method) && args != null && args.length >= 2) {
             int area = (args[0] instanceof Integer) ? (Integer) args[0] : -1;
@@ -6609,6 +9480,12 @@ public class BydDataCollector {
     }
 
     private void onGenericCallback(String method, Object[] args) {
+        long lifecycleGeneration = callbackLifecycleGeneration.get();
+        // Stamp callback arrival before any dispatch work. A reconnect poll can begin while this
+        // method is selecting its branch; assigning the sequence only inside the gun branch would
+        // make an older queued gun-out callback appear newer than that synchronous reconnect.
+        long callbackObservation = chargingObservationOrder.begin();
+        if (!isCallbackLifecycleCurrent(lifecycleGeneration)) return;
         // Typed callbacks for real-time updates
         if ("onElecPercentageChanged".equals(method) && args != null && args.length > 0) {
             try {
@@ -6616,7 +9493,7 @@ public class BydDataCollector {
                 if (soc >= 0 && soc <= 100) {
                     BydVehicleData current = snapshot.get();
                     if (current != null) {
-                        snapshot.set(current.toBuilder().socPercent(soc).build());
+                        publishNonChargingSnapshot(current.toBuilder().socPercent(soc).build());
                     }
                     // Fan out to the SoC voluntary-cutoff monitor (no-op when
                     // not running). Doesn't try to subclass the abstract
@@ -6636,7 +9513,7 @@ public class BydDataCollector {
                 if (fuel >= 0 && fuel <= 100 && !isBevFuelSentinel(fuel)) {
                     BydVehicleData current = snapshot.get();
                     if (current != null && isPhev(current)) {
-                        snapshot.set(current.toBuilder().fuelPercent(fuel).build());
+                        publishNonChargingSnapshot(current.toBuilder().fuelPercent(fuel).build());
                     }
                 }
             } catch (Exception e) { /* ignore */ }
@@ -6645,10 +9522,19 @@ public class BydDataCollector {
         if ("onSpeedChanged".equals(method) && args != null && args.length > 0) {
             try {
                 double speed = ((Number) args[0]).doubleValue();
-                if (speed != BydFeatureIds.SDK_NOT_AVAILABLE) {
+                double speedKmh = convertRawSpeedToKmh(speed, getSpeedToKmhFactor());
+                if (!Double.isNaN(speedKmh)) {
                     BydVehicleData current = snapshot.get();
                     if (current != null) {
-                        snapshot.set(current.toBuilder().speedKmh(speed * distanceToKmFactor).build());
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .speedKmh(speedKmh).build());
+                    }
+                    if (com.overdrive.app.automation.Automations.isEventReferenced(
+                                    com.overdrive.app.automation.condition.BydEvent.SPEED_KMPH)
+                            || com.overdrive.app.automation.Automations.isEventReferenced(
+                                    com.overdrive.app.automation.condition.BydEvent.SPEED_MPH)
+                            || com.overdrive.app.automation.Automations.editorSeedActive()) {
+                        com.overdrive.app.automation.condition.BydEvent.publishSpeedKmh(speedKmh);
                     }
                 }
             } catch (Exception e) { /* ignore */ }
@@ -6660,7 +9546,7 @@ public class BydDataCollector {
                 if (rpm >= 0 && rpm <= 8000) {
                     BydVehicleData current = snapshot.get();
                     if (current != null) {
-                        snapshot.set(current.toBuilder().engineSpeedRpm(rpm).build());
+                        publishNonChargingSnapshot(current.toBuilder().engineSpeedRpm(rpm).build());
                     }
                 }
             } catch (Exception e) { /* ignore */ }
@@ -6672,7 +9558,7 @@ public class BydDataCollector {
                 if (voltage > 0 && voltage < 20) {
                     BydVehicleData current = snapshot.get();
                     if (current != null) {
-                        snapshot.set(current.toBuilder().voltage12v(voltage).build());
+                        publishNonChargingSnapshot(current.toBuilder().voltage12v(voltage).build());
                     }
                     // Fan out — same rationale as onOtaCallback. Some BYD
                     // trims route OTA voltage through the generic hub instead.
@@ -6686,11 +9572,9 @@ public class BydDataCollector {
         }
         if ("onChargingGunStateChanged".equals(method) && args != null && args.length > 0) {
             try {
-                int gunState = ((Number) args[0]).intValue();
-                BydVehicleData current = snapshot.get();
-                if (current != null) {
-                    snapshot.set(current.toBuilder().chargingGunState(gunState).build());
-                }
+                publishChargingGunEdge(
+                        null, -1L, lifecycleGeneration,
+                        ((Number) args[0]).intValue(), callbackObservation);
             } catch (Exception e) { /* ignore */ }
             return;
         }
@@ -6743,6 +9627,13 @@ public class BydDataCollector {
     // confirm the hectowatt vs kW scaling against the cluster's own readout.
     private volatile boolean loggedExtChargePowerScale = false;
 
+    // One-shot each: whether the per-session charged-energy counter answers on this trim, and
+    // through which accessor. "Absent" has to be visible in a capture rather than inferred from
+    // a missing line, because it decides whether session energy is metered or reconstructed.
+    private volatile boolean loggedChargingPowerGetterSource = false;
+    private volatile boolean loggedChargeCapacitySource = false;
+    private volatile boolean loggedChargeCapacityAbsent = false;
+
     // Same one-shot, for the cluster's own CHARGING_CHARGE_POWER_DD readout — the PHEV-
     // trustworthy source. Logged once so a single field capture pins its scale.
     private volatile boolean loggedClusterChargePowerScale = false;
@@ -6756,15 +9647,112 @@ public class BydDataCollector {
     // 1014 per the OEM app's own SOH read (its second-tier attempt).
     private static final int STATISTIC_DEVICE_TYPE = 1014;
 
-    private void onChargingCallback(String method, Object[] args) {
+    /**
+     * Publish every gun edge through the same lock/version protocol used by BMS edges and deliver it
+     * to the detector before releasing that ordering position.
+     */
+    private void publishChargingGunEdge(Object sourceDevice, long generation,
+                                        long lifecycleGeneration, int gunState,
+                                        long observation) {
+        if (!isValidChargingGunState(gunState)) return;
+        synchronized (chargingEdgePublishLock) {
+            if (sourceDevice != null && !isActiveChargingListener(
+                    sourceDevice, generation, lifecycleGeneration)) {
+                return;
+            }
+            if (sourceDevice == null
+                    && !isCallbackLifecycleCurrent(lifecycleGeneration)) return;
+            // A synchronous poll may have read a reconnect while this older callback waited for
+            // the publication lock. Order by observation start, not lock acquisition.
+            if (!chargingObservationOrder.claimGunCallback(observation)) return;
+            try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation ignored =
+                         com.overdrive.app.monitor.ChargingDetector.beginPublicationMutation()) {
+                BydVehicleData current = snapshot.get();
+                boolean vtol;
+                if (gunState == 5) {
+                    vtol = true;
+                } else if (gunState == 1) {
+                    vtol = false;
+                } else if (gunState == 2 || gunState == 3 || gunState == 4) {
+                    // Keep the snapshot's independent type-derived export bit, but do not send it as
+                    // a fresh mode assertion to the detector. This callback observed only the gun.
+                    vtol = current != null && current.chargingType == 3;
+                } else {
+                    vtol = current != null && current.vtolCharging;
+                }
+                BydVehicleData published = current;
+                boolean authoritativeOff = gunState == 1 || gunState == 5;
+                boolean sessionWasLive = current != null
+                        && (current.chargingState == 1
+                            || com.overdrive.app.monitor.ChargingDetector
+                                    .getInstance().isCharging());
+                if (current != null) {
+                    published = current.toBuilder().chargingGunState(gunState)
+                            .vtolCharging(vtol).build();
+                    if (authoritativeOff) {
+                        published = clearChargingRateFields(
+                                published,
+                                ChargeSourceClassifier.isCounter(
+                                        ChargeSourceClassifier.SRC_EXTERNAL));
+                    }
+                    snapshot.set(published);
+                }
+                // Increment even for a duplicate snapshot value. An accepted callback is newer than
+                // the last successful synchronous gun observation. This must precede a final-counter
+                // getter that can block.
+                gunEdgeVersion.incrementAndGet();
+                if (authoritativeOff) {
+                    chargingRateClearVersion.incrementAndGet();
+                }
+                if (gunState == 1) {
+                    published = reconcileReservedFinalCountersLocked(
+                            published, observation, lifecycleGeneration, sessionWasLive);
+                }
+                if (gunState == 1 && published != null) {
+                    // Reservations began before this terminal edge; the synchronous getter below is
+                    // newer and must be applied last even when it wrapped/reset to a lower value.
+                    published = collectFinalChargeCountersLocked(published);
+                }
+                com.overdrive.app.monitor.ChargingDetector.getInstance()
+                        .updateConnectionState(gunState, gunState == 5);
+                publishAutomationSnapshot(published);
+            }
+        }
+    }
+
+    private void onChargingCallback(Object sourceDevice, long generation,
+                                    String method, Object[] args) {
+        // Capture the lifecycle first so an init/stop barrier between callback entry and later
+        // publication cannot make old work look current after reactivation.
+        long lifecycleGeneration = callbackLifecycleGeneration.get();
+        if (!isActiveChargingListener(
+                sourceDevice, generation, lifecycleGeneration)) return;
+        CounterCallbackReservation capacityReservation = null;
+        if ("onChargingCapacityChanged".equals(method)
+                && args != null && args.length > 0 && args[0] instanceof Number) {
+            try {
+                double cap = ((Number) args[0]).doubleValue();
+                if (isValidFinalCounterValue(ChargeSourceClassifier.SRC_CAPACITY, cap)) {
+                    // Reserve the payload atomically with its observation sequence before this callback
+                    // can wait for the publication lock. A later terminal edge can then settle it even
+                    // if its final getter is unavailable.
+                    capacityReservation = chargingObservationOrder.reserveCounterCallback(
+                            lifecycleGeneration, ChargeSourceClassifier.SRC_CAPACITY, cap);
+                }
+            } catch (RuntimeException ignored) {}
+        }
+        // Hardware-observation ordering is based on callback dispatch/reservation, not on when the
+        // callback eventually acquires chargingEdgePublishLock.
+        long callbackObservation = capacityReservation != null
+                ? capacityReservation.observation : chargingObservationOrder.begin();
+        long bmsVersionAtDispatch = bmsEdgeVersion.get();
+        long gunVersionAtDispatch = gunEdgeVersion.get();
+        long typeVersionAtDispatch = chargingTypeVersion.get();
         // Typed callbacks for real-time charging updates
         if ("onChargingGunStateChanged".equals(method) && args != null && args.length > 0) {
             try {
-                int gunState = ((Number) args[0]).intValue();
-                BydVehicleData current = snapshot.get();
-                if (current != null) {
-                    snapshot.set(current.toBuilder().chargingGunState(gunState).build());
-                }
+                publishChargingGunEdge(sourceDevice, generation, lifecycleGeneration,
+                        ((Number) args[0]).intValue(), callbackObservation);
             } catch (Exception e) { /* ignore */ }
             return;
         }
@@ -6773,31 +9761,137 @@ public class BydDataCollector {
             try {
                 int state = ((Number) args[0]).intValue();
                 if (state >= 0 && state <= 15) {
-                    BydVehicleData current = snapshot.get();
-                    if (current != null && current.chargingState != state) {
-                        int previous = current.chargingState;
-                        snapshot.set(current.toBuilder().chargingState(state).build());
-                        logger.info("BMS state changed: " + state + " (" +
-                                (state == 0 ? "READY" : state == 1 ? "CHARGING" : state == 2 ? "FINISHED" :
-                                 state == 3 ? "DISCHARGING" : state == 15 ? "IDLE" : "OTHER") + ")");
-                        notifyChargingStateListeners(previous, state);
+                    synchronized (chargingStateTransitionLock) {
+                        int previous = BydVehicleData.UNAVAILABLE;
+                        boolean changed = false;
+                        synchronized (chargingEdgePublishLock) {
+                            if (!isActiveChargingListener(
+                                    sourceDevice, generation, lifecycleGeneration)) return;
+                            if (!chargingObservationOrder.claimBmsCallback(callbackObservation)) {
+                                return;
+                            }
+                            try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation
+                                         ignored = com.overdrive.app.monitor.ChargingDetector
+                                                 .beginPublicationMutation()) {
+                                BydVehicleData current = snapshot.get();
+                                BydVehicleData published = current;
+                                com.overdrive.app.monitor.ChargingDetector detector =
+                                        com.overdrive.app.monitor.ChargingDetector.getInstance();
+                                boolean terminalBarrierActive =
+                                        detector.isTerminalSessionBarrierActive();
+                                if (current != null) {
+                                    previous = current.chargingState;
+                                    if (previous != state
+                                            && shouldPublishBmsCallbackTransition(
+                                                    previous, state,
+                                                    terminalBarrierActive)) {
+                                        published = current.toBuilder().chargingState(state).build();
+                                        changed = true;
+                                    }
+                                    if (isTerminalChargingState(state)) {
+                                        boolean chargingConnection =
+                                                current.chargingGunState == 2
+                                                || current.chargingGunState == 3
+                                                || current.chargingGunState == 4;
+                                        published = clearChargingRateFields(
+                                                published,
+                                                ChargeSourceClassifier.isCounter(
+                                                        ChargeSourceClassifier.SRC_EXTERNAL),
+                                                state == 2 && chargingConnection
+                                                        && !current.vtolCharging);
+                                    }
+                                    snapshot.set(published);
+                                }
+                                // Linearize the terminal lifecycle and rate clear before any final
+                                // counter getter. A newer counter-only callback can now capture these
+                                // versions while the getter blocks and will be admitted afterward.
+                                bmsEdgeVersion.incrementAndGet();
+                                if (isTerminalChargingState(state)) {
+                                    chargingRateClearVersion.incrementAndGet();
+                                }
+                                boolean sessionWasLive = previous == 1
+                                        || com.overdrive.app.monitor.ChargingDetector
+                                                .getInstance().isCharging();
+                                if (isTerminalChargingState(state)) {
+                                    published = reconcileReservedFinalCountersLocked(
+                                            published, callbackObservation,
+                                            lifecycleGeneration, sessionWasLive);
+                                }
+                                if (published != null
+                                        && sessionWasLive
+                                        && allowsTerminalCounterTail(state)) {
+                                    // A getter executed after the terminal observation is newer than
+                                    // every reservation settled above, regardless of value direction.
+                                    published = collectFinalChargeCountersLocked(published);
+                                }
+                                // Snapshot publication and detector delivery share both the collector
+                                // lock and the cross-component publication fence.
+                                detector.updateBmsState(state);
+                                publishAutomationSnapshot(published);
+                            }
+                        }
+                        if (changed) {
+                            logger.info("BMS state changed: " + state + " (" +
+                                    (state == 0 ? "READY"
+                                            : state == 1 ? "CHARGING"
+                                            : state == 2 ? "FINISHED"
+                                            : state == 3 ? "DISCHARGING"
+                                            : state == 15 ? "IDLE" : "OTHER") + ")");
+                            notifyChargingStateListeners(previous, state);
+                        }
                     }
-                    // Push edge into fused detector regardless of whether the
-                    // snapshot value moved (it may already match from a poll).
-                    com.overdrive.app.monitor.ChargingDetector.getInstance().updateBmsState(state);
                 }
             } catch (Exception e) { /* ignore */ }
             return;
         }
-        // Capacity event — purely diagnostic for charging session size, but the
-        // act of receiving it confirms the charging HAL is alive on this firmware.
+        // PER-SESSION CHARGED-ENERGY COUNTER, pushed by the HAL. This is the primary source for
+        // session energy, so it goes through the same admission gate as the poll read — and the
+        // domain is the SDK's [0, 65.534] kWh, not the old 200 (which would admit values that
+        // cannot be this counter).
         if ("onChargingCapacityChanged".equals(method) && args != null && args.length > 0) {
             try {
-                double cap = ((Number) args[0]).doubleValue();
-                if (cap > 0 && cap < 200) {
-                    BydVehicleData current = snapshot.get();
-                    if (current != null) {
-                        snapshot.set(current.toBuilder().chargingCapacityKwh(cap).build());
+                if (capacityReservation != null) {
+                    double cap = capacityReservation.raw;
+                    synchronized (chargingEdgePublishLock) {
+                        if (!isActiveChargingListener(
+                                sourceDevice, generation, lifecycleGeneration)) {
+                            chargingObservationOrder.completeCounterCallback(
+                                    capacityReservation);
+                            return;
+                        }
+                        if (capacityReservation.settledByTerminal) return;
+                        if (!isChargingCallbackLifecycleCurrent(
+                                bmsVersionAtDispatch, bmsEdgeVersion.get(),
+                                gunVersionAtDispatch, gunEdgeVersion.get(),
+                                typeVersionAtDispatch, chargingTypeVersion.get())) {
+                            chargingObservationOrder.completeCounterCallback(
+                                    capacityReservation);
+                            return;
+                        }
+                        try {
+                            try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation
+                                         ignored = com.overdrive.app.monitor.ChargingDetector
+                                                 .beginPublicationMutation()) {
+                                BydVehicleData current = snapshot.get();
+                                double admitted = admitChargingCallback(
+                                        current, ChargeSourceClassifier.SRC_CAPACITY, cap);
+                                if (current != null && !Double.isNaN(admitted)) {
+                                    BydVehicleData published = current.toBuilder()
+                                            .chargingCapacityKwh(admitted).build();
+                                    snapshot.set(published);
+                                    capacityEdgeVersion.incrementAndGet();
+                                    publishAutomationSnapshot(published);
+                                    if (!loggedChargeCapacitySource) {
+                                        loggedChargeCapacitySource = true;
+                                        logger.info("Charged-energy counter alive via callback: "
+                                                + cap + " kWh");
+                                    }
+                                }
+                            }
+                        } finally {
+                            chargingObservationOrder.completeCounterCallback(
+                                    capacityReservation);
+                        }
                     }
                 }
             } catch (Exception e) { /* ignore */ }
@@ -6820,15 +9914,53 @@ public class BydDataCollector {
         if ("onChargingPowerChanged".equals(method) && args != null && args.length > 0) {
             try {
                 double power = ((Number) args[0]).doubleValue();
-                // Listener callback delivers kW directly. SDK docs: range -500 to 500 kW.
-                if (Math.abs(power) > 0.1 && Math.abs(power) < 500) {
-                    BydVehicleData current = snapshot.get();
-                    if (current != null) {
-                        snapshot.set(current.toBuilder().chargingPowerKw(power).build());
-                        long now = System.currentTimeMillis();
-                        if (now - lastChargingPowerLogTime > 30_000) {
-                            lastChargingPowerLogTime = now;
-                            logger.info("Charging power via callback: " + String.format("%.1f", power) + " kW");
+                if (isChargingPowerCallbackPayload(power)) {
+                    synchronized (chargingEdgePublishLock) {
+                        if (!isActiveChargingListener(
+                                sourceDevice, generation, lifecycleGeneration)) return;
+                        if (!isChargingCallbackLifecycleCurrent(
+                                bmsVersionAtDispatch, bmsEdgeVersion.get(),
+                                gunVersionAtDispatch, gunEdgeVersion.get(),
+                                typeVersionAtDispatch, chargingTypeVersion.get())) {
+                            return;
+                        }
+                        try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation
+                                     ignored = com.overdrive.app.monitor.ChargingDetector
+                                             .beginPublicationMutation()) {
+                            BydVehicleData current = snapshot.get();
+                            double admitted = power > 0.1
+                                    ? admitChargingCallback(
+                                            current, ChargeSourceClassifier.SRC_DEVICE, power)
+                                    : Double.NaN;
+                            if (power <= 0.1 && current != null
+                                    && allowsRawChargingEvidence(
+                                            current.chargingGunState, current.vtolCharging)) {
+                                try {
+                                    com.overdrive.app.monitor.ChargingDetector.getInstance()
+                                            .observeRawChargingSignal(
+                                                ChargeSourceClassifier.SRC_DEVICE, 0.0);
+                                } catch (Throwable ignoredSignal) {}
+                            }
+                            if (current != null
+                                    && (power <= 0.1 || !Double.isNaN(admitted))) {
+                                long observedAtMs = System.currentTimeMillis();
+                                BydVehicleData published = current.toBuilder()
+                                        .chargingPowerKw(
+                                                power <= 0.1 ? Double.NaN : admitted)
+                                        .chargingPowerAtMs(
+                                                power <= 0.1 ? 0L : observedAtMs)
+                                        .build();
+                                snapshot.set(published);
+                                devicePowerEdgeVersion.incrementAndGet();
+                                publishAutomationSnapshot(published);
+                                long now = System.currentTimeMillis();
+                                if (power > 0.1
+                                        && now - lastChargingPowerLogTime > 30_000) {
+                                    lastChargingPowerLogTime = now;
+                                    logger.info("Charging power via callback: "
+                                            + String.format("%.1f", power) + " kW");
+                                }
+                            }
                         }
                     }
                 }
@@ -6845,7 +9977,7 @@ public class BydDataCollector {
                 if (voltage > 0 && voltage < 20) {
                     BydVehicleData current = snapshot.get();
                     if (current != null) {
-                        snapshot.set(current.toBuilder().voltage12v(voltage).build());
+                        publishNonChargingSnapshot(current.toBuilder().voltage12v(voltage).build());
                     }
                     // Fan out to BatteryVoltageMonitorV2's MCU sleep/wake
                     // hysteresis (no-op when not running). The collector
@@ -6860,7 +9992,26 @@ public class BydDataCollector {
         }
     }
 
-    private void onInstrumentCallback(String method, Object[] args) {
+    private void onInstrumentCallback(Object sourceDevice, long generation,
+                                      String method, Object[] args) {
+        long lifecycleGeneration = callbackLifecycleGeneration.get();
+        if (!isActiveInstrumentListener(
+                sourceDevice, generation, lifecycleGeneration)) return;
+        CounterCallbackReservation externalCounterReservation = null;
+        if ("onExternalChargingPowerChanged".equals(method)
+                && args != null && args.length > 0 && args[0] instanceof Number
+                && ChargeSourceClassifier.isCounter(ChargeSourceClassifier.SRC_EXTERNAL)) {
+            try {
+                double raw = ((Number) args[0]).doubleValue();
+                if (isValidFinalCounterValue(ChargeSourceClassifier.SRC_EXTERNAL, raw)) {
+                    externalCounterReservation = chargingObservationOrder.reserveCounterCallback(
+                            lifecycleGeneration, ChargeSourceClassifier.SRC_EXTERNAL, raw);
+                }
+            } catch (RuntimeException ignored) {}
+        }
+        long bmsVersionAtDispatch = bmsEdgeVersion.get();
+        long gunVersionAtDispatch = gunEdgeVersion.get();
+        long typeVersionAtDispatch = chargingTypeVersion.get();
         // Handle the new-style BYDAutoEvent callbacks
         if ("onDataEventChanged".equals(method) && args != null && args.length >= 2) {
             // NOTE: Do NOT blindly interpret all instrument events as charging power.
@@ -6883,6 +10034,10 @@ public class BydDataCollector {
             try {
                 if (anyReferenced(com.overdrive.app.automation.condition.BydEvent.SEATBELT_DRIVER,
                                   com.overdrive.app.automation.condition.BydEvent.SEATBELT_PASSENGER)) {
+                    // Drop the per-tick memo first: this callback exists to beat the 500ms poll,
+                    // and an edge landing just after a poll read would otherwise be answered from
+                    // the pre-edge memo and have to wait for the next tick.
+                    invalidateSeatbeltPairMemo();
                     com.overdrive.app.automation.condition.BydEvent.pollSeatbelts();
                 }
             } catch (Throwable t) {
@@ -6892,13 +10047,74 @@ public class BydDataCollector {
         }
         if ("onExternalChargingPowerChanged".equals(method) && args != null && args.length > 0) {
             try {
-                double power = ((Number) args[0]).doubleValue();
-                // Listener callback delivers kW directly (SDK converts from CAN bus internally).
-                boolean accepted = (power > 0.1 && power <= 500);
-                if (accepted) {
-                    BydVehicleData current = snapshot.get();
-                    if (current != null) {
-                        snapshot.set(current.toBuilder().externalChargingPowerKw(power).build());
+                double power = externalCounterReservation != null
+                        ? externalCounterReservation.raw
+                        : ((Number) args[0]).doubleValue();
+                // RAW, unscaled, and gated exactly like the poll read. This accessor's meaning is
+                // firmware-dependent (a live rate on some trims, a cumulative charged-energy
+                // counter on others), so the value is stored as-is and ChargeSourceClassifier
+                // decides what it is. The old code accepted it here with no gun/BMS gate at all,
+                // which is how a counter reading taken with the gun OUT became "charging power".
+                boolean accepted = false;
+                synchronized (chargingEdgePublishLock) {
+                    if (!isActiveInstrumentListener(
+                            sourceDevice, generation, lifecycleGeneration)) {
+                        chargingObservationOrder.completeCounterCallback(
+                                externalCounterReservation);
+                        return;
+                    }
+                    if (externalCounterReservation != null
+                            && externalCounterReservation.settledByTerminal) {
+                        return;
+                    }
+                    if (!isChargingCallbackLifecycleCurrent(
+                            bmsVersionAtDispatch, bmsEdgeVersion.get(),
+                            gunVersionAtDispatch, gunEdgeVersion.get(),
+                            typeVersionAtDispatch, chargingTypeVersion.get())) {
+                        chargingObservationOrder.completeCounterCallback(
+                                externalCounterReservation);
+                        return;
+                    }
+                    try {
+                        try (com.overdrive.app.monitor.ChargingDetector.PublicationMutation ignored =
+                                     com.overdrive.app.monitor.ChargingDetector
+                                             .beginPublicationMutation()) {
+                            BydVehicleData current = snapshot.get();
+                            ChargeSourceClassifier.Kind sourceKind =
+                                    ChargeSourceClassifier.kindOf(
+                                            ChargeSourceClassifier.SRC_EXTERNAL);
+                            boolean explicitRateStop = current != null
+                                    && isExplicitExternalRateStop(power, sourceKind);
+                            double admitted = explicitRateStop
+                                    ? Double.NaN
+                                    : admitChargingCallback(
+                                            current, ChargeSourceClassifier.SRC_EXTERNAL, power);
+                            accepted = current != null
+                                    && (explicitRateStop || !Double.isNaN(admitted));
+                            if (accepted) {
+                                if (explicitRateStop && allowsRawChargingEvidence(
+                                        current.chargingGunState, current.vtolCharging)) {
+                                    try {
+                                        com.overdrive.app.monitor.ChargingDetector.getInstance()
+                                                .observeRawChargingSignal(
+                                                    ChargeSourceClassifier.SRC_EXTERNAL, 0.0);
+                                    } catch (Throwable ignoredSignal) {}
+                                }
+                                long observedAtMs = System.currentTimeMillis();
+                                BydVehicleData published = current.toBuilder()
+                                        .externalChargingPowerKw(
+                                                explicitRateStop ? Double.NaN : admitted)
+                                        .externalChargingPowerAtMs(
+                                                explicitRateStop ? 0L : observedAtMs)
+                                        .build();
+                                snapshot.set(published);
+                                externalPowerEdgeVersion.incrementAndGet();
+                                publishAutomationSnapshot(published);
+                            }
+                        }
+                    } finally {
+                        chargingObservationOrder.completeCounterCallback(
+                                externalCounterReservation);
                     }
                 }
                 // DIAGNOSTIC: log EVERY callback arrival — this is the proof the
@@ -6932,7 +10148,8 @@ public class BydDataCollector {
                 if (eventId == BydFeatureIds.LIGHT_DAY_RUNNING_LIGHT_AUTO_STATE && iVal > 0 && iVal < 3) {
                     BydVehicleData current = snapshot.get();
                     if (current != null) {
-                        snapshot.set(current.toBuilder().dayTimeLight(iVal == 1).build());
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .dayTimeLight(iVal == 1).build());
                     }
                     return;
                 }
@@ -6967,7 +10184,7 @@ public class BydDataCollector {
         if (iVal == 0 || iVal == 1) {
             BydVehicleData current = snapshot.get();
             if (current != null) {
-                snapshot.set(current.toBuilder().ambientEnabled(iVal).build());
+                publishNonChargingSnapshot(current.toBuilder().ambientEnabled(iVal).build());
             }
         }
         return true;
@@ -6983,7 +10200,8 @@ public class BydDataCollector {
                 if (eventId == BydFeatureIds.ADAS_SLW_FUNC_SWITCH_STATE && iVal > 0 && iVal < 3) {
                     BydVehicleData current = snapshot.get();
                     if (current != null) {
-                        snapshot.set(current.toBuilder().speedLimitWarning(iVal == 2).build());
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .speedLimitWarning(iVal == 2).build());
                     }
                     return;
                 }
@@ -7002,6 +10220,17 @@ public class BydDataCollector {
      */
     private void handleBlindSpotEvent(int eventId, int value) {
         boolean left, alerting;
+        // Defensive: an id this SDK does not publish must never take part in the comparisons below.
+        // Currently unreachable (every constant here resolves to a real literal), kept so adding an
+        // UNRESOLVED_ID fallback later cannot silently attribute an unrelated event to a side.
+        if (!BydFeatureIds.isResolved(eventId)) return;
+        // Sanitize FIRST, exactly as the poll does. This is the instant path with no confirmation
+        // hold, and it writes the SAME bsCounterBaseline map: an event carrying a positive 16-bit
+        // rail (65535/65534) would otherwise fire an immediate alert AND park the baseline there,
+        // so the next real count reads as a drop and the one after it re-fires.
+        int sanitized = sanitizeAdasAlert(value);
+        if (sanitized == BydVehicleData.UNAVAILABLE) return;
+        value = sanitized;
         if (eventId == BydFeatureIds.ADAS_FL_BLIND_SPOT_ALARM
                 || eventId == BydFeatureIds.ADAS_FR_BLIND_SPOT_ALARM) {
             left = (eventId == BydFeatureIds.ADAS_FL_BLIND_SPOT_ALARM);
@@ -7015,7 +10244,6 @@ public class BydDataCollector {
             left = (eventId == BydFeatureIds.ADAS_LCA_WARNING_LEFT
                     || eventId == BydFeatureIds.ADAS_RCTA_WARNING_LEFT
                     || eventId == BydFeatureIds.ADAS_DOW_WARN_LEFT);
-            if (value < 0) return;
             // An event for THIS id proves its callback works, so the poll can stop
             // reading it (see anyCounterAdvanced). Recorded per id — an event for one
             // warning says nothing about the others.
@@ -7045,7 +10273,8 @@ public class BydDataCollector {
             if (eventId == BydFeatureIds.SETTING_CPD_SWITCH_STATUS && iVal > 0 && iVal < 4) {
                 BydVehicleData current = snapshot.get();
                 if (current != null) {
-                    snapshot.set(current.toBuilder().childPresenceDetection(iVal).build());
+                    publishNonChargingSnapshot(current.toBuilder()
+                            .childPresenceDetection(iVal).build());
                 }
                 return;
             }
@@ -7059,7 +10288,7 @@ public class BydDataCollector {
                 if (iVal >= 1 && iVal <= 31) {
                     BydVehicleData current = snapshot.get();
                     if (current != null) {
-                        snapshot.set(current.toBuilder().ambientColour(iVal).build());
+                        publishNonChargingSnapshot(current.toBuilder().ambientColour(iVal).build());
                     }
                 }
                 return;
@@ -7085,7 +10314,7 @@ public class BydDataCollector {
             else if (eventId == BydFeatureIds.SET_PASSENGER_SEAT_VENTILATING_STATE) cool[1] = normalized;
             else return;
 
-            snapshot.set(b.seatHeat(heat).seatCool(cool).build());
+            publishNonChargingSnapshot(b.seatHeat(heat).seatCool(cool).build());
         } catch (Exception ignored) {}
     }
 
@@ -7098,7 +10327,11 @@ public class BydDataCollector {
             try {
                 double angle = BydDeviceHelper.getDoubleValue(args[0]);
                 if (!Double.isNaN(angle) && angle >= -780 && angle <= 780) {
-                    snapshot.set(snapshot.get().toBuilder().steeringAngleDegrees(angle).build());
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .steeringAngleDegrees(angle).build());
+                    }
                 }
             } catch (Exception e) { logger.debug("handleSteeringAngleChanged error: " + e.getMessage()); }
         }
@@ -7109,7 +10342,11 @@ public class BydDataCollector {
             try {
                 int state = BydDeviceHelper.getIntValue(args[0]);
                 if (state >= 0 && state <= 2) {
-                    snapshot.set(snapshot.get().toBuilder().autoSystemState(state).build());
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .autoSystemState(state).build());
+                    }
                 }
             } catch (Exception e) { logger.debug("handleAutoSystemStateChanged error: " + e.getMessage()); }
         }
@@ -7120,7 +10357,10 @@ public class BydDataCollector {
             try {
                 int state = BydDeviceHelper.getIntValue(args[0]);
                 if (state >= 0 && state <= 255) {
-                    snapshot.set(snapshot.get().toBuilder().sunroofState(state).build());
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder().sunroofState(state).build());
+                    }
                 }
             } catch (Exception e) { logger.debug("handleSunroofStateChanged error: " + e.getMessage()); }
         }
@@ -7131,7 +10371,11 @@ public class BydDataCollector {
             try {
                 int position = BydDeviceHelper.getIntValue(args[0]);
                 if (position >= 0 && position <= 100) {
-                    snapshot.set(snapshot.get().toBuilder().sunroofPosition(position).build());
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .sunroofPosition(position).build());
+                    }
                 }
             } catch (Exception e) { logger.debug("handleSunroofPositionChanged error: " + e.getMessage()); }
         }
@@ -7142,7 +10386,10 @@ public class BydDataCollector {
             try {
                 double capacity = BydDeviceHelper.getDoubleValue(args[0]);
                 if (!Double.isNaN(capacity) && capacity >= 0 && capacity <= 200) {
-                    snapshot.set(snapshot.get().toBuilder().remainKwh(capacity).build());
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder().remainKwh(capacity).build());
+                    }
                 }
             } catch (Exception e) { logger.debug("handleChargingCapacityChanged error: " + e.getMessage()); }
         }
@@ -7153,7 +10400,11 @@ public class BydDataCollector {
             try {
                 double hours = BydDeviceHelper.getDoubleValue(args[0]);
                 if (!Double.isNaN(hours) && hours >= 0 && hours <= 10000) {
-                    snapshot.set(snapshot.get().toBuilder().drivingTimeHours(hours).build());
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .drivingTimeHours(hours).build());
+                    }
                 }
             } catch (Exception e) { logger.debug("handleDrivingTimeChanged error: " + e.getMessage()); }
         }
@@ -7164,7 +10415,11 @@ public class BydDataCollector {
             try {
                 int level = BydDeviceHelper.getIntValue(args[0]);
                 if (level >= 0 && level <= 1) {
-                    snapshot.set(snapshot.get().toBuilder().keyBatteryLevel(level).build());
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .keyBatteryLevel(level).build());
+                    }
                 }
             } catch (Exception e) { logger.debug("handleKeyBatteryLevelChanged error: " + e.getMessage()); }
         }
@@ -7177,8 +10432,17 @@ public class BydDataCollector {
      * extend BydFeatureIds.Engine with whatever fluid temperature IDs this
      * firmware happens to publish.
      */
-    private void onEngineCallback(String method, Object[] args) {
+    private void onEngineCallback(Object sourceDevice, long generation,
+                                  String method, Object[] args) {
+        long callbackObservedAtMs = System.currentTimeMillis();
+        long lifecycleGeneration = callbackLifecycleGeneration.get();
+        if (!isActiveEngineListener(
+                sourceDevice, generation, lifecycleGeneration)) return;
         if (args == null) return;
+        long bmsVersionAtDispatch = bmsEdgeVersion.get();
+        long gunVersionAtDispatch = gunEdgeVersion.get();
+        long typeVersionAtDispatch = chargingTypeVersion.get();
+        long rateClearVersionAtDispatch = chargingRateClearVersion.get();
         try {
             if ("onEngineCoolantLevelChanged".equals(method)) {
                 handleEngineCoolantLevelChanged(args);
@@ -7204,7 +10468,7 @@ public class BydDataCollector {
                 if (rpm >= 0 && rpm <= 8000) {
                     BydVehicleData current = snapshot.get();
                     if (current != null) {
-                        snapshot.set(current.toBuilder().engineSpeedRpm(rpm).build());
+                        publishNonChargingSnapshot(current.toBuilder().engineSpeedRpm(rpm).build());
                     }
                 }
                 return;
@@ -7231,7 +10495,8 @@ public class BydDataCollector {
                             && rawInt >= 0 && rawInt <= 8000) {
                         BydVehicleData current = snapshot.get();
                         if (current != null) {
-                            snapshot.set(current.toBuilder().engineSpeedRpm(rawInt).build());
+                            publishNonChargingSnapshot(current.toBuilder()
+                                    .engineSpeedRpm(rawInt).build());
                         }
                     }
                     return;
@@ -7239,11 +10504,11 @@ public class BydDataCollector {
                 if (eventId == BydFeatureIds.ENGINE_POWER) {
                     // The event's intValue carries the raw CAN signal; doubleValue is
                     // typically 0.0 on the listener path. Same dual-scale heuristic as
-                    // collectEngine: |raw| > 100 implies deciwatts (×0.1 → kW),
-                    // otherwise treat as kW directly. Range-filter excludes sentinels.
+                    // collectEngine: positive raw > 100 uses the 0.1 multiplier; negative values
+                    // are already kW. Range-filter excludes sentinels.
                     double raw = (rawInt != Integer.MIN_VALUE) ? (double) rawInt : rawDbl;
                     if (!Double.isNaN(raw) && raw >= -200.0 && raw <= 400.0) {
-                        double kw = (Math.abs(raw) > 100.0) ? raw * 0.1 : raw;
+                        double kw = scaleEnginePowerKw(raw);
                         // After scaling, re-check the kW range so a hectowatt value
                         // like 3095 (→ 309.5) gets rejected instead of mis-stored.
                         //
@@ -7270,12 +10535,37 @@ public class BydDataCollector {
                             if (!accIsOn && kw > -ENGINE_POWER_CHARGING_DEADBAND) {
                                 return;
                             }
-                            BydVehicleData current = snapshot.get();
-                            if (current != null) {
-                                // The Builder setter stamps enginePowerAtMs itself, so this write
-                                // is self-dating: the next poll and ChargingDetector both read the
-                                // age from the snapshot and cannot disagree about it.
-                                snapshot.set(current.toBuilder().enginePowerKw(kw).build());
+                            synchronized (chargingEdgePublishLock) {
+                                if (!isActiveEngineListener(
+                                        sourceDevice, generation,
+                                        lifecycleGeneration)) return;
+                                BydVehicleData current = snapshot.get();
+                                if (allowsEnginePowerCallback(
+                                        current, kw, accIsOn,
+                                        bmsVersionAtDispatch, bmsEdgeVersion.get(),
+                                        gunVersionAtDispatch, gunEdgeVersion.get(),
+                                        typeVersionAtDispatch, chargingTypeVersion.get(),
+                                        rateClearVersionAtDispatch,
+                                        chargingRateClearVersion.get(),
+                                        callbackObservedAtMs,
+                                        hasCoherentPostFinishedRateProof(
+                                                current, callbackObservedAtMs))) {
+                                    try (com.overdrive.app.monitor.ChargingDetector
+                                                     .PublicationMutation ignored =
+                                                 com.overdrive.app.monitor.ChargingDetector
+                                                         .beginPublicationMutation()) {
+                                        // Preserve dispatch time rather than lock-acquisition time.
+                                        // The terminal proof requires this callback itself to have
+                                        // begun after FINISHED.
+                                        BydVehicleData published = current.toBuilder()
+                                                .enginePowerKw(kw)
+                                                .enginePowerAtMs(callbackObservedAtMs)
+                                                .build();
+                                        snapshot.set(published);
+                                        enginePowerEdgeVersion.incrementAndGet();
+                                        publishAutomationSnapshot(published);
+                                    }
+                                }
                             }
                         }
                     }
@@ -7291,7 +10581,8 @@ public class BydDataCollector {
                             && Math.abs(rawInt) <= 25000) {
                         BydVehicleData current = snapshot.get();
                         if (current != null) {
-                            snapshot.set(current.toBuilder().frontMotorSpeed(-rawInt).build());
+                            publishNonChargingSnapshot(current.toBuilder()
+                                    .frontMotorSpeed(-rawInt).build());
                         }
                     }
                     return;
@@ -7304,7 +10595,8 @@ public class BydDataCollector {
                             && Math.abs(rawInt) <= 25000) {
                         BydVehicleData current = snapshot.get();
                         if (current != null) {
-                            snapshot.set(current.toBuilder().rearMotorSpeed(rawInt).build());
+                            publishNonChargingSnapshot(current.toBuilder()
+                                    .rearMotorSpeed(rawInt).build());
                         }
                     }
                     return;
@@ -7314,7 +10606,8 @@ public class BydDataCollector {
                     if (!Double.isNaN(rawDbl) && Math.abs(rawDbl) <= 1000.0) {
                         BydVehicleData current = snapshot.get();
                         if (current != null) {
-                            snapshot.set(current.toBuilder().frontMotorTorque(-rawDbl).build());
+                            publishNonChargingSnapshot(current.toBuilder()
+                                    .frontMotorTorque(-rawDbl).build());
                         }
                     }
                     return;
@@ -7354,7 +10647,11 @@ public class BydDataCollector {
             try {
                 int level = BydDeviceHelper.getIntValue(args[0]);
                 if (level >= 0 && level <= 1) {
-                    snapshot.set(snapshot.get().toBuilder().engineCoolantLevel(level).build());
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .engineCoolantLevel(level).build());
+                    }
                 }
             } catch (Exception e) { logger.debug("handleEngineCoolantLevelChanged error: " + e.getMessage()); }
         }
@@ -7365,7 +10662,10 @@ public class BydDataCollector {
             try {
                 int level = BydDeviceHelper.getIntValue(args[0]);
                 if (level >= 0 && level <= 254) {
-                    snapshot.set(snapshot.get().toBuilder().oilLevel(level).build());
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder().oilLevel(level).build());
+                    }
                 }
             } catch (Exception e) { logger.debug("handleOilLevelChanged error: " + e.getMessage()); }
         }
@@ -7432,7 +10732,7 @@ public class BydDataCollector {
      * <p>The 4th argument used to be the constant 1. That is Celsius by luck, not by derivation:
      * on a head unit set to Fahrenheit the SDK expects 64..91 with unit 0, so the old code's
      * {@code 17..33} pre-check rejected every legitimate write outright — AC temperature simply
-     * did nothing on a °F car. DiPlus reads {@code getTemperatureUnit()} and clamps to 64..91 or
+     * did nothing on a °F car. The OEM reads {@code getTemperatureUnit()} and clamps to 64..91 or
      * 17..33 accordingly (proven in its bytecode), which is what this now mirrors.
      *
      * <p>An unreadable unit falls back to Celsius — the previous hardcoded behaviour, so a device
@@ -7479,7 +10779,7 @@ public class BydDataCollector {
             // any non-zero unit as Celsius, so 22 clamps to itself) and hand Integer.MIN_VALUE to
             // the SDK as its unit argument. Only the sentinel is refused — any other non-zero
             // value is passed through verbatim, because "non-zero == Celsius" is the SDK's own
-            // rule and DiPlus forwards whatever getTemperatureUnit() returned rather than
+            // rule and the OEM forwards whatever getTemperatureUnit() returned rather than
             // normalizing it to 1.
             if (unit == BydVehicleData.UNAVAILABLE) {
                 logger.warn("setAcTemperatureRaw: refusing write with unresolved unit");
@@ -7509,7 +10809,7 @@ public class BydDataCollector {
      *
      * <p><b>Asymmetric by design, matching both reference apps:</b> [area] is the dial READ
      * (1 = driver), [zone] is the write target, and zone 0 = {@code AC_TEMPERATURE_MAIN_DEPUTY}
-     * sets BOTH dials. DiPlus does exactly this (reads area 1, writes zone 0), and Commander's
+     * sets BOTH dials. The OEM does exactly this (reads area 1, writes zone 0), and its
      * setter defaults zone to 0, so zone 0 is the proven "set the cabin temperature" target
      * rather than an oversight. On a dual-zone car with split dials this does move the passenger
      * side to match — which is the single-temperature behaviour these actions advertise. Pass
@@ -7527,7 +10827,7 @@ public class BydDataCollector {
         // rather than pick: a 22 reading with the unit claiming Fahrenheit would clamp 23 into
         // the F band and write 64, dropping the dial ~4 C in response to a "+1" press. Which
         // scale getTemprature actually returns is not device-proven here (the SDK javadoc
-        // documents a Celsius range; DiPlus's clamp implies display units), so a disagreement
+        // documents a Celsius range; the OEM's clamp implies display units), so a disagreement
         // means we do not know what we are holding — the one case where doing nothing is right.
         int bandUnit = inferUnitFromSetpoint(current);
         if (bandUnit == BydVehicleData.UNAVAILABLE) {
@@ -7794,17 +11094,28 @@ public class BydDataCollector {
         try {
             // area: 5=Sunroof, 6=Sunshade
             if (area < 5 || area > 6) return false;
+            // Use the named percentage setters. On this SDK:
+            // 100=open, 0=close, 254=stop. These commands also stay meaningful across
+            // trims that do not implement the voice-control facade.
+            int target = sunWindowPositionForCommand(command);
+            if (target >= 0) {
+                String setter = area == 5 ? "setMoonRoofState" : "setSunshadeState";
+                Object namedResult = BydDeviceHelper.callMethod(bodyworkDevice, setter, target);
+                boolean namedOk = namedResult instanceof Integer
+                        && ((Integer) namedResult).intValue() == 0;
+                logger.info("setSunWindow " + (area == 5 ? "Sunroof" : "Sunshade")
+                        + " cmd=" + command + " via " + setter + "(" + target + ")"
+                        + " -> result=" + namedResult + " (ok=" + namedOk + ")");
+                if (namedOk) return true;
+            }
+
             // incoming command: 1=open, 2=close, 3=stop, 4=half, (5=breath only for sunroof)
             // Remap to these values to match windows (3 and 4 are swapped)
             // SDK command: 1=open, 2=close, 3=half, 4=stop, (5=breath only for sunroof)
-            if (command == 3) {
-                command = 4;
-            } else if (command == 4) {
-                command = 3;
-            }
+            int voiceCommand = command == 3 ? 4 : command == 4 ? 3 : command;
             // SDK method: bodyworkDevice.voiceCtlMoonRoof(cmd) or bodyworkDevice.voiceCtlSunshadePanel(cmd)
             String cmd = area == 5 ? "voiceCtlMoonRoof" : "voiceCtlSunshadePanel";
-            Object result = BydDeviceHelper.callMethod(bodyworkDevice, cmd, command);
+            Object result = BydDeviceHelper.callMethod(bodyworkDevice, cmd, voiceCommand);
             boolean ok = result instanceof Integer && ((Integer) result).intValue() == 0;
             // Log the ACTUAL HAL return at info level so the field-reported "sunroof is
             // hit and miss" is diagnosable: distinguishes a rejected write (non-zero /
@@ -7818,6 +11129,15 @@ public class BydDataCollector {
         } catch (Exception e) {
             logger.warn("Set " + (area == 5 ? "Sunroof" : "Sunshade") +  " failed: " + e.getMessage());
             return false;
+        }
+    }
+
+    static int sunWindowPositionForCommand(int command) {
+        switch (command) {
+            case 1: return 100;
+            case 2: return 0;
+            case 3: return 254;
+            default: return -1;
         }
     }
 
@@ -7843,6 +11163,14 @@ public class BydDataCollector {
     }
 
     public boolean setAllWindowsCommand(int command) {
+        // Bound here as well as at the HTTP edge: MQTT and the keymap build the command directly,
+        // and 0 is the HAL's "no command for this area" filler — a silent no-op that returns 0 and
+        // so reads as success. Anything outside 1..3 is undefined for a 4-window write.
+        if (command < 1 || command > 3) {
+            logger.warn("setAllWindowsCommand: refusing out-of-domain command " + command
+                    + " (1=open, 2=close, 3=stop)");
+            return false;
+        }
         try {
             // command: 1=open, 2=close, 3=stop
             // SDK method: bodyworkDevice.setAllWindowState(cmd, cmd, cmd, cmd)
@@ -7877,7 +11205,14 @@ public class BydDataCollector {
     private int readWindowPercent(int area) {
         try {
             Object wp = BydDeviceHelper.callGetter(bodyworkDevice, "getWindowOpenPercent", area);
-            if (wp instanceof Number) return ((Number) wp).intValue();
+            if (wp instanceof Number) {
+                int pct = ((Number) wp).intValue();
+                // Only 0..100 is a position. Returning a rail (65535/65534) or any out-of-domain
+                // value verbatim would be read as a real reading by every caller: the closed-loop
+                // task would compute its direction from it and the "already at target" test could
+                // short-circuit, while the UI would render it as a window position.
+                if (pct >= 0 && pct <= 100) return pct;
+            }
         } catch (Exception ignored) {}
         return -1;
     }
@@ -7905,24 +11240,66 @@ public class BydDataCollector {
         final long maxRunMs = 12_000;     // window full-travel ≈ 4–6 s; cap at 12 s
         final long stallWindowMs = 1_200; // no progress for this long → stall / pinch
 
-        int initial = readWindowPercent(area);
-        if (initial >= 0 && Math.abs(initial - target) <= tolerance) {
-            logger.debug("Window " + area + " already near target (" + initial + "% vs " + target + "%)");
-            return false;
-        }
-
-        // Cancel any in-flight motion for this window.
+        // Cancel any in-flight motion for this window FIRST. Deciding "already at target" before
+        // cancelling silently dropped the user's newest request: a window sweeping past 50% on its
+        // way to 100% reads as already-at-50, so a fresh "50%" tap returned without cancelling and
+        // the old task kept driving to 100. The cancelled task's own `if (!stopped)` path issues the
+        // stop, and the per-area single-thread executor runs it before the new task starts.
         java.util.concurrent.Future<?> prev = windowMotionTasks[areaIdx];
         if (prev != null && !prev.isDone()) prev.cancel(true);
+
+        int initial = readWindowPercent(area);
+        if (initial >= 0 && Math.abs(initial - target) <= tolerance) {
+            // TRUE: the requested position is already the actual one, so the command is satisfied.
+            // Returning false reported "window move FAILED" to the caller — the keymap and
+            // automation surfaces both branch on that outcome, so asking for a position the window
+            // already holds looked like a broken control.
+            logger.debug("Window " + area + " already near target (" + initial + "% vs " + target + "%)");
+            return true;
+        }
+
+        // No position readback on this slot (common for sunroof/sunshade): closed-loop positioning
+        // is impossible, because `reached` and the stall detector both sit inside `now >= 0` so the
+        // only brake left is the 12s cap — and the direction would be GUESSED from an assumed
+        // mid-travel, so "half open" could drive the pane fully shut and hold the motor for 12s.
+        //
+        // Only the two unambiguous endpoints are safe without feedback: 0 can only mean close, 100
+        // can only mean open, and the pane's own limit stops it. Anything between is refused here,
+        // synchronously, so the caller gets a real failure instead of a silent wrong movement.
+        if (initial < 0) {
+            if (target != 0 && target != 100) {
+                logger.warn("Window " + area + ": no position readback — refusing target " + target
+                        + "% (only 0/100 are safe without feedback)");
+                return false;
+            }
+            int endpointDir = (target == 100) ? 1 : 2;
+            logger.info("Window " + area + ": no position readback — driving to the "
+                    + (endpointDir == 1 ? "open" : "closed") + " endpoint");
+            boolean ok = setWindowCommand(area, endpointDir);
+            if (!ok) {
+                try { setWindowCommand(area, 3); } catch (Exception ignored) {}
+            }
+            return ok;
+        }
 
         Runnable task = () -> {
             try {
                 int start = readWindowPercent(area);
-                if (start < 0) start = 50; // unknown — assume mid; stall-detect handles oddities
+                // Re-read can still fail between the check above and here; fall back to the value
+                // that passed the gate rather than guessing mid-travel.
+                if (start < 0) start = initial;
 
                 int direction = target > start ? 1 : 2; // 1=open, 2=close
-                if (!setWindowCommand(area, direction)) {
-                    logger.warn("Window " + area + ": initial command failed");
+                boolean issued = setWindowCommand(area, direction);
+                if (!issued) {
+                    // Do NOT return here. A false result only means the HAL did not answer the
+                    // success code — on this firmware a momentary window/roof command can be
+                    // accepted and MOVE while returning non-zero. Returning would skip every stop
+                    // path below and leave the pane travelling to its mechanical limit. Issue one
+                    // stop and give up instead.
+                    logger.warn("Window " + area + ": initial command returned failure — issuing a"
+                            + " stop in case it moved anyway, then aborting");
+                    try { setWindowCommand(area, 3); } catch (Exception ignored) {}
                     return;
                 }
 
@@ -8277,29 +11654,17 @@ public class BydDataCollector {
     // All schedule reads/writes go through BydCloudClient smart-charging
     // endpoints in VehicleControlApiHandler / VehicleCommandRouter.
 
-    // Charge cap / SOC hold — TWO paths, tried in priority order:
+    // Generic charge limit and PHEV SOC hold are distinct controls.
     //
-    //  1. PRIMARY: the SOC-target / battery-hold feature. Setting device's
-    //     setSOCTarget(percent) picks the target state-of-charge and the
-    //     charging device's setSocSaveSwitch(mode) turns the hold on/off.
-    //     This is the path that ACTUALLY applies the cap on these BYD trims.
-    //     The target is clamped exactly like the OEM: floor = 15 (or 25 when
-    //     getSOCConfig()==2), ceiling = 70 (SET_DR_SOC_TARGET_MAX). Value 0/1
-    //     result == success, same convention as every other SDK setter.
-    //     NOTE: despite the [15,70] window this is NOT BEV-only — it is the PHEV
-    //     "hold battery at N%" lever. Reference app DiPlus drives this exact pair
-    //     for its two DM-i modes: city = setSOCTarget(floor) + setSocSaveSwitch(1),
-    //     long-distance = setSOCTarget(min(currentSOC,50)) + setSocSaveSwitch(2).
-    //     So switch mode 2 means "hold at the target", not merely on/off. The
-    //     "Hold Battery Charge" action (energy-mode HEV) does NOT do this.
+    // Generic charge limit uses BYDAutoChargingDevice
+    // setChargeStopCapacityState (target %) and setChargeStopSwitchState
+    // (master on/off). Some Seal trims accept these writes without applying
+    // them, so every write requires matching readback before the control is
+    // exposed as supported.
     //
-    //  2. FALLBACK: BYDAutoChargingDevice.setChargeStopCapacityState (target %)
-    //     + setChargeStopSwitchState (master on/off). On Seal trims the
-    //     getChargeStopSupportConfig flag has historically returned 0, in which
-    //     case the framework accepts the call but doesn't apply the cap — so we
-    //     probe by writing then reading back; if the read-back doesn't match we
-    //     mark unsupported and the UI hides. Only used when the SOC-target
-    //     methods are absent on the firmware.
+    // SOC hold uses setSOCTarget + setSocSaveSwitch and is intentionally
+    // available only through the explicit SOC-hold commands below. It controls
+    // PHEV driving behavior, not the generic charge-stop cutoff.
     //
     // The smart-charging SCHEDULE (distinct from the cap) lives in BYD cloud,
     // not the HAL — see BydCloudClient smart-charging endpoints.
@@ -8310,34 +11675,46 @@ public class BydDataCollector {
 
     private volatile boolean chargeCapProbed = false;
     private volatile boolean chargeCapSupported = false;
+    /**
+     * Serializes only generic charge-stop mutations and their confirmation reads.
+     * The HAL has separate capacity and switch registers, but capacity support is
+     * inferred from a write/readback pair, so overlapping writes can otherwise
+     * make a working backend look unsupported.
+     */
+    private final Object chargeCapTransactionLock = new Object();
     /** Effective cap the last accepted write actually applied (post-clamp); -1 if none yet. */
     private volatile int lastAppliedCapPercent = -1;
+    /** Effective range and path from the last verified generic charge-limit write. */
+    private volatile int chargeCapMinimumPercent = -1;
+    private volatile int chargeCapMaximumPercent = -1;
+    private volatile String chargeCapControlKind = "unknown";
+
+    /**
+     * Final state sampled while a combined charge-cap write still owns the transaction lock.
+     * The HAL exposes independent capacity and switch setters, so a rejected second setter must
+     * be reported as a partial application instead of hiding a capacity change that took effect.
+     */
+    public static final class ChargeCapUpdateResult {
+        public final boolean fullyApplied;
+        public final int capacityPercent;
+        public final int enabledState;
+
+        private ChargeCapUpdateResult(boolean fullyApplied, int capacityPercent, int enabledState) {
+            this.fullyApplied = fullyApplied;
+            this.capacityPercent = capacityPercent;
+            this.enabledState = enabledState;
+        }
+
+        public boolean partiallyApplied(int requestedPercent, boolean requestedEnabled) {
+            return !fullyApplied
+                    && (capacityPercent == requestedPercent
+                    || enabledState == (requestedEnabled ? 1 : 0));
+        }
+    }
 
     /** Last known cap %. -1 if never probed/read or the HAL returned a sentinel. */
     public int getChargeCapPercent() {
-        try {
-            // Primary: SOC target (the value that actually applies on these trims).
-            Object v = BydDeviceHelper.callGetter(settingDevice, "getSOCTarget");
-            if (v instanceof Number) {
-                int iv = ((Number) v).intValue();
-                // Valid target window is [15,70]; be lenient to [15,100] so a
-                // fallback read isn't shadowed. Anything outside filters the HAL
-                // sentinels (0xFFFF=65535, -10011, …) → treated as unavailable.
-                if (iv >= 15 && iv <= 100) return iv;
-            }
-            // Fallback: legacy charge-stop capacity cap (50..100 on trims that
-            // support it). Same sentinel filtering via the range gate.
-            Object c = BydDeviceHelper.callGetter(chargingDevice, "getChargeStopCapacityState");
-            if (c instanceof Number) {
-                int cv = ((Number) c).intValue();
-                if (cv >= 15 && cv <= 100) return cv;
-            }
-            // Getter unavailable/sentinel — fall back to the value we last applied
-            // (avoids a racy immediate read-back returning stale after a write).
-            return lastAppliedCapPercent;
-        } catch (Exception e) {
-            return lastAppliedCapPercent;
-        }
+        return readChargeStopCapacity();
     }
 
     /** Effective cap the vehicle holds after the last accepted write; -1 if none. */
@@ -8345,27 +11722,22 @@ public class BydDataCollector {
         return lastAppliedCapPercent;
     }
 
+    public int getChargeCapMinimumPercent() {
+        return chargeCapMinimumPercent;
+    }
+
+    public int getChargeCapMaximumPercent() {
+        return chargeCapMaximumPercent;
+    }
+
+    /** {@code charge_stop} after a verified generic-limit write; {@code unknown} otherwise. */
+    public String getChargeCapControlKind() {
+        return chargeCapControlKind;
+    }
+
     /** Last known on/off state. -1 if unsupported/read failed or a sentinel. */
     public int getChargeCapEnabled() {
-        try {
-            // Primary: SOC-save switch (0=off, 1/2=hold mode → on).
-            Object v = BydDeviceHelper.callGetter(chargingDevice, "getSocSaveSwitch");
-            if (v instanceof Number) {
-                int iv = ((Number) v).intValue();
-                if (iv == 0) return 0;
-                if (iv == 1 || iv == 2) return 1;
-            }
-            // Fallback: legacy charge-stop master switch (0/1 only; a sentinel
-            // such as 0xFFFF must NOT be read as "on").
-            Object c = BydDeviceHelper.callGetter(chargingDevice, "getChargeStopSwitchState");
-            if (c instanceof Number) {
-                int cv = ((Number) c).intValue();
-                if (cv == 0 || cv == 1) return cv;
-            }
-            return -1;
-        } catch (Exception e) {
-            return -1;
-        }
+        return readChargeStopSwitch();
     }
 
     /**
@@ -8377,51 +11749,180 @@ public class BydDataCollector {
         return chargeCapProbed ? Boolean.valueOf(chargeCapSupported) : null;
     }
 
+    private void resetChargeCapVerification() {
+        synchronized (chargeCapTransactionLock) {
+            chargeCapProbed = false;
+            chargeCapSupported = false;
+            lastAppliedCapPercent = -1;
+            chargeCapMinimumPercent = -1;
+            chargeCapMaximumPercent = -1;
+            chargeCapControlKind = "unknown";
+        }
+    }
+
     /**
-     * Set the BEV charge cap. Tries the SOC-target path first (the path that
-     * applies on these trims); if the setting device doesn't expose it, falls
-     * back to the legacy charge-stop capacity cap.
+     * Re-establish process-local charge-limit support after a fresh device
+     * initialization without changing the vehicle's requested limit or switch.
+     *
+     * <p>The SDK provides no reliable read-only support flag. When both
+     * registers already have in-range values, write the same capacity back and
+     * require the capacity plus unchanged switch to read back exactly. An
+     * unavailable reading leaves support unknown so a later explicit command
+     * can attempt its normal verified write.
+     */
+    public Boolean reprobeChargeCapFromCurrentState() {
+        synchronized (chargeCapTransactionLock) {
+            if (chargeCapProbed) return Boolean.valueOf(chargeCapSupported);
+
+            int capacity = readChargeStopCapacity();
+            int enabled = readChargeStopSwitch();
+            if (capacity < 50 || capacity > 100 || (enabled != 0 && enabled != 1)) {
+                return null;
+            }
+            if (!setChargeStopCapacityFallback(capacity)) {
+                return chargeCapProbed ? Boolean.valueOf(chargeCapSupported) : null;
+            }
+
+            int capacityReadBack = readChargeStopCapacity();
+            int enabledReadBack = readChargeStopSwitch();
+            boolean confirmed = capacityReadBack == capacity && enabledReadBack == enabled;
+            if (!confirmed) {
+                chargeCapProbed = true;
+                chargeCapSupported = false;
+                chargeCapMinimumPercent = -1;
+                chargeCapMaximumPercent = -1;
+                chargeCapControlKind = "unknown";
+            }
+            logger.info("charge-stop restart re-probe: capacity=" + capacity
+                    + " enabled=" + enabled + " capacityReadBack=" + capacityReadBack
+                    + " enabledReadBack=" + enabledReadBack + " supported=" + confirmed);
+            return Boolean.valueOf(confirmed);
+        }
+    }
+
+    /**
+     * Set a generic charging cutoff only through the charge-stop backend.
+     * SOC target/hold is a PHEV driving feature and is intentionally exposed
+     * solely through the explicit SOC-hold commands below.
      */
     public boolean setChargeCapPercent(int percent) {
-        Boolean primary = trySetSocTarget(percent);
-        if (primary != null) return primary.booleanValue();
-        return setChargeStopCapacityFallback(percent);
+        synchronized (chargeCapTransactionLock) {
+            return setChargeStopCapacityFallback(percent);
+        }
+    }
+
+    /**
+     * Apply both generic charge-stop registers as one SDK transaction.
+     *
+     * <p>The capacity setter is the proof that this trim supports the generic
+     * charge-stop backend, so it always runs before the switch. Holding the
+     * same lock used by single-field writes prevents a concurrent API or MQTT
+     * update from leaving this request's capacity paired with another request's
+     * enabled state. Both registers are read again at the end before success is
+     * reported.
+     */
+    public boolean setChargeCapPercentAndEnabled(int percent, boolean enabled) {
+        return setChargeCapPercentAndEnabledWithResult(percent, enabled).fullyApplied;
+    }
+
+    /**
+     * Apply both generic charge-stop registers and return the final observed state.
+     *
+     * <p>A safe rollback is not possible when the old value is unreadable or the original setter
+     * only partially works. Returning the in-lock readback makes the public API honest about that
+     * hardware limitation.
+     */
+    public ChargeCapUpdateResult setChargeCapPercentAndEnabledWithResult(int percent, boolean enabled) {
+        synchronized (chargeCapTransactionLock) {
+            boolean capacityApplied = setChargeStopCapacityFallback(percent);
+            boolean switchApplied = capacityApplied && setChargeStopSwitchFallback(enabled);
+            int capacityReadBack = readChargeStopCapacity();
+            int switchReadBack = readChargeStopSwitch();
+            boolean confirmed = capacityApplied && switchApplied
+                    && capacityReadBack == percent
+                    && switchReadBack == (enabled ? 1 : 0);
+            logger.info("setChargeCapPercentAndEnabled capacity=" + percent
+                    + " enabled=" + enabled
+                    + " capacityApplied=" + capacityApplied
+                    + " switchApplied=" + switchApplied
+                    + " finalCapacityReadBack=" + capacityReadBack
+                    + " finalSwitchReadBack=" + switchReadBack
+                    + " confirmed=" + confirmed);
+            return new ChargeCapUpdateResult(confirmed, capacityReadBack, switchReadBack);
+        }
     }
 
     /**
      * PRIMARY charge-cap write: BYDAutoSettingDevice.setSOCTarget(percent),
      * clamped to [floor, 70] where floor = getSOCConfig()==2 ? 25 : 15 (matches
-     * the OEM). Returns null when the setter is absent on this firmware (so the
-     * caller can fall back); TRUE/FALSE = SDK acceptance.
+     * the OEM). A successful setter return is not enough: several BYD SDK
+     * setters acknowledge a no-op, so require a matching readback before
+     * reporting the value as applied.
      */
     private Boolean trySetSocTarget(int percent) {
         if (settingDevice == null) return null;
-        int floor = SOC_TARGET_FLOOR_DEFAULT;
-        Object cfg = BydDeviceHelper.callGetter(settingDevice, "getSOCConfig");
-        if (cfg instanceof Number && ((Number) cfg).intValue() == 2) {
-            floor = SOC_TARGET_FLOOR_ALT;
-        }
+        int floor = socTargetFloor();
         int target = percent;
         if (target < floor) target = floor;
         if (target > SOC_TARGET_MAX) target = SOC_TARGET_MAX;
-        // callMethod returns null both when the method is absent AND on invoke
-        // failure; either way we let the caller fall back to the legacy cap.
+        // callMethod returns null both when the method is absent and on invoke
+        // failure; SOC hold then reports failure without using charge-stop.
         Object result = BydDeviceHelper.callMethod(settingDevice, "setSOCTarget", target);
         if (result == null) return null;
         boolean accepted = (result instanceof Integer) && ((Integer) result).intValue() == 0;
-        // This is the proven-working path — acceptance means applied, no read-back
-        // probe needed (unlike the legacy cap which returns success-but-no-op).
-        chargeCapProbed = true;
-        chargeCapSupported = accepted;
-        if (accepted) lastAppliedCapPercent = target;
+        if (!accepted) return Boolean.FALSE;
+        try { Thread.sleep(150L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        int readBack = readSocTarget();
+        boolean confirmed = readBack == target;
         logger.info("setSOCTarget(" + target + ") [requested=" + percent + " floor=" + floor
-                + "] accepted=" + accepted);
-        return Boolean.valueOf(accepted);
+                + "] accepted=true readBack=" + readBack + " confirmed=" + confirmed);
+        return Boolean.valueOf(confirmed);
+    }
+
+    private int readSocTarget() {
+        try {
+            Object v = BydDeviceHelper.callGetter(settingDevice, "getSOCTarget");
+            if (v instanceof Number) {
+                int value = ((Number) v).intValue();
+                return (value >= 15 && value <= 100) ? value : -1;
+            }
+        } catch (Exception e) {
+            logger.debug("getSOCTarget readback failed: " + e.getMessage());
+        }
+        return -1;
+    }
+
+    /** Read the generic charge-stop capacity directly; never fall through to SOC-hold state. */
+    private int readChargeStopCapacity() {
+        try {
+            Object value = BydDeviceHelper.callGetter(chargingDevice, "getChargeStopCapacityState");
+            if (value instanceof Number) {
+                int percent = ((Number) value).intValue();
+                return (percent >= 50 && percent <= 100) ? percent : -1;
+            }
+        } catch (Exception e) {
+            logger.debug("getChargeStopCapacityState failed: " + e.getMessage());
+        }
+        return -1;
+    }
+
+    /** Read the generic charge-stop master switch directly. */
+    private int readChargeStopSwitch() {
+        try {
+            Object value = BydDeviceHelper.callGetter(chargingDevice, "getChargeStopSwitchState");
+            if (value instanceof Number) {
+                int state = ((Number) value).intValue();
+                return (state == 0 || state == 1) ? state : -1;
+            }
+        } catch (Exception e) {
+            logger.debug("getChargeStopSwitchState failed: " + e.getMessage());
+        }
+        return -1;
     }
 
     /**
-     * FALLBACK charge-cap write: BYDAutoChargingDevice.setChargeStopCapacityState
-     * (50..100%). Probes on first write via read-back; if the framework didn't
+     * Generic charge-cap write: BYDAutoChargingDevice.setChargeStopCapacityState
+     * (50..100%). Probes on every write via read-back; if the framework did not
      * honor it, flip supported=false so the UI hides. Subsequent calls
      * short-circuit if already known to no-op.
      */
@@ -8430,12 +11931,10 @@ public class BydDataCollector {
             logger.warn("setChargeStopCapacityState: chargingDevice null");
             return false;
         }
-        // Clamp to the legacy path's supported range instead of rejecting: the
-        // API acceptance surface is [15,100] but this legacy cap only honors
-        // [50,100], so a sub-floor request applies at 50 (matches the "clamps to
-        // whichever path applies" contract; getLastAppliedCapPercent then echoes 50).
-        if (percent < 50) percent = 50;
-        if (percent > 100) percent = 100;
+        if (percent < 50 || percent > 100) {
+            logger.warn("setChargeStopCapacityState: percent must be 50..100 (got " + percent + ")");
+            return false;
+        }
         if (chargeCapProbed && !chargeCapSupported) {
             logger.debug("setChargeStopCapacityState: known unsupported on this trim");
             return false;
@@ -8455,16 +11954,34 @@ public class BydDataCollector {
                 logger.debug("setChargeStopCapacityState(" + percent + ") returned " + result);
                 return false;
             }
-            // Probe: if not yet probed, read back to confirm the value stuck.
-            if (!chargeCapProbed) {
-                try { Thread.sleep(150L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                int readBack = getChargeCapPercent();
-                chargeCapProbed = true;
-                chargeCapSupported = (readBack == percent);
-                logger.info("setChargeStopCapacityState probe: wrote=" + percent
-                        + " readBack=" + readBack + " supported=" + chargeCapSupported);
+            int readBack = -1;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try {
+                    Thread.sleep(250L);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+                readBack = readChargeStopCapacity();
+                if (readBack >= 50 && readBack <= 100) break;
             }
+            // An unavailable getter is not proof that the setter is a no-op.
+            // Keep the support state unknown so the next explicit capacity
+            // write can retry instead of permanently hiding a working control.
+            if (readBack < 0) {
+                logger.info("setChargeStopCapacityState accepted but read-back remained unavailable");
+                return false;
+            }
+            chargeCapProbed = true;
+            chargeCapSupported = (readBack == percent);
+            logger.info("setChargeStopCapacityState probe: wrote=" + percent
+                    + " readBack=" + readBack + " supported=" + chargeCapSupported);
             if (chargeCapSupported) lastAppliedCapPercent = percent;
+            if (chargeCapSupported) {
+                chargeCapMinimumPercent = 50;
+                chargeCapMaximumPercent = 100;
+                chargeCapControlKind = "charge_stop";
+            }
             return chargeCapSupported;
         } catch (Exception e) {
             logger.debug("setChargeStopCapacityState failed: " + e.getMessage());
@@ -8473,29 +11990,208 @@ public class BydDataCollector {
     }
 
     /**
-     * Set the BEV charge-cap master switch. Tries the SOC-save switch first
-     * (pairs with setSOCTarget), then the legacy charge-stop switch.
+     * Set the generic charge-stop master switch after its capacity backend has
+     * been verified. This deliberately does not touch PHEV SOC-hold mode.
      */
     public boolean setChargeCapEnabled(boolean enabled) {
-        Boolean primary = trySetSocSaveSwitch(enabled);
-        if (primary != null) return primary.booleanValue();
-        return setChargeStopSwitchFallback(enabled);
+        synchronized (chargeCapTransactionLock) {
+            if (!chargeCapProbed || !chargeCapSupported) {
+                logger.warn("setChargeCapEnabled refused: charge-stop capacity is not verified");
+                return false;
+            }
+            return setChargeStopSwitchFallback(enabled);
+        }
+    }
+
+    // setSocSaveSwitch modes. 1 and 2 are two DISTINCT hold modes, not a boolean — reference app
+    // the OEM uses 1 for its city preset and 2 for its long-distance preset.
+    // The previous code hardcoded `enabled ? 1 : 0`, so mode 2 was unreachable.
+    //
+    // What each mode MEANS follows from the target the OEM pairs with it, and it is the opposite
+    // of what "city/long-distance" suggests to an English reader:
+    //   mode 1 ← setSOCTarget(FLOOR)          → let the pack DEPLETE to the floor (urban EV driving)
+    //   mode 2 ← setSOCTarget(min(SOC, 50))   → HOLD the charge you have now (save it for later)
+    // The AT_FLOOR / AT_CURRENT names encode the behaviour rather than the OEM's city /
+    // long-distance labels, which read backwards in English. The wire values are unchanged, and
+    // automations/keymaps store option WORDS, so no stored config depends on these names.
+    public static final int SOC_HOLD_MODE_OFF = 0;
+    public static final int SOC_HOLD_MODE_AT_FLOOR = 1;
+    public static final int SOC_HOLD_MODE_AT_CURRENT = 2;
+
+    /** Ceiling the OEM applies to a hold-at-current target. Not the API max (70) — see applySocHoldAtCurrent. */
+    private static final int SOC_HOLD_AT_CURRENT_MAX = 50;
+
+    /**
+     * Set the SOC-hold (battery-hold) mode. The SOC target says WHERE to hold,
+     * while this switch says whether/how to hold it.
+     *
+     * <p>Modes: 0 = off, 1 = city-style hold, 2 = long-distance hold. It
+     * never falls back to the legacy charge-stop switch: that is a charging
+     * cutoff with different semantics, not a hold mode.
+     *
+     * <p><b>UNVERIFIED on device:</b> the behavioural difference between mode 1 and mode 2. Both
+     * are proven to be what the OEM writes for its two presets, but no SDK constants document
+     * them and OverDrive's daemon UID may not be permitted to write them at all.
+     */
+    public boolean setSocHoldMode(int mode) {
+        if (mode < SOC_HOLD_MODE_OFF || mode > SOC_HOLD_MODE_AT_CURRENT) return false;
+        Boolean primary = trySetSocSaveSwitch(mode);
+        return primary != null && primary.booleanValue();
     }
 
     /**
-     * PRIMARY enable: BYDAutoChargingDevice.setSocSaveSwitch(1=on / 0=off).
-     * Returns null when the method is absent so the caller can fall back.
+     * The SOC-target floor this trim enforces: 25 on a DM2.5 platform
+     * ({@code getSOCConfig()==2}), else 15. Named after the official SDK constants
+     * {@code DM25_SOC_TARGET_MIN} / {@code DM20_SOC_TARGET_MIN}, which is what that magic
+     * {@code getSOCConfig()==2} test actually means.
      */
-    private Boolean trySetSocSaveSwitch(boolean enabled) {
-        if (chargingDevice == null) return null;
-        Object result = BydDeviceHelper.callMethod(chargingDevice, "setSocSaveSwitch", enabled ? 1 : 0);
-        if (result == null) return null;
-        boolean accepted = (result instanceof Integer) && ((Integer) result).intValue() == 0;
-        logger.info("setSocSaveSwitch(" + (enabled ? 1 : 0) + ") accepted=" + accepted);
-        return Boolean.valueOf(accepted);
+    private int socTargetFloor() {
+        try {
+            Object cfg = BydDeviceHelper.callGetter(settingDevice, "getSOCConfig");
+            if (cfg instanceof Number && ((Number) cfg).intValue() == 2) return SOC_TARGET_FLOOR_ALT;
+        } catch (Exception e) {
+            logger.debug("getSOCConfig failed, assuming DM2.0 floor: " + e.getMessage());
+        }
+        return SOC_TARGET_FLOOR_DEFAULT;
     }
 
-    /** FALLBACK enable: legacy BYDAutoChargingDevice.setChargeStopSwitchState (0=off, 1=on). */
+    /**
+     * "Deplete to floor" preset (the OEM's city mode): target = this trim's floor, hold mode 1.
+     * Lets the pack run down to the reserve — what you want for urban EV driving.
+     */
+    public boolean applySocHoldAtFloor() {
+        return applySocHold(socTargetFloor(), SOC_HOLD_MODE_AT_FLOOR);
+    }
+
+    /**
+     * Apply one SOC-hold preset: set the hold switch, then the target level.
+     *
+     * <p>Switch first, and the target only if the switch was accepted. The
+     * SOC-hold register is separate from the generic charge-stop limit.
+     *
+     * <p>Uses {@link #trySetSocTarget} / {@link #trySetSocSaveSwitch} directly.
+     * A hold exists only on the SOC-target path, so when that path is absent
+     * this reports failure rather than actuating the unrelated charge-stop
+     * limit.
+     */
+    private boolean applySocHold(int target, int mode) {
+        String label = mode == SOC_HOLD_MODE_AT_CURRENT ? "AT_CURRENT" : "AT_FLOOR";
+        // Both legs must be the genuine SOC-hold pair. Probe the real switch
+        // directly and bail if the firmware lacks it.
+        Boolean switchOk = trySetSocSaveSwitch(mode);
+        if (switchOk == null) {
+            logger.warn("SOC hold " + label + ": setSocSaveSwitch absent on this firmware — no"
+                    + " genuine SOC-hold path, so nothing was written");
+            return false;
+        }
+        if (!switchOk.booleanValue()) {
+            logger.warn("SOC hold " + label + ": setSocSaveSwitch(" + mode + ") refused — leaving the"
+                    + " SOC target untouched");
+            return false;
+        }
+        Boolean targetOk = trySetSocTarget(target);
+        if (targetOk == null) {
+            logger.warn("SOC hold " + label + ": setSOCTarget absent on this firmware — the hold"
+                    + " switch was set but the level is whatever the car already had");
+            return false;
+        }
+        logger.info("SOC hold " + label + ": setSocSaveSwitch(" + mode + ")=true setSOCTarget("
+                + target + ")=" + targetOk);
+        return targetOk.booleanValue();
+    }
+
+    /**
+     * "Hold current charge" preset (the OEM's long-distance mode, the requested Highway
+     * behaviour): target = min(current SOC, 50), hold mode 2 — preserve the charge you have
+     * for later instead of spending it now.
+     *
+     * <p>The 50 ceiling is the OEM's, NOT the API max (70): holding above 50 on a PHEV means
+     * the engine must generate to reach the target, which is the opposite of "keep what I
+     * have". Clamping DOWN to the floor is handled by {@link #trySetSocTarget}. Note the OEM
+     * itself has a bug here (an over-max target falls through to the MINIMUM) which is
+     * deliberately not reproduced.
+     *
+     * <p>When the current SOC is BELOW the trim's floor, {@code trySetSocTarget} clamps up to
+     * the floor — the HAL's own minimum, so there is nothing lower to ask for. Logged plainly,
+     * because the hold then sits slightly above the current charge.
+     *
+     * @return false when the current SOC can't be read — better to do nothing than to hold at
+     *         a guessed level.
+     */
+    public boolean applySocHoldAtCurrent() {
+        int soc = readSocPercentForHold();
+        if (soc < 0) {
+            logger.warn("SOC hold AT_CURRENT: current SOC unavailable — refusing to guess a target");
+            return false;
+        }
+        int target = Math.min(soc, SOC_HOLD_AT_CURRENT_MAX);
+        int floor = socTargetFloor();
+        if (target < floor) {
+            logger.info("SOC hold AT_CURRENT: soc=" + soc + "% is below this trim's floor (" + floor
+                    + "%), so the hold applies at the floor — the lowest the HAL accepts");
+        }
+        return applySocHold(target, SOC_HOLD_MODE_AT_CURRENT);
+    }
+
+    /**
+     * Turn any SOC hold off, leaving the target untouched.
+     */
+    public boolean clearSocHold() {
+        boolean ok = setSocHoldMode(SOC_HOLD_MODE_OFF);
+        logger.info("SOC hold OFF: setSocSaveSwitch(0)=" + ok);
+        return ok;
+    }
+
+    /**
+     * Current SOC as a whole percent for the hold presets, or -1 if unknown. Prefers the live
+     * snapshot (already resolved across several HAL sources) and falls back to the statistic
+     * getter the OEM uses.
+     */
+    private int readSocPercentForHold() {
+        BydVehicleData d = snapshot.get();
+        if (d != null && !Double.isNaN(d.socPercent) && d.socPercent > 0 && d.socPercent <= 100) {
+            return (int) Math.floor(d.socPercent);
+        }
+        try {
+            Object v = BydDeviceHelper.callGetter(statisticDevice, "getElecPercentageValue");
+            if (v instanceof Number) {
+                double soc = ((Number) v).doubleValue();
+                if (soc > 0 && soc <= 100) return (int) Math.floor(soc);
+            }
+        } catch (Exception e) {
+            logger.debug("getElecPercentageValue failed: " + e.getMessage());
+        }
+        return -1;
+    }
+
+    /**
+     * SOC-hold enable: BYDAutoChargingDevice.setSocSaveSwitch(mode) — 0=off,
+     * 1=city hold, 2=long-distance hold. Returns null when the method is absent.
+     */
+    private Boolean trySetSocSaveSwitch(int mode) {
+        // Direct reflection (via the shared charging-setter judge), NOT callMethod:
+        // callMethod collapses a VOID return into null, which applySocHold/
+        // setSocHoldMode would read as "method absent" after the switch had
+        // physically engaged. This distinguishes absent from void-success.
+        Boolean accepted = invokeChargingSetter("setSocSaveSwitch", mode);
+        if (accepted == null || !accepted.booleanValue()) return accepted;
+        try { Thread.sleep(150L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        try {
+            Object value = BydDeviceHelper.callGetter(chargingDevice, "getSocSaveSwitch");
+            if (value instanceof Number) {
+                int readBack = ((Number) value).intValue();
+                boolean confirmed = readBack == mode;
+                logger.info("setSocSaveSwitch(" + mode + ") readBack=" + readBack
+                        + " confirmed=" + confirmed);
+                return Boolean.valueOf(confirmed);
+            }
+        } catch (Exception e) {
+            logger.debug("getSocSaveSwitch readback failed: " + e.getMessage());
+        }
+        return Boolean.FALSE;
+    }
+
+    /** Generic charge-stop master switch with direct readback confirmation. */
     private boolean setChargeStopSwitchFallback(boolean enabled) {
         if (chargingDevice == null) {
             logger.warn("setChargeStopSwitchState: chargingDevice null");
@@ -8517,8 +12213,14 @@ public class BydDataCollector {
             boolean accepted = result instanceof Integer && ((Integer) result).intValue() == 0;
             if (!accepted) {
                 logger.debug("setChargeStopSwitchState(" + v + ") returned " + result);
+                return false;
             }
-            return accepted;
+            try { Thread.sleep(150L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            int readBack = readChargeStopSwitch();
+            boolean confirmed = readBack == v;
+            logger.info("setChargeStopSwitchState(" + v + ") readBack=" + readBack
+                    + " confirmed=" + confirmed);
+            return confirmed;
         } catch (Exception e) {
             logger.debug("setChargeStopSwitchState failed: " + e.getMessage());
             return false;
@@ -8614,6 +12316,28 @@ public class BydDataCollector {
             if (flag == 0 || flag == 1) return flag;
         } catch (Exception e) {
             logger.debug("getAmbientLightEnabled failed: " + e.getMessage());
+        }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    /**
+     * Steering-wheel heater READBACK, raw setting-HAL domain: 2 = on, 1 = off,
+     * {@link BydVehicleData#UNAVAILABLE} when the trim does not answer. Same domain as
+     * {@link #setSteeringWheelHeating}.
+     *
+     * <p>Only an exact 1/2 counts — 0 (unpopulated) and 65535 (the not-available rail) read
+     * UNAVAILABLE rather than being coerced to "off", so a trim without a heated wheel never
+     * publishes a confident wrong "off".
+     */
+    public int getSteeringWheelHeatingState() {
+        try {
+            Object raw = BydDeviceHelper.callGetter(settingDevice, "getSteeringWheelHeatingState");
+            if (raw instanceof Number) {
+                int v = ((Number) raw).intValue();
+                if (v == 1 || v == 2) return v;
+            }
+        } catch (Exception e) {
+            logger.debug("getSteeringWheelHeatingState failed: " + e.getMessage());
         }
         return BydVehicleData.UNAVAILABLE;
     }
@@ -8931,18 +12655,26 @@ public class BydDataCollector {
             // Matches the OEM firmware's seat-level normalization.
             int normalizedLevel = Math.min(level, 2) + 1;
 
-            // Capability gate via BYDAutoSettingDevice.hasFeature(). The
-            // canonical SDK exposes this for hardware detection — if it
-            // returns DEVICE_NOT_HAS_THE_FEATURE we know the vehicle (e.g.
-            // Atto 3 base trim) doesn't have ventilated seats wired and we
-            // shouldn't pretend the SDK accepting the call means anything.
-            // Probed once per session and cached.
+            // Capability probe via BYDAutoSettingDevice.hasFeature() — ADVISORY ONLY. A trim
+            // without ventilated seats (e.g. Atto 3 base) reports NOT_HAS_THE_FEATURE, which is
+            // worth surfacing, but the probe cannot distinguish "no such hardware" from "the
+            // method is absent / threw / answered something unexpected", and it may not answer
+            // while the car is asleep. It therefore must NOT veto the write: a field log showed
+            // 353 seat-vent commands reported as failures on a car that HAS ventilated seats,
+            // because a single non-1 probe result was cached for the whole daemon lifetime.
+            // Re-probed until it gives a definitive yes so one bad reading isn't permanent.
             if (!seatVentFeatureProbed) {
-                seatVentFeatureProbed = true;
-                seatVentFeatureSupported = probeHasFeature(settingDevice, "SEAT_VENTILATING");
-                if (!seatVentFeatureSupported) {
-                    logger.warn("Seat ventilation: hasFeature(\"SEAT_VENTILATING\") returned 0. "
-                        + "Vehicle hardware lacks ventilated seats. UI should grey out the control.");
+                int probe = probeFeatureState(settingDevice, "SEAT_VENTILATING");
+                // Latch only a definitive answer; INDETERMINATE leaves it open to re-probe.
+                if (probe != FEATURE_INDETERMINATE) {
+                    seatVentFeatureProbed = true;
+                    seatVentFeatureSupported = (probe == FEATURE_SUPPORTED);
+                }
+                if (probe != FEATURE_SUPPORTED) {
+                    logger.warn("Seat ventilation: hasFeature(\"SEAT_VENTILATING\") → "
+                        + describeFeatureState(probe) + " (advisory only; the write still proceeds "
+                        + "and the HAL's own return decides). UI may grey out the control only on "
+                        + "UNSUPPORTED.");
                 }
             }
 
@@ -8964,15 +12696,29 @@ public class BydDataCollector {
             Object result = m.invoke(settingDevice, position, normalizedLevel);
             boolean accepted = result instanceof Integer && ((Integer) result).intValue() == 0;
             if (!accepted) {
-                logger.debug("setSeatVentilatingState(" + position + ", " + normalizedLevel
-                    + ") returned " + result);
+                logger.warn("setSeatVentilatingState(" + position + ", " + normalizedLevel
+                    + ") returned " + result + " (expected 0)");
                 return false;
             }
-            // Honest result: only return true when the hardware actually
-            // exists. Otherwise the SDK accepts the call but nothing happens
-            // physically and the UI would mislead the user with a green
-            // toast.
-            return seatVentFeatureSupported;
+            // This HAL returns 0 even when an asleep vehicle ignores the write. Give the
+            // setting rail a short window to settle and require matching readback whenever
+            // that getter is available; a confirmed mismatch lets the router fall through
+            // to BYD Cloud instead of reporting a false local success.
+            int requestedLevel = normalizedLevel - 1;
+            int actualLevel = BydVehicleData.UNAVAILABLE;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                actualLevel = readSeatClimateNow(false, position);
+                if (actualLevel == requestedLevel) return true;
+                if (attempt < 2) SystemClock.sleep(75L);
+            }
+            if (actualLevel == BydVehicleData.UNAVAILABLE) {
+                logger.info("Seat ventilation readback unavailable after accepted write; "
+                    + "trusting HAL result for position=" + position);
+                return true;
+            }
+            logger.warn("Seat ventilation write was accepted but did not take: position="
+                + position + " requested=" + requestedLevel + " actual=" + actualLevel);
+            return false;
         } catch (Exception e) {
             logger.debug("setSeatVentilation failed: " + e.getMessage());
             return false;
@@ -9056,31 +12802,61 @@ public class BydDataCollector {
      * Probe (and cache) whether the trim has ventilated seats. Used by the
      * vehicle-control UI to grey out the cool buttons on cars without the
      * hardware (e.g. base-trim Atto 3, Seal without comfort package).
+     *
+     * <p>FAILS OPEN: an INDETERMINATE probe (method absent / threw / unexpected value, or the
+     * device asleep) reports supported and does not latch, so the control stays usable and the
+     * probe is retried. Only a definitive NOT_HAS_THE_FEATURE greys the control out.
      */
     public boolean isSeatVentilationSupported() {
         if (!seatVentFeatureProbed) {
+            int probe = probeFeatureState(settingDevice, "SEAT_VENTILATING");
+            if (probe == FEATURE_INDETERMINATE) return true; // fail open, re-probe next call
             seatVentFeatureProbed = true;
-            seatVentFeatureSupported = probeHasFeature(settingDevice, "SEAT_VENTILATING");
+            seatVentFeatureSupported = (probe == FEATURE_SUPPORTED);
         }
         return seatVentFeatureSupported;
     }
 
+    // Tri-state capability-probe results. A probe that cannot answer is INDETERMINATE, which is
+    // NOT the same as "unsupported": callers must fail OPEN on it and must not cache it, or one
+    // transient miss disables a feature for the whole daemon lifetime (the seat-ventilation bug).
+    private static final int FEATURE_SUPPORTED = 1;
+    private static final int FEATURE_UNSUPPORTED = 0;
+    private static final int FEATURE_INDETERMINATE = -1;
+
     /**
-     * Capability probe via BYDAutoSettingDevice.hasFeature(String).
-     * Returns DEVICE_HAS_THE_FEATURE (1) on supported vehicles per the
-     * canonical SDK. Treat any result == 1 as supported.
+     * Capability probe via BYDAutoSettingDevice.hasFeature(String), tri-state.
+     *
+     * <p>The canonical SDK returns DEVICE_HAS_THE_FEATURE(1) / DEVICE_NOT_HAS_THE_FEATURE(0).
+     * Only those two are definitive. A null device, an absent method, a thrown exception or a
+     * non-numeric/out-of-domain answer means we genuinely do not know →
+     * {@link #FEATURE_INDETERMINATE}.
+     *
+     * @return {@link #FEATURE_SUPPORTED}, {@link #FEATURE_UNSUPPORTED} or
+     *         {@link #FEATURE_INDETERMINATE}
      */
-    private static boolean probeHasFeature(Object settingDevice, String feature) {
-        if (settingDevice == null || feature == null) return false;
+    private static int probeFeatureState(Object settingDevice, String feature) {
+        if (settingDevice == null || feature == null) return FEATURE_INDETERMINATE;
         try {
             Method m = settingDevice.getClass().getMethod("hasFeature", String.class);
             Object result = m.invoke(settingDevice, feature);
             if (result instanceof Number) {
-                return ((Number) result).intValue() == 1;
+                int v = ((Number) result).intValue();
+                if (v == 1) return FEATURE_SUPPORTED;
+                if (v == 0) return FEATURE_UNSUPPORTED;
             }
-            return false;
+            return FEATURE_INDETERMINATE; // unexpected shape/value — don't guess
         } catch (Exception e) {
-            return false;
+            return FEATURE_INDETERMINATE;
+        }
+    }
+
+    /** Human-readable probe state for logs (never a hardcoded value — that hid the real answer). */
+    private static String describeFeatureState(int state) {
+        switch (state) {
+            case FEATURE_SUPPORTED:   return "SUPPORTED(1)";
+            case FEATURE_UNSUPPORTED: return "UNSUPPORTED(0)";
+            default:                  return "INDETERMINATE (absent/threw/unexpected value)";
         }
     }
 
@@ -9367,14 +13143,22 @@ public class BydDataCollector {
         return setAdasFeature(BydFeatureIds.ADAS_ECTB_STATE_SET, enabled ? 1 : 0);
     }
 
-    /** Front Cross Traffic Alert on/off (FCTA id, on=1/off=0). */
-    public boolean setFrontCrossTrafficAlert(boolean enabled) {
-        return setAdasFeature(BydFeatureIds.ADAS_FCTA_SWITCH_SET, enabled ? 1 : 0);
+    /**
+     * Front cross-traffic switch encoding. Both alert and brake controls use
+     * 2=on / 1=off; their user-facing on/off payloads must not be passed through.
+     */
+    static int frontCrossTrafficSwitchValue(boolean enabled) {
+        return enabled ? 2 : 1;
     }
 
-    /** Front Cross Traffic BRAKE on/off (FCTB id, on=1/off=0). SAFETY (auto-brake). */
+    /** Front Cross Traffic Alert on/off (FCTA id, on=2/off=1). */
+    public boolean setFrontCrossTrafficAlert(boolean enabled) {
+        return setAdasFeature(BydFeatureIds.ADAS_FCTA_SWITCH_SET, frontCrossTrafficSwitchValue(enabled));
+    }
+
+    /** Front Cross Traffic BRAKE on/off (FCTB id, on=2/off=1). SAFETY (auto-brake). */
     public boolean setFrontCrossTrafficBraking(boolean enabled) {
-        return setAdasFeature(BydFeatureIds.ADAS_FCTB_SWITCH_SET, enabled ? 1 : 0);
+        return setAdasFeature(BydFeatureIds.ADAS_FCTB_SWITCH_SET, frontCrossTrafficSwitchValue(enabled));
     }
 
     /** Traffic Light Attention on/off (TLA id, on=1/off=0). */
@@ -10025,46 +13809,18 @@ public class BydDataCollector {
     // --- Miscellaneous ---
 
     /**
-     * Fold/unfold the exterior mirrors, from the UID-2000 daemon. 1=fold / 0=unfold.
+     * Fold/unfold the exterior mirrors from the UID-2000 daemon.
      *
-     * <p><b>What was actually wrong.</b> Every previous variant reported SUCCESS unconditionally
-     * once the named method existed, which is why "mirror fold doesn't work" looked like a HAL
-     * mystery — the UI, the HA echo and the logs all claimed it had worked:
-     * <ul>
-     *   <li>The shipped version invoked {@code setMirrorFoldState} and did a bare
-     *       {@code return true} on any non-throwing call, deliberately not inspecting the
-     *       result. That also made its own {@code MIRROR_REARVIEW_SET} fallback dead code:
-     *       the fallback was reachable only when the method was ABSENT, never when it was
-     *       present and refused the write.</li>
-     *   <li>A later in-tree variant added extra candidate paths and an {@code anyAccepted}
-     *       flag with the same accept-on-no-throw flaw, and one of those paths wrote
-     *       {@code SET_OUTSIDE_REARVIEW_MIRROR_FOLD_SET} / 0x4C10A028 — an id that does NOT
-     *       exist in the OEM SDK (its {@code Mirror} class has exactly two fields, and
-     *       0x4C10A0xx is an Instrument-block range). {@link BydFeatureIds#resolveOrFallback}
-     *       silently substitutes an invented literal on a miss, so it wrote a foreign id and
-     *       the generic write's {@code code >= 0} test read the result as accepted. That
-     *       constant is now deleted.</li>
-     * </ul>
-     *
-     * <p>Per the shipped code's own note, {@code setMirrorFoldState} returns {@code void} on
-     * this platform's bodywork device — hence the explicit no-signal case below rather than
-     * pretending a void return proves actuation.
-     *
-     * <p>So this now does what the OEM does and nothing else: try the named method FIRST and
-     * believe its return code (success is equality with {@code BODYWORK_COMMAND_SUCCESS}==0 —
-     * the same predicate the reference app's {@code interpret()} uses, applied inline here and
-     * in {@link #isBodyworkCommandSuccess}), then fall back to the real bodywork mirror
-     * feature-id when — and only when — the named call gave a definite refusal. Every outcome
-     * is logged with the raw code so a single device run distinguishes "not fitted" from "HAL
-     * refused". Returns true ONLY when a write was genuinely accepted (or when the trim's
-     * {@code void} API leaves no signal to contradict it), so a failure now surfaces in the UI
-     * instead of a false confirmation.
-     *
-     * <p>The SDK's {@code HAVE_REARVIEW_MIRROR_AUTO_FOLD} capability is probed and LOGGED but
-     * deliberately not used as a gate — see the comment at the call site for why a 0 from
-     * that read cannot be distinguished from "no data".
+     * <p>The connected vehicle's DiCar write profile maps the manual fold command to
+     * {@code BYDAutoSettingDevice} (device type 1023), feature {@code 0x4C10A028}, with
+     * 1=fold / 2=unfold. The older bodywork API uses 1/0 and remains below only as a
+     * compatibility fallback for firmware that actually exposes {@code setMirrorFoldState(int)}.
      */
     public boolean setMirrorsFolded(boolean folded) {
+        int settingValue = BydConstants.mirrorFoldCommand(folded);
+        if (setMirrorsFoldedOnSettingDevice(settingValue)) return true;
+
+        // Legacy bodywork API encoding. Do not reuse the dedicated device's 1/2 values here.
         int val = folded ? 1 : 0;
 
         // Capability probe — ADVISORY ONLY, deliberately NOT a gate.
@@ -10123,9 +13879,10 @@ public class BydDataCollector {
             }
         }
 
-        // Path 2 — the generic feature-id write with the ONLY mirror id the OEM SDK defines
-        // (Mirror.BODYWORK_REARVIEW_MIRROR_SET, 0x4EF32010), on the bodywork device that owns
-        // it. Previously unreachable because the old code always claimed success above it.
+        // Path 2 — legacy compatibility: call the protected bodywork base-class setter directly
+        // with BODYWORK_REARVIEW_MIRROR_SET (0x4EF32010). Newer-device SDK wrappers use this
+        // three-int base setter. Unlike the public event-value API below, this path is not rejected
+        // merely because the bodywork device's advertised feature list omits the command.
         //
         // SKIPPED when path 1 already fired without a signal. Two reasons, both concrete:
         //  * If that void call DID move the mirrors, this second write lands mid-travel and
@@ -10138,24 +13895,38 @@ public class BydDataCollector {
         // refusal, which is exactly where a genuine second candidate is worth trying.
         if (bodyworkDevice != null && !firedWithoutSignal) {
             try {
-                int code = BydDeviceHelper.sendSetCommandRaw(
+                int code = BydDeviceHelper.callSetSingle(
                         bodyworkDevice, BydFeatureIds.MIRROR_REARVIEW_SET, val);
                 boolean ok = isBodyworkCommandSuccess(code);
-                logger.info("setMirrorsFolded: bodywork BODYWORK_REARVIEW_MIRROR_SET(" + val
-                        + ") -> code=" + code + (ok ? " ACCEPTED" : " REFUSED"));
+                logger.info("setMirrorsFolded: direct bodywork set("
+                        + "BODYWORK_REARVIEW_MIRROR_SET, " + val + ") -> code=" + code
+                        + (ok ? " ACCEPTED" : " REFUSED"));
                 if (ok) return true;
             } catch (Exception e) {
-                logger.debug("setMirrorsFolded bodywork-id write failed: " + e.getMessage());
+                logger.debug("setMirrorsFolded direct bodywork write failed: " + e.getMessage());
             }
         }
 
-        // Deliberately NO setting-device tier. The setting device's mirror methods are
-        // setRearViewMirrorFlip and setAutoExternalRearMirrorFollowUpSwitch — both documented as
-        // persistent Off/On SWITCHES with getters and "switch's change" listeners (the SDK also
-        // names the capability FEATURE_REARVIEW_MIRROR_FOLLOW_UP). That is the reverse-dip /
-        // follow-up preference family, NOT the power-fold actuator: writing them would silently
-        // change an unrelated user setting and report it as a fold. Folding lives only on the
-        // bodywork paths above.
+        // Path 3 — retain the standard public event-value API for firmware that advertises the
+        // mirror command through its feature list but does not expose the protected base setter.
+        if (bodyworkDevice != null && !firedWithoutSignal) {
+            try {
+                int code = BydDeviceHelper.sendSetCommandRaw(
+                        bodyworkDevice, BydFeatureIds.MIRROR_REARVIEW_SET, val);
+                boolean ok = isBodyworkCommandSuccess(code);
+                logger.info("setMirrorsFolded: public bodywork event("
+                        + "BODYWORK_REARVIEW_MIRROR_SET, " + val + ") -> code=" + code
+                        + (ok ? " ACCEPTED" : " REFUSED"));
+                if (ok) return true;
+            } catch (Exception e) {
+                logger.debug("setMirrorsFolded public bodywork event failed: " + e.getMessage());
+            }
+        }
+
+        // Do not substitute the named setting methods here. setRearViewMirrorFlip controls
+        // reverse dip, while setAutoExternalRearMirrorFollowUpSwitch controls the persistent
+        // automatic-fold preference. The manual actuator is the raw Setting feature attempted
+        // before these legacy bodywork paths.
 
         // No daemon path returned a definite accept. Last resort, ALWAYS attempted from here:
         // run the same write from the REAL app process (UID 10xxx, real Context) via the
@@ -10184,6 +13955,177 @@ public class BydDataCollector {
         logger.warn("setMirrorsFolded: no daemon path accepted the write (fold=" + folded
                 + "); app-process attempt dispatched — see VehicleActuator log");
         return false;
+    }
+
+    /** Use the connected model's write-profile Setting command before legacy bodywork APIs. */
+    private boolean setMirrorsFoldedOnSettingDevice(int value) {
+        Context bydContext = BydDeviceHelper.withBydPermissionBypass(context);
+        Object device = settingDevice;
+        if (device == null && bydContext != null) {
+            device = BydDeviceHelper.getDevice(
+                    BydConstants.MIRROR_FOLD_SETTING_DEVICE_CLASS, bydContext);
+            if (device != null) settingDevice = device;
+        }
+
+        int code = Integer.MIN_VALUE;
+        if (device != null) {
+            // Match the OEM DiCar HalSetter first: BYDAutoSettingDevice.set(int[], EventValue).
+            code = BydDeviceHelper.sendSetCommandRaw(
+                    device, BydFeatureIds.SETTING_OUTSIDE_REARVIEW_MIRROR_FOLD_SET, value);
+            boolean accepted = isBodyworkCommandSuccess(code);
+            logger.info("setMirrorsFolded: setting event("
+                    + "device=1023, SET_OUTSIDE_REARVIEW_MIRROR_FOLD_SET, " + value
+                    + ") -> code="
+                    + code + (accepted ? " ACCEPTED" : " REFUSED"));
+            if (accepted) {
+                logManualMirrorReadback(value);
+                return true;
+            }
+
+            // Some SDK builds reject unadvertised feature ids in the public set(...) wrapper.
+            // Its protected base setter is the same manager-level write without that local list
+            // validation, so retain it as the second form of the same Setting command.
+            code = BydDeviceHelper.callSetSingle(
+                    device, BydFeatureIds.SETTING_OUTSIDE_REARVIEW_MIRROR_FOLD_SET, value);
+            accepted = isBodyworkCommandSuccess(code);
+            logger.info("setMirrorsFolded: direct setting set("
+                    + "device=1023, SET_OUTSIDE_REARVIEW_MIRROR_FOLD_SET, " + value
+                    + ") -> code="
+                    + code + (accepted ? " ACCEPTED" : " REFUSED"));
+            if (accepted) {
+                logManualMirrorReadback(value);
+                return true;
+            }
+        }
+
+        // callSetSingle is already manager.setInt. Use the manager directly only when no singleton
+        // exists or reflection could not reach the inherited protected setter.
+        if ((device == null || code == -1 || code == Integer.MIN_VALUE) && bydContext != null) {
+            int managerCode = BydDeviceHelper.callManagerSetInt(
+                    bydContext,
+                    BydConstants.MIRROR_FOLD_SETTING_DEVICE_TYPE,
+                    BydFeatureIds.SETTING_OUTSIDE_REARVIEW_MIRROR_FOLD_SET,
+                    value);
+            boolean accepted = isBodyworkCommandSuccess(managerCode);
+            logger.info("setMirrorsFolded: setting manager set("
+                    + "device=1023, SET_OUTSIDE_REARVIEW_MIRROR_FOLD_SET, " + value
+                    + ") -> code="
+                    + managerCode + (accepted ? " ACCEPTED" : " REFUSED"));
+            if (accepted) {
+                logManualMirrorReadback(value);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void logManualMirrorReadback(int expected) {
+        Object stateDevice = rearViewMirrorDevice;
+        if (stateDevice == null) {
+            Context bydContext = BydDeviceHelper.withBydPermissionBypass(context);
+            stateDevice = BydDeviceHelper.getDevice(
+                    BydConstants.REAR_VIEW_MIRROR_DEVICE_CLASS, bydContext);
+            if (stateDevice != null) rearViewMirrorDevice = stateDevice;
+        }
+        Object state = BydDeviceHelper.callGetter(
+                stateDevice, "getAutoExternalRearMirrorState");
+        if (state instanceof Number) {
+            logger.info("setMirrorsFolded: mirror state="
+                    + ((Number) state).intValue() + " expectedCommand=" + expected);
+        } else {
+            logger.info("setMirrorsFolded: mirror state unavailable after accepted write");
+        }
+    }
+
+    /**
+     * Enable or disable the OEM's persistent exterior-mirror follow-up setting.
+     *
+     * <p>This is intentionally distinct from {@link #setMirrorsFolded(boolean)}. The latter is
+     * an immediate mirror actuator and is not available once the car is off on this platform.
+     * The setting device exposes {@code setAutoExternalRearMirrorFollowUpSwitch(int)} as an
+     * on/off preference with a documented result code and readback. Once enabled, the vehicle
+     * itself owns folding and unfolding across its power lifecycle.
+     *
+     * <p>Some firmware accepts settings only from a device handle created with a real system
+     * context. Try the collector's normal handle first, then its system-context setting handle,
+     * and finally the app-process actuator before reporting failure. Each synchronous handle
+     * verifies the matching getter when it is available, so an accepted-but-ignored setting
+     * write can progress to the next context. This does not fall back to
+     * {@code auto_mirror_for_lock}: that provider key is a separate lock-trigger preference and
+     * must not be substituted for power-state mirror behavior.
+     */
+    public boolean setAutoExternalRearMirrorFollowUp(boolean enabled) {
+        final int value = enabled ? 1 : 0; // BYDAutoSettingDevice.SET_ON / SET_OFF
+        if (setAutoExternalRearMirrorFollowUpOn(settingDevice, value, "daemon")) return true;
+
+        Object systemDevice = getSystemContextSettingDevice();
+        if (systemDevice != null && systemDevice != settingDevice
+                && setAutoExternalRearMirrorFollowUpOn(systemDevice, value, "system-context")) {
+            return true;
+        }
+
+        // Last retry from the real app process. The dispatch is asynchronous, so it cannot
+        // honestly turn this synchronous command into SUCCESS; its own verified result is logged
+        // by VehicleActuatorService. This is still worth trying because the OEM setting HAL can
+        // bind a write to the caller's Context/package.
+        try {
+            com.overdrive.app.byd.VehicleActuatorBridge
+                    .dispatchAutoExternalRearMirrorFollowUp(enabled);
+        } catch (Throwable t) {
+            logger.debug("setAutoExternalRearMirrorFollowUp app-process dispatch failed: "
+                    + t.getMessage());
+        }
+        logger.warn("setAutoExternalRearMirrorFollowUp(" + enabled
+                + "): no daemon setting write was confirmed; app-process retry dispatched");
+        return false;
+    }
+
+    /** Invoke the OEM mirror follow-up setter on one setting-device handle. */
+    private boolean setAutoExternalRearMirrorFollowUpOn(Object device, int value, String source) {
+        if (device == null) {
+            logger.debug("setAutoExternalRearMirrorFollowUp: " + source
+                    + " setting device unavailable");
+            return false;
+        }
+        try {
+            Method method = device.getClass().getMethod(
+                    "setAutoExternalRearMirrorFollowUpSwitch", int.class);
+            Object result = method.invoke(device, value);
+            boolean accepted = isSdkWriteSuccess(
+                    device, result, "setAutoExternalRearMirrorFollowUpSwitch");
+            logger.info("setAutoExternalRearMirrorFollowUpSwitch(" + value + ") via " + source
+                    + " -> " + result + (accepted ? " ACCEPTED" : " REFUSED"));
+            if (!accepted) return false;
+
+            // The setter's documented companion getter lets us distinguish an accepted result
+            // from a context-bound write that the HAL silently ignores. An absent getter is not
+            // treated as refusal: the setter is present and its explicit success result remains
+            // the best available evidence on that firmware.
+            Object readback = BydDeviceHelper.callGetter(
+                    device, "getAutoExternalRearMirrorFollowUpSwitch");
+            if (readback instanceof Number) {
+                int actual = ((Number) readback).intValue();
+                if (actual != value) {
+                    logger.warn("setAutoExternalRearMirrorFollowUpSwitch(" + value + ") via "
+                            + source + " read back " + actual + " — retrying another context");
+                    return false;
+                }
+                logger.info("setAutoExternalRearMirrorFollowUpSwitch(" + value + ") via "
+                        + source + " CONFIRMED");
+            } else {
+                logger.info("setAutoExternalRearMirrorFollowUpSwitch(" + value + ") via "
+                        + source + " accepted; getter unavailable for confirmation");
+            }
+            return true;
+        } catch (NoSuchMethodException e) {
+            logger.info("setAutoExternalRearMirrorFollowUpSwitch absent on "
+                    + device.getClass().getSimpleName() + " (" + source + ")");
+            return false;
+        } catch (Exception e) {
+            logger.warn("setAutoExternalRearMirrorFollowUpSwitch(" + value + ") via "
+                    + source + " failed: " + e.getMessage());
+            return false;
+        }
     }
 
     /**
@@ -10284,9 +14226,9 @@ public class BydDataCollector {
             // the 1/2 convention that iTAC/CPD proved is the real one on some trims.
             logger.warn("setWirelessCharging: readback=" + now + " after 1/0 write for enabled="
                     + enabled + " — retrying 1/2 convention");
-            writeWirelessCharging(enabled ? 1 : 2);
+            boolean fallbackWrote = writeWirelessCharging(enabled ? 1 : 2);
             Boolean after = readWirelessOn();
-            return after == null ? true : after == enabled;
+            return after == null ? fallbackWrote : after == enabled;
         }
         return wrote; // no readback on this trim — report the primary write
     }
@@ -10298,6 +14240,215 @@ public class BydDataCollector {
         } catch (Exception e) {
             logger.debug("writeWirelessCharging(" + value + ") failed: " + e.getMessage());
             return false;
+        }
+    }
+
+    // Wireless-charging pads. Two independent pads on trims that have them; a single pad
+    // otherwise (the global setWirelessCharging above still drives that case).
+    public static final int WIRELESS_PAD_LEFT = 0;
+    public static final int WIRELESS_PAD_RIGHT = 1;
+
+    static int wirelessPadPrimaryCode(int pad, boolean enabled) {
+        if (pad == WIRELESS_PAD_LEFT) return enabled ? 1 : 2;
+        if (pad == WIRELESS_PAD_RIGHT) return enabled ? 4 : 5;
+        throw new IllegalArgumentException("invalid wireless pad " + pad);
+    }
+
+    /** OEM fallback exists only for the right pad. */
+    static int wirelessPadFallbackFeatureId(int pad) {
+        if (pad == WIRELESS_PAD_RIGHT) return BydFeatureIds.CHARGING_WIRELESS_RIGHT_SWITCH_DIRECT;
+        throw new IllegalArgumentException("no OEM fallback for wireless pad " + pad);
+    }
+
+    static int wirelessPadFallbackValue(int pad, boolean enabled) {
+        if (pad == WIRELESS_PAD_RIGHT) return enabled ? 1 : 2;
+        throw new IllegalArgumentException("no OEM fallback for wireless pad " + pad);
+    }
+
+    enum WirelessPrimaryOutcome {
+        ACCEPTED,
+        REJECTED,
+        ABSENT,
+        ERROR
+    }
+
+    static boolean shouldFallbackWirelessPad(int pad, WirelessPrimaryOutcome primary) {
+        // The OEM right-pad fallback runs only after the named method explicitly returned a
+        // negative Integer. Null/non-Integer results, missing/throwing methods, and all left-pad
+        // failures are returned directly.
+        return pad == WIRELESS_PAD_RIGHT && primary == WirelessPrimaryOutcome.REJECTED;
+    }
+
+    static boolean isOemWirelessResultAccepted(Object result) {
+        return result instanceof Integer && ((Integer) result).intValue() >= 0;
+    }
+
+    /**
+     * Turn ONE wireless-charging pad on/off.
+     *
+     * <p>Primary path is the OEM's own {@code BYDAutoChargingDevice.setWirelessChargingSwitchState(int)},
+     * which encodes the pad AND the state in one code — proven from the reference implementation:
+     * <b>left on=1, left off=2, right on=4, right off=5</b>. The OEM has no left-pad fallback.
+     * For the right pad, it falls back only when an invoked primary explicitly returns a negative
+     * Integer, using {@code WIRELESS_CHARGING_RIGHT_SWITCH_DIRECT} with 1/2. A null/non-Integer,
+     * missing, or throwing primary returns failure directly.
+     *
+     * @param pad {@link #WIRELESS_PAD_LEFT} or {@link #WIRELESS_PAD_RIGHT}
+     */
+    public boolean setWirelessChargingPad(int pad, boolean enabled) {
+        if (pad != WIRELESS_PAD_LEFT && pad != WIRELESS_PAD_RIGHT) {
+            logger.warn("setWirelessChargingPad: invalid pad " + pad);
+            return false;
+        }
+        int code = wirelessPadPrimaryCode(pad, enabled);
+        WirelessPrimaryOutcome primary = tryWirelessSwitchState(code);
+        logger.info("wireless pad " + pad + " primary code=" + code + " outcome="
+                + primary);
+        if (primary == WirelessPrimaryOutcome.ACCEPTED) {
+            // Any nonnegative OEM result is accepted (including success codes 0 and 2). The
+            // readback is only a diagnostic: the *_STATE registers report CHARGING activity
+            // (1 = a phone is charging), so an enabled-but-empty pad reads non-1, and treating that
+            // as failure would report a genuine enable as failed. Log the discrepancy, don't act.
+            logReadbackDiscrepancy(
+                    "wireless pad " + pad, enabled, readWirelessPadOn(pad), true);
+            return true;
+        }
+        if (!shouldFallbackWirelessPad(pad, primary)) {
+            logReadbackDiscrepancy(
+                    "wireless pad " + pad, enabled, readWirelessPadOn(pad), false);
+            return false;
+        }
+
+        int featureId = wirelessPadFallbackFeatureId(pad);
+        int value = wirelessPadFallbackValue(pad, enabled);
+        Integer rawResult =
+                BydDeviceHelper.sendSetCommandIntegerResult(chargingDevice, featureId, value);
+        boolean wrote = isOemWirelessResultAccepted(rawResult);
+        logger.info("wireless pad " + pad + " fallback featureId=0x"
+                + Integer.toHexString(featureId) + " value=" + value + " rawResult=" + rawResult
+                + " accepted=" + wrote);
+        logReadbackDiscrepancy(
+                "wireless pad " + pad + " (feature-id)", enabled, readWirelessPadOn(pad), wrote);
+        return wrote;
+    }
+
+    /** Log when a pad's charging-activity readback disagrees with what we just commanded — a hint
+     *  for a device run, never a gate (the readback reflects charging, not switch position). */
+    private void logReadbackDiscrepancy(String what, boolean commanded, Boolean readback, boolean accepted) {
+        if (readback != null && readback.booleanValue() != commanded) {
+            logger.info(what + ": commanded " + (commanded ? "on" : "off") + " accepted=" + accepted
+                    + " but activity readback=" + (readback ? "charging" : "idle/off")
+                    + " (advisory — an enabled empty pad reads idle)");
+        }
+    }
+
+    /**
+     * Invoke {@code setWirelessChargingSwitchState(code)} with the OEM's exact result judge.
+     * Returns an explicit outcome so a returned rejection cannot be confused with an unavailable
+     * or throwing method. A nonnegative Integer is accepted, a negative Integer is rejected, and
+     * null/non-Integer results are errors that must not trigger the feature-ID fallback.
+     *
+     * <p>Reflects directly rather than via {@link BydDeviceHelper#callMethod} because that helper
+     * collapses a void return into null and cannot distinguish it from an unavailable method. The
+     * OEM accepts every nonnegative Integer, including both charging success codes 0 and 2.
+     */
+    private WirelessPrimaryOutcome tryWirelessSwitchState(int code) {
+        if (chargingDevice == null) return WirelessPrimaryOutcome.ABSENT;
+        final Method method;
+        try {
+            method = chargingDevice.getClass()
+                    .getMethod("setWirelessChargingSwitchState", int.class);
+        } catch (NoSuchMethodException e) {
+            return WirelessPrimaryOutcome.ABSENT;
+        } catch (Exception e) {
+            logger.debug("setWirelessChargingSwitchState lookup failed: " + e.getMessage());
+            return WirelessPrimaryOutcome.ERROR;
+        }
+        try {
+            Object result = method.invoke(chargingDevice, code);
+            if (!(result instanceof Integer)) {
+                logger.warn("setWirelessChargingSwitchState(" + code
+                        + ") returned unexpected result type: "
+                        + (result == null ? "null" : result.getClass().getName()));
+                return WirelessPrimaryOutcome.ERROR;
+            }
+            boolean accepted = ((Integer) result).intValue() >= 0;
+            logger.info("setWirelessChargingSwitchState(" + code + ") rawResult=" + result
+                    + " accepted=" + accepted);
+            return accepted
+                    ? WirelessPrimaryOutcome.ACCEPTED : WirelessPrimaryOutcome.REJECTED;
+        } catch (Exception e) {
+            logger.warn("setWirelessChargingSwitchState(" + code + ") failed: " + e.getMessage());
+            return WirelessPrimaryOutcome.ERROR;
+        }
+    }
+
+    /**
+     * Invoke a named int-arg setter on the charging device, distinguishing "absent" from
+     * "refused" for a caller that has a fallback path. Returns:
+     * <ul>
+     *   <li>{@code null} — the method is absent on this trim (or the device is null): the caller
+     *       should fall back to another mechanism;</li>
+     *   <li>{@code TRUE} — accepted: a {@code Boolean.TRUE}, a void/non-Integer return (the invoke
+     *       did not throw), or an Integer {@code >= 0};</li>
+     *   <li>{@code FALSE} — refused: a {@code Boolean.FALSE}, an Integer {@code < 0}, or a throwing
+     *       invoke. The caller decides whether a refusal should trigger another mechanism.</li>
+     * </ul>
+     *
+     * <p>Reflects directly rather than via {@link BydDeviceHelper#callMethod}, which collapses a
+     * VOID return into null and so cannot tell "absent" from "returned void" — a distinction that
+     * matters because some of these setters are void on some trims.
+     *
+     * <p>The Integer bar is {@code >= 0}, not {@code == 0}: the charging family has TWO success
+     * codes ({@code CHARGING_COMMAND_SUCCESS = 0} and {@code CHARGING_SUCCESS = 2}) while every
+     * failure is a large negative, so {@code == 0} would reject a genuine {@code 2} accept. The
+     * {@code Boolean.FALSE} case is honoured explicitly — the canonical {@link #isSdkWriteSuccess}
+     * and {@link BydDeviceHelper#sendSetCommandRaw} both treat a Boolean false as failure, and a
+     * hand-rolled judge that omitted it would report a refusal as success.
+     */
+    private Boolean invokeChargingSetter(String methodName, int arg) {
+        if (chargingDevice == null) return null;
+        java.lang.reflect.Method m;
+        try {
+            m = chargingDevice.getClass().getMethod(methodName, int.class);
+        } catch (NoSuchMethodException nsme) {
+            return null;   // absent on this trim → caller falls back
+        } catch (Exception e) {
+            logger.debug(methodName + " lookup failed: " + e.getMessage());
+            return null;
+        }
+        try {
+            Object result = m.invoke(chargingDevice, arg);
+            boolean accepted;
+            if (result instanceof Boolean) {
+                accepted = (Boolean) result;
+            } else if (result instanceof Integer) {
+                accepted = ((Integer) result).intValue() >= 0;
+            } else {
+                accepted = true;   // void / non-Integer, and the invoke didn't throw
+            }
+            logger.info(methodName + "(" + arg + ") result=" + result + " accepted=" + accepted);
+            return Boolean.valueOf(accepted);
+        } catch (Exception e) {
+            logger.warn(methodName + "(" + arg + ") failed: " + e.getMessage());
+            return Boolean.FALSE;   // present but threw → a real failure, NOT a fall-back trigger
+        }
+    }
+
+    /** One pad's state as a boolean, or null if unreadable. */
+    private Boolean readWirelessPadOn(int pad) {
+        try {
+            int id = (pad == WIRELESS_PAD_LEFT)
+                    ? BydFeatureIds.CHARGING_WIRELESS_LEFT_STATE
+                    : BydFeatureIds.CHARGING_WIRELESS_RIGHT_STATE;
+            Object v = BydDeviceHelper.callGet(chargingDevice, id, Integer.class);
+            if (v == null) return null;
+            int raw = BydDeviceHelper.getIntValue(v);
+            if (raw == BydFeatureIds.BMS_UNAVAILABLE || raw == BydFeatureIds.INVALID_VALUE || raw < 0) return null;
+            return raw == 1;
+        } catch (Exception e) {
+            logger.debug("readWirelessPadOn(" + pad + ") failed: " + e.getMessage());
+            return null;
         }
     }
 
@@ -10335,12 +14486,75 @@ public class BydDataCollector {
         }
     }
 
-    public boolean rotatePad() {
-        try {
-            return BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_PAD_ROTATION_SET, 1);
-        } catch (Exception e) {
-            logger.debug("rotatePad failed: " + e.getMessage());
+    /**
+     * Set the centre infotainment panel orientation using this unit's documented setting-device
+     * API: 1=horizontal, 2=vertical.
+     */
+    public boolean setPadRotation(int rotation) {
+        if (rotation != PAD_ROTATION_HORIZONTAL && rotation != PAD_ROTATION_VERTICAL) {
+            logger.warn("setPadRotation: invalid rotation " + rotation);
             return false;
+        }
+        if (settingDevice == null) {
+            logger.warn("setPadRotation: settingDevice unavailable");
+            return false;
+        }
+        try {
+            Method method = settingDevice.getClass().getMethod("setPadRotation", int.class);
+            Object result = method.invoke(settingDevice, rotation);
+            boolean accepted = isSdkWriteSuccess(settingDevice, result, "setPadRotation");
+            logger.info("setPadRotation(" + rotation + ") result=" + result
+                    + " accepted=" + accepted);
+            return accepted;
+        } catch (NoSuchMethodException e) {
+            // Older SDK wrappers may expose only the feature-id route.
+            return BydDeviceHelper.sendSetCommand(
+                    settingDevice, BydFeatureIds.SETTING_PAD_ROTATION_SET, rotation);
+        } catch (Exception e) {
+            logger.warn("setPadRotation(" + rotation + ") failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** Legacy caller compatibility; horizontal was the old hard-coded behavior. */
+    @Deprecated
+    public boolean rotatePad() {
+        return setPadRotation(PAD_ROTATION_HORIZONTAL);
+    }
+
+    /**
+     * Switch the view shown by the OEM native panorama camera application.
+     *
+     * <p>This only sends the OEM {@code AUTO_VIDEO_BUTTON} view command; it never opens
+     * the panorama application. Key mapping separately verifies that the native camera
+     * window is active before consuming a physical key. It does not touch OverDrive's
+     * AVM capture/viewpoint pipeline.
+     */
+    public boolean setNativeCameraView(int viewCode) {
+        if (!isNativeCameraViewCode(viewCode)) {
+            logger.warn("setNativeCameraView: invalid view code " + viewCode);
+            return false;
+        }
+        Context currentContext = context;
+        if (currentContext == null) {
+            logger.warn("setNativeCameraView: context unavailable");
+            return false;
+        }
+        return NativeCameraViewController.show(currentContext, viewCode);
+    }
+
+    static boolean isNativeCameraViewCode(int viewCode) {
+        switch (viewCode) {
+            case NATIVE_CAMERA_VIEW_FRONT:
+            case NATIVE_CAMERA_VIEW_REAR:
+            case NATIVE_CAMERA_VIEW_LEFT:
+            case NATIVE_CAMERA_VIEW_RIGHT:
+            case NATIVE_CAMERA_VIEW_FRONT_WIDE:
+            case NATIVE_CAMERA_VIEW_REAR_WIDE:
+            case NATIVE_CAMERA_VIEW_LEFT_RIGHT:
+                return true;
+            default:
+                return false;
         }
     }
 
@@ -10381,43 +14595,30 @@ public class BydDataCollector {
     // non-zero result is treated as failure by isSdkWriteSuccess.
 
     /**
-     * Drive/operation mode. Values are the SDK OperationMode enum from the docs
-     * (doc/android/hardware/bydauto/energy): ENERGY_OPERATION_ECONOMY = 1,
-     * ENERGY_OPERATION_SPORT = 2 — the ONLY two operation modes. There is no
-     * NORMAL and no SNOW on this axis (SNOW is a separate road-surface value,
-     * ENERGY_ROAD_SURFACE_SNOW = 2, on a different setter). Callers map the words
-     * to these ints in VehicleControlCatalog.driveModeValue(); mirrors the value
-     * read back as operationMode.
+     * Drive/operation mode using this head unit's SDK enum:
+     * economy=1, sport=2, normal=3, snow=4, muddy=5, sand=6.
      *
-     * <p>{@code BYDAutoEnergyDevice.setOperationMode(int)} is a real SDK method —
-     * confirmed present in the OEM implementation. Like every SDK write on this
-     * platform it is still gated by the BYD signature-permission wall, so the HAL
-     * may reject the write from our UID (returns non-zero) even though the method
-     * resolves. We invoke via {@link #invokeOptionalModeSetter} so that if a
-     * firmware variant ever drops/renames the method we surface it at WARN rather
-     * than a silent false.
+     * <p>The public setter values are not the values returned by the underlying CAN getter.
+     * This unit's SDK remaps normal/eco/sport 3/1/2 to raw 1/2/3 before writing. Keep that
+     * distinction in {@link #energyOperationModeForDriveConfig(int)} and
+     * {@link #driveModeFromEnergyAxis(int, int)} rather than treating the two axes as identical.
      */
     public boolean setOperationMode(int mode) {
         return invokeOptionalModeSetter(energyDevice, "setOperationMode", mode,
-                "operation mode (ECO/SPORT)");
+                "operation mode (NORMAL/ECO/SPORT)");
     }
 
     /**
-     * Drive mode on the SETTING-device "drive config" axis, which — unlike the
-     * energy-device {@link #setOperationMode} (ECO=1/SPORT=2 only) — supports
-     * NORMAL. Value convention per the OEM firmware's setOperationMode
-     * chain. The value is on the drive-config axis:
+     * Drive mode exposed to OverDrive on the config-axis convention:
      * <pre>NORMAL = 1, ECO = 2, SPORT = 3, SNOW = 4</pre>
-     * (NOTE: distinct from the energy-device numbering — do not mix them.)
      *
-     * <p>Fallback chain (first that sticks wins), per the OEM firmware:
+     * <p>Fallback chain (first that reports success wins):
      * <ol>
-     *   <li>{@code settingDevice.setDriveConfig(int)} — the dedicated method;</li>
-     *   <li>generic {@code set(SETTING_TARGET_DRIVING_MODE, value)};</li>
-     *   <li>generic {@code set(SETTING_TARGET_DRIVING_MODE_ALT, value)};</li>
-     *   <li>last resort for ECO/SPORT only: the energy-device
-     *       {@code setOperationMode} on ITS axis (config 2/3 → energy 1/2). NORMAL
-     *       and SNOW have no energy-axis equivalent, so they are not down-converted.</li>
+     *   <li>NORMAL: energy-device {@code setOperationMode(3)}, the same-device SDK constant;</li>
+     *   <li>SNOW: energy-device {@code setRoadSurfaceMode(2)};</li>
+     *   <li>{@code settingDevice.setDriveConfig(int)} when present on another firmware;</li>
+     *   <li>ECO/SPORT: energy-device {@code setOperationMode(1/2)};</li>
+     *   <li>generic target-driving-mode feature ids.</li>
      * </ol>
      *
      * @param configMode drive mode on the config axis (1=normal, 2=eco, 3=sport, 4=snow)
@@ -10426,28 +14627,35 @@ public class BydDataCollector {
     public boolean setDriveConfigMode(int configMode) {
         boolean ok = setDriveConfigModeInternal(configMode);
         if (ok) {
-            // Cache the last-commanded APP mode. The write sends a remapped "apiMode"
-            // (NORMAL and SPORT both → 2), so the raw axis readback is ambiguous and can't
-            // recover which of the two was chosen — getDriveConfigMode() prefers this cache
-            // so the published telemetry, the MQTT state echo, the drive-mode automation
-            // condition, and the DriveModeEvent fast trigger all report the mode the user
-            // actually selected, not the ambiguous raw value. Set-only-with-optimistic-echo,
-            // the same model the mirror-fold / child-lock controls use.
+            // The SDK write returns a command result before every readback path has necessarily
+            // settled. Preserve the accepted app-level intent for immediate MQTT/automation
+            // publication; a fresh process still reads the live setting/energy axes.
             lastCommandedDriveMode = configMode;
         }
         return ok;
     }
 
-    // Last app-level drive mode successfully commanded (1..4), or -1 if none yet. Preferred
-    // by getDriveConfigMode() over the ambiguous raw axis read. volatile: written on the
-    // command thread, read on the BydDataPoll + DriveModeEvent poll threads.
+    // Last app-level drive mode successfully commanded (1..4), or -1 if none yet. Used only
+    // when the live energy axis is unavailable; a valid physical readback always wins. volatile:
+    // written on the command thread, read on the BydDataPoll + DriveModeEvent poll threads.
     private volatile int lastCommandedDriveMode = -1;
 
+    /** App config mode -> public BYDAutoEnergyDevice.setOperationMode value. */
+    static int energyOperationModeForDriveConfig(int configMode) {
+        switch (configMode) {
+            case 1: return 3; // ENERGY_OPERATION_NORMAL
+            case 2: return 1; // ENERGY_OPERATION_ECONOMY
+            case 3: return 2; // ENERGY_OPERATION_SPORT
+            default: return -1;
+        }
+    }
+
     private boolean setDriveConfigModeInternal(int configMode) {
-        // Set when the NORMAL request reached setDriveConfig and it returned VOID (no
-        // accept/refuse signal). See the NORMAL note in step 1 for why that alone must not end
-        // the chain for NORMAL — and only for NORMAL.
-        boolean normalFiredWithoutSignal = false;
+        if (configMode < 1 || configMode > 4) {
+            logger.warn("setDriveConfigMode: invalid mode " + configMode);
+            return false;
+        }
+
         // SNOW (4) is NOT a setDriveConfig value on this axis — the OEM sets it via the
         // energy device's setRoadSurfaceMode(2) (ENERGY_ROAD_SURFACE_SNOW = 2). Try that FIRST,
         // but do NOT return early on failure: HEAD reached setDriveConfig(4) and both
@@ -10463,16 +14671,16 @@ public class BydDataCollector {
                     + "to setDriveConfig / target-mode feature-ids");
         }
 
+        int energyOperationMode = energyOperationModeForDriveConfig(configMode);
+        if (configMode == 1 && setOperationMode(energyOperationMode)) {
+            logger.info("setDriveConfigMode(NORMAL): applied via energy setOperationMode("
+                    + energyOperationMode + ")");
+            return true;
+        }
+
         // Map the app-level mode to the OEM's setDriveConfig "apiMode": ECO(2)→3, SPORT(3)→2,
-        // SNOW(4)→4. Verified in the OEM's packed-switch, not just the decompiler.
-        //
-        // NORMAL keeps its RAW 1 on purpose. The OEM remaps NORMAL→2 as well, i.e. NORMAL and
-        // SPORT send an IDENTICAL value — so remapping it made "select NORMAL" indistinguishable
-        // from SPORT and the mode became unreachable (the reported bug). 1 is at least a distinct
-        // value the axis may decode as normal, and our own getDriveConfig readback already
-        // decodes raw 1..4 as app-mode 1=normal/2=eco/3=sport/4=snow, so raw 1 is the only value
-        // consistent with how we READ this axis. If a device log later shows 1 being rejected,
-        // the answer is a different lever for NORMAL — not sending SPORT's value.
+        // SNOW(4)→4. NORMAL's proven primary route is the energy setter above; raw 1 remains only
+        // a distinct fallback for firmware that actually exposes setDriveConfig.
         int apiMode = (configMode == 4) ? 4 : (configMode == 2) ? 3 : (configMode == 3) ? 2 : 1;
 
         // 1) Dedicated setting-device method with the REMAPPED apiMode (the OEM's primary path).
@@ -10505,14 +14713,12 @@ public class BydDataCollector {
                                 + " — if this equals apiMode the axis echoes the write encoding,"
                                 + " if it equals " + configMode + " it reports app modes,"
                                 + " if it is unchanged the write did not take");
-                        // NORMAL ONLY: a void return proves nothing, and NORMAL is the one mode
-                        // whose value (raw 1) the OEM never emits — so "accepted" here is exactly
-                        // the false confirmation that made NORMAL look like a no-op while ECO/
-                        // SPORT/SNOW (which send the OEM's own apiMode) genuinely work. Keep
-                        // going to the carsettings tier instead of returning success. An explicit
-                        // Integer/Boolean accept is still trusted and returns immediately.
+                        // A void NORMAL call proves nothing. This exact firmware has no
+                        // setDriveConfig method at all, but a variant may expose a void shim;
+                        // never turn that into success after the explicit energy command failed.
                         if (configMode == 1 && !(r instanceof Integer) && !(r instanceof Boolean)) {
-                            normalFiredWithoutSignal = true;
+                            logger.warn("setDriveConfigMode(NORMAL): void setDriveConfig(1) "
+                                    + "returned no accept/refuse signal; continuing fallbacks");
                         } else {
                             return true;
                         }
@@ -10523,7 +14729,7 @@ public class BydDataCollector {
             }
         }
 
-        // 2) ECO/SPORT energy-device fallback: config 2/3 → energy operation-mode 1/2.
+        // 2) ECO/SPORT energy-device fallback: config 2/3 → public operation-mode 1/2.
         //    ORDER MATTERS, and this is the order HEAD shipped. This is a NAMED SDK method and
         //    the proven path on trims where setDriveConfig is absent (field-reported: eco/sport
         //    work via the energy axis there), whereas step 3 writes GUESSED feature-ids. Named
@@ -10533,8 +14739,9 @@ public class BydDataCollector {
         //    isSdkWriteSuccess, which accepts a void/non-Integer return as success, so on a trim
         //    where it resolves but does not actuate this can still claim success — that is why
         //    the paths are ordered by confidence rather than merged into a try-everything.
-        if ((configMode == 2 || configMode == 3) && setOperationMode(configMode - 1)) {
-            logger.info("setDriveConfigMode(" + configMode + "): applied via energy setOperationMode(" + (configMode - 1) + ")");
+        if ((configMode == 2 || configMode == 3) && setOperationMode(energyOperationMode)) {
+            logger.info("setDriveConfigMode(" + configMode
+                    + "): applied via energy setOperationMode(" + energyOperationMode + ")");
             return true;
         }
 
@@ -10557,37 +14764,14 @@ public class BydDataCollector {
             }
         }
 
-        // 4) Deliberately NO carsettings-provider tier. The provider key "power_management"
-        //    (BydCarSettings, labelled "Drive Mode") looks like the missing NORMAL lever, but
-        //    neither the key's identity nor its value order is evidenced anywhere — the label is
-        //    OverDrive's own and the registry records only the domain {0,1,2}. The provider write
-        //    also lands BEFORE its return is inspected (BydCarSettings.putIntRaw), so a "not
-        //    confirmed" result still mutated a real CAN-backed setting. Writing a guessed value
-        //    into an unidentified vehicle setting is worse than reporting failure, so this stays
-        //    out until a device dump pins down both the key and the numbering.
-
-        // 5) NO energy-device fallback for NORMAL, deliberately. The energy axis has only
-        //    ENERGY_OPERATION_ECONOMY=1 and ENERGY_OPERATION_SPORT=2 — no value reads back as
-        //    NORMAL (the OEM's getDriveConfig decodes op=1+surface=COMMON as ECO), so anything
-        //    written here would command ECO and then be cached as NORMAL. Failing honestly is
-        //    better: setOperationMode/setRoadSurfaceMode count a void return as success, so a
-        //    false success would also freeze MQTT/HA/automation on a wrong "normal".
-
-        if (normalFiredWithoutSignal) {
-            // setDriveConfig(1) went through and returned nothing to contradict it, and no
-            // other tier accepted. Report it as sent — same "no better evidence for a void
-            // API" rule setMirrorsFolded uses — but say plainly that it is unconfirmed, so a
-            // device log distinguishes this from a genuine accept.
-            logger.info("setDriveConfigMode(NORMAL): reporting success on the void "
-                    + "setDriveConfig(apiMode=" + apiMode + ") call (no accept/refuse signal, and "
-                    + "no target-mode feature-id accepted) — actuation UNVERIFIED");
-            return true;
-        }
+        // Deliberately no CarSettings-provider tier. This unit defines power_management, but its
+        // row remained 1 while the live HAL reported Sport, so it is preference storage rather
+        // than reliable actuation/readback for this command.
 
         logger.warn("setDriveConfigMode(" + configMode + ", apiMode=" + apiMode + "): no working "
                 + "drive-config path on this build (setDriveConfig + target-mode feature-ids rejected"
                 + ((configMode == 2 || configMode == 3) ? " + energy fallback rejected" : "")
-                + (configMode == 1 ? "; NORMAL has no energy-axis fallback by design" : "")
+                + (configMode == 1 ? " + energy setOperationMode(3) rejected" : "")
                 + (configMode == 4 ? " + energy setRoadSurfaceMode(2) rejected" : "") + ")");
         return false;
     }
@@ -10614,40 +14798,26 @@ public class BydDataCollector {
     }
 
     /**
-     * Read the drive mode on the setting-device drive-config axis
-     * (1=normal/2=eco/3=sport/4=snow). Returns the raw int, or -1 when the getter
-     * is unavailable / read failed. Used as the primary source for the published
-     * drive-mode telemetry so read and write share one axis.
+     * Read the drive mode on OverDrive's config axis
+     * (1=normal/2=eco/3=sport/4=snow).
+     *
+     * <p>Priority is live ENERGY-axis readback, last accepted command, then the legacy
+     * setting-device drive-config getter. The energy axis must win because this unit can leave
+     * {@code getDriveConfig()} at 3 after {@code getOperationMode()} has reached 1 (Normal).
      */
     public int getDriveConfigMode() {
-        // Prefer the last-commanded app mode. setDriveConfigMode writes a REMAPPED apiMode
-        // (NORMAL→2, ECO→3, SPORT→2), and getDriveConfig is an undocumented method — it is
-        // absent from the SDK javadoc entirely, so whether it reads back the app-level mode
-        // (1..4) or the apiMode we wrote is UNVERIFIED. That matters because the raw value flows
-        // straight into BydEvent.driveModeToString (1=normal/2=eco/3=sport/4=snow): if the
-        // readback is in apiMode space, commanding ECO writes 3 and reads back 3, which would
-        // publish "sport" for a car in eco. And even in app-mode space a raw 2 cannot separate
-        // NORMAL from SPORT, since both map to apiMode 2. So the commanded intent wins whenever
-        // we have one, and the live read is only a fallback for "no set this session".
-        //
-        // (A mode changed from the car's own UI won't update this cache — the accepted trade-off
-        // of a set-only axis with an unverified readback, same as mirror-fold / child-lock. The
-        // diagnostic below still fires until the first successful set, which is when the raw
-        // encoding can be identified from a logcat; once that is known this can be tightened.)
+        int energyMode = readEnergyAxisDriveMode();
         int cached = lastCommandedDriveMode;
-        if (cached >= 1 && cached <= 4) return cached;
+        int preferred = chooseDriveModeReadback(energyMode, cached, -1);
+        if (preferred >= 1) return preferred;
 
         if (settingDevice == null) return -1;
         try {
             Object r = BydDeviceHelper.callGetter(settingDevice, "getDriveConfig");
             if (r instanceof Number) {
                 int v = ((Number) r).intValue();
-                // Diagnostic (throttled 1/min): so an on-device logcat reveals whether the
-                // setting-device drive-config axis actually works on this trim — the field
-                // report is NORMAL never reads/applies while ECO/SPORT do, which happens iff
-                // getDriveConfig is absent and only the energy axis (eco/sport, no normal)
-                // answers. If this logs a valid 1..4 here, NORMAL is readable and the bug is
-                // elsewhere; if it never logs (getter absent) the energy fallback is in play.
+                // Diagnostic (throttled 1/min): records the setting-device axis independently
+                // from the energy-axis fallback, which has different setter/getter numbering.
                 long now = System.currentTimeMillis();
                 if (now - lastDriveConfigLogMs > 60000) {
                     lastDriveConfigLogMs = now;
@@ -10660,12 +14830,59 @@ public class BydDataCollector {
                 // raw pushed sentinel-filtering onto every caller. Both current consumers do
                 // filter, so this fixes no live symptom — it stops the next one from inheriting
                 // a leaky contract.
-                if (v >= 1 && v <= 4) return v;
+                return chooseDriveModeReadback(energyMode, cached, v);
             }
         } catch (Exception e) {
             logger.debug("getDriveConfig failed (getter likely absent on this trim): " + e.getMessage());
         }
         return -1;
+    }
+
+    /** Select a config-axis mode without allowing stale setting data to override live energy. */
+    static int chooseDriveModeReadback(int energyMode, int commandedMode, int settingMode) {
+        if (energyMode >= 1 && energyMode <= 4) return energyMode;
+        if (commandedMode >= 1 && commandedMode <= 4) return commandedMode;
+        if (settingMode >= 1 && settingMode <= 4) return settingMode;
+        return -1;
+    }
+
+    /**
+     * Drive mode derived from the ENERGY device axis, mapped onto the config axis
+     * (1=normal/2=eco/3=sport/4=snow), or -1 when that axis can't answer either.
+     *
+     * <p>This unit's getter returns the SDK's protected raw values:
+     * 1=normal, 2=eco, 3=sport. Snow may be raw 4 or eco plus road-surface 2.
+     */
+    private int readEnergyAxisDriveMode() {
+        if (energyDevice == null) return -1;
+        try {
+            Object opMode = BydDeviceHelper.callGetter(energyDevice, "getOperationMode");
+            if (!(opMode instanceof Number)) return -1;
+            int op = ((Number) opMode).intValue();
+            int surface = -1;
+            if (op == 2) {
+                Object surfaceValue =
+                        BydDeviceHelper.callGetter(energyDevice, "getRoadSurfaceMode");
+                if (surfaceValue instanceof Number) {
+                    surface = ((Number) surfaceValue).intValue();
+                }
+            }
+            return driveModeFromEnergyAxis(op, surface);
+        } catch (Exception e) {
+            logger.debug("energy-axis drive-mode read failed: " + e.getMessage());
+        }
+        return -1;
+    }
+
+    /** Raw energy-operation getter value + road surface -> app config mode. */
+    static int driveModeFromEnergyAxis(int rawOperationMode, int roadSurfaceMode) {
+        switch (rawOperationMode) {
+            case 1: return 1; // protected ENERGY_OPERATION_MODE_NORMAL
+            case 2: return roadSurfaceMode == 2 ? 4 : 2; // ECO, or SNOW surface
+            case 3: return 3; // protected ENERGY_OPERATION_MODE_SPORT
+            case 4: return 4; // direct ENERGY_OPERATION_SNOW on newer implementations
+            default: return -1;
+        }
     }
 
     /**
@@ -10694,6 +14911,178 @@ public class BydDataCollector {
     // rationale as lockUnlockStreak).
     private volatile long lastDriveConfigLogMs = 0;
 
+      /** Throttle for the getEnergyMode diagnostic (1/min). Same rationale as above. */
+      private volatile long lastEnergyModeLogMs = 0;
+
+      private static final int DAEMON_ENERGY_RECONCILE_MAX_ATTEMPTS = 6;
+      private static final long DAEMON_ENERGY_RECONCILE_BASE_DELAY_MS = 250L;
+      private static final long DAEMON_ENERGY_RECONCILE_MAX_DELAY_MS = 4000L;
+      private final Object daemonEnergyReconcileLock = new Object();
+      private java.util.concurrent.ScheduledThreadPoolExecutor daemonEnergyReconcileExecutor;
+      private java.util.concurrent.ScheduledFuture<?> daemonEnergyReconcileFuture;
+      private long daemonEnergyReconcileTicket;
+      private int daemonEnergyReconcileFailureCount;
+      /** Guarded by {@link #daemonEnergyReconcileLock}. */
+      private boolean daemonEnergyReconciliationEnabled;
+
+      /** Resume only rollback work durably owned by the daemon process class. */
+      private void reconcilePersistedDaemonEnergyState() {
+          final long ticket;
+          synchronized (daemonEnergyReconcileLock) {
+              if (!daemonEnergyReconciliationEnabled) return;
+              ticket = ++daemonEnergyReconcileTicket;
+              daemonEnergyReconcileFailureCount = 0;
+              if (daemonEnergyReconcileFuture != null) {
+                  daemonEnergyReconcileFuture.cancel(false);
+                  daemonEnergyReconcileFuture = null;
+              }
+          }
+          reconcilePersistedDaemonEnergyState(ticket, 0);
+      }
+
+      private void rearmPersistedDaemonEnergyReconciliation() {
+          final long ticket;
+          final int attempt;
+          synchronized (daemonEnergyReconcileLock) {
+              if (!daemonEnergyReconciliationEnabled) return;
+              ticket = ++daemonEnergyReconcileTicket;
+              attempt = ++daemonEnergyReconcileFailureCount;
+              if (daemonEnergyReconcileFuture != null) {
+                  daemonEnergyReconcileFuture.cancel(false);
+                  daemonEnergyReconcileFuture = null;
+              }
+          }
+          schedulePersistedDaemonEnergyReconciliation(ticket, attempt);
+      }
+
+      private void notePersistedDaemonEnergyReconciliationProgress() {
+          synchronized (daemonEnergyReconcileLock) {
+              daemonEnergyReconcileFailureCount = 0;
+          }
+      }
+
+      private void reconcilePersistedDaemonEnergyState(long ticket, int attempt) {
+          synchronized (daemonEnergyReconcileLock) {
+              if (!daemonEnergyReconciliationEnabled
+                      || ticket != daemonEnergyReconcileTicket || context == null) {
+                  return;
+              }
+              daemonEnergyReconcileFailureCount =
+                      Math.max(daemonEnergyReconcileFailureCount, attempt);
+          }
+          try {
+              VehicleActuatorBridge.PublishedEnergyRead read =
+                      VehicleActuatorBridge.readPublishedEnergyState(context);
+              VehicleActuatorBridge.PublishedEnergyRequest marker = read.request;
+              boolean retry = false;
+              synchronized (daemonEnergyReconcileLock) {
+                  if (!daemonEnergyReconciliationEnabled
+                          || ticket != daemonEnergyReconcileTicket) {
+                      return;
+                  }
+                  if (read.status == VehicleActuatorBridge.EnergyReadStatus.VALID
+                          && marker != null) {
+                      if (marker.cancelled
+                              && marker.rollbackPending
+                              && marker.rollbackOwner
+                              == VehicleActuatorBridge.ENERGY_ACTUATOR_DAEMON
+                              && marker.compensationAttempts
+                              < VehicleActuatorBridge.MAX_ENERGY_COMPENSATION_ATTEMPTS) {
+                          retry = !energySetterLane.reconcileCancellation(marker);
+                      } else if (!marker.cancelled && !marker.pending) {
+                          retry = !energySetterLane.reconcileDesired(marker);
+                      }
+                  } else {
+                      retry = read.status
+                              != VehicleActuatorBridge.EnergyReadStatus.VALID
+                              && read.status
+                              != VehicleActuatorBridge.EnergyReadStatus.MISSING;
+                  }
+              }
+              if (retry) {
+                  schedulePersistedDaemonEnergyReconciliation(ticket, attempt + 1);
+              }
+          } catch (Throwable failed) {
+              logger.warn("daemon energy rollback reconciliation failed: "
+                      + failed.getMessage());
+              schedulePersistedDaemonEnergyReconciliation(ticket, attempt + 1);
+          }
+      }
+
+      private void schedulePersistedDaemonEnergyReconciliation(
+              long ticket, int attempt) {
+          if (attempt > DAEMON_ENERGY_RECONCILE_MAX_ATTEMPTS) {
+              logger.warn("daemon energy rollback reconciliation exhausted after "
+                      + Math.max(0, attempt - 1) + " retries");
+              return;
+          }
+          long shift = Math.min(4, Math.max(0, attempt - 1));
+          long delay = Math.min(
+                  DAEMON_ENERGY_RECONCILE_MAX_DELAY_MS,
+                  DAEMON_ENERGY_RECONCILE_BASE_DELAY_MS << shift);
+          synchronized (daemonEnergyReconcileLock) {
+              if (!daemonEnergyReconciliationEnabled
+                      || ticket != daemonEnergyReconcileTicket || context == null) {
+                  return;
+              }
+              if (daemonEnergyReconcileExecutor == null
+                      || daemonEnergyReconcileExecutor.isShutdown()) {
+                  daemonEnergyReconcileExecutor =
+                          new java.util.concurrent.ScheduledThreadPoolExecutor(
+                                  1,
+                                  runnable -> {
+                                      Thread worker =
+                                              new Thread(
+                                                      runnable,
+                                                      "DaemonEnergyReconcile");
+                                      worker.setDaemon(true);
+                                      return worker;
+                                  },
+                                  new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+                  daemonEnergyReconcileExecutor.setRemoveOnCancelPolicy(true);
+              }
+              if (daemonEnergyReconcileFuture != null) {
+                  daemonEnergyReconcileFuture.cancel(false);
+              }
+              try {
+                  daemonEnergyReconcileFuture =
+                          daemonEnergyReconcileExecutor.schedule(
+                                  () -> {
+                                      synchronized (daemonEnergyReconcileLock) {
+                                          if (!daemonEnergyReconciliationEnabled
+                                                  || ticket != daemonEnergyReconcileTicket) {
+                                              return;
+                                          }
+                                          daemonEnergyReconcileFuture = null;
+                                      }
+                                      reconcilePersistedDaemonEnergyState(
+                                              ticket, attempt);
+                                  },
+                                  delay,
+                                  java.util.concurrent.TimeUnit.MILLISECONDS);
+              } catch (Throwable unavailable) {
+                  daemonEnergyReconcileFuture = null;
+                  logger.warn("could not schedule daemon energy reconciliation: "
+                          + unavailable.getMessage());
+              }
+          }
+      }
+
+      private void cancelPersistedDaemonEnergyReconciliation(boolean shutdown) {
+          synchronized (daemonEnergyReconcileLock) {
+              daemonEnergyReconciliationEnabled = !shutdown;
+              daemonEnergyReconcileTicket++;
+              if (daemonEnergyReconcileFuture != null) {
+                  daemonEnergyReconcileFuture.cancel(false);
+                  daemonEnergyReconcileFuture = null;
+              }
+              if (shutdown && daemonEnergyReconcileExecutor != null) {
+                  daemonEnergyReconcileExecutor.shutdownNow();
+                  daemonEnergyReconcileExecutor = null;
+              }
+          }
+      }
+
     /**
      * Energy/powertrain mode: EV vs HEV (BYD SDK EnergyMode enum, matches the
      * value read back as energyMode). Only meaningful on DM/PHEV vehicles.
@@ -10703,21 +15092,1222 @@ public class BydDataCollector {
      * caveat as {@link #setOperationMode}: resolves, but the HAL may reject the
      * write from our UID. Invoked defensively via {@link #invokeOptionalModeSetter}.
      *
-     * <p><b>Value guard:</b> the ONLY valid values are {@code 1 = EV} and
-     * {@code 3 = HEV} — the OEM firmware hard-rejects anything else. In particular
-     * {@code 0 = STOP} (NOT EV): an out-of-range or 0 value reaching the HAL would
-     * either be ignored or, worse, command STOP. The catalog word→int mapping only
-     * ever produces 1 or 3, but this method is public, so guard here too — a caller
-     * that bypasses the mapping can never drive the powertrain to an unintended mode.
+     * <p><b>Value guard:</b> {@code 0 = ENERGY_MODE_STOP} is refused — it is not a
+     * powertrain preference and commanding it could stop the drivetrain. Only the field-validated
+     * EV(1) and HEV(3) values are accepted as user commands. Other valid SDK values remain
+     * readable and may be restored internally as cancellation rollback targets.
      */
     public boolean setEnergyMode(int mode) {
-        if (mode != 1 && mode != 3) {
-            logger.warn("setEnergyMode: refusing invalid mode " + mode
-                + " (only 1=EV / 3=HEV are valid; 0=STOP)");
+        if (mode != ENERGY_MODE_EV && mode != ENERGY_MODE_HEV) {
+            logger.warn("setEnergyMode: refusing unproven user mode " + mode
+                    + " (valid: 1=EV, 3=HEV)");
             return false;
         }
-        return invokeOptionalModeSetter(energyDevice, "setEnergyMode", mode,
-                "energy/powertrain mode (EV/HEV)");
+        // Claim a process-wide monotonic token at ingress, before any device lookup can block.
+        // elapsedRealtimeNanos survives daemon process restarts within the same boot, so the app
+        // process can reject a delayed shell launch even when either side was recreated.
+        final long proposedGeneration = nextEnergyRequestGeneration();
+        VehicleActuatorBridge.PublishedEnergyRequest reservation =
+                VehicleActuatorBridge.reserveEnergyRequest(
+                        context, mode, proposedGeneration);
+        if (reservation == null) {
+            logger.warn("setEnergyMode(" + mode
+                    + ") aborted: global generation reservation failed");
+            return false;
+        }
+        final long generation = reservation.generation;
+        lastEnergyRequestGeneration.accumulateAndGet(generation, Math::max);
+        final EnergyRequest request = new EnergyRequest(generation, mode);
+        EnergyRequest published = energyModeCurrent.updateAndGet(previous ->
+                previous == null || request.generation > previous.generation ? request : previous);
+        if (published != request) {
+            cancelEnergyRequest(request, "superseded at ingress");
+            logger.info("setEnergyMode(" + mode + ") generation=" + generation
+                    + " superseded at ingress");
+            return false;
+        }
+        synchronized (energyModeWriteLock) {
+            if (!isDaemonEnergyRequestCurrent(request)) {
+                cancelEnergyRequest(request, "superseded before latest-state publication");
+                logger.info("setEnergyMode(" + mode + ") generation=" + generation
+                        + " superseded before latest-state publication");
+                return false;
+            }
+
+            // Publish while this request owns the serialization lock. A superseded caller used to
+            // publish before taking this lock and could therefore overwrite a newer marker after
+            // the newer request had already completed its publication.
+            boolean statePublished =
+                    VehicleActuatorBridge.publishEnergyRequest(context, mode, generation);
+            if (!statePublished && !Thread.currentThread().isInterrupted()
+                    && isDaemonEnergyRequestCurrent(request)) {
+                // One transient SettingsProvider timeout must not disable the app-process path, but
+                // proceeding without a confirmed marker would let an older delayed service start
+                // overwrite this request's daemon fallback.
+                statePublished =
+                        VehicleActuatorBridge.publishEnergyRequest(context, mode, generation);
+            }
+            if (!statePublished) {
+                cancelEnergyRequest(request, "latest-state publication failure");
+                logger.warn("setEnergyMode(" + mode + ") generation=" + generation
+                        + " aborted: latest-state marker could not be confirmed");
+                return false;
+            }
+            if (!isDaemonEnergyRequestCurrent(request)) {
+                cancelEnergyRequest(request, "superseded during latest-state publication");
+                logger.info("setEnergyMode(" + mode + ") generation=" + generation
+                        + " superseded during latest-state publication");
+                return false;
+            }
+
+            // The app-process path is load-bearing on the field-reported trim: daemon HAL writes
+            // return success without moving the axis. Launch it before any daemon-side lookup can
+            // block, and synchronously retain the launch result so shutdown cannot kill a queued
+            // bridge thread after this method has reported success.
+            boolean appLaunched = false;
+            try {
+                appLaunched =
+                        VehicleActuatorBridge.dispatchEnergyMode(context, mode, generation);
+            } catch (Throwable t) {
+                logger.warn("setEnergyMode app-process launch failed: " + t.getMessage());
+            }
+            if (Thread.currentThread().isInterrupted()) {
+                cancelEnergyRequest(request, "interrupted during app-process launch");
+                logger.info("setEnergyMode(" + mode + ") generation=" + generation
+                        + " canceled during app-process launch");
+                return false;
+            }
+            if (!isDaemonEnergyRequestCurrent(request)) {
+                cancelEnergyRequest(request, "superseded during app-process launch");
+                logger.info("setEnergyMode(" + mode + ") generation=" + generation
+                        + " superseded during app-process launch");
+                return false;
+            }
+
+            boolean applied = awaitEnergyMode(
+                    request, ENERGY_APP_APPLY_TIMEOUT_MS, energyDevice);
+            boolean localAccepted = false;
+            if (Thread.currentThread().isInterrupted() || request.cancelled) {
+                cancelEnergyRequest(request, "interrupted during app-process verification");
+                return false;
+            }
+            if (!isDaemonEnergyRequestCurrent(request)) {
+                cancelEnergyRequest(request, "superseded during app-process verification");
+                return false;
+            }
+            if (!applied && isDaemonEnergyRequestCurrent(request)) {
+                // App launch failed or was accepted-but-ignored. Retain the daemon SDK call as a
+                // fallback for trims where UID 2000 is the environment the HAL honours.
+                long deviceResolutionSequence =
+                        energyDeviceResolutionSequence.incrementAndGet();
+                Object device = freshEnergyDevice();
+                if (Thread.currentThread().isInterrupted()) {
+                    cancelEnergyRequest(request, "interrupted during daemon device lookup");
+                    return false;
+                }
+                if (!isDaemonEnergyRequestCurrent(request)) {
+                    cancelEnergyRequest(request, "superseded during daemon device lookup");
+                    return false;
+                }
+                EnergySetterOutcome setterOutcome = invokeOptionalModeSetterBounded(
+                        request, device, "setEnergyMode", mode,
+                        "energy/powertrain mode (" + energyModeName(mode) + ")",
+                        deviceResolutionSequence);
+                localAccepted = setterOutcome.accepted;
+                // If interruption raced a setter that had already begun, tombstone this generation.
+                // The fixed lane may finish the Binder call, but it must not retain retries for a
+                // command whose caller canceled.
+                if (Thread.currentThread().isInterrupted() || request.cancelled) {
+                    cancelEnergyRequest(request, "interrupted during daemon setter");
+                    return false;
+                }
+                if (!isDaemonEnergyRequestCurrent(request)) {
+                    cancelEnergyRequest(request, "superseded during daemon setter");
+                    return false;
+                }
+                // Verify through the same handle that received the fallback write. During Binder
+                // recovery the cached field can be stale while this freshly-resolved handle works.
+                // A timed-out setter transfers verification to the fixed lane. Polling here as well
+                // would make the caller and lane contend on the one bounded read executor and could
+                // turn a successful late write into two false-negative readback loops.
+                if (!setterOutcome.verificationHandedOff) {
+                    applied = awaitEnergyMode(request, ENERGY_LOCAL_APPLY_TIMEOUT_MS, device);
+                }
+            }
+            if (Thread.currentThread().isInterrupted() || request.cancelled) {
+                cancelEnergyRequest(request, "after daemon verification");
+                return false;
+            }
+            if (!isDaemonEnergyRequestCurrent(request)) {
+                cancelEnergyRequest(request, "superseded after daemon verification");
+                return false;
+            }
+
+            logger.info("setEnergyMode(" + mode + "=" + energyModeName(mode) + ") generation="
+                    + generation + " statePublished=" + statePublished
+                    + " appLaunched=" + appLaunched
+                    + " localAccepted=" + localAccepted + " applied=" + applied);
+            // A launch or setter return is not success: this HAL is known to accept ignored writes.
+            // Report/echo only generation-aware physical axis confirmation.
+            return applied;
+        }
+    }
+
+    /** One energy-mode command: its sequence number and the mode it asked for, published together
+     *  so a pending verify can never see one without the other. */
+    private static final class EnergyRequest {
+        final long generation; final int mode;
+        volatile boolean cancelled;
+        EnergyRequest(long generation, int mode) { this.generation = generation; this.mode = mode; }
+    }
+
+    /**
+     * Invalidate a request both in this process and in the boot-scoped app-service marker.
+     * Thread interruption is temporarily cleared only so the bounded marker lane can accept and
+     * confirm the tombstone; the exact interrupted status is restored before returning.
+     */
+    private void cancelEnergyRequest(EnergyRequest request, String stage) {
+        if (request == null) return;
+        request.cancelled = true;
+        energySetterLane.cancelThrough(request.generation);
+        boolean restoreInterrupt = Thread.interrupted();
+        try {
+            boolean markerCancelled =
+                    VehicleActuatorBridge.cancelPublishedEnergyRequest(
+                            context, request.generation);
+            if (!markerCancelled) {
+                logger.warn("setEnergyMode(" + request.mode + ") generation="
+                        + request.generation + " cancellation at " + stage
+                        + " was not synchronously confirmed");
+            }
+            VehicleActuatorBridge.PublishedEnergyRead read =
+                    VehicleActuatorBridge.readPublishedEnergyState(context);
+            if (read.status == VehicleActuatorBridge.EnergyReadStatus.VALID
+                    && read.request != null
+                    && read.request.cancelled
+                    && read.request.generation == request.generation) {
+                energySetterLane.reconcileCancellation(read.request);
+            }
+        } finally {
+            if (restoreInterrupt) Thread.currentThread().interrupt();
+        }
+    }
+
+    /** The newest energy-mode command. A verify compares its own ticket against this to tell whether
+     *  it has been superseded, and by a DIFFERENT mode or a repeat of its own. */
+    private final java.util.concurrent.atomic.AtomicReference<EnergyRequest> energyModeCurrent =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+    /**
+     * Reconcile process-local ordering with the boot-scoped marker. A daemon left over from an
+     * earlier automation process can never use its local reference as authority.
+     */
+    private boolean isDaemonEnergyRequestCurrent(EnergyRequest request) {
+        if (request == null || request.cancelled
+                || energyModeCurrent.get() != request) {
+            return false;
+        }
+        VehicleActuatorBridge.PublishedEnergyRead read =
+                VehicleActuatorBridge.readPublishedEnergyState(context);
+        VehicleActuatorBridge.PublishedEnergyRequest marker = read.request;
+        if (read.status != VehicleActuatorBridge.EnergyReadStatus.VALID
+                || marker == null) {
+            return false;
+        }
+        if (marker.cancelled) {
+            if (marker.generation == request.generation) request.cancelled = true;
+            return false;
+        }
+        if (marker.pending) return false;
+        if (marker.generation > request.generation) {
+            adoptAuthoritativeEnergyRequest(marker);
+            return false;
+        }
+        return marker.generation == request.generation
+                && marker.mode == request.mode
+                && energyModeCurrent.get() == request
+                && !request.cancelled;
+    }
+
+    private EnergyRequest adoptAuthoritativeEnergyRequest(
+            VehicleActuatorBridge.PublishedEnergyRequest marker) {
+        if (marker == null || marker.cancelled || marker.pending
+                || marker.mode < 1 || marker.mode > ENERGY_MODE_KEEP) {
+            return null;
+        }
+        lastEnergyRequestGeneration.accumulateAndGet(marker.generation, Math::max);
+        while (true) {
+            EnergyRequest current = energyModeCurrent.get();
+            if (current != null && current.generation >= marker.generation) return current;
+            EnergyRequest adopted = new EnergyRequest(marker.generation, marker.mode);
+            if (energyModeCurrent.compareAndSet(current, adopted)) return adopted;
+        }
+    }
+
+    /** Serializes daemon-side HAL writes; superseded waiters skip before touching the device. */
+    private final Object energyModeWriteLock = new Object();
+
+    private static final long ENERGY_APP_APPLY_TIMEOUT_MS = 1500L;
+    private static final long ENERGY_LOCAL_APPLY_TIMEOUT_MS = 500L;
+    private static final long ENERGY_APPLY_POLL_MS = 50L;
+    private static final long ENERGY_DEVICE_LOOKUP_TIMEOUT_MS = 500L;
+    private static final long ENERGY_SETTER_TIMEOUT_MS = 500L;
+    private static final long ENERGY_READ_TIMEOUT_MS = 200L;
+    private static final int ENERGY_CORRECTION_MAX_ATTEMPTS = 2;
+    private static final java.util.concurrent.ExecutorService ENERGY_DEVICE_LOOKUP_EXECUTOR =
+            newEnergyHalExecutor("EnergyDeviceLookup");
+    private static final java.util.concurrent.ExecutorService ENERGY_READ_EXECUTOR =
+            newEnergyHalExecutor("EnergyModeRead");
+    private static final java.util.concurrent.atomic.AtomicBoolean ENERGY_LOOKUP_STALLED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private static final java.util.concurrent.atomic.AtomicBoolean ENERGY_READ_STALLED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicLong energyDeviceResolutionSequence =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final EnergySetterLane energySetterLane = new EnergySetterLane();
+
+    private static java.util.concurrent.ExecutorService newEnergyHalExecutor(String threadName) {
+        return new java.util.concurrent.ThreadPoolExecutor(
+                1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(1),
+                runnable -> {
+                    Thread worker = new Thread(runnable, threadName);
+                    worker.setDaemon(true);
+                    return worker;
+                },
+                new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+    }
+
+    /** Monotonic source generation shared with the ordered app-process bridge. */
+    private final java.util.concurrent.atomic.AtomicLong lastEnergyRequestGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    private long nextEnergyRequestGeneration() {
+        final long clock = SystemClock.elapsedRealtimeNanos();
+        return lastEnergyRequestGeneration.updateAndGet(
+                previous -> Math.max(clock, previous == Long.MAX_VALUE ? previous : previous + 1L));
+    }
+
+    /**
+     * A freshly-resolved {@code BYDAutoEnergyDevice} handle for a one-shot write, falling back to
+     * the one cached at {@link #init} when re-resolution fails.
+     *
+     * <p>Returned as a LOCAL only — {@link #energyDevice} is deliberately not reassigned. The
+     * listener bookkeeping in {@code registerAllListeners} is keyed by handle identity, so
+     * swapping the field to a new instance would make it look unregistered and stack a duplicate
+     * HAL callback on the next init.
+     *
+     * <p>A handle that is genuinely NEW (not the process singleton) has never been through
+     * {@code init}'s activation step, and on a trim whose HAL requires enabling before it honours
+     * commands an un-activated handle accepts the write and ignores it — reproducing the exact
+     * symptom this path exists to diagnose. So activate any new instance before returning it;
+     * {@code enableDevice} is advisory and its result is deliberately ignored, matching
+     * {@code initDevice}. When {@code getInstance} hands back the cached singleton this is skipped
+     * entirely, so the common case costs nothing.
+     */
+    private Object freshEnergyDevice() {
+        return callEnergyHalBounded(
+                ENERGY_DEVICE_LOOKUP_EXECUTOR,
+                this::freshEnergyDeviceDirect,
+                ENERGY_DEVICE_LOOKUP_TIMEOUT_MS,
+                energyDevice,
+                ENERGY_LOOKUP_STALLED,
+                "energy device lookup/activation");
+    }
+
+    private Object freshEnergyDeviceDirect() {
+        try {
+            Object d = BydDeviceHelper.getDevice(
+                    "android.hardware.bydauto.energy.BYDAutoEnergyDevice", context);
+            if (d != null && d != energyDevice) {
+                try {
+                    BydManagerChannel.enableDevice(context, d, "Energy");
+                } catch (Throwable t) {
+                    logger.debug("freshEnergyDevice activation threw: " + t.getMessage());
+                }
+                return d;
+            }
+            if (d != null) return d;
+        } catch (Throwable t) {
+            logger.debug("freshEnergyDevice failed, using cached handle: " + t.getMessage());
+        }
+        return energyDevice;
+    }
+
+    /**
+     * Wait for the real energy axis to reach this request's mode. The request identity check makes
+     * the readback an acknowledgement of the current generation rather than a stale earlier write.
+     */
+    private boolean awaitEnergyMode(EnergyRequest request, long timeoutMs, Object device) {
+        long deadline = SystemClock.elapsedRealtime() + timeoutMs;
+        int seen = BydVehicleData.UNAVAILABLE;
+        while (isDaemonEnergyRequestCurrent(request)) {
+            long remaining = deadline - SystemClock.elapsedRealtime();
+            if (remaining <= 0L) break;
+            seen = readEnergyModeRawOn(
+                    device, Math.min(ENERGY_READ_TIMEOUT_MS, remaining));
+            if (!isDaemonEnergyRequestCurrent(request)) return false;
+            if (seen == request.mode) {
+                boolean committed = VehicleActuatorBridge.completeEnergyActuation(
+                        context, request.generation, request.mode);
+                if (!committed) {
+                    logger.warn("setEnergyMode(" + request.mode + ") generation="
+                            + request.generation
+                            + " reached target but durable completion was unavailable");
+                }
+                return committed;
+            }
+            remaining = deadline - SystemClock.elapsedRealtime();
+            if (remaining <= 0L) break;
+            try {
+                Thread.sleep(Math.min(ENERGY_APPLY_POLL_MS, remaining));
+            } catch (InterruptedException e) {
+                cancelEnergyRequest(request, "physical verification wait");
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        logger.warn("setEnergyMode(" + request.mode + ") generation=" + request.generation
+                + " did not reach target; axis=" + energyModeName(seen));
+        return false;
+    }
+
+    /** Uncached energy-axis read; never consults commanded state. */
+    private int readEnergyModeRawOn(Object device, long timeoutMs) {
+        if (device == null) return BydVehicleData.UNAVAILABLE;
+        Integer result = callEnergyHalBounded(
+                ENERGY_READ_EXECUTOR,
+                () -> readEnergyModeRawOnDirect(device),
+                timeoutMs,
+                Integer.valueOf(BydVehicleData.UNAVAILABLE),
+                ENERGY_READ_STALLED,
+                "energy-mode readback");
+        return result != null ? result.intValue() : BydVehicleData.UNAVAILABLE;
+    }
+
+    private int readEnergyModeRawOnDirect(Object device) {
+        try {
+            Object result = BydDeviceHelper.callGetter(device, "getEnergyMode");
+            if (result instanceof Number) return ((Number) result).intValue();
+        } catch (Exception e) {
+            logger.debug("readEnergyModeRawOn failed: " + e.getMessage());
+        }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    private static final class EnergySetterOutcome {
+        final boolean accepted;
+        final boolean verificationHandedOff;
+
+        EnergySetterOutcome(boolean accepted, boolean verificationHandedOff) {
+            this.accepted = accepted;
+            this.verificationHandedOff = verificationHandedOff;
+        }
+    }
+
+    private EnergySetterOutcome invokeOptionalModeSetterBounded(
+            EnergyRequest request,
+            Object device,
+            String methodName,
+            int value,
+            String label,
+            long deviceResolutionSequence) {
+        if (request.cancelled || Thread.currentThread().isInterrupted()) {
+            cancelEnergyRequest(request, "before daemon setter submission");
+            return new EnergySetterOutcome(false, false);
+        }
+        EnergySetterTask task =
+                energySetterLane.submit(
+                        request,
+                        device,
+                        methodName,
+                        value,
+                        label,
+                        deviceResolutionSequence);
+        Boolean result = task.await(ENERGY_SETTER_TIMEOUT_MS);
+        if (Thread.currentThread().isInterrupted()) {
+            energySetterLane.cancel(task);
+            return new EnergySetterOutcome(false, false);
+        }
+        if (result == null) {
+            logger.warn(methodName + "(" + value + ") exceeded "
+                    + ENERGY_SETTER_TIMEOUT_MS
+                    + "ms; fixed setter lane retains only the latest corrective request");
+        }
+        return new EnergySetterOutcome(
+                Boolean.TRUE.equals(result),
+                result == null && task.callerTimedOut());
+    }
+
+    private boolean isDaemonSetterTaskCurrent(EnergySetterTask task) {
+        if (task == null) return false;
+        VehicleActuatorBridge.PublishedEnergyRead read =
+                VehicleActuatorBridge.readPublishedEnergyState(context);
+        VehicleActuatorBridge.PublishedEnergyRequest marker = read.request;
+        if (read.status != VehicleActuatorBridge.EnergyReadStatus.VALID
+                || marker == null) {
+            return false;
+        }
+        if (task.compensation) {
+            return marker.cancelled
+                    && marker.rollbackPending
+                    && marker.generation == task.request.generation
+                    && marker.rollbackMode == task.value
+                    && marker.rollbackOwner
+                    == VehicleActuatorBridge.ENERGY_ACTUATOR_DAEMON;
+        }
+        if (marker.cancelled || marker.pending) return false;
+        if (marker.generation > task.request.generation) {
+            adoptAuthoritativeEnergyRequest(marker);
+            return false;
+        }
+        return !task.request.cancelled
+                && marker.generation == task.request.generation
+                && marker.mode == task.value;
+    }
+
+    private int readEnergyModeForSetterTask(
+            EnergySetterTask task, long timeoutMs) {
+        if (!isDaemonSetterTaskCurrent(task)) return BydVehicleData.UNAVAILABLE;
+        int mode = readEnergyModeRawOn(task.device, timeoutMs);
+        return isDaemonSetterTaskCurrent(task)
+                ? mode : BydVehicleData.UNAVAILABLE;
+    }
+
+    private boolean awaitEnergySetterTask(
+            EnergySetterTask task, long timeoutMs) {
+        long deadline = SystemClock.elapsedRealtime() + timeoutMs;
+        int seen = BydVehicleData.UNAVAILABLE;
+        while (isDaemonSetterTaskCurrent(task)) {
+            long remaining = deadline - SystemClock.elapsedRealtime();
+            if (remaining <= 0L) break;
+            seen = readEnergyModeForSetterTask(
+                    task, Math.min(ENERGY_READ_TIMEOUT_MS, remaining));
+            if (!isDaemonSetterTaskCurrent(task)) return false;
+            if (seen == task.value) return true;
+            remaining = deadline - SystemClock.elapsedRealtime();
+            if (remaining <= 0L) break;
+            try {
+                Thread.sleep(Math.min(ENERGY_APPLY_POLL_MS, remaining));
+            } catch (InterruptedException interrupted) {
+                task.cancel();
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        logger.warn("setEnergyMode(" + task.value + ") generation="
+                + task.request.generation + " did not reach target in daemon lane; axis="
+                + energyModeName(seen));
+        return false;
+    }
+
+    private boolean invokeEnergyModeSetter(EnergySetterTask task) {
+        if (task.device == null) {
+            logger.warn(task.methodName + ": device unavailable — "
+                    + task.label + " cannot be set");
+            return false;
+        }
+        final Method method;
+        try {
+            method = task.device.getClass().getMethod(task.methodName, int.class);
+        } catch (NoSuchMethodException absent) {
+            logger.warn(task.methodName + ": method not present on "
+                    + task.device.getClass().getSimpleName() + " — "
+                    + task.label + " has no local SDK write path on this build");
+            return false;
+        } catch (Throwable failed) {
+            logger.warn(task.methodName + ": lookup failed: " + failed.getMessage());
+            return false;
+        }
+        try {
+            Object result = task.invoke(this, method, task.device);
+            if (result == EnergySetterTask.INVOCATION_SKIPPED) return false;
+            return isSdkWriteSuccess(task.device, result, task.methodName);
+        } catch (Throwable failed) {
+            logger.warn(task.methodName + "(" + task.value + ") failed: "
+                    + failed.getMessage());
+            return false;
+        }
+    }
+
+    private final class EnergySetterLane {
+        private EnergySetterTask active;
+        private EnergySetterTask pending;
+        private boolean workerRunning;
+
+        synchronized EnergySetterTask submit(
+                EnergyRequest request,
+                Object device,
+                String methodName,
+                int value,
+                String label,
+                long deviceResolutionSequence) {
+            EnergySetterTask task =
+                    new EnergySetterTask(
+                            request,
+                            device,
+                            methodName,
+                            value,
+                            label,
+                            deviceResolutionSequence,
+                            device != null && device != energyDevice,
+                            0,
+                            false);
+            replacePendingLocked(task);
+            ensureWorkerLocked();
+            return task;
+        }
+
+        synchronized void cancel(EnergySetterTask task) {
+            task.cancel();
+            if (pending == task) pending = null;
+            task.complete(Boolean.FALSE);
+        }
+
+        synchronized void cancelThrough(long generation) {
+            if (active != null && active.request.generation <= generation
+                    && !(active.compensation
+                    && active.request.generation == generation)) {
+                active.cancel();
+            }
+            if (pending != null && pending.request.generation <= generation
+                    && !(pending.compensation
+                    && pending.request.generation == generation)) {
+                EnergySetterTask cancelled = pending;
+                pending = null;
+                cancelled.cancel();
+                cancelled.complete(Boolean.FALSE);
+            }
+        }
+
+          synchronized boolean reconcileCancellation(
+                  VehicleActuatorBridge.PublishedEnergyRequest marker) {
+              if (marker == null || !marker.cancelled || !marker.rollbackPending
+                      || marker.rollbackMode < 1 || marker.rollbackMode > ENERGY_MODE_KEEP
+                    || marker.rollbackOwner
+                    != VehicleActuatorBridge.ENERGY_ACTUATOR_DAEMON
+                      || marker.compensationAttempts
+                      >= VehicleActuatorBridge.MAX_ENERGY_COMPENSATION_ATTEMPTS) {
+                  return false;
+              }
+              cancelThrough(marker.generation);
+              if (hasOtherCompensationLocked(
+                      null, marker.generation, marker.rollbackMode)) {
+                  return true;
+              }
+            EnergyRequest request =
+                    new EnergyRequest(marker.generation, marker.requestedMode);
+            replacePendingLocked(new EnergySetterTask(
+                    request,
+                    energyDevice,
+                    "setEnergyMode",
+                    marker.rollbackMode,
+                    "energy cancellation rollback ("
+                            + energyModeName(marker.rollbackMode) + ")",
+                    energyDeviceResolutionSequence.incrementAndGet(),
+                    false,
+                    0,
+                      true));
+              ensureWorkerLocked();
+              return hasOtherCompensationLocked(
+                      null, marker.generation, marker.rollbackMode);
+          }
+
+          synchronized boolean reconcileDesired(
+                  VehicleActuatorBridge.PublishedEnergyRequest marker) {
+              if (marker == null || marker.cancelled || marker.pending
+                      || marker.mode < 1 || marker.mode > ENERGY_MODE_KEEP) {
+                  return false;
+              }
+              EnergyRequest request = adoptAuthoritativeEnergyRequest(marker);
+              if (request == null) return false;
+              cancelThrough(marker.generation - 1L);
+              if (hasDesiredLocked(marker.generation, marker.mode)) return true;
+              replacePendingLocked(new EnergySetterTask(
+                      request,
+                      energyDevice,
+                      "setEnergyMode",
+                      marker.mode,
+                      "energy/powertrain mode (" + energyModeName(marker.mode)
+                              + ") persisted reconciliation",
+                      energyDeviceResolutionSequence.incrementAndGet(),
+                      false,
+                      1,
+                      false));
+              ensureWorkerLocked();
+              return hasDesiredLocked(marker.generation, marker.mode);
+          }
+
+        private void drain() {
+            while (true) {
+                final EnergySetterTask task;
+                synchronized (this) {
+                    task = pending;
+                    pending = null;
+                    if (task == null) {
+                        workerRunning = false;
+                        return;
+                    }
+                    active = task;
+                }
+
+                boolean accepted = false;
+                if (isDaemonSetterTaskCurrent(task)) {
+                      if (!task.compensation) {
+                          int previousMode =
+                                  readEnergyModeForSetterTask(task, ENERGY_READ_TIMEOUT_MS);
+                          if (previousMode == task.value) {
+                              accepted = true;
+                          } else if (previousMode >= 1
+                                  && previousMode <= ENERGY_MODE_KEEP
+                                  && VehicleActuatorBridge.beginEnergyActuation(
+                                          context,
+                                          task.request.generation,
+                                        task.request.mode,
+                                        previousMode,
+                                        VehicleActuatorBridge.ENERGY_ACTUATOR_DAEMON)) {
+                            task.setPreviousMode(previousMode);
+                            accepted = invokeEnergyModeSetter(task);
+                        } else {
+                            logger.warn("setEnergyMode(" + task.value + ") generation="
+                                    + task.request.generation
+                                    + " skipped: pre-write mode/rollback metadata unavailable");
+                        }
+                          } else {
+                              int currentMode =
+                                      readEnergyModeForSetterTask(
+                                              task, ENERGY_READ_TIMEOUT_MS);
+                              if (currentMode == task.value) {
+                                  task.markCompensationPreconfirmed();
+                                  accepted = true;
+                              } else {
+                                  int claim =
+                                          VehicleActuatorBridge.claimEnergyRollbackAttempt(
+                                                  context,
+                                                  task.request.generation,
+                                                  task.value,
+                                                  VehicleActuatorBridge
+                                                  .ENERGY_ACTUATOR_DAEMON);
+                                  task.setCompensationClaim(claim);
+                                  if (claim > 0 && isDaemonSetterTaskCurrent(task)) {
+                                      accepted = invokeEnergyModeSetter(task);
+                                  } else {
+                                      logger.warn("energy rollback generation="
+                                              + task.request.generation
+                                              + " was not invoked; shared compensation claim="
+                                              + claim);
+                                  }
+                              }
+                          }
+                }
+                boolean applied = false;
+                boolean durableCompletion = false;
+                boolean verifyInLane =
+                        task.correctionAttempt > 0 || task.compensation;
+                if (!verifyInLane) {
+                    task.complete(Boolean.valueOf(accepted));
+                    verifyInLane = task.callerTimedOut();
+                }
+                if (verifyInLane && !task.needsCompensation()) {
+                    applied = awaitEnergySetterTask(
+                            task, ENERGY_LOCAL_APPLY_TIMEOUT_MS);
+                    if (applied) {
+                        durableCompletion = task.compensation
+                                ? VehicleActuatorBridge.completeEnergyRollback(
+                                        context,
+                                        task.request.generation,
+                                        task.value)
+                                : VehicleActuatorBridge.completeEnergyActuation(
+                                        context,
+                                        task.request.generation,
+                                        task.value);
+                    }
+                }
+                task.complete(Boolean.valueOf(accepted));
+
+                boolean retained = false;
+                if (task.compensation) {
+                    if (task.compensationClaim() < 0
+                            || task.wasCompensationPreconfirmed()
+                            && (!applied || !durableCompletion)) {
+                        task.requirePersistedReconciliation();
+                    }
+                    if ((!applied || !durableCompletion)
+                            && task.compensationClaim() > 0) {
+                        retained = retainAuthoritativeCorrection(task);
+                    }
+                } else if (task.needsCompensation()) {
+                    retained = retainAuthoritativeCorrection(task);
+                } else if (verifyInLane && (!applied || !durableCompletion)) {
+                    retained = retainSameRequestCorrection(task);
+                    if (!retained) retained = retainAuthoritativeCorrection(task);
+                } else {
+                    retained = retainAuthoritativeCorrection(task);
+                }
+                if (durableCompletion) {
+                    notePersistedDaemonEnergyReconciliationProgress();
+                }
+                synchronized (this) {
+                    // Atomic handoff with cancelThrough. If cancellation marked the active task
+                    // before this monitor was acquired, retain its rollback here. If this block
+                    // clears active first, the durable BEGIN metadata lets reconcileCancellation
+                    // retain the same rollback afterward.
+                    if (retained && (pending == null
+                            || pending.request.generation
+                            < task.request.generation)) {
+                        retained = false;
+                    }
+                    if (!retained && task.needsCompensation()
+                            && task.previousMode() >= 1
+                            && task.previousMode() <= ENERGY_MODE_KEEP) {
+                        VehicleActuatorBridge.PublishedEnergyRead read =
+                                VehicleActuatorBridge.readPublishedEnergyState(context);
+                        if (read.status
+                                == VehicleActuatorBridge.EnergyReadStatus.VALID
+                                && read.request != null
+                                && read.request.cancelled
+                                  && read.request.generation
+                                  == task.request.generation
+                                  && read.request.rollbackPending
+                                  && !hasOtherCompensationLocked(
+                                          task,
+                                          read.request.generation,
+                                          read.request.rollbackMode)) {
+                              replacePendingLocked(new EnergySetterTask(
+                                      new EnergyRequest(
+                                              read.request.generation,
+                                            read.request.requestedMode),
+                                    task.device,
+                                    "setEnergyMode",
+                                    read.request.rollbackMode,
+                                    "energy cancellation rollback ("
+                                            + energyModeName(
+                                                    read.request.rollbackMode)
+                                            + ")",
+                                    task.deviceResolutionSequence,
+                                    task.freshDevice,
+                                    0,
+                                    true));
+                            retained = true;
+                        }
+                    }
+                    if (active == task) active = null;
+                }
+                if (task.needsPersistedReconciliation()) {
+                    rearmPersistedDaemonEnergyReconciliation();
+                }
+            }
+        }
+
+        /**
+         * A synthetic correction is not trusted on its setter return: this HAL is known to accept
+         * ignored writes. Verify the physical axis and retain one fresh-handle retry when it did not
+         * move, unless a real/newer request is already pending.
+         */
+        private boolean retainSameRequestCorrection(EnergySetterTask completed) {
+            if (completed.correctionAttempt >= ENERGY_CORRECTION_MAX_ATTEMPTS) {
+                logger.warn("setEnergyMode(" + completed.request.mode + ") generation="
+                        + completed.request.generation
+                        + " corrective retries exhausted without physical confirmation");
+                return false;
+            }
+            if (!isDaemonSetterTaskCurrent(completed)) return false;
+            EnergyRequest current = completed.request;
+
+            long retryResolution = energyDeviceResolutionSequence.incrementAndGet();
+            Object retryDevice = freshEnergyDevice();
+            boolean retryFresh = retryDevice != null && retryDevice != energyDevice;
+            synchronized (this) {
+                if (!isDaemonSetterTaskCurrent(completed)) return false;
+                if (pending != null
+                        && pending.request.generation >= current.generation
+                        && isAtLeastAsFresh(pending, retryFresh, retryResolution)) {
+                    return false;
+                }
+                if (pending != null) pending.complete(Boolean.FALSE);
+                pending = new EnergySetterTask(
+                        current,
+                        retryDevice,
+                        "setEnergyMode",
+                        current.mode,
+                        "energy/powertrain mode (" + energyModeName(current.mode)
+                                + ") corrective retry",
+                        retryResolution,
+                        retryFresh,
+                        completed.correctionAttempt + 1,
+                        completed.compensation);
+                return true;
+            }
+        }
+
+        private boolean retainAuthoritativeCorrection(EnergySetterTask completed) {
+            VehicleActuatorBridge.PublishedEnergyRead read =
+                    VehicleActuatorBridge.readPublishedEnergyState(context);
+            VehicleActuatorBridge.PublishedEnergyRequest marker = read.request;
+            if (read.status != VehicleActuatorBridge.EnergyReadStatus.VALID
+                    || marker == null) {
+                completed.requirePersistedReconciliation();
+                return false;
+            }
+            if (marker.cancelled) {
+                if (!marker.rollbackPending
+                        || marker.generation < completed.request.generation
+                        || marker.rollbackMode < 1
+                        || marker.rollbackMode > ENERGY_MODE_KEEP
+                        || marker.rollbackOwner
+                        != VehicleActuatorBridge.ENERGY_ACTUATOR_DAEMON
+                        || marker.compensationAttempts
+                        >= VehicleActuatorBridge.MAX_ENERGY_COMPENSATION_ATTEMPTS) {
+                    return false;
+                  }
+                  synchronized (this) {
+                      if (hasOtherCompensationLocked(
+                              completed,
+                              marker.generation,
+                              marker.rollbackMode)) {
+                          return false;
+                      }
+                    replacePendingLocked(new EnergySetterTask(
+                            new EnergyRequest(
+                                    marker.generation, marker.requestedMode),
+                            completed.device,
+                            "setEnergyMode",
+                            marker.rollbackMode,
+                            "energy cancellation rollback ("
+                                    + energyModeName(marker.rollbackMode) + ")",
+                            completed.deviceResolutionSequence,
+                            completed.freshDevice,
+                            0,
+                            true));
+                    return true;
+                }
+            }
+            if (marker.pending
+                    || marker.generation < completed.request.generation
+                    || marker.generation == completed.request.generation
+                    && marker.mode == completed.value
+                    && !completed.needsCompensation()) {
+                return false;
+            }
+            EnergyRequest latest = adoptAuthoritativeEnergyRequest(marker);
+            if (latest == null) return false;
+            long correctionResolution =
+                    energyDeviceResolutionSequence.incrementAndGet();
+            Object correctionDevice = freshEnergyDevice();
+            synchronized (this) {
+                EnergyRequest current = energyModeCurrent.get();
+                if (current != null && current.generation > latest.generation) latest = current;
+                if (latest.cancelled) return false;
+                boolean correctionFresh =
+                        correctionDevice != null && correctionDevice != energyDevice;
+                if (pending != null && pending.request.generation >= latest.generation) {
+                    if (isAtLeastAsFresh(
+                            pending, correctionFresh, correctionResolution)) {
+                        return false;
+                    }
+                }
+                replacePendingLocked(new EnergySetterTask(
+                        latest,
+                        correctionDevice,
+                        "setEnergyMode",
+                        latest.mode,
+                        "energy/powertrain mode (" + energyModeName(latest.mode)
+                                + ") corrective",
+                        correctionResolution,
+                        correctionFresh,
+                        1,
+                        false));
+                return true;
+              }
+          }
+
+          private boolean hasOtherCompensationLocked(
+                  EnergySetterTask excluded, long generation, int mode) {
+              return active != excluded && isCompensation(active, generation, mode)
+                      || pending != excluded && isCompensation(pending, generation, mode);
+          }
+
+          private boolean hasDesiredLocked(long generation, int mode) {
+              return isDesired(active, generation, mode)
+                      || isDesired(pending, generation, mode);
+          }
+
+          private boolean isCompensation(
+                  EnergySetterTask task, long generation, int mode) {
+              return task != null
+                      && task.compensation
+                      && task.request.generation == generation
+                      && task.value == mode;
+          }
+
+          private boolean isDesired(
+                  EnergySetterTask task, long generation, int mode) {
+              return task != null
+                      && !task.compensation
+                      && task.request.generation == generation
+                      && task.value == mode;
+          }
+
+          private void replacePendingLocked(EnergySetterTask replacement) {
+              if (pending != null && pending != replacement) {
+                  pending.cancel();
+                pending.complete(Boolean.FALSE);
+            }
+            pending = replacement;
+        }
+
+        private void ensureWorkerLocked() {
+            if (workerRunning) return;
+            workerRunning = true;
+            try {
+                Thread worker = new Thread(this::drain, "EnergyModeSetter");
+                worker.setDaemon(true);
+                worker.start();
+            } catch (Throwable unavailable) {
+                EnergySetterTask stranded = pending;
+                pending = null;
+                workerRunning = false;
+                if (stranded != null) {
+                    stranded.cancel();
+                    stranded.complete(Boolean.FALSE);
+                }
+                logger.warn("energy setter worker could not start: "
+                        + unavailable.getMessage());
+            }
+        }
+
+        private boolean isAtLeastAsFresh(
+                EnergySetterTask candidate, boolean freshDevice, long resolutionSequence) {
+            return (candidate.freshDevice && !freshDevice)
+                    || (candidate.freshDevice == freshDevice
+                    && candidate.deviceResolutionSequence >= resolutionSequence);
+        }
+    }
+
+    private static final class EnergySetterTask {
+        static final Object INVOCATION_SKIPPED = new Object();
+        final EnergyRequest request;
+        final Object device;
+        final String methodName;
+        final int value;
+        final String label;
+        final long deviceResolutionSequence;
+        final boolean freshDevice;
+        final int correctionAttempt;
+        final boolean compensation;
+        final java.util.concurrent.CountDownLatch done =
+                new java.util.concurrent.CountDownLatch(1);
+        private final java.util.concurrent.locks.ReentrantLock invocationGate =
+                new java.util.concurrent.locks.ReentrantLock();
+        private volatile boolean cancelled;
+        private volatile boolean actuationStarted;
+        private volatile boolean compensationRequired;
+        private volatile boolean persistedReconciliationRequired;
+        private volatile int previousMode = BydVehicleData.UNAVAILABLE;
+        private volatile int compensationClaim = Integer.MIN_VALUE;
+        private volatile boolean compensationPreconfirmed;
+        private Boolean result;
+        private boolean completed;
+        private boolean callerTimedOut;
+
+        EnergySetterTask(
+                EnergyRequest request,
+                Object device,
+                String methodName,
+                int value,
+                String label,
+                long deviceResolutionSequence,
+                boolean freshDevice,
+                int correctionAttempt,
+                boolean compensation) {
+            this.request = request;
+            this.device = device;
+            this.methodName = methodName;
+            this.value = value;
+            this.label = label;
+            this.deviceResolutionSequence = deviceResolutionSequence;
+            this.freshDevice = freshDevice;
+            this.correctionAttempt = correctionAttempt;
+            this.compensation = compensation;
+        }
+
+        Boolean await(long timeoutMs) {
+            try {
+                if (!done.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    synchronized (this) {
+                        if (completed) return result;
+                        callerTimedOut = true;
+                        return null;
+                    }
+                }
+                synchronized (this) {
+                    return result;
+                }
+            } catch (InterruptedException interrupted) {
+                cancel();
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+
+        synchronized boolean callerTimedOut() {
+            return callerTimedOut;
+        }
+
+        void setPreviousMode(int mode) {
+            previousMode = mode;
+        }
+
+        int previousMode() {
+            return previousMode;
+        }
+
+        boolean needsCompensation() {
+            return compensationRequired;
+        }
+
+        void setCompensationClaim(int claim) {
+            compensationClaim = claim;
+        }
+
+        int compensationClaim() {
+            return compensationClaim;
+        }
+
+        void markCompensationPreconfirmed() {
+            compensationClaim = 0;
+            compensationPreconfirmed = true;
+        }
+
+        boolean wasCompensationPreconfirmed() {
+            return compensationPreconfirmed;
+        }
+
+        void requirePersistedReconciliation() {
+            persistedReconciliationRequired = true;
+        }
+
+        boolean needsPersistedReconciliation() {
+            return persistedReconciliationRequired;
+        }
+
+        Object invoke(
+                BydDataCollector owner, Method method, Object target) throws Exception {
+            invocationGate.lock();
+            try {
+                if (cancelled || !owner.isDaemonSetterTaskCurrent(this)) {
+                    return INVOCATION_SKIPPED;
+                }
+                actuationStarted = true;
+                Object value = method.invoke(target, this.value);
+                if (cancelled || !owner.isDaemonSetterTaskCurrent(this)) {
+                    if (!compensation) compensationRequired = true;
+                }
+                return value;
+            } finally {
+                invocationGate.unlock();
+            }
+        }
+
+        void cancel() {
+            if (invocationGate.tryLock()) {
+                try {
+                    cancelled = true;
+                    if (actuationStarted && !compensation) {
+                        compensationRequired = true;
+                    }
+                } finally {
+                    invocationGate.unlock();
+                }
+                return;
+            }
+            cancelled = true;
+            if (!compensation) compensationRequired = true;
+        }
+
+        synchronized void complete(Boolean value) {
+            if (completed) return;
+            completed = true;
+            result = value;
+            done.countDown();
+        }
+    }
+
+    /**
+     * Run one potentially blocking energy HAL call on a process-lifetime, one-thread lane.
+     * Binder calls can ignore interruption; a permanently blocked call therefore strands at most
+     * that lane. Later calls fail fast while it remains occupied, then resume once it unwinds,
+     * instead of leaking another thread or blocking the automation worker beyond its deadline.
+     */
+    private <T> T callEnergyHalBounded(
+            java.util.concurrent.ExecutorService executor,
+            java.util.concurrent.Callable<T> task,
+            long timeoutMs,
+            T fallback,
+            java.util.concurrent.atomic.AtomicBoolean stalled,
+            String operation) {
+        java.util.concurrent.ThreadPoolExecutor lane =
+                (java.util.concurrent.ThreadPoolExecutor) executor;
+        if (stalled.get()) {
+            if (lane.getActiveCount() != 0) {
+                logger.debug(operation + " skipped while its bounded HAL lane is stalled");
+                return fallback;
+            }
+            stalled.set(false);
+        }
+        final java.util.concurrent.Future<T> call;
+        try {
+            call = executor.submit(task);
+        } catch (Throwable unavailable) {
+            logger.debug(operation + " skipped while its bounded HAL lane is occupied");
+            return fallback;
+        }
+        try {
+            T result = call.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            stalled.set(false);
+            return result;
+        } catch (java.util.concurrent.TimeoutException timeout) {
+            call.cancel(true);
+            lane.remove((Runnable) call);
+            if (stalled.compareAndSet(false, true)) {
+                logger.warn(operation + " exceeded " + timeoutMs
+                        + "ms; later calls fail fast until the HAL lane unwinds");
+            }
+        } catch (InterruptedException interrupted) {
+            call.cancel(true);
+            lane.remove((Runnable) call);
+            Thread.currentThread().interrupt();
+        } catch (Throwable failed) {
+            call.cancel(true);
+            lane.remove((Runnable) call);
+            stalled.set(false);
+            logger.warn(operation + " failed: " + failed.getMessage());
+        }
+        return fallback;
+    }
+
+    // BYDAutoEnergyDevice energy-mode enum, from the OFFICIAL SDK constants (and the
+    // onEnergyModeChanged javadoc: Stop / Electric / Fuel / Force EV / HEV). Only EV and HEV
+    // were previously representable, so a car sitting in any other mode published NO
+    // powertrain state at all and no powertrain automation could match it.
+    public static final int ENERGY_MODE_STOP = 0;
+    public static final int ENERGY_MODE_EV = 1;
+    public static final int ENERGY_MODE_FORCE_EV = 2;
+    public static final int ENERGY_MODE_HEV = 3;
+    public static final int ENERGY_MODE_FUEL = 4;
+    public static final int ENERGY_MODE_KEEP = 5;
+
+    /** Stable lowercase word for an energy mode, or "unknown" — shared by telemetry and logs. */
+    public static String energyModeName(int mode) {
+        switch (mode) {
+            case ENERGY_MODE_STOP:     return "stop";
+            case ENERGY_MODE_EV:       return "ev";
+            case ENERGY_MODE_FORCE_EV: return "force_ev";
+            case ENERGY_MODE_HEV:      return "hev";
+            case ENERGY_MODE_FUEL:     return "fuel";
+            case ENERGY_MODE_KEEP:     return "keep";
+            default:                   return "unknown";
+        }
     }
 
     /**
@@ -10819,7 +16409,10 @@ public class BydDataCollector {
         try {
             // BYDAutoEnergyDevice → "ENERGY"; BYDAutoSettingDevice → "SETTING".
             String simple = deviceClass.getSimpleName(); // e.g. BYDAutoEnergyDevice
-            String family = simple.replaceFirst("^BYDAuto", "").replaceFirst("Device$", "").toUpperCase();
+            // Locale.ROOT: a Turkish default locale maps "Setting" to "SETTİNG" (dotted İ), missing
+            // the field and silently degrading this judge to its >=0 fallback.
+            String family = simple.replaceFirst("^BYDAuto", "").replaceFirst("Device$", "")
+                    .toUpperCase(java.util.Locale.ROOT);
             java.lang.reflect.Field f = deviceClass.getField(family + "_COMMAND_SUCCESS");
             Object v = f.get(null);
             if (v instanceof Integer) resolved = (Integer) v;

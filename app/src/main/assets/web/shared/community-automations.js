@@ -250,10 +250,17 @@ BYD.communityAutomations = {
 
     // ── Browse: load + render a page ──────────────────────────────────────────
 
-    loadPage: function (page) {
+    // `scrollTop` (opt-in) scrolls back to the head of the list once the new page has
+    // rendered. Set ONLY by the prev/next buttons: they sit BELOW the grid, so a user
+    // paging from there is scrolled to the bottom and would otherwise land in the
+    // middle of the next page. The sort/filter/search controls sit ABOVE the grid —
+    // the user is already at the top to touch them, and scrolling would yank the
+    // search box out from under an active cursor — so those paths don't set it.
+    loadPage: function (page, scrollTop) {
         var self = this;
         this.currentPage = page < 1 ? 1 : page;
         this._loading = true;
+        this._scrollAfterRender = !!scrollTop;
         this._renderState('loading');
 
         var params = [];
@@ -295,6 +302,7 @@ BYD.communityAutomations = {
         if (!items.length) {
             this._renderState('empty');
             this.renderPagination();
+            this._maybeScrollTop();
             return;
         }
         var empty = document.getElementById('communityEmpty');
@@ -304,6 +312,19 @@ BYD.communityAutomations = {
             grid.appendChild(this.createCard(items[i]));
         }
         this.renderPagination();
+        this._maybeScrollTop();
+    },
+
+    // Consume the one-shot scroll request armed by loadPage(page, true). Runs AFTER the
+    // cards are in the DOM so the scroll target is the new list's real position, and the
+    // flag is cleared unconditionally so a later filter/search reload never inherits it.
+    // Anchored on the controls row (not the grid) so the sort/filter bar stays visible.
+    _maybeScrollTop: function () {
+        if (!this._scrollAfterRender) return;
+        this._scrollAfterRender = false;
+        if (!(window.BYD && BYD.utils && BYD.utils.scrollToTop)) return;
+        var anchor = document.getElementById('communityControls') || document.getElementById('communityList');
+        BYD.utils.scrollToTop(anchor);
     },
 
     createCard: function (item) {
@@ -411,7 +432,8 @@ BYD.communityAutomations = {
         prev.setAttribute('data-i18n', 'community.prev');
         prev.textContent = this._t('community.prev');
         prev.disabled = this.currentPage <= 1;
-        prev.addEventListener('click', function () { if (self.currentPage > 1) self.loadPage(self.currentPage - 1); });
+        // scrollTop=true — these buttons live below the grid; see loadPage.
+        prev.addEventListener('click', function () { if (self.currentPage > 1) self.loadPage(self.currentPage - 1, true); });
         host.appendChild(prev);
 
         var info = document.createElement('span');
@@ -425,7 +447,7 @@ BYD.communityAutomations = {
         next.setAttribute('data-i18n', 'community.next');
         next.textContent = this._t('community.next');
         next.disabled = this.currentPage >= this.totalPages;
-        next.addEventListener('click', function () { if (self.currentPage < self.totalPages) self.loadPage(self.currentPage + 1); });
+        next.addEventListener('click', function () { if (self.currentPage < self.totalPages) self.loadPage(self.currentPage + 1, true); });
         host.appendChild(next);
     },
 

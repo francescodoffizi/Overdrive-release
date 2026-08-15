@@ -206,9 +206,9 @@
     <string name="onboarding_authorize_retry_title">Nog steeds niet verbonden</string>
     <string name="onboarding_authorize_retry_body">The helper isn\'t running yet. The Android permission may have been dismissed. Try again and remember to check <b>Always allow</b>.</string>
     <string name="onboarding_authorize_retry_button">Opnieuw proberen</string>
-    <string name="onboarding_mode_title">Wanneer moet Overdrive draaien?</string>
-    <string name="onboarding_mode_body">Kies hoe Overdrive zich gedraagt nadat u de auto uitschakelt.\n\n<b>Aan &amp; uit</b> blijft kijken terwijl geparkeerd — bewaking en achtergrondmonitoring blijven actief, dus de auto verbruikt \'s nachts een beetje stroom.\n\n<b>Alleen aan</b> sluit Overdrive volledig af zodra u weggaat. Dashcam, ritten en opladen werken nog steeds terwijl u rijdt, en alles start automatisch weer op zodra u de auto inschakelt. U kunt dit op elk moment wijzigen in Instellingen.</string>
-    <string name="onboarding_mode_on_off_button">Aan &amp; uit</string>
+    <string name="onboarding_mode_title">Wanneer moet Overdrive worden uitgevoerd?</string>
+    <string name="onboarding_mode_body">Kies hoe Overdrive zich gedraagt als je de auto uitschakelt.\n\n<b>In &amp; Off</b> blijft kijken terwijl ze worden geparkeerd - surveillance en achtergrondbewaking blijven actief, dus trekt de auto van de ene op de andere dag een beetje energie.\n\n<b>Alleen</b> sluit Overdrive volledig af zodra je vertrekt. Dashcam, trips en opladen werken nog steeds tijdens het rijden, en alles begint automatisch als je de auto aanzet. U kunt dit altijd wijzigen in Instellingen.</string>
+    <string name="onboarding_mode_on_off_button">Op &amp; uit</string>
     <string name="onboarding_mode_on_only_button">Alleen aan</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Camera · stap %1$d van %2$d</string>
@@ -1327,19 +1327,19 @@
     <string name="toast_cloudflared_saved_settings">Cloudflared instellingen opgeslagen</string>
     <!-- Projection screen -->
     <string name="projection_hero_title">Projectie</string>
-    <string name="projection_hero_subtitle">Cast een app naar het instrumentencluster en spiegel het hier.</string>
+    <string name="projection_hero_subtitle">Stuur een app naar het bestuurderscluster en spiegel het hier.</string>
     <string name="projection_pick_app">Kies een app om te projecteren</string>
-    <string name="projection_cast">Casten naar cluster</string>
+    <string name="projection_cast">Cast naar cluster</string>
     <string name="projection_stop">Stoppen</string>
     <string name="projection_cast_failed">Kon die app niet naar het cluster casten.</string>
-    <string name="projection_status_idle">Niet aan het projecteren.</string>
-    <string name="projection_status_live">Live spiegel — tik en veeg om te bedienen.</string>
-    <string name="projection_status_preview">Voorbeeldmodus (verlaagde framerate op dit voertuig).</string>
-    <string name="projection_status_none">Er wordt nog niets geprojecteerd — kies een app en cast.</string>
-    <string name="projection_status_unsupported">Live spiegelen wordt niet ondersteund op dit voertuig. De app wordt nog steeds op het cluster geprojecteerd.</string>
-    <string name="projection_note_single_app">Er kan één app tegelijk op het cluster worden geprojecteerd.</string>
+    <string name="projection_status_idle">Niet aan het projecten.</string>
+    <string name="projection_status_live">Live mirror - tik en veeg om te bedienen.</string>
+    <string name="projection_status_preview">Voorbeeldmodus (verlaagde framesnelheid voor dit voertuig).</string>
+    <string name="projection_status_none">Nog niets geprojecteerd - kies een app en cast.</string>
+    <string name="projection_status_unsupported">Live mirror wordt niet ondersteund in dit voertuig. De app wordt nog geprojecteerd op het cluster.</string>
+    <string name="projection_note_single_app">Er kan één app tegelijk worden geprojecteerd op het cluster.</string>
     <string name="projection_adjust_bounds">Gebied aanpassen</string>
-    <string name="projection_done_adjusting">Klaar</string>
+    <string name="projection_done_adjusting">Voltooid</string>
     <string name="projection_bounds_hint_idle">Spiegelgebied</string>
     <string name="projection_status_adjust">Sleep om te verplaatsen · sleep een hoek om het formaat te wijzigen.</string>
     <string name="projection_scale_title">Schalen</string>
@@ -1355,4 +1355,18 @@
     <string name="projection_autostart_conflict_confirm">Deze app gebruiken</string>
     <string name="projection_app_uninstalled">Die app is niet meer geïnstalleerd.</string>
     <string name="projection_status_service_down">De spiegelservice is niet gereed — herstart de app (of de camera-daemon) en probeer het opnieuw.</string>
+    <string name="cd_replay_status">Onmiddellijke afspelen status</string>
+    <string name="recording_lib_type_replay">HERHALING</string>
+    <string name="settings_overlay_replay_title">Direct afspelen indicator</string>
+    <string name="settings_overlay_replay_subtitle">Toon de CLIP badge: groen tijdens een replay records, blauw voor 5 keer opgeslagen, rood wanneer het mislukt. Verschijnt alleen als er een herhalingskoppeling of automatisering bestaat.</string>
+    <string name="recordings_segment_replays">Herhalingen</string>
+    <string name="recordings_segment_replays_count">Herhalingen · %d</string>
+    <string name="vehicle_model_seagull">BYD Seagull</string>
+    <string name="projection_window_title">Venster groeperen</string>
+    <string name="projection_window_desc">Positioneer de cast app op het chauffeurscluster. Voorinstellingen klikken op veelgebruikte lay-outs; Het formaat van het venster laat je het vrij slepen.</string>
+    <string name="projection_preset_full">Volledig</string>
+    <string name="projection_preset_left">Linkerscherm helft</string>
+    <string name="projection_preset_right">Rechts de helft</string>
+    <string name="projection_preset_center">Gecentreerd</string>
+    <string name="projection_lock_aspect">clusteraspect behouden</string>
 </resources>

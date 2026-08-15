@@ -43,16 +43,38 @@ public class SocHistoryDatabase {
     // are set. We're single-process anyway (only the camera daemon writes;
     // HTTP reads happen in the same JVM via NotificationApiHandler). The
     // FILE_LOCK=SOCKET is the actual cross-process safety net.
+    // AUTO_COMPACT_FILL_RATE=50: idle-CPU tuning shared by all seven H2 stores.
+    // The default fill-rate target of 90 keeps the MVStore background thread
+    // rewriting chunks while the car idles (FileStore.rewriteChunks /
+    // getChunksFillRate showed up in on-device profiles); 50 stops that without
+    // touching durability. WRITE_DELAY is deliberately left at its 500ms default:
+    // a head unit loses power abruptly with the car, and raising the delay widens
+    // the delayed-write loss window on every one of these stores.
     private static final String JDBC_URL = "jdbc:h2:file:" + DB_PATH +
-        ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE";
+        ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE" +
+        ";AUTO_COMPACT_FILL_RATE=50";
     
     // Table names
     private static final String TABLE_SOC = "soc_history";
     private static final String TABLE_CHARGING = "charging_sessions";
+    private static final String TABLE_CHARGING_IDENTITY = "charging_identity_allocator";
     private static final String TABLE_ACC_EVENTS = "acc_events";
     private static final String TABLE_CPS = "charging_power_samples";  // per-session ramp curves
     private static final String TABLE_CHARGING_DAILY = "charging_daily"; // permanent rollup
     private static final String TABLE_SOC_DAILY = "soc_daily";           // permanent rollup
+    private static final String TABLE_DATA_MIGRATIONS = "data_migrations";
+    private static final String REMAINING_KWH_MIGRATION =
+            "soc_history_remaining_kwh_frame";
+    private static final int REMAINING_KWH_FORMAT_VERSION = 1;
+    private static final int REMAINING_KWH_MIGRATION_ATTEMPTS = 3;
+    private static final String CHARGING_LIFECYCLE_JOURNAL_PATH =
+            "/data/local/tmp/overdrive_charging_lifecycle.json";
+    private static final int CHARGING_LIFECYCLE_JOURNAL_VERSION = 1;
+
+    /** Intentional physical/session boundary; it breaks integration but is not itself missing data. */
+    public static final double STOP_BOUNDARY_POWER_KW = -1.0;
+    /** Rate was unavailable while charging remained admitted; this interval is incomplete. */
+    public static final double MISSING_RATE_BOUNDARY_POWER_KW = -2.0;
 
     // Retention periods (per-table — see cleanupOldData()).
     //
@@ -76,6 +98,15 @@ public class SocHistoryDatabase {
     // is long enough to ride out a restart + reconnect, short enough that two
     // genuinely separate charges in the same spot aren't glued together.
     private static final long CHARGING_MERGE_GAP_MS = 15 * 60 * 1000L;
+    /**
+     * How far back to look for a prior session when deciding whether the charge now starting is a
+     * CONTINUATION of one interrupted by a daemon outage.
+     *
+     * <p>Generous because the outage itself can be hours — that is the whole case — but finite so a
+     * charge from days ago can never seed today's baseline. The counter's own value is the real
+     * discriminator; this only bounds the search.
+     */
+    private static final long CONTINUATION_LOOKBACK_MS = 24 * 60 * 60 * 1000L;
     
     // Singleton
     private static SocHistoryDatabase instance;
@@ -83,12 +114,9 @@ public class SocHistoryDatabase {
     
     // H2 Connection (kept open for performance)
     /**
-     * Shared H2 connection. {@code volatile} because query methods read it on HTTP threads while
-     * {@code reconnect()} (on the writer/HTTP thread, under the instance monitor) closes and
-     * replaces it — without it there is no happens-before, so a reader could see a stale or
-     * half-published handle. Readers must SNAPSHOT it into a local once and use that, never
-     * re-read the field: guard-then-use on the field itself can observe non-null at the guard and
-     * null at the use, which NPEs mid-query.
+     * Shared H2 connection. Every operation that touches it is serialized on this instance's
+     * monitor. H2 transaction state belongs to the connection, so even a reader must not run while
+     * repricing has auto-commit disabled or it can observe data that is subsequently rolled back.
      */
     private volatile Connection connection;
     
@@ -102,11 +130,49 @@ public class SocHistoryDatabase {
     private volatile double chargingStartSoc = 0;
     // Opt-in flag for Charging Analytics, pushed by ChargingSessionManager from
     // ChargingConfig. Default false (matches ChargingConfig's opt-in default);
-    // when false, trackChargingSession records nothing. Starting disabled ensures
-    // any SoC ticks that fire before ChargingSessionManager.init() pushes the real
-    // config value cannot record sessions for a feature the user never enabled.
+    // when false, trackChargingSession records nothing. The separate lifecycle-owner
+    // readiness gate prevents a pre-manager scheduler tick from interpreting this
+    // default as a user-selected opt-out for a restored open row.
     // volatile: set from the manager thread, read on the SoC sampler thread.
     private volatile boolean chargingAnalyticsEnabled = false;
+    /**
+     * The always-on SOC scheduler starts before ChargingSessionManager. Until the manager has loaded
+     * analytics config, registered its detector listeners, and reconciled physical state, the
+     * scheduler must not infer an OFF edge for a journal-restored open row.
+     */
+    private volatile boolean chargingLifecycleOwnerReady = false;
+    /** Manager-pushed physical truth, independent of whether the persistence row is still open. */
+    private volatile boolean physicalChargingStateKnown = false;
+    private volatile boolean physicalChargingNow = false;
+    /**
+     * Whether live SOC/power/TTF enrichment is allowed for the open row. Normally follows physical
+     * charging, but can be re-enabled for an admitted PHEV taper after FINISHED. It stays false while
+     * a row is retained solely for final-counter persistence.
+     */
+    private volatile boolean chargingLiveEnrichmentAllowed = false;
+    /**
+     * Start of the current analytics-disabled interval. Initialized at construction so SOC heartbeats
+     * written before ChargingSessionManager pushes its configuration cannot extend an old analytics row.
+     * Zero means analytics is currently enabled.
+     */
+    private volatile long analyticsDisabledSinceMs = System.currentTimeMillis();
+    /**
+     * A disable boundary whose open row has not committed yet. The boundary SOC/counter are captured
+     * exactly once while analytics is still transitioning off, so a later retry cannot absorb energy
+     * delivered during the opted-out interval.
+     */
+    private volatile boolean optOutClosePending = false;
+    private volatile long optOutBoundaryMs = 0L;
+    private volatile double optOutBoundarySoc = Double.NaN;
+    private volatile boolean optOutCounterCaptured = false;
+    private volatile PricingDecision optOutClosePricing = null;
+    private volatile int optOutCloseIsDc = -2;
+    /**
+     * True while ChargingSessionManager owns an open live session. The SoC recorder still stores the
+     * observed FINISHED state, but it must not independently close the charging_sessions row while the
+     * manager is waiting for a final counter callback or a parked-poll taper observation.
+     */
+    private volatile boolean chargingLifecycleHold = false;
     // Running aggregates accumulated across the live session (reset on each START).
     // peakPower was previously frozen at the start-instant power and never
     // updated; it is now a true running max persisted mid-session and at end.
@@ -114,6 +180,113 @@ public class SocHistoryDatabase {
     private volatile double chargingPowerSum = 0;
     private volatile int chargingPowerCount = 0;
     private volatile int chargingStartRange = -1;
+    /**
+     * Wrap/reset-aware accumulator over the vehicle's charged-energy counter — the primary source
+     * for energy_added_kwh. Its endpoints are persisted on the session row every tick, because the
+     * counter advances while the daemon is DOWN and the stored baseline is the only way to
+     * reconstruct a session that continued without us.
+     */
+    private final com.overdrive.app.charging.ChargeCounterAccumulator chargingCounter =
+            new com.overdrive.app.charging.ChargeCounterAccumulator();
+    /**
+     * True between SESSION START and the first counter observation that is safe to baseline from.
+     *
+     * <p>Exists because the counter field is intentionally retained past gun-out (the close path
+     * needs its final value), so at the instant a new session opens it may still hold the previous
+     * charge's total. A baseline taken then is too high and silently discards the start of the new
+     * charge. While pending, a candidate is only accepted once it looks like a freshly-reset counter
+     * or is below the value we last saw.
+     */
+    private volatile boolean counterBaselinePending = false;
+    /** Last counter value seen in the PREVIOUS session, used to recognise a stale reading. */
+    private volatile double lastSessionCounterKwh = Double.NaN;
+    /** When the baseline first became pending, for the bounded-wait escape hatch. 0 = not pending. */
+    private volatile long counterBaselinePendingSinceMs = 0;
+    /**
+     * Lowest counter reading observed while NO session row was open, and when it was seen.
+     *
+     * <p>Charging detection lags the physical start (L3 needs three consecutive observations), so the
+     * vehicle's post-start reset to 0 often arrives before the row exists. This carries that reading
+     * forward so SESSION START can baseline at the true zero instead of at whatever the counter had
+     * already climbed to. Bounded by {@link #PRE_SESSION_COUNTER_MAX_AGE_MS} so a value from a charge
+     * hours ago can never be adopted.
+     */
+    /**
+     * Which {@code SRC_*} source currently owns the single accumulator, or null before one claims it.
+     * Reset per session — see {@link #onChargeCounterObserved}.
+     */
+    private volatile String counterOwner = null;
+    /**
+     * Earliest external-counter reading seen while its classifier verdict was still UNKNOWN, and when.
+     * Committed as the session baseline if the verdict confirms COUNTER; discarded if it comes back RATE.
+     */
+    private volatile double provisionalExternalKwh = Double.NaN;
+    private volatile long provisionalExternalAtMs = 0;
+    /** Unit divisor in effect when {@link #provisionalExternalKwh} was captured. */
+    private volatile double provisionalExternalUnitDivisor = 1.0;
+    /** Earliest/latest admissible readings retained while a fresh-session baseline is unresolved. */
+    private volatile double counterBaselineCandidateKwh = Double.NaN;
+    private volatile long counterBaselineCandidateAtMs = 0L;
+    private volatile double counterBaselineLatestKwh = Double.NaN;
+    private volatile long counterBaselineLatestAtMs = 0L;
+    /**
+     * Full scale for the external counter, kWh. Wider than the 16-bit capacity counter: a field capture
+     * recorded this accessor at 119.0, so 65.534 cannot be its modulus. Sized to the SDK's own envelope
+     * for the accessor, which is the only documented bound available.
+     */
+    private static final double EXTERNAL_COUNTER_FULL_SCALE_KWH = 500.0;
+    /**
+     * Largest outage energy a source-less legacy row may claim as a continuation, kWh.
+     *
+     * <p>Only used when the row records no counter source, where the pairing itself is what must be
+     * validated. Generous enough for a genuinely long outage on a fast charger, but small enough that
+     * differencing two UNRELATED counters — which typically differ by tens or hundreds of kWh — fails.
+     */
+    private static final double LEGACY_CONTINUATION_MAX_GAP_KWH = 60.0;
+    private volatile double preSessionCounterLowKwh = Double.NaN;
+    private volatile long preSessionCounterAtMs = 0;
+    /**
+     * Which {@code SRC_*} source produced {@link #preSessionCounterLowKwh}.
+     *
+     * <p>A bare number is not enough. The value is captured before any session exists, so ownership is
+     * unbound; by the time SESSION START adopts it the snapshot path may have bound a DIFFERENT source,
+     * and pairing an external reading with a capacity baseline (or the reverse) yields an added-energy
+     * total computed across two unrelated series.
+     */
+    private volatile String preSessionCounterSource = null;
+    /** External accessor values observed before a row opens while its semantics are still UNKNOWN. */
+    private volatile double preSessionProvisionalExternalRaw = Double.NaN;
+    private volatile long preSessionProvisionalExternalAtMs = 0L;
+    private volatile double preSessionProvisionalExternalUnitDivisor = 1.0;
+    /** Source of the continuation offer currently being evaluated or held by this session. */
+    private volatile String continuationSource = null;
+    /**
+     * Row whose {@code closed_by_sweep} marker should be consumed IF the continuation value is applied,
+     * or -1. Deferred so a session that declines the offer (wrong source, implausible pairing) does not
+     * burn the one-shot token that the next session legitimately needs.
+     */
+    private volatile long pendingSweepMarkerRow = -1L;
+    /**
+     * Continuation endpoint claimed by the current durable session. The database token is consumed in
+     * the same transaction as the new row INSERT; these fields retain the offer only for this session so
+     * a counter that reports late can still attribute the outage.
+     */
+    private volatile long claimedContinuationSessionStart = 0L;
+    private volatile long claimedContinuationRow = -1L;
+    private volatile double claimedContinuationEndpointKwh = Double.NaN;
+    private volatile String claimedContinuationSource = null;
+    private volatile double claimedContinuationStartSoc = Double.NaN;
+    private volatile double claimedContinuationFullScaleKwh = Double.NaN;
+    /** Counter progress exists in memory that has not yet been confirmed durable. */
+    private volatile boolean counterProgressDirty = false;
+    /** How recent a pre-session counter reading must be to seed a baseline. */
+    private static final long PRE_SESSION_COUNTER_MAX_AGE_MS = 10 * 60_000L;
+    /**
+     * How long to wait for the vehicle to re-zero its counter before taking the baseline anyway.
+     * Two SoC ticks plus margin: long enough that a normal reset is always observed first, short
+     * enough that a trim which never resets still gets metered energy for most of the session.
+     */
+    private static final long COUNTER_BASELINE_WAIT_MS = 6 * 60_000L;
     // Vehicle odometer (km) snapshotted at charge START. -1 = not yet captured;
     // like chargingStartRange it's backfilled on a later mid-session tick if the
     // HAL wasn't reporting mileage at the exact start instant (common during
@@ -128,15 +301,138 @@ public class SocHistoryDatabase {
     private volatile double chargingStartLat = 0;
     private volatile double chargingStartLng = 0;
 
+    /**
+     * Frozen endpoint for a close that has not committed yet. Retries must close the same physical
+     * generation at the same SOC/counter boundary; reading live values again can absorb the next charge.
+     */
+    private volatile long pendingCloseSessionStart = 0L;
+    private volatile long pendingCloseAtMs = 0L;
+    private volatile double pendingCloseSoc = Double.NaN;
+    private volatile boolean pendingCloseCounterCaptured = false;
+    private volatile PricingDecision pendingClosePricing = null;
+    private volatile int pendingCloseIsDc = -2;
+    private volatile boolean pendingCloseResumeBlocked = false;
+    private volatile double pendingCloseTempHigh = -999;
+    private volatile double pendingCloseTempLow = -999;
+    private volatile double pendingCloseTempAvg = -999;
+    /** Write-ahead timestamp for the CPS sentinel required after restoring a live row. */
+    private volatile long recoveredActivePowerGapAtMs = 0L;
+
+    /**
+     * Physical charges that began while an earlier row was still retrying its close. Each generation
+     * owns its own identity, counter, curve, metadata and close boundary. A queue is required because a
+     * prolonged outage can contain complete B and C charges before A's close becomes writable.
+     */
+    private volatile boolean sessionInputsFenced = false;
+    private final java.util.ArrayDeque<DeferredChargingGeneration> deferredPhysicalGenerations =
+            new java.util.ArrayDeque<>();
+    /** Highest in-memory charging identity allocated, including clear/reset replacement rows. */
+    private volatile long lastAllocatedChargingStartMs = 0L;
+    private final java.io.File chargingLifecycleJournalFile;
+    private boolean chargingLifecycleJournalLoaded = false;
+    /** A journal that could not be decoded must remain byte-for-byte untouched for recovery. */
+    private boolean chargingLifecycleJournalReadFailed = false;
+    /** An in-memory lifecycle mutation has not yet reached the atomic journal file. */
+    private boolean chargingLifecycleJournalDirty = false;
+    /** Tariff mutations whose historical repricing has not yet completed. "*" means all tariffs. */
+    private final java.util.LinkedHashSet<String> pendingTariffReprices =
+            new java.util.LinkedHashSet<>();
+    /** Prevent metadata replay from recursively re-entering a queued repricing attempt. */
+    private boolean replayingTariffReprices = false;
+
+    private static final class DeferredChargingSample {
+        final long t;
+        final double powerKw;
+        final double soc;
+        final double temp;
+        final double tempHigh;
+        final double tempLow;
+
+        DeferredChargingSample(long t, double powerKw, double soc,
+                               double temp, double tempHigh, double tempLow) {
+            this.t = t;
+            this.powerKw = powerKw;
+            this.soc = soc;
+            this.temp = temp;
+            this.tempHigh = tempHigh;
+            this.tempLow = tempLow;
+        }
+    }
+
+    private static final class DeferredChargingGeneration {
+        long startMs;
+        double startSoc;
+        long endMs;
+        double endSoc = Double.NaN;
+        int startRange = -1;
+        int startOdometer = -1;
+        int gun = -1;
+        int timeToFull = -1;
+        double lat;
+        double lng;
+        double peakPower;
+        double powerSum;
+        int powerCount;
+        double endTempHigh = -999;
+        double endTempLow = -999;
+        double endTempAvg = -999;
+        final com.overdrive.app.charging.ChargeCounterAccumulator counter =
+                new com.overdrive.app.charging.ChargeCounterAccumulator();
+        String counterOwner;
+        double previousCounterKwh = Double.NaN;
+        boolean counterBaselinePending = true;
+        long counterBaselinePendingSinceMs;
+        double counterCandidateKwh = Double.NaN;
+        long counterCandidateAtMs;
+        double counterLatestKwh = Double.NaN;
+        long counterLatestAtMs;
+        double provisionalExternalKwh = Double.NaN;
+        long provisionalExternalAtMs;
+        double provisionalExternalUnitDivisor = 1.0;
+        boolean integrationTruncated;
+        PricingDecision closePricing;
+        int closeIsDc = -1;
+        boolean resumeBlocked;
+        ContinuationOffer continuationOffer;
+        final java.util.ArrayList<DeferredChargingSample> samples = new java.util.ArrayList<>();
+
+        boolean isEnded() {
+            return endMs > 0L;
+        }
+    }
+
+    /**
+     * Clear/reset transaction whose commit result could not yet be read back. All writes remain fenced
+     * until either the replacement row or the pre-transaction row is proven durable.
+     */
+    private volatile ActiveChargingReplacement pendingActiveReplacement = null;
+    private volatile long pendingActiveReplacementPreviousStart = 0L;
+    /** Durable clear/reset intent; non-null fences all lifecycle writers until H2 is reconciled. */
+    private volatile ChargingMaintenanceIntent pendingChargingMaintenanceIntent = null;
+    /**
+     * Exact maintenance-replacement aliases for a close already captured against an older row key.
+     * Only pending-close replacements are entered, so an arbitrary stale A close can never target a
+     * physically unrelated live B.
+     */
+    private final java.util.LinkedHashMap<Long, Long> chargingCloseTargetRemaps =
+            new java.util.LinkedHashMap<>();
+
     // Last recorded values for deduplication
     private long lastRecordTime = 0;
     private double lastRecordedSoc = -1;
     private double lastRecordedKwh = -1;
-    
+    /** Last physical/presented charging state written to soc_history, independent of session hold. */
+    private boolean lastRecordedObservedCharging = false;
+
     // SohEstimator reference (set externally)
     private volatile com.overdrive.app.abrp.SohEstimator sohEstimator;
     
     private SocHistoryDatabase() {
+        this(new java.io.File(CHARGING_LIFECYCLE_JOURNAL_PATH));
+    }
+
+    SocHistoryDatabase(java.io.File chargingLifecycleJournalFile) {
+        this.chargingLifecycleJournalFile = chargingLifecycleJournalFile;
         // Load the H2 JDBC driver (pure Java - always works)
         try {
             Class.forName("org.h2.Driver");
@@ -161,13 +457,16 @@ public class SocHistoryDatabase {
     
     // ==================== LIFECYCLE ====================
     
-    public void init() {
+    public synchronized void init() {
         if (isInitialized) return;
         
         synchronized (lock) {
             if (isInitialized) return;  // Double-check after acquiring lock
             
             logger.info("Initializing H2 database at: " + DB_PATH);
+            // The sidecar owns lifecycle durability while H2 is unavailable. Load it before attempting
+            // JDBC so a process that cannot open H2 at all can still journal its first physical ON edge.
+            loadChargingLifecycleJournal();
             
             int maxRetries = 3;
             int retryDelayMs = 1000;
@@ -187,6 +486,8 @@ public class SocHistoryDatabase {
                     createTables();
                     
                     isInitialized = true;
+                    reconcileChargingLifecycleJournalWithDatabase();
+                    replayPendingChargingPostCommitMetadata();
                     logger.info("SOC History Database initialized via H2 (Pure Java): " + DB_PATH);
                     return;  // Success - exit
                     
@@ -251,7 +552,9 @@ public class SocHistoryDatabase {
                 "charging_power_kw REAL DEFAULT 0," +
                 "voltage_v REAL DEFAULT 0," +
                 "range_km INTEGER DEFAULT 0," +
-                "remaining_kwh REAL DEFAULT 0" +
+                "remaining_kwh REAL DEFAULT 0," +
+                "remaining_kwh_format_version INTEGER DEFAULT "
+                    + REMAINING_KWH_FORMAT_VERSION +
                 ");"
             );
             
@@ -260,6 +563,22 @@ public class SocHistoryDatabase {
                 stmt.execute("ALTER TABLE " + TABLE_SOC + " ADD COLUMN IF NOT EXISTS remaining_kwh REAL DEFAULT 0;");
             } catch (Exception ignored) {
                 // Column may already exist
+            }
+            try {
+                // Existing rows remain NULL and are the only rows eligible for the one-shot
+                // frame repair. New writes bind the current version explicitly.
+                stmt.execute("ALTER TABLE " + TABLE_SOC
+                        + " ADD COLUMN IF NOT EXISTS remaining_kwh_format_version INTEGER DEFAULT NULL;");
+            } catch (Exception ignored) {
+                // Column may already exist.
+            }
+            try {
+                // ALTERing the default does not rewrite the NULLs assigned to pre-column rows.
+                stmt.execute("ALTER TABLE " + TABLE_SOC
+                        + " ALTER COLUMN remaining_kwh_format_version SET DEFAULT "
+                        + REMAINING_KWH_FORMAT_VERSION + ";");
+            } catch (Exception ignored) {
+                // Explicit INSERT binding still protects new rows on older H2 syntax.
             }
             
             // Migration: add battery health columns
@@ -280,6 +599,13 @@ public class SocHistoryDatabase {
             // Index for fast time-based queries
             stmt.execute(
                 "CREATE INDEX IF NOT EXISTS idx_soc_timestamp ON " + TABLE_SOC + "(timestamp);"
+            );
+            stmt.execute(
+                "CREATE TABLE IF NOT EXISTS " + TABLE_DATA_MIGRATIONS + " (" +
+                "migration_name VARCHAR(96) PRIMARY KEY," +
+                "version INTEGER NOT NULL," +
+                "completed_at BIGINT NOT NULL" +
+                ");"
             );
             
             // Charging sessions table
@@ -337,12 +663,105 @@ public class SocHistoryDatabase {
                 // owns. Empty tariff_id = priced by the global rate (every
                 // pre-v6 session, and any charge at an unmapped location).
                 "tariff_id VARCHAR(16) DEFAULT ''",
-                "tariff_label VARCHAR(64) DEFAULT ''"
+                "tariff_label VARCHAR(64) DEFAULT ''",
+                // v7: the vehicle's own charged-energy counter, which is now the PRIMARY source
+                // for energy_added_kwh. Both endpoints are persisted rather than kept in memory,
+                // because the counter keeps advancing while the daemon is DOWN: on restart the
+                // stored baseline is the only way to recover a session that continued without us.
+                // NULL on any pre-v7 row and on any trim where the counter never answers.
+                "counter_start_kwh DOUBLE DEFAULT NULL",
+                "counter_last_kwh DOUBLE DEFAULT NULL",
+                // Wrap-corrected accumulation so far. Kept separately from the endpoints because a
+                // counter that wrapped or reset cannot be reconstructed from them alone.
+                "counter_energy_kwh DOUBLE DEFAULT NULL",
+                // Which SRC_* counter owned this session's accumulator. Persisted rather than inferred:
+                // restart recovery previously guessed from the GLOBAL classifier verdict, so a
+                // capacity-owned session restored as external the moment the external source happened to
+                // hold a COUNTER verdict — then reset and lost its pre-restart accumulation when capacity
+                // next reported. The row is the only record of what this particular session was using.
+                "counter_source VARCHAR(32) DEFAULT NULL",
+                // Which estimate produced energy_added_kwh (SessionEnergyResolver.SRC_*). Support
+                // needs to know whether a number was metered, integrated or SOC-derived without
+                // re-deriving it, and it is the fastest signal that a trim's counter is dead.
+                "energy_source VARCHAR(32) DEFAULT ''",
+                // The independent SOC-derived estimate, retained alongside the chosen figure so a
+                // divergence stays visible after the fact instead of being silently overwritten.
+                "energy_soc_kwh DOUBLE DEFAULT NULL",
+                // 1 when the session is known to be missing a segment (counter reset/saturated, or
+                // the daemon was down and the gap could not be attributed). The UI marks the row
+                // rather than presenting a partial total as complete.
+                "energy_incomplete INTEGER DEFAULT 0",
+                // 1 when this row was closed by the startup sweep rather than by a live SESSION END —
+                // i.e. the daemon was absent when the charge ended. Distinct from energy_incomplete,
+                // which a NORMAL close also sets whenever its energy figure is a floor. Only this one
+                // means "interrupted", which is what continuation attribution must key on.
+                "closed_by_sweep INTEGER DEFAULT 0",
+                // One-shot continuation ownership. The next durable session claims an interrupted row
+                // atomically with its own INSERT, even if no counter ever reports in that next session.
+                "continuation_claimed INTEGER DEFAULT 0",
+                // Persist the accumulator's NORMALIZED modulus. External counter readings may be divided
+                // by a learned unit factor, so their raw SDK envelope is not necessarily their kWh scale.
+                "counter_full_scale_kwh DOUBLE DEFAULT NULL",
+                // Exact accumulator image. H2 and the lifecycle journal are separate durability domains;
+                // persisting the complete image in both lets startup merge whichever copy reached disk
+                // last without losing a wrap/reset/gap event or regressing a wrapped raw endpoint.
+                "counter_last_at_ms BIGINT DEFAULT 0",
+                "counter_observation_generation BIGINT DEFAULT 0",
+                "counter_wrap_count INTEGER DEFAULT 0",
+                "counter_reset_count INTEGER DEFAULT 0",
+                "counter_ceiling_streak INTEGER DEFAULT 0",
+                "counter_saturated INTEGER DEFAULT 0",
+                "counter_abandoned_kwh DOUBLE DEFAULT 0",
+                "counter_unattributed_gaps INTEGER DEFAULT 0",
+                "counter_awaiting_gap INTEGER DEFAULT 0",
+                "counter_gap_reconstructed INTEGER DEFAULT 0",
+                "counter_gap_estimate_kwh DOUBLE DEFAULT NULL",
+                "counter_recent_rate_kwh_per_h DOUBLE DEFAULT NULL",
+                // Durable lifecycle fence. A row closed because the user opted out must never be
+                // re-opened by the short-gap resume heuristic after analytics is enabled again.
+                "resume_blocked INTEGER DEFAULT 0",
+                // A graceful daemon stop deliberately breaks the power-sample trapezoid chain. Persist
+                // that missing interval so the boundary cannot make a truncated integral look complete.
+                "integration_truncated INTEGER DEFAULT 0",
+                // Post-commit effects are replayable after an uncertain COMMIT. Tariff usage is
+                // reconciled from authoritative rows; SOH keeps its exact calibration payload.
+                "post_commit_tariff_applied INTEGER DEFAULT 0",
+                "post_commit_soh_applied INTEGER DEFAULT 0",
+                "soh_calibration_energy_kwh DOUBLE DEFAULT NULL",
+                "soh_calibration_cell_v DOUBLE DEFAULT NULL",
+                "soh_calibration_nominal_identity VARCHAR(192) DEFAULT NULL",
+                "soh_calibration_estimator_generation BIGINT DEFAULT NULL",
+                "soh_calibration_reset_model_epoch BIGINT DEFAULT NULL",
+                "soh_calibration_prior_at_ms BIGINT DEFAULT NULL",
+                "soh_calibration_rejected INTEGER DEFAULT 0"
             };
             for (String col : newChargingCols) {
                 try {
                     stmt.execute("ALTER TABLE " + TABLE_CHARGING + " ADD COLUMN IF NOT EXISTS " + col + ";");
                 } catch (Exception ignored) {}
+            }
+            repairDuplicateChargingStartTimes();
+            stmt.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_charging_start"
+                            + " ON " + TABLE_CHARGING + "(start_time);");
+            stmt.execute(
+                    "CREATE TABLE IF NOT EXISTS " + TABLE_CHARGING_IDENTITY + " ("
+                            + "allocator_key INTEGER PRIMARY KEY,"
+                            + "last_start BIGINT NOT NULL);");
+            stmt.execute(
+                    "INSERT INTO " + TABLE_CHARGING_IDENTITY
+                            + " (allocator_key, last_start)"
+                            + " SELECT 1, 0 WHERE NOT EXISTS (SELECT 1 FROM "
+                            + TABLE_CHARGING_IDENTITY + " WHERE allocator_key = 1);");
+            try (PreparedStatement allocator = connection.prepareStatement(
+                    "UPDATE " + TABLE_CHARGING_IDENTITY
+                            + " SET last_start = CASE WHEN last_start < ? THEN ? ELSE last_start END"
+                            + " WHERE allocator_key = 1;")) {
+                allocator.setLong(1, lastAllocatedChargingStartMs);
+                allocator.setLong(2, lastAllocatedChargingStartMs);
+                if (allocator.executeUpdate() != 1) {
+                    throw new java.sql.SQLException("charging identity allocator row missing");
+                }
             }
 
             // Per-session power/SoC/temp samples for true ramp curves. Keyed on
@@ -382,9 +801,20 @@ public class SocHistoryDatabase {
                 "ac_count INTEGER DEFAULT 0," +
                 "peak_power_kw REAL DEFAULT 0," +
                 "soh_at_day REAL DEFAULT -999," +
-                "range_gained_km INTEGER DEFAULT 0" +
+                "range_gained_km INTEGER DEFAULT 0," +
+                // How many of the day's folded sessions had an incomplete energy figure. Without this
+                // the rollup and every lifetime total derived from it asserted a precision the
+                // underlying rows did not have: a session flagged incomplete (counter reset, dropped
+                // integration interval, unattributable restart gap) contributed its floor value and the
+                // total then read as measured.
+                "incomplete_count INTEGER DEFAULT 0" +
                 ");"
             );
+            // Migration for installs whose rollup predates the column.
+            try {
+                stmt.execute("ALTER TABLE " + TABLE_CHARGING_DAILY
+                        + " ADD COLUMN IF NOT EXISTS incomplete_count INTEGER DEFAULT 0;");
+            } catch (Exception ignored) {}
             stmt.execute(
                 "CREATE TABLE IF NOT EXISTS " + TABLE_SOC_DAILY + " (" +
                 "day_epoch BIGINT PRIMARY KEY," +
@@ -423,7 +853,59 @@ public class SocHistoryDatabase {
         }
     }
 
-    public void start() {
+    /**
+     * One-time repair for databases created before {@code start_time} became a true row identity.
+     * Samples at an ambiguous duplicate key remain with the oldest row; assigning fresh keys to the
+     * duplicate summaries prevents every future update/delete from affecting multiple sessions.
+     */
+    private void repairDuplicateChargingStartTimes() throws Exception {
+        java.util.ArrayList<long[]> duplicates = new java.util.ArrayList<>();
+        long maxStart = 0L;
+        long priorStart = Long.MIN_VALUE;
+        boolean firstAtStart = true;
+        try (PreparedStatement read = connection.prepareStatement(
+                "SELECT id, start_time FROM " + TABLE_CHARGING
+                        + " ORDER BY start_time ASC, id ASC;");
+             ResultSet rs = read.executeQuery()) {
+            while (rs.next()) {
+                long id = rs.getLong(1);
+                long start = rs.getLong(2);
+                maxStart = Math.max(maxStart, start);
+                if (start != priorStart) {
+                    priorStart = start;
+                    firstAtStart = true;
+                } else if (firstAtStart) {
+                    firstAtStart = false;
+                    duplicates.add(new long[] { id, start });
+                } else {
+                    duplicates.add(new long[] { id, start });
+                }
+            }
+        }
+        if (duplicates.isEmpty()) {
+            lastAllocatedChargingStartMs = Math.max(lastAllocatedChargingStartMs, maxStart);
+            return;
+        }
+        try (PreparedStatement update = connection.prepareStatement(
+                "UPDATE " + TABLE_CHARGING + " SET start_time = ? WHERE id = ?;")) {
+            for (long[] duplicate : duplicates) {
+                if (maxStart == Long.MAX_VALUE) {
+                    throw new java.sql.SQLException("charging start identity exhausted");
+                }
+                update.setLong(1, ++maxStart);
+                update.setLong(2, duplicate[0]);
+                if (update.executeUpdate() != 1) {
+                    throw new java.sql.SQLException(
+                            "could not repair duplicate charging identity " + duplicate[0]);
+                }
+            }
+        }
+        lastAllocatedChargingStartMs = Math.max(lastAllocatedChargingStartMs, maxStart);
+        logger.warn("Re-keyed " + duplicates.size()
+                + " charging row(s) that shared a legacy start_time");
+    }
+
+    public synchronized void start() {
         if (isRunning) return;
         
         if (!isInitialized) {
@@ -471,7 +953,7 @@ public class SocHistoryDatabase {
         logger.info("SOC history recording started (interval: " + SAMPLE_INTERVAL_MS + "ms)");
     }
     
-    public void stop() {
+    public synchronized void stop() {
         isRunning = false;
         if (scheduler != null) {
             scheduler.shutdown();
@@ -491,13 +973,35 @@ public class SocHistoryDatabase {
             scheduler = null;
         }
 
+        // This file is independent of H2 specifically so a failed A-close plus buffered B/C
+        // survives after the database handle is closed.
+        persistChargingLifecycleJournal();
         if (connection != null) {
+            // ChargingSessionManager writes a power<=0 boundary before this method runs. That boundary
+            // correctly prevents integration across daemon downtime, but on its own it also hides that
+            // an interval was dropped. Persist the fact on the open row before closing the connection.
+            if (wasCharging && chargingStartTime > 0) {
+                try (PreparedStatement p = connection.prepareStatement(
+                        "UPDATE " + TABLE_CHARGING
+                        + " SET integration_truncated = 1"
+                        + " WHERE start_time = ? AND end_time IS NULL;")) {
+                    p.setLong(1, chargingStartTime);
+                    if (p.executeUpdate() != 1) {
+                        logger.warn("Could not mark graceful-restart integration boundary for session "
+                                + chargingStartTime);
+                    }
+                } catch (Exception e) {
+                    logger.warn("Failed to persist graceful-restart integration boundary: "
+                            + e.getMessage());
+                }
+            }
             try {
                 connection.close();
             } catch (Exception ignored) {}
             connection = null;
         }
         isInitialized = false;
+        chargingLifecycleHold = false;
 
         logger.info("SOC history recording stopped");
     }
@@ -701,8 +1205,20 @@ public class SocHistoryDatabase {
             }
             
             double soc = socData.socPercent;
-            boolean isCharging = chargingData != null &&
-                chargingData.status == ChargingStateData.ChargingStatus.CHARGING;
+            // A constant-voltage taper counts as charging HERE even though the state code stays
+            // FINISHED. Some firmware calls the session finished while the charger is still
+            // delivering a declining current, and that tail is real energy the user pays for. The
+            // state code is deliberately left untouched (so `full`/`plugged` keep reading true), so
+            // the taper is carried by its own flag and has to be honoured explicitly — otherwise the
+            // session closes at the FINISHED edge and the taper's energy, peak and duration are lost.
+            boolean observedCharging = chargingData != null &&
+                (chargingData.status == ChargingStateData.ChargingStatus.CHARGING
+                 || chargingData.isTaperCharging);
+            // Session-row ownership belongs to ChargingSessionManager once it has opened an analytics
+            // session. A FINISHED callback can precede the final energy-counter callback or the next
+            // 90-second parked poll that establishes a real PHEV taper. Keep the row open until the
+            // manager explicitly closes it; the SOC history row itself still records the observed state.
+            boolean sessionCharging = observedCharging || (chargingLifecycleHold && wasCharging);
             // Use the charger power ONLY when it's a real reading. getChargingState()
             // substitutes a nominal PLACEHOLDER (3.3 kW PHEV / 7.0 kW BEV, flagged
             // isEstimated) before the BMS reports real kW. Feeding that into the
@@ -832,10 +1348,12 @@ public class SocHistoryDatabase {
             double sohPercent = -999;
             try {
                 com.overdrive.app.abrp.SohEstimator sohEst = getSohEstimator();
-                if (sohEst != null && sohEst.hasDisplaySoh()) {
+                com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                        sohEst != null ? sohEst.getCapacitySohSnapshot() : null;
+                if (capacitySoh != null && capacitySoh.hasDisplaySoh()) {
                     // Displayed (capped, anchored) SOH so stored history agrees with
                     // every live surface.
-                    sohPercent = sohEst.getDisplaySoh();
+                    sohPercent = capacitySoh.getDisplaySoh();
                     logger.debug("SOH from estimator: " + String.format("%.1f", sohPercent) + "%");
                 } else {
                     // Fallback: read from persisted file
@@ -873,7 +1391,8 @@ public class SocHistoryDatabase {
             // band and the charging_sessions table both see the start/end edges
             // even when SOC hasn't moved 0.5% yet (typical for the first minutes
             // of AC charging on a PHEV, and for any unplug while at 100%).
-            boolean stateTransition = (isCharging != wasCharging);
+            boolean stateTransition = (sessionCharging != wasCharging)
+                    || (observedCharging != lastRecordedObservedCharging);
 
             // BEV BMS reports remainKwh independently of SOC and can drift while
             // SOC stays in the same percent bucket — record those updates too.
@@ -907,15 +1426,18 @@ public class SocHistoryDatabase {
             }
             
             // Insert with all battery health columns
-            String sql = "INSERT INTO " + TABLE_SOC + 
+            String sql = "INSERT INTO " + TABLE_SOC +
                 " (timestamp, soc_percent, is_charging, charging_power_kw, voltage_v, range_km, remaining_kwh," +
-                " hv_temp_high, hv_temp_low, hv_temp_avg, cell_volt_high, cell_volt_low, soh_percent) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+                " hv_temp_high, hv_temp_low, hv_temp_avg, cell_volt_high, cell_volt_low, soh_percent," +
+                " remaining_kwh_format_version) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
             
             try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
                 pstmt.setLong(1, now);
                 pstmt.setDouble(2, soc);
-                pstmt.setInt(3, isCharging ? 1 : 0);
+                // The manager may hold the accounting row open briefly after the fused OFF edge for a
+                // final counter/taper probe. That must not present as ongoing charging in SOC history.
+                pstmt.setInt(3, observedCharging ? 1 : 0);
                 pstmt.setDouble(4, chargingPower);
                 pstmt.setDouble(5, voltage);
                 pstmt.setInt(6, range);
@@ -926,6 +1448,7 @@ public class SocHistoryDatabase {
                 pstmt.setDouble(11, cellVoltHigh);
                 pstmt.setDouble(12, cellVoltLow);
                 pstmt.setDouble(13, sohPercent);
+                pstmt.setInt(14, REMAINING_KWH_FORMAT_VERSION);
                 pstmt.executeUpdate();
             }
             
@@ -934,12 +1457,21 @@ public class SocHistoryDatabase {
             noteWriteOk();
             lastRecordTime = now;
             lastRecordedSoc = soc;
+            lastRecordedObservedCharging = observedCharging;
             if (remainingKwh > 0) lastRecordedKwh = remainingKwh;
 
-            logger.debug("Recorded SOC: " + soc + "% (charging: " + isCharging + ")");
+            logger.debug("Recorded SOC: " + soc + "% (charging: " + observedCharging + ")");
             
-            // Track charging sessions
-            trackChargingSession(isCharging, soc, chargingPower, now);
+            // SocHistoryDatabase starts before ChargingSessionManager. Do not let its immediate first
+            // tick manufacture an OFF edge for a restored row before config and detector ownership
+            // have been established explicitly by the manager.
+            if (chargingLifecycleOwnerReady) {
+                if (!trackChargingSession(sessionCharging, soc, chargingPower, now)) {
+                    logger.warn("Charging lifecycle write did not commit; state retained for retry");
+                }
+            } else {
+                logger.debug("Charging lifecycle tick deferred until manager ownership is ready");
+            }
             
         } catch (Exception e) {
             // Log but don't rethrow - scheduler must continue running
@@ -964,8 +1496,28 @@ public class SocHistoryDatabase {
         }
     }
     
-    private void trackChargingSession(boolean isCharging, double soc, double power, long now) {
-        if (!isInitialized || connection == null) return;
+    private boolean trackChargingSession(boolean isCharging, double soc, double power, long now) {
+        if (!isInitialized || connection == null) return false;
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+
+        // Re-enable can happen before a failed disable-time close retries. The old row still belongs
+        // only to the enabled segment that ended at optOutBoundaryMs; close that frozen segment before
+        // processing any current charging observation. Counter callbacks and fast samples are fenced
+        // separately while this flag is set, so no opted-out energy can enter its total or cost.
+        if (chargingAnalyticsEnabled && optOutClosePending && wasCharging) {
+            boolean enabled = chargingAnalyticsEnabled;
+            boolean closed;
+            try {
+                chargingAnalyticsEnabled = false;
+                closed = trackChargingSession(false,
+                        !Double.isNaN(optOutBoundarySoc) ? optOutBoundarySoc : chargingStartSoc,
+                        0, optOutBoundaryMs > 0 ? optOutBoundaryMs : now);
+            } finally {
+                chargingAnalyticsEnabled = enabled;
+            }
+            if (!closed) return false;
+            analyticsDisabledSinceMs = 0L;
+        }
 
         // Opt-in gate: Charging Analytics is an opt-out-able feature. When the
         // user has disabled it (chargingAnalytics.enabled=false, pushed here by
@@ -976,9 +1528,30 @@ public class SocHistoryDatabase {
         // row to "end" later.
         if (!chargingAnalyticsEnabled) {
             if (wasCharging) {
+                boolean closeCommitted = false;
                 // Close any open session that was mid-flight when feature was disabled
                 try {
                     if (connection != null && !connection.isClosed()) {
+                        if (optOutBoundaryMs <= 0) {
+                            optOutBoundaryMs = strictlyAfterChargingStart(
+                                    chargingStartTime, now);
+                        }
+                        if (Double.isNaN(optOutBoundarySoc)) optOutBoundarySoc = soc;
+                        if (!optOutCounterCaptured) {
+                            double counterAtBoundary = snapshotChargeCounterKwh();
+                            if (!Double.isNaN(counterAtBoundary)) {
+                                observeFinalCounterForClose(counterAtBoundary, optOutBoundarySoc,
+                                        optOutBoundaryMs);
+                            }
+                            // Do not sample again on retry: a later value belongs to the opted-out span.
+                            optOutCounterCaptured = true;
+                        }
+                        if (!persistChargingLifecycleJournal()) {
+                            throw new java.io.IOException(
+                                    "opt-out close boundary was not durable");
+                        }
+                        final double closeSoc = !Double.isNaN(optOutBoundarySoc)
+                                ? optOutBoundarySoc : soc;
                         // Update the open row with end values and mark it as ended.
                         // Persist ALL v2 columns (range/isDc/rate/currency/cost/ttf/
                         // thermal) just like the normal SESSION END flow, so an
@@ -987,38 +1560,76 @@ public class SocHistoryDatabase {
                             " SET end_time = ?, end_soc = ?, energy_added_kwh = ?, avg_power_kw = ?, peak_power_kw = ?, " +
                             "range_gained_km = ?, is_dc = ?, electricity_rate = ?, currency = ?, session_cost = ?, " +
                             "time_to_full_min = ?, hv_temp_high = ?, hv_temp_low = ?, hv_temp_avg = ?, " +
-                            "tariff_id = ?, tariff_label = ? " +
+                            "tariff_id = ?, tariff_label = ?, " +
+                            "energy_source = ?, energy_soc_kwh = ?, energy_incomplete = ?, " +
+                            "counter_energy_kwh = ?, counter_last_kwh = ?, counter_source = ?, " +
+                            "counter_full_scale_kwh = ?, counter_last_at_ms = ?, " +
+                            "counter_observation_generation = ?, counter_wrap_count = ?, " +
+                            "counter_reset_count = ?, counter_ceiling_streak = ?, counter_saturated = ?, " +
+                            "counter_abandoned_kwh = ?, counter_unattributed_gaps = ?, " +
+                            "counter_awaiting_gap = ?, counter_gap_reconstructed = ?, " +
+                            "counter_gap_estimate_kwh = ?, counter_recent_rate_kwh_per_h = ?, " +
+                            "resume_blocked = 1, " +
+                            "post_commit_tariff_applied = ?, post_commit_soh_applied = 1 " +
                             "WHERE start_time = ? AND end_time IS NULL;";
                         try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
-                            // Prefer ∫P·dt over recorded samples (same basis as the
-                            // normal SESSION END path), only falling back to SOC-delta
-                            // when integration yields nothing — a slow charge that never
-                            // moved a whole percent would otherwise blank energy/cost.
-                            double nominalKwh = getSohEstimator() != null ? getSohEstimator().getNominalCapacityKwh() : 0;
-                            double energyAdded = integrateSessionEnergyKwh(chargingStartTime);
-                            if (energyAdded <= 0) {
-                                energyAdded = (soc - chargingStartSoc) / 100.0 *
-                                    (nominalKwh > 0 ? nominalKwh : 60);
+                            // Same resolution as every other close path. The old code here fell back
+                            // to `socDelta/100 * (nominal > 0 ? nominal : 60)` — a hardcoded 60 kWh
+                            // pack, which is wrong on every PHEV (18-27 kWh) and on most BEVs in the
+                            // range, and it was PRICED. When nothing credible exists the row now
+                            // records 0 and is flagged, rather than inventing a figure.
+                            com.overdrive.app.charging.SessionEnergyResolver.Result disRes =
+                                    com.overdrive.app.charging.SessionEnergyResolver.resolve(
+                                            meteredEnergyKwh(),
+                                            chargingCounter.containsReconstructedGap(), chargingCounter.isIncomplete(),
+                                            integrateSessionEnergyKwh(chargingStartTime),
+                                            socEstimateForOpenSession(closeSoc),
+                                            // Java evaluates arguments left-to-right, so the integrate
+                                            // call above has already set this flag.
+                                            lastIntegrationTruncated,
+                                            counterScaleSuspect(counterOwner));
+                            double energyAdded = disRes.isUsable() ? disRes.energyKwh : 0;
+
+                            // The opt-out instant is an exact user-selected accounting boundary.
+                            // Power samples may stop while SOC/counter energy still rises, so using
+                            // the last sample truncates duration and can fold the charge into the
+                            // wrong UTC day.
+                            long closeTime = strictlyAfterChargingStart(
+                                    chargingStartTime, optOutBoundaryMs);
+                            // Time-weighted, like the other three close paths, so this row's average
+                            // agrees with its own energy and duration. The unweighted mean over
+                            // irregularly-spaced ticks remains only as the fallback when there is no
+                            // energy figure to divide.
+                            double avgPower = timeWeightedAvgKw(energyAdded, chargingStartTime, closeTime);
+                            if (avgPower < 0 && chargingPowerCount > 0) {
+                                avgPower = chargingPowerSum / chargingPowerCount;
                             }
-                            double avgPower = chargingPowerCount > 0 ? chargingPowerSum / chargingPowerCount : -1;
 
-                            // End-time / daily-bucket key: prefer the last recorded
-                            // power sample over `now`. A long parked charge whose
-                            // last activity was hours/days ago must NOT be folded
-                            // into TODAY's daily rollup (it would skew period
-                            // aggregates). Mirrors finalizeOneStaleSession, which
-                            // keys on the last sample time. Falls back to the
-                            // session start when no samples exist.
-                            long lastSampleT = getLastChargingSampleTime(chargingStartTime);
-                            long closeTime = (lastSampleT > 0) ? lastSampleT : chargingStartTime;
-
-                            // Compute additional values needed for daily rollup and session record.
+                            // Resolve the peak from BOTH series before the AC/DC verdict uses it, as
+                            // the other three close paths do. The coarse 2-min running max can miss a
+                            // ramp peak the 12-s sampler caught, and deriveIsDc needs a DC-plausible
+                            // peak to honour a DC gun — so the unresolved figure both understated the
+                            // stored peak and mispriced a genuine DC session at the AC rate.
+                            chargingPeakPower = resolvePeakKw(chargingStartTime, chargingPeakPower);
                             // Peak-guarded so a misread DC gun on a low-power charge isn't stored as DC.
-                            int isDc = deriveIsDc(chargingGunState, chargingPeakPower);
+                            int isDc = optOutCloseIsDc >= -1
+                                    ? optOutCloseIsDc
+                                    : deriveIsDc(chargingGunState, chargingPeakPower);
                             int rangeGained = rangeGainedFromEnergy(energyAdded);
                             // Price at the tariff for WHERE this charge happened,
                             // else the global DC/base rate (see priceSession).
-                            PricingDecision pd = priceSession(isDc, chargingStartLat, chargingStartLng);
+                            if (optOutClosePricing == null) {
+                                optOutClosePricing = priceSessionForClose(
+                                        isDc, chargingStartLat, chargingStartLng);
+                            }
+                            // A successful retry-time config read becomes part of the frozen
+                            // opt-out boundary before the H2 transaction is attempted. If H2 is
+                            // still unavailable, restart must retry this exact price.
+                            if (!persistChargingLifecycleJournal()) {
+                                throw new java.io.IOException(
+                                        "opt-out close snapshot was not durable");
+                            }
+                            PricingDecision pd = optOutClosePricing;
                             double rate = pd.rate;
                             String curr = pd.currency;
                             double cost = pd.costFor(energyAdded);
@@ -1036,53 +1647,125 @@ public class SocHistoryDatabase {
                                 }
                             } catch (Exception e) { /* use defaults */ }
 
-                            pstmt.setLong(1, closeTime);
-                            pstmt.setDouble(2, soc);
-                            pstmt.setDouble(3, energyAdded);
-                            pstmt.setDouble(4, avgPower);
-                            pstmt.setDouble(5, chargingPeakPower);
-                            pstmt.setInt(6, rangeGained);
-                            pstmt.setInt(7, isDc);
-                            pstmt.setDouble(8, rate);
-                            pstmt.setString(9, curr);
-                            pstmt.setDouble(10, cost);
-                            pstmt.setInt(11, ttf);
-                            pstmt.setDouble(12, tHi);
-                            pstmt.setDouble(13, tLo);
-                            pstmt.setDouble(14, tAvg);
-                            pstmt.setString(15, pd.tariffId);
-                            pstmt.setString(16, pd.tariffLabel);
-                            pstmt.setLong(17, chargingStartTime);
-                            pstmt.executeUpdate();
-                            noteTariffUsed(pd.tariffId, closeTime);
+                            final double persistedAvgPower = avgPower;
+                            final double persistedPeakPower = chargingPeakPower;
+                            final double persistedTHi = tHi;
+                            final double persistedTLo = tLo;
+                            final double persistedTAvg = tAvg;
+                            runInTransaction(() -> {
+                                pstmt.setLong(1, closeTime);
+                                pstmt.setDouble(2, closeSoc);
+                                pstmt.setDouble(3, energyAdded);
+                                pstmt.setDouble(4, persistedAvgPower);
+                                pstmt.setDouble(5, persistedPeakPower);
+                                pstmt.setInt(6, rangeGained);
+                                pstmt.setInt(7, isDc);
+                                pstmt.setDouble(8, rate);
+                                pstmt.setString(9, curr);
+                                pstmt.setDouble(10, cost);
+                                pstmt.setInt(11, ttf);
+                                pstmt.setDouble(12, persistedTHi);
+                                pstmt.setDouble(13, persistedTLo);
+                                pstmt.setDouble(14, persistedTAvg);
+                                pstmt.setString(15, pd.tariffId);
+                                pstmt.setString(16, pd.tariffLabel);
+                                // Provenance, same as the other close paths. Omitting it here left an
+                                // incomplete or SOC-derived total looking like a confident measurement:
+                                // energy_incomplete stayed 0 so the UI showed no '~', and energy_source
+                                // stayed empty so support could not tell what produced the figure.
+                                pstmt.setString(17, disRes.source);
+                                if (!Double.isNaN(disRes.socEstimateKwh)) {
+                                    pstmt.setDouble(18, disRes.socEstimateKwh);
+                                } else {
+                                    pstmt.setNull(18, java.sql.Types.DOUBLE);
+                                }
+                                pstmt.setInt(19, disRes.incomplete ? 1 : 0);
+                                if (chargingCounter.hasBaseline()) {
+                                    pstmt.setDouble(20, chargingCounter.energyKwh());
+                                    pstmt.setDouble(21, chargingCounter.lastRawKwh());
+                                    if (counterOwner != null) pstmt.setString(22, counterOwner);
+                                    else pstmt.setNull(22, java.sql.Types.VARCHAR);
+                                    pstmt.setDouble(23, chargingCounter.fullScaleKwh());
+                                } else {
+                                    pstmt.setNull(20, java.sql.Types.DOUBLE);
+                                    pstmt.setNull(21, java.sql.Types.DOUBLE);
+                                    pstmt.setNull(22, java.sql.Types.VARCHAR);
+                                    pstmt.setNull(23, java.sql.Types.DOUBLE);
+                                }
+                                int next = bindCounterState(
+                                        pstmt, 24, chargingCounter.snapshotState());
+                                pstmt.setInt(next++, pd.tariffId.isEmpty() ? 1 : 0);
+                                pstmt.setLong(next, chargingStartTime);
+                                if (pstmt.executeUpdate() != 1) {
+                                    throw new java.sql.SQLException(
+                                            "feature-disable close found no matching open session");
+                                }
 
-                            // Fold this interrupted session into the permanent daily
-                            // rollup, keyed on the actual session-end day (closeTime),
-                            // not the wall-clock disable moment.
-                            foldSessionIntoDaily(closeTime, energyAdded, cost, isDc, chargingPeakPower, rangeGained);
+                                // Fold this interrupted session into the permanent daily
+                                // rollup, keyed on the actual session-end day (closeTime),
+                                // not the wall-clock disable moment.
+                                foldSessionIntoDaily(closeTime, energyAdded, cost, isDc,
+                                        persistedPeakPower, rangeGained, disRes.incomplete);
+                            });
+                            closeCommitted = true;
+                            replayPendingChargingPostCommitMetadata();
                         }
                     }
                 } catch (Exception e) {
-                    logger.debug("Failed to close charging session on feature disable: " + e.getMessage());
+                    // COMMIT has an uncertain-result failure mode: H2 may durably commit and then
+                    // throw while returning the result. A retry updates zero rows because the row is
+                    // already closed. Reconcile the exact identity before retaining live state.
+                    closeCommitted = isSessionDurablyClosed(chargingStartTime);
+                    if (!closeCommitted && isSqlFailure(e)) {
+                        noteWriteFailed();
+                        try { reconnect(); } catch (Exception ignored) {}
+                        closeCommitted = isSessionDurablyClosed(chargingStartTime);
+                    }
+                    if (closeCommitted) {
+                        replayPendingChargingPostCommitMetadata();
+                    }
+                    logger.debug("Feature-disable close threw"
+                            + (closeCommitted ? " after the row was durably closed: " : ": ")
+                            + e.getMessage());
                 }
-                wasCharging = false;
-                // Reset all session aggregates to initial state so a re-enable
-                // doesn't mix stale values from the interrupted session into the next one
-                chargingStartTime = 0;
-                chargingStartSoc = 0;
-                chargingPeakPower = 0;
-                chargingPowerSum = 0;
-                chargingPowerCount = 0;
-                chargingStartRange = -1;
-                chargingGunState = -1;
-                chargingTimeToFullMin = -1;
+                // Retain both the live flag and all aggregates after a failed close. The disabled
+                // recorder will retry on its next tick; clearing them here would strand the open row
+                // and make a later retry impossible to account correctly.
+                if (!closeCommitted) return false;
+                resetLiveChargingState(true);
+                if (chargingLifecycleJournalDirty
+                        && !persistChargingLifecycleJournal()) {
+                    return false;
+                }
             }
-            return;
+            return true;
         }
 
+        // A newer physical charge is being buffered while this row retries its frozen close. The
+        // recorder can still present charging=true through its lifecycle hold, but none of those live
+        // values belong to the old row.
+        if (sessionInputsFenced && isCharging && wasCharging) {
+            return !counterProgressDirty || persistCounterProgress();
+        }
+
+        final boolean lifecycleTransition = isCharging != wasCharging;
+        SessionStartAttempt startAttempt = null;
         try {
             if (isCharging && !wasCharging) {
                 // ---- SESSION START (or RESUME) ----
+                final DeferredChargingGeneration deferredGeneration =
+                        deferredPhysicalGenerations.peekFirst();
+                final boolean deferredPhysicalStart = deferredGeneration != null;
+                if (deferredPhysicalStart) {
+                    now = deferredGeneration.startMs > 0 ? deferredGeneration.startMs : now;
+                    if (!Double.isNaN(deferredGeneration.startSoc)) {
+                        soc = deferredGeneration.startSoc;
+                    }
+                } else {
+                    // Use a database-backed monotonic identity before resume/continuation lookups too.
+                    // A wall-clock rollback must not hide the most recent row behind start_time < now.
+                    now = allocateMonotonicChargingStart(now);
+                }
                 // A daemon restart resets wasCharging to false. Without this,
                 // an UNINTERRUPTED charge that spans a restart (or a brief
                 // charging-state flicker) would open a brand-new session row,
@@ -1090,9 +1773,13 @@ public class SocHistoryDatabase {
                 // look for a session to RESUME: the most recent one whose gap to
                 // `now` is within CHARGING_MERGE_GAP_MS. If found, re-adopt it
                 // (restore start time/soc/aggregates) instead of creating a row.
-                if (tryResumeChargingSession(now, soc)) {
+                if (!deferredPhysicalStart && tryResumeChargingSession(now, soc)) {
+                    // RESTORE the charged-energy accumulator from the row. The counter kept
+                    // advancing while the daemon was down, so re-baselining at the CURRENT reading
+                    // would silently discard everything delivered during the outage. The persisted
+                    // endpoints are the only record of where we were.
                     wasCharging = isCharging;
-                    return;
+                    return true;
                 }
 
                 chargingStartTime = now;
@@ -1101,34 +1788,328 @@ public class SocHistoryDatabase {
                 // is 0 here when the start tick had an estimated/placeholder kW
                 // (see recordCurrentSoc) — seeding 0 keeps the average honest and
                 // lets the first measured tick set the true peak.
-                chargingPeakPower = power > 0 ? power : 0;
-                chargingPowerSum = power > 0 ? power : 0;
-                chargingPowerCount = power > 0 ? 1 : 0;
-                chargingStartRange = snapshotRangeKm();
-                chargingStartOdometer = snapshotOdometerKm();  // -1 if HAL not reporting yet → backfilled mid-session
-                chargingGunState = snapshotGunState();
-                chargingTimeToFullMin = snapshotTimeToFullMin();  // first live reading
-                // Snapshot where the charge began (0/0 if no GPS fix yet).
-                double[] loc = snapshotLocation();
-                chargingStartLat = loc[0];
-                chargingStartLng = loc[1];
+                chargingPeakPower = deferredPhysicalStart
+                        ? deferredGeneration.peakPower : power > 0 ? power : 0;
+                chargingPowerSum = deferredPhysicalStart
+                        ? deferredGeneration.powerSum : power > 0 ? power : 0;
+                chargingPowerCount = deferredPhysicalStart
+                        ? deferredGeneration.powerCount : power > 0 ? 1 : 0;
+                if (deferredPhysicalStart) {
+                    chargingStartRange = deferredGeneration.startRange;
+                    chargingStartOdometer = deferredGeneration.startOdometer;
+                    chargingGunState = deferredGeneration.gun;
+                    chargingTimeToFullMin = deferredGeneration.timeToFull;
+                    chargingStartLat = deferredGeneration.lat;
+                    chargingStartLng = deferredGeneration.lng;
+                } else {
+                    chargingStartRange = snapshotRangeKm();
+                    chargingStartOdometer = snapshotOdometerKm();
+                    chargingGunState = snapshotGunState();
+                    chargingTimeToFullMin = snapshotTimeToFullMin();
+                    double[] loc = snapshotLocation();
+                    chargingStartLat = loc[0];
+                    chargingStartLng = loc[1];
+                }
+                // Fresh accumulator for a genuinely new session, then capture the counter's
+                // baseline. A stale accumulator here would attribute a previous charge's energy to
+                // this one, so the reset is unconditional and precedes the first observation.
+                chargingCounter.reset();
+                counterOwner = null;   // a new charge chooses its own counter source
+                boolean freshPreOpenExternal = !deferredPhysicalStart
+                        && Double.isFinite(preSessionProvisionalExternalRaw)
+                        && preSessionProvisionalExternalAtMs > 0L
+                        && now - preSessionProvisionalExternalAtMs
+                                <= PRE_SESSION_COUNTER_MAX_AGE_MS;
+                if (freshPreOpenExternal) {
+                    provisionalExternalUnitDivisor =
+                            validCounterUnitDivisor(
+                                    preSessionProvisionalExternalUnitDivisor);
+                    provisionalExternalKwh =
+                            preSessionProvisionalExternalRaw
+                                    / provisionalExternalUnitDivisor;
+                    provisionalExternalAtMs =
+                            preSessionProvisionalExternalAtMs;
+                } else {
+                    provisionalExternalKwh = Double.NaN;
+                    provisionalExternalAtMs = 0L;
+                    provisionalExternalUnitDivisor = 1.0;
+                }
+                clearCounterBaselineCandidates();
+                // The baseline is deliberately NOT seeded from the snapshot at this instant. The
+                // counter field is intentionally not cleared at gun-out (it is an energy total, and
+                // the close path needs its final value), so right after a session opens it may still
+                // hold the PREVIOUS charge's figure — the vehicle resets it per session, but not
+                // necessarily before our detector opens the row. Seeding from it would set a
+                // too-high baseline and lose everything up to the vehicle's own reset: on a DC
+                // session opened before the counter cleared, a stale 2.0 kWh baseline silently
+                // discards the first 2 kWh. Leaving the baseline unset lets the first MID-SESSION
+                // observation establish it from a value the vehicle has already re-zeroed.
+                counterBaselinePending = true;
+                counterBaselinePendingSinceMs = now;
+                final ContinuationOffer continuationOffer = deferredPhysicalStart
+                        ? deferredGeneration.continuationOffer
+                        : findImmediateContinuationOffer(now);
+                continuationSource = continuationOffer != null ? continuationOffer.source : null;
+                pendingSweepMarkerRow = continuationOffer != null ? continuationOffer.rowStart : -1L;
+                boolean continuationApplied = false;
+                if (deferredPhysicalStart) {
+                    finalizeDeferredCounterBaseline(deferredGeneration);
+                    // This is an in-process/journal materialization, not a newly observed outage.
+                    // Copy the exact accumulator image so zero-delta state, wrap/reset counters,
+                    // saturation and an already-resolved gap cannot be reinterpreted by restore().
+                    chargingCounter.restoreState(
+                            deferredGeneration.counter.snapshotState());
+                    counterOwner = deferredGeneration.counterOwner;
+                    counterBaselinePending =
+                            deferredGeneration.counterBaselinePending;
+                    counterBaselinePendingSinceMs =
+                            deferredGeneration.counterBaselinePendingSinceMs;
+                    counterBaselineCandidateKwh =
+                            deferredGeneration.counterCandidateKwh;
+                    counterBaselineCandidateAtMs =
+                            deferredGeneration.counterCandidateAtMs;
+                    counterBaselineLatestKwh =
+                            deferredGeneration.counterLatestKwh;
+                    counterBaselineLatestAtMs =
+                            deferredGeneration.counterLatestAtMs;
+                    provisionalExternalKwh =
+                            deferredGeneration.provisionalExternalKwh;
+                    provisionalExternalAtMs =
+                            deferredGeneration.provisionalExternalAtMs;
+                    provisionalExternalUnitDivisor =
+                            deferredGeneration.provisionalExternalUnitDivisor;
+                    if (chargingCounter.hasBaseline()) {
+                        lastSessionCounterKwh =
+                                chargingCounter.lastRawKwh();
+                    }
+                }
+                // PRE-SESSION READING. Detection lags the physical start, so a reading taken before
+                // this row existed may already be the vehicle's post-reset zero — the true baseline.
+                // Adopt it when it is recent and lower than what the counter reads now (lower proves it
+                // predates this charge's accumulation, and equal adds nothing). Without this the
+                // baseline waited for a MID-SESSION observation and everything delivered up to it was
+                // absorbed and lost. Checked BEFORE the continuation test, which needs a clean pending
+                // state to reason about.
+                double preLow = preSessionCounterLowKwh;
+                long preAt = preSessionCounterAtMs;
+                String preSrc = preSessionCounterSource;
+                long preAgeMs = now - preAt;
+                if (!deferredPhysicalStart
+                        && Double.isFinite(preLow) && preLow >= 0.0
+                        && preAt > 0 && isValidCounterSource(preSrc, false)
+                        && preAgeMs >= 0L
+                        && preAgeMs <= PRE_SESSION_COUNTER_MAX_AGE_MS) {
+                    // BIND THE BUFFERED SOURCE FIRST. Ownership is unbound at this point, so calling
+                    // snapshotChargeCounterKwh() blind would let it bind whichever source it happens to
+                    // prefer — and pairing that with a baseline captured from the OTHER source computes
+                    // added energy across two unrelated series. Binding first makes the snapshot return
+                    // the same source the buffered value came from, or NaN if it has gone quiet.
+                    if (counterOwner == null) bindCounterOwner(preSrc);
+                    double liveNow = preSrc.equals(counterOwner)
+                            ? snapshotChargeCounterKwh() : Double.NaN;
+                    // A PRE-DETECTION READING IS NOT PROOF OF A RESET. An interrupted row ending at 10,
+                    // with pre-session readings of 12 -> 13, means the counter never reset and the 10 -> 12
+                    // delivered during the outage belongs to this session — but baselining at 12 discards
+                    // it and consumes the marker on the false premise that a reset occurred. Check the
+                    // interrupted endpoint FIRST: if this reading sits at or above it and within a
+                    // plausible outage, the endpoint is the better baseline.
+                    double contEndpoint = Double.NaN;
+                    if (!Double.isNaN(liveNow)) {
+                        double cand = continuationOffer != null
+                                ? continuationOffer.endpointKwh : Double.NaN;
+                        boolean srcOk = (continuationSource != null)
+                                ? continuationSource.equals(counterOwner)
+                                : (com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY
+                                        .equals(counterOwner) || counterOwner == null);
+                        boolean gapOk = (continuationSource != null)
+                                || (preLow - cand) <= LEGACY_CONTINUATION_MAX_GAP_KWH;
+                        if (srcOk && !Double.isNaN(cand) && gapOk) {
+                            contEndpoint = cand;
+                        }
+                    }
+                    if (!Double.isNaN(contEndpoint)) {
+                        // Continuation wins: seed at the interrupted endpoint so the outage is credited,
+                        // then walk forward through the pre-detection reading and the live one.
+                        continuationApplied = applyContinuationOffer(
+                                continuationOffer, preLow, soc, preAt);
+                        if (continuationApplied) {
+                            if (liveNow != preLow) chargingCounter.observe(liveNow, now);
+                            lastSessionCounterKwh = liveNow;
+                        }
+                    } else if (!Double.isNaN(liveNow) && preLow <= liveNow) {
+                        counterBaselinePending = false;
+                        counterBaselinePendingSinceMs = 0;
+                        chargingCounter.observe(preLow, preAt);
+                        if (liveNow > preLow) chargingCounter.observe(liveNow, now);
+                        lastSessionCounterKwh = liveNow;
+                        logger.info(String.format(java.util.Locale.US,
+                                "Session %d baselined at a pre-detection counter reading %.3f kWh"
+                                + " (counter now %.3f) — crediting %.3f kWh delivered before the"
+                                + " session was detected",
+                                now, preLow, liveNow, liveNow - preLow));
+                    } else if (Double.isNaN(liveNow)) {
+                        // The confirmed observation is the only durable opening endpoint available.
+                        // Move it into the active accumulator before the write-ahead generation clears
+                        // standalone ownership, so a transiently unavailable getter cannot lose the
+                        // energy delivered before the next callback.
+                        adoptConfirmedPreSessionCounterAsActiveBaseline(
+                                preLow, preAt, preSrc);
+                    }
+                }
+                // CONTINUATION CHECK. This SESSION START may not be a new charge at all: a restart
+                // after an outage longer than the resume window declines the resume and lands here
+                // while the SAME physical charge is still running. The old row is closed at whatever
+                // it had persisted, and if this session then re-baselines at the counter's current
+                // value, everything delivered during the outage falls between the two rows and is
+                // credited to NEITHER.
+                //
+                // The counter itself tells us which case this is: if it reads at or above the value
+                // the previous row last persisted, the vehicle never reset it, so this is a
+                // continuation and that difference is real energy belonging to this session. Seed the
+                // baseline at the persisted value to capture it. A LOWER reading means the vehicle
+                // did reset, so the normal fresh-baseline path is correct.
+                // Only when no baseline is established yet. The pre-session path above may already
+                // have anchored this session at the vehicle's own reset, which is strictly better
+                // evidence than a previous row's endpoint — and it also CONSUMES the sweep marker, so
+                // running both would credit the outage twice and burn the one-shot token.
+                // The offer was selected once, before any source binding, and is claimed atomically with
+                // this row's INSERT below. It therefore belongs to this immediate next session even when
+                // no usable counter ever arrives.
+                double prevPersistedLast = continuationOffer != null
+                        ? continuationOffer.endpointKwh : Double.NaN;
+                boolean baselineAlreadySet = !counterBaselinePending;
+                if (baselineAlreadySet && !Double.isNaN(prevPersistedLast)) {
+                    prevPersistedLast = Double.NaN;
+                }
+                double counterNowAtStart = snapshotChargeCounterKwh();
+                // SAME SOURCE ONLY. The persisted endpoint came from one specific counter; differencing
+                // it against a reading from the other one spans two unrelated series and invents energy.
+                // A legacy row with no recorded source is accepted only when this session is on the
+                // default capacity counter, which is what such rows were written by.
+                boolean sameSeries;
+                if (continuationSource != null) {
+                    sameSeries = continuationSource.equals(counterOwner);
+                } else {
+                    // LEGACY ROW WITH NO RECORDED SOURCE. Assuming capacity was a guess, and when it was
+                    // wrong the old EXTERNAL endpoint got differenced against the capacity counter —
+                    // two unrelated series, so the "outage energy" it credits is fabricated. There is a
+                    // cheap consistency check available: the endpoint is the last value the OWNING
+                    // counter reported, and a counter only rises within a session, so the live reading
+                    // of the true owner must be at or above it and within a plausible outage's worth of
+                    // it. A cross-series pairing typically fails both. Require that agreement instead of
+                    // assuming the source.
+                    // Also require the live SOURCE to be the one legacy rows were written by. Value
+                    // plausibility alone still admits a coincidence: an old EXTERNAL endpoint and a
+                    // current CAPACITY reading can land within the 60 kWh window by chance, and
+                    // differencing them fabricates energy. Legacy rows predate external-counter support
+                    // entirely, so only a capacity-owned session can legitimately continue one.
+                    boolean ownerIsLegacyPlausible =
+                            com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY
+                                    .equals(counterOwner) || counterOwner == null;
+                    boolean plausiblePairing = ownerIsLegacyPlausible
+                            && !Double.isNaN(prevPersistedLast)
+                            && !Double.isNaN(counterNowAtStart)
+                            && counterNowAtStart >= prevPersistedLast
+                            && (counterNowAtStart - prevPersistedLast)
+                                    <= LEGACY_CONTINUATION_MAX_GAP_KWH
+                            // A legacy row's endpoint came from a 16-bit register, so a value beyond
+                            // that ceiling cannot be one — it is the other counter.
+                            && prevPersistedLast <= com.overdrive.app.charging
+                                    .ChargeCounterAccumulator.COUNTER_FULL_SCALE_KWH
+                            && counterNowAtStart <= com.overdrive.app.charging
+                                    .ChargeCounterAccumulator.COUNTER_FULL_SCALE_KWH;
+                    sameSeries = plausiblePairing;   // owner check folded into plausiblePairing above
+                    if (!plausiblePairing && !Double.isNaN(prevPersistedLast)
+                            && !Double.isNaN(counterNowAtStart)) {
+                        logger.info(String.format(java.util.Locale.US,
+                                "Declining legacy continuation: endpoint %.3f vs live %.3f is not a"
+                                + " plausible same-counter pairing, so the row's source cannot be"
+                                + " confirmed and differencing them would invent energy",
+                                prevPersistedLast, counterNowAtStart));
+                    }
+                }
+                if (!deferredPhysicalStart && sameSeries
+                        && !Double.isNaN(prevPersistedLast)
+                        && !Double.isNaN(counterNowAtStart)) {
+                    continuationApplied = applyContinuationOffer(
+                            continuationOffer, counterNowAtStart, soc, now);
+                }
+                final DeferredChargingGeneration journaledStartGeneration =
+                        deferredPhysicalStart
+                                ? deferredGeneration
+                                : journalCurrentChargingStart(continuationOffer);
 
                 String sql = "INSERT INTO " + TABLE_CHARGING +
-                    " (start_time, start_soc, peak_power_kw, avg_power_kw, gun_state, start_lat, start_lng, start_range_km, start_odometer_km) " +
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
+                    " (start_time, start_soc, peak_power_kw, avg_power_kw, gun_state, start_lat, start_lng,"
+                    + " start_range_km, start_odometer_km, time_to_full_min, counter_start_kwh,"
+                    + " counter_last_kwh, counter_energy_kwh, counter_source, counter_full_scale_kwh,"
+                    + " counter_last_at_ms, counter_observation_generation,"
+                    + " counter_wrap_count, counter_reset_count,"
+                    + " counter_ceiling_streak, counter_saturated, counter_abandoned_kwh,"
+                    + " counter_unattributed_gaps, counter_awaiting_gap,"
+                    + " counter_gap_reconstructed, counter_gap_estimate_kwh,"
+                    + " counter_recent_rate_kwh_per_h) "
+                    + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                    + " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
-                try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
-                    pstmt.setLong(1, now);
-                    pstmt.setDouble(2, soc);
-                    pstmt.setDouble(3, power);
-                    pstmt.setDouble(4, power);
-                    pstmt.setInt(5, chargingGunState);
-                    pstmt.setDouble(6, chargingStartLat);
-                    pstmt.setDouble(7, chargingStartLng);
-                    pstmt.setInt(8, chargingStartRange);
-                    pstmt.setInt(9, chargingStartOdometer);
-                    pstmt.executeUpdate();
-                }
+                final boolean offerAppliedAtStart = continuationApplied;
+                startAttempt = new SessionStartAttempt(now, continuationOffer,
+                        offerAppliedAtStart || !counterBaselinePending, true);
+                final long persistedStartTime = now;
+                // applyContinuationOffer moves the accounting origin back to the interrupted row's
+                // endpoint SOC. Persist that same origin so a restart does not silently revert the
+                // continuation to the later detection SOC and lose the outage energy frame.
+                final double persistedStartSoc = chargingStartSoc;
+                final double persistedStartPeak = chargingPeakPower;
+                final double persistedStartAvg = chargingPowerCount > 0
+                        ? chargingPowerSum / chargingPowerCount : 0;
+                runInTransaction(() -> {
+                    try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+                        pstmt.setLong(1, persistedStartTime);
+                        pstmt.setDouble(2, persistedStartSoc);
+                        pstmt.setDouble(3, persistedStartPeak);
+                        pstmt.setDouble(4, persistedStartAvg);
+                        pstmt.setInt(5, chargingGunState);
+                        pstmt.setDouble(6, chargingStartLat);
+                        pstmt.setDouble(7, chargingStartLng);
+                        pstmt.setInt(8, chargingStartRange);
+                        pstmt.setInt(9, chargingStartOdometer);
+                        pstmt.setInt(10, chargingTimeToFullMin);
+                        if (chargingCounter.hasBaseline()) {
+                            pstmt.setDouble(11, chargingCounter.baselineKwh());
+                            pstmt.setDouble(12, chargingCounter.lastRawKwh());
+                            pstmt.setDouble(13, chargingCounter.energyKwh());
+                            pstmt.setDouble(15, chargingCounter.fullScaleKwh());
+                        } else {
+                            pstmt.setNull(11, java.sql.Types.DOUBLE);
+                            pstmt.setNull(12, java.sql.Types.DOUBLE);
+                            pstmt.setNull(13, java.sql.Types.DOUBLE);
+                            pstmt.setNull(15, java.sql.Types.DOUBLE);
+                        }
+                        if (counterOwner != null) pstmt.setString(14, counterOwner);
+                        else pstmt.setNull(14, java.sql.Types.VARCHAR);
+                        bindCounterState(
+                                pstmt, 16, chargingCounter.snapshotState());
+                        if (pstmt.executeUpdate() != 1) {
+                            throw new java.sql.SQLException("charging session INSERT did not create one row");
+                        }
+                    }
+                    if (journaledStartGeneration != null) {
+                        insertDeferredChargingSamples(
+                                journaledStartGeneration, persistedStartTime);
+                    }
+                    claimContinuationOffer(continuationOffer);
+                });
+                // The write-ahead generation remains durable until this active image can replace it.
+                wasCharging = true;
+                activateClaimedContinuationOffer(continuationOffer, now,
+                        offerAppliedAtStart || !counterBaselinePending);
+                preSessionCounterLowKwh = Double.NaN;
+                preSessionCounterAtMs = 0;
+                preSessionCounterSource = null;
+                clearPreSessionProvisionalExternal();
+                consumeDeferredPhysicalSessionAfterStart(now);
+                counterProgressDirty = false;
 
                 // Resolve a human place label asynchronously (SafeLocation
                 // "Home"/"Office" name first, else reverse-geocode) and write it
@@ -1140,12 +2121,87 @@ public class SocHistoryDatabase {
 
             } else if (isCharging && wasCharging) {
                 // ---- MID-SESSION TICK ----
+                if (power > 0 && !advancePendingCloseForAdmittedTaper(
+                        chargingStartTime, now, soc, -999, -999, -999)) {
+                    return false;
+                }
                 // v1 did nothing here, freezing peak_power_kw at the start
                 // instant. Advance the true running max + mean and persist them
                 // so an interrupted session still has a meaningful peak/avg.
                 if (power > chargingPeakPower) chargingPeakPower = power;
                 if (power > 0) { chargingPowerSum += power; chargingPowerCount++; }
                 double avgSoFar = chargingPowerCount > 0 ? chargingPowerSum / chargingPowerCount : power;
+                // Advance the charged-energy accumulator. Deliberately INDEPENDENT of `power`:
+                // metered energy must keep accruing on a trim whose rate getters are dead, so this
+                // is not nested under any power > 0 test. If the counter never answers here, the
+                // accumulator simply stays empty and the resolver falls back.
+                double counterNow = snapshotChargeCounterKwh();
+                if (!Double.isNaN(counterNow)) {
+                    // Keep the accumulator's independent estimate current. It uses this ONLY to veto
+                    // an implausible wrap (a reset while the counter is high is otherwise
+                    // indistinguishable from one); it never contributes to the total.
+                    chargingCounter.setIndependentEstimate(socEstimateForOpenSession(soc));
+                    if (counterBaselinePending) {
+                        rememberCounterBaselineCandidate(counterNow, now);
+                        // Accept a baseline only once the reading cannot be the previous session's
+                        // leftover. STRICTLY below the last value we saw, not "at or below": a reading
+                        // EQUAL to the previous session's final value is the most likely stale case
+                        // (the vehicle has not re-zeroed yet), and accepting it is precisely the bug
+                        // this guard exists to prevent. A genuinely re-zeroed counter reads lower.
+                        boolean looksFresh = Double.isNaN(lastSessionCounterKwh)
+                                || counterNow < lastSessionCounterKwh;
+                        // ESCAPE HATCH. A trim that resets its counter only at plug-in — or one whose
+                        // counter legitimately continues from where it stopped — would never satisfy
+                        // the test above, leaving the baseline pending forever and the session with no
+                        // metered energy at all. After a bounded wait, take the current reading and
+                        // accept the risk of a slightly-high baseline: an approximate metered figure
+                        // that the resolver will still cross-check beats no metered figure at all.
+                        boolean waitedLongEnough = counterBaselinePendingSinceMs > 0
+                                && (now - counterBaselinePendingSinceMs) > COUNTER_BASELINE_WAIT_MS;
+                        if (looksFresh || waitedLongEnough) {
+                            long baselineWaitMs = counterBaselinePendingSinceMs > 0
+                                    ? now - counterBaselinePendingSinceMs : 0;
+                            counterBaselinePending = false;
+                            counterBaselinePendingSinceMs = 0;
+                            // RETRY THE CONTINUATION. At SESSION START the counter may not have been
+                            // reporting yet, so the continuation check had nothing to compare and the
+                            // outage energy was left uncredited — permanently, because it was only ever
+                            // attempted once. Now that a real reading exists, ask again.
+                            if (tryLateContinuation(counterNow, now)) {
+                                clearCounterBaselineCandidates();
+                                lastSessionCounterKwh = counterNow;
+                                return persistCounterProgress();
+                            }
+                            // Late continuation declined, and this baseline stands — so the offer can
+                            // never apply to this session and must be retired rather than left claimable.
+                            consumeSupersededSweepMarker("a mid-session baseline was established and the"
+                                    + " late-continuation check declined the offer");
+                            if (!looksFresh) {
+                                logger.info("Counter baseline taken without an observed reset after "
+                                        + (baselineWaitMs / 60000)
+                                        + " min — metered energy may understate this session");
+                            }
+                            double baseline = looksFresh ? counterNow : counterBaselineCandidateKwh;
+                            long baselineAt = looksFresh ? now : counterBaselineCandidateAtMs;
+                            if (Double.isNaN(baseline)) {
+                                baseline = counterNow;
+                                baselineAt = now;
+                            }
+                            chargingCounter.observe(baseline, baselineAt > 0 ? baselineAt : now);
+                            if (counterNow != baseline) chargingCounter.observe(counterNow, now);
+                            clearCounterBaselineCandidates();
+                            counterProgressDirty = true;
+                            persistCounterProgress();
+                        }
+                        // else: still showing the old session's value — wait for the reset.
+                    } else {
+                        chargingCounter.observe(counterNow, now);
+                        counterProgressDirty = true;
+                        // Persist every tick so a crash loses at most one interval of attribution.
+                        persistCounterProgress();
+                    }
+                    lastSessionCounterKwh = counterNow;
+                }
                 // Latch the latest plausible time-to-full while still charging
                 // (rest-time reads ~0 once charging stops, so capturing at end
                 // would be useless). Keep the most recent positive reading.
@@ -1184,11 +2240,23 @@ public class SocHistoryDatabase {
                     if (backfillRange) pstmt.setInt(idx++, chargingStartRange);
                     if (backfillOdo) pstmt.setInt(idx++, chargingStartOdometer);
                     pstmt.setLong(idx, chargingStartTime);
-                    pstmt.executeUpdate();
+                    if (pstmt.executeUpdate() != 1) {
+                        throw new java.sql.SQLException(
+                                "mid-session aggregate found no matching open row");
+                    }
                 }
+                if (counterProgressDirty && !persistCounterProgress()) return false;
 
             } else if (!isCharging && wasCharging) {
                 // ---- SESSION END ----
+                if (pendingCloseSessionStart != chargingStartTime) {
+                    capturePendingChargingClose();
+                }
+                if (pendingCloseSessionStart == chargingStartTime) {
+                    if (pendingCloseAtMs > 0) now = pendingCloseAtMs;
+                    if (!Double.isNaN(pendingCloseSoc)) soc = pendingCloseSoc;
+                }
+                now = strictlyAfterChargingStart(chargingStartTime, now);
                 double socDelta = soc - chargingStartSoc;
 
                 // Compute energy added using nominal capacity if available,
@@ -1196,41 +2264,66 @@ public class SocHistoryDatabase {
                 double energyAdded = 0;
                 double packTemp = 25.0;    // Default — updated below if available
 
-                com.overdrive.app.abrp.SohEstimator sohEst = getSohEstimator();
-                double nominalKwh = sohEst != null ? sohEst.getNominalCapacityKwh() : 0;
-
                 // Prefer ∫P·dt over the recorded samples — SOC-delta reads ~0 for
                 // a slow charge that didn't move a whole percent, which blanked
                 // energy/cost/range. Same basis as the live in-progress card.
-                energyAdded = integrateSessionEnergyKwh(chargingStartTime);
-                if (energyAdded <= 0) {
-                    if (nominalKwh > 0 && socDelta > 0) {
-                        // Energy added ≈ socDelta% × nominalKwh (LFP: displayed
-                        // 0–100% ≈ 100% usable, no 0.95 fudge — updateFromCalibration
-                        // applies the chemistry-aware scale internally).
-                        energyAdded = (socDelta / 100.0) * nominalKwh;
-                    } else {
-                        energyAdded = socDelta * 0.6; // Rough fallback
+                // ENERGY RESOLUTION. Three independent estimates, ranked, with the best one
+                // cross-checked rather than trusted outright:
+                //   1. the vehicle's own charged-energy counter (metered, wrap/reset-aware)
+                //   2. the time integral of the sampled rate
+                //   3. SOC delta x usable capacity
+                // The counter wins when it agrees with the SOC estimate within a ratio band. It
+                // can silently lose a segment (BMS pause/resume restarts it), and this figure is
+                // priced, so no single source is trusted alone. The old code's SOC*capacity and
+                // `socDelta * 0.6` guesses are gone: 0.6 encoded a 60 kWh pack, which is wrong on
+                // every PHEV and on most BEVs in the range.
+                // FINAL counter observation before resolving. The charge stopped between the last
+                // mid-session tick and now (up to one tick period — 2 min, which at 150 kW is
+                // 5 kWh), and the counter still holds that tail because it is an energy total and
+                // is deliberately not cleared at the gun-out edge.
+                if (!pendingCloseCounterCaptured) {
+                    double counterAtEnd = snapshotChargeCounterKwh();
+                    if (!Double.isNaN(counterAtEnd)) {
+                        observeFinalCounterForClose(counterAtEnd, soc, now);
                     }
+                    pendingCloseCounterCaptured = true;
                 }
 
+                double meteredKwh = meteredEnergyKwh();
+                double socEstimate = socEstimateForOpenSession(soc);
+                double integrated = integrateSessionEnergyKwh(chargingStartTime);
+                com.overdrive.app.charging.SessionEnergyResolver.Result energyRes =
+                        com.overdrive.app.charging.SessionEnergyResolver.resolve(
+                                meteredKwh, chargingCounter.containsReconstructedGap(), chargingCounter.isIncomplete(),
+                                integrated, socEstimate, lastIntegrationTruncated,
+                                counterScaleSuspect(counterOwner));
+                energyAdded = energyRes.isUsable() ? energyRes.energyKwh : 0;
+                logger.info(String.format(java.util.Locale.US,
+                        "Session energy resolved: %.3f kWh via %s (metered=%s integrated=%.3f"
+                        + " soc=%s incomplete=%s)",
+                        energyAdded, energyRes.source,
+                        Double.isNaN(meteredKwh) ? "n/a" : String.format("%.3f", meteredKwh),
+                        integrated,
+                        Double.isNaN(socEstimate) ? "n/a" : String.format("%.3f", socEstimate),
+                        energyRes.incomplete));
+
                 // Battery temperature at session end (for calibration + chart).
-                double tHi = -999, tLo = -999, tAvg = -999;
-                try {
-                    VehicleDataMonitor monitor = VehicleDataMonitor.getInstance();
-                    BatteryThermalData thermal = monitor.getBatteryThermal();
-                    if (thermal != null && thermal.hasData()) {
-                        if (!Double.isNaN(thermal.highestTempC)) tHi = thermal.highestTempC;
-                        if (!Double.isNaN(thermal.lowestTempC)) tLo = thermal.lowestTempC;
-                        if (!Double.isNaN(thermal.averageTempC)) { tAvg = thermal.averageTempC; packTemp = tAvg; }
-                    }
-                } catch (Exception e) { /* use defaults */ }
+                double tHi = pendingCloseTempHigh;
+                double tLo = pendingCloseTempLow;
+                double tAvg = pendingCloseTempAvg;
+                if (tAvg > -999) packTemp = tAvg;
+
+                // Resolve the peak BEFORE the AC/DC verdict consumes it: deriveIsDc requires a
+                // DC-plausible peak to honour a DC gun, and the coarse 2-minute running max can
+                // miss a ramp peak that the 12-second sampler recorded. Using the coarse figure
+                // alone downgraded genuine DC sessions to the AC rate.
+                chargingPeakPower = resolvePeakKw(chargingStartTime, chargingPeakPower);
 
                 // AC/DC from gun state, peak-guarded against a HAL gun misread
                 // (a DC flag on a sub-DC-power charge is downgraded to unknown).
                 // gun: 2=AC 3=DC 4=AC_DC 5=V2L; AC_DC/V2L/unknown -> -1.
-                int isDc = deriveIsDc(chargingGunState, chargingPeakPower);
-                boolean isAcCharge = (isDc == 0);
+                int isDc = pendingCloseIsDc >= -1
+                        ? pendingCloseIsDc : deriveIsDc(chargingGunState, chargingPeakPower);
 
                 // Range gained derived from energy × the car's efficiency — the
                 // elecRangeKm delta was unavailable during parked charging (always
@@ -1238,46 +2331,172 @@ public class SocHistoryDatabase {
                 int rangeGained = rangeGainedFromEnergy(energyAdded);
                 // Price at the tariff registered for WHERE this charge happened;
                 // absent a match, the global DC/base rate (see priceSession).
-                PricingDecision pd = priceSession(isDc, chargingStartLat, chargingStartLng);
+                if (pendingClosePricing == null) {
+                    pendingClosePricing = priceSessionForClose(
+                            isDc, chargingStartLat, chargingStartLng);
+                }
+                // If the first config read failed, the retry that succeeds must freeze its result
+                // before H2 is attempted again. Otherwise another restart/config edit can price the
+                // same physical boundary differently.
+                if (!persistChargingLifecycleJournal()) {
+                    throw new java.io.IOException(
+                            "charging close snapshot was not durable");
+                }
+                PricingDecision pd = pendingClosePricing;
                 double rate = pd.rate;
                 String curr = pd.currency;
                 double cost = pd.costFor(energyAdded);
                 // Use the value latched WHILE charging — re-reading now would
                 // get ~0 since charging just stopped.
                 int ttf = chargingTimeToFullMin;
-                double avgPower = chargingPowerCount > 0 ? chargingPowerSum / chargingPowerCount : -1;
+                // Time-weighted, so it always agrees with energy/duration. The old unweighted mean
+                // over irregularly-spaced ticks could disagree with the row's own energy and
+                // duration by a large factor on a tapering session.
+                double avgPower = timeWeightedAvgKw(energyAdded, chargingStartTime, now);
+                if (avgPower < 0 && chargingPowerCount > 0) {
+                    avgPower = chargingPowerSum / chargingPowerCount;   // no energy figure to divide
+                }
+
+                final boolean sohCalibrationCandidate =
+                        isFinite(socDelta)
+                                && socDelta >= 25.0
+                                && isFinite(tAvg)
+                                && tAvg >= 15.0
+                                && tAvg <= 35.0
+                                && energyRes.canCalibrateSoh();
+                final SohCalibrationFrame stagedSohFrame =
+                        sohCalibrationCandidate
+                                ? captureSohCalibrationFrame(getSohEstimator()) : null;
+                final boolean stageSohCalibration =
+                        sohCalibrationCandidate && stagedSohFrame != null;
+                final double stagedSohEnergyKwh =
+                        stageSohCalibration
+                                ? energyRes.socIndependentKwh : Double.NaN;
+                double stagedHighCellV = Double.NaN;
+                if (stageSohCalibration) {
+                    try {
+                        com.overdrive.app.byd.BydDataCollector col =
+                                com.overdrive.app.byd.BydDataCollector.getInstance();
+                        if (col != null && col.isInitialized()) {
+                            com.overdrive.app.byd.BydVehicleData vd = col.getData();
+                            if (vd != null && !Double.isNaN(vd.highCellVoltage)) {
+                                stagedHighCellV = vd.highCellVoltage;
+                            }
+                        }
+                    } catch (Exception ignored) {
+                        // Cell voltage is optional; temperature and SOC quality are not.
+                    }
+                }
+                final double persistedHighCellV = stagedHighCellV;
 
                 String sql = "UPDATE " + TABLE_CHARGING +
                     " SET end_time = ?, end_soc = ?, energy_added_kwh = ?, avg_power_kw = ?, peak_power_kw = ?, " +
                     "range_gained_km = ?, is_dc = ?, electricity_rate = ?, currency = ?, session_cost = ?, " +
                     "time_to_full_min = ?, hv_temp_high = ?, hv_temp_low = ?, hv_temp_avg = ?, " +
-                    "tariff_id = ?, tariff_label = ? " +
+                    "tariff_id = ?, tariff_label = ?, " +
+                    "energy_source = ?, energy_soc_kwh = ?, energy_incomplete = ?, " +
+                    "counter_energy_kwh = ?, counter_last_kwh = ?, counter_source = ?, " +
+                    "counter_full_scale_kwh = ?, counter_last_at_ms = ?, " +
+                    "counter_observation_generation = ?, counter_wrap_count = ?, " +
+                    "counter_reset_count = ?, counter_ceiling_streak = ?, counter_saturated = ?, " +
+                    "counter_abandoned_kwh = ?, counter_unattributed_gaps = ?, " +
+                    "counter_awaiting_gap = ?, counter_gap_reconstructed = ?, " +
+                    "counter_gap_estimate_kwh = ?, counter_recent_rate_kwh_per_h = ?, " +
+                    "resume_blocked = ?, " +
+                    "post_commit_tariff_applied = ?, post_commit_soh_applied = ?, " +
+                    "soh_calibration_energy_kwh = ?, soh_calibration_cell_v = ?, " +
+                    "soh_calibration_nominal_identity = ?, " +
+                    "soh_calibration_estimator_generation = ?, " +
+                    "soh_calibration_reset_model_epoch = ?, " +
+                    "soh_calibration_prior_at_ms = ?, soh_calibration_rejected = 0 " +
                     "WHERE start_time = ? AND end_time IS NULL;";
 
-                try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
-                    pstmt.setLong(1, now);
-                    pstmt.setDouble(2, soc);
-                    pstmt.setDouble(3, energyAdded);
-                    pstmt.setDouble(4, avgPower);
-                    pstmt.setDouble(5, chargingPeakPower);
-                    pstmt.setInt(6, rangeGained);
-                    pstmt.setInt(7, isDc);
-                    pstmt.setDouble(8, rate);
-                    pstmt.setString(9, curr);
-                    pstmt.setDouble(10, cost);
-                    pstmt.setInt(11, ttf);
-                    pstmt.setDouble(12, tHi);
-                    pstmt.setDouble(13, tLo);
-                    pstmt.setDouble(14, tAvg);
-                    pstmt.setString(15, pd.tariffId);
-                    pstmt.setString(16, pd.tariffLabel);
-                    pstmt.setLong(17, chargingStartTime);
-                    pstmt.executeUpdate();
-                }
-                noteTariffUsed(pd.tariffId, now);
+                final double persistedEnergyAdded = energyAdded;
+                final double persistedAvgPower = avgPower;
+                final double persistedPeakPower = chargingPeakPower;
+                final double persistedTHi = tHi;
+                final double persistedTLo = tLo;
+                final double persistedTAvg = tAvg;
+                final long persistedEndTime = now;
+                final double persistedEndSoc = soc;
+                runInTransaction(() -> {
+                    try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+                        pstmt.setLong(1, persistedEndTime);
+                        pstmt.setDouble(2, persistedEndSoc);
+                        pstmt.setDouble(3, persistedEnergyAdded);
+                        pstmt.setDouble(4, persistedAvgPower);
+                        pstmt.setDouble(5, persistedPeakPower);
+                        pstmt.setInt(6, rangeGained);
+                        pstmt.setInt(7, isDc);
+                        pstmt.setDouble(8, rate);
+                        pstmt.setString(9, curr);
+                        pstmt.setDouble(10, cost);
+                        pstmt.setInt(11, ttf);
+                        pstmt.setDouble(12, persistedTHi);
+                        pstmt.setDouble(13, persistedTLo);
+                        pstmt.setDouble(14, persistedTAvg);
+                        pstmt.setString(15, pd.tariffId);
+                        pstmt.setString(16, pd.tariffLabel);
+                        // Provenance: which estimate won, the independent SOC figure it was checked
+                        // against, and whether the total is known to be missing a segment. Recorded so
+                        // a support question can be answered without re-deriving anything.
+                        pstmt.setString(17, energyRes.source);
+                        if (!Double.isNaN(energyRes.socEstimateKwh)) {
+                            pstmt.setDouble(18, energyRes.socEstimateKwh);
+                        } else {
+                            pstmt.setNull(18, java.sql.Types.DOUBLE);
+                        }
+                        pstmt.setInt(19, energyRes.incomplete ? 1 : 0);
+                        if (chargingCounter.hasBaseline()) {
+                            pstmt.setDouble(20, chargingCounter.energyKwh());
+                            pstmt.setDouble(21, chargingCounter.lastRawKwh());
+                            if (counterOwner != null) pstmt.setString(22, counterOwner);
+                            else pstmt.setNull(22, java.sql.Types.VARCHAR);
+                            pstmt.setDouble(23, chargingCounter.fullScaleKwh());
+                        } else {
+                            pstmt.setNull(20, java.sql.Types.DOUBLE);
+                            pstmt.setNull(21, java.sql.Types.DOUBLE);
+                            pstmt.setNull(22, java.sql.Types.VARCHAR);
+                            pstmt.setNull(23, java.sql.Types.DOUBLE);
+                        }
+                        int next = bindCounterState(
+                                pstmt, 24, chargingCounter.snapshotState());
+                        pstmt.setInt(next++, pendingCloseResumeBlocked ? 1 : 0);
+                        pstmt.setInt(next++, pd.tariffId.isEmpty() ? 1 : 0);
+                        pstmt.setInt(next++, stageSohCalibration ? 0 : 1);
+                        if (stageSohCalibration) {
+                            pstmt.setDouble(next++, stagedSohEnergyKwh);
+                        } else {
+                            pstmt.setNull(next++, java.sql.Types.DOUBLE);
+                        }
+                        if (!Double.isNaN(persistedHighCellV)) {
+                            pstmt.setDouble(next++, persistedHighCellV);
+                        } else {
+                            pstmt.setNull(next++, java.sql.Types.DOUBLE);
+                        }
+                        if (stageSohCalibration) {
+                            pstmt.setString(next++, stagedSohFrame.nominalIdentity);
+                            pstmt.setLong(next++, stagedSohFrame.estimatorGeneration);
+                            pstmt.setLong(next++, stagedSohFrame.resetModelEpoch);
+                            pstmt.setLong(next++, stagedSohFrame.priorCalibrationAtMs);
+                        } else {
+                            pstmt.setNull(next++, java.sql.Types.VARCHAR);
+                            pstmt.setNull(next++, java.sql.Types.BIGINT);
+                            pstmt.setNull(next++, java.sql.Types.BIGINT);
+                            pstmt.setNull(next++, java.sql.Types.BIGINT);
+                        }
+                        pstmt.setLong(next, chargingStartTime);
+                        if (pstmt.executeUpdate() != 1) {
+                            throw new java.sql.SQLException(
+                                    "session close found no matching open session");
+                        }
+                    }
 
-                // Fold this session into the permanent daily rollup.
-                foldSessionIntoDaily(now, energyAdded, cost, isDc, chargingPeakPower, rangeGained);
+                    // A closed row and its permanent daily contribution are one accounting unit.
+                    foldSessionIntoDaily(persistedEndTime, persistedEnergyAdded, cost, isDc, persistedPeakPower,
+                            rangeGained, energyRes.incomplete);
+                });
+                replayPendingChargingPostCommitMetadata();
 
                 logger.info("Charging session ended at " + soc + "% (+" +
                     String.format("%.1f", socDelta) + "%, ~" +
@@ -1286,33 +2505,136 @@ public class SocHistoryDatabase {
                     (isDc == 1 ? "DC" : isDc == 0 ? "AC" : "?") + ", " +
                     String.format("%.0f", packTemp) + "°C)");
 
-                // Feed calibration data to SohEstimator for ongoing SOH tracking.
-                // Pass the highest cell voltage observed at session end so
-                // updateFromCalibration() can pick LFP vs NMC chemistry scale.
-                if (sohEst != null && socDelta > 0 && energyAdded > 0) {
-                    double highCellV = Double.NaN;
-                    try {
-                        com.overdrive.app.byd.BydDataCollector col =
-                            com.overdrive.app.byd.BydDataCollector.getInstance();
-                        if (col != null && col.isInitialized()) {
-                            com.overdrive.app.byd.BydVehicleData vd = col.getData();
-                            if (vd != null && !Double.isNaN(vd.highCellVoltage)) {
-                                highCellV = vd.highCellVoltage;
-                            }
-                        }
-                    } catch (Exception ignored) { /* keep NaN → defaults to LFP */ }
-                    try {
-                        sohEst.updateFromCalibration(energyAdded, socDelta, packTemp, isAcCharge, highCellV);
-                    } catch (Exception e) {
-                        logger.debug("SOH calibration update failed: " + e.getMessage());
+                // Publish the committed close to memory only after both the row and daily rollup are
+                // durable. Retain the final counter solely as the next session's stale-value fence.
+                resetLiveChargingState(true);
+            }
+
+            wasCharging = isCharging;
+            if (!wasCharging) chargingLifecycleHold = false;
+            if (lifecycleTransition && isCharging) {
+                chargingLifecycleJournalDirty = true;
+            }
+            return !chargingLifecycleJournalDirty
+                    || persistChargingLifecycleJournal();
+
+        } catch (Exception e) {
+            final boolean closeAttempt = !isCharging && wasCharging && chargingStartTime > 0;
+            final long attemptedStart = chargingStartTime;
+            if (startAttempt != null && reconcileDurableSessionStart(startAttempt)) {
+                logger.warn("Charging start for session " + startAttempt.sessionStart
+                        + " threw after persistence committed; reconciled the exact open row"
+                        + " and its continuation claim");
+                noteWriteOk();
+                return persistChargingLifecycleJournal();
+            }
+            if (closeAttempt && isSessionDurablyClosed(attemptedStart)) {
+                logger.warn("Charging close for session " + attemptedStart
+                        + " threw after persistence committed; reconciled exact closed row");
+                replayPendingChargingPostCommitMetadata();
+                resetLiveChargingState(true);
+                noteWriteOk();
+                return persistChargingLifecycleJournal();
+            }
+            logger.error("Failed to track charging session", e);
+            if (isSqlFailure(e)) {
+                noteWriteFailed();
+                try { reconnect(); } catch (Exception ignored) {}
+            }
+            // A failed connection can prevent the first reconciliation query even when COMMIT was
+            // durable. Retry once after the normal reconnect path before exposing failure to the
+            // manager; otherwise every retry updates zero rows and the in-memory session stays open.
+            if (closeAttempt && isSessionDurablyClosed(attemptedStart)) {
+                logger.warn("Charging close for session " + attemptedStart
+                        + " reconciled as durable after reconnect");
+                replayPendingChargingPostCommitMetadata();
+                resetLiveChargingState(true);
+                noteWriteOk();
+                return persistChargingLifecycleJournal();
+            }
+            if (startAttempt != null && reconcileDurableSessionStart(startAttempt)) {
+                logger.warn("Charging start for session " + startAttempt.sessionStart
+                        + " reconciled as durable after reconnect, including its continuation claim");
+                noteWriteOk();
+                return persistChargingLifecycleJournal();
+            }
+            if (startAttempt != null || (isCharging && !wasCharging)) {
+                // No start row committed. Keep the pre-session counter buffer for retry, but clear
+                // transient offer ownership; the database claim rolled back with the INSERT.
+                continuationSource = null;
+                pendingSweepMarkerRow = -1L;
+                clearClaimedContinuationOffer();
+            }
+            return false;
+        }
+    }
+
+    /** Exact-row reconciliation for the uncertain-result side of JDBC commit. */
+    private boolean isSessionDurablyClosed(long sessionStart) {
+        Connection c = connection;
+        if (c == null || sessionStart <= 0) return false;
+        try (PreparedStatement p = c.prepareStatement(
+                "SELECT end_time FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
+            p.setLong(1, sessionStart);
+            try (ResultSet rs = p.executeQuery()) {
+                if (!rs.next()) return false;
+                long end = rs.getLong(1);
+                return !rs.wasNull() && end > 0;
+            }
+        } catch (Exception reconcileFailure) {
+            logger.debug("Could not reconcile charging close for session " + sessionStart
+                    + ": " + reconcileFailure.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Reconcile the uncertain-result side of a session-start commit. The new row and the prior row's
+     * continuation claim are one transaction, so both must be durable before memory adopts the start.
+     */
+    private boolean reconcileDurableSessionStart(SessionStartAttempt attempt) {
+        Connection c = connection;
+        if (c == null || attempt == null || attempt.sessionStart <= 0) return false;
+        try {
+            try (PreparedStatement p = c.prepareStatement(
+                    "SELECT end_time FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
+                p.setLong(1, attempt.sessionStart);
+                try (ResultSet rs = p.executeQuery()) {
+                    if (!rs.next()) return false;
+                    rs.getLong(1);
+                    if (!rs.wasNull()) return false;
+                }
+            }
+            ContinuationOffer offer = attempt.continuationOffer;
+            if (offer != null) {
+                try (PreparedStatement p = c.prepareStatement(
+                        "SELECT continuation_claimed FROM " + TABLE_CHARGING
+                                + " WHERE start_time = ?;")) {
+                    p.setLong(1, offer.rowStart);
+                    try (ResultSet rs = p.executeQuery()) {
+                        if (!rs.next() || rs.getInt(1) != 1) return false;
                     }
                 }
             }
 
-            wasCharging = isCharging;
-
-        } catch (Exception e) {
-            logger.error("Failed to track charging session", e);
+            chargingStartTime = attempt.sessionStart;
+            activateClaimedContinuationOffer(offer, attempt.sessionStart,
+                    attempt.continuationAlreadyResolved);
+            preSessionCounterLowKwh = Double.NaN;
+            preSessionCounterAtMs = 0L;
+            preSessionCounterSource = null;
+            clearPreSessionProvisionalExternal();
+            counterProgressDirty = false;
+            wasCharging = true;
+            if (attempt.deferredPhysicalStart) {
+                consumeDeferredPhysicalSessionAfterStart(attempt.sessionStart);
+            }
+            resolvePlaceLabelAsync(chargingStartTime, chargingStartLat, chargingStartLng);
+            return true;
+        } catch (Exception reconcileFailure) {
+            logger.debug("Could not reconcile charging start for session " + attempt.sessionStart
+                    + ": " + reconcileFailure.getMessage());
+            return false;
         }
     }
 
@@ -1332,7 +2654,10 @@ public class SocHistoryDatabase {
         if (!isInitialized || connection == null) return 0L;
         try (PreparedStatement ps = connection.prepareStatement(
                 "SELECT MAX(timestamp) FROM " + TABLE_SOC +
-                " WHERE is_charging = 1 AND timestamp >= ? AND timestamp <= ?;")) {
+                // Upper bound EXCLUSIVE. The caller passes the next session's start_time, and a
+                // heartbeat is written AT that instant — an inclusive bound handed the newer charge's
+                // first heartbeat to the older row as its final activity.
+                " WHERE is_charging = 1 AND timestamp >= ? AND timestamp < ?;")) {
             ps.setLong(1, startInclusive);
             ps.setLong(2, upperInclusive);
             try (ResultSet rs = ps.executeQuery()) {
@@ -1345,6 +2670,35 @@ public class SocHistoryDatabase {
             logger.debug("maxChargingHeartbeat failed: " + e.getMessage());
         }
         return 0L;
+    }
+
+    /**
+     * SoC% from the LAST charging heartbeat in the window, or NaN.
+     *
+     * <p>Companion to {@link #maxChargingHeartbeat}, which already uses these rows as the activity
+     * signal on models that produce no power samples. Their SoC was being ignored, so a stale session
+     * with no power samples closed with {@code end_soc = start_soc} — recording zero SoC gain for a
+     * charge that demonstrably delivered, and denying the energy resolver its SOC-derived estimate.
+     */
+    private double lastChargingHeartbeatSoc(long startInclusive, long upperInclusive) {
+        if (!isInitialized || connection == null) return Double.NaN;
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT soc_percent FROM " + TABLE_SOC +
+                // Exclusive upper bound, same reason as maxChargingHeartbeat.
+                " WHERE is_charging = 1 AND timestamp >= ? AND timestamp < ?" +
+                " ORDER BY timestamp DESC LIMIT 1;")) {
+            ps.setLong(1, startInclusive);
+            ps.setLong(2, upperInclusive);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    double v = rs.getDouble(1);
+                    if (!rs.wasNull() && v >= 0) return v;
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("lastChargingHeartbeatSoc failed: " + e.getMessage());
+        }
+        return Double.NaN;
     }
 
     /**
@@ -1363,31 +2717,102 @@ public class SocHistoryDatabase {
      * deletes them. Finally it re-opens the canonical row and rehydrates the
      * in-memory aggregates so peak/avg/start-soc/range continue seamlessly.
      */
+    private static final class ResumeState {
+        double peak;
+        double powerSum;
+        int powerCount;
+        int gun = -1;
+        int startRange = -1;
+        int startOdometer = -1;
+        double lat;
+        double lng;
+    }
+
+    private static final class ResumeCommitAttempt {
+        final long canonicalStart;
+        final long boundaryAt;
+        final java.util.List<Long> mergedStarts;
+        final double canonicalStartSoc;
+        final CounterRestoreState counterState;
+        final ResumeState state;
+        final int mergedMembers;
+        final double currentSoc;
+
+        ResumeCommitAttempt(long canonicalStart, long boundaryAt,
+                            java.util.List<Long> mergedStarts, double canonicalStartSoc,
+                            CounterRestoreState counterState, ResumeState state,
+                            int mergedMembers, double currentSoc) {
+            this.canonicalStart = canonicalStart;
+            this.boundaryAt = boundaryAt;
+            this.mergedStarts = mergedStarts;
+            this.canonicalStartSoc = canonicalStartSoc;
+            this.counterState = counterState;
+            this.state = state;
+            this.mergedMembers = mergedMembers;
+            this.currentSoc = currentSoc;
+        }
+    }
+
+    private static final class CounterRestoreState {
+        double baseline = Double.NaN;
+        double last = Double.NaN;
+        double energy = Double.NaN;
+        double fullScale = Double.NaN;
+        boolean incomplete;
+        String source;
+        com.overdrive.app.charging.ChargeCounterAccumulator.State exactState;
+    }
+
+    private static final class ContinuationOffer {
+        final long rowStart;
+        final double endpointKwh;
+        final String source;
+        final double startSoc;
+        final double fullScaleKwh;
+
+        ContinuationOffer(long rowStart, double endpointKwh, String source,
+                          double startSoc, double fullScaleKwh) {
+            this.rowStart = rowStart;
+            this.endpointKwh = endpointKwh;
+            this.source = source;
+            this.startSoc = startSoc;
+            this.fullScaleKwh = fullScaleKwh;
+        }
+    }
+
+    private static final class SessionStartAttempt {
+        final long sessionStart;
+        final ContinuationOffer continuationOffer;
+        final boolean continuationAlreadyResolved;
+        final boolean deferredPhysicalStart;
+
+        SessionStartAttempt(long sessionStart, ContinuationOffer continuationOffer,
+                            boolean continuationAlreadyResolved, boolean deferredPhysicalStart) {
+            this.sessionStart = sessionStart;
+            this.continuationOffer = continuationOffer;
+            this.continuationAlreadyResolved = continuationAlreadyResolved;
+            this.deferredPhysicalStart = deferredPhysicalStart;
+        }
+    }
+
     private boolean tryResumeChargingSession(long now, double soc) {
         if (!isInitialized || connection == null) return false;
+        ResumeCommitAttempt resumeAttempt = null;
         try {
-            // Pull recent sessions (bounded to a day) newest-first. We then
-            // measure each session's "last activity" from the MAX of:
-            //   (a) its last charging_power_samples row,
-            //   (b) its charging heartbeat in soc_history (is_charging=1 rows,
-            //       written every <=2 min by the independent SOC scheduler even
-            //       when NO power samples exist — the exact case that broke resume
-            //       on models reporting no charging-power signal, fragmenting one
-            //       physical charge into a new row every daemon restart / detector
-            //       flip and resetting energy/range/cost to ~0),
-            //   (c) close time, (d) start.
-            // The heartbeat (b) is scoped to [start, nextNewerSessionStart] (or
-            // [start, now] for the newest) so a LATER charge's heartbeat can never
-            // bleed onto an older session and wrongly merge two distinct charges.
-            java.util.List<long[]> rows = new java.util.ArrayList<>(); // [start, end, lastActivity]
+            java.util.List<long[]> rows = new java.util.ArrayList<>(); // [start, end, activity]
             java.util.List<Double> startSocs = new java.util.ArrayList<>();
-            java.util.List<Double> endSocs = new java.util.ArrayList<>(); // NaN = open / unknown
-            java.util.List<long[]> raw = new java.util.ArrayList<>();   // [start, end, cpsLastT(0=none)]
+            java.util.List<Double> endSocs = new java.util.ArrayList<>();
+            java.util.List<Boolean> resumeBlocked = new java.util.ArrayList<>();
+            java.util.List<Boolean> integrationTruncated = new java.util.ArrayList<>();
+            java.util.List<long[]> raw = new java.util.ArrayList<>();  // [start, end, last sample]
             long sinceTs = now - 24L * 60 * 60 * 1000L;
             try (PreparedStatement sel = connection.prepareStatement(
-                    "SELECT c.start_time, c.end_time, c.start_soc, c.end_soc, " +
-                    "  (SELECT MAX(t) FROM " + TABLE_CPS + " s WHERE s.session_start_time = c.start_time) AS last_t " +
-                    "FROM " + TABLE_CHARGING + " c WHERE c.start_time >= ? ORDER BY c.start_time DESC;")) {
+                    "SELECT c.start_time, c.end_time, c.start_soc, c.end_soc, "
+                    + "c.resume_blocked, c.integration_truncated, "
+                    + "(SELECT MAX(t) FROM " + TABLE_CPS
+                    + " s WHERE s.session_start_time = c.start_time) AS last_t "
+                    + "FROM " + TABLE_CHARGING
+                    + " c WHERE c.start_time >= ? ORDER BY c.start_time DESC;")) {
                 sel.setLong(1, sinceTs);
                 try (ResultSet rs = sel.executeQuery()) {
                     while (rs.next()) {
@@ -1397,226 +2822,266 @@ public class SocHistoryDatabase {
                         boolean ltNull = rs.wasNull();
                         double endSoc = rs.getDouble("end_soc");
                         if (rs.wasNull()) endSoc = Double.NaN;
-                        raw.add(new long[]{ st, en, (!ltNull && lt > 0) ? lt : 0L });
+                        raw.add(new long[]{st, en, (!ltNull && lt > 0) ? lt : 0L});
                         startSocs.add(rs.getDouble("start_soc"));
                         endSocs.add(endSoc);
+                        resumeBlocked.add(rs.getInt("resume_blocked") == 1);
+                        integrationTruncated.add(rs.getInt("integration_truncated") == 1);
                     }
                 }
             }
             if (raw.isEmpty()) return false;
+            // The newest row is an explicit lifecycle barrier. Looking past it would merely resume
+            // an older row into the same opted-out interval the durable marker is meant to exclude.
+            if (resumeBlocked.get(0)) return false;
 
-            // Second pass: fold in the per-session-scoped charging heartbeat.
             for (int i = 0; i < raw.size(); i++) {
                 long st = raw.get(i)[0];
                 long en = raw.get(i)[1];
-                long cpsLast = raw.get(i)[2];
-                // Upper bound = just BEFORE the next-NEWER session's start (rows
-                // are DESC), or `now` for the newest. The session-start tick writes
-                // an is_charging=1 row at exactly the newer session's start_time;
-                // excluding it (upper-1) keeps that boundary row attributed to the
-                // newer session only, not double-counted onto this older one.
-                long upper = (i == 0) ? now : raw.get(i - 1)[0] - 1;
-                long hb = maxChargingHeartbeat(st, upper);
-                // start (st) is the floor; cpsLast/hb/en are 0 when absent.
-                long act = Math.max(Math.max(cpsLast, hb), Math.max(en, st));
-                rows.add(new long[]{ st, en, act });
+                long upper = (i == 0) ? now - 1 : raw.get(i - 1)[0] - 1;
+                long heartbeat = maxChargingHeartbeat(st, upper);
+                long activity = Math.max(Math.max(raw.get(i)[2], heartbeat), Math.max(en, st));
+                rows.add(new long[]{st, en, activity});
             }
-            if (rows.isEmpty()) return false;
-
-            // The newest session must itself be recent enough to belong to this
-            // charge (its last activity within the window of now).
-            if (now - rows.get(0)[2] > CHARGING_MERGE_GAP_MS || now - rows.get(0)[2] < 0) return false;
-
-            // Unplug→short-drive→replug separator. The heartbeat keeps `act` fresh
-            // across a brief unplug+drive, so the within-window check above (and
-            // the canonical-start SOC guard below) is no longer sufficient to tell
-            // "one charge interrupted by a daemon restart" from "two distinct
-            // charges 10 min apart". Distinguishing signal: a genuine
-            // restart-mid-charge leaves the NEWEST session still OPEN (SESSION END
-            // never ran → end_soc NULL). An unplug→drive→replug leaves the newest
-            // session CLOSED (end_soc set) AND current SOC has DROPPED since that
-            // close (the drive consumed energy). So: if the newest candidate is
-            // closed and SOC fell below its end_soc, this is a new charge — decline
-            // resume and let the caller INSERT a fresh row. (Open newest → genuine
-            // resume, untouched. Charging never lowers SOC, so for a true continued
-            // charge soc >= end_soc always holds.)
+            if (now - rows.get(0)[2] > CHARGING_MERGE_GAP_MS
+                    || now - rows.get(0)[2] < 0) return false;
             double newestEndSoc = endSocs.get(0);
             if (!Double.isNaN(newestEndSoc) && soc + 1.0 < newestEndSoc) return false;
 
-            // Walk newest→oldest, extending the chain while consecutive gaps
-            // (older.lastActivity → newer.start) stay within the window.
-            int chainEnd = 0; // index of the EARLIEST member (inclusive)
+            int chainEnd = 0;
             for (int i = 1; i < rows.size(); i++) {
-                long newerStart = rows.get(i - 1)[0];
-                long olderActivity = rows.get(i)[2];
-                long gap = newerStart - olderActivity;
+                if (resumeBlocked.get(i)) break;
+                long gap = rows.get(i - 1)[0] - rows.get(i)[2];
                 if (gap < 0 || gap > CHARGING_MERGE_GAP_MS) break;
                 chainEnd = i;
             }
-
-            // Canonical = earliest in the chain; its start anchors the merge.
-            long canonStart = rows.get(chainEnd)[0];
-            double canonStartSoc = startSocs.get(chainEnd);
-            // SOC must not have DROPPED below the canonical start — a lower SOC
-            // means a drive happened (genuinely new charge), so don't merge.
+            boolean chainHasTruncatedIntegration = false;
+            for (int i = 0; i <= chainEnd; i++) {
+                chainHasTruncatedIntegration |= integrationTruncated.get(i);
+            }
+            final int mergedMembers = chainEnd;
+            // Any restart gap is observationally incomplete even when it is shorter than the old
+            // ten-minute integration cap: charging may have stopped and restarted while the daemon
+            // was absent. A boundary prevents pricing that idle interval as delivered energy.
+            final boolean resumedIntegrationTruncated = true;
+            final long canonStart = rows.get(chainEnd)[0];
+            final double canonStartSoc = startSocs.get(chainEnd);
             if (soc + 1.0 < canonStartSoc) return false;
 
-            // Fold every newer chain member into the canonical row, then drop it.
-            for (int i = 0; i < chainEnd; i++) {
+            // Read counter state before any mutation. A failed restoration query must decline resume
+            // while every row and daily bucket is still untouched.
+            final CounterRestoreState counterState = readCounterRestoreState(canonStart);
+            final ResumeState state = new ResumeState();
+            final java.util.Set<Long> affectedDays = new java.util.LinkedHashSet<>();
+            final long resumeBoundaryAt = Math.max(canonStart + 1L, now - 1L);
+            final java.util.List<Long> mergedStarts = new java.util.ArrayList<>();
+            for (int i = 0; i < mergedMembers; i++) {
                 long memberStart = rows.get(i)[0];
-                long memberEnd = rows.get(i)[1];
-                if (memberStart == canonStart) continue;
-                // Read the member's closed contribution so we can reverse its fold.
-                if (memberEnd > 0) {
-                    double mE = 0, mC = 0; int mDc = -1, mR = 0;
-                    try (PreparedStatement r = connection.prepareStatement(
-                            "SELECT energy_added_kwh, session_cost, is_dc, range_gained_km FROM " +
-                            TABLE_CHARGING + " WHERE start_time = ?;")) {
-                        r.setLong(1, memberStart);
-                        try (ResultSet rs = r.executeQuery()) {
-                            if (rs.next()) {
-                                double e = rs.getDouble(1); mE = rs.wasNull() ? 0 : e;
-                                double c = rs.getDouble(2); mC = rs.wasNull() ? 0 : c;
-                                int dcVal = rs.getInt(3); mDc = rs.wasNull() ? -1 : dcVal;
-                                int rg = rs.getInt(4); mR = rs.wasNull() ? 0 : rg;
-                            }
+                if (memberStart != canonStart) mergedStarts.add(memberStart);
+            }
+            resumeAttempt = new ResumeCommitAttempt(
+                    canonStart, resumeBoundaryAt, mergedStarts, canonStartSoc,
+                    counterState, state, mergedMembers, soc);
+
+            runInTransaction(() -> {
+                for (int i = 0; i < mergedMembers; i++) {
+                    long memberStart = rows.get(i)[0];
+                    long memberEnd = rows.get(i)[1];
+                    if (memberStart == canonStart) continue;
+                    if (memberEnd > 0) affectedDays.add(dayEpoch(memberEnd));
+
+                    try (PreparedStatement rk = connection.prepareStatement(
+                            "UPDATE " + TABLE_CPS
+                            + " SET session_start_time = ? WHERE session_start_time = ?;")) {
+                        rk.setLong(1, canonStart);
+                        rk.setLong(2, memberStart);
+                        rk.executeUpdate();
+                    }
+                    try (PreparedStatement ins = connection.prepareStatement(
+                            "INSERT INTO " + TABLE_CPS
+                            + " (session_start_time, t, power_kw, soc, temp, temp_high, temp_low)"
+                            + " VALUES (?, ?, -1, 0, -999, -999, -999);")) {
+                        ins.setLong(1, canonStart);
+                        ins.setLong(2, memberStart - 1);
+                        ins.executeUpdate();
+                    }
+                    try (PreparedStatement del = connection.prepareStatement(
+                            "DELETE FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
+                        del.setLong(1, memberStart);
+                        if (del.executeUpdate() != 1) {
+                            throw new java.sql.SQLException(
+                                    "resume member disappeared before consolidation: " + memberStart);
                         }
                     }
-                    reverseDailyFoldForSession(memberEnd, mE, mC, mDc, mR);
                 }
-                // Re-key the member's ramp samples onto the canonical session.
-                try (PreparedStatement rk = connection.prepareStatement(
-                        "UPDATE " + TABLE_CPS + " SET session_start_time = ? WHERE session_start_time = ?;")) {
-                    rk.setLong(1, canonStart);
-                    rk.setLong(2, memberStart);
-                    rk.executeUpdate();
+                try (PreparedStatement boundary = connection.prepareStatement(
+                        "INSERT INTO " + TABLE_CPS
+                                + " (session_start_time, t, power_kw, soc, temp, temp_high, temp_low)"
+                                + " VALUES (?, ?, -1, 0, -999, -999, -999);")) {
+                    boundary.setLong(1, canonStart);
+                    boundary.setLong(2, resumeBoundaryAt);
+                    boundary.executeUpdate();
                 }
-                // Insert a CHARGING-STOPPED boundary sentinel (power_kw = -1) just
-                // after this member's last sample. Once re-keyed, the member's
-                // samples are indistinguishable from the canonical run, so the
-                // energy integrator would otherwise bridge the inter-session idle
-                // gap into a spurious trapezoid (over-counting energy by that gap).
-                // integrateSessionEnergyKwh resets its trapezoid chain on any
-                // power_kw <= 0 row, so this sentinel cleanly severs the two
-                // physically distinct charges. (Fast-sampler skips ≤0 power, so a
-                // -1 row never collides with a real sample.) The member's samples
-                // all fall at/after memberStart, so a sentinel placed just BEFORE
-                // memberStart breaks the chain before the member segment begins.
-                try (PreparedStatement ins = connection.prepareStatement(
-                        "INSERT INTO " + TABLE_CPS +
-                        " (session_start_time, t, power_kw, soc, temp, temp_high, temp_low) " +
-                        "VALUES (?, ?, -1, 0, -999, -999, -999);")) {
-                    ins.setLong(1, canonStart);
-                    // Sever immediately BEFORE the member segment's first sample so
-                    // no trapezoid bridges the canonical run (or a prior segment)
-                    // into this member segment.
-                    ins.setLong(2, memberStart - 1);
-                    ins.executeUpdate();
+
+                try (PreparedStatement r = connection.prepareStatement(
+                        "SELECT end_time, peak_power_kw, gun_state, start_range_km,"
+                        + " start_odometer_km, start_lat, start_lng FROM " + TABLE_CHARGING
+                        + " WHERE start_time = ?;")) {
+                    r.setLong(1, canonStart);
+                    try (ResultSet rs = r.executeQuery()) {
+                        if (!rs.next()) {
+                            throw new java.sql.SQLException("resume canonical row missing");
+                        }
+                        long canonEnd = rs.getLong("end_time");
+                        if (!rs.wasNull() && canonEnd > 0) affectedDays.add(dayEpoch(canonEnd));
+                        double peak = rs.getDouble("peak_power_kw");
+                        state.peak = rs.wasNull() ? 0 : peak;
+                        state.gun = rs.getInt("gun_state");
+                        state.startRange = rs.getInt("start_range_km");
+                        state.startOdometer = rs.getInt("start_odometer_km");
+                        state.lat = rs.getDouble("start_lat");
+                        state.lng = rs.getDouble("start_lng");
+                    }
                 }
-                // Delete the now-empty member row.
-                try (PreparedStatement del = connection.prepareStatement(
-                        "DELETE FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
-                    del.setLong(1, memberStart);
-                    del.executeUpdate();
+                try (PreparedStatement upd = connection.prepareStatement(
+                        "UPDATE " + TABLE_CHARGING + " SET end_time = NULL, end_soc = NULL,"
+                        + " energy_added_kwh = NULL, session_cost = -1, range_gained_km = -1,"
+                        + " closed_by_sweep = 0, continuation_claimed = 0,"
+                        + " integration_truncated = ?"
+                        + " WHERE start_time = ?;")) {
+                    upd.setInt(1, resumedIntegrationTruncated ? 1 : 0);
+                    upd.setLong(2, canonStart);
+                    if (upd.executeUpdate() != 1) {
+                        throw new java.sql.SQLException("resume canonical reopen updated no row");
+                    }
+                }
+
+                try (PreparedStatement sp = connection.prepareStatement(
+                        "SELECT power_kw FROM " + TABLE_CPS
+                        + " WHERE session_start_time = ? AND power_kw > 0;")) {
+                    sp.setLong(1, canonStart);
+                    try (ResultSet rs = sp.executeQuery()) {
+                        while (rs.next()) {
+                            double p = rs.getDouble(1);
+                            if (p > state.peak) state.peak = p;
+                            state.powerSum += p;
+                            state.powerCount++;
+                        }
+                    }
+                }
+                for (long day : affectedDays) rebuildChargingDailyDay(day);
+            });
+
+            publishResumedSession(resumeAttempt);
+            return true;
+        } catch (Exception e) {
+            if (resumeAttempt != null && reconcileDurableResume(resumeAttempt)) {
+                logger.warn("Resume consolidation threw after its transaction committed; reconciled"
+                        + " canonical row " + resumeAttempt.canonicalStart);
+                publishResumedSession(resumeAttempt);
+                noteWriteOk();
+                return true;
+            }
+            if (isSqlFailure(e)) {
+                noteWriteFailed();
+                try { reconnect(); } catch (Exception ignored) {}
+            }
+            if (resumeAttempt != null && reconcileDurableResume(resumeAttempt)) {
+                logger.warn("Resume consolidation reconciled after reconnect for canonical row "
+                        + resumeAttempt.canonicalStart);
+                publishResumedSession(resumeAttempt);
+                noteWriteOk();
+                return true;
+            }
+            logger.debug("tryResumeChargingSession failed without mutation: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private boolean reconcileDurableResume(ResumeCommitAttempt attempt) {
+        Connection c = connection;
+        if (c == null || attempt == null) return false;
+        try {
+            try (PreparedStatement canonical = c.prepareStatement(
+                    "SELECT end_time, integration_truncated FROM " + TABLE_CHARGING
+                            + " WHERE start_time = ?;")) {
+                canonical.setLong(1, attempt.canonicalStart);
+                try (ResultSet rs = canonical.executeQuery()) {
+                    if (!rs.next()) return false;
+                    rs.getLong(1);
+                    if (!rs.wasNull() || rs.getInt(2) != 1) return false;
                 }
             }
-
-            // Read canonical row fields for rehydration.
-            double canonPeak = 0; int canonGun = -1, canonStartRange = -1, canonStartOdo = -1;
-            double canonLat = 0, canonLng = 0;
-            double canonEnergy = 0, canonCost = 0; int canonIsDc = -1, canonRange = 0; long canonEnd = 0;
-            try (PreparedStatement r = connection.prepareStatement(
-                    "SELECT end_time, peak_power_kw, gun_state, start_range_km, start_odometer_km, start_lat, start_lng, " +
-                    "energy_added_kwh, session_cost, is_dc, range_gained_km FROM " +
-                    TABLE_CHARGING + " WHERE start_time = ?;")) {
-                r.setLong(1, canonStart);
-                try (ResultSet rs = r.executeQuery()) {
-                    if (rs.next()) {
-                        canonEnd = rs.getLong("end_time");
-                        double pk = rs.getDouble("peak_power_kw"); canonPeak = rs.wasNull() ? 0 : pk;
-                        canonGun = rs.getInt("gun_state");
-                        canonStartRange = rs.getInt("start_range_km");
-                        canonStartOdo = rs.getInt("start_odometer_km");
-                        canonLat = rs.getDouble("start_lat");
-                        canonLng = rs.getDouble("start_lng");
-                        double e = rs.getDouble("energy_added_kwh"); canonEnergy = rs.wasNull() ? 0 : e;
-                        double c = rs.getDouble("session_cost");     canonCost = rs.wasNull() ? 0 : c;
-                        canonIsDc = rs.getInt("is_dc");
-                        int rg = rs.getInt("range_gained_km");       canonRange = rs.wasNull() ? 0 : rg;
+            for (long mergedStart : attempt.mergedStarts) {
+                try (PreparedStatement member = c.prepareStatement(
+                        "SELECT 1 FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
+                    member.setLong(1, mergedStart);
+                    try (ResultSet rs = member.executeQuery()) {
+                        if (rs.next()) return false;
                     }
                 }
             }
-            // If the canonical row had itself closed, reverse its fold too.
-            if (canonEnd > 0) reverseDailyFoldForSession(canonEnd, canonEnergy, canonCost, canonIsDc, canonRange);
-
-            // Re-open the canonical row (clear all end columns).
-            try (PreparedStatement upd = connection.prepareStatement(
-                    "UPDATE " + TABLE_CHARGING + " SET end_time = NULL, end_soc = NULL, " +
-                    "energy_added_kwh = NULL, session_cost = -1, range_gained_km = -1 " +
-                    "WHERE start_time = ?;")) {
-                upd.setLong(1, canonStart);
-                upd.executeUpdate();
-            }
-
-            // Rehydrate in-memory aggregates from the canonical row + ALL samples
-            // (including the just-re-keyed ones) so peak/mean continue honestly.
-            chargingStartTime = canonStart;
-            chargingStartSoc = canonStartSoc;
-            chargingGunState = canonGun;
-            // Keep the ORIGINAL start range. Do NOT re-anchor to the current
-            // range on resume — that reset range_gained to ~0 on every restart.
-            // If it was never captured (-1), leave it -1 so the next mid-session
-            // tick backfills the first valid reading.
-            chargingStartRange = canonStartRange;
-            // Same as range: keep the ORIGINAL start odometer; if it was never
-            // captured (-1) leave it -1 so the next mid-session tick backfills it.
-            chargingStartOdometer = canonStartOdo;
-            chargingStartLat = canonLat;
-            chargingStartLng = canonLng;
-            chargingTimeToFullMin = snapshotTimeToFullMin();
-            double peak = canonPeak, sum = 0; int count = 0;
-            try (PreparedStatement sp = connection.prepareStatement(
-                    "SELECT power_kw FROM " + TABLE_CPS + " WHERE session_start_time = ? AND power_kw > 0;")) {
-                sp.setLong(1, canonStart);
-                try (ResultSet rs = sp.executeQuery()) {
-                    while (rs.next()) {
-                        double p = rs.getDouble(1);
-                        if (p > peak) peak = p;
-                        sum += p; count++;
-                    }
+            try (PreparedStatement boundary = c.prepareStatement(
+                    "SELECT 1 FROM " + TABLE_CPS
+                            + " WHERE session_start_time = ? AND t = ? AND power_kw <= 0;")) {
+                boundary.setLong(1, attempt.canonicalStart);
+                boundary.setLong(2, attempt.boundaryAt);
+                try (ResultSet rs = boundary.executeQuery()) {
+                    return rs.next();
                 }
             }
-            chargingPeakPower = peak;
-            chargingPowerSum = sum;
-            chargingPowerCount = count;
+        } catch (Exception reconcileFailure) {
+            logger.debug("Could not reconcile charging resume for "
+                    + attempt.canonicalStart + ": " + reconcileFailure.getMessage());
+            return false;
+        }
+    }
 
-            // Re-trigger geocoding for the canonical row. The original START tried
-            // once, but if there was no GPS fix yet (or the place_label is still
-            // empty) the card falls back to raw lat/lng. Snapshot a fresh fix if
-            // the stored one is 0/0, then resolve a place name best-effort.
+    private void publishResumedSession(ResumeCommitAttempt attempt) {
+        ResumeState state = attempt.state;
+        chargingStartTime = attempt.canonicalStart;
+        chargingStartSoc = attempt.canonicalStartSoc;
+        chargingGunState = state.gun;
+        chargingStartRange = state.startRange;
+        chargingStartOdometer = state.startOdometer;
+        chargingStartLat = state.lat;
+        chargingStartLng = state.lng;
+        chargingTimeToFullMin = snapshotTimeToFullMin();
+        chargingPeakPower = state.peak;
+        chargingPowerSum = state.powerSum;
+        chargingPowerCount = state.powerCount;
+        clearClaimedContinuationOffer();
+        applyCounterRestoreState(attempt.counterState);
+
+        // Resume is already committed. Optional metadata backfill must not report "not resumed"
+        // to the caller, which would make it insert a second open row.
+        try {
             if (chargingStartLat == 0 && chargingStartLng == 0) {
                 double[] loc = snapshotLocation();
                 if (loc[0] != 0 || loc[1] != 0) {
                     chargingStartLat = loc[0];
                     chargingStartLng = loc[1];
                     try (PreparedStatement up = connection.prepareStatement(
-                            "UPDATE " + TABLE_CHARGING + " SET start_lat = ?, start_lng = ? WHERE start_time = ?;")) {
+                            "UPDATE " + TABLE_CHARGING
+                                    + " SET start_lat = ?, start_lng = ? WHERE start_time = ?;")) {
                         up.setDouble(1, chargingStartLat);
                         up.setDouble(2, chargingStartLng);
-                        up.setLong(3, canonStart);
+                        up.setLong(3, chargingStartTime);
                         up.executeUpdate();
                     }
                 }
             }
-            resolvePlaceLabelAsync(canonStart, chargingStartLat, chargingStartLng);
-
-            logger.info("Resumed+consolidated charging session start=" + canonStart
-                + " (merged " + chainEnd + " orphan row(s), soc=" + soc + "%, samples=" + count + ")");
-            return true;
         } catch (Exception e) {
-            logger.debug("tryResumeChargingSession failed: " + e.getMessage());
-            return false;
+            logger.debug("Resumed session location backfill failed: " + e.getMessage());
         }
+        try {
+            resolvePlaceLabelAsync(chargingStartTime, chargingStartLat, chargingStartLng);
+        } catch (Exception e) {
+            logger.debug("Resumed session place-label scheduling failed: " + e.getMessage());
+        }
+        logger.info("Resumed+consolidated charging session start=" + chargingStartTime
+                + " (merged " + attempt.mergedMembers + " orphan row(s), soc="
+                + attempt.currentSoc + "%, samples=" + state.powerCount + ")");
     }
 
     /**
@@ -1626,16 +3091,2793 @@ public class SocHistoryDatabase {
      * values). Called at init when NOT currently charging. Reconstructs the end
      * values from the recorded {@code charging_power_samples}: energy by ∫P·dt,
      * end_soc/temp/peak/avg from the last + max samples, then folds into the
-     * daily rollup. Skips a row whose last sample is too recent (< 2 min) — that
-     * could be a charge the resume path is about to re-adopt.
+     * daily rollup. Skips a row whose last activity is inside the resume window
+     * ({@link #CHARGING_MERGE_GAP_MS}) — that is a charge the resume path is about
+     * to re-adopt, and closing it here would split one physical charge in two.
      */
+    /**
+     * Open (or resume) the charging session row IMMEDIATELY on the fused charging edge, instead of
+     * waiting for the next 2-minute SoC tick.
+     *
+     * <p>Session bookkeeping runs on the {@link #SAMPLE_INTERVAL_MS} SoC tick, but the fused detector
+     * fires the moment charging is detected. Between the two, {@code getOpenChargingSessionStart()}
+     * returns -1, and the fast sampler discards every tick it takes in that window — so the first up
+     * to two minutes of the power curve was always lost, the peak could be missed entirely (DC power
+     * is highest early), and any charge shorter than one tick recorded nothing at all.
+     *
+     * <p>This delegates to the same {@link #trackChargingSession} used by the tick, so the resume
+     * path, the counter baseline and the opt-in gate all behave identically — it only changes WHEN
+     * the row is created. Idempotent: a second call while a session is open is a no-op, because
+     * {@code trackChargingSession} keys the SESSION START branch on {@code !wasCharging}.
+     *
+     * <p>{@code synchronized} on the same monitor as the SoC tick so an edge arriving mid-tick cannot
+     * interleave with it.
+     *
+     * @param isCharging the fused verdict that just became true
+     */
+    public synchronized boolean capturePendingChargingClose() {
+        return capturePendingChargingClose(false);
+    }
+
+    public synchronized boolean capturePendingChargingClose(boolean resumeBlocked) {
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        if (!wasCharging || chargingStartTime <= 0) {
+            return !chargingLifecycleJournalDirty || persistChargingLifecycleJournal();
+        }
+        if (pendingCloseSessionStart == chargingStartTime) {
+            if (resumeBlocked && !pendingCloseResumeBlocked) {
+                pendingCloseResumeBlocked = true;
+                return persistChargingLifecycleJournal();
+            }
+            return !chargingLifecycleJournalDirty || persistChargingLifecycleJournal();
+        }
+        pendingCloseSessionStart = chargingStartTime;
+        pendingCloseAtMs = strictlyAfterChargingStart(
+                chargingStartTime, System.currentTimeMillis());
+        pendingCloseSoc = lastRecordedSoc >= 0 ? lastRecordedSoc : chargingStartSoc;
+        try {
+            BatterySocData sd = VehicleDataMonitor.getInstance().getBatterySoc();
+            if (sd != null && sd.socPercent >= 0 && sd.socPercent <= 100) {
+                pendingCloseSoc = sd.socPercent;
+            }
+        } catch (Throwable ignored) {}
+        double counterAtBoundary = snapshotChargeCounterKwh();
+        if (!Double.isNaN(counterAtBoundary)) {
+            observeFinalCounterForClose(counterAtBoundary, pendingCloseSoc, pendingCloseAtMs);
+        }
+        // Later admitted callbacks may still advance the same accumulator during the bounded drain.
+        // The close path itself must not take another live snapshot after a new physical charge starts.
+        pendingCloseCounterCaptured = true;
+        chargingPeakPower = resolvePeakKw(chargingStartTime, chargingPeakPower);
+        pendingCloseIsDc = deriveIsDc(chargingGunState, chargingPeakPower);
+        try {
+            pendingClosePricing = priceSessionForClose(
+                    pendingCloseIsDc, chargingStartLat, chargingStartLng);
+        } catch (Exception unavailable) {
+            // Boundary/counter remain frozen in the lifecycle journal. The close path retries the
+            // config read and must not turn this transient failure into a permanent fallback price.
+            pendingClosePricing = null;
+            logger.warn("Charging close pricing unavailable at boundary: "
+                    + unavailable.getMessage());
+        }
+        pendingCloseResumeBlocked = resumeBlocked;
+        try {
+            BatteryThermalData thermal =
+                    VehicleDataMonitor.getInstance().getBatteryThermal();
+            if (thermal != null && thermal.hasData()) {
+                if (!Double.isNaN(thermal.highestTempC)) {
+                    pendingCloseTempHigh = thermal.highestTempC;
+                }
+                if (!Double.isNaN(thermal.lowestTempC)) {
+                    pendingCloseTempLow = thermal.lowestTempC;
+                }
+                if (!Double.isNaN(thermal.averageTempC)) {
+                    pendingCloseTempAvg = thermal.averageTempC;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return persistChargingLifecycleJournal();
+    }
+
+    private long allocateMonotonicChargingStart(long proposed) {
+        boolean databaseAvailable = connection != null;
+        long allocated = nextMonotonicChargingStart(proposed, chargingStartIdentityFloor());
+        boolean databaseDurable =
+                databaseAvailable && reserveChargingStartIdentity(allocated);
+        if (databaseAvailable && !databaseDurable) {
+            throw new IllegalStateException(
+                    "charging identity allocator did not reserve " + allocated);
+        }
+        lastAllocatedChargingStartMs = allocated;
+        boolean journalDurable = persistChargingLifecycleJournal();
+        if (!databaseDurable && !journalDurable) {
+            throw new IllegalStateException(
+                    "charging identity could not be made restart-safe");
+        }
+        return allocated;
+    }
+
+    /**
+     * Normalize a wall-clock boundary without allowing an RTC rollback to produce an open-looking
+     * closed row. Charging identities never allocate {@link Long#MAX_VALUE}, so saturation here is
+     * a corrupt-state error rather than a representable close timestamp.
+     */
+    static long strictlyAfterChargingStart(long sessionStart, long proposed) {
+        if (sessionStart <= 0L) return Math.max(1L, proposed);
+        if (sessionStart == Long.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    "charging start cannot be normalized past Long.MAX_VALUE");
+        }
+        return proposed > sessionStart ? proposed : sessionStart + 1L;
+    }
+
+    private long chargingStartIdentityFloor() {
+        long floor = Math.max(chargingStartTime, lastAllocatedChargingStartMs);
+        for (DeferredChargingGeneration generation : deferredPhysicalGenerations) {
+            floor = Math.max(floor, generation.startMs);
+        }
+        if (connection != null) {
+            try (PreparedStatement p = connection.prepareStatement(
+                    "SELECT last_start FROM " + TABLE_CHARGING_IDENTITY
+                            + " WHERE allocator_key = 1;");
+                 ResultSet rs = p.executeQuery()) {
+                if (!rs.next()) {
+                    throw new java.sql.SQLException(
+                            "charging identity allocator row missing");
+                }
+                floor = Math.max(floor, rs.getLong(1));
+            } catch (Exception e) {
+                throw new IllegalStateException(
+                        "Could not read durable charging identity allocator", e);
+            }
+            try (PreparedStatement p = connection.prepareStatement(
+                    "SELECT MAX(start_time) FROM " + TABLE_CHARGING + ";");
+                 ResultSet rs = p.executeQuery()) {
+                if (rs.next()) {
+                    long durableFloor = rs.getLong(1);
+                    if (!rs.wasNull()) floor = Math.max(floor, durableFloor);
+                }
+            } catch (Exception e) {
+                throw new IllegalStateException(
+                        "Could not read charging identity floor", e);
+            }
+        }
+        return floor;
+    }
+
+    /**
+     * Idempotently advance the database allocator. A zero-row UPDATE can mean a prior uncertain
+     * attempt already committed, so the durable value is always read back before reporting failure.
+     */
+    private boolean reserveChargingStartIdentity(long allocated) {
+        if (connection == null || allocated <= 0L) return false;
+        try {
+            try (PreparedStatement p = connection.prepareStatement(
+                    "UPDATE " + TABLE_CHARGING_IDENTITY
+                            + " SET last_start = ? WHERE allocator_key = 1"
+                            + " AND last_start < ?;")) {
+                p.setLong(1, allocated);
+                p.setLong(2, allocated);
+                if (p.executeUpdate() == 1) return true;
+            }
+        } catch (Exception updateFailure) {
+            logger.debug("Charging identity reservation needs reconciliation: "
+                    + updateFailure.getMessage());
+        }
+        try (PreparedStatement p = connection.prepareStatement(
+                "SELECT last_start FROM " + TABLE_CHARGING_IDENTITY
+                        + " WHERE allocator_key = 1;");
+             ResultSet rs = p.executeQuery()) {
+            return rs.next() && rs.getLong(1) >= allocated;
+        } catch (Exception reconcileFailure) {
+            logger.warn("Could not reconcile charging identity reservation: "
+                    + reconcileFailure.getMessage());
+            return false;
+        }
+    }
+
+    private boolean reserveDeferredChargingIdentities() {
+        if (deferredPhysicalGenerations.isEmpty()) return true;
+        if (connection == null) return false;
+        for (DeferredChargingGeneration generation : deferredPhysicalGenerations) {
+            if (!reserveChargingStartIdentity(generation.startMs)) return false;
+        }
+        return true;
+    }
+
+    static long nextMonotonicChargingStart(long proposed, long durableFloor) {
+        if (durableFloor == Long.MAX_VALUE) {
+            throw new IllegalStateException("charging start identity exhausted");
+        }
+        return Math.max(Math.max(1L, proposed), durableFloor + 1L);
+    }
+
+    private DeferredChargingGeneration currentDeferredPhysicalGeneration() {
+        return deferredPhysicalGenerations.peekLast();
+    }
+
+    public synchronized boolean hasDeferredPhysicalGenerations() {
+        return !deferredPhysicalGenerations.isEmpty();
+    }
+
+    /** True when startup must reconcile journal-restored lifecycle work even with no ON/OFF edge. */
+    public synchronized boolean hasPendingChargingLifecycle() {
+        return pendingActiveReplacement != null
+                || pendingChargingMaintenanceIntent != null
+                || wasCharging || optOutClosePending || pendingCloseSessionStart > 0L
+                || !deferredPhysicalGenerations.isEmpty();
+    }
+
+    /** True when the restored active row already owns a frozen physical-stop boundary. */
+    public synchronized boolean hasPendingChargingCloseBoundary() {
+        return wasCharging && chargingStartTime > 0L
+                && (pendingCloseSessionStart == chargingStartTime || optOutClosePending);
+    }
+
+    /**
+     * Persist a normal session start as a deferred generation before its H2 INSERT. The same image is
+     * usable on both sides of a crash: an absent row is materialized later, while an already-open row is
+     * adopted and the redundant generation is consumed during journal/database reconciliation.
+     */
+    private DeferredChargingGeneration journalCurrentChargingStart(
+            ContinuationOffer continuationOffer) throws Exception {
+        DeferredChargingGeneration generation = new DeferredChargingGeneration();
+        generation.startMs = chargingStartTime;
+        generation.startSoc = chargingStartSoc;
+        generation.startRange = chargingStartRange;
+        generation.startOdometer = chargingStartOdometer;
+        generation.gun = chargingGunState;
+        generation.timeToFull = chargingTimeToFullMin;
+        generation.lat = chargingStartLat;
+        generation.lng = chargingStartLng;
+        generation.peakPower = chargingPeakPower;
+        generation.powerSum = chargingPowerSum;
+        generation.powerCount = chargingPowerCount;
+        generation.counter.restoreState(chargingCounter.snapshotState());
+        generation.counterOwner = counterOwner;
+        generation.previousCounterKwh = lastSessionCounterKwh;
+        generation.counterBaselinePending = counterBaselinePending;
+        generation.counterBaselinePendingSinceMs = counterBaselinePendingSinceMs;
+        generation.counterCandidateKwh = counterBaselineCandidateKwh;
+        generation.counterCandidateAtMs = counterBaselineCandidateAtMs;
+        generation.counterLatestKwh = counterBaselineLatestKwh;
+        generation.counterLatestAtMs = counterBaselineLatestAtMs;
+        generation.provisionalExternalKwh = provisionalExternalKwh;
+        generation.provisionalExternalAtMs = provisionalExternalAtMs;
+        generation.provisionalExternalUnitDivisor = provisionalExternalUnitDivisor;
+        generation.continuationOffer = continuationOffer;
+
+        double consumedPreSessionCounter = preSessionCounterLowKwh;
+        long consumedPreSessionCounterAt = preSessionCounterAtMs;
+        String consumedPreSessionCounterSource = preSessionCounterSource;
+        double consumedPreSessionProvisionalRaw = preSessionProvisionalExternalRaw;
+        long consumedPreSessionProvisionalAt = preSessionProvisionalExternalAtMs;
+        double consumedPreSessionProvisionalDivisor =
+                preSessionProvisionalExternalUnitDivisor;
+        if (Double.isFinite(consumedPreSessionProvisionalRaw)
+                && consumedPreSessionProvisionalAt > 0L
+                && generation.startMs - consumedPreSessionProvisionalAt >= 0L
+                && generation.startMs - consumedPreSessionProvisionalAt
+                        <= PRE_SESSION_COUNTER_MAX_AGE_MS) {
+            double divisor =
+                    validCounterUnitDivisor(consumedPreSessionProvisionalDivisor);
+            double candidate = consumedPreSessionProvisionalRaw / divisor;
+            if (Double.isNaN(generation.provisionalExternalKwh)
+                    || consumedPreSessionProvisionalRaw
+                            < counterValueInRawFrame(
+                                    generation.provisionalExternalKwh,
+                                    generation.provisionalExternalUnitDivisor)) {
+                generation.provisionalExternalKwh = candidate;
+                generation.provisionalExternalAtMs =
+                        consumedPreSessionProvisionalAt;
+                generation.provisionalExternalUnitDivisor = divisor;
+            }
+        }
+        // The write-ahead generation is now the sole owner. Publish the generation and removal of
+        // standalone evidence in one journal image so a crash cannot replay either item twice.
+        preSessionCounterLowKwh = Double.NaN;
+        preSessionCounterAtMs = 0L;
+        preSessionCounterSource = null;
+        clearPreSessionProvisionalExternal();
+        deferredPhysicalGenerations.addLast(generation);
+        sessionInputsFenced = true;
+        lastAllocatedChargingStartMs =
+                Math.max(lastAllocatedChargingStartMs, generation.startMs);
+        if (!persistChargingLifecycleJournal()) {
+            deferredPhysicalGenerations.removeLastOccurrence(generation);
+            sessionInputsFenced = !deferredPhysicalGenerations.isEmpty();
+            preSessionCounterLowKwh = consumedPreSessionCounter;
+            preSessionCounterAtMs = consumedPreSessionCounterAt;
+            preSessionCounterSource = consumedPreSessionCounterSource;
+            preSessionProvisionalExternalRaw =
+                    consumedPreSessionProvisionalRaw;
+            preSessionProvisionalExternalAtMs =
+                    consumedPreSessionProvisionalAt;
+            preSessionProvisionalExternalUnitDivisor =
+                    consumedPreSessionProvisionalDivisor;
+            throw new java.io.IOException(
+                    "charging start write-ahead journal was not durable");
+        }
+        return generation;
+    }
+
+    private void adoptConfirmedPreSessionCounterAsActiveBaseline(
+            double valueKwh, long observedAtMs, String source) {
+        if (counterOwner == null) bindCounterOwner(source);
+        if (!source.equals(counterOwner)) return;
+        counterBaselinePending = false;
+        counterBaselinePendingSinceMs = 0L;
+        chargingCounter.observe(valueKwh, observedAtMs);
+        lastSessionCounterKwh = valueKwh;
+        clearCounterBaselineCandidates();
+    }
+
+    /** Fence the old row and queue a distinct physical charge while its close retries. */
+    public synchronized boolean deferPhysicalChargingStart() {
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        if (!wasCharging || chargingStartTime <= 0) return false;
+        capturePendingChargingClose();
+        DeferredChargingGeneration current = currentDeferredPhysicalGeneration();
+        if (current != null && !current.isEnded()) {
+            return persistChargingLifecycleJournal()
+                    && (connection == null || reserveChargingStartIdentity(current.startMs));
+        }
+
+        long observedAt = System.currentTimeMillis();
+        DeferredChargingGeneration generation = new DeferredChargingGeneration();
+        // Journal the complete generation before advancing the H2 allocator. Reserving first left a
+        // crash window in which the identity survived but the physical B/C session did not.
+        generation.startMs = nextMonotonicChargingStart(
+                observedAt, chargingStartIdentityFloor());
+        generation.startSoc = currentSocForContinuation();
+        generation.startRange = snapshotRangeKm();
+        generation.startOdometer = snapshotOdometerKm();
+        generation.gun = snapshotGunState();
+        generation.timeToFull = snapshotTimeToFullMin();
+        double[] location = snapshotLocation();
+        generation.lat = location[0];
+        generation.lng = location[1];
+        generation.counterBaselinePendingSinceMs = generation.startMs;
+        if (current != null && current.counter.hasBaseline()) {
+            generation.previousCounterKwh = current.counter.lastRawKwh();
+        } else {
+            generation.previousCounterKwh = chargingCounter.hasBaseline()
+                    ? chargingCounter.lastRawKwh() : lastSessionCounterKwh;
+        }
+        try {
+            ChargingStateData state = VehicleDataMonitor.getInstance().getChargingState();
+            if (state != null && !state.isEstimated && state.chargingPowerKW > 0) {
+                generation.peakPower = state.chargingPowerKW;
+                generation.powerSum = state.chargingPowerKW;
+                generation.powerCount = 1;
+            }
+        } catch (Throwable ignored) {}
+        deferredPhysicalGenerations.addLast(generation);
+        sessionInputsFenced = true;
+        lastAllocatedChargingStartMs =
+                Math.max(lastAllocatedChargingStartMs, generation.startMs);
+        if (!persistChargingLifecycleJournal()) return false;
+        return connection == null || reserveChargingStartIdentity(generation.startMs);
+    }
+
+    /**
+     * Journal a first physical ON edge while H2 is unavailable. This is the same deferred-generation
+     * format used behind a failed close, so reconnect can materialize it without inventing another
+     * identity or losing counter/sample ownership.
+     */
+    private boolean journalPhysicalChargingStartWithoutDatabase() {
+        if (!chargingAnalyticsEnabled || !chargingLifecycleJournalLoaded
+                || chargingLifecycleJournalReadFailed) {
+            return false;
+        }
+        DeferredChargingGeneration current = currentDeferredPhysicalGeneration();
+        if (current != null && !current.isEnded()) {
+            return persistChargingLifecycleJournal();
+        }
+        long observedAt = System.currentTimeMillis();
+        DeferredChargingGeneration generation = new DeferredChargingGeneration();
+        generation.startMs = nextMonotonicChargingStart(
+                observedAt, chargingStartIdentityFloor());
+        generation.startSoc = currentSocForContinuation();
+        generation.startRange = snapshotRangeKm();
+        generation.startOdometer = snapshotOdometerKm();
+        generation.gun = snapshotGunState();
+        generation.timeToFull = snapshotTimeToFullMin();
+        double[] location = snapshotLocation();
+        generation.lat = location[0];
+        generation.lng = location[1];
+        generation.previousCounterKwh = lastSessionCounterKwh;
+        generation.counterBaselinePendingSinceMs = generation.startMs;
+        if (Double.isFinite(preSessionCounterLowKwh)
+                && preSessionCounterLowKwh >= 0.0
+                && preSessionCounterAtMs > 0L
+                && preSessionCounterSource != null
+                && observedAt - preSessionCounterAtMs >= 0L
+                && observedAt - preSessionCounterAtMs <= PRE_SESSION_COUNTER_MAX_AGE_MS) {
+            generation.counterOwner = preSessionCounterSource;
+            generation.counter.setFullScaleKwh(
+                    counterScaleForSource(preSessionCounterSource));
+            generation.counter.observe(
+                    preSessionCounterLowKwh, preSessionCounterAtMs);
+            generation.counterBaselinePending = false;
+            generation.counterBaselinePendingSinceMs = 0L;
+            generation.counterLatestKwh = preSessionCounterLowKwh;
+            generation.counterLatestAtMs = preSessionCounterAtMs;
+        }
+        double consumedPreSessionCounter = preSessionCounterLowKwh;
+        long consumedPreSessionCounterAt = preSessionCounterAtMs;
+        String consumedPreSessionCounterSource = preSessionCounterSource;
+        double consumedPreSessionProvisionalRaw = preSessionProvisionalExternalRaw;
+        long consumedPreSessionProvisionalAt = preSessionProvisionalExternalAtMs;
+        double consumedPreSessionProvisionalDivisor =
+                preSessionProvisionalExternalUnitDivisor;
+        if (Double.isFinite(preSessionProvisionalExternalRaw)
+                && preSessionProvisionalExternalAtMs > 0L
+                && observedAt - preSessionProvisionalExternalAtMs >= 0L
+                && observedAt - preSessionProvisionalExternalAtMs
+                        <= PRE_SESSION_COUNTER_MAX_AGE_MS) {
+            generation.provisionalExternalKwh =
+                    preSessionProvisionalExternalRaw
+                            / validCounterUnitDivisor(
+                                    preSessionProvisionalExternalUnitDivisor);
+            generation.provisionalExternalAtMs =
+                    preSessionProvisionalExternalAtMs;
+            generation.provisionalExternalUnitDivisor =
+                    validCounterUnitDivisor(
+                            preSessionProvisionalExternalUnitDivisor);
+        }
+        // The generation now owns all admissible evidence. Clear every standalone field before the
+        // atomic publication; restore the exact prior image if publication fails.
+        preSessionCounterLowKwh = Double.NaN;
+        preSessionCounterAtMs = 0L;
+        preSessionCounterSource = null;
+        clearPreSessionProvisionalExternal();
+        try {
+            ChargingStateData state = VehicleDataMonitor.getInstance().getChargingState();
+            if (state != null && !state.isEstimated && state.chargingPowerKW > 0) {
+                generation.peakPower = state.chargingPowerKW;
+                generation.powerSum = state.chargingPowerKW;
+                generation.powerCount = 1;
+            }
+        } catch (Throwable ignored) {}
+        deferredPhysicalGenerations.addLast(generation);
+        sessionInputsFenced = true;
+        lastAllocatedChargingStartMs =
+                Math.max(lastAllocatedChargingStartMs, generation.startMs);
+        if (persistChargingLifecycleJournal()) {
+            return true;
+        }
+        deferredPhysicalGenerations.removeLastOccurrence(generation);
+        sessionInputsFenced = !deferredPhysicalGenerations.isEmpty();
+        preSessionCounterLowKwh = consumedPreSessionCounter;
+        preSessionCounterAtMs = consumedPreSessionCounterAt;
+        preSessionCounterSource = consumedPreSessionCounterSource;
+        preSessionProvisionalExternalRaw =
+                consumedPreSessionProvisionalRaw;
+        preSessionProvisionalExternalAtMs =
+                consumedPreSessionProvisionalAt;
+        preSessionProvisionalExternalUnitDivisor =
+                consumedPreSessionProvisionalDivisor;
+        return false;
+    }
+
+    /** Capture the endpoint of the newest deferred charge without changing an earlier generation. */
+    public synchronized boolean deferPhysicalChargingStop() {
+        return deferPhysicalChargingStop(false);
+    }
+
+    public synchronized boolean deferPhysicalChargingStop(boolean resumeBlocked) {
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        return endDeferredPhysicalGeneration(currentDeferredPhysicalGeneration(),
+                System.currentTimeMillis(), currentSocForContinuation(), resumeBlocked);
+    }
+
+    private boolean endDeferredPhysicalGeneration(DeferredChargingGeneration generation,
+                                                  long boundaryMs, double boundarySoc,
+                                                  boolean resumeBlocked) {
+        if (generation == null) return false;
+        if (!generation.isEnded()) {
+            generation.endMs = strictlyAfterChargingStart(
+                    generation.startMs, boundaryMs);
+            generation.endSoc = !Double.isNaN(boundarySoc)
+                    ? boundarySoc : generation.startSoc;
+            finalizeDeferredCounterBaseline(generation);
+            try {
+                BatteryThermalData thermal =
+                        VehicleDataMonitor.getInstance().getBatteryThermal();
+                if (thermal != null && thermal.hasData()) {
+                    if (!Double.isNaN(thermal.highestTempC)) {
+                        generation.endTempHigh = thermal.highestTempC;
+                    }
+                    if (!Double.isNaN(thermal.lowestTempC)) {
+                        generation.endTempLow = thermal.lowestTempC;
+                    }
+                    if (!Double.isNaN(thermal.averageTempC)) {
+                        generation.endTempAvg = thermal.averageTempC;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            generation.closeIsDc =
+                    deriveIsDc(generation.gun, generation.peakPower);
+            try {
+                generation.closePricing = priceSessionForClose(
+                        generation.closeIsDc, generation.lat, generation.lng);
+            } catch (Exception unavailable) {
+                generation.closePricing = null;
+                logger.warn("Deferred charging pricing unavailable at boundary: "
+                        + unavailable.getMessage());
+            }
+        }
+        generation.resumeBlocked |= resumeBlocked;
+        return persistChargingLifecycleJournal();
+    }
+
+    private void observeDeferredPhysicalCounter(DeferredChargingGeneration generation,
+                                                String source, double counterKwh,
+                                                double unitDivisor, long now) {
+        if (generation == null || source == null) return;
+        boolean external =
+                com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(source);
+        if (external && !com.overdrive.app.byd.ChargeSourceClassifier.isCounter(source)) {
+            if (com.overdrive.app.byd.ChargeSourceClassifier.isRate(source)) {
+                generation.provisionalExternalKwh = Double.NaN;
+                generation.provisionalExternalAtMs = 0L;
+                generation.provisionalExternalUnitDivisor = 1.0;
+            } else if (Double.isNaN(generation.provisionalExternalKwh)
+                    || counterValueInRawFrame(counterKwh, unitDivisor)
+                    < counterValueInRawFrame(
+                            generation.provisionalExternalKwh,
+                            generation.provisionalExternalUnitDivisor)) {
+                generation.provisionalExternalKwh = counterKwh;
+                generation.provisionalExternalAtMs = now;
+                generation.provisionalExternalUnitDivisor =
+                        validCounterUnitDivisor(unitDivisor);
+            }
+            persistChargingLifecycleJournal();
+            return;
+        }
+        if (generation.counterOwner == null) {
+            generation.counterOwner = source;
+            generation.counter.setFullScaleKwh(counterScaleForSource(source));
+            generation.counter.markPersistenceMetadataChanged();
+            if (external && !Double.isNaN(generation.provisionalExternalKwh)) {
+                double held = convertCounterUnitFrame(
+                        generation.provisionalExternalKwh,
+                        generation.provisionalExternalUnitDivisor, unitDivisor);
+                if (held <= counterKwh) {
+                    generation.counterCandidateKwh = held;
+                    generation.counterCandidateAtMs =
+                            generation.provisionalExternalAtMs > 0L
+                                    ? generation.provisionalExternalAtMs : now;
+                }
+                generation.provisionalExternalKwh = Double.NaN;
+                generation.provisionalExternalAtMs = 0L;
+                generation.provisionalExternalUnitDivisor = 1.0;
+            }
+        } else if (!generation.counterOwner.equals(source)) {
+            return;
+        }
+        generation.counter.setIndependentEstimate(Double.NaN);
+        generation.counterLatestKwh = counterKwh;
+        generation.counterLatestAtMs = now;
+        if (generation.counterBaselinePending) {
+            boolean resetObserved = Double.isNaN(generation.previousCounterKwh)
+                    || counterKwh < generation.previousCounterKwh;
+            if (!resetObserved) {
+                if (Double.isNaN(generation.counterCandidateKwh)
+                        || counterKwh < generation.counterCandidateKwh) {
+                    generation.counterCandidateKwh = counterKwh;
+                    generation.counterCandidateAtMs = now;
+                }
+                long pendingSince = generation.counterBaselinePendingSinceMs > 0L
+                        ? generation.counterBaselinePendingSinceMs : generation.startMs;
+                if (pendingSince <= 0L || now - pendingSince <= COUNTER_BASELINE_WAIT_MS) {
+                    persistChargingLifecycleJournal();
+                    return;
+                }
+                finalizeDeferredCounterBaseline(generation);
+                logger.info("Deferred physical session counter did not reset; accepted its earliest"
+                        + " reading after the bounded baseline wait");
+                persistChargingLifecycleJournal();
+                return;
+            }
+            generation.counterBaselinePending = false;
+            generation.counterBaselinePendingSinceMs = 0L;
+            generation.counterCandidateKwh = Double.NaN;
+            generation.counterCandidateAtMs = 0L;
+        }
+        generation.counter.observe(counterKwh, now);
+        persistChargingLifecycleJournal();
+    }
+
+    private void finalizeDeferredCounterBaseline(DeferredChargingGeneration generation) {
+        if (generation == null || !generation.counterBaselinePending) return;
+        double baseline = generation.counterCandidateKwh;
+        long baselineAt = generation.counterCandidateAtMs;
+        double latest = generation.counterLatestKwh;
+        long latestAt = generation.counterLatestAtMs;
+        generation.counterBaselinePending = false;
+        generation.counterBaselinePendingSinceMs = 0L;
+        generation.counterCandidateKwh = Double.NaN;
+        generation.counterCandidateAtMs = 0L;
+        if (Double.isNaN(baseline)) return;
+        generation.counter.observe(baseline,
+                baselineAt > 0L ? baselineAt : generation.startMs);
+        if (!Double.isNaN(latest) && latest != baseline) {
+            generation.counter.observe(latest,
+                    latestAt > 0L ? latestAt : generation.startMs);
+        }
+    }
+
+    static double convertCounterUnitFrame(
+            double value, double fromDivisor, double toDivisor) {
+        if (!Double.isFinite(value)) return Double.NaN;
+        return value * validCounterUnitDivisor(fromDivisor)
+                / validCounterUnitDivisor(toDivisor);
+    }
+
+    private static double counterValueInRawFrame(double value, double divisor) {
+        if (!Double.isFinite(value)) return Double.NaN;
+        return value * validCounterUnitDivisor(divisor);
+    }
+
+    private static double validCounterUnitDivisor(double divisor) {
+        return Double.isFinite(divisor) && divisor > 0.0 ? divisor : 1.0;
+    }
+
+    private void clearPreSessionProvisionalExternal() {
+        preSessionProvisionalExternalRaw = Double.NaN;
+        preSessionProvisionalExternalAtMs = 0L;
+        preSessionProvisionalExternalUnitDivisor = 1.0;
+    }
+
+    public synchronized boolean recordDeferredChargingSample(
+            long t, double powerKw, double soc, double temp, double tempHigh, double tempLow) {
+        if (!chargingAnalyticsEnabled || optOutClosePending || Double.isNaN(powerKw)) {
+            return false;
+        }
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        DeferredChargingGeneration generation = currentDeferredPhysicalGeneration();
+        if (generation == null) return false;
+        if (powerKw > 0 && generation.isEnded() && isAdmittedTaperTail()) {
+            generation.endMs = Math.max(
+                    generation.endMs,
+                    strictlyAfterChargingStart(generation.startMs, t));
+            if (!Double.isNaN(soc) && soc >= 0 && soc <= 100) {
+                generation.endSoc = soc;
+            }
+            if (tempHigh > -999) generation.endTempHigh = tempHigh;
+            if (tempLow > -999) generation.endTempLow = tempLow;
+            if (temp > -999) generation.endTempAvg = temp;
+        }
+        long sampleAt = Math.max(generation.startMs, t);
+        if (generation.isEnded()) sampleAt = Math.min(sampleAt, generation.endMs);
+        generation.samples.add(new DeferredChargingSample(
+                sampleAt, powerKw, soc, temp, tempHigh, tempLow));
+        if (powerKw == MISSING_RATE_BOUNDARY_POWER_KW) {
+            generation.integrationTruncated = true;
+        }
+        if (powerKw > 0) {
+            generation.peakPower = Math.max(generation.peakPower, powerKw);
+            generation.powerSum += powerKw;
+            generation.powerCount++;
+        }
+        if (tempHigh > -999) generation.endTempHigh = tempHigh;
+        if (tempLow > -999) generation.endTempLow = tempLow;
+        if (temp > -999) generation.endTempAvg = temp;
+        int liveTtf = snapshotTimeToFullMin();
+        if (liveTtf > 0) generation.timeToFull = liveTtf;
+        if (generation.startRange < 0) generation.startRange = snapshotRangeKm();
+        if (generation.startOdometer < 0) generation.startOdometer = snapshotOdometerKm();
+        return persistChargingLifecycleJournal();
+    }
+
+    private void insertDeferredChargingSamples(
+            DeferredChargingGeneration generation, long sessionStart) throws Exception {
+        if (generation == null || generation.samples.isEmpty()) return;
+        try (PreparedStatement p = connection.prepareStatement(
+                "INSERT INTO " + TABLE_CPS
+                        + " (session_start_time, t, power_kw, soc, temp, temp_high, temp_low)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?);")) {
+            for (DeferredChargingSample sample : generation.samples) {
+                p.setLong(1, sessionStart);
+                p.setLong(2, sample.t);
+                p.setDouble(3, sample.powerKw);
+                p.setDouble(4, sample.soc);
+                p.setDouble(5, sample.temp);
+                p.setDouble(6, sample.tempHigh);
+                p.setDouble(7, sample.tempLow);
+                p.addBatch();
+            }
+            p.executeBatch();
+        }
+        if (generation.integrationTruncated) {
+            try (PreparedStatement p = connection.prepareStatement(
+                    "UPDATE " + TABLE_CHARGING
+                            + " SET integration_truncated = 1"
+                            + " WHERE start_time = ? AND end_time IS NULL;")) {
+                p.setLong(1, sessionStart);
+                if (p.executeUpdate() != 1) {
+                    throw new java.sql.SQLException(
+                            "deferred integration marker found no open session");
+                }
+            }
+        }
+    }
+
+    private void consumeDeferredPhysicalSessionAfterStart(long sessionStart) {
+        DeferredChargingGeneration generation = deferredPhysicalGenerations.pollFirst();
+        if (generation == null) return;
+        // Older journals may contain both a deferred owner and the standalone evidence from which it
+        // was built. The active image must consume both in the same publication that removes the
+        // deferred owner, otherwise a crash can offer the evidence to the next physical session.
+        preSessionCounterLowKwh = Double.NaN;
+        preSessionCounterAtMs = 0L;
+        preSessionCounterSource = null;
+        clearPreSessionProvisionalExternal();
+        if (generation.isEnded()) {
+            pendingCloseSessionStart = sessionStart;
+            pendingCloseAtMs = strictlyAfterChargingStart(
+                    sessionStart, generation.endMs);
+            pendingCloseSoc = !Double.isNaN(generation.endSoc)
+                    ? generation.endSoc : chargingStartSoc;
+            pendingCloseCounterCaptured = true;
+            pendingClosePricing = generation.closePricing;
+            pendingCloseIsDc = generation.closeIsDc;
+            pendingCloseResumeBlocked = generation.resumeBlocked;
+            pendingCloseTempHigh = generation.endTempHigh;
+            pendingCloseTempLow = generation.endTempLow;
+            pendingCloseTempAvg = generation.endTempAvg;
+        } else {
+            pendingCloseSessionStart = 0L;
+            pendingCloseAtMs = 0L;
+            pendingCloseSoc = Double.NaN;
+            pendingCloseCounterCaptured = false;
+            pendingClosePricing = null;
+            pendingCloseIsDc = -2;
+            pendingCloseResumeBlocked = false;
+            pendingCloseTempHigh = -999;
+            pendingCloseTempLow = -999;
+            pendingCloseTempAvg = -999;
+        }
+        sessionInputsFenced = !deferredPhysicalGenerations.isEmpty();
+        persistChargingLifecycleJournal();
+    }
+
+    private void discardDeferredPhysicalSessions() {
+        deferredPhysicalGenerations.clear();
+        sessionInputsFenced = false;
+        persistChargingLifecycleJournal();
+    }
+
+    private boolean hasJournaledChargingLifecycle() {
+        return lastAllocatedChargingStartMs > 0L
+                || optOutClosePending
+                || pendingCloseSessionStart > 0L
+                || recoveredActivePowerGapAtMs > 0L
+                || pendingChargingMaintenanceIntent != null
+                || hasAnyConfirmedPreSessionCounter()
+                || !Double.isNaN(preSessionProvisionalExternalRaw)
+                || !pendingTariffReprices.isEmpty()
+                || !deferredPhysicalGenerations.isEmpty();
+    }
+
+    private boolean hasAnyConfirmedPreSessionCounter() {
+        return Double.isFinite(preSessionCounterLowKwh)
+                || preSessionCounterAtMs != 0L
+                || preSessionCounterSource != null;
+    }
+
+    private boolean hasValidConfirmedPreSessionCounter() {
+        return Double.isFinite(preSessionCounterLowKwh)
+                && preSessionCounterLowKwh >= 0.0
+                && preSessionCounterAtMs > 0L
+                && isValidCounterSource(preSessionCounterSource, false);
+    }
+
+    private boolean persistChargingLifecycleJournal() {
+        java.io.File file = chargingLifecycleJournalFile;
+        if (chargingLifecycleJournalReadFailed) {
+            chargingLifecycleJournalDirty = true;
+            logger.error("Refusing to overwrite an unreadable charging lifecycle journal");
+            return false;
+        }
+        if (file == null) {
+            chargingLifecycleJournalDirty = true;
+            return false;
+        }
+        try {
+            if (!hasJournaledChargingLifecycle()) {
+                boolean removed = java.nio.file.Files.deleteIfExists(file.toPath());
+                if (removed) syncDirectoryMetadata(file.getParentFile());
+                boolean deleted = !file.exists();
+                chargingLifecycleJournalDirty = !deleted;
+                return deleted;
+            }
+            JSONObject root = new JSONObject();
+            root.put("version", CHARGING_LIFECYCLE_JOURNAL_VERSION);
+            root.put("lastAllocatedStart", lastAllocatedChargingStartMs);
+            JSONArray reprices = new JSONArray();
+            for (String tariffKey : pendingTariffReprices) {
+                reprices.put(tariffKey);
+            }
+            root.put("pendingTariffReprices", reprices);
+            if (hasAnyConfirmedPreSessionCounter()) {
+                if (!hasValidConfirmedPreSessionCounter()) {
+                    throw new IllegalStateException(
+                            "confirmed pre-session counter state is incomplete");
+                }
+                JSONObject confirmed = new JSONObject();
+                confirmed.put("value", preSessionCounterLowKwh);
+                confirmed.put("at", preSessionCounterAtMs);
+                confirmed.put("source", preSessionCounterSource);
+                root.put("preSessionCounter", confirmed);
+            }
+            if (!Double.isNaN(preSessionProvisionalExternalRaw)) {
+                JSONObject preOpen = new JSONObject();
+                putFinite(preOpen, "raw", preSessionProvisionalExternalRaw);
+                preOpen.put("at", preSessionProvisionalExternalAtMs);
+                putFinite(preOpen, "unitDivisor",
+                        preSessionProvisionalExternalUnitDivisor);
+                root.put("preOpenExternal", preOpen);
+            }
+            if (wasCharging && chargingStartTime > 0L) {
+                root.put("active", activeChargingLifecycleToJson());
+            }
+            JSONArray deferred = new JSONArray();
+            for (DeferredChargingGeneration generation : deferredPhysicalGenerations) {
+                deferred.put(deferredGenerationToJson(generation));
+            }
+            root.put("deferred", deferred);
+            if (pendingChargingMaintenanceIntent != null) {
+                root.put("maintenanceIntent",
+                        chargingMaintenanceIntentToJson(pendingChargingMaintenanceIntent));
+            }
+
+            java.io.File parent = file.getParentFile();
+            if (parent == null
+                    || (!parent.exists() && !parent.mkdirs() && !parent.isDirectory())) {
+                throw new java.io.IOException("charging lifecycle journal directory unavailable");
+            }
+            java.io.File temporary = new java.io.File(parent, file.getName() + ".tmp");
+            byte[] bytes = root.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            try {
+                try (java.io.FileOutputStream output =
+                             new java.io.FileOutputStream(temporary, false)) {
+                    output.write(bytes);
+                    output.flush();
+                    output.getFD().sync();
+                }
+                try {
+                    java.nio.file.Files.move(
+                            temporary.toPath(), file.toPath(),
+                            java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                } catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
+                    java.nio.file.Files.move(
+                            temporary.toPath(), file.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+                syncDirectoryMetadata(parent);
+            } finally {
+                java.nio.file.Files.deleteIfExists(temporary.toPath());
+            }
+            chargingLifecycleJournalDirty = false;
+            return true;
+        } catch (Exception e) {
+            chargingLifecycleJournalDirty = true;
+            logger.error("Failed to persist charging lifecycle journal: " + e.getMessage());
+            return false;
+        }
+    }
+
+    static void syncDirectoryMetadata(java.io.File directory) throws Exception {
+        if (directory == null || !directory.isDirectory()) {
+            throw new java.io.IOException("directory metadata target unavailable");
+        }
+        try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(
+                directory.toPath(), java.nio.file.StandardOpenOption.READ)) {
+            channel.force(true);
+        }
+    }
+
+    private JSONObject activeChargingLifecycleToJson() throws Exception {
+        JSONObject active = new JSONObject();
+        active.put("start", chargingStartTime);
+        putFinite(active, "startSoc", chargingStartSoc);
+        putFinite(active, "peak", chargingPeakPower);
+        putFinite(active, "powerSum", chargingPowerSum);
+        active.put("powerCount", chargingPowerCount);
+        active.put("startRange", chargingStartRange);
+        active.put("startOdometer", chargingStartOdometer);
+        active.put("gun", chargingGunState);
+        active.put("timeToFull", chargingTimeToFullMin);
+        putFinite(active, "lat", chargingStartLat);
+        putFinite(active, "lng", chargingStartLng);
+        active.put("counterOwner", counterOwner != null ? counterOwner : "");
+        active.put("counter", counterStateToJson(chargingCounter.snapshotState()));
+        putFinite(active, "lastSessionCounter", lastSessionCounterKwh);
+        active.put("baselinePending", counterBaselinePending);
+        active.put("baselinePendingSince", counterBaselinePendingSinceMs);
+        putFinite(active, "baselineCandidate", counterBaselineCandidateKwh);
+        active.put("baselineCandidateAt", counterBaselineCandidateAtMs);
+        putFinite(active, "baselineLatest", counterBaselineLatestKwh);
+        active.put("baselineLatestAt", counterBaselineLatestAtMs);
+        putFinite(active, "provisionalExternal", provisionalExternalKwh);
+        active.put("provisionalExternalAt", provisionalExternalAtMs);
+        putFinite(active, "provisionalExternalDivisor",
+                provisionalExternalUnitDivisor);
+        active.put("recoveredPowerGapAt", recoveredActivePowerGapAtMs);
+
+        JSONObject close = new JSONObject();
+        close.put("sessionStart", pendingCloseSessionStart);
+        close.put("at", pendingCloseAtMs);
+        putFinite(close, "soc", pendingCloseSoc);
+        close.put("counterCaptured", pendingCloseCounterCaptured);
+        close.put("isDc", pendingCloseIsDc);
+        close.put("resumeBlocked", pendingCloseResumeBlocked);
+        putFinite(close, "tempHigh", pendingCloseTempHigh);
+        putFinite(close, "tempLow", pendingCloseTempLow);
+        putFinite(close, "tempAvg", pendingCloseTempAvg);
+        if (pendingClosePricing != null) {
+            close.put("pricing", pricingToJson(pendingClosePricing));
+        }
+        active.put("pendingClose", close);
+
+        JSONObject optOut = new JSONObject();
+        optOut.put("pending", optOutClosePending);
+        optOut.put("at", optOutBoundaryMs);
+        putFinite(optOut, "soc", optOutBoundarySoc);
+        optOut.put("counterCaptured", optOutCounterCaptured);
+        optOut.put("isDc", optOutCloseIsDc);
+        if (optOutClosePricing != null) {
+            optOut.put("pricing", pricingToJson(optOutClosePricing));
+        }
+        active.put("optOut", optOut);
+        return active;
+    }
+
+    private JSONObject deferredGenerationToJson(DeferredChargingGeneration generation)
+            throws Exception {
+        JSONObject out = new JSONObject();
+        out.put("start", generation.startMs);
+        putFinite(out, "startSoc", generation.startSoc);
+        out.put("end", generation.endMs);
+        putFinite(out, "endSoc", generation.endSoc);
+        out.put("startRange", generation.startRange);
+        out.put("startOdometer", generation.startOdometer);
+        out.put("gun", generation.gun);
+        out.put("timeToFull", generation.timeToFull);
+        putFinite(out, "lat", generation.lat);
+        putFinite(out, "lng", generation.lng);
+        putFinite(out, "peak", generation.peakPower);
+        putFinite(out, "powerSum", generation.powerSum);
+        out.put("powerCount", generation.powerCount);
+        putFinite(out, "tempHigh", generation.endTempHigh);
+        putFinite(out, "tempLow", generation.endTempLow);
+        putFinite(out, "tempAvg", generation.endTempAvg);
+        out.put("counterOwner",
+                generation.counterOwner != null ? generation.counterOwner : "");
+        out.put("counter", counterStateToJson(generation.counter.snapshotState()));
+        putFinite(out, "previousCounter", generation.previousCounterKwh);
+        out.put("baselinePending", generation.counterBaselinePending);
+        out.put("baselinePendingSince", generation.counterBaselinePendingSinceMs);
+        putFinite(out, "counterCandidate", generation.counterCandidateKwh);
+        out.put("counterCandidateAt", generation.counterCandidateAtMs);
+        putFinite(out, "counterLatest", generation.counterLatestKwh);
+        out.put("counterLatestAt", generation.counterLatestAtMs);
+        putFinite(out, "provisionalExternal", generation.provisionalExternalKwh);
+        out.put("provisionalExternalAt", generation.provisionalExternalAtMs);
+        putFinite(out, "provisionalExternalDivisor",
+                generation.provisionalExternalUnitDivisor);
+        out.put("integrationTruncated", generation.integrationTruncated);
+        out.put("closeIsDc", generation.closeIsDc);
+        out.put("resumeBlocked", generation.resumeBlocked);
+        if (generation.continuationOffer != null) {
+            JSONObject continuation = new JSONObject();
+            continuation.put("rowStart", generation.continuationOffer.rowStart);
+            putFinite(continuation, "endpointKwh",
+                    generation.continuationOffer.endpointKwh);
+            continuation.put("source",
+                    generation.continuationOffer.source != null
+                            ? generation.continuationOffer.source : "");
+            putFinite(continuation, "startSoc",
+                    generation.continuationOffer.startSoc);
+            putFinite(continuation, "fullScaleKwh",
+                    generation.continuationOffer.fullScaleKwh);
+            out.put("continuation", continuation);
+        }
+        if (generation.closePricing != null) {
+            out.put("pricing", pricingToJson(generation.closePricing));
+        }
+        JSONArray samples = new JSONArray();
+        for (DeferredChargingSample sample : generation.samples) {
+            JSONObject encoded = new JSONObject();
+            encoded.put("t", sample.t);
+            putFinite(encoded, "power", sample.powerKw);
+            putFinite(encoded, "soc", sample.soc);
+            putFinite(encoded, "temp", sample.temp);
+            putFinite(encoded, "tempHigh", sample.tempHigh);
+            putFinite(encoded, "tempLow", sample.tempLow);
+            samples.put(encoded);
+        }
+        out.put("samples", samples);
+        return out;
+    }
+
+    private JSONObject chargingMaintenanceIntentToJson(ChargingMaintenanceIntent intent)
+            throws Exception {
+        JSONObject out = new JSONObject();
+        out.put("operation", intent.operation);
+        out.put("previousStart", intent.previousStartTime);
+        if (intent.replacement != null) {
+            out.put("replacement", activeChargingReplacementToJson(intent.replacement));
+        }
+        JSONArray deferred = new JSONArray();
+        java.util.List<DeferredChargingGeneration> generations =
+                intent.replacement != null
+                        ? intent.replacement.deferredGenerations : intent.deferredGenerations;
+        for (DeferredChargingGeneration generation : generations) {
+            deferred.put(deferredGenerationToJson(generation));
+        }
+        out.put("deferred", deferred);
+        return out;
+    }
+
+    private JSONObject activeChargingReplacementToJson(ActiveChargingReplacement state)
+            throws Exception {
+        JSONObject out = new JSONObject();
+        out.put("previousStart", state.previousStartTime);
+        out.put("start", state.startTime);
+        putFinite(out, "startSoc", state.startSoc);
+        out.put("startRange", state.startRange);
+        out.put("startOdometer", state.startOdometer);
+        out.put("gun", state.gun);
+        out.put("timeToFull", state.timeToFull);
+        putFinite(out, "lat", state.lat);
+        putFinite(out, "lng", state.lng);
+        out.put("counterSource", state.counterSource != null ? state.counterSource : "");
+        out.put("counter", counterStateToJson(state.counterState != null
+                ? state.counterState
+                : new com.overdrive.app.charging.ChargeCounterAccumulator.State()));
+        out.put("lifecycleHold", state.lifecycleHold);
+        out.put("pendingClose", state.pendingClose);
+        out.put("closeAt", state.closeAtMs);
+        putFinite(out, "closeSoc", state.closeSoc);
+        out.put("closeCounterCaptured", state.closeCounterCaptured);
+        out.put("closeIsDc", state.closeIsDc);
+        out.put("closeResumeBlocked", state.closeResumeBlocked);
+        putFinite(out, "closeTempHigh", state.closeTempHigh);
+        putFinite(out, "closeTempLow", state.closeTempLow);
+        putFinite(out, "closeTempAvg", state.closeTempAvg);
+        if (state.closePricing != null) {
+            out.put("closePricing", pricingToJson(state.closePricing));
+        }
+        return out;
+    }
+
+    private ChargingMaintenanceIntent chargingMaintenanceIntentFromJson(JSONObject source) {
+        if (source == null) return null;
+        String operation = source.optString("operation", "");
+        if (!"clearChargingHistory".equals(operation) && !"resetAll".equals(operation)) {
+            return null;
+        }
+        ChargingMaintenanceIntent intent = new ChargingMaintenanceIntent();
+        intent.operation = operation;
+        intent.previousStartTime = source.optLong("previousStart", 0L);
+        JSONObject replacement = source.optJSONObject("replacement");
+        if (replacement != null) {
+            intent.replacement = activeChargingReplacementFromJson(replacement);
+            if (intent.replacement == null) return null;
+        }
+        JSONArray deferred = source.optJSONArray("deferred");
+        if (deferred != null) {
+            for (int i = 0; i < deferred.length(); i++) {
+                JSONObject encoded = deferred.optJSONObject(i);
+                if (encoded == null) continue;
+                DeferredChargingGeneration generation =
+                        deferredGenerationFromJson(encoded);
+                if (generation == null) continue;
+                if (intent.replacement != null) {
+                    intent.replacement.deferredGenerations.add(generation);
+                } else {
+                    intent.deferredGenerations.add(generation);
+                }
+            }
+        }
+        return intent;
+    }
+
+    private ActiveChargingReplacement activeChargingReplacementFromJson(JSONObject source) {
+        long start = source.optLong("start", 0L);
+        if (start <= 0L) return null;
+        ActiveChargingReplacement state = new ActiveChargingReplacement();
+        state.previousStartTime = source.optLong("previousStart", 0L);
+        state.startTime = start;
+        state.startSoc = finiteOrZero(source, "startSoc");
+        state.startRange = source.optInt("startRange", -1);
+        state.startOdometer = source.optInt("startOdometer", -1);
+        state.gun = source.optInt("gun", -1);
+        state.timeToFull = source.optInt("timeToFull", -1);
+        state.lat = finiteOrZero(source, "lat");
+        state.lng = finiteOrZero(source, "lng");
+        state.counterSource = emptyToNull(source.optString("counterSource", ""));
+        JSONObject counter = source.optJSONObject("counter");
+        state.counterState = counter != null
+                ? counterStateFromJson(counter)
+                : new com.overdrive.app.charging.ChargeCounterAccumulator.State();
+        state.lifecycleHold = source.optBoolean("lifecycleHold", false);
+        state.pendingClose = source.optBoolean("pendingClose", false);
+        state.closeAtMs = source.optLong("closeAt", 0L);
+        if (state.pendingClose) {
+            state.closeAtMs = strictlyAfterChargingStart(state.startTime, state.closeAtMs);
+        }
+        state.closeSoc = finiteOrNaN(source, "closeSoc");
+        state.closeCounterCaptured = source.optBoolean("closeCounterCaptured", false);
+        state.closeIsDc = source.optInt("closeIsDc", -2);
+        state.closeResumeBlocked = source.optBoolean("closeResumeBlocked", false);
+        state.closeTempHigh = finiteOrNaN(source, "closeTempHigh");
+        state.closeTempLow = finiteOrNaN(source, "closeTempLow");
+        state.closeTempAvg = finiteOrNaN(source, "closeTempAvg");
+        if (Double.isNaN(state.closeTempHigh)) state.closeTempHigh = -999;
+        if (Double.isNaN(state.closeTempLow)) state.closeTempLow = -999;
+        if (Double.isNaN(state.closeTempAvg)) state.closeTempAvg = -999;
+        state.closePricing = pricingFromJson(source.optJSONObject("closePricing"));
+        return state;
+    }
+
+    private static JSONObject counterStateToJson(
+            com.overdrive.app.charging.ChargeCounterAccumulator.State state)
+            throws Exception {
+        JSONObject out = new JSONObject();
+        putFinite(out, "baseline", state.baseline);
+        putFinite(out, "last", state.last);
+        out.put("lastAt", state.lastAtMs);
+        out.put("observationGeneration", Math.max(0L, state.observationGeneration));
+        putFinite(out, "energy", state.accumulated);
+        out.put("wraps", state.wraps);
+        out.put("resets", state.resets);
+        out.put("ceilingStreak", state.ceilingStreak);
+        out.put("saturated", state.saturated);
+        putFinite(out, "abandoned", state.abandonedKwh);
+        out.put("unattributedGaps", state.unattributedGaps);
+        out.put("awaitingGap", state.awaitingGapReconcile);
+        out.put("gapReconstructed", state.gapReconstructed);
+        putFinite(out, "gapEstimate", state.gapEstimateKwh);
+        putFinite(out, "recentRate", state.recentRateKwhPerH);
+        putFinite(out, "fullScale", state.fullScaleKwh);
+        return out;
+    }
+
+    private static com.overdrive.app.charging.ChargeCounterAccumulator.State
+            counterStateFromJson(JSONObject source) {
+        com.overdrive.app.charging.ChargeCounterAccumulator.State state =
+                new com.overdrive.app.charging.ChargeCounterAccumulator.State();
+        state.baseline = finiteOrNaN(source, "baseline");
+        state.last = finiteOrNaN(source, "last");
+        state.lastAtMs = source.optLong("lastAt", 0L);
+        state.observationGeneration =
+                Math.max(0L, source.optLong("observationGeneration", 0L));
+        state.accumulated = finiteOrZero(source, "energy");
+        state.wraps = Math.max(0, source.optInt("wraps", 0));
+        state.resets = Math.max(0, source.optInt("resets", 0));
+        state.ceilingStreak = Math.max(0, source.optInt("ceilingStreak", 0));
+        state.saturated = source.optBoolean("saturated", false);
+        state.abandonedKwh = finiteOrZero(source, "abandoned");
+        state.unattributedGaps = Math.max(0, source.optInt("unattributedGaps", 0));
+        state.awaitingGapReconcile = source.optBoolean("awaitingGap", false);
+        state.gapReconstructed = source.optBoolean("gapReconstructed", false);
+        state.gapEstimateKwh = finiteOrNaN(source, "gapEstimate");
+        state.recentRateKwhPerH = finiteOrNaN(source, "recentRate");
+        state.fullScaleKwh = finiteOrNaN(source, "fullScale");
+        return state;
+    }
+
+    private static int bindCounterState(
+            PreparedStatement statement, int first,
+            com.overdrive.app.charging.ChargeCounterAccumulator.State state)
+            throws Exception {
+        statement.setLong(first++, Math.max(0L, state.lastAtMs));
+        statement.setLong(first++, Math.max(0L, state.observationGeneration));
+        statement.setInt(first++, Math.max(0, state.wraps));
+        statement.setInt(first++, Math.max(0, state.resets));
+        statement.setInt(first++, Math.max(0, state.ceilingStreak));
+        statement.setInt(first++, state.saturated ? 1 : 0);
+        statement.setDouble(first++, Math.max(0.0, state.abandonedKwh));
+        statement.setInt(first++, Math.max(0, state.unattributedGaps));
+        statement.setInt(first++, state.awaitingGapReconcile ? 1 : 0);
+        statement.setInt(first++, state.gapReconstructed ? 1 : 0);
+        if (Double.isFinite(state.gapEstimateKwh)) {
+            statement.setDouble(first++, state.gapEstimateKwh);
+        } else {
+            statement.setNull(first++, java.sql.Types.DOUBLE);
+        }
+        if (Double.isFinite(state.recentRateKwhPerH)) {
+            statement.setDouble(first++, state.recentRateKwhPerH);
+        } else {
+            statement.setNull(first++, java.sql.Types.DOUBLE);
+        }
+        return first;
+    }
+
+    private static JSONObject pricingToJson(PricingDecision pricing) throws Exception {
+        JSONObject out = new JSONObject();
+        putFinite(out, "rate", pricing.rate);
+        out.put("currency", pricing.currency);
+        out.put("tariffId", pricing.tariffId);
+        out.put("tariffLabel", pricing.tariffLabel);
+        return out;
+    }
+
+    private static PricingDecision pricingFromJson(JSONObject source) {
+        if (source == null) return null;
+        double rate = finiteOrNaN(source, "rate");
+        if (Double.isNaN(rate)) return null;
+        return new PricingDecision(
+                rate,
+                source.optString("currency", ""),
+                source.optString("tariffId", ""),
+                source.optString("tariffLabel", ""));
+    }
+
+    private static void putFinite(JSONObject target, String key, double value)
+            throws Exception {
+        target.put(key, Double.isFinite(value) ? Double.valueOf(value) : JSONObject.NULL);
+    }
+
+    private static double finiteOrNaN(JSONObject source, String key) {
+        if (source == null || !source.has(key) || source.isNull(key)) return Double.NaN;
+        double value = source.optDouble(key, Double.NaN);
+        return Double.isFinite(value) ? value : Double.NaN;
+    }
+
+    private static double finiteOrZero(JSONObject source, String key) {
+        double value = finiteOrNaN(source, key);
+        return Double.isNaN(value) ? 0.0 : value;
+    }
+
+    private static void validateChargingLifecycleJournal(JSONObject root) {
+        requireJournalLong(
+                root, "version",
+                CHARGING_LIFECYCLE_JOURNAL_VERSION,
+                CHARGING_LIFECYCLE_JOURNAL_VERSION);
+        long lastAllocated = requireJournalLong(
+                root, "lastAllocatedStart", 0L, Long.MAX_VALUE - 1L);
+        JSONArray reprices = requireJournalArray(root, "pendingTariffReprices");
+        for (int i = 0; i < reprices.length(); i++) {
+            Object value = reprices.opt(i);
+            if (!(value instanceof String)
+                    || normalizeTariffRepriceKey((String) value).isEmpty()) {
+                throw invalidJournal(
+                        "pendingTariffReprices contains an invalid key");
+            }
+        }
+        JSONObject confirmed = optionalJournalObject(root, "preSessionCounter");
+        if (confirmed != null) {
+            requireJournalFinite(
+                    confirmed, "value", 0.0, Double.MAX_VALUE);
+            requireJournalLong(confirmed, "at", 1L, Long.MAX_VALUE);
+            requireJournalCounterSource(confirmed, "source", false);
+        }
+        JSONObject preOpen = optionalJournalObject(root, "preOpenExternal");
+        if (preOpen != null) {
+            requireJournalFinite(preOpen, "raw", 0.0, Double.MAX_VALUE);
+            requireJournalLong(preOpen, "at", 1L, Long.MAX_VALUE);
+            requireJournalFinite(
+                    preOpen, "unitDivisor", Double.MIN_VALUE, Double.MAX_VALUE);
+        }
+        JSONObject active = optionalJournalObject(root, "active");
+        if (active != null) {
+            validateActiveChargingLifecycle(active);
+            long activeStart = requireJournalLong(
+                    active, "start", 1L, Long.MAX_VALUE - 1L);
+            if (lastAllocated < activeStart) {
+                throw invalidJournal(
+                        "lastAllocatedStart precedes the active session identity");
+            }
+        }
+
+        JSONArray deferred = requireJournalArray(root, "deferred");
+        long priorStart = active != null
+                ? requireJournalLong(active, "start", 1L, Long.MAX_VALUE - 1L)
+                : 0L;
+        for (int i = 0; i < deferred.length(); i++) {
+            JSONObject generation = requireJournalArrayObject(
+                    deferred, i, "deferred");
+            validateDeferredChargingGeneration(generation);
+            long start = requireJournalLong(
+                    generation, "start", 1L, Long.MAX_VALUE - 1L);
+            if (start <= priorStart) {
+                throw invalidJournal(
+                        "deferred session identities are not strictly increasing");
+            }
+            if (lastAllocated < start) {
+                throw invalidJournal(
+                        "lastAllocatedStart precedes a deferred session identity");
+            }
+            priorStart = start;
+        }
+
+        JSONObject maintenance = optionalJournalObject(root, "maintenanceIntent");
+        if (maintenance != null) {
+            validateChargingMaintenanceIntent(maintenance, lastAllocated);
+        }
+    }
+
+    private static void validateActiveChargingLifecycle(JSONObject active) {
+        long start = requireJournalLong(
+                active, "start", 1L, Long.MAX_VALUE - 1L);
+        requireJournalSoc(active, "startSoc");
+        requireOptionalJournalFinite(active, "peak", 0.0, Double.MAX_VALUE);
+        requireOptionalJournalFinite(active, "powerSum", 0.0, Double.MAX_VALUE);
+        requireJournalLong(active, "powerCount", 0L, Integer.MAX_VALUE);
+        requireJournalLong(active, "startRange", -1L, Integer.MAX_VALUE);
+        requireJournalLong(active, "startOdometer", -1L, Integer.MAX_VALUE);
+        requireJournalLong(active, "gun", -1L, Integer.MAX_VALUE);
+        requireJournalLong(active, "timeToFull", -1L, Integer.MAX_VALUE);
+        requireOptionalJournalFinite(active, "lat", -90.0, 90.0);
+        requireOptionalJournalFinite(active, "lng", -180.0, 180.0);
+        requireJournalCounterSource(active, "counterOwner", true);
+        validateJournalCounter(requireJournalObject(active, "counter"));
+        requireOptionalJournalFinite(
+                active, "lastSessionCounter", 0.0, Double.MAX_VALUE);
+        boolean baselinePending = requireJournalBoolean(active, "baselinePending");
+        long baselinePendingSince = requireJournalLong(
+                active, "baselinePendingSince", 0L, Long.MAX_VALUE);
+        if (baselinePending && baselinePendingSince <= 0L) {
+            throw invalidJournal(
+                    "active pending counter baseline has no timestamp");
+        }
+        validateOptionalValueTimestampPair(
+                active, "baselineCandidate", "baselineCandidateAt",
+                0.0, Double.MAX_VALUE);
+        validateOptionalValueTimestampPair(
+                active, "baselineLatest", "baselineLatestAt",
+                0.0, Double.MAX_VALUE);
+        validateOptionalValueTimestampPair(
+                active, "provisionalExternal", "provisionalExternalAt",
+                0.0, Double.MAX_VALUE);
+        requireJournalFinite(
+                active, "provisionalExternalDivisor",
+                Double.MIN_VALUE, Double.MAX_VALUE);
+        long recoveredGap = requireJournalLong(
+                active, "recoveredPowerGapAt", 0L, Long.MAX_VALUE);
+        if (recoveredGap > 0L && recoveredGap <= start) {
+            throw invalidJournal(
+                    "active recovered power-gap timestamp does not follow its session");
+        }
+
+        JSONObject close = requireJournalObject(active, "pendingClose");
+        long closeSession = requireJournalLong(
+                close, "sessionStart", 0L, Long.MAX_VALUE - 1L);
+        long closeAt = requireJournalLong(close, "at", 0L, Long.MAX_VALUE);
+        requireOptionalJournalSoc(close, "soc");
+        if (closeSession != 0L) {
+            if (closeSession != start || closeAt <= start) {
+                throw invalidJournal(
+                        "active pending-close identity or timestamp is invalid");
+            }
+        } else if (closeAt != 0L) {
+            throw invalidJournal(
+                    "active pending-close timestamp exists without an identity");
+        }
+        requireJournalBoolean(close, "counterCaptured");
+        requireJournalBoolean(close, "resumeBlocked");
+        requireJournalLong(close, "isDc", -2L, 1L);
+        requireOptionalJournalFinite(
+                close, "tempHigh", -999.0, Double.MAX_VALUE);
+        requireOptionalJournalFinite(
+                close, "tempLow", -999.0, Double.MAX_VALUE);
+        requireOptionalJournalFinite(
+                close, "tempAvg", -999.0, Double.MAX_VALUE);
+        validateOptionalJournalPricing(close, "pricing");
+
+        JSONObject optOut = requireJournalObject(active, "optOut");
+        boolean pending = requireJournalBoolean(optOut, "pending");
+        long boundaryAt = requireJournalLong(
+                optOut, "at", 0L, Long.MAX_VALUE);
+        requireOptionalJournalSoc(optOut, "soc");
+        if (pending) {
+            if (boundaryAt <= start) {
+                throw invalidJournal(
+                        "active opt-out boundary does not follow its session");
+            }
+        } else if (boundaryAt != 0L) {
+            throw invalidJournal(
+                    "active opt-out timestamp exists without a pending boundary");
+        }
+        requireJournalBoolean(optOut, "counterCaptured");
+        requireJournalLong(optOut, "isDc", -2L, 1L);
+        validateOptionalJournalPricing(optOut, "pricing");
+    }
+
+    private static void validateDeferredChargingGeneration(JSONObject generation) {
+        long start = requireJournalLong(
+                generation, "start", 1L, Long.MAX_VALUE - 1L);
+        requireJournalSoc(generation, "startSoc");
+        long end = requireJournalLong(
+                generation, "end", 0L, Long.MAX_VALUE);
+        if (end > 0L) {
+            if (end <= start) {
+                throw invalidJournal(
+                        "deferred session end does not follow its start");
+            }
+            requireJournalSoc(generation, "endSoc");
+        } else {
+            requireOptionalJournalSoc(generation, "endSoc");
+        }
+        requireJournalLong(generation, "startRange", -1L, Integer.MAX_VALUE);
+        requireJournalLong(
+                generation, "startOdometer", -1L, Integer.MAX_VALUE);
+        requireJournalLong(generation, "gun", -1L, Integer.MAX_VALUE);
+        requireJournalLong(
+                generation, "timeToFull", -1L, Integer.MAX_VALUE);
+        requireOptionalJournalFinite(generation, "lat", -90.0, 90.0);
+        requireOptionalJournalFinite(generation, "lng", -180.0, 180.0);
+        requireOptionalJournalFinite(
+                generation, "peak", 0.0, Double.MAX_VALUE);
+        requireOptionalJournalFinite(
+                generation, "powerSum", 0.0, Double.MAX_VALUE);
+        requireJournalLong(generation, "powerCount", 0L, Integer.MAX_VALUE);
+        requireOptionalJournalFinite(
+                generation, "tempHigh", -999.0, Double.MAX_VALUE);
+        requireOptionalJournalFinite(
+                generation, "tempLow", -999.0, Double.MAX_VALUE);
+        requireOptionalJournalFinite(
+                generation, "tempAvg", -999.0, Double.MAX_VALUE);
+        requireJournalCounterSource(generation, "counterOwner", true);
+        validateJournalCounter(requireJournalObject(generation, "counter"));
+        requireOptionalJournalFinite(
+                generation, "previousCounter", 0.0, Double.MAX_VALUE);
+        boolean baselinePending =
+                requireJournalBoolean(generation, "baselinePending");
+        long baselinePendingSince = requireJournalLong(
+                generation, "baselinePendingSince", 0L, Long.MAX_VALUE);
+        if (baselinePending && baselinePendingSince <= 0L) {
+            throw invalidJournal(
+                    "deferred pending counter baseline has no timestamp");
+        }
+        validateOptionalValueTimestampPair(
+                generation, "counterCandidate", "counterCandidateAt",
+                0.0, Double.MAX_VALUE);
+        validateOptionalValueTimestampPair(
+                generation, "counterLatest", "counterLatestAt",
+                0.0, Double.MAX_VALUE);
+        validateOptionalValueTimestampPair(
+                generation, "provisionalExternal", "provisionalExternalAt",
+                0.0, Double.MAX_VALUE);
+        requireJournalFinite(
+                generation, "provisionalExternalDivisor",
+                Double.MIN_VALUE, Double.MAX_VALUE);
+        requireJournalBoolean(generation, "integrationTruncated");
+        requireJournalBoolean(generation, "resumeBlocked");
+        requireJournalLong(generation, "closeIsDc", -2L, 1L);
+        JSONObject continuation =
+                optionalJournalObject(generation, "continuation");
+        if (continuation != null) {
+            validateJournalContinuation(continuation);
+        }
+        validateOptionalJournalPricing(generation, "pricing");
+
+        JSONArray samples = requireJournalArray(generation, "samples");
+        for (int i = 0; i < samples.length(); i++) {
+            JSONObject sample = requireJournalArrayObject(
+                    samples, i, "deferred samples");
+            long sampleAt = requireJournalLong(
+                    sample, "t", start, Long.MAX_VALUE);
+            if (end > 0L && sampleAt > end) {
+                throw invalidJournal(
+                        "deferred sample lies after its session boundary");
+            }
+            requireJournalFinite(sample, "power", -Double.MAX_VALUE, Double.MAX_VALUE);
+            requireOptionalJournalFinite(
+                    sample, "soc", 0.0, 100.0);
+            requireOptionalJournalFinite(
+                    sample, "temp", -999.0, Double.MAX_VALUE);
+            requireOptionalJournalFinite(
+                    sample, "tempHigh", -999.0, Double.MAX_VALUE);
+            requireOptionalJournalFinite(
+                    sample, "tempLow", -999.0, Double.MAX_VALUE);
+        }
+    }
+
+    private static void validateChargingMaintenanceIntent(
+            JSONObject maintenance, long lastAllocated) {
+        Object operationValue = maintenance.opt("operation");
+        if (!(operationValue instanceof String)) {
+            throw invalidJournal("maintenance operation is missing or not a string");
+        }
+        String operation = (String) operationValue;
+        if (!"clearChargingHistory".equals(operation) && !"resetAll".equals(operation)) {
+            throw invalidJournal("maintenance operation is unsupported");
+        }
+        long previousStart = requireJournalLong(
+                maintenance, "previousStart", 0L, Long.MAX_VALUE - 1L);
+        JSONObject replacement = optionalJournalObject(maintenance, "replacement");
+        long priorStart = 0L;
+        if (replacement != null) {
+            validateActiveChargingReplacement(replacement);
+            long replacementPrevious = requireJournalLong(
+                    replacement, "previousStart", 0L, Long.MAX_VALUE - 1L);
+            if (replacementPrevious != previousStart) {
+                throw invalidJournal(
+                        "maintenance replacement does not reference its previous session");
+            }
+            priorStart = requireJournalLong(
+                    replacement, "start", 1L, Long.MAX_VALUE - 1L);
+            if (lastAllocated < priorStart) {
+                throw invalidJournal(
+                        "lastAllocatedStart precedes the maintenance replacement");
+            }
+        }
+        JSONArray deferred = requireJournalArray(maintenance, "deferred");
+        for (int i = 0; i < deferred.length(); i++) {
+            JSONObject generation = requireJournalArrayObject(
+                    deferred, i, "maintenance deferred sessions");
+            validateDeferredChargingGeneration(generation);
+            long start = requireJournalLong(
+                    generation, "start", 1L, Long.MAX_VALUE - 1L);
+            if (start <= priorStart) {
+                throw invalidJournal(
+                        "maintenance session identities are not strictly increasing");
+            }
+            if (lastAllocated < start) {
+                throw invalidJournal(
+                        "lastAllocatedStart precedes a maintenance session identity");
+            }
+            priorStart = start;
+        }
+    }
+
+    private static void validateActiveChargingReplacement(JSONObject replacement) {
+        long start = requireJournalLong(
+                replacement, "start", 1L, Long.MAX_VALUE - 1L);
+        requireJournalLong(
+                replacement, "previousStart", 0L, Long.MAX_VALUE - 1L);
+        requireJournalSoc(replacement, "startSoc");
+        requireJournalLong(replacement, "startRange", -1L, Integer.MAX_VALUE);
+        requireJournalLong(
+                replacement, "startOdometer", -1L, Integer.MAX_VALUE);
+        requireJournalLong(replacement, "gun", -1L, Integer.MAX_VALUE);
+        requireJournalLong(
+                replacement, "timeToFull", -1L, Integer.MAX_VALUE);
+        requireOptionalJournalFinite(replacement, "lat", -90.0, 90.0);
+        requireOptionalJournalFinite(replacement, "lng", -180.0, 180.0);
+        requireJournalCounterSource(replacement, "counterSource", true);
+        validateJournalCounter(requireJournalObject(replacement, "counter"));
+        requireJournalBoolean(replacement, "lifecycleHold");
+        boolean pendingClose = requireJournalBoolean(replacement, "pendingClose");
+        long closeAt = requireJournalLong(
+                replacement, "closeAt", 0L, Long.MAX_VALUE);
+        requireOptionalJournalSoc(replacement, "closeSoc");
+        if (pendingClose) {
+            if (closeAt <= start) {
+                throw invalidJournal(
+                        "maintenance replacement close does not follow its start");
+            }
+        } else if (closeAt != 0L) {
+            throw invalidJournal(
+                    "maintenance replacement close timestamp has no pending close");
+        }
+        requireJournalBoolean(replacement, "closeCounterCaptured");
+        requireJournalBoolean(replacement, "closeResumeBlocked");
+        requireJournalLong(replacement, "closeIsDc", -2L, 1L);
+        requireOptionalJournalFinite(
+                replacement, "closeTempHigh", -999.0, Double.MAX_VALUE);
+        requireOptionalJournalFinite(
+                replacement, "closeTempLow", -999.0, Double.MAX_VALUE);
+        requireOptionalJournalFinite(
+                replacement, "closeTempAvg", -999.0, Double.MAX_VALUE);
+        validateOptionalJournalPricing(replacement, "closePricing");
+    }
+
+    private static void validateJournalContinuation(JSONObject continuation) {
+        requireJournalLong(
+                continuation, "rowStart", 1L, Long.MAX_VALUE - 1L);
+        requireOptionalJournalFinite(
+                continuation, "endpointKwh", 0.0, Double.MAX_VALUE);
+        requireJournalCounterSource(continuation, "source", true);
+        requireOptionalJournalSoc(continuation, "startSoc");
+        Double fullScale = requireOptionalJournalFinite(
+                continuation, "fullScaleKwh", 0.0, Double.MAX_VALUE);
+        if (fullScale != null && fullScale <= 1.0) {
+            throw invalidJournal(
+                    "continuation counter full scale is outside its domain");
+        }
+    }
+
+    private static void validateOptionalValueTimestampPair(
+            JSONObject source, String valueKey, String timestampKey,
+            double minimum, double maximum) {
+        Double value =
+                requireOptionalJournalFinite(source, valueKey, minimum, maximum);
+        long timestamp =
+                requireJournalLong(source, timestampKey, 0L, Long.MAX_VALUE);
+        if ((value == null) != (timestamp == 0L)) {
+            throw invalidJournal(
+                    valueKey + " and " + timestampKey
+                            + " must be present together");
+        }
+    }
+
+    private static void validateJournalCounter(JSONObject counter) {
+        Double baseline = requireOptionalJournalFinite(
+                counter, "baseline", 0.0, Double.MAX_VALUE);
+        Double last = requireOptionalJournalFinite(
+                counter, "last", 0.0, Double.MAX_VALUE);
+        if ((baseline == null) != (last == null)) {
+            throw invalidJournal(
+                    "counter baseline and last value must be present together");
+        }
+        requireJournalFinite(counter, "energy", 0.0, Double.MAX_VALUE);
+        long lastAt = requireJournalLong(
+                counter, "lastAt", 0L, Long.MAX_VALUE);
+        if (baseline != null && lastAt <= 0L) {
+            throw invalidJournal(
+                    "counter series has no observation timestamp");
+        }
+        long observationGeneration = requireJournalLong(
+                counter, "observationGeneration", 0L, Long.MAX_VALUE);
+        requireJournalLong(counter, "wraps", 0L, Integer.MAX_VALUE);
+        requireJournalLong(counter, "resets", 0L, Integer.MAX_VALUE);
+        requireJournalLong(counter, "ceilingStreak", 0L, Integer.MAX_VALUE);
+        requireJournalBoolean(counter, "saturated");
+        requireJournalFinite(counter, "abandoned", 0.0, Double.MAX_VALUE);
+        requireJournalLong(
+                counter, "unattributedGaps", 0L, Integer.MAX_VALUE);
+        boolean awaitingGap = requireJournalBoolean(counter, "awaitingGap");
+        boolean gapReconstructed =
+                requireJournalBoolean(counter, "gapReconstructed");
+        if ((awaitingGap || gapReconstructed)
+                && (baseline == null || last == null
+                        || lastAt <= 0L || observationGeneration <= 0L)) {
+            throw invalidJournal(
+                    "counter gap state has no durable endpoint lineage");
+        }
+        requireOptionalJournalFinite(
+                counter, "gapEstimate", 0.0, Double.MAX_VALUE);
+        requireOptionalJournalFinite(
+                counter, "recentRate", 0.0, Double.MAX_VALUE);
+        Double fullScale = requireOptionalJournalFinite(
+                counter, "fullScale", 0.0, Double.MAX_VALUE);
+        if (fullScale != null && fullScale <= 1.0) {
+            throw invalidJournal("counter full scale is outside its domain");
+        }
+    }
+
+    private static void validateOptionalJournalPricing(
+            JSONObject parent, String key) {
+        JSONObject pricing = optionalJournalObject(parent, key);
+        if (pricing == null) return;
+        requireJournalFinite(pricing, "rate", 0.0, Double.MAX_VALUE);
+        requireJournalString(pricing, "currency");
+        requireJournalString(pricing, "tariffId");
+        requireJournalString(pricing, "tariffLabel");
+    }
+
+    private static JSONObject requireJournalObject(JSONObject source, String key) {
+        Object value = source.opt(key);
+        if (!(value instanceof JSONObject)) {
+            throw invalidJournal(key + " is missing or not an object");
+        }
+        return (JSONObject) value;
+    }
+
+    private static JSONObject optionalJournalObject(JSONObject source, String key) {
+        if (!source.has(key)) return null;
+        return requireJournalObject(source, key);
+    }
+
+    private static JSONArray requireJournalArray(JSONObject source, String key) {
+        Object value = source.opt(key);
+        if (!(value instanceof JSONArray)) {
+            throw invalidJournal(key + " is missing or not an array");
+        }
+        return (JSONArray) value;
+    }
+
+    private static JSONObject requireJournalArrayObject(
+            JSONArray source, int index, String label) {
+        Object value = source.opt(index);
+        if (!(value instanceof JSONObject)) {
+            throw invalidJournal(label + " contains a non-object entry");
+        }
+        return (JSONObject) value;
+    }
+
+    private static long requireJournalLong(
+            JSONObject source, String key, long minimum, long maximum) {
+        Object value = source.opt(key);
+        if (!(value instanceof Number)) {
+            throw invalidJournal(key + " is missing or not an integer");
+        }
+        try {
+            java.math.BigDecimal exact =
+                    new java.math.BigDecimal(value.toString()).stripTrailingZeros();
+            if (exact.scale() > 0
+                    || exact.compareTo(java.math.BigDecimal.valueOf(minimum)) < 0
+                    || exact.compareTo(java.math.BigDecimal.valueOf(maximum)) > 0) {
+                throw invalidJournal(key + " is outside its integer domain");
+            }
+            return exact.longValueExact();
+        } catch (NumberFormatException | ArithmeticException invalid) {
+            throw invalidJournal(key + " is outside its integer domain");
+        }
+    }
+
+    private static boolean requireJournalBoolean(JSONObject source, String key) {
+        Object value = source.opt(key);
+        if (!(value instanceof Boolean)) {
+            throw invalidJournal(key + " is missing or not a boolean");
+        }
+        return (Boolean) value;
+    }
+
+    private static String requireJournalString(JSONObject source, String key) {
+        Object value = source.opt(key);
+        if (!(value instanceof String)) {
+            throw invalidJournal(key + " is missing or not a string");
+        }
+        return (String) value;
+    }
+
+    private static String requireJournalCounterSource(
+            JSONObject source, String key, boolean allowEmpty) {
+        String value = requireJournalString(source, key);
+        if (!isValidCounterSource(value, allowEmpty)) {
+            throw invalidJournal(key + " is not a supported counter source");
+        }
+        return value;
+    }
+
+    private static boolean isValidCounterSource(
+            String value, boolean allowEmpty) {
+        return (allowEmpty && (value == null || value.isEmpty()))
+                || com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(value)
+                || com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(value);
+    }
+
+    private static double requireJournalFinite(
+            JSONObject source, String key, double minimum, double maximum) {
+        Object value = source.opt(key);
+        if (!(value instanceof Number)) {
+            throw invalidJournal(key + " is missing or not numeric");
+        }
+        double result = ((Number) value).doubleValue();
+        if (!Double.isFinite(result) || result < minimum || result > maximum) {
+            throw invalidJournal(key + " is outside its numeric domain");
+        }
+        return result;
+    }
+
+    private static Double requireOptionalJournalFinite(
+            JSONObject source, String key, double minimum, double maximum) {
+        if (!source.has(key)) {
+            throw invalidJournal(key + " is missing");
+        }
+        Object value = source.opt(key);
+        if (value == null || value == JSONObject.NULL) return null;
+        if (!(value instanceof Number)) {
+            throw invalidJournal(key + " is not numeric or null");
+        }
+        double result = ((Number) value).doubleValue();
+        if (!Double.isFinite(result) || result < minimum || result > maximum) {
+            throw invalidJournal(key + " is outside its numeric domain");
+        }
+        return result;
+    }
+
+    private static double requireJournalSoc(JSONObject source, String key) {
+        return requireJournalFinite(source, key, 0.0, 100.0);
+    }
+
+    private static void requireOptionalJournalSoc(JSONObject source, String key) {
+        requireOptionalJournalFinite(source, key, 0.0, 100.0);
+    }
+
+    private static IllegalStateException invalidJournal(String reason) {
+        return new IllegalStateException(
+                "invalid charging lifecycle journal: " + reason);
+    }
+
+    private void loadChargingLifecycleJournal() {
+        if (chargingLifecycleJournalLoaded) return;
+        chargingLifecycleJournalLoaded = true;
+        java.io.File file = chargingLifecycleJournalFile;
+        if (file == null || !file.isFile()) return;
+        try {
+            String encoded = new String(
+                    java.nio.file.Files.readAllBytes(file.toPath()),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            JSONObject root = new JSONObject(encoded);
+            if (root.optInt("version", -1) != CHARGING_LIFECYCLE_JOURNAL_VERSION) {
+                throw new IllegalStateException("unsupported charging lifecycle journal version");
+            }
+            validateChargingLifecycleJournal(root);
+            lastAllocatedChargingStartMs = Math.max(
+                    lastAllocatedChargingStartMs,
+                    root.optLong("lastAllocatedStart", 0L));
+            JSONArray reprices = root.optJSONArray("pendingTariffReprices");
+            if (reprices != null) {
+                for (int i = 0; i < reprices.length(); i++) {
+                    String tariffKey = normalizeTariffRepriceKey(
+                            reprices.optString(i, ""));
+                    if (!tariffKey.isEmpty()) pendingTariffReprices.add(tariffKey);
+                }
+            }
+            JSONObject confirmed = root.optJSONObject("preSessionCounter");
+            if (confirmed != null) {
+                preSessionCounterLowKwh = confirmed.getDouble("value");
+                preSessionCounterAtMs = confirmed.getLong("at");
+                preSessionCounterSource = confirmed.getString("source");
+            }
+            JSONObject preOpen = root.optJSONObject("preOpenExternal");
+            if (preOpen != null) {
+                preSessionProvisionalExternalRaw = finiteOrNaN(preOpen, "raw");
+                preSessionProvisionalExternalAtMs = preOpen.optLong("at", 0L);
+                preSessionProvisionalExternalUnitDivisor =
+                        validCounterUnitDivisor(
+                                finiteOrNaN(preOpen, "unitDivisor"));
+            }
+            JSONObject active = root.optJSONObject("active");
+            if (active != null) restoreActiveChargingLifecycle(active);
+            JSONArray deferred = root.optJSONArray("deferred");
+            if (deferred != null) {
+                for (int i = 0; i < deferred.length(); i++) {
+                    JSONObject item = deferred.optJSONObject(i);
+                    if (item == null) continue;
+                    DeferredChargingGeneration generation =
+                            deferredGenerationFromJson(item);
+                    if (generation != null) {
+                        deferredPhysicalGenerations.addLast(generation);
+                        lastAllocatedChargingStartMs = Math.max(
+                                lastAllocatedChargingStartMs, generation.startMs);
+                    }
+                }
+            }
+            JSONObject maintenance = root.optJSONObject("maintenanceIntent");
+            if (maintenance != null) {
+                pendingChargingMaintenanceIntent =
+                        chargingMaintenanceIntentFromJson(maintenance);
+                if (pendingChargingMaintenanceIntent == null) {
+                    throw new IllegalStateException(
+                            "invalid charging maintenance intent");
+                }
+            }
+            sessionInputsFenced = !deferredPhysicalGenerations.isEmpty();
+            chargingLifecycleJournalReadFailed = false;
+            chargingLifecycleJournalDirty = false;
+            logger.warn("Restored charging lifecycle journal: active="
+                    + (wasCharging ? chargingStartTime : "none")
+                    + ", deferred=" + deferredPhysicalGenerations.size());
+        } catch (Exception e) {
+            chargingLifecycleJournalReadFailed = true;
+            chargingLifecycleJournalDirty = true;
+            logger.error("Charging lifecycle journal is unreadable; preserving it: "
+                    + e.getMessage());
+        }
+    }
+
+    private void restoreActiveChargingLifecycle(JSONObject active) {
+        chargingStartTime = active.optLong("start", 0L);
+        if (chargingStartTime <= 0L) return;
+        wasCharging = true;
+        chargingStartSoc = finiteOrZero(active, "startSoc");
+        chargingPeakPower = finiteOrZero(active, "peak");
+        chargingPowerSum = finiteOrZero(active, "powerSum");
+        chargingPowerCount = Math.max(0, active.optInt("powerCount", 0));
+        chargingStartRange = active.optInt("startRange", -1);
+        chargingStartOdometer = active.optInt("startOdometer", -1);
+        chargingGunState = active.optInt("gun", -1);
+        chargingTimeToFullMin = active.optInt("timeToFull", -1);
+        chargingStartLat = finiteOrZero(active, "lat");
+        chargingStartLng = finiteOrZero(active, "lng");
+        counterOwner = emptyToNull(active.optString("counterOwner", ""));
+        JSONObject counter = active.optJSONObject("counter");
+        chargingCounter.restoreState(
+                counter != null ? counterStateFromJson(counter) : null);
+        lastSessionCounterKwh = finiteOrNaN(active, "lastSessionCounter");
+        counterBaselinePending = active.optBoolean("baselinePending", false);
+        counterBaselinePendingSinceMs = active.optLong("baselinePendingSince", 0L);
+        counterBaselineCandidateKwh = finiteOrNaN(active, "baselineCandidate");
+        counterBaselineCandidateAtMs = active.optLong("baselineCandidateAt", 0L);
+        counterBaselineLatestKwh = finiteOrNaN(active, "baselineLatest");
+        counterBaselineLatestAtMs = active.optLong("baselineLatestAt", 0L);
+        provisionalExternalKwh = finiteOrNaN(active, "provisionalExternal");
+        provisionalExternalAtMs = active.optLong("provisionalExternalAt", 0L);
+        provisionalExternalUnitDivisor = validCounterUnitDivisor(
+                finiteOrNaN(active, "provisionalExternalDivisor"));
+        recoveredActivePowerGapAtMs =
+                active.optLong("recoveredPowerGapAt", 0L);
+
+        JSONObject close = active.optJSONObject("pendingClose");
+        if (close != null) {
+            pendingCloseSessionStart = close.optLong("sessionStart", 0L);
+            pendingCloseAtMs = close.optLong("at", 0L);
+            if (pendingCloseSessionStart == chargingStartTime) {
+                pendingCloseAtMs = strictlyAfterChargingStart(
+                        chargingStartTime, pendingCloseAtMs);
+            }
+            pendingCloseSoc = finiteOrNaN(close, "soc");
+            pendingCloseCounterCaptured = close.optBoolean("counterCaptured", false);
+            pendingCloseIsDc = close.optInt("isDc", -2);
+            pendingCloseResumeBlocked = close.optBoolean("resumeBlocked", false);
+            pendingCloseTempHigh = finiteOrNaN(close, "tempHigh");
+            pendingCloseTempLow = finiteOrNaN(close, "tempLow");
+            pendingCloseTempAvg = finiteOrNaN(close, "tempAvg");
+            if (Double.isNaN(pendingCloseTempHigh)) pendingCloseTempHigh = -999;
+            if (Double.isNaN(pendingCloseTempLow)) pendingCloseTempLow = -999;
+            if (Double.isNaN(pendingCloseTempAvg)) pendingCloseTempAvg = -999;
+            pendingClosePricing = pricingFromJson(close.optJSONObject("pricing"));
+        }
+        JSONObject optOut = active.optJSONObject("optOut");
+        if (optOut != null) {
+            optOutClosePending = optOut.optBoolean("pending", false);
+            optOutBoundaryMs = optOut.optLong("at", 0L);
+            if (optOutClosePending) {
+                optOutBoundaryMs = strictlyAfterChargingStart(
+                        chargingStartTime, optOutBoundaryMs);
+            }
+            optOutBoundarySoc = finiteOrNaN(optOut, "soc");
+            optOutCounterCaptured = optOut.optBoolean("counterCaptured", false);
+            optOutCloseIsDc = optOut.optInt("isDc", -2);
+            optOutClosePricing = pricingFromJson(optOut.optJSONObject("pricing"));
+        }
+        lastAllocatedChargingStartMs = Math.max(
+                lastAllocatedChargingStartMs, chargingStartTime);
+    }
+
+    private DeferredChargingGeneration deferredGenerationFromJson(JSONObject source) {
+        long start = source.optLong("start", 0L);
+        if (start <= 0L) return null;
+        DeferredChargingGeneration generation = new DeferredChargingGeneration();
+        generation.startMs = start;
+        generation.startSoc = finiteOrZero(source, "startSoc");
+        generation.endMs = source.optLong("end", 0L);
+        if (generation.endMs > 0L) {
+            generation.endMs = strictlyAfterChargingStart(
+                    generation.startMs, generation.endMs);
+        }
+        generation.endSoc = finiteOrNaN(source, "endSoc");
+        generation.startRange = source.optInt("startRange", -1);
+        generation.startOdometer = source.optInt("startOdometer", -1);
+        generation.gun = source.optInt("gun", -1);
+        generation.timeToFull = source.optInt("timeToFull", -1);
+        generation.lat = finiteOrZero(source, "lat");
+        generation.lng = finiteOrZero(source, "lng");
+        generation.peakPower = finiteOrZero(source, "peak");
+        generation.powerSum = finiteOrZero(source, "powerSum");
+        generation.powerCount = Math.max(0, source.optInt("powerCount", 0));
+        generation.endTempHigh = finiteOrNaN(source, "tempHigh");
+        generation.endTempLow = finiteOrNaN(source, "tempLow");
+        generation.endTempAvg = finiteOrNaN(source, "tempAvg");
+        if (Double.isNaN(generation.endTempHigh)) generation.endTempHigh = -999;
+        if (Double.isNaN(generation.endTempLow)) generation.endTempLow = -999;
+        if (Double.isNaN(generation.endTempAvg)) generation.endTempAvg = -999;
+        generation.counterOwner = emptyToNull(source.optString("counterOwner", ""));
+        JSONObject counter = source.optJSONObject("counter");
+        generation.counter.restoreState(
+                counter != null ? counterStateFromJson(counter) : null);
+        generation.previousCounterKwh = finiteOrNaN(source, "previousCounter");
+        generation.counterBaselinePending = source.optBoolean("baselinePending", true);
+        generation.counterBaselinePendingSinceMs =
+                source.optLong("baselinePendingSince", start);
+        generation.counterCandidateKwh = finiteOrNaN(source, "counterCandidate");
+        generation.counterCandidateAtMs = source.optLong("counterCandidateAt", 0L);
+        generation.counterLatestKwh = finiteOrNaN(source, "counterLatest");
+        generation.counterLatestAtMs = source.optLong("counterLatestAt", 0L);
+        generation.provisionalExternalKwh = finiteOrNaN(source, "provisionalExternal");
+        generation.provisionalExternalAtMs = source.optLong("provisionalExternalAt", 0L);
+        generation.provisionalExternalUnitDivisor = validCounterUnitDivisor(
+                finiteOrNaN(source, "provisionalExternalDivisor"));
+        generation.integrationTruncated =
+                source.optBoolean("integrationTruncated", false);
+        generation.closeIsDc = source.optInt("closeIsDc", -1);
+        generation.resumeBlocked = source.optBoolean("resumeBlocked", false);
+        JSONObject continuation = source.optJSONObject("continuation");
+        if (continuation != null) {
+            long rowStart = continuation.optLong("rowStart", 0L);
+            if (rowStart > 0L) {
+                generation.continuationOffer = new ContinuationOffer(
+                        rowStart,
+                        finiteOrNaN(continuation, "endpointKwh"),
+                        emptyToNull(continuation.optString("source", "")),
+                        finiteOrNaN(continuation, "startSoc"),
+                        finiteOrNaN(continuation, "fullScaleKwh"));
+            }
+        }
+        generation.closePricing = pricingFromJson(source.optJSONObject("pricing"));
+        JSONArray samples = source.optJSONArray("samples");
+        if (samples != null) {
+            for (int i = 0; i < samples.length(); i++) {
+                JSONObject sample = samples.optJSONObject(i);
+                if (sample == null) continue;
+                long t = sample.optLong("t", start);
+                double power = finiteOrNaN(sample, "power");
+                if (Double.isNaN(power)) continue;
+                generation.samples.add(new DeferredChargingSample(
+                        t, power,
+                        finiteOrNaN(sample, "soc"),
+                        finiteOrNaN(sample, "temp"),
+                        finiteOrNaN(sample, "tempHigh"),
+                        finiteOrNaN(sample, "tempLow")));
+            }
+        }
+        // Restore byte-for-byte here. Reconciliation marks only still-live generations as an outage
+        // gap after durable H2 state has been merged and an independent estimate can be computed.
+        return generation;
+    }
+
+    private static String emptyToNull(String value) {
+        return value == null || value.isEmpty() ? null : value;
+    }
+
+    /**
+     * Remove journal entries whose transaction committed before the process died, and retain only
+     * identities that still need materialization.
+     */
+    private void reconcileChargingLifecycleJournalWithDatabase() {
+        if (!chargingLifecycleJournalLoaded || chargingLifecycleJournalReadFailed
+                || connection == null) return;
+        try {
+            if (!reconcilePendingChargingMaintenanceIntent(null)) {
+                throw new java.sql.SQLException(
+                        "could not reconcile restored charging maintenance intent");
+            }
+            if (!reserveDeferredChargingIdentities()) {
+                throw new java.sql.SQLException(
+                        "could not reserve restored deferred charging identities");
+            }
+            if (wasCharging && chargingStartTime > 0L) {
+                if (!isDurablyOpenSession(chargingStartTime)) {
+                    clearRecoveredActiveLifecycle();
+                } else {
+                    mergeRecoveredActiveCounterWithDatabase();
+                    reconcileRecoveredActivePowerGap();
+                }
+            }
+            java.util.Iterator<DeferredChargingGeneration> iterator =
+                    deferredPhysicalGenerations.iterator();
+            while (iterator.hasNext()) {
+                DeferredChargingGeneration generation = iterator.next();
+                int state = durableChargingRowState(generation.startMs);
+                if (state == 2) {
+                    iterator.remove();
+                } else if (state == 1 && !wasCharging) {
+                    adoptDeferredGenerationAsRecoveredActive(generation);
+                    iterator.remove();
+                    mergeRecoveredActiveCounterWithDatabase();
+                } else if (!generation.isEnded()
+                        && generation.counter.hasSeriesState()) {
+                    generation.counter.beginGapReconciliation(
+                            outageGapEstimate(
+                                    generation.startSoc,
+                                    generation.counter.energyKwh()));
+                }
+            }
+            sessionInputsFenced = !deferredPhysicalGenerations.isEmpty();
+            persistChargingLifecycleJournal();
+        } catch (Exception e) {
+            logger.warn("Could not reconcile charging lifecycle journal: " + e.getMessage());
+        }
+    }
+
+    private void mergeRecoveredActiveCounterWithDatabase() throws Exception {
+        CounterRestoreState durable = readCounterRestoreState(chargingStartTime);
+        com.overdrive.app.charging.ChargeCounterAccumulator.State journal =
+                chargingCounter.snapshotState();
+        boolean durableWins =
+                com.overdrive.app.charging.ChargeCounterAccumulator.preferSecondCompleteState(
+                        journal, durable.exactState);
+        com.overdrive.app.charging.ChargeCounterAccumulator.State selected =
+                com.overdrive.app.charging.ChargeCounterAccumulator.newestCompleteState(
+                        journal, durable.exactState, durable.incomplete);
+        chargingCounter.restoreState(selected);
+        if (durableWins) counterOwner = durable.source;
+        if (chargingCounter.hasBaseline()) {
+            lastSessionCounterKwh = chargingCounter.lastRawKwh();
+            counterBaselinePending = false;
+            counterBaselinePendingSinceMs = 0L;
+        }
+        // A frozen close belongs to a physical generation that already ended. Only a still-live
+        // generation gets an outage fence; otherwise startup would invent a second gap after its end.
+        boolean ended = pendingCloseSessionStart == chargingStartTime || optOutClosePending;
+        if (!ended && chargingCounter.hasSeriesState()) {
+            chargingCounter.beginGapReconciliation(
+                    outageGapEstimate(chargingStartSoc, chargingCounter.energyKwh()));
+        }
+    }
+
+    private void reconcileRecoveredActivePowerGap() throws Exception {
+        boolean ended = pendingCloseSessionStart == chargingStartTime || optOutClosePending;
+        if (ended) {
+            recoveredActivePowerGapAtMs = 0L;
+            return;
+        }
+        if (recoveredActivePowerGapAtMs <= 0L) {
+            recoveredActivePowerGapAtMs = strictlyAfterChargingStart(
+                    chargingStartTime, System.currentTimeMillis());
+            chargingLifecycleJournalDirty = true;
+            if (!persistChargingLifecycleJournal()) {
+                throw new java.io.IOException(
+                        "recovered charging power-gap intent was not durable");
+            }
+        }
+        final long sessionStart = chargingStartTime;
+        final long boundaryAt = recoveredActivePowerGapAtMs;
+        try {
+            runInTransaction(() -> {
+                try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO " + TABLE_CPS
+                                + " (session_start_time, t, power_kw, soc, temp, temp_high, temp_low)"
+                                + " SELECT ?, ?, ?, NULL, NULL, NULL, NULL"
+                                + " WHERE NOT EXISTS (SELECT 1 FROM " + TABLE_CPS
+                                + " WHERE session_start_time = ? AND t = ? AND power_kw = ?);")) {
+                    insert.setLong(1, sessionStart);
+                    insert.setLong(2, boundaryAt);
+                    insert.setDouble(3, STOP_BOUNDARY_POWER_KW);
+                    insert.setLong(4, sessionStart);
+                    insert.setLong(5, boundaryAt);
+                    insert.setDouble(6, STOP_BOUNDARY_POWER_KW);
+                    insert.executeUpdate();
+                }
+                try (PreparedStatement mark = connection.prepareStatement(
+                        "UPDATE " + TABLE_CHARGING
+                                + " SET integration_truncated = 1"
+                                + " WHERE start_time = ? AND end_time IS NULL;")) {
+                    mark.setLong(1, sessionStart);
+                    if (mark.executeUpdate() != 1) {
+                        throw new java.sql.SQLException(
+                                "recovered power-gap marker found no open session");
+                    }
+                }
+            });
+        } catch (Exception e) {
+            if (!isRecoveredActivePowerGapDurable(sessionStart, boundaryAt)) throw e;
+        }
+        recoveredActivePowerGapAtMs = 0L;
+        chargingLifecycleJournalDirty = true;
+        persistChargingLifecycleJournal();
+    }
+
+    private boolean isRecoveredActivePowerGapDurable(long sessionStart, long boundaryAt) {
+        Connection c = connection;
+        if (c == null) return false;
+        try (PreparedStatement row = c.prepareStatement(
+                "SELECT integration_truncated FROM " + TABLE_CHARGING
+                        + " WHERE start_time = ? AND end_time IS NULL;");
+             PreparedStatement sample = c.prepareStatement(
+                     "SELECT 1 FROM " + TABLE_CPS
+                             + " WHERE session_start_time = ? AND t = ? AND power_kw = ?;")) {
+            row.setLong(1, sessionStart);
+            try (ResultSet rs = row.executeQuery()) {
+                if (!rs.next() || rs.getInt(1) != 1) return false;
+            }
+            sample.setLong(1, sessionStart);
+            sample.setLong(2, boundaryAt);
+            sample.setDouble(3, STOP_BOUNDARY_POWER_KW);
+            try (ResultSet rs = sample.executeQuery()) {
+                return rs.next();
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private double outageGapEstimate(double startSoc, double alreadyAccountedKwh) {
+        try {
+            BatterySocData current = VehicleDataMonitor.getInstance().getBatterySoc();
+            if (current == null || current.socPercent < 0 || current.socPercent > 100
+                    || Double.isNaN(startSoc)) {
+                return Double.NaN;
+            }
+            com.overdrive.app.abrp.SohEstimator soh = getSohEstimator();
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                    soh != null ? soh.getCapacitySohSnapshot() : null;
+            double total = com.overdrive.app.charging.SessionEnergyResolver.socEstimateKwh(
+                    current.socPercent - startSoc,
+                    capacitySoh != null ? capacitySoh.getNominalCapacityKwh() : 0,
+                    capacitySoh != null && capacitySoh.hasDisplaySoh()
+                            ? capacitySoh.getDisplaySoh() : Double.NaN);
+            return !Double.isNaN(total) && total > alreadyAccountedKwh
+                    ? total - Math.max(0.0, alreadyAccountedKwh) : Double.NaN;
+        } catch (Throwable ignored) {
+            return Double.NaN;
+        }
+    }
+
+    /** 0=absent, 1=open, 2=closed. */
+    private int durableChargingRowState(long start) throws Exception {
+        try (PreparedStatement p = connection.prepareStatement(
+                "SELECT end_time FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
+            p.setLong(1, start);
+            try (ResultSet rs = p.executeQuery()) {
+                if (!rs.next()) return 0;
+                rs.getLong(1);
+                return rs.wasNull() ? 1 : 2;
+            }
+        }
+    }
+
+    private void clearRecoveredActiveLifecycle() {
+        long clearedStart = chargingStartTime;
+        wasCharging = false;
+        chargingStartTime = 0L;
+        pendingCloseSessionStart = 0L;
+        pendingCloseAtMs = 0L;
+        pendingCloseSoc = Double.NaN;
+        pendingCloseCounterCaptured = false;
+        pendingClosePricing = null;
+        optOutClosePending = false;
+        optOutBoundaryMs = 0L;
+        optOutBoundarySoc = Double.NaN;
+        optOutCounterCaptured = false;
+        optOutClosePricing = null;
+        chargingCounter.reset();
+        recoveredActivePowerGapAtMs = 0L;
+        counterOwner = null;
+        clearCounterBaselineCandidates();
+        forgetChargingCloseTargetAliases(clearedStart);
+    }
+
+    private void adoptDeferredGenerationAsRecoveredActive(
+            DeferredChargingGeneration generation) {
+        wasCharging = true;
+        chargingStartTime = generation.startMs;
+        chargingStartSoc = generation.startSoc;
+        chargingPeakPower = generation.peakPower;
+        chargingPowerSum = generation.powerSum;
+        chargingPowerCount = generation.powerCount;
+        chargingStartRange = generation.startRange;
+        chargingStartOdometer = generation.startOdometer;
+        chargingGunState = generation.gun;
+        chargingTimeToFullMin = generation.timeToFull;
+        chargingStartLat = generation.lat;
+        chargingStartLng = generation.lng;
+        chargingCounter.restoreState(generation.counter.snapshotState());
+        recoveredActivePowerGapAtMs = 0L;
+        counterOwner = generation.counterOwner;
+        counterBaselinePending = generation.counterBaselinePending;
+        counterBaselinePendingSinceMs = generation.counterBaselinePendingSinceMs;
+        counterBaselineCandidateKwh = generation.counterCandidateKwh;
+        counterBaselineCandidateAtMs = generation.counterCandidateAtMs;
+        counterBaselineLatestKwh = generation.counterLatestKwh;
+        counterBaselineLatestAtMs = generation.counterLatestAtMs;
+        provisionalExternalKwh = generation.provisionalExternalKwh;
+        provisionalExternalAtMs = generation.provisionalExternalAtMs;
+        provisionalExternalUnitDivisor =
+                generation.provisionalExternalUnitDivisor;
+        if (chargingCounter.hasBaseline()) {
+            lastSessionCounterKwh = chargingCounter.lastRawKwh();
+        }
+        if (generation.isEnded()) {
+            pendingCloseSessionStart = generation.startMs;
+            pendingCloseAtMs = strictlyAfterChargingStart(
+                    generation.startMs, generation.endMs);
+            pendingCloseSoc = generation.endSoc;
+            pendingCloseCounterCaptured = true;
+            pendingClosePricing = generation.closePricing;
+            pendingCloseIsDc = generation.closeIsDc;
+            pendingCloseResumeBlocked = generation.resumeBlocked;
+            pendingCloseTempHigh = generation.endTempHigh;
+            pendingCloseTempLow = generation.endTempLow;
+            pendingCloseTempAvg = generation.endTempAvg;
+        }
+    }
+
+    private boolean trackWithAnalyticsTemporarilyEnabled(
+            boolean charging, double soc, double power, long now) {
+        boolean enabled = chargingAnalyticsEnabled;
+        try {
+            chargingAnalyticsEnabled = true;
+            return trackChargingSession(charging, soc, power, now);
+        } finally {
+            chargingAnalyticsEnabled = enabled;
+        }
+    }
+
+    /**
+     * Materialize queued generations in physical order. Completed generations ahead of the newest
+     * generation are opened and closed before the current one is exposed as the durable open row.
+     */
+    private boolean materializeDeferredGenerationsForOpenEdge(
+            double edgeSoc, double power, long now) {
+        while (true) {
+            if (wasCharging && pendingCloseSessionStart == chargingStartTime
+                    && !deferredPhysicalGenerations.isEmpty()) {
+                if (!trackChargingSession(false, pendingCloseSoc, 0, pendingCloseAtMs)) {
+                    return false;
+                }
+                continue;
+            }
+            DeferredChargingGeneration generation = deferredPhysicalGenerations.peekFirst();
+            if (generation == null) {
+                return wasCharging || trackChargingSession(true, edgeSoc, power, now);
+            }
+            boolean ended = generation.isEnded();
+            if (!wasCharging
+                    && !trackChargingSession(true, generation.startSoc, 0, generation.startMs)) {
+                return false;
+            }
+            // Capture ended before SESSION START consumes the queue head. A sole completed
+            // generation still has to close before the actual current physical generation opens.
+            if (ended) {
+                if (!trackChargingSession(false, pendingCloseSoc, 0, pendingCloseAtMs)) {
+                    return false;
+                }
+                continue;
+            }
+            return true;
+        }
+    }
+
+    /** Drain every restored generation when the detector proves the vehicle is physically off. */
+    private boolean materializeDeferredGenerationsForClosedEdge(double edgeSoc, long now) {
+        while (wasCharging || !deferredPhysicalGenerations.isEmpty()) {
+            if (wasCharging) {
+                double closeSoc = !Double.isNaN(pendingCloseSoc) ? pendingCloseSoc : edgeSoc;
+                long closeAt = pendingCloseAtMs > 0L ? pendingCloseAtMs : now;
+                if (!trackChargingSession(false, closeSoc, 0, closeAt)) return false;
+                continue;
+            }
+
+            DeferredChargingGeneration generation = deferredPhysicalGenerations.peekFirst();
+            if (generation == null) break;
+            if (!generation.isEnded()) {
+                // The process disappeared while this queued generation was live. Detector OFF proves
+                // it ended, but not when during the outage; preserve the current endpoint and mark the
+                // power integral as a floor.
+                generation.integrationTruncated = true;
+                endDeferredPhysicalGeneration(generation, now, edgeSoc, false);
+            }
+            if (!trackChargingSession(true, generation.startSoc, 0, generation.startMs)) {
+                return false;
+            }
+        }
+        return !wasCharging && deferredPhysicalGenerations.isEmpty();
+    }
+
+    /** Persist every enabled deferred interval after the user disables analytics. */
+    private boolean materializeDeferredGenerationsAtOptOut() {
+        while ((wasCharging && pendingCloseResumeBlocked)
+                || !deferredPhysicalGenerations.isEmpty()) {
+            if (wasCharging) {
+                if (!trackWithAnalyticsTemporarilyEnabled(
+                        false, pendingCloseSoc, 0, pendingCloseAtMs)) {
+                    return false;
+                }
+                continue;
+            }
+            DeferredChargingGeneration generation = deferredPhysicalGenerations.peekFirst();
+            if (generation == null) break;
+            if (!trackWithAnalyticsTemporarilyEnabled(
+                    true, generation.startSoc, 0, generation.startMs)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public synchronized boolean onChargingEdge(boolean isCharging) {
+        long expectedCloseStart = !isCharging && wasCharging ? chargingStartTime : 0L;
+        return onChargingEdge(isCharging, expectedCloseStart, true);
+    }
+
+    /**
+     * Apply one manager-owned edge, fencing a close to the exact row captured at the physical edge.
+     *
+     * <p>A delayed retry may run after that row has already closed and a replacement is live. In that
+     * case the expected row's durable postcondition is checked and no mutable lifecycle state is
+     * touched. {@code drainDeferredOnClose} is false while a newer physical generation is still live.
+     */
+    public synchronized boolean onChargingEdge(
+            boolean isCharging, long expectedCloseStart, boolean drainDeferredOnClose) {
+        if (!isInitialized || connection == null) {
+            if (!isCharging) return false;
+            if (wasCharging && chargingStartTime > 0L) {
+                return !chargingLifecycleJournalDirty
+                        || persistChargingLifecycleJournal();
+            }
+            return journalPhysicalChargingStartWithoutDatabase();
+        }
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        if (!isCharging && expectedCloseStart > 0L) {
+            expectedCloseStart = resolveChargingCloseTargetStart(expectedCloseStart);
+        }
+        // A stale close may arrive after a replacement became live. Persisting that replacement's
+        // current image is safe and cannot mutate H2; acknowledging the old close while this image
+        // remains volatile would lose the replacement on a power cut.
+        if (chargingLifecycleJournalDirty && !persistChargingLifecycleJournal()) return false;
+        if (!isCharging && expectedCloseStart > 0L
+                && (!wasCharging || chargingStartTime != expectedCloseStart)) {
+            return isChargingSessionCloseSatisfied(expectedCloseStart);
+        }
+        if (!reserveDeferredChargingIdentities()) return false;
+        if (!isCharging) chargingLifecycleHold = false;
+        if (isCharging == wasCharging
+                && deferredPhysicalGenerations.isEmpty()
+                && !(pendingCloseResumeBlocked && wasCharging)) {
+            return !counterProgressDirty || persistCounterProgress();
+        }
+        try {
+            VehicleDataMonitor monitor = VehicleDataMonitor.getInstance();
+            if (monitor == null) return false;
+            BatterySocData socData = monitor.getBatterySoc();
+            if (socData == null && isCharging) return false;
+            // A stop must still close/fence the row if the live SOC accessor drops at the edge. Use
+            // the most recent recorded value, then the session start, rather than leaving it OPEN
+            // until an unrelated two-minute tick happens to recover.
+            double edgeSoc = socData != null ? socData.socPercent
+                    : lastRecordedSoc >= 0 ? lastRecordedSoc : chargingStartSoc;
+            ChargingStateData cs = monitor.getChargingState();
+            // Same rule as the tick: an estimated/placeholder kW must not seed peak/avg.
+            double power = isCharging && cs != null && !cs.isEstimated ? cs.chargingPowerKW : 0;
+            if (Double.isNaN(power) || power < 0) power = 0;
+            long now = System.currentTimeMillis();
+            if (!chargingAnalyticsEnabled && pendingCloseResumeBlocked && wasCharging) {
+                if (!trackWithAnalyticsTemporarilyEnabled(
+                        false, pendingCloseSoc, 0, pendingCloseAtMs)) {
+                    return false;
+                }
+                if (!materializeDeferredGenerationsAtOptOut()) return false;
+                return !isCharging;
+            }
+            if (isCharging && !deferredPhysicalGenerations.isEmpty()) {
+                if (!materializeDeferredGenerationsForOpenEdge(edgeSoc, power, now)) return false;
+            } else {
+                if (!trackChargingSession(isCharging, edgeSoc, power, now)) return false;
+                if (!isCharging && !chargingAnalyticsEnabled
+                        && !deferredPhysicalGenerations.isEmpty()
+                        && !materializeDeferredGenerationsAtOptOut()) {
+                    return false;
+                }
+            }
+            if (!isCharging) {
+                if (drainDeferredOnClose
+                        && chargingAnalyticsEnabled && !deferredPhysicalGenerations.isEmpty()
+                        && !materializeDeferredGenerationsForClosedEdge(edgeSoc, now)) {
+                    return false;
+                }
+                return expectedCloseStart > 0L
+                        ? isChargingSessionCloseSatisfied(expectedCloseStart)
+                        : !wasCharging && deferredPhysicalGenerations.isEmpty();
+            }
+            // Try to establish the counter baseline NOW as well. Opening the row early is only half
+            // the fix: the baseline is left pending at SESSION START (deliberately — the counter may
+            // still hold the previous charge's total), and it was then only resolved on the 2-minute
+            // tick. Whatever the charger delivered before that first tick was therefore absorbed into
+            // the baseline and never counted as energy — on a DC session that is several kWh. This
+            // runs the same acceptance test immediately, so a counter that has already re-zeroed
+            // anchors at the true start; one that has not stays pending exactly as before.
+            if (counterBaselinePending && wasCharging) {
+                double counterNow = snapshotChargeCounterKwh();
+                if (!Double.isNaN(counterNow)) {
+                    rememberCounterBaselineCandidate(counterNow, now);
+                }
+                if (!Double.isNaN(counterNow)
+                        && (Double.isNaN(lastSessionCounterKwh) || counterNow < lastSessionCounterKwh)) {
+                    // Ask about continuation BEFORE claiming this as a fresh baseline. The callback path
+                    // does; this one did not, so a value that first became available on the edge was taken
+                    // as a new session's start and an interrupted 10 -> 13 still lost 3 kWh.
+                    if (tryLateContinuation(counterNow, now)) {
+                        counterBaselinePending = false;
+                        counterBaselinePendingSinceMs = 0;
+                        clearCounterBaselineCandidates();
+                        lastSessionCounterKwh = counterNow;
+                        return persistCounterProgress();
+                    }
+                    counterBaselinePending = false;
+                    counterBaselinePendingSinceMs = 0;
+                    consumeSupersededSweepMarker("a baseline was established on the charging edge");
+                    chargingCounter.observe(counterNow, now);
+                    clearCounterBaselineCandidates();
+                    counterProgressDirty = true;
+                    lastSessionCounterKwh = counterNow;
+                    return persistCounterProgress();
+                }
+            }
+            return !counterProgressDirty || persistCounterProgress();
+        } catch (Exception e) {
+            logger.debug("onChargingEdge failed: " + e.getMessage());
+            if (isSqlFailure(e)) noteWriteFailed();
+            return false;
+        }
+    }
+
+    /**
+     * Offer a freshly-observed charged-energy counter reading directly to the open session.
+     *
+     * <p>Pushed by the collector the moment a value is admitted, so the accumulator does not have to
+     * wait for the next {@link #SAMPLE_INTERVAL_MS} tick to see it. That wait is what still lost the
+     * opening energy of a session: the vehicle resets its counter to 0 shortly after the charge starts,
+     * and if that 0 arrived between the fused ON edge and the first tick, the accumulator never saw it —
+     * the tick read whatever the counter had climbed to by then and made THAT the baseline, silently
+     * discarding everything delivered in between. An in-flight poll overwriting the snapshot has the
+     * same effect, and this path is immune to it because the value is handed over directly.
+     *
+     * <p>Only ever ESTABLISHES a pending baseline or advances an established one — it cannot open or
+     * close a session, so a stray callback outside a session is a no-op.
+     *
+     * @param counterKwh the admitted raw counter reading, kWh (0 is valid and is the ideal baseline)
+     */
+    public synchronized void onChargeCounterObserved(String source, double counterKwh) {
+        if (Double.isNaN(counterKwh) || counterKwh < 0) return;
+        if (source == null) return;
+        final double rawCounterValue = counterKwh;
+        // APPLY THE SAME UNIT CALIBRATION THE RATE PATH APPLIES. ChargeRateResolver corrects a
+        // hectowatt-scaled counter's derived POWER; without the matching correction here the raw value
+        // would flow straight into session ENERGY, leaving a trim with believable kW next to a total
+        // 100x wrong. Energy is what gets priced, so it is the worse half to leave uncorrected. The
+        // divisor is 1.0 unless the counter's own slope disagrees with the kWh-grounded reference by
+        // very nearly exactly the unit factor.
+        double unitDiv = 1.0;
+        try {
+            unitDiv = com.overdrive.app.monitor.ChargeRateResolver.counterUnitDivisor(source);
+            if (unitDiv > 1.0) counterKwh = counterKwh / unitDiv;
+        } catch (Throwable ignored) {}
+        if (!chargingAnalyticsEnabled || optOutClosePending) return;
+        // Deferred generations are owned by the atomic sidecar journal, not H2. Route their observations
+        // before any JDBC/replacement gate so a failed A close and unavailable reconnect cannot discard
+        // B/C's only monotonic-counter evidence.
+        if (sessionInputsFenced && !deferredPhysicalGenerations.isEmpty()) {
+            observeDeferredPhysicalCounter(
+                    currentDeferredPhysicalGeneration(), source, counterKwh, unitDiv,
+                    System.currentTimeMillis());
+            return;
+        }
+        boolean databaseAvailable = isInitialized && connection != null;
+        if (databaseAvailable) {
+            if (!reconcilePendingActiveChargingReplacement()) return;
+        } else if (pendingChargingMaintenanceIntent != null
+                || pendingActiveReplacement != null) {
+            return;
+        }
+        // PROVISIONAL vs COMMITTED. An external source may be fed here BEFORE the classifier has ruled,
+        // because its COUNTER verdict needs a 20-minute rising span and waiting for it discards the
+        // opening portion of every external-counter-only session — the same loss the pre-session buffer
+        // exists to prevent, just at a different stage.
+        //
+        // But an unclassified value must not be integrated: if it turns out to be a RATE, treating it as
+        // kWh is nonsense. So hold the earliest reading only, and commit it as the baseline once the
+        // verdict confirms COUNTER. The baseline is all that is needed — every later rise is measured
+        // against it, so nothing between is lost by not accumulating yet.
+        boolean isExternal = com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(source);
+        if (isExternal && !com.overdrive.app.byd.ChargeSourceClassifier.isCounter(source)) {
+            if (com.overdrive.app.byd.ChargeSourceClassifier.isRate(source)) {
+                provisionalExternalKwh = Double.NaN;   // ruled a rate; the held value is meaningless
+                provisionalExternalAtMs = 0L;
+                provisionalExternalUnitDivisor = 1.0;
+                clearPreSessionProvisionalExternal();
+                persistChargingLifecycleJournal();
+                return;
+            }
+            if (!wasCharging || chargingStartTime <= 0L) {
+                if (Double.isNaN(preSessionProvisionalExternalRaw)
+                        || rawCounterValue < preSessionProvisionalExternalRaw) {
+                    preSessionProvisionalExternalRaw = rawCounterValue;
+                    preSessionProvisionalExternalAtMs = System.currentTimeMillis();
+                    preSessionProvisionalExternalUnitDivisor =
+                            validCounterUnitDivisor(unitDiv);
+                    persistChargingLifecycleJournal();
+                }
+                return;
+            }
+            // Still UNKNOWN. Keep the LOWEST reading seen — the closest observed point to the session's
+            // true start, and immune to how long classification took.
+            if (Double.isNaN(provisionalExternalKwh)
+                    || counterValueInRawFrame(counterKwh, unitDiv)
+                    < counterValueInRawFrame(
+                            provisionalExternalKwh, provisionalExternalUnitDivisor)) {
+                provisionalExternalKwh = counterKwh;
+                provisionalExternalAtMs = System.currentTimeMillis();
+                provisionalExternalUnitDivisor = validCounterUnitDivisor(unitDiv);
+                persistChargingLifecycleJournal();
+            }
+            return;
+        }
+        if (isExternal && !wasCharging && chargingStartTime <= 0L
+                && !Double.isNaN(preSessionProvisionalExternalRaw)) {
+            double held = preSessionProvisionalExternalRaw
+                    / validCounterUnitDivisor(unitDiv);
+            long heldAt = preSessionProvisionalExternalAtMs;
+            if (held <= counterKwh) {
+                preSessionCounterLowKwh = held;
+                preSessionCounterAtMs = heldAt > 0L
+                        ? heldAt : System.currentTimeMillis();
+                preSessionCounterSource = source;
+            }
+            clearPreSessionProvisionalExternal();
+            persistChargingLifecycleJournal();
+        }
+        // The provisional external baseline is committed BELOW, only once ownership arbitration has
+        // granted this source the accumulator. Committing it here — before arbitration — hijacked an
+        // ALREADY-ACTIVE capacity series: it overwrote counterOwner and injected a value from a
+        // different counter into a running monotonic series, which is exactly the corruption the
+        // one-counter rule exists to prevent.
+        // ONE COUNTER PER SESSION. There is a single accumulator, and it tracks one monotonic series —
+        // so feeding it two independent counters interleaves them, and their alternating values read as
+        // rises and resets of one counter. That silently corrupts session energy, which is worse than
+        // ignoring a source. Claim the accumulator for the first counter that reports and ignore any
+        // other for the rest of the session; the dedicated capacity counter is preferred when both
+        // appear, because its unit and per-session semantics are documented rather than inferred.
+        if (counterOwner == null) {
+            bindCounterOwner(source);
+            if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(source)) {
+                // Now that this source owns the accumulator, adopt the reading held while it was still
+                // unclassified: that is the closest observed point to the session's start, and using it
+                // as the baseline credits the energy delivered before classification completed.
+                double held = convertCounterUnitFrame(
+                        provisionalExternalKwh,
+                        provisionalExternalUnitDivisor, unitDiv);
+                long heldAt = provisionalExternalAtMs;
+                provisionalExternalKwh = Double.NaN;
+                provisionalExternalAtMs = 0L;
+                provisionalExternalUnitDivisor = 1.0;
+                // Classification can latch a divisor on the confirming observation. Convert the
+                // pre-verdict reading from its captured frame before comparing or baselining it.
+                if (!Double.isNaN(held) && held <= counterKwh) {
+                    logger.info(String.format(java.util.Locale.US,
+                            "External counter confirmed and owns the accumulator; baselining at the"
+                            + " earliest pre-verdict reading %.3f kWh (now %.3f) — crediting %.3f kWh"
+                            + " delivered before classification completed",
+                            held, counterKwh, counterKwh - held));
+                    counterBaselinePending = false;
+                    counterBaselinePendingSinceMs = 0;
+                    consumeSupersededSweepMarker("the external counter's pre-verdict reading became this"
+                            + " session's baseline");
+                    chargingCounter.observe(held, heldAt > 0 ? heldAt : System.currentTimeMillis());
+                    clearCounterBaselineCandidates();
+                }
+            }
+        } else if (!counterOwner.equals(source)) {
+            boolean incomingIsPreferred =
+                    com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(source);
+            if (!incomingIsPreferred) return;   // keep the owner; ignore the challenger
+            // DO NOT REBIND ONCE ENERGY HAS BEEN GATHERED. Rebinding restarts the accumulation, and the
+            // incumbent's total cannot be carried into a different series — so it is thrown away. That
+            // is a straight loss whenever the incumbent has measured anything, and it is worst in the
+            // case it was most likely to fire: a session RESTORED after a restart re-establishes
+            // external ownership carrying all its pre-restart energy, and the first capacity reading
+            // afterwards would discard exactly that. Preferring the documented counter is only worth
+            // anything at the START of a session, before either source has measured energy.
+            // Guard on ANY series state, not just a non-zero total. A session restored after a restart
+            // holds a baseline, a last value and a pending gap reconciliation while its accumulated
+            // energy is still exactly 0 — nothing has risen yet — so an energy-only test left precisely
+            // that state unprotected and discarded the pre-restart endpoints with it.
+            if (chargingCounter.hasSeriesState()) {
+                logger.info("Declining to rebind the charged-energy accumulator from '" + counterOwner
+                        + "' to '" + source + "': the incumbent series is live (measured "
+                        + String.format(java.util.Locale.US, "%.3f", chargingCounter.energyKwh())
+                        + " kWh so far) and rebinding would discard its baseline and any pending gap"
+                        + " reconciliation. Preference only applies before a series exists.");
+                return;
+            }
+            logger.info("Charged-energy accumulator rebinding from '" + counterOwner + "' to '"
+                    + source + "' (documented counter takes precedence, nothing measured yet)");
+            counterOwner = source;
+            chargingCounter.reset();
+            chargingCounter.markPersistenceMetadataChanged();
+            provisionalExternalKwh = Double.NaN;   // belongs to the source being displaced
+            provisionalExternalAtMs = 0L;
+            provisionalExternalUnitDivisor = 1.0;
+            lastSessionCounterKwh = Double.NaN;
+            counterBaselinePending = true;
+            counterBaselinePendingSinceMs = System.currentTimeMillis();
+            clearCounterBaselineCandidates();
+        }
+        if (!wasCharging || chargingStartTime <= 0) {
+            // NO ROW YET — but this reading still matters. Detection is not instantaneous: L3 needs
+            // three consecutive observations (~15 s at the ACC-on cadence, longer parked) and the
+            // movement channel does not itself force a recompute, so the vehicle's post-start reset to
+            // 0 routinely arrives BEFORE the session row exists. Dropping it meant the row, once
+            // opened, baselined at an already-incremented counter and silently lost the opening energy.
+            //
+            // Remember the LOWEST reading seen while no session was open. Lowest, not latest: the
+            // counter only rises within a charge, so the minimum is the closest thing observed to the
+            // true zero point, and it cannot be inflated by however long detection took. SESSION START
+            // picks this up if it looks like a plausible baseline.
+            // REFUSE a reading taken at a TERMINAL state. The collector deliberately admits a final
+            // counter callback so the closing session keeps its tail — but if the close already won the
+            // race, that same value arrives here with no session open and was buffered as the NEXT
+            // charge's pre-session baseline. The next charge then anchors at the previous total and loses
+            // its real opening interval once the vehicle resets the counter.
+            if (isTerminalChargingStateNow()) return;
+            if (Double.isNaN(preSessionCounterLowKwh) || counterKwh < preSessionCounterLowKwh
+                    || !source.equals(preSessionCounterSource)) {
+                // A reading from a DIFFERENT source replaces rather than competes: "lowest" is only
+                // meaningful within one series, and the preferred source should win outright.
+                boolean differentSource = !source.equals(preSessionCounterSource);
+                boolean preferIncoming = differentSource
+                        && com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(source);
+                if (!differentSource || preferIncoming || preSessionCounterSource == null) {
+                    preSessionCounterLowKwh = counterKwh;
+                    preSessionCounterAtMs = System.currentTimeMillis();
+                    preSessionCounterSource = source;
+                    persistChargingLifecycleJournal();
+                }
+            }
+            return;
+        }
+        // A session is open, so any pre-session candidate has served its purpose.
+        preSessionCounterLowKwh = Double.NaN;
+        preSessionCounterAtMs = 0L;
+        preSessionCounterSource = null;
+        try {
+            long now = System.currentTimeMillis();
+            if (counterBaselinePending) {
+                rememberCounterBaselineCandidate(counterKwh, now);
+                if (!databaseAvailable) {
+                    persistChargingLifecycleJournal();
+                    return;
+                }
+                // Same freshness test the tick applies: only accept a reading that cannot still be the
+                // previous session's leftover. A genuinely re-zeroed counter reads lower than the last
+                // value we saw (and 0 always does).
+                if (!Double.isNaN(lastSessionCounterKwh) && counterKwh >= lastSessionCounterKwh) return;
+                // FIRST CALLBACK OF A SESSION: lastSessionCounterKwh is NaN, so any value is accepted as
+                // the baseline — including one that is actually a CONTINUATION of an interrupted charge.
+                // The retry lived only on the periodic path, so a restart gap of 10 -> 13 lost 3 kWh here.
+                // Ask before baselining; tryLateContinuation seeds the accumulator itself when it applies.
+                if (tryLateContinuation(counterKwh, now)) {
+                    counterBaselinePending = false;
+                    counterBaselinePendingSinceMs = 0;
+                    clearCounterBaselineCandidates();
+                    lastSessionCounterKwh = counterKwh;
+                    persistCounterProgress();
+                    return;
+                }
+                counterBaselinePending = false;
+                counterBaselinePendingSinceMs = 0;
+                clearCounterBaselineCandidates();
+                // A RESET WAS OBSERVED, so this is definitively a NEW charge — the vehicle re-zeroed its
+                // counter. That supersedes any interrupted row's offer, and the marker must be consumed
+                // rather than left claimable by a later unrelated session for the rest of the lookback.
+                // This path baselines normally and never retries continuation, so nothing else clears it.
+                consumeSupersededSweepMarker("a counter reset was observed after session start");
+            }
+            // A reading above the accumulator's assumed ceiling would be DROPPED by its domain gate. On
+            // a session restored from a legacy row that recorded no source, the ceiling is a guess — so
+            // treat the reading as the correction rather than discarding it. Only widens, and only
+            // before any wrap has been credited (see widenFullScaleKwh).
+            if (counterKwh > chargingCounter.fullScaleKwh()
+                    && counterKwh <= EXTERNAL_COUNTER_FULL_SCALE_KWH) {
+                if (chargingCounter.widenFullScaleKwh(
+                            counterScaleForSource(
+                                    com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL))
+                        && counterOwner == null) {
+                    // Only the external register is this wide, so the reading also identifies the owner.
+                    counterOwner = com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL;
+                }
+            }
+            chargingCounter.observe(counterKwh, now);
+            counterProgressDirty = true;
+            lastSessionCounterKwh = counterKwh;
+            if (databaseAvailable) persistCounterProgress();
+            else persistChargingLifecycleJournal();
+        } catch (Exception e) {
+            logger.debug("onChargeCounterObserved failed: " + e.getMessage());
+        }
+    }
+
     // synchronized: an EXTERNAL entry point (ChargingSessionManager.init) that
     // writes session rows + daily rollups. repriceSessionsForTariff runs an explicit
     // transaction on the shared JDBC Connection, and autoCommit is connection-level,
     // so an unserialized write here could land inside that transaction and be
     // committed or rolled back with it.
-    public synchronized void finalizeStaleOpenSessions() {
-        if (!isInitialized || connection == null) return;
+    public synchronized boolean finalizeStaleOpenSessions() {
+        return finalizeStaleOpenSessions(false);
+    }
+
+    /**
+     * Finalize persisted OPEN rows left by an earlier process.
+     *
+     * @param forceRecent when true, the detector is known OFF and even rows inside the normal resume
+     *                    window must close; no live charge exists for them to resume into
+     */
+    public synchronized boolean finalizeStaleOpenSessions(boolean forceRecent) {
+        if (!isInitialized || connection == null) return false;
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        boolean allCommitted = true;
         try {
             java.util.List<Long> staleStarts = new java.util.ArrayList<>();
             long now = System.currentTimeMillis();
@@ -1645,19 +5887,59 @@ public class SocHistoryDatabase {
                     while (rs.next()) staleStarts.add(rs.getLong(1));
                 }
             }
-            for (Long startObj : staleStarts) {
-                long start = startObj;
-                // Skip the live session if one is genuinely open in memory.
-                if (wasCharging && start == chargingStartTime) continue;
-                finalizeOneStaleSession(start, now);
+            // Upper bound for each row's reconstruction window: the NEXT session's start, so an
+            // abandoned row cannot claim a later charge's samples or heartbeats as its own ending.
+            // Rows are ordered ascending, so the successor is the next element. The last row is bounded
+            // at `now`. Without this a row abandoned days ago picked up today's charge as its final
+            // activity and was priced with that SoC and end time.
+            try (PreparedStatement nx = connection.prepareStatement(
+                    "SELECT MIN(start_time) FROM " + TABLE_CHARGING + " WHERE start_time > ?;")) {
+                for (int i = 0; i < staleStarts.size(); i++) {
+                    long start = staleStarts.get(i);
+                    boolean matchesInMemory = wasCharging && start == chargingStartTime;
+                    // A normal sweep preserves a genuinely-live row. A forced sweep is an
+                    // authoritative OFF reconciliation, so retaining this row would defeat its contract.
+                    if (matchesInMemory && !forceRecent) continue;
+                    // The successor is the next OPEN row we are about to close, or — more often — a
+                    // closed row that opened after this one. Ask the table so both cases are covered.
+                    nx.setLong(1, start);
+                    // The heartbeat queries treat this bound as EXCLUSIVE, so use now+1 when there is
+                    // no successor — otherwise a heartbeat written exactly at `now` would be dropped.
+                    long bound = now + 1;
+                    try (ResultSet rs = nx.executeQuery()) {
+                        if (rs.next()) {
+                            long v = rs.getLong(1);
+                            if (!rs.wasNull() && v > start) bound = Math.min(now + 1, v);
+                        }
+                    }
+                    boolean committed = finalizeOneStaleSession(start, now, bound, forceRecent);
+                    allCommitted &= committed;
+                    if (committed && matchesInMemory) {
+                        resetLiveChargingState(true);
+                        chargingLifecycleHold = false;
+                    }
+                }
             }
         } catch (Exception e) {
             logger.debug("finalizeStaleOpenSessions failed: " + e.getMessage());
+            allCommitted = false;
         }
+        return allCommitted;
     }
 
-    private void finalizeOneStaleSession(long start, long now) {
+    /**
+     * @param now   wall clock, used for the resume-window recency guard
+     * @param bound upper bound on this session's reconstruction window — the next session's start, so
+     *              an abandoned row cannot claim a later charge's samples or heartbeats as its ending
+     */
+    private boolean finalizeOneStaleSession(long start, long now, long bound,
+                                            boolean forceRecent) {
         try {
+            long accountingBound = bound;
+            if (!chargingAnalyticsEnabled && analyticsDisabledSinceMs > 0) {
+                accountingBound = Math.min(accountingBound, analyticsDisabledSinceMs);
+            }
+            if (accountingBound < start) accountingBound = start;
             // Aggregate the recorded samples for this session.
             long lastT = -1; double lastSoc = Double.NaN, lastTemp = -999;
             double peak = 0, sum = 0; int count = 0;
@@ -1679,12 +5961,13 @@ public class SocHistoryDatabase {
             // but +1 session_count) in the daily rollup.
             if (!rowFound) {
                 logger.debug("finalizeOneStaleSession(" + start + ") skipped: session row missing");
-                return;
+                return true;
             }
             try (PreparedStatement sp = connection.prepareStatement(
                     "SELECT t, power_kw, soc, temp FROM " + TABLE_CPS +
-                    " WHERE session_start_time = ? AND power_kw >= 0 ORDER BY t ASC;")) {
+                    " WHERE session_start_time = ? AND power_kw >= 0 AND t < ? ORDER BY t ASC;")) {
                 sp.setLong(1, start);
+                sp.setLong(2, accountingBound);
                 try (ResultSet rs = sp.executeQuery()) {
                     while (rs.next()) {
                         long t = rs.getLong(1);
@@ -1701,25 +5984,126 @@ public class SocHistoryDatabase {
             // Activity = last power sample, else last charging heartbeat in
             // soc_history (the only activity signal on models with no power
             // samples), else start.
-            long heartbeat = maxChargingHeartbeat(start, now);
+            long heartbeat = maxChargingHeartbeat(start, accountingBound);
             long lastActivity = Math.max(lastT, heartbeat);
             // No samples/heartbeat → nothing to reconstruct; close with start
             // values so it stops showing as a dangling open row.
-            long endTime = (lastActivity > 0) ? lastActivity : start;
-            // Guard: if the last activity is very recent, a charge may still be
-            // live (resume will adopt it) — leave it for now. Honor the heartbeat
-            // too, else a no-power-sample live charge gets prematurely closed at
-            // init and then churns through a fold/reverse-fold on resume.
-            if (lastActivity > 0 && (now - lastActivity) < 120_000L) return;
+            long endTime = strictlyAfterChargingStart(
+                    start, (lastActivity > 0) ? lastActivity : start);
+            // Guard: if the last activity is recent enough that the RESUME path would adopt this row,
+            // leave it alone. The threshold must be the resume window itself — it was 120 s while
+            // tryResumeChargingSession accepts a gap up to CHARGING_MERGE_GAP_MS (15 min), so a restart
+            // whose outage fell between the two closed a session that was about to be legitimately
+            // resumed: the charge got split across two rows, the first flagged incomplete, and the
+            // metered energy divided between them. Honour the heartbeat too, else a no-power-sample
+            // live charge gets prematurely closed at init and churns through a fold/reverse-fold.
+            if (!forceRecent && lastActivity > 0
+                    && (now - lastActivity) < CHARGING_MERGE_GAP_MS) return true;
 
-            double energyAdded = integrateSessionEnergyKwh(start);
+            // Prefer a CPS sample's SoC; fall back to the last charging HEARTBEAT before falling back
+            // to startSoc. On a model that produces no power samples the heartbeat is the only SoC
+            // record of the charge, and defaulting to startSoc recorded a zero SoC gain — which also
+            // starved the energy resolver of the SOC-derived estimate it uses to cross-check the
+            // counter. Only accept a heartbeat that actually moved upward; a lower reading is not this
+            // charge's endpoint.
             double endSoc = !Double.isNaN(lastSoc) ? lastSoc : startSoc;
-            if (energyAdded <= 0) {
-                // Fallback to SOC-delta if integration yielded nothing.
-                double nominal = getSohEstimator() != null ? getSohEstimator().getNominalCapacityKwh() : 0;
-                if (nominal > 0 && endSoc > startSoc) energyAdded = (endSoc - startSoc) / 100.0 * nominal;
+            if (Double.isNaN(lastSoc)) {
+                double hbSoc = lastChargingHeartbeatSoc(start, accountingBound);
+                if (!Double.isNaN(hbSoc) && hbSoc > startSoc) endSoc = hbSoc;
             }
-            double avgPower = count > 0 ? sum / count : -1;
+            // ENERGY for a session we were NOT present to finish (daemon was down when the charge
+            // ended, or it ended during a restart). Same resolution as the live path, with one
+            // extra step: the counter endpoints persisted on the row are all that survive, and the
+            // interval between the last one we saw and the true end was never observed.
+            //
+            // Prefer what the counter accumulated up to our last observation over re-differencing
+            // the endpoints, because the accumulated figure already has wraps and resets applied
+            // while a bare difference does not. Anything delivered after our last observation is
+            // genuinely unrecoverable from the counter, so the row is marked incomplete rather than
+            // padded with a guess.
+            double counterEnergy = Double.NaN, counterStart = Double.NaN, counterLast = Double.NaN;
+            double rowCounterFullScale = Double.NaN;
+            boolean rowIncomplete = false;
+            String rowCounterSource = null;
+            try (PreparedStatement cp = connection.prepareStatement(
+                    "SELECT counter_start_kwh, counter_last_kwh, counter_energy_kwh, energy_incomplete,"
+                    + " counter_source, counter_full_scale_kwh FROM " + TABLE_CHARGING
+                    + " WHERE start_time = ?;")) {
+                cp.setLong(1, start);
+                try (ResultSet crs = cp.executeQuery()) {
+                    if (crs.next()) {
+                        counterStart = crs.getDouble(1); if (crs.wasNull()) counterStart = Double.NaN;
+                        counterLast = crs.getDouble(2);  if (crs.wasNull()) counterLast = Double.NaN;
+                        counterEnergy = crs.getDouble(3); if (crs.wasNull()) counterEnergy = Double.NaN;
+                        rowIncomplete = crs.getInt(4) == 1;
+                        rowCounterSource = crs.getString(5);
+                        rowCounterFullScale = crs.getDouble(6);
+                        if (crs.wasNull()) rowCounterFullScale = Double.NaN;
+                    }
+                }
+            } catch (Exception e) {
+                logger.debug("counter columns unavailable for stale session " + start + ": " + e.getMessage());
+            }
+            // NOTE: the outage tail is NOT credited here. It is credited to the session that is
+            // still LIVE, at SESSION START, by seeding that session's baseline from this row's
+            // persisted counter_last_kwh when the counter shows it never reset (see the continuation
+            // check in trackChargingSession). Crediting it in both places would double-count the same
+            // energy, and attributing it to the live session is the more useful of the two: that row
+            // is the one the user is watching, and it gets priced normally rather than as a
+            // reconstructed floor.
+            com.overdrive.app.abrp.SohEstimator staleSoh = getSohEstimator();
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot staleCapacitySoh =
+                    staleSoh != null ? staleSoh.getCapacitySohSnapshot() : null;
+            if (Double.isNaN(counterEnergy) && !Double.isNaN(counterStart) && !Double.isNaN(counterLast)) {
+                // Endpoints without an accumulated total: a pre-restore row. Resolve the ambiguity
+                // (did it wrap, or reset?) against the SOC estimate rather than assuming.
+                // The wrap candidate depends on the counter's MODULUS, so it must be that counter's.
+                // Using the 16-bit default for an external-counter row makes the wrapped candidate wrong
+                // by the difference between the two scales — hundreds of kWh.
+                double[] cands = com.overdrive.app.charging.ChargeCounterAccumulator
+                        .gapCandidatesKwh(counterStart, counterLast,
+                                !Double.isNaN(rowCounterFullScale) ? rowCounterFullScale
+                                        : counterScaleForSource(
+                                                rowCounterSource, counterStart, counterLast));
+                double socForPick = com.overdrive.app.charging.SessionEnergyResolver.socEstimateKwh(
+                        endSoc - startSoc,
+                        staleCapacitySoh != null
+                                ? staleCapacitySoh.getNominalCapacityKwh() : 0,
+                        staleCapacitySoh != null && staleCapacitySoh.hasDisplaySoh()
+                                ? staleCapacitySoh.getDisplaySoh() : Double.NaN);
+                counterEnergy = com.overdrive.app.charging.ChargeCounterAccumulator.chooseCandidate(
+                        cands, socForPick,
+                        com.overdrive.app.charging.SessionEnergyResolver.RATIO_LOW,
+                        com.overdrive.app.charging.SessionEnergyResolver.RATIO_HIGH);
+            }
+            double socEstStale = com.overdrive.app.charging.SessionEnergyResolver.socEstimateKwh(
+                    endSoc - startSoc,
+                    staleCapacitySoh != null
+                            ? staleCapacitySoh.getNominalCapacityKwh() : 0,
+                    staleCapacitySoh != null && staleCapacitySoh.hasDisplaySoh()
+                            ? staleCapacitySoh.getDisplaySoh() : Double.NaN);
+            // Both `counter_energy_kwh` and the wrap candidates above are in the counter's OWN frame
+            // (see meteredEnergyKwh), so a proven register-width fault is corrected here — the same
+            // boundary the live paths use, so a session finalized after a restart is not priced
+            // differently from one we were present to close.
+            counterEnergy = correctStoredCounterEnergy(counterEnergy, rowCounterSource);
+            com.overdrive.app.charging.SessionEnergyResolver.Result staleRes =
+                    com.overdrive.app.charging.SessionEnergyResolver.resolve(
+                            counterEnergy, true, rowIncomplete,
+                            integrateSessionEnergyKwh(start), socEstStale,
+                            lastIntegrationTruncated,
+                            counterScaleSuspect(rowCounterSource));
+            double energyAdded = staleRes.isUsable() ? staleRes.energyKwh : 0;
+            logger.info(String.format(java.util.Locale.US,
+                    "Stale session %d energy resolved: %.3f kWh via %s (counter=%s soc=%s)",
+                    start, energyAdded, staleRes.source,
+                    Double.isNaN(counterEnergy) ? "n/a" : String.format("%.3f", counterEnergy),
+                    Double.isNaN(socEstStale) ? "n/a" : String.format("%.3f", socEstStale)));
+            // Same peak/avg rules as the live close path, so a session reconstructed after a
+            // restart is not reported differently from one we were present to finish.
+            peak = resolvePeakKw(start, peak);
+            double avgPower = timeWeightedAvgKw(energyAdded, start, endTime);
+            if (avgPower < 0 && count > 0) avgPower = sum / count;
             int rangeGained = rangeGainedFromEnergy(energyAdded);
             // Determine AC/DC first — the DC tariff selection depends on it.
             // Read the charge LOCATION from the row too: this path runs after a
@@ -1741,71 +6125,176 @@ public class SocHistoryDatabase {
             }
             int isDc = deriveIsDc(gun, peak);  // peak-guarded against a misread DC gun
             // Price at the location's tariff, else the global DC/base rate.
-            PricingDecision pd = priceSession(isDc, rowLat, rowLng);
+            PricingDecision pd = priceSessionForClose(isDc, rowLat, rowLng);
             double rate = pd.rate;
             double cost = pd.costFor(energyAdded);
             String curr = pd.currency;
             double tAvg = lastTemp > -999 ? lastTemp : -999;
 
-            try (PreparedStatement upd = connection.prepareStatement(
-                    "UPDATE " + TABLE_CHARGING + " SET end_time = ?, end_soc = ?, energy_added_kwh = ?, " +
-                    "avg_power_kw = ?, peak_power_kw = ?, range_gained_km = ?, is_dc = ?, " +
-                    "electricity_rate = ?, currency = ?, session_cost = ?, hv_temp_avg = ?, " +
-                    "tariff_id = ?, tariff_label = ? " +
-                    "WHERE start_time = ? AND end_time IS NULL;")) {
-                upd.setLong(1, endTime);
-                upd.setDouble(2, endSoc);
-                upd.setDouble(3, energyAdded);
-                upd.setDouble(4, avgPower);
-                upd.setDouble(5, peak);
-                upd.setInt(6, rangeGained);
-                upd.setInt(7, isDc);
-                upd.setDouble(8, rate);
-                upd.setString(9, curr);
-                upd.setDouble(10, cost);
-                upd.setDouble(11, tAvg);
-                upd.setString(12, pd.tariffId);
-                upd.setString(13, pd.tariffLabel);
-                upd.setLong(14, start);
-                upd.executeUpdate();
-            }
-            noteTariffUsed(pd.tariffId, endTime);
-            foldSessionIntoDaily(endTime, energyAdded, cost, isDc, peak, rangeGained);
+            final double persistedEndSoc = endSoc;
+            final double persistedAvgPower = avgPower;
+            final double persistedPeak = peak;
+            runInTransaction(() -> {
+                try (PreparedStatement upd = connection.prepareStatement(
+                        "UPDATE " + TABLE_CHARGING + " SET end_time = ?, end_soc = ?, energy_added_kwh = ?, " +
+                        "avg_power_kw = ?, peak_power_kw = ?, range_gained_km = ?, is_dc = ?, " +
+                        "electricity_rate = ?, currency = ?, session_cost = ?, hv_temp_avg = ?, " +
+                        "tariff_id = ?, tariff_label = ?, " +
+                        "energy_source = ?, energy_soc_kwh = ?, energy_incomplete = ?," +
+                        " closed_by_sweep = 1, post_commit_tariff_applied = ?," +
+                        " post_commit_soh_applied = 1, resume_blocked = ? " +
+                        "WHERE start_time = ? AND end_time IS NULL;")) {
+                    upd.setLong(1, endTime);
+                    upd.setDouble(2, persistedEndSoc);
+                    upd.setDouble(3, energyAdded);
+                    upd.setDouble(4, persistedAvgPower);
+                    upd.setDouble(5, persistedPeak);
+                    upd.setInt(6, rangeGained);
+                    upd.setInt(7, isDc);
+                    upd.setDouble(8, rate);
+                    upd.setString(9, curr);
+                    upd.setDouble(10, cost);
+                    upd.setDouble(11, tAvg);
+                    upd.setString(12, pd.tariffId);
+                    upd.setString(13, pd.tariffLabel);
+                    upd.setString(14, staleRes.source);
+                    if (!Double.isNaN(staleRes.socEstimateKwh)) {
+                        upd.setDouble(15, staleRes.socEstimateKwh);
+                    } else {
+                        upd.setNull(15, java.sql.Types.DOUBLE);
+                    }
+                    // ALWAYS incomplete. This path exists precisely because nobody observed the end of
+                    // the charge: the daemon was down when it finished, so everything delivered between
+                    // our last sample and the unplug is unrecoverable. A 60 kWh pack that we watched for
+                    // the first 10 min of a DC charge and then reconstructed would otherwise be stored
+                    // as a confident ~5 kWh session when the car actually took ~54 kWh — and it is
+                    // PRICED. Flagging it makes the UI show '~' rather than presenting a floor as exact.
+                    // (The condition previously read `staleRes.incomplete || rowIncomplete`, which is a
+                    // strictly weaker claim than this comment asserted.)
+                    upd.setInt(16, 1);
+                    upd.setInt(17, pd.tariffId.isEmpty() ? 1 : 0);
+                    upd.setInt(18, forceRecent ? 1 : 0);
+                    upd.setLong(19, start);
+                    if (upd.executeUpdate() != 1) {
+                        throw new java.sql.SQLException(
+                                "stale close found no matching open session");
+                    }
+                }
+                // A stale-finalized session is incomplete by construction: the daemon was absent for
+                // part of it, so its energy is a floor.
+                foldSessionIntoDaily(endTime, energyAdded, cost, isDc, persistedPeak, rangeGained, true);
+            });
+            replayPendingChargingPostCommitMetadata();
             logger.info("Finalized stale open charging session start=" + start +
                 " (samples=" + count + ", energy=" + String.format("%.1f", energyAdded) +
                 " kWh, end_soc=" + String.format("%.0f", endSoc) + "%)");
+            return true;
         } catch (Exception e) {
+            if (isSessionDurablyClosed(start)) {
+                logger.warn("Stale-session finalization threw after commit; reconciled exact row "
+                        + start);
+                replayPendingChargingPostCommitMetadata();
+                noteWriteOk();
+                return true;
+            }
             logger.debug("finalizeOneStaleSession(" + start + ") failed: " + e.getMessage());
+            if (isSqlFailure(e)) {
+                noteWriteFailed();
+                try { reconnect(); } catch (Exception ignored) {}
+            }
+            if (isSessionDurablyClosed(start)) {
+                logger.warn("Stale-session finalization reconciled after reconnect for row " + start);
+                replayPendingChargingPostCommitMetadata();
+                noteWriteOk();
+                return true;
+            }
+            return false;
         }
     }
 
+    private static long dayEpoch(long timestamp) {
+        return (timestamp / 86_400_000L) * 86_400_000L;
+    }
+
     /**
-     * Subtract a single closed session's contribution from its day's rollup so
-     * a resume→re-close doesn't double count. Mirrors the reversal in
-     * {@link #deleteChargingSession} (count + energy + cost + dc/ac + range),
-     * clamped at zero. {@code endTime} is the session's prior close time (its
-     * day bucket key).
+     * Rebuild one daily charging bucket from the authoritative closed session rows.
+     *
+     * <p>Used after resume consolidation and deletion. Recomputing is both simpler and safer than
+     * subtracting an assumed prior fold: legacy rows may never have been folded, and a swallowed
+     * decrement failure followed by a re-fold is exactly how duplicate daily energy was created.
+     * The caller must include this in the same transaction as the row mutation.
      */
-    private void reverseDailyFoldForSession(long endTime, double energy, double cost,
-                                            int isDc, int rangeGained) {
-        if (!isInitialized || connection == null) return;
-        try {
-            long day = (endTime / 86_400_000L) * 86_400_000L;
-            try (PreparedStatement upd = connection.prepareStatement(
-                    "UPDATE " + TABLE_CHARGING_DAILY + " SET session_count = GREATEST(session_count - 1, 0), " +
-                    "energy_kwh = GREATEST(energy_kwh - ?, 0), cost = GREATEST(cost - ?, 0), " +
-                    "dc_count = GREATEST(dc_count - ?, 0), ac_count = GREATEST(ac_count - ?, 0), " +
-                    "range_gained_km = GREATEST(range_gained_km - ?, 0) WHERE day_epoch = ?;")) {
-                upd.setDouble(1, energy > 0 ? energy : 0);
-                upd.setDouble(2, cost > 0 ? cost : 0);
-                upd.setInt(3, isDc == 1 ? 1 : 0);
-                upd.setInt(4, isDc == 0 ? 1 : 0);
-                upd.setInt(5, rangeGained > 0 ? rangeGained : 0);
-                upd.setLong(6, day);
-                upd.executeUpdate();
+    private void rebuildChargingDailyDay(long day) throws Exception {
+        double previousSoh = -999;
+        try (PreparedStatement prior = connection.prepareStatement(
+                "SELECT soh_at_day FROM " + TABLE_CHARGING_DAILY + " WHERE day_epoch = ?;")) {
+            prior.setLong(1, day);
+            try (ResultSet rs = prior.executeQuery()) {
+                if (rs.next()) previousSoh = rs.getDouble(1);
             }
-        } catch (Exception e) {
-            logger.debug("reverseDailyFoldForSession failed: " + e.getMessage());
+        }
+
+        int count;
+        double energy;
+        double cost;
+        int dc;
+        int ac;
+        double peak;
+        int range;
+        int incomplete;
+        try (PreparedStatement aggregate = connection.prepareStatement(
+                "SELECT COUNT(*),"
+                + " COALESCE(SUM(CASE WHEN energy_added_kwh > 0 THEN energy_added_kwh ELSE 0 END), 0),"
+                + " COALESCE(SUM(CASE WHEN session_cost > 0 THEN session_cost ELSE 0 END), 0),"
+                + " COALESCE(SUM(CASE WHEN is_dc = 1 THEN 1 ELSE 0 END), 0),"
+                + " COALESCE(SUM(CASE WHEN is_dc = 0 THEN 1 ELSE 0 END), 0),"
+                + " COALESCE(MAX(CASE WHEN peak_power_kw > 0 THEN peak_power_kw ELSE 0 END), 0),"
+                + " COALESCE(SUM(CASE WHEN range_gained_km > 0 THEN range_gained_km ELSE 0 END), 0),"
+                + " COALESCE(SUM(CASE WHEN energy_incomplete = 1 THEN 1 ELSE 0 END), 0)"
+                + " FROM " + TABLE_CHARGING
+                + " WHERE end_time >= ? AND end_time < ?;")) {
+            aggregate.setLong(1, day);
+            aggregate.setLong(2, day + 86_400_000L);
+            try (ResultSet rs = aggregate.executeQuery()) {
+                if (!rs.next()) throw new java.sql.SQLException("daily aggregate returned no row");
+                count = rs.getInt(1);
+                energy = rs.getDouble(2);
+                cost = rs.getDouble(3);
+                dc = rs.getInt(4);
+                ac = rs.getInt(5);
+                peak = rs.getDouble(6);
+                range = rs.getInt(7);
+                incomplete = rs.getInt(8);
+            }
+        }
+
+        if (count == 0) {
+            try (PreparedStatement delete = connection.prepareStatement(
+                    "DELETE FROM " + TABLE_CHARGING_DAILY + " WHERE day_epoch = ?;")) {
+                delete.setLong(1, day);
+                delete.executeUpdate();
+            }
+            return;
+        }
+
+        try (PreparedStatement merge = connection.prepareStatement(
+                "MERGE INTO " + TABLE_CHARGING_DAILY
+                + " (day_epoch, session_count, energy_kwh, cost, dc_count, ac_count,"
+                + " peak_power_kw, soh_at_day, range_gained_km, incomplete_count)"
+                + " KEY(day_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")) {
+            merge.setLong(1, day);
+            merge.setInt(2, count);
+            merge.setDouble(3, energy);
+            merge.setDouble(4, cost);
+            merge.setInt(5, dc);
+            merge.setInt(6, ac);
+            merge.setDouble(7, peak);
+            merge.setDouble(8, previousSoh);
+            merge.setInt(9, range);
+            merge.setInt(10, incomplete);
+            if (merge.executeUpdate() <= 0) {
+                throw new java.sql.SQLException("daily bucket rebuild updated no row");
+            }
         }
     }
 
@@ -1832,10 +6321,31 @@ public class SocHistoryDatabase {
      * price, and rewriting them would churn the rollups for no gain.
      *
      * @return the number of sessions whose cost actually changed
+     * @throws IllegalStateException when the durable intent or repricing attempt cannot complete
      */
     public synchronized int repriceSessionsForTariff(String tariffId) {
-        if (!isAvailable()) return 0;
+        String queuedKey = queuePendingTariffReprice(tariffId);
+        try {
+            int changed = repriceSessionsForTariffNow(
+                    tariffIdForRepriceKey(queuedKey));
+            completePendingTariffReprice(queuedKey);
+            replayPendingChargingPostCommitMetadata();
+            return changed;
+        } catch (Exception e) {
+            logger.error("repriceSessionsForTariff failed; durable retry retained: "
+                    + e.getMessage());
+            throw new IllegalStateException(
+                    "Tariff repricing is pending durable replay", e);
+        }
+    }
+
+    private int repriceSessionsForTariffNow(String tariffId) throws Exception {
+        if (!isAvailable()) {
+            throw new java.sql.SQLException("charging database unavailable for tariff repricing");
+        }
         int changed = 0;
+        java.util.List<RepricePostcondition> expectedUpdates = new java.util.ArrayList<>();
+        boolean commitAttempted = false;
         try {
             // Snapshot the rows first: we mutate inside the loop, and H2 doesn't
             // like an open ResultSet over a table being updated.
@@ -1872,10 +6382,17 @@ public class SocHistoryDatabase {
             // the whole sweep: 2N autocommits on a 2000-session history is minutes
             // of disk churn on a head unit, and a mid-sweep failure would otherwise
             // leave half the rows re-priced with charging_daily half-adjusted.
-            boolean priorAutoCommit = connection.getAutoCommit();
-            connection.setAutoCommit(false);
+            Connection transactionConnection = connection;
+            boolean priorAutoCommit = transactionConnection.getAutoCommit();
+            if (!priorAutoCommit) {
+                discardTransactionConnection(transactionConnection);
+                throw new java.sql.SQLException(
+                        "tariff repricing found auto-commit disabled before its transaction");
+            }
+            transactionConnection.setAutoCommit(false);
             boolean committed = false;
-            try (PreparedStatement upd = connection.prepareStatement(
+            Exception transactionFailure = null;
+            try (PreparedStatement upd = transactionConnection.prepareStatement(
                     "UPDATE " + TABLE_CHARGING + " SET electricity_rate = ?, currency = ?, " +
                     "session_cost = ?, tariff_id = ?, tariff_label = ? WHERE start_time = ?;")) {
 
@@ -1936,7 +6453,7 @@ public class SocHistoryDatabase {
                             && pd.tariffId.equals(owner)
                             && pd.currency.equals(oldCurrency)
                             && pd.tariffLabel.equals(oldLabel)
-                            && Math.abs(pd.rate - oldRate) < 1e-9;
+                            && realStorageEquivalent(oldRate, pd.rate);
                     if (rowSame) continue;
 
                     upd.setDouble(1, pd.rate);
@@ -1963,27 +6480,138 @@ public class SocHistoryDatabase {
                     // rollup permanently out of step with the session rows.
                     // adjustDailyCost already no-ops on a zero/NaN delta.
                     adjustDailyCost(endTime, (newCost > 0 ? newCost : 0) - (oldCost > 0 ? oldCost : 0));
+                    expectedUpdates.add(new RepricePostcondition(
+                            startTime, pd.rate, pd.currency, newCost,
+                            pd.tariffId, pd.tariffLabel, !costSame));
                     if (!costSame) changed++;
                 }
-                connection.commit();
+                commitAttempted = true;
+                transactionConnection.commit();
                 committed = true;
+            } catch (Exception e) {
+                transactionFailure = e;
+                throw e;
             } finally {
                 if (!committed) {
-                    try { connection.rollback(); } catch (Exception ignored) {}
+                    try {
+                        transactionConnection.rollback();
+                    } catch (Exception rollbackFailure) {
+                        if (transactionFailure != null) {
+                            transactionFailure.addSuppressed(rollbackFailure);
+                        }
+                        discardTransactionConnection(transactionConnection);
+                    }
                     // Nothing persisted — never report a count for rolled-back work,
                     // or the UI would claim "N past charges re-priced" after a failure.
                     changed = 0;
                 }
-                try { connection.setAutoCommit(priorAutoCommit); } catch (Exception ignored) {}
+                try {
+                    if (!transactionConnection.isClosed()) {
+                        transactionConnection.setAutoCommit(priorAutoCommit);
+                    }
+                } catch (Exception restoreFailure) {
+                    discardTransactionConnection(transactionConnection);
+                    if (transactionFailure != null) {
+                        transactionFailure.addSuppressed(restoreFailure);
+                    } else {
+                        throw restoreFailure;
+                    }
+                }
             }
             if (changed > 0) {
                 logger.info("Re-priced " + changed + " charging session(s) for tariff "
                         + (tariffId == null || tariffId.isEmpty() ? "(all)" : tariffId));
             }
         } catch (Exception e) {
-            logger.error("repriceSessionsForTariff failed: " + e.getMessage());
+            if (commitAttempted && !expectedUpdates.isEmpty()
+                    && reconcileRepriceCommit(expectedUpdates, e)) {
+                changed = countCostChanged(expectedUpdates);
+                noteWriteOk();
+                logger.warn("Tariff repricing commit result was uncertain; reconciled "
+                        + expectedUpdates.size() + " durable session update(s)");
+                return changed;
+            }
+            // A completed scan with no updates has no transactional state to reconcile. A failure
+            // before the commit boundary keeps commitAttempted false and remains retryable.
+            if (commitAttempted && expectedUpdates.isEmpty()) return 0;
+            throw e;
         }
         return changed;
+    }
+
+    static String normalizeTariffRepriceKey(String tariffId) {
+        return tariffId == null || tariffId.isEmpty() ? "*" : tariffId;
+    }
+
+    private static String tariffIdForRepriceKey(String tariffKey) {
+        return "*".equals(tariffKey) ? "" : tariffKey;
+    }
+
+    /**
+     * Write the retry intent before H2 is touched. A wildcard subsumes every targeted request because
+     * repricing always resolves against the latest durable tariff configuration.
+     */
+    private String queuePendingTariffReprice(String tariffId) {
+        String requestedKey = normalizeTariffRepriceKey(tariffId);
+        boolean changed = false;
+        if ("*".equals(requestedKey)) {
+            if (pendingTariffReprices.size() != 1
+                    || !pendingTariffReprices.contains("*")) {
+                pendingTariffReprices.clear();
+                pendingTariffReprices.add("*");
+                changed = true;
+            }
+        } else if (!pendingTariffReprices.contains("*")) {
+            changed = pendingTariffReprices.add(requestedKey);
+        }
+        if (changed) chargingLifecycleJournalDirty = true;
+        if ((changed || chargingLifecycleJournalDirty)
+                && !persistChargingLifecycleJournal()) {
+            throw new IllegalStateException(
+                    "tariff repricing intent was not durable");
+        }
+        return pendingTariffReprices.contains("*") ? "*" : requestedKey;
+    }
+
+    /**
+     * Remove an intent only after the H2 commit is known durable. Restore the in-memory queue when
+     * journal cleanup is uncertain; the previously synced file still carries the same retry.
+     */
+    private void completePendingTariffReprice(String tariffKey) throws Exception {
+        java.util.LinkedHashSet<String> before =
+                new java.util.LinkedHashSet<>(pendingTariffReprices);
+        if ("*".equals(tariffKey)) pendingTariffReprices.clear();
+        else pendingTariffReprices.remove(tariffKey);
+        chargingLifecycleJournalDirty = true;
+        if (!persistChargingLifecycleJournal()) {
+            pendingTariffReprices.clear();
+            pendingTariffReprices.addAll(before);
+            chargingLifecycleJournalDirty = true;
+            throw new java.io.IOException(
+                    "tariff repricing completion was not durable");
+        }
+    }
+
+    /** Replay journal-restored tariff edits before reconciling tariff usage metadata. */
+    private void replayPendingTariffReprices() {
+        if (replayingTariffReprices || pendingTariffReprices.isEmpty()) return;
+        replayingTariffReprices = true;
+        try {
+            while (!pendingTariffReprices.isEmpty()) {
+                String tariffKey = pendingTariffReprices.iterator().next();
+                try {
+                    repriceSessionsForTariffNow(
+                            tariffIdForRepriceKey(tariffKey));
+                    completePendingTariffReprice(tariffKey);
+                } catch (Exception e) {
+                    logger.warn("Pending tariff repricing replay deferred for "
+                            + tariffKey + ": " + e.getMessage());
+                    break;
+                }
+            }
+        } finally {
+            replayingTariffReprices = false;
+        }
     }
 
     /**
@@ -2004,10 +6632,25 @@ public class SocHistoryDatabase {
      * callers treat as "use the configured global rate" — the pre-existing
      * behaviour, so nothing regresses.
      *
-     * @param maxAgeDays ignore charges older than this; {@code <= 0} = no limit
+    * @param maxAgeDays ignore charges older than this; {@code <= 0} = no limit
      */
-    public JSONObject getLastChargeRate(int maxAgeDays) {
-        if (!isAvailable()) return null;
+    public synchronized JSONObject getLastChargeRate(int maxAgeDays) {
+        try {
+            return getLastChargeRateStrict(maxAgeDays);
+        } catch (java.sql.SQLException e) {
+            logger.debug("getLastChargeRate failed: " + e.getMessage());
+            try { reconnect(); } catch (Exception ignored) {}
+            return null;
+        }
+    }
+
+    /**
+     * Strict trip-pricing lookup. {@code null} means the query succeeded and no tariff-owned charge
+     * exists; an unavailable or failed database throws so a trip snapshot can remain retryable.
+     */
+    public synchronized JSONObject getLastChargeRateStrict(int maxAgeDays)
+            throws java.sql.SQLException {
+        final Connection conn = requireChargingHistoryReadConnection();
         try {
             // Take the MOST RECENT priced charge, then require that it be
             // tariff-owned. Filtering tariff-ownership inside the WHERE clause
@@ -2034,16 +6677,22 @@ public class SocHistoryDatabase {
             }
             sql.append(" ORDER BY end_time DESC LIMIT 1;");
 
-            try (PreparedStatement ps = connection.prepareStatement(sql.toString())) {
+            try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
                 if (maxAgeDays > 0) {
                     long cutoff = System.currentTimeMillis() - (maxAgeDays * 86_400_000L);
                     ps.setLong(1, cutoff - 30L * 86_400_000L);   // index prune, slacked
                     ps.setLong(2, cutoff);                        // the real age bound
                 }
                 try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) return null;
+                    if (!rs.next()) {
+                        noteReadOk();
+                        return null;
+                    }
                     double rate = rs.getDouble(2);
-                    if (Double.isNaN(rate) || rate <= 0) return null;
+                    if (Double.isNaN(rate) || rate <= 0) {
+                        noteReadOk();
+                        return null;
+                    }
                     String tId = null, tLabel = null;
                     try {
                         tId = rs.getString(4);
@@ -2054,7 +6703,10 @@ public class SocHistoryDatabase {
                     // The latest priced charge was on the GLOBAL rate (or predates
                     // tariffs): return null so trips fall back to the configured
                     // base rate — the pre-feature behaviour (I1).
-                    if (tId == null || tId.isEmpty()) return null;
+                    if (tId == null || tId.isEmpty()) {
+                        noteReadOk();
+                        return null;
+                    }
                     JSONObject out = new JSONObject();
                     out.put("endTime", rs.getLong(1));
                     out.put("rate", rate);
@@ -2064,12 +6716,13 @@ public class SocHistoryDatabase {
                     out.put("tariffLabel", tLabel != null ? tLabel : "");
                     int isDc = rs.getInt(6);
                     out.put("isDc", isDc == 1);
+                    noteReadOk();
                     return out;
                 }
             }
         } catch (Exception e) {
-            logger.debug("getLastChargeRate failed: " + e.getMessage());
-            return null;
+            if (isSqlFailure(e)) noteReadFailed();
+            throw chargingHistoryReadException("get last charge rate", e);
         }
     }
 
@@ -2079,31 +6732,26 @@ public class SocHistoryDatabase {
      * totals track a re-priced session without disturbing that day's session
      * count, AC/DC split, peak power, or {@code soh_at_day}.
      *
-     * <p>No-ops when the day has no rollup row: a session whose day bucket was
-     * never folded has nothing to correct.
+     * <p>Throws when the day has no rollup row so the surrounding repricing transaction rolls back;
+     * committing only the session row would make period/lifetime totals inconsistent.
      */
-    private void adjustDailyCost(long endTime, double delta) {
-        if (!isInitialized || connection == null) return;
+    private void adjustDailyCost(long endTime, double delta) throws Exception {
+        if (!isInitialized || connection == null) {
+            throw new java.sql.SQLException("charging database unavailable during daily cost adjustment");
+        }
         if (delta == 0 || Double.isNaN(delta)) return;
-        try {
-            long day = (endTime / 86_400_000L) * 86_400_000L;
-            try (PreparedStatement upd = connection.prepareStatement(
-                    "UPDATE " + TABLE_CHARGING_DAILY +
-                    " SET cost = GREATEST(cost + ?, 0) WHERE day_epoch = ?;")) {
-                upd.setDouble(1, delta);
-                upd.setLong(2, day);
-                int rows = upd.executeUpdate();
-                if (rows == 0) {
-                    // No rollup row for that day — foldSessionIntoDaily swallows its
-                    // own exceptions, so this state is reachable. Warn rather than
-                    // drop the correction silently: period/lifetime cost totals will
-                    // be short by `delta` for that day and nothing else would say so.
-                    logger.warn("adjustDailyCost: no charging_daily row for day " + day
-                            + " — cost correction of " + String.format("%.4f", delta) + " not applied");
-                }
+        long day = (endTime / 86_400_000L) * 86_400_000L;
+        try (PreparedStatement upd = connection.prepareStatement(
+                "UPDATE " + TABLE_CHARGING_DAILY +
+                " SET cost = GREATEST(cost + ?, 0) WHERE day_epoch = ?;")) {
+            upd.setDouble(1, delta);
+            upd.setLong(2, day);
+            if (upd.executeUpdate() != 1) {
+                // The session row and daily rollup are one accounting unit. Throw through the caller's
+                // transaction so repricing rolls back instead of committing an inconsistent row cost.
+                throw new java.sql.SQLException(
+                        "daily cost adjustment found no row for day " + day);
             }
-        } catch (Exception e) {
-            logger.debug("adjustDailyCost failed: " + e.getMessage());
         }
     }
 
@@ -2204,19 +6852,24 @@ public class SocHistoryDatabase {
                         String label = result.mediumLabel();
                         if (label == null || label.isEmpty()) return;
                         if (!isInitialized || connection == null) return;
-                        try (PreparedStatement p = connection.prepareStatement(
-                                "UPDATE " + TABLE_CHARGING + " SET place_label = ? WHERE start_time = ?;")) {
-                            // Clamp to the column width (96) defensively.
-                            p.setString(1, label.length() > 96 ? label.substring(0, 96) : label);
-                            p.setLong(2, sessionStart);
-                            p.executeUpdate();
-                        } catch (Exception e) {
-                            logger.debug("place_label update failed: " + e.getMessage());
-                        }
+                        updateSessionPlaceLabel(sessionStart, label);
                     }
                 });
         } catch (Exception e) {
             logger.debug("resolvePlaceLabelAsync failed: " + e.getMessage());
+        }
+    }
+
+    private synchronized void updateSessionPlaceLabel(long sessionStart, String label) {
+        if (!isInitialized || connection == null) return;
+        try (PreparedStatement p = connection.prepareStatement(
+                "UPDATE " + TABLE_CHARGING + " SET place_label = ? WHERE start_time = ?;")) {
+            // Clamp to the column width (96) defensively.
+            p.setString(1, label.length() > 96 ? label.substring(0, 96) : label);
+            p.setLong(2, sessionStart);
+            p.executeUpdate();
+        } catch (Exception e) {
+            logger.debug("place_label update failed: " + e.getMessage());
         }
     }
 
@@ -2247,6 +6900,757 @@ public class SocHistoryDatabase {
             return (peakKw >= DC_MIN_PEAK_KW) ? 1 : -1;  // DC flag needs DC-plausible power
         }
         return (gunState == 2) ? 0 : -1;
+    }
+
+    /**
+     * Current reading of the vehicle's per-session charged-energy counter, kWh, or NaN.
+     *
+     * <p>Only returns a value the collector has ADMITTED (gun asserting a charging connection or a
+     * live fused verdict, non-terminal BMS state) — the collector NaNs the field otherwise, so a
+     * counter still holding its value with the gun out cannot be read here as live.
+     */
+    /**
+     * The {@code SRC_*} key of the counter the snapshot path should read, or null when none qualifies.
+     *
+     * <p>ONCE A SESSION HAS AN OWNER, THIS RETURNS ONLY THAT OWNER. The snapshot path feeds the
+     * accumulator directly from session start, tick and close, so if it silently switched sources
+     * mid-session it would interleave two independent monotonic series into one — the exact corruption
+     * the ownership rule exists to prevent, entered through a door that never consulted the rule.
+     * Preference order only applies while no owner is bound yet.
+     */
+    private String resolveCounterSource(com.overdrive.app.byd.BydVehicleData vd) {
+        if (vd == null) return null;
+        boolean capAlive = !Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0;
+        boolean extAlive = !Double.isNaN(vd.externalChargingPowerKw)
+                && vd.externalChargingPowerKw >= 0
+                && vd.externalChargingPowerKw <= EXTERNAL_COUNTER_FULL_SCALE_KWH
+                && com.overdrive.app.byd.ChargeSourceClassifier.isCounter(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL);
+        String owner = counterOwner;
+        if (owner != null) {
+            // Bound already — honour it exclusively, and report nothing if it has gone quiet. Returning
+            // the other source here is what would mix the series.
+            if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(owner)) {
+                return capAlive ? com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY : null;
+            }
+            if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(owner)) {
+                return extAlive ? com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL : null;
+            }
+            return null;
+        }
+        // Unbound. If an INTERRUPTED row is offering a continuation, prefer the source IT used: binding
+        // the other one makes the pairing cross-series and the outage energy is refused. Only then fall
+        // back to the documented per-session counter.
+        String wanted = pendingContinuationSourceHint();
+        if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(wanted) && extAlive) {
+            return com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL;
+        }
+        if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(wanted) && capAlive) {
+            return com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY;
+        }
+        if (capAlive) return com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY;
+        if (extAlive) return com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL;
+        return null;
+    }
+
+    /**
+     * Raw reading of the counter that owns this session, kWh, or NaN.
+     *
+     * <p>Every caller feeds this straight into the accumulator, so it MUST be the owner's value — see
+     * {@link #resolveCounterSource}. Binds the owner on first use so that the source which establishes
+     * the baseline is the one that keeps it.
+     */
+    private double snapshotChargeCounterKwh() {
+        try {
+            com.overdrive.app.byd.BydDataCollector col = com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (col != null && col.isInitialized()) {
+                com.overdrive.app.byd.BydVehicleData vd = col.getData();
+                String src = resolveCounterSource(vd);
+                if (src == null) return Double.NaN;
+                if (counterOwner == null) bindCounterOwner(src);
+                else if (!counterOwner.equals(src)) return Double.NaN;
+                return snapshotCounterForSource(vd, src);
+            }
+        } catch (Exception ignored) {}
+        return Double.NaN;
+    }
+
+    /** Read one explicit counter without changing the active row's owner. */
+    private double snapshotCounterForSource(com.overdrive.app.byd.BydVehicleData vd, String source) {
+        if (vd == null || source == null) return Double.NaN;
+        if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(source)) {
+            if (Double.isNaN(vd.externalChargingPowerKw) || vd.externalChargingPowerKw < 0
+                    || vd.externalChargingPowerKw > EXTERNAL_COUNTER_FULL_SCALE_KWH
+                    || !com.overdrive.app.byd.ChargeSourceClassifier.isCounter(source)) {
+                return Double.NaN;
+            }
+            // Same unit calibration the push path applies — both paths feed the same accumulator.
+            double div = 1.0;
+            try {
+                div = com.overdrive.app.monitor.ChargeRateResolver.counterUnitDivisor(source);
+            } catch (Throwable ignored) {}
+            return div > 1.0 ? vd.externalChargingPowerKw / div : vd.externalChargingPowerKw;
+        }
+        if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(source)
+                && !Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0) {
+            // Zero is the ideal post-reset baseline and is therefore valid.
+            return vd.chargingCapacityKwh;
+        }
+        return Double.NaN;
+    }
+
+    private void rememberCounterBaselineCandidate(double counterKwh, long observedAt) {
+        if (Double.isNaN(counterKwh) || counterKwh < 0) return;
+        if (Double.isNaN(counterBaselineCandidateKwh)
+                || counterKwh < counterBaselineCandidateKwh) {
+            counterBaselineCandidateKwh = counterKwh;
+            counterBaselineCandidateAtMs = observedAt;
+        }
+        counterBaselineLatestKwh = counterKwh;
+        counterBaselineLatestAtMs = observedAt;
+        if (wasCharging && chargingStartTime > 0L) {
+            persistChargingLifecycleJournal();
+        }
+    }
+
+    private void clearCounterBaselineCandidates() {
+        counterBaselineCandidateKwh = Double.NaN;
+        counterBaselineCandidateAtMs = 0L;
+        counterBaselineLatestKwh = Double.NaN;
+        counterBaselineLatestAtMs = 0L;
+    }
+
+    /** Admit one final counter snapshot without letting a stale previous-session value become energy. */
+    private void observeFinalCounterForClose(double counterKwh, double endSoc, long observedAt) {
+        if (Double.isNaN(counterKwh) || counterKwh < 0) return;
+        chargingCounter.setIndependentEstimate(socEstimateForOpenSession(endSoc));
+        if (counterBaselinePending) {
+            rememberCounterBaselineCandidate(counterKwh, observedAt);
+            if (tryLateContinuation(counterKwh, observedAt)) {
+                counterBaselinePending = false;
+                counterBaselinePendingSinceMs = 0;
+            } else {
+                boolean fresh = Double.isNaN(lastSessionCounterKwh)
+                        || counterKwh < lastSessionCounterKwh;
+                if (!fresh) {
+                    // A continuous (non-session-resetting) counter never becomes lower than the prior
+                    // endpoint. Its earliest in-session reading is still a valid baseline; use it at
+                    // close so a short session does not lose its entire metered delta while waiting for
+                    // the six-minute escape hatch.
+                    double baseline = counterBaselineCandidateKwh;
+                    long baselineAt = counterBaselineCandidateAtMs;
+                    if (Double.isNaN(baseline) || baseline > counterKwh) return;
+                    counterBaselinePending = false;
+                    counterBaselinePendingSinceMs = 0;
+                    consumeSupersededSweepMarker(
+                            "the continuous counter's earliest session reading became its baseline");
+                    chargingCounter.observe(
+                            baseline, baselineAt > 0L ? baselineAt : observedAt);
+                    if (counterKwh != baseline) {
+                        chargingCounter.observe(counterKwh, observedAt);
+                    }
+                    clearCounterBaselineCandidates();
+                    lastSessionCounterKwh = counterKwh;
+                    counterProgressDirty = true;
+                    return;
+                }
+                counterBaselinePending = false;
+                counterBaselinePendingSinceMs = 0;
+                consumeSupersededSweepMarker("the final boundary counter established a fresh baseline");
+            }
+        }
+        chargingCounter.observe(counterKwh, observedAt);
+        clearCounterBaselineCandidates();
+        lastSessionCounterKwh = counterKwh;
+        counterProgressDirty = true;
+    }
+
+    /** True when the BMS currently reports a terminal (non-charging) state, or the gun is out. */
+    private boolean isTerminalChargingStateNow() {
+        try {
+            com.overdrive.app.byd.BydDataCollector col =
+                    com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (col == null || !col.isInitialized()) return false;
+            com.overdrive.app.byd.BydVehicleData vd = col.getData();
+            if (vd == null) return false;
+            if (vd.chargingGunState == 1) return true;
+            return isTerminalChargingStateCode(vd.chargingState);
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    static boolean isTerminalChargingStateCode(int state) {
+        return state == 0 || state == 2 || state == 3 || state == 4
+                || (state >= 5 && state <= 8)
+                || state == 10 || state == 11 || state == 12;
+    }
+
+    /**
+     * The counter source an interrupted row is offering for continuation, or null.
+     *
+     * <p>Consulted only while ownership is unbound, so a session that is about to continue an interrupted
+     * charge binds the SAME series that charge was using. Cheap: one indexed lookup once per session.
+     */
+    private String pendingContinuationSourceHint() {
+        if (!counterBaselinePending) return null;
+        if (claimedContinuationSessionStart == chargingStartTime
+                && claimedContinuationSource != null) {
+            return claimedContinuationSource;
+        }
+        return continuationSource;
+    }
+
+    /**
+     * Bind the accumulator to a counter source and declare its modulus.
+     *
+     * <p>Single place that establishes ownership, so the push path and the snapshot path cannot disagree
+     * about which counter a session is using. The modulus must be set before the first observation
+     * because the wrap arithmetic keys off it and it is immutable once a series has begun.
+     */
+    /**
+     * Modulus to use for a persisted row's counter, kWh.
+     *
+     * <p>A row written before {@code counter_source} existed has no recorded owner. Defaulting such a
+     * row to the 16-bit scale is right for the capacity counter but wrong for the external one, and the
+     * accumulator cannot be re-scaled once a baseline exists — so the choice made here is final. When
+     * the source is unknown, infer it from the endpoints themselves: a value ABOVE the 16-bit ceiling
+     * cannot have come from a 16-bit register, so it is unambiguously the wider one. Below the ceiling
+     * both are possible and the default is correct, because the capacity counter is the common case and
+     * an external counter that never exceeded 65.534 wraps identically under either reading.
+     */
+    /**
+     * Decide which counter a restored legacy series belongs to, by seeing which one currently reads
+     * close to its stored endpoint.
+     *
+     * <p>The endpoint is the last value we observed from the owning counter, so the owner should still
+     * be near it — a counter only rises within a session. The other source has no reason to agree.
+     * Falls back to the documented capacity counter when neither is decisive, because that is what
+     * legacy rows were overwhelmingly written by.
+     */
+    private String inferOwnerFromLiveReading(double storedLast) {
+        String def = com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY;
+        if (Double.isNaN(storedLast)) return def;
+        try {
+            com.overdrive.app.byd.BydDataCollector col =
+                    com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (col == null || !col.isInitialized()) return def;
+            com.overdrive.app.byd.BydVehicleData vd = col.getData();
+            if (vd == null) return def;
+            // DIRECTION FIRST, THEN DISTANCE. "Closest to the stored endpoint" is the wrong test on its
+            // own: after an outage the genuine owner has kept RISING and moved away from its endpoint,
+            // while the other counter can sit coincidentally near it — so the naive comparison actively
+            // favours the wrong source, and the resulting cross-series difference corrupts added energy.
+            //
+            // A counter only rises within a session, so the owner's live value must be AT OR ABOVE its
+            // endpoint. That rules a candidate in or out on physics rather than on proximity. Only when
+            // both are still plausible does distance decide, and then the SMALLER advance is preferred
+            // because the outage bounds how much could really have been delivered.
+            boolean capValid = !Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0;
+            boolean extValid = !Double.isNaN(vd.externalChargingPowerKw)
+                    && vd.externalChargingPowerKw >= 0
+                    && com.overdrive.app.byd.ChargeSourceClassifier.isCounter(
+                            com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL);
+            double externalKwh = vd.externalChargingPowerKw;
+            if (extValid) {
+                try {
+                    double divisor = com.overdrive.app.monitor.ChargeRateResolver.counterUnitDivisor(
+                            com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL);
+                    if (divisor > 1.0) externalKwh /= divisor;
+                } catch (Throwable ignored) {}
+            }
+            // Advance since the endpoint; NaN when the candidate is absent or has moved BACKWARDS,
+            // which a counter cannot do mid-session and therefore disqualifies it.
+            double capAdvance = (capValid && vd.chargingCapacityKwh >= storedLast)
+                    ? (vd.chargingCapacityKwh - storedLast) : Double.NaN;
+            double extAdvance = (extValid && externalKwh >= storedLast)
+                    ? (externalKwh - storedLast) : Double.NaN;
+            // An advance larger than any outage could deliver is not this series either.
+            if (!Double.isNaN(capAdvance) && capAdvance > LEGACY_CONTINUATION_MAX_GAP_KWH) {
+                capAdvance = Double.NaN;
+            }
+            if (!Double.isNaN(extAdvance) && extAdvance > LEGACY_CONTINUATION_MAX_GAP_KWH) {
+                extAdvance = Double.NaN;
+            }
+            if (Double.isNaN(capAdvance) && Double.isNaN(extAdvance)) return def;
+            if (Double.isNaN(capAdvance)) return com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL;
+            if (Double.isNaN(extAdvance)) return def;
+            // BOTH still plausible — so this is a coincidence, and picking either risks differencing two
+            // unrelated series. A legacy row predates external-counter support entirely, so it can only
+            // have been written by the capacity counter; that is evidence, not a coin toss. Take the
+            // default and log, rather than letting the smaller advance decide an ambiguous case.
+            logger.info(String.format(java.util.Locale.US,
+                    "Legacy counter row is ambiguous — both counters are plausible against endpoint"
+                    + " %.3f (capacity +%.3f, external +%.3f). Binding capacity, which is what rows"
+                    + " predating source tagging were written by.",
+                    storedLast, capAdvance, extAdvance));
+            return def;
+        } catch (Throwable ignored) {}
+        return def;
+    }
+
+    /**
+     * The accumulator's total corrected for a PROVEN counter register-width fault, kWh, or NaN.
+     *
+     * <p>The one place a metered figure crosses from the raw counter frame into the priced frame. The
+     * accumulator deliberately stays in the counter's own units — its wrap, saturation and reset
+     * arithmetic all key off the register's real modulus, and {@code counter_energy_kwh} round-trips
+     * through the database in that frame, so correcting inside it would double-apply on every restore.
+     *
+     * <p>Returns NaN while a fault is suspected but unproven, which makes the resolver fall through to
+     * the SOC estimate and flag the row. That is the recoverable direction: a withheld figure can be
+     * re-derived, whereas a factor-of-two energy total is billed and also calibrates SOH.
+     */
+    private double meteredEnergyKwh() {
+        if (!chargingCounter.hasBaseline()) return Double.NaN;
+        double raw = chargingCounter.energyKwh();
+        if (Double.isNaN(raw)) return Double.NaN;
+        String source = counterOwner != null
+                ? counterOwner : com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY;
+        try {
+            double factor = com.overdrive.app.charging.CounterScaleCalibrator.factorFor(source);
+            if (factor != 1.0) return raw * factor;
+            if (com.overdrive.app.charging.CounterScaleCalibrator.isScaleSuspect(source)) {
+                return Double.NaN;
+            }
+        } catch (Throwable ignored) { /* uncalibrated: behave exactly as before */ }
+        return raw;
+    }
+
+    /**
+     * Whether the metered counter's UNIT is under suspicion, so its total must not be priced or
+     * offered for SOH calibration. See {@link com.overdrive.app.charging.CounterScaleCalibrator}.
+     */
+    private boolean counterScaleSuspect(String source) {
+        String owner = source != null ? source
+                : counterOwner != null ? counterOwner
+                : com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY;
+        try {
+            return com.overdrive.app.charging.CounterScaleCalibrator.isScaleSuspect(owner);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * As {@link #meteredEnergyKwh}, for a total read back from a stored row rather than the live
+     * accumulator. A null source predates source tagging; the capacity counter is the default owner.
+     */
+    private double correctStoredCounterEnergy(double storedKwh, String source) {
+        if (Double.isNaN(storedKwh)) return storedKwh;
+        String owner = source != null
+                ? source : com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY;
+        try {
+            double factor = com.overdrive.app.charging.CounterScaleCalibrator.factorFor(owner);
+            if (factor != 1.0) return storedKwh * factor;
+            if (com.overdrive.app.charging.CounterScaleCalibrator.isScaleSuspect(owner)) {
+                return Double.NaN;
+            }
+        } catch (Throwable ignored) { /* uncalibrated: behave exactly as before */ }
+        return storedKwh;
+    }
+
+    private double counterScaleForSource(String source) {
+        if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(source)) {
+            double divisor = 1.0;
+            try {
+                divisor = com.overdrive.app.monitor.ChargeRateResolver.counterUnitDivisor(source);
+            } catch (Throwable ignored) {}
+            return EXTERNAL_COUNTER_FULL_SCALE_KWH / Math.max(1.0, divisor);
+        }
+        return com.overdrive.app.charging.ChargeCounterAccumulator.COUNTER_FULL_SCALE_KWH;
+    }
+
+    /** As {@link #counterScaleForSource}, with a fallback inferred from observed endpoints. */
+    private double counterScaleForSource(String source, double... endpoints) {
+        if (source != null) return counterScaleForSource(source);
+        double ceiling = com.overdrive.app.charging.ChargeCounterAccumulator.COUNTER_FULL_SCALE_KWH;
+        for (double v : endpoints) {
+            if (!Double.isNaN(v) && v > ceiling) return EXTERNAL_COUNTER_FULL_SCALE_KWH;
+        }
+        return ceiling;
+    }
+
+    private void bindCounterOwner(String source) {
+        counterOwner = source;
+        if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(source)) {
+            chargingCounter.setFullScaleKwh(counterScaleForSource(source));
+        }
+        chargingCounter.markPersistenceMetadataChanged();
+        if (wasCharging && chargingStartTime > 0L) {
+            persistChargingLifecycleJournal();
+        }
+        logger.info("Charged-energy accumulator bound to source '" + source + "' for this session");
+    }
+
+    /**
+     * Independent SOC-derived energy estimate for the open session, kWh, or NaN.
+     *
+     * <p>This is the cross-check that decides whether a metered figure is believable. It is coarse
+     * (bounded by the 1% gauge quantum and by the capacity figure) but always monotonic, which is
+     * exactly the property the counter lacks.
+     */
+    private double socEstimateForOpenSession(double endSoc) {
+        try {
+            if (Double.isNaN(endSoc) || chargingStartSoc < 0) return Double.NaN;
+            com.overdrive.app.abrp.SohEstimator soh = getSohEstimator();
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                    soh != null ? soh.getCapacitySohSnapshot() : null;
+            double nominal = capacitySoh != null
+                    ? capacitySoh.getNominalCapacityKwh() : 0;
+            double sohPct = capacitySoh != null && capacitySoh.hasDisplaySoh()
+                    ? capacitySoh.getDisplaySoh() : Double.NaN;
+            return com.overdrive.app.charging.SessionEnergyResolver.socEstimateKwh(
+                    endSoc - chargingStartSoc, nominal, sohPct);
+        } catch (Exception e) {
+            return Double.NaN;
+        }
+    }
+
+    private CounterRestoreState readCounterRestoreState(long sessionStart) throws Exception {
+        if (connection == null || sessionStart <= 0) {
+            throw new java.sql.SQLException("counter restore requested without a session");
+        }
+        CounterRestoreState state = new CounterRestoreState();
+        try (PreparedStatement p = connection.prepareStatement(
+                "SELECT counter_start_kwh, counter_last_kwh, counter_energy_kwh,"
+                + " energy_incomplete, counter_source, counter_full_scale_kwh,"
+                + " counter_last_at_ms, counter_observation_generation,"
+                + " counter_wrap_count, counter_reset_count,"
+                + " counter_ceiling_streak, counter_saturated, counter_abandoned_kwh,"
+                + " counter_unattributed_gaps, counter_awaiting_gap,"
+                + " counter_gap_reconstructed, counter_gap_estimate_kwh,"
+                + " counter_recent_rate_kwh_per_h"
+                + " FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
+            p.setLong(1, sessionStart);
+            try (ResultSet rs = p.executeQuery()) {
+                if (!rs.next()) throw new java.sql.SQLException("counter restore row missing");
+                state.baseline = rs.getDouble(1);
+                if (rs.wasNull()) state.baseline = Double.NaN;
+                state.last = rs.getDouble(2);
+                if (rs.wasNull()) state.last = Double.NaN;
+                state.energy = rs.getDouble(3);
+                if (rs.wasNull()) state.energy = Double.NaN;
+                state.incomplete = rs.getInt(4) == 1;
+                state.source = rs.getString(5);
+                if (state.source != null && state.source.isEmpty()) state.source = null;
+                state.fullScale = rs.getDouble(6);
+                if (rs.wasNull()) state.fullScale = Double.NaN;
+                com.overdrive.app.charging.ChargeCounterAccumulator.State exact =
+                        new com.overdrive.app.charging.ChargeCounterAccumulator.State();
+                exact.baseline = state.baseline;
+                exact.last = state.last;
+                exact.accumulated = !Double.isNaN(state.energy) ? state.energy : 0.0;
+                exact.fullScaleKwh = state.fullScale;
+                exact.lastAtMs = rs.getLong(7);
+                exact.observationGeneration = Math.max(0L, rs.getLong(8));
+                exact.wraps = Math.max(0, rs.getInt(9));
+                exact.resets = Math.max(0, rs.getInt(10));
+                exact.ceilingStreak = Math.max(0, rs.getInt(11));
+                exact.saturated = rs.getInt(12) == 1;
+                exact.abandonedKwh = Math.max(0.0, rs.getDouble(13));
+                exact.unattributedGaps = Math.max(0, rs.getInt(14));
+                exact.awaitingGapReconcile = rs.getInt(15) == 1;
+                exact.gapReconstructed = rs.getInt(16) == 1;
+                exact.gapEstimateKwh = rs.getDouble(17);
+                if (rs.wasNull()) exact.gapEstimateKwh = Double.NaN;
+                exact.recentRateKwhPerH = rs.getDouble(18);
+                if (rs.wasNull()) exact.recentRateKwhPerH = Double.NaN;
+                state.exactState = exact;
+            }
+        }
+        return state;
+    }
+
+    private void applyCounterRestoreState(CounterRestoreState state) {
+        if (Double.isNaN(state.baseline) && Double.isNaN(state.energy)) {
+            chargingCounter.reset();
+            counterOwner = null;
+            counterBaselinePending = true;
+            counterBaselinePendingSinceMs = System.currentTimeMillis();
+            counterProgressDirty = false;
+            return;
+        }
+        double gapEstimate = Double.NaN;
+        try {
+            BatterySocData sd = VehicleDataMonitor.getInstance().getBatterySoc();
+            if (sd != null && sd.socPercent >= 0 && sd.socPercent <= 100) {
+                double total = socEstimateForOpenSession(sd.socPercent);
+                double already = (!Double.isNaN(state.energy) && state.energy > 0)
+                        ? state.energy : 0;
+                if (!Double.isNaN(total) && total > already) gapEstimate = total - already;
+            }
+        } catch (Exception ignored) {}
+
+        double scale = !Double.isNaN(state.fullScale) ? state.fullScale
+                : counterScaleForSource(state.source, state.baseline, state.last);
+        com.overdrive.app.charging.ChargeCounterAccumulator.State durable =
+                state.exactState;
+        if (durable == null) {
+            durable = new com.overdrive.app.charging.ChargeCounterAccumulator.State();
+            durable.baseline = state.baseline;
+            durable.last = state.last;
+            durable.accumulated = !Double.isNaN(state.energy) ? state.energy : 0.0;
+            durable.fullScaleKwh = scale;
+        } else if (Double.isNaN(durable.fullScaleKwh)) {
+            durable.fullScaleKwh = scale;
+        }
+        chargingCounter.restoreState(
+                com.overdrive.app.charging.ChargeCounterAccumulator.newestCompleteState(
+                        null, durable, state.incomplete));
+        chargingCounter.beginGapReconciliation(gapEstimate);
+        counterOwner = state.source;
+        if (counterOwner == null) {
+            counterOwner = scale > com.overdrive.app.charging.ChargeCounterAccumulator
+                    .COUNTER_FULL_SCALE_KWH
+                    ? com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL
+                    : inferOwnerFromLiveReading(state.last);
+        }
+        counterBaselinePending = false;
+        counterBaselinePendingSinceMs = 0;
+        counterProgressDirty = false;
+        logger.info(String.format(java.util.Locale.US,
+                "Restored charged-energy accumulator for session %d:"
+                + " baseline=%.3f last=%.3f accumulated=%.3f incomplete=%s gapEstimate=%s",
+                chargingStartTime, state.baseline, state.last, state.energy, state.incomplete,
+                Double.isNaN(gapEstimate) ? "n/a" : String.format("%.3f", gapEstimate)));
+    }
+
+    private ContinuationOffer findImmediateContinuationOffer(long newSessionStart) throws Exception {
+        if (connection == null) throw new java.sql.SQLException("continuation lookup unavailable");
+        long since = newSessionStart - CONTINUATION_LOOKBACK_MS;
+        try (PreparedStatement p = connection.prepareStatement(
+                "SELECT start_time, counter_last_kwh, counter_source, continuation_claimed,"
+                + " end_time, closed_by_sweep, end_soc, counter_full_scale_kwh"
+                + " FROM " + TABLE_CHARGING
+                + " WHERE start_time < ?"
+                + " ORDER BY start_time DESC LIMIT 1;")) {
+            p.setLong(1, newSessionStart);
+            try (ResultSet rs = p.executeQuery()) {
+                if (!rs.next()) return null;
+                long rowStart = rs.getLong(1);
+                int claimed = rs.getInt(4);
+                rs.getLong(5);
+                boolean endIsNull = rs.wasNull();
+                boolean swept = rs.getInt(6) == 1;
+                if (rowStart < since || claimed != 0 || (!endIsNull && !swept)) return null;
+                double endpoint = rs.getDouble(2);
+                if (rs.wasNull() || endpoint < 0) endpoint = Double.NaN;
+                double startSoc = rs.getDouble(7);
+                if (rs.wasNull()) startSoc = Double.NaN;
+                double fullScale = rs.getDouble(8);
+                if (rs.wasNull()) fullScale = Double.NaN;
+                return new ContinuationOffer(
+                        rowStart, endpoint, rs.getString(3), startSoc, fullScale);
+            }
+        }
+    }
+
+    /** Claim the offer in the caller's session-INSERT transaction. */
+    private void claimContinuationOffer(ContinuationOffer offer) throws Exception {
+        if (offer == null) return;
+        try (PreparedStatement claim = connection.prepareStatement(
+                "UPDATE " + TABLE_CHARGING
+                + " SET continuation_claimed = 1"
+                + " WHERE start_time = ? AND continuation_claimed = 0;")) {
+            claim.setLong(1, offer.rowStart);
+            if (claim.executeUpdate() != 1) {
+                throw new java.sql.SQLException(
+                        "continuation offer was claimed concurrently: " + offer.rowStart);
+            }
+        }
+    }
+
+    private void activateClaimedContinuationOffer(ContinuationOffer offer, long sessionStart,
+                                                   boolean alreadyResolved) {
+        clearClaimedContinuationOffer();
+        if (offer == null || alreadyResolved) return;
+        claimedContinuationSessionStart = sessionStart;
+        claimedContinuationRow = offer.rowStart;
+        claimedContinuationEndpointKwh = offer.endpointKwh;
+        claimedContinuationSource = offer.source;
+        claimedContinuationStartSoc = offer.startSoc;
+        claimedContinuationFullScaleKwh = offer.fullScaleKwh;
+        continuationSource = offer.source;
+        pendingSweepMarkerRow = offer.rowStart;
+    }
+
+    private void clearClaimedContinuationOffer() {
+        claimedContinuationSessionStart = 0L;
+        claimedContinuationRow = -1L;
+        claimedContinuationEndpointKwh = Double.NaN;
+        claimedContinuationSource = null;
+        claimedContinuationStartSoc = Double.NaN;
+        claimedContinuationFullScaleKwh = Double.NaN;
+        continuationSource = null;
+        pendingSweepMarkerRow = -1L;
+    }
+
+    private void consumeSupersededSweepMarker(String why) {
+        if (claimedContinuationSessionStart == chargingStartTime
+                && !Double.isNaN(claimedContinuationEndpointKwh)) {
+            logger.info("Continuation offer was claimed but not applied — " + why);
+        }
+        clearClaimedContinuationOffer();
+    }
+
+    private double currentSocForContinuation() {
+        try {
+            BatterySocData sd = VehicleDataMonitor.getInstance().getBatterySoc();
+            if (sd != null && sd.socPercent >= 0 && sd.socPercent <= 100) {
+                return sd.socPercent;
+            }
+        } catch (Throwable ignored) {}
+        return lastRecordedSoc >= 0 ? lastRecordedSoc : chargingStartSoc;
+    }
+
+    /**
+     * Seed this row from an interrupted row's endpoint, selecting plain versus wrapped counter
+     * progression against the SOC movement that covers the same outage interval.
+     */
+    private boolean applyContinuationOffer(ContinuationOffer offer, double counterNow,
+                                           double currentSoc, long observedAt) {
+        if (offer == null || Double.isNaN(offer.endpointKwh) || Double.isNaN(counterNow)) {
+            return false;
+        }
+        double scale = !Double.isNaN(offer.fullScaleKwh)
+                ? offer.fullScaleKwh
+                : counterScaleForSource(offer.source, offer.endpointKwh, counterNow);
+        double socEstimate = Double.NaN;
+        if (!Double.isNaN(offer.startSoc) && currentSoc >= offer.startSoc) {
+            try {
+                com.overdrive.app.abrp.SohEstimator soh = getSohEstimator();
+                com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                        soh != null ? soh.getCapacitySohSnapshot() : null;
+                socEstimate = com.overdrive.app.charging.SessionEnergyResolver.socEstimateKwh(
+                        currentSoc - offer.startSoc,
+                        capacitySoh != null ? capacitySoh.getNominalCapacityKwh() : 0,
+                        capacitySoh != null && capacitySoh.hasDisplaySoh()
+                                ? capacitySoh.getDisplaySoh() : Double.NaN);
+            } catch (Throwable ignored) {}
+        }
+        double[] candidates = com.overdrive.app.charging.ChargeCounterAccumulator.gapCandidatesKwh(
+                offer.endpointKwh, counterNow, scale);
+        double chosen = com.overdrive.app.charging.SessionEnergyResolver
+                .continuationCounterEnergyKwh(offer.endpointKwh, counterNow, scale, socEstimate);
+        if (Double.isNaN(chosen)) return false;
+
+        double continuationStartSoc = chargingStartSoc;
+        if (!Double.isNaN(offer.startSoc) && offer.startSoc >= 0 && offer.startSoc <= currentSoc) {
+            continuationStartSoc = offer.startSoc;
+            if (wasCharging && chargingStartTime > 0) {
+                try (PreparedStatement p = connection.prepareStatement(
+                        "UPDATE " + TABLE_CHARGING
+                                + " SET start_soc = ? WHERE start_time = ? AND end_time IS NULL;")) {
+                    p.setDouble(1, continuationStartSoc);
+                    p.setLong(2, chargingStartTime);
+                    if (p.executeUpdate() != 1) return false;
+                } catch (Exception e) {
+                    return false;
+                }
+            }
+        }
+        boolean unverifiedAmbiguity = (Double.isNaN(socEstimate) || socEstimate <= 0)
+                && candidates.length > 1;
+        chargingCounter.restore(
+                offer.endpointKwh, counterNow, chosen, unverifiedAmbiguity,
+                Double.NaN, scale);
+        // Clear restore's pending-next-observation state without adding another delta.
+        chargingCounter.observe(counterNow, observedAt);
+        chargingCounter.markReconstructedGap();
+        counterOwner = offer.source != null ? offer.source : counterOwner;
+        counterBaselinePending = false;
+        counterBaselinePendingSinceMs = 0L;
+        counterProgressDirty = true;
+        lastSessionCounterKwh = counterNow;
+        chargingStartSoc = continuationStartSoc;
+        logger.info(String.format(java.util.Locale.US,
+                "Continuation applied: counter %.3f -> %.3f, selected %.3f kWh"
+                        + " (SOC estimate %s, full scale %.3f)",
+                offer.endpointKwh, counterNow, chosen,
+                Double.isNaN(socEstimate) ? "n/a" : String.format("%.3f", socEstimate), scale));
+        return true;
+    }
+
+    private boolean tryLateContinuation(double counterNow, long now) {
+        if (Double.isNaN(counterNow)
+                || claimedContinuationSessionStart != chargingStartTime
+                || Double.isNaN(claimedContinuationEndpointKwh)) {
+            return false;
+        }
+        double prevLast = claimedContinuationEndpointKwh;
+        String source = claimedContinuationSource;
+        boolean sameSeries = source != null
+                ? source.equals(counterOwner)
+                : ((com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(counterOwner)
+                        || counterOwner == null)
+                   && prevLast <= com.overdrive.app.charging.ChargeCounterAccumulator
+                        .COUNTER_FULL_SCALE_KWH);
+        if (!sameSeries) return false;
+        if (source == null && counterNow >= prevLast
+                && counterNow - prevLast > LEGACY_CONTINUATION_MAX_GAP_KWH) {
+            return false;
+        }
+        ContinuationOffer offer = new ContinuationOffer(
+                claimedContinuationRow, prevLast, source,
+                claimedContinuationStartSoc, claimedContinuationFullScaleKwh);
+        if (!applyContinuationOffer(offer, counterNow, currentSocForContinuation(), now)) {
+            return false;
+        }
+        clearClaimedContinuationOffer();
+        return true;
+    }
+
+    /**
+     * Persist counter endpoints for restart recovery.
+     *
+     * @return true only when the current open row confirmed the update
+     */
+    private boolean persistCounterProgress() {
+        final Connection conn = connection;
+        if (!chargingCounter.hasBaseline() || chargingStartTime <= 0) {
+            boolean journalDurable = persistChargingLifecycleJournal();
+            counterProgressDirty = !journalDurable;
+            return journalDurable;
+        }
+        if (conn == null) {
+            counterProgressDirty = true;
+            return false;
+        }
+        counterProgressDirty = true;
+        try (PreparedStatement p = conn.prepareStatement(
+                "UPDATE " + TABLE_CHARGING + " SET counter_start_kwh = ?, counter_last_kwh = ?, " +
+                "counter_energy_kwh = ?, energy_incomplete = ?, counter_source = ?, " +
+                "counter_full_scale_kwh = ?, counter_last_at_ms = ?, " +
+                "counter_observation_generation = ?, counter_wrap_count = ?, " +
+                "counter_reset_count = ?, counter_ceiling_streak = ?, counter_saturated = ?, " +
+                "counter_abandoned_kwh = ?, counter_unattributed_gaps = ?, " +
+                "counter_awaiting_gap = ?, counter_gap_reconstructed = ?, " +
+                "counter_gap_estimate_kwh = ?, counter_recent_rate_kwh_per_h = ? " +
+                "WHERE start_time = ? AND end_time IS NULL;")) {
+            p.setDouble(1, chargingCounter.baselineKwh());
+            p.setDouble(2, chargingCounter.lastRawKwh());
+            p.setDouble(3, chargingCounter.energyKwh());
+            p.setInt(4, chargingCounter.isIncomplete() ? 1 : 0);
+            if (counterOwner != null) p.setString(5, counterOwner); else p.setNull(5, java.sql.Types.VARCHAR);
+            p.setDouble(6, chargingCounter.fullScaleKwh());
+            int next = bindCounterState(p, 7, chargingCounter.snapshotState());
+            p.setLong(next, chargingStartTime);
+            if (p.executeUpdate() != 1) {
+                throw new java.sql.SQLException("counter progress found no matching open session");
+            }
+            if (!persistChargingLifecycleJournal()) {
+                throw new java.io.IOException(
+                        "counter progress lifecycle journal was not durable");
+            }
+            counterProgressDirty = false;
+            noteWriteOk();
+            return true;
+        } catch (Exception e) {
+            logger.debug("persistCounterProgress failed: " + e.getMessage());
+            if (isSqlFailure(e)) noteWriteFailed();
+            try { reconnect(); } catch (Exception ignored) {}
+            return false;
+        }
     }
 
     private int snapshotGunState() {
@@ -2292,7 +7696,10 @@ public class SocHistoryDatabase {
         // known pack, and a positive power; else -1 (UI shows "--").
         try {
             com.overdrive.app.abrp.SohEstimator soh = getSohEstimator();
-            double nominal = (soh != null) ? soh.getNominalCapacityKwh() : 0;
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                    soh != null ? soh.getCapacitySohSnapshot() : null;
+            double nominal = capacitySoh != null
+                    ? capacitySoh.getNominalCapacityKwh() : 0;
             if (nominal > 0) {
                 VehicleDataMonitor vm = VehicleDataMonitor.getInstance();
                 BatterySocData sd = (vm != null) ? vm.getBatterySoc() : null;
@@ -2306,7 +7713,8 @@ public class SocHistoryDatabase {
                 // outlive the window that produced it. Estimated → no TTF; the caller falls back
                 // to the HAL's own charging-rest-time.
                 double powerKw = (cs != null && !cs.isEstimated) ? cs.chargingPowerKW : Double.NaN;
-                double sohFrac = (soh != null && soh.hasDisplaySoh()) ? soh.getDisplaySoh() / 100.0 : 1.0;
+                double sohFrac = capacitySoh != null && capacitySoh.hasDisplaySoh()
+                        ? capacitySoh.getDisplaySoh() / 100.0 : 1.0;
                 if (sohFrac <= 0) sohFrac = 1.0;
                 if (!Double.isNaN(soc) && soc >= 0 && soc < 100
                         && !Double.isNaN(powerKw) && powerKw > 0.1) {
@@ -2406,6 +7814,31 @@ public class SocHistoryDatabase {
     }
 
     /**
+     * Strict monetary snapshot used by every close path.
+     *
+     * <p>A tariff/config read failure is intentionally propagated so the frozen physical boundary can
+     * retry. Returning the global fallback here would make a transient I/O error permanent.
+     */
+    private PricingDecision priceSessionForClose(int isDc, double lat, double lng)
+            throws Exception {
+        com.overdrive.app.charging.TariffProfile p =
+                com.overdrive.app.charging.TariffManager.getInstance()
+                        .resolveStrict(lat, lng, isDc);
+        if (p != null) {
+            double rate = p.rateFor(isDc);
+            if (rate > 0) {
+                String currency = p.getCurrency();
+                if (currency == null || currency.isEmpty()) {
+                    currency = globalPricingStrict(isDc).currency;
+                }
+                return new PricingDecision(
+                        rate, currency, p.getId(), p.getLabel());
+            }
+        }
+        return globalPricingStrict(isDc);
+    }
+
+    /**
      * Global (non-tariff) pricing resolved from a SINGLE config read.
      *
      * <p>getElectricityRate/getDcRate/getCurrencySymbol each call loadConfig()
@@ -2437,6 +7870,29 @@ public class SocHistoryDatabase {
         } catch (Exception ignored) {}
         if (isDc == 1 && dc > 0) return new PricingDecision(dc, curr, "", "");
         return new PricingDecision(rate, curr, "", "");
+    }
+
+    private PricingDecision globalPricingStrict(int isDc) throws Exception {
+        org.json.JSONObject cfg =
+                com.overdrive.app.charging.TariffManager.loadVerifiedConfig();
+        double rate = -1;
+        double dc = 0;
+        String currency = "";
+        org.json.JSONObject trips = cfg.optJSONObject("tripAnalytics");
+        if (trips != null) {
+            double configured = trips.optDouble("electricityRate", -1);
+            if (configured > 0) rate = configured;
+            currency = trips.optString("currency", "");
+            if (currency == null) currency = "";
+        }
+        org.json.JSONObject charging = cfg.optJSONObject("chargingAnalytics");
+        if (charging != null) {
+            double configuredDc = charging.optDouble("dcRate", 0);
+            if (configuredDc > 0) dc = configuredDc;
+        }
+        return new PricingDecision(
+                isDc == 1 && dc > 0 ? dc : rate,
+                currency, "", "");
     }
 
     /**
@@ -2491,16 +7947,446 @@ public class SocHistoryDatabase {
         }
     }
 
+    private static final class SohCalibrationFrame {
+        final String nominalIdentity;
+        final long estimatorGeneration;
+        final long resetModelEpoch;
+        final long priorCalibrationAtMs;
+
+        SohCalibrationFrame(String nominalIdentity, long estimatorGeneration,
+                            long resetModelEpoch, long priorCalibrationAtMs) {
+            this.nominalIdentity = nominalIdentity;
+            this.estimatorGeneration = estimatorGeneration;
+            this.resetModelEpoch = resetModelEpoch;
+            this.priorCalibrationAtMs = priorCalibrationAtMs;
+        }
+    }
+
+    private static final class PendingSohCalibration {
+        long sessionStart;
+        double socDelta;
+        double energyKwh;
+        double packTempC;
+        boolean acCharge;
+        double highCellV = Double.NaN;
+        String nominalIdentity;
+        long estimatorGeneration;
+        long resetModelEpoch;
+        long priorCalibrationAtMs;
+        boolean hasResetModelEpoch;
+        boolean hasFrame;
+        boolean persistedPayloadValid;
+        String persistedPayloadError;
+    }
+
+    private SohCalibrationFrame captureSohCalibrationFrame(
+            com.overdrive.app.abrp.SohEstimator estimator) {
+        if (estimator == null || !estimator.isInitializationReady()) return null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot before =
+                        estimator.getCapacitySohSnapshot();
+                com.overdrive.app.abrp.SohEstimator.NominalSnapshot nominal =
+                        estimator.getNominalSnapshot();
+                String modelId = selectedVehicleModelIdentity();
+                long priorCalibrationAtMs = estimator.getCalibrationTimestampMs();
+                com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot after =
+                        estimator.getCapacitySohSnapshot();
+                String modelIdAfter = selectedVehicleModelIdentity();
+                if (before == null || after == null || nominal == null
+                        || !estimator.isInitializationReady()
+                        || before.getEstimatorGeneration()
+                                != after.getEstimatorGeneration()
+                        || before.getResetModelEpoch()
+                                != after.getResetModelEpoch()
+                        || before.getResetModelEpoch() <= 0
+                        || Double.doubleToLongBits(before.getNominalCapacityKwh())
+                                != Double.doubleToLongBits(
+                                        after.getNominalCapacityKwh())
+                        || Double.doubleToLongBits(before.getNominalCapacityKwh())
+                                != Double.doubleToLongBits(
+                                        nominal.getNominalCapacityKwh())
+                        || before.getResetModelEpoch()
+                                != nominal.getResetModelEpoch()
+                        || nominal.getNominalCapacityKwh() <= 0
+                        || !modelId.equals(modelIdAfter)) {
+                    continue;
+                }
+                return new SohCalibrationFrame(
+                        sohNominalIdentity(
+                                nominal.getNominalCapacityKwh(),
+                                nominal.getNominalSource(), modelId),
+                        before.getEstimatorGeneration(),
+                        before.getResetModelEpoch(),
+                        Math.max(0L, priorCalibrationAtMs));
+            } catch (Throwable unavailable) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    static String sohNominalIdentity(
+            double nominalKwh, String nominalSource, String modelId) {
+        String source = nominalSource == null || nominalSource.isEmpty()
+                ? "unset" : nominalSource;
+        String model = modelId == null ? "" : modelId.trim();
+        return source + ":" + Long.toHexString(
+                Double.doubleToLongBits(nominalKwh)) + ":" + model;
+    }
+
+    private static String selectedVehicleModelIdentity() {
+        String modelId =
+                com.overdrive.app.config.UnifiedConfigManager
+                        .getSelectedVehicleModelIdStrict();
+        return modelId != null ? modelId.trim() : "";
+    }
+
+    /** Exact row image used to reconcile a tariff transaction whose COMMIT result is uncertain. */
+    private static final class RepricePostcondition {
+        final long startTime;
+        final double rate;
+        final String currency;
+        final double cost;
+        final String tariffId;
+        final String tariffLabel;
+        final boolean costChanged;
+
+        RepricePostcondition(long startTime, double rate, String currency, double cost,
+                             String tariffId, String tariffLabel, boolean costChanged) {
+            this.startTime = startTime;
+            this.rate = rate;
+            this.currency = currency != null ? currency : "";
+            this.cost = cost;
+            this.tariffId = tariffId != null ? tariffId : "";
+            this.tariffLabel = tariffLabel != null ? tariffLabel : "";
+            this.costChanged = costChanged;
+        }
+    }
+
+    private static int countCostChanged(java.util.List<RepricePostcondition> expected) {
+        int count = 0;
+        for (RepricePostcondition row : expected) {
+            if (row.costChanged) count++;
+        }
+        return count;
+    }
+
+    private Boolean areRepriceRowsDurable(java.util.List<RepricePostcondition> expected) {
+        Connection c = connection;
+        if (c == null) return null;
+        try (PreparedStatement p = c.prepareStatement(
+                "SELECT electricity_rate, currency, session_cost, tariff_id, tariff_label"
+                        + " FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
+            for (RepricePostcondition row : expected) {
+                p.setLong(1, row.startTime);
+                try (ResultSet rs = p.executeQuery()) {
+                    if (!rs.next()
+                            || !realStorageEquivalent(
+                                    rs.getDouble("electricity_rate"), row.rate)
+                            || !realStorageEquivalent(
+                                    rs.getDouble("session_cost"), row.cost)
+                            || !row.currency.equals(nullToEmpty(rs.getString("currency")))
+                            || !row.tariffId.equals(nullToEmpty(rs.getString("tariff_id")))
+                            || !row.tariffLabel.equals(
+                                    nullToEmpty(rs.getString("tariff_label")))) {
+                        return Boolean.FALSE;
+                    }
+                }
+            }
+            return Boolean.TRUE;
+        } catch (Exception e) {
+            logger.debug("Could not reconcile tariff repricing: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private boolean reconcileRepriceCommit(
+            java.util.List<RepricePostcondition> expected, Exception failure) {
+        Boolean durable = areRepriceRowsDurable(expected);
+        if (durable != null) return durable;
+        if (isSqlFailure(failure)) noteWriteFailed();
+        try { reconnect(); } catch (Exception ignored) {}
+        return Boolean.TRUE.equals(areRepriceRowsDurable(expected));
+    }
+
+    private static String nullToEmpty(String value) {
+        return value != null ? value : "";
+    }
+
+    private static boolean isFinite(double value) {
+        return !Double.isNaN(value) && !Double.isInfinite(value);
+    }
+
     /**
-     * Bump the use-counter on the tariff that priced a just-closed session, so
-     * the UI can order profiles by real usage and show provenance. Best-effort:
-     * the rate is already persisted on the row, so a failure here costs nothing.
+     * H2 REAL is IEEE-754 single precision. Compare the representation that is actually stored,
+     * including NaN, rather than applying a double-precision epsilon to a float column.
      */
-    private void noteTariffUsed(String tariffId, long whenMs) {
-        if (tariffId == null || tariffId.isEmpty()) return;
+    static boolean realStorageEquivalent(double actual, double expected) {
+        return Float.floatToIntBits((float) actual)
+                == Float.floatToIntBits((float) expected);
+    }
+
+    /**
+     * Replay close side effects from authoritative rows.
+     *
+     * <p>The close transaction stores both the payload and an unapplied flag. This method can run
+     * after an ordinary commit, an uncertain commit reconciliation, or a process restart. Tariff
+     * usage is assigned from a database aggregate rather than incremented, so a crash between the
+     * config write and the row flag update is idempotent. SOH calibration overwrites one deterministic
+     * anchor image and is likewise safe to repeat before its flag becomes durable.
+     */
+    public synchronized void replayPendingChargingPostCommitMetadata() {
+        if (!isInitialized || connection == null) return;
+
+        com.overdrive.app.charging.TariffManager tariffManager =
+                com.overdrive.app.charging.TariffManager.getInstance();
+        // Repricing resolves every row through TariffManager. Load it before the
+        // database transaction starts; a lazy load inside that transaction replays
+        // config-side reprice intents and recursively enters a second H2 transaction.
+        java.util.List<com.overdrive.app.charging.TariffProfile> configuredTariffs =
+                tariffManager.getProfiles();
+        replayPendingTariffReprices();
         try {
-            com.overdrive.app.charging.TariffManager.getInstance().markUsed(tariffId, whenMs);
-        } catch (Throwable ignored) {}
+            java.util.LinkedHashSet<String> tariffIds =
+                    new java.util.LinkedHashSet<>();
+            // Maintenance can remove the final row for a tariff, leaving no row-level flag to replay.
+            // Include every configured profile so delete/clear can assign an authoritative zero.
+            for (com.overdrive.app.charging.TariffProfile profile
+                    : configuredTariffs) {
+                if (profile != null && profile.getId() != null
+                        && !profile.getId().isEmpty()) {
+                    tariffIds.add(profile.getId());
+                }
+            }
+            try (PreparedStatement pending = connection.prepareStatement(
+                    "SELECT DISTINCT tariff_id FROM " + TABLE_CHARGING
+                            + " WHERE end_time IS NOT NULL"
+                            + " AND post_commit_tariff_applied = 0"
+                            + " AND tariff_id IS NOT NULL AND tariff_id <> ''"
+                            + " ORDER BY tariff_id ASC;");
+                 ResultSet rs = pending.executeQuery()) {
+                while (rs.next()) tariffIds.add(rs.getString(1));
+            }
+            for (String tariffId : tariffIds) {
+                int useCount = 0;
+                long lastUsedAt = 0L;
+                try (PreparedStatement aggregate = connection.prepareStatement(
+                        "SELECT COUNT(*), MAX(end_time) FROM " + TABLE_CHARGING
+                                + " WHERE end_time IS NOT NULL AND tariff_id = ?;")) {
+                    aggregate.setString(1, tariffId);
+                    try (ResultSet rs = aggregate.executeQuery()) {
+                        if (rs.next()) {
+                            useCount = rs.getInt(1);
+                            lastUsedAt = rs.getLong(2);
+                            if (rs.wasNull()) lastUsedAt = 0L;
+                        }
+                    }
+                }
+                if (!tariffManager.reconcileUsage(
+                        tariffId, lastUsedAt, useCount)) {
+                    continue;
+                }
+                try (PreparedStatement applied = connection.prepareStatement(
+                        "UPDATE " + TABLE_CHARGING
+                                + " SET post_commit_tariff_applied = 1"
+                                + " WHERE end_time IS NOT NULL AND tariff_id = ?"
+                                + " AND post_commit_tariff_applied = 0;")) {
+                    applied.setString(1, tariffId);
+                    applied.executeUpdate();
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("Charging tariff metadata replay deferred: " + e.getMessage());
+            if (isSqlFailure(e)) noteWriteFailed();
+        }
+
+        com.overdrive.app.abrp.SohEstimator estimator = getSohEstimator();
+        if (estimator == null) return;
+        try {
+            java.util.ArrayList<PendingSohCalibration> pendingRows =
+                    new java.util.ArrayList<>();
+            try (PreparedStatement pending = connection.prepareStatement(
+                    "SELECT start_time, start_soc, end_soc, hv_temp_avg, is_dc,"
+                            + " soh_calibration_energy_kwh, soh_calibration_cell_v,"
+                            + " soh_calibration_nominal_identity,"
+                            + " soh_calibration_estimator_generation,"
+                            + " soh_calibration_reset_model_epoch,"
+                            + " soh_calibration_prior_at_ms"
+                            + " FROM " + TABLE_CHARGING
+                            + " WHERE end_time IS NOT NULL"
+                            + " AND post_commit_soh_applied = 0"
+                            // Newest first: one accepted anchor supersedes every older pending row.
+                            + " ORDER BY start_time DESC;");
+                 ResultSet rs = pending.executeQuery()) {
+                while (rs.next()) {
+                    PendingSohCalibration row = new PendingSohCalibration();
+                    row.sessionStart = rs.getLong("start_time");
+                    double startSoc = rs.getDouble("start_soc");
+                    boolean startSocMissing = rs.wasNull();
+                    double endSoc = rs.getDouble("end_soc");
+                    boolean endSocMissing = rs.wasNull();
+                    row.socDelta = endSoc - startSoc;
+                    row.packTempC = rs.getDouble("hv_temp_avg");
+                    boolean packTempMissing = rs.wasNull();
+                    int isDc = rs.getInt("is_dc");
+                    boolean isDcMissing = rs.wasNull();
+                    row.acCharge = isDc == 0;
+                    row.energyKwh = rs.getDouble("soh_calibration_energy_kwh");
+                    boolean energyMissing = rs.wasNull();
+                    row.highCellV = rs.getDouble("soh_calibration_cell_v");
+                    boolean highCellMissing = rs.wasNull();
+                    if (highCellMissing) row.highCellV = Double.NaN;
+                    row.nominalIdentity =
+                            rs.getString("soh_calibration_nominal_identity");
+                    row.estimatorGeneration =
+                            rs.getLong("soh_calibration_estimator_generation");
+                    boolean estimatorGenerationMissing = rs.wasNull();
+                    row.resetModelEpoch =
+                            rs.getLong("soh_calibration_reset_model_epoch");
+                    row.hasResetModelEpoch = !rs.wasNull();
+                    row.priorCalibrationAtMs =
+                            rs.getLong("soh_calibration_prior_at_ms");
+                    boolean priorMissing = rs.wasNull();
+                    row.hasFrame = row.nominalIdentity != null
+                            && !row.nominalIdentity.isEmpty()
+                            && !estimatorGenerationMissing
+                            && row.hasResetModelEpoch && !priorMissing;
+                    if (startSocMissing || endSocMissing || packTempMissing
+                            || isDcMissing || energyMissing) {
+                        row.persistedPayloadError = "required numeric payload is NULL";
+                    } else if (!isFinite(startSoc) || !isFinite(endSoc)
+                            || !isFinite(row.packTempC) || !isFinite(row.energyKwh)
+                            || !highCellMissing && !isFinite(row.highCellV)) {
+                        row.persistedPayloadError = "numeric payload is non-finite";
+                    } else if (startSoc < 0 || startSoc > 100
+                            || endSoc < 0 || endSoc > 100
+                            || row.socDelta <= 0 || row.energyKwh <= 0
+                            || row.packTempC <= -999) {
+                        row.persistedPayloadError = "numeric payload is outside its domain";
+                    }
+                    row.persistedPayloadValid = row.persistedPayloadError == null;
+                    pendingRows.add(row);
+                }
+            }
+            for (PendingSohCalibration row : pendingRows) {
+                try {
+                    if (!row.persistedPayloadValid) {
+                        markSohCalibrationResolved(row.sessionStart, true);
+                        logger.warn("Rejected malformed charging SOH calibration "
+                                + row.sessionStart + ": " + row.persistedPayloadError);
+                        continue;
+                    }
+                    SohCalibrationFrame current =
+                            captureSohCalibrationFrame(estimator);
+                    if (!row.hasResetModelEpoch || row.resetModelEpoch <= 0) {
+                        markSohCalibrationResolved(row.sessionStart, true);
+                        logger.warn("Rejected legacy charging SOH calibration "
+                                + row.sessionStart
+                                + ": durable reset/model epoch is absent or invalid");
+                        continue;
+                    }
+                    if (!row.hasFrame) {
+                        markSohCalibrationResolved(row.sessionStart, true);
+                        logger.warn("Rejected malformed charging SOH calibration "
+                                + row.sessionStart
+                                + ": durable calibration frame is absent");
+                        continue;
+                    }
+                    if (current == null) {
+                        logger.warn("Charging SOH metadata replay remains pending for "
+                                + row.sessionStart
+                                + ": current calibration frame is temporarily unavailable");
+                        break;
+                    }
+                    if (!row.nominalIdentity.equals(current.nominalIdentity)) {
+                        markSohCalibrationResolved(row.sessionStart, true);
+                        logger.warn("Rejected stale charging SOH calibration "
+                                + row.sessionStart
+                                + ": nominal/model identity is absent or changed");
+                        continue;
+                    }
+                    if (row.resetModelEpoch != current.resetModelEpoch) {
+                        markSohCalibrationResolved(row.sessionStart, true);
+                        logger.warn("Rejected stale charging SOH calibration "
+                                + row.sessionStart
+                                + ": durable reset/model epoch changed");
+                        continue;
+                    }
+
+                    long currentCalibrationAt = current.priorCalibrationAtMs;
+                    if (currentCalibrationAt > row.sessionStart) {
+                        // A newer deterministic anchor already supersedes this row.
+                        markSohCalibrationResolved(row.sessionStart, false);
+                        continue;
+                    }
+                    if (currentCalibrationAt != row.sessionStart
+                            && currentCalibrationAt != row.priorCalibrationAtMs) {
+                        markSohCalibrationResolved(row.sessionStart, true);
+                        logger.warn("Rejected stale charging SOH calibration "
+                                + row.sessionStart
+                                + ": calibration lineage changed");
+                        continue;
+                    }
+
+                    final com.overdrive.app.abrp.SohEstimator.CalibrationReplayOutcome[]
+                            replayOutcome = {
+                                com.overdrive.app.abrp.SohEstimator
+                                    .CalibrationReplayOutcome.RETRY_LATER
+                            };
+                    boolean generationAccepted =
+                            estimator.runWithEstimatorGenerationGuard(
+                                    current.estimatorGeneration,
+                                    () -> replayOutcome[0] =
+                                            estimator.applyCalibrationReplayWithOutcome(
+                                                    row.energyKwh, row.socDelta,
+                                                    row.packTempC, row.acCharge,
+                                                    row.highCellV,
+                                                    row.sessionStart));
+                    if (!generationAccepted
+                            || replayOutcome[0]
+                                == com.overdrive.app.abrp.SohEstimator
+                                    .CalibrationReplayOutcome.RETRY_LATER) {
+                        logger.warn("Charging SOH metadata replay remains pending for "
+                                + row.sessionStart + ": calibration was not durably accepted");
+                        break;
+                    }
+                    boolean rejected =
+                            replayOutcome[0]
+                                == com.overdrive.app.abrp.SohEstimator
+                                    .CalibrationReplayOutcome.PERMANENTLY_REJECTED;
+                    markSohCalibrationResolved(row.sessionStart, rejected);
+                    if (rejected) {
+                        logger.warn("Rejected invalid charging SOH calibration "
+                                + row.sessionStart);
+                    }
+                } catch (Exception rowFailure) {
+                    logger.warn("Charging SOH metadata replay deferred for "
+                            + row.sessionStart + ": " + rowFailure.getMessage());
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("Charging SOH metadata scan deferred: " + e.getMessage());
+            if (isSqlFailure(e)) noteWriteFailed();
+        }
+    }
+
+    private void markSohCalibrationResolved(long sessionStart, boolean rejected)
+            throws Exception {
+        try (PreparedStatement applied = connection.prepareStatement(
+                "UPDATE " + TABLE_CHARGING
+                        + " SET post_commit_soh_applied = 1,"
+                        + " soh_calibration_rejected = ?"
+                        + " WHERE start_time = ?"
+                        + " AND post_commit_soh_applied = 0;")) {
+            applied.setInt(1, rejected ? 1 : 0);
+            applied.setLong(2, sessionStart);
+            if (applied.executeUpdate() != 1) {
+                throw new java.sql.SQLException(
+                        "SOH metadata row disappeared during replay");
+            }
+        }
     }
 
     private String getCurrencySymbol() {
@@ -2515,66 +8401,196 @@ public class SocHistoryDatabase {
         return "";
     }
 
+    @FunctionalInterface
+    private interface SqlTransactionWork {
+        void run() throws Exception;
+    }
+
+    @FunctionalInterface
+    private interface SqlTransactionCommit {
+        void commit(Connection connection) throws Exception;
+    }
+
+    /**
+     * Execute a short write unit atomically on the shared H2 connection. Callers are already under
+     * this instance's monitor, the same ownership used by the existing tariff-reprice transaction.
+     */
+    private void runInTransaction(SqlTransactionWork work) throws Exception {
+        runInTransaction(work, Connection::commit);
+    }
+
+    private void runInTransaction(
+            SqlTransactionWork work, SqlTransactionCommit commit) throws Exception {
+        Connection c = connection;
+        if (c == null || c.isClosed()) throw new java.sql.SQLException("charging database unavailable");
+        boolean priorAutoCommit = c.getAutoCommit();
+        if (!priorAutoCommit) {
+            discardTransactionConnection(c);
+            throw new java.sql.SQLException(
+                    "shared charging connection entered a write with auto-commit disabled");
+        }
+        c.setAutoCommit(false);
+        Exception primaryFailure = null;
+        try {
+            work.run();
+            commit.commit(c);
+        } catch (Exception e) {
+            primaryFailure = e;
+            try {
+                c.rollback();
+            } catch (Exception rollbackFailure) {
+                e.addSuppressed(rollbackFailure);
+                discardTransactionConnection(c);
+            }
+            throw e;
+        } finally {
+            try {
+                if (!c.isClosed()) c.setAutoCommit(true);
+            } catch (Exception restoreFailure) {
+                discardTransactionConnection(c);
+                if (primaryFailure != null) {
+                    primaryFailure.addSuppressed(restoreFailure);
+                } else {
+                    throw restoreFailure;
+                }
+            }
+        }
+    }
+
+    /** A connection with unknown transaction state must never be reused for an apparent autocommit. */
+    private void discardTransactionConnection(Connection c) {
+        if (connection == c) connection = null;
+        try { c.close(); } catch (Exception ignored) {}
+    }
+
+    private Boolean areTablesDurablyEmpty(String... tableNames) {
+        Connection c = connection;
+        if (c == null) return null;
+        try (Statement statement = c.createStatement()) {
+            for (String table : tableNames) {
+                try (ResultSet rs = statement.executeQuery(
+                        "SELECT COUNT(*) FROM " + table + ";")) {
+                    if (!rs.next() || rs.getLong(1) != 0L) return Boolean.FALSE;
+                }
+            }
+            return Boolean.TRUE;
+        } catch (Exception e) {
+            logger.debug("Could not reconcile cleared tables: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private boolean reconcileClearedTables(Exception failure, String... tableNames) {
+        Boolean durable = areTablesDurablyEmpty(tableNames);
+        if (durable != null) return durable;
+        if (isSqlFailure(failure)) noteWriteFailed();
+        try { reconnect(); } catch (Exception ignored) {}
+        return Boolean.TRUE.equals(areTablesDurablyEmpty(tableNames));
+    }
+
+    private Boolean isChargingSessionDurablyAbsent(long id) {
+        Connection c = connection;
+        if (c == null) return null;
+        try (PreparedStatement p = c.prepareStatement(
+                "SELECT 1 FROM " + TABLE_CHARGING + " WHERE id = ?;")) {
+            p.setLong(1, id);
+            try (ResultSet rs = p.executeQuery()) {
+                return !rs.next();
+            }
+        } catch (Exception e) {
+            logger.debug("Could not reconcile charging-session delete " + id
+                    + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    private boolean reconcileDeletedChargingSession(long id, Exception failure) {
+        Boolean absent = isChargingSessionDurablyAbsent(id);
+        if (absent != null) return absent;
+        if (isSqlFailure(failure)) noteWriteFailed();
+        try { reconnect(); } catch (Exception ignored) {}
+        return Boolean.TRUE.equals(isChargingSessionDurablyAbsent(id));
+    }
+
     /**
      * Upsert one completed session into the permanent {@code charging_daily}
      * rollup so lifetime / monthly-cost trends survive the soc_history prune.
      * H2 MERGE accumulates per-day counters.
      */
     private void foldSessionIntoDaily(long endTime, double energyKwh, double cost,
-                                      int isDc, double peakKw, int rangeGained) {
-        if (!isInitialized || connection == null) return;
-        try {
-            long day = (endTime / 86_400_000L) * 86_400_000L;
-            double soh = -999;
-            try {
-                com.overdrive.app.abrp.SohEstimator est = getSohEstimator();
-                if (est != null && est.hasEstimate()) soh = est.getDisplaySoh();
-            } catch (Exception ignored) {}
+                                      int isDc, double peakKw, int rangeGained) throws Exception {
+        foldSessionIntoDaily(endTime, energyKwh, cost, isDc, peakKw, rangeGained, false);
+    }
 
-            // Read current row (if any), accumulate, then MERGE the new totals.
-            int sessionCount = 0, dcCount = 0, acCount = 0, rangeSum = 0;
-            double energySum = 0, costSum = 0, peakMax = 0, sohDay = soh;
-            try (PreparedStatement sel = connection.prepareStatement(
-                    "SELECT session_count, energy_kwh, cost, dc_count, ac_count, peak_power_kw, " +
-                    "soh_at_day, range_gained_km FROM " + TABLE_CHARGING_DAILY + " WHERE day_epoch = ?;")) {
-                sel.setLong(1, day);
-                try (ResultSet rs = sel.executeQuery()) {
-                    if (rs.next()) {
-                        sessionCount = rs.getInt(1);
-                        energySum = rs.getDouble(2);
-                        costSum = rs.getDouble(3);
-                        dcCount = rs.getInt(4);
-                        acCount = rs.getInt(5);
-                        peakMax = rs.getDouble(6);
-                        double prevSoh = rs.getDouble(7);
-                        rangeSum = rs.getInt(8);
-                        if (soh <= 0 && prevSoh > 0) sohDay = prevSoh; // keep last known if no fresh reading
-                    }
+    /**
+     * @param incomplete true when this session's energy figure is a floor rather than a measurement.
+     *                   Counted separately so the day's total does not silently assert a precision its
+     *                   constituent rows do not have.
+     */
+    private void foldSessionIntoDaily(long endTime, double energyKwh, double cost,
+                                      int isDc, double peakKw, int rangeGained,
+                                      boolean incomplete) throws Exception {
+        if (!isInitialized || connection == null) {
+            throw new java.sql.SQLException("charging database unavailable during daily fold");
+        }
+        long day = (endTime / 86_400_000L) * 86_400_000L;
+        double soh = -999;
+        try {
+            com.overdrive.app.abrp.SohEstimator est = getSohEstimator();
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                    est != null ? est.getCapacitySohSnapshot() : null;
+            if (capacitySoh != null && capacitySoh.hasDisplaySoh()) {
+                soh = capacitySoh.getDisplaySoh();
+            }
+        } catch (Exception ignored) {}
+
+        // Read current row (if any), accumulate, then MERGE the new totals.
+        int sessionCount = 0, dcCount = 0, acCount = 0, rangeSum = 0, incompleteCount = 0;
+        double energySum = 0, costSum = 0, peakMax = 0, sohDay = soh;
+        try (PreparedStatement sel = connection.prepareStatement(
+                "SELECT session_count, energy_kwh, cost, dc_count, ac_count, peak_power_kw, " +
+                "soh_at_day, range_gained_km, incomplete_count FROM " + TABLE_CHARGING_DAILY
+                + " WHERE day_epoch = ?;")) {
+            sel.setLong(1, day);
+            try (ResultSet rs = sel.executeQuery()) {
+                if (rs.next()) {
+                    sessionCount = rs.getInt(1);
+                    energySum = rs.getDouble(2);
+                    costSum = rs.getDouble(3);
+                    dcCount = rs.getInt(4);
+                    acCount = rs.getInt(5);
+                    peakMax = rs.getDouble(6);
+                    double prevSoh = rs.getDouble(7);
+                    rangeSum = rs.getInt(8);
+                    incompleteCount = rs.getInt(9);
+                    if (soh <= 0 && prevSoh > 0) sohDay = prevSoh;
                 }
             }
-            sessionCount += 1;
-            if (energyKwh > 0) energySum += energyKwh;
-            if (cost > 0) costSum += cost;
-            if (isDc == 1) dcCount += 1; else if (isDc == 0) acCount += 1;
-            if (peakKw > peakMax) peakMax = peakKw;
-            if (rangeGained > 0) rangeSum += rangeGained;
+        }
+        sessionCount += 1;
+        if (energyKwh > 0) energySum += energyKwh;
+        if (cost > 0) costSum += cost;
+        if (isDc == 1) dcCount += 1; else if (isDc == 0) acCount += 1;
+        if (peakKw > peakMax) peakMax = peakKw;
+        if (rangeGained > 0) rangeSum += rangeGained;
+        if (incomplete) incompleteCount += 1;
 
-            try (PreparedStatement merge = connection.prepareStatement(
-                    "MERGE INTO " + TABLE_CHARGING_DAILY +
-                    " (day_epoch, session_count, energy_kwh, cost, dc_count, ac_count, peak_power_kw, soh_at_day, range_gained_km) KEY(day_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);")) {
-                merge.setLong(1, day);
-                merge.setInt(2, sessionCount);
-                merge.setDouble(3, energySum);
-                merge.setDouble(4, costSum);
-                merge.setInt(5, dcCount);
-                merge.setInt(6, acCount);
-                merge.setDouble(7, peakMax);
-                merge.setDouble(8, sohDay);
-                merge.setInt(9, rangeSum);
-                merge.executeUpdate();
-            }
-        } catch (Exception e) {
-            logger.debug("foldSessionIntoDaily failed: " + e.getMessage());
+        try (PreparedStatement merge = connection.prepareStatement(
+                "MERGE INTO " + TABLE_CHARGING_DAILY +
+                " (day_epoch, session_count, energy_kwh, cost, dc_count, ac_count, peak_power_kw,"
+                + " soh_at_day, range_gained_km, incomplete_count)"
+                + " KEY(day_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")) {
+            merge.setLong(1, day);
+            merge.setInt(2, sessionCount);
+            merge.setDouble(3, energySum);
+            merge.setDouble(4, costSum);
+            merge.setInt(5, dcCount);
+            merge.setInt(6, acCount);
+            merge.setDouble(7, peakMax);
+            merge.setDouble(8, sohDay);
+            merge.setInt(9, rangeSum);
+            merge.setInt(10, incompleteCount);
+            merge.executeUpdate();
         }
     }
 
@@ -2582,35 +8598,787 @@ public class SocHistoryDatabase {
      * Append a fine-grained in-session sample (driven by ChargingSessionManager's
      * fast sampler while ChargingDetector.isCharging()). Best-effort; never throws.
      */
-    public synchronized void recordChargingSample(long sessionStartTime, long t, double powerKw, double soc,
-                                     double temp, double tempHigh, double tempLow) {
-        if (!isInitialized || connection == null || sessionStartTime <= 0) return;
-        if (Double.isNaN(powerKw)) return;
+    private boolean advancePendingCloseForAdmittedTaper(
+            long sessionStartTime, long sampleAtMs, double soc,
+            double temp, double tempHigh, double tempLow) {
+        if (!isAdmittedTaperTail()
+                || pendingCloseSessionStart != sessionStartTime
+                || chargingStartTime != sessionStartTime
+                || !wasCharging) {
+            return true;
+        }
+        long advancedAt = Math.max(
+                pendingCloseAtMs,
+                strictlyAfterChargingStart(sessionStartTime, sampleAtMs));
+        pendingCloseAtMs = advancedAt;
+        if (!Double.isNaN(soc) && soc >= 0 && soc <= 100) pendingCloseSoc = soc;
+        if (tempHigh > -999) pendingCloseTempHigh = tempHigh;
+        if (tempLow > -999) pendingCloseTempLow = tempLow;
+        if (temp > -999) pendingCloseTempAvg = temp;
+        // The sample is not acknowledged until its advanced accounting boundary is restart-safe.
+        return persistChargingLifecycleJournal();
+    }
+
+    private boolean isAdmittedTaperTail() {
+        return physicalChargingStateKnown
+                && !physicalChargingNow
+                && chargingLiveEnrichmentAllowed;
+    }
+
+    public synchronized boolean recordChargingSample(long sessionStartTime, long t, double powerKw,
+                                      double soc, double temp, double tempHigh, double tempLow) {
+        if (!isInitialized || connection == null || sessionStartTime <= 0) return false;
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        if (!chargingAnalyticsEnabled || optOutClosePending) return false;
+        // A clear/reset can atomically replace the active row while a sampler is waiting on this
+        // monitor with the old start key. Reject that stale write instead of creating an orphan sample.
+        if (wasCharging && sessionStartTime != chargingStartTime) return false;
+        if (Double.isNaN(powerKw)) return false;
+        if (powerKw > 0 && !advancePendingCloseForAdmittedTaper(
+                sessionStartTime, t, soc, temp, tempHigh, tempLow)) {
+            return false;
+        }
         try {
-            try (PreparedStatement pstmt = connection.prepareStatement(
-                    "INSERT INTO " + TABLE_CPS + " (session_start_time, t, power_kw, soc, temp, temp_high, temp_low) VALUES (?, ?, ?, ?, ?, ?, ?);")) {
-                pstmt.setLong(1, sessionStartTime);
-                pstmt.setLong(2, t);
-                pstmt.setDouble(3, powerKw);
-                pstmt.setDouble(4, soc);
-                pstmt.setDouble(5, temp);
-                pstmt.setDouble(6, tempHigh);
-                pstmt.setDouble(7, tempLow);
-                pstmt.executeUpdate();
-            }
+            runInTransaction(() -> {
+                try (PreparedStatement pstmt = connection.prepareStatement(
+                        "INSERT INTO " + TABLE_CPS
+                                + " (session_start_time, t, power_kw, soc, temp,"
+                                + " temp_high, temp_low) VALUES (?, ?, ?, ?, ?, ?, ?);")) {
+                    pstmt.setLong(1, sessionStartTime);
+                    pstmt.setLong(2, t);
+                    pstmt.setDouble(3, powerKw);
+                    pstmt.setDouble(4, soc);
+                    pstmt.setDouble(5, temp);
+                    pstmt.setDouble(6, tempHigh);
+                    pstmt.setDouble(7, tempLow);
+                    if (pstmt.executeUpdate() != 1) {
+                        throw new java.sql.SQLException(
+                                "charging sample INSERT did not create one row");
+                    }
+                }
+                if (powerKw == MISSING_RATE_BOUNDARY_POWER_KW) {
+                    try (PreparedStatement mark = connection.prepareStatement(
+                            "UPDATE " + TABLE_CHARGING
+                                    + " SET integration_truncated = 1"
+                                    + " WHERE start_time = ? AND end_time IS NULL;")) {
+                        mark.setLong(1, sessionStartTime);
+                        if (mark.executeUpdate() != 1) {
+                            throw new java.sql.SQLException(
+                                    "missing-rate marker found no matching open session");
+                        }
+                    }
+                }
+            });
+            noteWriteOk();
+            return true;
         } catch (Exception e) {
             logger.debug("recordChargingSample failed: " + e.getMessage());
+            if (isChargingSampleDurable(
+                    sessionStartTime, t, powerKw, soc, temp, tempHigh, tempLow)) {
+                noteWriteOk();
+                return true;
+            }
+            if (isSqlFailure(e)) noteWriteFailed();
+            try { reconnect(); } catch (Exception ignored) {}
+            if (isChargingSampleDurable(
+                    sessionStartTime, t, powerKw, soc, temp, tempHigh, tempLow)) {
+                noteWriteOk();
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /** Reconcile an INSERT that may have committed before JDBC threw while returning its result. */
+    private boolean isChargingSampleDurable(
+            long sessionStartTime, long t, double powerKw,
+            double soc, double temp, double tempHigh, double tempLow) {
+        Connection c = connection;
+        if (c == null || sessionStartTime <= 0L || t <= 0L) return false;
+        try (PreparedStatement p = c.prepareStatement(
+                "SELECT power_kw, soc, temp, temp_high, temp_low FROM " + TABLE_CPS
+                        + " WHERE session_start_time = ? AND t = ? ORDER BY id ASC;")) {
+            p.setLong(1, sessionStartTime);
+            p.setLong(2, t);
+            try (ResultSet rs = p.executeQuery()) {
+                boolean sampleDurable = false;
+                while (rs.next()) {
+                    if (realStorageEquivalent(rs.getDouble(1), powerKw)
+                            && realStorageEquivalent(rs.getDouble(2), soc)
+                            && realStorageEquivalent(rs.getDouble(3), temp)
+                            && realStorageEquivalent(rs.getDouble(4), tempHigh)
+                            && realStorageEquivalent(rs.getDouble(5), tempLow)) {
+                        sampleDurable = true;
+                        break;
+                    }
+                }
+                if (!sampleDurable) return false;
+            }
+            if (powerKw != MISSING_RATE_BOUNDARY_POWER_KW) return true;
+            try (PreparedStatement marker = c.prepareStatement(
+                    "SELECT integration_truncated FROM " + TABLE_CHARGING
+                            + " WHERE start_time = ? AND end_time IS NULL;")) {
+                marker.setLong(1, sessionStartTime);
+                try (ResultSet rs = marker.executeQuery()) {
+                    return rs.next() && rs.getInt(1) == 1;
+                }
+            }
+        } catch (Exception reconcileFailure) {
+            logger.debug("Could not reconcile charging sample "
+                    + sessionStartTime + "/" + t + ": " + reconcileFailure.getMessage());
+            return false;
         }
     }
 
     /** Start time of the currently-open charging session, or -1 if none. */
-    public long getOpenChargingSessionStart() {
+    public synchronized long getOpenChargingSessionStart() {
+        if (!reconcilePendingActiveChargingReplacement()) return -1L;
         return wasCharging ? chargingStartTime : -1;
+    }
+
+    /** Durable H2 truth used by manager edge postcondition checks. */
+    public synchronized boolean hasOpenChargingSessionRow() throws java.sql.SQLException {
+        if (!reconcilePendingActiveChargingReplacement()) {
+            throw new java.sql.SQLException(
+                    "active charging replacement identity is unresolved");
+        }
+        if (connection == null) {
+            throw new java.sql.SQLException("charging history storage is unavailable");
+        }
+        try (PreparedStatement p = connection.prepareStatement(
+                "SELECT 1 FROM " + TABLE_CHARGING
+                        + " WHERE end_time IS NULL LIMIT 1;");
+             ResultSet rs = p.executeQuery()) {
+            return rs.next();
+        }
+    }
+
+    /** Exact row frozen for the next close retry, or the current open row when not yet frozen. */
+    public synchronized long getChargingCloseTargetStart() {
+        if (!reconcilePendingActiveChargingReplacement()) return -1L;
+        if (pendingCloseSessionStart > 0L) return pendingCloseSessionStart;
+        if (optOutClosePending && chargingStartTime > 0L) return chargingStartTime;
+        return wasCharging ? chargingStartTime : -1L;
+    }
+
+    /** Resolve a captured close key through clear/reset replacements of the same physical boundary. */
+    public synchronized long remapChargingCloseTargetStart(long capturedStart) {
+        if (!reconcilePendingActiveChargingReplacement()) return -1L;
+        return resolveChargingCloseTargetStart(capturedStart);
+    }
+
+    private long resolveChargingCloseTargetStart(long capturedStart) {
+        long current = capturedStart;
+        java.util.HashSet<Long> visited = new java.util.HashSet<>();
+        while (current > 0L && visited.add(current)) {
+            Long replacement = chargingCloseTargetRemaps.get(current);
+            if (replacement == null || replacement <= 0L) break;
+            current = replacement;
+        }
+        return current;
+    }
+
+    private void forgetChargingCloseTargetAliases(long closedStart) {
+        if (closedStart <= 0L || chargingCloseTargetRemaps.isEmpty()) return;
+        java.util.Iterator<java.util.Map.Entry<Long, Long>> iterator =
+                chargingCloseTargetRemaps.entrySet().iterator();
+        while (iterator.hasNext()) {
+            java.util.Map.Entry<Long, Long> entry = iterator.next();
+            if (entry.getKey() == closedStart
+                    || resolveChargingCloseTargetStart(entry.getValue()) == closedStart) {
+                iterator.remove();
+            }
+        }
+    }
+
+    /**
+     * True only when the requested identity is durably closed or intentionally absent.
+     * A different open row does not affect the answer and is never mutated by this check.
+     */
+    public synchronized boolean isChargingSessionCloseSatisfied(long sessionStart) {
+        if (connection == null || sessionStart <= 0L) return false;
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        sessionStart = resolveChargingCloseTargetStart(sessionStart);
+        try {
+            return durableChargingRowState(sessionStart) != 1;
+        } catch (Exception e) {
+            logger.debug("Could not verify exact charging close " + sessionStart
+                    + ": " + e.getMessage());
+            return false;
+        }
     }
 
     /** Latched estimated time-to-full (minutes) for the open session, or -1 if none. */
     public int getOpenChargingSessionTimeToFullMin() {
         return wasCharging ? chargingTimeToFullMin : -1;
+    }
+
+    /** Snapshot used to replace an active row atomically when charging history is cleared. */
+    private static final class ActiveChargingReplacement {
+        long previousStartTime;
+        long startTime;
+        double startSoc;
+        int startRange;
+        int startOdometer;
+        int gun;
+        int timeToFull;
+        double lat;
+        double lng;
+        String counterSource;
+        com.overdrive.app.charging.ChargeCounterAccumulator.State counterState;
+        boolean lifecycleHold;
+        boolean pendingClose;
+        long closeAtMs;
+        double closeSoc = Double.NaN;
+        boolean closeCounterCaptured;
+        PricingDecision closePricing;
+        int closeIsDc = -2;
+        boolean closeResumeBlocked;
+        double closeTempHigh = -999;
+        double closeTempLow = -999;
+        double closeTempAvg = -999;
+        final java.util.ArrayList<DeferredChargingGeneration> deferredGenerations =
+                new java.util.ArrayList<>();
+    }
+
+    /**
+     * Write-ahead description of a clear/reset boundary. The old lifecycle remains the primary journal
+     * image until H2 proves whether the transaction committed; this intent contains the exact image to
+     * publish when the replacement/empty-table postcondition is durable.
+     */
+    private static final class ChargingMaintenanceIntent {
+        String operation;
+        long previousStartTime;
+        ActiveChargingReplacement replacement;
+        final java.util.ArrayList<DeferredChargingGeneration> deferredGenerations =
+                new java.util.ArrayList<>();
+    }
+
+    private enum ChargingMaintenanceOutcome {
+        COMMITTED,
+        ROLLED_BACK,
+        UNKNOWN
+    }
+
+    private ChargingMaintenanceIntent snapshotChargingMaintenanceIntent(String operation) {
+        ChargingMaintenanceIntent intent = new ChargingMaintenanceIntent();
+        intent.operation = operation;
+        intent.previousStartTime = wasCharging ? chargingStartTime : 0L;
+        intent.replacement = snapshotActiveChargingReplacement();
+        if (intent.replacement == null && !deferredPhysicalGenerations.isEmpty()) {
+            double boundarySoc = currentSocForContinuation();
+            long proposedStart = System.currentTimeMillis();
+            for (DeferredChargingGeneration generation : deferredPhysicalGenerations) {
+                DeferredChargingGeneration rebased =
+                        rebaseDeferredGenerationAtMaintenanceBoundary(
+                                generation, proposedStart, boundarySoc);
+                intent.deferredGenerations.add(rebased);
+                proposedStart = rebased.startMs + 1L;
+            }
+        }
+        return intent;
+    }
+
+    private ChargingMaintenanceIntent beginChargingMaintenance(String operation)
+            throws Exception {
+        ChargingMaintenanceIntent intent = snapshotChargingMaintenanceIntent(operation);
+        pendingChargingMaintenanceIntent = intent;
+        if (!persistChargingLifecycleJournal()) {
+            pendingChargingMaintenanceIntent = null;
+            throw new java.io.IOException(
+                    "charging maintenance intent was not durable");
+        }
+        return intent;
+    }
+
+    private ActiveChargingReplacement snapshotActiveChargingReplacement() {
+        if (!chargingAnalyticsEnabled || !wasCharging || chargingStartTime <= 0) return null;
+        ActiveChargingReplacement state = new ActiveChargingReplacement();
+        state.previousStartTime = chargingStartTime;
+        state.startTime = allocateMonotonicChargingStart(System.currentTimeMillis());
+        state.startSoc = lastRecordedSoc >= 0 ? lastRecordedSoc : chargingStartSoc;
+        try {
+            BatterySocData sd = VehicleDataMonitor.getInstance().getBatterySoc();
+            if (sd != null && !Double.isNaN(sd.socPercent)) state.startSoc = sd.socPercent;
+        } catch (Throwable ignored) {}
+        state.startRange = snapshotRangeKm();
+        state.startOdometer = snapshotOdometerKm();
+        state.gun = snapshotGunState();
+        state.timeToFull = snapshotTimeToFullMin();
+        double[] location = snapshotLocation();
+        state.lat = location[0];
+        state.lng = location[1];
+        // A current reading is a valid zero point for the post-clear segment. Do not fall back to a
+        // stale cached endpoint: that could re-credit energy delivered before the clear boundary.
+        double counterKwh = snapshotChargeCounterKwh();
+        state.counterSource = counterOwner;
+        com.overdrive.app.charging.ChargeCounterAccumulator replacementCounter =
+                new com.overdrive.app.charging.ChargeCounterAccumulator();
+        replacementCounter.setFullScaleKwh(chargingCounter.fullScaleKwh());
+        if (!Double.isNaN(counterKwh)) {
+            replacementCounter.observe(counterKwh, state.startTime);
+        }
+        state.counterState = replacementCounter.snapshotState();
+        state.lifecycleHold = chargingLifecycleHold;
+        if (pendingCloseSessionStart == state.previousStartTime) {
+            state.pendingClose = true;
+            state.closeAtMs = strictlyAfterChargingStart(
+                    state.startTime, pendingCloseAtMs);
+            state.closeSoc = pendingCloseSoc;
+            state.closeCounterCaptured = pendingCloseCounterCaptured;
+            state.closePricing = pendingClosePricing;
+            state.closeIsDc = pendingCloseIsDc;
+            state.closeResumeBlocked = pendingCloseResumeBlocked;
+            state.closeTempHigh = pendingCloseTempHigh;
+            state.closeTempLow = pendingCloseTempLow;
+            state.closeTempAvg = pendingCloseTempAvg;
+        }
+        for (DeferredChargingGeneration generation : deferredPhysicalGenerations) {
+            state.deferredGenerations.add(
+                    rebaseDeferredGenerationAtMaintenanceBoundary(generation, state));
+        }
+        return state;
+    }
+
+    private DeferredChargingGeneration rebaseDeferredGenerationAtMaintenanceBoundary(
+            DeferredChargingGeneration original, ActiveChargingReplacement replacement) {
+        return rebaseDeferredGenerationAtMaintenanceBoundary(
+                original, replacement.startTime + 1L, replacement.startSoc);
+    }
+
+    private DeferredChargingGeneration rebaseDeferredGenerationAtMaintenanceBoundary(
+            DeferredChargingGeneration original, long proposedStart, double boundarySoc) {
+        DeferredChargingGeneration rebased = new DeferredChargingGeneration();
+        rebased.startMs = allocateMonotonicChargingStart(proposedStart);
+        rebased.startSoc = boundarySoc;
+        rebased.startRange = original.startRange;
+        rebased.startOdometer = original.startOdometer;
+        rebased.gun = original.gun;
+        rebased.timeToFull = original.timeToFull;
+        rebased.lat = original.lat;
+        rebased.lng = original.lng;
+        rebased.previousCounterKwh = Double.NaN;
+        rebased.counterOwner = original.counterOwner;
+        rebased.counterBaselinePendingSinceMs = rebased.startMs;
+        if (original.counter.hasBaseline()) {
+            double boundaryCounter = original.counter.lastRawKwh();
+            rebased.counter.setFullScaleKwh(original.counter.fullScaleKwh());
+            rebased.counter.observe(boundaryCounter, rebased.startMs);
+            rebased.counterBaselinePending = false;
+            rebased.counterLatestKwh = boundaryCounter;
+            rebased.counterLatestAtMs = rebased.startMs;
+        }
+        if (original.isEnded()) {
+            rebased.endMs = strictlyAfterChargingStart(
+                    rebased.startMs, rebased.startMs);
+            rebased.endSoc = boundarySoc;
+            rebased.closeIsDc = original.closeIsDc;
+            rebased.closePricing = original.closePricing;
+            rebased.resumeBlocked = original.resumeBlocked;
+        }
+        return rebased;
+    }
+
+    private void insertActiveChargingReplacement(ActiveChargingReplacement state) throws Exception {
+        if (state == null) return;
+        com.overdrive.app.charging.ChargeCounterAccumulator.State counter =
+                state.counterState != null
+                        ? state.counterState
+                        : new com.overdrive.app.charging.ChargeCounterAccumulator.State();
+        try (PreparedStatement p = connection.prepareStatement(
+                "INSERT INTO " + TABLE_CHARGING
+                + " (start_time, start_soc, peak_power_kw, avg_power_kw, gun_state,"
+                + " start_lat, start_lng, start_range_km, start_odometer_km, time_to_full_min,"
+                + " counter_start_kwh, counter_last_kwh, counter_energy_kwh,"
+                + " energy_incomplete, counter_source, counter_full_scale_kwh,"
+                + " counter_last_at_ms, counter_observation_generation,"
+                + " counter_wrap_count, counter_reset_count, counter_ceiling_streak,"
+                + " counter_saturated, counter_abandoned_kwh, counter_unattributed_gaps,"
+                + " counter_awaiting_gap, counter_gap_reconstructed,"
+                + " counter_gap_estimate_kwh, counter_recent_rate_kwh_per_h)"
+                + " VALUES (?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                + " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")) {
+            p.setLong(1, state.startTime);
+            p.setDouble(2, state.startSoc);
+            p.setInt(3, state.gun);
+            p.setDouble(4, state.lat);
+            p.setDouble(5, state.lng);
+            p.setInt(6, state.startRange);
+            p.setInt(7, state.startOdometer);
+            p.setInt(8, state.timeToFull);
+            if (!Double.isNaN(counter.baseline)) {
+                p.setDouble(9, counter.baseline);
+                p.setDouble(10, counter.last);
+                p.setDouble(11, counter.accumulated);
+            } else {
+                p.setNull(9, java.sql.Types.DOUBLE);
+                p.setNull(10, java.sql.Types.DOUBLE);
+                p.setNull(11, java.sql.Types.DOUBLE);
+            }
+            p.setInt(12, counterStateIncomplete(counter) ? 1 : 0);
+            if (state.counterSource != null) p.setString(13, state.counterSource);
+            else p.setNull(13, java.sql.Types.VARCHAR);
+            if (!Double.isNaN(counter.fullScaleKwh) && counter.fullScaleKwh > 1.0) {
+                p.setDouble(14, counter.fullScaleKwh);
+            } else {
+                p.setNull(14, java.sql.Types.DOUBLE);
+            }
+            bindCounterState(p, 15, counter);
+            if (p.executeUpdate() != 1) {
+                throw new java.sql.SQLException("active charging replacement was not inserted");
+            }
+        }
+    }
+
+    private static boolean counterStateIncomplete(
+            com.overdrive.app.charging.ChargeCounterAccumulator.State state) {
+        return state != null && (state.saturated || state.resets > 0
+                || state.unattributedGaps > 0 || state.awaitingGapReconcile);
+    }
+
+    /**
+     * Reload the exact replacement row after a commit whose result was uncertain. Returning the
+     * durable values, rather than the pre-transaction proposal, keeps the live key and DB row aligned.
+     */
+    private ActiveChargingReplacement readDurableActiveChargingReplacement(
+            ActiveChargingReplacement expected) {
+        Connection c = connection;
+        if (c == null || expected == null || expected.startTime <= 0) return null;
+        ActiveChargingReplacement durable = null;
+        try (PreparedStatement p = c.prepareStatement(
+                "SELECT start_time, start_soc, start_range_km, start_odometer_km, gun_state,"
+                        + " time_to_full_min, start_lat, start_lng"
+                        + " FROM " + TABLE_CHARGING
+                        + " WHERE start_time = ? AND end_time IS NULL;")) {
+            p.setLong(1, expected.startTime);
+            try (ResultSet rs = p.executeQuery()) {
+                if (!rs.next()) return null;
+                durable = new ActiveChargingReplacement();
+                durable.startTime = rs.getLong("start_time");
+                durable.startSoc = rs.getDouble("start_soc");
+                durable.startRange = rs.getInt("start_range_km");
+                durable.startOdometer = rs.getInt("start_odometer_km");
+                durable.gun = rs.getInt("gun_state");
+                durable.timeToFull = rs.getInt("time_to_full_min");
+                durable.lat = rs.getDouble("start_lat");
+                durable.lng = rs.getDouble("start_lng");
+            }
+            CounterRestoreState counter = readCounterRestoreState(expected.startTime);
+            durable.counterState = counter.exactState;
+            durable.counterSource = counter.source;
+            copyReplacementLifecycleState(expected, durable);
+            return durable;
+        } catch (Exception e) {
+            logger.debug("Could not reconcile active charging replacement "
+                    + expected.startTime + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static void copyReplacementLifecycleState(
+            ActiveChargingReplacement source, ActiveChargingReplacement target) {
+        target.previousStartTime = source.previousStartTime;
+        target.lifecycleHold = source.lifecycleHold;
+        target.pendingClose = source.pendingClose;
+        target.closeAtMs = source.closeAtMs;
+        target.closeSoc = source.closeSoc;
+        target.closeCounterCaptured = source.closeCounterCaptured;
+        target.closePricing = source.closePricing;
+        target.closeIsDc = source.closeIsDc;
+        target.closeResumeBlocked = source.closeResumeBlocked;
+        target.closeTempHigh = source.closeTempHigh;
+        target.closeTempLow = source.closeTempLow;
+        target.closeTempAvg = source.closeTempAvg;
+        target.deferredGenerations.addAll(source.deferredGenerations);
+    }
+
+    private Boolean isDurablyOpenSession(long sessionStart) {
+        Connection c = connection;
+        if (sessionStart <= 0) return Boolean.FALSE;
+        if (c == null) return null;
+        try (PreparedStatement p = c.prepareStatement(
+                "SELECT end_time FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
+            p.setLong(1, sessionStart);
+            try (ResultSet rs = p.executeQuery()) {
+                if (!rs.next()) return Boolean.FALSE;
+                rs.getLong(1);
+                return rs.wasNull();
+            }
+        } catch (Exception e) {
+            logger.debug("Could not read durable open-row state for "
+                    + sessionStart + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    private boolean reconcilePendingChargingMaintenanceIntent(Exception failure) {
+        return reconcileChargingMaintenanceOutcome(failure)
+                != ChargingMaintenanceOutcome.UNKNOWN;
+    }
+
+    private ChargingMaintenanceOutcome reconcileChargingMaintenanceOutcome(Exception failure) {
+        ChargingMaintenanceIntent intent = pendingChargingMaintenanceIntent;
+        if (intent == null) return ChargingMaintenanceOutcome.ROLLED_BACK;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (intent.replacement != null) {
+                ActiveChargingReplacement durable =
+                        readDurableActiveChargingReplacement(intent.replacement);
+                if (durable != null) {
+                    publishCommittedChargingMaintenance(intent, durable);
+                    return ChargingMaintenanceOutcome.COMMITTED;
+                }
+                Boolean oldStillOpen = isDurablyOpenSession(intent.previousStartTime);
+                if (Boolean.TRUE.equals(oldStillOpen)) {
+                    cancelRolledBackChargingMaintenance();
+                    return ChargingMaintenanceOutcome.ROLLED_BACK;
+                }
+            } else {
+                Boolean empty = areTablesDurablyEmpty(
+                        chargingMaintenanceTables(intent.operation));
+                if (Boolean.TRUE.equals(empty)) {
+                    publishCommittedChargingMaintenance(intent, null);
+                    return ChargingMaintenanceOutcome.COMMITTED;
+                }
+                if (Boolean.FALSE.equals(empty)) {
+                    cancelRolledBackChargingMaintenance();
+                    return ChargingMaintenanceOutcome.ROLLED_BACK;
+                }
+            }
+            if (attempt == 0 && (connection == null
+                    || failure != null && isSqlFailure(failure))) {
+                if (failure != null && isSqlFailure(failure)) noteWriteFailed();
+                try { reconnect(); } catch (Exception ignored) {}
+            } else {
+                break;
+            }
+        }
+        return ChargingMaintenanceOutcome.UNKNOWN;
+    }
+
+    private String[] chargingMaintenanceTables(String operation) {
+        if ("resetAll".equals(operation)) {
+            return new String[] {
+                    TABLE_SOC, TABLE_CPS, TABLE_CHARGING, TABLE_CHARGING_DAILY,
+                    TABLE_SOC_DAILY, TABLE_ACC_EVENTS
+            };
+        }
+        return new String[] { TABLE_CPS, TABLE_CHARGING, TABLE_CHARGING_DAILY };
+    }
+
+    private void publishCommittedChargingMaintenance(
+            ChargingMaintenanceIntent intent, ActiveChargingReplacement durable) {
+        pendingChargingMaintenanceIntent = null;
+        if (durable != null) {
+            publishActiveChargingReplacement(durable);
+            return;
+        }
+        resetLiveChargingState(false, false);
+        deferredPhysicalGenerations.clear();
+        deferredPhysicalGenerations.addAll(intent.deferredGenerations);
+        sessionInputsFenced = !deferredPhysicalGenerations.isEmpty();
+        persistChargingLifecycleJournal();
+    }
+
+    private void cancelRolledBackChargingMaintenance() {
+        pendingChargingMaintenanceIntent = null;
+        persistChargingLifecycleJournal();
+    }
+
+    private ActiveChargingReplacement reconcileActiveChargingReplacement(
+            ActiveChargingReplacement expected, long previousStart,
+            Exception transactionFailure) {
+        if (expected == null) return null;
+        ActiveChargingReplacement durable = readDurableActiveChargingReplacement(expected);
+        if (durable != null) {
+            pendingActiveReplacement = null;
+            pendingActiveReplacementPreviousStart = 0L;
+            return durable;
+        }
+        Boolean oldStillOpen = isDurablyOpenSession(previousStart);
+        if (Boolean.TRUE.equals(oldStillOpen)) {
+            pendingActiveReplacement = null;
+            pendingActiveReplacementPreviousStart = 0L;
+            return null; // rollback is durable; the pre-transaction in-memory key is still correct
+        }
+        if (isSqlFailure(transactionFailure)) {
+            noteWriteFailed();
+            try { reconnect(); } catch (Exception ignored) {}
+            durable = readDurableActiveChargingReplacement(expected);
+            if (durable != null) {
+                pendingActiveReplacement = null;
+                pendingActiveReplacementPreviousStart = 0L;
+                return durable;
+            }
+            oldStillOpen = isDurablyOpenSession(previousStart);
+            if (Boolean.TRUE.equals(oldStillOpen)) return null;
+        }
+        // Neither postcondition could be proved. Retain the exact identities and fence every writer;
+        // a later healthy call will publish the replacement or confirm rollback before using a key.
+        pendingActiveReplacement = expected;
+        pendingActiveReplacementPreviousStart = previousStart;
+        return null;
+    }
+
+    private boolean reconcilePendingActiveChargingReplacement() {
+        if (!reconcilePendingChargingMaintenanceIntent(null)) return false;
+        ActiveChargingReplacement expected = pendingActiveReplacement;
+        if (expected == null) return true;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            ActiveChargingReplacement durable =
+                    readDurableActiveChargingReplacement(expected);
+            if (durable != null) {
+                pendingActiveReplacement = null;
+                pendingActiveReplacementPreviousStart = 0L;
+                publishActiveChargingReplacement(durable);
+                noteWriteOk();
+                return true;
+            }
+            Boolean oldStillOpen =
+                    isDurablyOpenSession(pendingActiveReplacementPreviousStart);
+            if (Boolean.TRUE.equals(oldStillOpen)) {
+                pendingActiveReplacement = null;
+                pendingActiveReplacementPreviousStart = 0L;
+                return true;
+            }
+            if (attempt == 0 && (oldStillOpen == null || connection == null)) {
+                try { reconnect(); } catch (Exception ignored) {}
+            } else {
+                break;
+            }
+        }
+        return false;
+    }
+
+    private void publishActiveChargingReplacement(ActiveChargingReplacement state) {
+        pendingActiveReplacement = null;
+        pendingActiveReplacementPreviousStart = 0L;
+        if (state.pendingClose && state.previousStartTime > 0L
+                && state.previousStartTime != state.startTime) {
+            chargingCloseTargetRemaps.put(
+                    state.previousStartTime, state.startTime);
+        }
+        wasCharging = true;
+        chargingStartTime = state.startTime;
+        chargingStartSoc = state.startSoc;
+        chargingPeakPower = 0;
+        chargingPowerSum = 0;
+        chargingPowerCount = 0;
+        chargingStartRange = state.startRange;
+        chargingStartOdometer = state.startOdometer;
+        chargingGunState = state.gun;
+        chargingTimeToFullMin = state.timeToFull;
+        chargingStartLat = state.lat;
+        chargingStartLng = state.lng;
+        chargingCounter.restoreState(state.counterState);
+        recoveredActivePowerGapAtMs = 0L;
+        counterOwner = state.counterSource;
+        if (chargingCounter.hasBaseline()) {
+            lastSessionCounterKwh = chargingCounter.lastRawKwh();
+            counterBaselinePending = false;
+            counterBaselinePendingSinceMs = 0L;
+        } else {
+            // This is a replacement boundary inside the same physical charge, not a new session
+            // waiting for the vehicle to reset. Let the next admitted reading baseline immediately.
+            lastSessionCounterKwh = Double.NaN;
+            counterBaselinePending = true;
+            counterBaselinePendingSinceMs = state.startTime;
+        }
+        provisionalExternalKwh = Double.NaN;
+        provisionalExternalAtMs = 0L;
+        provisionalExternalUnitDivisor = 1.0;
+        clearCounterBaselineCandidates();
+        preSessionCounterLowKwh = Double.NaN;
+        preSessionCounterAtMs = 0L;
+        preSessionCounterSource = null;
+        counterProgressDirty = false;
+        clearClaimedContinuationOffer();
+        optOutClosePending = false;
+        optOutBoundaryMs = 0L;
+        optOutBoundarySoc = Double.NaN;
+        optOutCounterCaptured = false;
+        optOutClosePricing = null;
+        optOutCloseIsDc = -2;
+        pendingCloseSessionStart = state.pendingClose ? state.startTime : 0L;
+        pendingCloseAtMs = state.pendingClose
+                ? strictlyAfterChargingStart(state.startTime, state.closeAtMs) : 0L;
+        pendingCloseSoc = state.pendingClose ? state.closeSoc : Double.NaN;
+        pendingCloseCounterCaptured =
+                state.pendingClose && state.closeCounterCaptured;
+        pendingClosePricing = state.pendingClose ? state.closePricing : null;
+        pendingCloseIsDc = state.pendingClose ? state.closeIsDc : -2;
+        pendingCloseResumeBlocked =
+                state.pendingClose && state.closeResumeBlocked;
+        pendingCloseTempHigh =
+                state.pendingClose ? state.closeTempHigh : -999;
+        pendingCloseTempLow =
+                state.pendingClose ? state.closeTempLow : -999;
+        pendingCloseTempAvg =
+                state.pendingClose ? state.closeTempAvg : -999;
+        chargingLifecycleHold = state.lifecycleHold;
+        deferredPhysicalGenerations.clear();
+        deferredPhysicalGenerations.addAll(state.deferredGenerations);
+        sessionInputsFenced = !deferredPhysicalGenerations.isEmpty();
+        persistChargingLifecycleJournal();
+    }
+
+    private void resetLiveChargingState(boolean retainLastCounter) {
+        resetLiveChargingState(retainLastCounter, true);
+    }
+
+    private void resetLiveChargingState(boolean retainLastCounter, boolean persistJournal) {
+        long closedStart = chargingStartTime;
+        if (retainLastCounter && chargingCounter.hasBaseline()
+                && !Double.isNaN(chargingCounter.lastRawKwh())) {
+            lastSessionCounterKwh = chargingCounter.lastRawKwh();
+        } else if (!retainLastCounter) {
+            lastSessionCounterKwh = Double.NaN;
+        }
+        wasCharging = false;
+        chargingStartTime = 0L;
+        chargingStartSoc = 0;
+        chargingPeakPower = 0;
+        chargingPowerSum = 0;
+        chargingPowerCount = 0;
+        chargingStartRange = -1;
+        chargingStartOdometer = -1;
+        chargingGunState = -1;
+        chargingTimeToFullMin = -1;
+        chargingStartLat = 0;
+        chargingStartLng = 0;
+        chargingCounter.reset();
+        counterOwner = null;
+        provisionalExternalKwh = Double.NaN;
+        provisionalExternalAtMs = 0L;
+        provisionalExternalUnitDivisor = 1.0;
+        counterBaselinePending = false;
+        counterBaselinePendingSinceMs = 0L;
+        clearCounterBaselineCandidates();
+        counterProgressDirty = false;
+        clearClaimedContinuationOffer();
+        chargingLifecycleHold = false;
+        chargingLiveEnrichmentAllowed = false;
+        optOutClosePending = false;
+        optOutBoundaryMs = 0L;
+        optOutBoundarySoc = Double.NaN;
+        optOutCounterCaptured = false;
+        optOutClosePricing = null;
+        optOutCloseIsDc = -2;
+        pendingCloseSessionStart = 0L;
+        pendingCloseAtMs = 0L;
+        pendingCloseSoc = Double.NaN;
+        pendingCloseCounterCaptured = false;
+        pendingClosePricing = null;
+        pendingCloseIsDc = -2;
+        pendingCloseResumeBlocked = false;
+        pendingCloseTempHigh = -999;
+        pendingCloseTempLow = -999;
+        pendingCloseTempAvg = -999;
+        recoveredActivePowerGapAtMs = 0L;
+        forgetChargingCloseTargetAliases(closedStart);
+        if (deferredPhysicalGenerations.isEmpty()) sessionInputsFenced = false;
+        // ChargingSessionManager owns classifier/rate generations. Closing A here while buffered B is
+        // already collecting evidence must not globally reset B's classifier.
+        if (persistJournal) persistChargingLifecycleJournal();
     }
 
     /** SoC% at the start of the currently-open charging session, or -1 if none. */
@@ -2625,49 +9393,75 @@ public class SocHistoryDatabase {
      * Single source of truth for the dashboard "Session" + stats "Added this
      * session" metrics so they can't read 0 early in a slow charge.
      */
-    public double getOpenChargingSessionEnergyKwh() {
+    /**
+     * Live energy for the open session, kWh, or -1.
+     *
+     * <p>{@code synchronized} because {@link com.overdrive.app.charging.ChargeCounterAccumulator} is
+     * documented as not thread-safe and {@code restore()} briefly zeroes its state before
+     * re-establishing it. This method is called from HTTP/status and MQTT threads while the SoC
+     * thread may be resuming a session, so an unsynchronised read could observe that window and
+     * publish 0 for a session that has real energy.
+     */
+    public synchronized double getOpenChargingSessionEnergyKwh() {
         if (!wasCharging || chargingStartTime <= 0) return -1;
-        double e = integrateSessionEnergyKwh(chargingStartTime);
-        if (e > 0) return e;
+        // SAME resolution as the session-close path, deliberately. This accessor feeds the live
+        // in-progress card and /status, so using a different rule here made the card disagree with
+        // the row it turns into the moment the charge ended.
         try {
-            double nominal = getSohEstimator() != null ? getSohEstimator().getNominalCapacityKwh() : 0;
             double liveSoc = Double.NaN;
             BatterySocData sd = VehicleDataMonitor.getInstance().getBatterySoc();
-            // Validate SOC range [0,100] to match chargingRowToJson — an
-            // out-of-range BMS read (e.g. 101) must NOT drive the live energy
-            // estimate, or /status would emit a value while the detail endpoint
-            // emits NULL for the same in-progress session (visible inconsistency).
+            // Validate SOC range [0,100] to match chargingRowToJson — an out-of-range BMS read
+            // (e.g. 101) must NOT drive the live energy estimate, or /status would emit a value
+            // while the detail endpoint emits NULL for the same session.
             if (sd != null && sd.socPercent >= 0 && sd.socPercent <= 100) liveSoc = sd.socPercent;
-            if (nominal > 0 && !Double.isNaN(liveSoc) && liveSoc > chargingStartSoc) {
-                return (liveSoc - chargingStartSoc) / 100.0 * nominal;
-            }
+
+            double meteredKwh = meteredEnergyKwh();
+            double socEstimate = Double.isNaN(liveSoc) ? Double.NaN
+                    : socEstimateForOpenSession(liveSoc);
+            com.overdrive.app.charging.SessionEnergyResolver.Result r =
+                    com.overdrive.app.charging.SessionEnergyResolver.resolve(
+                            meteredKwh, chargingCounter.containsReconstructedGap(), chargingCounter.isIncomplete(),
+                            integrateSessionEnergyKwh(chargingStartTime), socEstimate,
+                            lastIntegrationTruncated,
+                            counterScaleSuspect(counterOwner));
+            return r.isUsable() ? r.energyKwh : -1;
         } catch (Exception ignored) {}
         return -1;
     }
 
 
     // ==================== DATA RETRIEVAL ====================
-    
+
     /**
      * Get SOC history for charting.
      * Uses time-based bucketing for efficient downsampling - larger windows = larger buckets.
      * Returns data in ASC order (oldest first) for time-series chart rendering.
      */
-    public JSONArray getSocHistory(int hoursBack, int maxPoints) {
-        JSONArray results = new JSONArray();
-        
-        // Snapshot ONCE — see the connection field's doc. Guard-then-use on the field could pass
-        // the null check and then read null at prepareStatement() if reconnect() swapped it in
-        // between, NPE-ing mid-query and handing the UI an empty graph for that refresh.
-        final Connection conn = connection;
-        if (!isInitialized || conn == null) {
-            logger.debug("Database not initialized for getSocHistory");
-            return results;
+    public synchronized JSONArray getSocHistory(int hoursBack, int maxPoints) {
+        if (!isInitialized || connection == null) {
+            return new JSONArray();
         }
+        try {
+            return getSocHistoryStrict(hoursBack, maxPoints);
+        } catch (java.sql.SQLException e) {
+            logger.error("Failed to get SOC history", e);
+            try { reconnect(); } catch (Exception ignored) {}
+            return new JSONArray();
+        }
+    }
+
+    /**
+     * Strict API-facing SoC history read. Storage failure throws; a valid
+     * query with no rows returns an empty array.
+     */
+    public synchronized JSONArray getSocHistoryStrict(
+            int hoursBack, int maxPoints) throws java.sql.SQLException {
+        JSONArray results = new JSONArray();
+        final Connection conn = requireChargingHistoryReadConnection();
         
         try {
             long now = System.currentTimeMillis();
-            int hours = Math.min(hoursBack, 168);
+            int hours = clampSocHistoryHours(hoursBack);
             long startTime = now - (hours * 60 * 60 * 1000L);
             
             // Calculate bucket size based on time window
@@ -2748,23 +9542,22 @@ public class SocHistoryDatabase {
             // heartbeat) — so a recovered store could stay flagged dead for up to 10 minutes while
             // reads were already succeeding.
             noteReadOk();
-            
+            return results;
         } catch (Exception e) {
-            logger.error("Failed to get SOC history", e);
-            // Count a genuine JDBC failure so a broken-but-OPEN connection escalates to
-            // dead and the reconnect below actually reopens it. Non-SQL throws are not
-            // counted — they say nothing about the connection (see isSqlFailure).
             if (isSqlFailure(e)) noteReadFailed();
-            reconnect();
+            throw chargingHistoryReadException(
+                    "get SOC history", e);
         }
-        
-        return results;
+    }
+
+    static int clampSocHistoryHours(int hoursBack) {
+        return Math.max(1, Math.min(hoursBack, 24 * 30));
     }
     
     /**
      * Get charging sessions.
      */
-    public JSONArray getChargingSessions(int daysBack) {
+    public synchronized JSONArray getChargingSessions(int daysBack) {
         JSONArray results = new JSONArray();
         
         // Snapshot once — see the connection field's doc.
@@ -2788,10 +9581,12 @@ public class SocHistoryDatabase {
                         JSONObject row = new JSONObject();
                         row.put("startTime", rs.getLong("startTime"));
                         row.put("endTime", rs.getLong("endTime"));
-                        row.put("startSoc", rs.getDouble("startSoc"));
-                        row.put("endSoc", rs.getDouble("endSoc"));
-                        row.put("energyAdded", rs.getDouble("energyAdded"));
-                        row.put("peakPower", rs.getDouble("peakPower"));
+                        // NaN-safe: put(String,double) throws on NaN, which would abort the whole
+                        // response. A session opened before SoC ever resolved can hold NaN here.
+                        row.put("startSoc", jsonNum(rs.getDouble("startSoc")));
+                        row.put("endSoc", jsonNum(rs.getDouble("endSoc")));
+                        row.put("energyAdded", jsonNum(rs.getDouble("energyAdded")));
+                        row.put("peakPower", jsonNum(rs.getDouble("peakPower")));
                         results.put(row);
                     }
                 }
@@ -2816,16 +9611,27 @@ public class SocHistoryDatabase {
         "id, start_time, end_time, start_soc, end_soc, energy_added_kwh, peak_power_kw, avg_power_kw, " +
         "range_gained_km, gun_state, is_dc, electricity_rate, currency, session_cost, time_to_full_min, " +
         "hv_temp_high, hv_temp_low, hv_temp_avg, start_lat, start_lng, place_label, start_odometer_km, " +
-        "tariff_id, tariff_label";
+        "tariff_id, tariff_label, energy_source, energy_soc_kwh, energy_incomplete, " +
+        "counter_energy_kwh";
+
+    /** NaN -> JSON null. {@code JSONObject.put(String,double)} throws on NaN, failing whole responses. */
+    private static Object jsonNum(double v) {
+        return Double.isNaN(v) ? JSONObject.NULL : (Object) Double.valueOf(v);
+    }
 
     private JSONObject chargingRowToJson(ResultSet rs) throws Exception {
         JSONObject o = new JSONObject();
         long start = rs.getLong("start_time");
         long end = rs.getLong("end_time");
+        boolean inProgress = rs.wasNull();
         o.put("id", rs.getLong("id"));
         o.put("startTime", start);
         o.put("endTime", end);
-        o.put("startSoc", rs.getDouble("start_soc"));
+        o.put("inProgress", inProgress);
+        o.put("chargingNow", inProgress
+                && wasCharging && start == chargingStartTime
+                && physicalChargingStateKnown && physicalChargingNow);
+        o.put("startSoc", jsonNum(rs.getDouble("start_soc")));
         double endSoc = rs.getDouble("end_soc");
         o.put("endSoc", rs.wasNull() ? JSONObject.NULL : endSoc);
         double energy = rs.getDouble("energy_added_kwh");
@@ -2880,6 +9686,23 @@ public class SocHistoryDatabase {
             o.put("tariffId", JSONObject.NULL);
             o.put("tariffLabel", JSONObject.NULL);
         }
+        // Energy provenance. Surfaced so the UI can mark a row whose total is known to be missing a
+        // segment, and so support can tell a metered figure from a reconstructed one without
+        // re-deriving anything. Read defensively: a row written before the migration still serves.
+        try {
+            String esrc = rs.getString("energy_source");
+            o.put("energySource", (esrc != null && !esrc.isEmpty()) ? esrc : JSONObject.NULL);
+            double esoc = rs.getDouble("energy_soc_kwh");
+            o.put("energySocKwh", rs.wasNull() ? JSONObject.NULL : esoc);
+            double ectr = rs.getDouble("counter_energy_kwh");
+            o.put("energyCounterKwh", rs.wasNull() ? JSONObject.NULL : ectr);
+            o.put("energyIncomplete", rs.getInt("energy_incomplete") == 1);
+        } catch (Exception ignored) {
+            o.put("energySource", JSONObject.NULL);
+            o.put("energySocKwh", JSONObject.NULL);
+            o.put("energyCounterKwh", JSONObject.NULL);
+            o.put("energyIncomplete", false);
+        }
 
         // ---- Live enrichment for the OPEN (in-progress) session ----
         // The end_soc / energy / range / cost / ttf / temp columns are only
@@ -2890,9 +9713,9 @@ public class SocHistoryDatabase {
         // Fill them from the live monitor + running aggregates so the card and
         // detail view reflect the charge so far. Only the row matching the
         // currently-open session is touched.
-        boolean isOpen = (end == 0 || end <= start);
-        if (isOpen && wasCharging && start == chargingStartTime) {
-            o.put("inProgress", true);
+        boolean isOpen = inProgress;
+        if (isOpen && wasCharging && start == chargingStartTime
+                && chargingLiveEnrichmentAllowed) {
             long nowMs = System.currentTimeMillis();
             o.put("durationMinutes", Math.max(0, Math.round((nowMs - start) / 60000.0)));
             // AC/DC verdict for the OPEN session. The is_dc COLUMN is not written by
@@ -2919,11 +9742,11 @@ public class SocHistoryDatabase {
                 // the recorded power samples instead (∫P·dt over the ramp) — it's
                 // non-zero from the first sample. Fall back to SOC-delta only if
                 // there are too few samples to integrate.
-                double nominal = getSohEstimator() != null ? getSohEstimator().getNominalCapacityKwh() : 0;
-                double e = integrateSessionEnergyKwh(start);
-                if (e <= 0 && nominal > 0 && !Double.isNaN(liveSoc) && liveSoc > chargingStartSoc) {
-                    e = (liveSoc - chargingStartSoc) / 100.0 * nominal;
-                }
+                // Same accessor the /status endpoint uses, which in turn uses the same resolver as
+                // the session-close path. Previously this block ran its own integrate-then-
+                // SOC x capacity rule, so the in-progress card could show a different figure from
+                // the row it turned into the moment the charge ended.
+                double e = getOpenChargingSessionEnergyKwh();
                 if (e > 0) {
                     o.put("energyAdded", e);
                     // Same classifier + tariff resolution as the SESSION END path
@@ -2975,6 +9798,38 @@ public class SocHistoryDatabase {
         return o;
     }
 
+    /**
+     * Session peak (kW), taken as the max of the COARSE running max and the FINE sample series.
+     *
+     * <p>The two series disagree because they are sampled 10x apart: the 2-minute tick can miss a
+     * ramp peak the 12-second sampler caught. That mattered beyond display — the AC/DC verdict is
+     * peak-guarded, so a real DC session whose coarse ticks all missed the threshold was recorded as
+     * AC and priced at the AC rate. Taking the max of both makes every close path agree with the
+     * curve the UI draws above it.
+     */
+    private double resolvePeakKw(long sessionStartTime, double coarsePeak) {
+        double fine = peakSampleKw(sessionStartTime);
+        return Math.max(coarsePeak > 0 ? coarsePeak : 0, fine > 0 ? fine : 0);
+    }
+
+    /**
+     * Session average (kW) as energy over elapsed time.
+     *
+     * <p>Time-weighted by construction, unlike a mean of the tick values: those ticks are
+     * irregularly spaced (the SoC recorder skips a tick when nothing changed), so an unweighted
+     * mean over-weights whichever moments happened to fire and could disagree with
+     * energy/duration by a large factor on a session that tapered.
+     *
+     * @return kW, or -1 when it cannot be computed
+     */
+    private static double timeWeightedAvgKw(double energyKwh, long startMs, long endMs) {
+        if (energyKwh <= 0 || startMs <= 0 || endMs <= startMs) return -1;
+        double hours = (endMs - startMs) / 3_600_000.0;
+        if (hours <= 0) return -1;
+        double kw = energyKwh / hours;
+        return (kw > 0 && kw <= 500) ? kw : -1;
+    }
+
     /** Max measured power (kW) across a session's recorded samples, or 0. */
     private double peakSampleKw(long sessionStartTime) {
         if (!isInitialized || connection == null || sessionStartTime <= 0) return 0;
@@ -3016,8 +9871,36 @@ public class SocHistoryDatabase {
         return -1;
     }
 
+    /**
+     * Set by the most recent {@link #integrateSessionEnergyKwh} when it had to DROP an interval
+     * (a gap longer than the 10-minute cap, i.e. a daemon restart mid-charge).
+     *
+     * <p>Read immediately after the integrate call on the same thread — every caller integrates and
+     * resolves in one statement, so there is no interleaving to guard. It exists because the integral
+     * alone cannot express "this is a floor, not a total": a truncated figure looks exactly like a
+     * complete one, and without this it could be priced as a complete {@code integrated_rate}.
+     */
+    private volatile boolean lastIntegrationTruncated = false;
+
+    private boolean hasPersistedIntegrationTruncation(long sessionStartTime) {
+        try (PreparedStatement p = connection.prepareStatement(
+                "SELECT integration_truncated FROM " + TABLE_CHARGING
+                + " WHERE start_time = ?;")) {
+            p.setLong(1, sessionStartTime);
+            try (ResultSet rs = p.executeQuery()) {
+                return rs.next() && rs.getInt(1) == 1;
+            }
+        } catch (Exception e) {
+            // Failure to prove continuity must not promote an integral to a complete measurement.
+            logger.warn("Could not read integration continuity for session " + sessionStartTime
+                    + ": " + e.getMessage());
+            return true;
+        }
+    }
+
     private double integrateSessionEnergyKwh(long sessionStartTime) {
         if (!isInitialized || connection == null || sessionStartTime <= 0) return 0;
+        lastIntegrationTruncated = hasPersistedIntegrationTruncation(sessionStartTime);
         // Pull ALL rows (NOT just power_kw > 0) ordered by time. A power_kw <= 0
         // row is a CHARGING-STOPPED boundary: either a fast-sampler tick that read
         // ≤0 power, or an explicit merge-boundary sentinel (power_kw = -1) written
@@ -3025,11 +9908,13 @@ public class SocHistoryDatabase {
         // sessions onto one canonical start_time. We must RESET the trapezoid
         // chain at each such boundary so the gap between two separate charges is
         // not bridged into a spurious trapezoid — that would over-count energy by
-        // the inter-session idle gap. (A within-session daemon-restart gap has NO
-        // boundary row, so it is still bridged, capped at 10 min, as intended.)
+        // an unobserved idle gap. Resume now writes the same boundary even when it
+        // reopens one row, because a short daemon outage can still contain stop/restart.
         try (PreparedStatement pstmt = connection.prepareStatement(
                 "SELECT t, power_kw FROM " + TABLE_CPS +
-                " WHERE session_start_time = ? ORDER BY t ASC;")) {
+                " WHERE session_start_time = ?"
+                + " ORDER BY t ASC,"
+                + " CASE WHEN power_kw <= 0 THEN 1 ELSE 0 END ASC, id ASC;")) {
             pstmt.setLong(1, sessionStartTime);
             try (ResultSet rs = pstmt.executeQuery()) {
                 double kwh = 0; long prevT = -1; double prevP = 0; int n = 0;
@@ -3048,6 +9933,13 @@ public class SocHistoryDatabase {
                         // integral — cap any single interval at 10 min.
                         if (dtHours > 0 && dtHours <= (10.0 / 60.0)) {
                             kwh += (prevP + p) / 2.0 * dtHours;
+                        } else if (dtHours > (10.0 / 60.0)) {
+                            // DROPPED an interval. Both samples showed real power, so energy did flow
+                            // across this gap — we simply cannot say how much. Record that, because a
+                            // silently-truncated integral is indistinguishable from a complete one and
+                            // would be priced as `integrated_rate` with no incompleteness flag when no
+                            // counter or SOC fallback exists.
+                            lastIntegrationTruncated = true;
                         }
                     }
                     prevT = t; prevP = p; n++;
@@ -3064,9 +9956,21 @@ public class SocHistoryDatabase {
      * Paginated v2 session list (all enriched columns). Returns up to {@code limit}
      * rows so the caller can detect "has more" by a full page (Trips convention).
      */
-    public JSONArray getChargingSessionsV2(int daysBack, int limit, int offset) {
+    public synchronized JSONArray getChargingSessionsV2(int daysBack, int limit, int offset) {
+        try {
+            return getChargingSessionsV2Strict(daysBack, limit, offset);
+        } catch (java.sql.SQLException e) {
+            logger.error("Failed to get charging sessions v2", e);
+            try { reconnect(); } catch (Exception ignored) {}
+            return new JSONArray();
+        }
+    }
+
+    /** Strict API-facing list: storage failure throws; a genuine empty result returns an empty array. */
+    public synchronized JSONArray getChargingSessionsV2Strict(
+            int daysBack, int limit, int offset) throws java.sql.SQLException {
         long from = System.currentTimeMillis() - (daysBack * 24L * 60 * 60 * 1000L);
-        return getChargingSessionsV2Range(from, Long.MAX_VALUE, limit, offset);
+        return getChargingSessionsV2RangeStrict(from, Long.MAX_VALUE, limit, offset);
     }
 
     /**
@@ -3075,11 +9979,22 @@ public class SocHistoryDatabase {
      * well beyond the 90-day quick filters). {@code toMs}=Long.MAX_VALUE = no
      * upper bound. start_time is epoch-ms.
      */
-    public JSONArray getChargingSessionsV2Range(long fromMs, long toMs, int limit, int offset) {
+    public synchronized JSONArray getChargingSessionsV2Range(
+            long fromMs, long toMs, int limit, int offset) {
+        try {
+            return getChargingSessionsV2RangeStrict(fromMs, toMs, limit, offset);
+        } catch (java.sql.SQLException e) {
+            logger.error("Failed to get charging sessions v2 (range)", e);
+            try { reconnect(); } catch (Exception ignored) {}
+            return new JSONArray();
+        }
+    }
+
+    /** Strict API-facing range list: storage failure is distinct from a valid empty range. */
+    public synchronized JSONArray getChargingSessionsV2RangeStrict(
+            long fromMs, long toMs, int limit, int offset) throws java.sql.SQLException {
         JSONArray results = new JSONArray();
-        // Snapshot once — see the connection field's doc (guard-then-use can NPE).
-        final Connection conn = connection;
-        if (!isInitialized || conn == null) return results;
+        final Connection conn = requireChargingHistoryReadConnection();
         try {
             String sql = "SELECT " + CHARGING_V2_COLS + " FROM " + TABLE_CHARGING +
                 " WHERE start_time >= ? AND start_time <= ? ORDER BY start_time DESC LIMIT ? OFFSET ?;";
@@ -3092,42 +10007,61 @@ public class SocHistoryDatabase {
                     while (rs.next()) results.put(chargingRowToJson(rs));
                 }
             }
+            noteReadOk();
+            return results;
         } catch (Exception e) {
-            logger.error("Failed to get charging sessions v2 (range)", e);
-            // Count a genuine JDBC failure so a broken-but-OPEN connection escalates to
-            // dead and the reconnect below actually reopens it. Non-SQL throws are not
-            // counted — they say nothing about the connection (see isSqlFailure).
             if (isSqlFailure(e)) noteReadFailed();
-            reconnect();
+            throw chargingHistoryReadException("list charging sessions", e);
         }
-        return results;
     }
 
     /** Single session by its IDENTITY id, or null. */
-    public JSONObject getChargingSessionById(long id) {
-        // Snapshot once — see the connection field's doc (guard-then-use can NPE).
-        final Connection conn = connection;
-        if (!isInitialized || conn == null) return null;
+    public synchronized JSONObject getChargingSessionById(long id) {
+        try {
+            return getChargingSessionByIdStrict(id);
+        } catch (java.sql.SQLException e) {
+            logger.error("Failed to get charging session " + id, e);
+            try { reconnect(); } catch (Exception ignored) {}
+            return null;
+        }
+    }
+
+    /** Strict API-facing lookup: null means absent; unavailable/failed storage throws. */
+    public synchronized JSONObject getChargingSessionByIdStrict(long id)
+            throws java.sql.SQLException {
+        final Connection conn = requireChargingHistoryReadConnection();
         try {
             String sql = "SELECT " + CHARGING_V2_COLS + " FROM " + TABLE_CHARGING + " WHERE id = ?;";
             try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
                 pstmt.setLong(1, id);
                 try (ResultSet rs = pstmt.executeQuery()) {
-                    if (rs.next()) return chargingRowToJson(rs);
+                    JSONObject result = rs.next() ? chargingRowToJson(rs) : null;
+                    noteReadOk();
+                    return result;
                 }
             }
         } catch (Exception e) {
-            logger.error("Failed to get charging session " + id, e);
+            if (isSqlFailure(e)) noteReadFailed();
+            throw chargingHistoryReadException("get charging session " + id, e);
         }
-        return null;
     }
 
     /** Per-session fine-grained ramp samples (ASC by time) for the given session id. */
-    public JSONArray getChargingSamples(long id) {
+    public synchronized JSONArray getChargingSamples(long id) {
+        try {
+            return getChargingSamplesStrict(id);
+        } catch (java.sql.SQLException e) {
+            logger.error("Failed to get charging samples for " + id, e);
+            try { reconnect(); } catch (Exception ignored) {}
+            return new JSONArray();
+        }
+    }
+
+    /** Strict API-facing sample read: failure throws; absent session or no samples is empty. */
+    public synchronized JSONArray getChargingSamplesStrict(long id)
+            throws java.sql.SQLException {
         JSONArray results = new JSONArray();
-        // Snapshot once — see the connection field's doc (guard-then-use can NPE).
-        final Connection conn = connection;
-        if (!isInitialized || conn == null) return results;
+        final Connection conn = requireChargingHistoryReadConnection();
         try {
             // Resolve id -> start_time (the FK used by charging_power_samples).
             long start = -1;
@@ -3138,7 +10072,10 @@ public class SocHistoryDatabase {
                     if (rs.next()) start = rs.getLong(1);
                 }
             }
-            if (start <= 0) return results;
+            if (start <= 0) {
+                noteReadOk();
+                return results;
+            }
             try (PreparedStatement pstmt = conn.prepareStatement(
                     "SELECT t, power_kw, soc, temp, temp_high, temp_low FROM " + TABLE_CPS +
                     " WHERE session_start_time = ? AND power_kw >= 0 ORDER BY t ASC;")) {
@@ -3148,7 +10085,13 @@ public class SocHistoryDatabase {
                         JSONObject o = new JSONObject();
                         o.put("t", rs.getLong("t"));
                         o.put("power", rs.getDouble("power_kw"));
-                        o.put("soc", rs.getDouble("soc"));
+                        // NaN-safe. The fast sampler stores whatever SoC it had, and NaN is reachable
+                        // (a sentinel SoC read while the power accessor still answers). JSONObject.put
+                        // THROWS on a NaN double, which aborted this loop mid-session and served a
+                        // silently TRUNCATED curve — the chart just stopped, with no error anywhere.
+                        double sampleSoc = rs.getDouble("soc");
+                        o.put("soc", (rs.wasNull() || Double.isNaN(sampleSoc))
+                                ? JSONObject.NULL : sampleSoc);
                         double temp = rs.getDouble("temp");
                         o.put("temp", temp > -999 ? temp : JSONObject.NULL);
                         double tHi = rs.getDouble("temp_high");
@@ -3159,10 +10102,36 @@ public class SocHistoryDatabase {
                     }
                 }
             }
+            noteReadOk();
+            return results;
         } catch (Exception e) {
-            logger.error("Failed to get charging samples for " + id, e);
+            if (isSqlFailure(e)) noteReadFailed();
+            throw chargingHistoryReadException("get charging samples for " + id, e);
         }
-        return results;
+    }
+
+    private Connection requireChargingHistoryReadConnection() throws java.sql.SQLException {
+        Connection conn = connection;
+        if (!isInitialized || conn == null) {
+            throw new java.sql.SQLException("charging history storage is unavailable");
+        }
+        try {
+            if (conn.isClosed()) {
+                throw new java.sql.SQLException("charging history storage is closed");
+            }
+        } catch (java.sql.SQLException e) {
+            noteReadFailed();
+            throw e;
+        }
+        return conn;
+    }
+
+    private static java.sql.SQLException chargingHistoryReadException(
+            String operation, Exception failure) {
+        if (failure instanceof java.sql.SQLException) {
+            return (java.sql.SQLException) failure;
+        }
+        return new java.sql.SQLException("Could not " + operation, failure);
     }
 
     /**
@@ -3170,9 +10139,23 @@ public class SocHistoryDatabase {
      * permanent charging_daily, lifetime totals (survive pruning), SOH trend
      * from soc_daily, and the per-day series for the cost chart.
      */
-    public JSONObject getChargingSummary(int daysBack) {
+    public synchronized JSONObject getChargingSummary(int daysBack) {
+        if (!isInitialized || connection == null) {
+            return new JSONObject();
+        }
+        try {
+            return getChargingSummaryStrict(daysBack);
+        } catch (java.sql.SQLException e) {
+            logger.error("Failed to build charging summary", e);
+            try { reconnect(); } catch (Exception ignored) {}
+            return new JSONObject();
+        }
+    }
+
+    public synchronized JSONObject getChargingSummaryStrict(
+            int daysBack) throws java.sql.SQLException {
         long from = System.currentTimeMillis() - (daysBack * 24L * 60 * 60 * 1000L);
-        return getChargingSummaryRange(from, Long.MAX_VALUE);
+        return getChargingSummaryRangeStrict(from, Long.MAX_VALUE);
     }
 
     /**
@@ -3180,9 +10163,27 @@ public class SocHistoryDatabase {
      * [fromMs, toMs]. Lifetime totals + SOH trend remain all-time. toMs=
      * Long.MAX_VALUE = no upper bound.
      */
-    public JSONObject getChargingSummaryRange(long fromMs, long toMs) {
+    public synchronized JSONObject getChargingSummaryRange(long fromMs, long toMs) {
+        if (!isInitialized || connection == null) {
+            return new JSONObject();
+        }
+        try {
+            return getChargingSummaryRangeStrict(fromMs, toMs);
+        } catch (java.sql.SQLException e) {
+            logger.error("Failed to build charging summary", e);
+            try { reconnect(); } catch (Exception ignored) {}
+            return new JSONObject();
+        }
+    }
+
+    /**
+     * Strict API-facing rollup read. Query failure throws instead of returning
+     * whichever fields happened to be populated before the failure.
+     */
+    public synchronized JSONObject getChargingSummaryRangeStrict(
+            long fromMs, long toMs) throws java.sql.SQLException {
         JSONObject out = new JSONObject();
-        if (!isInitialized || connection == null) return out;
+        final Connection conn = requireChargingHistoryReadConnection();
         try {
             long sinceDay = (fromMs / 86_400_000L) * 86_400_000L;
             long untilDay = (toMs == Long.MAX_VALUE) ? Long.MAX_VALUE : (toMs / 86_400_000L) * 86_400_000L;
@@ -3190,10 +10191,11 @@ public class SocHistoryDatabase {
             // Period aggregates from charging_daily.
             JSONArray daily = new JSONArray();
             double periodEnergy = 0, periodCost = 0;
-            int periodSessions = 0, periodDc = 0, periodAc = 0, periodRange = 0;
-            try (PreparedStatement pstmt = connection.prepareStatement(
-                    "SELECT day_epoch, session_count, energy_kwh, cost, dc_count, ac_count, range_gained_km " +
-                    "FROM " + TABLE_CHARGING_DAILY + " WHERE day_epoch >= ? AND day_epoch <= ? ORDER BY day_epoch ASC;")) {
+            int periodSessions = 0, periodDc = 0, periodAc = 0, periodRange = 0, periodIncomplete = 0;
+            try (PreparedStatement pstmt = conn.prepareStatement(
+                    "SELECT day_epoch, session_count, energy_kwh, cost, dc_count, ac_count, range_gained_km,"
+                    + " incomplete_count FROM " + TABLE_CHARGING_DAILY
+                    + " WHERE day_epoch >= ? AND day_epoch <= ? ORDER BY day_epoch ASC;")) {
                 pstmt.setLong(1, sinceDay);
                 pstmt.setLong(2, untilDay);
                 try (ResultSet rs = pstmt.executeQuery()) {
@@ -3203,6 +10205,9 @@ public class SocHistoryDatabase {
                         d.put("sessions", rs.getInt("session_count"));
                         d.put("energy", rs.getDouble("energy_kwh"));
                         d.put("cost", rs.getDouble("cost"));
+                        // How many of the day's sessions carried a floor rather than a measured total.
+                        // Exposed so a consumer can qualify the figure instead of reading it as exact.
+                        d.put("incomplete", rs.getInt("incomplete_count"));
                         daily.put(d);
                         periodSessions += rs.getInt("session_count");
                         periodEnergy += rs.getDouble("energy_kwh");
@@ -3210,6 +10215,7 @@ public class SocHistoryDatabase {
                         periodDc += rs.getInt("dc_count");
                         periodAc += rs.getInt("ac_count");
                         periodRange += rs.getInt("range_gained_km");
+                        periodIncomplete += rs.getInt("incomplete_count");
                     }
                 }
             }
@@ -3220,23 +10226,25 @@ public class SocHistoryDatabase {
             out.put("periodDcCount", periodDc);
             out.put("periodAcCount", periodAc);
             out.put("periodRangeGained", periodRange);
+            out.put("periodIncompleteSessions", periodIncomplete);
             out.put("avgCostPerKwh", periodEnergy > 0 && periodCost > 0 ? periodCost / periodEnergy : JSONObject.NULL);
 
             // Lifetime totals (entire charging_daily — survives the prune).
-            try (Statement st = connection.createStatement();
+            try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery(
-                     "SELECT COALESCE(SUM(session_count),0), COALESCE(SUM(energy_kwh),0), COALESCE(SUM(cost),0) " +
-                     "FROM " + TABLE_CHARGING_DAILY + ";")) {
+                     "SELECT COALESCE(SUM(session_count),0), COALESCE(SUM(energy_kwh),0), COALESCE(SUM(cost),0),"
+                     + " COALESCE(SUM(incomplete_count),0) FROM " + TABLE_CHARGING_DAILY + ";")) {
                 if (rs.next()) {
                     out.put("lifetimeSessions", rs.getInt(1));
                     out.put("lifetimeEnergyKwh", rs.getDouble(2));
                     out.put("lifetimeCost", rs.getDouble(3));
+                    out.put("lifetimeIncompleteSessions", rs.getInt(4));
                 }
             }
 
             // SOH-degradation trend from soc_daily.
             JSONArray sohTrend = new JSONArray();
-            try (Statement st = connection.createStatement();
+            try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery(
                      "SELECT day_epoch, soh_percent FROM " + TABLE_SOC_DAILY +
                      " WHERE soh_percent > 0 ORDER BY day_epoch ASC;")) {
@@ -3248,34 +10256,48 @@ public class SocHistoryDatabase {
                 }
             }
             out.put("sohTrend", sohTrend);
+            noteReadOk();
+            return out;
         } catch (Exception e) {
-            logger.error("Failed to build charging summary", e);
+            if (isSqlFailure(e)) noteReadFailed();
+            throw chargingHistoryReadException(
+                    "build charging summary", e);
         }
-        return out;
     }
 
     /** Wipe only the charging-related tables (user "Clear charging history"). Returns rows deleted. */
     public synchronized long clearChargingHistory() {
         if (!isInitialized || connection == null) return -1;
-        long total = 0;
-        try (Statement stmt = connection.createStatement()) {
-            total += stmt.executeUpdate("DELETE FROM " + TABLE_CHARGING);
-            total += stmt.executeUpdate("DELETE FROM " + TABLE_CPS);
-            total += stmt.executeUpdate("DELETE FROM " + TABLE_CHARGING_DAILY);
-            logger.info("clearChargingHistory: removed " + total + " rows");
-            // Reset live session state so a charge in progress starts clean.
-            wasCharging = false;
-            chargingStartTime = 0;
-            chargingStartSoc = 0;
-            chargingPeakPower = 0;
-            chargingPowerSum = 0;
-            chargingPowerCount = 0;
-            chargingStartRange = -1;
-            chargingStartOdometer = -1;
-            chargingGunState = -1;
-            chargingTimeToFullMin = -1;
-            return total;
+        if (!reconcilePendingActiveChargingReplacement()) return -1;
+        final long[] deleted = {0L};
+        ChargingMaintenanceIntent stagedIntent = null;
+        try {
+            stagedIntent = beginChargingMaintenance("clearChargingHistory");
+            final ChargingMaintenanceIntent intent = stagedIntent;
+            final ActiveChargingReplacement replacement = intent.replacement;
+            runInTransaction(() -> {
+                try (Statement stmt = connection.createStatement()) {
+                    deleted[0] += stmt.executeUpdate("DELETE FROM " + TABLE_CPS);
+                    deleted[0] += stmt.executeUpdate("DELETE FROM " + TABLE_CHARGING);
+                    deleted[0] += stmt.executeUpdate("DELETE FROM " + TABLE_CHARGING_DAILY);
+                }
+                insertActiveChargingReplacement(replacement);
+            });
+            publishCommittedChargingMaintenance(intent, replacement);
+            replayPendingChargingPostCommitMetadata();
+            logger.info("clearChargingHistory: removed " + deleted[0] + " rows");
+            return deleted[0];
         } catch (Exception e) {
+            ChargingMaintenanceOutcome outcome = stagedIntent != null
+                    ? reconcileChargingMaintenanceOutcome(e)
+                    : ChargingMaintenanceOutcome.ROLLED_BACK;
+            if (outcome == ChargingMaintenanceOutcome.COMMITTED) {
+                noteWriteOk();
+                replayPendingChargingPostCommitMetadata();
+                logger.warn("clearChargingHistory commit result was uncertain; reconciled its"
+                        + " durable write-ahead maintenance intent");
+                return deleted[0];
+            }
             logger.error("clearChargingHistory failed", e);
             return -1;
         }
@@ -3283,84 +10305,78 @@ public class SocHistoryDatabase {
 
     /**
      * Delete a single charging session (and its fine-grained samples), and
-     * decrement the {@code charging_daily} rollup so lifetime/period totals
-     * stay consistent. Mirrors the Trips per-trip delete. Returns true on
-     * success (also true if the row was already gone).
+     * rebuild the affected {@code charging_daily} rollup so lifetime/period
+     * totals stay consistent. Mirrors the Trips per-trip delete. Returns true
+     * on success (also true if the row was already gone).
      */
     public synchronized boolean deleteChargingSession(long id) {
         if (!isInitialized || connection == null) return false;
         try {
-            // Read the row first so we can reverse its contribution to the daily rollup.
-            long startTime = -1, endTime = 0;
-            double energy = 0, cost = 0, peak = 0;
-            int isDc = -1, rangeGained = 0;
+            long startTime;
+            long endTime;
+            boolean closed;
+            boolean found;
             try (PreparedStatement sel = connection.prepareStatement(
-                    "SELECT start_time, end_time, energy_added_kwh, session_cost, is_dc, range_gained_km " +
-                    "FROM " + TABLE_CHARGING + " WHERE id = ?;")) {
+                    "SELECT start_time, end_time FROM " + TABLE_CHARGING + " WHERE id = ?;")) {
                 sel.setLong(1, id);
                 try (ResultSet rs = sel.executeQuery()) {
                     if (rs.next()) {
+                        found = true;
                         startTime = rs.getLong("start_time");
                         endTime = rs.getLong("end_time");
-                        double energyRead = rs.getDouble("energy_added_kwh");
-                        energy = rs.wasNull() ? -1 : energyRead;
-                        double costRead = rs.getDouble("session_cost");
-                        cost = rs.wasNull() ? -1 : costRead;
-                        isDc = rs.getInt("is_dc");
-                        if (rs.wasNull()) isDc = -1;
-                        int rangeGainedRead = rs.getInt("range_gained_km");
-                        rangeGained = rs.wasNull() ? -1 : rangeGainedRead;
+                        closed = !rs.wasNull();
                     } else {
-                        return true; // already gone
+                        found = false;
+                        startTime = 0L;
+                        endTime = 0L;
+                        closed = false;
                     }
                 }
             }
-
-            try (PreparedStatement del = connection.prepareStatement(
-                    "DELETE FROM " + TABLE_CHARGING + " WHERE id = ?;")) {
-                del.setLong(1, id);
-                del.executeUpdate();
+            if (!found) {
+                // A retry after an uncertain delete may arrive after the row disappeared but before
+                // its display-only tariff usage metadata was repaired.
+                replayPendingChargingPostCommitMetadata();
+                return true;
             }
-            if (startTime > 0) {
+
+            if (!closed && wasCharging && chargingStartTime == startTime) {
+                logger.warn("Refusing to delete active charging session " + id);
+                return false;
+            }
+
+            final long sessionStart = startTime;
+            final long sessionEnd = endTime;
+            final boolean sessionClosed = closed;
+            runInTransaction(() -> {
                 try (PreparedStatement delS = connection.prepareStatement(
                         "DELETE FROM " + TABLE_CPS + " WHERE session_start_time = ?;")) {
-                    delS.setLong(1, startTime);
+                    delS.setLong(1, sessionStart);
                     delS.executeUpdate();
                 }
-            }
-
-            // Reverse this session's contribution to its day's rollup. Use the
-            // end-time day to match foldSessionIntoDaily (which keys on endTime).
-            long dayBasis = endTime > 0 ? endTime : startTime;
-            if (dayBasis > 0) {
-                long day = (dayBasis / 86_400_000L) * 86_400_000L;
-                try (PreparedStatement upd = connection.prepareStatement(
-                        "UPDATE " + TABLE_CHARGING_DAILY + " SET session_count = GREATEST(session_count - 1, 0), " +
-                        "energy_kwh = GREATEST(energy_kwh - ?, 0), cost = GREATEST(cost - ?, 0), " +
-                        "dc_count = GREATEST(dc_count - ?, 0), ac_count = GREATEST(ac_count - ?, 0), " +
-                        "range_gained_km = GREATEST(range_gained_km - ?, 0) WHERE day_epoch = ?;")) {
-                    upd.setDouble(1, energy >= 0 ? energy : 0);
-                    upd.setDouble(2, cost >= 0 ? cost : 0);
-                    upd.setInt(3, isDc == 1 ? 1 : 0);
-                    upd.setInt(4, isDc == 0 ? 1 : 0);
-                    upd.setInt(5, rangeGained > 0 ? rangeGained : 0);
-                    upd.setLong(6, day);
-                    int updatedRows = upd.executeUpdate();
-                    if (updatedRows == 0) {
-                        logger.warn("deleteChargingSession: daily rollup row for day=" + day + " not found; session " + id +
-                                    " may not have been folded into daily (foldSessionIntoDaily may have failed earlier)");
+                try (PreparedStatement del = connection.prepareStatement(
+                        "DELETE FROM " + TABLE_CHARGING + " WHERE id = ?;")) {
+                    del.setLong(1, id);
+                    if (del.executeUpdate() != 1) {
+                        throw new java.sql.SQLException(
+                                "charging session disappeared before delete: " + id);
                     }
                 }
-                // Drop a now-empty day bucket so it doesn't linger at zero.
-                try (PreparedStatement clean = connection.prepareStatement(
-                        "DELETE FROM " + TABLE_CHARGING_DAILY + " WHERE day_epoch = ? AND session_count <= 0;")) {
-                    clean.setLong(1, day);
-                    clean.executeUpdate();
+                if (sessionClosed && sessionEnd > 0) {
+                    rebuildChargingDailyDay(dayEpoch(sessionEnd));
                 }
-            }
+            });
+            replayPendingChargingPostCommitMetadata();
             logger.info("Deleted charging session " + id);
             return true;
         } catch (Exception e) {
+            if (reconcileDeletedChargingSession(id, e)) {
+                noteWriteOk();
+                replayPendingChargingPostCommitMetadata();
+                logger.warn("deleteChargingSession commit result was uncertain; reconciled"
+                        + " durable absence of session " + id);
+                return true;
+            }
             logger.error("deleteChargingSession failed for " + id, e);
             return false;
         }
@@ -3369,7 +10385,7 @@ public class SocHistoryDatabase {
     /**
      * Get SOC statistics.
      */
-    public JSONObject getSocStats(int hoursBack) {
+    public synchronized JSONObject getSocStats(int hoursBack) {
         JSONObject stats = new JSONObject();
         
         try {
@@ -3432,7 +10448,7 @@ public class SocHistoryDatabase {
      * Get full report for dashboard.
      * Always includes current SOC from VehicleDataMonitor even if no history exists.
      */
-    public JSONObject getFullReport(int hoursBack, int maxPoints) {
+    public synchronized JSONObject getFullReport(int hoursBack, int maxPoints) {
         JSONObject report = new JSONObject();
         
         try {
@@ -3450,22 +10466,35 @@ public class SocHistoryDatabase {
             if (currentSocData != null) {
                 JSONObject livePoint = new JSONObject();
                 livePoint.put("t", System.currentTimeMillis());
-                livePoint.put("soc", currentSocData.socPercent);
-                livePoint.put("charging", chargingData != null && 
-                    chargingData.status == ChargingStateData.ChargingStatus.CHARGING);
-                livePoint.put("power", chargingData != null ? chargingData.chargingPowerKW : 0);
+                // NaN-safe: JSONObject.put THROWS on a NaN double, which would abort this whole
+                // response rather than merely omitting one point. Both of these are live HAL-derived
+                // values that can legitimately be NaN.
+                livePoint.put("soc", Double.isNaN(currentSocData.socPercent)
+                        ? JSONObject.NULL : currentSocData.socPercent);
+                // Honour the CV taper, exactly as session accounting does. The state code stays
+                // FINISHED during a taper by design, so a bare status test reported charging=false on the
+                // live chart while the session row was still open and still accruing energy — the report
+                // contradicted the accounting.
+                livePoint.put("charging", chargingData != null
+                    && (chargingData.status == ChargingStateData.ChargingStatus.CHARGING
+                        || chargingData.isTaperCharging));
+                double livePower = (chargingData != null) ? chargingData.chargingPowerKW : 0;
+                livePoint.put("power", Double.isNaN(livePower) ? 0 : livePower);
                 livePoint.put("range", rangeData != null ? rangeData.elecRangeKm : 0);
                 double liveKwh = monitor.getBatteryRemainPowerKwh();
                 if (liveKwh > 0) livePoint.put("kwh", Math.round(liveKwh * 10) / 10.0);
                 
                 com.overdrive.app.abrp.SohEstimator sohEst = getSohEstimator();
-                if (sohEst != null && sohEst.hasDisplaySoh()) {
+                com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                        sohEst != null ? sohEst.getCapacitySohSnapshot() : null;
+                if (capacitySoh != null && capacitySoh.hasDisplaySoh()) {
                     // Use the headline display chain (frame_anchor > capacity_ah
                     // > live > calibration on PHEV) so this last "live" point
                     // matches the chip / detail card the user sees, instead
                     // of the raw live formula that often diverges from the
                     // higher-priority anchors on PHEV trims.
-                    livePoint.put("soh", Math.round(sohEst.getDisplaySoh() * 10) / 10.0);
+                    livePoint.put("soh",
+                            Math.round(capacitySoh.getDisplaySoh() * 10) / 10.0);
                 }
 
                 // MONOTONICITY GUARD, belt-and-braces with the query's upper bound. The chart
@@ -3515,8 +10544,30 @@ public class SocHistoryDatabase {
     /**
      * Set the SohEstimator reference for recording SOH alongside battery data.
      */
-    public void setSohEstimator(com.overdrive.app.abrp.SohEstimator estimator) {
+    public synchronized void setSohEstimator(com.overdrive.app.abrp.SohEstimator estimator) {
         this.sohEstimator = estimator;
+        replayPendingChargingPostCommitMetadata();
+    }
+
+    /**
+     * Gate scheduler-owned lifecycle inference until ChargingSessionManager has loaded config and
+     * reconciled detector state. Manager-owned edge calls remain available while the gate is closed.
+     */
+    public synchronized void setChargingLifecycleOwnerReady(boolean ready) {
+        chargingLifecycleOwnerReady = ready;
+        if (!ready) chargingLiveEnrichmentAllowed = false;
+    }
+
+    /** Update the physical charging flag independently of persistence-row close grace. */
+    public synchronized void setPhysicalChargingNow(boolean chargingNow) {
+        physicalChargingStateKnown = true;
+        physicalChargingNow = chargingNow;
+        chargingLiveEnrichmentAllowed = chargingNow;
+    }
+
+    /** Admit live open-row enrichment for a proven taper while physical fused state remains OFF. */
+    public synchronized void setChargingLiveEnrichmentAllowed(boolean allowed) {
+        chargingLiveEnrichmentAllowed = allowed && physicalChargingStateKnown;
     }
 
     /**
@@ -3525,49 +10576,393 @@ public class SocHistoryDatabase {
      * {@code ChargingConfig.enabled} at init and whenever the user toggles it.
      * When false, {@link #trackChargingSession} records nothing.
      */
-    public void setChargingAnalyticsEnabled(boolean enabled) {
+    public synchronized boolean setChargingAnalyticsEnabled(boolean enabled) {
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        boolean wasEnabled = this.chargingAnalyticsEnabled;
+        long priorDisabledSinceMs = analyticsDisabledSinceMs;
+        long now = System.currentTimeMillis();
+        // Re-enable is allowed to touch H2 below. First prove the exact disabled boundary already
+        // captured in memory is durable; otherwise the close could commit while its retry image is
+        // still only volatile.
+        if (enabled && (optOutClosePending || chargingLifecycleJournalDirty)
+                && !persistChargingLifecycleJournal()) {
+            logger.warn("Charging analytics enable deferred until the opt-out boundary is durable");
+            return false;
+        }
+        boolean bufferedReplacement = !enabled && !deferredPhysicalGenerations.isEmpty();
+        if (!enabled && bufferedReplacement) {
+            DeferredChargingGeneration current = currentDeferredPhysicalGeneration();
+            if (current != null && !current.isEnded()) {
+                endDeferredPhysicalGeneration(
+                        current, now, currentSocForContinuation(), true);
+            }
+            for (DeferredChargingGeneration generation : deferredPhysicalGenerations) {
+                generation.resumeBlocked = true;
+            }
+        }
         this.chargingAnalyticsEnabled = enabled;
+        if (!enabled) {
+            if (wasEnabled || analyticsDisabledSinceMs <= 0) analyticsDisabledSinceMs = now;
+            chargingLifecycleHold = false;
+            if (wasCharging && !optOutClosePending) {
+                optOutClosePending = true;
+                if (bufferedReplacement && pendingCloseSessionStart == chargingStartTime
+                        && pendingCloseAtMs > 0L) {
+                    // A already stopped and B is buffered behind A's failed close. Disabling analytics
+                    // must close A at its frozen A boundary, not sample B's current SOC/counter into A.
+                    optOutBoundaryMs = strictlyAfterChargingStart(
+                            chargingStartTime, pendingCloseAtMs);
+                    optOutBoundarySoc = !Double.isNaN(pendingCloseSoc)
+                            ? pendingCloseSoc : chargingStartSoc;
+                    optOutCounterCaptured = true;
+                    optOutClosePricing = pendingClosePricing;
+                    optOutCloseIsDc = pendingCloseIsDc;
+                } else {
+                    optOutBoundaryMs = strictlyAfterChargingStart(
+                            chargingStartTime, now);
+                    try {
+                        BatterySocData sd = VehicleDataMonitor.getInstance().getBatterySoc();
+                        optOutBoundarySoc = sd != null ? sd.socPercent
+                                : lastRecordedSoc >= 0 ? lastRecordedSoc : chargingStartSoc;
+                    } catch (Throwable ignored) {
+                        optOutBoundarySoc = lastRecordedSoc >= 0
+                                ? lastRecordedSoc : chargingStartSoc;
+                    }
+                    double counterAtBoundary = snapshotChargeCounterKwh();
+                    if (!Double.isNaN(counterAtBoundary)) {
+                        observeFinalCounterForClose(counterAtBoundary, optOutBoundarySoc, now);
+                    }
+                    optOutCounterCaptured = true;
+                    chargingPeakPower = resolvePeakKw(chargingStartTime, chargingPeakPower);
+                    optOutCloseIsDc = deriveIsDc(chargingGunState, chargingPeakPower);
+                    try {
+                        optOutClosePricing = priceSessionForClose(
+                                optOutCloseIsDc, chargingStartLat, chargingStartLng);
+                    } catch (Exception unavailable) {
+                        optOutClosePricing = null;
+                        logger.warn("Opt-out close pricing unavailable at boundary: "
+                                + unavailable.getMessage());
+                    }
+                }
+            }
+            // A pre-session reading captured before opt-out cannot become the baseline of a segment
+            // recorded after re-enable; doing so would credit energy delivered while analytics was off.
+            preSessionCounterLowKwh = Double.NaN;
+            preSessionCounterAtMs = 0L;
+            preSessionCounterSource = null;
+        } else if (optOutClosePending && wasCharging) {
+            // Retry immediately while the captured boundary is still the only admitted endpoint.
+            // The central fence at trackChargingSession's entry temporarily restores disabled mode,
+            // commits the resume-blocked close, and leaves the pending state intact if it still fails.
+            if (!trackChargingSession(false,
+                    !Double.isNaN(optOutBoundarySoc) ? optOutBoundarySoc : chargingStartSoc,
+                    0, optOutBoundaryMs > 0 ? optOutBoundaryMs : now)) {
+                logger.warn("Analytics re-enabled while the opt-out boundary is still pending;"
+                        + " accounting remains fenced until its close commits");
+            }
+        } else {
+            // No pending row owns the disabled boundary, so normal enabled accounting can resume.
+            analyticsDisabledSinceMs = 0L;
+        }
+        boolean durable = persistChargingLifecycleJournal();
+        if (!durable && enabled && !wasEnabled) {
+            // Do not expose a newly-enabled recorder before its lifecycle boundary is durable.
+            this.chargingAnalyticsEnabled = false;
+            chargingLifecycleHold = false;
+            analyticsDisabledSinceMs =
+                    priorDisabledSinceMs > 0L ? priorDisabledSinceMs : now;
+        }
+        return durable;
+    }
+
+    /** Hold/release manager ownership of the currently-open session row. */
+    public synchronized void setChargingLifecycleHold(boolean held) {
+        this.chargingLifecycleHold = held && chargingAnalyticsEnabled;
     }
 
     /**
-     * Clean up old remaining_kwh records that have a stuck/stale value.
-     * Called after PHEV capacity is correctly detected to fix historical data.
-     * Updates records where remaining_kwh doesn't match SOC x nominal within 30%.
+     * True only while the manager owns the bounded post-stop lifecycle window for a live row.
+     *
+     * <p>The collector uses this to admit the final counter callback after authoritative gun-out.
+     * Deriving the result from both feature state and the in-memory open row prevents a stale hold
+     * bit from admitting callbacks after opt-out, close, clear, or reset.
      */
-    public void fixStaleRemainingKwh(double nominalCapacityKwh) {
-        if (!isInitialized || connection == null || nominalCapacityKwh <= 0) return;
+    public synchronized boolean isChargingLifecycleHoldActive() {
+        if (!reconcilePendingActiveChargingReplacement()) return false;
+        return chargingLifecycleHold
+                && chargingAnalyticsEnabled
+                && wasCharging
+                && chargingStartTime > 0;
+    }
+
+    /**
+     * Clean up old remaining_kwh records using a one-shot repair limited to legacy PHEV rows.
+     */
+    public synchronized void fixStaleRemainingKwh(double nominalCapacityKwh) {
+        com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh = null;
         try {
-            // Effective per-row energy uses the SAME frame as the live store and
-            // display: (soc/100) × nominal × (SOH/100). Including the SOH factor
-            // (was omitted) means a migrated row and a freshly-written row for the
-            // same SOC match once SOH<100, removing the ~8% step at the boundary.
-            double sohFrac = 1.0;
+            if (sohEstimator != null) {
+                capacitySoh = sohEstimator.getCapacitySohSnapshot();
+            }
+        } catch (Throwable ignored) {}
+        if (capacitySoh == null
+                || Double.doubleToLongBits(capacitySoh.getNominalCapacityKwh())
+                    != Double.doubleToLongBits(nominalCapacityKwh)) {
+            logger.warn("Legacy remaining_kwh migration skipped: nominal capacity snapshot changed");
+            return;
+        }
+        fixStaleRemainingKwh(capacitySoh);
+    }
+
+    public synchronized boolean fixStaleRemainingKwh(
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh) {
+        if (!isInitialized || connection == null || capacitySoh == null) return false;
+
+        com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot attemptSnapshot = capacitySoh;
+        for (int attempt = 1; attempt <= REMAINING_KWH_MIGRATION_ATTEMPTS; attempt++) {
+            if (!isPhevRemainingKwhMigrationSnapshot(attemptSnapshot)) return false;
+
+            final com.overdrive.app.abrp.SohEstimator expectedEstimator = sohEstimator;
+            final com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot expectedSnapshot =
+                    attemptSnapshot;
+            final int[] correctedRows = {0};
+            final boolean[] alreadyComplete = {false};
             try {
-                if (sohEstimator != null && sohEstimator.hasDisplaySoh()) {
-                    sohFrac = sohEstimator.getDisplaySoh() / 100.0;
+                runInTransaction(() -> {
+                    if (isRemainingKwhMigrationComplete()) {
+                        alreadyComplete[0] = true;
+                        return;
+                    }
+
+                    requireCurrentMigrationSnapshot(expectedEstimator, expectedSnapshot);
+                    correctedRows[0] = migrateLegacyRemainingKwhRows(expectedSnapshot);
+                    requireCurrentMigrationSnapshot(expectedEstimator, expectedSnapshot);
+                    markRemainingKwhMigrationComplete();
+                    // Keep this as the final operation before runInTransaction commits. A reset or
+                    // nominal change during the scan rolls back both row updates and the marker.
+                    requireCurrentMigrationSnapshot(expectedEstimator, expectedSnapshot);
+                }, transactionConnection -> commitRemainingKwhMigrationWithSnapshot(
+                        expectedEstimator, expectedSnapshot, transactionConnection));
+
+                noteWriteOk();
+                if (alreadyComplete[0]) {
+                    logger.debug("Legacy remaining_kwh migration already complete");
+                } else {
+                    logger.info("Migrated " + correctedRows[0]
+                            + " legacy remaining_kwh records (nominal="
+                            + String.format("%.1f", expectedSnapshot.getNominalCapacityKwh())
+                            + " kWh)");
                 }
-            } catch (Throwable ignored) {}
-            double effPerSoc = nominalCapacityKwh * sohFrac;   // kWh per 100% SOC
-            // Rewrite rows deviating >12% from the SOC-derived value (matches the
-            // display gate's tolerance; was a looser 30%).
-            String sql = "UPDATE " + TABLE_SOC +
-                " SET remaining_kwh = (soc_percent / 100.0) * ? " +
-                "WHERE soc_percent > 0 AND remaining_kwh > 0 " +
-                "AND ABS(remaining_kwh - (soc_percent / 100.0) * ?) / ((soc_percent / 100.0) * ?) > 0.12";
-            try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
-                pstmt.setDouble(1, effPerSoc);
-                pstmt.setDouble(2, effPerSoc);
-                pstmt.setDouble(3, effPerSoc);
-                int updated = pstmt.executeUpdate();
-                if (updated > 0) {
-                    logger.info("Fixed " + updated + " stale remaining_kwh records (nominal=" +
-                        String.format("%.1f", nominalCapacityKwh) + " kWh, SOH="
-                        + String.format("%.0f", sohFrac * 100) + "%)");
+                return true;
+            } catch (EstimatorSnapshotChangedException changed) {
+                attemptSnapshot = captureCurrentCapacitySohSnapshot();
+                logger.warn("Legacy remaining_kwh migration snapshot changed; retrying ("
+                        + attempt + "/" + REMAINING_KWH_MIGRATION_ATTEMPTS + ")");
+            } catch (Exception e) {
+                if (reconcileRemainingKwhMigrationCommit(e)) {
+                    noteWriteOk();
+                    logger.warn("Legacy remaining_kwh migration commit result was uncertain;"
+                            + " durable version marker confirmed");
+                    return true;
+                }
+                logger.error("Failed to migrate legacy remaining_kwh: " + e.getMessage());
+                return false;
+            }
+        }
+
+        logger.warn("Legacy remaining_kwh migration deferred after repeated estimator changes");
+        return false;
+    }
+
+    private static final class LegacyRemainingKwhUpdate {
+        final long id;
+        final double targetKwh;
+
+        LegacyRemainingKwhUpdate(long id, double targetKwh) {
+            this.id = id;
+            this.targetKwh = targetKwh;
+        }
+    }
+
+    private static final class EstimatorSnapshotChangedException extends Exception {
+        EstimatorSnapshotChangedException() {
+            super("SOH estimator capacity snapshot changed");
+        }
+    }
+
+    private int migrateLegacyRemainingKwhRows(
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh)
+            throws Exception {
+        java.util.ArrayList<LegacyRemainingKwhUpdate> updates = new java.util.ArrayList<>();
+        try (PreparedStatement read = connection.prepareStatement(
+                "SELECT id, soc_percent, remaining_kwh, soh_percent FROM " + TABLE_SOC
+                        + " WHERE (remaining_kwh_format_version IS NULL"
+                        + " OR remaining_kwh_format_version < ?)"
+                        + " AND soc_percent > 0 AND remaining_kwh > 0;")) {
+            read.setInt(1, REMAINING_KWH_FORMAT_VERSION);
+            try (ResultSet rs = read.executeQuery()) {
+                while (rs.next()) {
+                    long id = rs.getLong(1);
+                    double socPercent = rs.getDouble(2);
+                    double remainingKwh = rs.getDouble(3);
+                    double rowSohPercent = rs.getDouble(4);
+                    if (rs.wasNull()) rowSohPercent = Double.NaN;
+                    double targetKwh = legacyRemainingKwhTarget(
+                            socPercent,
+                            capacitySoh.getNominalCapacityKwh(),
+                            rowSohPercent,
+                            // Never rewrite historical rows from today's mutable display SOH. A row
+                            // without its own historical SOH uses the deterministic 100% fallback.
+                            Double.NaN);
+                    if (!Double.isNaN(targetKwh)
+                            && Math.abs(remainingKwh - targetKwh) / targetKwh > 0.12) {
+                        updates.add(new LegacyRemainingKwhUpdate(id, targetKwh));
+                    }
                 }
             }
-        } catch (Exception e) {
-            logger.error("Failed to fix stale remaining_kwh: " + e.getMessage());
         }
+
+        try (PreparedStatement update = connection.prepareStatement(
+                "UPDATE " + TABLE_SOC
+                        + " SET remaining_kwh = ?, remaining_kwh_format_version = ?"
+                        + " WHERE id = ? AND (remaining_kwh_format_version IS NULL"
+                        + " OR remaining_kwh_format_version < ?);")) {
+            for (LegacyRemainingKwhUpdate row : updates) {
+                update.setDouble(1, row.targetKwh);
+                update.setInt(2, REMAINING_KWH_FORMAT_VERSION);
+                update.setLong(3, row.id);
+                update.setInt(4, REMAINING_KWH_FORMAT_VERSION);
+                update.addBatch();
+            }
+            if (!updates.isEmpty()) update.executeBatch();
+        }
+        try (PreparedStatement markRows = connection.prepareStatement(
+                "UPDATE " + TABLE_SOC + " SET remaining_kwh_format_version = ?"
+                        + " WHERE remaining_kwh_format_version IS NULL"
+                        + " OR remaining_kwh_format_version < ?;")) {
+            markRows.setInt(1, REMAINING_KWH_FORMAT_VERSION);
+            markRows.setInt(2, REMAINING_KWH_FORMAT_VERSION);
+            markRows.executeUpdate();
+        }
+        return updates.size();
+    }
+
+    static double legacyRemainingKwhTarget(double socPercent, double nominalCapacityKwh,
+                                           double rowSohPercent, double fallbackDisplaySoh) {
+        if (Double.isNaN(socPercent) || socPercent <= 0 || socPercent > 100
+                || Double.isNaN(nominalCapacityKwh) || nominalCapacityKwh <= 0) {
+            return Double.NaN;
+        }
+        double selectedSoh = rowSohPercent > 0 && rowSohPercent <= 100
+                ? rowSohPercent
+                : fallbackDisplaySoh > 0 && fallbackDisplaySoh <= 100
+                        ? fallbackDisplaySoh : 100.0;
+        return (socPercent / 100.0) * nominalCapacityKwh * (selectedSoh / 100.0);
+    }
+
+    private boolean isRemainingKwhMigrationComplete() throws Exception {
+        try (PreparedStatement read = connection.prepareStatement(
+                "SELECT version FROM " + TABLE_DATA_MIGRATIONS
+                        + " WHERE migration_name = ?;")) {
+            read.setString(1, REMAINING_KWH_MIGRATION);
+            try (ResultSet rs = read.executeQuery()) {
+                return rs.next() && rs.getInt(1) >= REMAINING_KWH_FORMAT_VERSION;
+            }
+        }
+    }
+
+    private void markRemainingKwhMigrationComplete() throws Exception {
+        try (PreparedStatement marker = connection.prepareStatement(
+                "MERGE INTO " + TABLE_DATA_MIGRATIONS
+                        + " (migration_name, version, completed_at)"
+                        + " KEY(migration_name) VALUES (?, ?, ?);")) {
+            marker.setString(1, REMAINING_KWH_MIGRATION);
+            marker.setInt(2, REMAINING_KWH_FORMAT_VERSION);
+            marker.setLong(3, System.currentTimeMillis());
+            marker.executeUpdate();
+        }
+    }
+
+    private boolean reconcileRemainingKwhMigrationCommit(Exception failure) {
+        try {
+            if (isRemainingKwhMigrationComplete()) return true;
+        } catch (Exception ignored) {
+            // Retry below after normal broken-connection escalation.
+        }
+        if (isSqlFailure(failure)) noteWriteFailed();
+        try { reconnect(); } catch (Exception ignored) {}
+        try {
+            return connection != null && isRemainingKwhMigrationComplete();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot
+            captureCurrentCapacitySohSnapshot() {
+        try {
+            com.overdrive.app.abrp.SohEstimator estimator = sohEstimator;
+            return estimator != null ? estimator.getCapacitySohSnapshot() : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private void requireCurrentMigrationSnapshot(
+            com.overdrive.app.abrp.SohEstimator expectedEstimator,
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot expectedSnapshot)
+            throws EstimatorSnapshotChangedException {
+        if (expectedEstimator == null || sohEstimator != expectedEstimator) {
+            throw new EstimatorSnapshotChangedException();
+        }
+        com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot current;
+        try {
+            current = expectedEstimator.getCapacitySohSnapshot();
+        } catch (Throwable unavailable) {
+            throw new EstimatorSnapshotChangedException();
+        }
+        if (!sameCapacitySohSnapshot(expectedSnapshot, current)) {
+            throw new EstimatorSnapshotChangedException();
+        }
+    }
+
+    /**
+     * Keep the final estimator-generation check and JDBC commit in one estimator lock hold. Without
+     * this guard, reset/nominal mutation could land after the final check in the transaction body but
+     * before {@link Connection#commit()}, publishing a migration marker for a stale capacity frame.
+     */
+    private void commitRemainingKwhMigrationWithSnapshot(
+            com.overdrive.app.abrp.SohEstimator expectedEstimator,
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot expectedSnapshot,
+            Connection transactionConnection) throws Exception {
+        if (expectedEstimator == null || expectedSnapshot == null
+                || sohEstimator != expectedEstimator) {
+            throw new EstimatorSnapshotChangedException();
+        }
+        boolean committed = expectedEstimator.runWithEstimatorGenerationGuard(
+                expectedSnapshot.getEstimatorGeneration(),
+                transactionConnection::commit);
+        if (!committed) throw new EstimatorSnapshotChangedException();
+    }
+
+    private static boolean sameCapacitySohSnapshot(
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot expected,
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot current) {
+        return expected != null
+                && current != null
+                && expected.getEstimatorGeneration()
+                    == current.getEstimatorGeneration()
+                && expected.getResetModelEpoch()
+                    == current.getResetModelEpoch()
+                && Double.doubleToLongBits(expected.getNominalCapacityKwh())
+                    == Double.doubleToLongBits(current.getNominalCapacityKwh());
+    }
+
+    private static boolean isPhevRemainingKwhMigrationSnapshot(
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot snapshot) {
+        return snapshot != null
+                && snapshot.getNominalCapacityKwh() > 0
+                && snapshot.getNominalCapacityKwh() < 30.0;
     }
     
     public com.overdrive.app.abrp.SohEstimator getSohEstimator() {
@@ -3632,7 +11027,7 @@ public class SocHistoryDatabase {
     /**
      * Get 12V battery voltage history for charting.
      */
-    public JSONArray getBatteryVoltageHistory(int hoursBack, int maxPoints) {
+    public synchronized JSONArray getBatteryVoltageHistory(int hoursBack, int maxPoints) {
         JSONArray results = new JSONArray();
         // Snapshot once — see the connection field's doc (guard-then-use can NPE).
         final Connection conn = connection;
@@ -3683,7 +11078,7 @@ public class SocHistoryDatabase {
     /**
      * Get HV battery thermal history for charting.
      */
-    public JSONArray getThermalHistory(int hoursBack, int maxPoints) {
+    public synchronized JSONArray getThermalHistory(int hoursBack, int maxPoints) {
         JSONArray results = new JSONArray();
         // Snapshot once — see the connection field's doc (guard-then-use can NPE).
         final Connection conn = connection;
@@ -3744,7 +11139,7 @@ public class SocHistoryDatabase {
     /**
      * Get battery health report — current state + historical stats.
      */
-    public JSONObject getBatteryHealthReport(int hoursBack, int maxPoints) {
+    public synchronized JSONObject getBatteryHealthReport(int hoursBack, int maxPoints) {
         JSONObject report = new JSONObject();
         
         try {
@@ -3760,7 +11155,9 @@ public class SocHistoryDatabase {
             }
             
             BatterySocData socData = monitor.getBatterySoc();
-            if (socData != null) {
+            if (socData != null && !Double.isNaN(socData.socPercent)) {
+                // Omitted rather than emitted as NaN — JSONObject.put throws on NaN, which would
+                // fail the whole response instead of one field.
                 current.put("soc", socData.socPercent);
             }
             
@@ -3774,15 +11171,23 @@ public class SocHistoryDatabase {
             }
             
             com.overdrive.app.abrp.SohEstimator sohEst = getSohEstimator();
-            if (sohEst != null && sohEst.hasDisplaySoh()) {
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                    sohEst != null ? sohEst.getCapacitySohSnapshot() : null;
+            if (capacitySoh != null && capacitySoh.hasDisplaySoh()) {
                 // Headline display chain (frame_anchor > capacity_ah > live >
                 // calibration on PHEV) — keeps the battery-health card and
                 // the SoH detail card in lockstep instead of showing two
                 // different numbers on PHEV trims where capacity_ah outranks
                 // the live formula.
-                current.put("soh", Math.round(sohEst.getDisplaySoh() * 10) / 10.0);
-                current.put("estimatedCapacityKwh", Math.round(sohEst.getEstimatedCapacityKwh() * 10) / 10.0);
-                current.put("nominalCapacityKwh", sohEst.getNominalCapacityKwh());
+                double nominalCapacityKwh = capacitySoh.getNominalCapacityKwh();
+                double estimatedCapacityKwh = nominalCapacityKwh > 0
+                        ? capacitySoh.getDisplaySoh() / 100.0 * nominalCapacityKwh
+                        : -1;
+                current.put("soh",
+                        Math.round(capacitySoh.getDisplaySoh() * 10) / 10.0);
+                current.put("estimatedCapacityKwh",
+                        Math.round(estimatedCapacityKwh * 10) / 10.0);
+                current.put("nominalCapacityKwh", nominalCapacityKwh);
             } else {
                 // Fallback: read persisted SOH from file if estimator reference not wired yet
                 logger.info("SOH estimator " + (sohEst == null ? "is null" : "has no estimate") + " for health report, trying persisted file fallback");
@@ -3886,49 +11291,67 @@ public class SocHistoryDatabase {
      * Returns total rows deleted, or -1 on failure. Tables remain so inserts
      * continue to work.
      */
-    public long resetAll() {
+    public synchronized long resetAll() {
         if (!isInitialized || connection == null) return -1;
-        long total = 0;
-        try (Statement stmt = connection.createStatement()) {
-            int n1 = stmt.executeUpdate("DELETE FROM " + TABLE_SOC);
-            int n2 = stmt.executeUpdate("DELETE FROM " + TABLE_CHARGING);
-            int n3 = 0;
-            try {
-                n3 = stmt.executeUpdate("DELETE FROM " + TABLE_ACC_EVENTS);
-            } catch (Exception ignored) {
-                // Table may not exist on very old installs that haven't yet
-                // run the migration — ignore so SOC/charging still wipe.
-            }
-            // New charging-analytics tables — ignore individually if a very old
-            // install hasn't migrated them yet.
-            int n4 = 0;
-            try { n4 += stmt.executeUpdate("DELETE FROM " + TABLE_CPS); } catch (Exception ignored) {}
-            try { n4 += stmt.executeUpdate("DELETE FROM " + TABLE_CHARGING_DAILY); } catch (Exception ignored) {}
-            try { n4 += stmt.executeUpdate("DELETE FROM " + TABLE_SOC_DAILY); } catch (Exception ignored) {}
-            total = n1 + n2 + n3 + n4;
-            logger.info("resetAll: cleared " + n1 + " from " + TABLE_SOC
-                + ", " + n2 + " from " + TABLE_CHARGING
-                + ", " + n3 + " from " + TABLE_ACC_EVENTS
-                + ", " + n4 + " from charging-analytics rollups/samples");
+        if (!reconcilePendingActiveChargingReplacement()) return -1;
+        final int[] deleted = new int[4];
+        ChargingMaintenanceIntent stagedIntent = null;
+        try {
+            stagedIntent = beginChargingMaintenance("resetAll");
+            final ChargingMaintenanceIntent intent = stagedIntent;
+            final ActiveChargingReplacement replacement = intent.replacement;
+            runInTransaction(() -> {
+                try (Statement stmt = connection.createStatement()) {
+                    deleted[0] = stmt.executeUpdate("DELETE FROM " + TABLE_SOC);
+                    deleted[1] = stmt.executeUpdate("DELETE FROM " + TABLE_CPS);
+                    deleted[2] = stmt.executeUpdate("DELETE FROM " + TABLE_CHARGING);
+                    deleted[3] = stmt.executeUpdate("DELETE FROM " + TABLE_CHARGING_DAILY)
+                            + stmt.executeUpdate("DELETE FROM " + TABLE_SOC_DAILY)
+                            + stmt.executeUpdate("DELETE FROM " + TABLE_ACC_EVENTS);
+                }
+                insertActiveChargingReplacement(replacement);
+            });
+            publishCommittedChargingMaintenance(intent, replacement);
+            replayPendingChargingPostCommitMetadata();
+            int total = deleted[0] + deleted[1] + deleted[2] + deleted[3];
+            logger.info("resetAll: cleared " + deleted[0] + " from " + TABLE_SOC
+                + ", " + deleted[2] + " from " + TABLE_CHARGING
+                + ", and " + (deleted[1] + deleted[3])
+                + " from charging/accounting support tables");
             return total;
         } catch (Exception e) {
+            ChargingMaintenanceOutcome outcome = stagedIntent != null
+                    ? reconcileChargingMaintenanceOutcome(e)
+                    : ChargingMaintenanceOutcome.ROLLED_BACK;
+            if (outcome == ChargingMaintenanceOutcome.COMMITTED) {
+                noteWriteOk();
+                replayPendingChargingPostCommitMetadata();
+                int total = deleted[0] + deleted[1] + deleted[2] + deleted[3];
+                logger.warn("resetAll commit result was uncertain; reconciled its durable"
+                        + " write-ahead maintenance intent");
+                return total;
+            }
             logger.error("resetAll failed", e);
             return -1;
         }
     }
 
-    private void cleanupOldData() {
+    private synchronized void cleanupOldData() {
         if (!isInitialized || connection == null) return;
 
         try {
             long now = System.currentTimeMillis();
-            long socCutoff = now - (SOC_RETENTION_DAYS * 24 * 60 * 60 * 1000L);
+            // Floored to a whole UTC day: soc_daily is MERGE-keyed by day and MERGE OVERWRITES, so a
+            // mid-day cutoff rolls the boundary day up across two passes and the second pass replaces
+            // the first half's min/max/avg/count instead of accumulating it.
+            long socCutoff = dayEpoch(now - (SOC_RETENTION_DAYS * 24 * 60 * 60 * 1000L));
             long cpsCutoff = now - (CPS_RETENTION_DAYS * 24 * 60 * 60 * 1000L);
             long accCutoff = now - (ACC_RETENTION_DAYS * 24 * 60 * 60 * 1000L);
 
             // ROLLUP-ON-PRUNE: fold soc_history rows about to be deleted into the
             // permanent soc_daily table so the SOH/temp degradation trend outlives
             // the 30-day raw-sample window. MERGE upserts one row per UTC day.
+            boolean rolledUp = false;
             try {
                 String rollup =
                     "MERGE INTO " + TABLE_SOC_DAILY +
@@ -3936,22 +11359,44 @@ public class SocHistoryDatabase {
                     "SELECT (timestamp/86400000)*86400000 AS d, MIN(soc_percent), MAX(soc_percent), AVG(soc_percent), " +
                     "MAX(CASE WHEN soh_percent > 0 THEN soh_percent ELSE NULL END), " +
                     "AVG(CASE WHEN hv_temp_avg > -999 THEN hv_temp_avg ELSE NULL END), COUNT(*) " +
-                    "FROM " + TABLE_SOC + " WHERE timestamp < ? GROUP BY (timestamp/86400000);";
+                    // The GROUP BY must match the select expression TEXTUALLY. H2 resolves grouped
+                    // expressions by generated-SQL equality, so a bare "(timestamp/86400000)" left the
+                    // rescaled select item ungrouped and threw MUST_GROUP_BY_COLUMN on every run.
+                    "FROM " + TABLE_SOC + " WHERE timestamp < ? GROUP BY (timestamp/86400000)*86400000;";
                 try (PreparedStatement pstmt = connection.prepareStatement(rollup)) {
                     pstmt.setLong(1, socCutoff);
                     pstmt.executeUpdate();
                 }
+                rolledUp = true;
             } catch (Exception e) {
-                logger.warn("soc_daily rollup failed (continuing with prune): " + e.getMessage());
+                logger.error("soc_daily rollup failed — deferring the prune so the raw rows survive"
+                        + " to the next pass", e);
             }
 
-            // Prune soc_history (now safely rolled up) — was 7 days, now 30.
-            try (PreparedStatement pstmt = connection.prepareStatement(
-                    "DELETE FROM " + TABLE_SOC + " WHERE timestamp < ?;")) {
-                pstmt.setLong(1, socCutoff);
-                int deleted = pstmt.executeUpdate();
-                if (deleted > 0) {
-                    logger.info("Pruned " + deleted + " soc_history rows (rolled into soc_daily)");
+            // Prune soc_history ONLY once its rows are aggregated — autoCommit is on here, so a
+            // failed rollup and a successful delete would otherwise commit independently and destroy
+            // the history un-rolled. Re-running is safe: whole-day cutoff + MERGE upsert is idempotent.
+            if (rolledUp) {
+                try (PreparedStatement pstmt = connection.prepareStatement(
+                        "DELETE FROM " + TABLE_SOC + " WHERE timestamp < ?;")) {
+                    pstmt.setLong(1, socCutoff);
+                    int deleted = pstmt.executeUpdate();
+                    if (deleted > 0) {
+                        logger.info("Pruned " + deleted + " soc_history rows (rolled into soc_daily)");
+                    }
+                }
+            } else {
+                // A rollup that keeps failing must not grow soc_history without bound. Past twice the
+                // retention window the raw rows go anyway, loudly, so the loss is never silent.
+                long hardCutoff = dayEpoch(now - (2 * SOC_RETENTION_DAYS * 24 * 60 * 60 * 1000L));
+                try (PreparedStatement pstmt = connection.prepareStatement(
+                        "DELETE FROM " + TABLE_SOC + " WHERE timestamp < ?;")) {
+                    pstmt.setLong(1, hardCutoff);
+                    int deleted = pstmt.executeUpdate();
+                    if (deleted > 0) {
+                        logger.error("Pruned " + deleted + " soc_history rows WITHOUT rollup (past 2x"
+                                + " retention) — soc_daily is permanently missing that history");
+                    }
                 }
             }
 
@@ -3996,7 +11441,7 @@ public class SocHistoryDatabase {
     /**
      * Get record count.
      */
-    public int getRecordCount() {
+    public synchronized int getRecordCount() {
         if (!isInitialized || connection == null) return 0;
         
         try {
@@ -4017,7 +11462,7 @@ public class SocHistoryDatabase {
         return isRunning;
     }
     
-    public boolean isAvailable() {
+    public synchronized boolean isAvailable() {
         return isInitialized && connection != null;
     }
 
@@ -4129,7 +11574,7 @@ public class SocHistoryDatabase {
      *   deltaKwh present only when both samples have remaining_kwh &gt; 0.
      *   isCharging=true if deltaSoc &gt; 0.5 (battery gained energy parked = plugged in).
      */
-    public JSONObject getLastParkingDelta(int maxAgeHours) {
+    public synchronized JSONObject getLastParkingDelta(int maxAgeHours) {
         // Edge case: DB unavailable / not initialized.
         if (!isAvailable()) return null;
         if (maxAgeHours <= 0) return null;
@@ -4231,7 +11676,7 @@ public class SocHistoryDatabase {
      * Returned JSON shape:
      *  { startTime, endTime, durationMinutes, energyAddedKwh, startSoc, endSoc }
      */
-    public JSONObject getMostRecentCompletedChargingSession(int hoursBack) {
+    public synchronized JSONObject getMostRecentCompletedChargingSession(int hoursBack) {
         if (!isAvailable()) return null;
         if (hoursBack <= 0) return null;
         try {
@@ -4274,7 +11719,7 @@ public class SocHistoryDatabase {
      * Returns a positive value if SOC is rising (charging), negative if falling,
      * or 0 if insufficient data, samples are too close together, or too old.
      */
-    public double getSocChangeRatePerHour() {
+    public synchronized double getSocChangeRatePerHour() {
         if (!isAvailable()) return 0;
         try {
             // Only use samples from the last 10 minutes to avoid stale cross-session data

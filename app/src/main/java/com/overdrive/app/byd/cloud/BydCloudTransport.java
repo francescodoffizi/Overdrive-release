@@ -7,13 +7,17 @@ import com.overdrive.app.logging.DaemonLogger;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
+import okhttp3.Call;
 import okhttp3.Cookie;
 import okhttp3.CookieJar;
 import okhttp3.HttpUrl;
@@ -39,6 +43,7 @@ public final class BydCloudTransport {
     private final BydCloudConfig config;
     private final EnvelopeCodec codec;
     private final OkHttpClient httpClient;
+    private final ConcurrentMap<Thread, Call> activeCalls = new ConcurrentHashMap<>();
 
     public BydCloudTransport(BydCloudConfig config, EnvelopeCodec codec) {
         this.config = config;
@@ -81,6 +86,7 @@ public final class BydCloudTransport {
      * @throws IOException on network or protocol errors
      */
     public JSONObject postSecure(String endpoint, JSONObject outerPayload) throws IOException {
+        throwIfRequestCancelled();
         // Encode the outer payload into a Bangcle envelope
         String requestEnvelope = codec.encodeEnvelope(outerPayload.toString());
 
@@ -110,49 +116,81 @@ public final class BydCloudTransport {
         }
         Request request = requestBuilder.build();
 
-        try (Response response = httpClient.newCall(request).execute()) {
-            logger.debug("  HTTP " + response.code() + " " + endpoint);
-            if (!response.isSuccessful()) {
-                logger.warn("  HTTP error " + response.code() + " " + endpoint);
-                throw new IOException("HTTP " + response.code() + " " + endpoint);
-            }
-
-            String bodyText = response.body() != null ? response.body().string() : "";
-            logger.debug("  Response length: " + bodyText.length() + " bytes");
-            JSONObject body;
+        Thread owner = Thread.currentThread();
+        Call call = httpClient.newCall(request);
+        activeCalls.put(owner, call);
+        try {
+            // A router timeout can race the Call registration above. Re-check
+            // after publishing the Call so a timeout cannot leave a newly
+            // registered request free to dispatch.
             try {
-                body = new JSONObject(bodyText);
-            } catch (Exception e) {
-                logger.warn("  Invalid JSON response from " + endpoint + " (length=" + bodyText.length() + ")");
-                throw new IOException("Invalid JSON response from " + endpoint);
+                throwIfRequestCancelled();
+            } catch (InterruptedIOException cancelled) {
+                call.cancel();
+                throw cancelled;
             }
+            try (Response response = call.execute()) {
+                logger.debug("  HTTP " + response.code() + " " + endpoint);
+                if (!response.isSuccessful()) {
+                    logger.warn("  HTTP error " + response.code() + " " + endpoint);
+                    throw new IOException("HTTP " + response.code() + " " + endpoint);
+                }
 
-            String responseEnvelope = body.optString("response", "");
-            if (responseEnvelope.isEmpty()) {
-                logger.warn("  Missing 'response' field in body from " + endpoint);
-                throw new IOException("Missing response payload for " + endpoint);
+                String bodyText = response.body() != null ? response.body().string() : "";
+                logger.debug("  Response length: " + bodyText.length() + " bytes");
+                JSONObject body;
+                try {
+                    body = new JSONObject(bodyText);
+                } catch (Exception e) {
+                    logger.warn("  Invalid JSON response from " + endpoint + " (length=" + bodyText.length() + ")");
+                    throw new IOException("Invalid JSON response from " + endpoint);
+                }
+
+                String responseEnvelope = body.optString("response", "");
+                if (responseEnvelope.isEmpty()) {
+                    logger.warn("  Missing 'response' field in body from " + endpoint);
+                    throw new IOException("Missing response payload for " + endpoint);
+                }
+
+                // Decode the Bangcle envelope
+                logger.debug("  Decoding Bangcle envelope (" + responseEnvelope.length() + " chars)");
+                String decodedText = codec.decodeEnvelope(responseEnvelope);
+
+                // Handle edge case where decoded text starts with "F{" or "F["
+                String normalized = decodedText;
+                if (normalized.startsWith("F{") || normalized.startsWith("F[")) {
+                    normalized = normalized.substring(1);
+                }
+
+                try {
+                    JSONObject parsed = new JSONObject(normalized);
+                    String code = parsed.optString("code", "?");
+                    String message = parsed.optString("message", "");
+                    logger.debug("  Decoded: code=" + code + " message=" + message);
+                    return parsed;
+                } catch (Exception e) {
+                    logger.warn("  Decoded response is not valid JSON from " + endpoint);
+                    throw new IOException("Decoded response is not JSON from " + endpoint);
+                }
             }
+        } finally {
+            activeCalls.remove(owner, call);
+        }
+    }
 
-            // Decode the Bangcle envelope
-            logger.debug("  Decoding Bangcle envelope (" + responseEnvelope.length() + " chars)");
-            String decodedText = codec.decodeEnvelope(responseEnvelope);
+    /** Cancel the one request currently owned by a router worker thread. */
+    public void cancelCallForThread(Thread owner) {
+        if (owner == null) return;
+        Call call = activeCalls.get(owner);
+        if (call != null) {
+            logger.info("Cancelling timed-out BYD cloud HTTP call");
+            call.cancel();
+        }
+    }
 
-            // Handle edge case where decoded text starts with "F{" or "F["
-            String normalized = decodedText;
-            if (normalized.startsWith("F{") || normalized.startsWith("F[")) {
-                normalized = normalized.substring(1);
-            }
-
-            try {
-                JSONObject parsed = new JSONObject(normalized);
-                String code = parsed.optString("code", "?");
-                String message = parsed.optString("message", "");
-                logger.debug("  Decoded: code=" + code + " message=" + message);
-                return parsed;
-            } catch (Exception e) {
-                logger.warn("  Decoded response is not valid JSON from " + endpoint);
-                throw new IOException("Decoded response is not JSON from " + endpoint);
-            }
+    private static void throwIfRequestCancelled() throws InterruptedIOException {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedIOException("BYD cloud request cancelled");
         }
     }
 

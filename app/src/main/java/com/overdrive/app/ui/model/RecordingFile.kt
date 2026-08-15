@@ -50,14 +50,9 @@ data class RecordingFile(
     // rail, so cutting USB power unmounts it and clips fall back to internal).
     // Null = unknown/unclassified; the adapter omits the badge.
     val storageType: String? = null,
-    // Stable server identity and action URLs. Null for direct-filesystem rows
-    // and daemons predating the volume-aware v4 index.
-    val recordingId: String? = null,
+    // Daemon-backed fallbacks for volumes the app process cannot open directly.
     val videoUrl: String? = null,
     val thumbnailUrl: String? = null,
-    val deleteUrl: String? = null,
-    val eventUrl: String? = null,
-    val available: Boolean = true
 ) {
     // Secondary constructor for MediaStore results
     constructor(
@@ -80,6 +75,7 @@ data class RecordingFile(
     
     val name: String get() = file.name
     val path: String get() = file.absolutePath
+    val playbackSource: String get() = videoUrl ?: path
     
     val formattedDate: String
         get() = SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()).format(Date(timestamp))

@@ -5,6 +5,7 @@ import com.overdrive.app.logging.DaemonLogger;
 import org.json.JSONObject;
 
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -19,6 +20,14 @@ public final class BydCloudDataProvider {
     private static volatile BydCloudDataProvider instance;
 
     private final AtomicReference<VehicleCloudSnapshot> snapshot = new AtomicReference<>();
+    private final Object snapshotPublishLock = new Object();
+    private final AtomicLong vehicleInfoUpdateSequence = new AtomicLong();
+    /** Guarded by {@link #snapshotPublishLock}. */
+    private long publishedVehicleInfoUpdateSequence;
+    /** Guarded by {@link #snapshotPublishLock}; every sequence at or below this began pre-reset. */
+    private long resetVehicleInfoUpdateSequence;
+    /** Guarded by {@link #snapshotPublishLock}; retained across timestamp-less publications. */
+    private long maximumVehicleInfoTimestamp;
     private final CopyOnWriteArrayList<CloudLockStateListener> lockListeners = new CopyOnWriteArrayList<>();
 
     // Track previous lock state to detect transitions
@@ -113,29 +122,94 @@ public final class BydCloudDataProvider {
     }
 
     public void updateFromVehicleInfo(JSONObject vehicleInfo, JSONObject hvac) {
+        updateFromVehicleInfo(vehicleInfo, hvac, beginVehicleInfoUpdate());
+    }
+
+    long beginVehicleInfoUpdate() {
+        return vehicleInfoUpdateSequence.incrementAndGet();
+    }
+
+    void updateFromVehicleInfo(
+            JSONObject vehicleInfo, JSONObject hvac, long updateSequence) {
         if (vehicleInfo == null) return;
 
-        VehicleCloudSnapshot prev = snapshot.get();
-        VehicleCloudSnapshot next = VehicleCloudSnapshot.fromVehicleInfo(vehicleInfo, hvac).build();
-        snapshot.set(next);
-        totalMessagesReceived++;
-        lastMessageReceivedAt = System.currentTimeMillis();
+        VehicleCloudSnapshot.Builder nextBuilder =
+                VehicleCloudSnapshot.fromVehicleInfo(vehicleInfo, hvac);
+        VehicleCloudSnapshot next = nextBuilder.build();
+        synchronized (snapshotPublishLock) {
+            VehicleCloudSnapshot current = snapshot.get();
+            long incomingTimestamp = next.vehicleInfoTimestamp;
+            boolean timestamped = incomingTimestamp > 0;
+            boolean preResetResponse = updateSequence <= resetVehicleInfoUpdateSequence;
+            boolean timestampRegression = timestamped
+                    && maximumVehicleInfoTimestamp > 0
+                    && incomingTimestamp < maximumVehicleInfoTimestamp;
+            // A timestamp-less cabin value is observed at receipt time. An explicit source time at
+            // or before that observation is stale even when it advances the historical explicit
+            // maximum or belongs to a request with a newer sequence.
+            boolean staleAcrossTimestampLessBoundary = timestamped
+                    && current != null
+                    && current.vehicleInfoTimestamp == 0L
+                    && current.hasInsideTemp()
+                    && current.insideTempObservedAt > 0L
+                    && incomingTimestamp <= current.insideTempObservedAt;
+            // A strictly newer source timestamp is authoritative even when its request started
+            // earlier. Missing timestamps, equal timestamps against the current timestamped
+            // snapshot, and the first explicit timestamp are ordered by request generation.
+            boolean sequenceRegression = (!timestamped
+                    || maximumVehicleInfoTimestamp == 0
+                    || incomingTimestamp == maximumVehicleInfoTimestamp)
+                    && updateSequence <= publishedVehicleInfoUpdateSequence;
+            if (preResetResponse || timestampRegression || staleAcrossTimestampLessBoundary
+                    || sequenceRegression) {
+                logger.debug("Ignoring out-of-order vehicleInfo: incoming="
+                        + next.vehicleInfoTimestamp + "/" + updateSequence + " current="
+                        + (current != null ? current.vehicleInfoTimestamp : 0L)
+                        + "/" + publishedVehicleInfoUpdateSequence + " maxTimestamp="
+                        + maximumVehicleInfoTimestamp + " resetSequence="
+                        + resetVehicleInfoUpdateSequence);
+                return;
+            }
 
-        // Detect lock state transitions
-        if (next.hasValidLockState()) {
-            boolean nowLocked = next.isAllLocked();
-            boolean nowUnlocked = next.isAnyUnlocked();
+            // Preserve age only when both snapshots actually came from the same explicit source
+            // observation. maximumVehicleInfoTimestamp survives timestamp-less publications and
+            // therefore cannot establish that identity.
+            boolean repeatedSourceTimestamp = incomingTimestamp > 0L
+                    && current != null
+                    && incomingTimestamp == current.vehicleInfoTimestamp;
+            if (current != null && current.insideTempObservedAt > 0L
+                    && next.hasInsideTemp()
+                    && repeatedSourceTimestamp) {
+                nextBuilder.insideTempObservedAt(current.insideTempObservedAt);
+                next = nextBuilder.build();
+            }
 
-            if (nowLocked && (!lastKnownValid || !lastKnownLocked)) {
-                lastKnownLocked = true;
-                lastKnownValid = true;
-                logger.info("Cloud lock state: LOCKED");
-                fireLockStateChanged(true, next.receivedAt);
-            } else if (nowUnlocked && (!lastKnownValid || lastKnownLocked)) {
-                lastKnownLocked = false;
-                lastKnownValid = true;
-                logger.info("Cloud lock state: UNLOCKED");
-                fireLockStateChanged(false, next.receivedAt);
+            snapshot.set(next);
+            publishedVehicleInfoUpdateSequence =
+                    Math.max(publishedVehicleInfoUpdateSequence, updateSequence);
+            if (timestamped) {
+                maximumVehicleInfoTimestamp =
+                        Math.max(maximumVehicleInfoTimestamp, incomingTimestamp);
+            }
+            totalMessagesReceived++;
+            lastMessageReceivedAt = System.currentTimeMillis();
+
+            // Detect and deliver lock transitions under the same ordering lock as publication.
+            if (next.hasValidLockState()) {
+                boolean nowLocked = next.isAllLocked();
+                boolean nowUnlocked = next.isAnyUnlocked();
+
+                if (nowLocked && (!lastKnownValid || !lastKnownLocked)) {
+                    lastKnownLocked = true;
+                    lastKnownValid = true;
+                    logger.info("Cloud lock state: LOCKED");
+                    fireLockStateChanged(true, next.receivedAt);
+                } else if (nowUnlocked && (!lastKnownValid || lastKnownLocked)) {
+                    lastKnownLocked = false;
+                    lastKnownValid = true;
+                    logger.info("Cloud lock state: UNLOCKED");
+                    fireLockStateChanged(false, next.receivedAt);
+                }
             }
         }
     }
@@ -155,9 +229,15 @@ public final class BydCloudDataProvider {
      */
     public void reset() {
         stopSubscriber();
-        snapshot.set(null);
-        lastKnownLocked = false;
-        lastKnownValid = false;
+        synchronized (snapshotPublishLock) {
+            snapshot.set(null);
+            long resetSequence = vehicleInfoUpdateSequence.incrementAndGet();
+            resetVehicleInfoUpdateSequence = resetSequence;
+            publishedVehicleInfoUpdateSequence = resetSequence;
+            maximumVehicleInfoTimestamp = 0L;
+            lastKnownLocked = false;
+            lastKnownValid = false;
+        }
         mqttConnected = false;
     }
 
@@ -292,6 +372,7 @@ public final class BydCloudDataProvider {
         final String pollVin = vin;
         realtimePoller.scheduleAtFixedRate(() -> {
             try {
+                long updateSequence = vehicleInfoUpdateSequence.incrementAndGet();
                 BydCloudConfig cfg = BydCloudConfig.fromUnifiedConfig();
                 if (!cfg.cloudDataMerge) {
                     logger.info("Cloud data merge disabled — stopping poller");
@@ -304,7 +385,7 @@ public final class BydCloudDataProvider {
 
                 JSONObject vehicleInfo = client.fetchVehicleRealtime(pollVin);
                 if (vehicleInfo != null) {
-                    updateFromVehicleInfo(vehicleInfo);
+                    updateFromVehicleInfo(vehicleInfo, null, updateSequence);
                     logger.info("REST realtime poll: data updated");
                 }
             } catch (Exception e) {
@@ -353,6 +434,7 @@ public final class BydCloudDataProvider {
             BydCloudClient client = getOrCreateClient();
             if (client == null) return false;
 
+            long updateSequence = vehicleInfoUpdateSequence.incrementAndGet();
             JSONObject vehicleInfo = client.fetchVehicleRealtime(config.vin);
             if (vehicleInfo != null) {
                 // Diagnostic: log door/lock fields so we can confirm the
@@ -364,7 +446,7 @@ public final class BydCloudDataProvider {
                     + " lr=" + vehicleInfo.opt("leftRearDoorLock")
                     + " rr=" + vehicleInfo.opt("rightRearDoorLock")
                     + " online=" + vehicleInfo.opt("onlineState"));
-                updateFromVehicleInfo(vehicleInfo);
+                updateFromVehicleInfo(vehicleInfo, null, updateSequence);
                 logger.info("On-demand lock-state refresh: data updated");
                 return true;
             }
@@ -421,7 +503,6 @@ public final class BydCloudDataProvider {
         try {
             VehicleCloudSnapshot s = snapshot.get();
             boolean hasData = lastMessageReceivedAt > 0;
-            boolean dataFresh = hasData && (System.currentTimeMillis() - lastMessageReceivedAt) < VehicleCloudSnapshot.TELEMETRY_MAX_AGE_MS;
 
             status.put("connected", mqttConnected || (realtimePoller != null));
             status.put("mqttConnected", mqttConnected);
@@ -455,7 +536,7 @@ public final class BydCloudDataProvider {
                     }
                 }
                 if (s.hasElecRange()) status.put("rangeKm", s.elecRangeKm);
-                if (s.hasInsideTemp()) status.put("insideTempC", s.insideTempC);
+                if (s.hasFreshInsideTemp()) status.put("insideTempC", s.insideTempC);
             }
 
             BydCloudConfig config = BydCloudConfig.fromUnifiedConfig();

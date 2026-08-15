@@ -1,8 +1,16 @@
 package com.overdrive.app.config
 
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Single source of truth for Overdrive's settings backup / restore.
@@ -44,12 +52,19 @@ object ConfigBackupService {
     // it, to keep this class free of a crypto dependency. Must match
     // CredentialCipher.java:29.
     private const val DID_PATH = "/data/local/tmp/.byd_device_id"
+    private const val RESTORE_JOURNAL_PATH =
+        "/data/local/tmp/.overdrive_config_restore_txn.json"
+    private const val RESTORE_JOURNAL_VERSION = 1
+    private val didTempSequence = AtomicLong(0)
+    private val restoreJournalTempSequence = AtomicLong(0)
 
     // Runtime/coordination keys that are meaningless or harmful to restore even
     // on the same device. Stripped on BOTH export and import (defence in depth
     // against a hand-edited bundle). Path form: "section.key".
     private val EPHEMERAL_KEYS = listOf(
         "navMap.clusterMapActive",   // daemon↔activity runtime flag; stale=ghost map
+        "chargingAnalytics.pendingTariffReprices",
+        "chargingAnalytics.pendingTariffRepriceTokens",
     )
 
     // Whole top-level keys never carried in a bundle.
@@ -61,7 +76,13 @@ object ConfigBackupService {
     //    — that could wedge the highest-seq-wins recovery/promotion ordering.
     //    Stripped on export + skipped on import; the live config keeps its own
     //    seq and saveConfig bumps it past the prior value on write.
-    private val EXCLUDED_SECTIONS = listOf("updates", "lastModified", "version", "configSeq")
+    private val EXCLUDED_SECTIONS = listOf(
+        "updates",
+        "lastModified",
+        "version",
+        "configSeq",
+        "__overdriveMutationClocks",
+    )
 
     // Sections whose secret fields are device-bound `ENC:` blobs. If the DID
     // could NOT be restored (writeDid failed), overlaying these would replace
@@ -144,12 +165,15 @@ object ConfigBackupService {
     @JvmOverloads
     fun buildBundle(appVersion: String, deviceModel: String, nowMs: Long,
                     includeTrips: Boolean = false): JSONObject {
-        // Fresh read so a just-saved peer write is included.
-        val live = UnifiedConfigManager.forceReload()
-        val unified = JSONObject(live.toString())   // deep copy; don't mutate cache
-
-        for (sec in EXCLUDED_SECTIONS) unified.remove(sec)
-        stripEphemeral(unified)
+        // Config and credential key material are one export snapshot. A restore
+        // cannot interleave and pair settings from one revision with another DID.
+        val snapshot = UnifiedConfigManager.runUnderConfigLock {
+            val unified = JSONObject(
+                UnifiedConfigManager.readDurableConfigStrict().toString())
+            for (sec in EXCLUDED_SECTIONS) unified.remove(sec)
+            stripEphemeral(unified)
+            ExportSnapshot(unified, readDidSnapshotStrict())
+        }
 
         val categories = org.json.JSONArray().put("settings")
 
@@ -165,12 +189,12 @@ object ConfigBackupService {
 
         val bundle = JSONObject()
             .put("manifest", manifest)
-            .put("settings", JSONObject().put("unified", unified))
+            .put("settings", JSONObject().put("unified", snapshot.unified))
 
         // Snapshot the DID so the ENC: secrets remain decryptable after a
         // factory reset. Best-effort: absent DID just means secrets fall back
         // to re-entry on a reset (they still decrypt on a non-reset restore).
-        readDid()?.let { bundle.put("did", it) }
+        didValue(snapshot.did)?.let { bundle.put("did", it) }
 
         // Opt-in trips category (stats only — no telemetry files). The trips DB
         // lives in the daemon; pulled via the manager. Best-effort: if the
@@ -201,6 +225,29 @@ object ConfigBackupService {
     // ==================== IMPORT ====================
 
     data class ApplyResult(val success: Boolean, val message: String, val warnings: List<String>)
+    private data class ExportSnapshot(
+        val unified: JSONObject,
+        val did: DidSnapshot,
+    )
+    private data class DidSnapshot(
+        val existed: Boolean,
+        val bytes: ByteArray,
+    )
+    private data class DidWriteResult(
+        val usable: Boolean,
+        val changed: Boolean,
+    )
+    private data class RestoreTransaction(
+        val success: Boolean,
+        val didUsable: Boolean,
+        val didChanged: Boolean,
+        val secretsDecryptable: Boolean,
+        val skipSections: Set<String>,
+    )
+    private class SohLineageResetException(
+        message: String,
+        cause: Throwable? = null,
+    ) : IllegalStateException(message, cause)
 
     /**
      * Validate a bundle WITHOUT writing anything. Used by the import-preview
@@ -281,10 +328,10 @@ object ConfigBackupService {
     /**
      * Apply a bundle. DAEMON-ONLY caller (UID 2000) — this performs the atomic
      * whole-config write. Order matters:
-     *   1. Restore the DID file FIRST so the imported ENC: secrets decrypt.
-     *   2. Strip excluded/ephemeral keys + preserve THIS install's OTA channel.
-     *   3. Atomic whole-object save via UnifiedConfigManager.saveConfig
-     *      (tmp+rename, .bak mirror, single notifyListeners("all") cascade).
+     *   1. Journal the prior config+DID and publish a credential-free bridge.
+     *   2. Restore the DID, verify imported secrets, and build the merged root.
+     *   3. Atomic whole-object save via UnifiedConfigManager.saveConfig, then
+     *      durably clear the journal.
      *
      * R8 (corruption latch): saveConfig refuses if a prior load latched
      * corruption. We forceReload() first; a clean load clears the latch. If it
@@ -299,194 +346,187 @@ object ConfigBackupService {
         // a runtime warning (DID restore failure) discovered during apply.
         val warnings = ArrayList(validation.warnings)
 
-        // 1. DID first so the imported ENC: secrets decrypt post-restore.
-        // Snapshot the PRIOR DID before overwriting so we can roll it back if the
-        // config save later fails: otherwise we'd be left split-brained — the
-        // NEW device-id on disk but the OLD config blobs (keyed to the old DID),
-        // which would silently decrypt to "" on next boot even though the restore
-        // reported failure. didWasRestored records whether we actually changed it.
-        var didOk = true   // true if no DID to restore OR the restore succeeded
-        var didWasRestored = false
-        val priorDid: String? = if (bundle.has("did")) readDid() else null
-        if (bundle.has("did")) {
-            val did = bundle.optString("did", "")
-            if (did.isNotEmpty()) {
-                if (writeDid(did)) {
-                    didWasRestored = true
-                    Log.i(TAG, "Restored device-id from bundle")
-                } else {
-                    didOk = false
-                    Log.w(TAG, "Could not restore device-id; will skip credential sections")
-                }
-            }
-        }
-
-        val incoming = bundle.optJSONObject("settings")?.optJSONObject("unified")
+        val incomingRaw = bundle.optJSONObject("settings")?.optJSONObject("unified")
             ?: return ApplyResult(false, "Backup contains no settings.", warnings)
+        // Runtime obligations belong to this installation. Strip them only from
+        // the incoming image; stripping the merged root would erase a currently
+        // pending durable tariff reprice.
+        val incoming = JSONObject(incomingRaw.toString())
+        stripEphemeral(incoming)
 
-        // Authoritative test: actually PROVE the bundle's ENC: credential blobs
-        // decrypt under the now-current key before overlaying them. This is the
-        // SOLE gate — we no longer pre-skip on a fingerprint change. Since
-        // CredentialCipher.decrypt tries the STABLE (fingerprint-free) key
-        // first, a backup written under the stable key decrypts fine AFTER an
-        // OTA, so a firmware change must NOT by itself drop the credentials
-        // (that was the OTA-loss strand the stable key exists to prevent). A
-        // genuinely-undecryptable blob (legacy fingerprint-bound + fingerprint
-        // changed, or corrupt/tampered) still fails this test → "" → skip, so
-        // we never overwrite live credentials with dead ciphertext.
-        val secretsDecryptable = if (didOk) bundleSecretsDecrypt(incoming) else false
-        if (didOk && !secretsDecryptable) {
-            Log.w(TAG, "Bundled secrets did not decrypt under the restored key; " +
-                "skipping credential sections")
-        }
-        // fpChanged is kept only for the human-readable warning reason below —
-        // it no longer drives the skip decision.
         val fpChanged = run {
             val fp = bundle.optJSONObject("manifest")?.optString("fingerprint", "") ?: ""
             fp.isNotEmpty() && fp != safeFingerprint()
         }
-        val skipSections =
-            if (didOk && secretsDecryptable) emptySet()
-            else CREDENTIAL_SECTIONS.toSet()
 
-        // Warn ONLY about credential sections that were ACTUALLY skipped AND that
-        // the bundle genuinely carried an ENC: secret for — so we never name a
-        // token the backup didn't contain (false-positive) nor stay silent when
-        // one was dropped (false-negative). Grounds the warning in what really
-        // happened, not a binary flag.
-        if (skipSections.isNotEmpty()) {
-            val dropped = skipSections.filter { sectionHasEncryptedSecret(incoming, it) }
-            if (dropped.isNotEmpty()) {
-                val names = dropped.joinToString(", ") { credentialLabel(it) }
-                // Name the actual root cause. The skip is now driven solely by
-                // a failed test-decrypt; a fingerprint change only matters when
-                // it's WHY a legacy-key blob no longer decrypts, so mention it
-                // as context rather than as the gate.
-                val reason = when {
-                    !didOk -> "the device key could not be restored"
-                    fpChanged -> "the saved credentials could not be decrypted " +
-                        "(device firmware changed since this backup)"
-                    else -> "the saved credentials could not be decrypted"
-                }
-                warnings.add("Because $reason, these saved credentials were not restored " +
-                    "and your current ones were kept — re-enter if needed: $names.")
-            }
-        }
-
-        // 2+3. Merge + persist UNDER the cross-process config lock. This is the
-        // same OS advisory lock updateSection/updateValues hold for their whole
-        // read-modify-write; without it a peer daemon JVM's section write
-        // landing between our fresh-read and our save would be silently dropped
-        // (the documented stale-snapshot lost-update invariant). forceReload()
-        // INSIDE the lock gives a guaranteed-fresh base; the lock is reentrant,
-        // so saveConfig's own locked paths nest harmlessly.
-        val ok = UnifiedConfigManager.runUnderConfigLock {
-            // Fresh under-lock base: a COMPLETE config (every seeded section +
-            // THIS install's OTA channel) and clears any corruption latch (R8).
-            val current = UnifiedConfigManager.forceReload()
-            val toWrite = JSONObject(current.toString())
-
-            // Per-KEY deep merge (not per-section put): when an OLDER backup is
-            // restored onto a NEWER app, a section may have gained keys the
-            // bundle predates (e.g. surveillance.detectBike). A wholesale
-            // section put would drop those; a per-key merge keeps the live
-            // section's keys and only overrides the ones the bundle carries —
-            // matching updateSection's semantics. EXCLUDED_SECTIONS are skipped
-            // (never import the OTA channel — R6).
-            val sectionKeys = incoming.keys()
-            while (sectionKeys.hasNext()) {
-                val k = sectionKeys.next()
-                if (EXCLUDED_SECTIONS.contains(k)) continue
-                if (skipSections.contains(k)) continue   // DID-failed: keep live creds
-                val incomingVal = incoming.get(k)
-                val baseVal = toWrite.opt(k)
-                if (incomingVal is JSONObject && baseVal is JSONObject) {
-                    // DEEP merge, not depth-1. The previous one-level loop did
-                    // baseVal.put(ik, incomingVal.get(ik)) — when an inner value
-                    // was ITSELF an object (geocoding.recording/surveillance/
-                    // advanced, oemDashcam.surveillance, camera.roleMappings) it
-                    // wholesale-REPLACED the live nested object, silently
-                    // dropping sub-keys the (older) bundle predated. Recursing
-                    // preserves live nested sub-keys while still overriding the
-                    // ones the bundle carries — matching the stated intent.
-                    // Pass the section name as the path root so atomic-child
-                    // paths (camera.roleMappings) replace rather than merge.
-                    deepMergeInto(baseVal, incomingVal, k)
-                    toWrite.put(k, baseVal)
+        val transaction = try {
+            UnifiedConfigManager.runUnderConfigLock {
+                recoverInterruptedRestoreUnderConfigLock()
+                val priorDid = readDidSnapshotStrict()
+                // Exact fresh bytes when valid; only genuinely absent or
+                // malformed config may use a seeded restore base.
+                val current =
+                    UnifiedConfigManager.readDurableConfigForRestore()
+                val didWrite = if (bundle.has("did")
+                        && bundle.optString("did", "").isNotEmpty()) {
+                    beginBundledDidTransition(
+                        bundle.optString("did"), priorDid, current)
                 } else {
-                    toWrite.put(k, incomingVal)
+                    DidWriteResult(usable = true, changed = false)
+                }
+
+                try {
+                    // Prove every carried credential against the DID that will
+                    // accompany the restored config.
+                    val secretsDecryptable =
+                        didWrite.usable && bundleSecretsDecrypt(incoming)
+                    val skipSections =
+                        if (didWrite.usable && secretsDecryptable) emptySet()
+                        else CREDENTIAL_SECTIONS.toSet()
+
+                    val toWrite = JSONObject(current.toString())
+
+                    val sectionKeys = incoming.keys()
+                    while (sectionKeys.hasNext()) {
+                        val k = sectionKeys.next()
+                        if (EXCLUDED_SECTIONS.contains(k)
+                                || skipSections.contains(k)
+                                || (didWrite.changed
+                                    && CREDENTIAL_SECTIONS.contains(k))) continue
+                        val incomingVal = incoming.get(k)
+                        val baseVal = toWrite.opt(k)
+                        if (incomingVal is JSONObject && baseVal is JSONObject) {
+                            deepMergeInto(baseVal, incomingVal, k)
+                            toWrite.put(k, baseVal)
+                        } else {
+                            toWrite.put(k, incomingVal)
+                        }
+                    }
+                    replaceCredentialSectionsAfterDidChange(
+                        toWrite,
+                        incoming,
+                        skipSections,
+                        didWrite.changed,
+                    )
+                    for (sec in EXCLUDED_SECTIONS) {
+                        if (!toWrite.has(sec) && current.has(sec)) {
+                            toWrite.put(sec, current.get(sec))
+                        }
+                    }
+
+                    try {
+                        val restoredTrips = toWrite.optJSONObject("tripAnalytics")
+                        val bundleTrips = incoming.optJSONObject("tripAnalytics")
+                        if (restoredTrips != null && bundleTrips != null
+                                && bundleTrips.has("enabled")) {
+                            restoredTrips.remove("enabledDefaultMigrated")
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "trips migration-marker reset failed: ${e.message}")
+                    }
+
+                    UnifiedConfigManager.ensureDefaults(toWrite)
+
+                    // A model-lineage boundary is durable before the new model
+                    // identity can become durable. A crash between these writes
+                    // leaves either old-model+cleared-SOH or new-model+cleared-SOH.
+                    if (resolvedVehicleModelId(current)
+                            != resolvedVehicleModelId(toWrite)) {
+                        resetSohForModelRestore()
+                    }
+
+                    val saved = UnifiedConfigManager.saveConfig(
+                        toWrite, /* force = */ true)
+                    if (didWrite.changed) {
+                        if (saved) {
+                            clearRestoreJournal()
+                        } else {
+                            recoverInterruptedRestoreUnderConfigLock()
+                        }
+                    }
+                    RestoreTransaction(
+                        success = saved,
+                        didUsable = didWrite.usable,
+                        didChanged = didWrite.changed,
+                        secretsDecryptable = secretsDecryptable,
+                        skipSections = skipSections,
+                    )
+                } catch (t: Throwable) {
+                    if (File(RESTORE_JOURNAL_PATH).exists()) {
+                        try {
+                            recoverInterruptedRestoreUnderConfigLock()
+                        } catch (rollbackFailure: Throwable) {
+                            throw IOException(
+                                "Restore failed and write-ahead rollback failed",
+                                rollbackFailure,
+                            )
+                        }
+                    }
+                    throw t
                 }
             }
-            stripEphemeral(toWrite)   // drop runtime-only keys the bundle may carry
-
-            // Defensive: EXCLUDED_SECTIONS are skipped on overlay so they keep
-            // the live values, but if the live base somehow lacked one (e.g. a
-            // first-boot config with no "updates" yet), make sure it isn't left
-            // absent — restore it from current (no-op if current also lacked it;
-            // getUpdateChannel then falls back to the compiled channel safely).
-            for (sec in EXCLUDED_SECTIONS) {
-                if (!toWrite.has(sec) && current.has(sec)) toWrite.put(sec, current.get(sec))
+        } catch (t: Throwable) {
+            Log.e(TAG, "Backup restore transaction failed: ${t.message}", t)
+            val message = if (t is SohLineageResetException) {
+                "Could not restore settings because battery-health model lineage " +
+                    "could not be reset durably."
+            } else {
+                "Could not write settings. The config may be locked or damaged — " +
+                    "try again after restarting the camera service."
             }
-
-            // A bundle taken BEFORE the trips default-ON change carries
-            // tripAnalytics.enabled=false, while the per-key merge above keeps the
-            // live enabledDefaultMigrated=true. ensureDefaults would then skip
-            // both the seed and the one-shot flip (it sees both keys present), so
-            // restoring an old backup would silently turn trip recording off
-            // FOREVER with no way for the migration to re-fire. Drop the marker
-            // whenever the bundle supplied an explicit `enabled`, so the one-shot
-            // upgrade re-evaluates against the restored value exactly once.
-            try {
-                val restoredTrips = toWrite.optJSONObject("tripAnalytics")
-                val bundleTrips = incoming.optJSONObject("tripAnalytics")
-                if (restoredTrips != null && bundleTrips != null && bundleTrips.has("enabled")) {
-                    restoredTrips.remove("enabledDefaultMigrated")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "trips migration-marker reset failed: ${e.message}")
-            }
-
-            // Backfill any key the current app expects but neither the live
-            // config nor the bundle carried, so we never PERSIST an incomplete
-            // config (saveConfig doesn't run applyDefaults; loadConfig only
-            // re-defaults on the geocoding-migration path). Idempotent.
-            UnifiedConfigManager.ensureDefaults(toWrite)
-
-            // force=true: bypass the corruption latch. `toWrite` is a COMPLETE,
-            // already-validated user config (validateBundle passed + merged onto a
-            // fresh forceReload base + ensureDefaults), NOT a defaults-merge — so
-            // the latch's "don't clobber recoverable settings with defaults" guard
-            // does not apply. Critically, RESTORE is the recovery path FOR config
-            // corruption: if the live file is corrupt and both .bak copies are
-            // unusable, the latch is set and the forceReload above can't clear it,
-            // so a plain saveConfig would return false and block the very action
-            // meant to fix the corruption ("Could not write settings"). Forcing
-            // writes the good bytes and clears the latch on success.
-            val saved = UnifiedConfigManager.saveConfig(toWrite, /* force = */ true)
-            // Refresh the in-memory cache to the bytes we just wrote WHILE STILL
-            // HOLDING the lock. Doing the final forceReload outside the lock left
-            // a window where a peer daemon's section write could land between our
-            // save and our reload, so the cache would reflect the peer's bytes
-            // (harmless for data, but the IPC reply's freshness contract wants
-            // our write visible). Inside the lock the reload is serialized.
-            if (saved) UnifiedConfigManager.forceReload()
-            saved
+            return ApplyResult(false, message, warnings)
         }
-        if (!ok) {
-            // The config save failed but we may have ALREADY overwritten the DID
-            // file. Roll the DID back to its prior value so we don't leave the
-            // new device-id paired with the old config's blobs (which would
-            // decrypt to "" on next boot — silent credential loss despite a
-            // reported failure). Restores atomicity: failed save ⇒ DID unchanged.
-            if (didWasRestored && priorDid != null) {
-                if (writeDid(priorDid)) Log.w(TAG, "Config save failed; rolled device-id back")
-                else Log.e(TAG, "Config save failed AND device-id rollback failed; " +
-                    "credentials may need re-entry")
-            }
+
+        if (!transaction.success) {
             return ApplyResult(false,
                 "Could not write settings. The config may be locked or damaged — " +
                 "try again after restarting the camera service.", warnings)
         }
+
+        if (transaction.skipSections.isNotEmpty()) {
+            val dropped = transaction.skipSections.filter {
+                sectionHasEncryptedSecret(incoming, it)
+            }
+            if (dropped.isNotEmpty()) {
+                val names = dropped.joinToString(", ") { credentialLabel(it) }
+                val reason = when {
+                    !transaction.didUsable -> "the device key could not be restored"
+                    fpChanged -> "the saved credentials could not be decrypted " +
+                        "(device firmware changed since this backup)"
+                    else -> "the saved credentials could not be decrypted"
+                }
+                val disposition = if (transaction.didChanged) {
+                    "and credentials encrypted with the previous device key were cleared"
+                } else {
+                    "and your current ones were kept"
+                }
+                warnings.add("Because $reason, these saved credentials were not restored " +
+                    "$disposition — re-enter if needed: $names.")
+            }
+        }
+
+        // The whole-config write bypasses the charging API callback, so its
+        // manager-owned config and tariff snapshots otherwise keep the pre-restore
+        // values until process restart. Reload outside the config lock: the callback
+        // can perform database/lifecycle work and strict tariff reads of its own.
+        try {
+            val chargingManager =
+                com.overdrive.app.daemon.CameraDaemon.getChargingSessionManager()
+            val chargingReloaded = chargingManager?.onConfigRestored()
+                ?: com.overdrive.app.charging.TariffManager.getInstance().load()
+            if (!chargingReloaded) {
+                warnings.add("Settings were restored, but charging analytics could not " +
+                    "reload them. Restart the camera service before relying on charging rates.")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Charging runtime reload after restore failed: ${t.message}")
+            warnings.add("Settings were restored, but charging analytics could not " +
+                "reload them. Restart the camera service before relying on charging rates.")
+        }
+
+        // Trips read the tariff at finalize time from the restored config, so a
+        // restore needs no separate pricing reconciliation here.
+
         // Trips category (opt-in, stats-only). Replayed AFTER the config save so
         // a settings restore never depends on the trips DB being up. Idempotent
         // + deduped inside importTripsJson, so a partial/duplicate import is
@@ -604,49 +644,294 @@ object ConfigBackupService {
         }
     }
 
+    /**
+     * Credential ciphertext is bound to the DID. Once the DID changes, no field
+     * from the prior root may cross into the committed image through additive
+     * merge. Verified incoming sections replace their live counterparts as
+     * complete objects; absent or rejected sections remain absent.
+     */
+    private fun replaceCredentialSectionsAfterDidChange(
+        target: JSONObject,
+        verifiedIncoming: JSONObject,
+        rejectedSections: Set<String>,
+        didChanged: Boolean,
+    ) {
+        if (!didChanged) return
+        for (section in CREDENTIAL_SECTIONS) {
+            target.remove(section)
+            if (rejectedSections.contains(section)) continue
+            val replacement = verifiedIncoming.optJSONObject(section) ?: continue
+            target.put(section, JSONObject(replacement.toString()))
+        }
+    }
+
     private fun safeFingerprint(): String = try {
         android.os.Build.FINGERPRINT ?: "unknown"
     } catch (e: Exception) { "unknown" }
 
-    // Read the DID exactly as CredentialCipher does — FIRST LINE only, trimmed.
-    // CredentialCipher.readDid uses BufferedReader.readLine().trim(), so reading
-    // the whole file here could capture a trailing line the cipher ignores,
-    // making the snapshot diverge from the key-derivation input. firstLine keeps
-    // the two byte-identical.
-    private fun readDid(): String? = try {
-        val f = File(DID_PATH)
-        if (f.exists()) f.readText().lineSequence().firstOrNull()?.trim()?.ifEmpty { null } else null
-    } catch (e: Exception) {
-        Log.w(TAG, "DID read failed: ${e.message}"); null
+    private fun resolvedVehicleModelId(root: JSONObject): String? {
+        val vehicle = root.optJSONObject("vehicle") ?: return null
+        return VehicleModelSelection.resolvedModelId(
+            vehicle.optString("modelId", ""),
+            vehicle.optString("modelSource", ""),
+        )
+    }
+
+    private fun resetSohForModelRestore() {
+        val estimator = try {
+            com.overdrive.app.monitor.SocHistoryDatabase.getInstance()
+                ?.getSohEstimator()
+        } catch (t: Throwable) {
+            throw SohLineageResetException(
+                "SOH estimator is unavailable for model-changing restore", t)
+        } ?: throw SohLineageResetException(
+            "SOH estimator is unavailable for model-changing restore")
+        try {
+            estimator.reset()
+        } catch (t: Throwable) {
+            throw SohLineageResetException(
+                "SOH estimator reset was not durable", t)
+        }
     }
 
     /**
-     * Write the DID world-readable. This is INTENTIONAL and required, NOT a
-     * leak: CredentialCipher reads .byd_device_id cross-UID (app 10xxx AND
-     * daemon 2000) to derive its key; if the file isn't world-readable the
-     * app-side decrypt falls back to a sentinel DID and every credential reads
-     * as "" (see the credentialcipher-did-perms invariant). So unlike a secret
-     * temp file, the DID's *final* state is world-readable by design — there is
-     * no "tighten after write" race here: a freshly created file is at most
-     * owner-only during the gap (MORE restrictive, not less), and an existing
-     * file is already world-readable. The setReadable call LOOSENS to the
-     * required end state; ordering write-vs-chmod doesn't change exposure. The
-     * DID is a device identifier, not the secret — the encrypted blobs it keys
-     * already sit at 0666 in overdrive_config.json under the same on-device
-     * threat model.
+     * Recover an interrupted cross-file restore. The caller must hold
+     * UnifiedConfigManager's stable config lock.
+     *
+     * Both forward progress and rollback pass through a config with credential
+     * sections removed. Therefore a process death can expose old credentials
+     * with the old DID, new credentials with the new DID, or no credentials,
+     * but never encrypted credentials paired with the wrong DID.
      */
-    private fun writeDid(value: String): Boolean = try {
-        val f = File(DID_PATH)
-        // Persist only the FIRST line, trimmed — exactly what CredentialCipher
-        // (readLine().trim()) will read back for key derivation. A bundle whose
-        // "did" field somehow carried embedded newlines can't then create a file
-        // whose whole-text snapshot differs from the cipher's first-line read.
+    @JvmStatic
+    fun recoverInterruptedRestoreUnderConfigLock(): Boolean {
+        val journalFile = File(RESTORE_JOURNAL_PATH)
+        if (!journalFile.exists()) return true
+        if (!journalFile.isFile) {
+            throw IOException("Restore journal path is not a regular file")
+        }
+        val journal = try {
+            JSONObject(journalFile.readText())
+        } catch (e: Exception) {
+            throw IOException("Restore journal is unreadable", e)
+        }
+        if (journal.optInt("version", -1) != RESTORE_JOURNAL_VERSION) {
+            throw IOException("Unsupported restore journal version")
+        }
+        val priorConfig = journal.optJSONObject("priorConfig")
+            ?: throw IOException("Restore journal has no prior config")
+        val priorDid = didSnapshotFromJournal(journal)
+
+        val bridge = credentialFreeBridge(priorConfig)
+        if (!UnifiedConfigManager.saveConfig(bridge, /* force = */ true)) {
+            throw IOException("Could not publish credential-free rollback bridge")
+        }
+        if (!restoreDidSnapshot(priorDid)) {
+            throw IOException("Could not restore prior DID")
+        }
+        if (!UnifiedConfigManager.saveConfig(
+                JSONObject(priorConfig.toString()), /* force = */ true)) {
+            throw IOException("Could not restore prior config")
+        }
+        clearRestoreJournal()
+        Log.w(TAG, "Recovered interrupted config/DID restore")
+        return true
+    }
+
+    private fun beginBundledDidTransition(
+        value: String,
+        priorDid: DidSnapshot,
+        priorConfig: JSONObject,
+    ): DidWriteResult {
         val single = value.lineSequence().firstOrNull()?.trim() ?: ""
-        f.writeText(single)
-        f.setReadable(true, false)
-        f.setWritable(true, false)
-        true
-    } catch (e: Exception) {
-        Log.w(TAG, "DID write failed: ${e.message}"); false
+        if (single.isEmpty()) {
+            Log.w(TAG, "Bundled device-id is empty; credential sections will be kept")
+            return DidWriteResult(usable = false, changed = false)
+        }
+        val bytes = single.toByteArray(StandardCharsets.UTF_8)
+        if (priorDid.existed && priorDid.bytes.contentEquals(bytes)) {
+            return DidWriteResult(usable = true, changed = false)
+        }
+
+        return try {
+            writeRestoreJournal(priorDid, priorConfig)
+            if (!UnifiedConfigManager.saveConfig(
+                    credentialFreeBridge(priorConfig), /* force = */ true)) {
+                throw IOException("Could not publish credential-free restore bridge")
+            }
+            writeDidBytesAtomic(bytes)
+            Log.i(TAG, "Restored device-id from bundle")
+            DidWriteResult(usable = true, changed = true)
+        } catch (transitionFailure: Throwable) {
+            if (File(RESTORE_JOURNAL_PATH).exists()) {
+                try {
+                    recoverInterruptedRestoreUnderConfigLock()
+                } catch (rollbackFailure: Throwable) {
+                    throw IOException(
+                        "DID transition failed and rollback failed",
+                        rollbackFailure,
+                    )
+                }
+            }
+            Log.w(TAG, "Could not restore device-id; credential sections will be kept")
+            DidWriteResult(usable = false, changed = false)
+        }
+    }
+
+    private fun credentialFreeBridge(root: JSONObject): JSONObject {
+        val bridge = JSONObject(root.toString())
+        for (section in CREDENTIAL_SECTIONS) bridge.remove(section)
+        return bridge
+    }
+
+    private fun writeRestoreJournal(
+        priorDid: DidSnapshot,
+        priorConfig: JSONObject,
+    ) {
+        val didBytes = JSONArray()
+        for (byte in priorDid.bytes) didBytes.put(byte.toInt() and 0xff)
+        val journal = JSONObject()
+            .put("version", RESTORE_JOURNAL_VERSION)
+            .put("priorDidExisted", priorDid.existed)
+            .put("priorDidBytes", didBytes)
+            .put("priorConfig", JSONObject(priorConfig.toString()))
+        writeAtomicFile(
+            File(RESTORE_JOURNAL_PATH),
+            journal.toString().toByteArray(StandardCharsets.UTF_8),
+            worldAccessible = false,
+            sequence = restoreJournalTempSequence.incrementAndGet(),
+        )
+    }
+
+    private fun didSnapshotFromJournal(journal: JSONObject): DidSnapshot {
+        val encoded = journal.optJSONArray("priorDidBytes")
+            ?: throw IOException("Restore journal has no prior DID bytes")
+        val bytes = ByteArray(encoded.length())
+        for (i in 0 until encoded.length()) {
+            val value = encoded.optInt(i, -1)
+            if (value !in 0..255) {
+                throw IOException("Restore journal has malformed DID bytes")
+            }
+            bytes[i] = value.toByte()
+        }
+        return DidSnapshot(
+            existed = journal.optBoolean("priorDidExisted", false),
+            bytes = bytes,
+        )
+    }
+
+    private fun clearRestoreJournal() {
+        val file = File(RESTORE_JOURNAL_PATH)
+        if (!file.exists()) return
+        if (!file.delete()) throw IOException("Could not clear restore journal")
+        val parent = file.parentFile
+            ?: throw IOException("Restore journal parent is unavailable")
+        syncDidDirectory(parent)
+    }
+
+    private fun readDidSnapshotStrict(): DidSnapshot {
+        val f = File(DID_PATH)
+        if (!f.exists()) return DidSnapshot(existed = false, bytes = ByteArray(0))
+        if (!f.isFile) throw IOException("DID path is not a regular file")
+        return try {
+            DidSnapshot(existed = true, bytes = f.readBytes())
+        } catch (e: Exception) {
+            throw IOException("DID read failed", e)
+        }
+    }
+
+    private fun didValue(snapshot: DidSnapshot): String? {
+        if (!snapshot.existed) return null
+        return String(snapshot.bytes, StandardCharsets.UTF_8)
+            .lineSequence()
+            .firstOrNull()
+            ?.trim()
+            ?.ifEmpty { null }
+    }
+
+    private fun restoreDidSnapshot(snapshot: DidSnapshot): Boolean {
+        return try {
+            if (snapshot.existed) {
+                writeDidBytesAtomic(snapshot.bytes)
+            } else {
+                val file = File(DID_PATH)
+                if (file.exists() && !file.delete()) {
+                    throw IOException("Could not remove newly-created DID")
+                }
+                val parent = file.parentFile
+                    ?: throw IOException("DID parent is unavailable")
+                syncDidDirectory(parent)
+            }
+            true
+        } catch (rollbackFailure: Throwable) {
+            Log.e(TAG, "DID rollback failed: ${rollbackFailure.message}", rollbackFailure)
+            false
+        }
+    }
+
+    private fun writeDidBytesAtomic(bytes: ByteArray) {
+        val f = File(DID_PATH)
+        writeAtomicFile(
+            f,
+            bytes,
+            worldAccessible = true,
+            sequence = didTempSequence.incrementAndGet(),
+        )
+    }
+
+    private fun writeAtomicFile(
+        file: File,
+        bytes: ByteArray,
+        worldAccessible: Boolean,
+        sequence: Long,
+    ) {
+        val parent = file.parentFile
+            ?: throw IOException("Atomic file parent is unavailable")
+        val tmp = File(
+            parent,
+            "${file.name}.tmp.${android.os.Process.myPid()}.$sequence",
+        )
+        try {
+            FileOutputStream(tmp).use { output ->
+                output.write(bytes)
+                output.flush()
+                tmp.setReadable(true, !worldAccessible)
+                tmp.setWritable(true, !worldAccessible)
+                output.fd.sync()
+            }
+            if (!tmp.renameTo(file)) {
+                throw IOException("Atomic file rename failed")
+            }
+            file.setReadable(true, !worldAccessible)
+            file.setWritable(true, !worldAccessible)
+            syncDidDirectory(parent)
+        } finally {
+            if (tmp.exists()) tmp.delete()
+        }
+    }
+
+    private fun syncDidDirectory(directory: File) {
+        var descriptor: java.io.FileDescriptor? = null
+        try {
+            descriptor = Os.open(
+                directory.absolutePath,
+                OsConstants.O_RDONLY or OsConstants.O_CLOEXEC,
+                0,
+            )
+            Os.fsync(descriptor)
+        } catch (e: ErrnoException) {
+            if (e.errno != OsConstants.EINVAL
+                    && e.errno != OsConstants.ENOSYS
+                    && e.errno != OsConstants.ENOTSUP
+                    && e.errno != OsConstants.EOPNOTSUPP) {
+                throw IOException("DID directory fsync failed", e)
+            }
+        } finally {
+            if (descriptor != null) {
+                try {
+                    Os.close(descriptor)
+                } catch (_: Exception) {}
+            }
+        }
     }
 }

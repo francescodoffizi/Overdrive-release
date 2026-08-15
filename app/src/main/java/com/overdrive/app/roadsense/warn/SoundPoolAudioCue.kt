@@ -7,20 +7,18 @@ import android.util.Log
 import com.overdrive.app.roadsense.detect.Severity
 
 /**
- * SOTA approach chime via [SoundPool] — three designed samples, one per severity,
- * low-latency (pre-loaded, no per-play decode). This is the proper audio path
- * (vs the ToneGenerator placeholder); SoundPool is the right API for short,
- * frequently-triggered UI cues.
+ * Legacy public-stream chime via [SoundPool] — three preloaded samples, one per
+ * severity. Production uses [BridgedAudioCue] for OEM channel routing; this class
+ * remains the low-latency fallback where only public Android streams are available.
  *
- * ## Sample assets (drop-in — see TODO)
- * Expects three raw resources under `res/raw/`:
+ * ## Bundled sample assets
+ * Uses three raw resources under `res/raw/`:
  *   - `roadsense_chime_minor`    — soft single tick
  *   - `roadsense_chime_moderate` — firmer double note
- *   - `roadsense_chime_severe`   — urgent triple / rising alert
- * Use short (<800 ms), normalized .ogg files (ogg = smaller than wav, SoundPool
- * decodes it fine). **Until those files exist this cue reports notReady and the
- * WarningCoordinator falls back to [ToneAudioCue]** — so the feature is never
- * silent waiting on sound design.
+ *   - `roadsense_chime_severe`   — clear two-note rising alert
+ * Use short, normalized Ogg Vorbis files (the current cues are 0.46 s, 0.64 s,
+ * and 0.74 s). This legacy path remains available as a public-stream fallback, while the
+ * installed controller uses [BridgedAudioCue] for OEM channel routing.
  *
  * Plays on STREAM-equivalent USAGE_ASSISTANCE_SONIFICATION so the chime ducks
  * politely under media rather than fighting it. Lazy-loads on first use; [release]
@@ -45,9 +43,9 @@ class SoundPoolAudioCue(private val context: Context) : WarningCoordinator.Audio
         val moderate = rawId("roadsense_chime_moderate")
         val severe = rawId("roadsense_chime_severe")
         if (minor == 0 || moderate == 0 || severe == 0) {
-            // Samples not bundled yet → mark unavailable; caller falls back to tones.
+            // A failed resource lookup keeps the legacy tone fallback available.
             unavailable = true
-            Log.i(TAG, "chime samples not present in res/raw — using ToneGenerator fallback")
+            Log.i(TAG, "chime samples unavailable — using ToneGenerator fallback")
             return
         }
         val attrs = AudioAttributes.Builder()
@@ -90,11 +88,10 @@ class SoundPoolAudioCue(private val context: Context) : WarningCoordinator.Audio
 }
 
 /**
- * Composite cue: prefer the designed [SoundPoolAudioCue] samples; transparently
- * fall back to [ToneAudioCue] system tones when the raw samples aren't bundled
- * (or fail to load). This is what the controller installs — so audio works today
- * (tones) and upgrades automatically the moment the sample files land, with no
- * code change. Mirrors the project's "graceful degradation" stance.
+ * Legacy composite cue: prefer the designed [SoundPoolAudioCue] samples and fall
+ * back to [ToneAudioCue] system tones when the raw samples aren't bundled or fail
+ * to load. The installed controller uses [BridgedAudioCue] instead so it can route
+ * warnings through the selected OEM audio channel.
  */
 class RoadSenseAudioCue(context: Context) : WarningCoordinator.AudioCue {
     private val sound = SoundPoolAudioCue(context)

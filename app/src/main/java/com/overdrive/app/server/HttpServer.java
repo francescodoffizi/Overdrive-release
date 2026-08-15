@@ -233,6 +233,7 @@ public class HttpServer {
 
     public void stop() {
         running = false;
+        RemoteCommunicationWebSocket.stopActive("Communication server stopped");
         try {
             if (serverSocket != null) serverSocket.close();
         } catch (Exception e) {}
@@ -404,12 +405,14 @@ public class HttpServer {
                 client.setSoTimeout(60000);
             }
             
-            // WebSocket upgrade on /ws path (check auth first for non-public paths).
-            // Match /ws and /ws?... (query params allow JWT-as-?token= since browser
-            // WebSocket clients can't set arbitrary headers — cookies may be dropped
-            // through tunnels' SameSite policies).
+            // WebSocket upgrades (check auth first). /ws is the H.264 stream;
+            // /ws/communicate is the inbound PCM push-to-talk stream. Query
+            // tokens are supported because browser WebSocket clients cannot set
+            // arbitrary Authorization headers.
             String wsPathOnly = path.contains("?") ? path.substring(0, path.indexOf("?")) : path;
-            if (wsPathOnly.equals("/ws") && websocketKey != null && "websocket".equalsIgnoreCase(upgradeHeader)) {
+            if ((wsPathOnly.equals("/ws") || wsPathOnly.equals("/ws/communicate"))
+                    && websocketKey != null
+                    && "websocket".equalsIgnoreCase(upgradeHeader)) {
                 // Promote ?token= query param into a synthetic Authorization header
                 // so AuthMiddleware's existing Bearer-token path handles it.
                 String wsAuthHeader = authHeader;
@@ -429,7 +432,11 @@ public class HttpServer {
                     client.close();
                     return;
                 }
-                handleWebSocketUpgrade(client, websocketKey);
+                if (wsPathOnly.equals("/ws/communicate")) {
+                    RemoteCommunicationWebSocket.handle(client, websocketKey);
+                } else {
+                    handleWebSocketUpgrade(client, websocketKey);
+                }
                 return;
             }
 
@@ -488,6 +495,10 @@ public class HttpServer {
             } else if (path.equals("/live-view.html") || path.equals("/live-view")) {
                 if (!serveStaticFile(out, "local/live-view.html")) {
                     HttpResponse.sendError(out, 404, "live-view.html not found");
+                }
+            } else if (path.equals("/communicate.html") || path.equals("/communicate")) {
+                if (!serveStaticFile(out, "local/communicate.html")) {
+                    HttpResponse.sendError(out, 404, "communicate.html not found");
                 }
             } else if (path.startsWith("/manifest.json")) {
                 if (!serveStaticFile(out, "local/manifest.json")) {
@@ -549,6 +560,10 @@ public class HttpServer {
             } else if (path.equals("/road-sense.html") || path.equals("/road-sense")) {
                 if (!serveStaticFile(out, "local/road-sense.html")) {
                     HttpResponse.sendError(out, 404, "road-sense.html not found");
+                }
+            } else if (path.equals("/network.html") || path.equals("/network")) {
+                if (!serveStaticFile(out, "local/network.html")) {
+                    HttpResponse.sendError(out, 404, "network.html not found");
                 }
             } else if (path.equals("/notifications.html") || path.equals("/notifications")) {
                 if (!serveStaticFile(out, "local/notifications.html")) {
@@ -642,6 +657,9 @@ public class HttpServer {
         "/api/recording/mode", // recording mode
         "/api/apps/launch",    // open-app action: launch a user-selected app (NOT /api/apps/list)
         "/api/camview/",       // camera-view show/hide (native lane, shares blind-spot pipeline)
+        "/api/bs/",            // blind-spot: enable/disable/hide/view/geometry/target/tweak
+                               // (same native camera lane as /api/camview/ above — the card's
+                               // own on/off + view knobs, no new capability class)
     };
 
     /** Whether an automation-originated request path is inside the allowlist above. */
@@ -850,7 +868,9 @@ public class HttpServer {
             com.overdrive.app.charging.ChargingSessionManager csm = CameraDaemon.getChargingSessionManager();
             if (csm != null) {
                 com.overdrive.app.charging.ChargingApiHandler handler =
-                    new com.overdrive.app.charging.ChargingApiHandler(csm);
+                    new com.overdrive.app.charging.ChargingApiHandler(
+                        csm,
+                        CameraDaemon::getTripAnalyticsManager);
                 org.json.JSONObject result = handler.handleRequest(path, method, null, body);
                 if (result != null) {
                     int status = result.optInt("_status", 200);
@@ -885,6 +905,11 @@ public class HttpServer {
             return AudioApiHandler.handle(method, path, body, out);
         }
 
+        // Dedicated remote voice/message control surface.
+        if (path.startsWith("/api/communicate/")) {
+            return RemoteCommunicationApiHandler.handle(method, path, body, out);
+        }
+
         // Vehicle Control API
         if (path.startsWith("/api/vehicle")) {
             return VehicleControlApiHandler.handle(method, path, body, out);
@@ -902,6 +927,14 @@ public class HttpServer {
         // accessibility service POST here so BYD SDK writes run in the daemon UID.
         if (path.startsWith("/api/keymap")) {
             return KeymapApiHandler.handle(method, path, body, out);
+        }
+
+        // User-defined quick-control buttons. Stores the same action payload a key binding
+        // does and fires it through KeymapApiHandler.runBoundAction, so a button inherits the
+        // physical key's exact privileges (curated catalog, API allowlist, shell gate) rather
+        // than adding a second actuation path.
+        if (path.startsWith("/api/quick-controls")) {
+            return QuickControlsApiHandler.handle(method, path, body, out);
         }
 
         // Installed-app enumeration + launch — shared by the key-mapping app picker
@@ -959,6 +992,11 @@ public class HttpServer {
         // Performance API
         if (path.startsWith("/api/performance")) {
             return PerformanceApiHandler.handle(method, path, body, out);
+        }
+
+        // Network & Hotspot API (AP on/off, clients, session stats, data limit, proxy)
+        if (path.startsWith("/api/hotspot")) {
+            return HotspotApiHandler.handle(method, path, body, out);
         }
         
         // External Storage API (SD card and CDR cleanup)
@@ -1078,86 +1116,17 @@ public class HttpServer {
         // RemoteException must not zero out unrelated fields. Any failure
         // here is logged so customers reporting "blank data" produce evidence
         // we can act on, instead of silent emptiness.
+        com.overdrive.app.charging.ChargingApiHandler.LivePublication
+            chargingPublication = null;
+        status.put("charging", buildIdleChargingStatus());
         try {
             com.overdrive.app.monitor.VehicleDataMonitor vehicleMonitor =
                 com.overdrive.app.monitor.VehicleDataMonitor.getInstance();
-
-            com.overdrive.app.monitor.ChargingStateData chargingState = vehicleMonitor.getChargingState();
-            if (chargingState != null) {
-                JSONObject charging = new JSONObject();
-                charging.put("stateName", chargingState.stateName);
-                charging.put("status", chargingState.status.name());
-                charging.put("chargingPowerKW", chargingState.chargingPowerKW);
-                charging.put("isDischarging", chargingState.isDischarging);
-                charging.put("isError", chargingState.isError);
-                // Surface the "estimated from SOC rate" flag so the UI can show
-                // a "~" prefix on the kW value (core.js already reads this).
-                charging.put("isEstimated", chargingState.isEstimated);
-
-                // Dashboard charging-card fields (consumed by index.html
-                // updateFromStatus). `charging`/`plugged`/`full`/`fault` are the
-                // discrete chip states; powerKw/socPercent/timeToFullMin feed the
-                // metric grid. `charging` uses ChargingDetector's fused verdict
-                // (BMS + power-MCU cross-check) rather than the raw HAL state.
-                boolean isChargingFused = false;
-                try {
-                    isChargingFused = com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging();
-                } catch (Exception ignored) {
-                    isChargingFused = chargingState.status
-                        == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.CHARGING;
-                }
-                boolean isFull = chargingState.status
-                    == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.FINISHED;
-                boolean isPlugged = isFull || isChargingFused
-                    || chargingState.status == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.READY
-                    || chargingState.status == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.SCHEDULED;
-                charging.put("charging", isChargingFused);
-                charging.put("plugged", isPlugged);
-                charging.put("full", isFull);
-                charging.put("fault", chargingState.isError);
-                charging.put("powerKw", chargingState.chargingPowerKW);
-                double socForCardPct = -1;
-                try {
-                    com.overdrive.app.monitor.BatterySocData socForCard = vehicleMonitor.getBatterySoc();
-                    if (socForCard != null) {
-                        socForCardPct = socForCard.socPercent;
-                        charging.put("socPercent", socForCard.socPercent);
-                    }
-                } catch (Exception ignored) {}
-                // Session energy added so far (the dashboard "Session"/"Added"
-                // metric). MUST use the SAME accessor as ChargingApiHandler
-                // .buildLiveBlock() — getOpenChargingSessionEnergyKwh() — or the
-                // dashboard and the charging page show different numbers for the
-                // same open session. That accessor integrates ∫P·dt over the
-                // recorded power samples and falls back to (soc - startSoc) ×
-                // nominal when the integral isn't available yet, so it is never
-                // blanker than the old inline SOC-delta this replaced. The
-                // dashboard polls /status (not /api/charging), so it still has to
-                // emit sessionKwh itself — but now from the shared source of truth.
-                try {
-                    com.overdrive.app.monitor.SocHistoryDatabase db =
-                        com.overdrive.app.monitor.SocHistoryDatabase.getInstance();
-                    if (db != null && db.getOpenChargingSessionStart() > 0) {
-                        double sessionKwh = db.getOpenChargingSessionEnergyKwh();
-                        if (sessionKwh > 0) charging.put("sessionKwh", sessionKwh);
-                    }
-                } catch (Exception ignored) {}
-                // Time-to-full from the BYD rest-time fields, if available.
-                try {
-                    com.overdrive.app.byd.BydDataCollector col = com.overdrive.app.byd.BydDataCollector.getInstance();
-                    if (col != null && col.isInitialized()) {
-                        com.overdrive.app.byd.BydVehicleData vd = col.getData();
-                        int UNAVAIL = com.overdrive.app.byd.BydVehicleData.UNAVAILABLE;
-                        if (vd != null && (vd.chargingRestTimeHours != UNAVAIL || vd.chargingRestTimeMinutes != UNAVAIL)) {
-                            int ttf = (vd.chargingRestTimeHours != UNAVAIL ? vd.chargingRestTimeHours * 60 : 0)
-                                    + (vd.chargingRestTimeMinutes != UNAVAIL ? vd.chargingRestTimeMinutes : 0);
-                            if (ttf > 0) charging.put("timeToFullMin", ttf);
-                        }
-                    }
-                } catch (Exception ignored) {}
-
-                status.put("charging", charging);
-            }
+            chargingPublication =
+                com.overdrive.app.charging.ChargingApiHandler
+                    .readLivePublication(
+                        com.overdrive.app.monitor.SocHistoryDatabase.getInstance());
+            status.put("charging", chargingPublication.toStatusJson());
             
             com.overdrive.app.monitor.BatterySocData socData = vehicleMonitor.getBatterySoc();
             if (socData != null) {
@@ -1184,6 +1153,13 @@ public class HttpServer {
                 if (rangeData.hasFuelPercent()) {
                     range.put("fuelPercent", rangeData.fuelPercent);
                 }
+                // Drivetrain flag — lets clients render the PHEV EV/fuel
+                // breakdown even when the petrol leg currently reads 0 km
+                // (empty tank ≠ BEV, fuelRangeKm alone can't distinguish).
+                range.put("isPhev", vehicleMonitor.isPhev());
+                // No "personalized" block: clients fall back to the HAL range
+                // fields above. GET /api/trips/range still serves the learned
+                // per-leg estimates directly.
                 status.put("range", range);
             }
 
@@ -1196,6 +1172,16 @@ public class HttpServer {
                 status.put("distanceUnit", (collector != null && collector.isMilesMode()) ? "mi" : "km");
             } catch (Exception ignored) {
                 status.put("distanceUnit", "km");
+            }
+
+            // Tyre pressure display unit — "kpa" | "psi" | "bar". Same delivery
+            // pattern as distanceUnit above: BYD.units.pressureMode in core.js
+            // picks it up on every poll so all pages render pressure alike.
+            try {
+                status.put("pressureUnit",
+                        com.overdrive.app.config.UnifiedConfigManager.getTyrePressureUnit());
+            } catch (Exception ignored) {
+                status.put("pressureUnit", "psi");
             }
 
             // Active UI locale — exposed so the WebView can sync its i18n
@@ -1291,6 +1277,47 @@ public class HttpServer {
                 recordingStatus.put("pipelineRunning", false);
                 recordingStatus.put("modeActive", false);
             }
+            // Camera-view state, so the status overlay can RECONCILE its floating ✕ rather
+            // than relying solely on the daemon's edge broadcast — an `am broadcast` is
+            // dropped if the overlay service isn't up (or lacked overlay permission) at
+            // that instant, and nothing re-sends it, leaving a rendering view with no
+            // on-screen way to close it. Emitted OUTSIDE the rmm branch: the camview lane
+            // is owned by the pipeline, not by RecordingModeManager, so gating on rmm
+            // would silently disable the self-heal whenever rmm is unavailable — exactly
+            // the degraded case where it matters most. Two volatile field reads, no lock.
+            if (pipeline != null) {
+                recordingStatus.put("camViewActive", pipeline.isCamViewActive());
+                recordingStatus.put("camViewTarget", pipeline.getCamViewTargetString());
+                // Blind-spot card state, so the overlay can RECONCILE its floating ✕ from
+                // the poll when a daemon edge broadcast is dropped — same self-heal the
+                // camView fields above provide. "bsCardShowing" is the composite predicate
+                // (BS program owns the lane AND the layer is shown), NOT bare visibility:
+                // the layer is shared with camview, so gating on visibility alone would
+                // reconcile the BS ✕ over a camera view. Target pairs with it so the
+                // overlay can suppress the ✕ on the cluster (a display it can't overlay).
+                recordingStatus.put("bsCardShowing", pipeline.isBlindSpotCardShowing());
+                recordingStatus.put("bsCardTarget", pipeline.getBsTargetString());
+                // On-screen rect of whichever program owns the lane, so the overlay can
+                // place its floating ✕ CLEAR of the card. The card's SurfaceControl layer
+                // sits above every app window, so a ✕ that overlaps it is composited
+                // underneath and invisible. Absent when no geometry is resolved yet — the
+                // overlay then falls back to its fixed corner.
+                //
+                // HEAD-UNIT ONLY. A cluster rect is in the 1920×720 cluster panel's space,
+                // and the overlay can't draw on that display (it suppresses the ✕ there), so
+                // publishing one would only leave wrong-space coordinates cached for a later
+                // head-unit show to position against. Keyed to the lane's CURRENT owner:
+                // bsTarget is the shared field camview overwrites, so it names whichever
+                // program the rect belongs to.
+                boolean laneOnCluster = "cluster".equals(pipeline.getBsTargetString());
+                int[] laneRect = laneOnCluster ? null : pipeline.getLaneGeomRect();
+                if (laneRect != null) {
+                    org.json.JSONObject lr = new org.json.JSONObject();
+                    lr.put("x", laneRect[0]); lr.put("y", laneRect[1]);
+                    lr.put("w", laneRect[2]); lr.put("h", laneRect[3]);
+                    recordingStatus.put("laneRect", lr);
+                }
+            }
             status.put("recordingStatus", recordingStatus);
         } catch (Exception e) {
             // Recording status not available
@@ -1379,7 +1406,83 @@ public class HttpServer {
             // Pre-record stats are diagnostic; failure here mustn't block /status.
         }
 
+        // Status assembly below the charging block can be substantial. Revalidate immediately before
+        // serialization so a stop or taper-close during that work cannot leak the earlier positive.
+        if (chargingPublication != null
+                && chargingPublication.hasPositivePresentation()
+                && !chargingPublication.isStillCurrent()) {
+            chargingPublication =
+                com.overdrive.app.charging.ChargingApiHandler
+                    .readLivePublication(
+                        com.overdrive.app.monitor.SocHistoryDatabase.getInstance());
+            status.put("charging", chargingPublication.toStatusJson());
+        }
         HttpResponse.sendJson(out, status.toString());
+    }
+
+    static boolean resolveChargingPlugged(
+            boolean charging,
+            com.overdrive.app.monitor.ChargingStateData.ChargingStatus status,
+            int gunState,
+            boolean vtolCharging) {
+        return com.overdrive.app.charging.ChargingApiHandler.resolvePlugged(
+                charging, status, gunState, vtolCharging);
+    }
+
+    static boolean resolveChargingActive(
+            boolean fusedCharging, boolean taperCharging,
+            com.overdrive.app.monitor.ChargingStateData.ChargingStatus status,
+            int gunState, boolean vtolCharging) {
+        if (gunState == 1 || gunState == 5 || vtolCharging
+                || status == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.DISCHARGING) {
+            return false;
+        }
+        if (status == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.READY
+                || status == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.FINISHED
+                || status == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.TERMINATED
+                || status == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.TIMEOUT
+                || status == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.ERROR) {
+            return status
+                    == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.FINISHED
+                    && taperCharging;
+        }
+        return fusedCharging;
+    }
+
+    static boolean resolveChargingFull(
+            com.overdrive.app.monitor.ChargingStateData.ChargingStatus status,
+            boolean taperCharging, int gunState, boolean vtolCharging) {
+        if (gunState == 1 || gunState == 5
+                || vtolCharging || taperCharging
+                || status == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.DISCHARGING) {
+            return false;
+        }
+        return status
+                == com.overdrive.app.monitor.ChargingStateData.ChargingStatus.FINISHED;
+    }
+
+    static JSONObject buildIdleChargingStatus() {
+        JSONObject charging = new JSONObject();
+        try {
+            charging.put("stateName", "Unavailable");
+            charging.put("status", "UNKNOWN");
+            charging.put("chargingPowerKW", 0);
+            charging.put("isDischarging", false);
+            charging.put("isError", false);
+            charging.put("isEstimated", false);
+            charging.put("powerSource", "none");
+            charging.put("powerObservedAtMs", 0);
+            charging.put("powerQuality",
+                    com.overdrive.app.monitor.ChargingStateData
+                            .PowerQuality.UNKNOWN.name());
+            charging.put("powerConfidence", 0);
+            charging.put("charging", false);
+            charging.put("plugged", false);
+            charging.put("full", false);
+            charging.put("fault", false);
+            charging.put("powerKw", 0);
+        } catch (Exception ignored) {}
+        return charging;
     }
 
     /**
@@ -1586,19 +1689,6 @@ public class HttpServer {
             GpuPipelineConfig.StreamingQuality q = GpuPipelineConfig.StreamingQuality.fromString(
                 StreamingApiHandler.getStreamingQuality());
             
-            // Prefer the daemon-static "last desired view mode" set by
-            // StreamingApiHandler whenever the user picks a view. The
-            // scaler's own getStreamViewMode() returns -1 after a prior
-            // disableStreaming nulled the scaler — which is exactly the
-            // mobile-browser idle-shutdown reconnect window we need to
-            // recover from. Falling back to scaler-state alone would lose
-            // the user's pick on every reconnect after the WS idle timer.
-            int savedViewMode = StreamingApiHandler.getLastDesiredViewMode();
-            if (savedViewMode < 0) {
-                int scalerView = pipeline.getStreamViewMode();
-                savedViewMode = scalerView >= 0 ? scalerView : 0;
-            }
-            
             // SOTA: Reuse existing encoder if streaming is already enabled at same quality.
             // Only restart if not enabled or quality changed.
             boolean needsRestart = !pipeline.isStreamingEnabled();
@@ -1630,6 +1720,15 @@ public class HttpServer {
             } else {
                 CameraDaemon.log("WS: Reusing existing stream encoder (no restart)");
             }
+
+            // Read intent only after a fresh scaler is ready. A user can
+            // select Front/All while this reconnect waits for initialization;
+            // a pre-restart DVR snapshot must not override that newer choice.
+            int savedViewMode = StreamingApiHandler.getLastDesiredViewMode();
+            if (savedViewMode < 0) {
+                int scalerView = pipeline.getStreamViewMode();
+                savedViewMode = scalerView >= 0 ? scalerView : 0;
+            }
             
             // Apply the saved view mode — EXCEPT view 6 (OEM Dashcam), which must wait
             // until the OEM re-route below actually succeeds. Setting uViewMode=6 while
@@ -1652,18 +1751,36 @@ public class HttpServer {
             // uOemActive==0 the shader fell through its OEM early-return into the
             // legacy 4-pano mosaic branch (uApaMode>1.5 catches it via the else-if
             // chain) — symptom: DVR view showed the 4-pano mosaic instead of the OEM
-            // dashcam. The view-6 set is now DEFERRED into the `rerouted` branch
-            // below, so the scaler only enters the OEM branch once the bind actually
-            // landed; until then it keeps showing the previous (valid) view.
+            // dashcam. The view-6 set is deferred until the OEM producer has
+            // published its first transform, so the scaler only enters the OEM
+            // branch with a valid frame; until then it keeps the prior view.
             // Re-route here so the WS source switches back to the OEM
             // encoder if the user's saved view is 6.
             if (savedViewMode == 6) {
-                boolean rerouted = CameraDaemon.routeStreamToOemDashcam();
-                CameraDaemon.log("WS: View 6 OEM re-route " + (rerouted ? "ok" : "skipped (OEM not ready)"));
-                if (rerouted) {
-                    // Bind landed (uOemActive will flip 1 on the next published matrix)
-                    // — NOW it's safe to switch the shader to the OEM branch.
-                    pipeline.setStreamViewMode(6);
+                boolean rerouted = false;
+                boolean viewActivated = false;
+                if (StreamingApiHandler.getLastDesiredViewMode() == 6) {
+                    rerouted = CameraDaemon.routeStreamToOemDashcam();
+                    if (StreamingApiHandler.getLastDesiredViewMode() == 6) {
+                        viewActivated = rerouted && pipeline.activateOemStreamViewWhenReady();
+                    }
+                }
+                // A newer HTTP selection may have arrived while OEM was
+                // binding. Undo the source bind before the first OEM frame
+                // can promote this stale reconnect back to view 6.
+                if (StreamingApiHandler.getLastDesiredViewMode() != 6) {
+                    int latestViewMode = StreamingApiHandler.getLastDesiredViewMode();
+                    pipeline.reattachOwnStreamCallback();
+                    if (latestViewMode >= 0) {
+                        pipeline.setStreamViewMode(latestViewMode);
+                    }
+                    rerouted = false;
+                    viewActivated = false;
+                }
+                CameraDaemon.log("WS: View 6 OEM re-route "
+                    + (rerouted ? (viewActivated ? "ok" : "waiting for first OEM frame")
+                        : "skipped (OEM not ready)"));
+                if (viewActivated) {
                     CameraDaemon.log("WS: View mode 6 (OEM Dashcam)");
                 }
                 // OEM not ready (cold-boot first-WS-open race) — kick the
@@ -1676,43 +1793,11 @@ public class HttpServer {
                 }
             }
             
-            HardwareEventRecorderGpu encoder = pipeline.getStreamEncoder();
-            if (encoder == null) {
-                CameraDaemon.log("WS: Stream encoder not available");
-                sendWebSocketClose(out, 1011, "Encoder not available");
-                return;
-            }
-            
-            // SOTA: Send cached SPS/PPS immediately from WebSocketStreamServer
-            // so the client decoder can initialize before the first frame arrives.
-            com.overdrive.app.streaming.WebSocketStreamServer wsServer = pipeline.getWebSocketServer();
-            boolean spsPpsSent = false;
-            if (wsServer != null) {
-                byte[] cachedSpsPps = wsServer.getCachedSpsPps();
-                if (cachedSpsPps != null && cachedSpsPps.length > 0) {
-                    try {
-                        sendWebSocketBinaryFrame(out, cachedSpsPps);
-                        spsPpsSent = true;
-                        CameraDaemon.log("WS: Sent cached SPS/PPS (" + cachedSpsPps.length + " bytes)");
-                    } catch (Exception e) {
-                        CameraDaemon.log("WS: Failed to send cached SPS/PPS: " + e.getMessage());
-                    }
-                }
-            }
-            
-            // SOTA: Request IDR keyframe so client gets a clean decode start.
-            // This is instant — no encoder restart needed.
-            encoder.requestSyncFrame();
-            CameraDaemon.log("WS: IDR keyframe requested");
-            
-            // Also request SPS/PPS re-send if we didn't have cached ones
-            if (!spsPpsSent) {
-                // The encoder will send SPS/PPS before the next IDR via the callback
-                CameraDaemon.log("WS: Waiting for SPS/PPS from encoder");
-            }
-            
             // Stream callback with congestion control
-            final boolean[] gotKeyframe = {spsPpsSent};  // Skip waiting if we already sent SPS/PPS
+            final java.util.concurrent.atomic.AtomicBoolean headersReceived =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+            final java.util.concurrent.atomic.AtomicBoolean gotKeyframe =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
             HardwareEventRecorderGpu.StreamCallback callback = new HardwareEventRecorderGpu.StreamCallback() {
                 @Override
                 public void onSpsPps(ByteBuffer sps, ByteBuffer pps) {
@@ -1722,18 +1807,21 @@ public class HttpServer {
                     sps.get(combined, 0, spsSize);
                     pps.get(combined, spsSize, ppsSize);
                     frameQueue.offer(combined);
-                    gotKeyframe[0] = true;
+                    gotKeyframe.set(false);
+                    headersReceived.set(true);
                     CameraDaemon.log("WS: Queued SPS/PPS (" + combined.length + " bytes)");
                 }
                 
                 @Override
                 public void onH264Packet(ByteBuffer data, android.media.MediaCodec.BufferInfo info) {
-                    // SOTA: Drop P-frames until we've sent SPS/PPS + IDR
-                    // Sending P-frames before the decoder has SPS/PPS causes decode failure
-                    if (!gotKeyframe[0]) {
+                    // Do not open the packet gate on SPS/PPS alone. A
+                    // late-joining client must receive headers followed by a
+                    // real IDR; otherwise the first P-frame references a
+                    // picture it never decoded.
+                    if (!headersReceived.get() || !gotKeyframe.get()) {
                         boolean isKeyframe = (info.flags & android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
-                        if (!isKeyframe) return;  // Drop P-frames before first keyframe
-                        gotKeyframe[0] = true;
+                        if (!headersReceived.get() || !isKeyframe) return;
+                        gotKeyframe.set(true);
                     }
                     
                     if (frameQueue.remainingCapacity() > 0) {
@@ -1745,13 +1833,18 @@ public class HttpServer {
                     // If queue is full, drop frame (congestion control)
                 }
             };
-            
-            encoder.setStreamCallback(callback);
-            CameraDaemon.log("WS: Stream callback registered");
-            
-            if (wsServer != null) {
-                wsServer.registerExternalClient();
+
+            com.overdrive.app.surveillance.GpuSurveillancePipeline
+                    .ExternalStreamClientSubscription subscription =
+                pipeline.registerExternalStreamClient(callback);
+            if (subscription == null) {
+                CameraDaemon.log("WS: Stream encoder was retired during subscription");
+                sendWebSocketClose(out, 1013, "Stream restarting");
+                return;
             }
+            HardwareEventRecorderGpu encoder = subscription.getEncoder();
+            encoder.requestSyncFrame();
+            CameraDaemon.log("WS: Stream callback registered; IDR keyframe requested");
             
             long lastFrameTime = System.currentTimeMillis();
             int frameCount = 0;
@@ -1797,12 +1890,8 @@ public class HttpServer {
                     }
                 }
             } finally {
-                if (wsServer != null) {
-                    wsServer.unregisterExternalClient();
-                }
+                pipeline.unregisterExternalStreamClient(subscription);
             }
-            
-            encoder.clearStreamCallback();
             CameraDaemon.log("WS: Stream ended (" + frameCount + " frames sent)");
             
         } catch (Exception e) {

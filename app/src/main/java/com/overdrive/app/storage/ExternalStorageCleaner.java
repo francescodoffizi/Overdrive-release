@@ -316,8 +316,9 @@ public class ExternalStorageCleaner {
             return (String) get.invoke(null, key, "");
         } catch (Exception e) {
             // Fall back to shell
+            Process p = null;
             try {
-                Process p = Runtime.getRuntime().exec(new String[]{"getprop", key});
+                p = Runtime.getRuntime().exec(new String[]{"getprop", key});
                 int exitCode = waitForBounded(p, GETPROP_TIMEOUT_MS);
                 if (exitCode != 0) {
                     if (exitCode == PROCESS_WAIT_FAILED) {
@@ -332,6 +333,16 @@ public class ExternalStorageCleaner {
                 }
             } catch (Exception e2) {
                 return "";
+            } finally {
+                // destroyForcibly() does not close the child's stdio, and the
+                // non-zero-exit path returns before the reader is opened — so
+                // without this the pipe FDs leak on every 60s discovery retry.
+                if (p != null) {
+                    try { p.getInputStream().close(); } catch (Exception ignored) {}
+                    try { p.getErrorStream().close(); } catch (Exception ignored) {}
+                    try { p.getOutputStream().close(); } catch (Exception ignored) {}
+                    try { p.destroyForcibly(); } catch (Throwable ignored) {}
+                }
             }
         }
     }
@@ -920,16 +931,29 @@ public class ExternalStorageCleaner {
         }
         
         // Try shell rm
+        Process p = null;
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"rm", "-f", file.getAbsolutePath()});
+            p = Runtime.getRuntime().exec(new String[]{"rm", "-f", file.getAbsolutePath()});
             int exitCode = waitForBounded(p, DELETE_TIMEOUT_MS);
             if (exitCode == PROCESS_WAIT_FAILED) {
                 logWarn("Shell delete timed out or was interrupted: " + file.getAbsolutePath());
+                // The unlink may still have landed before we killed the process. Ask
+                // the filesystem instead of reporting a false failure — the caller
+                // sums freed bytes from this return, so a wrong `false` makes it
+                // keep deleting while reporting "0 files deleted".
+                return !file.exists();
             }
             return exitCode == 0 && !file.exists();
         } catch (Exception e) {
             logWarn("Shell delete failed: " + e.getMessage());
             return false;
+        } finally {
+            if (p != null) {
+                try { p.getInputStream().close(); } catch (Exception ignored) {}
+                try { p.getErrorStream().close(); } catch (Exception ignored) {}
+                try { p.getOutputStream().close(); } catch (Exception ignored) {}
+                try { p.destroyForcibly(); } catch (Throwable ignored) {}
+            }
         }
     }
     

@@ -11,7 +11,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <!--
       Per-page bottom-tab manifest. Five tabs grouped by user task:
         General   — mode toggle + schedule + deterrent (when/how surveillance runs)
@@ -33,9 +33,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <style>
         /* Per-camera detection toggles — 2-column on tablets, single column on
            narrow phones so the toggle never runs out of room next to the label. */
@@ -183,6 +181,25 @@
                             <div class="setting-control">
                                 <label class="toggle-switch">
                                     <input type="checkbox" id="survKeepUsbPower" onchange="SurvSettings.toggleKeepUsbPower()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- Parked cellular keep-alive. Default OFF (opt-in): on some
+                             models the data module sleeps a while after the car is
+                             switched off, which drops cellular while WiFi survives.
+                             When ON the daemon re-asserts the mobile-data master switch
+                             each parked tick. Only armed if mobile data was already on
+                             at park entry, so it never enables data by itself. -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.mobile_data_keepalive">Keep mobile data awake while parked</div>
+                                <div class="setting-desc" data-i18n="surveillance.mobile_data_keepalive_desc">On some models the mobile data module goes to sleep a while after the car is switched off, so the car drops off the network while parked. Turn this on to keep it awake. It is recommended to leave this off unless you actually lose cellular while parked, because keeping the connection alive uses extra battery and mobile data. Only takes effect if mobile data is already on when you park. Takes effect the next time the car is switched off.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="survMobileDataKeepAlive" onchange="SurvSettings.toggleMobileDataKeepAlive()">
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
@@ -1375,6 +1392,12 @@
                             <span id="survLimitMin" data-i18n="surveillance.limit_min_default">100 MB</span>
                             <span id="survLimitMax" data-i18n="surveillance.limit_max_default">100 GB</span>
                         </div>
+                        <!-- Combined-limit advisory — see recording.html for the
+                             rationale; same shared renderer, same server payload. -->
+                        <div class="storage-fallback-banner" id="survBudgetBanner" style="display:none;" role="status" aria-live="polite">
+                            <span class="sd-status-dot" style="background:#f0a020;"></span>
+                            <span data-budget-text></span>
+                        </div>
                     </div>
                 </div>
 
@@ -1486,9 +1509,10 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/surveillance.js?v=survfix1"></script>
+    <script src="../shared/storage-budget.js?v=8"></script>
+    <script src="../shared/surveillance.js?v=survtoggle1"></script>
     <script src="../shared/safe-locations.js"></script>
     <script src="../shared/roi-schedule.js"></script>
     <script>

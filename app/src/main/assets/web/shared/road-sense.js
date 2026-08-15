@@ -11,6 +11,7 @@
  * Config keys (the `roadSense` UCM section; RoadSenseConfig.kt reads these
  * exact names):
  *   enabled, warnEnabled, warnMode ("visual"|"audio"|"both"),
+ *   warnAudioChannel ("navigation"|"media"|"voice"|"alarm"), warnAudioVolume (10..100),
  *   warnLeadSeconds (default 4, 2..8), warnConfidenceThreshold (0..1, default 0),
  *   warnSeverityMinor / warnSeverityModerate / warnSeveritySevere,
  *   calibrationMode, crowdUpload, crowdDownload, syncWorkerUrl.
@@ -28,6 +29,10 @@ BYD.roadSense = {
         enabled: false,
         warnEnabled: true,
         warnMode: 'both',
+        // Chime audio channel: 'navigation' (car guidance stream) | 'media' | 'voice' | 'alarm'.
+        warnAudioChannel: 'navigation',
+        // Severe-alert ceiling; minor and moderate are scaled below it daemon-side.
+        warnAudioVolume: 75,
         warnLeadSeconds: 4,
         // Stored 0..1 in the config; the slider works in whole percent (0..100).
         warnConfidenceThreshold: 0,
@@ -80,6 +85,14 @@ BYD.roadSense = {
         // (side/rear). Separate from the recording pipeline's dewarp; 0 = off.
         // Ignored for the merged 'both' view.
         bsRectifyStrength: 0,
+        // Conditional display: the card only appears while the vehicle speed is
+        // inside [bsMinSpeedKmh, bsMaxSpeedKmh] and, optionally, not in reverse.
+        // 0 means "no bound on that end", so 0/0 = any speed (the shipping
+        // behaviour). Always km/h on the wire — the daemon gate compares in km/h;
+        // the UI only converts for the mph hint. bsSuppressReverse defaults false.
+        bsMinSpeedKmh: 0,
+        bsMaxSpeedKmh: 0,
+        bsSuppressReverse: false,
         // On-screen card size (% of panel width) + corner. Persisted as a preset
         // (not absolute px) so it stays correct across portrait/landscape rotation.
         // PER-TARGET: the head-unit set (bsSizePct/bsCorner) and the cluster set
@@ -123,8 +136,18 @@ BYD.roadSense = {
         // write is mid-flight). Cheap and keeps the page in sync with the
         // native settings UI / daemon-side changes.
         const self = this;
+
+        // The speed hint / validation error is written imperatively via textContent, so
+        // it has no data-i18n for hydrate() to re-translate on an in-page language
+        // switch. Re-render it from the new catalog when the locale changes.
+        try {
+            if (window.BYD && BYD.i18n && typeof BYD.i18n.onChange === 'function') {
+                BYD.i18n.onChange(function () { self._bsPaintSpeedHint(); });
+            }
+        } catch (e) { /* no i18n runtime — the hint keeps its English fallback */ }
         document.addEventListener('visibilitychange', function () {
             if (document.visibilityState === 'hidden') {
+                self._flushWarnVolumeOnExit();
                 // CRITICAL: tearing the page away (tab switch / background) while
                 // a debug preview is active would otherwise leave debugPreview=true
                 // pinned in UCM — the native service keeps the HW decoder warm and
@@ -140,8 +163,14 @@ BYD.roadSense = {
         });
         // pagehide/beforeunload cover hard navigation away from the page (the
         // visibilitychange('hidden') above covers background/tab-switch).
-        window.addEventListener('pagehide', function () { if (self._bsPreviewActive) self.bsPreviewStop(); });
-        window.addEventListener('beforeunload', function () { if (self._bsPreviewActive) self.bsPreviewStop(); });
+        window.addEventListener('pagehide', function () {
+            self._flushWarnVolumeOnExit();
+            if (self._bsPreviewActive) self.bsPreviewStop();
+        });
+        window.addEventListener('beforeunload', function () {
+            self._flushWarnVolumeOnExit();
+            if (self._bsPreviewActive) self.bsPreviewStop();
+        });
     },
 
     async reload() {
@@ -159,6 +188,20 @@ BYD.roadSense = {
                 if (typeof rs.enabled === 'boolean') c.enabled = rs.enabled;
                 if (typeof rs.warnEnabled === 'boolean') c.warnEnabled = rs.warnEnabled;
                 if (rs.warnMode) c.warnMode = String(rs.warnMode).toLowerCase();
+                // Unknown/absent value keeps the 'navigation' default, matching the
+                // daemon's own clamp (RoadSenseAudioChannels.normalize).
+                if (rs.warnAudioChannel) {
+                    const ch = String(rs.warnAudioChannel).toLowerCase();
+                    if (['navigation', 'media', 'voice', 'alarm'].indexOf(ch) >= 0) {
+                        c.warnAudioChannel = ch;
+                    }
+                }
+                if (typeof rs.warnAudioVolume === 'number') {
+                    c.warnAudioVolume = this._clamp(Math.round(rs.warnAudioVolume), 10, 100);
+                    if (!this._warnVolumeSavePromise && this._warnVolumePending == null) {
+                        this._warnVolumeConfirmed = c.warnAudioVolume;
+                    }
+                }
 
                 if (typeof rs.warnLeadSeconds === 'number') {
                     let v = Math.round(rs.warnLeadSeconds);
@@ -187,6 +230,13 @@ BYD.roadSense = {
                 // hidden on an explicit stored false.
                 if (typeof rs.overlayVisible === 'boolean') c.overlayVisible = rs.overlayVisible;
             }
+            // Any successful RESPONSE means the persisted speed window is now known —
+            // including one whose config has no `blindspot` section at all, which
+            // legitimately means "both bounds absent = 0/0 = any". Set the flag here,
+            // OUTSIDE the section guard: keying it to the section's presence would leave
+            // it stuck false after one transient failure on such a config, permanently
+            // disabling Apply (the flag is only ever cleared by a failed load).
+            if (data && data.success && data.config) this._bsSpeedLoaded = true;
             // Blind Spot lives in its own top-level section.
             if (data && data.success && data.config && data.config.blindspot) {
                 const bs = data.config.blindspot;
@@ -214,6 +264,35 @@ BYD.roadSense = {
                 if (typeof bs.rearRoll === 'number') c.bsRearRoll = this._clamp(bs.rearRoll, -0.4, 0.4);
                 if (typeof bs.rearPitch === 'number') c.bsRearPitch = this._clamp(bs.rearPitch, -0.4, 0.4);
                 if (typeof bs.rectifyStrength === 'number') c.bsRectifyStrength = this._clamp(bs.rectifyStrength, 0, 100);
+                // Conditional display. Anything outside 1..BS_SPEED_MAX collapses to 0
+                // ("any") — the same normalisation the daemon gate applies, so the UI
+                // can never display a bound the daemon quietly ignores.
+                c.bsMinSpeedKmh = this._bsNormSpeed(bs.minSpeedKmh);
+                c.bsMaxSpeedKmh = this._bsNormSpeed(bs.maxSpeedKmh);
+                // An INVERTED stored pair is unsatisfiable, so the daemon gate ignores
+                // it entirely (shows at any speed). Paths that bypass the POST validator
+                // can still produce one — a hand-edited config backup restore, chiefly —
+                // so mirror the gate here rather than painting a window that isn't in
+                // force. Displaying 0/0 tells the truth: the gate is disarmed.
+                if (c.bsMinSpeedKmh > 0 && c.bsMaxSpeedKmh > 0
+                        && c.bsMinSpeedKmh > c.bsMaxSpeedKmh) {
+                    c.bsMinSpeedKmh = 0;
+                    c.bsMaxSpeedKmh = 0;
+                }
+                // Mirror org.json optBoolean, which the daemon reads this with: it also
+                // accepts the STRINGS "true"/"false" (case-insensitive). A typeof-only
+                // check would render the toggle OFF while the gate was actually armed —
+                // reachable via a hand-edited config or a restored backup.
+                // NO trim(): org.json compares with equalsIgnoreCase and does NOT trim,
+                // so " true" is FALSE to the daemon. Trimming here would show the toggle
+                // ON for a disarmed gate — re-creating the very mismatch this closes.
+                if (typeof bs.suppressInReverse === 'boolean') {
+                    c.bsSuppressReverse = bs.suppressInReverse;
+                } else if (typeof bs.suppressInReverse === 'string') {
+                    var sir = bs.suppressInReverse.toLowerCase();
+                    if (sir === 'true') c.bsSuppressReverse = true;
+                    else if (sir === 'false') c.bsSuppressReverse = false;
+                }
                 // Display target ('head_unit' default | 'cluster').
                 if (bs.target === 'cluster' || bs.target === 'head_unit') c.bsTarget = bs.target;
                 // Cluster layout (size profile opcode 29/30/31).
@@ -252,6 +331,13 @@ BYD.roadSense = {
             }
         } catch (e) {
             console.warn('RoadSense: failed to load config:', e);
+            // The speed window is the only control written as an ATOMIC PAIR, so a
+            // failed load is uniquely dangerous here: the inputs would paint the 0/0
+            // defaults ("Any speed") while the daemon still holds e.g. maxSpeedKmh=200,
+            // and applying an edit to one bound would POST both and silently erase the
+            // other. Mark the pair unknown so bsApplySpeedWindow refuses to commit
+            // until a successful load establishes the real values.
+            this._bsSpeedLoaded = false;
         }
     },
 
@@ -337,6 +423,14 @@ BYD.roadSense = {
         document.querySelectorAll('#rsWarnModeBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === c.warnMode));
 
+        // Chime audio channel.
+        const chanSel = document.getElementById('rsWarnChannel');
+        if (chanSel) chanSel.value = c.warnAudioChannel;
+
+        const volumeSlider = document.getElementById('rsWarnVolumeSlider');
+        if (volumeSlider) volumeSlider.value = c.warnAudioVolume;
+        this._setWarnVolumeLabel(c.warnAudioVolume);
+
         // Lead-time slider.
         const leadSlider = document.getElementById('rsWarnLeadSlider');
         if (leadSlider) leadSlider.value = c.warnLeadSeconds;
@@ -388,6 +482,19 @@ BYD.roadSense = {
         // Fisheye slider value + row visibility (single-camera modes only).
         this._bsSetSlider('bsRectify', 'bsRectifyVal', c.bsRectifyStrength);
         this._bsReflectRectifyRow(c.bsMergeMode);
+        // Conditional display: baseline the group as saved so Apply starts disabled
+        // (same staged-edit model as the display/placement group below), then paint —
+        // but PRESERVE a pending edit. updateUI also runs from reload() on
+        // visibilitychange, and on a head unit the WebView is backgrounded constantly
+        // (reverse camera, launcher, calls). Repainting unconditionally would silently
+        // discard numbers the user had typed but not yet applied — including the
+        // retry state left by a failed Apply. Keep the typed values and leave Apply
+        // live; a fresh page load has no pending edit, so it paints normally.
+        this._setChecked('bsSuppressReverse', c.bsSuppressReverse);
+        var speedPending = this._bsSpeedPending();
+        this._bsSpeedSaved = { min: c.bsMinSpeedKmh, max: c.bsMaxSpeedKmh };
+        if (!speedPending) this._bsPaintSpeedWindow();
+        this._bsMarkSpeedDirty();
         // Live preview is a NATIVE on-car window — only meaningful in the in-app
         // WebView. Hide the preview controls on a tunnel/browser (no AndroidBridge),
         // where tapping them would do nothing. Sliders + Apply still work remotely
@@ -471,7 +578,10 @@ BYD.roadSense = {
             card.classList.toggle('rs-gated', !masterOn);
             // Block pointer + keyboard interaction on the controls when gated,
             // without touching their checked/value (so state survives a toggle).
-            card.querySelectorAll('input, button, .btn-toggle').forEach(ctrl => {
+            // `select` included: the chime-channel dropdown is the first <select> in a
+            // GATED card (the other two live in the exempt map/blindspot tabs), so
+            // without it that control stayed live inside a dimmed card.
+            card.querySelectorAll('input, button, select, .btn-toggle').forEach(ctrl => {
                 if (!masterOn) {
                     ctrl.setAttribute('disabled', 'disabled');
                     ctrl.setAttribute('aria-disabled', 'true');
@@ -499,6 +609,11 @@ BYD.roadSense = {
 
     _setConfLabel(pct) {
         const el = document.getElementById('rsWarnConfValue');
+        if (el) el.textContent = pct + '%';
+    },
+
+    _setWarnVolumeLabel(pct) {
+        const el = document.getElementById('rsWarnVolumeValue');
         if (el) el.textContent = pct + '%';
     },
 
@@ -591,6 +706,92 @@ BYD.roadSense = {
         } else { el.checked = !on; this._toastFailed(); }
     },
 
+    /**
+     * Audio channel the chime plays on. "navigation" puts it on the car's guidance
+     * stream (STREAM_NAVI) so it ducks music; the daemon clamps anything unknown
+     * back to navigation, so the four options here are the whole supported set.
+     */
+    async setWarnChannel(channel) {
+        const allowed = ['navigation', 'media', 'voice', 'alarm'];
+        if (allowed.indexOf(channel) < 0) return;
+        const prev = this.config.warnAudioChannel;
+        if (channel === prev) return;
+        const el = document.getElementById('rsWarnChannel');
+        const requestId = (this._warnChannelRequestId || 0) + 1;
+        this._warnChannelRequestId = requestId;
+        if (el) el.disabled = true;
+        try {
+            const ok = await this._save({ warnAudioChannel: channel });
+            // A programmatic change can overlap this request even though the picker is
+            // disabled. Only its newest completion may update the UI or live snapshot.
+            if (requestId !== this._warnChannelRequestId) return;
+            if (ok) {
+                this.config.warnAudioChannel = channel;
+                this._toastSaved();
+            } else {
+                // Revert the <select> to the still-persisted value.
+                if (el) el.value = prev;
+                this._toastFailed();
+            }
+        } finally {
+            if (requestId === this._warnChannelRequestId && el) el.disabled = false;
+        }
+    },
+
+    /**
+     * Play the chime now via POST /api/roadsense/test-chime. The live cue only fires
+     * while DRIVING on approach to a stored hazard, so this is the only way to hear it
+     * (and check the channel's volume) without driving past a mapped bump. The daemon
+     * uses the same playRawResource call the live cue does.
+     *
+     * The response means DISPATCHED, not "you heard it" — playback is async in the app
+     * process — so the toast says "sent" rather than claiming playback was confirmed.
+     */
+    async testChime() {
+        const btn = document.getElementById('rsTestChimeBtn');
+        if (btn) btn.disabled = true;
+        try {
+            // Commit a just-dragged value before previewing it. A failed write restores
+            // the last confirmed value, so the test can never imply that an unsaved
+            // level will be used by live warnings.
+            await this._flushWarnVolumeSave();
+            const channelSelect = document.getElementById('rsWarnChannel');
+            const channel = channelSelect ? channelSelect.value : this.config.warnAudioChannel;
+            const volumeSlider = document.getElementById('rsWarnVolumeSlider');
+            const volume = volumeSlider
+                ? this._clamp(parseInt(volumeSlider.value, 10) || 75, 10, 100)
+                : this.config.warnAudioVolume;
+            const resp = await fetch('/api/roadsense/test-chime', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                // Send the channel the dropdown is CURRENTLY showing, so testing a channel
+                // the user just picked doesn't depend on the save having landed first.
+                body: JSON.stringify({
+                    // Preview the severe-alert ceiling the slider controls; minor and
+                    // moderate live warnings are intentionally scaled below this level.
+                    severity: 'severe',
+                    channel: channel,
+                    volumePercent: volume
+                })
+            });
+            const data = await resp.json();
+            if (data && data.dispatched) {
+                // "sent", NOT "playing": the daemon dispatches asynchronously and only ever
+                // reports that the command was issued, never that a sound came out. Claiming
+                // "playing" here would assert something no layer has confirmed.
+                this._toast('road_sense.warn_test_playing',
+                    'Chime sent at the selected RoadSense volume', 'success');
+            } else {
+                this._toast('road_sense.warn_test_failed', 'Could not send the chime', 'error');
+            }
+        } catch (e) {
+            console.warn('RoadSense: test chime failed:', e);
+            this._toast('road_sense.warn_test_failed', 'Could not send the chime', 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    },
+
     async setWarnMode(mode) {
         if (mode !== 'visual' && mode !== 'audio' && mode !== 'both') return;
         const prev = this.config.warnMode;
@@ -625,6 +826,151 @@ BYD.roadSense = {
         this.config.warnConfidenceThreshold = t;
         this._setConfLabel(pct);
         this._debounceSave('warnConfidenceThreshold', { warnConfidenceThreshold: t });
+    },
+
+    updateWarnVolume(value) {
+        let pct = parseInt(value, 10);
+        if (isNaN(pct)) pct = 75;
+        pct = this._clamp(pct, 10, 100);
+        this.config.warnAudioVolume = pct;
+        this._setWarnVolumeLabel(pct);
+        this._warnVolumePending = pct;
+        this._warnVolumePendingSequence = this._nextWarnVolumeSequence();
+        this._warnVolumeExitFlushed = false;
+        if (this._warnVolumeTimer) clearTimeout(this._warnVolumeTimer);
+        const self = this;
+        this._warnVolumeTimer = setTimeout(function () {
+            self._warnVolumeTimer = null;
+            self._flushWarnVolumeSave();
+        }, 250);
+    },
+
+    _warnVolumeWriter() {
+        if (this._warnVolumeWriterId) return this._warnVolumeWriterId;
+        let id = '';
+        try {
+            const words = new Uint32Array(4);
+            window.crypto.getRandomValues(words);
+            for (let i = 0; i < words.length; i++) {
+                id += ('00000000' + words[i].toString(16)).slice(-8);
+            }
+        } catch (e) {
+            // Legacy WebViews without getRandomValues still get a page-unique token.
+            for (let i = 0; i < 4; i++) {
+                const word = ((Math.random() * 0x100000000) ^ Date.now() ^ (i * 2654435761)) >>> 0;
+                id += ('00000000' + word.toString(16)).slice(-8);
+            }
+        }
+        this._warnVolumeWriterId = id;
+        return id;
+    },
+
+    _nextWarnVolumeSequence() {
+        this._warnVolumeSequence = (this._warnVolumeSequence || 0) + 1;
+        return this._warnVolumeSequence;
+    },
+
+    /** Range-input change fires when pointer/keyboard adjustment is committed. */
+    commitWarnVolume(value) {
+        this.updateWarnVolume(value);
+        return this._flushWarnVolumeSave();
+    },
+
+    /**
+     * Serialize volume writes, remember the last confirmed value, and restore it when
+     * persistence fails. A newer drag that lands while a request is in flight is kept
+     * pending and written immediately after the first request settles.
+     */
+    async _flushWarnVolumeSave() {
+        if (this._warnVolumeTimer) {
+            clearTimeout(this._warnVolumeTimer);
+            this._warnVolumeTimer = null;
+        }
+        if (this._warnVolumeSavePromise) {
+            await this._warnVolumeSavePromise;
+            return this._flushWarnVolumeSave();
+        }
+        if (this._warnVolumePending == null) return true;
+
+        const value = this._warnVolumePending;
+        const sequence = this._warnVolumePendingSequence || this._nextWarnVolumeSequence();
+        this._warnVolumePending = null;
+        this._warnVolumePendingSequence = null;
+        this._warnVolumeInFlightValue = value;
+        this._warnVolumeInFlightSequence = sequence;
+        const request = this._save({
+            warnAudioVolume: value,
+            warnAudioVolumeWriter: this._warnVolumeWriter(),
+            warnAudioVolumeSequence: sequence
+        });
+        this._warnVolumeSavePromise = request;
+        const ok = await request;
+        this._warnVolumeSavePromise = null;
+        this._warnVolumeInFlightValue = null;
+        this._warnVolumeInFlightSequence = null;
+
+        const hasNewerValue = this._warnVolumePending != null;
+        if (ok) {
+            this._warnVolumeConfirmed = value;
+            if (!hasNewerValue) this._toastSaved();
+        } else if (!hasNewerValue) {
+            const confirmed = (typeof this._warnVolumeConfirmed === 'number')
+                ? this._warnVolumeConfirmed : 75;
+            this.config.warnAudioVolume = confirmed;
+            const slider = document.getElementById('rsWarnVolumeSlider');
+            if (slider) slider.value = confirmed;
+            this._setWarnVolumeLabel(confirmed);
+            this._toastFailed();
+        }
+
+        if (hasNewerValue) return this._flushWarnVolumeSave();
+        return ok;
+    },
+
+    /**
+     * Page teardown can cancel a normal fetch before the 250 ms debounce fires.
+     * sendBeacon is supported by the legacy head-unit WebView and carries same-origin
+     * cookies; keepalive fetch is a fallback for browsers that reject the beacon.
+     */
+    _flushWarnVolumeOnExit() {
+        if (this._warnVolumeTimer) {
+            clearTimeout(this._warnVolumeTimer);
+            this._warnVolumeTimer = null;
+        }
+        const value = this._warnVolumePending != null
+            ? this._warnVolumePending : this._warnVolumeInFlightValue;
+        const sequence = this._warnVolumePending != null
+            ? this._warnVolumePendingSequence : this._warnVolumeInFlightSequence;
+        // visibilitychange, pagehide and beforeunload can all fire for one exit.
+        // Send only the newest value once; otherwise the first handler clears pending
+        // and a later handler can beacon the older in-flight value over it.
+        if (value == null || sequence == null || this._warnVolumeExitFlushed) return;
+        this._warnVolumeExitFlushed = true;
+        // Keep the pending value intact so a page that was only backgrounded can finish
+        // the normal serialized write after any older in-flight request settles.
+        this._flushWarnVolumeSave();
+        const body = JSON.stringify({
+            section: 'roadSense',
+            data: {
+                warnAudioVolume: value,
+                warnAudioVolumeWriter: this._warnVolumeWriter(),
+                warnAudioVolumeSequence: sequence
+            }
+        });
+        try {
+            if (navigator.sendBeacon) {
+                const payload = new Blob([body], { type: 'application/json' });
+                if (navigator.sendBeacon('/api/settings/unified', payload)) return;
+            }
+        } catch (e) { /* fall through to keepalive fetch */ }
+        try {
+            fetch('/api/settings/unified', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: body,
+                keepalive: true
+            });
+        } catch (e) { /* page is already leaving */ }
     },
 
     // Detection-sensitivity multiplier band — MUST mirror EventDetector's
@@ -686,8 +1032,8 @@ BYD.roadSense = {
                 // Toast on BOTH outcomes so a slider gives the same "Saved"
                 // confirmation as the toggles. Debounced (only fires ~250 ms after
                 // the user stops dragging), so a continuous drag yields one toast on
-                // settle, not one per input event. Shared by the lead-time,
-                // confidence, and detection-sensitivity sliders.
+                // settle, not one per input event. Shared by lead-time, confidence,
+                // and detection-sensitivity; volume has confirmed-value rollback above.
                 if (ok) self._toastSaved(); else self._toastFailed();
             });
         }, 250);
@@ -1165,9 +1511,14 @@ BYD.roadSense = {
                 body: JSON.stringify({ section: 'blindspot', data: delta })
             });
             const data = await resp.json();
+            // Stash the server's reason so a caller can show it instead of the generic
+            // "Save failed" — the daemon rejects e.g. an inverted speed window with a
+            // localized explanation that would otherwise be dropped here.
+            this._bsLastError = (data && !data.success && data.error) ? String(data.error) : null;
             return !!(data && data.success);
         } catch (e) {
             console.warn('BlindSpot: save failed:', e);
+            this._bsLastError = null;
             return false;
         } finally {
             this._writing = false;
@@ -1264,6 +1615,276 @@ BYD.roadSense = {
         const ok = await this._bsSave({ rectifyStrength: n });
         if (ok) { this._toastSaved(); }
         else { this.config.bsRectifyStrength = prev; this._bsSetSlider('bsRectify', 'bsRectifyVal', prev); this._toastFailed(); }
+    },
+
+    // ── Conditional display: speed window + reverse suppression ────────────────
+    // The speed pair is STAGED (typed freely, validated + committed on Apply) rather
+    // than saved per keystroke: the two bounds constrain each other, so a half-typed
+    // "6" on the way to "60" would momentarily be an inverted window — which the
+    // daemon would reject and, worse, which reads as a real setting if persisted.
+    // The reverse toggle is independent, so it saves immediately like the others.
+
+    /** Upper limit for a speed bound; mirrors UnifiedConfigManager.BS_SPEED_MAX_KMH
+     *  and the inputs' max attribute. */
+    BS_SPEED_MAX: 300,
+
+    /** Normalise a STORED bound to a whole 1..BS_SPEED_MAX, or 0 for "any". Matches
+     *  UnifiedConfigManager.clampBsSpeedBound so the UI and the daemon gate agree on
+     *  exactly which values are armed. Truncates toward zero rather than rounding,
+     *  because the daemon reads the same key with optInt() — which truncates — so a
+     *  hand-edited fractional 29.6 must display as the 29 the gate will use, not 30. */
+    _bsNormSpeed(v) {
+        var n = (typeof v === 'number') ? Math.trunc(v) : parseInt(v, 10);
+        if (isNaN(n) || n <= 0 || n > this.BS_SPEED_MAX) return 0;
+        return n;
+    },
+
+    /** True when the speed inputs hold an edit the user hasn't applied yet — i.e. they
+     *  differ from the last-saved snapshot. Used to protect that edit from a repaint on
+     *  the visibilitychange reload. Returns false before the first paint (no snapshot
+     *  yet) and false for a blank field matching a stored 0, so a fresh load is never
+     *  treated as pending. */
+    _bsSpeedPending() {
+        var s = this._bsSpeedSaved;
+        if (!s) return false;
+        var lo = document.getElementById('bsMinSpeed');
+        var hi = document.getElementById('bsMaxSpeed');
+        if (!lo || !hi) return false;
+        var v = this._bsReadSpeedInputs();
+        // NaN (mid-typing garbage) counts as pending: it is the user's in-progress text.
+        if (isNaN(v.min) || isNaN(v.max)) return true;
+        var norm = function (n) { return (n === null) ? 0 : n; };
+        return norm(v.min) !== s.min || norm(v.max) !== s.max;
+    },
+
+    /** Paint both speed inputs from config + refresh the mph/any hint. */
+    _bsPaintSpeedWindow() {
+        var lo = document.getElementById('bsMinSpeed');
+        var hi = document.getElementById('bsMaxSpeed');
+        if (lo) lo.value = String(this.config.bsMinSpeedKmh);
+        if (hi) hi.value = String(this.config.bsMaxSpeedKmh);
+        this._bsPaintSpeedHint();
+    },
+
+    /** Read the two inputs as typed. Returns null for a genuinely EMPTY field ("any"),
+     *  NaN for anything unusable, else the integer. */
+    _bsReadSpeedInputs() {
+        var read = function (id) {
+            var el = document.getElementById(id);
+            if (!el) return null;
+            var raw = String(el.value).trim();
+            if (raw === '') {
+                // CAREFUL: for <input type=number> the value-sanitization algorithm
+                // replaces any string that isn't a "valid floating-point number" with
+                // "" — so "+60", "1e" and a lone "-" all read as blank while the box
+                // still SHOWS the text. Treating that as "any" would silently apply 0
+                // for something the user can see is not 0. Distinguish via validity:
+                // a truly empty field is valid (no constraint here is required),
+                // whereas sanitized-away text reports badInput.
+                var bad = el.validity && el.validity.badInput;
+                return bad ? NaN : null;
+            }
+            // "-0" is a valid number-input value and is numerically the 0 ("any")
+            // sentinel, so accept it rather than reporting a range error that names no
+            // cause. Any other sign/format still falls through to NaN.
+            if (raw === '-0') return 0;
+            return /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
+        };
+        return { min: read('bsMinSpeed'), max: read('bsMaxSpeed') };
+    },
+
+    /** Echo the entered window in plain language (and in mph when the user's display
+     *  unit is miles) so the km/h-only inputs aren't a trap for mph drivers. When the
+     *  typed pair is INVALID this shows the reason instead: Apply is disabled in that
+     *  state, so without it the row would silently describe a window the user didn't
+     *  type (NaN coerced to "any") with no hint as to why nothing can be saved. */
+    _bsPaintSpeedHint() {
+        var el = document.getElementById('bsSpeedConv');
+        if (!el) return;
+        var v = this._bsReadSpeedInputs();
+        var err = this._bsSpeedError(v);
+        // is-error colours the shared hint slot so a validation message doesn't read as
+        // just another muted description line. Cleared on every valid repaint below.
+        // classList is guarded only because this helper is also driven from the
+        // i18n onChange callback, which can fire before the card is in the DOM.
+        if (err) {
+            el.textContent = err;
+            if (el.classList) el.classList.add('is-error');
+            return;
+        }
+        if (el.classList) el.classList.remove('is-error');
+        var lo = (v.min === null) ? 0 : v.min;
+        var hi = (v.max === null) ? 0 : v.max;
+        if (!lo && !hi) {
+            el.textContent = this._t('road_sense.bs_speed_any', 'Any speed — the view always appears on the indicator.');
+            return;
+        }
+        // BYD.units.mode starts at 'km' and is only set from /status.distanceUnit by
+        // core.js's refreshStatus, which races this page's config fetch. Remember which
+        // mode we painted with and re-paint once (below) if it later changes, so an mph
+        // driver never keeps a km/h hint just because the config landed first.
+        var mi = (window.BYD && BYD.units && BYD.units.mode === 'mi');
+        this._bsHintMi = mi;
+        this._bsArmUnitWatch();
+        var fmt = function (kmh) {
+            if (!kmh) return null;
+            return mi ? (Math.round(kmh * 0.621371) + ' mph') : (kmh + ' km/h');
+        };
+        var a = fmt(lo), b = fmt(hi);
+        if (a && b) el.textContent = this._t('road_sense.bs_speed_between', 'Shown between {a} and {b}.', { a: a, b: b });
+        else if (a) el.textContent = this._t('road_sense.bs_speed_above', 'Shown at {a} and above.', { a: a });
+        else el.textContent = this._t('road_sense.bs_speed_below', 'Shown up to {b}.', { b: b });
+    },
+
+    /** Watch for a late BYD.units.mode change (core.js's /status fetch resolving after
+     *  ours) and re-paint the speed hint once it lands. Short, self-cancelling poll —
+     *  the unit arrives on the first status refresh or not at all, so this is bounded
+     *  rather than a permanent ticker. Idempotent: only one watch runs at a time. */
+    _bsArmUnitWatch() {
+        if (this._bsUnitWatch) return;
+        var self = this;
+        var tries = 0;
+        this._bsUnitWatch = setInterval(function () {
+            var mi = (window.BYD && BYD.units && BYD.units.mode === 'mi');
+            var settled = (mi !== self._bsHintMi);
+            if (settled || ++tries >= 20) {          // ~10s ceiling
+                clearInterval(self._bsUnitWatch);
+                self._bsUnitWatch = null;
+                if (settled) self._bsPaintSpeedHint();
+            }
+        }, 500);
+    },
+
+    /** i18n with an English fallback + {name} interpolation applied to BOTH, so the
+     *  hint stays correct before the catalog loads (t() returns null then). */
+    _t(key, fallback, vars) {
+        var s = null;
+        try { s = (window.BYD && BYD.i18n && BYD.i18n.t) ? BYD.i18n.t(key, vars) : null; } catch (e) { s = null; }
+        if (!s || s === key) s = fallback;
+        if (vars) {
+            for (var n in vars) {
+                if (vars.hasOwnProperty(n)) s = s.split('{' + n + '}').join(vars[n]);
+            }
+        }
+        return s;
+    },
+
+    /** Live-refresh the hint + Apply state while typing. Nothing persists here. */
+    bsSpeedInput() {
+        this._bsPaintSpeedHint();
+        this._bsMarkSpeedDirty();
+    },
+
+    /** Enable Apply only when the typed pair is BOTH valid and different from what's
+     *  saved — so a partially-typed or inverted window can't be committed at all. */
+    _bsMarkSpeedDirty() {
+        var v = this._bsReadSpeedInputs();
+        var s = this._bsSpeedSaved || { min: 0, max: 0 };
+        var valid = this._bsSpeedError(v) === null;
+        // A blank field means "any" (0) for the dirty compare, matching Apply.
+        var lo = (v.min === null) ? 0 : v.min;
+        var hi = (v.max === null) ? 0 : v.max;
+        var dirty = valid && (lo !== s.min || hi !== s.max);
+        var btn = document.getElementById('bsSpeedApplyBtn');
+        if (btn) { btn.disabled = !dirty; btn.classList.toggle('has-changes', dirty); }
+    },
+
+    /** @return an error message, or null when the pair is committable. Mirrors the
+     *  daemon's validateBsSpeedWindow (range + no inverted window). */
+    _bsSpeedError(v) {
+        var vals = [v.min, v.max];
+        for (var i = 0; i < vals.length; i++) {
+            var n = vals[i];
+            if (n === null) continue;   // blank = "any"
+            if (isNaN(n) || n < 0 || n > this.BS_SPEED_MAX) {
+                return this._t('road_sense.bs_speed_err_range',
+                    'Enter a whole number between 0 and {max} km/h (0 = any).',
+                    { max: this.BS_SPEED_MAX });
+            }
+        }
+        var lo = (v.min === null) ? 0 : v.min;
+        var hi = (v.max === null) ? 0 : v.max;
+        // 0 disarms an end, so only a both-armed pair can be inverted.
+        if (lo > 0 && hi > 0 && lo > hi) {
+            return this._t('road_sense.bs_speed_err_order',
+                'The maximum must not be lower than the minimum.');
+        }
+        return null;
+    },
+
+    /** Commit the staged speed window in ONE save. Both keys always go together so
+     *  the daemon validates the pair it will actually store (a single-key POST would
+     *  be merged against the persisted sibling). */
+    async bsApplySpeedWindow() {
+        // Refuse to commit the atomic pair when the last load failed: the inputs would
+        // be showing defaults, not the persisted window, so writing both keys could
+        // erase a bound the user never saw. Tell them to reload rather than guess.
+        if (this._bsSpeedLoaded === false) {
+            var m = this._t('road_sense.bs_speed_not_loaded',
+                'Could not read the saved speed range — reload the page before changing it.');
+            if (window.BYD && BYD.utils && BYD.utils.toast) BYD.utils.toast(m, 'error');
+            return;
+        }
+        var v = this._bsReadSpeedInputs();
+        var err = this._bsSpeedError(v);
+        if (err) {
+            // Already localized by _bsSpeedError — pass it straight to the toast
+            // rather than through _toast(key,...), which would re-look-up a key.
+            if (window.BYD && BYD.utils && BYD.utils.toast) BYD.utils.toast(err, 'error');
+            return;
+        }
+        var lo = (v.min === null) ? 0 : v.min;
+        var hi = (v.max === null) ? 0 : v.max;
+        var btn = document.getElementById('bsSpeedApplyBtn');
+        if (btn) btn.disabled = true;
+        var prevMin = this.config.bsMinSpeedKmh, prevMax = this.config.bsMaxSpeedKmh;
+        this.config.bsMinSpeedKmh = lo;
+        this.config.bsMaxSpeedKmh = hi;
+        const ok = await this._bsSave({ minSpeedKmh: lo, maxSpeedKmh: hi });
+        if (ok) {
+            // Re-assert from the validated LOCALS, never from this.config: a reload()
+            // can land during the await (a concurrent _bsSave's finally clears the
+            // shared _writing flag, re-opening the visibilitychange reload gate) and
+            // rewrite config back to the pre-save values. Painting from config then
+            // showed 0/0 with Apply lit as "unsaved" while 60/120 was actually
+            // persisted — and that Apply would silently revert the save the toast had
+            // just confirmed. The locals are what the daemon accepted, so they are the
+            // truth for both the inputs and the dirty baseline.
+            this.config.bsMinSpeedKmh = lo;
+            this.config.bsMaxSpeedKmh = hi;
+            this._bsSpeedSaved = { min: lo, max: hi };
+            this._bsPaintSpeedWindow();   // echo the normalised values back
+            this._bsMarkSpeedDirty();
+            this._toastSaved();
+        } else {
+            // Roll back the in-memory config but LEAVE THE INPUTS as typed: repainting
+            // from config here would erase the user's numbers and (since they'd then
+            // match the saved snapshot) grey out Apply, leaving no way to retry. Same
+            // choice as bsApplyDisplay's failure path — stay dirty so Apply is live.
+            this.config.bsMinSpeedKmh = prevMin;
+            this.config.bsMaxSpeedKmh = prevMax;
+            this._bsMarkSpeedDirty();
+            if (btn) btn.disabled = false;
+            // Prefer the daemon's own (localized) reason over "Save failed" — it names
+            // the exact rejection, e.g. a cross-key inverted window the client couldn't
+            // see because only one bound was in this delta.
+            if (this._bsLastError && window.BYD && BYD.utils && BYD.utils.toast) {
+                BYD.utils.toast(this._bsLastError, 'error');
+            } else {
+                this._toastFailed();
+            }
+        }
+    },
+
+    /** Hide the card while reverse gear is engaged. Independent of the speed window,
+     *  so it persists immediately (no Apply). */
+    async bsToggleSuppressReverse() {
+        var el = document.getElementById('bsSuppressReverse');
+        if (!el) return;
+        var on = el.checked;
+        const ok = await this._bsSave({ suppressInReverse: on });
+        if (ok) { this.config.bsSuppressReverse = on; this._toastSaved(); }
+        else { el.checked = !on; this._toastFailed(); }
     },
 
     /** Select a SIDE's on-screen card rotation: a fixed quarter turn (0/90/180/270)

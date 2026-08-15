@@ -77,6 +77,7 @@ class SurveillanceConfigManager(
         private const val KEY_DISCARD_EMPTY_BRIGHT = "discardEmptyBrightMotionEvents"
         private const val KEY_DISCARD_EMPTY_NIGHT = "discardEmptyMotionAtNight"
         private const val KEY_MOTION_SALIENCE = "motionSalienceEnabled"
+        private const val KEY_POST_PARK_VIGILANCE = "postParkVigilanceEnabled"
     }
     
     /**
@@ -213,6 +214,7 @@ class SurveillanceConfigManager(
             put(KEY_DISCARD_EMPTY_BRIGHT, config.isDiscardEmptyBrightMotionEvents)
             put(KEY_DISCARD_EMPTY_NIGHT, config.isDiscardEmptyMotionAtNight)
             put(KEY_MOTION_SALIENCE, config.isMotionSalienceEnabled)
+            put(KEY_POST_PARK_VIGILANCE, config.isPostParkVigilanceEnabled)
             put(KEY_SHADOW_FILTER, config.shadowFilterMode)
 
             // Per-quadrant overrides (null = inherit). Persisted as a single
@@ -310,6 +312,7 @@ class SurveillanceConfigManager(
         if (json.has(KEY_DISCARD_EMPTY_BRIGHT)) config.setDiscardEmptyBrightMotionEvents(json.optBoolean(KEY_DISCARD_EMPTY_BRIGHT, false))
         if (json.has(KEY_DISCARD_EMPTY_NIGHT)) config.setDiscardEmptyMotionAtNight(json.optBoolean(KEY_DISCARD_EMPTY_NIGHT, false))
         if (json.has(KEY_MOTION_SALIENCE)) config.setMotionSalienceEnabled(json.optBoolean(KEY_MOTION_SALIENCE, false))
+        if (json.has(KEY_POST_PARK_VIGILANCE)) config.setPostParkVigilanceEnabled(json.optBoolean(KEY_POST_PARK_VIGILANCE, true))
         if (json.has(KEY_SHADOW_FILTER)) config.setShadowFilterMode(json.optInt(KEY_SHADOW_FILTER, 2))
         
         // Per-quadrant overrides

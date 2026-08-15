@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="settings_navigation_title">Navigation</string>
+    <string name="settings_navigation_subtitle">Choose which optional destinations stay pinned in the left navigation.</string>
+    <string name="settings_navigation_fixed_hint">Dashboard, Settings, and About always remain available.</string>
+    <string name="settings_navigation_reset">Reset to default</string>
+    <string name="settings_navigation_reset_done">Navigation restored</string>
+    <string name="settings_navigation_shown">shown</string>
+    <string name="settings_navigation_hidden">hidden</string>
+    <string name="settings_navigation_option_state">%1$s, %2$s in navigation</string>
+</resources>

@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 
 import com.overdrive.app.ui.daemon.DaemonStartupManager;
 
@@ -17,8 +18,9 @@ import com.overdrive.app.ui.daemon.DaemonStartupManager;
  * This gives our app the highest possible process priority — same tier as the
  * keyboard or phone call — preventing the 24-hour kill cycle on newer BYD firmware.
  *
- * The service itself is a no-op for accessibility events. Its sole purpose is
- * process keep-alive. The foreground notification provides user visibility.
+ * Accessibility events are used only to cache the active package for conditional
+ * key mappings; no window content is inspected. The foreground notification
+ * provides user visibility.
  *
  * Enable via ADB (one-time):
  *   settings put secure enabled_accessibility_services com.overdrive.app/com.overdrive.app.services.KeepAliveAccessibilityService
@@ -97,6 +99,26 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         }
         instance = this;
 
+        // Seed the conditional-keymap foreground cache in case the active window
+        // was already open before this service connected. Future window changes
+        // update the same cache from onAccessibilityEvent().
+        AccessibilityNodeInfo root = null;
+        try {
+            root = getRootInActiveWindow();
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
+                    root != null ? stringValue(root.getPackageName()) : null);
+        } catch (Throwable t) {
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+            Log.w(TAG, "Unable to seed active package: " + t.getMessage());
+        } finally {
+            if (root != null) {
+                try {
+                    root.recycle();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+
         // Prime the key-mapping snapshot off-thread so the first hardware key
         // press already has its bindings (onKeyEvent never reads disk itself).
         try {
@@ -118,7 +140,22 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // No-op — we don't process accessibility events
+        if (event == null
+                || event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            return;
+        }
+        try {
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
+                    stringValue(event.getPackageName()));
+        } catch (Throwable t) {
+            // Foreground detection is advisory. Unknown must fail open so a
+            // conditional mapping never suppresses the vehicle's default key action.
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+        }
+    }
+
+    private static String stringValue(CharSequence value) {
+        return value != null ? value.toString() : null;
     }
 
     /**

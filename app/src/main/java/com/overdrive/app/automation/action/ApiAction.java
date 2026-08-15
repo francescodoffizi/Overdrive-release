@@ -123,6 +123,11 @@ public class ApiAction extends BaseAction {
      * @param automationAction The AutomationAction with the variables needed to trigger this action
      */
     public void trigger(AutomationAction automationAction) {
+        triggerWithResult(automationAction);
+    }
+
+    @Override
+    public boolean triggerWithResult(AutomationAction automationAction) {
         // Path substitution is NOT JSON-escaped (it's a URL, and existing values are
         // simple tokens/ints); body substitution IS JSON-escaped so a free-text value
         // (e.g. the Speak message with a quote/backslash/newline) can't break the JSON.
@@ -131,13 +136,46 @@ public class ApiAction extends BaseAction {
         HttpServer server = CameraDaemon.getHttpServer();
         if (server != null && path != null && body != null) {
             String response = server.automationApiRequest(getMethod(), path, body);
-            // The response was previously discarded, so an endpoint that answered
-            // {"success":false,"error":...} — or was refused by the automation allowlist
-            // (null) — looked identical to one that worked. That is what made the
-            // screenshot/system actions "do nothing" with nothing to diagnose from.
-            logFailure(path, response);
+            boolean success = responseSucceeded(response);
+            logFailure(path, response, success);
+            return success;
         } else {
             logger.error("Could not trigger API action (" + getMethod() + "," + path + "," + body + ")");
+            return false;
+        }
+    }
+
+    /**
+     * Interpret the in-process HTTP response for queue/result semantics. A routed 2xx response is
+     * successful unless its JSON body explicitly says otherwise. Async {@code starting:true}
+     * responses are accepted because the command was admitted and intentionally completes later.
+     */
+    static boolean responseSucceeded(String response) {
+        if (response == null) return false;
+        String trimmed = response.trim();
+        if (trimmed.startsWith("HTTP/")) {
+            int firstSpace = trimmed.indexOf(' ');
+            if (firstSpace < 0 || trimmed.length() < firstSpace + 4) return false;
+            try {
+                int status = Integer.parseInt(trimmed.substring(firstSpace + 1, firstSpace + 4));
+                if (status < 200 || status >= 300) return false;
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+        int start = response.indexOf('{');
+        if (start < 0) return true;
+        try {
+            org.json.JSONObject json = new org.json.JSONObject(response.substring(start));
+            if (json.optBoolean("starting", false)) return true;
+            if (json.has("success") && !json.optBoolean("success", false)) return false;
+            String status = json.optString("status", "");
+            return !"error".equalsIgnoreCase(status)
+                    && !"failed".equalsIgnoreCase(status)
+                    && !"failure".equalsIgnoreCase(status);
+        } catch (Exception e) {
+            // A 2xx handler is allowed to return a non-JSON body.
+            return true;
         }
     }
 
@@ -147,7 +185,8 @@ public class ApiAction extends BaseAction {
      * non-JSON body, no {@code success} key, or an async {@code "starting":true} — is left
      * alone, so this never turns a working action into a scary log line.
      */
-    private void logFailure(String path, String response) {
+    private void logFailure(String path, String response, boolean success) {
+        if (success) return;
         if (response == null) {
             // null covers three cases in automationApiRequest — allowlist refusal, no handler
             // matched the path, and a handler that threw — so don't name just one of them.
@@ -159,18 +198,16 @@ public class ApiAction extends BaseAction {
             // The in-process call returns the body only, but be tolerant of a leading
             // preamble by starting at the first brace.
             int start = response.indexOf('{');
-            if (start < 0 || !response.contains("\"success\"")) return;
-            org.json.JSONObject json = new org.json.JSONObject(response.substring(start));
-            // "starting":true is an async "come back later" (camera-view/pano cold start), not a
-            // failure — warning on it would flag a normally-working automation.
-            if (json.optBoolean("starting", false)) return;
-            if (!json.optBoolean("success", true)) {
-                logger.warn("API action " + getMethod() + " " + path + " failed: "
-                        + json.optString("error", "(no reason given)"));
+            if (start < 0) {
+                logger.warn("API action " + getMethod() + " " + path + " failed");
+                return;
             }
+            org.json.JSONObject json = new org.json.JSONObject(response.substring(start));
+            logger.warn("API action " + getMethod() + " " + path + " failed: "
+                    + json.optString("error",
+                    json.optString("message", json.optString("status", "(no reason given)"))));
         } catch (Exception e) {
-            // Not a JSON envelope we understand — nothing reliable to report.
-            logger.debug("API action " + path + " response not parsed: " + e.getMessage());
+            logger.warn("API action " + getMethod() + " " + path + " failed");
         }
     }
 

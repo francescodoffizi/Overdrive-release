@@ -19,7 +19,7 @@
     /* Chart palette — accents used by data visualizations / legends.
        Mid-luminance hues that read OK on either theme; the light-theme
        overlay below tweaks them for AA contrast on light surfaces. */
-    --chart-line-1: #00D4AA; /* original brand teal kept as data-viz accent */
+    --chart-line-1: var(--primary); /* original brand teal kept as data-viz accent */
     --chart-line-2: #0EA5E9;
     --chart-warning: #fbbf24;
     --chart-soh: #a855f7;
@@ -65,7 +65,7 @@
 :root[data-theme="light"] {
     --bg-glass: rgba(247, 250, 247, 0.88);
 
-    --chart-line-1: #00876C;
+    --chart-line-1: #007A62;
     --chart-line-2: #00658F;
     --chart-warning: #B45309;
     --chart-soh: #7C3AED;
@@ -106,7 +106,7 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html { font-size: 16px; -webkit-text-size-adjust: 100%; }
 body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-family: var(--family-sans);
     background: var(--bg-base);
     color: var(--text-primary);
     line-height: 1.5;
@@ -122,6 +122,66 @@ body {
 a { color: inherit; text-decoration: none; }
 button { font-family: inherit; cursor: pointer; border: none; background: none; }
 input, select { font-family: inherit; }
+
+/* Chrome 58-compatible focus baseline. Keep :focus as the fallback instead
+   of relying only on :focus-visible, which the head-unit WebView lacks. */
+button:focus,
+a:focus,
+input:focus,
+select:focus,
+textarea:focus,
+[tabindex]:focus {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+/* Shared asynchronous-state primitives. Page-specific rules may refine
+   layout, but color, typography, and spacing stay consistent. */
+.empty-state,
+.loading-state,
+.error-state {
+    padding: var(--card-pad);
+    text-align: center;
+    color: var(--on-surface-variant);
+}
+
+.empty-icon,
+.error-state .state-icon {
+    width: 40px;
+    height: 40px;
+    margin: 0 auto 12px;
+    color: var(--outline);
+}
+
+.empty-title,
+.state-title {
+    color: var(--on-surface);
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: 0;
+}
+
+.empty-text,
+.empty-state-hint,
+.state-message {
+    max-width: 46ch;
+    margin: 6px auto 0;
+    color: var(--on-surface-variant);
+    font-size: 13px;
+}
+
+.error-state {
+    color: var(--status-danger);
+    background: var(--status-danger-container);
+    border: 1px solid var(--status-danger);
+    border-radius: var(--radius-md);
+}
+
+.loading-state .spinner,
+.loading > .spinner {
+    border-color: var(--outline-variant);
+    border-top-color: var(--primary);
+}
 
 /* === APP LAYOUT === */
 .app-layout {
@@ -145,6 +205,23 @@ input, select { font-family: inherit; }
     transition: transform 0.3s ease;
     overflow-y: auto;
     overflow-x: hidden;
+}
+
+[dir="rtl"] .sidebar {
+    left: auto;
+    right: 0;
+    border-right: 0;
+    border-left: 1px solid var(--border-subtle);
+}
+
+[dir="rtl"] .main-content {
+    margin-left: 0;
+    margin-right: var(--sidebar-width);
+}
+
+[dir="rtl"] .setting-control {
+    margin-left: 0;
+    margin-right: 24px;
 }
 
 .sidebar::-webkit-scrollbar {
@@ -185,8 +262,8 @@ input, select { font-family: inherit; }
 
 .sidebar-close {
     display: none;
-    width: 36px;
-    height: 36px;
+    width: 48px;
+    height: 48px;
     border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: var(--text-secondary);
@@ -253,7 +330,7 @@ input, select { font-family: inherit; }
 .brand-name {
     font-size: 18px;
     font-weight: 700;
-    letter-spacing: -0.02em;
+    letter-spacing: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -293,6 +370,7 @@ input, select { font-family: inherit; }
     align-items: center;
     gap: 12px;
     padding: 12px 16px;
+    min-height: 48px;
     border-radius: var(--radius-md);
     color: var(--text-secondary);
     font-size: 14px;
@@ -511,7 +589,7 @@ input, select { font-family: inherit; }
 /* === PAGE HEADER === */
 .page-header {
     height: var(--header-height);
-    padding: 0 32px;
+    padding: 0 var(--page-pad-x);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -525,7 +603,7 @@ input, select { font-family: inherit; }
 .page-title {
     font-size: 20px;
     font-weight: 600;
-    letter-spacing: -0.02em;
+    letter-spacing: 0;
 }
 
 .header-actions {
@@ -550,8 +628,8 @@ input, select { font-family: inherit; }
 /* === PAGE BODY === */
 .page-body {
     flex: 1;
-    padding: 32px;
-    padding-bottom: calc(32px + 80px); /* Account for fixed footer */
+    padding: var(--page-pad-y) var(--page-pad-x);
+    padding-bottom: calc(var(--page-pad-y) + 80px); /* Account for fixed footer */
     overflow-y: auto;
     overflow-x: hidden;
 }
@@ -566,7 +644,7 @@ input, select { font-family: inherit; }
     z-index: 0;
 }
 
-.card + .card { margin-top: 24px; }
+.card + .card { margin-top: var(--card-gap); }
 
 /* RoadSense: a dependent card whose master switch is OFF. Dimmed + non-interactive
    so its toggles don't read as live while they have no effect (the master_enable
@@ -605,8 +683,36 @@ input, select { font-family: inherit; }
 }
 .text-input:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* `.text-input` on a <select> (RoadSense cluster-size / chime-channel pickers):
+   drop the native control chrome and draw the same chevron the other select
+   classes use, so it reads as one system rather than raw WebView chrome. */
+select.text-input {
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    padding-right: 32px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a1a1aa' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+}
+[dir="rtl"] select.text-input {
+    padding-right: 14px;
+    padding-left: 32px;
+    background-position: left 12px center;
+}
+:root[data-theme="light"] select.text-input {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23586068' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+}
+/* The <option> list is OS-rendered; only background/color are themeable. Without
+   these it renders as a white popup against the dark surface. */
+select.text-input option {
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    padding: 8px;
+}
+
 .card-header {
-    padding: 20px 24px;
+    padding: var(--card-pad);
     border-bottom: 1px solid var(--border-subtle);
     display: flex;
     align-items: center;
@@ -627,10 +733,10 @@ input, select { font-family: inherit; }
     color: var(--brand-primary);
 }
 
-.card-body { padding: 24px; }
+.card-body { padding: var(--card-pad); }
 
 .card-footer {
-    padding: 16px 24px;
+    padding: 16px var(--card-pad);
     border-top: 1px solid var(--border-subtle);
     background: var(--bg-elevated);
 }
@@ -705,18 +811,23 @@ input, select { font-family: inherit; }
 .toggle-switch {
     position: relative;
     display: inline-block;
-    width: 48px;
-    height: 28px;
+    width: 52px;
+    height: 48px;
 }
 
-.toggle-switch input { opacity: 0; width: 0; height: 0; }
+.toggle-switch input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+}
 
 .toggle-slider {
     position: absolute;
-    top: 0;
+    top: 10px;
     left: 0;
     right: 0;
-    bottom: 0;
+    bottom: 10px;
     background: var(--bg-hover);
     border-radius: var(--radius-full);
     transition: 0.3s;
@@ -740,6 +851,11 @@ input, select { font-family: inherit; }
     background: var(--brand-primary);
 }
 
+.toggle-switch input:focus + .toggle-slider {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
 .toggle-switch input:checked + .toggle-slider::before {
     transform: translateX(20px);
 }
@@ -758,6 +874,7 @@ input, select { font-family: inherit; }
 
 .btn-toggle {
     padding: 8px 12px;
+    min-height: 48px;
     font-size: 13px;
     font-weight: 500;
     color: var(--text-secondary);
@@ -774,7 +891,7 @@ input, select { font-family: inherit; }
 
 .btn-toggle.active {
     background: var(--brand-primary);
-    color: #000;
+    color: var(--on-primary);
 }
 
 /* === BUTTONS === */
@@ -783,6 +900,7 @@ input, select { font-family: inherit; }
     align-items: center;
     justify-content: center;
     padding: 10px 20px;
+    min-height: 48px;
     font-size: 14px;
     font-weight: 500;
     border-radius: var(--radius-md);
@@ -812,7 +930,7 @@ input, select { font-family: inherit; }
 
 .btn-primary {
     background: var(--brand-primary);
-    color: #000;
+    color: var(--on-primary);
 }
 
 .btn-primary:hover { filter: brightness(1.1); }
@@ -832,6 +950,21 @@ input, select { font-family: inherit; }
     display: flex;
     align-items: center;
     gap: 12px;
+}
+
+.slider-track-control {
+    width: 120px;
+}
+
+.slider-track-control .slider {
+    display: block;
+    width: 100%;
+}
+
+.slider-track-control .slider-range-labels {
+    box-sizing: border-box;
+    margin-top: 6px;
+    width: 100%;
 }
 
 .slider-value {
@@ -892,6 +1025,12 @@ input, select { font-family: inherit; }
     transition: border-color 0.15s ease;
 }
 
+[dir="rtl"] .select-control {
+    padding-right: 12px;
+    padding-left: 32px;
+    background-position: left 10px center;
+}
+
 .select-control:hover {
     border-color: var(--border-default);
 }
@@ -928,7 +1067,19 @@ input, select { font-family: inherit; }
     color: var(--brand-primary);
 }
 
-.checkbox-item input { display: none; }
+.checkbox-item input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    opacity: 0;
+    overflow: hidden;
+}
+
+.checkbox-item:focus-within {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
 
 /* === TELEMETRY OVERLAY FIELD PICKER ===========================
  * Chip grid for choosing which telemetry fields burn into recordings.
@@ -1404,7 +1555,7 @@ select.md-input ~ .md-label {
 }
 
 .status-badge.active {
-    background: rgba(34, 197, 94, 0.15);
+    background: var(--status-success-container);
     color: var(--success);
 }
 
@@ -1414,8 +1565,29 @@ select.md-input ~ .md-label {
 }
 
 .status-badge.errored {
-    background: rgba(239, 68, 68, 0.15);
+    background: var(--status-danger-container);
     color: var(--danger);
+}
+
+/* Explicit reduced-motion opt-in works on the Chrome 58 WebView. The media
+   query below provides the standard automatic behavior on newer engines. */
+:root[data-reduced-motion="true"] *,
+:root[data-reduced-motion="true"] *::before,
+:root[data-reduced-motion="true"] *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 1ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 1ms !important;
+        scroll-behavior: auto !important;
+    }
 }
 
 /* === TIMELINE === */
@@ -1436,7 +1608,7 @@ select.md-input ~ .md-label {
 }
 
 .timeline-pre { background: rgba(14, 165, 233, 0.3); flex: 0.5; }
-.timeline-event { background: var(--brand-primary); color: #000; flex: 0.2; }
+.timeline-event { background: var(--brand-primary); color: var(--on-primary); flex: 0.2; }
 .timeline-post { background: rgba(245, 158, 11, 0.3); flex: 0.5; }
 
 .timeline-labels {
@@ -1966,7 +2138,7 @@ select.md-input ~ .md-label {
     background: rgba(15, 25, 25, 0.8);
     border: 1px solid rgba(0,212,170,0.25);
     border-radius: 14px;
-    color: #00D4AA;
+    color: var(--primary);
     cursor: pointer;
     box-shadow: 0 4px 20px rgba(0,0,0,0.4), 0 0 30px rgba(0,212,170,0.1);
     transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
@@ -1982,14 +2154,14 @@ select.md-input ~ .md-label {
 }
 
 .btn-map-float.btn-directions {
-    background: linear-gradient(135deg, #00D4AA 0%, #00a080 100%);
+    background: linear-gradient(135deg, var(--primary) 0%, #00a080 100%);
     border: none;
     color: #000;
     box-shadow: 0 4px 20px rgba(0,212,170,0.4);
 }
 
 .btn-map-float.btn-directions:hover {
-    background: linear-gradient(135deg, #00ffcc 0%, #00D4AA 100%);
+    background: linear-gradient(135deg, #00ffcc 0%, var(--primary) 100%);
     transform: scale(1.08);
     box-shadow: 0 6px 30px rgba(0,212,170,0.5);
 }
@@ -2154,7 +2326,7 @@ select.md-input ~ .md-label {
 
 .map-container .leaflet-control-zoom a {
     background: rgba(15, 25, 25, 0.85);
-    color: #00D4AA;
+    color: var(--primary);
     border: none;
     border-bottom: 1px solid rgba(0,212,170,0.1);
     font-weight: 600;
@@ -2715,7 +2887,7 @@ select.md-input ~ .md-label {
 .stream-badge.live {
     background: rgba(34, 197, 94, 0.2);
     border-color: rgba(34, 197, 94, 0.4);
-    color: #22c55e;
+    color: var(--status-success);
 }
 
 .stream-badge.connecting {
@@ -2732,7 +2904,7 @@ select.md-input ~ .md-label {
 }
 
 .status-dot.live {
-    background: #22c55e;
+    background: var(--status-success);
     animation: pulse 1.5s infinite;
 }
 
@@ -2913,10 +3085,28 @@ select.md-input ~ .md-label {
     .setting-row {
         flex-direction: column;
         align-items: flex-start;
-        gap: 12px;
     }
-    
-    .setting-control { margin-left: 0; }
+    /* Sibling-margin stand-in for the `gap` above: flex `gap` is Chrome 84+ and is
+       silently ignored on the head-unit WebView, so the label and its control butted
+       together with zero space once the row stacked. */
+    .setting-row > * + * { margin-top: 12px; }
+
+    /* Stacked, the control owns the full row — so let a <select> fill it instead of
+       sitting at its 120px minimum with a ragged right edge. `.setting-control` is
+       flex-shrink:0 with a 24px lead margin for the SIDE-BY-SIDE layout; neither
+       applies once stacked, and keeping them clipped long localized labels (the card
+       is overflow:hidden, so the excess was cut off rather than scrolled). */
+    .setting-control {
+        margin-left: 0;
+        margin-right: 0;
+        width: 100%;
+        min-width: 0;
+    }
+    .setting-control > .select-control,
+    .setting-control > select,
+    .setting-control > .text-input { width: 100%; box-sizing: border-box; }
+    /* Let the label text wrap rather than force the row wider than the card. */
+    .setting-row > .setting-info { min-width: 0; max-width: 100%; }
     
     .pip-container {
         bottom: 80px;
@@ -3332,7 +3522,7 @@ select.md-input ~ .md-label {
     font-family: 'JetBrains Mono', monospace;
     font-size: 14px;
     font-weight: 700;
-    color: #22c55e;
+    color: var(--status-success);
 }
 
 /* === FUEL CARD (PHEV only) === */
@@ -3359,7 +3549,7 @@ select.md-input ~ .md-label {
     font-family: 'JetBrains Mono', monospace;
     font-size: 18px;
     font-weight: 700;
-    color: #F59E0B;
+    color: var(--status-warning);
 }
 .fuel-bar-track {
     height: 6px;
@@ -3369,7 +3559,7 @@ select.md-input ~ .md-label {
 }
 .fuel-bar-fill {
     height: 100%;
-    background: linear-gradient(90deg, #F59E0B, #FBBF24);
+    background: linear-gradient(90deg, var(--status-warning), #FBBF24);
     border-radius: 3px;
     transition: width 0.6s ease;
 }
@@ -3543,7 +3733,7 @@ select.md-input ~ .md-label {
     font-weight: 600;
     color: var(--text-primary);
     line-height: 1.2;
-    letter-spacing: -0.005em;
+    letter-spacing: 0;
 }
 
 .mode-desc {
@@ -3918,7 +4108,7 @@ select.md-input ~ .md-label {
     margin: 0 0 18px 0;
     font-size: 18px;
     font-weight: 600;
-    letter-spacing: -0.01em;
+    letter-spacing: 0;
     color: var(--text-primary);
 }
 .soh-modal-label {
@@ -3979,22 +4169,33 @@ select.md-input ~ .md-label {
     color: var(--text-primary);
 }
 
+/* A WRAPPING button row: the community detail modal can show five buttons
+   (Edit / Unpublish / Report / Close / Add). flex `gap` is Chrome 84+ and is
+   silently ignored on the head-unit WebView, so the buttons butted together
+   there. Negative-inset shim (not sibling margins) because it must also space
+   the second and later LINES; the -4px inset keeps the row flush with the
+   modal's padding and folds into the 22px top margin (18 + 4). */
 .soh-modal-actions {
     display: flex;
     justify-content: flex-end;
-    gap: 8px;
-    margin-top: 22px;
+    margin: 18px -4px 0;
     flex-wrap: wrap;
 }
+.soh-modal-actions > * { margin: 4px; }
 
 /* Stacked-button fallback on narrow viewports so labels don't crash. */
 @media (max-width: 480px) {
+    /* Stacked: no horizontal shim to cancel, so drop the container's side insets
+       too — otherwise the buttons hang 4px past the modal on both edges. */
     .soh-modal-actions {
         flex-direction: column-reverse;
-        gap: 8px;
+        margin: 18px 0 0;
     }
-    .soh-modal-actions .btn { width: 100%; }
+    .soh-modal-actions > * { margin: 4px 0; }
+    .soh-modal-actions .btn { width: auto; align-self: stretch; }
 }
+/* No [dir="rtl"] mirror needed: the shim uses a symmetric `margin: 4px`, and
+   flex-direction/justify-content already flip with the document direction. */
 
 #sohCapacityRow:hover {
     background: var(--bg-hover);
@@ -4021,4 +4222,3 @@ select.md-input ~ .md-label {
     font-weight: 600;
     margin-top: 4px;
 }
-

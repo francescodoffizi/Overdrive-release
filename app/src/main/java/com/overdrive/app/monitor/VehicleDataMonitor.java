@@ -40,26 +40,17 @@ public class VehicleDataMonitor {
 
     // Throttle for the charging-power resolution diagnostic (see getChargingState).
     private volatile long lastChargePowerLogMs = 0L;
+    /** FINISHED epoch whose bounded taper-admission window has closed. */
+    private volatile long closedTaperFinishedAtMs = 0L;
 
+    /** A co-observed motor-bus flow is live only inside the detector's own freshness window. */
+    private static final long TAPER_PACK_FLOW_FRESHNESS_MS = 15_000L;
     /**
-     * Last observed {@code clusterChargePowerKw} and when it last CHANGED, used only by the
-     * PHEV CV-taper admission in {@link #getChargingState()}. The cluster feature id keeps
-     * answering its last in-band value after the gun comes out and nothing else ages that field,
-     * so "in band" alone would keep a finished session alive forever; requiring recent MOVEMENT
-     * turns a frozen reading back into the sentinel it is. {@code volatile} — getChargingState()
-     * is called from HTTP, MQTT, ABRP and daemon threads.
+     * Direct charge-rate observations may bridge one 90-second parked poll plus scheduler margin.
+     * This ages the hardware observation, not value movement: a steady PHEV rate remains valid when
+     * the collector successfully observes the same value again.
      */
-    /** Guards the taper freshness pair below — read-then-write must be atomic across the many
-     *  threads that call getChargingState(). */
-    private final Object taperLock = new Object();
-    private volatile double lastTaperClusterKw = Double.NaN;
-    private volatile long lastTaperClusterChangeMs = 0L;
-    /**
-     * How long a CV-taper reading may go unchanged before it stops counting as live. A real taper
-     * keeps moving as it decays; a value pinned for this long is the sticky-getter artifact.
-     * Generous enough to tolerate the 90 s parked poll cadence plus quantisation plateaus.
-     */
-    private static final long TAPER_CLUSTER_TTL_MS = 10 * 60_000L;
+    static final long CHARGING_POWER_OBSERVATION_MAX_AGE_MS = 120_000L;
 
     /** Compact formatter for a possibly-NaN candidate value in the diag line. */
     private static String fmt(double v) {
@@ -140,6 +131,42 @@ public class VehicleDataMonitor {
             return c.isInitialized() ? c.getData() : null;
         } catch (Exception e) { return null; }
     }
+
+    /** One stable charging publication: the exact vehicle snapshot used to derive its state. */
+    public static final class ChargingSnapshot {
+        private final BydVehicleData vehicleData;
+        private final ChargingStateData chargingState;
+
+        private ChargingSnapshot(BydVehicleData vehicleData, ChargingStateData chargingState) {
+            this.vehicleData = vehicleData;
+            this.chargingState = chargingState;
+        }
+
+        public BydVehicleData getVehicleData() {
+            return vehicleData;
+        }
+
+        public ChargingStateData getChargingState() {
+            return chargingState;
+        }
+    }
+
+    /**
+     * Fence the current FINISHED epoch after its taper tail ends (or fails to appear during the
+     * bounded probe window). Later stale cluster/flow callbacks cannot reopen charging presentation.
+     */
+    public void closeTaperAdmissionForCurrentFinishedState() {
+        BydVehicleData vd = getVd();
+        if (vd != null
+                && vd.chargingState == ChargingStateData.CHARGING_BATTERY_STATE_CHARG_FINISH
+                && vd.chargingStateAtMs > 0
+                && vd.chargingStateAtMs != closedTaperFinishedAtMs) {
+            try (ChargingDetector.PublicationMutation ignored =
+                         ChargingDetector.beginPublicationMutation()) {
+                closedTaperFinishedAtMs = vd.chargingStateAtMs;
+            }
+        }
+    }
     
     public BatteryVoltageData getBatteryVoltage() {
         BydVehicleData vd = getVd();
@@ -193,56 +220,509 @@ public class VehicleDataMonitor {
      *       cross-check that catches the PHEV "BMS stuck at 15 IDLE while
      *       charging" firmware bug.
      *   L3. Power-flow inference with hysteresis and a positive AC/DC gun
-     *       assertion (gun==2/3/4/5; UNAVAILABLE no longer slips through
-     *       like the old "!= 1 disconnected" guard).
+     *       assertion (gun==2/3/4; V2L gun==5 is authoritative OFF).
      *   E1. ACTION_POWER_CONNECTED — biases fusion toward charging during
      *       the ramp-up window before BMS reports.
-     *   E2. ACTION_POWER_DISCONNECTED — overrides the fused state to
-     *       NOT_CHARGING for {@code UNPLUG_OVERRIDE_MS} so a stale BMS
-     *       value can't keep us in "charging" after the cable comes out.
+     *   E2. ACTION_POWER_DISCONNECTED — latches NOT_CHARGING until a physical
+     *       reconnect, so delayed BMS/L2 callbacks cannot resurrect the session.
      *
      * This method is now a thin presentation wrapper: ask the detector
      * for the verdict, choose an effective state code (CHARGING when the
      * detector says yes, else the BMS state if known, else null), and
      * resolve power magnitude.
      *
-     * Power magnitude resolution (when fused says CHARGING) SPLITS BY DRIVETRAIN,
-     * because the hardware getters that are authoritative on BEV are actively
-     * wrong on PHEV — getExternalChargingPower() reports the EVSE's RATED
-     * capacity there (a flat 7.13 kW on a real ~1.7 kW charge) and
-     * getChargePower() has been seen returning the AC-side figure:
+     * Power magnitude resolution (when fused says CHARGING) is DRIVETRAIN-INDEPENDENT. Each accessor's
+     * unit is decided at runtime from how its value moves (ChargeSourceClassifier) and converted to kW
+     * by ChargeRateResolver, so the same cascade serves PHEV and BEV. Order is by DIRECTNESS:
+     * cluster -> chargingDevice -> externalCharger -> energy-counter slope -> pack-side chargePower ->
+     * ring estimator (flagged) -> engine power (flagged) -> nominal hint (flagged).
      *
-     *   PHEV:
-     *     1. clusterChargePowerKw — the cluster's own dash readout (feature id
-     *        0x32300018). Measured, available on the first poll, and PHEV-only
-     *        because its raw scale is inferred (see the branch comment below).
-     *     2. ring-buffer estimator — SOC-derived, needs ≥2 SOC ticks to warm up.
-     *     3. abs(engine power) when current is flowing into the pack.
-     *     4. nominal-capacity hint (3.3/7 kW, marked estimated).
-     *   PHEV deliberately NEVER falls through to externalChargingPower /
-     *   chargingDevice.chargingPower — a confidently-wrong measured-looking
-     *   value is worse than an honest estimate.
-     *
-     *   BEV:
-     *     1. chargePower (InstrumentDevice.getChargePower — real DC rate INTO the
-     *        pack; matches the BYD app/cloud). Preferred over externalChargingPower
-     *        because that one is the AC wall-side input (higher: includes
-     *        onboard-charger conversion loss) or a 104857.5 sentinel.
-     *     2. external charging power (InstrumentDevice — charger-reported, AC-side)
-     *     3. chargingDevice.chargingPower
-     *     4. abs(engine power) — only when ACC is on (NaN-guarded after
-     *        ACC OFF invalidation in BydDataCollector.setAccState)
-     *     5. ring-buffer counter-derivative estimator (measured, not nominal)
-     *     6. nominal-capacity hint (7 kW, marked estimated)
+     * <p><b>A classified rate is not necessarily the PACK's rate.</b> Classification establishes that a
+     * value behaves like an instantaneous rate rather than a cumulative counter; it says nothing about
+     * what that rate measures. Two documented hazards survive it, because both are numerically
+     * well-behaved:
+     * <ul>
+     *   <li><b>EVSE-rated, not delivered.</b> getExternalChargingPower has been captured reporting a
+     *       flat 7.13 kW throughout a real ~1.7 kW charge — the wallbox's RATED capacity. A constant is
+     *       a perfectly valid-looking rate, so no behavioural test rejects it.</li>
+     *   <li><b>AC-side, not pack-side.</b> A wall-side figure includes onboard-charger conversion loss,
+     *       so it over-reads pack energy by roughly 10-15%.</li>
+     * </ul>
+     * Both are mitigated rather than detected: {@link #crossCheckAgainstCounter} compares the winning
+     * rate against the vehicle's own charged-energy counter slope — the one kWh-grounded measurement
+     * available — and flags the reading as an estimate when they disagree materially, which keeps it out
+     * of the persisted curve, the cost and the outbound feeds. Where no counter exists there is no
+     * independent yardstick, and a wrong-but-plausible rate cannot be distinguished from a right one.
      *
      * @return ChargingStateData populated from the fused detector, or
      *         null when no state signal is available at all.
      */
-    public ChargingStateData getChargingState() {
-        BydVehicleData vd = getVd();
-        if (vd == null) return null;
+    /**
+     * How far a published rate may exceed the counter-derived reference before it is demoted to an
+     * estimate. The counter measures energy actually accumulated, so a rate materially above it is not
+     * what the pack is taking — the documented cases being an EVSE RATED capacity (a flat 7.13 kW on a
+     * ~1.7 kW charge) and an AC-side figure carrying onboard-charger conversion loss.
+     *
+     * <p>Asymmetric and generous. Only the HIGH side is policed, because the failure modes all
+     * over-report and over-reporting is what gets over-billed; a rate below the reference is either
+     * correct or conservative. 1.35 clears genuine AC/DC conversion loss (~10-15%) plus the reference's
+     * own quantisation without clearing a 4x rated-capacity error.
+     */
+    private static final double RATE_VS_COUNTER_MAX_RATIO = 1.35;
+    /** Uncorroborated high raw direct values are ambiguous on PHEV and must not reach the display. */
+    private static final double PHEV_UNVERIFIED_DIRECT_MAX_KW = 22.0;
+    /**
+     * Largest permitted skew between the cluster rate and pack-flow observations used to verify it.
+     *
+     * <p>The parked collector can be sparse, so the individual observations need not be recent at
+     * read time. They must, however, come from the same collection round: a prior drive's negative
+     * flow must never verify a later cluster rate.
+     */
+    private static final long CLUSTER_PACK_FLOW_MAX_SKEW_MS = 15_000L;
 
-        boolean fusedCharging = ChargingDetector.getInstance().isCharging();
+    /**
+     * Marker for the pack-side direct read, which is not classifier-managed but must still be
+     * cross-checked for scale and accuracy. It owns a separate session-scoped divisor because it is
+     * not a {@code ChargeSourceClassifier} key.
+     */
+    private static final String SRC_PACK_SIDE_DIRECT = "__packSideDirect";
+
+
+
+    /**
+     * Demote a rate that the vehicle's own energy counter contradicts.
+     *
+     * <p>Classification proves a value behaves like a rate, not that it measures pack draw. This is the
+     * only independent check available for that, and it applies to every source equally — the counter
+     * itself is excluded because comparing it with its own slope is vacuous.
+     *
+     * @return true when the reading should be treated as an estimate
+     */
+    private static boolean contradictedByCounter(String source, double kw) {
+        return contradictedByCounter(source, kw, Double.NaN, false);
+    }
+
+    /**
+     * @param packFlowKw an independent pack-side rate (magnitude) for this poll, or NaN. On PHEV the
+     *                   motor-bus figure is exactly this: it is measured at the pack, so it is a valid
+     *                   second yardstick when the energy counter has not produced one yet.
+     */
+    private static boolean contradictedByCounter(String source, double kw, double packFlowKw,
+                                                boolean phev) {
+        if (Double.isNaN(kw) || kw <= 0) return false;
+        if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(source)) return false;
+        // This is a current, same-session observation supplied by the caller. It describes "now";
+        // the counter derivative below may legally be held for minutes between quanta. Once current
+        // pack flow exists, an older counter slope must not veto a candidate that agrees with it.
+        if (hasUsablePhevPackFlow(packFlowKw, phev)) {
+            return isMaterialRateMismatch(kw, packFlowKw);
+        }
+        double ref = ChargeRateResolver.referenceRateKw();
+        if (Double.isNaN(ref) || ref <= 0.1) {
+            // A fresh pack-flow sample may have expired between the 90-second parked polls while the
+            // 12-second session sampler continues. A rate independently proved earlier in THIS
+            // physical session remains measured while it stays near that proved operating point.
+            if (ChargeRateResolver.isSessionRateCorroborated(source, kw)) return false;
+            // NO COUNTER YARDSTICK YET. Fall back to the pack-side flow when one is available: this is
+            // the window in which the documented EVSE-rated behaviour does its damage (a flat 7.13 kW
+            // published against a real ~1.7 kW charge), because the counter needs minutes of charging
+            // before its slope exists and the first minutes are priced too.
+            if (!Double.isNaN(packFlowKw) && packFlowKw > 0.1) {
+                return isMaterialRateMismatch(kw, packFlowKw);
+            }
+            // NEITHER YARDSTICK, ON PHEV. This is the case that cannot be resolved by any threshold:
+            // the documented failure is an EVSE RATED capacity (a flat 7.13 kW throughout a real
+            // ~1.7 kW charge), and 7.13 kW is a perfectly ordinary reading for a PHEV onboard charger.
+            // No magnitude test separates the two — that is the same mistake as the /100 heuristic this
+            // subsystem removed.
+            //
+            // So do not try. On PHEV, with no independent reference of any kind, the value is simply
+            // NOT VERIFIED, and the honest thing is to say so rather than to guess. It still gets
+            // published (blanking the card would be worse), but flagged — which keeps it out of the
+            // persisted curve, the cost and the outbound feeds. The flag clears by itself the moment
+            // either yardstick appears, which on a working trim is the first counter slope.
+            //
+            // BEV is left publishing unflagged: the EVSE-rated behaviour is documented on PHEV, and a
+            // BEV DC session has no comparable observation against it.
+            if (phev) return true;
+            return false;
+        }
+        return isCandidateContradictedByReference(source, kw, ref);
+    }
+
+    /**
+     * A PHEV external accessor may expose the EVSE's rated capacity rather than delivered power.
+     * When its scale or accuracy is not independently proved, a kWh-grounded ring estimate is the
+     * more truthful display source even though both remain excluded from priced energy.
+     */
+    static boolean shouldDeferExternalToGroundedEstimate(
+            double externalKw, double packFlowKw, boolean phev, boolean estimateUsable) {
+        if (!phev || !estimateUsable || Double.isNaN(externalKw)) return false;
+        String source = com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL;
+        return !ChargeRateResolver.isScaleVerified(source, externalKw, packFlowKw)
+                || contradictedByCounter(source, externalKw, packFlowKw, true);
+    }
+
+    /**
+     * True for the pack-side accessor's documented idle junk.
+     *
+     * <p>{@code getChargePower} emits ~359.x when nothing is charging on the trims where this has
+     * been captured. The value is inside every plausibility bound (it looks like a legitimate DC
+     * rate), so only its characteristic magnitude distinguishes it. Deliberately a NARROW window
+     * rather than a range: a real charge could plausibly sit at 350 or 370 kW on a future vehicle,
+     * and rejecting a genuine rate is its own defect.
+     */
+    private static boolean isChargePowerIdleGarbage(double kw) {
+        return kw >= 359.0 && kw < 360.0;
+    }
+
+    /**
+     * The instrument cluster shares the direct getter's known ~359.x idle value on PHEV/AC.
+     *
+     * <p>A missing gun sample must not make this known PHEV sentinel admissible. BEV DC remains
+     * exempt because a future fast charger can legitimately deliver roughly 359 kW.
+     */
+    static boolean isClusterChargePowerIdleGarbage(double rawKw, boolean phev, int gunState) {
+        boolean dcConnection = gunState == 3 || gunState == 4;
+        return ChargeRateResolver.isKnownPhevRawPowerJunk(rawKw, phev)
+                || (isChargePowerIdleGarbage(rawKw) && !dcConnection);
+    }
+
+    /**
+     * The captured PHEV signatures and BEV/AC 359.x are always junk. BEV/DC 359.x remains a
+     * candidate here, but {@link #resolveDirectChargePower} requires independent corroboration.
+     */
+    static boolean isDirectChargePowerIdleGarbage(double rawKw, boolean phev, int gunState) {
+        boolean dcConnection = gunState == 3 || gunState == 4;
+        return ChargeRateResolver.isKnownPhevRawPowerJunk(rawKw, phev)
+                || (isChargePowerIdleGarbage(rawKw) && !dcConnection);
+    }
+
+    /**
+     * Detect the documented half-scale session-energy counter without treating an ordinary taper
+     * mismatch as a unit correction.
+     *
+     * <p>The ring estimator is independent here: on a BEV it prefers the full-scale remaining-energy
+     * slope, and if it had fallen back to this capacity counter both values would be equal rather than
+     * near a 1:2 ratio. Keep the band tight around one half so a held estimator cannot hide a normal
+     * taper, and leave PHEV untouched because its estimator can be SOC-derived.
+     */
+    static boolean isLikelyHalfScaleCapacityRate(double capacityKw, double estimatorKw,
+                                                  boolean phev) {
+        if (phev || Double.isNaN(capacityKw) || Double.isNaN(estimatorKw)
+                || capacityKw <= 0 || estimatorKw <= 0) {
+            return false;
+        }
+        double ratio = capacityKw / estimatorKw;
+        return ratio >= 0.45 && ratio <= 0.55;
+    }
+
+    /**
+     * A PHEV cluster rate is scale-verified when the independently sampled pack flow agrees.
+     *
+     * <p>The PHEV charged-energy counter is zero on some trims, so waiting for its slope leaves a
+     * correct 2-7 kW cluster reading permanently display-only. Pack flow is measured on a separate
+     * path and is sufficient to resolve the remaining 10x unit ambiguity when the two rates agree.
+     * Keep the check symmetric: a value that is materially lower can also be unit-scaled wrong.
+     */
+    static boolean isPhevClusterRateCorroboratedByPackFlow(double clusterKw, long clusterAtMs,
+                                                             double packFlowKw, long packFlowAtMs,
+                                                             boolean phev) {
+        return isPhevClusterRateCorroboratedByPackFlow(
+                clusterKw, clusterAtMs, packFlowKw, packFlowAtMs, phev, 0L);
+    }
+
+    static boolean isPhevClusterRateCorroboratedByPackFlow(double clusterKw, long clusterAtMs,
+                                                             double packFlowKw, long packFlowAtMs,
+                                                             boolean phev,
+                                                             long sessionStartedAtMs) {
+        if (!phev || Double.isNaN(clusterKw) || Double.isNaN(packFlowKw)
+                || clusterKw <= 0.1 || packFlowKw <= 0.1
+                || clusterAtMs <= 0 || packFlowAtMs <= 0
+                || (sessionStartedAtMs > 0
+                    && (clusterAtMs < sessionStartedAtMs || packFlowAtMs < sessionStartedAtMs))
+                || Math.abs(clusterAtMs - packFlowAtMs) > CLUSTER_PACK_FLOW_MAX_SKEW_MS) {
+            return false;
+        }
+        double ratio = clusterKw / packFlowKw;
+        return ratio >= 1.0 / RATE_VS_COUNTER_MAX_RATIO
+                && ratio <= RATE_VS_COUNTER_MAX_RATIO;
+    }
+
+    static boolean hasComparablePhevPackFlow(double clusterKw, long clusterAtMs,
+                                               double packFlowKw, long packFlowAtMs,
+                                               boolean phev, long sessionStartedAtMs) {
+        return phev && !Double.isNaN(clusterKw) && !Double.isNaN(packFlowKw)
+                && clusterKw > 0.1 && packFlowKw > 0.1
+                && clusterAtMs > 0 && packFlowAtMs > 0
+                && (sessionStartedAtMs <= 0
+                    || (clusterAtMs >= sessionStartedAtMs && packFlowAtMs >= sessionStartedAtMs))
+                && Math.abs(clusterAtMs - packFlowAtMs) <= CLUSTER_PACK_FLOW_MAX_SKEW_MS;
+    }
+
+    static boolean isPhevClusterPackFlowMismatch(double clusterKw, long clusterAtMs,
+                                                   double packFlowKw, long packFlowAtMs,
+                                                   boolean phev, long sessionStartedAtMs) {
+        return hasComparablePhevPackFlow(clusterKw, clusterAtMs, packFlowKw, packFlowAtMs,
+                        phev, sessionStartedAtMs)
+                && !isPhevClusterRateCorroboratedByPackFlow(
+                        clusterKw, clusterAtMs, packFlowKw, packFlowAtMs,
+                        phev, sessionStartedAtMs);
+    }
+
+    static boolean isCandidateContradictedByFreshPackFlow(double candidateKw,
+                                                           double packFlowKw,
+                                                           boolean phev) {
+        if (!phev || Double.isNaN(candidateKw) || Double.isNaN(packFlowKw)
+                || candidateKw <= 0.1 || packFlowKw <= 0.1) {
+            return false;
+        }
+        return isMaterialRateMismatch(candidateKw, packFlowKw);
+    }
+
+    static boolean isCandidateContradictedByReference(String source,
+                                                       double candidateKw,
+                                                       double referenceKw) {
+        return !com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(source)
+                && !Double.isNaN(candidateKw) && candidateKw > 0.1
+                && !Double.isNaN(referenceKw) && referenceKw > 0.1
+                // A counter slope describes the preceding interval. It can disprove a materially
+                // higher EVSE-rated value, but a lower current reading may be legitimate taper and
+                // must not be replaced by the older slope.
+                && candidateKw / referenceKw > RATE_VS_COUNTER_MAX_RATIO;
+    }
+
+    private static boolean isMaterialRateMismatch(double candidateKw, double referenceKw) {
+        double ratio = candidateKw / referenceKw;
+        return ratio < 1.0 / RATE_VS_COUNTER_MAX_RATIO
+                || ratio > RATE_VS_COUNTER_MAX_RATIO;
+    }
+
+    static boolean shouldRejectCandidateBeforeSelection(String source,
+                                                        double candidateKw,
+                                                        double packFlowKw,
+                                                        boolean phev) {
+        if (Double.isNaN(candidateKw)) return false;
+        if (hasUsablePhevPackFlow(packFlowKw, phev)) {
+            return isCandidateContradictedByFreshPackFlow(candidateKw, packFlowKw, true);
+        }
+        double ref = ChargeRateResolver.referenceRateKw();
+        // The counter is an interval average and can legitimately lag an instantaneous source during
+        // a ramp. Once that source's UNIT is independently proven, keep it selectable for display;
+        // the post-selection accuracy gate still marks an above-counter rate estimated, excluding it
+        // from persistence, pricing, and outbound telemetry until the counter catches up.
+        return !ChargeRateResolver.hasProvenUnitScale(source)
+                && isCandidateContradictedByReference(source, candidateKw, ref);
+    }
+
+    private static boolean hasUsablePhevPackFlow(double packFlowKw, boolean phev) {
+        return phev && !Double.isNaN(packFlowKw) && packFlowKw > 0.1;
+    }
+
+    /** A power value without an age is not allowed to cross a charging-session boundary. */
+    static boolean isCurrentSessionPowerObservation(long observedAtMs, long sessionStartedAtMs) {
+        return sessionStartedAtMs > 0 && observedAtMs >= sessionStartedAtMs;
+    }
+
+    static boolean isFreshPowerObservation(long observedAtMs, long sessionStartedAtMs,
+                                           long nowMs) {
+        return isCurrentSessionPowerObservation(observedAtMs, sessionStartedAtMs)
+                && nowMs >= observedAtMs
+                && nowMs - observedAtMs <= CHARGING_POWER_OBSERVATION_MAX_AGE_MS;
+    }
+
+    static double freshNegativeEnginePackFlow(double enginePowerKw, long enginePowerAtMs,
+                                              long sessionBoundaryMs, long nowMs) {
+        return !Double.isNaN(enginePowerKw) && enginePowerKw < -0.3
+                && enginePowerAtMs > 0 && nowMs >= enginePowerAtMs
+                && nowMs - enginePowerAtMs <= TAPER_PACK_FLOW_FRESHNESS_MS
+                && isCurrentSessionPowerObservation(enginePowerAtMs, sessionBoundaryMs)
+                ? Math.abs(enginePowerKw) : Double.NaN;
+    }
+
+    /**
+     * Return the current pack-flow reference only when the candidate and reference were co-observed
+     * in this session. The caller has already applied the pack-flow wall-clock freshness bound.
+     */
+    static double packFlowReferenceForSource(double raw, long rawAtMs,
+                                             double packFlowKw, long packFlowAtMs,
+                                             boolean phev, long sessionStartedAtMs) {
+        return hasComparablePhevPackFlow(raw, rawAtMs, packFlowKw, packFlowAtMs,
+                phev, sessionStartedAtMs) ? packFlowKw : Double.NaN;
+    }
+
+    /**
+     * Resolve the direct instrument getter without inferring its unit from magnitude. A current
+     * independent reference can prove either an in-band raw register (320 -> 3.2 kW) or an out-of-band
+     * one (650 -> 6.5 kW); that divisor is reusable only until the current physical session ends.
+     */
+    static double resolveDirectChargePower(double raw, double packFlowReferenceKw) {
+        if (Double.isNaN(raw) || raw <= 0.1) {
+            return Double.NaN;
+        }
+        // 359.x is both a captured idle signature and a plausible future BEV DC rate. Drivetrain/gun
+        // context establishes only possibility, not validity: require an independent same-scale
+        // observation from this physical session before this exact signature can publish.
+        if (isChargePowerIdleGarbage(raw)
+                && !ChargeRateResolver.hasSameSessionDirectCorroboration(
+                        SRC_PACK_SIDE_DIRECT, raw, packFlowReferenceKw)) {
+            return Double.NaN;
+        }
+        return ChargeRateResolver.resolveSessionRateValue(
+                SRC_PACK_SIDE_DIRECT, raw, packFlowReferenceKw);
+    }
+
+    static double selectTaperRate(double clusterKw, double deviceKw,
+                                  double externalKw, double directKw) {
+        return !Double.isNaN(clusterKw) ? clusterKw
+                : !Double.isNaN(deviceKw) ? deviceKw
+                : !Double.isNaN(externalKw) ? externalKw : directKw;
+    }
+
+    static boolean shouldWithholdUnverifiedDirectRate(double resolvedKw,
+                                                      double packFlowReferenceKw,
+                                                      boolean phev) {
+        return phev && resolvedKw > PHEV_UNVERIFIED_DIRECT_MAX_KW
+                && !ChargeRateResolver.isScaleVerified(
+                        SRC_PACK_SIDE_DIRECT, resolvedKw, packFlowReferenceKw);
+    }
+
+    static boolean shouldPreferDirectPackSide(boolean phev, double directKw) {
+        return !phev && !Double.isNaN(directKw);
+    }
+
+    /**
+     * Capture source scale and delivered-rate proof while both sides of a parked poll are still fresh.
+     *
+     * <p>Power presentation and persistence are read on independent schedules. Deferring this comparison
+     * until an HTTP or 12-second sampler read made correctness depend on phase: the 15-second pack-flow
+     * sample could expire before the first consumer ran, then remain unavailable for the rest of the
+     * 90-second parked interval.
+     */
+    public static void observePhevSessionRateProofs(BydVehicleData vd,
+                                                    long sessionStartedAtMs,
+                                                    long nowMs) {
+        if (vd == null || sessionStartedAtMs <= 0
+                || Double.isNaN(vd.enginePowerKw) || vd.enginePowerKw >= -0.3
+                || vd.enginePowerAtMs <= 0 || nowMs < vd.enginePowerAtMs
+                || nowMs - vd.enginePowerAtMs > TAPER_PACK_FLOW_FRESHNESS_MS
+                || vd.enginePowerAtMs < sessionStartedAtMs) {
+            return;
+        }
+        double packFlowKw = Math.abs(vd.enginePowerKw);
+        observePhevSessionRateProof(
+                com.overdrive.app.byd.ChargeSourceClassifier.SRC_CLUSTER,
+                isClusterChargePowerIdleGarbage(
+                        vd.clusterChargePowerKw, true, vd.chargingGunState)
+                        ? Double.NaN : vd.clusterChargePowerKw,
+                vd.clusterChargePowerAtMs, packFlowKw, vd.enginePowerAtMs,
+                sessionStartedAtMs);
+        observePhevSessionRateProof(
+                com.overdrive.app.byd.ChargeSourceClassifier.SRC_DEVICE,
+                ChargeRateResolver.isKnownPhevRawPowerJunk(vd.chargingPowerKw, true)
+                        ? Double.NaN : vd.chargingPowerKw,
+                vd.chargingPowerAtMs,
+                packFlowKw, vd.enginePowerAtMs, sessionStartedAtMs);
+        observePhevSessionRateProof(
+                com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL,
+                ChargeRateResolver.isKnownPhevRawPowerJunk(
+                        vd.externalChargingPowerKw, true)
+                        ? Double.NaN : vd.externalChargingPowerKw,
+                vd.externalChargingPowerAtMs,
+                packFlowKw, vd.enginePowerAtMs, sessionStartedAtMs);
+        observePhevSessionRateProof(
+                SRC_PACK_SIDE_DIRECT,
+                isDirectChargePowerIdleGarbage(
+                        vd.chargePowerKw, true, vd.chargingGunState)
+                        ? Double.NaN : vd.chargePowerKw,
+                vd.chargePowerAtMs, packFlowKw, vd.enginePowerAtMs,
+                sessionStartedAtMs);
+    }
+
+    private static void observePhevSessionRateProof(String source, double raw, long rawAtMs,
+                                                    double packFlowKw, long packFlowAtMs,
+                                                    long sessionStartedAtMs) {
+        double reference = packFlowReferenceForSource(
+                raw, rawAtMs, packFlowKw, packFlowAtMs, true, sessionStartedAtMs);
+        if (!Double.isNaN(reference)) {
+            ChargeRateResolver.resolveSessionRateValue(source, raw, reference);
+        }
+    }
+
+    static boolean hasFreshPostFinishIndependentEvidence(
+            long sourceObservedAtMs,
+            double packFlowKw, long packFlowAtMs,
+            long finishedAtMs, long nowMs, boolean phev) {
+        return phev && finishedAtMs > 0
+                && sourceObservedAtMs > finishedAtMs
+                && packFlowAtMs > finishedAtMs
+                && !Double.isNaN(packFlowKw) && packFlowKw > 0.1
+                && Math.abs(sourceObservedAtMs - packFlowAtMs)
+                        <= CLUSTER_PACK_FLOW_MAX_SKEW_MS
+                && nowMs >= sourceObservedAtMs
+                && nowMs >= packFlowAtMs
+                && nowMs - packFlowAtMs <= TAPER_PACK_FLOW_FRESHNESS_MS;
+    }
+
+    static boolean hasFreshPostFinishRateMovement(
+            long sourceChangedAtMs, long finishedAtMs, long nowMs) {
+        return finishedAtMs > 0
+                && sourceChangedAtMs > finishedAtMs
+                && nowMs >= sourceChangedAtMs
+                && nowMs - sourceChangedAtMs <= CHARGING_POWER_OBSERVATION_MAX_AGE_MS;
+    }
+
+    static boolean isFreshPostFinishPackFlow(double clusterKw, long clusterAtMs,
+                                               double packFlowKw, long packFlowAtMs,
+                                               long finishedAtMs, long nowMs,
+                                               boolean phev) {
+        return isPhevClusterRateCorroboratedByPackFlow(
+                        clusterKw, clusterAtMs, packFlowKw, packFlowAtMs, phev, finishedAtMs)
+                && nowMs >= packFlowAtMs
+                && nowMs - packFlowAtMs <= TAPER_PACK_FLOW_FRESHNESS_MS;
+    }
+
+    public ChargingStateData getChargingState() {
+        ChargingSnapshot snapshot = getChargingSnapshot();
+        return snapshot != null ? snapshot.getChargingState() : null;
+    }
+
+    public ChargingSnapshot getChargingSnapshot() {
+        ChargingDetector detector = ChargingDetector.getInstance();
+        return readStableChargingComponent(detector, () -> {
+            BydVehicleData vd = getVd();
+            if (vd == null) return null;
+            return new ChargingSnapshot(vd, buildChargingState(detector, vd));
+        });
+    }
+
+    static <T> T readStableChargingComponent(
+            ChargingDetector detector, java.util.function.Supplier<T> builder) {
+        if (detector == null || builder == null) return null;
+        if (ChargingDetector.isCurrentThreadPublicationMutationActive()) {
+            return builder.get();
+        }
+        for (int attempt = 0; attempt < 3; attempt++) {
+            ChargingDetector.StateSnapshot before = detector.getStateSnapshot();
+            ChargeRateResolver.beginEvidenceTransaction();
+            try {
+                T state = builder.get();
+                boolean committed = detector.commitIfComponentPublicationWindowStable(
+                        before, ChargeRateResolver::commitEvidenceTransaction);
+                ChargeRateResolver.flushCommittedEvidenceLog();
+                if (committed) return state;
+            } finally {
+                ChargeRateResolver.discardEvidenceTransaction();
+            }
+        }
+        return null;
+    }
+
+    private ChargingStateData buildChargingState(
+            ChargingDetector detector, BydVehicleData vd) {
+        boolean exporting = vd.vtolCharging || vd.chargingGunState == 5;
+        boolean fusedCharging = detector.isCharging() && !exporting;
+        long sessionStartedAtMs = detector.getLastSessionStartedAtMs();
 
         // TAPER OVERRIDE — BMS says FINISHED but the cluster still reports a real rate through a
         // connected gun. On BYD PHEV firmware "FINISHED" means bulk-charge complete, NOT cable
@@ -268,44 +748,120 @@ public class VehicleDataMonitor {
         // is not resolved until inside the power block below.
         boolean phevForTaper;
         try { phevForTaper = isPhev(); } catch (Throwable t) { phevForTaper = false; }
-        // MOVEMENT BOUND. In-band is NOT enough: the cluster feature id is documented to keep
-        // answering the last in-band rate after the gun comes out, and nothing else ages this
-        // field — so an in-band-only test held "charging" for as long as the cable stayed in,
-        // which never closed the session row and fed a permanent phantom to ABRP/MQTT. Requiring
-        // the value to have CHANGED recently makes a frozen reading a sentinel by I4, per
-        // asymmetry 6 ("freshness means the DATA moved").
-        // Tracking is confined to PHEV and serialised. Previously it ran on every call before the
-        // drivetrain gate, so getChargingState() — a READ path reached from HTTP, MQTT, ABRP, the SoC
-        // recorder and the CPS sampler — mutated shared state on BEV too, and the read-then-write was
-        // not atomic across those threads (two callers could each see clusterLive true off the
-        // other's write). The values are only ever consumed inside the phev-gated expression below.
-        boolean clusterLive = false;
-        if (phevForTaper) {
-            synchronized (taperLock) {
-                clusterLive = vd.clusterChargePowerKw != lastTaperClusterKw
-                        || (System.currentTimeMillis() - lastTaperClusterChangeMs) < TAPER_CLUSTER_TTL_MS;
-                if (vd.clusterChargePowerKw != lastTaperClusterKw) {
-                    lastTaperClusterKw = vd.clusterChargePowerKw;
-                    lastTaperClusterChangeMs = System.currentTimeMillis();
-                }
-            }
+        // A cluster value cannot establish liveness by itself: the accessor is known to retain its
+        // last positive value and small post-stop jitter is indistinguishable from a real taper.
+        // Require an independently sampled, charging-direction pack flow observed after the exact
+        // FINISHED transition. This is intentionally fail-closed; missing a tiny unobservable tail is
+        // preferable to reopening a stopped session and billing phantom energy.
+        double taperPackFlowKw = !Double.isNaN(vd.enginePowerKw) && vd.enginePowerKw < -0.3
+                ? Math.abs(vd.enginePowerKw) : Double.NaN;
+        // Observation freshness alone is insufficient here: retained getters and delayed callbacks
+        // can repeatedly restamp an unchanged terminal value. The rate source must move materially
+        // after this exact FINISHED epoch, while an independent charging-direction pack flow is live.
+        boolean postFinishPackFlowObservation = vd.chargingStateAtMs > 0
+                && vd.enginePowerAtMs > vd.chargingStateAtMs;
+        long taperNowMs = System.currentTimeMillis();
+        boolean clusterHasIndependentTaperEvidence = postFinishPackFlowObservation
+                && hasFreshPostFinishRateMovement(
+                        vd.clusterChargePowerChangedAtMs,
+                        vd.chargingStateAtMs, taperNowMs)
+                && hasFreshPostFinishIndependentEvidence(
+                        vd.clusterChargePowerAtMs,
+                        taperPackFlowKw, vd.enginePowerAtMs,
+                        vd.chargingStateAtMs, taperNowMs, phevForTaper);
+        boolean deviceHasIndependentTaperEvidence = postFinishPackFlowObservation
+                && hasFreshPostFinishRateMovement(
+                        vd.chargingPowerChangedAtMs,
+                        vd.chargingStateAtMs, taperNowMs)
+                && hasFreshPostFinishIndependentEvidence(
+                        vd.chargingPowerAtMs,
+                        taperPackFlowKw, vd.enginePowerAtMs,
+                        vd.chargingStateAtMs, taperNowMs, phevForTaper);
+        boolean externalHasIndependentTaperEvidence = postFinishPackFlowObservation
+                && hasFreshPostFinishRateMovement(
+                        vd.externalChargingPowerChangedAtMs,
+                        vd.chargingStateAtMs, taperNowMs)
+                && hasFreshPostFinishIndependentEvidence(
+                        vd.externalChargingPowerAtMs,
+                        taperPackFlowKw, vd.enginePowerAtMs,
+                        vd.chargingStateAtMs, taperNowMs, phevForTaper);
+        boolean directHasIndependentTaperEvidence = postFinishPackFlowObservation
+                && hasFreshPostFinishRateMovement(
+                        vd.chargePowerChangedAtMs,
+                        vd.chargingStateAtMs, taperNowMs)
+                && hasFreshPostFinishIndependentEvidence(
+                        vd.chargePowerAtMs,
+                        taperPackFlowKw, vd.enginePowerAtMs,
+                        vd.chargingStateAtMs, taperNowMs, phevForTaper);
+        boolean taperClusterIdleGarbage = isClusterChargePowerIdleGarbage(
+                vd.clusterChargePowerKw, phevForTaper, vd.chargingGunState);
+        double taperClusterKw = taperClusterIdleGarbage
+                || !clusterHasIndependentTaperEvidence ? Double.NaN
+                : ChargeRateResolver.rateKw(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_CLUSTER,
+                        vd.clusterChargePowerKw, taperPackFlowKw);
+        double taperDeviceKw = ChargeRateResolver.isKnownPhevRawPowerJunk(
+                        vd.chargingPowerKw, phevForTaper)
+                || !deviceHasIndependentTaperEvidence ? Double.NaN
+                : ChargeRateResolver.rateKw(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_DEVICE,
+                        vd.chargingPowerKw, taperPackFlowKw);
+        double taperExternalKw = ChargeRateResolver.isKnownPhevRawPowerJunk(
+                        vd.externalChargingPowerKw, phevForTaper)
+                || !externalHasIndependentTaperEvidence ? Double.NaN
+                : ChargeRateResolver.rateKw(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL,
+                        vd.externalChargingPowerKw, taperPackFlowKw);
+        boolean taperDirectIdleGarbage = isDirectChargePowerIdleGarbage(
+                vd.chargePowerKw, phevForTaper, vd.chargingGunState);
+        double taperDirectKw = taperDirectIdleGarbage || !directHasIndependentTaperEvidence
+                ? Double.NaN
+                : resolveDirectChargePower(vd.chargePowerKw, taperPackFlowKw);
+        if (shouldWithholdUnverifiedDirectRate(
+                taperDirectKw, taperPackFlowKw, phevForTaper)) {
+            taperDirectKw = Double.NaN;
         }
+        boolean clusterLive = clusterHasIndependentTaperEvidence
+                && isFreshPostFinishPackFlow(
+                taperClusterKw, vd.clusterChargePowerAtMs, taperPackFlowKw, vd.enginePowerAtMs,
+                vd.chargingStateAtMs, taperNowMs, phevForTaper);
+        boolean deviceLive = deviceHasIndependentTaperEvidence
+                && isFreshPostFinishPackFlow(
+                taperDeviceKw, vd.chargingPowerAtMs, taperPackFlowKw, vd.enginePowerAtMs,
+                vd.chargingStateAtMs, taperNowMs, phevForTaper);
+        boolean externalLive = externalHasIndependentTaperEvidence
+                && isFreshPostFinishPackFlow(
+                taperExternalKw, vd.externalChargingPowerAtMs, taperPackFlowKw, vd.enginePowerAtMs,
+                vd.chargingStateAtMs, taperNowMs, phevForTaper);
+        boolean directLive = directHasIndependentTaperEvidence
+                && isFreshPostFinishPackFlow(
+                taperDirectKw, vd.chargePowerAtMs, taperPackFlowKw, vd.enginePowerAtMs,
+                vd.chargingStateAtMs, taperNowMs, phevForTaper);
+        double taperRateKw = selectTaperRate(
+                clusterLive ? taperClusterKw : Double.NaN,
+                deviceLive ? taperDeviceKw : Double.NaN,
+                externalLive ? taperExternalKw : Double.NaN,
+                directLive ? taperDirectKw : Double.NaN);
         boolean taperCharging = !fusedCharging
+                && !exporting
                 && phevForTaper
                 && vd.chargingState == ChargingStateData.CHARGING_BATTERY_STATE_CHARG_FINISH
+                && vd.chargingStateAtMs != closedTaperFinishedAtMs
                 && gunCharging
-                && !Double.isNaN(vd.clusterChargePowerKw)
-                && vd.clusterChargePowerKw > 0.1 && vd.clusterChargePowerKw <= 300
-                && clusterLive;
+                && !Double.isNaN(taperRateKw);
 
         int effectiveState;
-        if (fusedCharging) {
+        if (exporting) {
+            effectiveState = ChargingStateData.CHARGING_BATTERY_STATE_DISCHARG;
+        } else if (fusedCharging) {
             effectiveState = ChargingStateData.CHARGING_BATTERY_STATE_CHARGING;
-        } else if (vd.chargingState != BydVehicleData.UNAVAILABLE) {
+        } else if (vd.chargingState != BydVehicleData.UNAVAILABLE
+                && vd.chargingState != ChargingStateData.CHARGING_BATTERY_STATE_CHARGING) {
             // Pass through whatever the BMS reports (READY, FINISHED, IDLE, error...)
             effectiveState = vd.chargingState;
         } else {
-            // No BMS state and detector is OFF — caller has nothing to show.
+            // No trustworthy state. In particular, never bypass an authoritative detector OFF with
+            // a delayed raw BMS CHARGING value.
             return null;
         }
 
@@ -321,181 +877,299 @@ public class VehicleDataMonitor {
         if (effectiveState == ChargingStateData.CHARGING_BATTERY_STATE_CHARGING || taperCharging) {
             String powerSource;  // which cascade branch won — surfaced in the diag log below
             double estKw = ChargingPowerEstimator.getInstance().estimatePowerKw();
-            // On PHEV, externalChargingPower is NOT trustworthy for charging power:
-            // it reports the EVSE's RATED capacity (observed a flat 7.13 kW on a real
-            // ~1.7 kW charge), not the actual draw. So on PHEV the SOC-derived ring
-            // estimator (which tracks the true rate via the SOC gauge) OUTRANKS the
-            // external/device getters. On BEV the external getter is genuine, so it
-            // keeps priority and the estimator stays the last-resort fallback.
+            boolean estUsable = !Double.isNaN(estKw);
+            // Drivetrain is NOT consulted for power any more. Every raw accessor's unit is decided
+            // at runtime by ChargeSourceClassifier from how the value MOVES, and ChargeRateResolver
+            // turns whatever it is into kW — the reading itself when the source is a RATE, its
+            // slope when the source is a cumulative COUNTER, and nothing at all while the source is
+            // still UNKNOWN. That makes the cascade identical on PHEV and BEV.
+            //
+            // The old cascade had to branch by drivetrain because each accessor's unit was a GUESS:
+            // the cluster reading was divided by 100 above a threshold, which is right for one
+            // firmware family and a 100x error for another, so it was confined to the drivetrain
+            // that could not reach the ambiguous band. The cost was that the other drivetrain lost
+            // access to the vehicle's own dash figure entirely, and a trim that reported a
+            // cumulative counter had it published as an instantaneous rate.
+            //
+            // Order is by DIRECTNESS, not by drivetrain: the charger's own figures first, then the
+            // pack-side figure, then derived estimates. Each returns NaN unless it can currently
+            // express a real rate, so the cascade falls through cleanly.
             boolean phev;
             try { phev = isPhev(); } catch (Throwable t) { phev = false; }
-            boolean estUsable = !Double.isNaN(estKw);
 
-            // TOP PRIORITY ON PHEV: the INSTRUMENT CLUSTER's own charge readout (feature id
-            // 0x32300018). This is the number on the dash, it is MEASURED, and unlike the typed
-            // getters it is correct on PHEV — where getExternalChargingPower() returns the
-            // EVSE's rated capacity and getChargePower() has been seen returning the AC-side
-            // figure. It outranks the SOC-derived estimator because the estimator needs ≥2 SOC
-            // ticks (≈15 min on a slow charge) to say anything at all, and even then it is a
-            // derivative of a 1%-granular gauge; this is the charger's own number, available on
-            // the first poll.
-            //
-            // NOTE: this read used to be gated behind "only if the typed getters found nothing"
-            // in BydDataCollector, which on PHEV never opened (the wrong-but-present external
-            // value satisfied the gate) — and it passed a wrapper Class to a HAL that matches
-            // primitives only. Both are fixed, so this branch can finally win.
-            //
-            // DELIBERATELY PHEV-ONLY, and this gate is load-bearing. The raw feature value is
-            // reported in two different units across firmware families with no unit flag, so
-            // scaleClusterChargePowerKw() has to GUESS from the magnitude, and it resolves the
-            // ambiguous 22..500 band as hectowatts (which is what our PHEV field captures
-            // show). That guess is safe on PHEV — an onboard charger physically cannot exceed
-            // ~7 kW, so the band is unreachable — but on a BEV a genuine 60-250 kW DC fast
-            // charge lands squarely in it and would be divided by 100, displaying 0.6-2.5 kW
-            // for a 60-250 kW session and poisoning the session peak/avg. BEV already has a
-            // trustworthy source in chargePowerKw (getChargePower, the battery-side figure the
-            // OEM app and cloud show), so there is nothing to gain there and a 100x error to
-            // lose. Restricting the branch to PHEV — the drivetrain that actually had the bug —
-            // keeps BEV behaviour bit-identical to before this change.
-            if (phev && !Double.isNaN(vd.clusterChargePowerKw)
-                    && vd.clusterChargePowerKw > 0.1 && vd.clusterChargePowerKw <= 300) {
-                data.updateChargingPower(vd.clusterChargePowerKw);
-                powerSource = "clusterChargePowerKw(DD)";
-            } else if (phev && estUsable) {
-                // PHEV, cluster readout unavailable on this trim: the SOC-derived ring
-                // estimator is the next best thing, and it OUTRANKS the remaining hardware
-                // getters. On PHEV those are unreliable: getChargePower() has been seen
-                // returning the AC/EVSE-side ~7 kW (not the true DC pack rate) on some
-                // trims, and getExternalChargingPower() reports the EVSE's rated
-                // capacity. Trusting either produced the "shows 7 kW on a 1.7 kW
-                // charge" bug. Only once the estimator has a value do we prefer it;
-                // before warm-up we fall to the phev placeholder branch below.
-                data.updateChargingPower(estKw);
-                powerSource = "estimator(ring,phev)";
-            } else if (!phev && !Double.isNaN(vd.chargePowerKw) && vd.chargePowerKw > 0.1 && vd.chargePowerKw <= 300) {
-                // Real DC charge rate into the pack (InstrumentDevice.getChargePower).
-                // BEV ONLY: it is the battery-side power the BYD app/cloud shows. This
-                // is NOT trusted on PHEV — getChargePower() has been seen returning the
-                // AC/EVSE-side ~7 kW there (not the true DC pack rate), so PHEV is
-                // handled entirely by the estimator/placeholder branches (above and
-                // below), never by a raw hardware getter.
-                data.updateChargingPower(vd.chargePowerKw);
-                powerSource = "chargePowerKw(DC)";
-            } else if (phev) {
-                // PHEV but the SOC estimator hasn't warmed up yet (needs ≥2 SOC ticks
-                // ≈ 15 min on a slow charge). Do NOT fall through to
-                // externalChargingPower/chargingPower here: on PHEV externalChargingPower
-                // is the EVSE's RATED capacity (a flat, confidently-WRONG 7.13 kW), not
-                // the real draw — displaying it would poison the session peak/avg and
-                // mislead. Skip to the engine-power / nominal-placeholder branches so
-                // the early window shows an honest estimated hint (isEstimated=true)
-                // instead of a wrong measured-looking value.
-                if (!Double.isNaN(vd.enginePowerKw) && vd.enginePowerKw < -0.3) {
-                    data.updateChargingPower(Math.abs(vd.enginePowerKw));
-                    // FLAGGED ESTIMATED. abs(engine power) is an INFERENCE — it is the
-                    // motor/generator's own figure, not a charger-side measurement, and the
-                    // reference OEM app deliberately refuses this substitution for charging power
-                    // (its charging band is unsigned, precisely so ICE/regen watts cannot surface
-                    // as a charge rate). Publishing it unflagged let it into the CPS ramp curve and
-                    // hence session energy/cost (invariant I3) — the same defect class as the
-                    // frozen estimator. Newly reachable mid-session now that the estimator can
-                    // expire, so this is no longer a warm-up-only path.
-                    //
-                    // COST: isEstimated is overloaded as both "don't persist" and "don't display"
-                    // — core.js:1015 and local/index.html:887 both hide the NUMBER when it is set,
-                    // so the card shows "Charging"/"--" instead of a value here. That is the right
-                    // trade (an unflagged inference in the cost curve is money-wrong; a blank is
-                    // only unhelpful), but it IS a visible loss. Splitting the flag into
-                    // isEstimated (display) + isInferred (persistence) would let this branch be
-                    // shown-but-not-persisted; left as a deliberate residual, not an oversight.
-                    data.isEstimated = true;
-                    powerSource = "enginePowerKw(phev)";
-                } else {
-                    powerSource = "phev-awaiting-estimator";
-                    try {
-                        com.overdrive.app.abrp.SohEstimator soh =
-                            com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
-                        if (soh != null && soh.getNominalCapacityKwh() > 0) {
-                            double nominal = soh.getNominalCapacityKwh();
-                            data.updateChargingPower(nominal < 30 ? 3.3 : 7.0);
-                            data.isEstimated = true;
-                            powerSource = "nominalPlaceholder(phev)";
-                        }
-                    } catch (Exception ignored) { /* leave power at 0 */ }
-                }
-            } else if (!Double.isNaN(vd.externalChargingPowerKw) && vd.externalChargingPowerKw > 0) {
-                data.updateChargingPower(vd.externalChargingPowerKw);
-                powerSource = "externalChargingPowerKw(AC)";
-            } else if (!Double.isNaN(vd.chargingPowerKw) && vd.chargingPowerKw > 0) {
-                data.updateChargingPower(vd.chargingPowerKw);
-                powerSource = "chargingPowerKw(device)";
-            } else if (estUsable) {
-                // FALLBACK: no charger-reported power on this model. Derive it
-                // from the time-derivative of the rising charge-energy counter
-                // (ring-buffer estimator). This is a MEASURED-from-counter value,
-                // not a nominal guess, so it is NOT flagged isEstimated — it can
-                // legitimately seed the session peak/avg and drive the live curve.
-                // The estimator only produces a value while fused-CHARGING + Park,
-                // so it is regen/V2L-safe by construction.
+            // Same-session pack flow is the only immediate independent rate reference on PHEV.
+            // Validate candidates before applying source precedence; demoting the winner afterwards
+            // left a valid lower-priority measured source (notably the capacity slope) unused.
+            long powerObservationBoundaryMs = taperCharging
+                    ? vd.chargingStateAtMs : sessionStartedAtMs;
+            long powerResolutionNowMs = System.currentTimeMillis();
+            double packFlowKw = freshNegativeEnginePackFlow(
+                    vd.enginePowerKw, vd.enginePowerAtMs,
+                    powerObservationBoundaryMs, powerResolutionNowMs);
+            boolean clusterIdleGarbage = isClusterChargePowerIdleGarbage(
+                    vd.clusterChargePowerKw, phev, vd.chargingGunState);
+            boolean clusterFromCurrentSession = isFreshPowerObservation(
+                    vd.clusterChargePowerAtMs, powerObservationBoundaryMs,
+                    powerResolutionNowMs);
+            double clusterPackFlowRef = packFlowReferenceForSource(
+                    vd.clusterChargePowerKw, vd.clusterChargePowerAtMs,
+                    packFlowKw, vd.enginePowerAtMs, phev, powerObservationBoundaryMs);
+            double clusterResolvedKw = clusterIdleGarbage || !clusterFromCurrentSession
+                    ? Double.NaN : ChargeRateResolver.rateKw(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_CLUSTER,
+                        vd.clusterChargePowerKw, clusterPackFlowRef);
+            boolean clusterPackFlowMismatch = isPhevClusterPackFlowMismatch(
+                    clusterResolvedKw, vd.clusterChargePowerAtMs,
+                    packFlowKw, vd.enginePowerAtMs, phev, powerObservationBoundaryMs);
+            double clusterKw = clusterPackFlowMismatch
+                    || shouldRejectCandidateBeforeSelection(
+                            com.overdrive.app.byd.ChargeSourceClassifier.SRC_CLUSTER,
+                            clusterResolvedKw, clusterPackFlowRef, phev)
+                    ? Double.NaN : clusterResolvedKw;
+            boolean extFromCurrentSession = isFreshPowerObservation(
+                    vd.externalChargingPowerAtMs, powerObservationBoundaryMs,
+                    powerResolutionNowMs);
+            boolean extIdleGarbage = ChargeRateResolver.isKnownPhevRawPowerJunk(
+                    vd.externalChargingPowerKw, phev);
+            double extPackFlowRef = packFlowReferenceForSource(
+                    vd.externalChargingPowerKw, vd.externalChargingPowerAtMs,
+                    packFlowKw, vd.enginePowerAtMs, phev, powerObservationBoundaryMs);
+            double extResolvedKw = extIdleGarbage || !extFromCurrentSession ? Double.NaN
+                    : ChargeRateResolver.rateKw(
+                    com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL,
+                    vd.externalChargingPowerKw, extPackFlowRef);
+            double extKw = shouldRejectCandidateBeforeSelection(
+                    com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL,
+                    extResolvedKw, extPackFlowRef, phev) ? Double.NaN : extResolvedKw;
+            boolean deferExternalToEstimator = shouldDeferExternalToGroundedEstimate(
+                    extKw, extPackFlowRef, phev, estUsable);
+            boolean devFromCurrentSession = isFreshPowerObservation(
+                    vd.chargingPowerAtMs, powerObservationBoundaryMs,
+                    powerResolutionNowMs);
+            boolean devIdleGarbage = ChargeRateResolver.isKnownPhevRawPowerJunk(
+                    vd.chargingPowerKw, phev);
+            double devPackFlowRef = packFlowReferenceForSource(
+                    vd.chargingPowerKw, vd.chargingPowerAtMs,
+                    packFlowKw, vd.enginePowerAtMs, phev, powerObservationBoundaryMs);
+            double devResolvedKw = devIdleGarbage || !devFromCurrentSession ? Double.NaN
+                    : ChargeRateResolver.rateKw(
+                    com.overdrive.app.byd.ChargeSourceClassifier.SRC_DEVICE,
+                    vd.chargingPowerKw, devPackFlowRef);
+            double devKw = shouldRejectCandidateBeforeSelection(
+                    com.overdrive.app.byd.ChargeSourceClassifier.SRC_DEVICE,
+                    devResolvedKw, devPackFlowRef, phev) ? Double.NaN : devResolvedKw;
+            // The per-session charged-energy counter is a known-cumulative kWh meter, so its slope
+            // is a genuine measured rate. Available on trims where every rate accessor is dead.
+            double capKw = ChargeRateResolver.rateKw(
+                    com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY, vd.chargingCapacityKwh);
+            boolean capacityHalfScale = isLikelyHalfScaleCapacityRate(capKw, estKw, phev);
+            boolean directFromCurrentSession = isFreshPowerObservation(
+                    vd.chargePowerAtMs, powerObservationBoundaryMs,
+                    powerResolutionNowMs);
+            double directPackFlowRef = packFlowReferenceForSource(
+                    vd.chargePowerKw, vd.chargePowerAtMs,
+                    packFlowKw, vd.enginePowerAtMs, phev, powerObservationBoundaryMs);
+            double directScaleRef = ChargeRateResolver.preferredScaleReference(
+                    directPackFlowRef, capKw);
+            boolean directIdleGarbage = isDirectChargePowerIdleGarbage(
+                    vd.chargePowerKw, phev, vd.chargingGunState);
+            double directResolvedKw = directFromCurrentSession && !directIdleGarbage
+                    ? resolveDirectChargePower(vd.chargePowerKw, directScaleRef)
+                    : Double.NaN;
+            double directKw = shouldRejectCandidateBeforeSelection(
+                    SRC_PACK_SIDE_DIRECT, directResolvedKw, directPackFlowRef, phev)
+                    || shouldWithholdUnverifiedDirectRate(
+                            directResolvedKw, directScaleRef, phev)
+                    ? Double.NaN : directResolvedKw;
+
+            // A classifier-managed rate whose SCALE could not be corroborated is publishable for
+            // DISPLAY but must not be integrated into priced energy: in the 2.2-22 kW band a
+            // hectowatt-scaled firmware is wrong by 10x. Marking it estimated is what keeps it out of
+            // the persisted curve, the cost and the outbound feeds, which all gate on isEstimated.
+            String scaleSrc = null;
+            double winningPackFlowRef = Double.NaN;
+            if (shouldPreferDirectPackSide(phev, directKw)) {
+                // Preserve the established BEV contract: its battery-side getter is the OEM/cloud
+                // rate and outranks AC-side or ambiguous charging accessors.
+                data.updateChargingPower(
+                        directKw, "chargePowerKw", vd.chargePowerAtMs,
+                        ChargingStateData.PowerQuality.MEASURED, 1.0);
+                powerSource = "chargePowerKw";
+                scaleSrc = SRC_PACK_SIDE_DIRECT;
+                winningPackFlowRef = directScaleRef;
+            } else if (!Double.isNaN(clusterKw)) {
+                // The instrument cluster's own charge readout — the number on the dash.
+                data.updateChargingPower(
+                        clusterKw, "cluster", vd.clusterChargePowerAtMs,
+                        ChargingStateData.PowerQuality.MEASURED, 1.0);
+                powerSource = "cluster";
+                scaleSrc = com.overdrive.app.byd.ChargeSourceClassifier.SRC_CLUSTER;
+                winningPackFlowRef = clusterPackFlowRef;
+            } else if (!Double.isNaN(devKw)) {
+                // The charging device's own rate. Signed by contract; the resolver already rejected
+                // negatives, so a V2L discharge cannot surface here as charging.
+                data.updateChargingPower(
+                        devKw, "chargingDevice", vd.chargingPowerAtMs,
+                        ChargingStateData.PowerQuality.MEASURED, 1.0);
+                powerSource = "chargingDevice";
+                scaleSrc = com.overdrive.app.byd.ChargeSourceClassifier.SRC_DEVICE;
+                winningPackFlowRef = devPackFlowRef;
+            } else if (!Double.isNaN(extKw) && !deferExternalToEstimator) {
+                data.updateChargingPower(
+                        extKw, "externalCharger",
+                        vd.externalChargingPowerAtMs,
+                        ChargingStateData.PowerQuality.MEASURED, 1.0);
+                powerSource = "externalCharger";
+                scaleSrc = com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL;
+                winningPackFlowRef = extPackFlowRef;
+            } else if (!Double.isNaN(capKw) && !capacityHalfScale) {
+                // Differentiated from the metered energy counter. Measured, not inferred.
+                data.updateChargingPower(
+                        capKw, "energyCounterSlope", 0L,
+                        ChargingStateData.PowerQuality.MEASURED, 0.9);
+                powerSource = "energyCounterSlope";
+                scaleSrc = com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY;
+            } else if (!Double.isNaN(directKw)) {
+                // Pack-side charge rate. Not classifier-managed: it is read through a different
+                // accessor that has only ever been observed as an instantaneous kW, and it is the
+                // long-standing source on trims where it works, so it keeps its direct read.
                 //
-                // OUTRANKS enginePowerKw below (it used to sit under it). Both describe the same
-                // charge, but only this one is unflagged — and because isEstimated doubles as
-                // "don't persist", losing the race to the inference zeroed the CPS samples, hence
-                // peak_power_kw, hence deriveIsDc's peak guard, hence DC pricing and both graphs.
-                // Mirrors the PHEV ordering above, where the estimator already outranks it.
-                data.updateChargingPower(estKw);
-                powerSource = "estimator(ring)";
-            } else if (!Double.isNaN(vd.enginePowerKw) && vd.enginePowerKw < -0.3) {
-                // engine current flowing into pack. setAccState(false) wipes
-                // this to NaN, so a value here is fresh from an ACC-on cycle.
-                data.updateChargingPower(Math.abs(vd.enginePowerKw));
-                // FLAGGED, exactly like the PHEV copy of this same inference above. abs(motor power)
-                // is not a charger-side measurement, and I3 requires the flag on every such branch.
-                // The PHEV branch got it and this one did not — an asymmetry with real cost: the
-                // -1.0 sentinel filter is deliberately exact-match, so any OTHER placeholder
-                // (-1.5, -2.0) or a genuine parked motor draw published here as MEASURED, entered
-                // the CPS curve, and priced the session. I1 says BEV must stay bit-identical; I3 is
-                // the load-bearing guard for I5 (money). Where they conflict, I3 wins — an unflagged
-                // inference in the cost integral is wrong in currency, a blank display is only
-                // unhelpful. Recorded as a second sanctioned BEV-visible change in I1.
+                // The idle-garbage filter matters because this tier is reached routinely: it sits
+                // below four classifier-managed sources, all of which return NaN while their verdict
+                // is still UNKNOWN. So early in a charge this is often the FIRST tier that can
+                // answer — and it is the one accessor documented to emit a ~359 junk value when
+                // idle, which is in-band for the 500 ceiling and would publish unflagged as 359 kW.
+                data.updateChargingPower(
+                        directKw, "chargePowerKw", vd.chargePowerAtMs,
+                        ChargingStateData.PowerQuality.MEASURED, 1.0);
+                powerSource = "chargePowerKw";
+                // Subject to both scale and accuracy checks like every other measured tier. It is not
+                // classifier-managed, so the sentinel below owns a separate session-scoped divisor.
+                scaleSrc = SRC_PACK_SIDE_DIRECT;
+                winningPackFlowRef = directScaleRef;
+            } else if (estUsable) {
+                // The generic ring estimate is flagged: a derivative of a quantised gauge is not a
+                // direct charger reading. The narrowly-detected half-scale case is different: on a BEV
+                // the estimator's only possible non-capacity input is the full-scale remainKwh slope,
+                // and it disagrees with the capacity slope by the documented 1:2 fault signature.
+                // That is an independent, kWh-grounded measured rate, so publish it to the card and
+                // session curve instead of hiding a known-good 6-7 kW value as a generic estimate.
+                data.updateChargingPower(
+                        estKw,
+                        capacityHalfScale
+                                ? "remainEnergySlope(capacityHalfScale)"
+                                : "ringEstimator",
+                        0L,
+                        capacityHalfScale
+                                ? ChargingStateData.PowerQuality.MEASURED
+                                : ChargingStateData.PowerQuality.ESTIMATED,
+                        capacityHalfScale ? 0.9 : 0.5);
+                if (!capacityHalfScale) data.isEstimated = true;
+                powerSource = capacityHalfScale
+                        ? "remainEnergySlope(capacityHalfScale)"
+                        : "ringEstimator";
+            } else if (!Double.isNaN(packFlowKw)) {
+                // Current flowing into the pack on the motor bus. An INFERENCE — it is the motor's
+                // own figure, not a charger-side measurement — so it is flagged and therefore
+                // excluded from the persisted curve and the price.
+                data.updateChargingPower(
+                        packFlowKw, "enginePower", vd.enginePowerAtMs,
+                        ChargingStateData.PowerQuality.ESTIMATED, 0.5);
                 data.isEstimated = true;
-                powerSource = "enginePowerKw";
+                powerSource = "enginePower";
             } else {
-                // Detector says CHARGING but no real kW signal arrived.
-                // Show a nominal-based hint so the UI doesn't say "Charging at 0 kW".
+                // Detector says CHARGING but nothing can express a rate yet. Show a nominal-based
+                // hint so the card does not read "0 kW", flagged so it cannot be persisted or priced.
                 powerSource = "none";
                 try {
                     com.overdrive.app.abrp.SohEstimator soh =
                         com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
-                    if (soh != null && soh.getNominalCapacityKwh() > 0) {
-                        double nominal = soh.getNominalCapacityKwh();
-                        // < 30 kWh nominal pack → PHEV (3.3 kW AC); else BEV (7 kW AC)
-                        data.updateChargingPower(nominal < 30 ? 3.3 : 7.0);
+                    com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                            soh != null ? soh.getCapacitySohSnapshot() : null;
+                    if (capacitySoh != null
+                            && capacitySoh.getNominalCapacityKwh() > 0) {
+                        double nominal = capacitySoh.getNominalCapacityKwh();
+                        data.updateChargingPower(
+                                nominal < 30 ? 3.3 : 7.0,
+                                "nominalPlaceholder", 0L,
+                                ChargingStateData.PowerQuality.ESTIMATED, 0.0);
                         data.isEstimated = true;
                         powerSource = "nominalPlaceholder";
                     }
                 } catch (Exception ignored) { /* leave power at 0 */ }
             }
-            // Diagnostic (throttled 1/min): which branch resolved the displayed
-            // charging power, the chosen value, and EVERY candidate's raw value —
-            // so a single charge log says definitively whether 3.4 kW is the DC
-            // getter reading half, or the ring estimator. INFO so it lands in a
-            // default-level capture.
+            boolean clusterScaleCorroborated = com.overdrive.app.byd.ChargeSourceClassifier
+                    .SRC_CLUSTER.equals(scaleSrc)
+                    && isPhevClusterRateCorroboratedByPackFlow(
+                            data.chargingPowerKW, vd.clusterChargePowerAtMs,
+                            packFlowKw, vd.enginePowerAtMs, phev, sessionStartedAtMs);
+            // Scale gate on the winning classifier-managed source. The resolver publishes an
+            // uncorroborated reading below its safe ceiling so AC charging is not blank on trims with
+            // no kWh yardstick, but an unverified figure in that band could be 10x out — so it is
+            // marked estimated here and thereby kept out of the persisted curve, the price and the
+            // outbound feeds. Once any yardstick exists the flag clears by itself.
+            // PHEV-contained per I1, like every sibling gate: the unit ambiguity is a documented
+            // PHEV/AC observation, and on BEV no yardstick can ever appear (the pack-flow reference
+            // is phev-gated), so the flag would never clear and would zero the peak, the curve and
+            // the DC verdict for the whole session.
+            if (scaleSrc != null && phev && !data.isEstimated
+                    && !clusterScaleCorroborated
+                    && !ChargeRateResolver.isScaleVerified(
+                            scaleSrc, data.chargingPowerKW, winningPackFlowRef)) {
+                data.isEstimated = true;
+                data.updatePowerQuality(
+                        ChargingStateData.PowerQuality.UNVERIFIED, 0.25);
+                powerSource = powerSource + "(scaleUnverified)";
+            }
+            // ACCURACY gate, distinct from the SCALE gate above. A source can be in kW and still not be
+            // the pack's rate — an EVSE rated capacity or an AC-side figure both are. The energy
+            // counter measures what actually accumulated, so a rate materially above it is demoted to
+            // an estimate rather than persisted and priced.
+            if (scaleSrc != null && !data.isEstimated
+                    && contradictedByCounter(
+                            scaleSrc, data.chargingPowerKW, winningPackFlowRef, phev)) {
+                data.isEstimated = true;
+                data.updatePowerQuality(
+                        ChargingStateData.PowerQuality.UNVERIFIED, 0.25);
+                powerSource = powerSource + "(aboveCounterRate)";
+            }
+            // Diagnostic (throttled 1/min). Prints the resolved rate, which branch won, and BOTH
+            // the raw stored value and the resolver's kW for every source alongside its classified
+            // kind — so one charge log shows whether a source was refused because it is still
+            // UNKNOWN, or because its slope was not yet computable, rather than leaving "why is
+            // this blank" to inference. INFO so it survives a default-level capture.
             long nowMs = System.currentTimeMillis();
             if (nowMs - lastChargePowerLogMs > 60_000L) {
                 lastChargePowerLogMs = nowMs;
                 logger.info(String.format(
-                    "ChargingPower resolved=%.2fkW source=%s phev=%s | candidates: clusterKw=%s chargePowerKw=%s extChgKw=%s chgDevKw=%s engineKw=%s estimatorKw=%s",
-                    data.chargingPowerKW, powerSource, phev,
-                    fmt(vd.clusterChargePowerKw),
-                    fmt(vd.chargePowerKw), fmt(vd.externalChargingPowerKw),
-                    fmt(vd.chargingPowerKw), fmt(vd.enginePowerKw),
-                    // Reuse the SNAPSHOT the cascade actually used, not a fresh read: re-reading
-                    // here can observe a concurrent derive (or reset) on the collector thread and
-                    // print a candidate that contradicts the resolved `source` field — e.g.
-                    // "source=nominalPlaceholder(phev) ... estimatorKw=1.54" — which would send a
-                    // future reader after a phantom cascade bug.
-                    fmt(estKw)));
+                    "ChargingPower resolved=%.2fkW source=%s estimated=%s phev=%s | "
+                    + "cluster raw=%s kw=%s kind=%s idleGarbage=%s | extChg raw=%s kw=%s kind=%s | "
+                    + "chgDev raw=%s kw=%s kind=%s | energyCounter raw=%s kw=%s kind=%s "
+                    + "unitFactor=%s suspect=%s | "
+                    + "capacityHalfScale=%s chargePowerKw=%s engineKw=%s ringEstimator=%s",
+                    data.chargingPowerKW, powerSource, data.isEstimated, phev,
+                    fmt(vd.clusterChargePowerKw), fmt(clusterResolvedKw),
+                    com.overdrive.app.byd.ChargeSourceClassifier.kindOf(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_CLUSTER),
+                    clusterIdleGarbage,
+                    fmt(vd.externalChargingPowerKw), fmt(extResolvedKw),
+                    com.overdrive.app.byd.ChargeSourceClassifier.kindOf(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL),
+                    fmt(vd.chargingPowerKw), fmt(devResolvedKw),
+                    com.overdrive.app.byd.ChargeSourceClassifier.kindOf(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_DEVICE),
+                    fmt(vd.chargingCapacityKwh), fmt(capKw),
+                    com.overdrive.app.byd.ChargeSourceClassifier.kindOf(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY),
+                    // The register-width verdict and its pre-verdict suspicion. Without these a
+                    // capture cannot distinguish "counter refused because its unit is wrong" from
+                    // "counter had no slope yet", which was the whole difficulty in log AL37RNJ9.
+                    com.overdrive.app.charging.CounterScaleCalibrator.factorFor(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY),
+                    com.overdrive.app.charging.CounterScaleCalibrator.isScaleSuspect(
+                        com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY),
+                    capacityHalfScale,
+                    fmt(vd.chargePowerKw), fmt(vd.enginePowerKw), fmt(estKw)));
             }
         }
         return data;
@@ -596,13 +1270,17 @@ public class VehicleDataMonitor {
         try {
             com.overdrive.app.abrp.SohEstimator soh =
                 com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
-            if (soh != null && soh.getNominalCapacityKwh() > 0 && soc > 0) {
-                double nominal = soh.getNominalCapacityKwh();
+            com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot capacitySoh =
+                    soh != null ? soh.getCapacitySohSnapshot() : null;
+            if (capacitySoh != null
+                    && capacitySoh.getNominalCapacityKwh() > 0 && soc > 0) {
+                double nominal = capacitySoh.getNominalCapacityKwh();
                 // SINGLE SOURCE OF TRUTH for remaining energy. SOH is the
                 // displayed (capped ≤100, independently-anchored) value so this
                 // number always agrees with the SOH chip/card. Default 100 until
                 // a real measurement exists.
-                double sohPercent = soh.hasDisplaySoh() ? soh.getDisplaySoh() : 100.0;
+                double sohPercent = capacitySoh.hasDisplaySoh()
+                        ? capacitySoh.getDisplaySoh() : 100.0;
                 if (sohPercent <= 0) sohPercent = 100.0;
                 double computedKwh = (soc / 100.0) * nominal * (sohPercent / 100.0);
 
@@ -662,6 +1340,9 @@ public class VehicleDataMonitor {
             if (vd != null && !Double.isNaN(vd.voltage12v)) {
                 JSONObject bpJson = new JSONObject();
                 bpJson.put("voltageVolts", vd.voltage12v);
+                if (vd.voltage12vAtMs > 0L) {
+                    bpJson.put("observedAtMs", vd.voltage12vAtMs);
+                }
                 bpJson.put("isWarning", vd.voltage12v < 11.5);
                 bpJson.put("isCritical", vd.voltage12v < 10.5);
                 bpJson.put("healthStatus", vd.voltage12v < 10.5 ? "CRITICAL" : vd.voltage12v < 11.5 ? "WARNING" : "NORMAL");
@@ -691,6 +1372,10 @@ public class VehicleDataMonitor {
                 csJson.put("chargingPowerKW", cs.chargingPowerKW);
                 csJson.put("isDischarging", cs.isDischarging);
                 csJson.put("isEstimated", cs.isEstimated);
+                csJson.put("powerSource", cs.powerSource);
+                csJson.put("powerObservedAtMs", cs.powerObservedAtMs);
+                csJson.put("powerQuality", cs.powerQuality.name());
+                csJson.put("powerConfidence", cs.powerConfidence);
                 json.put("chargingState", csJson);
             }
             

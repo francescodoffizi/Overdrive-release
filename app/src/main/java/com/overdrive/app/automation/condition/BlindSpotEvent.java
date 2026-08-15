@@ -3,13 +3,8 @@ package com.overdrive.app.automation.condition;
 import com.overdrive.app.automation.Automations;
 import com.overdrive.app.logging.DaemonLogger;
 
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Publishes the radar blind-spot / lane-change / cross-traffic ALERT state into
@@ -38,25 +33,22 @@ import java.util.concurrent.atomic.AtomicReference;
  * genuinely quiet window publishes "off". The hold is refreshed by every new
  * alert, so a sustained hazard stays "on" throughout.
  *
- * <p><b>Zero cost unless a blind-spot automation exists.</b> Same self-gating as
- * the other fast pollers: the poll reschedules itself but performs no SDK read
- * unless {@link Automations#isEventReferenced} reports an enabled automation that
- * actually uses the signal. The instant path costs nothing either way — it is a
- * branch inside an ADAS callback that already fires.
+ * <p><b>Zero cost unless a blind-spot automation exists.</b> The fallback task is absent
+ * while neither side is referenced. The instant callback also returns before touching state
+ * when its side has no enabled reference.
  */
 public final class BlindSpotEvent {
     private static final DaemonLogger logger = DaemonLogger.getInstance("Automations");
-    private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1, r -> {
-        Thread t = new Thread(r, "BlindSpotEvent");
-        t.setDaemon(true);
-        return t;
-    });
-    private static final AtomicReference<ScheduledFuture<?>> active = new AtomicReference<>();
 
     // A blind-spot hazard is a fast-moving situation, so sample at the same rate
     // as the other safety-relevant inputs. Only paid while a blind-spot
     // automation exists (see poll()).
     private static final long POLL_MS = 250L;
+    private static final ConditionalPoller poller = new ConditionalPoller(
+            "blind spot",
+            POLL_MS,
+            BlindSpotEvent::referenced,
+            BlindSpotEvent::sample);
 
     // How long an alert holds "on" after the last warning. Must exceed the poll
     // interval by a wide margin so the hold spans several ticks; a few seconds
@@ -80,12 +72,13 @@ public final class BlindSpotEvent {
 
     private BlindSpotEvent() {}
 
-    public static void scheduleBlindSpotEvent() {
-        ScheduledFuture<?> next = scheduler.schedule(BlindSpotEvent::poll, POLL_MS, TimeUnit.MILLISECONDS);
-        ScheduledFuture<?> previous = active.getAndSet(next);
-        if (previous != null && !previous.isDone()) {
-            previous.cancel(false);
-        }
+    private static boolean referenced() {
+        return Automations.isEventReferenced(BydEvent.BLIND_SPOT_LEFT)
+                || Automations.isEventReferenced(BydEvent.BLIND_SPOT_RIGHT);
+    }
+
+    public static void refresh() {
+        poller.refresh();
     }
 
     /**
@@ -95,7 +88,8 @@ public final class BlindSpotEvent {
      */
     public static void onAlert(boolean left) {
         try {
-            if (Automations.isDisabled()) return;
+            EventData key = left ? BydEvent.BLIND_SPOT_LEFT : BydEvent.BLIND_SPOT_RIGHT;
+            if (!Automations.isEventReferenced(key)) return;
             long now = System.currentTimeMillis();
             // publish() seeds the baseline itself, which matters when an alert beats
             // the poll to it: the automation layer ignores a transition out of an
@@ -138,27 +132,6 @@ public final class BlindSpotEvent {
         }
     }
 
-    private static void poll() {
-        try {
-            // Gate on a real listener: only touch the SDK when an enabled
-            // automation actually references the blind-spot signal.
-            if (Automations.isEventReferenced(BydEvent.BLIND_SPOT_LEFT)
-                    || Automations.isEventReferenced(BydEvent.BLIND_SPOT_RIGHT)) {
-                sample();
-            } else {
-                // Not referenced (or the rule was just disabled) — no SDK read.
-                // Still expire any outstanding hold: the instant event path can
-                // publish "on" without the poll ever having run, and if nothing
-                // released it that side would stay stuck "on" forever.
-                expireHolds();
-            }
-        } catch (Throwable t) {
-            logger.error("Failed to run blind-spot event", t);
-        } finally {
-            scheduleBlindSpotEvent();
-        }
-    }
-
     /**
      * Release a held "on" once its window has elapsed, without reading the SDK.
      * Safety net for the instant path, which publishes the alert edge but relies
@@ -176,8 +149,21 @@ public final class BlindSpotEvent {
      * Re-guards on {@code isDisabled} so a race that disables the last automation
      * mid-tick is a no-op.
      */
+    /**
+     * Read the warning registers NOW and publish, for the editor's live-value hints. The poll below
+     * only samples while an enabled rule references the signal, so in the editor blindSpot had no
+     * publisher and read "not reported yet on this car". Store-only while nothing is enabled
+     * (Automations.update forces {@code fire = false}), so it cannot raise a false alert.
+     */
+    public static void seedForEditor() {
+        try { sample(); } catch (Throwable ignored) { /* best-effort hint */ }
+    }
+
     private static void sample() {
-        if (Automations.isDisabled()) return;
+        // Seed-aware like the other samplers: with nothing enabled this returned before publishing,
+        // so blindSpot read "not reported yet on this car" in the editor. Storing is not firing —
+        // Automations.update forces fire=false while disabled.
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
         int packed;
         try {
             packed = com.overdrive.app.byd.BydDataCollector.getInstance().readBlindSpotNow();

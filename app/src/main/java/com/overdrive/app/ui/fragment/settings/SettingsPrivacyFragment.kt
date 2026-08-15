@@ -29,12 +29,6 @@ import java.util.concurrent.Executors
  * (clip count + total size), the log-verbosity picker, and the
  * destructive reset action.
  *
- * Log verbosity lives here because logs are on-device data and this is
- * the control that decides how much of it gets written. Lowering the gate
- * to Debug turns on per-ADB-command tracing, which fills the rotation
- * window fast; raising it to Warnings/Errors throws away the context a
- * later diagnosis needs. Both ends get an inline advisory.
- *
  * The reset button delegates to [MainActivity.invokeResetDataDialog],
  * preserving the exact behaviour of the legacy portrait "Reset data"
  * card.
@@ -86,15 +80,12 @@ class SettingsPrivacyFragment : Fragment() {
     }
 
     /**
-     * Wire the log-verbosity picker.
+     * Wire the log-verbosity picker. Writes through [ConfigManager.updateLoggingConfig],
+     * whose listener pushes the new config into the running LogManager, so the change
+     * takes effect without an app restart.
      *
-     * Writes through [ConfigManager.updateLoggingConfig], which notifies the listener
-     * OverdriveApplication registered — that pushes the new config into the running
-     * LogManager, so the change takes effect immediately with no app restart.
-     *
-     * Selection maps to [LogLevel] by explicit button id, not by index. The previous
-     * dropdown mapped position→`LogLevel.values()[i]`, which quietly depended on the enum
-     * and the string-array staying in the same order; here the two can't drift.
+     * NOTE: release builds strip all LogManager calls via proguard-rules-strip-logs.pro,
+     * so this control only has an observable effect on the braveheart channel.
      */
     private fun setupLogLevel(root: View) {
         val group = root.findViewById<MaterialButtonToggleGroup>(R.id.toggleLogLevel) ?: return
@@ -128,10 +119,9 @@ class SettingsPrivacyFragment : Fragment() {
 
         val current = ConfigManager.getInstance(ctx).getLoggingConfig().minLevel
 
-        // Seed BEFORE registering the listener. addOnButtonCheckedListener fires on a
-        // programmatic check() too, and letting it run here would re-persist the value and
-        // re-schedule the LogCleaner worker on every visit to the page. Ordering is what
-        // prevents that — a suppress-flag would be dead code given this sequence.
+        // Seed BEFORE registering the listener: addOnButtonCheckedListener fires on a
+        // programmatic check() too, which would re-persist the value and re-schedule the
+        // LogCleaner worker on every visit to the page.
         group.check(buttonIdFor(current))
         applyCopy(current)
 
@@ -143,11 +133,8 @@ class SettingsPrivacyFragment : Fragment() {
             val existing = cfg.getLoggingConfig()
             applyCopy(chosen)
             if (existing.minLevel == chosen) return@addOnButtonCheckedListener
-            // Logged BEFORE the write, at WARN, so the transition is recorded under the OLD
-            // gate. Logging afterwards would lose exactly the interesting case — "why did the
-            // logs go quiet?" — because the new stricter gate would drop its own audit line.
-            // The one transition this can't record is a move away from ERROR-only, where the
-            // user has already asked for near-silence.
+            // Logged before the write, at WARN, so the transition is recorded under the OLD
+            // gate — afterwards the new stricter gate would drop its own audit line.
             LogManager.getInstance().warn(TAG, "Log level changed: ${existing.minLevel} → $chosen")
             cfg.updateLoggingConfig(existing.copy(minLevel = chosen))
         }

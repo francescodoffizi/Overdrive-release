@@ -1511,7 +1511,7 @@ public class OemDashcamPipeline {
 
         // Attach surface. We try the legacy addPreviewSurface(Surface, mode)
         // first because OEM dashcam ids on Seal/Han respond to mode=0
-        // (single-channel passthrough). DiLink 4 (USE_ESCO_SURFACE_TEXTURE_PATH)
+        // (single-channel passthrough). DiLink 4 (USE_OEM_SURFACE_TEXTURE_PATH)
         // pano uses addTexture(SurfaceTexture, idx) with idx=0 mosaic; for OEM
         // dashcam idx=0 is also "the only channel", so the same call works.
         boolean attached = false;
@@ -1974,14 +1974,14 @@ public class OemDashcamPipeline {
         // R8-A #1: detachFromPano runs OUTSIDE lifecycleLock to avoid a
         // potential deadlock cycle (OEM-lifecycleLock ↔ pano-streamLifecycleLock
         // ↔ pano-GL-handler-barrier). It only reads pano state and posts
-        // a no-op Runnable; nothing in it mutates OEM-instance state, so
-        // it doesn't need the OEM lock. By moving it out of the locked
-        // region we sidestep any future lock-ordering bug.
-        detachFromPano();
+        // a GL fence; nothing in it mutates OEM-instance state, so it
+        // doesn't need the OEM lock. By moving it out of the locked region
+        // we sidestep any future lock-ordering bug.
+        boolean panoGpuQuiesced = detachFromPano();
 
         lifecycleLock.lock();
         try {
-            stopInternalLocked(fromStartFailure);
+            stopInternalLocked(fromStartFailure, panoGpuQuiesced);
         } finally {
             lifecycleLock.unlock();
         }
@@ -1994,46 +1994,70 @@ public class OemDashcamPipeline {
      * in-flight pano drawFrame. Lock-free; called from stopInternal
      * before lifecycleLock acquisition (R8-A #1).
      */
-    private void detachFromPano() {
+    private boolean detachFromPano() {
         try {
             com.overdrive.app.surveillance.GpuSurveillancePipeline pano =
                 com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
-            if (pano == null) return;
-            boolean wasSampling = false;
-            try {
-                wasSampling = pano.isStreamingEnabled()
-                    && pano.getStreamViewMode() == 6;
-            } catch (Throwable ignored) {}
+            if (pano == null) return true;
             pano.reattachOwnStreamCallback();
-            if (wasSampling) {
-                com.overdrive.app.camera.PanoramicCameraGpu panoCam = pano.getCamera();
-                android.os.Handler glH = panoCam != null ? panoCam.getGlHandler() : null;
-                if (glH != null) {
-                    final java.util.concurrent.CountDownLatch barrier =
-                        new java.util.concurrent.CountDownLatch(1);
-                    if (glH.post(barrier::countDown)) {
-                        try { barrier.await(500, java.util.concurrent.TimeUnit.MILLISECONDS); }
-                        catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                        }
-                    }
-                }
+            final long fenceGeneration = pano.getPendingOemSourceFenceGeneration();
+            if (fenceGeneration == 0L) return true;
+            com.overdrive.app.camera.PanoramicCameraGpu panoCam = pano.getCamera();
+            android.os.Handler glH = panoCam != null ? panoCam.getGlHandler() : null;
+            if (glH == null) {
+                // No pano GL thread exists, so no pano draw can still sample
+                // this source. Mark the generation complete and release OEM.
+                pano.completeOemSourceFence(fenceGeneration);
+                return true;
             }
+            final java.util.concurrent.CountDownLatch barrier =
+                new java.util.concurrent.CountDownLatch(1);
+            final java.util.concurrent.atomic.AtomicBoolean glFinished =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+            if (!glH.post(() -> {
+                try {
+                    // Handler ordering alone proves only CPU ordering. Finish
+                    // all preceding pano draws before OEM can delete the
+                    // shared EXTERNAL_OES texture from its context.
+                    GLES20.glFinish();
+                    glFinished.set(true);
+                } finally {
+                    barrier.countDown();
+                }
+            })) {
+                logger.warn("stop: pano GL fence post rejected; preserving shared texture");
+                return false;
+            }
+            try {
+                if (!barrier.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    logger.warn("stop: pano GL fence timed out; preserving shared texture");
+                    return false;
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            if (glFinished.get()) {
+                pano.completeOemSourceFence(fenceGeneration);
+                return true;
+            }
+            return false;
         } catch (Throwable t) {
             logger.warn("stop: pano reattach failed: " + t.getMessage());
+            return false;
         }
     }
 
-    private void stopInternalLocked(boolean fromStartFailure) {
+    private void stopInternalLocked(boolean fromStartFailure, boolean panoGpuQuiesced) {
         // Best-effort tear-down. Errors during stop are logged and swallowed
         // so we never block a daemon shutdown.
         //
         // detachFromPano() ran in stopInternal BEFORE we acquired
         // lifecycleLock — it's lock-free and just reattaches pano's
-        // stream sink + waits one frame on pano's GL handler. By the
-        // time we reach this method, pano is no longer sampling our
-        // EXTERNAL_OES texture, so the glDeleteTextures inside the GL
-        // Runnable below is safe.
+        // stream sink + finishes its preceding pano GL work. By the time we
+        // reach this method, pano is no longer sampling our EXTERNAL_OES
+        // texture. If that fence timed out, preserve the OEM GL objects
+        // rather than deleting a texture that may still be in use.
         try {
             if (recording.getAndSet(false) && encoder != null) {
                 encoder.stopEventRecording(true, 0);
@@ -2092,7 +2116,7 @@ public class OemDashcamPipeline {
         // unsafely so the surfaces / texture release with the process at
         // worst on next start (or full daemon kill, if ever).
         boolean glReleased = false;
-        if (glHandler != null) {
+        if (panoGpuQuiesced && glHandler != null) {
             try {
                 runOnGlThreadAndWait(() -> {
                     // Release SurfaceTexture + Surface FIRST on the GL
@@ -2190,7 +2214,7 @@ public class OemDashcamPipeline {
                     if (cameraSurfaceLocal != null) cameraSurfaceLocal.release();
                 } catch (Throwable wedgeIgnoredB) {}
             }
-        } else {
+        } else if (panoGpuQuiesced) {
             // No GL handler at all (init aborted before glThread came up).
             // Release the ST/Surface here directly — no GL thread to race.
             try {
@@ -2202,6 +2226,8 @@ public class OemDashcamPipeline {
             try {
                 if (cameraSurfaceLocal != null) cameraSurfaceLocal.release();
             } catch (Throwable noGlIgnoredB) {}
+        } else {
+            logger.warn("stop: preserving OEM GL resources after an unconfirmed pano fence");
         }
         encoderEglSurface = null;
         dummySurface = null;

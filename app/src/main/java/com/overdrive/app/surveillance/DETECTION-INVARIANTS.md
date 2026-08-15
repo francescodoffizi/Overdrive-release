@@ -8,10 +8,10 @@ each lives in the referenced code comments; this file is the index.
 Only misses (false negatives) are defects. A change is shippable only if it is
 FP-neutral or FP-reducing. "Catches more" is not, by itself, a justification.
 
-## The three evidence channels
+## The four evidence channels
 
-A recording is justified by ONE of three independent kinds of evidence. Any change
-must be checked against all three, because a stage that serves one can starve another:
+A recording is justified by ONE of four independent kinds of evidence. Any change
+must be checked against all four, because a stage that serves one can starve another:
 
 1. **Class evidence** — YOLO resolved a person/vehicle (`sequenceConfirmed`).
 2. **Dwell evidence** — a TRUSTED HIGH loiter (coherent translation or an in-zone
@@ -19,10 +19,26 @@ must be checked against all three, because a stage that serves one can starve an
 3. **Salience evidence** — the motion geometry itself is object-grade: large,
    compact, sustained, photometrically stable, rigidly translating. Opt-in
    (`motionSalienceEnabled`, default OFF).
+4. **Context evidence (post-park vigilance)** — motion adjacent to a FRESH PARKER:
+   a confirmed vehicle baseline entry that was WATCHED arriving by a live event
+   (`Entry.fromLiveEvent`, never the sentry-start seed or a lighting refresh)
+   within the last 10 min. `postParkVigilanceEnabled`, default ON.
 
 Channel 3 exists because 1 and 2 both fail on the same real subject: YOLO gets
 ~2-4 windows on a dark fisheye crop and returns nothing, and a subject that keeps
 moving never reads as a loiter. Its own inversion hazard is documented below.
+
+Channel 4 exists because the parking event itself DISARMS the other channels for
+its own aftermath: the parked car is baseline-suppressed (so its boxes no longer
+confirm anything), the occupant's exit is short and fragmented (never a loiter,
+resets the sequence on >2 s pauses), the person is door/self-occluded (YOLO-blind),
+walks AWAY (reads passing), and a car parked beyond NEAR/MID keeps
+`peakCloseZoneDuringSequence` false so the far-unconfirmed gate kills the timeout
+fallback. Vigilance grants: a 1 s bar, a far-gate exemption, and the fast AI
+cadence — it does NOT clear the AI-confirm gate (YOLO always gets its 2 s timeout
+window). Brakes: 10 s min-gap after any stop + a hard budget of 3 assisted
+(unconfirmed) triggers per rolling 10 min + TTL'd latch (10 s) + quadrant scoping
++ brightness/incoherence discriminators at every consumer.
 
 ## The funnel
 
@@ -127,6 +143,11 @@ be attributed to a stage without a rebuild.
 
 | Stage | Last audited | Result |
 |---|---|---|
+| S2 brightness-event scoping (I3 alignment) | 2026-08-11 (re-audited same day; correlated-lighting gap found and closed) | The trigger path's lighting-artifact discriminator was ONE scene-wide any-quadrant OR (`brightnessEventDuringSequence`); a headlight sweep on any camera closed the close-zone fast-path + override and stretched the 2 s AI-confirm timeout to 20 s for every quadrant. Replaced with per-consumer evidence scoping (`brightnessEventInQuadrant` + three scope flags): close-zone consumers test {best-threat quadrant, `peakCloseZoneQuadrant` (new, latched with the close-zone latch, reset with it)}, salience consumers {best-threat, `salienceQuadrant`}, vigilance consumers {best-threat, `vigilanceQuadrant`}. AUDIT FINDING (fixed): one physical lighting event can suppress camera A while its light POOL reads as ordinary coherent MEDIUM+ motion in camera B — per-quadrant scoping alone re-opened the fast paths for B's pool. Closed by the CORRELATED-LIGHTING GUARD: any quadrant's suppression ONSET within ±1 s (`LIGHTING_CORRELATION_MS`) of the sequence's `firstMotionTime` marks the WHOLE sequence lighting-correlated for all three scopes (the old OR's protection, restored exactly where the correlation exists); onset stamps are edge-detected every tick unconditionally (`suppressionOnsetMs[]`/`brightnessPrevTick[]`, reset in enable()). A sweep starting well after a real subject's sequence began stays quadrant-scoped — the cross-camera FN fix is preserved. Checked against I2/I3/I6/I7 as before; the "AI gate holding" line logs any-quadrant AND scoped values. The `shouldDiscardEvent` night path is UNTOUCHED — its own scene-wide-OR coupling was already neutralized by `eventSawUncharacterizedMotion` (verified: the native suppressed path early-returns before component formation, so "FP evidence and unexplained blob on the same tick in the same quadrant" is unreachable). |
+| Stationary-subject revival channel (MOG2 persistent foreground) | 2026-08-11 (re-audited same day by 4 adversarial reviewers; all findings fixed) | Fifth immunity mechanism (after brightness-immunity and standing-person immunity), covering the YOLO-blind stationary subject: frame differencing loses a stopped subject in ~300ms and the >2s gap resets the sequence before any bar is reached. The dormant OpenCV MOG2 in native_motion.cpp is now fed the full 640×480 mosaic at 2 FPS via new JNI (`computeMOG2Quadrants` — ONE apply() per call, per-quadrant fractions out; `resetMOG2` for session reset; both mutex-guarded and exception-guarded at the JNI boundary — audit found the unguarded cv::Ptr reassignment racing a straggler apply() on fast disable→enable, and that an escaped cv::Exception would abort the daemon). REVIVAL-ONLY by construction: revives `anyMotion` for an already-running, NOT-YET-RECORDING sequence exactly like the standing-person immunity; can NEVER start a sequence (revive-only guard `firstMotionTime != 0`), never runs while recording (audit: a recording-time revival fed the extension branch every tick and made the 3× postRecord hard ceiling unreachable), never lowers a bar, never touches the AI-confirm/far gates, NOT a discard KEEP. PRE-TRIGGER SCOPE means the recording decision (bars + AI gate + far gate + no-AI rate limits) is unchanged; the acknowledged FP residual — a sequence started by real motion whose quadrant retains OTHER static foreground — is bounded by the DEPARTURE BRAKE: the current fraction must hold ≥80% of the baseline captured at the last qualifying-motion tick (`sequenceMog2BaselineFrac`; missing baseline = revival disarmed, I9). Further brakes: quadrant-scoped to the exact quadrant that produced the qualifying signal (`sequenceMotionQuadrant` — audit: captured from the qualifying loop / tracked-person quadrant itself, NOT getHighestThreatQuadrant, which any LOW(pass) quadrant can poison; I11), brightness-discriminated on that quadrant (I3), fail-closed on ANY missing evidence — OpenCV absent, warmup (arms after the 21st sample ≈ 10s), stale sample (>1.6s), native error (I9), 60s per-stretch budget (I10) atop the model's natural ~50s static-scene absorption. ALL session state + the native model reset in enable() BEFORE the volatile `active` publication (audit: post-publication resets both raced the native apply() — UAF — and could be lost to the engine thread — a skipped lr=1.0 reseed + pre-satisfied warmup). Config kill switch `stationaryRevivalEnabled` (default true), read once per session. DEVICE-UNVERIFIED — `MOG2_REVIVE_MIN_FRAC` (0.03), `MOG2_NO_DROP_FRAC` (0.8) and the warmup/budget values are reasoned, not measured. |
+| S3 side-cam detector-input dewarp (`FisheyeDewarp`) | 2026-08-11 | Mirror cams (Q1/Q3) get their DETECTOR INPUT dewarped with the same division model the recorder/blind-spot card ship (k1=0.15, k2=0.05 ⇔ strength 0.5 — chosen by an offline sweep of the shipped yolo26n-DRQ over 30 real recorded frames: left cam +54% summed confidence / +71% detections at 0.5, collapse at ≥0.75). FIXED in-code constants, deliberately NOT the user's display slider (a display preference must not move detection accuracy, and its default 0 would keep the fix off). Scope: full-tile 320×240 mosaic crops only — a foveated window is not lens-centered, so the tile-radial model would be wrong there; the close-subject wide-crop gate already forces NEAR subjects onto the mosaic path. I5: boxes are mapped back to warped source space immediately after detect() (same forward transform, corners+edge midpoints), so every downstream consumer (motion-overlap, baseline, ActorTracker, ThumbnailBuffer, tracker seeds) sees the exact space it always has — verified by an 11-test JVM suite incl. a pixel↔box round-trip (`FisheyeDewarpTest`). I1: any error/ineligibility → null → original crop + identity boxes (add-only stage). Front/rear at 0 (no subjects in test footage — enable only with evidence). DEVICE-UNVERIFIED for the right cam specifically (constant inherited from the left's identical mirror-camera hardware). |
+| S3/S4 detector head auto-detection (END2END support) | 2026-08-11 | `YoloDetector.kt` now probes output tensor 0's shape in `init()`: `[1,4+C,N]` → legacy raw-anchor parser + host NMS (the shipped yolo11n path, byte-identical — dims were hardcoded 84/8400 and are now read from the model, same values); `[1,D,6]` → new END2END parser for NMS-free exports (YOLO26 via `dev/export_yolo26_int8.py`). Input size likewise probed (square-enforced). UNKNOWN layouts now FAIL `init()` loudly instead of parsing garbage — a mis-parsed head would read downstream as "YOLO saw nothing" on every real event, the silent-FN mode I7 exists to prevent. The END2END parser mirrors every legacy gate (class mask, implausible-class floor, size gates, ghost cap TRUNCATE-never-clear, raw-funnel diagnostics) in the same order; comments in both parsers require mirrored edits. Coordinate units decided ONCE PER TENSOR from conf-passing rows (audit: the earlier per-row probe could misroute a confident sub-2px-corner pixel-unit box into a large phantom that SURVIVES the size gate — the opposite of its comment's claim; per-tensor decision removes the path, and the reverse misroute is impossible since normalized coords are ≤1.0). init() failure paths close+null the interpreter (audit: allocateTensors/probe throws formerly leaked the live native interpreter). The shipped END2END artifact (yolo26n-DRQ) was validated offline against its FP32 reference on real device frames (10/12 matched, misses threshold-edge); ON-DEVICE latency still unverified. Legacy path regression risk: nil (same constants, same code path; rollback asset loads via the candidate list). |
+| Post-park vigilance channel (S2 wiring + DetectionBaseline anchors) | 2026-08-09 | Added; pure Java, no native change. Checked against I2 (TTL latch, per-tick stamp, enable() reset), I3 (anchor-scoped: quadrant + 0.30-norm foot-point radius + 10 min age), I9 (confirmed live-event vehicle entries only; probe errors → no anchor), I10 (10 s min-gap + 3-assists/10 min rolling budget), I11 (10 s TTL re-stamped per qualifying tick; consumers require best-threat quadrant == latch quadrant). Deliberately NOT a `shouldDiscardEvent` KEEP (mirrors salience: the no-actor discard is the precision partner). DEVICE-UNVERIFIED — the adjacency radius (0.30), TTL (10 s) and window/budget (10 min / 3) are reasoned, not measured. |
 | Salience channel (native probe + S2 wiring) | 2026-07-31 | Added; see I8/I9. Compiles; native `.so` verified rebuilt. DEVICE-UNVERIFIED — the five per-tick terms' thresholds (12 blocks, 0.60 dominance, ≤3 blobs, 6 ticks, 12 luma) are reasoned, not measured. |
 | S1 native motion | 2026-07-25 | No actionable MISS findings. Verified: `-1` coherence sentinel survives `memset`; `suppressionCountdown` decrements every frame AND fast-adapts baseline during suppression (α=0.2) so post-flash drift can't re-trigger forever; global-flash sync checks only NEW shifts, never existing countdowns (self-reinforcing-loop guard); exposure hysteresis has an 85/95 deadband + 15-frame ISP blindfold; Stage 3 increment/decay mutually exclusive; `edgeChangedCount>=2` exempts a block from shadow suppression (self-erasing-person guard); all block loops bounded by `V2_GRID_ROWS` with an extra `gy >= HEIGHT` guard. |
 | S2-S7 Java | 2026-07-25 | See git history for the fix set; residuals listed under I4. |
@@ -157,6 +178,14 @@ than per-quadrant-instance; affects only a log line.
   non-qualifying tick and in `enable()`, but NOT at motion-sequence start. They
   describe the scene, not the sequence, and a sequence boundary is itself >2 s of
   non-qualifying ticks.
+- Post-park vigilance, like salience, is NOT a `shouldDiscardEvent` KEEP
+  (`eventTriggerWasVigilance` is attribution-only). And unlike every sequence
+  latch, its ANCHORS live in `DetectionBaseline` and survive both sequence
+  boundaries and recording stops on purpose — the anchor describes the scene
+  (a car arrived here recently), not the sequence. It is bounded by `addedAtMs`
+  age, cleared by `baseline.reset()` on disable, and can never be created by the
+  sentry-start seed (`fromLiveEvent` stays false there), so a re-arm cannot
+  inherit a zone it didn't watch form.
 
 ### Salience: accepted residual (audited 2026-07-31)
 

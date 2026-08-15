@@ -1,6 +1,7 @@
 package com.overdrive.app.automation.condition;
 
 import com.overdrive.app.automation.Automations;
+import com.overdrive.app.automation.AutomationQueue;
 import com.overdrive.app.byd.BydVehicleData;
 import com.overdrive.app.byd.bodywork.BodyworkConstants;
 import com.overdrive.app.monitor.GearMonitor;
@@ -8,6 +9,8 @@ import com.overdrive.app.monitor.GearMonitor;
 import java.util.Map;
 
 public class BydEvent {
+    private static final com.overdrive.app.logging.DaemonLogger logger =
+            com.overdrive.app.logging.DaemonLogger.getInstance("Automations");
     // Stored as static variables to prevent the EventData objects being created repeatedly
     public static final EventData POWER = new EventData("power");
     public static final EventData GEAR = new EventData("gear");
@@ -25,6 +28,7 @@ public class BydEvent {
     public static final EventData WINDOW_SUNSHADE = new EventData("windowState", Map.of("area", "sunshade"));
     public static final EventData WINDOW_ALL = new EventData("windowState", Map.of("area", "all"));
     public static final EventData BATTERY_LEVEL = new EventData("batteryLevel");
+    public static final EventData TARGET_SOC = new EventData("targetSoc");
     public static final EventData ESTIMATED_RANGE = new EventData("estimatedRange");
     public static final EventData LIGHTS_LOW_BEAM = new EventData("lights", Map.of("area", "lowBeam"));
     public static final EventData LIGHTS_HIGH_BEAM = new EventData("lights", Map.of("area", "highBeam"));
@@ -59,7 +63,8 @@ public class BydEvent {
     public static final EventData SEAT_COOL_DRIVER = new EventData("seatClimate", Map.of("type", "cool", "area", "driver"));
     public static final EventData SEAT_COOL_PASSENGER = new EventData("seatClimate", Map.of("type", "cool", "area", "passenger"));
     public static final EventData AC = new EventData("ac");
-    // CABIN temperature, parked as well as driving (ambient only as a stopped-sensor fallback).
+    // Measured CABIN temperature, parked as well as driving. Never substitute the exterior
+    // sensor or AC dial setpoint: those are separate automation signals below.
     public static final EventData TEMPERATURE = new EventData("temperature");
     // Outside/ambient temperature as a first-class event, distinct from TEMPERATURE. This one is
     // ALWAYS the ambient reading (outside cluster sensor, then weather by GPS) so an automation can
@@ -85,12 +90,10 @@ public class BydEvent {
     // BydVehicleData.speedKmh, the mph value is derived once here.
     public static final EventData SPEED_KMPH = new EventData("speed", Map.of("units", "kmph"));
     public static final EventData SPEED_MPH = new EventData("speed", Map.of("units", "mph"));
-    // Dynamic-driving inputs, already ingested on every snapshot (accelPercent /
-    // brakePercent via BYDAutoSpeedDevice.getAccelerateDeepness/getBrakeDeepness,
-    // steeringAngleDegrees via BYDAutoBodyworkDevice.getSteeringWheelValue). These
-    // update at the telemetry cadence (5s ACC-on); for sub-second gestures the
-    // RoadSense fast-dynamics poll (250ms) refreshes accel/brake, but automations
-    // key off value transitions so a 5s floor is fine for "pedal past X%" rules.
+    // Dynamic-driving inputs, read directly by DynamicsEvent at 250ms only while a rule
+    // references them. The regular snapshot still ingests the same getters for telemetry, but
+    // does not own automation publication because its five-second cadence is too slow for a
+    // pedal, steering, or speed threshold.
     public static final EventData ACCELERATOR = new EventData("accelerator");
     public static final EventData BRAKE = new EventData("brake");
     // Steering angle is signed (SDK: negative = left, positive = right, ±780° range).
@@ -166,11 +169,6 @@ public class BydEvent {
     // classified actor). Ranked person > bike > vehicle > animal.
     public static final EventData SURVEILLANCE_OBJECT = new EventData("surveillanceObject");
     // ── Safety / ADAS events ─────────────────────────────────────────────
-    // Emergency alarm (BODYWORK_EMERGENCY_ALARM). The closest signal this HAL
-    // exposes to an "incident/accident" event — no true collision/airbag event
-    // exists on this firmware (the HAL surfaces no such readable signal), so this
-    // is the best available proxy. Published on/off from a raw non-zero transition.
-    public static final EventData EMERGENCY_ALARM = new EventData("emergencyAlarm");
     // Tyre safety warnings — genuine "warning fired" states from the TPMS. Per
     // wheel: pressure (normal/under/over) and air-leak (normal/slow/fast). An
     // "any wheel abnormal" convenience is also published so a user can trigger on
@@ -188,6 +186,13 @@ public class BydEvent {
     public static final EventData BATTERY_SOH = new EventData("batterySoh");
     public static final EventData KEY_BATTERY = new EventData("keyBattery");
     public static final EventData AUX_BATTERY_12V = new EventData("aux12vBattery");
+    // The 12V rail as a real VOLTAGE, alongside the low/normal enum above. Two events on
+    // purpose: the enum's source (BYDAutoBodyworkDevice.getBatteryVoltageLevel) returns
+    // INVALID on trims that never populate it — so the enum published nothing at all — while
+    // BYDAutoOtaDevice.getBatteryPowerVoltage() is the reading the 12V performance graph has
+    // always charted (BatteryPowerMonitor → BatteryPowerData.voltageVolts). Exposing volts
+    // also enables the rule the enum cannot express: "12V below 12.2 → warn me".
+    public static final EventData AUX_BATTERY_12V_VOLTS = new EventData("aux12vVoltage");
     // ── Fuel (PHEV) ───────────────────────────────────────────────────────
     public static final EventData FUEL_LEVEL = new EventData("fuelLevel");
     // ── Air quality (PM2.5, µg/m³) inside + outside ───────────────────────
@@ -204,12 +209,12 @@ public class BydEvent {
     // zones so a single "obstacle within X" trigger works without wiring 8 zones. ─
     public static final EventData RADAR_NEAREST = new EventData("radarNearest");
     // ── Tier-2 sensors (wired from previously-unused SDK getters) ─────────
-    // Auto-wiper engaged — the closest "it's raining" proxy this platform has (no
-    // rain-intensity sensor exists). Wiper activity is a separate on/off.
+    // Automatic-wiper MODE and actual blade ACTIVITY are separate signals. AUTO_WIPER
+    // does not assert that rain is currently detected or that the blades are moving.
     public static final EventData AUTO_WIPER = new EventData("autoWiper");
     public static final EventData WIPER_ACTIVE = new EventData("wiperActive");
-    // Auto-headlights engaged (the light sensor turned the lamps on) — the usable
-    // "it's dark" proxy; there is no lux value on this platform.
+    // Automatic-headlight MODE switch. It is not a darkness sensor; actual lamp output
+    // is represented by the low/high-beam events.
     public static final EventData AUTO_LIGHTS = new EventData("autoLights");
     // Seat occupancy (someone sitting). The PASSENGER seat has a real occupancy sensor
     // (getPassengerStatus area 1) and publishes both occupied and empty.
@@ -224,9 +229,7 @@ public class BydEvent {
     // mode flags). The state key is EventData("variable", {name}); this is just the
     // shared "variable" type string both the setter and the condition key by.
     public static final String VARIABLE_TYPE = "variable";
-    // Pushed once by NetworkEvent shortly after the daemon starts. "on" is only
-    // published when this is a genuine device boot (see NetworkEvent.publishBoot),
-    // never on a mere daemon restart, so boot automations don't re-fire on every relaunch.
+    // Pushed once by NetworkEvent after saved configuration loads for this daemon process.
     public static final EventData BOOT = new EventData("boot");
 
     // Turn-indicator blink off-debounce (ms). The lamp toggles ~1.5 Hz, so a single
@@ -235,17 +238,371 @@ public class BydEvent {
     //
     // SIZING: this must exceed the SAMPLING interval AND the blink off-phase (~330ms at
     // 1.5Hz). Turn signals are now sampled by the dedicated TurnSignalEvent poll at
-    // 500ms (see pollTurnSignals) — far tighter than the old ~5s stationary snapshot
-    // cadence that forced a 6s debounce. At 1.5s the window spans ~3 fast polls and
+    // 250ms (see pollTurnSignals) — far tighter than the old ~5s stationary snapshot
+    // cadence that forced a 6s debounce. At 1s the window spans ~4 fast polls and
     // comfortably bridges a blink off-phase, so a still-signalling lamp never reports a
-    // spurious "off", while the genuine OFF edge now lags only ~1.5s after cancel
+    // spurious "off", while the genuine OFF edge now lags only ~1s after cancel
     // (was ~6s) — the responsiveness the "long delay" report was about, on both edges.
-    private static final long TURN_OFF_DEBOUNCE_MS = 1500L;
-    // Per-side clock of the last observed on-phase, for the blink debounce above.
-    // Static; the single-threaded TurnSignalEvent poll is the sole writer — 0 means
-    // "never seen lit".
+    private static final long TURN_OFF_DEBOUNCE_MS = 1000L;
+    // Per-side MONOTONIC clock (see monotonicMs) of the last observed on-phase, for the blink
+    // debounce above. Static; the single-threaded TurnSignalEvent poll is the sole writer —
+    // 0 means "never seen lit", and is also how a released hold is re-armed.
     private static final java.util.concurrent.atomic.AtomicLong lastLeftOnMs = new java.util.concurrent.atomic.AtomicLong(0);
     private static final java.util.concurrent.atomic.AtomicLong lastRightOnMs = new java.util.concurrent.atomic.AtomicLong(0);
+    private static final java.util.concurrent.atomic.AtomicLong lastHazardOnMs = new java.util.concurrent.atomic.AtomicLong(0);
+
+    // Keys owned by a fast poller, which publishes them from a LIVE HAL read. The snapshot
+    // path (bydEvent) must NOT publish these: toBuilder() carries every field forward, and the
+    // ~59 partial-rebuild sites (snapshot.set(current.toBuilder().socPercent(x).build())) each
+    // fire bydEvent with a STALE value for every field they didn't refresh. A stale republish
+    // racing the live poller makes Automations.update see a transition each way, so an
+    // automation with an ELSE branch alternates THEN/ELSE until the next full collectAll()
+    // resyncs the snapshot. See docs/AUTOMATION-PUBLISH-INVARIANTS.md.
+    //
+    // Ownership is STATIC, never conditional on the poller's isEventReferenced gate: when the
+    // gate is shut nothing reads the key either, and falling back to the snapshot would
+    // reintroduce the race exactly when a rule is added mid-session.
+    private static final java.util.Set<EventData> FAST_POLL_OWNED = java.util.Set.of(
+            SEATBELT_DRIVER, SEATBELT_PASSENGER,   // SeatbeltEvent   (500ms) + HAL belt callback
+            OCCUPANT_PASSENGER, OCCUPANT_DRIVER,   // SeatbeltEvent   (500ms)
+            TURN_LEFT, TURN_RIGHT, LIGHTS_HAZARD,  // TurnSignalEvent (250ms, blink-debounced)
+            GEAR,                                  // GearEvent       (250ms)
+            DRIVE_MODE,                            // DriveModeEvent  (1s)
+            SEAT_COOL_DRIVER, SEAT_COOL_PASSENGER, // ClimateEvent    (500ms)
+            SEAT_HEAT_DRIVER, SEAT_HEAT_PASSENGER, // ClimateEvent    (500ms)
+            LIGHTS_LOW_BEAM, LIGHTS_HIGH_BEAM,     // ClimateEvent    (500ms)
+            LIGHTS_DRL, AUTO_LIGHTS,               // ClimateEvent    (500ms)
+            AUTO_WIPER, WIPER_ACTIVE,              // ClimateEvent    (500ms)
+            AC, AC_SETPOINT,                       // ClimateEvent    (500ms)
+            SPEED_KMPH, SPEED_MPH,                 // DynamicsEvent   (250ms)
+            ACCELERATOR, BRAKE, STEERING_ANGLE);   // DynamicsEvent   (250ms)
+
+    /** Whether a fast poller owns this key, so the snapshot path must not republish it. */
+    private static boolean ownedByFastPoll(EventData key) {
+        return FAST_POLL_OWNED.contains(key);
+    }
+
+    /**
+     * Publish from the SNAPSHOT path. Drops keys owned by a fast poller (see
+     * {@link #FAST_POLL_OWNED}) so a carried-forward field can't fight the live reading.
+     * Every {@code Automations.update} inside {@link #bydEvent} must route through here.
+     */
+    private static void publishFromSnapshot(EventData key, String value) {
+        if (ownedByFastPoll(key)) return;
+        // A null word means "not a real reading" (see seatClimateToString): skip it. update()
+        // guards a null Value, not a null String, so this would otherwise store StringValue(null).
+        if (value == null) return;
+        // forceStore only while the editor is seeding (nothing enabled): update() otherwise
+        // returns before storing, which left the editor's live-value hints blank. Storing is not
+        // firing — a first value is a silent seed either way (Invariant 0).
+        Automations.update(key, value);
+    }
+
+    /** Integer-valued {@link #publishFromSnapshot}. */
+    private static void publishFromSnapshot(EventData key, Integer value) {
+        if (ownedByFastPoll(key)) return;
+        // new IntValue(...) explicitly, matching what update(key, Integer) did — including for a
+        // null Integer, so this stays a pure forceStore change with no behaviour difference.
+        Automations.update(key, new com.overdrive.app.automation.value.IntValue(value));
+    }
+
+    // The ON/OFF side of the last ACC edge published by publishPowerEdge, or null before the
+    // first one. Owned here (not read off BydDataCollector.isAccOn) so the suppression arms
+    // ATOMICALLY with the publish it has to protect: the edge handler can publish, or decide not
+    // to, and the snapshot path's view can never disagree with what was actually published.
+    private static volatile Boolean lastPublishedPowerOn = null;
+    // Whether the currently-latched edge occurrence actually reached triggers. Paired with
+    // lastPublishedPowerOn and cleared wherever that is, so it can never outlive its occurrence.
+    // It is what makes a RETAINED PUBLICATION REPLAY (re-run on any config change mid-publication,
+    // e.g. saving a rule) idempotent, without suppressing the replay of an edge that was published
+    // while automations were disabled and so never fired.
+    private static volatile boolean powerEdgeDelivered = false;
+    // MONOTONIC clock (System.nanoTime) of the last edge publish, for the suppression grace
+    // window below. nanoTime deliberately, not currentTimeMillis: an NTP/RTC backward jump
+    // would make a wall-clock age negative and fail the window open, letting a stale snapshot
+    // republish fire a false power flip — a wrong action, which is worse than a late one.
+    // Written only inside the POWER latest-state mutation, same as the latch it accompanies.
+    private static volatile long lastPowerEdgeAtNanos = 0;
+
+    // How long a contradicting SNAPSHOT publish is dropped after an ACC edge. The stale-field
+    // window the suppression exists for is bounded: after an edge, partial toBuilder().build()
+    // republishes carry the PRE-edge powerLevel only until the next full collect refreshes it
+    // (≤5s driving, ≤90s parked). Past this window a snapshot that still contradicts the latch
+    // is not a stale republish — it is ground truth the edge pipeline failed to deliver (edge
+    // publication admission can be rejected and its retry can starve; 2026-08 field report:
+    // "power on never fires"). Then the latch must YIELD, or the power signal is wrong for the
+    // rest of the process lifetime and every power rule/condition is stuck on the old side.
+    // 150s > the 90s parked collect cadence with margin.
+    private static final long POWER_EDGE_SUPPRESS_GRACE_MS = 150_000L;
+
+    // How long after an ACC edge a level on the SAME side but with a different word (i.e. ACC
+    // under an off edge) is treated as the key still rotating, rather than as a state the driver
+    // has selected. A key turn passes through ACC in well under a second, so 5s is generous.
+    //
+    // This must be MUCH shorter than POWER_EDGE_SUPPRESS_GRACE_MS. That window exists for a
+    // CONTRADICTING level (a stale pre-edge value carried forward by a partial rebuild until the
+    // next full collect). An AGREEING-side level cannot be that stale value — for an off edge the
+    // carried-forward value is "on", which the contradiction branch already handles — so "acc"
+    // here is a FRESH reading. Holding it for the full 150s would swallow a genuine accessory
+    // selection: ACC is ACC-off across the stack, so the edge that fires for it says "off" and
+    // only this snapshot can report the finer "acc" (audit 2026-08).
+    private static final long POWER_EDGE_SETTLE_MS = 5_000L;
+
+    /** The {@code power} vocabulary word for a raw bodywork level (off/acc/on). Single source of
+     *  truth for both publishers, so the edge and the snapshot always speak the same words. */
+    private static String powerLevelWord(int powerLevel) {
+        return BodyworkConstants.powerLevelToString(powerLevel).toLowerCase();
+    }
+
+    /** The word an ACC edge publishes. The edge is boolean, so it only ever says off or on —
+     *  never acc, which only the snapshot's wider vocabulary can report. */
+    private static String powerEdgeWord(boolean accOn) {
+        return powerLevelWord(accOn
+                ? BodyworkConstants.POWER_LEVEL_ON
+                : BodyworkConstants.POWER_LEVEL_OFF);
+    }
+
+    /**
+     * Whether a raw bodywork level is one of the three levels the {@code power} condition
+     * vocabulary can express (OFF/ACC/ON).
+     *
+     * <p>The HAL also returns OK(3), FAKE_OK(4) and INVALID(255) — the "HAL is bluffing" values
+     * that {@code AccMonitor} and {@code RecordingModeManager} already refuse to trust.
+     * {@code powerLevelToString} maps all of them to {@code unknown(N)}, which no dropdown option
+     * can match, so publishing one makes every {@code power} condition read false. Worse, 3/4/255
+     * are all {@code >= POWER_LEVEL_ON}, so they pass the ON-side staleness check and would be
+     * stored verbatim under an ON latch — silently breaking "when power turns on" for the whole
+     * accessory session. Skip them and leave the last good value in place.
+     */
+    private static boolean isRealPowerLevel(int powerLevel) {
+        return powerLevel == BodyworkConstants.POWER_LEVEL_OFF
+                || powerLevel == BodyworkConstants.POWER_LEVEL_ACC
+                || powerLevel == BodyworkConstants.POWER_LEVEL_ON;
+    }
+
+    /**
+     * Publish {@code power} for an observed ACC edge, and take ownership of the signal so a stale
+     * snapshot can't contradict it. Idempotent — {@code Automations.update} is edge-triggered, so
+     * a repeated edge of the same polarity is a no-op.
+     *
+     * @param accOn true when the key is on, false when parked
+     */
+    public static void publishPowerEdge(boolean accOn) {
+        AutomationQueue.runLatestStateMutation(
+                AutomationQueue.LatestStateStream.POWER,
+                () -> {
+                    // IDEMPOTENT PER EDGE OCCURRENCE. A retained POWER publication is REPLAYED
+                    // whenever the config changes mid-publication (saving a rule), which re-runs
+                    // this whole method. The engine's delivered-value dedup normally absorbs that,
+                    // but it cannot once the snapshot has legitimately moved the mark in between:
+                    // park at t=0 delivers "off", an accessory dwell delivers "acc" at t=8s, and a
+                    // replay at t=20s then looks like a fresh acc→off transition and runs
+                    // "when power turns off" a SECOND time with the key untouched (audit 2026-08).
+                    //
+                    // Suppress only when THIS latched occurrence has already reached triggers.
+                    // Two signals are needed and neither suffices alone:
+                    //  - the LATCH still naming this side means no yield/retraction has happened,
+                    //    so a re-run is the same occurrence rather than a new event. (The engine's
+                    //    delivery mark alone cannot tell: the snapshot may have legitimately
+                    //    delivered "acc" in between, which hides the duplicate.)
+                    //  - powerEdgeDelivered records whether that occurrence actually FIRED. An edge
+                    //    published while automations were disabled did not, so its replay after the
+                    //    user enables them must still fire — the documented recovery in
+                    //    Automations.update.
+                    // Both are cleared by the grace-window yield and by resetPowerEdge, so an
+                    // occurrence that has been superseded never suppresses a genuine later edge.
+                    Boolean latched = lastPublishedPowerOn;
+                    if (latched != null && latched.booleanValue() == accOn && powerEdgeDelivered) {
+                        return;
+                    }
+                    lastPublishedPowerOn = accOn;
+                    lastPowerEdgeAtNanos = System.nanoTime();
+                    // OBSERVED-EDGE publish, not a sampled one: the ACC dispatch watched this
+                    // transition happen (and dedups repeats + admits one publication per
+                    // transition generation), so it must fire even when it is the first value
+                    // after a daemon start or a racing snapshot already seeded the same side.
+                    // A plain update() made boot-time power rules a race between this handler
+                    // and the telemetry seed (see Automations.updateObservedEdge).
+                    String word = powerEdgeWord(accOn);
+                    Automations.updateObservedEdge(POWER, word);
+                    // Did this occurrence actually reach triggers? Ask the engine rather than
+                    // assuming: it is false while automations are disabled, and false when a
+                    // racing sampler had already delivered the same value.
+                    powerEdgeDelivered = Automations.isLastDelivered(POWER, word);
+                });
+    }
+
+    /**
+     * Forget the last published ACC edge, handing {@code power} back to the snapshot path. Used
+     * when an edge is retracted rather than applied (the cold-boot drain discards a queued edge
+     * that the hardware probe contradicts) — otherwise the retracted value would stay latched and
+     * keep suppressing the true state.
+     */
+    public static void resetPowerEdge(boolean expectedAccOn) {
+        AutomationQueue.runLatestStateMutation(
+                AutomationQueue.LatestStateStream.POWER,
+                () -> {
+                    Boolean edge = lastPublishedPowerOn;
+                    if (edge != null && edge.booleanValue() == expectedAccOn) {
+                        lastPublishedPowerOn = null;
+                        // The occurrence is retracted, so its delivery record must go with it —
+                        // the same side may legitimately be published again once the true state is
+                        // known, and a stale flag would suppress it.
+                        powerEdgeDelivered = false;
+                    }
+                });
+    }
+
+    /**
+     * Publish {@code power} from the snapshot, unless the carried-forward level contradicts the
+     * ACC edge already published.
+     *
+     * <p>{@code powerLevel} is refreshed only by collectBodywork, so between an ACC edge and the
+     * next full collect (up to 90s while parked) every partial {@code toBuilder().build()} in the
+     * tree republishes the PREVIOUS level. Since the edge is published the instant it fires, that
+     * stale republish would fight it and strobe the rule (Invariant 1/2c).
+     *
+     * <p>Dropping the publish — rather than rewriting the snapshot field — keeps this free of side
+     * effects: correcting the field would need a {@code build()}, which re-fires this whole method
+     * and would flip the powerLevel-gated AC publish below.
+     *
+     * <p>The ON/OFF SIDE decides STALENESS: a level on the other side of the last edge is a
+     * carried-forward pre-edge value and is dropped. But agreeing on the side does not make the
+     * snapshot's publish a NEW EVENT — the two publishers have different vocabulary widths. The
+     * edge is boolean (off/on only); the snapshot reports off/acc/on. Accessory mode is ACC-off
+     * across the stack, so {@code acc} agrees with an OFF edge and used to pass this gate as an
+     * ordinary off→acc transition, which FIRED. One key turn traverses several stored states
+     * (off→acc→off as the level settles), so every {@code power} rule ran two or three times per
+     * cycle; field report: "car power on is triggered more than once".
+     *
+     * <p>So for {@link #POWER_EDGE_SETTLE_MS} after an edge, a same-side level is treated as the key
+     * still rotating toward the position the edge already reported: the edge's own word is RESTATED
+     * (stored, fires nothing, delivery mark untouched) and any other word — {@code acc} on the way
+     * through — is DROPPED. Outside that window the snapshot publishes normally, because it is then
+     * the only witness to a state the driver actually selected.
+     *
+     * <p>Three bounds, each one an audit finding from an earlier attempt (2026-08):
+     * <ul>
+     *   <li>Drop {@code acc}, do NOT store-without-firing. Storing it makes it the current value,
+     *       so every later republish of level 1 is a non-transition and can never fire — which
+     *       swallowed a genuine key-to-ACC outright. Dropping leaves the edge's word stored, so the
+     *       first republish past the window is still a real transition.</li>
+     *   <li>Bound the special-casing by this SHORT window, not the 150s stale-value grace. That
+     *       grace exists for a CONTRADICTING level; an agreeing-side level cannot be the stale
+     *       carried-forward value, so {@code acc} here is a fresh reading.</li>
+     *   <li>Bound the RESTATEMENT too, not just the drop. Unbounded, a driver who sat in accessory
+     *       mode (delivering {@code acc}) and then turned the key fully off had that {@code off}
+     *       restated instead of delivered — "when power turns off" never ran for the rest of the
+     *       parked session, and the stale mark then killed {@code acc} as well.</li>
+     *   <li>Do NOT special-case ACC under an ON latch. It looks asymmetric (the other side, so the
+     *       150s grace rather than the 5s settle), but rotating the key ON→ACC fires a real ACC-OFF
+     *       edge — accOn is {@code powerLevel >= POWER_LEVEL_ON} — which re-latches to the off side,
+     *       after which the level agrees and takes the ordinary settle path. An ACC level under a
+     *       LIVE ON latch is therefore a stale mid-sweep reading, which is precisely what the grace
+     *       suppresses. A "confirm window plus latch release" tried here on the opposite premise
+     *       re-fired "power turns on" on every rule save while the key sat in accessory, because the
+     *       release cleared the state the replay guard reads.</li>
+     * </ul>
+     *
+     * <p>Only a level in the real OFF/ACC/ON vocabulary is published — see
+     * {@link #isRealPowerLevel}. That covers {@link BydVehicleData#UNAVAILABLE} (bodywork device
+     * absent, or its getter returned a non-Number) AND the HAL's OK(3)/FAKE_OK(4)/INVALID(255)
+     * bluffs: all stringify to {@code unknown(N)}, which no condition can match, and 3/4/255 also
+     * pass the ON-side staleness check, so they would be stored under an ON latch and break every
+     * "power turns on" rule. Leave the last good value in place instead.
+     */
+    private static void publishPower(int powerLevel) {
+        if (!isRealPowerLevel(powerLevel)) return;
+        AutomationQueue.runLatestStateMutation(
+                AutomationQueue.LatestStateStream.POWER,
+                () -> {
+                    Boolean edge = lastPublishedPowerOn;
+                    // NOTE on ACC and the ON latch: a level of ACC can never linger under a LIVE
+                    // ON latch, because ACC-on is derived as `powerLevel >= POWER_LEVEL_ON`
+                    // (AccMonitor), so rotating the key ON→ACC flips accOn true→false and fires a
+                    // real ACC-OFF edge. That edge re-latches this signal to the off side, after
+                    // which the level agrees with the latch and takes the ordinary settle path —
+                    // the same 5s bound as any other same-side level, with no special case.
+                    //
+                    // An earlier fix added a 12s "confirm" window plus a latch release here, on the
+                    // premise that ACC publishes no edge of its own. That premise was wrong, and the
+                    // release then cleared the state the replay guard depends on: a retained
+                    // publication replay (any rule save) re-fired "power turns on" while the key sat
+                    // in accessory. Reverted 2026-08 — an ACC level under an ON latch is a genuinely
+                    // STALE reading (the ≤5s collector caught the key mid-sweep), which is exactly
+                    // what the grace window below exists to suppress.
+                    if (edge != null
+                            && (powerLevel >= BodyworkConstants.POWER_LEVEL_ON)
+                            != edge.booleanValue()) {
+                        // Stale-republish window: a partial rebuild can carry the pre-edge level
+                        // for up to one full collect (≤90s parked). Inside the grace window the
+                        // edge wins. PAST it, a snapshot that still contradicts the latch means
+                        // the edge pipeline missed a real transition (rejected admission /
+                        // starved retry) — then the collector is ground truth and the latch must
+                        // yield, or `power` stays wrong for the whole process and every power
+                        // rule/condition is stuck (field report: "power on never fires").
+                        long edgeAgeMs = (System.nanoTime() - lastPowerEdgeAtNanos) / 1_000_000L;
+                        if (edgeAgeMs < POWER_EDGE_SUPPRESS_GRACE_MS) {
+                            return;
+                        }
+                        logger.warn("power: snapshot level " + powerLevel
+                                + " contradicts the last published edge (on=" + edge
+                                + ", " + (edgeAgeMs / 1000) + "s old) past the grace window — "
+                                + "edge publication was missed; yielding to the snapshot");
+                        lastPublishedPowerOn = null;
+                        // The latched occurrence is superseded, so its delivery record goes too.
+                        // Leaving it set stranded the replay guard: after this yield delivered the
+                        // opposite value, the next GENUINE edge of the yielded-from side was
+                        // suppressed as a duplicate and the latch was never re-armed (audit
+                        // 2026-08 — the starved-edge-retry case this yield exists for).
+                        powerEdgeDelivered = false;
+                        edge = null;   // yielded: this publish is now a normal sampled one
+                    }
+                    String word = powerLevelWord(powerLevel);
+                    // A level on the edge's own side but with a DIFFERENT word — "acc" under an
+                    // off edge — is the key still rotating through accessory mode on its way to
+                    // the position the edge reported. DROP it for the brief settle window: the
+                    // edge already delivered this event, and a key turn passes through ACC in
+                    // under a second.
+                    //
+                    // DROP, not store-without-firing: storing "acc" makes it the current value,
+                    // so every later republish of level 1 is a non-transition and can never fire.
+                    // That silently swallowed a genuine accessory selection — the edge that fires
+                    // for it can only say "off" (accOn is `powerLevel >= POWER_LEVEL_ON`), so this
+                    // snapshot is the only publisher that can report the finer "acc" (audit
+                    // 2026-08). Dropping leaves the edge's word stored, so the first republish past
+                    // the settle window is still a real transition and delivers normally.
+                    //
+                    // The settle-back leg (returning to the edge's own word) needs nothing here:
+                    // the engine's delivered-value dedup in Automations.update suppresses it, and
+                    // that also covers retained replays and heartbeats.
+                    long edgeAgeMs = (System.nanoTime() - lastPowerEdgeAtNanos) / 1_000_000L;
+                    // BOTH special cases below are bounded by the SETTLE window. Outside it the
+                    // snapshot is the only witness to what the driver has selected, so it must take
+                    // the ordinary path — an unbounded restatement swallowed the key's ACC→OFF turn
+                    // for the whole parked session (audit 2026-08).
+                    if (edge != null && edgeAgeMs < POWER_EDGE_SETTLE_MS) {
+                        if (word.equals(powerEdgeWord(edge))) {
+                            // The edge's OWN word, re-published while the key is still settling.
+                            // The edge already delivered it, so restate: store the level, fire
+                            // nothing, and leave the delivery mark exactly as it was.
+                            Automations.updateEdgeRestatement(POWER, word);
+                        }
+                        // Otherwise (same side, different word — i.e. acc on the way to the edge's
+                        // position) drop it entirely. Storing it would make it the current value and
+                        // every later republish a non-transition, which swallowed a genuine
+                        // key-to-ACC outright.
+                        //
+                        // Cost of the drop: for these few seconds `power` reads the edge's word, so
+                        // a condition / waitUntil / ${signal:power} sees off (or on) rather than
+                        // acc. Bounded by the settle window rather than the collect cadence —
+                        // bydEvent runs on EVERY Builder.build(), so one of the ~59 partial-rebuild
+                        // sites re-publishes the level as soon as the window closes.
+                        return;
+                    }
+                    Automations.update(POWER, word);
+                });
+    }
 
     private BydEvent() {}
 
@@ -257,12 +614,52 @@ public class BydEvent {
      *
      * @param data The current BydVehicleData with the vehicle state
      */
-    public static void bydEvent(BydVehicleData data) {
-        // Do nothing when no automations enabled
-        if (Automations.isDisabled()) return;
+    /**
+     * Seed EVERY signal the editor can show, for the live-value hints, when no automation is
+     * enabled (so nothing is publishing yet).
+     *
+     * <p>Two distinct groups, and the split is why the snapshot alone was not enough:
+     * <ul>
+     *   <li>Snapshot-published keys come from {@link #bydEvent}.</li>
+     *   <li>{@link #FAST_POLL_OWNED} keys are DROPPED by the snapshot path (Invariant 1 — a
+     *       fast poller owns them), and their pollers only run while an enabled rule references
+     *       the key. So gear/driveMode/seatbelt/turn/climate/dynamics had NO publisher at all in
+     *       the editor and read "not reported yet on this car" no matter what the car was doing —
+     *       the reported bug. Their live pollers are invoked directly here instead, which is the
+     *       legitimate owner reading the HAL, so ownership is not violated.</li>
+     * </ul>
+     *
+     * <p>Publishing is store-only while disabled ({@code Automations.update} sets
+     * {@code fire = false}), so this can never run a rule. Each call is individually guarded: one
+     * unreadable HAL getter must not stop the rest of the signals from seeding.
+     */
+    public static void seedForEditor(BydVehicleData data) {
+        if (data != null) {
+            try { bydEvent(data); } catch (Throwable t) { logger.warn("seed snapshot: " + t.getMessage()); }
+        }
+        // FAST_POLL_OWNED keys, from their live pollers (the snapshot path drops these).
+        try { pollGear(); }           catch (Throwable t) { logger.warn("seed gear: " + t.getMessage()); }
+        try { pollDriveMode(); }      catch (Throwable t) { logger.warn("seed driveMode: " + t.getMessage()); }
+        try { pollSeatbelts(); }      catch (Throwable t) { logger.warn("seed seatbelts: " + t.getMessage()); }
+        try { pollOccupants(); }      catch (Throwable t) { logger.warn("seed occupants: " + t.getMessage()); }
+        try { pollDriverOccupant(); } catch (Throwable t) { logger.warn("seed driverOccupant: " + t.getMessage()); }
+        try { pollTurnSignals(); }    catch (Throwable t) { logger.warn("seed turnSignals: " + t.getMessage()); }
+        try { pollClimate(); }        catch (Throwable t) { logger.warn("seed climate: " + t.getMessage()); }
+    }
 
-        Automations.update(POWER, BodyworkConstants.powerLevelToString(data.powerLevel).toLowerCase());
-        Automations.update(GEAR, GearMonitor.gearToString(data.gearMode).toLowerCase());
+    public static void bydEvent(BydVehicleData data) {
+        // Do nothing when no automations enabled — EXCEPT while the editor is asking for live
+        // values. With nothing enabled, Automations.update() short-circuits and stores nothing,
+        // so the whole state map was empty and every signal in the editor read "not reported yet
+        // on this car" — including on the very first automation a user ever builds, which is
+        // exactly when the hint matters most. The store itself is allowed by the matching gate in
+        // Automations.update (one central place, since most publish sites call plain update); this
+        // gate only stops the poller returning before it ever gets there. Storing is never
+        // firing — update() forces fire=false while disabled.
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
+
+        publishPower(data.powerLevel);
+        publishFromSnapshot(GEAR, GearMonitor.gearToString(data.gearMode).toLowerCase());
         // windowOpenPercent is nullable (defaults null; only populated when the bodywork HAL device is
         // present, and may be left null if the HAL reflection threw), and the HAL fills unavailable /
         // unreadable slots with a negative sentinel (-1). Guard the whole block so the telemetry poll
@@ -289,57 +686,64 @@ public class BydEvent {
             if (anyKnown) Automations.update(WINDOW_ALL, anyOpen ? "open" : "closed");
         }
         if (!Double.isNaN(data.socPercent)) Automations.update(BATTERY_LEVEL, (int) data.socPercent);
+        if (data.socTargetPercent >= 0 && data.socTargetPercent <= 100) {
+            Automations.update(TARGET_SOC, data.socTargetPercent);
+        }
         if (data.elecRangeKm != BydVehicleData.UNAVAILABLE) {
             Automations.update(ESTIMATED_RANGE, data.elecRangeKm);
         } else if (data.bodyworkRangeKm != BydVehicleData.UNAVAILABLE) {
             Automations.update(ESTIMATED_RANGE, data.bodyworkRangeKm);
         }
-        Automations.update(LIGHTS_LOW_BEAM, data.lowBeam ? "on" : "off");
-        Automations.update(LIGHTS_HIGH_BEAM, data.highBeam ? "on" : "off");
-        Automations.update(LIGHTS_HAZARD, data.hazard ? "on" : "off");
-        Automations.update(LIGHTS_DRL, data.dayTimeLight ? "on" : "off");
+        publishFromSnapshot(LIGHTS_LOW_BEAM, data.lowBeam ? "on" : "off");
+        publishFromSnapshot(LIGHTS_HIGH_BEAM, data.highBeam ? "on" : "off");
+        publishFromSnapshot(LIGHTS_HAZARD, data.hazard ? "on" : "off");
+        publishFromSnapshot(LIGHTS_DRL, data.dayTimeLight ? "on" : "off");
         // Ambient main switch — only on a real reading (UNAVAILABLE → publish nothing, so an
         // unreadable switch cannot fire a spurious "off" trigger on every poll).
         if (data.ambientEnabled != BydVehicleData.UNAVAILABLE) {
             Automations.update(AMBIENT_STATE, data.ambientEnabled == 1 ? "on" : "off");
         }
         Automations.update(SLW, data.speedLimitWarning ? "on" : "off");
-        Automations.update(CPD, cpdToString(data.childPresenceDetection));
+        // Skip a non-reading: cpdToString returns null outside the three real states, and
+        // update(key, String) would wrap it in a StringValue(null) — non-null to the guard in
+        // update(), so it would store a null and publish a value no condition can match.
+        String cpdWord = cpdToString(data.childPresenceDetection);
+        if (cpdWord != null) Automations.update(CPD, cpdWord);
         if (data.seatHeat != null) {
-            if (data.seatHeat.length > 0) Automations.update(SEAT_HEAT_DRIVER, seatClimateToString(data.seatHeat[0]));
-            if (data.seatHeat.length > 1) Automations.update(SEAT_HEAT_PASSENGER, seatClimateToString(data.seatHeat[1]));
+            if (data.seatHeat.length > 0) publishFromSnapshot(SEAT_HEAT_DRIVER, seatClimateToString(data.seatHeat[0]));
+            if (data.seatHeat.length > 1) publishFromSnapshot(SEAT_HEAT_PASSENGER, seatClimateToString(data.seatHeat[1]));
         }
         if (data.seatCool != null) {
-            if (data.seatCool.length > 0) Automations.update(SEAT_COOL_DRIVER, seatClimateToString(data.seatCool[0]));
-            if (data.seatCool.length > 1) Automations.update(SEAT_COOL_PASSENGER, seatClimateToString(data.seatCool[1]));
+            if (data.seatCool.length > 0) publishFromSnapshot(SEAT_COOL_DRIVER, seatClimateToString(data.seatCool[0]));
+            if (data.seatCool.length > 1) publishFromSnapshot(SEAT_COOL_PASSENGER, seatClimateToString(data.seatCool[1]));
         }
-        boolean poweredOn = data.powerLevel >= 2;
-        Automations.update(AC, (poweredOn && data.acStartState == 1) ? "on" : "off");
-        // Temperature: the CABIN sensor, parked as well as driving (the outside cluster
-        // sensor, then the Open-Meteo weather API by last-known GPS, are used only if the
-        // cabin sensor stops answering). The weather read is CACHED + refreshed on a
-        // background thread — never a network call on this telemetry-poll thread. See
-        // WeatherTemperature for the ACC-off-blackout-tolerant fetch model, and
-        // updateTemperature for the freshness/hold rules.
+        // AC power is owned by ClimateEvent's live getter. Do not gate it on vehicle power:
+        // remote/parked preconditioning legitimately reports AC=on while the head unit is below
+        // POWER_LEVEL_ON. Also do not turn an invalid/sentinel reading into a confident "off".
+        publishFromSnapshot(AC, acStateToString(data.acStartState));
+        // Cabin and exterior temperature are deliberately independent. updateTemperature()
+        // publishes the measured cabin sensor only when a valid cabin reading exists; it never
+        // substitutes the exterior sensor or weather estimate for a missing cabin measurement.
         updateTemperature(data);
         // speedKmh is canonical km/h (already scaled by distanceToKmFactor at ingestion),
         // so the mph value is a straight km→mi conversion. Guard NaN (unreadable speed).
         if (!Double.isNaN(data.speedKmh)) {
-            Automations.update(SPEED_KMPH, (int) Math.round(data.speedKmh));
-            Automations.update(SPEED_MPH, (int) Math.round(data.speedKmh * 0.621371));
+            publishFromSnapshot(SPEED_KMPH, (int) Math.round(data.speedKmh));
+            publishFromSnapshot(SPEED_MPH,
+                    (int) Math.round(data.speedKmh * 0.621371));
         }
         // Pedal deepness (0-100). UNAVAILABLE (Integer.MIN_VALUE) until the speed
         // device first reports; skip the sentinel so a condition never sees a bogus
         // huge-negative value and the event keeps its last real reading.
         if (data.accelPercent != BydVehicleData.UNAVAILABLE) {
-            Automations.update(ACCELERATOR, data.accelPercent);
+            publishFromSnapshot(ACCELERATOR, data.accelPercent);
         }
         if (data.brakePercent != BydVehicleData.UNAVAILABLE) {
-            Automations.update(BRAKE, data.brakePercent);
+            publishFromSnapshot(BRAKE, data.brakePercent);
         }
         // Steering angle (signed degrees). NaN until the bodywork device reports.
         if (!Double.isNaN(data.steeringAngleDegrees)) {
-            Automations.update(STEERING_ANGLE, (int) Math.round(data.steeringAngleDegrees));
+            publishFromSnapshot(STEERING_ANGLE, (int) Math.round(data.steeringAngleDegrees));
         }
         // Turn indicators are NOT sampled here: this snapshot path runs only every ~5s
         // while stationary, which lagged the trigger by up to that long (a turn signal
@@ -383,6 +787,9 @@ public class BydEvent {
         // treatment; INVALID and anything else are dropped rather than published.
         if (data.battery12vLevel == 0) Automations.update(AUX_BATTERY_12V, "low");
         else if (data.battery12vLevel == 1) Automations.update(AUX_BATTERY_12V, "normal");
+        else publishAux12vFromVoltage();   // enum unavailable → derive it from the real volts
+        // The 12V rail as VOLTS, from the same source the performance graph charts.
+        publishAux12vVoltage();
         // ── Fuel (PHEV), percent — double with NaN = unavailable ──
         if (!Double.isNaN(data.fuelPercent) && data.fuelPercent >= 0) {
             Automations.update(FUEL_LEVEL, (int) Math.round(data.fuelPercent));
@@ -403,23 +810,20 @@ public class BydEvent {
         // ── Seatbelts (sanitized on/off per seat). ──
         updateSeatbelts(data);
         // ── Tier-2 sensors ──
-        // Auto-wiper engaged (rain proxy): 1=on.
         if (data.autoWiperState != BydVehicleData.UNAVAILABLE) {
-            Automations.update(AUTO_WIPER, data.autoWiperState == 1 ? "on" : "off");
+            publishFromSnapshot(AUTO_WIPER, data.autoWiperState == 1 ? "on" : "off");
         }
-        // Wiper active: any non-zero raw wiper state = wiping. UNAVAILABLE → unseeded.
         if (data.wiperState != BydVehicleData.UNAVAILABLE) {
-            Automations.update(WIPER_ACTIVE, data.wiperState != 0 ? "on" : "off");
+            publishFromSnapshot(WIPER_ACTIVE, data.wiperState != 0 ? "on" : "off");
         }
-        // Auto-headlights engaged ("it's dark" proxy): 1=on.
         if (data.lightAutoStatus != BydVehicleData.UNAVAILABLE) {
-            Automations.update(AUTO_LIGHTS, data.lightAutoStatus == 1 ? "on" : "off");
+            publishFromSnapshot(AUTO_LIGHTS, data.lightAutoStatus == 1 ? "on" : "off");
         }
         // Seat occupancy per seat: 1=someone, 0=nobody, UNAVAILABLE→skip.
         // passengerDetection is a 1-slot front-passenger array (see readOccupantsNow) —
         // its shape is frozen at one slot because it is serialized positionally to MQTT/JSON.
         int[] occ = data.passengerDetection;
-        if (occ != null && occ.length > 0) {
+        if (occ != null && occ.length > 0 && !ownedByFastPoll(OCCUPANT_PASSENGER)) {
             publishOccupant(OCCUPANT_PASSENGER, occ[0]);
         }
         // Inferred DRIVER presence from the snapshot's already-sanitized driver belt (slot 0):
@@ -429,24 +833,45 @@ public class BydEvent {
         // can only ever publish "occupied", so a subset of tiers here can never contradict the
         // poller — it only means presence may be established a tick later on this path.
         int[] belts = data.seatbeltStatus;
-        if (belts != null && belts.length > 0 && belts[0] == 1) {
+        if (belts != null && belts.length > 0 && belts[0] == 1 && !ownedByFastPoll(OCCUPANT_DRIVER)) {
             publishOccupant(OCCUPANT_DRIVER, 1);
         }
-        // Drive mode on the config axis (1=normal..4=snow); only publish an in-band
-        // value so a trim without the drive-config getter (which can only see eco/sport
-        // via the energy fallback) never manufactures a spurious "normal"/"snow" edge.
+        // Drive mode on the config axis (1=normal..4=snow); only publish an in-band value.
+        // The collector normalizes the setting-device and energy-device getter encodings.
         String driveMode = driveModeToString(data.operationMode);
-        if (driveMode != null) Automations.update(DRIVE_MODE, driveMode);
-        // Powertrain EV/HEV (PHEV only). Raw SDK energy-mode int: ENERGY_MODE_EV=1,
-        // ENERGY_MODE_HEV=3 (0=STOP, NOT ev — matches the MQTT powertrain_mode mapping).
-        // Anything else (incl. STOP and the unavailable sentinel) is dropped.
-        if (data.energyMode == 1) Automations.update(POWERTRAIN_MODE, "ev");
-        else if (data.energyMode == 3) Automations.update(POWERTRAIN_MODE, "hev");
+        if (driveMode != null) publishFromSnapshot(DRIVE_MODE, driveMode);
+        // Powertrain mode applies to fuel-capable hybrids. HEV and PHEV are deliberately one
+        // bucket; the important boundary is BEV, where some firmware returns the SDK default HEV
+        // value even though no engine exists.
+        boolean supportsPowertrain =
+                com.overdrive.app.automation.AutomationCategories
+                        .supportsHybridOnlyItemsOnCurrentVehicle();
+        String powertrain = powertrainModeToString(data.energyMode, supportsPowertrain);
+        if (powertrain != null) {
+            Automations.update(POWERTRAIN_MODE, powertrain);
+        } else if (!supportsPowertrain) {
+            Automations.expireState(POWERTRAIN_MODE);
+        }
 
         // Energy-recuperation (regen) level is published by the dedicated fast poller
         // EnergyRegenEvent (1s, self-gated on isEventReferenced) — NOT here. Reading it on
         // the ~5s snapshot lagged a regen change 2-4s (the reported delay); the fast poller
         // catches it within ~1s. Kept off the snapshot so build() does no regen SDK read.
+    }
+
+    /**
+     * Map the raw energy-mode axis to a word, or null when it is not a user-selectable mode
+     * (stop=0, the UNAVAILABLE sentinel, anything outside the SDK enum) so no spurious edge
+     * is manufactured. Delegates to the collector so the word set cannot drift from the one
+     * the write path and the MQTT/HA state template use.
+     */
+    static String powertrainModeToString(int mode, boolean supportsPowertrain) {
+        if (!supportsPowertrain) return null;
+        if (mode < com.overdrive.app.byd.BydDataCollector.ENERGY_MODE_EV
+                || mode > com.overdrive.app.byd.BydDataCollector.ENERGY_MODE_KEEP) {
+            return null;
+        }
+        return com.overdrive.app.byd.BydDataCollector.energyModeName(mode);
     }
 
     /** Map the drive-config axis to a word, or null if not an in-band reading. */
@@ -458,6 +883,54 @@ public class BydEvent {
             case 4:  return "snow";
             default: return null; // 0/-1/unset → unseeded (no spurious edge)
         }
+    }
+
+    /**
+     * The live 12V rail in volts, or NaN when unavailable. Reads the SAME source the 12V
+     * performance graph charts — {@code VehicleDataMonitor.getBatteryPower()}, backed by
+     * {@code BYDAutoOtaDevice.getBatteryPowerVoltage()} — rather than the bodywork device's
+     * LOW/NORMAL/INVALID enum, which returns INVALID on trims that never populate it.
+     * Bounds-checked with the data class's own validity window (9–16V) so a garbage read
+     * cannot publish a nonsense voltage.
+     */
+    private static double read12vVolts() {
+        try {
+            com.overdrive.app.monitor.VehicleDataMonitor monitor =
+                    com.overdrive.app.monitor.VehicleDataMonitor.getInstance();
+            if (monitor == null) return Double.NaN;
+            com.overdrive.app.monitor.BatteryPowerData d = monitor.getBatteryPower();
+            if (d == null || !d.isValidRange()) return Double.NaN;
+            return d.voltageVolts;
+        } catch (Throwable t) {
+            return Double.NaN;   // monitor not up yet (early boot) — stay unseeded
+        }
+    }
+
+    /**
+     * Publish the 12V rail in TENTHS of a volt (135 = 13.5V), when a real reading exists.
+     *
+     * <p>Tenths, not volts, because every numeric condition in this engine is an
+     * {@code IntType} — there is no decimal value type — and whole volts would be far too
+     * coarse for the one rule this signal exists for ("below 12.2V"). The UI labels the field
+     * as tenths so the user picks 122, not 12.2.
+     */
+    private static void publishAux12vVoltage() {
+        double v = read12vVolts();
+        if (Double.isNaN(v)) return;
+        Automations.update(AUX_BATTERY_12V_VOLTS, (int) Math.round(v * 10.0));
+    }
+
+    /**
+     * Derive the low/normal enum from the real voltage, for trims whose bodywork enum reads
+     * INVALID. Uses BatteryPowerData's own warning threshold so the word and the graph's
+     * "warning" shading can never disagree.
+     */
+    private static void publishAux12vFromVoltage() {
+        double v = read12vVolts();
+        if (Double.isNaN(v)) return;
+        Automations.update(AUX_BATTERY_12V,
+                v < com.overdrive.app.monitor.BatteryPowerData.WARNING_THRESHOLD_VOLTS
+                        ? "low" : "normal");
     }
 
     /** Publish one seat's occupancy: 1→occupied, 0→empty, else skip (unseeded). */
@@ -492,12 +965,19 @@ public class BydEvent {
      * reading the instrument device's dedicated {@code getSafetyBeltStatus(int)} getter
      * (the same live path the telemetry-recording overlay uses). seatbeltStatus is a
      * 2-slot array: index 0 = driver, index 1 = front passenger.
+     *
+     * <p>Both belt keys are {@link #FAST_POLL_OWNED}, so this is a no-op today: the belts are
+     * published only by the live {@code pollSeatbelts} path. Republishing the carried-forward
+     * snapshot value from the ~59 partial-rebuild {@code build()} sites is what made a
+     * seatbelt automation with an ELSE branch alternate THEN/ELSE every ~500ms after a real
+     * buckle. The ownership check is kept here (rather than deleting the call) so the snapshot
+     * path stays the single fallback if belt ownership is ever handed back.
      */
     private static void updateSeatbelts(BydVehicleData data) {
         int[] belts = data.seatbeltStatus;
         if (belts == null) return;
-        if (belts.length > 0) publishSeatbelt(SEATBELT_DRIVER, belts[0]);
-        if (belts.length > 1) publishSeatbelt(SEATBELT_PASSENGER, belts[1]);
+        if (belts.length > 0 && !ownedByFastPoll(SEATBELT_DRIVER)) publishSeatbelt(SEATBELT_DRIVER, belts[0]);
+        if (belts.length > 1 && !ownedByFastPoll(SEATBELT_PASSENGER)) publishSeatbelt(SEATBELT_PASSENGER, belts[1]);
     }
 
     /** Publish one seat's already-sanitized belt state: 1→on(buckled), 0→off(unbuckled),
@@ -519,7 +999,7 @@ public class BydEvent {
      * the value hasn't changed since the last sample.
      */
     public static void pollSeatbelts() {
-        if (Automations.isDisabled()) return;
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
         int[] belts;
         try {
             belts = com.overdrive.app.byd.BydDataCollector.getInstance().readSeatbeltsNow();
@@ -540,15 +1020,18 @@ public class BydEvent {
      * is exactly the parked case — so the trigger lagged by up to 90s.
      */
     public static void pollOccupants() {
-        if (Automations.isDisabled()) return;
-        int[] occ;
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
         try {
-            occ = com.overdrive.app.byd.BydDataCollector.getInstance().readOccupantsNow();
+            com.overdrive.app.byd.BydDataCollector.getInstance().pollPassengerOccupancyEvent();
         } catch (Throwable t) {
             return; // safety-belt device unreachable this tick — leave the events untouched
         }
-        if (occ == null || occ.length < 1) return; // no real reading → unseeded (no false publish)
-        publishOccupant(OCCUPANT_PASSENGER, occ[0]);
+    }
+
+    /** Publish one validated front-passenger callback state through the normal dedup path. */
+    public static void publishPassengerOccupancy(int occupancy) {
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
+        publishOccupant(OCCUPANT_PASSENGER, occupancy);
     }
 
     /**
@@ -566,7 +1049,7 @@ public class BydEvent {
      * deliberate — see readDriverOccupancyNow for why a 0 would be a fabricated reading.
      */
     public static void pollDriverOccupant() {
-        if (Automations.isDisabled()) return;
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
         int occ;
         try {
             occ = com.overdrive.app.byd.BydDataCollector.getInstance().readDriverOccupancyNow();
@@ -586,7 +1069,7 @@ public class BydEvent {
         // The fast poll already gates on Automations.isEventReferenced, but re-guard on
         // isDisabled so a race that disables the last automation mid-tick is a no-op
         // (mirrors Automations.update's own guard; keeps this a true no-op when off).
-        if (Automations.isDisabled()) return;
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
         updateTurnSignals();
     }
 
@@ -602,7 +1085,7 @@ public class BydEvent {
      * spurious edge (Automations.update is transition-gated, so a repeat is a no-op).
      */
     public static void pollDriveMode() {
-        if (Automations.isDisabled()) return;
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
         int mode = com.overdrive.app.byd.BydDataCollector.getInstance().getDriveConfigMode();
         String word = driveModeToString(mode);
         if (word != null) Automations.update(DRIVE_MODE, word);
@@ -621,10 +1104,36 @@ public class BydEvent {
      * trim without the getter never manufactures a spurious edge.
      */
     public static void pollGear() {
-        if (Automations.isDisabled()) return;
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
         int gear = com.overdrive.app.byd.BydDataCollector.getInstance().readGearNow();
         if (gear == BydVehicleData.UNAVAILABLE) return;
+        // Publish only in-band selector values (P=1 … S=6). During head-unit boot / HAL init the
+        // getter can return an out-of-band transient (0, sentinel); gearToString maps that to
+        // "unknown(x)", which is a real string transition BOTH ways (…→unknown→p) and re-fires
+        // every gear-triggered automation right at power-on. An unknown reading is a non-reading:
+        // skip it and keep the last good gear (Automations.update dedups repeats anyway).
+        if (gear < GearMonitor.GEAR_P || gear > GearMonitor.GEAR_S) return;
         Automations.update(GEAR, GearMonitor.gearToString(gear).toLowerCase());
+    }
+
+    /**
+     * Publish speed from a single live HAL read. The speed-device listener does not push
+     * {@code onSpeedChanged} on every supported firmware, so relying on that callback leaves the
+     * regular five-second snapshot as the fallback. DynamicsEvent calls this at 250 ms only while
+     * an enabled rule references speed.
+     */
+    public static void pollSpeed() {
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
+        double speedKmh =
+                com.overdrive.app.byd.BydDataCollector.getInstance().readSpeedNowKmh();
+        publishSpeedKmh(speedKmh);
+    }
+
+    /** Publish one canonical km/h speed observation from either the live getter or HAL callback. */
+    public static void publishSpeedKmh(double speedKmh) {
+        if (Double.isNaN(speedKmh) || Double.isInfinite(speedKmh) || speedKmh < 0.0) return;
+        Automations.update(SPEED_KMPH, (int) Math.round(speedKmh));
+        Automations.update(SPEED_MPH, (int) Math.round(speedKmh * 0.621371));
     }
 
     /**
@@ -640,58 +1149,74 @@ public class BydEvent {
      * of them never reads the others' SDK getters.
      */
     public static void pollClimate() {
-        if (Automations.isDisabled()) return;
+        if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
         com.overdrive.app.byd.BydDataCollector collector =
                 com.overdrive.app.byd.BydDataCollector.getInstance();
+        // AC system power. This must be a live read: while parked, the regular telemetry
+        // snapshot runs at a much lower cadence, but remote preconditioning is exactly when an
+        // AC on/off automation is most useful.
+        if (Automations.isEventReferenced(AC) || Automations.editorSeedActive()) {
+            String state = acStateToString(collector.readAcPowerNow());
+            if (state != null) Automations.update(AC, state);
+        }
         // Seat cooling (ventilation) — driver + passenger.
-        if (Automations.isEventReferenced(SEAT_COOL_DRIVER)) {
+        if (Automations.isEventReferenced(SEAT_COOL_DRIVER) || Automations.editorSeedActive()) {
             int v = collector.readSeatClimateNow(false, 1);
             if (v != BydVehicleData.UNAVAILABLE) Automations.update(SEAT_COOL_DRIVER, seatClimateToString(v));
         }
-        if (Automations.isEventReferenced(SEAT_COOL_PASSENGER)) {
+        if (Automations.isEventReferenced(SEAT_COOL_PASSENGER) || Automations.editorSeedActive()) {
             int v = collector.readSeatClimateNow(false, 2);
             if (v != BydVehicleData.UNAVAILABLE) Automations.update(SEAT_COOL_PASSENGER, seatClimateToString(v));
         }
         // Seat heating — driver + passenger.
-        if (Automations.isEventReferenced(SEAT_HEAT_DRIVER)) {
+        if (Automations.isEventReferenced(SEAT_HEAT_DRIVER) || Automations.editorSeedActive()) {
             int v = collector.readSeatClimateNow(true, 1);
             if (v != BydVehicleData.UNAVAILABLE) Automations.update(SEAT_HEAT_DRIVER, seatClimateToString(v));
         }
-        if (Automations.isEventReferenced(SEAT_HEAT_PASSENGER)) {
+        if (Automations.isEventReferenced(SEAT_HEAT_PASSENGER) || Automations.editorSeedActive()) {
             int v = collector.readSeatClimateNow(true, 2);
             if (v != BydVehicleData.UNAVAILABLE) Automations.update(SEAT_HEAT_PASSENGER, seatClimateToString(v));
         }
         // AC dial setpoint — only read when a rule actually references it (same gate as every
         // other entry here), so a car whose dial is unreadable pays nothing.
-        if (Automations.isEventReferenced(AC_SETPOINT)) {
+        if (Automations.isEventReferenced(AC_SETPOINT) || Automations.editorSeedActive()) {
             int v = collector.readAcSetpointNow(
                     com.overdrive.app.byd.BydDataCollector.AC_TEMP_AREA_DRIVER);
             if (v != BydVehicleData.UNAVAILABLE) Automations.update(AC_SETPOINT, setpointCelsius(v));
         }
         // High / low beam.
-        if (Automations.isEventReferenced(LIGHTS_HIGH_BEAM)) {
+        if (Automations.isEventReferenced(LIGHTS_HIGH_BEAM) || Automations.editorSeedActive()) {
             int v = collector.readBeamNow(true);
             if (v != BydVehicleData.UNAVAILABLE) Automations.update(LIGHTS_HIGH_BEAM, v == 1 ? "on" : "off");
         }
-        if (Automations.isEventReferenced(LIGHTS_LOW_BEAM)) {
+        if (Automations.isEventReferenced(LIGHTS_LOW_BEAM) || Automations.editorSeedActive()) {
             int v = collector.readBeamNow(false);
             if (v != BydVehicleData.UNAVAILABLE) Automations.update(LIGHTS_LOW_BEAM, v == 1 ? "on" : "off");
+        }
+        if (Automations.isEventReferenced(LIGHTS_DRL) || Automations.editorSeedActive()) {
+            int v = collector.readDrlNow();
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(LIGHTS_DRL, v == 1 ? "on" : "off");
+        }
+        if (Automations.isEventReferenced(AUTO_LIGHTS) || Automations.editorSeedActive()) {
+            int v = collector.readAutoHeadlightNow();
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(AUTO_LIGHTS, v == 1 ? "on" : "off");
+        }
+        if (Automations.isEventReferenced(AUTO_WIPER) || Automations.editorSeedActive()) {
+            int v = collector.readAutoWiperNow();
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(AUTO_WIPER, v == 1 ? "on" : "off");
+        }
+        if (Automations.isEventReferenced(WIPER_ACTIVE) || Automations.editorSeedActive()) {
+            int v = collector.readWiperActiveNow();
+            if (v != BydVehicleData.UNAVAILABLE) Automations.update(WIPER_ACTIVE, v == 1 ? "on" : "off");
         }
     }
 
     /**
-     * Publish the safety/ADAS events. This HAL exposes no true collision/accident
-     * event (no such readable signal exists on this firmware), so we surface the
-     * genuine "something fired" signals it DOES have: the emergency alarm (best
-     * incident proxy) and the TPMS pressure/leak warnings.
+     * Publish documented safety/ADAS states. The raw bodywork "emergency alarm" enum is
+     * deliberately excluded: on this firmware it reflects anti-theft/armed state, not an
+     * accident or emergency event.
      */
     private static void updateSafetyEvents(BydVehicleData data) {
-        // Emergency alarm: raw enum, UNAVAILABLE until reported. Any non-zero value
-        // is an active alarm → "on"; 0 → "off". Skip the sentinel so a never-reported
-        // alarm stays unseeded (never a spurious "off" at boot before the first read).
-        if (data.emergencyAlarmState != BydVehicleData.UNAVAILABLE) {
-            Automations.update(EMERGENCY_ALARM, data.emergencyAlarmState != 0 ? "on" : "off");
-        }
         // Tyre pressure: worst state across the four wheels (0=normal,1=under,2=over).
         // Publishing the worst gives a single "tyre pressure" trigger that fires on any
         // wheel going abnormal; the UI condition offers normal/under/over.
@@ -759,12 +1284,72 @@ public class BydEvent {
         try {
             packed = com.overdrive.app.byd.BydDataCollector.getInstance().readTurnNow();
         } catch (Throwable t) {
-            return; // light device unreachable this tick — leave the events untouched
+            expireTurnHolds();
+            return;
         }
-        if (packed < 0) return; // -1 = light device unavailable → unseeded
-        long now = System.currentTimeMillis();
-        publishTurn(TURN_LEFT, (packed & 0x1) != 0, lastLeftOnMs, now);
-        publishTurn(TURN_RIGHT, (packed & 0x2) != 0, lastRightOnMs, now);
+        if (packed < 0) {
+            expireTurnHolds();
+            return;
+        }
+        applyTurnSample(packed, monotonicMs());
+    }
+
+    /** Apply one validated packed turn-lamp sample. Kept separate from the HAL read so the
+     * hazard/indicator exclusivity and blink debounce can be tested deterministically. */
+    static void applyTurnSample(int packed, long now) {
+        boolean left = (packed & 0x1) != 0;
+        boolean right = (packed & 0x2) != 0;
+        boolean hazard = left && right;
+        if (hazard) {
+            publishTurn(LIGHTS_HAZARD, true, lastHazardOnMs, now);
+            forceTurnOff(TURN_LEFT, lastLeftOnMs);
+            forceTurnOff(TURN_RIGHT, lastRightOnMs);
+            return;
+        }
+
+        // Seeing either individual side is positive proof that hazard mode is no longer active,
+        // so release it immediately. With no lamp lit, retain the normal blink debounce.
+        if (left || right) {
+            forceTurnOff(LIGHTS_HAZARD, lastHazardOnMs);
+        } else {
+            publishTurn(LIGHTS_HAZARD, false, lastHazardOnMs, now);
+        }
+        publishTurn(TURN_LEFT, left, lastLeftOnMs, now);
+        publishTurn(TURN_RIGHT, right, lastRightOnMs, now);
+    }
+
+    /**
+     * Release a debounce hold when the light device stops answering. Without this, a side
+     * published "on" stays "on" for the life of the process — only a successful read publishes
+     * "off", so an unreadable device (parked with the hazards last seen lit) would leave the key
+     * stuck. Once the hold has aged past the debounce window the last on-phase is no longer
+     * evidence of a live lamp, so report "off"; inside the window keep holding, exactly as a
+     * blink off-phase does.
+     */
+    private static void expireTurnHolds() {
+        long now = monotonicMs();
+        expireTurnHold(TURN_LEFT, lastLeftOnMs, now);
+        expireTurnHold(TURN_RIGHT, lastRightOnMs, now);
+        expireTurnHold(LIGHTS_HAZARD, lastHazardOnMs, now);
+    }
+
+    private static void expireTurnHold(
+            EventData key, java.util.concurrent.atomic.AtomicLong lastOn, long now) {
+        long since = lastOn.get();
+        if (since == 0) return; // never seen lit → nothing to release, stay unseeded
+        if ((now - since) < TURN_OFF_DEBOUNCE_MS) return;
+        lastOn.set(0L);
+        Automations.update(key, "off");
+    }
+
+    /**
+     * Monotonic milliseconds for the blink debounce. Deliberately NOT currentTimeMillis: a
+     * head unit boots on a stale RTC and NTP/GPS corrects it seconds later, and a backward jump
+     * makes {@code now - since} negative — which reads as "inside the off-phase window" and pins
+     * the indicator "on" for the whole size of the jump.
+     */
+    private static long monotonicMs() {
+        return System.nanoTime() / 1_000_000L;
     }
 
     /**
@@ -787,30 +1372,12 @@ public class BydEvent {
         Automations.update(key, "off");
     }
 
-    /**
-     * Publish the two temperature events, which are now cleanly separated by WHAT they measure
-     * rather than by the car's power state:
-     *
-     * <ul>
-     *   <li>{@link #TEMPERATURE} ("Temperature") — the CABIN sensor, parked as well as driving.
-     *       Ambient is used only as a last resort, when the cabin sensor has stopped answering
-     *       (see {@code isCabinTempFresh}).</li>
-     *   <li>{@link #OUTSIDE_TEMPERATURE} ("Outside Temperature") — always ambient: the exterior
-     *       cluster sensor, then the Open-Meteo weather API by last-known GPS. Never the cabin.</li>
-     * </ul>
-     *
-     * <p>Previously TEMPERATURE switched to ambient whenever the car was powered off, which made a
-     * parked cabin rule (the pet/child heat alert people actually want this for) compare against
-     * outside air. That gate existed to avoid a STALE cabin value, not because the sensor was
-     * unreadable — {@code collectAc} polls the AC device with ACC off too. Freshness is now
-     * decided directly via {@code insideTempReadAt}, so the power state no longer matters.
-     *
-     * <p>The weather value is served from cache and refreshed on a background thread
-     * (WeatherTemperature), so this never blocks the telemetry poll. When no source yields a value
-     * we publish nothing — the event keeps its last value (no spurious "dropped to 0" transition).
-     * All sources use Math.round for a consistent integer so a source switch never adds a phantom
-     * 1° step.
-     */
+    private static void forceTurnOff(
+            EventData key, java.util.concurrent.atomic.AtomicLong lastOn) {
+        lastOn.set(0L);
+        Automations.update(key, "off");
+    }
+
     /** A dial setpoint in display units → whole Celsius (the disjoint bands identify the scale). */
     private static int setpointCelsius(int setpoint) {
         if (setpoint >= com.overdrive.app.byd.BydDataCollector.AC_SETPOINT_MIN_F
@@ -820,10 +1387,15 @@ public class BydEvent {
         return setpoint;
     }
 
+    /**
+     * Publish temperature events according to what they measure, not the car's power state.
+     * {@link #TEMPERATURE} is measured cabin air and remains unavailable when this vehicle does
+     * not expose that sensor. {@link #OUTSIDE_TEMPERATURE} is ambient air from the exterior sensor
+     * or weather fallback, while {@link #AC_SETPOINT} is the climate dial.
+     */
     private static void updateTemperature(BydVehicleData data) {
         // Compute the ambient (outside) temperature once: outside cluster sensor first,
-        // then weather by last-known GPS. Reused for both the ambient-only
-        // OUTSIDE_TEMPERATURE event and as the fallback tail of the smart TEMPERATURE event.
+        // then weather by last-known GPS. It belongs only to OUTSIDE_TEMPERATURE.
         double ambient = ambientTemperature(data);
         if (!Double.isNaN(ambient)) {
             Automations.update(OUTSIDE_TEMPERATURE, (int) Math.round(ambient));
@@ -833,7 +1405,7 @@ public class BydEvent {
         // miss), so a trim that doesn't expose getTemprature leaves the event unseeded rather
         // than fabricating a value a comparison would silently match against.
         if (data.acSetpointDriver != BydVehicleData.UNAVAILABLE) {
-            Automations.update(AC_SETPOINT, setpointCelsius(data.acSetpointDriver));
+            publishFromSnapshot(AC_SETPOINT, setpointCelsius(data.acSetpointDriver));
         }
 
         // Rain-likely probability rides the SAME Open-Meteo fetch ambientTemperature()
@@ -854,44 +1426,39 @@ public class BydEvent {
         // a frozen cabin reading forever. That is now decided properly — collectAc polls the AC
         // device on the always-alive loop (ACC on AND off, explicitly for parked temperature
         // alerts), and insideTempReadAt records when the sensor last actually answered. So we use
-        // the cabin value whenever it is FRESH, whatever the power state, and fall back to ambient
-        // only when the sensor has genuinely stopped answering.
-        if (isCabinTempFresh(data)) {
-            cabinTempSourceActive = true;
-            Automations.update(TEMPERATURE, (int) Math.round(data.insideTempC));
+        // the cabin value until its bounded automation-retention deadline, whatever the power
+        // state. If the sensor stops answering, TEMPERATURE expires instead of being silently
+        // replaced by outside air.
+        Integer cabinTemperature = retainedCabinTemperatureForAutomation(data);
+        if (cabinTemperature != null) {
+            // Re-publish against the original observation deadline. This reconstructs the same
+            // retained state when the editor opens after automations were previously disabled;
+            // it never extends a stale parked reading.
+            Automations.updateExpiring(
+                    TEMPERATURE,
+                    cabinTemperature,
+                    data.insideTempReadAt + CABIN_TEMP_GIVE_UP_MS);
             return;
         }
-        // Cabin read has aged out. Do NOT switch straight to ambient: this method runs on every
-        // snapshot build, and the ~40 LISTENER-driven rebuilds (charging power, SOC, speed, …) call
-        // build() → bydEvent() while carrying the previous cabin stamp forward unrefreshed. So a
-        // rebuild landing after the freshness window but before the next poll would publish ambient,
-        // and the next poll would publish cabin again — flapping the event between two very
-        // different numbers (a sun-baked cabin at 55 vs 35 outside). Every flip is a real edge to
-        // Automations.update, so a "cabin above 40 → notify" rule would re-fire on every cycle: a
-        // notification loop, in exactly the pet/child scenario this event exists for.
-        //
-        // Only hand the event over to ambient once the cabin sensor is confirmed gone, using a
-        // GIVE-UP threshold well beyond one poll cycle rather than a poll/listener flag (there is
-        // one bydEvent entry point, shared by both, so no such flag exists to test). Between the
-        // freshness window and the give-up threshold the event simply holds its last cabin value —
-        // no publish, so no edge, so no flapping. Past the threshold the sensor has missed many
-        // consecutive polls and ambient is genuinely the better answer.
-        if (cabinTempSourceActive && cabinTempAge(data) < CABIN_TEMP_GIVE_UP_MS) {
-            return;
-        }
-        cabinTempSourceActive = false;
-        if (!Double.isNaN(ambient)) {
-            Automations.update(TEMPERATURE, (int) Math.round(ambient));
-        }
+        // Do not publish another source under the same signal. The expiration overlay hides the
+        // last measured value after the give-up deadline; outside air and the HVAC setpoint remain
+        // separate signals.
     }
 
-    /**
-     * Whether the TEMPERATURE event is currently sourced from the cabin sensor. Used to keep a
-     * listener-driven rebuild from flipping the source mid-cycle (see updateTemperature). Written
-     * only from the telemetry/listener publish path, which is effectively single-threaded per
-     * snapshot build; volatile so a read from another publisher thread sees the latest value.
-     */
-    private static volatile boolean cabinTempSourceActive = false;
+    /** Fresh measured cabin temperature for the automation signal, or null when unavailable. */
+    static Integer freshCabinTemperatureForAutomation(BydVehicleData data) {
+        if (!isCabinTempFresh(data)) return null;
+        return (int) Math.round(data.insideTempC);
+    }
+
+    /** A measured cabin value still inside the automation retention window, or null. */
+    static Integer retainedCabinTemperatureForAutomation(BydVehicleData data) {
+        if (data == null || Double.isNaN(data.insideTempC)
+                || cabinTempAge(data) >= CABIN_TEMP_GIVE_UP_MS) {
+            return null;
+        }
+        return (int) Math.round(data.insideTempC);
+    }
 
     /**
      * Whether {@code insideTempC} came from a recent AC-device read rather than being carried
@@ -900,31 +1467,24 @@ public class BydEvent {
      * <p>The window MUST be sized against the PARKED poll cadence, not the driving one: the
      * collector polls every 5s with ACC on but only every 90s with ACC off
      * ({@code BydDataCollector.POLL_INTERVAL_PARKED_MS}). A window shorter than that would make a
-     * parked cabin reading look stale on essentially every evaluation, so the event would fall back
-     * to ambient permanently — silently reintroducing the very bug this replaced. 4 missed parked
+     * parked cabin reading look stale on essentially every evaluation. 4 missed parked
      * polls (6 min) tolerates a busy HAL or a couple of transient device errors while still ageing
      * out a sensor that has genuinely stopped answering.
      */
     private static boolean isCabinTempFresh(BydVehicleData data) {
-        if (Double.isNaN(data.insideTempC)) return false;
-        if (data.insideTempReadAt <= 0L) return false;   // never read
-        return cabinTempAge(data) <= CABIN_TEMP_MAX_AGE_MS;
+        return data.hasFreshCabinTemperature();
     }
 
     /** Age of the last cabin read in ms, or Long.MAX_VALUE if there has never been one. A clock jump
      *  backwards yields a negative age, which every caller treats as fresh — better than spuriously
-     *  falling back to ambient. */
+     *  expiring the last measured value. */
     private static long cabinTempAge(BydVehicleData data) {
         if (data.insideTempReadAt <= 0L) return Long.MAX_VALUE;
         return System.currentTimeMillis() - data.insideTempReadAt;
     }
 
-    /** How old a cabin read may be and still drive the TEMPERATURE event. Derived from the PARKED
-     *  poll interval (90s) — see isCabinTempFresh for why the driving interval is the wrong basis. */
-    private static final long CABIN_TEMP_MAX_AGE_MS = 6 * 60_000L;   // 6 min ≈ 4 parked polls
-
-    /** Age at which the cabin sensor is declared gone and TEMPERATURE reverts to ambient. Beyond
-     *  CABIN_TEMP_MAX_AGE_MS so the gap between them is a quiet hold rather than a flap. */
+    /** Age at which the cabin sensor is declared gone and TEMPERATURE becomes unavailable. Beyond
+     *  {@link BydVehicleData#CABIN_TEMP_MAX_AGE_MS} so the gap between them is a quiet hold. */
     private static final long CABIN_TEMP_GIVE_UP_MS = 30 * 60_000L;   // 30 min ≈ 20 parked polls
 
     /**
@@ -966,6 +1526,11 @@ public class BydEvent {
         Automations.update(stateKey, percent == 0 ? "closed" : "open");
     }
 
+    /**
+     * Seat heat/cool level word, or null when the slot is not a real 0/1/2 reading. Null, not
+     * "unknown": the condition's vocabulary is {off, low, high}, so an "unknown" would be a word
+     * no rule could ever match (the same silent-killer the cpd publish had).
+     */
     private static String seatClimateToString(int level) {
         switch (level) {
             case 0:
@@ -975,10 +1540,27 @@ public class BydEvent {
             case 2:
                 return "high";
             default:
-                return "unknown";
+                return null;
         }
     }
 
+    /** Raw {@code getAcStartState()} value to the automation vocabulary, or null on a miss. */
+    static String acStateToString(int state) {
+        if (state == 0) return "off";
+        if (state == 1) return "on";
+        return null;
+    }
+
+    /**
+     * CPD state word, or null when the reading is not one of the three real states.
+     *
+     * <p>Returns null rather than "unknown" (which it used to) because "unknown" is not in the
+     * condition's declared vocabulary {on, off, delay}. The builder field has no initializer, so
+     * it defaults to 0 on any trim whose CPD feature never answers — the collector deliberately
+     * rejects the 0 / 65535 rails — and publishing "unknown" pinned a word the editor cannot
+     * select: every cpd rule compared lexically against it and could never match. Mirrors
+     * EnergyRegenEvent.regenWord, which returns null for the same reason.
+     */
     private static String cpdToString(int value) {
         switch (value) {
             case 1:
@@ -988,7 +1570,7 @@ public class BydEvent {
             case 3:
                 return "delay";
             default:
-                return "unknown";
+                return null;
         }
     }
 }

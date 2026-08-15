@@ -1,0 +1,83 @@
+package com.overdrive.app.overlay;
+
+import android.app.AppOpsManager;
+import android.content.Context;
+import android.os.Build;
+import android.provider.Settings;
+import android.util.Log;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Authoritative app-process check for Display-over-other-apps permission.
+ */
+public final class OverlayPermissionChecker {
+
+    private static final String TAG = "OverlayPermission";
+    private static final AtomicBoolean mismatchLogged = new AtomicBoolean(false);
+
+    private OverlayPermissionChecker() {}
+
+    public static boolean isGranted(Context context) {
+        Context appContext = context.getApplicationContext();
+        Context probeContext = appContext != null ? appContext : context;
+        boolean frameworkAllowed = frameworkAllows(probeContext);
+        Boolean appOpsAllowed = appOpsAllows(probeContext);
+        boolean granted =
+                OverlayPermissionDecision.resolve(appOpsAllowed, frameworkAllowed);
+
+        if (appOpsAllowed != null
+                && appOpsAllowed.booleanValue() != frameworkAllowed
+                && mismatchLogged.compareAndSet(false, true)) {
+            Log.w(TAG, "Permission APIs disagree: appOps=" + appOpsAllowed
+                    + ", framework=" + frameworkAllowed
+                    + "; using AppOps");
+        }
+        return granted;
+    }
+
+    private static boolean frameworkAllows(Context context) {
+        try {
+            return Settings.canDrawOverlays(context);
+        } catch (Throwable error) {
+            Log.w(TAG, "Settings.canDrawOverlays failed: " + error.getMessage());
+            return false;
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static Boolean appOpsAllows(Context context) {
+        try {
+            AppOpsManager appOps =
+                    (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
+            if (appOps == null) return null;
+
+            int mode;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                mode = appOps.unsafeCheckOpRawNoThrow(
+                        AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW,
+                        context.getApplicationInfo().uid,
+                        context.getOpPackageName());
+            } else {
+                mode = appOps.checkOpNoThrow(
+                        AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW,
+                        context.getApplicationInfo().uid,
+                        context.getOpPackageName());
+            }
+            if (mode == AppOpsManager.MODE_ALLOWED
+                    || mode == AppOpsManager.MODE_FOREGROUND) {
+                return Boolean.TRUE;
+            }
+            if (mode == AppOpsManager.MODE_IGNORED
+                    || mode == AppOpsManager.MODE_ERRORED
+                    || mode == AppOpsManager.MODE_DEFAULT) {
+                return Boolean.FALSE;
+            }
+            Log.w(TAG, "Unknown SYSTEM_ALERT_WINDOW AppOps mode: " + mode);
+        } catch (Throwable error) {
+            Log.w(TAG, "SYSTEM_ALERT_WINDOW AppOps check failed: "
+                    + error.getMessage());
+        }
+        return null;
+    }
+}

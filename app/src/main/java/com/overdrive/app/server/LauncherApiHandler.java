@@ -181,6 +181,17 @@ public final class LauncherApiHandler {
             boolean charging = false;
             try { charging = com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging(); }
             catch (Throwable ignored) {}
+            // Include the CV taper, so this agrees with charging.active in the same response. Reporting
+            // acc="off" while charging.active=true is an internal contradiction the launcher then has to
+            // arbitrate, and it picked the wrong one.
+            try {
+                com.overdrive.app.monitor.VehicleDataMonitor vm =
+                        com.overdrive.app.monitor.VehicleDataMonitor.getInstance();
+                if (!charging && vm != null) {
+                    com.overdrive.app.monitor.ChargingStateData cs = vm.getChargingState();
+                    if (cs != null && cs.isTaperCharging) charging = true;
+                }
+            } catch (Throwable ignored) {}
             boolean accOn = false;
             try { accOn = com.overdrive.app.monitor.AccMonitor.isAccOn(); } catch (Throwable ignored) {}
             o.put("acc", charging ? "charging" : (accOn ? "on" : "off"));
@@ -318,21 +329,60 @@ public final class LauncherApiHandler {
             boolean active = false;
             try { active = com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging(); }
             catch (Throwable ignored) {}
+            // A CV taper IS charging. The fused verdict is intentionally false during it (the BMS calls
+            // the session FINISHED while current still flows), so on its own this published
+            // active=false alongside a positive MEASURED kw in the same object. Fifth outbound surface
+            // to need this — the dashboard, ABRP, MQTT and the charging API all honour it.
+            try {
+                com.overdrive.app.monitor.VehicleDataMonitor vm =
+                        com.overdrive.app.monitor.VehicleDataMonitor.getInstance();
+                if (!active && vm != null) {
+                    com.overdrive.app.monitor.ChargingStateData cs = vm.getChargingState();
+                    if (cs != null && cs.isTaperCharging) active = true;
+                }
+            } catch (Throwable ignored) {}
             o.put("active", active);
 
+            // MEASURED only, matching every other outbound surface. getChargingState() substitutes a
+            // nominal placeholder (3.3/7.0 kW) flagged isEstimated whenever the detector says
+            // CHARGING but nothing has resolved a real rate yet — routine at the start of a charge,
+            // and permanent on a trim where no rate source resolves. Publishing it here showed the
+            // launcher widget a confident round number that has nothing to do with the actual charge.
+            // MEASURED only, matching every other outbound surface. getChargingState() substitutes a
+            // nominal placeholder (3.3/7.0 kW) flagged isEstimated whenever the detector says
+            // CHARGING but nothing has resolved a real rate yet — routine early in a charge, and
+            // permanent on a trim where no accessor ever resolves. Publishing it showed the widget a
+            // confident round number unrelated to the actual charge.
+            //
+            // `kwEstimated` is published alongside so the widget can render a dash rather than a
+            // fabricated figure. Without it, suppressing the value would make the widget read
+            // "0.0 kW" while charging, which looks broken rather than unknown.
             double kw = 0;
+            boolean kwEstimated = false;
             try {
                 com.overdrive.app.monitor.ChargingStateData cs =
                         com.overdrive.app.monitor.VehicleDataMonitor.getInstance().getChargingState();
-                if (cs != null) kw = cs.chargingPowerKW;
+                if (cs != null && !Double.isNaN(cs.chargingPowerKW)) {
+                    if (cs.isEstimated) {
+                        kwEstimated = true;
+                    } else {
+                        kw = cs.chargingPowerKW;
+                    }
+                }
             } catch (Throwable ignored) {}
             o.put("kw", round1(kw));
+            o.put("kwEstimated", kwEstimated);
 
-            // targetPct: BEV charge-cap target (valid 15..100), else null.
+            // targetPct: verified generic charge-stop limit (valid 50..100), else null.
             Object targetPct = JSONObject.NULL;
             try {
-                int pct = com.overdrive.app.byd.BydDataCollector.getInstance().getChargeCapPercent();
-                if (pct >= 15 && pct <= 100) targetPct = pct;
+                com.overdrive.app.byd.BydDataCollector collector =
+                        com.overdrive.app.byd.BydDataCollector.getInstance();
+                int pct = collector.getChargeCapPercent();
+                if (Boolean.TRUE.equals(collector.isChargeCapSupported())
+                        && pct >= 50 && pct <= 100) {
+                    targetPct = pct;
+                }
             } catch (Throwable ignored) {}
             o.put("targetPct", targetPct);
 
@@ -355,8 +405,12 @@ public final class LauncherApiHandler {
             // is the cache's stored start time string (HH:mm) when present.
             JSONObject schedule = new JSONObject();
             try {
-                Boolean en = com.overdrive.app.byd.cloud.SmartChargeCache.getEnabled();
-                String start = com.overdrive.app.byd.cloud.SmartChargeCache.getStartChargeTime();
+                String vin = com.overdrive.app.byd.cloud.BydCloudConfig
+                        .fromUnifiedConfig().vin;
+                JSONObject cached = com.overdrive.app.byd.cloud.SmartChargeCache.getSnapshot(vin);
+                Boolean en = cached.has("enabled") && !cached.isNull("enabled")
+                        ? Boolean.valueOf(cached.optBoolean("enabled")) : null;
+                String start = cached.optString("startChargeTime", null);
                 schedule.put("enabled", en == null ? JSONObject.NULL : en.booleanValue());
                 schedule.put("startHhmm", (start == null || start.isEmpty()) ? JSONObject.NULL : start);
             } catch (Throwable ignored) {

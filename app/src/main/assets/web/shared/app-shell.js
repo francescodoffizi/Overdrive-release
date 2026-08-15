@@ -51,6 +51,7 @@
         { divider: true, label: 'Overview', i18n: 'nav.overview_group' },
         { href: 'index.html',           i18n: 'nav.dashboard',       label: 'Dashboard',       svg: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>' },
         { href: 'live-view.html',       i18n: 'nav.live_view',       label: 'Live View',       svg: '<path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><path d="M2 12a9 9 0 0 0 8 8"/><circle cx="2" cy="12" r="2"/>' },
+        { href: 'communicate.html',     i18n: 'nav.communicate',     label: 'Communicate',     svg: '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3M8 22h8"/>' },
         { href: 'events.html',          i18n: 'nav.recordings',      label: 'Recordings',      svg: '<path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2"/>' },
 
         // ===== Vehicle ===== — control + trip history.
@@ -73,6 +74,7 @@
         // page that exists on web; the native diagnostics fragment is native.
         { divider: true, label: 'Diagnostics', i18n: 'nav.diagnostics_group' },
         { href: 'performance.html',                       i18n: 'nav.performance',    label: 'Performance',    svg: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>' },
+        { href: 'network.html',                           i18n: 'nav.network',        label: 'Network',        svg: '<path d="M12 20h.01"/><path d="M8.5 16.4a5 5 0 0 1 7 0"/><path d="M5 13a9 9 0 0 1 14 0"/><path d="M1.8 9.6a14 14 0 0 1 20.4 0"/>', svgExtra: 'stroke-linecap="round"' },
 
         // ===== Settings ===== — surveillance + recording + notifications
         // are settings sub-destinations under SettingsFragment on native.
