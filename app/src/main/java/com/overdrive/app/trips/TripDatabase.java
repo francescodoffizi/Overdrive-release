@@ -156,15 +156,60 @@ public class TripDatabase {
                 reconnect();
                 return connection != null && !connection.isClosed();
             }
-            return true;
+            // isClosed() is not enough. It reports only whether THIS Connection object was
+            // closed on our side; when H2 shuts the DATABASE down underneath us it keeps
+            // returning false while every statement throws 90098 "The database has been
+            // closed". Observed on a BYD Seal head unit on 2026-08-14: the store closed
+            // mid-session and stayed dead for hours until the daemon was restarted. The
+            // failure is near-silent, because every DAO logs its SQLException and returns an
+            // empty result — so GET /api/trips answered `success:true, trips:[]`, anything
+            // derived from trip history (recent consumption, range estimates) went null, and
+            // a real drive was recorded to the telemetry file only, to be rebuilt later by
+            // recoverTripsFromDisk. So probe the store instead of trusting the flag.
+            if (probe()) return true;
+            logger.warn("connection alive but database unusable — forcing a reopen");
+            forceReconnect();
+            return probe();
         } catch (Exception e) {
             logger.error("Connection check failed", e);
-            reconnect();
+            forceReconnect();
             try {
                 return connection != null && !connection.isClosed();
             } catch (Exception e2) {
                 return false;
             }
+        }
+    }
+
+    /**
+     * Cheapest round-trip that actually reaches the store. Embedded H2, so this is
+     * microseconds; the alternative is trusting a client-side flag that lies.
+     */
+    private boolean probe() {
+        Connection c = connection;
+        if (c == null) return false;
+        try (java.sql.Statement st = c.createStatement()) {
+            st.execute("SELECT 1");
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Reopen unconditionally. {@link #reconnect()} is a no-op when {@code isClosed()} returns
+     * false, which is exactly the case that needs reopening here, so the handle is dropped
+     * first.
+     */
+    private synchronized void forceReconnect() {
+        Connection old = connection;
+        connection = null;
+        if (old != null) {
+            try { old.close(); } catch (Exception ignored) { }
+        }
+        reconnect();
+        if (connection != null) {
+            logger.info("Trip database reopened after the store closed underneath us");
         }
     }
 
