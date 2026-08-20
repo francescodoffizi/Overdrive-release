@@ -15,7 +15,9 @@ import com.overdrive.app.launcher.AdbDaemonLauncher
  *
  *   1. read the 360/pano preview (taught read-from-the-bottom: BL=rear, BR=left)
  *   2. read the dashcam (forward) preview via the candidate navigator
- *   3. pick the normal camera id (rgManualCameraId) + dashcam id (rgOemDashcamId)
+ *   3. PAIRING — spotlight the "Which camera is which?" card; the common fix is the
+ *      one-tap Swap. "Pick IDs manually" expands the advanced section and falls back to
+ *      the classic per-group walkthrough (rgManualCameraId + rgOemDashcamId)
  *   4. SAVE & RESTART — the wizard fires the full daemon restart so "save and restart"
  *      is one action; narrated ~10s determinate progress ("feed blinks, this is normal")
  *   5. VERIFY — "do the feeds look right?" with a Re-pick loop (non-destructive)
@@ -210,15 +212,62 @@ class CameraWizardCoach(
             title = activity.getString(R.string.onboarding_camera_dashcam_title),
             body = activity.getString(R.string.onboarding_camera_dashcam_body),
             primaryText = activity.getString(R.string.onboarding_next),
-            onPrimary = { coachPickIds() },
+            onPrimary = { coachPairing() },
             secondaryText = activity.getString(R.string.onboarding_back),
             onSecondary = { coachReadPano() },
             stepLabel = stepLabel(Sub.READ_DASHCAM),
         )
     }
 
+    /**
+     * Pairing-first step: spotlight the "Which camera is which?" card and
+     * teach the one-tap Swap. Primary advances straight to save & restart
+     * (Swap already saved if the user tapped it — re-saving is idempotent);
+     * secondary expands the advanced ID pickers and falls back to the
+     * classic per-group walkthrough. On layouts without the pairing card
+     * (dialog rendered from an older APK layout) this step degrades to the
+     * classic flow immediately, preserving the pre-pairing wizard.
+     */
+    private fun coachPairing() {
+        val v = dialogView ?: return
+        val pairingCard = v.findViewById<View>(R.id.cardCameraPairing)
+        if (pairingCard == null) {
+            // Legacy layout — keep the original two-radio-group walkthrough.
+            coachPickIds()
+            return
+        }
+        overlay.consumeCutoutTouch = false  // let the user tap Swap underneath
+        overlay.spotlight(pairingCard)
+        overlay.bindStep(
+            title = activity.getString(R.string.onboarding_camera_pair_title),
+            body = activity.getString(R.string.onboarding_camera_pair_body),
+            primaryText = activity.getString(R.string.onboarding_camera_pair_primary),
+            onPrimary = { coachSaveAndRestart() },
+            secondaryText = activity.getString(R.string.onboarding_camera_pair_secondary),
+            onSecondary = {
+                ensureAdvancedIdsVisible(v)
+                coachPickIds()
+            },
+            stepLabel = stepLabel(Sub.PICK_IDS),
+        )
+    }
+
+    /**
+     * The manual ID pickers live behind a collapsed "advanced" expander.
+     * Expand via the real toggle (keeps its chevron state in sync) before
+     * spotlighting anything inside; no-op on layouts without the expander.
+     */
+    private fun ensureAdvancedIdsVisible(v: View) {
+        val section = v.findViewById<View>(R.id.advancedIdSection) ?: return
+        if (section.visibility != View.VISIBLE) {
+            val toggle = v.findViewById<View>(R.id.btnToggleAdvancedIds)
+            if (toggle != null) toggle.performClick() else section.visibility = View.VISIBLE
+        }
+    }
+
     private fun coachPickIds() {
         val v = dialogView ?: return
+        ensureAdvancedIdsVisible(v)
         val panoGroup = v.findViewById<View>(R.id.rgManualCameraId)
         overlay.spotlight(panoGroup ?: v)
         overlay.bindStep(
@@ -236,7 +285,7 @@ class CameraWizardCoach(
                         primaryText = activity.getString(R.string.onboarding_camera_save_primary),
                         onPrimary = { coachSaveAndRestart() },
                         secondaryText = activity.getString(R.string.onboarding_back),
-                        onSecondary = { coachReadDashcam() },
+                        onSecondary = { coachPairing() },
                         stepLabel = stepLabel(Sub.PICK_IDS),
                     )
                 } else {
@@ -244,7 +293,7 @@ class CameraWizardCoach(
                 }
             },
             secondaryText = activity.getString(R.string.onboarding_back),
-            onSecondary = { coachReadDashcam() },
+            onSecondary = { coachPairing() },
             stepLabel = stepLabel(Sub.PICK_IDS),
         )
     }

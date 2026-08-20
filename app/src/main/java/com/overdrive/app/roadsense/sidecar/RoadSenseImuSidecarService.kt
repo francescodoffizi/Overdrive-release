@@ -35,16 +35,16 @@ import java.net.Socket
  * IPC server (port 19877) as `IMU_BATCH` frames. ALL detection/storage/sync logic
  * runs daemon-side; this service is a dumb pump.
  *
- * Mirrors `LocationSidecarService`: a foreground service, one socket per outbound
- * message (the daemon's IPC server is one-line-per-connection), background thread
+ * Mirrors `LocationSidecarService`: a foreground service with a background thread
  * for all sensor + network work. The difference is RATE — 100 Hz × 2 sensors — so
- * we **batch** (~[ImuFrameCodec.TARGET_BATCH_MS] per frame) instead of one write
- * per sample (D-023: per-sample sockets would dominate CPU and starve the camera).
+ * we **batch** (~[ImuFrameCodec.TARGET_BATCH_MS] per frame) and keep one socket
+ * while driving instead of connecting per sample.
  *
  * Resource scaling (D-021) is driven by the daemon via start/stop of THIS service
- * and the [EXTRA_RATE] hint: DRIVING → FAST (~100 Hz), RELAXED → SLOW, ACC OFF →
- * the daemon stops the service entirely (zero cost). The service itself just
- * honors the rate it's started with; the daemon owns the policy (VehicleStateGate).
+ * and the [EXTRA_RATE] hint: DRIVING → FAST (~100 Hz), RELAXED → SLOW (service
+ * resident, sensors unregistered), ACC OFF → the daemon stops the service entirely.
+ * Keeping the service/handler resident preserves the existing fast D-gear resume
+ * without streaming or serializing unused IMU data in P/N/R.
  */
 class RoadSenseImuSidecarService : Service(), SensorEventListener {
 
@@ -53,10 +53,9 @@ class RoadSenseImuSidecarService : Service(), SensorEventListener {
     private var gyro: Sensor? = null
     private var ioThread: HandlerThread? = null
     private var ioHandler: android.os.Handler? = null
-    // Rate we're currently registered at (null = not registered). Used to skip a
-    // redundant same-rate re-register (audit). Read/written on ioHandler's thread
-    // (registerSensors) but also cleared from onDestroy on the main thread, so
-    // @Volatile gives the cross-thread visibility that makes the clear reliable.
+    // Applied operating mode. FAST means listeners are registered; SLOW is the
+    // compatibility command name for the resident-but-paused RELAXED state.
+    // Read/written on ioHandler's thread but cleared from onDestroy on main.
     @Volatile private var registeredRate: ImuRate? = null
 
     // Batch accumulators — only touched on ioHandler's thread (sensor callbacks
@@ -90,7 +89,7 @@ class RoadSenseImuSidecarService : Service(), SensorEventListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val rateName = intent?.getStringExtra(EXTRA_RATE)
         currentRate = if (rateName == ImuRate.SLOW.name) ImuRate.SLOW else ImuRate.FAST
-        ioHandler?.post { registerSensors(currentRate) }
+        ioHandler?.post { applyRate(currentRate) }
         // Not sticky: the daemon owns our lifecycle (D-021). If the OS kills us,
         // the daemon's controller re-starts us on the next DRIVING evaluation.
         return START_NOT_STICKY
@@ -112,13 +111,11 @@ class RoadSenseImuSidecarService : Service(), SensorEventListener {
 
     // ── Sensor acquisition ────────────────────────────────────────────────────
 
-    private fun registerSensors(rate: ImuRate) {
+    private fun applyRate(rate: ImuRate) {
         // Idempotence (audit): a redundant start at the SAME rate (e.g. the daemon
-        // re-issuing the same regime, or any duplicate `am`) would otherwise force an
-        // unregister + re-register cycle that briefly drops the listener for no reason.
-        // Skip when we're already registered at this exact rate.
-        if (rate == registeredRate && sensorManager != null) {
-            Log.d(TAG, "registerSensors: already at rate=$rate, no-op")
+        // re-issuing the same regime) must not churn listeners or the IPC connection.
+        if (rate == registeredRate) {
+            Log.d(TAG, "applyRate: already at rate=$rate, no-op")
             return
         }
         val sm = getSystemService(SENSOR_SERVICE) as? SensorManager ?: run {
@@ -126,28 +123,45 @@ class RoadSenseImuSidecarService : Service(), SensorEventListener {
             return
         }
         sensorManager = sm
-        // Re-register cleanly if rate changed mid-run.
+
+        // Every mode transition starts from a clean listener/batch state. In
+        // particular, don't let a partial FAST batch escape after gear leaves D.
         sm.unregisterListener(this)
         registeredRate = null
+        accelBatch.clear()
+        gyroBatch.clear()
+        batchStartMs = 0L
 
-        val resolved = ImuSource.resolve(sm)
-        if (!resolved.usableForDetection) {
-            // R-EXT-6 graceful fallback: no real -iner accel on this trim. There's
-            // nothing to stream and no point holding a foreground service + its
-            // notification, so self-stop. The daemon's regime poll won't usefully
-            // re-start us (still no sensor), so this cleanly disables the feature
-            // on unsupported hardware rather than leaving a zombie FGS up.
-            Log.w(TAG, "no usable -iner accelerometer on this trim; stopping IMU sidecar")
+        if (accel == null) {
+            val resolved = ImuSource.resolve(sm)
+            if (!resolved.usableForDetection) {
+                // R-EXT-6 graceful fallback: no real -iner accel on this trim.
+                Log.w(TAG, "no usable -iner accelerometer on this trim; stopping IMU sidecar")
+                stopSelf()
+                return
+            }
+            accel = resolved.accelerometer
+            gyro = resolved.gyroscope
+        }
+
+        if (rate == ImuRate.SLOW) {
+            // RELAXED does no detection, so even 5 Hz callbacks only create JSON,
+            // socket and GC work. Keep the FGS + HandlerThread resident for the
+            // existing fast resume path, but release sensors and the daemon worker
+            // blocked on this otherwise-idle persistent connection.
+            closeIpcSocket()
+            registeredRate = ImuRate.SLOW
+            Log.i(TAG, "IMU sidecar paused for RELAXED; sensors unregistered")
+            return
+        }
+
+        val activeAccel = accel ?: run {
+            Log.w(TAG, "resolved accelerometer disappeared; stopping IMU sidecar")
             stopSelf()
             return
         }
-        accel = resolved.accelerometer
-        gyro = resolved.gyroscope
 
-        val delay = when (rate) {
-            ImuRate.FAST -> SensorManager.SENSOR_DELAY_FASTEST   // ~100 Hz (F-005)
-            ImuRate.SLOW -> SensorManager.SENSOR_DELAY_NORMAL    // relaxed, ~5 Hz
-        }
+        val delay = SensorManager.SENSOR_DELAY_FASTEST
         // Hardware FIFO batching (FAST only): ask the sensor hub to buffer up to
         // ~TARGET_BATCH_MS of samples and wake the AP once per window instead of
         // per sample. At 100 Hz × 2 sensors this cuts AP wakeups from ~200/s to
@@ -157,20 +171,19 @@ class RoadSenseImuSidecarService : Service(), SensorEventListener {
         // downstream. End-to-end latency is unchanged: the software flush window
         // (TARGET_BATCH_MS) already delayed shipping by the same amount. If the
         // sensor has no hardware FIFO, Android silently falls back to per-sample
-        // delivery — strictly no worse than before. SLOW keeps latency 0 (it is
-        // already low-rate, so batching would buffer ~1 sample). The batch is also
-        // hard-capped by MAX_SAMPLES_PER_FRAME in onSensorChanged.
-        val maxReportLatencyUs = when (rate) {
-            ImuRate.FAST -> (ImuFrameCodec.TARGET_BATCH_MS * 1000L).toInt()
-            ImuRate.SLOW -> 0
-        }
-        accel?.let { sm.registerListener(this, it, delay, maxReportLatencyUs, ioHandler) }
+        // delivery — strictly no worse than before. The batch is also hard-capped
+        // by MAX_SAMPLES_PER_FRAME in onSensorChanged.
+        val maxReportLatencyUs = (ImuFrameCodec.TARGET_BATCH_MS * 1000L).toInt()
+        sm.registerListener(this, activeAccel, delay, maxReportLatencyUs, ioHandler)
         gyro?.let { sm.registerListener(this, it, delay, maxReportLatencyUs, ioHandler) }
-        registeredRate = rate
-        Log.i(TAG, "IMU sidecar registered: accel=${accel?.name} gyro=${gyro?.name} rate=$rate")
+        registeredRate = ImuRate.FAST
+        Log.i(TAG, "IMU sidecar registered: accel=${accel?.name} gyro=${gyro?.name} rate=FAST")
     }
 
     override fun onSensorChanged(event: SensorEvent) {
+        // unregisterListener can race with an already-queued callback. Once RELAXED
+        // has been applied, ignore that tail event instead of recreating a batch.
+        if (registeredRate != ImuRate.FAST) return
         val tMs = wallClockFromElapsed(event.timestamp)
         if (batchStartMs == 0L) batchStartMs = tMs
         when (event.sensor.type) {

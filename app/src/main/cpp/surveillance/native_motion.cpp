@@ -1062,17 +1062,59 @@ Java_com_overdrive_app_surveillance_NativeMotion_computeGridMotion(
 // Global MOG2 instance (one per process)
 static cv::Ptr<cv::BackgroundSubtractorMOG2> g_mog2;
 static bool g_mog2_initialized = false;
+// Explicit-release latch (audit R11-6 / ExtD-6). releaseMOG2 (disarm
+// teardown) sets it; resetMOG2 (session arm) clears it. Java's disable()
+// does not join an in-flight frame tick, so a straggler
+// computeMOG2Quadrants landing AFTER releaseMOG2 used to find
+// !g_mog2_initialized and lazily initMog2() — silently re-creating the
+// ~18.7MB model for the entire disarm period (the driving majority of
+// runtime), defeating the R3b Ext-14 release. With the latch, a
+// post-release sample returns -1 (channel fails CLOSED per I9, exactly as
+// if OpenCV were absent) until the next session's resetMOG2 re-arms it.
+// Guarded by g_mog2_mutex like the rest of the MOG2 globals.
+static bool g_mog2_released = false;
 
 // Global motion mask for overlap checking
 static cv::Mat g_lastMotionMask;
 static int g_motionMaskWidth = 0;
 static int g_motionMaskHeight = 0;
 
+// Serializes ALL touches of the process-global g_mog2 AND g_lastMotionMask
+// (reassignment/release in resetMOG2 vs apply() in computeMOG2Quadrants —
+// plus the legacy computeMOG2 / checkMotionOverlap paths, dead today but
+// locked so this claim stays true if they ever gain a caller; audit R2 #7).
+// The Java side orders its enable() reset before the volatile `active`
+// publication, but disable() does not join an in-flight frame tick — a fast
+// disable→enable can still reach resetMOG2 while a straggler apply()
+// (~20-30ms) is executing on the engine thread. Reassigning a cv::Ptr
+// concurrently with a method call on the pointee is a use-after-free.
+// Uncontended in steady state (one lock per 500ms sample); only ever
+// contended for one apply() duration during a re-arm.
+#include <mutex>
+static std::mutex g_mog2_mutex;
+
+// Confine OpenCV's internal parallel_for_ to the calling thread.
+// opencv-mobile is linked with OpenMP and by default fans apply() /
+// morphologyEx out onto default-priority workers across all cores —
+// including the cluster the encoder threads live on — contradicting the
+// engine's nice-gradient isolation strategy (audit R2-perf#2). Single-
+// threaded also makes the documented ~20-30ms apply() estimate the actual
+// behavior. Only ever called under g_mog2_mutex (both init paths), so the
+// guard flag needs no atomics.
+static void confineOpenCvToCallingThread() {
+    static bool s_cvThreadsConfined = false;
+    if (!s_cvThreadsConfined) {
+        cv::setNumThreads(1);
+        s_cvThreadsConfined = true;
+    }
+}
+
 /**
  * Initialize MOG2 background subtractor.
  */
 static void initMog2() {
     if (!g_mog2_initialized) {
+        confineOpenCvToCallingThread();
         // Parameters tuned for surveillance:
         // - history=100: Learn background over 100 frames (~50 seconds at 2 FPS)
         // - varThreshold=8: Lower = more sensitive (default is 16)
@@ -1088,6 +1130,9 @@ static void initMog2() {
  * Returns overlap ratio (0.0-1.0).
  */
 static float checkMotionOverlap(int x, int y, int w, int h, int frameW, int frameH) {
+    // g_lastMotionMask is released by resetMOG2 under g_mog2_mutex; hold the
+    // same lock for the whole read (dead path today — audit R2 #7 coverage).
+    std::lock_guard<std::mutex> lock(g_mog2_mutex);
     if (g_lastMotionMask.empty() || g_motionMaskWidth == 0) {
         return 1.0f;  // No motion mask, assume overlap
     }
@@ -1140,6 +1185,154 @@ Java_com_overdrive_app_surveillance_NativeMotion_isMog2Available(
 }
 
 /**
+ * Reset the MOG2 background model (fresh sentry session).
+ *
+ * g_mog2 is process-global and survives surveillance arm/disarm cycles; a
+ * stale background from the PREVIOUS parking spot would classify the entire
+ * new scene as foreground for the whole learning window. The Java engine
+ * calls this from enable() so every session starts from a clean model
+ * (invariant I2 — every latch/state that can influence a trigger resets in
+ * enable()).
+ */
+// (g_mog2_mutex + its doc live with the other MOG2 globals above — moved in
+// audit R2 #7 so the legacy checkMotionOverlap/computeMOG2 paths, which are
+// declared before this point, can take the same lock.)
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_overdrive_app_surveillance_NativeMotion_resetMOG2(
+    JNIEnv* env, jclass clazz) {
+#if HAVE_OPENCV
+    try {
+        std::lock_guard<std::mutex> lock(g_mog2_mutex);
+        confineOpenCvToCallingThread();
+        g_mog2 = cv::createBackgroundSubtractorMOG2(100, 8, false);
+        g_mog2_initialized = true;
+        g_mog2_released = false;  // new session re-arms the channel (audit R11-6)
+        g_lastMotionMask.release();
+        return JNI_TRUE;
+    } catch (...) {
+        // An exception across the JNI boundary would abort the daemon;
+        // a failed reset just means the channel re-arms on stale state,
+        // which the Java-side warmup gate then re-learns through.
+        return JNI_FALSE;
+    }
+#else
+    return JNI_FALSE;
+#endif
+}
+
+/**
+ * Release the MOG2 background model + legacy overlap mask (disarm teardown,
+ * audit R3b Ext-14). The model is ~18.7MB of native heap (bgmodel = 307,200
+ * px × 5 mixtures × 3 floats + used-modes map) that used to stay resident
+ * across disarm — i.e. for the driving majority of runtime — and bought
+ * nothing: enable() reseeds via resetMOG2() anyway. g_mog2_mutex covers
+ * teardown vs a straggler apply() (same discipline as resetMOG2).
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_overdrive_app_surveillance_NativeMotion_releaseMOG2(
+    JNIEnv* env, jclass clazz) {
+#if HAVE_OPENCV
+    try {
+        std::lock_guard<std::mutex> lock(g_mog2_mutex);
+        g_mog2.release();
+        g_mog2_initialized = false;
+        g_mog2_released = true;  // refuse lazy re-init until resetMOG2 (audit R11-6)
+        g_lastMotionMask.release();
+        g_motionMaskWidth = 0;
+        g_motionMaskHeight = 0;
+    } catch (...) {
+        // Never throw across the JNI boundary; a failed release just leaves
+        // the model resident until the next resetMOG2 replaces it.
+    }
+#endif
+}
+
+/**
+ * MOG2 background subtraction over the FULL 2x2 mosaic with per-quadrant
+ * foreground fractions.
+ *
+ * One g_mog2->apply() per call (g_mog2 is a single process-global model —
+ * feeding quadrants separately would corrupt its learning; the mosaic layout
+ * is stable so one whole-frame model is correct). Same grayscale + open/close
+ * morphology as the legacy computeMOG2 above. Deliberately does NOT touch
+ * g_lastMotionMask (no side effects on the legacy overlap path).
+ *
+ * Quadrant tiling matches SurveillanceEngineGpu.cropFromMosaic exactly:
+ * quadrant q occupies (x = (q%2)*w/2, y = (q/2)*h/2), i.e. Q0=TL front,
+ * Q1=TR right, Q2=BL rear, Q3=BR left.
+ *
+ * @param learningRate  OpenCV semantics: -1 = automatic (1/history);
+ *                      1.0 = reseed the background entirely from this frame
+ *                      (used for the first frame of a session).
+ * @param outQuadrantFractions  float[4] out: per-quadrant foreground pixel
+ *                      fraction in [0,1], indexed as above.
+ * @return whole-frame foreground fraction in [0,1], or -1 on error /
+ *         OpenCV absent (caller treats <0 as "channel unavailable" and the
+ *         adding-only Java channel fails CLOSED — invariant I9).
+ */
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_overdrive_app_surveillance_NativeMotion_computeMOG2Quadrants(
+    JNIEnv* env, jclass clazz,
+    jobject rgbBuffer, jint width, jint height,
+    jfloat learningRate, jfloatArray outQuadrantFractions) {
+#if HAVE_OPENCV
+    // try/catch(...) is load-bearing: this is the first LIVE OpenCV path in
+    // this file (the legacy computeMOG2 has no Java caller), and an escaped
+    // cv::Exception / std::bad_alloc through the extern "C" JNI boundary is
+    // std::terminate — the daemon aborts while parked. The Java caller's
+    // catch(Throwable) cannot intercept a native abort; returning -1 keeps
+    // the documented "negative ⇒ channel fails closed" contract (I9).
+    try {
+        uint8_t* rgbData = (uint8_t*)env->GetDirectBufferAddress(rgbBuffer);
+        if (rgbData == nullptr || width <= 1 || height <= 1) {
+            return -1.0f;
+        }
+        cv::Mat rgbMat(height, width, CV_8UC3, rgbData);
+        cv::Mat grayMat;
+        cv::cvtColor(rgbMat, grayMat, cv::COLOR_RGB2GRAY);
+
+        cv::Mat fgMask;
+        {
+            // Guarded region: model creation + apply(). See g_mog2_mutex doc.
+            std::lock_guard<std::mutex> lock(g_mog2_mutex);
+            // Post-release straggler (audit R11-6 / ExtD-6): the model was
+            // explicitly torn down by disarm; do NOT lazily re-create ~18.7MB
+            // that would then sit resident for the whole drive. Fail closed
+            // (-1) like the OpenCV-absent case; the next resetMOG2 re-arms.
+            if (g_mog2_released) {
+                return -1.0f;
+            }
+            if (!g_mog2_initialized) {
+                initMog2();
+            }
+            g_mog2->apply(grayMat, fgMask, learningRate);
+        }
+
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+        cv::morphologyEx(fgMask, fgMask, cv::MORPH_OPEN, kernel);   // remove small noise
+        cv::morphologyEx(fgMask, fgMask, cv::MORPH_CLOSE, kernel);  // fill small holes
+
+        if (outQuadrantFractions != nullptr
+                && env->GetArrayLength(outQuadrantFractions) >= 4) {
+            jfloat fr[4];
+            int qw = width / 2, qh = height / 2;
+            for (int q = 0; q < 4; q++) {
+                cv::Rect r((q % 2) * qw, (q / 2) * qh, qw, qh);
+                fr[q] = (float)cv::countNonZero(fgMask(r)) / (float)(qw * qh);
+            }
+            env->SetFloatArrayRegion(outQuadrantFractions, 0, 4, fr);
+        }
+        return (float)cv::countNonZero(fgMask) / (float)(width * height);
+    } catch (...) {
+        return -1.0f;
+    }
+#else
+    return -1.0f;
+#endif
+}
+
+/**
  * Check if object detection is available.
  */
 extern "C" JNIEXPORT jboolean JNICALL
@@ -1164,11 +1357,6 @@ Java_com_overdrive_app_surveillance_NativeMotion_computeMOG2(
     jbyteArray roiMask, jfloat learningRate) {
     
 #if HAVE_OPENCV
-    // Initialize MOG2 if needed
-    if (!g_mog2_initialized) {
-        initMog2();
-    }
-    
     // Get RGB data
     uint8_t* rgbData = (uint8_t*)env->GetDirectBufferAddress(rgbBuffer);
     if (rgbData == nullptr) {
@@ -1183,7 +1371,16 @@ Java_com_overdrive_app_surveillance_NativeMotion_computeMOG2(
     
     // Apply MOG2
     cv::Mat fgMask;
-    g_mog2->apply(grayMat, fgMask, learningRate);
+    {
+        // Guarded region: model init + apply() — same discipline as
+        // computeMOG2Quadrants (audit R2 #7: this legacy path touched
+        // g_mog2 unlocked, the exact UAF class g_mog2_mutex closes).
+        std::lock_guard<std::mutex> lock(g_mog2_mutex);
+        if (!g_mog2_initialized) {
+            initMog2();
+        }
+        g_mog2->apply(grayMat, fgMask, learningRate);
+    }
     
     // Apply ROI mask if provided
     if (roiMask != nullptr) {
@@ -1200,10 +1397,14 @@ Java_com_overdrive_app_surveillance_NativeMotion_computeMOG2(
     cv::morphologyEx(fgMask, fgMask, cv::MORPH_OPEN, kernel);  // Remove small noise
     cv::morphologyEx(fgMask, fgMask, cv::MORPH_CLOSE, kernel); // Fill small holes
     
-    // Store motion mask globally for overlap checking
-    g_lastMotionMask = fgMask.clone();
-    g_motionMaskWidth = width;
-    g_motionMaskHeight = height;
+    // Store motion mask globally for overlap checking (locked: resetMOG2
+    // releases this mask under g_mog2_mutex — audit R2 #7).
+    {
+        std::lock_guard<std::mutex> lock(g_mog2_mutex);
+        g_lastMotionMask = fgMask.clone();
+        g_motionMaskWidth = width;
+        g_motionMaskHeight = height;
+    }
     
     // Count foreground pixels
     int foregroundPixels = cv::countNonZero(fgMask);

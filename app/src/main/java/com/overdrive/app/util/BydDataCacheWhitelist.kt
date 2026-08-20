@@ -152,7 +152,7 @@ object BydDataCacheWhitelist {
             val opsValue = 0
             
             // SDK >= 31 uses byd_datacached, otherwise bg_datacache.
-            // Esco gates on >= 31 (C0241c.m941c). DiLink 4 ROMs that ship
+            // Oem gates on >= 31 (C0241c.m941c). DiLink 4 ROMs that ship
             // Android 12 base (API 31) have the new service available;
             // routing them through bg_datacache instead hits ACCESS_APPOPSDATA
             // which the BYD ROM denies post-ACC-OFF.

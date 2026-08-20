@@ -1311,7 +1311,7 @@
     <string name="projection_status_live">ภาพสะท้อนสด — แตะและปัดเพื่อควบคุม</string>
     <string name="projection_status_preview">โหมดแสดงตัวอย่าง (อัตราเฟรมลดลงในรถคันนี้)</string>
     <string name="projection_status_none">ยังไม่มีการฉายภาพใด ๆ — เลือกแอปแล้วส่งภาพ</string>
-    <string name="projection_status_unsupported">รถคันนี้ไม่รองรับภาพสะท้อนสด แอปยังคงถูกฉายบนหน้าปัด</string>
+    <string name="projection_status_unsupported">รถคันนี้ไม่รองรับโหมด Live Mirror แต่แอปจะยังคงแสดงผลบนหน้าจอ Driver Cluster</string>
     <string name="projection_note_single_app">สามารถฉายภาพแอปบนหน้าปัดได้ครั้งละหนึ่งแอปเท่านั้น</string>
     <string name="projection_adjust_bounds">ปรับพื้นที่</string>
     <string name="projection_done_adjusting">เสร็จ</string>

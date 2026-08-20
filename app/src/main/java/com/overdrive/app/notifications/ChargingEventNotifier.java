@@ -84,14 +84,100 @@ public final class ChargingEventNotifier {
                 return t;
             });
 
-    private volatile boolean sessionActive = false;
     private volatile ScheduledFuture<?> socPoller;
-    private volatile boolean fullFiredThisSession = false;
-    private volatile double sessionStartSoc = Double.NaN;
-    private volatile double sessionMaxSoc = Double.NaN;
-    private volatile long plateauStartedAtMs = 0L;
+    private final Object pollerLock = new Object();
+    private final FullSessionState fullSessionState = new FullSessionState();
 
     private ChargingEventNotifier() {}
+
+    interface FullPublisher {
+        void publish(double socPercent);
+    }
+
+    static final class SessionEdge {
+        final long generation;
+        final boolean changed;
+
+        SessionEdge(long generation, boolean changed) {
+            this.generation = generation;
+            this.changed = changed;
+        }
+    }
+
+    /**
+     * Session generation and full-detection state share one monitor. The publisher callback runs
+     * while that monitor is held so a stop/new-session edge cannot pass its generation update
+     * between the final eligibility check and publication.
+     */
+    static final class FullSessionState {
+        private volatile long generation;
+        private volatile boolean active;
+        private boolean fullFired;
+        private double startSoc = Double.NaN;
+        private double maxSoc = Double.NaN;
+        private long plateauStartedAtMs;
+
+        synchronized SessionEdge onEdge(boolean nextActive, double socPercent) {
+            boolean changed = active != nextActive;
+            active = nextActive;
+            if (changed && nextActive) {
+                startSoc = socPercent;
+                maxSoc = socPercent;
+                plateauStartedAtMs = 0L;
+                fullFired = false;
+            } else if (changed) {
+                plateauStartedAtMs = 0L;
+            }
+            // Publish the generation last. A lock-free poller check that observes it also observes
+            // the active flag and all session initialization that precede this volatile write.
+            long nextGeneration = ++generation;
+            return new SessionEdge(nextGeneration, changed);
+        }
+
+        synchronized void initializeStartSoc(long expectedGeneration,
+                                             double socPercent) {
+            if (expectedGeneration != generation || !active
+                    || isFinite(startSoc) || !isFinite(socPercent)) {
+                return;
+            }
+            startSoc = socPercent;
+            maxSoc = socPercent;
+        }
+
+        synchronized void checkAndPublish(long expectedGeneration,
+                                          double soc, long nowMs,
+                                          FullPublisher publisher) {
+            if (expectedGeneration != generation || !active || fullFired
+                    || !isFinite(soc)) {
+                return;
+            }
+
+            if (!isFinite(maxSoc) || soc > maxSoc) maxSoc = soc;
+            if (soc >= PLATEAU_SOC_FLOOR) {
+                if (plateauStartedAtMs == 0L) plateauStartedAtMs = nowMs;
+            } else {
+                plateauStartedAtMs = 0L;
+            }
+
+            boolean startedFull =
+                    isFinite(startSoc) && startSoc >= FULL_SOC_THRESHOLD;
+            boolean thresholdFull = soc >= FULL_SOC_THRESHOLD;
+            boolean plateauFull = plateauStartedAtMs != 0L
+                    && nowMs - plateauStartedAtMs >= PLATEAU_HOLD_MS
+                    && !startedFull
+                    && isFinite(startSoc)
+                    && soc - startSoc >= MIN_SOC_RISE_FOR_PLATEAU;
+            if (!thresholdFull && !plateauFull) return;
+
+            fullFired = true;
+            if (!startedFull) publisher.publish(soc);
+        }
+
+        boolean isCurrent(long expectedGeneration, boolean expectedActive) {
+            return generation == expectedGeneration
+                    && active == expectedActive;
+        }
+    }
 
     public static synchronized void start() {
         if (instance != null) return;
@@ -117,23 +203,38 @@ public final class ChargingEventNotifier {
     }
 
     private void onFusedEdge(boolean isCharging, String source) {
-        if (isCharging == sessionActive) return;
-        sessionActive = isCharging;
+        // Fence the prior session before any snapshot read. A stop/new-session callback must make
+        // an already-running full check stale at its first synchronized transition, rather than
+        // leaving a read window in which that check can publish for the old session.
+        SessionEdge edge = fullSessionState.onEdge(isCharging, Double.NaN);
+        BydVehicleData snap = null;
+        try {
+            snap = BydDataCollector.getInstance().getData();
+        } catch (Throwable ignored) {
+            // The generation/poller transition must still complete if telemetry is unavailable.
+        }
+        double startSoc = (snap != null) ? snap.socPercent : Double.NaN;
+        if (isCharging) {
+            fullSessionState.initializeStartSoc(edge.generation, startSoc);
+        }
 
-        BydVehicleData snap = BydDataCollector.getInstance().getData();
+        // Fused listeners are edge-driven, but a duplicate callback is still allowed to invalidate
+        // an already-running check. Restart its poller with the new generation without re-publishing
+        // the user-facing start event.
+        if (!edge.changed) {
+            if (isCharging) startSocPoller(edge.generation);
+            else stopSocPoller(edge.generation);
+            return;
+        }
 
         if (isCharging) {
-            sessionStartSoc = (snap != null) ? snap.socPercent : Double.NaN;
-            sessionMaxSoc = sessionStartSoc;
-            plateauStartedAtMs = 0L;
-            fullFiredThisSession = false;
-            startSocPoller();
+            startSocPoller(edge.generation);
             int stateCode = (snap != null)
                     ? snap.chargingState
                     : ChargingStateData.CHARGING_BATTERY_STATE_CHARGING;
             publishStarted(stateCode);
         } else {
-            stopSocPoller();
+            stopSocPoller(edge.generation);
             int stateCode = (snap != null)
                     ? snap.chargingState
                     : ChargingStateData.CHARGING_BATTERY_STATE_IDLE;
@@ -141,14 +242,24 @@ public final class ChargingEventNotifier {
         }
     }
 
-    private void startSocPoller() {
-        stopSocPoller();
-        socPoller = scheduler.scheduleWithFixedDelay(
-                this::checkSocFull,
-                0L, SOC_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    private void startSocPoller(long generation) {
+        synchronized (pollerLock) {
+            if (!fullSessionState.isCurrent(generation, true)) return;
+            cancelSocPollerLocked();
+            socPoller = scheduler.scheduleWithFixedDelay(
+                    () -> checkSocFull(generation),
+                    0L, SOC_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        }
     }
 
-    private void stopSocPoller() {
+    private void stopSocPoller(long generation) {
+        synchronized (pollerLock) {
+            if (!fullSessionState.isCurrent(generation, false)) return;
+            cancelSocPollerLocked();
+        }
+    }
+
+    private void cancelSocPollerLocked() {
         ScheduledFuture<?> f = socPoller;
         if (f != null) {
             f.cancel(false);
@@ -156,46 +267,33 @@ public final class ChargingEventNotifier {
         }
     }
 
-    private void checkSocFull() {
-        if (!sessionActive || fullFiredThisSession) return;
+    private void checkSocFull(long generation) {
         BydVehicleData snap = BydDataCollector.getInstance().getData();
         if (snap == null) return;
         double soc = snap.socPercent;
-        if (!isFinite(soc)) return;
-
-        if (!isFinite(sessionMaxSoc) || soc > sessionMaxSoc) {
-            sessionMaxSoc = soc;
-        }
-
-        long now = System.currentTimeMillis();
-        if (soc >= PLATEAU_SOC_FLOOR) {
-            if (plateauStartedAtMs == 0L) plateauStartedAtMs = now;
-        } else {
-            plateauStartedAtMs = 0L;
-        }
-
-        boolean startedFull = isFinite(sessionStartSoc)
-                && sessionStartSoc >= FULL_SOC_THRESHOLD;
-
-        if (soc >= FULL_SOC_THRESHOLD) {
-            fullFiredThisSession = true;
-            if (!startedFull) publishFull(soc);
-            return;
-        }
-
-        if (plateauStartedAtMs != 0L
-                && (now - plateauStartedAtMs) >= PLATEAU_HOLD_MS
-                && !startedFull
-                && isFinite(sessionStartSoc)
-                && (soc - sessionStartSoc) >= MIN_SOC_RISE_FOR_PLATEAU) {
-            fullFiredThisSession = true;
-            publishFull(soc);
-        }
+        fullSessionState.checkAndPublish(
+                generation, soc, System.currentTimeMillis(),
+                this::publishFull);
     }
 
     private void publishStarted(int stateCode) {
         BydVehicleData snap = BydDataCollector.getInstance().getData();
-        double powerKw = (snap != null) ? snap.chargingPowerKw : Double.NaN;
+        // RESOLVED rate, not the raw field. Raw charging accessors are stored unscaled and their
+        // unit is decided at runtime — a value may be a cumulative kWh counter rather than a kW
+        // rate — so printing one directly could put a counter reading in a notification as "kW".
+        double powerKw = Double.NaN;
+        try {
+            com.overdrive.app.monitor.ChargingStateData cs =
+                    com.overdrive.app.monitor.VehicleDataMonitor.getInstance().getChargingState();
+            // !isEstimated, matching every other outbound surface. On the fused START edge nothing
+            // measured has usually resolved yet (all classifier verdicts begin UNKNOWN), so without
+            // this the notification announces the nominal placeholder — "Charging started, 7.0 kW" on
+            // a 2 kW charge — as if it were the real rate. Omitting the figure is the honest option.
+            if (cs != null && !cs.isEstimated
+                    && !Double.isNaN(cs.chargingPowerKW) && cs.chargingPowerKW > 0) {
+                powerKw = cs.chargingPowerKW;
+            }
+        } catch (Throwable ignored) { /* leave NaN — the body simply omits the rate */ }
         double socPercent = (snap != null) ? snap.socPercent : Double.NaN;
 
         StringBuilder body = new StringBuilder();

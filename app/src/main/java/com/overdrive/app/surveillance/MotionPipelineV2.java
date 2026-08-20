@@ -87,8 +87,18 @@ public class MotionPipelineV2 {
     // behaviour rather than mis-parsing the result struct.
     private boolean nativeHasSalience = false;
 
-    // Pre-allocated direct ByteBuffers for JNI (zero GC)
-    private ByteBuffer configBuffer;
+    // CONFIG BUFFER — IMMUTABLE-SWAP (audit R13-1b / ExtE-7). applyConfig
+    // used to rewrite this direct buffer IN PLACE on the control thread
+    // while the engine thread's native processFrameV2 memcpys it — a torn
+    // config (half old, half new floats/ints) for one frame. Now applyConfig
+    // builds a FRESH direct buffer and publishes it with a single volatile
+    // write; processFrame reads the reference once per frame. A published
+    // buffer is never written again, so the native memcpy always sees a
+    // complete, coherent config. Allocation is ~76 bytes per config change
+    // (rare user action) — no hot-path GC impact. resultBuffer stays
+    // pre-allocated: it is only ever touched on the engine thread.
+    private volatile ByteBuffer configBuffer;
+    private int configStructSizeBytes;
     private ByteBuffer resultBuffer;
     
     // Parsed results (reused across frames)
@@ -583,9 +593,13 @@ public class MotionPipelineV2 {
                     nativeHasCoherence ? "supported" : "NOT supported (Phase-1 native)",
                     nativeHasSalience ? "supported" : "NOT supported (pre-salience native)"));
             
-            // Allocate direct ByteBuffers
-            configBuffer = ByteBuffer.allocateDirect(configStructSize);
-            configBuffer.order(ByteOrder.nativeOrder());
+            // Allocate direct ByteBuffers. The config buffer here is only
+            // the pre-applyConfig default; applyConfig publishes fresh
+            // immutable buffers (audit R13-1b).
+            configStructSizeBytes = configStructSize;
+            ByteBuffer initialConfig = ByteBuffer.allocateDirect(configStructSize);
+            initialConfig.order(ByteOrder.nativeOrder());
+            configBuffer = initialConfig;
             
             resultBuffer = ByteBuffer.allocateDirect(resultStructSize * NUM_QUADRANTS);
             resultBuffer.order(ByteOrder.nativeOrder());
@@ -609,77 +623,76 @@ public class MotionPipelineV2 {
     public void applyConfig(Config config) {
         if (!initialized) return;
 
-        configBuffer.clear();
-        // Zero-fill the buffer before writing fields. ByteBuffer.clear() only
-        // resets position/limit — not the underlying bytes. If the native
-        // struct grows in a future build (e.g. partial shadow-fields support
-        // between BASE_CONFIG_SIZE and BASE_CONFIG_SIZE+SHADOW_FIELDS_SIZE),
-        // any bytes we don't explicitly write would carry stale values from
-        // the previous applyConfig call. Costs ~60-76 byte writes — negligible.
-        for (int i = 0; i < configBuffer.capacity(); i++) {
-            configBuffer.put((byte) 0);
-        }
-        configBuffer.position(0);
+        // IMMUTABLE-SWAP (audit R13-1b / ExtE-7): serialize into a FRESH
+        // direct buffer and publish it with one volatile write at the end.
+        // Never mutate the currently-published buffer — the engine thread's
+        // native memcpy may be reading it right now. allocateDirect zero-fills
+        // (JLS-guaranteed for direct buffers), so any bytes we don't
+        // explicitly write are 0 rather than stale — preserving the old
+        // zero-fill loop's forward-compat guarantee for free.
+        ByteBuffer buf = ByteBuffer.allocateDirect(configStructSizeBytes);
+        buf.order(ByteOrder.nativeOrder());
 
         // Stage 1
-        configBuffer.putFloat(config.brightnessShiftThreshold);
-        configBuffer.putInt(config.brightnessSuppressionFrames);
+        buf.putFloat(config.brightnessShiftThreshold);
+        buf.putInt(config.brightnessSuppressionFrames);
         
         // Stage 2
-        configBuffer.putInt(config.shadowThreshold);
-        configBuffer.putFloat(config.lumaRatioThreshold);
-        configBuffer.putInt(config.edgeDiffThreshold);
-        configBuffer.putInt(config.densityThreshold);
+        buf.putInt(config.shadowThreshold);
+        buf.putFloat(config.lumaRatioThreshold);
+        buf.putInt(config.edgeDiffThreshold);
+        buf.putInt(config.densityThreshold);
         
         // Stage 3
-        configBuffer.putFloat(config.confidenceIncrement);
-        configBuffer.putFloat(config.confidenceDecay);
-        configBuffer.putFloat(config.confidenceThreshold);
+        buf.putFloat(config.confidenceIncrement);
+        buf.putFloat(config.confidenceDecay);
+        buf.putFloat(config.confidenceThreshold);
         
         // Stage 4
-        configBuffer.putInt(config.minComponentSize);
+        buf.putInt(config.minComponentSize);
         
         // Stage 5
-        configBuffer.putFloat(config.loiteringRadiusBlocks);
-        configBuffer.putInt(config.loiteringFrames);
+        buf.putFloat(config.loiteringRadiusBlocks);
+        buf.putInt(config.loiteringFrames);
         
         // Per-quadrant enable (4 bools → 4 bytes with padding)
         for (int i = 0; i < NUM_QUADRANTS; i++) {
-            configBuffer.put((byte)(config.quadrantEnabled[i] ? 1 : 0));
+            buf.put((byte)(config.quadrantEnabled[i] ? 1 : 0));
         }
         
         // Alarm threshold
-        configBuffer.putInt(config.alarmBlockThreshold);
+        buf.putInt(config.alarmBlockThreshold);
         
         // Detection zone: max centroid row for distance filtering
-        configBuffer.putInt(config.maxDistanceRow);
+        buf.putInt(config.maxDistanceRow);
         
         // Shadow discrimination parameters (only if native supports them)
         if (nativeHasShadowFilter) {
-            configBuffer.putInt(config.shadowFilterMode);
-            configBuffer.putFloat(config.chromaRatioTolerance);
-            configBuffer.putFloat(config.shadowPixelFraction);
-            configBuffer.putInt(config.oscillationThreshold);
+            buf.putInt(config.shadowFilterMode);
+            buf.putFloat(config.chromaRatioTolerance);
+            buf.putFloat(config.shadowPixelFraction);
+            buf.putInt(config.oscillationThreshold);
         }
 
         // Flow-coherence parameters (only if native supports them — Phase 2).
         // Must come AFTER the shadow fields to match the C struct layout.
         if (nativeHasCoherence) {
-            configBuffer.putFloat(config.coherenceRatioMin);
-            configBuffer.putFloat(config.coherenceNetMin);
-            configBuffer.putInt(config.coherenceMinFrames);
+            buf.putFloat(config.coherenceRatioMin);
+            buf.putFloat(config.coherenceNetMin);
+            buf.putInt(config.coherenceMinFrames);
         }
 
         // Salience-probe parameters. Must come AFTER the coherence fields to match
         // the C struct layout. salienceEnabled is an int in C (not bool) so the
         // 4-byte write is exact with no padding ambiguity.
         if (nativeHasSalience) {
-            configBuffer.putInt(config.salienceEnabled ? 1 : 0);
-            configBuffer.putInt(config.salienceMinBlocks);
-            configBuffer.putFloat(config.salienceDominanceFrac);
+            buf.putInt(config.salienceEnabled ? 1 : 0);
+            buf.putInt(config.salienceMinBlocks);
+            buf.putFloat(config.salienceDominanceFrac);
         }
 
-        configBuffer.flip();
+        buf.flip();
+        configBuffer = buf; // single volatile publish (audit R13-1b)
     }
     
     /**
@@ -695,7 +708,11 @@ public class MotionPipelineV2 {
         
         resultBuffer.clear();
         
-        NativeMotion.processFrameV2(frameBuffer, width, height, configBuffer, resultBuffer);
+        // One volatile read pins this frame's config buffer; a concurrent
+        // applyConfig publishes a NEW buffer and never touches this one
+        // (audit R13-1b / ExtE-7).
+        final ByteBuffer cfg = configBuffer;
+        NativeMotion.processFrameV2(frameBuffer, width, height, cfg, resultBuffer);
         
         // Deserialize results
         resultBuffer.rewind();

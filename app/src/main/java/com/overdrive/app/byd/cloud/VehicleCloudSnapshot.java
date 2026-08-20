@@ -1,5 +1,7 @@
 package com.overdrive.app.byd.cloud;
 
+import com.overdrive.app.byd.BydVehicleData;
+
 import org.json.JSONObject;
 
 /**
@@ -46,6 +48,27 @@ public final class VehicleCloudSnapshot {
     public final int remainingHours;
     public final int remainingMinutes;
 
+    // ── Seat climate (cloud composite command source) ──────────────────
+    // Raw cloud status values: front seats 1=off/2=low/3=high; steering
+    // wheel -1=on/1=off. Other values mean the cloud did not supply state.
+    public final int mainSeatHeatState;
+    public final int mainSeatVentilationState;
+    public final int copilotSeatHeatState;
+    public final int copilotSeatVentilationState;
+    /**
+     * Steering-wheel heat, raw cloud domain -1=on / 1=off. Absent state is
+     * {@link #WHEEL_HEAT_UNKNOWN}, NOT the shared -1 sentinel: -1 is a valid
+     * "on" here, so reusing it would make a car that never reported the wheel
+     * indistinguishable from one reporting the heater on.
+     */
+    public final int steeringWheelHeatState;
+
+    /** Absent steering-wheel state. 0 is outside the cloud's {-1, 1} domain. */
+    public static final int WHEEL_HEAT_UNKNOWN = 0;
+
+    /** Traction-battery preconditioning: 0=off, >0=heating, SENTINEL when not reported. */
+    public final int batteryHeatState;
+
     // ── Temperature (mergeable) ─────────────────────────────────────────
     public final double insideTempC;         // tempInCar
     public final double outsideTempC;        // tempOutCar
@@ -74,8 +97,9 @@ public final class VehicleCloudSnapshot {
     public final int powerGear;
 
     // ── Timestamps ──────────────────────────────────────────────────────
-    public final long vehicleInfoTimestamp;   // 'time' field from vehicleInfo (unix seconds)
+    public final long vehicleInfoTimestamp;   // normalized 'time' field from vehicleInfo (epoch ms)
     public final long receivedAt;             // System.currentTimeMillis() when processed
+    public final long insideTempObservedAt;   // source observation time, independent of receipt
 
     private VehicleCloudSnapshot(Builder b) {
         this.leftFrontDoorLock = b.leftFrontDoorLock;
@@ -90,6 +114,12 @@ public final class VehicleCloudSnapshot {
         this.chargingState = b.chargingState;
         this.remainingHours = b.remainingHours;
         this.remainingMinutes = b.remainingMinutes;
+        this.mainSeatHeatState = b.mainSeatHeatState;
+        this.mainSeatVentilationState = b.mainSeatVentilationState;
+        this.copilotSeatHeatState = b.copilotSeatHeatState;
+        this.copilotSeatVentilationState = b.copilotSeatVentilationState;
+        this.steeringWheelHeatState = b.steeringWheelHeatState;
+        this.batteryHeatState = b.batteryHeatState;
         this.insideTempC = b.insideTempC;
         this.outsideTempC = b.outsideTempC;
         this.pm25Inside = b.pm25Inside;
@@ -109,6 +139,7 @@ public final class VehicleCloudSnapshot {
         this.powerGear = b.powerGear;
         this.vehicleInfoTimestamp = b.vehicleInfoTimestamp;
         this.receivedAt = b.receivedAt;
+        this.insideTempObservedAt = b.insideTempObservedAt;
     }
 
     // ── Freshness checks ────────────────────────────────────────────────
@@ -187,8 +218,75 @@ public final class VehicleCloudSnapshot {
         return remainingMinutes >= 0;
     }
 
+    /** True when every front-seat channel needed by VENTILATIONHEATING is known. */
+    public boolean hasCompleteFrontSeatClimateState() {
+        return isSeatStatus(mainSeatHeatState)
+                && isSeatStatus(mainSeatVentilationState)
+                && isSeatStatus(copilotSeatHeatState)
+                && isSeatStatus(copilotSeatVentilationState);
+    }
+
+    /** Returns front seat state in the app's UI scale (off=0, low=1, high=2). */
+    public int[] frontSeatClimateUiState() {
+        if (!hasCompleteFrontSeatClimateState()) return null;
+        return new int[] {
+                mainSeatHeatState - 1,
+                mainSeatVentilationState - 1,
+                copilotSeatHeatState - 1,
+                copilotSeatVentilationState - 1
+        };
+    }
+
+    /** The cloud reports steering-wheel heat as -1=on and 1=off. */
+    public boolean hasSteeringWheelHeatState() {
+        return steeringWheelHeatState == -1 || steeringWheelHeatState == 1;
+    }
+
+    /** True when the cloud reported traction-battery preconditioning at all. */
+    public boolean hasBatteryHeatState() {
+        return batteryHeatState >= 0;
+    }
+
+    /** Return the VENTILATIONHEATING wire value (1=on, 3=off), or -1 if unknown. */
+    public int steeringWheelHeatWireState() {
+        if (steeringWheelHeatState == -1) return 1;
+        if (steeringWheelHeatState == 1) return 3;
+        return -1;
+    }
+
+    /** Cloud MQTT/REST state may safely seed a remote composite for two minutes. */
+    public boolean isSeatClimateFresh() {
+        return System.currentTimeMillis() - receivedAt < CONNECTION_HEALTH_MAX_AGE_MS;
+    }
+
+    private static boolean isSeatStatus(int value) {
+        return value >= 1 && value <= 3;
+    }
+
+    /**
+     * Shared cloud cabin-temperature validity contract. The lower bound matches the reference
+     * readers, the upper bound rejects positive CAN sentinels, and zero is unavailable only when
+     * the payload explicitly reports the vehicle offline. Unknown online state must not erase a
+     * legitimate 0 C observation.
+     */
+    public static boolean isValidCabinTempC(double value, int onlineState) {
+        return Double.isFinite(value) && value > -128.0 && value <= 90.0
+                && (value != 0.0 || onlineState != OFFLINE);
+    }
+
+    /** Compatibility overload for callers that have a definitive binary online state. */
+    public static boolean isValidCabinTempC(double value, boolean online) {
+        return isValidCabinTempC(value, online ? ONLINE : OFFLINE);
+    }
+
     public boolean hasInsideTemp() {
-        return insideTempC > SENTINEL_TEMP && !(insideTempC == 0.0 && !isOnline());
+        return isValidCabinTempC(insideTempC, onlineState);
+    }
+
+    public boolean hasFreshInsideTemp() {
+        if (!hasInsideTemp() || insideTempObservedAt <= 0L) return false;
+        long ageMs = System.currentTimeMillis() - insideTempObservedAt;
+        return ageMs >= 0L && ageMs <= BydVehicleData.CABIN_TEMP_MAX_AGE_MS;
     }
 
     public boolean hasOutsideTemp() {
@@ -251,13 +349,25 @@ public final class VehicleCloudSnapshot {
         b.chargingState = cs != SENTINEL_INT ? cs : vi.optInt("chargingState", SENTINEL_INT);
         b.remainingHours = vi.optInt("remainingHours", SENTINEL_INT);
         b.remainingMinutes = vi.optInt("remainingMinutes", SENTINEL_INT);
+        b.mainSeatHeatState = cloudStatusInt(vi, hvac, "mainSeatHeatState");
+        b.mainSeatVentilationState = cloudStatusInt(vi, hvac, "mainSeatVentilationState");
+        b.copilotSeatHeatState = cloudStatusInt(vi, hvac, "copilotSeatHeatState");
+        b.copilotSeatVentilationState = cloudStatusInt(vi, hvac, "copilotSeatVentilationState");
+        // Absent must NOT collapse onto -1 here — that is this field's "on".
+        b.steeringWheelHeatState = cloudStatusIntOrDefault(WHEEL_HEAT_UNKNOWN, vi, hvac,
+                "steeringWheelHeatState", "stearingWheelHeatState");
+        b.batteryHeatState = cloudStatusInt(vi, hvac, "batteryHeatState");
 
         // Temperature — from vehicleInfo or HVAC
         b.insideTempC = vi.optDouble("tempInCar", SENTINEL_TEMP);
         b.outsideTempC = vi.optDouble("tempOutCar", Double.NaN);
         if (hvac != null) {
             double hvacIn = hvac.optDouble("tempInCar", SENTINEL_TEMP);
-            if (hvacIn > SENTINEL_TEMP && b.insideTempC <= SENTINEL_TEMP) b.insideTempC = hvacIn;
+            int onlineState = vi.optInt("onlineState", ONLINE_UNKNOWN);
+            if (isValidCabinTempC(hvacIn, onlineState)
+                    && !isValidCabinTempC(b.insideTempC, onlineState)) {
+                b.insideTempC = hvacIn;
+            }
             double hvacOut = hvac.optDouble("tempOutCar", Double.NaN);
             if (!Double.isNaN(hvacOut) && Double.isNaN(b.outsideTempC)) b.outsideTempC = hvacOut;
         }
@@ -289,12 +399,67 @@ public final class VehicleCloudSnapshot {
         b.vehicleState = vi.optInt("vehicleState", SENTINEL_INT);
         b.powerGear = vi.optInt("powerGear", SENTINEL_INT);
 
-        // Timestamp
-        long time = vi.optLong("time", 0);
-        b.vehicleInfoTimestamp = time > 1_000_000_000L ? time : 0;
+        // Keep source observation time separate from receipt time. BYD responses have used both
+        // epoch seconds and epoch milliseconds; reject other magnitudes and future outliers.
         b.receivedAt = System.currentTimeMillis();
+        b.vehicleInfoTimestamp = normalizeSourceTimestampMs(
+                vi.optLong("time", 0L), b.receivedAt);
+        b.insideTempObservedAt = b.vehicleInfoTimestamp > 0L
+                ? Math.min(b.vehicleInfoTimestamp, b.receivedAt)
+                : b.receivedAt;
 
         return b;
+    }
+
+    private static long normalizeSourceTimestampMs(long rawTimestamp, long receivedAtMs) {
+        if (rawTimestamp < 1_000_000_000L) return 0L;
+
+        long normalized;
+        if (rawTimestamp < 100_000_000_000L) {
+            if (rawTimestamp > Long.MAX_VALUE / 1000L) return 0L;
+            normalized = rawTimestamp * 1000L;
+        } else {
+            normalized = rawTimestamp;
+        }
+
+        // A future source time cannot safely participate in ordering: retaining it as the
+        // provider's maximum would reject every real update until wall time caught up. Treat it
+        // as timestamp-less instead, so request sequence orders it and receipt time records the
+        // observation.
+        return normalized <= receivedAtMs ? normalized : 0L;
+    }
+
+    /** Read a status field from a direct payload, statusNow wrapper, or HVAC companion payload. */
+    private static int cloudStatusInt(JSONObject vehicleInfo, JSONObject hvac, String... keys) {
+        return cloudStatusIntOrDefault(SENTINEL_INT, vehicleInfo, hvac, keys);
+    }
+
+    /**
+     * As {@link #cloudStatusInt} but with a caller-chosen absent value, for fields whose
+     * real domain includes the shared -1 sentinel.
+     */
+    private static int cloudStatusIntOrDefault(int absentValue, JSONObject vehicleInfo,
+                                               JSONObject hvac, String... keys) {
+        for (JSONObject source : new JSONObject[] { vehicleInfo, statusNow(vehicleInfo), hvac,
+                statusNow(hvac) }) {
+            if (source == null) continue;
+            for (String key : keys) {
+                if (source.has(key) && !source.isNull(key)) {
+                    Object raw = source.opt(key);
+                    if (raw instanceof Number) return ((Number) raw).intValue();
+                    try {
+                        return Integer.parseInt(String.valueOf(raw));
+                    } catch (NumberFormatException ignored) {
+                        // Continue to an alternate key/payload.
+                    }
+                }
+            }
+        }
+        return absentValue;
+    }
+
+    private static JSONObject statusNow(JSONObject source) {
+        return source == null ? null : source.optJSONObject("statusNow");
     }
 
     public static final class Builder {
@@ -312,6 +477,13 @@ public final class VehicleCloudSnapshot {
         int chargingState = SENTINEL_INT;
         int remainingHours = SENTINEL_INT;
         int remainingMinutes = SENTINEL_INT;
+
+        int mainSeatHeatState = SENTINEL_INT;
+        int mainSeatVentilationState = SENTINEL_INT;
+        int copilotSeatHeatState = SENTINEL_INT;
+        int copilotSeatVentilationState = SENTINEL_INT;
+        int steeringWheelHeatState = WHEEL_HEAT_UNKNOWN;
+        int batteryHeatState = SENTINEL_INT;
 
         double insideTempC = SENTINEL_TEMP;
         double outsideTempC = Double.NaN;
@@ -337,6 +509,12 @@ public final class VehicleCloudSnapshot {
 
         long vehicleInfoTimestamp = 0;
         long receivedAt = System.currentTimeMillis();
+        long insideTempObservedAt = 0;
+
+        Builder insideTempObservedAt(long observedAtMs) {
+            insideTempObservedAt = observedAtMs;
+            return this;
+        }
 
         public VehicleCloudSnapshot build() {
             return new VehicleCloudSnapshot(this);

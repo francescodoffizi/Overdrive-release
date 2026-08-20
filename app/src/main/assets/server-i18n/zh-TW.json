@@ -118,7 +118,8 @@
     "mqtt_not_initialized": "MQTT沒有初始化",
     "max_connections_reached": "達到最大的連接 ({0})",
     "missing_connection_id": "缺失連接身份證",
-    "connection_not_found": "沒有找到連結: {0}"
+    "connection_not_found": "沒有找到連結: {0}",
+    "tyres_invalid_unit": "pressureUnit 必須是 kpa、psi 或 bar"
   },
   "notifications": {
     "charging_started": "開始充電",
@@ -164,7 +165,7 @@
     "tyre_wheel_reading": "{0} — {1}",
     "tyre_fast_leak": "偵測到快速漏氣",
     "tyre_slow_leak": "偵測到緩慢漏氣",
-    "tyre_wheel_pressure": "{0}（{1} kPa）"
+    "tyre_wheel_pressure": "{0}（{1}）"
   },
   "telegram": {
     "recording_caption": "錄音 ({0}) - {1}",
@@ -486,6 +487,9 @@
     "close_all_windows_label": "關閉所有窗口"
   },
   "automation": {
+    "wait_until_state_description": "暫停其餘動作，直到所選的開／關訊號達到某個狀態，或逾時。範例：在繼續前等待 Indicators = Off。",
+    "wait_timeout": "逾時（秒）",
+    "wait_until_description": "暫停其餘動作，直到所選訊號滿足某個比較條件，或逾時。範例：在關閉車窗前等待 Speed = 0。",
     "control_automation": "控制自動化",
     "control_automation_description": "啟用、停用或切換另一個自動化——從某條規則啟動或停用某個例程。",
     "control_target": "自動化",
@@ -906,7 +910,7 @@
     "auto_lights": "自動大燈",
     "auto_lights_description": "當光感自動大燈開啟或關閉時觸發 — 車輛所提供最接近「天黑了」的訊號。",
     "occupant": "座椅乘坐",
-    "occupant_description": "當前排乘客座椅有人乘坐或變空時觸發。",
+    "occupant_description": "當前排乘客座椅有人乘坐或變空時觸發。車輛未提供座椅佔用訊號時，狀態會根據乘客安全帶提醒和安全帶扣狀態估算。如果空座位的安全帶被扣上，或提醒被靜音，估算結果可能不正確。",
     "occupied": "有人",
     "empty": "空",
     "boot": "系統開機",
@@ -1083,10 +1087,7 @@
     "mqtt_trigger": "MQTT 訊息",
     "mqtt_trigger_description": "當你的 MQTT 伺服器向 <base>/automation/<channel> 發布訊息時觸發（例如來自 Home Assistant）。輸入頻道名稱並比對其值。",
     "mqtt_channel": "頻道",
-    "mqtt_value": "數值",
-    "wait_until_description": "暫停其餘動作，直到所選訊號滿足某個比較條件，或逾時。範例：在關閉車窗前等待 Speed = 0。",
-    "wait_timeout": "逾時（秒）",
-    "wait_until_state_description": "暫停其餘動作，直到所選的開／關訊號達到某個狀態，或逾時。範例：在繼續前等待 Indicators = Off。"
+    "mqtt_value": "數值"
   },
   "messages": {
     "logged_out": "已登入",
@@ -1114,5 +1115,10 @@
     "update_installing_finishing": "頭單位的安裝將會很快恢復上線.",
     "update_install_failed": "裝置失敗",
     "update_install_crashed": "裝置故障"
+  },
+  "units": {
+    "bar": "bar",
+    "kpa": "kPa",
+    "psi": "PSI"
   }
 }

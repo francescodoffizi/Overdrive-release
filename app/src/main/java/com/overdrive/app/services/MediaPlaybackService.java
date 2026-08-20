@@ -14,7 +14,10 @@ import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.speech.tts.TextToSpeech;
 import android.util.Log;
 
@@ -52,12 +55,21 @@ public final class MediaPlaybackService extends Service {
     private static final String TAG = "MediaPlaybackService";
     private static final String CHANNEL_ID = "overdrive_media_playback";
     private static final int NOTIFICATION_ID = 9971;
+    static final PlaybackDuckCoordinator ROAD_SENSE_DUCK = new PlaybackDuckCoordinator();
+    public static void attachRoadSenseDuckTarget(PlaybackDuckCoordinator.Target target) {
+        ROAD_SENSE_DUCK.attach(target);
+    }
+    public static void detachRoadSenseDuckTarget(PlaybackDuckCoordinator.Target target) {
+        ROAD_SENSE_DUCK.detach(target);
+    }
     /** Daemon base — same loopback the app's DaemonHttpClient uses. */
     private static final String DAEMON_BASE = "http://127.0.0.1:8080";
     /** Broadcast that stops playback (shared with the video activity + daemon stop()). */
     public static final String ACTION_STOP = "com.overdrive.app.action.STOP_MEDIA";
 
     private MediaPlayer player;
+    private boolean playerPrepared;
+    private int latestStartId;
     private AudioManager audioManager;
     private Object audioFocusRequest; // AudioFocusRequest (API26+) or null
     private AudioManager.OnAudioFocusChangeListener focusListener;
@@ -69,16 +81,39 @@ public final class MediaPlaybackService extends Service {
     private boolean ttsReady;
     private String pendingSpeak;
     private String pendingSpeakChannel;
+    private int pendingSpeakStartId;
+    private long pendingSpeakGeneration;
+    private String activeSpeakText;
+    private String activeSpeakChannel;
+    private int activeSpeakStartId;
+    private long activeSpeakGeneration;
+    private boolean ttsPausedForRoadSense;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private volatile boolean roadSenseDucked;
+    private final PlaybackDuckCoordinator.Target roadSenseDuckTarget = ducked -> {
+        roadSenseDucked = ducked;
+        mainHandler.post(this::applyRoadSenseDuck);
+    };
+    // TTS progress callbacks may arrive off the main Looper. This synchronized token makes
+    // callbacks from a released player or cancelled utterance harmless when a newer request
+    // has replaced it; callback cleanup is then marshalled back to the main Looper.
+    private final PlaybackSessionGuard playbackSession = new PlaybackSessionGuard();
 
     private final BroadcastReceiver stopReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
             Log.i(TAG, "stop broadcast received");
+            invalidatePlaybackSession();
             stopSelf();
         }
     };
 
     @Override public void onCreate() {
         super.onCreate();
+        try {
+            ROAD_SENSE_DUCK.attach(roadSenseDuckTarget);
+        } catch (Throwable t) {
+            Log.w(TAG, "RoadSense duck coordinator attach failed: " + t.getMessage());
+        }
         // NOTHING in here may throw. This service is started by an `am
         // start-foreground-service` from the daemon whenever an automation or a
         // key-mapping plays a sound, so an escaping Throwable is a user-visible
@@ -109,41 +144,108 @@ public final class MediaPlaybackService extends Service {
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null) return START_NOT_STICKY;
-        String action = intent.getStringExtra("action");
+        latestStartId = startId;
+        StartRequest request = readStartRequest(intent);
+        if (request == null) {
+            rejectStartWithoutInterruptingPlayback(startId, "malformed extras");
+            return START_NOT_STICKY;
+        }
+        String action = request.action;
         if ("stop".equals(action)) {
+            invalidatePlaybackSession();
             stopSelf();
             return START_NOT_STICKY;
         }
         if ("speak".equals(action)) {
-            String text = intent.getStringExtra("text");
-            String ch = orDefault(intent.getStringExtra("channel"), "voice");
-            speak(text, ch);
+            String text = request.text;
+            if (text == null || text.trim().isEmpty()) {
+                rejectStartWithoutInterruptingPlayback(startId, "missing speech text");
+                return START_NOT_STICKY;
+            }
+            String ch = orDefault(request.channel, "voice");
+            long generation = beginPlaybackSession();
+            releasePlayer();
+            stopTts();
+            speak(text, ch, startId, generation);
             return START_NOT_STICKY;
         }
-        String channel = orDefault(intent.getStringExtra("channel"), "media");
-        boolean loop = intent.getBooleanExtra("loop", false);
-        String libName = intent.getStringExtra("libName");
-        String filePath = intent.getStringExtra("filePath");
+        boolean hasLibrarySource =
+                request.libName != null && !request.libName.trim().isEmpty();
+        boolean hasFileSource =
+                request.filePath != null && !request.filePath.trim().isEmpty();
+        if (!hasLibrarySource && !hasFileSource) {
+            rejectStartWithoutInterruptingPlayback(startId, "missing audio source");
+            return START_NOT_STICKY;
+        }
+        long generation = beginPlaybackSession();
+        String channel = orDefault(request.channel, "media");
+        boolean loop = request.loop;
+        String libName = request.libName;
+        String filePath = request.filePath;
 
-        Uri uri;
+        Uri uri = null;
         Map<String, String> headers = null;
-        if (libName != null && !libName.isEmpty()) {
+        if (hasLibrarySource) {
             // Stream from the daemon (app can't read the library dir). Authenticated.
             uri = Uri.parse(DAEMON_BASE + "/api/audio/library/raw?name=" + Uri.encode(libName));
             headers = authHeaders();
-        } else if (filePath != null && !filePath.isEmpty()) {
+        } else if (hasFileSource) {
             uri = Uri.fromFile(new java.io.File(filePath));
-        } else {
-            Log.w(TAG, "no libName/filePath — nothing to play");
-            stopSelf();
-            return START_NOT_STICKY;
         }
-        startPlayback(uri, headers, channel, loop);
+        // A play request replaces every prior audio mode. Invalidating the old generation
+        // first means tts.stop() callbacks cannot stop this freshly started player.
+        stopTts();
+        startPlayback(uri, headers, channel, loop, startId, generation);
         // Not sticky: if the OS kills us mid-clip we don't silently resurrect a sound.
         return START_NOT_STICKY;
     }
 
-    private void startPlayback(Uri uri, Map<String, String> headers, String channel, boolean loop) {
+    private StartRequest readStartRequest(Intent intent) {
+        try {
+            Bundle extras = intent.getExtras();
+            if (extras == null) return new StartRequest(null, null, null, false, null, null);
+
+            boolean hasAction = extras.containsKey("action");
+            boolean hasText = extras.containsKey("text");
+            boolean hasChannel = extras.containsKey("channel");
+            boolean hasLoop = extras.containsKey("loop");
+            boolean hasLibName = extras.containsKey("libName");
+            boolean hasFilePath = extras.containsKey("filePath");
+            String action = parseStringExtra(extras.get("action"), hasAction);
+            String text = parseStringExtra(extras.get("text"), hasText);
+            String channel = parseStringExtra(extras.get("channel"), hasChannel);
+            Boolean loop = parseBooleanExtra(extras.get("loop"), hasLoop);
+            String libName = parseStringExtra(extras.get("libName"), hasLibName);
+            String filePath = parseStringExtra(extras.get("filePath"), hasFilePath);
+            if ((hasAction && action == null)
+                    || (hasText && text == null)
+                    || (hasChannel && channel == null)
+                    || loop == null
+                    || (hasLibName && libName == null)
+                    || (hasFilePath && filePath == null)) {
+                return null;
+            }
+            return new StartRequest(action, text, channel, loop, libName, filePath);
+        } catch (Throwable t) {
+            // This component is exported to the shell UID. BadParcelableException and
+            // adversarial extra types must reject the command, not crash the app process.
+            Log.w(TAG, "could not parse playback extras: " + t.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    static String parseStringExtra(Object raw, boolean present) {
+        if (!present) return null;
+        return raw instanceof String ? (String) raw : null;
+    }
+
+    static Boolean parseBooleanExtra(Object raw, boolean present) {
+        if (!present) return Boolean.FALSE;
+        return raw instanceof Boolean ? (Boolean) raw : null;
+    }
+
+    private void startPlayback(Uri uri, Map<String, String> headers,
+                               String channel, boolean loop, int startId, long generation) {
         releasePlayer();
         requestFocus(channel, loop);
         // Constructor INSIDE a guard. `new MediaPlayer()` runs native_setup and
@@ -157,29 +259,13 @@ public final class MediaPlaybackService extends Service {
             mp = new MediaPlayer();
         } catch (Throwable t) {
             Log.w(TAG, "MediaPlayer construction failed (mediaserver down?): " + t.getMessage());
-            stopSelf();
+            finishSession(startId, generation);
             return;
         }
         player = mp;
+        playerPrepared = false;
         try {
-            int stream = streamForChannel(channel);
-            // Route to the target stream EXACTLY as the OEM reference does: set BOTH an
-            // AudioAttributes with
-            // setLegacyStreamType(stream) AND the deprecated setAudioStreamType(stream),
-            // in that order, for EVERY channel — public and OEM-extended (nav=14/voice=16)
-            // alike. Neither alone is sufficient on this head unit: setLegacyStreamType by
-            // itself doesn't reach the OEM-extended streams, and setAudioStreamType can be
-            // reset by a subsequent attributes-bearing focus grant — so the OEM applies
-            // both and lets the direct setter win. Critically, the usage is USAGE_MEDIA for
-            // ALL channels (the OEM hardcodes setUsage(1)); using
-            // USAGE_ASSISTANCE_NAVIGATION_GUIDANCE for "navigation" is what pulled the sound
-            // back onto the media amp — the reported "nav audio plays on media" bug.
-            mp.setAudioAttributes(new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .setLegacyStreamType(stream)
-                    .build());
-            mp.setAudioStreamType(stream);
+            applyChannelRouting(mp, channel);
             if (headers != null) {
                 mp.setDataSource(this, uri, headers);
             } else {
@@ -187,13 +273,21 @@ public final class MediaPlaybackService extends Service {
             }
             mp.setLooping(loop);
             mp.setOnPreparedListener(p -> {
+                if (!isCurrentPlayer(p, generation)) return;
+                playerPrepared = true;
+                applyRoadSenseDuck(p);
                 try { p.start(); Log.i(TAG, "playback started (loop=" + loop + ")"); }
-                catch (Throwable t) { Log.w(TAG, "start failed: " + t.getMessage()); stopSelf(); }
+                catch (Throwable t) {
+                    Log.w(TAG, "start failed: " + t.getMessage());
+                    finishPlayback(p, startId, generation);
+                }
             });
-            if (!loop) mp.setOnCompletionListener(p -> stopSelf());
+            if (!loop) {
+                mp.setOnCompletionListener(p -> finishPlayback(p, startId, generation));
+            }
             mp.setOnErrorListener((p, what, extra) -> {
                 Log.w(TAG, "MediaPlayer error what=" + what + " extra=" + extra);
-                stopSelf();
+                finishPlayback(p, startId, generation);
                 return true;
             });
             // Async prepare — this service has a real Looper (main thread), so the
@@ -202,7 +296,7 @@ public final class MediaPlaybackService extends Service {
             mp.prepareAsync();
         } catch (Throwable t) {
             Log.w(TAG, "setup failed: " + t.getMessage());
-            stopSelf();
+            finishPlayback(mp, startId, generation);
         }
     }
 
@@ -213,16 +307,21 @@ public final class MediaPlaybackService extends Service {
      * flushed from the init callback. The foreground notification keeps us alive for the
      * duration; we self-stop when the utterance finishes.
      */
-    private void speak(String text, String channel) {
-        if (text == null || text.trim().isEmpty()) { stopSelf(); return; }
+    private void speak(String text, String channel, int startId, long generation) {
+        if (text == null || text.trim().isEmpty()) {
+            finishSession(startId, generation);
+            return;
+        }
         requestFocus(channel, false);
         if (tts != null && ttsReady) {
-            speakNow(text, channel);
+            speakNow(text, channel, startId, generation);
             return;
         }
         // Stash until init completes (last request wins — a newer speak supersedes).
         pendingSpeak = text;
         pendingSpeakChannel = channel;
+        pendingSpeakStartId = startId;
+        pendingSpeakGeneration = generation;
         if (tts == null) {
             // GUARDED. The TextToSpeech constructor synchronously resolves and
             // binds an engine, so on a ROM with no/broken TTS it can throw
@@ -238,8 +337,12 @@ public final class MediaPlaybackService extends Service {
                         try { tts.setLanguage(Locale.getDefault()); } catch (Throwable ignored) {}
                         String pend = pendingSpeak;
                         String pendCh = pendingSpeakChannel;
+                        int pendStartId = pendingSpeakStartId;
+                        long pendGeneration = pendingSpeakGeneration;
                         pendingSpeak = null;
-                        if (pend != null) speakNow(pend, pendCh);
+                        if (pend != null && isCurrentSession(pendGeneration)) {
+                            speakNow(pend, pendCh, pendStartId, pendGeneration);
+                        }
                     } else {
                         Log.w(TAG, "TTS init failed (status=" + status + ")");
                         // Release the handle so a LATER speak retries init instead
@@ -247,22 +350,42 @@ public final class MediaPlaybackService extends Service {
                         // `tts != null && ttsReady` fast path fails AND the
                         // `tts == null` init path is skipped, so every subsequent
                         // speak would silently drop for the service's lifetime.
+                        int pendingStartId = pendingSpeakStartId;
+                        long pendingGeneration = pendingSpeakGeneration;
                         try { tts.shutdown(); } catch (Throwable ignored) {}
                         tts = null;
                         pendingSpeak = null;
-                        stopSelf();
+                        // A newer speak can arrive while this engine is still binding.
+                        // It replaces pendingSpeak above, but it cannot create another
+                        // engine until this callback releases the first one. Finish that
+                        // newer request explicitly instead of leaving its foreground
+                        // service alive with no TTS engine and no callback to stop it.
+                        if (isCurrentSession(pendingGeneration)) {
+                            finishSession(pendingStartId, pendingGeneration);
+                        }
                     }
                 });
             } catch (Throwable t) {
                 Log.w(TAG, "TextToSpeech unavailable on this ROM: " + t.getMessage());
                 tts = null;
                 pendingSpeak = null;
-                stopSelf();
+                finishSession(startId, generation);
             }
         }
     }
 
-    private void speakNow(String text, String channel) {
+    private void speakNow(String text, String channel, int startId, long generation) {
+        if (!isCurrentSession(generation) || tts == null) return;
+        activeSpeakText = text;
+        activeSpeakChannel = channel;
+        activeSpeakStartId = startId;
+        activeSpeakGeneration = generation;
+        if (roadSenseDucked) {
+            ttsPausedForRoadSense = true;
+            Log.i(TAG, "delaying TTS until RoadSense chime completes");
+            return;
+        }
+        ttsPausedForRoadSense = false;
         try {
             android.os.Bundle params = new android.os.Bundle();
             // TextToSpeech can only route to a PUBLIC AudioManager stream — its
@@ -275,11 +398,16 @@ public final class MediaPlaybackService extends Service {
             int ttsStream = streamForChannel(channel);
             if (isOemExtendedStream(ttsStream)) ttsStream = AudioManager.STREAM_MUSIC;
             params.putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, ttsStream);
-            String uttId = "overdrive-tts";
+            params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f);
+            String uttId = playbackSession.nextTtsUtteranceId();
             tts.setOnUtteranceProgressListener(new android.speech.tts.UtteranceProgressListener() {
                 @Override public void onStart(String id) {}
-                @Override public void onDone(String id) { stopSelf(); }
-                @Override public void onError(String id) { stopSelf(); }
+                @Override public void onDone(String id) {
+                    finishTtsSessionFromCallback(startId, generation, uttId, id);
+                }
+                @Override public void onError(String id) {
+                    finishTtsSessionFromCallback(startId, generation, uttId, id);
+                }
             });
             // Truncate to the engine's limit. TextToSpeech.speak() REJECTS input
             // longer than getMaxSpeechInputLength() (4000) by returning ERROR
@@ -300,14 +428,14 @@ public final class MediaPlaybackService extends Service {
                 // No utterance started ⇒ onDone/onError will never fire ⇒ nothing
                 // would ever stop this service. Stop it ourselves.
                 Log.w(TAG, "tts.speak returned " + rc + " — stopping service (no utterance)");
-                stopSelf();
+                finishSession(startId, generation);
                 return;
             }
             Log.i(TAG, "speak (" + channel + "): "
                 + (toSpeak.length() > 40 ? toSpeak.substring(0, 40) + "…" : toSpeak));
         } catch (Throwable t) {
             Log.w(TAG, "speak failed: " + t.getMessage());
-            stopSelf();
+            finishSession(startId, generation);
         }
     }
 
@@ -371,6 +499,7 @@ public final class MediaPlaybackService extends Service {
     }
 
     private void releasePlayer() {
+        playerPrepared = false;
         if (player != null) {
             try { if (player.isPlaying()) player.stop(); } catch (Throwable ignored) {}
             try { player.release(); } catch (Throwable ignored) {}
@@ -378,10 +507,130 @@ public final class MediaPlaybackService extends Service {
         }
     }
 
+    private void applyRoadSenseDuck() {
+        if (playerPrepared) applyRoadSenseDuck(player);
+        if (roadSenseDucked) {
+            pauseTtsForRoadSense();
+        } else {
+            resumeTtsAfterRoadSense();
+        }
+    }
+
+    private void applyRoadSenseDuck(MediaPlayer target) {
+        if (target == null) return;
+        // -12 dB leaves automation audible but makes a short safety cue distinct.
+        float volume = roadSenseDucked ? 0.25f : 1.0f;
+        try {
+            target.setVolume(volume, volume);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void pauseTtsForRoadSense() {
+        if (ttsPausedForRoadSense || activeSpeakText == null || tts == null) return;
+        if (!playbackSession.hasActiveTtsUtterance(activeSpeakGeneration)) return;
+        ttsPausedForRoadSense = true;
+        playbackSession.invalidateTtsCallbacks();
+        try {
+            tts.stop();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void resumeTtsAfterRoadSense() {
+        if (!ttsPausedForRoadSense) return;
+        String text = activeSpeakText;
+        String channel = activeSpeakChannel;
+        int startId = activeSpeakStartId;
+        long generation = activeSpeakGeneration;
+        ttsPausedForRoadSense = false;
+        if (text == null || !isCurrentSession(generation)) {
+            clearActiveTtsState();
+            return;
+        }
+        if (tts == null || !ttsReady) {
+            finishSession(startId, generation);
+            return;
+        }
+        requestFocus(channel, false);
+        speakNow(text, channel, startId, generation);
+    }
+
+    private void clearActiveTtsState() {
+        playbackSession.invalidateTtsCallbacks();
+        activeSpeakText = null;
+        activeSpeakChannel = null;
+        activeSpeakStartId = 0;
+        activeSpeakGeneration = 0;
+        ttsPausedForRoadSense = false;
+    }
+
+    private long beginPlaybackSession() {
+        return playbackSession.begin();
+    }
+
+    private void invalidatePlaybackSession() {
+        playbackSession.invalidate();
+        pendingSpeak = null;
+    }
+
+    private boolean isCurrentSession(long generation) {
+        return playbackSession.isCurrent(generation);
+    }
+
+    private boolean isCurrentPlayer(MediaPlayer expected, long generation) {
+        return isCurrentSession(generation) && player == expected;
+    }
+
+    private void finishTtsSessionFromCallback(int startId, long generation, String expectedId,
+                                              String callbackId) {
+        if (!playbackSession.claimCurrentTtsCallback(
+                generation, expectedId, callbackId)) return;
+        mainHandler.post(() -> {
+            if (isCurrentSession(generation)) finishSession(startId, generation);
+        });
+    }
+
+    private void finishPlayback(MediaPlayer expected, int startId, long generation) {
+        if (!isCurrentPlayer(expected, generation)) return;
+        releasePlayer();
+        stopSelfResult(latestStartId);
+    }
+
+    private void finishSession(int startId, long generation) {
+        if (!isCurrentSession(generation)) return;
+        clearActiveTtsState();
+        releasePlayer();
+        stopSelfResult(latestStartId);
+    }
+
+    private boolean hasActivePlayback() {
+        return player != null || pendingSpeak != null || activeSpeakText != null;
+    }
+
+    private void rejectStartWithoutInterruptingPlayback(int startId, String reason) {
+        Log.w(TAG, "rejected playback start: " + reason);
+        // Retain the newest start ID while audio is active so its normal completion
+        // consumes this rejected command too. If idle, stop the foreground service now.
+        if (!hasActivePlayback()) stopSelfResult(startId);
+    }
+
+    private void stopTts() {
+        pendingSpeak = null;
+        clearActiveTtsState();
+        try {
+            if (tts != null) tts.stop();
+        } catch (Throwable ignored) {
+        }
+    }
+
     @Override public void onDestroy() {
+        ROAD_SENSE_DUCK.detach(roadSenseDuckTarget);
+        invalidatePlaybackSession();
         super.onDestroy();
         releasePlayer();
         if (tts != null) {
+            clearActiveTtsState();
             try { tts.stop(); tts.shutdown(); } catch (Throwable ignored) {}
             tts = null; ttsReady = false;
         }
@@ -393,6 +642,25 @@ public final class MediaPlaybackService extends Service {
     }
 
     @Override public IBinder onBind(Intent intent) { return null; }
+
+    private static final class StartRequest {
+        final String action;
+        final String text;
+        final String channel;
+        final boolean loop;
+        final String libName;
+        final String filePath;
+
+        StartRequest(String action, String text, String channel, boolean loop,
+                     String libName, String filePath) {
+            this.action = action;
+            this.text = text;
+            this.channel = channel;
+            this.loop = loop;
+            this.libName = libName;
+            this.filePath = filePath;
+        }
+    }
 
     private static int usageForChannel(String channel) {
         if (channel == null) return AudioAttributes.USAGE_MEDIA;
@@ -409,7 +677,24 @@ public final class MediaPlaybackService extends Service {
         }
     }
 
-    private static int streamForChannel(String channel) {
+    /**
+     * Apply the proven OEM route recipe. Package-visible so the isolated RoadSense
+     * player cannot drift from Automation Audio's channel behavior.
+     */
+    static void applyChannelRouting(MediaPlayer mediaPlayer, String channel) {
+        int stream = streamForChannel(channel);
+        // Set BOTH attributes and the deprecated direct stream type, in this order.
+        // The direct setter is required for OEM-extended nav/voice streams, while the
+        // attributes keep public streams aligned with the OEM reference player.
+        mediaPlayer.setAudioAttributes(new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .setLegacyStreamType(stream)
+                .build());
+        mediaPlayer.setAudioStreamType(stream);
+    }
+
+    static int streamForChannel(String channel) {
         if (channel == null) return AudioManager.STREAM_MUSIC;
         switch (channel.trim().toLowerCase()) {
             case "phone":
@@ -459,7 +744,7 @@ public final class MediaPlaybackService extends Service {
     }
 
     /** True for the OEM-extended stream ints that need the direct setAudioStreamType path. */
-    private static boolean isOemExtendedStream(int stream) {
+    static boolean isOemExtendedStream(int stream) {
         return stream == STREAM_NAVI || stream == STREAM_VOICE_OEM;
     }
 

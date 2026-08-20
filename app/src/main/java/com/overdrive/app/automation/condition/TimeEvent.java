@@ -7,11 +7,9 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoField;
 import java.time.temporal.ChronoUnit;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Publishes the local time-of-day (minutes since midnight) and day-of-week to the
@@ -21,12 +19,48 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class TimeEvent {
     private static final DaemonLogger logger = DaemonLogger.getInstance("Automations");
-    private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-    private static final AtomicReference<ScheduledFuture<?>> active = new AtomicReference<>();
+    private static final ScheduledThreadPoolExecutor scheduler =
+            new ScheduledThreadPoolExecutor(1, runnable -> {
+                Thread thread = new Thread(runnable, "AutomationTime");
+                thread.setDaemon(true);
+                return thread;
+            });
+    private static ScheduledFuture<?> active;
+
+    static {
+        scheduler.setRemoveOnCancelPolicy(true);
+        // Longer than the maximum next-minute delay so an active delayed task always retains a
+        // worker; after cancellation the idle worker still exits without periodic wakeups.
+        scheduler.setKeepAliveTime(75L, TimeUnit.SECONDS);
+        scheduler.allowCoreThreadTimeOut(true);
+    }
 
     private TimeEvent() {}
 
-    public static void scheduleTimeEvent() {
+    private static boolean referenced() {
+        return Automations.isEventReferenced(BydEvent.TIME)
+                || Automations.isEventReferenced(BydEvent.DAY)
+                || Automations.isEventReferenced(BydEvent.DAY_OF_MONTH)
+                || Automations.isEventReferenced(BydEvent.MONTH)
+                || Automations.isEventReferenced(BydEvent.SUN_PHASE);
+    }
+
+    /** Start or cancel the minute-aligned task according to the current automation config. */
+    public static synchronized void refresh() {
+        if (!referenced()) {
+            if (active != null) active.cancel(false);
+            active = null;
+            return;
+        }
+        if (active != null && !active.isDone() && !active.isCancelled()) return;
+
+        // Establish the current minute/day as a baseline. Saving a rule must not look like
+        // midnight, sunrise, or a day change merely because this poller was previously stopped.
+        Automations.runSilentSeed(TimeEvent::publishNow);
+        scheduleNextLocked();
+    }
+
+    private static void scheduleNextLocked() {
         // Compute the next-minute boundary against LocalDateTime, NOT LocalTime: at 23:59
         // LocalTime.plusMinutes(1) wraps to 00:00 and Duration.between(now, 00:00) on a
         // LocalTime goes BACKWARDS (~ -86340s), which schedule() treats as "run now" and
@@ -38,34 +72,37 @@ public class TimeEvent {
         // Clamp to >=1s as a final guard against any clock skew yielding a non-positive delay.
         long delay = Math.max(1, Duration.between(now, nextRun).getSeconds() + 1);
 
-        ScheduledFuture<?> next = scheduler.schedule(TimeEvent::sendEvent, delay, TimeUnit.SECONDS);
-
-        ScheduledFuture<?> previous = active.getAndSet(next);
-        if (previous != null && !previous.isDone()) {
-            previous.cancel(false);
-        }
+        active = scheduler.schedule(TimeEvent::sendEvent, delay, TimeUnit.SECONDS);
     }
 
     private static void sendEvent() {
         try {
-            LocalDateTime now = LocalDateTime.now();
-            // Store time as minutes since start of day to make comparison easier
-            Automations.update(BydEvent.TIME, now.get(ChronoField.MINUTE_OF_DAY));
-            Automations.update(BydEvent.DAY, now.getDayOfWeek().name().toLowerCase());
-            // Calendar signals for date/monthly automations. dayOfMonth is numeric
-            // (IntType condition, 1-31). month is published as a STRING ("1".."12") to
-            // match the month-name EnumType condition — an Integer would wrap as IntValue
-            // and never compare-equal to the enum's String ids (StringValue), silently
-            // never firing.
-            Automations.update(BydEvent.DAY_OF_MONTH, now.getDayOfMonth());
-            Automations.update(BydEvent.MONTH, String.valueOf(now.getMonthValue()));
-            // Solar phase (day/night) from GPS + local date. Only published when we
-            // have a location fix — otherwise unseeded (no bogus sunset at lat/lon 0,0).
-            publishSunPhase(now);
+            if (referenced()) publishNow();
         } catch (Exception e) {
             logger.error("Failed to run time event", e);
+        } finally {
+            synchronized (TimeEvent.class) {
+                active = null;
+            }
+            refresh();
         }
-        scheduleTimeEvent();
+    }
+
+    public static void seedForEditor() {
+        try {
+            publishNow();
+        } catch (Throwable t) {
+            logger.warn("Failed to seed time signals: " + t.getMessage());
+        }
+    }
+
+    private static void publishNow() {
+        LocalDateTime now = LocalDateTime.now();
+        Automations.update(BydEvent.TIME, now.get(ChronoField.MINUTE_OF_DAY));
+        Automations.update(BydEvent.DAY, now.getDayOfWeek().name().toLowerCase());
+        Automations.update(BydEvent.DAY_OF_MONTH, now.getDayOfMonth());
+        Automations.update(BydEvent.MONTH, String.valueOf(now.getMonthValue()));
+        publishSunPhase(now);
     }
 
     /**

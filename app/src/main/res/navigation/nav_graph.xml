@@ -200,6 +200,15 @@
         android:name="com.overdrive.app.ui.fragment.RoadSenseFragment"
         android:label="@string/rail_roadsense" />
 
+    <!-- Network & Hotspot: SIM-data sharing, clients, data limit, proxy.
+         Its own top-level destination (not a Daemons entry) because it owns
+         the radio and has a live client/stats surface. -->
+    <fragment
+        android:id="@+id/networkFragment"
+        android:name="com.overdrive.app.ui.fragment.NetworkFragment"
+        android:label="@string/network_title"
+        tools:layout="@layout/fragment_network" />
+
     <!-- Diagnostics: logs + ADB console + utilities -->
     <fragment
         android:id="@+id/diagnosticsFragment"

@@ -1,39 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  Recording grid tile — designed for a 2-column grid (Google-Photos /
-  Eufy-style). Aspect 16:10 with metadata layered on top of the thumbnail.
-
-  Layered overlays (top → bottom):
-    ・ Severity stripe across the top edge.
-    ・ Top-right column: severity badge over type badge.
-    ・ Top-left: camera-id chip OR selection checkbox (in select mode).
-    ・ Centre: play affordance.
-    ・ Bottom-right: duration scrim.
-    ・ Bottom-left: actor + proximity scrim.
-
-  Card uses ?attr/colorSurfaceContainer (no stroke), 20dp radius. Footer
-  text uses ?attr/colorOnSurface / ?attr/colorOnSurfaceVariant. The
-  per-item severity tints (stripe + badge background) and the bottom-edge
-  scrim pills (duration / actors) are deliberately hard-coded to dark
-  semi-transparent values: those overlays sit on the thumbnail bitmap
-  (not on the card surface), so they need their own contrast independent
-  of the app theme.
-
-  Preserved IDs (RecordingAdapter.kt findViewById targets):
-    ivThumbnail, severityStripe, tvSeverity, tvCameraId, tvDuration,
-    tvActorSummary, tvLocation, cbSelect, tvFilename, tvRecordingTime, tvSize,
-    btnDelete, tvTypeBadge
--->
 <com.google.android.material.card.MaterialCardView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:layout_margin="@dimen/card_gap_horizontal_half"
     android:layout_gravity="top"
+    android:layout_margin="6dp"
     android:foreground="?attr/selectableItemBackground"
     app:cardBackgroundColor="?attr/colorSurfaceContainer"
-    app:cardCornerRadius="@dimen/card_radius_standard"
+    app:cardCornerRadius="8dp"
     app:cardElevation="0dp">
 
     <LinearLayout
@@ -41,10 +16,10 @@
         android:layout_height="wrap_content"
         android:orientation="vertical">
 
-        <!-- ==================== THUMBNAIL ==================== -->
-        <FrameLayout
+        <com.overdrive.app.ui.view.RecordingAspectRatioFrameLayout
+            android:id="@+id/recordingMedia"
             android:layout_width="match_parent"
-            android:layout_height="160dp">
+            android:layout_height="wrap_content">
 
             <ImageView
                 android:id="@+id/ivThumbnail"
@@ -54,24 +29,32 @@
                 android:contentDescription="@string/cd_video_thumbnail"
                 android:scaleType="centerCrop" />
 
-            <!-- Severity stripe — top edge, dynamic color via adapter. -->
             <View
                 android:id="@+id/severityStripe"
                 android:layout_width="match_parent"
-                android:layout_height="3dp"
+                android:layout_height="4dp"
                 android:layout_gravity="top"
-                android:background="?attr/colorTertiary"
                 android:visibility="gone" />
 
-            <!-- Top-right column: severity badge stacked above the type badge.
-                 Both pills share the same right edge so they read as one
-                 corner cluster. Each is independently visible — type badge
-                 is always shown, severity only when the sidecar provides one. -->
+            <TextView
+                android:id="@+id/tvCameraId"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="top|start"
+                android:layout_margin="8dp"
+                android:background="#A6000000"
+                android:fontFamily="sans-serif-medium"
+                android:paddingHorizontal="8dp"
+                android:paddingVertical="4dp"
+                android:textColor="@android:color/white"
+                android:textSize="11sp"
+                tools:text="C0" />
+
             <LinearLayout
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="top|end"
-                android:layout_margin="6dp"
+                android:layout_margin="8dp"
                 android:gravity="end"
                 android:orientation="vertical">
 
@@ -80,10 +63,10 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:fontFamily="sans-serif-medium"
-                    android:paddingHorizontal="6dp"
-                    android:paddingVertical="2dp"
+                    android:paddingHorizontal="8dp"
+                    android:paddingVertical="4dp"
                     android:textColor="@android:color/white"
-                    android:textSize="9sp"
+                    android:textSize="11sp"
                     android:visibility="gone"
                     tools:text="ALERT" />
 
@@ -91,189 +74,156 @@
                     android:id="@+id/tvTypeBadge"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="3dp"
-                    android:background="#99000000"
+                    android:layout_marginTop="4dp"
+                    android:background="#A6000000"
                     android:fontFamily="sans-serif-medium"
-                    android:paddingHorizontal="6dp"
-                    android:paddingVertical="2dp"
+                    android:paddingHorizontal="8dp"
+                    android:paddingVertical="4dp"
                     android:textColor="@android:color/white"
-                    android:textSize="9sp"
+                    android:textSize="11sp"
                     tools:text="EVENT" />
 
-                <!-- Storage tag (INTERNAL / SD_CARD / USB) — where the clip
-                     actually landed. Makes the silent SD→internal fallback (SD
-                     bridged behind the USB power rail) visible per file. The
-                     adapter sets the text, icon and tint; hidden when the
-                     storage type is unknown. -->
                 <TextView
                     android:id="@+id/tvStorageBadge"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="3dp"
-                    android:background="#99000000"
-                    android:drawablePadding="3dp"
+                    android:layout_marginTop="4dp"
                     android:fontFamily="sans-serif-medium"
-                    android:paddingHorizontal="6dp"
-                    android:paddingVertical="2dp"
+                    android:paddingHorizontal="8dp"
+                    android:paddingVertical="4dp"
                     android:textColor="@android:color/white"
-                    android:textSize="9sp"
+                    android:textSize="11sp"
                     android:visibility="gone"
                     tools:text="SD"
                     tools:visibility="visible" />
             </LinearLayout>
 
-            <!-- Top-left camera/type chip -->
-            <TextView
-                android:id="@+id/tvCameraId"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="top|start"
-                android:layout_margin="6dp"
-                android:background="@drawable/calendar_day_bg_selected"
-                android:fontFamily="sans-serif-medium"
-                android:paddingHorizontal="6dp"
-                android:paddingVertical="2dp"
-                android:textColor="?attr/colorOnPrimary"
-                android:textSize="9sp"
-                tools:text="C0" />
-
-            <!-- Bottom-right duration — dark scrim is intentional, sits over
-                 the thumbnail bitmap, not on a theme surface. -->
-            <TextView
-                android:id="@+id/tvDuration"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="bottom|end"
-                android:layout_margin="6dp"
-                android:background="#99000000"
-                android:paddingHorizontal="6dp"
-                android:paddingVertical="2dp"
-                android:textColor="@android:color/white"
-                android:textSize="11sp"
-                tools:text="0:42" />
-
-            <!-- Bottom-left actor summary — same justification as duration. -->
             <TextView
                 android:id="@+id/tvActorSummary"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="bottom|start"
-                android:layout_margin="6dp"
-                android:background="#99000000"
+                android:layout_margin="8dp"
+                android:background="#A6000000"
                 android:ellipsize="end"
-                android:maxWidth="220dp"
-                android:paddingHorizontal="6dp"
-                android:paddingVertical="2dp"
+                android:maxWidth="240dp"
+                android:paddingHorizontal="8dp"
+                android:paddingVertical="4dp"
                 android:singleLine="true"
                 android:textColor="@android:color/white"
                 android:textSize="11sp"
                 android:visibility="gone"
                 tools:text="1 person · close" />
 
-            <!-- Selection checkbox: top-left when in select mode. -->
-            <CheckBox
-                android:id="@+id/cbSelect"
+            <TextView
+                android:id="@+id/tvDuration"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:layout_gravity="bottom|end"
+                android:layout_margin="8dp"
+                android:background="#A6000000"
+                android:paddingHorizontal="8dp"
+                android:paddingVertical="4dp"
+                android:textColor="@android:color/white"
+                android:textSize="11sp"
+                android:visibility="gone"
+                tools:text="0:42"
+                tools:visibility="visible" />
+
+            <CheckBox
+                android:id="@+id/cbSelect"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
                 android:layout_gravity="top|start"
                 android:layout_margin="2dp"
                 android:buttonTint="?attr/colorPrimary"
+                android:gravity="center"
                 android:visibility="gone" />
 
-            <!-- Big play affordance, slightly transparent. -->
             <ImageView
-                android:layout_width="44dp"
-                android:layout_height="44dp"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
                 android:layout_gravity="center"
-                android:alpha="0.85"
-                android:contentDescription="@string/cd_play"
+                android:alpha="0.9"
+                android:contentDescription="@null"
                 android:src="@drawable/ic_play_circle" />
-        </FrameLayout>
+        </com.overdrive.app.ui.view.RecordingAspectRatioFrameLayout>
 
-        <!-- ==================== FOOTER ==================== -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:paddingHorizontal="12dp"
-            android:paddingVertical="10dp">
+            android:paddingStart="12dp"
+            android:paddingTop="10dp"
+            android:paddingEnd="6dp"
+            android:paddingBottom="6dp">
 
             <TextView
                 android:id="@+id/tvFilename"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:ellipsize="middle"
-                android:singleLine="true"
-                android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
-                android:textColor="?attr/colorOnSurface"
+                android:visibility="gone"
                 tools:text="event_20260514_223124.mp4" />
 
-            <!--
-              Location chip — populated from the v3 sidecar's geo.place block
-              when reverse-geocoding is enabled. Hidden entirely when no
-              place is known so legacy clips and clips with no GPS fix look
-              identical to the pre-geo design.
-            -->
             <TextView
                 android:id="@+id/tvLocation"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:drawablePadding="6dp"
                 android:ellipsize="end"
-                android:singleLine="true"
-                android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
-                android:textColor="?attr/colorOnSurfaceVariant"
-                android:visibility="gone"
+                android:maxLines="1"
+                android:minLines="1"
+                android:textAppearance="@style/TextAppearance.Material3.TitleSmall"
+                android:textColor="?attr/colorOnSurface"
+                android:visibility="invisible"
                 tools:text="Cheras, Kuala Lumpur"
                 tools:visibility="visible" />
 
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
                 android:gravity="center_vertical"
+                android:minHeight="48dp"
                 android:orientation="horizontal">
 
                 <TextView
                     android:id="@+id/tvRecordingTime"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
-                    android:textColor="?attr/colorOnSurfaceVariant"
-                    tools:text="22:31" />
-
-                <View
-                    android:layout_width="3dp"
-                    android:layout_height="3dp"
-                    android:layout_marginHorizontal="6dp"
-                    android:background="@drawable/recording_indicator_dot" />
-
-                <TextView
-                    android:id="@+id/tvSize"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
+                    android:ellipsize="end"
                     android:singleLine="true"
-                    android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textColor="?attr/colorOnSurface"
+                    tools:text="22:31" />
+
+                <TextView
+                    android:id="@+id/tvSize"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:ellipsize="end"
+                    android:singleLine="true"
+                    android:textAppearance="@style/TextAppearance.Material3.LabelMedium"
                     android:textColor="?attr/colorOnSurfaceVariant"
                     tools:text="125 MB" />
 
                 <ImageButton
                     android:id="@+id/btnShare"
-                    android:layout_width="32dp"
-                    android:layout_height="32dp"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
                     android:background="?attr/selectableItemBackgroundBorderless"
                     android:contentDescription="@string/cd_share"
+                    android:padding="12dp"
                     android:src="@drawable/ic_share"
                     app:tint="?attr/colorOnSurfaceVariant" />
 
                 <ImageButton
                     android:id="@+id/btnDelete"
-                    android:layout_width="32dp"
-                    android:layout_height="32dp"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
                     android:background="?attr/selectableItemBackgroundBorderless"
                     android:contentDescription="@string/cd_delete"
+                    android:padding="12dp"
                     android:src="@drawable/ic_delete"
                     app:tint="?attr/colorOnSurfaceVariant" />
             </LinearLayout>

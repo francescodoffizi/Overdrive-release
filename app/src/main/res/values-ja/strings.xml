@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">OverDrive</string>
     <!-- Accessibility Service -->
-    <string name="accessibility_service_description">Overdriveの車両監視機能をバックグラウンドで常駐実行します。このサービスは画面の内容を読み取ったり、操作したりすることはありません。</string>
+    <string name="accessibility_service_description">Overdrive の車両モニタリングをバックグラウンドで有効に保ちます。このサービスは画面の内容を読み取ったり、操作したりすることはありません。</string>
     <!-- Recording Mode Labels -->
     <!-- Proximity Guard Settings Labels -->
     <!-- Quality Settings Labels -->
@@ -25,7 +25,7 @@
     <string name="action_delete">削除</string>
     <string name="action_share">共有</string>
     <string name="action_done">完成</string>
-    <string name="action_remind_me_later">後で通知</string>
+    <string name="action_remind_me_later">後で思い出してください</string>
     <string name="action_retry">再試行</string>
     <string name="action_run">走る</string>
     <string name="action_clear_output">清潔な出力</string>
@@ -40,7 +40,7 @@
     <string name="cd_clear_logs">清潔な日記</string>
     <string name="cd_expand_collapse">拡大/崩壊</string>
     <string name="cd_recording_status">記録状態</string>
-    <string name="cd_trip_tracking_status">走行追跡状態</string>
+    <string name="cd_trip_tracking_status">旅行追跡状況</string>
     <string name="cd_mic_status">マイクロフォンキャプチャの状態</string>
     <string name="cd_video_thumbnail">ビデオミニカー</string>
     <string name="cd_play">再生</string>
@@ -119,7 +119,7 @@
     <string name="camera_dilink4_save">調整を適用する</string>
     <string name="camera_dilink4_hint">HALがフード上に赤色の\"キャリブレーション失敗\"クロームを塗った場合にのみ,これらのタグを切り替える. Daemon リセットアップは変更を適用します.</string>
     <string name="camera_dilink4_red_mask_label">赤い校准覆い (GL) を抑制する</string>
-    <string name="camera_dilink4_red_mask_subtitle">フラグメント・シェーダ・パスを追加し、鮮やかな赤色のHAL「キャリブレーションエラー」ピクセルを検出して、近傍画素で置換（または範囲が広すぎ置き換え不可の場合は明度グレー化）します。見た目の補正のみなので、内部のキャリブレーション状態への影響はありません。</string>
+    <string name="camera_dilink4_red_mask_subtitle">鮮やかな赤色のHAL\"校正失敗\"ピクセルを検出するフラグメントシェッダーパスを追加し,隣接するサンプル (またはバナーが塗装するには大きすぎると明るさ灰色) で置き換える.</string>
     <!-- dialog_camera_selection -->
     <string name="camera_selection_title">カメラ選択</string>
     <string name="camera_selection_subtitle">パノラマカメラ源を選択する</string>
@@ -134,7 +134,7 @@
     <string name="camera_selection_hint">カメラ1 = BYD Seal, カメラ0 = Atto トリム. 設定が有効になるために カメラIDを変更した後,デモンを再起動します.</string>
     <!-- OEM Dashcam camera ID picker (Phase 5: separate forward-sensor pipeline) -->
     <string name="camera_oem_dashcam_title">OEMダッシュカムカメラID</string>
-    <string name="camera_oem_dashcam_hint">フロントAVMカメラのIDを選択してください。ダッシュカメラとAVMカメラのIDは反対です: Seal/Han漢 pano = 1 → dashcam = 0; Atto / Tang唐 pano = 0 → dashcam = 1。「自動」はOverDriveに設定検出を任せます。</string>
+    <string name="camera_oem_dashcam_hint">前方ダッシュカムセンサーを指すAVMCamera idを選択します。 DashcamはPanoのOPPOSITEです: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. OverDriveを選択させるには、format@@0をオンにします。</string>
     <string name="camera_oem_dashcam_auto_resolved">自動 — id %1$d の使用 (pano is id %2$d)</string>
     <string name="camera_oem_dashcam_auto_unavailable">Auto — pano id is %1$d, cannot confer dashcam</string>
     <string name="camera_oem_dashcam_save">保存</string>
@@ -154,7 +154,7 @@
     <string name="camera_candidate_previous">前記</string>
     <string name="camera_candidate_next">次へ</string>
     <string name="camera_preview_unavailable">デイモンが再起動した後,ダイアログを再開して別の候補を試すかリフレッシュする.</string>
-    <string name="camera_mapping_save">保存</string>
+    <string name="camera_mapping_save">マッピングを保存する</string>
     <string name="camera_mapping_clear">明確な役割</string>
     <string name="camera_mapping_saved">カメラマッピングが保存されました</string>
     <string name="camera_mapping_cleared">カメラのロールマッピングがクリア</string>
@@ -206,7 +206,7 @@
     <string name="onboarding_authorize_retry_title">まだ接続されていません</string>
     <string name="onboarding_authorize_retry_body">The helper isn\'t running yet. The Android permission may have been dismissed. Try again and remember to check <b>Always allow</b>.</string>
     <string name="onboarding_authorize_retry_button">もう一度やり直してください</string>
-    <string name="onboarding_mode_title">Overdrive はいつ動作しますか？</string>
+    <string name="onboarding_mode_title">Overdriveはいつ実行されますか？</string>
     <string name="onboarding_mode_body">車の電源を切った後の Overdrive の動作を選択します。\n\n<b>オン &amp; オフ</b>は駐車中も監視を続けます — 監視とバックグラウンド監視が有効なままになるため、夜間に車がわずかに電力を消費します。\n\n<b>オンのみ</b>は、降車すると Overdrive を完全にシャットダウンします。走行中はドライブレコーダー、走行履歴、充電は引き続き動作し、車の電源を入れたときにすべて自動的に再起動します。これは設定でいつでも変更できます。</string>
     <string name="onboarding_mode_on_off_button">オン &amp; オフ</string>
     <string name="onboarding_mode_on_only_button">オンのみ</string>
@@ -317,7 +317,7 @@
     <!-- fragment_webview -->
     <string name="webview_loading">荷物...</string>
     <string name="webview_camera_daemon_not_running">カメラデモンが動かない</string>
-    <string name="webview_start_camera_daemon">デーモン設定画面にカメラデーモンを起動してから、このページを開いてください。</string>
+    <string name="webview_start_camera_daemon">このページにアクセスするために デーモン画面からカメラデーモンを起動します</string>
     <!-- dialog_roi_drawing -->
     <!-- dialog_zrok_token -->
     <string name="zrok_enable_token_hint">トークンを有効にする</string>
@@ -436,7 +436,7 @@
     <string name="update_preparing">更新を準備する...</string>
     <string name="update_percent_zero">0%</string>
     <!-- dialog_battery_health -->
-    <string name="battery_health_title">バッテリーの健全性</string>
+    <string name="battery_health_title">バッテリーの健康</string>
     <string name="battery_health_subtitle">健康状態</string>
     <string name="battery_health_dashes">--</string>
     <string name="battery_health_waiting">データを待ってる</string>
@@ -565,14 +565,14 @@
     <string name="dialog_reset_following_message">This cannot be undone.\n\n%1$s</string>
     <string name="dialog_reset_complete_title">セット完了</string>
     <string name="dialog_traffic_cannot_check_title">ステータスを確認できない</string>
-    <string name="dialog_traffic_cannot_check_message">ADB接続はまだ準備できていません。\\n\\nこのアプリはシステムパッケージを管理するためにはADBアクセスを必要としています。\\n以下をご確認ください：\\n• 開発者設定の「USBデバッグ」が有効になっている\\n• ADB許可プロンプトを受け入れた\\n• 接続されると、ステータスは自動的に更新されます。</string>
-    <string name="dialog_traffic_disable_title">BYD交通モニターを無効にしますか?</string>
-    <string name="dialog_traffic_disable_message">BYD交通状況モニター(com.byd.trafficmonitor)は、常にバックグラウンドでの交通状況を受信する内蔵システムアプリです。\\n\\n️なぜ無効にしますか?\\n\\n• モバイル通信データを消費する(駐車時にも)\\n• バックグラウンドでCPUとバッテリーを消費する\\n• ナビは内蔵アプリ以外を利用する場合は不要\\n• ダッシュカメラのネットワーク利用を干渉する\\n\\n無効にしても内蔵ナビアプリの地図の交通状況オーバーレイにしか影響がありません。ほかのナビアプリやBluetoothそして車の機能は影響を受けていません。\\n\\n無効化後にハードリブートが必要です（中央コンソールボタンを5秒間を押す）。</string>
+    <string name="dialog_traffic_cannot_check_message">ADB接続はまだ準備ができていない.\n\nアプリケーションはシステムパッケージを管理するために ADBアクセスを必要としています. 開発者オプションでは:\n\n• USB デバッグが有効になっていることを確認してください.</string>
+    <string name="dialog_traffic_disable_title">BYDトラフィックモニターを無効にするか?</string>
+    <string name="dialog_traffic_disable_message">BYD トラフィックモニター (com.byd.trafficmonitor) は,バックグラウンドでの道路交通状態を継続的に監視する内蔵システムアプリです.\n\n️ なぜそれを無効にするのですか?\n\n• 携帯電話データを消費します (駐車している場合でも)\n• CPUとバックグラウンドのバッテリーを使用します\n• 別なナビゲーションアプリを使用している場合は不要です\n• ダッシュカメラのネットワーク使用に干渉できます\n\n これは無効にできます.</string>
     <string name="dialog_traffic_enable_title">BYDトラフィックモニターを再起動する?</string>
-    <string name="dialog_traffic_enable_message">BYD交通モニターは現在無効です。\\n\\n再起動すると、内蔵ナビアプリの地図に交通状況オーバーレイが再び表示されます。バックグラウンドで実行し、モバイル通信データを消費することを注意してください。\\n\\n有効化はハードリブートが必要です (中央コンソールボタンを5秒間押す)。</string>
-    <string name="dialog_traffic_status_title">BYD交通モニター %1$s</string>
+    <string name="dialog_traffic_enable_message">BYD トラフィックモニターは現在無効です.\n\n再起動すると,ナビゲーションマップの内蔵のトラフィックオーバーレイを回復します.バックグラウンドで実行し,モバイルデータを消費することを注意してください.\n\n有効化後にハードリブートが必要です (中央コンソールボタンを5秒保持します).</string>
+    <string name="dialog_traffic_status_title">交通モニター %1$s</string>
     <string name="dialog_traffic_reboot_message">変更が適用されました. 硬いリブートを実行してください. 鍵を押して中央コンソールボタンを5秒押してください.</string>
-    <string name="traffic_monitor_loading">BYD交通モニター: 確認中...</string>
+    <string name="traffic_monitor_loading">交通モニター: チェック...</string>
     <string name="traffic_monitor_tap_to_check">交通モニター (チェックするにはタップ)</string>
     <!-- Reset categories -->
     <string name="reset_label_trips">走行履歴</string>
@@ -686,7 +686,7 @@
     <string name="play_with_chooser">遊びなさい</string>
     <!-- Setup guide -->
     <string name="setup_version_banner">%1$s に更新 — 自動起動を再確認し、BYDはインストールごとに消去します。</string>
-    <string name="setup_overlay_already_granted">付与済み</string>
+    <string name="setup_overlay_already_granted">すでに 認め られ て いる</string>
     <!-- Setup guide — post-setup tips section -->
     <string name="setup_tips_header">提示 &amp; トラブルシューティング</string>
     <string name="setup_traffic_title">BYD トラフィックモニターを無効にする</string>
@@ -733,7 +733,7 @@
     <string name="rail_live">生きている</string>
     <string name="rail_recordings">録画</string>
     <string name="rail_vehicle">車両</string>
-    <string name="rail_projection">プロジェクション</string>
+    <string name="rail_projection">投影図</string>
     <string name="rail_trips">走行履歴</string>
     <string name="rail_charging">充電中</string>
     <string name="rail_automations">オートメーション</string>
@@ -1316,18 +1316,18 @@
     <string name="toast_cloudflared_token_invalid">無効なトークン: 使用する文字、数字、および . _ - = 文字</string>
     <string name="toast_cloudflared_saved_settings">Cloudflared settings saved</string>
     <!-- Projection feature -->
-    <string name="projection_hero_title">プロジェクション</string>
-    <string name="projection_hero_subtitle">アプリをドライバーのメータークラスターにキャストし、ここにミラーリングします。</string>
-    <string name="projection_pick_app">投影するアプリを選択</string>
-    <string name="projection_cast">メータークラスターにキャスト</string>
+    <string name="projection_hero_title">投影図</string>
+    <string name="projection_hero_subtitle">ドライバクラスタにアプリをキャストし、ここでミラーリングします。</string>
+    <string name="projection_pick_app">プロジェクトするアプリを選択してください</string>
+    <string name="projection_cast">クラスタにキャスト</string>
     <string name="projection_stop">停止</string>
-    <string name="projection_cast_failed">そのアプリをメータークラスターにキャストできませんでした。</string>
+    <string name="projection_cast_failed">そのアプリをクラスタにキャストできませんでした。</string>
     <string name="projection_status_idle">投影していません。</string>
-    <string name="projection_status_live">ライブミラー — タップとスワイプで操作します。</string>
-    <string name="projection_status_preview">プレビューモード（この車両ではフレームレートが低下します）。</string>
-    <string name="projection_status_none">まだ何も投影されていません — アプリを選択してキャストしてください。</string>
-    <string name="projection_status_unsupported">この車両ではライブミラーはサポートされていません。アプリはメータークラスターに引き続き投影されます。</string>
-    <string name="projection_note_single_app">メータークラスターには一度に1つのアプリのみ投影できます。</string>
+    <string name="projection_status_live">ライブミラー — タップしてスワイプしてコントロールします。</string>
+    <string name="projection_status_preview">プレビューモード（この車両ではフレームレートが低下しています）</string>
+    <string name="projection_status_none">まだ何も投影されていません — アプリを選択してキャストします。</string>
+    <string name="projection_status_unsupported">この車両ではライブミラーはサポートされていません。アプリは引き続きクラスターに投影されます。</string>
+    <string name="projection_note_single_app">一度に一つのアプリをクラスタに投影することができます。</string>
     <string name="projection_adjust_bounds">範囲を調整</string>
     <string name="projection_done_adjusting">完了</string>
     <string name="projection_bounds_hint_idle">ミラー範囲</string>
@@ -1345,4 +1345,18 @@
     <string name="projection_autostart_conflict_confirm">このアプリを使用</string>
     <string name="projection_app_uninstalled">そのアプリはインストールされていません。</string>
     <string name="projection_status_service_down">ミラーサービスの準備ができていません。アプリ（またはカメラデーモン）を再起動してもう一度お試しください。</string>
+    <string name="cd_replay_status">即時再生の状態</string>
+    <string name="recording_lib_type_replay">リプレイ</string>
+    <string name="settings_overlay_replay_title">インスタントリプレイインジケーターを表示</string>
+    <string name="settings_overlay_replay_subtitle">CLIPバッジを表示:再生中に緑色、保存後5秒間は青色、失敗したときは赤色。 リプレイバインディングまたは自動化が存在する場合にのみ表示されます。</string>
+    <string name="recordings_segment_replays">リプレイ</string>
+    <string name="recordings_segment_replays_count">リプレイ中 · %d</string>
+    <string name="vehicle_model_seagull">BYD Seagull</string>
+    <string name="projection_window_title">クラスターウィンドウ</string>
+    <string name="projection_window_desc">キャストアプリをドライバークラスタ上に配置します。プリセットは共通のレイアウトにスナップします。リサイズウィンドウで自由にドラッグできます。</string>
+    <string name="projection_preset_full">フル</string>
+    <string name="projection_preset_left">左半分</string>
+    <string name="projection_preset_right">右半分</string>
+    <string name="projection_preset_center">中央揃え</string>
+    <string name="projection_lock_aspect">クラスターの側面を維持する</string>
 </resources>

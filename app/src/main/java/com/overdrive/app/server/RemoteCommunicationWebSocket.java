@@ -1,0 +1,385 @@
+package com.overdrive.app.server;
+
+import android.util.Base64;
+
+import com.overdrive.app.communication.RemoteCommunicationAvailability;
+import com.overdrive.app.communication.RemoteCommunicationPolicy;
+import com.overdrive.app.communication.RemoteCommunicationSettings;
+import com.overdrive.app.communication.RemoteVoiceBridge;
+import com.overdrive.app.communication.RemoteVoiceController;
+import com.overdrive.app.communication.VehicleCommunicationSafety;
+import com.overdrive.app.logging.DaemonLogger;
+
+import org.json.JSONObject;
+
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.concurrent.atomic.AtomicReference;
+
+/** Authenticated push-to-talk WebSocket endpoint at {@code /ws/communicate}. */
+public final class RemoteCommunicationWebSocket {
+
+    private static final String WS_MAGIC =
+            "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    private static final DaemonLogger logger =
+            DaemonLogger.getInstance("RemoteCommunicate");
+    private static final AtomicReference<Session> ACTIVE = new AtomicReference<>();
+    private static final long NETWORK_GAP_WARN_MS = 150L;
+
+    private RemoteCommunicationWebSocket() {}
+
+    public static boolean isBusy() {
+        return ACTIVE.get() != null;
+    }
+
+    public static void stopActive(String reason) {
+        Session session = ACTIVE.get();
+        if (session != null) session.requestStop(reason);
+    }
+
+    public static void handle(Socket client, String websocketKey) {
+        Session session = new Session(client);
+        try {
+            session.handshake(websocketKey);
+            if (!ACTIVE.compareAndSet(null, session)) {
+                session.failAndClose("Another talk session is already active", 1013);
+                return;
+            }
+            session.run();
+        } catch (Throwable error) {
+            logger.warn("PTT WebSocket failed: " + error.getMessage());
+            if (!session.stopRequested) session.requestStop("Connection lost");
+        } finally {
+            ACTIVE.compareAndSet(session, null);
+            session.logPcmStats();
+            session.close();
+        }
+    }
+
+    private static final class Session implements RemoteVoiceBridge.Listener {
+        private final Socket socket;
+        private final Object outputLock = new Object();
+        private volatile boolean stopRequested;
+        private volatile String stopReason = "Released";
+        private InputStream input;
+        private OutputStream output;
+        private RemoteVoiceBridge bridge;
+        private long pcmFrames;
+        private long pcmBytes;
+        private long previousPcmAt;
+        private long maxPcmGapMs;
+        private long delayedPcmFrames;
+
+        Session(Socket socket) {
+            this.socket = socket;
+        }
+
+        void handshake(String key) throws Exception {
+            input = socket.getInputStream();
+            output = socket.getOutputStream();
+            String accept = websocketAccept(key);
+            String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                    + "Upgrade: websocket\r\n"
+                    + "Connection: Upgrade\r\n"
+                    + "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
+            output.write(response.getBytes(StandardCharsets.US_ASCII));
+            output.flush();
+            socket.setTcpNoDelay(true);
+            socket.setKeepAlive(true);
+            socket.setSoTimeout(1_000);
+        }
+
+        void run() throws Exception {
+            RemoteCommunicationSettings.Snapshot settings =
+                    RemoteCommunicationSettings.load();
+            boolean carOff = VehicleCommunicationSafety.isCarKnownOff();
+            Boolean overlay = RemoteCommunicationAvailability.shouldCheckVoiceOverlay(
+                    carOff, settings, false)
+                    ? RemoteVoiceController.hasOverlayPermission() : null;
+            RemoteCommunicationAvailability.Result availability =
+                    RemoteCommunicationAvailability.voice(
+                            carOff,
+                            settings,
+                            false,
+                            overlay);
+            if (!availability.ready) {
+                failAndClose(availability.reason, 1008);
+                return;
+            }
+
+            sendJson(new JSONObject()
+                    .put("type", "connected")
+                    .put("maxSeconds",
+                            RemoteCommunicationPolicy.MAX_SESSION_MS / 1000L));
+
+            if (!awaitStartCommand()) return;
+
+            try {
+                bridge = RemoteVoiceBridge.connect(
+                        RemoteCommunicationPolicy.effectiveOutputLevel(
+                                settings.outputLevelOverrideEnabled,
+                                settings.outputLevel),
+                        this);
+            } catch (RemoteVoiceBridge.RejectedException rejected) {
+                failAndClose(rejected.getMessage(), 1011);
+                return;
+            }
+
+            long startedAt = System.currentTimeMillis();
+            long lastAudioAt = startedAt;
+            sendJson(new JSONObject()
+                    .put("type", "live")
+                    .put("sampleRate", RemoteCommunicationPolicy.PCM_SAMPLE_RATE_HZ)
+                    .put("maxSeconds",
+                            RemoteCommunicationPolicy.MAX_SESSION_MS / 1000L));
+
+            while (!stopRequested && !socket.isClosed()) {
+                long now = System.currentTimeMillis();
+                if (VehicleCommunicationSafety.isCarKnownOff()) {
+                    stopReason = RemoteCommunicationAvailability.voice(
+                            true, settings, false, null).reason;
+                    break;
+                }
+                if (RemoteCommunicationPolicy.shouldStopForLimit(now - startedAt)) {
+                    stopReason = "30 second limit reached";
+                    break;
+                }
+                if (RemoteCommunicationPolicy.shouldStopForInactivity(now - lastAudioAt)) {
+                    stopReason = "Audio stream became inactive";
+                    break;
+                }
+
+                Frame frame;
+                try {
+                    frame = readFrame(input);
+                } catch (SocketTimeoutException timeout) {
+                    continue;
+                } catch (IOException disconnected) {
+                    if (stopRequested) break;
+                    throw disconnected;
+                }
+                if (frame == null || frame.opcode == 0x8) {
+                    if (!stopRequested) stopReason = "Connection closed";
+                    break;
+                }
+                if (frame.opcode == 0x9) {
+                    sendFrame(0xA, frame.payload);
+                    continue;
+                }
+                if (frame.opcode == 0x1) {
+                    String text = new String(frame.payload, StandardCharsets.UTF_8);
+                    JSONObject command = new JSONObject(text);
+                    if ("stop".equals(command.optString("type"))) {
+                        stopReason = command.optString("reason", "Released");
+                        break;
+                    }
+                    continue;
+                }
+                if (frame.opcode != 0x2) continue;
+                if (frame.payload.length == 0
+                        || frame.payload.length
+                        > RemoteCommunicationPolicy.MAX_PCM_FRAME_BYTES
+                        || (frame.payload.length & 1) != 0) {
+                    throw new IOException("Invalid PCM WebSocket frame");
+                }
+                bridge.sendPcm(frame.payload);
+                long receivedAt = System.currentTimeMillis();
+                if (previousPcmAt > 0L) {
+                    long gapMs = receivedAt - previousPcmAt;
+                    maxPcmGapMs = Math.max(maxPcmGapMs, gapMs);
+                    if (gapMs >= NETWORK_GAP_WARN_MS) delayedPcmFrames++;
+                }
+                previousPcmAt = receivedAt;
+                pcmFrames++;
+                pcmBytes += frame.payload.length;
+                lastAudioAt = receivedAt;
+            }
+
+            sendJson(new JSONObject()
+                    .put("type", "stopped")
+                    .put("reason", stopReason));
+            sendClose(1000, stopReason);
+        }
+
+        void logPcmStats() {
+            if (pcmFrames == 0L) return;
+            logger.info("PTT network stats: frames=" + pcmFrames
+                    + ", bytes=" + pcmBytes
+                    + ", maxGapMs=" + maxPcmGapMs
+                    + ", delayedFrames=" + delayedPcmFrames);
+        }
+
+        private boolean awaitStartCommand() throws Exception {
+            long deadline = System.currentTimeMillis() + 5_000L;
+            while (!stopRequested && System.currentTimeMillis() < deadline) {
+                Frame frame;
+                try {
+                    frame = readFrame(input);
+                } catch (SocketTimeoutException timeout) {
+                    continue;
+                }
+                if (frame == null || frame.opcode == 0x8) return false;
+                if (frame.opcode == 0x9) {
+                    sendFrame(0xA, frame.payload);
+                    continue;
+                }
+                if (frame.opcode != 0x1) continue;
+                JSONObject command = new JSONObject(
+                        new String(frame.payload, StandardCharsets.UTF_8));
+                if (!"start".equals(command.optString("type"))) continue;
+                int sampleRate = command.optInt("sampleRate", 0);
+                String format = command.optString("format", "");
+                if (sampleRate != RemoteCommunicationPolicy.PCM_SAMPLE_RATE_HZ
+                        || !"pcm_s16le".equals(format)) {
+                    failAndClose("Unsupported browser audio format", 1003);
+                    return false;
+                }
+                return true;
+            }
+            failAndClose("Talk session did not start in time", 1008);
+            return false;
+        }
+
+        @Override public void onControl(String control) {
+            if (control == null) return;
+            try {
+                if (control.startsWith("MUTE:")) {
+                    sendJson(new JSONObject()
+                            .put("type", "receiver-muted")
+                            .put("muted", control.endsWith("1")));
+                } else if ("STOP".equals(control)) {
+                    requestStop("Stopped in the car");
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        @Override public void onReceiverLost(String reason) {
+            requestStop(reason);
+        }
+
+        void requestStop(String reason) {
+            stopRequested = true;
+            if (reason != null && !reason.trim().isEmpty()) stopReason = reason;
+            try { socket.shutdownInput(); } catch (Throwable ignored) {}
+        }
+
+        void failAndClose(String reason, int closeCode) {
+            try {
+                sendJson(new JSONObject().put("type", "failed").put("reason", reason));
+                sendClose(closeCode, reason);
+            } catch (Throwable ignored) {}
+            requestStop(reason);
+        }
+
+        void close() {
+            if (bridge != null) bridge.close();
+            try { socket.close(); } catch (Throwable ignored) {}
+        }
+
+        private void sendJson(JSONObject object) throws IOException {
+            sendFrame(0x1, object.toString().getBytes(StandardCharsets.UTF_8));
+        }
+
+        private void sendClose(int code, String reason) throws IOException {
+            byte[] reasonBytes = reason == null
+                    ? new byte[0] : reason.getBytes(StandardCharsets.UTF_8);
+            int reasonLength = Math.min(reasonBytes.length, 123);
+            byte[] payload = new byte[2 + reasonLength];
+            payload[0] = (byte) ((code >>> 8) & 0xFF);
+            payload[1] = (byte) (code & 0xFF);
+            System.arraycopy(reasonBytes, 0, payload, 2, reasonLength);
+            sendFrame(0x8, payload);
+        }
+
+        private void sendFrame(int opcode, byte[] payload) throws IOException {
+            synchronized (outputLock) {
+                int length = payload.length;
+                output.write(0x80 | (opcode & 0x0F));
+                if (length <= 125) {
+                    output.write(length);
+                } else if (length <= 65_535) {
+                    output.write(126);
+                    output.write((length >>> 8) & 0xFF);
+                    output.write(length & 0xFF);
+                } else {
+                    output.write(127);
+                    for (int i = 7; i >= 0; i--) {
+                        output.write((int) (((long) length >>> (8 * i)) & 0xFF));
+                    }
+                }
+                output.write(payload);
+                output.flush();
+            }
+        }
+    }
+
+    private static final class Frame {
+        final int opcode;
+        final byte[] payload;
+
+        Frame(int opcode, byte[] payload) {
+            this.opcode = opcode;
+            this.payload = payload;
+        }
+    }
+
+    private static Frame readFrame(InputStream input) throws IOException {
+        int first = input.read();
+        if (first < 0) return null;
+        int second = input.read();
+        if (second < 0) throw new EOFException();
+        boolean fin = (first & 0x80) != 0;
+        int opcode = first & 0x0F;
+        boolean masked = (second & 0x80) != 0;
+        long length = second & 0x7F;
+        if (!fin) throw new IOException("Fragmented client frames are unsupported");
+        if (!masked) throw new IOException("Client WebSocket frame was not masked");
+        if (length == 126) {
+            length = ((long) readRequired(input) << 8) | readRequired(input);
+        } else if (length == 127) {
+            length = 0L;
+            for (int i = 0; i < 8; i++) {
+                length = (length << 8) | readRequired(input);
+            }
+        }
+        if (length < 0 || length > RemoteCommunicationPolicy.MAX_PCM_FRAME_BYTES) {
+            throw new IOException("WebSocket frame is too large");
+        }
+        byte[] mask = new byte[4];
+        readFully(input, mask);
+        byte[] payload = new byte[(int) length];
+        readFully(input, payload);
+        for (int i = 0; i < payload.length; i++) {
+            payload[i] = (byte) (payload[i] ^ mask[i & 3]);
+        }
+        return new Frame(opcode, payload);
+    }
+
+    private static int readRequired(InputStream input) throws IOException {
+        int value = input.read();
+        if (value < 0) throw new EOFException();
+        return value;
+    }
+
+    private static void readFully(InputStream input, byte[] target) throws IOException {
+        int offset = 0;
+        while (offset < target.length) {
+            int read = input.read(target, offset, target.length - offset);
+            if (read < 0) throw new EOFException();
+            offset += read;
+        }
+    }
+
+    private static String websocketAccept(String key) throws Exception {
+        MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+        byte[] digest = sha1.digest(
+                (key + WS_MAGIC).getBytes(StandardCharsets.UTF_8));
+        return Base64.encodeToString(digest, Base64.NO_WRAP);
+    }
+}

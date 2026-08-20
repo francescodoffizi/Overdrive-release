@@ -6,7 +6,7 @@
     <title data-i18n="app.performance_title">Performance - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <!--
       Bottom-tab manifest — performance dashboard splits into 4 tabs
       so the long single-scroll page stops being a wall of charts:
@@ -27,9 +27,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <style>
         /* Performance Dashboard Specific Styles */
         .metrics-grid {
@@ -503,6 +501,290 @@
         .gpu-health-hint.critical .hint-text {
             color: #fca5a5;
         }
+
+        /* Request-scoped Android top snapshot */
+        .process-monitor {
+            margin-bottom: 16px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+
+        .process-monitor-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 18px 20px 16px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .process-monitor-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+        }
+
+        .process-monitor-title h2 {
+            margin: 0;
+            font-size: 16px;
+            line-height: 1.2;
+            color: var(--text-primary);
+        }
+
+        .process-live-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            min-height: 22px;
+            padding: 2px 8px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-full);
+            color: var(--text-muted);
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .process-live-badge::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--text-muted);
+        }
+
+        .process-live-badge.is-live {
+            color: var(--success);
+            border-color: rgba(34, 197, 94, 0.35);
+            background: rgba(34, 197, 94, 0.08);
+        }
+
+        .process-live-badge.is-live::before {
+            background: var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        .process-monitor-meta {
+            margin-top: 5px;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+        }
+
+        .process-refresh {
+            width: 36px;
+            height: 36px;
+            flex: 0 0 36px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+        }
+
+        .process-refresh:hover {
+            color: var(--text-primary);
+            border-color: var(--brand-primary);
+        }
+
+        .process-refresh:disabled {
+            opacity: 0.45;
+            cursor: default;
+        }
+
+        .process-refresh svg {
+            width: 17px;
+            height: 17px;
+        }
+
+        .process-summary {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            border-bottom: 1px solid var(--border-subtle);
+            background: var(--bg-elevated);
+        }
+
+        .process-summary-item {
+            min-width: 0;
+            padding: 14px 18px;
+            border-right: 1px solid var(--border-subtle);
+        }
+
+        .process-summary-item:last-child {
+            border-right: 0;
+        }
+
+        .process-summary-label {
+            color: var(--text-muted);
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .process-summary-value {
+            margin-top: 5px;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 20px;
+            font-weight: 700;
+            line-height: 1.1;
+        }
+
+        .process-summary-detail {
+            margin-top: 4px;
+            min-height: 14px;
+            overflow: hidden;
+            color: var(--text-muted);
+            font-size: 10px;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .process-table {
+            width: 100%;
+            overflow-x: auto;
+        }
+
+        .process-table-header,
+        .process-row {
+            display: grid;
+            grid-template-columns:
+                minmax(220px, 2fr)
+                minmax(130px, 0.85fr)
+                84px
+                84px
+                96px
+                68px;
+            align-items: center;
+            column-gap: 16px;
+            min-width: 850px;
+        }
+
+        .process-table-header {
+            padding: 10px 20px;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .process-row {
+            min-height: 58px;
+            padding: 10px 20px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .process-row:last-child {
+            border-bottom: 0;
+        }
+
+        .process-row.is-overdrive {
+            background: rgba(0, 212, 170, 0.06);
+        }
+
+        .process-command {
+            min-width: 0;
+            overflow: hidden;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            font-weight: 600;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .process-detail {
+            margin-top: 4px;
+            overflow: hidden;
+            color: var(--text-muted);
+            font-size: 10px;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .process-number {
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            text-align: right;
+        }
+
+        .process-cpu-value {
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            font-weight: 700;
+            text-align: right;
+        }
+
+        .process-cpu-track {
+            height: 4px;
+            margin-top: 6px;
+            overflow: hidden;
+            background: var(--bg-elevated);
+            border-radius: 2px;
+        }
+
+        .process-cpu-fill {
+            height: 100%;
+            min-width: 2px;
+            background: var(--brand-primary);
+            border-radius: 2px;
+        }
+
+        .process-empty {
+            padding: 34px 20px;
+            color: var(--text-muted);
+            font-size: 13px;
+            text-align: center;
+        }
+
+        @media (max-width: 768px) {
+            .process-monitor-header {
+                padding: 16px;
+            }
+
+            .process-summary {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .process-summary-item:nth-child(2) {
+                border-right: 0;
+            }
+
+            .process-summary-item:nth-child(-n + 2) {
+                border-bottom: 1px solid var(--border-subtle);
+            }
+
+            .process-table {
+                overflow: visible;
+            }
+
+            .process-table-header {
+                display: none;
+            }
+
+            .process-row {
+                grid-template-columns: minmax(0, 1fr) 92px;
+                min-width: 0;
+                min-height: 68px;
+                padding: 12px 16px;
+            }
+
+            .process-row > .process-memory,
+            .process-row > .process-resident,
+            .process-row > .process-user,
+            .process-row > .process-pid {
+                display: none;
+            }
+        }
     </style>
 </head>
 <body>
@@ -869,6 +1151,69 @@
                     </div>
                 </div>
 
+                <section class="process-monitor" data-tab="system" id="topProcessPanel">
+                    <div class="process-monitor-header">
+                        <div>
+                            <div class="process-monitor-title">
+                                <h2>Live Processes</h2>
+                                <span class="process-live-badge" id="topLiveBadge">Paused</span>
+                            </div>
+                            <div class="process-monitor-meta">
+                                <span id="topSource">top -b -n 1</span>
+                                <span aria-hidden="true"> · </span>
+                                <span id="topUpdated">Waiting</span>
+                            </div>
+                        </div>
+                        <button class="process-refresh" id="topRefreshButton"
+                                type="button" title="Refresh process snapshot"
+                                aria-label="Refresh process snapshot"
+                                onclick="BYD.performance.refreshTopNow()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M20 11a8 8 0 1 0 2 5.3"/>
+                                <path d="M20 4v7h-7"/>
+                            </svg>
+                        </button>
+                    </div>
+
+                    <div class="process-summary">
+                        <div class="process-summary-item">
+                            <div class="process-summary-label">CPU activity</div>
+                            <div class="process-summary-value" id="topCpuBusy">--%</div>
+                            <div class="process-summary-detail" id="topCpuDetail">--</div>
+                        </div>
+                        <div class="process-summary-item">
+                            <div class="process-summary-label">Tasks</div>
+                            <div class="process-summary-value" id="topTasks">--</div>
+                            <div class="process-summary-detail" id="topTasksDetail">--</div>
+                        </div>
+                        <div class="process-summary-item">
+                            <div class="process-summary-label">RAM</div>
+                            <div class="process-summary-value" id="topMemory">--</div>
+                            <div class="process-summary-detail" id="topMemoryDetail">--</div>
+                        </div>
+                        <div class="process-summary-item">
+                            <div class="process-summary-label">Swap</div>
+                            <div class="process-summary-value" id="topSwap">--</div>
+                            <div class="process-summary-detail" id="topSwapDetail">--</div>
+                        </div>
+                    </div>
+
+                    <div class="process-table" role="table" aria-label="Android processes">
+                        <div class="process-table-header" role="row">
+                            <span role="columnheader">Process</span>
+                            <span role="columnheader" style="text-align:right;">CPU</span>
+                            <span role="columnheader" style="text-align:right;">Memory</span>
+                            <span role="columnheader" style="text-align:right;">Resident</span>
+                            <span role="columnheader" style="text-align:right;">User</span>
+                            <span role="columnheader" style="text-align:right;">PID</span>
+                        </div>
+                        <div id="topProcessRows" role="rowgroup">
+                            <div class="process-empty">Waiting for a process snapshot</div>
+                        </div>
+                    </div>
+                </section>
+
                 <!-- Data Usage Chart (Persistent - 30 days) -->
                 <div class="chart-card soc-chart-card" data-tab="data" id="dataUsageCard">
                     <div class="chart-header">
@@ -1067,9 +1412,9 @@
     <div id="toastContainer" class="toast-container"></div>
 
     <script src="../shared/auth.js"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/performance.js?v=10"></script>
+    <script src="../shared/performance.js?v=11"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

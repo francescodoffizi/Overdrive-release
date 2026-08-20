@@ -1,5 +1,7 @@
 package com.overdrive.app.camera;
 
+import android.app.ActivityManager;
+import android.content.ComponentName;
 import android.content.Context;
 
 import com.overdrive.app.logging.DaemonLogger;
@@ -7,10 +9,11 @@ import com.overdrive.app.logging.DaemonLogger;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.List;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 /**
- * Reflective port of esco's il.C6498a (BYDApaHelper).
+ * Reflective port of oem's il.C6498a (BYDApaHelper).
  *
  * Purpose: on byd_apa / apa firmware variants the AVMCamera HAL boots in
  * single-camera (dashcam) mode. Even with a correct addTexture(st, 0)
@@ -26,7 +29,7 @@ import java.util.concurrent.CopyOnWriteArraySet;
  * We resolve setIntArray + enableDevice + disableDevice + register/unregisterListener
  * via reflection — same pattern the rest of this package uses for AVMCamera.
  *
- * Mirrors esco's lifecycle:
+ * Mirrors oem's lifecycle:
  *   m28930h(register)   → enableDevice(1031, features) + setViewpoint(2012)
  *   m28933k(unregister) → setViewpoint(0) + disableDevice(1031)
  */
@@ -36,7 +39,7 @@ public final class BydApaViewpointHelper {
 
     private static final int DEVICE_PANORAMA = 1031;
 
-    /** Feature IDs from esco il/C6498a.java:35 — PANO_VIEWPOINT_SET_FEATURES. */
+    /** Feature IDs from oem il/C6498a.java:35 — PANO_VIEWPOINT_SET_FEATURES. */
     private static final int[] PANO_VIEWPOINT_SET_FEATURES = {
         1306529808,
         1306529812,
@@ -159,17 +162,29 @@ public final class BydApaViewpointHelper {
     private static final int VIEWPOINT_ON  = 2012;  // mosaic / panoramic output
     private static final int VIEWPOINT_OFF = 0;     // reset
 
+    /**
+     * The DiLink 4 panorama app owns the AVC process. Oemrt yields its
+     * viewpoint while this process is foreground, then restores it once the
+     * native camera UI leaves the foreground.
+     */
+    private static final String AVC_PACKAGE = "com.byd.avc";
+    private static final long AVC_FOREGROUND_POLL_MS = 500L;
+
     /** Feature ID for PANORAMA_OUTPUT_STATE — when this transitions to 1
      *  (HAL re-init / native AVM app yielded back to us), we must re-issue
-     *  the viewpoint=2012 write or the HAL keeps streaming dashcam. esco
+     *  the viewpoint=2012 write or the HAL keeps streaming dashcam. oem
      *  il/C6498a.java:303-309. */
     private static final int FEATURE_PANORAMA_OUTPUT_STATE = 1329598480;
 
     private static final Object LOCK = new Object();
     private static volatile Object autoManagerInstance = null;
     private static volatile Object listenerProxy = null;
+    private static volatile Thread avcForegroundMonitorThread = null;
+    private static volatile boolean avcForegroundMonitorRunning = false;
+    private static final Di4AvcViewpointPolicy avcForegroundPolicy =
+        new Di4AvcViewpointPolicy();
 
-    /** Token-based observer set. Mirrors esco C6498a observerSet
+    /** Token-based observer set. Mirrors oem C6498a observerSet
      *  (CopyOnWriteArraySet<Object>). The set transitions 0→1 trigger
      *  viewpoint=2012 + enableDevice + listener register; 1→0 transitions
      *  trigger viewpoint=0 + listener unregister + disableDevice. While
@@ -187,7 +202,7 @@ public final class BydApaViewpointHelper {
      *  ACC-OFF flow uses this to STRADDLE a session boundary: acquire a
      *  fresh "sentry" token before releasing the active "pano" token, so
      *  the set never goes 1→0 and the HAL never sees a viewpoint=0 write
-     *  during the camera close. Mirrors esco's C7340b sentry restart not
+     *  during the camera close. Mirrors oem's C7340b sentry restart not
      *  unregistering its observer until after the new C5319i registers.
      *
      *  Token must be a stable Object reference — a per-instance Object()
@@ -207,6 +222,11 @@ public final class BydApaViewpointHelper {
                 }
                 boolean wasEmpty = observerSet.isEmpty();
                 if (!observerSet.add(token)) {
+                    if (avcForegroundPolicy.isViewpointYielded()) {
+                        logger.info("Viewpoint re-apply skipped — native AVC is foreground"
+                            + " (token=" + token + ", set=" + observerSet.size() + ")");
+                        return;
+                    }
                     // Already held by this token — re-issue viewpoint as
                     // an HAL-reset recovery, mirroring the prior idempotent
                     // call site (PANORAMA_OUTPUT_STATE=1 → re-apply).
@@ -218,41 +238,53 @@ public final class BydApaViewpointHelper {
                     return;
                 }
                 if (wasEmpty) {
-                    // Mirror esco C6498a.m28930h size==1 branch (il/C6498a.java:176-178):
+                    // Mirror oem C6498a.m28930h size==1 branch (il/C6498a.java:176-178):
                     // enableDevice + listener register + viewpoint=2012 fire ONLY on
                     // 0→1 transition. Subsequent holders register silently; the
                     // listener's PANORAMA_OUTPUT_STATE=1 handler is the recovery
                     // path for HAL resets, not a per-add re-issue.
                     invokeEnableDevice(mgr, DEVICE_PANORAMA, resolveListenerFeatures());
                     registerListener(mgr);
-                    int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
-                        PANO_VIEWPOINT_SET_FEATURES,
-                        new int[]{ 7, 0, 1, 0, 0 });
-                    logger.info("Viewpoint acquire 0→1 (vp=" + VIEWPOINT_ON
-                        + ", rc=" + rc + ", token=" + token + ")");
-                    // VERIFY the write. This write is what flips the byd_apa HAL
-                    // out of single-camera dashcam mode into mosaic output; if it
-                    // silently fails the HAL keeps streaming one camera and every
-                    // downstream 2x2 assumption is wrong. Previously rc was logged
-                    // and discarded, so a rejected write was indistinguishable
-                    // from a successful one.
-                    //
-                    // NOTE on the success test: `rc == 0` is an INFERRED
-                    // convention, carried over from other BYD HAL writes in this
-                    // codebase (see byd-write-success-semantics: success is code
-                    // == 0, never >= 0). It is NOT corroborated by the reference
-                    // app — the OEM boxes setIntArray's return straight into a log
-                    // string (il/a.java:169-171) and never branches on it, and no
-                    // BYDAutoManager source or constants ship in the APK. So treat
-                    // a non-zero rc as "unconfirmed", not as proven failure: we
-                    // only surface it, we do not gate anything on it.
-                    lastAcquireRc = rc;
-                    mosaicViewpointConfirmed = (rc == 0);
-                    if (rc != 0) {
-                        logger.warn("Viewpoint write REJECTED (rc=" + rc + " != 0) — the AVM HAL"
-                            + " is probably still in single-camera dashcam mode. Expect a"
-                            + " non-mosaic producer; 2x2 quadrant geometry will be wrong.");
+                    boolean dilink4 = isDilink4CameraMode();
+                    avcForegroundPolicy.beginSession(dilink4);
+                    Di4AvcViewpointPolicy.Action initialAction = dilink4
+                        ? avcForegroundPolicy.onNativeAvcForeground(
+                            probeNativeAvcForeground(), true)
+                        : Di4AvcViewpointPolicy.Action.NONE;
+                    if (initialAction == Di4AvcViewpointPolicy.Action.YIELD) {
+                        yieldViewpointToNativeAvcLocked(mgr, "acquire");
+                    } else {
+                        int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
+                            PANO_VIEWPOINT_SET_FEATURES,
+                            new int[]{ 7, 0, 1, 0, 0 });
+                        logger.info("Viewpoint acquire 0→1 (vp=" + VIEWPOINT_ON
+                            + ", rc=" + rc + ", token=" + token + ")");
+                        // VERIFY the write. This write is what flips the byd_apa HAL
+                        // out of single-camera dashcam mode into mosaic output; if it
+                        // silently fails the HAL keeps streaming one camera and every
+                        // downstream 2x2 assumption is wrong. Previously rc was logged
+                        // and discarded, so a rejected write was indistinguishable
+                        // from a successful one.
+                        //
+                        // NOTE on the success test: `rc == 0` is an INFERRED
+                        // convention, carried over from other BYD HAL writes in this
+                        // codebase (see byd-write-success-semantics: success is code
+                        // == 0, never >= 0). It is NOT corroborated by the reference
+                        // app — the OEM boxes setIntArray's return straight into a log
+                        // string (il/a.java:169-171) and never branches on it, and no
+                        // BYDAutoManager source or constants ship in the APK. So treat
+                        // a non-zero rc as "unconfirmed", not as proven failure: we
+                        // only surface it, we do not gate anything on it.
+                        lastAcquireRc = rc;
+                        mosaicViewpointConfirmed = (rc == 0);
+                        if (rc != 0) {
+                            logger.warn("Viewpoint write REJECTED (rc=" + rc
+                                + " != 0) — the AVM HAL is probably still in"
+                                + " single-camera dashcam mode. Expect a non-mosaic"
+                                + " producer; 2x2 quadrant geometry will be wrong.");
+                        }
                     }
+                    startAvcForegroundMonitorLocked(dilink4);
                 } else {
                     logger.info("Viewpoint acquire (additional holder, no HAL write, token="
                         + token + ", set=" + observerSet.size() + ")");
@@ -274,7 +306,7 @@ public final class BydApaViewpointHelper {
     /** Release {@code token}. If this was the last holder, write viewpoint=0,
      *  unregister the listener, and disableDevice. Otherwise no HAL writes.
      *
-     *  Mirrors esco C6498a.m28933k (line 217-226): on observerSet emptiness
+     *  Mirrors oem C6498a.m28933k (line 217-226): on observerSet emptiness
      *  it calls m28932j(0) + processMonitor.m28941d() + panoStateMonitor.m28937d();
      *  otherwise it just removes the entry silently. */
     public static void release(Object token) {
@@ -311,6 +343,11 @@ public final class BydApaViewpointHelper {
                 } else {
                     logger.warn("release failed: " + t.getMessage());
                 }
+            } finally {
+                // The last holder is gone even when a HAL call failed, so the
+                // DI4-only foreground monitor cannot leak into the next session.
+                avcForegroundPolicy.endSession();
+                stopAvcForegroundMonitorLocked();
             }
         }
     }
@@ -335,13 +372,9 @@ public final class BydApaViewpointHelper {
      * foreground probe needs {@code PACKAGE_USAGE_STATS}, which this app is not
      * granted. Attempting either would just throw on every call.
      *
-     * <p>So we close the same gap with an idempotent periodic re-assert, driven
-     * from the ACC-off keep-alive tick that already runs on DiLink 4. That covers
-     * the failure this is really about: the panorama HAL silently dropping our
-     * viewpoint mid-park (AVC coming to foreground and back, HAL re-init that does
-     * not emit PANORAMA_OUTPUT_STATE=1) leaving the mosaic feed stuck on the
-     * single-camera dashcam view. Slower to react than the reference app's 50 ms,
-     * but it is bounded recovery instead of none.
+     * <p>On DiLink 4, a regular foreground probe supplies the same ownership
+     * handoff when the platform permits it. This periodic re-assert remains the
+     * fallback for HAL resets and for builds that do not expose foreground state.
      *
      * <p>Deliberately a NO-OP when {@code observerSet} is empty — if nothing holds
      * the viewpoint we must not write it, or we would flip the HAL into mosaic mode
@@ -354,6 +387,10 @@ public final class BydApaViewpointHelper {
     public static boolean reassertIfHeld() {
         synchronized (LOCK) {
             if (observerSet.isEmpty()) return false;
+            if (avcForegroundPolicy.isViewpointYielded()) {
+                logger.info("Viewpoint periodic re-assert skipped — native AVC is foreground");
+                return false;
+            }
             // ensureAutoManager(), not the raw cached field. A dead binder causes
             // acquire/release to call invalidateAutoManagerInstance(), which nulls
             // the cache — so reading the field directly made this periodic
@@ -381,7 +418,7 @@ public final class BydApaViewpointHelper {
     }
 
     /** Legacy wrapper: per-process singleton token used by the existing
-     *  startCameraViaAvmReflection callsite. Equivalent to esco's
+     *  startCameraViaAvmReflection callsite. Equivalent to oem's
      *  C5920a.mo26750v register call (single C5920a instance per camera
      *  open). New code paths (sentry straddle) should allocate their own
      *  token so the observerSet semantics work as designed. */
@@ -431,6 +468,164 @@ public final class BydApaViewpointHelper {
         listenerProxy = null;
     }
 
+    /**
+     * Starts the DI4-only fallback for Oemrt's privileged process observer.
+     * The native AVC activity must own the panorama viewpoint while visible;
+     * repeatedly reasserting our viewpoint over it makes its red safety chrome
+     * flicker. If the activity state cannot be observed on a firmware build,
+     * this monitor leaves the established viewpoint behavior unchanged.
+     */
+    private static void startAvcForegroundMonitorLocked(boolean dilink4Session) {
+        if (!dilink4Session || avcForegroundMonitorRunning) return;
+        avcForegroundMonitorRunning = true;
+        Thread monitor = new Thread(() -> {
+            while (avcForegroundMonitorRunning
+                    && !Thread.currentThread().isInterrupted()) {
+                try {
+                    Boolean foreground = probeNativeAvcForeground();
+                    if (foreground != null) {
+                        handleNativeAvcForegroundState(foreground);
+                    }
+                    Thread.sleep(AVC_FOREGROUND_POLL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Throwable t) {
+                    logger.warn("Native AVC foreground probe failed: " + t.getMessage());
+                    try {
+                        Thread.sleep(AVC_FOREGROUND_POLL_MS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }, "PanoAvcForeground");
+        monitor.setDaemon(true);
+        avcForegroundMonitorThread = monitor;
+        monitor.start();
+    }
+
+    private static void stopAvcForegroundMonitorLocked() {
+        avcForegroundMonitorRunning = false;
+        Thread monitor = avcForegroundMonitorThread;
+        avcForegroundMonitorThread = null;
+        if (monitor != null) monitor.interrupt();
+    }
+
+    private static void handleNativeAvcForegroundState(boolean foreground) {
+        Di4AvcViewpointPolicy.Action action;
+        synchronized (LOCK) {
+            action = avcForegroundPolicy.onNativeAvcForeground(
+                foreground, !observerSet.isEmpty());
+            if (action == Di4AvcViewpointPolicy.Action.NONE) return;
+
+            Object mgr = ensureAutoManager();
+            if (mgr == null) return;
+            if (action == Di4AvcViewpointPolicy.Action.YIELD) {
+                yieldViewpointToNativeAvcLocked(mgr, "foreground");
+                return;
+            }
+        }
+
+        // Oemrt delays recovery 50 ms after AVC leaves the foreground so the
+        // native activity can finish its own panorama state transition first.
+        try {
+            Thread.sleep(50L);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+
+        synchronized (LOCK) {
+            if (!avcForegroundPolicy.isRestorePending(!observerSet.isEmpty())) return;
+            Object mgr = ensureAutoManager();
+            if (mgr == null) return;
+            try {
+                int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
+                    PANO_VIEWPOINT_SET_FEATURES,
+                    new int[]{ 7, 0, 1, 0, 0 });
+                avcForegroundPolicy.markViewpointRestored();
+                lastAcquireRc = rc;
+                mosaicViewpointConfirmed = (rc == 0);
+                logger.info("Native AVC left foreground — recovered viewpoint="
+                    + VIEWPOINT_ON + " after 50ms (rc=" + rc + ")");
+            } catch (Throwable t) {
+                logger.warn("Native AVC viewpoint recovery failed: " + t.getMessage());
+            }
+        }
+    }
+
+    private static void yieldViewpointToNativeAvcLocked(Object mgr, String reason) {
+        if (!avcForegroundPolicy.isYieldPending()) return;
+        try {
+            int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
+                PANO_VIEWPOINT_SET_FEATURES,
+                new int[]{ 2, 0, 1, 0, 0 });
+            avcForegroundPolicy.markViewpointYielded();
+            mosaicViewpointConfirmed = false;
+            logger.info("Native AVC " + reason + " — yielded viewpoint="
+                + VIEWPOINT_OFF + " (rc=" + rc + ")");
+        } catch (Throwable t) {
+            logger.warn("Native AVC viewpoint yield failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * @return {@code TRUE}/{@code FALSE} when activity state is observable, or
+     *         {@code null} when this firmware denies the query. The nullable
+     *         result preserves the existing behavior rather than guessing.
+     */
+    private static Boolean probeNativeAvcForeground() {
+        Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+        if (ctx == null) return null;
+        Object service = ctx.getSystemService(Context.ACTIVITY_SERVICE);
+        if (!(service instanceof ActivityManager)) return null;
+        ActivityManager activityManager = (ActivityManager) service;
+
+        try {
+            List<ActivityManager.RunningTaskInfo> tasks = activityManager.getRunningTasks(1);
+            if (tasks != null && !tasks.isEmpty()) {
+                ComponentName topActivity = tasks.get(0).topActivity;
+                if (topActivity != null) {
+                    return AVC_PACKAGE.equals(topActivity.getPackageName());
+                }
+            }
+        } catch (Throwable ignored) {
+            // Fall through to the process-importance probe.
+        }
+
+        try {
+            List<ActivityManager.RunningAppProcessInfo> processes =
+                activityManager.getRunningAppProcesses();
+            if (processes == null) return null;
+            for (ActivityManager.RunningAppProcessInfo process : processes) {
+                if (process == null || process.pkgList == null) continue;
+                for (String pkg : process.pkgList) {
+                    if (AVC_PACKAGE.equals(pkg)) {
+                        return process.importance
+                            <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND;
+                    }
+                }
+            }
+            return false;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean isDilink4CameraMode() {
+        try {
+            org.json.JSONObject camera = com.overdrive.app.config.UnifiedConfigManager
+                .loadConfig().optJSONObject("camera");
+            return camera != null
+                && Di4AvcViewpointPolicy.isEnabledForCameraMode(
+                    camera.optString("cameraMode", "default"));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private static Object ensureAutoManager() {
         if (autoManagerInstance != null) return autoManagerInstance;
         Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
@@ -449,7 +644,7 @@ public final class BydApaViewpointHelper {
         return autoManagerInstance;
     }
 
-    /** Mirror esco panoStateMonitor.m28936c: register an OnBYDAutoListener so
+    /** Mirror oem panoStateMonitor.m28936c: register an OnBYDAutoListener so
      *  we can re-apply viewpoint=2012 if PANORAMA_OUTPUT_STATE flips back to
      *  1 (HAL re-init, native app yielded). The listener interface is an
      *  inner of BYDAutoManager — load it reflectively so the SDK-stub
@@ -491,6 +686,11 @@ public final class BydApaViewpointHelper {
                             // release() runs on whichever thread closes the camera.
                             synchronized (LOCK) {
                                 if (observerSet.isEmpty()) return null;  // last release() already ran
+                                if (avcForegroundPolicy.isViewpointYielded()) {
+                                    logger.info("Skipped PANORAMA_OUTPUT_STATE recovery —"
+                                        + " native AVC is foreground");
+                                    return null;
+                                }
                                 try {
                                     int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
                                         PANO_VIEWPOINT_SET_FEATURES,
@@ -504,7 +704,7 @@ public final class BydApaViewpointHelper {
                         }
                         // PANORAMA_OUTPUT_STATE=7 (compositor reporting
                         // non-matching mode) is intentionally unhandled.
-                        // Esco only releases viewpoint here when AVC is
+                        // Oem only releases viewpoint here when AVC is
                         // foreground (il/C6498a.java:310-313 — guarded by
                         // processMonitor.m28938a()). We don't have UsageStats
                         // access, so we previously fired UNCONDITIONAL release

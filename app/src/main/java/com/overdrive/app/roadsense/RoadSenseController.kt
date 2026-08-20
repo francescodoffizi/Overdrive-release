@@ -161,9 +161,22 @@ class RoadSenseController @JvmOverloads constructor(
         coverageSupplier = { lastCoverageLevel },
         clock = clock,
     )
+    // Audio channel the chime plays on (default navigation = the OEM guidance stream).
+    // @Volatile: written on the tick/regime-poll threads from the config snapshot, read by
+    // the cue's supplier when a chime fires — so a settings change applies live and the
+    // chime never hits disk itself.
+    @Volatile private var warnAudioChannel = "navigation"
+    @Volatile private var warnAudioVolume =
+        com.overdrive.app.roadsense.config.RoadSenseChimeLevels.DEFAULT_MASTER_PERCENT
     private val warnings = com.overdrive.app.roadsense.warn.WarningCoordinator(
         store, visualSink = visualSink, clock = clock,
-        audio = com.overdrive.app.roadsense.warn.RoadSenseAudioCue(appContext),
+        // Chimes go out through the app-process player so they can ride the OEM-extended
+        // nav stream; a daemon-side SoundPool/ToneGenerator can only reach usage-routed or
+        // public streams. See BridgedAudioCue.
+        audio = com.overdrive.app.roadsense.warn.BridgedAudioCue(
+            channelSupplier = { warnAudioChannel },
+            volumeSupplier = { warnAudioVolume },
+        ),
     )
 
     // Rolling gyro peaks over the current event window, reset when an event closes.
@@ -417,6 +430,13 @@ class RoadSenseController @JvmOverloads constructor(
             enabledListener = null
             attached = false
             stop()
+            // Unconditional sidecar stop: stop() early-returns when !started, so
+            // if a prior daemon instance was force-halted (Runtime.halt / kill)
+            // its app-process IMU sidecar can survive as an orphan — this fresh
+            // controller never saw started=true and would leave it streaming
+            // batches at a dead socket forever. The stop is an idempotent
+            // fire-and-forget `am stopservice`; a redundant call is a no-op.
+            RoadSenseImuSidecarService.stop()
         }
     }
 
@@ -458,7 +478,11 @@ class RoadSenseController @JvmOverloads constructor(
         started = true
         store.init()
         store.start()
-        groundTruth.init()
+        // groundTruth is deliberately NOT init()ed here: it opens lazily on the first
+        // label write (see GroundTruthStore.record). Labels arrive at most a few times
+        // per drive, but an eagerly opened H2 store keeps MVStore background writer/
+        // compaction threads running for the whole session — measurable idle CPU.
+        // stop() below stays unconditional (a no-op when the store was never opened).
         // Restore persisted per-vehicle calibration so maturity ACCUMULATES across
         // daemon restarts / reboots / app updates instead of resetting to 0 every
         // trip (a head unit power-cycles with the car, so without this the overlay
@@ -492,6 +516,14 @@ class RoadSenseController @JvmOverloads constructor(
         if (!started) return
         started = false
         featureEnabled = false
+        // Stop the IMU sidecar FIRST, before anything below that can block
+        // (the synchronized classification drain can wait on an in-flight
+        // IMU_BATCH; the calibration/coverage/H2 flushes do file I/O). The
+        // stop is a fire-and-forget `am stopservice` exec (~non-blocking),
+        // and issuing it early both halts the ~10 Hz inbound batch stream
+        // during teardown and guarantees the app-process service is torn
+        // down even if a later step wedges and the process is halted.
+        RoadSenseImuSidecarService.stop()
         // The overlay is an app-process service, independent of this daemon-side
         // detector. The master-disable reconcile stops the ticker immediately, so no
         // later vehicle-state edge exists to tear the overlay down for us.
@@ -525,7 +557,7 @@ class RoadSenseController @JvmOverloads constructor(
         imuStream.stop()
         // Stop the scoped fast-dynamics poll if it was running (DRIVING at shutdown).
         try { vehicleSource.collectorOrNull()?.stopFastDynamicsPoll() } catch (_: Throwable) {}
-        RoadSenseImuSidecarService.stop()
+        // (sidecar stop already issued at the top of stop(), before the drain)
         warnings.release()
         // Flush + close any open raw recording (debug, D-036).
         try { rawRecorder.stop() } catch (_: Throwable) {}
@@ -652,6 +684,33 @@ class RoadSenseController @JvmOverloads constructor(
         val newRegime = if (!featureEnabled) VehicleStateGate.Regime.OFF
         else VehicleStateGate.evaluate(accOn, accAuth, gear)
         if (newRegime == regime) return
+        // RACE FIX: serialize the edge with stop()/detach(). This tick may have
+        // passed the started check at the top just before shutdown or a toggle-
+        // off flipped it; applying the edge would then re-launch the IMU sidecar
+        // (startImu/slowImu) AFTER stop() issued its `am stopservice`, orphaning
+        // the app-process service until the next daemon respawn. Recheck started
+        // under the same lock stop()'s callers hold so no later start can win;
+        // also recheck the edge in case another path already moved the regime.
+        synchronized(lifecycleLock) {
+            if (!started) return
+            if (newRegime == regime) return
+            applyRegimeTransitionLocked(newRegime, cfgSnap, now, accOn, accAuth, gear)
+        }
+    }
+
+    /**
+     * Apply a regime edge: sidecar start/stop, overlay lifecycle, transient-reset
+     * flags, fast-dynamics poll and IMU stream rate. MUST be called under
+     * [lifecycleLock] with started=true (see the race note in onVehicleStatePoll).
+     */
+    private fun applyRegimeTransitionLocked(
+        newRegime: VehicleStateGate.Regime,
+        cfgSnap: RoadSenseConfig.Snapshot,
+        now: Long,
+        accOn: Boolean,
+        accAuth: Boolean,
+        gear: Int,
+    ) {
         val action = VehicleStateGate.transition(regime, newRegime)
         Log.i(TAG, "regime $regime → $newRegime")
         // Persist regime transitions (survives a no-ADB drive). gear + acc context so
@@ -861,6 +920,8 @@ class RoadSenseController @JvmOverloads constructor(
         // they've stopped (regime → RELAXED/OFF). Cheap mtime-gated read.
         val cfgTick = RoadSenseConfig.snapshot(forceReload = false)
         calibrationMode = cfgTick.calibrationMode
+        warnAudioChannel = cfgTick.warnAudioChannel
+        warnAudioVolume = cfgTick.warnAudioVolume
 
         // Raw-IMU recorder lifecycle (D-036, debug): start/stop with the rawRecord flag, and
         // consume a one-shot ground-truth MARK poked into roadSense.rawMark (adb/web). Runs
@@ -909,15 +970,25 @@ class RoadSenseController @JvmOverloads constructor(
         // coming up. Only meaningful once data has flowed at least once (isStalled guards
         // lastFeedMs>0), so a not-yet-started stream on a cold tick doesn't false-trip.
         if (imuStream.isStalled(now) && (now - lastSidecarRelaunchMs) > SIDECAR_RELAUNCH_MS) {
-            lastSidecarRelaunchMs = now
-            Log.w(TAG, "IMU sidecar stalled → relaunch FAST")
-            plog.info("imu sidecar stalled (no batch >${DaemonImuStream.DEFAULT_STALL_MS}ms) → relaunching FAST")
-            try {
-                RoadSenseImuSidecarService.start(RoadSenseImuSidecarService.ImuRate.FAST)
-            } catch (t: Throwable) { Log.w(TAG, "sidecar relaunch failed: ${t.message}") }
+            // RACE FIX (same as onVehicleStatePoll's edge): recheck started under
+            // lifecycleLock before relaunching — this tick may have passed the
+            // started check at the top just before stop() flipped it, and a
+            // relaunch here would resurrect the sidecar stop() just stopped.
+            synchronized(lifecycleLock) {
+                if (!started) return
+                lastSidecarRelaunchMs = now
+                Log.w(TAG, "IMU sidecar stalled → relaunch FAST")
+                plog.info("imu sidecar stalled (no batch >${DaemonImuStream.DEFAULT_STALL_MS}ms) → relaunching FAST")
+                try {
+                    RoadSenseImuSidecarService.start(RoadSenseImuSidecarService.ImuRate.FAST)
+                } catch (t: Throwable) { Log.w(TAG, "sidecar relaunch failed: ${t.message}") }
+            }
         }
 
-        val cfg = RoadSenseConfig.snapshot(forceReload = false)
+        // One coherent snapshot drives both warning gates and the channel/volume
+        // suppliers above. A second read here could straddle a settings write and pair
+        // the new warning policy with the previous audio destination for one tick.
+        val cfg = cfgTick
 
         val rawPose = locationSource.latest(now)
         if (rawPose == null) {

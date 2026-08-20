@@ -50,6 +50,85 @@
         android:layout_height="match_parent"
         android:layout_gravity="center" />
 
+    <LinearLayout
+        android:id="@+id/playerLoadingContainer"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <ProgressBar
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:indeterminateTint="?attr/colorPrimary" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/video_player_buffering"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/playerErrorContainer"
+        android:layout_width="320dp"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="#E61C1B1F"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/tvPlayerError"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="@string/video_player_error_title"
+            android:textColor="#FFFFFF"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:text="@string/video_player_error_body"
+            android:textColor="#B3FFFFFF"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnPlayerRetry"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="wrap_content"
+                android:layout_height="48dp"
+                android:text="@string/video_player_retry"
+                android:textAllCaps="false" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnPlayerErrorNext"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="48dp"
+                android:layout_marginStart="8dp"
+                android:text="@string/video_player_next"
+                android:textAllCaps="false"
+                android:visibility="gone" />
+        </LinearLayout>
+    </LinearLayout>
+
     <!-- ==================== TOP BAR ==================== -->
     <!-- Dark scrim is intentional; see header comment. -->
     <LinearLayout
@@ -65,8 +144,8 @@
 
         <ImageButton
             android:id="@+id/btnBack"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/cd_back"
             android:scaleType="centerInside"
@@ -106,8 +185,8 @@
         -->
         <ImageButton
             android:id="@+id/btnMute"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:layout_marginStart="8dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/cd_player_mute"
@@ -117,8 +196,8 @@
 
         <ImageButton
             android:id="@+id/btnFullscreen"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:layout_marginStart="8dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/cd_player_maximize"
@@ -150,7 +229,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|center_horizontal"
-        android:layout_marginBottom="120dp"
+        android:layout_marginBottom="184dp"
         android:background="@drawable/bg_quadrant_bar"
         android:clickable="true"
         android:gravity="center_vertical"
@@ -160,8 +239,8 @@
 
         <ImageButton
             android:id="@+id/btnQuadrantAll"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/cd_player_quadrant_all"
             android:scaleType="centerInside"
@@ -169,8 +248,8 @@
 
         <ImageButton
             android:id="@+id/btnQuadrantFront"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:layout_marginStart="2dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/cd_player_quadrant_front"
@@ -179,8 +258,8 @@
 
         <ImageButton
             android:id="@+id/btnQuadrantRight"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:layout_marginStart="2dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/cd_player_quadrant_right"
@@ -189,8 +268,8 @@
 
         <ImageButton
             android:id="@+id/btnQuadrantRear"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:layout_marginStart="2dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/cd_player_quadrant_rear"
@@ -199,8 +278,8 @@
 
         <ImageButton
             android:id="@+id/btnQuadrantLeft"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:layout_marginStart="2dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/cd_player_quadrant_left"
@@ -222,7 +301,7 @@
         <!-- Event Timeline -->
         <FrameLayout
             android:layout_width="match_parent"
-            android:layout_height="32dp"
+            android:layout_height="48dp"
             android:layout_marginBottom="4dp">
 
             <View
@@ -234,7 +313,9 @@
             <com.overdrive.app.ui.view.EventTimelineView
                 android:id="@+id/eventTimeline"
                 android:layout_width="match_parent"
-                android:layout_height="match_parent" />
+                android:layout_height="match_parent"
+                android:clickable="true"
+                android:focusable="true" />
         </FrameLayout>
 
         <!-- Seek bar — brand teal accent so it matches the rest of the app -->
@@ -256,8 +337,8 @@
 
             <ImageButton
                 android:id="@+id/btnPrev"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:contentDescription="@string/cd_player_prev"
                 android:scaleType="centerInside"
@@ -267,8 +348,8 @@
 
             <ImageButton
                 android:id="@+id/btnPlayPause"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
                 android:layout_marginStart="2dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:contentDescription="@string/cd_play_pause"
@@ -278,8 +359,8 @@
 
             <ImageButton
                 android:id="@+id/btnNext"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
                 android:layout_marginStart="2dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:contentDescription="@string/cd_player_next"
@@ -308,9 +389,8 @@
 
             <TextView
                 android:id="@+id/tvDuration"
-                android:layout_width="0dp"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
                 android:fontFamily="monospace"
                 android:text="@string/player_time_zero"
                 android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
@@ -318,8 +398,13 @@
 
             <TextView
                 android:id="@+id/tvEventInfo"
-                android:layout_width="wrap_content"
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:gravity="end"
+                android:maxLines="1"
                 android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
                 android:textColor="#B3FFFFFF" />
         </LinearLayout>

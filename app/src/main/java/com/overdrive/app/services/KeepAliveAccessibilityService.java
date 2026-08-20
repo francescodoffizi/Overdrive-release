@@ -23,8 +23,9 @@ import java.util.concurrent.Executors;
  * This gives our app the highest possible process priority — same tier as the
  * keyboard or phone call — preventing the 24-hour kill cycle on newer BYD firmware.
  *
- * The service itself is a no-op for accessibility events. Its sole purpose is
- * process keep-alive. The foreground notification provides user visibility.
+ * Accessibility events are used only to cache the active package for conditional
+ * key mappings; no window content is inspected. The foreground notification
+ * provides user visibility.
  *
  * Enable via ADB (one-time):
  *   settings put secure enabled_accessibility_services com.overdrive.app/com.overdrive.app.services.KeepAliveAccessibilityService
@@ -110,6 +111,26 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         }
         instance = this;
 
+        // Seed the conditional-keymap foreground cache in case the active window
+        // was already open before this service connected. Future window changes
+        // update the same cache from onAccessibilityEvent().
+        AccessibilityNodeInfo root = null;
+        try {
+            root = getRootInActiveWindow();
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
+                    root != null ? stringValue(root.getPackageName()) : null);
+        } catch (Throwable t) {
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+            Log.w(TAG, "Unable to seed active package: " + t.getMessage());
+        } finally {
+            if (root != null) {
+                try {
+                    root.recycle();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+
         // Prime the key-mapping snapshot off-thread so the first hardware key
         // press already has its bindings (onKeyEvent never reads disk itself).
         try {
@@ -151,9 +172,28 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        // Two consumers now share this callback, so dispatch on event type rather than
+        // assuming one. Upstream tracks the foreground package from window-state changes for
+        // conditional key mappings; seat capture watches for a long-press on BYD's own
+        // position buttons. Neither is interested in the other's event.
+        if (event == null) return;
+        final int type = event.getEventType();
+
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            try {
+                KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
+                        stringValue(event.getPackageName()));
+            } catch (Throwable t) {
+                // Foreground detection is advisory. Unknown must fail open so a
+                // conditional mapping never suppresses the vehicle's default key action.
+                KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+            }
+            return;
+        }
+
         // Only interested in the user long-pressing a BYD seat-position button (the
         // "save current position" gesture). Everything else is ignored cheaply.
-        if (event == null || event.getEventType() != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return;
+        if (type != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return;
         CharSequence pkg = event.getPackageName();
         if (pkg == null) return;
         if (!SEAT_POS_PKG.contentEquals(pkg) && !SEAT_POS_WIDGET_PKG.contentEquals(pkg)) return;
@@ -161,6 +201,10 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         if (slot < 1) return;
         Log.i(TAG, "seat-position long-press: slot " + slot + " — capturing geometry");
         captureSeatPosition(slot);
+    }
+
+    private static String stringValue(CharSequence value) {
+        return value != null ? value.toString() : null;
     }
 
     /**

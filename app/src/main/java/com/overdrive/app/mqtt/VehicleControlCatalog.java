@@ -199,6 +199,27 @@ public final class VehicleControlCatalog {
 
         public ControlAction toAction(String sub, String payload, BydVehicleData snap) {
             try {
+                // The only catalog entity with subtopics is climate. Covers advertise a
+                // position topic for HA compatibility, but this catalog deliberately has no
+                // position command; accepting OPEN on /position/set would turn a malformed
+                // position publish into a physical movement.
+                if ("climate".equals(platform)) {
+                    if (!"mode".equals(sub) && !"temperature".equals(sub)
+                            && !"fan_mode".equals(sub)) {
+                        return null;
+                    }
+                } else if (sub != null) {
+                    return null;
+                }
+
+                // AEB is enable-only. In particular, a blind "toggle" can resolve to OFF
+                // after a previously committed ON, so it must not reach the generic toggle
+                // resolver below.
+                if ("adas_aeb".equals(key) && payload != null
+                        && "toggle".equalsIgnoreCase(payload.trim())) {
+                    return null;
+                }
+
                 if (payload != null && "toggle".equalsIgnoreCase(payload.trim())) {
                     // Two toggle strategies:
                     //  (a) SWITCH with a live state reader → flip the reported on/off.
@@ -228,12 +249,18 @@ public final class VehicleControlCatalog {
                     // Anything else: "toggle" falls through to the builder unchanged
                     // (which treats the unknown payload via its own default).
                 }
+                payload = normalizePayload(sub, payload);
+                if (payload == null) return null;
                 ControlAction action = cmd.build(sub, payload, snap);
                 // Remember the last concrete payload we commanded for a cycle-capable
                 // select, so the NEXT "toggle" advances from here even without readback.
+                // This is deferred until dispatch; a blocked or unsupported write
+                // must not advance a state the car never received.
                 if (action != null && options != null && !options.isEmpty()
                         && payload != null && !"toggle".equalsIgnoreCase(payload.trim())) {
-                    LAST_SELECT_PAYLOAD.put(key, payload);
+                    final String committed = payload;
+                    final String k = key;
+                    action = action.withToggleCommit(() -> LAST_SELECT_PAYLOAD.put(k, committed));
                 }
                 // Same for a set-only switch (mirror fold): record the concrete on/off value
                 // just commanded so the next "toggle" flips from it. DEFERRED, not applied
@@ -252,6 +279,107 @@ public final class VehicleControlCatalog {
                 }
                 return action;
             } catch (Exception e) { return null; }
+        }
+
+        /**
+         * Reject malformed ingress before a command builder can interpret it as a
+         * default. MQTT, key mappings, and automations all use this boundary.
+         */
+        private String normalizePayload(String sub, String payload) {
+            String value = payload == null ? "" : payload.trim();
+            if ("switch".equals(platform)) {
+                Boolean enabled = strictBoolean(value);
+                if (enabled == null) return null;
+                // AEB is exposed enable-only. Reject a direct MQTT/keymap "off"
+                // before it reaches the lower SDK guard.
+                if ("adas_aeb".equals(key) && !enabled.booleanValue()) return null;
+                return enabled.booleanValue()
+                        ? (onVal != null ? onVal : "on")
+                        : (offVal != null ? offVal : "off");
+            }
+            if ("cover".equals(platform)) {
+                if ("OPEN".equalsIgnoreCase(value)) return "OPEN";
+                if ("CLOSE".equalsIgnoreCase(value)) return "CLOSE";
+                if ("STOP".equalsIgnoreCase(value)) return "STOP";
+                return null;
+            }
+            if ("select".equals(platform)) {
+                // Older keymap/automation payloads used a four-level seat scale. The HAL and
+                // cloud both have three levels, so retain "medium" as a high alias without
+                // advertising it or allowing the old raw "3" value through.
+                if (isSeatClimateControl() && "medium".equalsIgnoreCase(value)) return "high";
+                if (options == null) return null;
+                for (String option : options) {
+                    if (option.equalsIgnoreCase(value)) return option;
+                }
+                return null;
+            }
+            if ("number".equals(platform)) {
+                try {
+                    int number = Integer.parseInt(value);
+                    if (number < min || number > max) return null;
+                    // HA's min/max/step declaration is also the ingress contract. Without
+                    // this check, e.g. a charge cap of 51 bypassed the advertised 5% steps.
+                    if (step > 0d) {
+                        double steps = (number - min) / step;
+                        if (Math.abs(steps - Math.rint(steps)) > 0.000001d) return null;
+                    }
+                    return String.valueOf(number);
+                } catch (NumberFormatException ignored) {
+                    return null;
+                }
+            }
+            if ("climate".equals(platform)) {
+                if ("mode".equals(sub)) {
+                    if ("off".equalsIgnoreCase(value)) return "off";
+                    if ("auto".equalsIgnoreCase(value)) return "auto";
+                    return null;
+                }
+                if ("temperature".equals(sub)) {
+                    try {
+                        double temperature = Double.parseDouble(value);
+                        if (Double.isNaN(temperature) || Double.isInfinite(temperature)
+                                || temperature < min || temperature > max) {
+                            return null;
+                        }
+                        if (step > 0d) {
+                            double steps = (temperature - min) / step;
+                            if (Math.abs(steps - Math.rint(steps)) > 0.000001d) return null;
+                        }
+                        return value;
+                    } catch (NumberFormatException ignored) {
+                        return null;
+                    }
+                }
+                if ("fan_mode".equals(sub)) {
+                    try {
+                        int fan = Integer.parseInt(value);
+                        return fan >= 1 && fan <= 7 ? String.valueOf(fan) : null;
+                    } catch (NumberFormatException ignored) {
+                        return null;
+                    }
+                }
+                return null;
+            }
+            if ("button".equals(platform)) {
+                return "PRESS".equalsIgnoreCase(value) ? "PRESS" : null;
+            }
+            if ("text".equals(platform)) {
+                return value.isEmpty() ? null : value;
+            }
+            if ("lock".equals(platform)) {
+                if ("LOCK".equalsIgnoreCase(value)) return "LOCK";
+                if ("UNLOCK".equalsIgnoreCase(value)) return "UNLOCK";
+                return null;
+            }
+            // New catalog platforms must define an explicit payload domain before they can
+            // become remotely controllable.
+            return null;
+        }
+
+        private boolean isSeatClimateControl() {
+            return "seat_heat_driver".equals(key) || "seat_heat_passenger".equals(key)
+                    || "seat_vent_driver".equals(key) || "seat_vent_passenger".equals(key);
         }
 
         /**
@@ -316,7 +444,7 @@ public final class VehicleControlCatalog {
                         c.put("temperature_state_topic", baseTopic + "/climate_setpoint");
                         c.put("min_temp", min); c.put("max_temp", max); c.put("temp_step", step);
                         JSONArray fans = new JSONArray();
-                        for (int i = 0; i <= 7; i++) fans.put(String.valueOf(i));
+                        for (int i = 1; i <= 7; i++) fans.put(String.valueOf(i));
                         c.put("fan_modes", fans);
                         c.put("fan_mode_command_topic", cmdBase + "/fan_mode/set");
                         c.put("fan_mode_state_topic", baseTopic + "/ac_fan");
@@ -377,10 +505,19 @@ public final class VehicleControlCatalog {
                         c.put("payload_press", "PRESS");
                         break;
                     }
+                    case "text": {
+                        c.put("command_topic", cmdBase + "/set");
+                        c.put("mode", "text");
+                        break;
+                    }
                     case "switch":
                     default: {
                         c.put("command_topic", cmdBase + "/set");
-                        if (stateKey != null) c.put("state_topic", baseTopic + "/" + stateKey);
+                        if (stateKey != null) {
+                            c.put("state_topic", baseTopic + "/" + stateKey);
+                        } else {
+                            c.put("optimistic", true);
+                        }
                         c.put("payload_on", onVal != null ? onVal : "1");
                         c.put("payload_off", offVal != null ? offVal : "0");
                         c.put("state_on", onVal != null ? onVal : "1");
@@ -416,6 +553,14 @@ public final class VehicleControlCatalog {
 
     public static Collection<ControlEntity> all() { return ENTITIES.values(); }
     public static ControlEntity get(String key) { return ENTITIES.get(key); }
+
+    /**
+     * Generic charge-stop controls are dynamically exposed in HA only after the
+     * matching SDK backend has a complete, verified readback.
+     */
+    static boolean isGenericChargeCapControl(String key) {
+        return "charge_cap_enabled".equals(key) || "charge_cap_percent".equals(key);
+    }
 
     // ── factories ───────────────────────────────────────────────────────
     static ControlEntity sw(String key, String name, String icon, String category, String stateKey,
@@ -460,6 +605,10 @@ public final class VehicleControlCatalog {
         return new ControlEntity("climate", "climate", "Climate", "mdi:air-conditioner", null, false, null,
                 17, 33, 1, null, null, null, null, null, cmd, null);
     }
+    static ControlEntity text(String key, String name, String icon, String category, CommandFn cmd) {
+        return new ControlEntity(key, "text", name, icon, category, false, null,
+                0, 0, 0, null, null, null, null, null, cmd, null);
+    }
 
     // ── helpers ─────────────────────────────────────────────────────────
     static int pInt(String s, int dflt) { try { return Integer.parseInt(s.trim()); } catch (Exception e) { return dflt; } }
@@ -469,32 +618,249 @@ public final class VehicleControlCatalog {
         String t = s.trim();
         return t.equals("1") || t.equalsIgnoreCase("on") || t.equalsIgnoreCase("true") || t.equalsIgnoreCase("ON");
     }
+    private static Boolean strictBoolean(String value) {
+        if (value == null) return null;
+        String normalized = value.trim();
+        if ("1".equals(normalized) || "on".equalsIgnoreCase(normalized)
+                || "true".equalsIgnoreCase(normalized)) return Boolean.TRUE;
+        if ("0".equals(normalized) || "off".equalsIgnoreCase(normalized)
+                || "false".equalsIgnoreCase(normalized)) return Boolean.FALSE;
+        return null;
+    }
+    private static Integer chargeCapPercent(String value) {
+        try {
+            int percent = Integer.parseInt(value.trim());
+            return percent >= 50 && percent <= 100 ? Integer.valueOf(percent) : null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+    /** Build a parameterized remote-climate start from a HA text JSON payload. */
+    private static ControlAction remoteClimateStartAction(String payload) {
+        try {
+            JSONObject request = new JSONObject(payload);
+            Object rawTemp = request.opt("temp");
+            Object rawDuration = request.opt("durationMinutes");
+            if (!(rawTemp instanceof Number) || !(rawDuration instanceof Number)) return null;
+            double temp = ((Number) rawTemp).doubleValue();
+            double duration = ((Number) rawDuration).doubleValue();
+            if (Double.isNaN(temp) || Double.isInfinite(temp) || temp != Math.rint(temp)
+                    || temp < 15D || temp > 31D || duration != Math.rint(duration)
+                    || duration < Integer.MIN_VALUE || duration > Integer.MAX_VALUE) {
+                return null;
+            }
+            int minutes = (int) duration;
+            if (minutes != 10 && minutes != 15 && minutes != 20
+                    && minutes != 25 && minutes != 30) {
+                return null;
+            }
+            return ControlAction.of(new VehicleCommandRouter.ClimateOnCommand(temp, minutes));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+    /**
+     * Build a BOOKINGAIR lifecycle command from one HA text payload. Booking IDs and times may
+     * be canonical decimal strings so 64-bit identifiers are never rounded by a JSON client.
+     */
+    private static ControlAction remoteClimateScheduleAction(String payload) {
+        try {
+            JSONObject request = new JSONObject(payload);
+            Object rawAction = request.opt("action");
+            if (!(rawAction instanceof String)) return null;
+            String action = (String) rawAction;
+            boolean create = "create".equals(action);
+            boolean update = "update".equals(action);
+            boolean delete = "delete".equals(action);
+            if (!create && !update && !delete) return null;
+
+            Long bookingId = request.has("bookingId")
+                    ? positiveJsonLong(request, "bookingId") : null;
+            if (request.has("bookingId") && bookingId == null) return null;
+            if ((update || delete) && bookingId == null) return null;
+            if (delete) {
+                return ControlAction.of(new VehicleCommandRouter.ClimateScheduleCommand(
+                        VehicleCommandRouter.ClimateScheduleCommand.REMOVE,
+                        bookingId, null, null, null));
+            }
+
+            Long bookingTime = positiveJsonLong(request, "bookingTime");
+            long nowSeconds = System.currentTimeMillis() / 1000L;
+            if (bookingTime == null || bookingTime.longValue() <= nowSeconds + 30L) return null;
+
+            double temp = 22D;
+            if (request.has("temp")) {
+                Object rawTemp = request.opt("temp");
+                if (!(rawTemp instanceof Number)) return null;
+                temp = ((Number) rawTemp).doubleValue();
+            }
+            if (Double.isNaN(temp) || Double.isInfinite(temp) || temp != Math.rint(temp)
+                    || temp < 15D || temp > 31D) {
+                return null;
+            }
+
+            int duration = 20;
+            if (request.has("durationMinutes")) {
+                Object rawDuration = request.opt("durationMinutes");
+                if (!(rawDuration instanceof Number)) return null;
+                double raw = ((Number) rawDuration).doubleValue();
+                if (Double.isNaN(raw) || Double.isInfinite(raw) || raw != Math.rint(raw)
+                        || raw < Integer.MIN_VALUE || raw > Integer.MAX_VALUE) {
+                    return null;
+                }
+                duration = (int) raw;
+            }
+            if (!isValidRemoteClimateDuration(duration)) return null;
+
+            return ControlAction.of(new VehicleCommandRouter.ClimateScheduleCommand(
+                    create ? VehicleCommandRouter.ClimateScheduleCommand.CREATE
+                            : VehicleCommandRouter.ClimateScheduleCommand.MODIFY,
+                    bookingId, bookingTime, Double.valueOf(temp), Integer.valueOf(duration)));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+    /** Positive integral JSON value or canonical positive decimal text, preserving 64-bit IDs. */
+    private static Long positiveJsonLong(JSONObject request, String key) {
+        if (request == null || !request.has(key) || request.isNull(key)) return null;
+        Object raw = request.opt(key);
+        long value;
+        try {
+            if (raw instanceof String) {
+                String decimal = (String) raw;
+                if (!decimal.matches("[1-9][0-9]*")) return null;
+                value = Long.parseLong(decimal);
+            } else if (raw instanceof Byte || raw instanceof Short
+                    || raw instanceof Integer || raw instanceof Long) {
+                value = ((Number) raw).longValue();
+            } else if (raw instanceof Number) {
+                double number = ((Number) raw).doubleValue();
+                if (Double.isNaN(number) || Double.isInfinite(number)
+                        || number != Math.rint(number)
+                        || number > 9_007_199_254_740_991D
+                        || number < 1D) {
+                    return null;
+                }
+                value = (long) number;
+            } else {
+                return null;
+            }
+        } catch (NumberFormatException invalid) {
+            return null;
+        }
+        return value > 0L ? Long.valueOf(value) : null;
+    }
+    private static boolean isValidRemoteClimateDuration(int minutes) {
+        return minutes == 10 || minutes == 15 || minutes == 20
+                || minutes == 25 || minutes == 30;
+    }
+    /** Build a cloud smart-charge schedule from the JSON accepted by the HA text entity. */
+    private static ControlAction smartChargeScheduleAction(String payload) {
+        try {
+            JSONObject schedule = new JSONObject(payload);
+            Object rawStart = schedule.opt("startChargeTime");
+            Object rawEnd = schedule.opt("endChargeTime");
+            Object rawWay = schedule.opt("chargeWay");
+            if (!(rawStart instanceof String) || !(rawEnd instanceof String)
+                    || !(rawWay instanceof String)) {
+                return null;
+            }
+            String start = (String) rawStart;
+            String end = (String) rawEnd;
+            String way = (String) rawWay;
+            if (!isValidChargingTime(start, false) || !isValidChargingTime(end, true)
+                    || !isValidChargeWay(way)) {
+                return null;
+            }
+            boolean enabled = true;
+            if (schedule.has("enabled")) {
+                Object rawEnabled = schedule.opt("enabled");
+                if (!(rawEnabled instanceof Boolean)) return null;
+                enabled = ((Boolean) rawEnabled).booleanValue();
+            }
+            return ControlAction.of(new VehicleCommandRouter.ChargeScheduleCommand(
+                    start, end, way, enabled));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+    private static boolean isValidChargingTime(String value, boolean allowFull) {
+        if (allowFull && "full".equals(value)) return true;
+        if (value == null || !value.matches("\\d{2}:\\d{2}")) return false;
+        int hour = (value.charAt(0) - '0') * 10 + value.charAt(1) - '0';
+        int minute = (value.charAt(3) - '0') * 10 + value.charAt(4) - '0';
+        return hour <= 23 && minute <= 59;
+    }
+    private static boolean isValidChargeWay(String value) {
+        if ("s".equals(value) || "e".equals(value)) return true;
+        if (value == null || value.isEmpty()) return false;
+        String[] days = value.split(",", -1);
+        boolean[] seen = new boolean[7];
+        for (String day : days) {
+            if (day.length() != 1 || day.charAt(0) < '0' || day.charAt(0) > '6') return false;
+            int index = day.charAt(0) - '0';
+            if (seen[index]) return false;
+            seen[index] = true;
+        }
+        return true;
+    }
     private static int seatHeat(BydVehicleData s, int idx) {
         return (s != null && s.seatHeat != null && s.seatHeat.length > idx) ? s.seatHeat[idx] : 0;
     }
     private static int seatCool(BydVehicleData s, int idx) {
         return (s != null && s.seatCool != null && s.seatCool.length > idx) ? s.seatCool[idx] : 0;
     }
-    private static final List<String> LEVEL_4 = java.util.Arrays.asList("off", "low", "medium", "high");
-    private static int levelIndex(String payload) {
-        int i = LEVEL_4.indexOf(payload.trim().toLowerCase());
-        return i >= 0 ? i : pInt(payload, 0);
+    /**
+     * Local seat telemetry may seed the composite cloud command only when all
+     * sibling levels are current. The router can otherwise use a fresh cloud
+     * vehicle snapshot and fails closed when neither source is complete.
+     */
+    private static boolean hasCurrentCompleteSeatState(BydVehicleData s) {
+        return VehicleCommandRouter.hasFreshCompleteSeatState(s);
     }
-    // BYD operation-mode enum values from the SDK docs
-    // (doc/android/hardware/bydauto/energy/BYDAutoEnergyDevice.html + constant-values):
-    //   ENERGY_OPERATION_ECONOMY = 1, ENERGY_OPERATION_SPORT = 2.
-    // These are the ONLY two operation modes the SDK defines — there is no
-    // NORMAL and no SNOW here (SNOW is a *road-surface* value on a different
-    // axis: ENERGY_ROAD_SURFACE_SNOW = 2). The earlier 0-based list
-    // (eco=0/sport=1/normal=2/snow=3) sent setOperationMode(0) for ECO, which is
-    // not a valid operation-mode value, so the HAL rejected the write
-    // (ENERGY_COMMAND_INVALID) and the mode never changed. Map the words to the
-    // real SDK ints; a raw int passes through.
+    private static final List<String> SEAT_LEVELS = java.util.Arrays.asList("off", "low", "high");
+    private static int seatLevel(String payload) {
+        if ("medium".equalsIgnoreCase(payload.trim())) return 2;
+        return SEAT_LEVELS.indexOf(payload.trim().toLowerCase());
+    }
+    private static long seatSnapshotAtMs(BydVehicleData s, boolean fresh) {
+        return fresh ? s.seatClimateAtMs : 0L;
+    }
+    private static final List<String> INFOTAINMENT_ROTATIONS =
+            java.util.Arrays.asList("horizontal", "vertical");
+    private static int infotainmentRotationValue(String payload) {
+        if ("horizontal".equalsIgnoreCase(payload)) {
+            return com.overdrive.app.byd.BydDataCollector.PAD_ROTATION_HORIZONTAL;
+        }
+        if ("vertical".equalsIgnoreCase(payload)) {
+            return com.overdrive.app.byd.BydDataCollector.PAD_ROTATION_VERTICAL;
+        }
+        return -1;
+    }
+    private static final List<String> NATIVE_CAMERA_VIEWS = java.util.Arrays.asList(
+            "front", "front_wide", "rear", "rear_wide", "left", "right", "left_right");
+    static int nativeCameraViewCode(String payload) {
+        if (payload == null) return -1;
+        switch (payload.trim().toLowerCase()) {
+            case "front": return com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_FRONT;
+            case "front_wide":
+                return com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_FRONT_WIDE;
+            case "rear": return com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_REAR;
+            case "rear_wide":
+                return com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_REAR_WIDE;
+            case "left": return com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_LEFT;
+            case "right": return com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_RIGHT;
+            case "left_right":
+                return com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_LEFT_RIGHT;
+            default: return -1;
+        }
+    }
+    // User-facing config-axis values. BydDataCollector maps these onto this head unit's
+    // operation-mode setter enum (normal=3, economy=1, sport=2) and keeps snow on its
+    // road-surface path.
     private static final List<String> DRIVE_MODES = java.util.Arrays.asList("normal", "eco", "sport");
-    // Drive mode on the setting-device "drive config" axis (see
-    // BydDataCollector.setDriveConfigMode): NORMAL=1, ECO=2, SPORT=3, SNOW=4.
-    // NOTE: this is the config axis, NOT the energy-device operation-mode axis
-    // (which is eco=1/sport=2 and has no NORMAL).
+    // Stable OverDrive config axis (see BydDataCollector.setDriveConfigMode):
+    // NORMAL=1, ECO=2, SPORT=3, SNOW=4. This is not the energy setter's public numbering.
     private static int driveModeValue(String payload) {
         String p = payload.trim().toLowerCase();
         if ("normal".equals(p)) return 1;
@@ -502,6 +868,19 @@ public final class VehicleControlCatalog {
         if ("sport".equals(p)) return 3;
         if ("snow".equals(p)) return 4;
         return pInt(payload, 1);
+    }
+
+    /**
+     * User-writable powertrain option word to SDK energy-mode int (ev=1, hev=3).
+     * Modes 2/4/5 remain decodable as telemetry but are not field-validated writes.
+     */
+    static Integer powertrainModeValue(String payload) {
+        String p = payload == null ? "" : payload.trim().toLowerCase();
+        switch (p) {
+            case "ev":                            return com.overdrive.app.byd.BydDataCollector.ENERGY_MODE_EV;
+            case "hev": case "auto":              return com.overdrive.app.byd.BydDataCollector.ENERGY_MODE_HEV;
+            default:                              return null;
+        }
     }
 
     /** Config-axis drive-mode int → option word (inverse of driveModeValue). */
@@ -536,11 +915,20 @@ public final class VehicleControlCatalog {
             }
             return null;
         }));
+        // The normal HA climate entity keeps its standard in-car 17..33 C controls.
+        // This cloud-only text entity supplies OPENAIR's exact 15..31 C / 10..30 minute
+        // shape for off-car automations without repurposing a temperature write into a start.
+        register(text("remote_climate_start", "Remote Climate Start", "mdi:air-conditioner",
+                "config", (sub, payload, snap) -> remoteClimateStartAction(payload)));
+        // BOOKINGAIR has no SDK leg, but the command is capability-gated and terminally
+        // confirmed by the normal router. A single JSON text control covers create/update/delete.
+        register(text("remote_climate_schedule", "Remote Climate Schedule", "mdi:calendar-clock",
+                "config", (sub, payload, snap) -> remoteClimateScheduleAction(payload)));
 
         // ── Windows (all) — cover, command-only (per-window + position: Tier 2) ──
         register(cover("windows_all", "Windows", "mdi:car-door", "window", true, null, (sub, payload, snap) -> {
-            // CLOSE-all routes to the dedicated CloseAllWindowsCommand (CLOUD_FIRST with
-            // SDK fallback), NOT the bare local setAllWindowState(2,2,2,2). On this
+            // CLOSE-all routes to the dedicated CloseAllWindowsCommand (SDK_FIRST with
+            // cloud fallback), NOT the bare local setAllWindowState(2,2,2,2). On this
             // generation the local all-windows CLOSE is unreliable (anti-pinch / the HAL
             // often ignores a simultaneous 4-window raise), which is exactly why the
             // composite cloud CLOSEWINDOW command exists — that's the path that actually
@@ -550,48 +938,88 @@ public final class VehicleControlCatalog {
             if ("CLOSE".equalsIgnoreCase(payload)) {
                 return ControlAction.of(new VehicleCommandRouter.CloseAllWindowsCommand());
             }
-            int action = "OPEN".equalsIgnoreCase(payload) ? 1 : "STOP".equalsIgnoreCase(payload) ? 3 : 2;
-            return ControlAction.of(new VehicleCommandRouter.WindowMoveCommand(0, action, null));
+            if ("OPEN".equalsIgnoreCase(payload)) {
+                return ControlAction.of(new VehicleCommandRouter.OpenAllWindowsCommand());
+            }
+            return ControlAction.of(new VehicleCommandRouter.WindowMoveCommand(0, 3, null));
         }));
+        // OPENWINDOW is ventilation only, never a full-drop. Keep it separate from the cover
+        // so Home Assistant cannot mark a successful 10% vent as a full-open command.
+        register(new ControlEntity("windows_vent", "button", "Vent Windows", "mdi:car-door",
+                null, true, null, 0, 0, 0, null, null, null, null, null,
+                (sub, payload, snap) -> "PRESS".equalsIgnoreCase(payload)
+                        ? ControlAction.of(new VehicleCommandRouter.VentAllWindowsCommand()) : null,
+                null));
 
-        // ── Tailgate — cover (open=SDK motor, close/stop) ───────────────
+        // ── Tailgate — cover (open is cloud-safe when the keymap allows fallback) ──
         register(cover("tailgate", "Tailgate", "mdi:car-back", "door", true, null, (sub, payload, snap) -> {
             if ("CLOSE".equalsIgnoreCase(payload)) return ControlAction.of(new VehicleCommandRouter.TrunkCloseCommand());
             if ("STOP".equalsIgnoreCase(payload)) return ControlAction.of(new VehicleCommandRouter.TrunkStopCommand());
-            return ControlAction.of(new VehicleCommandRouter.TrunkOpenSdkCommand());
+            return ControlAction.of(new VehicleCommandRouter.TrunkOpenCommand());
         }));
 
-        // ── Seat heating (driver/passenger) — select off/low/medium/high ─
+        // ── Seat heating (driver/passenger) — select off/low/high ───────
         register(select("seat_heat_driver", "Driver Seat Heating", "mdi:car-seat-heater", null,
-                "seat_heat_driver", LEVEL_4, (sub, payload, snap) -> {
-            int lvl = levelIndex(payload);
+                "seat_heat_driver", SEAT_LEVELS, (sub, payload, snap) -> {
+            int lvl = seatLevel(payload);
+            boolean fresh = hasCurrentCompleteSeatState(snap);
             VehicleCommand c = new VehicleCommandRouter.SeatHeatCommand(1, lvl,
-                    lvl, seatCool(snap, 0), seatHeat(snap, 1), seatCool(snap, 1));
-            return ControlAction.echo(c, "seat_heat_driver", LEVEL_4.get(Math.min(3, Math.max(0, lvl))));
+                    lvl, seatCool(snap, 0), seatHeat(snap, 1), seatCool(snap, 1),
+                    true, seatSnapshotAtMs(snap, fresh));
+            return ControlAction.echo(c, "seat_heat_driver", SEAT_LEVELS.get(lvl));
         }));
         register(select("seat_heat_passenger", "Passenger Seat Heating", "mdi:car-seat-heater", null,
-                "seat_heat_passenger", LEVEL_4, (sub, payload, snap) -> {
-            int lvl = levelIndex(payload);
+                "seat_heat_passenger", SEAT_LEVELS, (sub, payload, snap) -> {
+            int lvl = seatLevel(payload);
+            boolean fresh = hasCurrentCompleteSeatState(snap);
             VehicleCommand c = new VehicleCommandRouter.SeatHeatCommand(2, lvl,
-                    seatHeat(snap, 0), seatCool(snap, 0), lvl, seatCool(snap, 1));
-            return ControlAction.echo(c, "seat_heat_passenger", LEVEL_4.get(Math.min(3, Math.max(0, lvl))));
+                    seatHeat(snap, 0), seatCool(snap, 0), lvl, seatCool(snap, 1),
+                    true, seatSnapshotAtMs(snap, fresh));
+            return ControlAction.echo(c, "seat_heat_passenger", SEAT_LEVELS.get(lvl));
         }));
 
         // ── Seat ventilation (driver/passenger) — select ────────────────
         register(select("seat_vent_driver", "Driver Seat Ventilation", "mdi:car-seat-cooler", null,
-                "seat_vent_driver", LEVEL_4, (sub, payload, snap) -> {
-            int lvl = levelIndex(payload);
+                "seat_vent_driver", SEAT_LEVELS, (sub, payload, snap) -> {
+            int lvl = seatLevel(payload);
+            boolean fresh = hasCurrentCompleteSeatState(snap);
             VehicleCommand c = new VehicleCommandRouter.SeatVentCommand(1, lvl,
-                    seatHeat(snap, 0), lvl, seatHeat(snap, 1), seatCool(snap, 1));
-            return ControlAction.echo(c, "seat_vent_driver", LEVEL_4.get(Math.min(3, Math.max(0, lvl))));
+                    seatHeat(snap, 0), lvl, seatHeat(snap, 1), seatCool(snap, 1),
+                    true, seatSnapshotAtMs(snap, fresh));
+            return ControlAction.echo(c, "seat_vent_driver", SEAT_LEVELS.get(lvl));
         }));
         register(select("seat_vent_passenger", "Passenger Seat Ventilation", "mdi:car-seat-cooler", null,
-                "seat_vent_passenger", LEVEL_4, (sub, payload, snap) -> {
-            int lvl = levelIndex(payload);
+                "seat_vent_passenger", SEAT_LEVELS, (sub, payload, snap) -> {
+            int lvl = seatLevel(payload);
+            boolean fresh = hasCurrentCompleteSeatState(snap);
             VehicleCommand c = new VehicleCommandRouter.SeatVentCommand(2, lvl,
-                    seatHeat(snap, 0), seatCool(snap, 0), seatHeat(snap, 1), lvl);
-            return ControlAction.echo(c, "seat_vent_passenger", LEVEL_4.get(Math.min(3, Math.max(0, lvl))));
+                    seatHeat(snap, 0), seatCool(snap, 0), seatHeat(snap, 1), lvl,
+                    true, seatSnapshotAtMs(snap, fresh));
+            return ControlAction.echo(c, "seat_vent_passenger", SEAT_LEVELS.get(lvl));
         }));
+
+        // ── Steering-wheel heating — switch (live readback where reported) ─
+        // SDK-first with the composite cloud fallback (SteeringWheelHeatCommand sends the
+        // full front-seat snapshot plus the explicit wheel target atomically, and opts
+        // into allowCloudFallbackFromMqtt), so this works from HA even while the car is
+        // asleep — same reach as the vehicle-control page tile. State: the
+        // steering_wheel_heat telemetry key (setting-HAL readback normalized to 1/0,
+        // published only on a confident read — see MqttConnectionManager); the command
+        // ALSO echoes optimistically so a cloud-executed press on a trim with no local
+        // readback still updates HA instantly. The StateFn makes "toggle" flip the live
+        // state where the getter answers.
+        register(sw("steering_heat", "Steering Wheel Heating", "mdi:steering", null,
+                "steering_wheel_heat", "1", "0",
+                (sub, payload, snap) -> ControlAction.echo(
+                        new VehicleCommandRouter.SteeringWheelHeatCommand(truthy(payload)),
+                        "steering_wheel_heat", truthy(payload) ? "1" : "0"),
+                snap -> {
+                    // Raw setting-HAL domain: 2=on, 1=off; anything else = never reported.
+                    if (snap == null) return null;
+                    if (snap.steeringWheelHeat == 2) return Boolean.TRUE;
+                    if (snap.steeringWheelHeat == 1) return Boolean.FALSE;
+                    return null;
+                }));
 
         // ── Seat memory recall — buttons ────────────────────────────────
         register(new ControlEntity("seat_memory_driver", "button", "Recall Driver Seat", "mdi:seat-recline-extra",
@@ -755,17 +1183,42 @@ public final class VehicleControlCatalog {
                         new VehicleCommandRouter.AdasFcwLevelCommand(pInt(payload, 0)),
                         "adas_fcw", String.valueOf(pInt(payload, 0)))));
 
-        // ── Charge cap (BEV) — switch + number, optimistic state ────────
-        register(sw("charge_cap_enabled", "Charge Limit", "mdi:battery-charging-100", "config", null, "1", "0",
-                (sub, payload, snap) -> ControlAction.echo(
-                        new VehicleCommandRouter.ChargeCapToggleCommand(truthy(payload)),
-                        "charge_cap_enabled", truthy(payload) ? "1" : "0")));
+        // ── Charge cap (BEV) — switch + number, verified state ──────────
+        register(sw("charge_cap_enabled", "Charge Limit", "mdi:battery-charging-100", "config",
+                "charge_cap_enabled", "1", "0",
+                (sub, payload, snap) -> {
+                    Boolean enabled = strictBoolean(payload);
+                    return enabled == null ? null : ControlAction.echo(
+                            new VehicleCommandRouter.ChargeCapToggleCommand(enabled.booleanValue()),
+                            "charge_cap_enabled", enabled.booleanValue() ? "1" : "0");
+                }));
         register(number("charge_cap_percent", "Charge Limit %", "mdi:battery-charging-80", "config",
-                "charge_cap_percent", 15, 100, 5, "%", (sub, payload, snap) -> {
-            int pct = Math.max(15, Math.min(100, pInt(payload, 70)));
-            return ControlAction.echo(new VehicleCommandRouter.ChargeCapPercentCommand(pct),
-                    "charge_cap_percent", String.valueOf(pct));
+                "charge_cap_percent", 50, 100, 5, "%", (sub, payload, snap) -> {
+            Integer percent = chargeCapPercent(payload);
+            return percent == null ? null : ControlAction.echo(
+                    new VehicleCommandRouter.ChargeCapPercentCommand(percent.intValue()),
+                    "charge_cap_percent", String.valueOf(percent));
         }));
+        // Smart charging is cloud-only, but it is explicitly safe for the MQTT router's
+        // normal route: each command is capability-gated and terminally confirmed.
+        register(sw("smart_charging", "Smart Charging", "mdi:battery-clock", "config",
+                null, "1", "0", (sub, payload, snap) -> {
+                    Boolean enabled = strictBoolean(payload);
+                    return enabled == null ? null : ControlAction.echo(
+                            new VehicleCommandRouter.SmartChargingToggleCommand(
+                                    enabled.booleanValue()),
+                            "smart_charging", enabled.booleanValue() ? "1" : "0");
+                }));
+        register(new ControlEntity("start_charging_now", "button", "Start Charging Now",
+                "mdi:battery-charging", null, false, null, 0, 0, 0,
+                null, null, null, null, null,
+                (sub, payload, snap) -> "PRESS".equalsIgnoreCase(payload)
+                        ? ControlAction.of(new VehicleCommandRouter.StartChargingNowCommand())
+                        : null,
+                null));
+        register(text("smart_charge_schedule", "Smart Charging Schedule",
+                "mdi:calendar-clock", "config",
+                (sub, payload, snap) -> smartChargeScheduleAction(payload)));
 
         // ── Tier 2: sunroof / sunshade (covers) + child lock + wireless charger ──
         register(cover("sunroof", "Sunroof", "mdi:window-shutter-open", "window", true, null, (sub, payload, snap) -> {
@@ -787,10 +1240,52 @@ public final class VehicleControlCatalog {
                 (sub, payload, snap) -> ControlAction.echo(
                         new VehicleCommandRouter.MirrorFoldCommand(truthy(payload)),
                         "mirror_fold", truthy(payload) ? "1" : "0")));
+        // Persistent OEM preference, distinct from mirror_fold's immediate bodywork command.
+        // The vehicle owns the actual fold/unfold when its power state changes, so this setting
+        // can be enabled while awake even on a trim that rejects manual mirror commands.
+        register(sw("mirror_auto_follow_up", "Auto Fold / Unfold Mirrors", "mdi:car-side", "config",
+                null, "1", "0",
+                (sub, payload, snap) -> ControlAction.echo(
+                        new VehicleCommandRouter.MirrorAutoFollowUpCommand(truthy(payload)),
+                        "mirror_auto_follow_up", truthy(payload) ? "1" : "0")));
         register(sw("wireless_charging", "Phone Wireless Charger", "mdi:battery-charging-wireless", null, null, "1", "0",
                 (sub, payload, snap) -> ControlAction.echo(
                         new VehicleCommandRouter.WirelessChargingCommand(truthy(payload)),
                         "wireless_charging", truthy(payload) ? "1" : "0")));
+        // Per-pad wireless charging for dual-pad trims. Independent of the global switch above.
+        // These controls are optimistic; the same-named telemetry fields report charging activity,
+        // not switch position, so a command must not overwrite them with its desired state.
+        // left=pad 0, right=pad 1.
+        register(sw("wireless_charging_left", "Wireless Charger (Left)", "mdi:battery-charging-wireless", null, null, "1", "0",
+                (sub, payload, snap) -> ControlAction.of(
+                        new VehicleCommandRouter.WirelessChargingPadCommand(
+                                com.overdrive.app.byd.BydDataCollector.WIRELESS_PAD_LEFT, truthy(payload)))));
+        register(sw("wireless_charging_right", "Wireless Charger (Right)", "mdi:battery-charging-wireless", null, null, "1", "0",
+                (sub, payload, snap) -> ControlAction.of(
+                        new VehicleCommandRouter.WirelessChargingPadCommand(
+                                com.overdrive.app.byd.BydDataCollector.WIRELESS_PAD_RIGHT, truthy(payload)))));
+
+        // ── Infotainment orientation + OEM native panorama view ─────────
+        // These are command-only selects: the connected SDK exposes a setter but no reliable
+        // orientation getter, and the native camera receiver publishes no selected-view state.
+        // Key mapping may additionally send "toggle" to the rotation select; the generic
+        // readback-less select cycle alternates horizontal ↔ vertical from its command cache.
+        register(select("infotainment_rotation", "Infotainment Orientation",
+                "mdi:screen-rotation", "config", null, INFOTAINMENT_ROTATIONS,
+                (sub, payload, snap) -> {
+                    int rotation = infotainmentRotationValue(payload);
+                    return rotation < 0 ? null : ControlAction.of(
+                            new VehicleCommandRouter.InfotainmentRotationCommand(rotation));
+        }));
+        // OEM camera-view codes. This controls the native panorama app, not OverDrive's
+        // /api/camview SurfaceControl overlay. It sends a view command only and never opens
+        // the native panorama UI.
+        register(select("native_camera_view", "Native Camera View", "mdi:camera-switch",
+                null, null, NATIVE_CAMERA_VIEWS, (sub, payload, snap) -> {
+                    int viewCode = nativeCameraViewCode(payload);
+                    return viewCode < 0 ? null : ControlAction.of(
+                            new VehicleCommandRouter.NativeCameraViewCommand(viewCode));
+                }));
 
         // ── Drive / energy modes (BYDAutoEnergyDevice / SettingDevice) ────
         // select entities: HA renders a dropdown, keymap binds one option, the
@@ -800,13 +1295,10 @@ public final class VehicleControlCatalog {
         // "operation_mode") as a raw int; bind the state topic there and map the
         // int→word via value_template so the HA select accepts live telemetry.
         // The echo emits the option word directly (in-domain).
-        // drive_mode: op_mode telemetry is published on the setting-device "drive
-        // config" axis (NORMAL=1, ECO=2, SPORT=3, SNOW=4) — see
-        // BydDataCollector.collectEnergy, which reads getDriveConfig (or maps the
-        // energy-device getOperationMode up to this axis). Echo the word and map
-        // int→word on the state topic using the SAME 1/2/3/4 values, so live
-        // telemetry and the optimistic echo agree. Adds NORMAL, which the old
-        // energy-device path could not represent.
+        // drive_mode: op_mode telemetry is normalized onto the OverDrive config axis
+        // (NORMAL=1, ECO=2, SPORT=3, SNOW=4). BydDataCollector maps the authoritative
+        // energy-device getOperationMode value onto this axis and uses getDriveConfig only
+        // as a legacy fallback. Echo the word and map int→word using the same values.
         register(select("drive_mode", "Drive Mode", "mdi:car-shift-pattern", null, "op_mode",
                 DRIVE_MODES,
                 "{% set m = value | int(-1) %}{{ 'normal' if m == 1 else 'eco' if m == 2 else 'sport' if m == 3 else 'snow' if m == 4 else value }}",
@@ -820,29 +1312,55 @@ public final class VehicleControlCatalog {
         // The old code sent setEnergyMode(0) for EV — which is STOP — so EV never
         // engaged. Map the words to the real SDK ints and mirror them on the
         // state topic.
+        // Only field-validated writes are exposed. Raw telemetry still decodes the complete SDK
+        // enum so a vehicle already reporting 2/4/5 does not lose observability.
         final List<String> POWERTRAIN = java.util.Arrays.asList("ev", "hev");
         register(select("powertrain_mode", "Powertrain Mode", "mdi:engine", null, "energy_mode",
                 POWERTRAIN,
-                "{% set m = value | int(-1) %}{{ 'ev' if m == 1 else 'hev' if m == 3 else value }}",
+                "{% set m = value | int(-1) %}{{ 'ev' if m == 1 else 'force_ev' if m == 2 else "
+                        + "'hev' if m == 3 else 'fuel' if m == 4 else 'keep' if m == 5 else value }}",
                 (sub, payload, snap) -> {
-                    int m = "hev".equalsIgnoreCase(payload.trim()) ? 3   // ENERGY_MODE_HEV
-                          : "ev".equalsIgnoreCase(payload.trim()) ? 1    // ENERGY_MODE_EV
-                          : pInt(payload, 1);
+                    Integer m = powertrainModeValue(payload);
+                    if (m == null) return null;
                     return ControlAction.echo(new VehicleCommandRouter.EnergyModeCommand(m),
-                            "energy_mode", m == 3 ? "hev" : "ev");
+                            "energy_mode", com.overdrive.app.byd.BydDataCollector.energyModeName(m));
                 }));
         // hold_battery: a friendly alias for "switch to HEV". NOTE this does NOT hold the
         // pack at its current level — field-reported on a SeaLion 6 DM-i: selecting HEV
-        // starts the ICE and RECHARGES the battery. A real SOC-hold lever does exist
-        // (BYDAutoSettingDevice.setSOCTarget + BYDAutoChargingDevice.setSocSaveSwitch,
-        // wired in BydDataCollector as the "charge cap"); the reference app DiPlus drives
-        // exactly that pair for its PHEV battery-hold modes. Prefer charge_cap_* for a
-        // genuine hold. Any payload commands HEV (3); mirrors energy_mode state as hev.
-        register(select("hold_battery", "Hold Battery Charge", "mdi:battery-lock", null, "energy_mode",
+        // starts the ICE and RECHARGES the battery. Renamed to say what it actually does;
+        // the key is unchanged so existing automations/keymaps keep working. Use
+        // battery_hold below for a genuine hold. Any payload commands HEV (3).
+        register(select("hold_battery", "Engine Mode (HEV)", "mdi:engine", null, "energy_mode",
                 java.util.Arrays.asList("on"),
                 "{% set m = value | int(-1) %}{{ 'on' if m == 3 else 'off' }}",
                 (sub, payload, snap) ->
                     ControlAction.echo(new VehicleCommandRouter.EnergyModeCommand(3), "energy_mode", "hev")));
+        // battery_hold: THE REAL SOC-hold lever, as a single one-tap control. Writes both legs of
+        // the pair — the hold switch first, then the target level (see applySocHold for why that
+        // order, which deliberately differs from the OEM's):
+        //   at_current → switch 2 + min(SOC,50) — "keep the charge I have" (the Highway preset)
+        //   at_floor   → switch 1 + this trim's floor — "let it deplete" (the City preset)
+        //   off        → switch 0, target untouched
+        // No telemetry field reports the hold state (getSocSaveSwitch does not exist in the SDK
+        // or on any trim), so this is set-only and reports no state.
+        // OPTION ORDER IS DELIBERATE: off → at_current → at_floor, in increasing order of
+        // intervention. No UI offers "toggle" for this entity (it is declared per-entry in the
+        // keymap catalog and the automation picker, and HA is sent only these three options), but
+        // a hand-published MQTT "toggle" still reaches toAction's no-readback cycle, which
+        // defaults to index 0 and advances — so the first such press must land on the MILDEST
+        // change. With this order that is at_current ("keep what I have"); the previous order put
+        // at_floor there, silently permitting the pack to run down to the reserve.
+        register(select("battery_hold", "Battery Hold", "mdi:battery-lock", null, null,
+                java.util.Arrays.asList("off", "at_current", "at_floor"),
+                (sub, payload, snap) -> {
+                    String p = payload == null ? "" : payload.trim().toLowerCase();
+                    if ("off".equals(p)) {
+                        return ControlAction.of(new VehicleCommandRouter.SocHoldToggleCommand(false));
+                    }
+                    // "toggle" never arrives here — toAction rewrites it to a concrete option
+                    // first. Anything unrecognised → at_current, the intent behind the name.
+                    return ControlAction.of(new VehicleCommandRouter.SocHoldPresetCommand(!"at_floor".equals(p)));
+                }));
         // regen_level: normalized user level fed to BydDataCollector.setEnergyFeedback,
         // which maps 0..2 -> MCU 2..4. standard = 0 (SETTING_ENERGY_FEEDBACK_STANDARD),
         // high = 1 (SETTING_ENERGY_FEEDBACK_LARGE) — per the OEM firmware convention.

@@ -188,15 +188,13 @@ public class OemDashcamApiHandler {
                     continue;
                 }
                 if (!selfHealRunning) return;
-                // Only do work when some trigger is actually armed — an
-                // all-Off install should never spin up the pipeline or even
-                // pay the forceReload inside the resolver. The resolver's own
-                // idempotence handles the running-but-should-stop case, but
-                // gating here keeps the steady-state tick to a single cheap
-                // UCM read when the feature is unused.
+                // A live DVR selection is also an active consumer. Without
+                // this branch, a watchdog-stop in streaming-only mode stays
+                // down forever because no recording trigger is armed.
                 try {
                     if (com.overdrive.app.config.UnifiedConfigManager
-                            .isAnyOemDashcamTriggerEnabled()) {
+                            .isAnyOemDashcamTriggerEnabled()
+                            || isAnyStreamingViewerActive()) {
                         scheduleLifecycleRecalc();
                     }
                 } catch (Throwable t) {
@@ -343,6 +341,27 @@ public class OemDashcamApiHandler {
                 com.overdrive.app.daemon.CameraDaemon.log(
                     "OemDashcam: trigger lifecycle failed (phase 1): " + t.getMessage());
                 return;
+            }
+        }
+
+        // The lifecycle worker owns recovery after an OEM watchdog stop.
+        // Reattach a rebuilt, route-ready source and let its first real
+        // SurfaceTexture frame promote view 6. This avoids requiring another
+        // browser click or WebSocket reconnect to resume a live DVR view.
+        if (streamingDesired && existing != null && existing.isRouteReady()) {
+            try {
+                com.overdrive.app.surveillance.GpuSurveillancePipeline pano =
+                    com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+                if (pano != null && pano.isStreamingEnabled()
+                        && com.overdrive.app.daemon.CameraDaemon
+                                .getOemDashcamPipeline() == existing
+                        && com.overdrive.app.daemon.CameraDaemon
+                                .routeStreamToOemDashcam()) {
+                    pano.activateOemStreamViewWhenReady();
+                }
+            } catch (Throwable t) {
+                com.overdrive.app.daemon.CameraDaemon.log(
+                    "OemDashcam: lifecycle stream reattach failed: " + t.getMessage());
             }
         }
 
@@ -728,6 +747,26 @@ public class OemDashcamApiHandler {
         applyTriggerLifecycle(enabled, isAnyStreamingViewerActive());
     }
 
+    /**
+     * Rebuild the OEM camera and encoder from current persisted intent.
+     * applyLifecycle(false) is not a restart when view 6 still keeps the
+     * pipeline desired; it simply retains the old instance.
+     */
+    public static void forceRestartPipelineFromCurrentIntent() {
+        synchronized (LIFECYCLE_LOCK) {
+            com.overdrive.app.camera.OemDashcamPipeline existing =
+                com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+            if (existing != null) {
+                try { existing.stopRecording(); } catch (Throwable ignored) {}
+                try { existing.stop(); } catch (Throwable ignored) {}
+                com.overdrive.app.daemon.CameraDaemon.setOemDashcamPipeline(null);
+                com.overdrive.app.daemon.CameraDaemon.log(
+                    "OemDashcam: force restart released current pipeline");
+            }
+        }
+        applyTriggerLifecycleFromUcm();
+    }
+
 
     /**
      * Poll the OEM pipeline's encoder until OUTPUT_FORMAT_CHANGED has
@@ -967,30 +1006,21 @@ public class OemDashcamApiHandler {
             // user's new pick is silent until next toggle off+on. Always
             // a stop+start cycle so the new HAL id is picked up.
             if (req.optBoolean("restart", false)) {
-                com.overdrive.app.camera.OemDashcamPipeline live =
-                    com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
-                if (live != null && live.isRunning()) {
-                    // Route through the same single-threaded executor so
-                    // rapid restart-cfg POSTs serialize cleanly with the
-                    // ordinary trigger-recalc submissions. Without this,
-                    // a per-call new-Thread spawn lets two concurrent
-                    // applyLifecycle(false)+applyLifecycle(true) pairs
-                    // race and orphan a half-built pipeline.
-                    LIFECYCLE_EXEC.execute(() -> {
-                        try {
-                            applyLifecycle(false);
-                            // After teardown, let the lifecycle worker compute the new desired
-                            // state from the just-applied UCM mode pair instead of hardcoding
-                            // recordingDesired=true. Otherwise a concurrent picker change can
-                            // get absorbed into a stale snapshot.
-                            applyTriggerLifecycleFromUcm();
-                        } catch (Exception e) {
-                            logger.warn("OEM dashcam restart failed: " + e.getMessage());
-                        }
-                    });
-                    com.overdrive.app.daemon.CameraDaemon.log(
-                        "OEM Dashcam: restart scheduled on lifecycle executor");
-                }
+                // Route through the same single-threaded executor so rapid
+                // restart-cfg POSTs serialize cleanly with ordinary trigger
+                // recalcs. This also applies when a watchdog has already
+                // cleared the pipeline: forceRestart resolves current intent
+                // and starts the replacement immediately instead of waiting
+                // for the periodic self-heal ticker.
+                LIFECYCLE_EXEC.execute(() -> {
+                    try {
+                        forceRestartPipelineFromCurrentIntent();
+                    } catch (Exception e) {
+                        logger.warn("OEM dashcam restart failed: " + e.getMessage());
+                    }
+                });
+                com.overdrive.app.daemon.CameraDaemon.log(
+                    "OEM Dashcam: restart scheduled on lifecycle executor");
             }
 
             // Drive the pipeline lifecycle off the persisted state on the

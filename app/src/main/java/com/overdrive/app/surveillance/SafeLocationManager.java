@@ -47,7 +47,13 @@ public class SafeLocationManager {
 
     private final CopyOnWriteArrayList<SafeLocation> zones = new CopyOnWriteArrayList<>();
     private volatile boolean featureEnabled = true;
+    // Suppression axis: true only when surveillance should be held off here
+    // (feature toggle ON + inside a zone whose own switch is ON). Drives the
+    // camera lifecycle. See onLocationUpdate for the two-axis contract.
     private volatile boolean cachedInSafeZone = false;
+    // Identity axis: name of the zone the car is inside (ANY zone, regardless of
+    // either toggle), or null when outside all. Drives the locationZone automation
+    // event, notification labels, and hysteresis tracking.
     private volatile String cachedZoneName = null;
     private volatile double cachedDistanceM = Double.MAX_VALUE;
 
@@ -168,46 +174,66 @@ public class SafeLocationManager {
     // ========================================================================
 
     /**
-     * Check if current GPS position is inside any enabled safe zone.
-     * Uses cached result — updated on every GPS tick via onLocationUpdate().
+     * Should surveillance be suppressed at the current position? True only when the
+     * master feature toggle is ON and the car is inside a zone whose own switch is ON.
+     * Uses cached result — updated on every GPS tick via onLocationUpdate(). The
+     * redundant featureEnabled guard covers the no-GPS window where a toggle flip
+     * can't trigger a recompute (reevaluateZone needs a fix).
+     *
+     * <p>NOT the same as "is the car at a named location" — use
+     * {@link #getCurrentZoneName()} for that; it ignores both toggles.
      */
     public boolean isInSafeZone() {
         return featureEnabled && cachedInSafeZone;
     }
 
+    /**
+     * Name of the zone the car is currently inside (any zone, independent of the
+     * surveillance feature toggle and the per-zone switch), or null when outside all.
+     */
     public String getCurrentZoneName() { return cachedZoneName; }
     public double getDistanceToNearestZone() { return cachedDistanceM; }
 
     /**
      * Called by GpsMonitor on every IPC location update (~2s).
      * Performs Haversine check and triggers zone transitions.
+     *
+     * <p>DECOUPLED AXES — one geometry pass feeds two independent consumers:
+     * <ul>
+     *   <li><b>Zone identity</b> (which zone is the car in?) — computed over ALL
+     *       zones, regardless of the surveillance feature toggle AND the per-zone
+     *       enabled switch. Drives the {@code locationZone} automation event,
+     *       {@link #getCurrentZoneName()} labels, and status JSON. A zone the user
+     *       switched off for camera suppression still names the place the car is
+     *       parked, and an automation on that zone must keep firing.</li>
+     *   <li><b>Surveillance suppression</b> (should the sentry stay off here?) —
+     *       requires the master feature toggle ON and the matched zone's own
+     *       enabled switch ON. Only this axis touches the camera lifecycle
+     *       (onEntered/LeftSafeZone).</li>
+     * </ul>
      */
     public void onLocationUpdate(double lat, double lng) {
-        if (!featureEnabled || zones.isEmpty()) {
+        if (zones.isEmpty()) {
+            cachedZoneName = null;
+            cachedDistanceM = Double.MAX_VALUE;
             if (cachedInSafeZone) {
-                // Feature was disabled or all zones removed while in zone
+                // All zones removed while suppressing here
                 cachedInSafeZone = false;
-                cachedZoneName = null;
-                cachedDistanceM = Double.MAX_VALUE;
                 onLeftSafeZone();
             }
-            // The surveillance-suppression side is gated off (or has no zones), but an
-            // automation may still want the geofence event. Compute + publish it
-            // independently when zones exist and an automation is enabled — this does
-            // NOT touch surveillance state (no onEntered/LeftSafeZone camera control).
-            if (!zones.isEmpty()) publishLocationForAutomations(lat, lng);
+            // No zones = outside every zone. Publish "none" so an automation whose
+            // last committed state was a zone name doesn't stay stale forever after
+            // the user deletes that zone. Automations.update dedups, so this is free.
+            publishLocationEvent(null);
             return;
         }
 
-        boolean wasInZone = cachedInSafeZone;
         String prevZoneName = cachedZoneName;
-        boolean nowInZone = false;
-        String zoneName = null;
+        SafeLocation matchedEnabled = null;   // preferred: also suppresses surveillance
+        SafeLocation matchedDisabled = null;  // identity-only match (per-zone toggle off)
         double nearestDist = Double.MAX_VALUE;
 
         for (SafeLocation zone : zones) {
-            if (!zone.isEnabled()) continue;
-
             double dist = haversine(lat, lng, zone.getLatitude(), zone.getLongitude());
             if (dist < nearestDist) {
                 nearestDist = dist;
@@ -220,68 +246,48 @@ public class SafeLocationManager {
             // Entry still uses the exact radius, so a zone never triggers early.
             // Keyed off cachedZoneName (== prevZoneName) alone — a non-null cached zone
             // name already means "we resolved inside that zone last tick", which is the
-            // hysteresis precondition. This matches the suppression-off path
-            // (publishLocationForAutomations) exactly, so both paths share one tracker
-            // and agree at the boundary across a feature toggle (no spurious leave).
+            // hysteresis precondition. One shared tracker means toggling either the
+            // feature or a zone while parked in the hysteresis annulus can't reset it
+            // and spuriously fire a leave.
             boolean isCurrent = zone.getName() != null && zone.getName().equals(prevZoneName);
             double effectiveRadius = isCurrent ? zone.getRadiusMeters() + HYSTERESIS_M : zone.getRadiusMeters();
             if (dist <= effectiveRadius) {
-                nowInZone = true;
-                zoneName = zone.getName();
-                nearestDist = dist;
-                break;  // Inside at least one zone — that's enough
+                if (zone.isEnabled()) {
+                    matchedEnabled = zone;
+                    nearestDist = dist;
+                    break;  // Inside an enabled zone — that's enough for both axes
+                }
+                // Overlapping zones: keep scanning for an ENABLED match so a disabled
+                // zone can't shadow an enabled one for the suppression axis. First
+                // disabled hit still wins identity if no enabled zone matches.
+                if (matchedDisabled == null) matchedDisabled = zone;
             }
         }
 
-        cachedInSafeZone = nowInZone;
+        SafeLocation current = matchedEnabled != null ? matchedEnabled : matchedDisabled;
+        String zoneName = current != null ? current.getName() : null;
         cachedZoneName = zoneName;
         cachedDistanceM = nearestDist;
 
-        // Zone transitions
-        if (!wasInZone && nowInZone) {
+        // Suppression axis: master toggle AND the matched zone's own switch.
+        boolean wasSuppressing = cachedInSafeZone;
+        boolean nowSuppressing = featureEnabled && matchedEnabled != null;
+        cachedInSafeZone = nowSuppressing;
+        if (!wasSuppressing && nowSuppressing) {
             onEnteredSafeZone(zoneName);
-        } else if (wasInZone && !nowInZone) {
+        } else if (wasSuppressing && !nowSuppressing) {
             onLeftSafeZone();
         }
 
-        // Publish the geofence event for automations (shared with the suppression-off
-        // path below). Free/no-op when no automation is enabled.
-        publishLocationEvent(zoneName);
-    }
-
-    /**
-     * Compute the current zone name from GPS and publish the automation geofence event
-     * WITHOUT touching surveillance-suppression state. Used only on the path where the
-     * surveillance safe-zone feature is disabled (or its camera control isn't wanted)
-     * but an automation still wants a location trigger. Kept separate from the main
-     * onLocationUpdate body so it can never fire onEntered/LeftSafeZone camera
-     * lifecycle.
-     */
-    private void publishLocationForAutomations(double lat, double lng) {
-        // Same exit-hysteresis as the main path (see onLocationUpdate). CRITICAL: this
-        // shares the SAME cachedZoneName tracker the main path uses, not a separate
-        // one — otherwise toggling the surveillance feature (which switches which path
-        // runs) while parked in a zone's hysteresis annulus would reset the tracker and
-        // spuriously fire a leave. One tracker = the two paths agree at the boundary
-        // across a feature toggle. cachedInSafeZone is left to the main path (it drives
-        // camera lifecycle); this path only needs the zone-name identity for hysteresis.
-        String prevZoneName = cachedZoneName;
-        String zoneName = null;
-        for (SafeLocation zone : zones) {
-            if (!zone.isEnabled()) continue;
-            double dist = haversine(lat, lng, zone.getLatitude(), zone.getLongitude());
-            boolean isCurrent = zone.getName() != null && zone.getName().equals(prevZoneName);
-            double effectiveRadius = isCurrent ? zone.getRadiusMeters() + HYSTERESIS_M : zone.getRadiusMeters();
-            if (dist <= effectiveRadius) { zoneName = zone.getName(); break; }
-        }
-        cachedZoneName = zoneName;
+        // Identity axis: publish the geofence event for automations on EVERY tick,
+        // independent of both toggles. Free/no-op when no automation is enabled.
         publishLocationEvent(zoneName);
     }
 
     /**
      * Publish the current geofence zone to automations. Uses the zone name, or "none"
-     * when outside every zone. Called every location tick from BOTH the suppression
-     * path and the automation-only path.
+     * when outside every zone. Called on every location tick, independent of the
+     * surveillance feature toggle and the per-zone enabled switch.
      *
      * <p>We deliberately do NOT keep a local "last value" dedup latch here.
      * {@link com.overdrive.app.automation.Automations#update} is the single source of
@@ -323,8 +329,8 @@ public class SafeLocationManager {
         // otherwise have its recording torn down here.
         com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
         if (pipeline != null && pipeline.isSurveillanceMode()) {
-            // ESCO-PARITY: dilink4 keeps the pipeline alive on safe-zone
-            // entry — only flip sentry off. esco has no safe-zone feature
+            // OEM-PARITY: dilink4 keeps the pipeline alive on safe-zone
+            // entry — only flip sentry off. oem has no safe-zone feature
             // but its analogous "pause sentry" logic never closes the
             // AVMCamera. Closing the camera here triggers the same
             // close+reopen race that produces all-zero frames on byd_apa.
@@ -341,7 +347,7 @@ public class SafeLocationManager {
             if (!dilink4) {
                 pipeline.stop();
             } else {
-                CameraDaemon.log(TAG + ": dilink4 esco-parity — keeping pipeline alive on safe-zone entry");
+                CameraDaemon.log(TAG + ": dilink4 oem-parity — keeping pipeline alive on safe-zone entry");
             }
             CameraDaemon.setSafeZoneSuppressed(true);
         } else {

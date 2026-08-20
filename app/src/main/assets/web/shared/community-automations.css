@@ -3,15 +3,24 @@
  * Uses the shared M3 design tokens (design-tokens.css): --radius-*, --card-gap,
  * --card-pad, color roles. No hard-coded colors beyond token fallbacks. Chrome-58
  * safe (no :has(), no container queries, no gap on flex where a fallback is needed).
+ *
+ * Spacing idiom: flex `gap` is Chrome 84+ and is SILENTLY IGNORED on the DiLink
+ * head-unit WebView, so every intra-flex space here uses sibling margins — the same
+ * idiom automations.css / app-tabs.css / .btn already use. Never pair a `gap` with a
+ * sibling margin for the same space: modern engines apply both and double it.
  */
 
 /* ── Controls (search / sort / filter chips) ─────────────────────────────── */
 #communityControls {
     display: flex;
     flex-direction: column;
-    gap: 12px;
     margin-bottom: 16px;
 }
+/* Column shim. Scoped to the three rows that need it rather than `> * + *`, because
+   an ID selector (1-0-1) would outrank the class-level `margin` the wrapping chip row
+   sets below (0-1-0) and clobber its negative top inset. */
+#communityControls > .community-sort-row,
+#communityControls > .community-filter-row { margin-top: 12px; }
 
 .community-search-input {
     width: 100%;
@@ -33,8 +42,8 @@
 .community-sort-row {
     display: flex;
     align-items: center;
-    gap: 10px;
 }
+.community-sort-row > * + * { margin-left: 10px; }
 .community-sort-label {
     font-size: 13px;
     color: var(--text-secondary, #aaa);
@@ -66,22 +75,31 @@
 /* Minimum rating / downloads filter selects — two compact columns. */
 .community-filter-row {
     display: flex;
-    gap: 10px;
 }
+.community-filter-row > * + * { margin-left: 10px; }
 .community-minfilter {
     flex: 1;
+    /* min-width:0 so a long localized label can't push the pair wider than the
+       row (a flex item defaults to min-width:auto). */
+    min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 4px;
 }
+.community-minfilter > * + * { margin-top: 4px; }
 .community-minfilter .community-sort-label { font-size: 12px; }
 
-/* Filter chips — mirror the events.js .filter-chip pattern. */
+/* Filter chips — mirror the events.js .filter-chip pattern. A WRAPPING row, so the
+   Chrome-58 gap shim is the negative-inset idiom (per-child margin + a matching
+   negative container inset that keeps the row flush with the card edges). A
+   sibling-margin shim would not space the second and later LINES. */
 .community-filter-chips {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    /* 8px top = the 12px column rhythm the sibling rows use, less the 4px each chip
+       adds; the -4px sides keep the row flush with the card edge. */
+    margin: 8px -4px 0;
 }
+.community-filter-chips > * { margin: 4px; }
 .community-filter-chips .filter-chip {
     padding: 6px 14px;
     border-radius: var(--radius-full, 999px);
@@ -101,8 +119,8 @@
    the owned-card accent, so the ownership cue reads as one consistent language
    (distinct from the blue category-active state). */
 .community-filter-chips .community-chip-mine.active {
-    background: var(--brand-primary, #00d4aa);
-    border-color: var(--brand-primary, #00d4aa);
+    background: var(--brand-primary, var(--primary));
+    border-color: var(--brand-primary, var(--primary));
     color: #05100c;
 }
 
@@ -110,8 +128,8 @@
 #communityList {
     display: flex;
     flex-direction: column;
-    gap: var(--card-gap, 12px);
 }
+#communityList > * + * { margin-top: var(--card-gap, 12px); }
 
 .community-card {
     padding: var(--card-pad, 20px);
@@ -120,9 +138,16 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 10px;
 }
-.community-card-titlewrap { min-width: 0; }
+/* Title block → category badge → optional "Yours" badge. */
+.community-card-head > * + * { margin-left: 10px; }
+.community-card-titlewrap {
+    min-width: 0;
+    /* Claim the free space so a long name wraps instead of shoving the badges
+       off the card's trailing edge (a flex item is not allowed to shrink below
+       its content without this pair). */
+    flex: 1 1 auto;
+}
 .community-card-name {
     font-size: 16px;
     font-weight: 600;
@@ -136,10 +161,11 @@
 }
 
 .community-badge-mine {
-    background: var(--brand-primary, #00d4aa);
-    border-color: var(--brand-primary, #00d4aa);
+    background: var(--brand-primary, var(--primary));
+    border-color: var(--brand-primary, var(--primary));
     color: #05100c;
-    margin-left: 6px;
+    /* No margin-left here: .community-card-head's sibling-margin shim already
+       spaces this badge from the category pill. Adding one would double it. */
     font-weight: 700;
     /* leading dot so an owner spots it instantly among neutral pills */
     letter-spacing: 0.2px;
@@ -158,7 +184,7 @@
    the Chrome-58 WebView floor; if even the gradient is dropped, the solid
    border-left accent still marks the card. */
 .community-card-mine {
-    border-left: 3px solid var(--brand-primary, #00d4aa);
+    border-left: 3px solid var(--brand-primary, var(--primary));
     background-image: linear-gradient(90deg,
         rgba(0, 212, 170, 0.09), rgba(0, 212, 170, 0) 140px);
 }
@@ -186,13 +212,17 @@
     overflow: hidden;
 }
 
+/* Stars + downloads + "shared on" — WRAPS on a narrow head unit, so this uses the
+   negative-inset shim (see .community-filter-chips) rather than sibling margins,
+   which would collapse the spacing between wrapped lines. The 12px top margin is
+   folded into the -3px inset to keep the intended distance from the description. */
 .community-card-meta {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 10px;
-    margin-top: 12px;
+    margin: 9px -5px 0;
 }
+.community-card-meta > * { margin: 3px 5px; }
 .community-meta-chip {
     font-size: 12px;
     color: var(--text-secondary, #999);
@@ -200,17 +230,19 @@
 
 .community-card-actions {
     display: flex;
-    gap: 10px;
     margin-top: 14px;
 }
-.community-card-actions .btn { flex: 1; }
+.community-card-actions > * + * { margin-left: 10px; }
+/* min-width:0 so the two equal-width buttons can shrink for a long localized
+   label instead of overflowing the card. */
+.community-card-actions .btn { flex: 1 1 0; min-width: 0; }
 
 /* ── Stars ─────────────────────────────────────────────────────────────────── */
 .community-stars {
     display: inline-flex;
     align-items: center;
-    gap: 2px;
 }
+.community-stars > * + * { margin-left: 2px; }
 .community-star {
     display: inline-flex;
     width: 16px;
@@ -219,7 +251,11 @@
 }
 .community-star svg { width: 16px; height: 16px; }
 .community-star-count {
-    margin-left: 6px;
+    /* 8px = the old `gap:2px` + this element's own 6px, so the count keeps the
+       same distance from the last star now that the gap is a sibling margin.
+       Same specificity as the .community-stars shim above but declared later,
+       so this value wins rather than adding to it. */
+    margin-left: 8px;
     font-size: 12px;
     color: var(--text-secondary, #999);
 }
@@ -239,9 +275,9 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 16px;
     margin-top: 20px;
 }
+#communityPagination > * + * { margin-left: 16px; }
 #communityPagination .pagination-btn {
     padding: 8px 18px;
     border-radius: var(--radius-md, 12px);
@@ -305,20 +341,25 @@
 .community-compat.ok {
     background: rgba(34, 197, 94, 0.1);
     border: 1px solid rgba(34, 197, 94, 0.4);
-    color: #22c55e;
+    color: var(--status-success);
 }
 .community-compat.warn {
     background: rgba(245, 158, 11, 0.1);
     border: 1px solid rgba(245, 158, 11, 0.4);
-    color: #f59e0b;
+    color: var(--status-warning);
 }
 
+/* "Rate this" + five 28px tap targets can exceed a narrow modal, so this row WRAPS —
+   which means the negative-inset shim, not `> * + *` (that leaves the wrapped star
+   strip flush against the label with no vertical space). The insets fold the intended
+   outer box: net 0 top (-3 + 3), 8px bottom (5 + 3), flush sides (-5 + 5). */
 .community-rate-wrap {
     display: flex;
     align-items: center;
-    gap: 10px;
-    margin-bottom: 8px;
+    flex-wrap: wrap;
+    margin: -3px -5px 5px;
 }
+.community-rate-wrap > * { margin: 3px 5px; }
 .community-rate-label {
     font-size: 13px;
     color: var(--text-secondary, #aaa);
@@ -332,14 +373,14 @@
 .community-publish-form {
     display: flex;
     flex-direction: column;
-    gap: 12px;
     margin: 12px 0;
 }
+.community-publish-form > * + * { margin-top: 12px; }
 .community-publish-row {
     display: flex;
     flex-direction: column;
-    gap: 6px;
 }
+.community-publish-row > * + * { margin-top: 6px; }
 .community-publish-row .label {
     font-size: 13px;
     font-weight: 500;
@@ -369,3 +410,19 @@ textarea.community-publish-input {
    automations.css; nudge its icon color to the primary accent to hint "share". */
 .community-publish-btn { color: var(--primary, #3b82f6); }
 .community-publish-btn:hover { border-color: var(--primary, #3b82f6); }
+
+/* ── RTL ──────────────────────────────────────────────────────────────────────
+   The sibling-margin shims above replace flex `gap`, which was direction-aware —
+   a bare margin-left is not, so under <html dir="rtl"> (Arabic ships; see
+   RTL_LANGS in core.js) the space would land on the wrong side and the row would
+   read as bunched-left-then-a-hole. Mirror each one, matching the [dir="rtl"]
+   idiom already used in styles.css / vehicle-control.css.
+   The negative-inset shims (.community-filter-chips, .community-card-meta,
+   .community-rate-wrap) use SYMMETRIC side values, so they mirror on their own. */
+[dir="rtl"] .community-sort-row > * + *,
+[dir="rtl"] .community-filter-row > * + *,
+[dir="rtl"] .community-card-head > * + *,
+[dir="rtl"] .community-card-actions > * + * { margin-left: 0; margin-right: 10px; }
+[dir="rtl"] .community-stars > * + * { margin-left: 0; margin-right: 2px; }
+[dir="rtl"] .community-star-count { margin-left: 0; margin-right: 8px; }
+[dir="rtl"] #communityPagination > * + * { margin-left: 0; margin-right: 16px; }

@@ -201,6 +201,49 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
     }
     
     /**
+     * Best-effort graceful pre-kill flush for the camera daemon.
+     *
+     * <p>Retries a refusal the daemon marks transient (a just-ended trip still
+     * draining), but never blocks the stop: the user asked for it, so a final
+     * refusal proceeds to the kill anyway.
+     */
+    private void prepareCameraDaemonForKill(CommandContext ctx) {
+        for (int attempt = 1; attempt <= 4; attempt++) {
+            java.net.HttpURLConnection connection = null;
+            try {
+                connection = com.overdrive.app.util.DaemonHttpClient.open(
+                        "/api/surveillance/prepare-restart", "POST", 3000, 10000);
+                connection.setDoOutput(true);
+                try (java.io.OutputStream body = connection.getOutputStream()) {
+                    body.write(new byte[0]);
+                }
+                int code = connection.getResponseCode();
+                if (code >= 200 && code < 300) {
+                    ctx.log("Camera daemon checkpointed its active trip before stop");
+                    return;
+                }
+                boolean retryable = code == 503;
+                ctx.log("prepare-restart before camera stop returned HTTP " + code);
+                if (!retryable || attempt == 4) return;
+            } catch (Exception e) {
+                // The daemon may already be down, or have no HTTP server — the
+                // kill below is still correct.
+                ctx.log("prepare-restart before camera stop failed: "
+                        + e.getMessage());
+                return;
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /**
      * Check if daemon is running using process name.
      * Same approach as AccSentryDaemonController.
      */
@@ -237,6 +280,14 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
 
         // For camera daemon, also kill the restart wrapper script and delete it
         if ("byd_cam_daemon".equals(processName)) {
+            // Ask the daemon to durably checkpoint its active trip before the
+            // SIGKILL below. `kill -9` never runs the JVM shutdown hook, so
+            // without this everything buffered since the last periodic flush is
+            // lost. Best-effort by design: a Telegram stop is an explicit user
+            // instruction and must not be blocked by a refusal, unlike the
+            // update path which aborts. The trip still survives as a
+            // recoverable telemetry file either way.
+            prepareCameraDaemonForKill(ctx);
             // Write disable sentinel FIRST — prevents watchdog from restarting
             if (writeSentinel) {
                 ctx.execShell("echo \"disabled by telegram at $(date)\" > /data/local/tmp/camera_daemon.disabled; chmod 666 /data/local/tmp/camera_daemon.disabled 2>/dev/null");

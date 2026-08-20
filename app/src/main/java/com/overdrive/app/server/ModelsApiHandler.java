@@ -63,6 +63,14 @@ public class ModelsApiHandler {
 
     // Per-model download state. Concurrent because handler threads read while downloader writes.
     private static final ConcurrentHashMap<String, DownloadState> downloads = new ConcurrentHashMap<>();
+    private static final Object MODEL_SELECTION_LOCK = new Object();
+
+    public static final class SelectedModelConfigUnavailableException
+            extends IllegalStateException {
+        SelectedModelConfigUnavailableException(Throwable cause) {
+            super("Durable selected-model config is unavailable", cause);
+        }
+    }
 
     // Last successful manifest fetch's ETag — used to send If-None-Match on subsequent
     // refreshes. In-memory only; lost on process restart, which just means one extra
@@ -345,33 +353,76 @@ public class ModelsApiHandler {
             HttpResponse.sendJsonError(out, Messages.get("errors.models_nothing_to_update"));
             return;
         }
-        boolean ok = UnifiedConfigManager.setVehicle(patch);
-        if (!ok) {
-            HttpResponse.sendJsonError(out, Messages.get("errors.models_persist_failed"));
-            return;
-        }
-
-        // When the user changes the vehicle model, the baseline pack
-        // capacity that the SOH estimator was using may no longer apply
-        // (different model = different default kWh). Reset and re-seed
-        // SOH so the displayed health value reflects the new pack rather
-        // than carrying stale calibration from the previous selection.
-        // Skipped when only color changed — that has no SOH bearing.
-        if (modelSelectionChanged) {
-            try {
+        final boolean changesModelSelection = modelSelectionChanged;
+        final double selectedModelNominal = changesModelSelection
+            ? nominalKwhForModelId(patch.optString("modelId", ""))
+            : 0;
+        synchronized (MODEL_SELECTION_LOCK) {
+            com.overdrive.app.abrp.SohEstimator modelChangeEstimator = null;
+            if (changesModelSelection) {
                 com.overdrive.app.monitor.SocHistoryDatabase socDb =
                     com.overdrive.app.monitor.SocHistoryDatabase.getInstance();
-                com.overdrive.app.abrp.SohEstimator sohEst =
+                modelChangeEstimator =
                     socDb != null ? socDb.getSohEstimator() : null;
-                if (sohEst != null) {
-                    sohEst.reset();
-                    android.content.Context appCtx =
-                        com.overdrive.app.daemon.CameraDaemon.getAppContext();
-                    sohEst.autoDetectCarModel(appCtx);
-                    sohEst.seedInitialEstimate();
-                }
+            }
+
+            final com.overdrive.app.abrp.SohEstimator estimator =
+                modelChangeEstimator;
+            final boolean ok;
+            try {
+                // ConfigBackupService establishes the global lock order as
+                // config -> estimator. Hold both through reset, config commit,
+                // and reseed so no old-model estimator mutation can land in
+                // either crash window.
+                ok = UnifiedConfigManager.runUnderConfigLock(() -> {
+                    if (!changesModelSelection) {
+                        return UnifiedConfigManager.setVehicle(patch);
+                    }
+                    if (estimator == null) {
+                        throw new IllegalStateException(
+                            "SOH estimator is unavailable for model invalidation");
+                    }
+                    // Capture all config-derived estimator inputs before
+                    // acquiring its mutation lock. The stable order is always
+                    // config -> estimator.
+                    final double configuredUserNominal =
+                        UnifiedConfigManager.readVehicleNominalKwhStrict();
+                    final boolean[] configSaved = {false};
+                    estimator.runWithEstimatorLock(() -> {
+                        if (!estimator.isInitializationReady()) {
+                            throw new IllegalStateException(
+                                "SOH estimator is unavailable for model invalidation");
+                        }
+                        // Establish the durable invalidation before publishing
+                        // the new model. A crash can therefore leave either the
+                        // old model with cleared SOH or the new model with
+                        // cleared SOH, never the new model with old-pack state.
+                        estimator.resetFromConfigSnapshot(configuredUserNominal);
+                        configSaved[0] = UnifiedConfigManager.setVehicle(patch);
+                        if (!configSaved[0]) return;
+                        try {
+                            android.content.Context appCtx =
+                                com.overdrive.app.daemon.CameraDaemon.getAppContext();
+                            estimator.autoDetectCarModelFromConfigSnapshot(
+                                appCtx, selectedModelNominal);
+                            estimator.seedInitialEstimate();
+                        } catch (Throwable t) {
+                            logger.warn(TAG + ": SOH re-seed after model change deferred: "
+                                + t.getMessage());
+                        }
+                    });
+                    return configSaved[0];
+                });
             } catch (Throwable t) {
-                logger.warn(TAG + ": SOH reset on model change failed: " + t.getMessage());
+                logger.warn(TAG + ": model change transaction failed: "
+                    + t.getMessage());
+                HttpResponse.sendJsonError(
+                    out, Messages.get("errors.models_persist_failed"));
+                return;
+            }
+            if (!ok) {
+                HttpResponse.sendJsonError(out, Messages.get("errors.models_persist_failed"));
+                return;
             }
         }
 
@@ -401,17 +452,22 @@ public class ModelsApiHandler {
      * same half-scale HAL artifact and has been removed.)
      */
     public static double nominalKwhForSelectedModel() {
+        final String modelId;
         try {
-            String modelId = UnifiedConfigManager.getSelectedVehicleModelId();
-            if (modelId == null || modelId.isEmpty()) return 0;
-            JSONObject manifest = readManifest();
-            if (manifest == null) return 0;
-            JSONObject m = findModel(manifest, modelId);
-            if (m == null) return 0;
-            return m.optDouble("nominalKwh", 0);
-        } catch (Throwable t) {
-            return 0;
+            modelId = UnifiedConfigManager.getSelectedVehicleModelIdStrict();
+        } catch (Exception unavailable) {
+            throw new SelectedModelConfigUnavailableException(unavailable);
         }
+        return nominalKwhForModelId(modelId);
+    }
+
+    private static double nominalKwhForModelId(String modelId) {
+        if (modelId == null || modelId.isEmpty()) return 0;
+        JSONObject manifest = readManifest();
+        if (manifest == null) return 0;
+        JSONObject m = findModel(manifest, modelId);
+        if (m == null) return 0;
+        return m.optDouble("nominalKwh", 0);
     }
 
     /**
@@ -422,17 +478,7 @@ public class ModelsApiHandler {
      * nameplate for the physical coulomb-count comparison".
      */
     public static double grossNameplateKwhForSelectedModel() {
-        try {
-            String modelId = UnifiedConfigManager.getSelectedVehicleModelId();
-            if (modelId == null || modelId.isEmpty()) return 0;
-            JSONObject manifest = readManifest();
-            if (manifest == null) return 0;
-            JSONObject m = findModel(manifest, modelId);
-            if (m == null) return 0;
-            return m.optDouble("nominalKwh", 0);
-        } catch (Throwable t) {
-            return 0;
-        }
+        return nominalKwhForSelectedModel();
     }
 
     private static void handleList(OutputStream out) throws Exception {

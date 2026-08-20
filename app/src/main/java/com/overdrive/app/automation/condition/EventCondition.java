@@ -93,6 +93,12 @@ public class EventCondition {
             }
             json.put("variables", variables);
             json.put("description", getDescription());
+            // The MQTT telemetry key carrying the same fact, when one exists — a read-only
+            // cross-reference for users who wire automations and Home Assistant against the
+            // same car. Cosmetic: never stored, never resolved against. Omitted (not null)
+            // when the signal has no twin, so the UI can simply test for presence.
+            String mqtt = SignalMqttMap.forId(getLabel().getId());
+            if (mqtt != null) json.put("mqtt", mqtt);
             json.put("comparator", getValue().getComparators().toJson());
             json.put("value", getValue().toJson());
         } catch (Exception e) {

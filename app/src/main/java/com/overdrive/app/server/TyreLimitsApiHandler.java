@@ -70,6 +70,9 @@ public class TyreLimitsApiHandler {
         response.put("min", UnifiedConfigManager.TYRE_KPA_MIN);
         response.put("max", UnifiedConfigManager.TYRE_KPA_MAX);
         response.put("unit", "kPa");
+        // Display-unit preference ("kpa" | "psi" | "bar"). Presentation only —
+        // the limits above are, and stay, kPa regardless of this value.
+        response.put("pressureUnit", UnifiedConfigManager.getTyrePressureUnit());
         response.put("success", true);
         HttpResponse.sendJson(out, response.toString());
     }
@@ -116,6 +119,21 @@ public class TyreLimitsApiHandler {
             patch.put(key, (int) value);
         }
 
+        // Display-unit preference rides along in the same section. Validated
+        // against the closed token set so a client bug can't persist a value
+        // no formatter understands (the read side also falls back, belt and
+        // braces). Case-normalised so "PSI" and "psi" store identically.
+        if (incoming.has("pressureUnit")) {
+            String unit = String.valueOf(incoming.opt("pressureUnit"))
+                    .trim().toLowerCase(java.util.Locale.ROOT);
+            if (!unit.equals("kpa") && !unit.equals("psi") && !unit.equals("bar")) {
+                HttpResponse.sendJsonError(out,
+                        Messages.get("errors.tyres_invalid_unit"));
+                return;
+            }
+            patch.put("pressureUnit", unit);
+        }
+
         if (patch.length() == 0) {
             HttpResponse.sendJsonError(out, Messages.get("errors.tyres_nothing_to_update"));
             return;
@@ -149,6 +167,7 @@ public class TyreLimitsApiHandler {
         // Echo the post-write effective values so the client repaints from the
         // authoritative state rather than from what it optimistically sent.
         response.put("limits", UnifiedConfigManager.getTyreThresholds());
+        response.put("pressureUnit", UnifiedConfigManager.getTyrePressureUnit());
         HttpResponse.sendJson(out, response.toString());
     }
 

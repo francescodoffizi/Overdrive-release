@@ -1,8 +1,10 @@
 package com.overdrive.app.telemetry;
 
 import android.content.Context;
+import android.os.SystemClock;
 
 import com.overdrive.app.logging.DaemonLogger;
+import com.overdrive.app.monitor.GpsMonitor;
 
 import java.lang.reflect.Method;
 import java.util.concurrent.Executors;
@@ -66,6 +68,9 @@ public class TelemetryDataCollector {
     // Polling
     private ScheduledExecutorService executor;
     private volatile TelemetrySnapshot latestSnapshot;
+    private final Object pollExecutionLock = new Object();
+    private long nextPollingGeneration = 0L;
+    private volatile long activePollingGeneration = 0L;
 
     // Lifecycle monitor. The singleton collector is shared across concurrent
     // callers — pano (GpuSurveillancePipeline), OEM dashcam (OemDashcamPipeline),
@@ -78,9 +83,9 @@ public class TelemetryDataCollector {
     // thread (still scheduled, never shut down), so two pollers run forever,
     // doubling the reflective BYD-HAL sweep and contending on the same
     // non-thread-safe device handles. All five lifecycle methods take this
-    // monitor; poll()/pollInner() deliberately do NOT (they run on the
-    // executor thread and only touch volatiles), so the hot path never
-    // contends with lifecycle transitions.
+    // monitor. Polling uses a separate execution lock, then briefly takes this
+    // monitor only to verify its generation and publish a snapshot atomically
+    // with lifecycle transitions.
     private final Object pollingLock = new Object();
 
     // Recording mode: when true, polls at POLL_INTERVAL_MS (2 Hz) for the
@@ -122,12 +127,18 @@ public class TelemetryDataCollector {
     private int lastSpeedKmh = 0;
     private int lastAccelPercent = 0;
     private int lastBrakePercent = 0;
-    // Staleness detection: if speed stays identical for too long, force reconnect
-    private int staleSpeedCount = 0;
-    private int prevSpeedForStaleCheck = -1;
-    private static final int STALE_THRESHOLD = 20; // 10 seconds at 2Hz
+    private boolean lastSpeedValid = false;
+    private long lastSpeedReadElapsedRealtimeMs = -1;
+    private boolean lastAccelValid = false;
+    private long lastAccelReadElapsedRealtimeMs = -1;
+    private boolean lastBrakeValid = false;
+    private long lastBrakeReadElapsedRealtimeMs = -1;
     private boolean lastBrakePedalPressed = false;
+    private boolean lastBrakePedalPressedValid = false;
+    private long lastBrakePedalPressedReadElapsedRealtimeMs = -1;
     private int lastGearMode = 1; // P
+    private boolean lastGearValid = false;
+    private long lastGearReadElapsedRealtimeMs = -1;
     private boolean lastLeftTurn = false;
     private boolean lastRightTurn = false;
     // NOT buckled-by-default. This array is what the overlay renders when the seatbelt read
@@ -158,7 +169,7 @@ public class TelemetryDataCollector {
     // is 25% of the period — anything above that and we're risking missed
     // ticks plus regressing the overlay's frame freshness.
     private static final long SLOW_TICK_LOG_BUDGET_MS = 50L;
-    private long lastSlowTickWarnAtMs = 0L;
+    private long lastSlowTickWarnElapsedRealtimeMs = 0L;
 
     // 750ms heartbeat at 1Hz idle polling. The poll itself fires every 1000ms
     // (SLOW_POLL_INTERVAL_MS) but ScheduledExecutorService.scheduleAtFixedRate
@@ -169,7 +180,33 @@ public class TelemetryDataCollector {
     // always fires before the next poll tick, keeping the snapshot freshness
     // well under 1 second.
     private static final long HEARTBEAT_INTERVAL_MS = 750L;
-    private long lastPublishedTimestampMs = 0L;
+    private long lastPublishedElapsedRealtimeMs = -1L;
+
+    // Speed-device recovery is intentionally monotonic and rate limited. A
+    // failed boot-time bind must not disable speed/pedal telemetry for the
+    // rest of a long drive, while a dead HAL must not be rebound every tick.
+    private static final long SPEED_RECONNECT_INITIAL_BACKOFF_MS = 10_000L;
+    private static final long SPEED_RECONNECT_MAX_BACKOFF_MS = 60_000L;
+    private final Object speedReconnectLock = new Object();
+    private long nextSpeedReconnectElapsedRealtimeMs = 0L;
+    private long speedReconnectBackoffMs =
+            SPEED_RECONNECT_INITIAL_BACKOFF_MS;
+
+    // An unchanged non-zero speed is valid during constant-speed cruising.
+    // Quarantine it only when several distinct, live, accurate GPS fixes
+    // disagree for a sustained period and a device rebind does not recover a
+    // plausible speed.
+    private static final long GPS_SPEED_MAX_AGE_MS = 5_000L;
+    private static final float GPS_SPEED_MAX_ACCURACY_M = 20.0f;
+    private static final double GPS_SPEED_MAX_KMH = 300.0;
+    private static final double SPEED_CONTRADICTION_DELTA_KMH = 20.0;
+    private static final long SPEED_CONTRADICTION_MIN_DURATION_MS = 10_000L;
+    private static final int SPEED_CONTRADICTION_MIN_FIXES = 3;
+    private long speedContradictionSinceElapsedRealtimeMs = -1L;
+    private long lastContradictingGpsFixId = -1L;
+    private int distinctContradictingGpsFixes = 0;
+    private boolean speedSourceInvalidated = false;
+    private int invalidatedFrozenSpeedKmh = -1;
 
     /**
      * Initialize BYD device handles via reflection using PermissionBypassContext.
@@ -185,10 +222,30 @@ public class TelemetryDataCollector {
         try {
             Class<?> cls = Class.forName("android.hardware.bydauto.speed.BYDAutoSpeedDevice");
             Method getInstance = cls.getMethod("getInstance", Context.class);
-            speedDevice = getInstance.invoke(null, permissiveContext);
-            getCurrentSpeedMethod = cls.getMethod("getCurrentSpeed");
-            getAccelerateDeepnessMethod = cls.getMethod("getAccelerateDeepness");
-            getBrakeDeepnessMethod = cls.getMethod("getBrakeDeepness");
+            Object newSpeedDevice =
+                    getInstance.invoke(null, permissiveContext);
+            if (newSpeedDevice == null) {
+                throw new IllegalStateException(
+                        "BYDAutoSpeedDevice.getInstance returned null");
+            }
+            Method newGetCurrentSpeedMethod =
+                    cls.getMethod("getCurrentSpeed");
+            Method newGetAccelerateDeepnessMethod =
+                    cls.getMethod("getAccelerateDeepness");
+            Method newGetBrakeDeepnessMethod =
+                    cls.getMethod("getBrakeDeepness");
+            synchronized (speedReconnectLock) {
+                speedDevice = newSpeedDevice;
+                getCurrentSpeedMethod =
+                        newGetCurrentSpeedMethod;
+                getAccelerateDeepnessMethod =
+                        newGetAccelerateDeepnessMethod;
+                getBrakeDeepnessMethod =
+                        newGetBrakeDeepnessMethod;
+                nextSpeedReconnectElapsedRealtimeMs = 0L;
+                speedReconnectBackoffMs =
+                        SPEED_RECONNECT_INITIAL_BACKOFF_MS;
+            }
             logger.info("BYDAutoSpeedDevice initialized");
         } catch (Exception e) {
             logger.warn("BYDAutoSpeedDevice unavailable: " + e.getMessage());
@@ -343,6 +400,7 @@ public class TelemetryDataCollector {
      */
     private void restartAtCurrentRateLocked() {
         if (executor == null || executor.isShutdown()) return;
+        activePollingGeneration = 0L;
         executor.shutdown();
         executor = null;
         startExecutorLocked();
@@ -361,12 +419,20 @@ public class TelemetryDataCollector {
      */
     private void startExecutorLocked() {
         long interval = currentIntervalMs();
-        executor = Executors.newSingleThreadScheduledExecutor(r -> {
+        long generation = ++nextPollingGeneration;
+        activePollingGeneration = generation;
+        ScheduledExecutorService newExecutor =
+                Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "TelemetryPoller");
             t.setDaemon(true);
             return t;
         });
-        executor.scheduleAtFixedRate(this::poll, 0, interval, TimeUnit.MILLISECONDS);
+        executor = newExecutor;
+        newExecutor.scheduleAtFixedRate(
+                () -> poll(generation),
+                0,
+                interval,
+                TimeUnit.MILLISECONDS);
     }
 
     private long currentIntervalMs() {
@@ -392,6 +458,7 @@ public class TelemetryDataCollector {
                 }
                 return;
             }
+            activePollingGeneration = 0L;
             if (executor != null) {
                 executor.shutdown();
                 executor = null;
@@ -407,6 +474,7 @@ public class TelemetryDataCollector {
     public void forceStopPolling() {
         synchronized (pollingLock) {
             pollingRefCount.set(0);
+            activePollingGeneration = 0L;
             if (executor != null) {
                 executor.shutdown();
                 executor = null;
@@ -426,33 +494,51 @@ public class TelemetryDataCollector {
      * Poll all BYD devices and produce a new TelemetrySnapshot.
      * On failure for any individual field, uses the last-known-good value.
      */
-    private void poll() {
-        // FIX H2: instrument tick duration. The 6+ reflective Method.invoke()
-        // calls per tick are the dominant CPU cost at 5 Hz; if a single
-        // BYD-HAL call gets slow (e.g., the speed device gets reconnected
-        // mid-tick) the tick can blow past the 200 ms period. We rate-limit
-        // the WARN to once per minute so a slow HAL doesn't spam the log.
-        long startNanos = System.nanoTime();
-        try {
-            pollInner();
-        } catch (Throwable t) {
-            // CRITICAL: ScheduledExecutorService silently stops if task throws.
-            // Catch everything to keep polling alive.
-            logger.error("Poll error (keeping alive): " + t.getMessage());
+    private void poll(long generation) {
+        if (!isCurrentPollingGeneration(generation)) {
+            return;
         }
-        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
-        if (elapsedMs > SLOW_TICK_LOG_BUDGET_MS) {
-            long now = System.currentTimeMillis();
-            if (now - lastSlowTickWarnAtMs > 60_000L) {
-                lastSlowTickWarnAtMs = now;
-                logger.warn("Telemetry poll tick took " + elapsedMs
-                        + " ms (budget " + SLOW_TICK_LOG_BUDGET_MS
-                        + " ms) — BYD HAL may be slow");
+        synchronized (pollExecutionLock) {
+            if (!isCurrentPollingGeneration(generation)) {
+                return;
+            }
+            // FIX H2: instrument tick duration. The reflective Method.invoke()
+            // calls are the dominant polling cost; rate-limit slow-HAL logs.
+            long startNanos = System.nanoTime();
+            try {
+                pollInner(generation);
+            } catch (Throwable t) {
+                // A scheduled executor suppresses future runs if a task throws.
+                logger.error("Poll error (keeping alive): " + t.getMessage());
+            }
+            long elapsedMs =
+                    (System.nanoTime() - startNanos) / 1_000_000L;
+            if (elapsedMs > SLOW_TICK_LOG_BUDGET_MS) {
+                long nowElapsedRealtimeMs =
+                        SystemClock.elapsedRealtime();
+                if (lastSlowTickWarnElapsedRealtimeMs <= 0
+                        || nowElapsedRealtimeMs
+                        - lastSlowTickWarnElapsedRealtimeMs > 60_000L) {
+                    lastSlowTickWarnElapsedRealtimeMs =
+                            nowElapsedRealtimeMs;
+                    logger.warn("Telemetry poll tick took " + elapsedMs
+                            + " ms (budget " + SLOW_TICK_LOG_BUDGET_MS
+                            + " ms) — BYD HAL may be slow");
+                }
             }
         }
     }
 
-    private void pollInner() {
+    private boolean isCurrentPollingGeneration(long generation) {
+        return generation != 0L
+                && activePollingGeneration == generation;
+    }
+
+    private void pollInner(long generation) {
+        if (!isCurrentPollingGeneration(generation)) {
+            return;
+        }
+        long pollElapsedRealtimeMs = SystemClock.elapsedRealtime();
         int speedKmh = lastSpeedKmh;
         int accelPercent = lastAccelPercent;
         int brakePercent = lastBrakePercent;
@@ -467,10 +553,22 @@ public class TelemetryDataCollector {
         // and are needed for the video overlay at 5Hz.
 
         // Speed device: getCurrentSpeed(), getAccelerateDeepness(), getBrakeDeepness()
-        if (speedDevice != null) {
+        Object polledSpeedDevice = speedDevice;
+        Method polledGetCurrentSpeedMethod =
+                getCurrentSpeedMethod;
+        Method polledGetAccelerateDeepnessMethod =
+                getAccelerateDeepnessMethod;
+        Method polledGetBrakeDeepnessMethod =
+                getBrakeDeepnessMethod;
+        if (polledSpeedDevice != null
+                && polledGetCurrentSpeedMethod != null
+                && polledGetAccelerateDeepnessMethod != null
+                && polledGetBrakeDeepnessMethod != null) {
             boolean deviceFailed = false;
             try {
-                double rawSpeed = (double) getCurrentSpeedMethod.invoke(speedDevice);
+                double rawSpeed =
+                        (double) polledGetCurrentSpeedMethod.invoke(
+                                polledSpeedDevice);
                 // BYDAutoSpeedDevice.getCurrentSpeed() returns the value in the
                 // cluster's configured unit (mph on imperial trims), so normalize
                 // to canonical km/h here — matching the contract every downstream
@@ -484,63 +582,137 @@ public class TelemetryDataCollector {
                 // a bogus +838M km/h that would poison the overlay and the trip's
                 // max/avg/histogram. On a bad read we keep the last-known-good speed.
                 if (isValidRawSpeed(rawSpeed)) {
-                    speedKmh = (int) Math.round(rawSpeed * speedToKmhFactor());
-                    lastSpeedKmh = speedKmh;
+                    int convertedSpeed =
+                            (int) Math.round(
+                                    rawSpeed * speedToKmhFactor());
+                    if (convertedSpeed >= 0
+                            && convertedSpeed <= 300) {
+                        acceptSpeedCandidate(
+                                convertedSpeed,
+                                pollElapsedRealtimeMs);
+                        speedKmh = lastSpeedKmh;
+                    } else {
+                        deviceFailed = true;
+                    }
+                } else {
+                    deviceFailed = true;
                 }
             } catch (Exception e) {
                 logger.warn("Failed to read speed: " + e.getMessage());
                 deviceFailed = true;
             }
             try {
-                accelPercent = (int) getAccelerateDeepnessMethod.invoke(speedDevice);
-                lastAccelPercent = accelPercent;
+                int candidate =
+                        (int) polledGetAccelerateDeepnessMethod.invoke(
+                                polledSpeedDevice);
+                if (isValidPedalPercent(candidate)) {
+                    accelPercent = candidate;
+                    lastAccelPercent = candidate;
+                    lastAccelValid = true;
+                    lastAccelReadElapsedRealtimeMs =
+                            pollElapsedRealtimeMs;
+                } else {
+                    deviceFailed = true;
+                }
             } catch (Exception e) {
                 logger.warn("Failed to read accel pedal: " + e.getMessage());
                 deviceFailed = true;
             }
             try {
-                brakePercent = (int) getBrakeDeepnessMethod.invoke(speedDevice);
-                lastBrakePercent = brakePercent;
+                int candidate =
+                        (int) polledGetBrakeDeepnessMethod.invoke(
+                                polledSpeedDevice);
+                if (isValidPedalPercent(candidate)) {
+                    brakePercent = candidate;
+                    lastBrakePercent = candidate;
+                    lastBrakeValid = true;
+                    lastBrakeReadElapsedRealtimeMs =
+                            pollElapsedRealtimeMs;
+                } else {
+                    deviceFailed = true;
+                }
             } catch (Exception e) {
                 logger.warn("Failed to read brake depth: " + e.getMessage());
                 deviceFailed = true;
             }
             // If any read failed, try to re-obtain the device reference
             if (deviceFailed) {
-                boolean reconnected = tryReconnectSpeedDevice();
-                if (reconnected) {
+                SpeedReconnectResult reconnect =
+                        maybeReconnectSpeedDevice(
+                                generation,
+                                pollElapsedRealtimeMs,
+                                "read failure");
+                if (reconnect.anyValidRead) {
                     speedKmh = lastSpeedKmh;
                     accelPercent = lastAccelPercent;
                     brakePercent = lastBrakePercent;
                 }
             }
+        } else {
+            SpeedReconnectResult reconnect =
+                    maybeReconnectSpeedDevice(
+                            generation,
+                            pollElapsedRealtimeMs,
+                            "device unavailable");
+            if (reconnect.anyValidRead) {
+                speedKmh = lastSpeedKmh;
+                accelPercent = lastAccelPercent;
+                brakePercent = lastBrakePercent;
+            }
+        }
 
-            // Staleness detection: if speed value is identical for 10+ seconds, force reconnect
-            if (speedKmh == prevSpeedForStaleCheck && !(speedKmh == 0 && lastGearMode == 1)) {
-                staleSpeedCount++;
-                if (staleSpeedCount >= STALE_THRESHOLD) {
-                    long pollIntervalMs = overlayRecordingActive ? POLL_INTERVAL_MS : SLOW_POLL_INTERVAL_MS;
-                    logger.warn("Speed device appears stale (same value " + speedKmh + " for " + (staleSpeedCount * pollIntervalMs / 1000) + "s), reconnecting");
-                    boolean reconnected = tryReconnectSpeedDevice();
-                    if (reconnected) {
-                        speedKmh = lastSpeedKmh;
-                        accelPercent = lastAccelPercent;
-                        brakePercent = lastBrakePercent;
-                    }
-                    staleSpeedCount = 0;
-                    prevSpeedForStaleCheck = -1;
+        GpsSpeedEvidence gpsSpeedEvidence =
+                captureTrustworthyGpsSpeed(
+                        pollElapsedRealtimeMs,
+                        System.currentTimeMillis());
+        boolean sustainedSpeedContradiction =
+                updateSpeedContradiction(
+                        speedKmh,
+                        gpsSpeedEvidence,
+                        pollElapsedRealtimeMs);
+        if (sustainedSpeedContradiction
+                || speedSourceInvalidated) {
+            SpeedReconnectResult reconnect =
+                    maybeReconnectSpeedDevice(
+                            generation,
+                            pollElapsedRealtimeMs,
+                            speedSourceInvalidated
+                                    ? "invalidated speed source"
+                                    : "GPS/CAN speed contradiction");
+            if (reconnect.anyValidRead) {
+                speedKmh = lastSpeedKmh;
+                accelPercent = lastAccelPercent;
+                brakePercent = lastBrakePercent;
+            }
+            if (sustainedSpeedContradiction
+                    && reconnect.attempted) {
+                boolean recovered =
+                        reconnect.speedReadValid
+                        && !isSpeedContradictory(
+                                reconnect.speedKmh,
+                                gpsSpeedEvidence);
+                if (recovered) {
+                    resetSpeedContradiction();
+                } else {
+                    invalidateFrozenSpeed(speedKmh);
                 }
-            } else {
-                staleSpeedCount = 0;
-                prevSpeedForStaleCheck = speedKmh;
             }
         }
 
         // Gearbox: gear mode (every poll — changes on shift)
-        if (gearboxDevice != null) {
+        if (gearboxDevice != null
+                && getGearboxAutoModeTypeMethod != null) {
             try {
-                gearMode = (int) getGearboxAutoModeTypeMethod.invoke(gearboxDevice);
-                lastGearMode = gearMode;
+                int candidate =
+                        (int) getGearboxAutoModeTypeMethod.invoke(
+                                gearboxDevice);
+                if (isValidGearMode(candidate)) {
+                    gearMode = candidate;
+                    lastGearMode = candidate;
+                    lastGearValid = true;
+                    lastGearReadElapsedRealtimeMs =
+                            pollElapsedRealtimeMs;
+                }
             } catch (Exception e) {
                 logger.warn("Failed to read gear mode: " + e.getMessage());
             }
@@ -651,8 +823,14 @@ public class TelemetryDataCollector {
             if (gearboxDevice != null) {
                 try {
                     int brakeState = (int) getBrakePedalStateMethod.invoke(gearboxDevice);
-                    brakePedalPressed = brakeState == 1;
-                    lastBrakePedalPressed = brakePedalPressed;
+                    if (brakeState == 0 || brakeState == 1) {
+                        brakePedalPressed = brakeState == 1;
+                        lastBrakePedalPressed =
+                                brakePedalPressed;
+                        lastBrakePedalPressedValid = true;
+                        lastBrakePedalPressedReadElapsedRealtimeMs =
+                                pollElapsedRealtimeMs;
+                    }
                 } catch (Exception e) {
                     logger.warn("Failed to read brake pedal state: " + e.getMessage());
                 }
@@ -672,8 +850,14 @@ public class TelemetryDataCollector {
                 || prev.brakePedalPercent != brakePercent
                 || prev.brakePedalPressed != brakePedalPressed
                 || prev.gearMode != gearMode
+                || prev.gearValid != lastGearValid
                 || prev.leftTurnSignal != leftTurn
                 || prev.rightTurnSignal != rightTurn
+                || prev.speedValid != lastSpeedValid
+                || prev.accelPedalValid != lastAccelValid
+                || prev.brakePedalValid != lastBrakeValid
+                || prev.brakePedalPressedValid
+                != lastBrakePedalPressedValid
                 || prev.seatbeltBuckled == null
                 || prev.seatbeltBuckled.length != (seatbelts == null ? 0 : seatbelts.length)
                 || (seatbelts != null
@@ -683,18 +867,48 @@ public class TelemetryDataCollector {
         // freshness-checking consumers (GearMonitor, TripTelemetryRecorder)
         // don't see a stale timestampMs.
         long now = System.currentTimeMillis();
-        boolean heartbeatDue = (now - lastPublishedTimestampMs) >= HEARTBEAT_INTERVAL_MS;
+        boolean heartbeatDue =
+                lastPublishedElapsedRealtimeMs < 0
+                || pollElapsedRealtimeMs
+                < lastPublishedElapsedRealtimeMs
+                || pollElapsedRealtimeMs
+                - lastPublishedElapsedRealtimeMs
+                >= HEARTBEAT_INTERVAL_MS;
         if (fieldsChanged || heartbeatDue) {
-            latestSnapshot = new TelemetrySnapshot(
+            TelemetrySnapshot nextSnapshot = new TelemetrySnapshot(
                     speedKmh, accelPercent, brakePercent,
                     brakePedalPressed, gearMode,
                     leftTurn, rightTurn,
-                    seatbelts, now
+                    seatbelts, now,
+                    pollElapsedRealtimeMs,
+                    lastSpeedValid,
+                    lastSpeedReadElapsedRealtimeMs,
+                    lastAccelValid,
+                    lastAccelReadElapsedRealtimeMs,
+                    lastBrakeValid,
+                    lastBrakeReadElapsedRealtimeMs,
+                    lastBrakePedalPressedValid,
+                    lastBrakePedalPressedReadElapsedRealtimeMs,
+                    lastGearValid,
+                    lastGearReadElapsedRealtimeMs
             );
-            lastPublishedTimestampMs = now;
+            synchronized (pollingLock) {
+                if (!isCurrentPollingGeneration(generation)) {
+                    return;
+                }
+                latestSnapshot = nextSnapshot;
+                lastPublishedElapsedRealtimeMs =
+                        pollElapsedRealtimeMs;
+                pollCount++;
+            }
+        } else {
+            synchronized (pollingLock) {
+                if (!isCurrentPollingGeneration(generation)) {
+                    return;
+                }
+                pollCount++;
+            }
         }
-
-        pollCount++;
     }
 
     /**
@@ -736,39 +950,338 @@ public class TelemetryDataCollector {
                 && rawSpeed != com.overdrive.app.byd.BydFeatureIds.SDK_NOT_AVAILABLE;
     }
 
+    private static boolean isValidPedalPercent(int percent) {
+        return percent >= 0 && percent <= 100;
+    }
+
+    private static boolean isValidGearMode(int gearMode) {
+        return gearMode >= 1 && gearMode <= 6;
+    }
+
+    private boolean acceptSpeedCandidate(
+            int candidateSpeedKmh,
+            long readElapsedRealtimeMs) {
+        if (speedSourceInvalidated) {
+            if (candidateSpeedKmh == invalidatedFrozenSpeedKmh) {
+                lastSpeedValid = false;
+                return false;
+            }
+            logger.info("Speed source changed after quarantine; accepting live data");
+            speedSourceInvalidated = false;
+            invalidatedFrozenSpeedKmh = -1;
+            resetSpeedContradiction();
+        }
+        lastSpeedKmh = candidateSpeedKmh;
+        lastSpeedValid = true;
+        lastSpeedReadElapsedRealtimeMs =
+                readElapsedRealtimeMs;
+        return true;
+    }
+
+    private SpeedReconnectResult maybeReconnectSpeedDevice(
+            long generation,
+            long nowElapsedRealtimeMs,
+            String reason) {
+        synchronized (speedReconnectLock) {
+            if (!isCurrentPollingGeneration(generation)
+                    || nowElapsedRealtimeMs
+                    < nextSpeedReconnectElapsedRealtimeMs) {
+                return SpeedReconnectResult.notAttempted();
+            }
+            SpeedReconnectResult result =
+                    reconnectSpeedDevice(
+                            generation,
+                            nowElapsedRealtimeMs);
+            if (!result.attempted) {
+                return result;
+            }
+            if (result.anyValidRead) {
+                speedReconnectBackoffMs =
+                        SPEED_RECONNECT_INITIAL_BACKOFF_MS;
+            } else {
+                speedReconnectBackoffMs = Math.min(
+                        SPEED_RECONNECT_MAX_BACKOFF_MS,
+                        Math.max(
+                                SPEED_RECONNECT_INITIAL_BACKOFF_MS,
+                                speedReconnectBackoffMs * 2L));
+            }
+            long attemptCompletedElapsedRealtimeMs =
+                    Math.max(
+                            nowElapsedRealtimeMs,
+                            SystemClock.elapsedRealtime());
+            nextSpeedReconnectElapsedRealtimeMs =
+                    attemptCompletedElapsedRealtimeMs
+                    + speedReconnectBackoffMs;
+            if (result.anyValidRead) {
+                logger.info("Re-obtained BYDAutoSpeedDevice after "
+                        + reason);
+            } else {
+                logger.warn("BYDAutoSpeedDevice reconnect after "
+                        + reason + " failed; retrying in "
+                        + (speedReconnectBackoffMs / 1000L) + "s");
+            }
+            return result;
+        }
+    }
+
     /**
-     * Try to re-obtain the BYDAutoSpeedDevice reference and verify it returns fresh data.
-     * This can happen if the BYD service restarts between trips.
-     * Returns true if reconnect succeeded and fresh data was obtained.
+     * Rebuild all reflection handles as well as the device object. This is
+     * required when init ran before the BYD service or its classes were ready.
      */
-    private boolean tryReconnectSpeedDevice() {
+    private SpeedReconnectResult reconnectSpeedDevice(
+            long generation,
+            long readElapsedRealtimeMs) {
         try {
             Class<?> cls = Class.forName("android.hardware.bydauto.speed.BYDAutoSpeedDevice");
             Method getInstance = cls.getMethod("getInstance", Context.class);
             Object newDevice = getInstance.invoke(null, savedContext);
-            if (newDevice == null) return false;
-            
-            // Verify the new device actually returns data by doing a test read
-            double testSpeed = (double) getCurrentSpeedMethod.invoke(newDevice);
-            int testAccel = (int) getAccelerateDeepnessMethod.invoke(newDevice);
-            int testBrake = (int) getBrakeDeepnessMethod.invoke(newDevice);
-
-            // If we get here without exception, the device is alive
-            speedDevice = newDevice;
-            // Normalize to km/h, same as the main poll path (no-op on metric trims).
-            // Guard the sentinel/negative so a not-yet-ready value doesn't overflow
-            // into a bogus speed; the device is still considered alive (the reads
-            // didn't throw), we just keep the last-known-good speed this tick.
-            if (isValidRawSpeed(testSpeed)) {
-                lastSpeedKmh = (int) Math.round(testSpeed * speedToKmhFactor());
+            if (newDevice == null) {
+                return SpeedReconnectResult.failed();
             }
-            lastAccelPercent = testAccel;
-            lastBrakePercent = testBrake;
-            logger.info("Re-obtained BYDAutoSpeedDevice — verified working (speed=" + lastSpeedKmh + ")");
-            return true;
+            Method newGetCurrentSpeedMethod =
+                    cls.getMethod("getCurrentSpeed");
+            Method newGetAccelerateDeepnessMethod =
+                    cls.getMethod("getAccelerateDeepness");
+            Method newGetBrakeDeepnessMethod =
+                    cls.getMethod("getBrakeDeepness");
+            int reconnectSpeedKmh = lastSpeedKmh;
+            boolean speedReadValid = false;
+            int reconnectAccelPercent = lastAccelPercent;
+            boolean accelReadValid = false;
+            int reconnectBrakePercent = lastBrakePercent;
+            boolean brakeReadValid = false;
+            boolean anyValidRead = false;
+            try {
+                double testSpeed =
+                        (double) newGetCurrentSpeedMethod.invoke(
+                                newDevice);
+                if (isValidRawSpeed(testSpeed)) {
+                    int convertedSpeed =
+                            (int) Math.round(
+                                    testSpeed * speedToKmhFactor());
+                    if (convertedSpeed >= 0
+                            && convertedSpeed <= 300) {
+                        reconnectSpeedKmh = convertedSpeed;
+                        speedReadValid = true;
+                        anyValidRead = true;
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("Speed reconnect read failed: "
+                        + e.getMessage());
+            }
+            try {
+                int testAccel =
+                        (int) newGetAccelerateDeepnessMethod.invoke(
+                                newDevice);
+                if (isValidPedalPercent(testAccel)) {
+                    reconnectAccelPercent = testAccel;
+                    accelReadValid = true;
+                    anyValidRead = true;
+                }
+            } catch (Exception e) {
+                logger.warn("Accel reconnect read failed: "
+                        + e.getMessage());
+            }
+            try {
+                int testBrake =
+                        (int) newGetBrakeDeepnessMethod.invoke(
+                                newDevice);
+                if (isValidPedalPercent(testBrake)) {
+                    reconnectBrakePercent = testBrake;
+                    brakeReadValid = true;
+                    anyValidRead = true;
+                }
+            } catch (Exception e) {
+                logger.warn("Brake reconnect read failed: "
+                        + e.getMessage());
+            }
+            if (!isCurrentPollingGeneration(generation)) {
+                return SpeedReconnectResult.notAttempted();
+            }
+            speedDevice = newDevice;
+            getCurrentSpeedMethod =
+                    newGetCurrentSpeedMethod;
+            getAccelerateDeepnessMethod =
+                    newGetAccelerateDeepnessMethod;
+            getBrakeDeepnessMethod =
+                    newGetBrakeDeepnessMethod;
+            if (speedReadValid) {
+                acceptSpeedCandidate(
+                        reconnectSpeedKmh,
+                        readElapsedRealtimeMs);
+            }
+            if (accelReadValid) {
+                lastAccelPercent = reconnectAccelPercent;
+                lastAccelValid = true;
+                lastAccelReadElapsedRealtimeMs =
+                        readElapsedRealtimeMs;
+            }
+            if (brakeReadValid) {
+                lastBrakePercent = reconnectBrakePercent;
+                lastBrakeValid = true;
+                lastBrakeReadElapsedRealtimeMs =
+                        readElapsedRealtimeMs;
+            }
+            return new SpeedReconnectResult(
+                    true,
+                    anyValidRead,
+                    speedReadValid,
+                    reconnectSpeedKmh);
         } catch (Exception e) {
             logger.warn("Speed device reconnect failed: " + e.getMessage());
+            return SpeedReconnectResult.failed();
+        }
+    }
+
+    private GpsSpeedEvidence captureTrustworthyGpsSpeed(
+            long nowElapsedRealtimeMs,
+            long nowEpochMs) {
+        try {
+            GpsMonitor gps = GpsMonitor.getInstance();
+            for (int attempt = 0; attempt < 2; attempt++) {
+                long fixElapsedBefore = gps.getFixElapsedMs();
+                long updateBefore = gps.getLastUpdate();
+                boolean cachedBefore = gps.isLoadedFromCache();
+                float speedMps = gps.getSpeed();
+                float accuracyM = gps.getAccuracy();
+                long fixElapsedAfter = gps.getFixElapsedMs();
+                long updateAfter = gps.getLastUpdate();
+                boolean cachedAfter = gps.isLoadedFromCache();
+                if (fixElapsedBefore != fixElapsedAfter
+                        || updateBefore != updateAfter
+                        || cachedBefore != cachedAfter) {
+                    continue;
+                }
+                if (cachedAfter
+                        || Float.isNaN(speedMps)
+                        || Float.isInfinite(speedMps)
+                        || speedMps < 0.0f
+                        || Float.isNaN(accuracyM)
+                        || Float.isInfinite(accuracyM)
+                        || accuracyM <= 0.0f
+                        || accuracyM > GPS_SPEED_MAX_ACCURACY_M) {
+                    return null;
+                }
+                long fixId;
+                long ageMs;
+                if (fixElapsedAfter > 0L) {
+                    if (fixElapsedAfter > nowElapsedRealtimeMs) {
+                        return null;
+                    }
+                    fixId = fixElapsedAfter;
+                    ageMs = nowElapsedRealtimeMs - fixElapsedAfter;
+                } else {
+                    if (updateAfter <= 0L
+                            || updateAfter > nowEpochMs) {
+                        return null;
+                    }
+                    fixId = updateAfter;
+                    ageMs = nowEpochMs - updateAfter;
+                }
+                double speedKmh = speedMps * 3.6;
+                if (ageMs > GPS_SPEED_MAX_AGE_MS
+                        || speedKmh > GPS_SPEED_MAX_KMH) {
+                    return null;
+                }
+                return new GpsSpeedEvidence(fixId, speedKmh);
+            }
+        } catch (Throwable ignored) {
+            // GPS is optional; unavailable evidence must never invalidate CAN.
+        }
+        return null;
+    }
+
+    private boolean updateSpeedContradiction(
+            int canSpeedKmh,
+            GpsSpeedEvidence gps,
+            long nowElapsedRealtimeMs) {
+        if (gps == null
+                || canSpeedKmh <= 0
+                || !isSpeedContradictory(canSpeedKmh, gps)) {
+            resetSpeedContradiction();
             return false;
+        }
+        if (gps.fixId != lastContradictingGpsFixId) {
+            if (lastContradictingGpsFixId < 0L
+                    || gps.fixId < lastContradictingGpsFixId) {
+                speedContradictionSinceElapsedRealtimeMs =
+                        nowElapsedRealtimeMs;
+                distinctContradictingGpsFixes = 1;
+            } else {
+                distinctContradictingGpsFixes++;
+            }
+            lastContradictingGpsFixId = gps.fixId;
+        }
+        return speedContradictionSinceElapsedRealtimeMs >= 0L
+                && distinctContradictingGpsFixes
+                >= SPEED_CONTRADICTION_MIN_FIXES
+                && nowElapsedRealtimeMs
+                - speedContradictionSinceElapsedRealtimeMs
+                >= SPEED_CONTRADICTION_MIN_DURATION_MS;
+    }
+
+    private static boolean isSpeedContradictory(
+            int canSpeedKmh,
+            GpsSpeedEvidence gps) {
+        return gps != null
+                && Math.abs(canSpeedKmh - gps.speedKmh)
+                >= SPEED_CONTRADICTION_DELTA_KMH;
+    }
+
+    private void invalidateFrozenSpeed(int frozenSpeedKmh) {
+        if (!speedSourceInvalidated) {
+            logger.warn("Invalidating frozen CAN speed "
+                    + frozenSpeedKmh
+                    + "km/h after sustained live GPS disagreement"
+                    + " and failed source recovery");
+        }
+        speedSourceInvalidated = true;
+        invalidatedFrozenSpeedKmh = frozenSpeedKmh;
+        lastSpeedValid = false;
+    }
+
+    private void resetSpeedContradiction() {
+        speedContradictionSinceElapsedRealtimeMs = -1L;
+        lastContradictingGpsFixId = -1L;
+        distinctContradictingGpsFixes = 0;
+    }
+
+    private static final class GpsSpeedEvidence {
+        final long fixId;
+        final double speedKmh;
+
+        GpsSpeedEvidence(long fixId, double speedKmh) {
+            this.fixId = fixId;
+            this.speedKmh = speedKmh;
+        }
+    }
+
+    private static final class SpeedReconnectResult {
+        final boolean attempted;
+        final boolean anyValidRead;
+        final boolean speedReadValid;
+        final int speedKmh;
+
+        SpeedReconnectResult(
+                boolean attempted,
+                boolean anyValidRead,
+                boolean speedReadValid,
+                int speedKmh) {
+            this.attempted = attempted;
+            this.anyValidRead = anyValidRead;
+            this.speedReadValid = speedReadValid;
+            this.speedKmh = speedKmh;
+        }
+
+        static SpeedReconnectResult notAttempted() {
+            return new SpeedReconnectResult(
+                    false, false, false, 0);
+        }
+
+        static SpeedReconnectResult failed() {
+            return new SpeedReconnectResult(
+                    true, false, false, 0);
         }
     }
 

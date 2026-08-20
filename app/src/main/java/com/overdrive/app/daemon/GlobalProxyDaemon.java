@@ -160,6 +160,20 @@ public class GlobalProxyDaemon {
         }
     }
 
+    /**
+     * Inbound bind address. Loopback unless the user opted into letting tethered
+     * hotspot clients use the proxy — clients must still set it themselves, so a
+     * wider bind alone changes nothing for traffic that isn't pointed at it.
+     */
+    private static String inboundListen() {
+        try {
+            if (com.overdrive.app.config.UnifiedConfigManager.isHotspotProxyForClients()) {
+                return "0.0.0.0";
+            }
+        } catch (Throwable ignored) {}
+        return LOCALHOST();
+    }
+
     private static void createSingboxConfig() throws IOException {
         // Use /data/local/tmp/ since UID 1000 can't write to /data/system/ (SELinux)
         String configPath = SINGBOX_CONFIG();
@@ -178,7 +192,7 @@ public class GlobalProxyDaemon {
                 "    {\n" +
                 "      \"type\": \"mixed\",\n" +
                 "      \"tag\": \"mixed-in\",\n" +
-                "      \"listen\": \"" + LOCALHOST() + "\",\n" +
+                "      \"listen\": \"" + inboundListen() + "\",\n" +
                 "      \"listen_port\": " + PROXY_PORT + ",\n" +
                 "      \"sniff\": true\n" +
                 "    }\n" +

@@ -48,7 +48,7 @@ public final class HighResPreviewSampler {
     private static final DaemonLogger logger =
             DaemonLogger.getInstance("HighResPreviewSampler");
 
-    // esco-parity: uTexMatrix from SurfaceTexture.getTransformMatrix()
+    // oem-parity: uTexMatrix from SurfaceTexture.getTransformMatrix()
     // crops to the HAL's live region. Identity by default.
     //
     // TEX_COORDS below are pre-flipped V (legacy convention). On DiLink 4
@@ -69,7 +69,7 @@ public final class HighResPreviewSampler {
             "}\n";
 
     private static String buildMosaicShader(float[] offsets) {
-        // uApaMode > 2.5 = esco-parity passthrough (HAL emits final 2x2
+        // uApaMode > 2.5 = oem-parity passthrough (HAL emits final 2x2
         // mosaic natively). Default 0 = legacy 4-strip → 2x2 rearrangement.
         return String.format(Locale.US,
                 "#extension GL_OES_EGL_image_external : require\n" +
@@ -660,11 +660,11 @@ public final class HighResPreviewSampler {
         }
     }
 
-    /** 0 = legacy 4-strip → 2x2 rearrangement; 3 = esco-parity passthrough. */
+    /** 0 = legacy 4-strip → 2x2 rearrangement; 3 = oem-parity passthrough. */
     public void setCameraLayout(int layout) { this.cameraLayout = layout; }
 
     /** Enables the GL red-overlay suppression on dialog preview JPEGs. */
-    /** APA center inset (esco APACropFilter parity). See {@link
+    /** APA center inset (oem APACropFilter parity). See {@link
      *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
     public void setApaCenterInset(float inset) {
         this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));

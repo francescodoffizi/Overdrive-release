@@ -872,7 +872,7 @@ public final class ScreenDeterrent {
      *
      * <p>Tier 1 ({@code TurnBacklightOff(long)}) is the original path and is
      * kept for legacy units exactly as it was. On dilink4 we use the verified
-     * two-tier path instead: the reference app (Escort_Auto.apk
+     * two-tier path instead: the reference OEM dashcam app (
      * {@code BacklightController.turnOffBacklight}) escalates to
      * {@code TurnBacklightOffWithLock} and re-checks
      * {@code getPowerScreenStatus()}, because tier 1 alone does not reliably

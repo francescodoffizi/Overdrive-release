@@ -11,12 +11,10 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <link rel="stylesheet" href="../shared/leaflet.css">
     <script src="../shared/leaflet.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
 </head>
 <body class="dashboard-page">
     <div class="app-layout">
@@ -40,30 +38,158 @@
                             <h1 data-i18n="dashboard.heading">Dashboard</h1>
                             <p id="dashHeroSubtitle" data-i18n="dashboard.subtitle">Vehicle status, position and main controls.</p>
                         </div>
+                        <div class="dash-drive-state is-pending" id="dashDriveState"
+                             role="status" aria-live="polite" aria-atomic="true">
+                            <div class="dash-drive-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                     stroke-width="2" stroke-linecap="round">
+                                    <path d="M12 2v10"/>
+                                    <path d="M6.3 5.8a8 8 0 1 0 11.4 0"/>
+                                </svg>
+                            </div>
+                            <div class="dash-drive-copy">
+                                <span id="dashDrivePower"
+                                      data-i18n="dashboard.drive_power_pending">Vehicle --</span>
+                                <strong id="dashDriveMode"
+                                        data-i18n="dashboard.drive_state_waiting">Waiting for status</strong>
+                                <small id="dashDriveDetail">--</small>
+                            </div>
+                            <div class="dash-drive-readouts">
+                                <div class="dash-drive-readout dash-drive-gear">
+                                    <span data-i18n="dashboard.drive_metric_gear">Gear</span>
+                                    <strong id="dashDriveGear">--</strong>
+                                </div>
+                                <div class="dash-drive-readout dash-drive-speed">
+                                    <span data-i18n="dashboard.drive_metric_speed">Speed</span>
+                                    <div>
+                                        <strong id="dashDriveSpeed">--</strong>
+                                        <small id="dashDriveSpeedUnit">km/h</small>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                         <div class="dash-hero-status">
                             <span class="dash-chip" id="dashConnChip" data-i18n="dashboard.chip_device_pending">Device --</span>
                             <span class="dash-chip" id="dashSurvChip" data-i18n="dashboard.chip_surveillance_pending">Surveillance --</span>
                             <span class="dash-chip" id="dashGpsChip" data-i18n="dashboard.chip_gps_pending">GPS --</span>
                         </div>
                     </div>
-                    <div class="dash-vehicle-canvas-wrap">
-                        <div class="dash-hero-soc" aria-live="polite">
-                            <span data-i18n="dashboard.metric_battery">Battery</span>
-                            <strong id="dashHeroSoc">--</strong>
+                    <!--
+                      Vehicle glance panel. Replaces the decorative hero GLB
+                      (the sidebar EV-card still renders the 3D model) with
+                      live state: a top-down schematic annotated with per-door
+                      lock pills + per-corner tyre PSI from /api/vehicle/state
+                      (polled every 6s by refreshVehicleState), an SoC ring +
+                      range fed by /api/status, and glance rows for climate /
+                      windows / tyres. When a charge session is live the panel
+                      gains a charging strip (power · time-to-full · kWh) —
+                      the "what matters right now" takeover.
+                    -->
+                    <div class="dash-glance" id="dashGlance">
+                        <div class="dash-glance-car" aria-hidden="true">
+                            <svg class="dash-car-svg" viewBox="0 0 150 260" preserveAspectRatio="xMidYMid meet">
+                                <!-- wheels — coloured by tyre pressure state -->
+                                <rect id="glTyreFL" class="dash-car-tyre" x="18" y="46" width="13" height="34" rx="5"/>
+                                <rect id="glTyreFR" class="dash-car-tyre" x="119" y="46" width="13" height="34" rx="5"/>
+                                <rect id="glTyreRL" class="dash-car-tyre" x="18" y="186" width="13" height="34" rx="5"/>
+                                <rect id="glTyreRR" class="dash-car-tyre" x="119" y="186" width="13" height="34" rx="5"/>
+                                <!-- body + glass -->
+                                <path class="dash-car-body" d="M75 12 C51 12 37 24 35 50 L31 92 L31 196 C31 228 47 248 75 248 C103 248 119 228 119 196 L119 92 L115 50 C113 24 99 12 75 12 Z"/>
+                                <path class="dash-car-glass" d="M48 62 C58 54 92 54 102 62 L98 88 C84 82 66 82 52 88 Z"/>
+                                <path class="dash-car-glass" d="M52 202 C66 208 84 208 98 202 L102 222 C92 230 58 230 48 222 Z"/>
+                                <rect class="dash-car-roof" x="46" y="98" width="58" height="96" rx="16"/>
+                                <!-- per-door lock pills (locked / unlocked / unknown) -->
+                                <rect id="glDoorLF" class="dash-car-door" x="27" y="98" width="5" height="44" rx="2.5"/>
+                                <rect id="glDoorLR" class="dash-car-door" x="27" y="148" width="5" height="44" rx="2.5"/>
+                                <rect id="glDoorRF" class="dash-car-door" x="118" y="98" width="5" height="44" rx="2.5"/>
+                                <rect id="glDoorRR" class="dash-car-door" x="118" y="148" width="5" height="44" rx="2.5"/>
+                                <!-- per-corner tyre PSI callouts -->
+                                <text id="glPsiFL" class="dash-car-psi" x="24" y="36" text-anchor="middle">--</text>
+                                <text id="glPsiFR" class="dash-car-psi" x="126" y="36" text-anchor="middle">--</text>
+                                <text id="glPsiRL" class="dash-car-psi" x="24" y="240" text-anchor="middle">--</text>
+                                <text id="glPsiRR" class="dash-car-psi" x="126" y="240" text-anchor="middle">--</text>
+                                <!-- centre lock glyph -->
+                                <g id="glLockGlyph" class="dash-car-lock" transform="translate(75,142)">
+                                    <path id="glLockShackle" d="M-4 -3 v-3 a4 4 0 0 1 8 0 v3" fill="none"/>
+                                    <rect x="-7" y="-3" width="14" height="11" rx="2.5"/>
+                                </g>
+                            </svg>
                         </div>
-                        <canvas id="dashHero3d" class="dash-vehicle-canvas" aria-hidden="true"></canvas>
+                        <div class="dash-glance-side">
+                            <div class="dash-soc-ring" id="dashSocRing" role="img" aria-live="polite">
+                                <svg viewBox="0 0 96 96" aria-hidden="true">
+                                    <circle class="dash-ring-track" cx="48" cy="48" r="41"/>
+                                    <circle class="dash-ring-fill" id="dashRingFill" cx="48" cy="48" r="41"/>
+                                </svg>
+                                <div class="dash-ring-text">
+                                    <strong id="dashHeroSoc">--</strong>
+                                    <span id="dashHeroRange">--</span>
+                                </div>
+                            </div>
+                            <!-- PHEV-only fuel gauge — hidden unless /api/status
+                                 emits range.fuelPercent (the server gates that
+                                 field on nominal capacity, so BEVs never see it). -->
+                            <div class="dash-glance-fuel" id="dashGlanceFuel" hidden>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 22V6a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v16"/><path d="M2 22h12"/><path d="M13 10h2a2 2 0 0 1 2 2v5a1.5 1.5 0 0 0 3 0V9l-3-3"/><path d="M5 8h6"/></svg>
+                                <div class="dash-fuel-bar"><i id="dashFuelBarFill"></i></div>
+                                <span id="dashGlanceFuelText">--</span>
+                            </div>
+                            <div class="dash-glance-rows">
+                                <div class="dash-glance-row">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+                                    <span data-i18n="dashboard.metric_lock">Lock</span>
+                                    <strong id="glLockText">--</strong>
+                                </div>
+                                <div class="dash-glance-row">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M4.2 6l15.6 12M4.2 18 19.8 6"/></svg>
+                                    <span data-i18n="dashboard.glance_climate">Climate</span>
+                                    <strong id="glClimateText">--</strong>
+                                </div>
+                                <div class="dash-glance-row">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 12h18"/></svg>
+                                    <span data-i18n="dashboard.glance_windows">Windows</span>
+                                    <strong id="glWindowsText">--</strong>
+                                </div>
+                                <div class="dash-glance-row">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/></svg>
+                                    <span data-i18n="dashboard.glance_tyres">Tyres</span>
+                                    <strong id="glTyresText">--</strong>
+                                </div>
+                                <div class="dash-glance-row">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3z"/></svg>
+                                    <span data-i18n="dashboard.glance_sentry">Sentry</span>
+                                    <strong id="glSentryText">--</strong>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="dash-range-intel" id="dashRangeIntel" hidden aria-live="polite">
+                            <div class="dash-range-values">
+                                <div class="dash-range-value dash-range-value--personalized">
+                                    <span data-i18n="trip.card.personalized_range">Personalized Range</span>
+                                    <strong id="dashPersonalizedRange">--</strong>
+                                </div>
+                                <div class="dash-range-value dash-range-value--vehicle">
+                                    <span data-i18n="dashboard.kicker_vehicle">Vehicle</span>
+                                    <strong id="dashVehicleRange">--</strong>
+                                </div>
+                            </div>
+                            <div class="dash-range-tracks" aria-hidden="true">
+                                <div><i id="dashPersonalizedTrack"></i></div>
+                                <div><i id="dashVehicleTrack"></i></div>
+                            </div>
+                            <div class="dash-range-meta">
+                                <span id="dashRangeConfidence"></span>
+                                <span id="dashRangeSamples"></span>
+                                <span id="dashRangeLegs"></span>
+                            </div>
+                        </div>
+                        <div class="dash-glance-charge" id="dashGlanceCharge" hidden>
+                            <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M13 2 3 14h7l-1 8 11-13h-7l1-7z"/></svg>
+                            <span id="dashGlanceChargeText">--</span>
+                        </div>
                     </div>
                 </section>
 
-                <!--
-                  Vehicle hero card. Renders the user's selected GLB tinted in
-                  their selected paint colour, framed front-on so the front
-                  fascia faces the camera. mountVehicleCanvas + the existing
-                  applyVehicleSelection / overdrive:vehicle-changed pipeline
-                  drive (model, colour) — same source of truth as the sidebar
-                  EV-card. yawOffset = π/2 reuses the side rig and rotates the
-                  GLB to face the camera (no new view in ev-card-3d.js).
-                -->
                 <!-- Reorderable card grid. Dashboard + vehicle now live in
                      the unified hero above; the remaining cards carry
                      data-card-id for layout persistence. -->
@@ -125,6 +251,10 @@
                                 <span data-i18n="dashboard.cmd_trunk_close">Close trunk</span>
                             </button>
                         </div>
+                        <!-- User-defined buttons (GET /api/quick-controls). Rendered into its
+                             own grid so the built-in commands above are never reordered or
+                             replaced; stays display:none until at least one button exists. -->
+                        <div class="dash-command-grid" id="dashCustomCommands" style="display:none"></div>
                         <div class="dash-command-grid dash-command-grid-media">
                             <a class="dash-command" href="live-view.html">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><path d="M2 12a9 9 0 0 0 8 8"/><circle cx="2" cy="12" r="2"/></svg>
@@ -151,12 +281,18 @@
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="18" r="1"/></svg>
                             </button>
                         </div>
-                        <div class="dash-metric-grid">
+                        <div class="dash-metric-grid" id="dashInfoGrid">
                             <div class="dash-metric"><span data-i18n="dashboard.metric_battery">Battery</span><strong id="dashSoc">--</strong></div>
-                            <div class="dash-metric"><span data-i18n="dashboard.metric_range">Range</span><strong id="dashRange">--</strong></div>
+                            <!-- On PHEVs the strong shows TOTAL range and the small
+                                 carries the EV + fuel breakdown; on BEVs the small
+                                 stays hidden and strong = electric range. -->
+                            <div class="dash-metric"><span id="dashRangeLabel" data-i18n="dashboard.metric_range">Range</span><strong id="dashRange">--</strong><small id="dashRangeBreakdown" style="display:none"></small></div>
+                            <!-- PHEV-only; unhidden when /api/status carries range.fuelPercent -->
+                            <div class="dash-metric" id="dashFuelMetric" style="display:none"><span data-i18n="vehicle.fuel">Fuel</span><strong id="dashFuel">--</strong></div>
                             <div class="dash-metric"><span>12V</span><strong id="dash12v">--</strong></div>
-                            <div class="dash-metric"><span>ACC</span><strong id="dashAcc">--</strong></div>
-                            <div class="dash-metric"><span data-i18n="dashboard.metric_network">Network</span><strong id="dashNetwork">--</strong></div>
+                            <div class="dash-metric"><span data-i18n="dashboard.metric_power">Power</span><strong id="dashAcc">--</strong></div>
+                            <!-- Value = SSID / Mobile Data / Ethernet; small = IPv4 when known -->
+                            <div class="dash-metric"><span data-i18n="dashboard.metric_network">Network</span><strong id="dashNetwork">--</strong><small id="dashNetworkIp" style="display:none"></small></div>
                             <div class="dash-metric"><span data-i18n="dashboard.metric_lock">Lock</span><strong id="dashLock">--</strong></div>
                         </div>
                     </article>
@@ -279,6 +415,161 @@
             font-size: 15px;
         }
 
+        /* Hero-level drive state. This is a status band, not another card:
+           power and motion state lead, while gear and speed keep fixed-width
+           readouts so live updates never shift the surrounding hero layout. */
+        .dash-drive-state {
+            --drive-accent: var(--text-muted);
+            position: relative;
+            display: grid;
+            grid-template-columns: 54px minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 12px;
+            min-height: 76px;
+            padding: 13px 0;
+            border-top: 1px solid var(--border-subtle);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+        .dash-drive-state::before {
+            content: '';
+            position: absolute;
+            top: 14px;
+            bottom: 14px;
+            left: -4px;
+            width: 3px;
+            border-radius: 2px;
+            background: var(--drive-accent);
+        }
+        .dash-drive-icon {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 38px;
+            height: 38px;
+            margin-left: 12px;
+            border-radius: 50%;
+            color: var(--drive-accent);
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+        }
+        .dash-drive-icon svg {
+            width: 19px;
+            height: 19px;
+        }
+        .dash-drive-copy {
+            min-width: 0;
+        }
+        .dash-drive-copy > span {
+            display: block;
+            color: var(--drive-accent);
+            font-size: 10px;
+            font-weight: 800;
+            text-transform: uppercase;
+        }
+        .dash-drive-copy > strong {
+            display: block;
+            margin-top: 3px;
+            overflow: hidden;
+            color: var(--text-primary);
+            font-size: 24px;
+            line-height: 1.05;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .dash-drive-copy > small {
+            display: block;
+            margin-top: 5px;
+            overflow: hidden;
+            color: var(--text-muted);
+            font-size: 11px;
+            font-weight: 600;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .dash-drive-readouts {
+            display: grid;
+            grid-template-columns: 58px 88px;
+            align-self: stretch;
+        }
+        .dash-drive-readout {
+            display: flex;
+            min-width: 0;
+            padding-left: 12px;
+            border-left: 1px solid var(--border-subtle);
+            flex-direction: column;
+            justify-content: center;
+        }
+        .dash-drive-readout > span {
+            color: var(--text-muted);
+            font-size: 9px;
+            font-weight: 800;
+            text-transform: uppercase;
+        }
+        .dash-drive-readout strong {
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+        }
+        .dash-drive-gear strong {
+            margin-top: 2px;
+            font-size: 30px;
+            line-height: 1;
+        }
+        .dash-drive-speed > div {
+            display: flex;
+            align-items: baseline;
+            gap: 4px;
+            min-width: 0;
+            margin-top: 3px;
+        }
+        .dash-drive-speed strong {
+            font-size: 20px;
+            line-height: 1;
+        }
+        .dash-drive-speed small {
+            overflow: hidden;
+            color: var(--text-muted);
+            font-size: 9px;
+            font-weight: 700;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .dash-drive-state.is-ready,
+        .dash-drive-state.is-driving {
+            --drive-accent: var(--brand-primary);
+        }
+        .dash-drive-state.is-reverse,
+        .dash-drive-state.is-neutral,
+        .dash-drive-state.is-plugged {
+            --drive-accent: #f5a623;
+        }
+        .dash-drive-state.is-charging {
+            --drive-accent: #0ea5e9;
+        }
+        .dash-drive-state.is-fault {
+            --drive-accent: #e74c3c;
+        }
+        .dash-drive-state.is-ready .dash-drive-icon,
+        .dash-drive-state.is-driving .dash-drive-icon {
+            background: rgba(0, 212, 170, 0.10);
+            border-color: rgba(0, 212, 170, 0.30);
+        }
+        .dash-drive-state.is-reverse .dash-drive-icon,
+        .dash-drive-state.is-neutral .dash-drive-icon,
+        .dash-drive-state.is-plugged .dash-drive-icon {
+            background: rgba(245, 166, 35, 0.10);
+            border-color: rgba(245, 166, 35, 0.30);
+        }
+        .dash-drive-state.is-charging .dash-drive-icon {
+            background: rgba(14, 165, 233, 0.10);
+            border-color: rgba(14, 165, 233, 0.30);
+        }
+        .dash-drive-state.is-fault .dash-drive-icon {
+            background: rgba(231, 76, 60, 0.10);
+            border-color: rgba(231, 76, 60, 0.30);
+        }
+
         .dash-hero-status,
         .dash-action-row {
             display: flex;
@@ -357,70 +648,340 @@
 
         .dash-chip.good { color: var(--brand-primary); border-color: rgba(0, 212, 170, 0.35); }
         .dash-chip.warn { color: #f59e0b; border-color: rgba(245, 158, 11, 0.35); }
+        .dash-chip.alert { color: #ef4444; border-color: rgba(239, 68, 68, 0.35); }
 
-        .dash-vehicle-canvas-wrap {
-            position: relative;
+        /* ── Vehicle glance panel ────────────────────────────────────
+           Hero right column: top-down schematic + SoC ring + glance
+           rows, followed by learned-range intelligence and an optional
+           charging strip. */
+        .dash-glance {
+            display: grid;
+            grid-template-columns: minmax(120px, 0.9fr) minmax(150px, 1.1fr);
+            grid-template-rows: 1fr auto;
+            gap: 6px 14px;
             width: 100%;
-            --dash-canvas-pad: 10px;
-            /* Stable height for old BYD WebViews without aspect-ratio.
-               Desktop fills the unified hero card; mobile trims to 200px. */
             min-height: 270px;
             height: 100%;
-            /* Soft brand-tinted gradient. Diagonal teal glow upper-left
-               fading to base elevated dark bottom-right gives the panel
-               depth without competing with the 3D model. Layered:
-                 1. broad teal radial highlight from upper-left,
-                 2. faint warm glow under the car (ground bounce),
-                 3. base elevated surface. */
-            background: transparent;
-            padding: var(--dash-canvas-pad);
             box-sizing: border-box;
+            padding: 6px 4px;
+        }
+        .dash-glance.has-range {
+            grid-template-rows: 1fr auto auto;
         }
 
-        .dash-vehicle-canvas {
+        .dash-glance-car {
+            grid-row: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 0;
+        }
+
+        .dash-car-svg {
+            height: 100%;
+            max-height: 280px;
+            width: 100%;
+        }
+
+        /* Schematic palette — theme vars keep it legible in light mode. */
+        .dash-car-body {
+            fill: var(--bg-elevated);
+            stroke: var(--border-default);
+            stroke-width: 1.5;
+        }
+        .dash-car-glass { fill: rgba(0, 212, 170, 0.10); }
+        .dash-car-roof {
+            fill: var(--bg-surface);
+            stroke: var(--border-subtle);
+            stroke-width: 1;
+        }
+        /* AC on → glass picks up a cool tint so climate reads at a glance. */
+        .dash-glance.ac-on .dash-car-glass { fill: rgba(14, 165, 233, 0.22); }
+        .dash-glance.vehicle-ready .dash-car-body,
+        .dash-glance.vehicle-driving .dash-car-body {
+            stroke: var(--brand-primary);
+        }
+        .dash-glance.vehicle-reverse .dash-car-body,
+        .dash-glance.vehicle-neutral .dash-car-body,
+        .dash-glance.vehicle-plugged .dash-car-body {
+            stroke: #f5a623;
+        }
+        .dash-glance.vehicle-charging .dash-car-body { stroke: #0ea5e9; }
+        .dash-glance.vehicle-fault .dash-car-body { stroke: #e74c3c; }
+        .dash-glance.vehicle-parked .dash-car-svg { opacity: 0.74; }
+
+        .dash-car-door { fill: var(--text-tertiary, #9aa0a6); opacity: 0.5; }
+        .dash-car-door.locked   { fill: var(--brand-primary); opacity: 1; }
+        .dash-car-door.unlocked { fill: #f5a623; opacity: 1; }
+
+        .dash-car-tyre { fill: var(--border-default); }
+        .dash-car-tyre.normal { fill: var(--brand-primary); opacity: 0.75; }
+        .dash-car-tyre.warn   { fill: #f5a623; }
+        .dash-car-tyre.alert  { fill: #e74c3c; }
+
+        .dash-car-psi {
+            fill: var(--text-muted);
+            font-size: 11px;
+            font-weight: 700;
+            font-family: inherit;
+        }
+        .dash-car-psi.warn  { fill: #f5a623; }
+        .dash-car-psi.alert { fill: #e74c3c; }
+
+        .dash-car-lock rect,
+        .dash-car-lock path { stroke: var(--text-muted); stroke-width: 1.6; }
+        .dash-car-lock rect { fill: var(--bg-surface); }
+        .dash-car-lock.locked rect,
+        .dash-car-lock.locked path { stroke: var(--brand-primary); }
+        .dash-car-lock.unlocked rect,
+        .dash-car-lock.unlocked path { stroke: #f5a623; }
+        /* Unlocked → open shackle (swing it off the body). */
+        .dash-car-lock.unlocked #glLockShackle,
+        .dash-car-lock.unlocked path { transform: translateX(3px) rotate(14deg); }
+
+        .dash-glance-side {
+            grid-row: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 12px;
+            min-width: 0;
+        }
+
+        /* SoC donut. stroke-dasharray = circumference (2π·41 ≈ 257.6);
+           JS drives stroke-dashoffset. */
+        .dash-soc-ring {
+            position: relative;
+            width: 108px;
+            height: 108px;
+            align-self: center;
+        }
+        .dash-soc-ring svg {
+            width: 100%;
+            height: 100%;
+            transform: rotate(-90deg);
+        }
+        .dash-ring-track {
+            fill: none;
+            stroke: var(--bg-elevated);
+            stroke-width: 7;
+        }
+        .dash-ring-fill {
+            fill: none;
+            stroke: var(--brand-primary);
+            stroke-width: 7;
+            stroke-linecap: round;
+            stroke-dasharray: 257.6;
+            stroke-dashoffset: 257.6;
+            transition: stroke-dashoffset 0.6s cubic-bezier(0.2, 0, 0, 1), stroke 0.3s ease;
+        }
+        .dash-soc-ring.soc-mid .dash-ring-fill { stroke: #f5a623; }
+        .dash-soc-ring.soc-low .dash-ring-fill { stroke: #e74c3c; }
+        .dash-glance.charging .dash-ring-fill { animation: dashRingCharge 1.6s ease-in-out infinite; }
+        @keyframes dashRingCharge {
+            0%, 100% { stroke-opacity: 1; }
+            50%      { stroke-opacity: 0.55; }
+        }
+
+        .dash-ring-text {
             position: absolute;
-            top: var(--dash-canvas-pad);
-            left: var(--dash-canvas-pad);
-            width: calc(100% - (var(--dash-canvas-pad) * 2));
-            height: calc(100% - (var(--dash-canvas-pad) * 2));
-            display: block;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+        }
+        .dash-ring-text strong {
+            color: var(--text-primary);
+            font-size: 21px;
+            line-height: 1.1;
+        }
+        .dash-ring-text span {
+            color: var(--text-muted);
+            font-size: 11px;
+            font-weight: 700;
         }
 
-        .dash-hero-soc {
-            position: absolute;
-            top: 14px;
-            right: 14px;
-            z-index: 2;
-            min-width: 90px;
-            padding: 8px 10px;
-            border-radius: 10px;
-            /* Theme-aware surface + border. The text uses --text-primary /
-               --text-muted, which flip to dark glyphs in light theme — a
-               hardcoded dark background (rgba(4,18,22,..)) made them
-               dark-on-dark and unreadable. --bg-glass + --border-default
-               flip with the palette so the badge stays legible in both. */
-            border: 1px solid var(--border-default);
-            background: var(--bg-glass);
-            -webkit-backdrop-filter: blur(6px);
-            backdrop-filter: blur(6px);
-            text-align: right;
+        .dash-glance-rows {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
         }
+        .dash-glance-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 10px;
+            border-radius: 8px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            font-size: 12px;
+            min-width: 0;
+        }
+        .dash-glance-row svg {
+            width: 15px;
+            height: 15px;
+            flex: 0 0 auto;
+            color: var(--text-muted);
+        }
+        .dash-glance-row span {
+            color: var(--text-muted);
+            font-weight: 700;
+        }
+        .dash-glance-row strong {
+            margin-left: auto;
+            color: var(--text-primary);
+            font-weight: 700;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .dash-glance-row strong.warn { color: #f5a623; }
+        .dash-glance-row strong.alert { color: #e74c3c; }
+        .dash-glance-row strong.good { color: var(--brand-primary); }
 
-        .dash-hero-soc span {
+        /* PHEV fuel gauge under the SoC ring: pump icon + level bar + "62% · 410 km". */
+        .dash-glance-fuel {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 10px;
+            border-radius: 8px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        .dash-glance-fuel[hidden] { display: none; }
+        .dash-glance-fuel svg {
+            width: 15px;
+            height: 15px;
+            flex: 0 0 auto;
+            color: var(--text-muted);
+        }
+        .dash-glance-fuel span { white-space: nowrap; }
+        .dash-fuel-bar {
+            flex: 1 1 auto;
+            height: 6px;
+            border-radius: 999px;
+            background: var(--bg-base);
+            overflow: hidden;
+            min-width: 30px;
+        }
+        .dash-fuel-bar i {
             display: block;
+            height: 100%;
+            width: 0;
+            border-radius: inherit;
+            background: #FBBF24;
+            transition: width 0.5s cubic-bezier(0.2, 0, 0, 1), background 0.3s ease;
+        }
+        .dash-glance-fuel.fuel-warn i { background: #F59E0B; }
+        .dash-glance-fuel.fuel-low i  { background: #EF4444; }
+
+        /* Learned-vs-vehicle range comparison. This is an unframed band
+           within the hero rather than a nested card: two explicit values,
+           proportional tracks, then confidence/sample context. */
+        .dash-range-intel {
+            grid-column: 1 / -1;
+            grid-row: 2;
+            min-width: 0;
+            padding: 12px 2px 4px;
+            border-top: 1px solid var(--border-subtle);
+        }
+        .dash-range-intel[hidden] { display: none; }
+        .dash-range-values {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 16px;
+        }
+        .dash-range-value {
+            min-width: 0;
+        }
+        .dash-range-value span {
+            display: block;
+            color: var(--text-muted);
+            font-size: 11px;
+            font-weight: 700;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .dash-range-value strong {
+            display: block;
+            margin-top: 3px;
+            color: var(--text-primary);
+            font-size: 20px;
+            line-height: 1.1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .dash-range-value--personalized strong {
+            color: var(--brand-primary);
+            font-size: 24px;
+        }
+        .dash-range-tracks {
+            display: grid;
+            gap: 4px;
+            margin-top: 9px;
+        }
+        .dash-range-tracks > div {
+            height: 3px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: var(--border-subtle);
+        }
+        .dash-range-tracks i {
+            display: block;
+            width: 0;
+            height: 100%;
+            border-radius: inherit;
+            transition: width 0.55s cubic-bezier(0.2, 0, 0, 1);
+        }
+        #dashPersonalizedTrack { background: var(--brand-primary); }
+        #dashVehicleTrack { background: var(--text-muted); opacity: 0.65; }
+        .dash-range-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px 12px;
+            margin-top: 8px;
             color: var(--text-muted);
             font-size: 10px;
             font-weight: 700;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            margin-bottom: 2px;
+            line-height: 1.35;
         }
+        .dash-range-meta span:empty { display: none; }
 
-        .dash-hero-soc strong {
-            display: block;
-            color: var(--text-primary);
-            font-size: 20px;
-            line-height: 1;
+        /* Charging takeover strip — spans both columns when visible. */
+        .dash-glance-charge {
+            grid-column: 1 / -1;
+            grid-row: 2;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 9px 12px;
+            border-radius: 8px;
+            background: rgba(14, 165, 233, 0.12);
+            border: 1px solid rgba(14, 165, 233, 0.35);
+            color: #0ea5e9;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        .dash-glance.has-range .dash-glance-charge { grid-row: 3; }
+        .dash-glance-charge[hidden] { display: none; }
+        .dash-glance-charge svg {
+            width: 15px;
+            height: 15px;
+            flex: 0 0 auto;
+            animation: dashBoltPulse 1.4s ease-in-out infinite;
+        }
+        @keyframes dashBoltPulse {
+            0%, 100% { opacity: 1; }
+            50%      { opacity: 0.45; }
         }
 
         .dash-grid {
@@ -648,6 +1209,13 @@
             grid-template-columns: repeat(4, minmax(0, 1fr));
         }
 
+        /* PHEV: the Fuel metric makes 7 cells — a 6-up track would strand the
+           seventh alone on a second row, so re-track to 4-up (4 + 3) while the
+           fuel cell is visible. The ≤980px rules still collapse to 2-up. */
+        .dash-metric-grid.has-fuel {
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+
         .dash-metric {
             min-height: 76px;
             padding: 13px;
@@ -677,9 +1245,22 @@
             line-height: 1.1;
         }
 
+        /* PHEV range breakdown line ("150 km EV · 260 km fuel") under the total. */
+        .dash-metric small {
+            display: block;
+            margin-top: 4px;
+            color: var(--text-muted);
+            font-size: 11px;
+            font-weight: 700;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
         @media (max-width: 980px) {
             .dash-grid,
-            .dash-metric-grid {
+            .dash-metric-grid,
+            .dash-metric-grid.has-fuel {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }
             .dash-metric-grid--4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -696,20 +1277,47 @@
                 padding: 18px;
             }
             .dash-hero h1 { font-size: 27px; }
-            /* The GLB renders side-on (wider than tall); a fixed
-               200px wastes vertical space on portrait phones. Scale
-               with viewport width so the card stays proportional
-               from a 320px small phone up to a 768px tablet, with
-               hard floor + ceiling for legibility. PWA-only page
-               (the head-unit's in-app WebView never loads this), so
-               clamp() (Chrome 79+) is fair game. */
-            .dash-vehicle-canvas-wrap {
-                min-height: 140px;
-                height: clamp(140px, 38vw, 200px);
+            .dash-drive-state {
+                grid-template-columns: 50px minmax(0, 1fr);
+                min-height: 0;
+                gap: 10px;
             }
+            .dash-drive-icon {
+                width: 34px;
+                height: 34px;
+            }
+            .dash-drive-copy > strong { font-size: 22px; }
+            .dash-drive-readouts {
+                grid-column: 1 / -1;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                min-height: 52px;
+                border-top: 1px solid var(--border-subtle);
+            }
+            .dash-drive-readout {
+                align-items: center;
+                padding: 9px 8px 0;
+                border-left: 0;
+                text-align: center;
+            }
+            .dash-drive-readout + .dash-drive-readout {
+                border-left: 1px solid var(--border-subtle);
+            }
+            /* Portrait phones: the glance keeps its two inner columns
+               (schematic | ring + rows) but relaxes the height so the
+               hero doesn't dominate the scroll. */
+            .dash-glance {
+                min-height: 0;
+                padding: 2px 0;
+            }
+            .dash-car-svg { max-height: 210px; }
+            .dash-soc-ring { width: 92px; height: 92px; }
+            .dash-ring-text strong { font-size: 18px; }
+            .dash-range-value--personalized strong { font-size: 21px; }
+            .dash-range-value strong { font-size: 18px; }
             .dash-grid,
             .dash-command-grid,
-            .dash-metric-grid {
+            .dash-metric-grid,
+            .dash-metric-grid.has-fuel {
                 grid-template-columns: 1fr 1fr;
             }
             .dash-metric-grid--4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -733,7 +1341,7 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=19"></script>
     <script src="../shared/update-flow.js"></script>
     <script src="../shared/map.js?v=1"></script>
     <script>
@@ -744,6 +1352,12 @@
 
         BYD.dashboard = {
             lastStatus: null,
+            vehicleStateRequest: null,
+            vehicleStateRefreshQueued: false,
+            vehicleStateFailureCount: 0,
+            vehicleStatePollTimer: null,
+            VEHICLE_STATE_STALE_AFTER_FAILURES: 2,
+            VEHICLE_STATE_POLL_MS: 6000,
             command: function(btn, url, payload) {
                 if (!btn || btn.classList.contains('pending')) return;
                 btn.classList.add('pending');
@@ -767,32 +1381,745 @@
                     btn.classList.remove('pending');
                 });
             },
-            refreshVehicleState: function() {
-                fetch('/api/vehicle/state').then(function(r) {
+            // User-defined quick controls. The button carries only its id; the daemon looks the
+            // action up in the persisted list and fires it through the SAME executor a physical
+            // key uses, so the client can never name an action the user didn't save.
+            loadCustomCommands: function() {
+                fetch('/api/quick-controls').then(function(r) {
                     return r.json();
                 }).then(function(data) {
-                    if (!data || !data.success) return;
-                    BYD.dashboard.updateVehicleState(data);
+                    var grid = document.getElementById('dashCustomCommands');
+                    if (!grid) return;
+                    var buttons = (data && data.success && data.buttons) ? data.buttons : [];
+                    grid.textContent = '';
+                    if (!buttons.length) { grid.style.display = 'none'; return; }
+                    for (var i = 0; i < buttons.length; i++) {
+                        var b = buttons[i];
+                        if (!b || !b.id) continue;
+                        var el = document.createElement('button');
+                        el.className = 'dash-command';
+                        el.type = 'button';
+                        el.setAttribute('data-qc-id', b.id);
+                        // Label via textContent, never innerHTML — a user-authored label must
+                        // not be able to inject markup into the dashboard.
+                        var span = document.createElement('span');
+                        span.textContent = b.label || b.id;
+                        el.appendChild(span);
+                        el.addEventListener('click', function() {
+                            BYD.dashboard.fireCustom(this);
+                        });
+                        grid.appendChild(el);
+                    }
+                    grid.style.display = '';
                 }).catch(function() {});
             },
-            updateVehicleState: function(data) {
-                var lockEl = document.getElementById('dashLock');
-                if (!lockEl || !data || !data.doors) return;
-                var overall = data.doors.overall;
-                // `overall` can describe the driver door only (Atto OTA path), so
-                // honour scope rather than claiming a whole-car state.
-                var partial = data.doors.scope && data.doors.scope !== 'vehicle';
-                if (overall === 1) {
-                    lockEl.textContent = partial
-                        ? (BYD.i18n.t('vehicle.driver_door_locked') || 'Driver door locked')
-                        : (BYD.i18n.t('dashboard.status_locked') || 'Locked');
-                } else if (overall === 2) {
-                    lockEl.textContent = partial
-                        ? (BYD.i18n.t('vehicle.driver_door_unlocked') || 'Driver door unlocked')
-                        : (BYD.i18n.t('dashboard.status_unlocked') || 'Unlocked');
-                } else {
-                    lockEl.textContent = '--';
+            fireCustom: function(btn) {
+                var id = btn && btn.getAttribute('data-qc-id');
+                if (!id) return;
+                BYD.dashboard.command(btn, '/api/quick-controls/fire/' + encodeURIComponent(id));
+            },
+            refreshVehicleState: function() {
+                var self = this;
+                if (this.vehicleStateRequest) {
+                    this.vehicleStateRefreshQueued = true;
+                    return this.vehicleStateRequest;
                 }
+                var request = fetch('/api/vehicle/state', { cache: 'no-store' })
+                    .then(function(r) {
+                        if (!r.ok) throw new Error('HTTP ' + r.status);
+                        return r.json();
+                    }).then(function(data) {
+                        if (!data || data.success !== true) {
+                            throw new Error('Invalid vehicle-state response');
+                        }
+                        self.vehicleStateFailureCount = 0;
+                        self.updateVehicleState(data);
+                        return data;
+                    }).catch(function() {
+                        self.vehicleStateFailureCount++;
+                        if (self.vehicleStateFailureCount
+                                >= self.VEHICLE_STATE_STALE_AFTER_FAILURES) {
+                            self.markVehicleStateUnavailable();
+                        }
+                        return null;
+                    }).finally(function() {
+                        self.vehicleStateRequest = null;
+                        if (self.vehicleStateRefreshQueued) {
+                            self.vehicleStateRefreshQueued = false;
+                            setTimeout(function() {
+                                self.refreshVehicleState();
+                            }, 0);
+                        }
+                    });
+                this.vehicleStateRequest = request;
+                return request;
+            },
+            startVehicleStatePolling: function() {
+                this.stopVehicleStatePolling();
+                if (document.hidden) return;
+                this.refreshVehicleState();
+                var self = this;
+                this.vehicleStatePollTimer = setInterval(function() {
+                    self.refreshVehicleState();
+                }, this.VEHICLE_STATE_POLL_MS);
+            },
+            stopVehicleStatePolling: function() {
+                if (this.vehicleStatePollTimer) {
+                    clearInterval(this.vehicleStatePollTimer);
+                    this.vehicleStatePollTimer = null;
+                }
+            },
+            initVehicleStatePolling: function() {
+                var self = this;
+                document.addEventListener('visibilitychange', function() {
+                    if (document.hidden) {
+                        self.stopVehicleStatePolling();
+                    } else {
+                        self.startVehicleStatePolling();
+                    }
+                });
+                this.startVehicleStatePolling();
+            },
+            markVehicleStateUnavailable: function() {
+                // Reuse the normal reducer with explicit unknown values so every
+                // lock/window/climate/tyre class is cleared consistently.
+                this.updateVehicleState({
+                    doors: {},
+                    windows: {},
+                    climate: {},
+                    tyres: { available: false }
+                });
+            },
+            // Security digest for the glance panel: sentry + proximity
+            // clips recorded today, from the H2-backed recordings index.
+            // Cheap flat-counter endpoint; polled slowly (60s) since new
+            // events land minutes apart, not seconds.
+            refreshSecurityDigest: function() {
+                fetch('/api/recordings/stats').then(function(r) {
+                    return r.json();
+                }).then(function(data) {
+                    var el = document.getElementById('glSentryText');
+                    if (!el) return;
+                    // indexUnavailable → counters are zeroed and NOT
+                    // authoritative (same contract events.js honours).
+                    if (!data || !data.success || data.indexUnavailable) {
+                        el.textContent = '--';
+                        el.classList.remove('good', 'warn', 'alert');
+                        return;
+                    }
+                    var sentry = (data.byType && data.byType.sentry) || { todayCount: data.sentryTodayCount };
+                    var prox = (data.byType && data.byType.proximity) || { todayCount: data.proximityTodayCount };
+                    var n = (sentry.todayCount || 0) + (prox.todayCount || 0);
+                    el.classList.remove('good', 'warn', 'alert');
+                    if (n > 0) {
+                        el.textContent = BYD.i18n.t('dashboard.glance_sentry_count', { n: n }) || (n + ' today');
+                        el.classList.add('warn');
+                    } else {
+                        el.textContent = BYD.i18n.t('dashboard.glance_sentry_none') || 'No events today';
+                        el.classList.add('good');
+                    }
+                }).catch(function() {});
+            },
+            // ── Vehicle glance panel ────────────────────────────────
+            // Drives the hero schematic + SoC ring + glance rows from
+            // /api/vehicle/state (update) and /api/status (setStatus /
+            // setCharging). Pure DOM writes — no fetching of its own.
+            glance: {
+                // Same defaults as vehicle-control.js; replaced by
+                // tyres.limits from the server when present.
+                tyreLimits: { frontLow: 234, frontHigh: 310, rearLow: 234, rearHigh: 310, criticalLow: 152 },
+
+                // Mirror of vehicle-control.js _tyreStateToken, minus the UI
+                // coupling: numeric band first, firmware enum as backstop.
+                tyreState: function(corner, isFront) {
+                    if (!corner || corner.available === false) return 'muted';
+                    if (corner.signalState === 1) return 'muted';
+                    if (corner.airLeakState && corner.airLeakState >= 1) return 'alert';
+                    var lim = this.tyreLimits;
+                    var low = isFront ? lim.frontLow : lim.rearLow;
+                    var high = isFront ? lim.frontHigh : lim.rearHigh;
+                    if (typeof corner.kPa === 'number' && corner.kPa > 0) {
+                        if (corner.kPa <= lim.criticalLow) return 'alert';
+                        if (corner.kPa < low || corner.kPa > high) return 'warn';
+                    }
+                    if (typeof corner.pressureState === 'number'
+                            && corner.pressureState >= 1) return 'warn';
+                    return 'normal';
+                },
+
+                update: function(data, lockText, lockState) {
+                    var panel = document.getElementById('dashGlance');
+                    if (!panel || !data) return;
+
+                    function setText(id, value) {
+                        var el = document.getElementById(id);
+                        if (el) el.textContent = value;
+                    }
+                    function setRowState(id, cls) {
+                        var el = document.getElementById(id);
+                        if (!el) return;
+                        el.classList.remove('good', 'warn', 'alert');
+                        if (cls) el.classList.add(cls);
+                    }
+
+                    // Lock row + centre glyph + door pills.
+                    setText('glLockText', lockText || '--');
+                    setRowState('glLockText', lockState === 'locked' ? 'good' : lockState === 'unlocked' ? 'warn' : '');
+                    var glyph = document.getElementById('glLockGlyph');
+                    if (glyph) glyph.setAttribute('class', 'dash-car-lock' + (lockState ? ' ' + lockState : ''));
+                    if (data.doors) {
+                        var doorMap = { lf: 'glDoorLF', rf: 'glDoorRF', lr: 'glDoorLR', rr: 'glDoorRR' };
+                        for (var dk in doorMap) {
+                            var dEl = document.getElementById(doorMap[dk]);
+                            if (!dEl) continue;
+                            var dv = data.doors[dk];
+                            dEl.setAttribute('class', 'dash-car-door'
+                                + (dv === 1 ? ' locked' : dv === 2 ? ' unlocked' : ''));
+                        }
+                    }
+
+                    // Windows — 0-100 = % open, anything else = no reading.
+                    if (data.windows) {
+                        var w = data.windows;
+                        var openCount = 0, known = 0;
+                        var parts = [w.lf, w.rf, w.lr, w.rr, w.sunroof];
+                        for (var i = 0; i < parts.length; i++) {
+                            var v = parts[i];
+                            if (typeof v === 'number' && v >= 0 && v <= 100) {
+                                known++;
+                                if (v > 0) openCount++;
+                            }
+                        }
+                        if (!known) {
+                            setText('glWindowsText', '--');
+                            setRowState('glWindowsText', '');
+                        } else if (openCount === 0) {
+                            setText('glWindowsText', BYD.i18n.t('dashboard.glance_windows_closed') || 'All closed');
+                            setRowState('glWindowsText', 'good');
+                        } else {
+                            setText('glWindowsText',
+                                BYD.i18n.t('dashboard.glance_windows_open', { n: openCount }) || (openCount + ' open'));
+                            setRowState('glWindowsText', 'warn');
+                        }
+                    }
+
+                    // Climate — distinguish a reported OFF from no reading.
+                    if (data.climate) {
+                        var remoteKnown = typeof data.climate.remoteClimateActive === 'boolean';
+                        var localKnown = typeof data.climate.acOn === 'boolean';
+                        var climateKnown = remoteKnown || localKnown;
+                        var acOn = data.climate.remoteClimateActive === true
+                            || data.climate.acOn === true;
+                        panel.classList.toggle('ac-on', acOn);
+                        var climText = climateKnown
+                            ? (acOn
+                                ? (BYD.i18n.t('dashboard.glance_ac_on') || 'AC on')
+                                : (BYD.i18n.t('dashboard.glance_ac_off') || 'AC off'))
+                            : '--';
+                        var t = data.climate.insideTempC;
+                        if (typeof t === 'number' && t > 0) {
+                            climText = climateKnown
+                                ? climText + ' · ' + Math.round(t) + '°C'
+                                : Math.round(t) + '°C';
+                        }
+                        setText('glClimateText', climText);
+                        setRowState('glClimateText', climateKnown && acOn ? 'good' : '');
+                    }
+
+                    // Tyres — colour the wheels, print PSI at each corner,
+                    // and roll the worst corner up into the summary row.
+                    if (data.tyres) {
+                        var L = data.tyres.limits;
+                        if (L) {
+                            var cur = this.tyreLimits;
+                            this.tyreLimits = {
+                                frontLow:    typeof L.frontLow    === 'number' ? L.frontLow    : cur.frontLow,
+                                frontHigh:   typeof L.frontHigh   === 'number' ? L.frontHigh   : cur.frontHigh,
+                                rearLow:     typeof L.rearLow     === 'number' ? L.rearLow     : cur.rearLow,
+                                rearHigh:    typeof L.rearHigh    === 'number' ? L.rearHigh    : cur.rearHigh,
+                                criticalLow: typeof L.criticalLow === 'number' ? L.criticalLow : cur.criticalLow
+                            };
+                        }
+                        var corners = ['fl', 'fr', 'rl', 'rr'];
+                        var worst = 'muted';
+                        var rank = { muted: 0, normal: 1, warn: 2, alert: 3 };
+                        for (var c = 0; c < corners.length; c++) {
+                            var key = corners[c];
+                            var corner = data.tyres[key] || { available: false };
+                            var state = this.tyreState(corner, c < 2);
+                            if (rank[state] > rank[worst] || (worst === 'muted' && state === 'normal')) worst = state;
+                            var suffix = key.toUpperCase();
+                            var tyreEl = document.getElementById('glTyre' + suffix);
+                            if (tyreEl) tyreEl.setAttribute('class', 'dash-car-tyre ' + state);
+                            var psiEl = document.getElementById('glPsi' + suffix);
+                            if (psiEl) {
+                                // Corner labels honour the pressure display
+                                // unit (BYD.units.pressureMode, fed from
+                                // /status.pressureUnit). PSI stays a whole
+                                // number here — the schematic corners are too
+                                // small for decimals — while kPa is integral
+                                // anyway and bar keeps its 2 decimals to stay
+                                // meaningful (whole bar would always read "2").
+                                var pv = '--';
+                                if (corner.available && typeof corner.psi === 'number') {
+                                    var UU = (window.BYD && BYD.units && BYD.units.pressureVal)
+                                        ? BYD.units : null;
+                                    if (!UU || UU.pressureMode === 'psi') {
+                                        pv = corner.psi.toFixed(0);
+                                    } else {
+                                        pv = UU.pressureVal(corner.kPa || 0);
+                                    }
+                                }
+                                psiEl.textContent = pv;
+                                psiEl.setAttribute('class', 'dash-car-psi'
+                                    + (state === 'warn' || state === 'alert' ? ' ' + state : ''));
+                            }
+                        }
+                        if (worst === 'alert') {
+                            setText('glTyresText', BYD.i18n.t('dashboard.glance_tyres_alert') || 'Low pressure');
+                            setRowState('glTyresText', 'alert');
+                        } else if (worst === 'warn') {
+                            setText('glTyresText', BYD.i18n.t('dashboard.glance_tyres_warn') || 'Check pressure');
+                            setRowState('glTyresText', 'warn');
+                        } else if (worst === 'normal') {
+                            setText('glTyresText', BYD.i18n.t('dashboard.glance_tyres_ok') || 'All OK');
+                            setRowState('glTyresText', 'good');
+                        } else {
+                            setText('glTyresText', '--');
+                            setRowState('glTyresText', '');
+                        }
+                    }
+                },
+
+                // SoC ring + range readout, from /api/status.
+                RING_CIRC: 257.6,
+                setSoc: function(percent, rangeText) {
+                    var ring = document.getElementById('dashSocRing');
+                    var fill = document.getElementById('dashRingFill');
+                    var rangeEl = document.getElementById('dashHeroRange');
+                    if (rangeEl) rangeEl.textContent = rangeText || '--';
+                    if (!ring || !fill) return;
+                    ring.classList.remove('soc-mid', 'soc-low');
+                    if (typeof percent === 'number' && percent >= 0) {
+                        var clamped = Math.max(0, Math.min(100, percent));
+                        fill.style.strokeDashoffset = (this.RING_CIRC * (1 - clamped / 100)).toFixed(1);
+                        if (clamped < 20) ring.classList.add('soc-low');
+                        else if (clamped < 50) ring.classList.add('soc-mid');
+                    } else {
+                        fill.style.strokeDashoffset = this.RING_CIRC;
+                    }
+                },
+
+                // PHEV fuel gauge. Hidden when fuelPct is null (BEV — the
+                // server omits range.fuelPercent entirely on those). Colour
+                // thresholds match the sidebar fuel card: ≤15% red, ≤30% amber.
+                setFuel: function(fuelPct, fuelKm) {
+                    var box = document.getElementById('dashGlanceFuel');
+                    if (!box) return;
+                    if (fuelPct === null || fuelPct === undefined) { box.hidden = true; return; }
+                    var fill = document.getElementById('dashFuelBarFill');
+                    if (fill) fill.style.width = Math.min(100, fuelPct) + '%';
+                    box.classList.remove('fuel-low', 'fuel-warn');
+                    if (fuelPct <= 15) box.classList.add('fuel-low');
+                    else if (fuelPct <= 30) box.classList.add('fuel-warn');
+                    var text = Math.round(fuelPct) + '%';
+                    if (fuelKm) text += ' · ' + BYD.units.dist(fuelKm);
+                    var textEl = document.getElementById('dashGlanceFuelText');
+                    if (textEl) textEl.textContent = text;
+                    box.hidden = false;
+                },
+
+                // Charging takeover strip. `c` = status.charging or null.
+                setCharging: function(c) {
+                    var panel = document.getElementById('dashGlance');
+                    var strip = document.getElementById('dashGlanceCharge');
+                    if (!panel || !strip) return;
+                    var live = !!(c && c.charging);
+                    panel.classList.toggle('charging', live);
+                    if (!live) { strip.hidden = true; return; }
+                    var bits = [];
+                    var stripPower = Number(c.powerKw || c.chargingPowerKW || 0);
+                    if (stripPower > 0 && c.powerSource !== 'nominalPlaceholder') {
+                        bits.push((c.isEstimated ? '~' : '') + stripPower.toFixed(1) + ' kW');
+                    }
+                    if (c.timeToFullMin && c.timeToFullMin > 0) {
+                        var ttf = Math.floor(c.timeToFullMin / 60) + 'h ' + (c.timeToFullMin % 60) + 'm';
+                        bits.push(BYD.i18n.t('dashboard.glance_time_to_full', { t: ttf }) || (ttf + ' to full'));
+                    }
+                    if (c.sessionKwh && c.sessionKwh > 0) bits.push('+' + c.sessionKwh.toFixed(1) + ' kWh');
+                    if (!bits.length) bits.push(BYD.i18n.t('charge.state_charging') || 'Charging');
+                    var textEl = document.getElementById('dashGlanceChargeText');
+                    if (textEl) textEl.textContent = bits.join(' · ');
+                    strip.hidden = false;
+                },
+            },
+            updateVehicleState: function(data) {
+                if (!data) return;
+                var lockText = '--';
+                var lockState = '';   // '' | 'locked' | 'unlocked'
+                if (data.doors) {
+                    var overall = data.doors.overall;
+                    // `overall` can describe the driver door only (Atto OTA path), so
+                    // honour scope rather than claiming a whole-car state.
+                    var partial = data.doors.scope && data.doors.scope !== 'vehicle';
+                    if (overall === 1) {
+                        lockState = 'locked';
+                        lockText = partial
+                            ? (BYD.i18n.t('vehicle.driver_door_locked') || 'Driver door locked')
+                            : (BYD.i18n.t('dashboard.status_locked') || 'Locked');
+                    } else if (overall === 2) {
+                        lockState = 'unlocked';
+                        lockText = partial
+                            ? (BYD.i18n.t('vehicle.driver_door_unlocked') || 'Driver door unlocked')
+                            : (BYD.i18n.t('dashboard.status_unlocked') || 'Unlocked');
+                    }
+                }
+                var lockEl = document.getElementById('dashLock');
+                if (lockEl) lockEl.textContent = lockText;
+                this.glance.update(data, lockText, lockState);
+            },
+            renderHalRange: function(status) {
+                status = status || {};
+                var rng = status.range || {};
+                var socPercent = (status.soc && status.soc.percent !== undefined)
+                    ? status.soc.percent : null;
+                var elecKm = (typeof rng.elecRangeKm === 'number'
+                    && rng.elecRangeKm > 0) ? rng.elecRangeKm : 0;
+                var fuelKm = (typeof rng.fuelRangeKm === 'number'
+                    && rng.fuelRangeKm > 0) ? rng.fuelRangeKm : 0;
+                var totalKm = (typeof rng.totalRangeKm === 'number'
+                    && rng.totalRangeKm > 0) ? rng.totalRangeKm : 0;
+                var isPhev = rng.isPhev === true
+                    || fuelKm > 0
+                    || (typeof rng.fuelPercent === 'number'
+                        && isFinite(rng.fuelPercent));
+                var vehicleKm = isPhev
+                    ? (totalKm || (elecKm + fuelKm))
+                    : (totalKm || elecKm);
+                var rangeText = vehicleKm > 0 ? BYD.units.dist(vehicleKm) : '--';
+
+                var label = document.getElementById('dashRangeLabel');
+                if (label) {
+                    label.textContent = BYD.i18n.t('dashboard.metric_range') || 'Range';
+                }
+                var value = document.getElementById('dashRange');
+                if (value) value.textContent = rangeText;
+                this.glance.setSoc(socPercent, rangeText);
+
+                var breakdown = document.getElementById('dashRangeBreakdown');
+                if (!breakdown) return;
+                if (isPhev && elecKm > 0 && fuelKm > 0) {
+                    breakdown.textContent =
+                        BYD.i18n.t('dashboard.range_breakdown', {
+                            ev: BYD.units.dist(elecKm),
+                            fuel: BYD.units.dist(fuelKm)
+                        }) || (BYD.units.dist(elecKm) + ' EV · '
+                            + BYD.units.dist(fuelKm) + ' fuel');
+                    breakdown.style.display = '';
+                } else {
+                    breakdown.style.display = 'none';
+                }
+            },
+            updatePersonalizedRange: function(snapshot) {
+                var panel = document.getElementById('dashRangeIntel');
+                if (!panel) return;
+                var glance = document.getElementById('dashGlance');
+                if (!snapshot || !snapshot.available
+                        || !(snapshot.personalizedKm > 0)) {
+                    panel.hidden = true;
+                    if (glance) glance.classList.remove('has-range');
+                    this.renderHalRange(this.lastStatus);
+                    return;
+                }
+
+                var personalizedText = BYD.units.dist(snapshot.personalizedKm);
+                var vehicleText = snapshot.vehicleKm > 0
+                    ? BYD.units.dist(snapshot.vehicleKm) : '--';
+                var personalizedEl = document.getElementById('dashPersonalizedRange');
+                var vehicleEl = document.getElementById('dashVehicleRange');
+                if (personalizedEl) personalizedEl.textContent = personalizedText;
+                if (vehicleEl) vehicleEl.textContent = vehicleText;
+
+                var scaleMax = Math.max(
+                    snapshot.personalizedKm || 0,
+                    snapshot.vehicleKm || 0,
+                    snapshot.upperKm || 0,
+                    1
+                );
+                var personalizedTrack = document.getElementById('dashPersonalizedTrack');
+                var vehicleTrack = document.getElementById('dashVehicleTrack');
+                if (personalizedTrack) {
+                    personalizedTrack.style.width =
+                        Math.max(4, Math.min(100,
+                            snapshot.personalizedKm / scaleMax * 100)) + '%';
+                }
+                if (vehicleTrack) {
+                    vehicleTrack.style.width = snapshot.vehicleKm > 0
+                        ? Math.max(4, Math.min(100,
+                            snapshot.vehicleKm / scaleMax * 100)) + '%'
+                        : '0';
+                }
+
+                var confidence = document.getElementById('dashRangeConfidence');
+                if (confidence) {
+                    if (snapshot.lowerKm > 0 && snapshot.upperKm > 0) {
+                        var confidenceLabel =
+                            BYD.i18n.t('trip.range_confidence') || 'Confidence';
+                        confidence.textContent = confidenceLabel + ' · '
+                            + BYD.units.distVal(snapshot.lowerKm) + '\u2013'
+                            + BYD.units.distVal(snapshot.upperKm) + ' '
+                            + BYD.units.distLabel();
+                    } else {
+                        confidence.textContent = '';
+                    }
+                }
+                var samples = document.getElementById('dashRangeSamples');
+                if (samples) {
+                    samples.textContent = snapshot.sampleCount > 0
+                        ? (BYD.i18n.t('trip.range.samples', {
+                            count: snapshot.sampleCount
+                        }) || (snapshot.sampleCount + ' samples'))
+                        : '';
+                }
+                var legs = document.getElementById('dashRangeLegs');
+                if (legs) {
+                    if (snapshot.isPhev
+                            && snapshot.resolvedEvKm > 0
+                            && snapshot.resolvedFuelKm > 0) {
+                        legs.textContent = BYD.i18n.t('dashboard.range_breakdown', {
+                            ev: BYD.units.dist(snapshot.resolvedEvKm),
+                            fuel: BYD.units.dist(snapshot.resolvedFuelKm)
+                        }) || (BYD.units.dist(snapshot.resolvedEvKm) + ' EV · '
+                            + BYD.units.dist(snapshot.resolvedFuelKm) + ' fuel');
+                    } else {
+                        legs.textContent = '';
+                    }
+                }
+
+                var rangeLabel = document.getElementById('dashRangeLabel');
+                if (rangeLabel) {
+                    rangeLabel.textContent =
+                        BYD.i18n.t('trip.card.personalized_range')
+                        || 'Personalized Range';
+                }
+                var rangeValue = document.getElementById('dashRange');
+                if (rangeValue) rangeValue.textContent = personalizedText;
+                var rangeBreakdown = document.getElementById('dashRangeBreakdown');
+                if (rangeBreakdown) {
+                    var vehicleLabel =
+                        BYD.i18n.t('dashboard.kicker_vehicle') || 'Vehicle';
+                    rangeBreakdown.textContent = snapshot.vehicleKm > 0
+                        ? vehicleLabel + ' · ' + vehicleText : '';
+                    rangeBreakdown.style.display = snapshot.vehicleKm > 0
+                        ? '' : 'none';
+                }
+
+                var socPercent = (this.lastStatus
+                    && this.lastStatus.soc
+                    && this.lastStatus.soc.percent !== undefined)
+                    ? this.lastStatus.soc.percent : null;
+                this.glance.setSoc(socPercent, personalizedText);
+                panel.hidden = false;
+                if (glance) glance.classList.add('has-range');
+            },
+            resolveDriveState: function(status) {
+                status = status || {};
+                var recording = status.recordingStatus || {};
+                var charging = status.charging || {};
+                var gps = status.gps || {};
+                var powerOn = typeof status.acc === 'boolean'
+                    ? status.acc
+                    : recording.accOn === true;
+
+                var rawGear = recording.gear !== undefined
+                    ? recording.gear
+                    : status.gear;
+                var gear = rawGear === undefined || rawGear === null
+                    ? '--'
+                    : String(rawGear).toUpperCase();
+                if (!/^(P|R|N|D|M|S)$/.test(gear)) gear = '--';
+                // Once ACC is off, a non-P value is normally the last HAL
+                // sample from shutdown. Do not present that stale drive gear
+                // as the car's current state.
+                if (!powerOn && gear !== 'P') gear = '--';
+
+                var speedKmh = null;
+                var gpsFresh = powerOn
+                    && gps.hasLocation === true
+                    && gps.isStale !== true
+                    && gps.isCached !== true
+                    && gps.isFixStale !== true
+                    && typeof gps.speed === 'number'
+                    && isFinite(gps.speed);
+                if (gpsFresh) speedKmh = Math.max(0, gps.speed * 3.6);
+
+                var mode = 'parked';
+                var stateKey = 'dashboard.drive_state_parked';
+                var stateFallback = 'Parked';
+                var detailKey = status.gpuSurveillance
+                    ? 'dashboard.drive_detail_parked_sentry'
+                    : 'dashboard.drive_detail_parked';
+                var detailFallback = status.gpuSurveillance
+                    ? 'Vehicle off · surveillance active'
+                    : 'Vehicle powered down';
+                var detailVars = null;
+
+                if (charging.fault === true) {
+                    mode = 'fault';
+                    stateKey = 'dashboard.drive_state_fault';
+                    stateFallback = 'Charge fault';
+                    detailKey = 'dashboard.drive_detail_fault';
+                    detailFallback = 'Charging system needs attention';
+                } else if (charging.charging === true) {
+                    mode = 'charging';
+                    stateKey = 'dashboard.drive_state_charging';
+                    stateFallback = 'Charging';
+                    var chargePower = Number(charging.powerKw || charging.chargingPowerKW || 0);
+                    if (chargePower > 0 && charging.powerSource !== 'nominalPlaceholder') {
+                        var powerText = (charging.isEstimated ? '~' : '')
+                            + chargePower.toFixed(1) + ' kW';
+                        detailKey = 'dashboard.drive_detail_charging';
+                        detailFallback = 'Charging at ' + powerText;
+                        detailVars = { power: powerText };
+                    } else {
+                        detailKey = 'dashboard.drive_detail_charging_generic';
+                        detailFallback = 'Charging in progress';
+                    }
+                } else if (powerOn && gear === 'R') {
+                    mode = 'reverse';
+                    stateKey = 'dashboard.drive_state_reverse';
+                    stateFallback = 'Reversing';
+                    detailKey = 'dashboard.drive_detail_reverse';
+                    detailFallback = 'Reverse selected';
+                } else if (powerOn && (gear === 'D' || gear === 'M' || gear === 'S')) {
+                    mode = 'driving';
+                    stateKey = 'dashboard.drive_state_driving';
+                    stateFallback = 'Driving';
+                    detailKey = 'dashboard.drive_detail_active';
+                    detailFallback = 'Powertrain active';
+                } else if (powerOn && gear === 'N') {
+                    mode = 'neutral';
+                    stateKey = 'dashboard.drive_state_neutral';
+                    stateFallback = 'Neutral';
+                    detailKey = 'dashboard.drive_detail_neutral';
+                    detailFallback = 'Neutral selected';
+                } else if (powerOn && gear === 'P') {
+                    mode = 'ready';
+                    stateKey = 'dashboard.drive_state_ready';
+                    stateFallback = 'Ready';
+                    detailKey = 'dashboard.drive_detail_ready';
+                    detailFallback = 'Parked and ready to drive';
+                } else if (powerOn && gpsFresh
+                        && (gps.isMoving === true || speedKmh >= 3)) {
+                    mode = 'driving';
+                    stateKey = 'dashboard.drive_state_driving';
+                    stateFallback = 'Driving';
+                    detailKey = 'dashboard.drive_detail_active';
+                    detailFallback = 'Powertrain active';
+                } else if (powerOn) {
+                    mode = 'ready';
+                    stateKey = 'dashboard.drive_state_powered';
+                    stateFallback = 'Powered on';
+                    detailKey = 'dashboard.drive_detail_on';
+                    detailFallback = 'Vehicle systems are active';
+                } else if (charging.plugged === true) {
+                    mode = 'plugged';
+                    stateKey = 'dashboard.drive_state_plugged';
+                    stateFallback = 'Plugged in';
+                    detailKey = 'dashboard.drive_detail_plugged';
+                    detailFallback = 'Connected to charger';
+                }
+
+                return {
+                    mode: mode,
+                    powerOn: powerOn,
+                    gear: gear,
+                    speedKmh: speedKmh,
+                    stateKey: stateKey,
+                    stateFallback: stateFallback,
+                    detailKey: detailKey,
+                    detailFallback: detailFallback,
+                    detailVars: detailVars
+                };
+            },
+            updateDriveState: function(status) {
+                var state = this.resolveDriveState(status);
+                var root = document.getElementById('dashDriveState');
+                if (!root) return state;
+
+                function translated(key, fallback, vars) {
+                    var value = BYD.i18n.t(key, vars);
+                    return value && value !== key ? value : fallback;
+                }
+                function setIfChanged(id, value) {
+                    var el = document.getElementById(id);
+                    if (el && el.textContent !== value) el.textContent = value;
+                    return el;
+                }
+
+                var powerText = state.powerOn
+                    ? translated('dashboard.drive_power_on', 'Vehicle on')
+                    : translated('dashboard.drive_power_off', 'Vehicle off');
+                var stateText = translated(
+                    state.stateKey, state.stateFallback, state.detailVars);
+                var detailText = translated(
+                    state.detailKey, state.detailFallback, state.detailVars);
+                setIfChanged('dashDrivePower', powerText);
+                setIfChanged('dashDriveMode', stateText);
+                setIfChanged('dashDriveDetail', detailText);
+
+                root.className = 'dash-drive-state is-' + state.mode;
+                root.setAttribute('data-state', state.mode);
+
+                var gearEl = setIfChanged('dashDriveGear', state.gear);
+                var gearKeys = {
+                    P: ['dashboard.gear_park', 'Park'],
+                    R: ['dashboard.gear_reverse', 'Reverse'],
+                    N: ['dashboard.gear_neutral', 'Neutral'],
+                    D: ['dashboard.gear_drive', 'Drive'],
+                    M: ['dashboard.gear_manual', 'Manual'],
+                    S: ['dashboard.gear_sport', 'Sport']
+                };
+                var gearName = state.gear;
+                if (gearKeys[state.gear]) {
+                    gearName = translated(
+                        gearKeys[state.gear][0], gearKeys[state.gear][1]);
+                }
+                if (gearEl && gearEl.parentNode) {
+                    gearEl.parentNode.setAttribute(
+                        'title', state.gear === '--' ? '' : gearName);
+                }
+
+                var speedUnit = BYD.units.speedLabel();
+                var speedText = state.speedKmh === null
+                    ? '--'
+                    : String(Math.round(BYD.units.speedVal(state.speedKmh)));
+                setIfChanged('dashDriveSpeed', speedText);
+                setIfChanged('dashDriveSpeedUnit', speedUnit);
+
+                var accessibleSpeed = speedText === '--'
+                    ? speedText
+                    : speedText + ' ' + speedUnit;
+                root.setAttribute('aria-label',
+                    powerText + '. ' + stateText + '. '
+                    + translated('dashboard.drive_metric_gear', 'Gear')
+                    + ' ' + (state.gear === '--' ? state.gear : gearName)
+                    + '. ' + translated('dashboard.drive_metric_speed', 'Speed')
+                    + ' ' + accessibleSpeed);
+
+                var glance = document.getElementById('dashGlance');
+                if (glance) {
+                    var vehicleClasses = [
+                        'vehicle-ready', 'vehicle-driving', 'vehicle-reverse',
+                        'vehicle-neutral', 'vehicle-charging', 'vehicle-plugged',
+                        'vehicle-parked', 'vehicle-fault'
+                    ];
+                    for (var i = 0; i < vehicleClasses.length; i++) {
+                        glance.classList.remove(vehicleClasses[i]);
+                    }
+                    glance.classList.add('vehicle-' + state.mode);
+                }
+                return state;
             },
             updateFromStatus: function(status) {
                 if (!status) return;
@@ -806,7 +2133,7 @@
                     var el = document.getElementById(id);
                     if (!el) return;
                     el.textContent = value;
-                    el.classList.remove('good', 'warn');
+                    el.classList.remove('good', 'warn', 'alert');
                     if (cls) el.classList.add(cls);
                 }
                 function timeAgo(timestamp) {
@@ -835,28 +2162,80 @@
                         : (BYD.i18n.t('status.off') || 'OFF');
                 }
 
+                var driveState = this.updateDriveState(status);
                 var deviceLabel = BYD.i18n.t('dashboard.chip_device_value', { id: status.deviceId || '--' })
                                   || ('Device ' + (status.deviceId || '--'));
                 setChip('dashConnChip', deviceLabel, status.deviceId ? 'good' : '');
                 var survLabel = BYD.i18n.t('dashboard.chip_surveillance_value', { state: tOnOff(status.gpuSurveillance) })
                                 || ('Surveillance ' + tOnOff(status.gpuSurveillance));
                 setChip('dashSurvChip', survLabel, status.gpuSurveillance ? 'good' : '');
-                setText('dashAcc', tOnOff(status.acc));
+                setText('dashAcc', tOnOff(driveState.powerOn));
 
-                if (status.battery && status.battery.voltage) setText('dash12v', status.battery.voltage.toFixed(1) + 'V');
-                if (status.soc && status.soc.percent !== undefined) {
-                    var socText = status.soc.percent.toFixed(1) + '%';
+                var batteryVoltage = status.battery
+                    ? Number(status.battery.voltage) : NaN;
+                var batteryFresh = status.battery
+                    && status.battery.available !== false
+                    && status.battery.isStale !== true
+                    && isFinite(batteryVoltage)
+                    && batteryVoltage > 0;
+                setText('dash12v', batteryFresh
+                    ? batteryVoltage.toFixed(1) + 'V' : '--');
+                var socPercent = (status.soc && status.soc.percent !== undefined) ? status.soc.percent : null;
+                if (socPercent !== null) {
+                    var socText = socPercent.toFixed(1) + '%';
                     setText('dashSoc', socText);
                     setText('dashHeroSoc', socText);
                 } else {
                     setText('dashSoc', '--');
                     setText('dashHeroSoc', '--');
                 }
-                if (status.range && status.range.elecRangeKm !== undefined) setText('dashRange', BYD.units.dist(status.range.elecRangeKm));
+                this.renderHalRange(status);
 
-                if (status.network && status.network.type === 'wifi') setText('dashNetwork', status.network.ssid || 'WiFi');
-                else if (status.network && status.network.type === 'mobile') setText('dashNetwork', BYD.i18n.t('dashboard.network_mobile') || 'Mobile');
-                else setText('dashNetwork', '--');
+                // ----- PHEV fuel (glance gauge + Main info metric) -----
+                // Same guard as the sidebar fuel card in core.js: fuelPercent
+                // is only emitted for PHEVs, and 0 means "no real reading".
+                var rng = status.range || {};
+                var fuelPct = (typeof rng.fuelPercent === 'number' && rng.fuelPercent > 0) ? rng.fuelPercent : null;
+                var fuelKm = (typeof rng.fuelRangeKm === 'number' && rng.fuelRangeKm > 0) ? rng.fuelRangeKm : null;
+                this.glance.setFuel(fuelPct, fuelKm);
+                var fuelMetric = document.getElementById('dashFuelMetric');
+                if (fuelMetric) {
+                    var showFuel = fuelPct !== null;
+                    fuelMetric.style.display = showFuel ? '' : 'none';
+                    var infoGrid = document.getElementById('dashInfoGrid');
+                    if (infoGrid) infoGrid.classList.toggle('has-fuel', showFuel);
+                    if (showFuel) {
+                        setText('dashFuel', Math.round(fuelPct) + '%'
+                            + (fuelKm ? ' · ' + BYD.units.dist(fuelKm) : ''));
+                    }
+                }
+
+                if (BYD.core.personalizedRangeSnapshot) {
+                    this.updatePersonalizedRange(
+                        BYD.core.personalizedRangeSnapshot);
+                }
+
+                // Network metric — name on the value line, IPv4 on the small
+                // line below (same data the sidebar shows). NetworkMonitor
+                // emits type wifi | cellular | ethernet | none; the old
+                // 'mobile' comparison here never matched, so mobile data
+                // rendered as "--".
+                var net = status.network || {};
+                var netName = null;
+                if (net.type === 'wifi') {
+                    netName = net.ssid || (BYD.i18n.t('status.wifi') || 'WiFi');
+                } else if (net.type === 'cellular') {
+                    netName = BYD.i18n.t('status.mobile_data') || 'Mobile Data';
+                } else if (net.type === 'ethernet') {
+                    netName = 'Ethernet';
+                }
+                setText('dashNetwork', netName || (BYD.i18n.t('status.no_network') || 'No Network'));
+                var netIpEl = document.getElementById('dashNetworkIp');
+                if (netIpEl) {
+                    var ip = (netName && net.ip) ? net.ip : '';
+                    netIpEl.textContent = ip;
+                    netIpEl.style.display = ip ? '' : 'none';
+                }
 
                 if (status.gps && status.gps.hasLocation) {
                     var stale = status.gps.isCached || status.gps.isStale;
@@ -873,35 +2252,50 @@
                 // daemon's /api/status assembler (charging/plugged/full/fault +
                 // powerKw/socPercent/timeToFullMin). Absent on non-EV reads.
                 var c = status.charging;
+                this.glance.setCharging(c || null);
                 if (c) {
                     var stateKey = c.fault ? 'charge.state_fault'
-                                 : c.full ? 'charge.state_full'
                                  : c.charging ? 'charge.state_charging'
+                                 : c.full ? 'charge.state_full'
                                  : c.plugged ? 'charge.state_plugged'
                                  : 'charge.state_idle';
                     var dotCls = c.fault ? 'dot-danger'
-                               : c.full ? 'dot-good'
                                : c.charging ? 'dot-active'
+                               : c.full ? 'dot-good'
                                : c.plugged ? 'dot-warn'
                                : 'dot-idle';
                     var dot = document.getElementById('dashChargeDot');
                     if (dot) dot.className = 'ic_status_dot ' + dotCls;
-                    var fallbackState = c.fault ? 'Charge fault' : c.full ? 'Full'
-                                      : c.charging ? 'Charging' : c.plugged ? 'Plugged in' : 'Idle';
+                    var fallbackState = c.fault ? 'Charge fault' : c.charging ? 'Charging'
+                                      : c.full ? 'Full' : c.plugged ? 'Plugged in' : 'Idle';
                     setText('dashChargeState', BYD.i18n.t(stateKey) || fallbackState);
 
                     if (c.socPercent !== undefined && c.socPercent !== null) {
                         setText('dashChargeSoc', c.socPercent.toFixed(1) + '%');
+                    } else {
+                        setText('dashChargeSoc', '--');
                     }
-                    // Don't show the estimated/placeholder kW (nav bar suppresses
-                    // it too) — it read a fabricated ~7 kW vs the real 6.1.
-                    setText('dashChargePower', (c.charging && c.powerKw > 0 && !c.isEstimated) ? c.powerKw.toFixed(1) + ' kW' : '--');
+                    var dashboardPower = Number(c.powerKw || c.chargingPowerKW || 0);
+                    var dashboardPowerText = c.charging
+                            && dashboardPower > 0
+                            && c.powerSource !== 'nominalPlaceholder'
+                        ? (c.isEstimated ? '~' : '') + dashboardPower.toFixed(1) + ' kW'
+                        : '--';
+                    setText('dashChargePower', dashboardPowerText);
                     setText('dashChargeKwh', (c.sessionKwh && c.sessionKwh > 0) ? c.sessionKwh.toFixed(1) + ' kWh' : '--');
                     if (c.charging && c.timeToFullMin && c.timeToFullMin > 0) {
                         setText('dashChargeTtf', Math.floor(c.timeToFullMin / 60) + 'h ' + (c.timeToFullMin % 60) + 'm');
                     } else {
                         setText('dashChargeTtf', '--');
                     }
+                } else {
+                    var idleDot = document.getElementById('dashChargeDot');
+                    if (idleDot) idleDot.className = 'ic_status_dot dot-idle';
+                    setText('dashChargeState', BYD.i18n.t('charge.state_idle') || 'Idle');
+                    setText('dashChargeSoc', '--');
+                    setText('dashChargePower', '--');
+                    setText('dashChargeKwh', '--');
+                    setText('dashChargeTtf', '--');
                 }
             },
             openDirections: function() {
@@ -911,6 +2305,17 @@
                     return;
                 }
                 window.open('https://www.google.com/maps/dir/?api=1&destination=' + gps.lat + ',' + gps.lng + '&travelmode=driving', '_blank');
+            },
+            setStatusHealth: function(state) {
+                var chip = document.getElementById('dashConnChip');
+                if (!chip || state === 'live') return;
+                var disconnected = state === 'disconnected';
+                var key = disconnected ? 'status.disconnected' : 'status.stale';
+                var fallback = disconnected ? 'Disconnected' : 'Status stale';
+                var label = BYD.i18n.t(key);
+                chip.textContent = label && label !== key ? label : fallback;
+                chip.classList.remove('good', 'warn', 'alert');
+                chip.classList.add(disconnected ? 'alert' : 'warn');
             }
         };
 
@@ -919,6 +2324,12 @@
             return originalCoreRefreshStatus().then(function(status) {
                 if (status && BYD.dashboard && BYD.dashboard.updateFromStatus) {
                     BYD.dashboard.updateFromStatus(status);
+                } else if (BYD.dashboard && BYD.dashboard.setStatusHealth
+                        && BYD.core.pollFailureCount
+                            >= BYD.core.POLL_STALE_AFTER_FAILURES) {
+                    BYD.dashboard.setStatusHealth(
+                        BYD.core.pollFailureCount > 4
+                            ? 'disconnected' : 'stale');
                 }
                 return status;
             });
@@ -927,49 +2338,13 @@
         BYD.i18n.init().then(function() {
             BYD.core.init();
             if (BYD.map) BYD.map.init();
-            BYD.dashboard.refreshVehicleState();
-            setInterval(function() { BYD.dashboard.refreshVehicleState(); }, 6000);
+            BYD.dashboard.initVehicleStatePolling();
+            BYD.dashboard.refreshSecurityDigest();
+            setInterval(function() { BYD.dashboard.refreshSecurityDigest(); }, 60000);
+            // Once, after i18n: the labels are user-authored so they need no translation,
+            // and the grid stays hidden when the user has defined no buttons.
+            BYD.dashboard.loadCustomCommands();
         });
-
-        // Hero 3D vehicle. Mounts via OverdriveAppShell.mountVehicleCanvas
-        // (same pipeline as the sidebar EV-card), passing only `view`
-        // — the dashboard hero gets the identical side-profile framing
-        // the sidebar uses. (model, colour) come from the daemon's
-        // /api/models/selected endpoint via the shell's standard
-        // applyVehicleSelection() flow.
-        //
-        // mountVehicleCanvas internally calls ensureEv3d() which looks
-        // for the sidebar's #evCardCanvas to decide whether to inject
-        // ev-card-3d.js — so we must wait for the sidebar to be mounted
-        // before calling. The shell dispatches `app-shell:ready` after
-        // mount; we listen for that (with a DOMContentLoaded fallback).
-        //
-        // Note: on the laptop static-server preview the daemon endpoint
-        // 404s, so neither sidebar EV-card nor this hero canvas paint
-        // a model. To preview the dashboard layout/CSS in a browser
-        // without the device, run the app on-device. We do not seed
-        // any synthetic default here — keeping the renderer pipeline
-        // strictly daemon-driven matches the sidebar's behaviour.
-        (function () {
-            var didMount = false;
-            function mountHero() {
-                if (didMount) return;
-                var canvas = document.getElementById('dashHero3d');
-                if (!canvas) return;
-                var shell = window.OverdriveAppShell;
-                if (!shell || typeof shell.mountVehicleCanvas !== 'function') return;
-                didMount = true;
-                shell.mountVehicleCanvas(canvas, { view: 'three-quarter' });
-            }
-            document.addEventListener('app-shell:ready', mountHero);
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', function () {
-                    setTimeout(mountHero, 0);
-                });
-            } else {
-                setTimeout(mountHero, 0);
-            }
-        })();
 
         // ── Dashboard card reorder ──────────────────────────────────
         // PWA-only feature (the head-unit's in-app WebView never loads

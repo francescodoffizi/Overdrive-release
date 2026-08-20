@@ -31,8 +31,11 @@ public class TripDatabase {
     // (H2 throws JdbcSQLFeatureNotSupportedException at init). Single-
     // process architecture: only CameraDaemon writes, TripApiHandler reads
     // from the same JVM. FILE_LOCK=SOCKET handles cross-process safety.
+    // AUTO_COMPACT_FILL_RATE=50: idle-CPU tuning shared by all seven H2 stores
+    // (see SocHistoryDatabase.JDBC_URL for the full rationale).
     private static final String JDBC_URL = "jdbc:h2:file:" + DB_PATH +
-            ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE";
+            ";FILE_LOCK=SOCKET;TRACE_LEVEL_FILE=0;DB_CLOSE_ON_EXIT=FALSE" +
+            ";AUTO_COMPACT_FILL_RATE=50";
 
     // volatile: reassigned by reconnect() (now synchronized); the fence gives a
     // happens-before edge so any reader sees the freshly-swapped connection.
@@ -153,15 +156,60 @@ public class TripDatabase {
                 reconnect();
                 return connection != null && !connection.isClosed();
             }
-            return true;
+            // isClosed() is not enough. It reports only whether THIS Connection object was
+            // closed on our side; when H2 shuts the DATABASE down underneath us it keeps
+            // returning false while every statement throws 90098 "The database has been
+            // closed". Observed on a BYD Seal head unit on 2026-08-14: the store closed
+            // mid-session and stayed dead for hours until the daemon was restarted. The
+            // failure is near-silent, because every DAO logs its SQLException and returns an
+            // empty result — so GET /api/trips answered `success:true, trips:[]`, anything
+            // derived from trip history (recent consumption, range estimates) went null, and
+            // a real drive was recorded to the telemetry file only, to be rebuilt later by
+            // recoverTripsFromDisk. So probe the store instead of trusting the flag.
+            if (probe()) return true;
+            logger.warn("connection alive but database unusable — forcing a reopen");
+            forceReconnect();
+            return probe();
         } catch (Exception e) {
             logger.error("Connection check failed", e);
-            reconnect();
+            forceReconnect();
             try {
                 return connection != null && !connection.isClosed();
             } catch (Exception e2) {
                 return false;
             }
+        }
+    }
+
+    /**
+     * Cheapest round-trip that actually reaches the store. Embedded H2, so this is
+     * microseconds; the alternative is trusting a client-side flag that lies.
+     */
+    private boolean probe() {
+        Connection c = connection;
+        if (c == null) return false;
+        try (java.sql.Statement st = c.createStatement()) {
+            st.execute("SELECT 1");
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Reopen unconditionally. {@link #reconnect()} is a no-op when {@code isClosed()} returns
+     * false, which is exactly the case that needs reopening here, so the handle is dropped
+     * first.
+     */
+    private synchronized void forceReconnect() {
+        Connection old = connection;
+        connection = null;
+        if (old != null) {
+            try { old.close(); } catch (Exception ignored) { }
+        }
+        reconnect();
+        if (connection != null) {
+            logger.info("Trip database reopened after the store closed underneath us");
         }
     }
 
@@ -1340,10 +1388,9 @@ public class TripDatabase {
     // phantom trip in history + rollups + routes.
     private static final long MIN_TRIP_DURATION_MS = 60_000L;
     private static final double MIN_TRIP_DISTANCE_KM = 0.2;
-    // GPS-altitude noise floor for elevation reconstruction, mirroring the live
-    // scoring path (TripScoreEngine.ALT_NOISE_THRESHOLD = 2.0 m). Sub-floor
-    // altitude wobble is ignored so recovered climb/descent isn't fabricated.
-    private static final double ALT_NOISE_THRESHOLD_M = 2.0;
+    // Elevation reconstruction uses the SAME ElevationEstimator as the live
+    // scoring path (TripScoreEngine) — one implementation, one set of noise/
+    // accuracy constants, instead of a hand-synced duplicate deadband here.
     // Max file-missing-while-volume-up rows the orphan reconcile will delete in
     // ONE pass. Genuine deletions are incremental (a handful per 30s tick); a
     // larger batch signals a transient FUSE stat storm (files exist() returns
@@ -1676,7 +1723,8 @@ public class TripDatabase {
         int maxSpeed = 0;
         long speedSum = 0; int speedCount = 0;
         double elevGain = 0, elevLoss = 0;
-        double prevLat = 0, prevLon = 0, prevAlt = Double.NaN;
+        ElevationEstimator elevation = new ElevationEstimator();
+        double prevLat = 0, prevLon = 0;
         long prevGpsTs = 0;
         boolean havePrevGps = false;
         double firstLat = 0, firstLon = 0, lastLat = 0, lastLon = 0;
@@ -1713,23 +1761,18 @@ public class TripDatabase {
                 }
                 prevLat = s.lat; prevLon = s.lon; prevGpsTs = s.timestampMs; havePrevGps = true;
             }
-            if (!Double.isNaN(s.altitude) && s.altitude != 0) {
-                if (Double.isNaN(prevAlt)) {
-                    prevAlt = s.altitude;
-                } else {
-                    double dAlt = s.altitude - prevAlt;
-                    // Deadband: GPS altitude jitters several metres even parked.
-                    // Only accumulate (and only advance the baseline) once the
-                    // change clears a noise floor, mirroring the live scoring
-                    // path (TripScoreEngine.ALT_NOISE_THRESHOLD = 2.0 m). Without
-                    // this, ~1Hz jitter integrates into fabricated climb totals.
-                    if (Math.abs(dAlt) >= ALT_NOISE_THRESHOLD_M) {
-                        if (dAlt > 0) elevGain += dAlt; else elevLoss += -dAlt;
-                        prevAlt = s.altitude;
-                    }
-                }
-            }
+            // Elevation: SAME pipeline as the live scoring path (movement gate,
+            // vertical-accuracy gate, 10s median smoothing, MSL-source-flip and
+            // long-gap resets, hysteresis banking). Works at this file's ~1Hz
+            // rate because the smoothing window is time-based. Old telemetry
+            // files lack the "va"/"am" keys — they decode as 0/false, meaning
+            // "no accuracy gate, no source flips" (graceful degradation).
+            elevation.addSample(s.timestampMs, s.altitude, s.verticalAccuracyM,
+                    s.altitudeIsMsl,
+                    ElevationEstimator.isElevationEligible(s.gearMode, s.speedKmh));
         }
+        elevGain = elevation.getGainM();
+        elevLoss = elevation.getLossM();
 
         t.distanceKm = distKm;
         t.maxSpeedKmh = maxSpeed;

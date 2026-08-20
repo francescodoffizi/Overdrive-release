@@ -1754,9 +1754,9 @@ public class RecordingModeManager {
                 }
 
                 if (currentMode == Mode.NONE) {
-                    // ESCO-PARITY: on dilink4 the pipeline is started at daemon
+                    // OEM-PARITY: on dilink4 the pipeline is started at daemon
                     // boot (CameraDaemon Dilink4BootPipelineStart) and must
-                    // STAY ALIVE across the entire daemon lifetime — esco's
+                    // STAY ALIVE across the entire daemon lifetime — oem's
                     // PanoCameraRecordService never gets stopped on any ACC
                     // edge. Suppressing the legacy "tear down on mode=NONE"
                     // path here.
@@ -1769,7 +1769,7 @@ public class RecordingModeManager {
                         dilink4 = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
                     } catch (Throwable ignored) {}
                     if (dilink4) {
-                        logger.info("ACC ON with mode=NONE — keeping pipeline alive (dilink4 esco-parity)");
+                        logger.info("ACC ON with mode=NONE — keeping pipeline alive (dilink4 oem-parity)");
                     } else if (bsKeepWarmActive()) {
                         // Blind-spot is enabled and ACC is on: keep the camera
                         // WARM for the BS lane even though no recording mode is
@@ -1823,8 +1823,8 @@ public class RecordingModeManager {
             // running, the keep-alive watchdog might be) — preserve that.
             CameraDaemon.stopAvcKeepAlive();
 
-            // ESCO-PARITY DILINK4 PATH (esco MainService.java:677-689 +
-            // FlameoutService p111dh/C4995i.java:371-411): esco never closes
+            // OEM-PARITY DILINK4 PATH (oem MainService.java:677-689 +
+            // FlameoutService p111dh/C4995i.java:371-411): oem never closes
             // AVMCamera on ACC-OFF, period. PanoCameraRecord stays alive
             // for the entire MainService lifetime. ACC-OFF only schedules
             // the secondary auto-sentry-record consumer (separate C5920a)
@@ -1833,8 +1833,8 @@ public class RecordingModeManager {
             //
             // For dilink4, ALWAYS take the keep-alive path. Drop every
             // surveillance / safe-zone / schedule gate the prior wiring
-            // had — none of those gates exist in esco. If the user has
-            // surveillance off, esco still keeps the camera open for the
+            // had — none of those gates exist in oem. If the user has
+            // surveillance off, oem still keeps the camera open for the
             // user's preview path; OverDrive must do the same.
             //
             // Legacy mode (non-dilink4) keeps the original teardown
@@ -1849,7 +1849,7 @@ public class RecordingModeManager {
 
             if (dilink4) {
                 if (pipeline.isRunning()) {
-                    logger.info("ACC OFF (dilink4) — finalize recording, keep camera alive (esco-parity, unconditional)");
+                    logger.info("ACC OFF (dilink4) — finalize recording, keep camera alive (oem-parity, unconditional)");
                     try {
                         pipeline.stopRecording();
                     } catch (Throwable t) {
@@ -2104,7 +2104,7 @@ public class RecordingModeManager {
         // already disabled by CameraDaemon.onAccOn() before this thread runs,
         // and CONTINUOUS/DRIVE_MODE recording hasn't started yet — there is no
         // active recording state to lose.
-        // ESCO-PARITY: skip the FPS-stale teardown on dilink4. esco only
+        // OEM-PARITY: skip the FPS-stale teardown on dilink4. oem only
         // restarts the camera for resolution/quality changes (config-diff
         // at PanoCameraRecordService.m19844Z); FPS changes don't close the
         // AVMCamera. On dilink4 we live with stale FPS until the next
@@ -2117,7 +2117,7 @@ public class RecordingModeManager {
             logger.info("Camera FPS config changed — restarting pipeline to apply");
             pipeline.stop();
         } else if (mode != Mode.NONE && pipeline.isFpsConfigStale() && dilink4FpsSkip) {
-            logger.info("Camera FPS config stale — keeping pipeline alive (dilink4 esco-parity)");
+            logger.info("Camera FPS config stale — keeping pipeline alive (dilink4 oem-parity)");
         }
 
         switch (mode) {
@@ -2131,7 +2131,7 @@ public class RecordingModeManager {
                 if (proximityController != null) {
                     proximityController.stop();
                 }
-                // ESCO-PARITY: dilink4 keeps pipeline alive on user-initiated
+                // OEM-PARITY: dilink4 keeps pipeline alive on user-initiated
                 // mode=NONE; only legacy tears down for resource saving.
                 {
                     boolean dilink4None = false;
@@ -2151,7 +2151,7 @@ public class RecordingModeManager {
                         pipeline.stop();
                         CameraDaemon.stopAvcKeepAlive();
                     } else if (dilink4None) {
-                        logger.info("NONE mode requested — keeping pipeline alive (dilink4 esco-parity)");
+                        logger.info("NONE mode requested — keeping pipeline alive (dilink4 oem-parity)");
                     } else if (pipeline.isRunning()) {
                         logger.info("NONE mode requested — keeping pipeline alive for blind-spot keep-warm");
                     }
@@ -2343,9 +2343,9 @@ public class RecordingModeManager {
         // Check if surveillance should be preserved — don't stop pipeline during ACC OFF
         // (surveillance/sentry mode needs the pipeline running).
         //
-        // ESCO-PARITY: dilink4 keeps the pipeline alive across user mode-
+        // OEM-PARITY: dilink4 keeps the pipeline alive across user mode-
         // switch deactivations (CONTINUOUS → other, PROXIMITY_GUARD → other).
-        // esco's mode toggles never close the AVMCamera handle.
+        // oem's mode toggles never close the AVMCamera handle.
         boolean dilink4Persistent = false;
         try {
             dilink4Persistent = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
@@ -2366,7 +2366,7 @@ public class RecordingModeManager {
 
         if (keepPipelineRunning) {
             if (dilink4Persistent && accIsOn) {
-                logger.info("dilink4 + ACC ON — keeping pipeline alive across deactivate (esco-parity)");
+                logger.info("dilink4 + ACC ON — keeping pipeline alive across deactivate (oem-parity)");
             } else {
                 logger.info("ACC is OFF — keeping pipeline running for surveillance");
             }
@@ -2382,7 +2382,7 @@ public class RecordingModeManager {
                 
             case CONTINUOUS:
                 // Stop recording but keep pipeline if ACC is OFF (surveillance
-                // running), dilink4 (esco-parity), blind-spot keep-warm, or a
+                // running), dilink4 (oem-parity), blind-spot keep-warm, or a
                 // switch to another camera-owning mode (no cold-restart churn).
                 pipeline.stopRecording();
                 OemDashcamMirror.onPanoRecordingStopped();
@@ -2399,7 +2399,7 @@ public class RecordingModeManager {
                 // unconditionally for "quick resume" — but a parked-in-P car
                 // (DRIVE_MODE shifted to P) then burned full-quality GPU+encode
                 // for a recording that can't happen until a driving gear. Now we
-                // stop unless ACC is off (surveillance owns it), dilink4 (esco-
+                // stop unless ACC is off (surveillance owns it), dilink4 (oem-
                 // parity), or blind-spot is keeping the rails warm. When BS keeps
                 // it warm, throttle the recorder lane to the BS profile so it
                 // isn't running at full recording quality (applyRecorderProfileForState).
@@ -2790,11 +2790,23 @@ public class RecordingModeManager {
         }
         // Rung 2: blind-spot keep-warm.
         if (bsKeepWarmActive()) {
+            // A camera-view can now hold the shared lane WHILE blind-spot is enabled but
+            // idle (the arbiter yields the lane when no turn signal is active, or when the
+            // conditional speed/reverse gate suppresses the card). Those frames go to the
+            // screen, so they need a real rate: without this the BS idle floor (~1fps)
+            // would starve a visible camera-view down to a frozen image — the same
+            // "overlay opens but shows nothing" failure rung 2b below exists to prevent.
+            // Take the max of both demands rather than reordering the rungs, so a SHOWN
+            // blind-spot card is never slowed down either.
             int bsFps = bsViewShown()
                     ? UnifiedConfigManager.getBlindSpotActiveFps()
                     : UnifiedConfigManager.getBlindSpotIdleFps();
-            return new CameraIntent(false, Math.max(bsFps, streamFps), false,
-                    "blind-spot keep-warm (view " + (bsViewShown() ? "SHOWN" : "hidden") + ")");
+            int camDemand = camViewKeepWarmActive()
+                    ? UnifiedConfigManager.getBlindSpotActiveFps() : 0;
+            int want = Math.max(bsFps, Math.max(camDemand, streamFps));
+            return new CameraIntent(false, want, false,
+                    "blind-spot keep-warm (view " + (bsViewShown() ? "SHOWN" : "hidden") + ")"
+                    + (camDemand > 0 ? "+camview" : ""));
         }
         // Rung 2b: camera-view overlay (show-camera) is the consumer. Renders the pano onto
         // the native SurfaceControl lane exactly like a shown blind-spot view, so it needs a

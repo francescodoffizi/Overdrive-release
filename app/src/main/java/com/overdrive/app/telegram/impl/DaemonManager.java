@@ -3,9 +3,12 @@ package com.overdrive.app.telegram.impl;
 import com.overdrive.app.telegram.IDaemonManager;
 import com.overdrive.app.telegram.model.DaemonInfo;
 import com.overdrive.app.telegram.model.DaemonStatus;
+import com.overdrive.app.util.DaemonHttpClient;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -74,21 +77,29 @@ public class DaemonManager implements IDaemonManager {
         // wrapper. With ps+awk+kill we filter by PID and exclude
         // $MY_PID so the wrapper survives.
         if ("camera".equals(name.toLowerCase())) {
-            execShell(
+            if (!prepareCameraRestart()) {
+                return false;
+            }
+            boolean stopped = execShell(
                 "MY_PID=$$; ps -A -o PID,ARGS | grep -F start_cam_daemon | grep -v grep "
                 + "| awk '{print $1}' | while read pid; do "
                 + "if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done"
-            );
-            execShell("rm -f /data/local/tmp/start_cam_daemon.sh 2>/dev/null");
+            ) != null;
+            stopped &= execShell(
+                    "rm -f /data/local/tmp/start_cam_daemon.sh 2>/dev/null") != null;
             try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-            execShell(
+            stopped &= execShell(
                 "MY_PID=$$; ps -A -o PID,ARGS | grep -F byd_cam_daemon | grep -v grep "
                 + "| awk '{print $1}' | while read pid; do "
                 + "if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done"
-            );
-            execShell("killall -9 byd_cam_daemon 2>/dev/null");
-            execShell("rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null");
-            return true;
+            ) != null;
+            stopped &= execShell("killall -9 byd_cam_daemon 2>/dev/null") != null;
+            stopped &= execShell(
+                    "rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null") != null;
+            if (!stopped) {
+                abortCameraRestart();
+            }
+            return stopped;
         }
 
         // Same ps+awk+kill pattern — entry.className is interpolated
@@ -100,6 +111,49 @@ public class DaemonManager implements IDaemonManager {
             + "if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done"
         );
         return true;
+    }
+
+    /**
+     * Camera stops are SIGKILL-based, so the daemon must explicitly confirm
+     * that its active trip journal and camera pipeline are durable first.
+     */
+    private boolean prepareCameraRestart() {
+        HttpURLConnection connection = null;
+        try {
+            connection = DaemonHttpClient.open(
+                    "/api/surveillance/prepare-restart", "POST", 3000, 10000);
+            connection.setDoOutput(true);
+            try (OutputStream body = connection.getOutputStream()) {
+                body.write(new byte[0]);
+            }
+            int code = connection.getResponseCode();
+            return code >= 200 && code < 300;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    private void abortCameraRestart() {
+        HttpURLConnection connection = null;
+        try {
+            connection = DaemonHttpClient.open(
+                    "/api/surveillance/abort-restart", "POST", 2000, 2000);
+            connection.setDoOutput(true);
+            try (OutputStream body = connection.getOutputStream()) {
+                body.write(new byte[0]);
+            }
+            connection.getResponseCode();
+        } catch (Exception ignored) {
+            // Best effort. The stop method already returns false to its caller.
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
     }
     
     @Override

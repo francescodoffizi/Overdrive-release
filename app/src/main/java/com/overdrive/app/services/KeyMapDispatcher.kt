@@ -4,6 +4,7 @@ import android.os.FileObserver
 import android.util.Log
 import com.overdrive.app.config.UnifiedConfigManager
 import com.overdrive.app.util.DaemonHttpClient
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
@@ -49,6 +50,8 @@ import java.util.concurrent.TimeUnit
 object KeyMapDispatcher {
 
     private const val TAG = "KeyMapDispatcher"
+    private const val NATIVE_CAMERA_PACKAGE = "com.byd.avc"
+    private const val NATIVE_CAMERA_ACTION_KEY = "native_camera_view"
     // Disambiguation window for single-vs-double, measured from the FIRST DOWN of the
     // first tap. A deliberate hardware double-tap on a steering-wheel/dash button spans
     // longer than a touchscreen double-tap (Android's 300ms default): each press is a
@@ -124,6 +127,7 @@ object KeyMapDispatcher {
     private class Snapshot(val enabled: Boolean, val bindings: List<JSONObject>, val doubleWindowMs: Long)
 
     @Volatile private var cache: Snapshot? = null
+    @Volatile private var foregroundPackage: String? = null
     @Volatile private var lastRefreshKickMs = 0L
     // Separate timestamp for the coarse re-enable poll (see maybeRefreshSlow), so
     // the disabled-state backstop throttles independently of the enabled hot path.
@@ -185,6 +189,14 @@ object KeyMapDispatcher {
     // Guarded by `this`; cleared alongside the other transient maps in refresh()/teardown().
     private val downPassedThrough = HashSet<Int>()
 
+    // A camera-view mapping that was ineligible because the native panorama app
+    // was not active must let the complete firmware key burst reach the OEM. The
+    // first passed-through DOWN may itself open that app; without this short grace
+    // period, a follow-on DOWN from the SAME physical press could see the newly
+    // active package and fire the mapped view. Guarded by `this`.
+    private val nativeCameraPassThroughUntilMs = HashMap<Int, Long>()
+    private val nativeCameraDefaultGesture = HashSet<Int>()
+
     // Keycodes for which we injected a synthetic native tap (the "block native single"
     // replay — see the double-only branch) and are waiting for that injected event to
     // round-trip back through onKeyEvent. FLAG_REQUEST_FILTER_KEY_EVENTS re-delivers
@@ -227,6 +239,43 @@ object KeyMapDispatcher {
      */
     fun warmUp() {
         io.submit { refresh() }
+    }
+
+    /**
+     * Update the package owning the active accessibility window. This is called
+     * from TYPE_WINDOW_STATE_CHANGED events and is deliberately just a volatile
+     * assignment so key filtering never performs an ActivityManager/Binder query.
+     */
+    fun onForegroundPackageChanged(packageName: String?) {
+        foregroundPackage = packageName?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * Camera-view actions are eligible only while the OEM panorama application is
+     * active. Sequences inherit the restriction so wrapping the action cannot make
+     * an otherwise conditional binding consume the vehicle key.
+     */
+    @JvmStatic
+    fun isBindingEligibleForForeground(
+        binding: JSONObject,
+        activePackage: String?
+    ): Boolean {
+        val action = binding.optJSONObject("action") ?: return true
+        return !containsNativeCameraView(action) || activePackage == NATIVE_CAMERA_PACKAGE
+    }
+
+    private fun containsNativeCameraView(action: JSONObject): Boolean {
+        if (action.optString("kind") == "catalog" &&
+            action.optString("key") == NATIVE_CAMERA_ACTION_KEY) {
+            return true
+        }
+        if (action.optString("kind") != "sequence") return false
+        val steps: JSONArray = action.optJSONArray("steps") ?: return false
+        for (i in 0 until steps.length()) {
+            val step = steps.optJSONObject(i) ?: continue
+            if (containsNativeCameraView(step)) return true
+        }
+        return false
     }
 
     /** Register a FileObserver on the config dir so a daemon write refreshes us
@@ -401,14 +450,48 @@ object KeyMapDispatcher {
         // Enabled hot path — keep the ~2s freshness so a live binding edit lands fast.
         maybeRefresh() // async, throttled — never touches disk on this thread
 
+        // If an ineligible camera binding already passed a DOWN to the OEM, keep
+        // passing the remainder of that firmware burst even if the first DOWN
+        // opened the camera app and changed the foreground package meanwhile.
+        val nowMs = System.currentTimeMillis()
+        val nativeCameraBurstPassThrough = synchronized(this) {
+            if (nativeCameraDefaultGesture.contains(keyCode)) {
+                if (!isDown) {
+                    nativeCameraDefaultGesture.remove(keyCode)
+                    downPassedThrough.remove(keyCode)
+                }
+                return@synchronized true
+            }
+            val until = nativeCameraPassThroughUntilMs[keyCode]
+            if (until != null && nowMs <= until) {
+                if (isDown) {
+                    nativeCameraDefaultGesture.add(keyCode)
+                    downPassedThrough.add(keyCode)
+                } else {
+                    downPassedThrough.remove(keyCode)
+                }
+                true
+            } else {
+                if (until != null) nativeCameraPassThroughUntilMs.remove(keyCode)
+                false
+            }
+        }
+        if (nativeCameraBurstPassThrough) return false
+
         // Cheap in-memory filter — no I/O.
         var singleB: JSONObject? = null
         var doubleB: JSONObject? = null
         var longB: JSONObject? = null
         var owned = false
+        var conditionalCameraBinding = false
+        val activePackage = foregroundPackage
         for (b in snap.bindings) {
             if (b.optInt("keycode", -1) != keyCode) continue
             if (!b.optBoolean("enabled", true)) continue
+            if (!isBindingEligibleForForeground(b, activePackage)) {
+                conditionalCameraBinding = true
+                continue
+            }
             owned = true
             when (b.optString("pressType")) {
                 "double" -> doubleB = b
@@ -416,7 +499,27 @@ object KeyMapDispatcher {
                 else -> singleB = b
             }
         }
-        if (!owned) return false
+        if (!owned) {
+            if (!conditionalCameraBinding) return false
+            if (!isDown) {
+                // If the matching DOWN was consumed while the camera was active,
+                // consume its UP too. If it was passed through, preserve the pair.
+                val passed = synchronized(this) { downPassedThrough.remove(keyCode) }
+                return !passed
+            }
+            if (repeatCount > 0) {
+                // Preserve the decision made for the initial DOWN of a held key.
+                val passed = synchronized(this) { downPassedThrough.contains(keyCode) }
+                return !passed
+            }
+            synchronized(this) {
+                nativeCameraDefaultGesture.add(keyCode)
+                downPassedThrough.add(keyCode)
+                nativeCameraPassThroughUntilMs[keyCode] =
+                    System.currentTimeMillis() + FIRE_DEBOUNCE_MS
+            }
+            return false
+        }
 
         // Trailing UP handling. Normally we consume the UP for an owned key so the OEM
         // never sees a dangling UP for a DOWN we swallowed. BUT if the matching DOWN was
@@ -571,7 +674,8 @@ object KeyMapDispatcher {
                                     it.optInt("keycode", -1) == keyCode &&
                                         it.optBoolean("enabled", true) &&
                                         it.optString("pressType") != "double" &&
-                                        it.optString("pressType") != "long"
+                                        it.optString("pressType") != "long" &&
+                                        isBindingEligibleForForeground(it, foregroundPackage)
                                 }
                             // Honor FIRE_DEBOUNCE_MS exactly like every other fire site
                             // (the two immediate branches above). Belt-and-suspenders:
@@ -744,6 +848,8 @@ object KeyMapDispatcher {
                     // disabled feature must carry no stale burst-coalesce gap or
                     // half-seen cycle into a later re-enable.
                     lastDownAtMs.clear(); upSeenSinceDown.clear(); downPassedThrough.clear()
+                    nativeCameraPassThroughUntilMs.clear()
+                    nativeCameraDefaultGesture.clear()
                     injectGuard.clear(); injectGuardUntilMs.clear()
                 } else {
                     val liveLongKeys = HashSet<Int>()
@@ -791,8 +897,11 @@ object KeyMapDispatcher {
             // burst-coalesce gap or half-seen cycle measured before teardown can't
             // misclassify the first DOWN after re-enable.
             lastDownAtMs.clear(); upSeenSinceDown.clear(); downPassedThrough.clear()
+            nativeCameraPassThroughUntilMs.clear()
+            nativeCameraDefaultGesture.clear()
             injectGuard.clear(); injectGuardUntilMs.clear()
         }
+        foregroundPackage = null
     }
 
     /**

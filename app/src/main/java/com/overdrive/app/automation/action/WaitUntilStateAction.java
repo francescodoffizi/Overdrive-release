@@ -141,9 +141,15 @@ public class WaitUntilStateAction extends BaseAction {
      */
     private static boolean stateMet(String eventId, String target) {
         if (EVENT_TURN_ANY.equals(eventId)) {
-            boolean leftOn = isOn(BydEvent.TURN_LEFT);
-            boolean rightOn = isOn(BydEvent.TURN_RIGHT);
-            boolean anyOn = leftOn || rightOn;
+            Value left = Automations.getStateValue(BydEvent.TURN_LEFT);
+            Value right = Automations.getStateValue(BydEvent.TURN_RIGHT);
+            // NEITHER side observed yet → not met, for BOTH targets. Treating an unseeded signal as
+            // "not on" made a "wait until indicators = off" satisfy on the FIRST poll while the lamp
+            // was still blinking, because both keys read null. That is the unsafe direction: it
+            // reports a state that was never measured. Waiting instead lets the poller seed the keys
+            // (isEventReferenced now sees turnAny, see resolveEvent's note) or times out honestly.
+            if (left == null && right == null) return false;
+            boolean anyOn = isOn(left) || isOn(right);
             return "on".equalsIgnoreCase(target) ? anyOn : !anyOn;
         }
         EventData event = resolveEvent(eventId);
@@ -160,9 +166,8 @@ public class WaitUntilStateAction extends BaseAction {
         return AutomationCondition.evaluate(event, "eq", target);
     }
 
-    /** True iff the event's current state reads "on". Unknown (null) → false. */
-    private static boolean isOn(EventData event) {
-        Value v = Automations.getStateValue(event);
+    /** True iff this state value reads "on". Unknown (null) → false. */
+    private static boolean isOn(Value v) {
         return v != null && Boolean.TRUE.equals(v.compare("on", "eq"));
     }
 

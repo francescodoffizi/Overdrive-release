@@ -72,9 +72,33 @@ public class MqttConnectionManager {
     // Poll the car once, cache the result, let all publishers grab the cached JSON.
     private volatile JSONObject lastCachedTelemetry = null;
     private volatile long lastCollectionTimeMs = 0;
+    private volatile long lastCachedCabinExpiresAtMs = 0;
     private static final long TELEMETRY_CACHE_TTL_MS = 2000; // 2 seconds
 
+    private static final class CollectedTelemetry {
+        final JSONObject payload;
+        final long cabinExpiresAtMs;
+
+        CollectedTelemetry(JSONObject payload, long cabinExpiresAtMs) {
+            this.payload = payload;
+            this.cabinExpiresAtMs = cabinExpiresAtMs;
+        }
+    }
+
     private volatile boolean initialized = false;
+
+    // One-way shutdown latch + lifecycle mutex. stopAll() is only ever called on
+    // daemon shutdown (never followed by a restart of the same instance), but it
+    // runs on the shutdown thread while add/update tasks queued on controlExecutor
+    // may still be mid-startConnection(): without coordination, a publisher whose
+    // connect() was in flight when stopAll() cleared the maps lands in the map
+    // AFTER the clear — a live, connected client with no scheduler and nothing to
+    // ever disconnect it. lifecycleLock serializes startConnection/stopConnection/
+    // stopAll; the stopped flag makes any start that loses the race a no-op.
+    // A dedicated lock (not the instance monitor) so it can't interact with
+    // collectTelemetry()'s synchronized(this).
+    private volatile boolean stopped = false;
+    private final Object lifecycleLock = new Object();
 
     public MqttConnectionManager() {
         this.store = new MqttConnectionStore();
@@ -153,26 +177,39 @@ public class MqttConnectionManager {
     public void stopAll() {
         logger.info("Stopping all MQTT connections");
 
-        for (Map.Entry<String, ScheduledFuture<?>> entry : scheduledTasks.entrySet()) {
-            entry.getValue().cancel(false);
-        }
-        scheduledTasks.clear();
+        // Refuse new lifecycle work first (visible before we take the lock), then
+        // stop accepting queued control tasks. shutdownNow() interrupts an idle
+        // control thread; a task already inside startConnection() holds
+        // lifecycleLock and is waited out below, then sees stopped and unwinds.
+        stopped = true;
+        controlExecutor.shutdownNow();
 
-        for (Map.Entry<String, ScheduledExecutorService> entry : schedulers.entrySet()) {
-            entry.getValue().shutdownNow();
-        }
-        schedulers.clear();
+        synchronized (lifecycleLock) {
+            for (Map.Entry<String, ScheduledFuture<?>> entry : scheduledTasks.entrySet()) {
+                entry.getValue().cancel(false);
+            }
+            scheduledTasks.clear();
 
-        for (Map.Entry<String, MqttPublisherService> entry : publishers.entrySet()) {
-            entry.getValue().disconnect();
+            for (Map.Entry<String, ScheduledExecutorService> entry : schedulers.entrySet()) {
+                entry.getValue().shutdownNow();
+            }
+            schedulers.clear();
+
+            for (Map.Entry<String, MqttPublisherService> entry : publishers.entrySet()) {
+                entry.getValue().disconnect();
+            }
+            publishers.clear();
         }
-        publishers.clear();
 
         // All connections are down — now it's safe to clear the process-global
         // SOCKS proxy properties (individual disconnect() no longer does this, to
         // avoid one connection stomping a sibling's still-needed proxy routing).
-        System.clearProperty("socksProxyHost");
-        System.clearProperty("socksProxyPort");
+        // Under the shared props lock so we can't stomp a connect that is mid
+        // socket-creation elsewhere (e.g. the BYD cloud subscriber).
+        synchronized (ProxyHelper.SOCKS_PROPS_LOCK) {
+            System.clearProperty("socksProxyHost");
+            System.clearProperty("socksProxyPort");
+        }
 
         logger.info("All MQTT connections stopped");
     }
@@ -183,51 +220,68 @@ public class MqttConnectionManager {
      * Start a single connection's publish loop.
      */
     private void startConnection(MqttConnectionConfig config) {
-        // Stop existing if running
-        stopConnection(config.id);
+        synchronized (lifecycleLock) {
+            // Lost the race against stopAll() (daemon shutdown) — don't create a
+            // publisher nobody will ever tear down.
+            if (stopped) {
+                logger.info("Skipping start of " + config.name + " — manager is stopped");
+                return;
+            }
 
-        MqttPublisherService publisher = new MqttPublisherService(config, deviceId);
+            // Stop existing if running
+            stopConnection(config.id);
 
-        // Attempt initial connection (non-blocking — will retry on first publish if fails)
-        boolean connected = publisher.connect();
-        logger.info("Connection " + config.name + " (" + config.id + "): "
-                + (connected ? "connected" : "will retry on first publish"));
+            MqttPublisherService publisher = new MqttPublisherService(config, deviceId);
 
-        publishers.put(config.id, publisher);
+            // Attempt initial connection (non-blocking — will retry on first publish if fails)
+            boolean connected = publisher.connect();
+            logger.info("Connection " + config.name + " (" + config.id + "): "
+                    + (connected ? "connected" : "will retry on first publish"));
 
-        // Create per-connection scheduler
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "MQTT-" + config.id);
-            t.setDaemon(true);
-            return t;
-        });
-        schedulers.put(config.id, scheduler);
+            publishers.put(config.id, publisher);
 
-        // Schedule publish loop at the min-interval floor.
-        scheduleNext(config.id, scheduler, Math.max(1, config.minIntervalSeconds));
+            // Create per-connection scheduler
+            ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "MQTT-" + config.id);
+                t.setDaemon(true);
+                return t;
+            });
+            schedulers.put(config.id, scheduler);
+
+            // Schedule publish loop at the min-interval floor.
+            long cadenceDelayMs = Math.max(1, config.minIntervalSeconds) * 1000L;
+            scheduleNext(config.id, scheduler,
+                    Math.min(cadenceDelayMs, currentCabinExpiryDelayMs()));
+        }
     }
 
     /**
      * Stop a single connection.
      */
     private void stopConnection(String connectionId) {
-        ScheduledFuture<?> task = scheduledTasks.remove(connectionId);
-        if (task != null) task.cancel(false);
+        synchronized (lifecycleLock) {
+            ScheduledFuture<?> task = scheduledTasks.remove(connectionId);
+            if (task != null) task.cancel(false);
 
-        ScheduledExecutorService scheduler = schedulers.remove(connectionId);
-        if (scheduler != null) scheduler.shutdownNow();
+            ScheduledExecutorService scheduler = schedulers.remove(connectionId);
+            if (scheduler != null) scheduler.shutdownNow();
 
-        MqttPublisherService publisher = publishers.remove(connectionId);
-        if (publisher != null) publisher.disconnect();
+            MqttPublisherService publisher = publishers.remove(connectionId);
+            if (publisher != null) publisher.disconnect();
 
-        // Once no connection remains, clear the process-global SOCKS proxy props so
-        // unrelated daemon sockets (zrok, APK download, push) aren't routed through
-        // sing-box by a leftover from a WS+proxy connection. While ≥1 connection is
-        // live we leave them — a sibling may still need them, and each connect()
-        // re-asserts/clears authoritatively from the current proxy state.
-        if (publishers.isEmpty()) {
-            System.clearProperty("socksProxyHost");
-            System.clearProperty("socksProxyPort");
+            // Once no connection remains, clear the process-global SOCKS proxy props so
+            // unrelated daemon sockets (zrok, APK download, push) aren't routed through
+            // sing-box by a leftover from a WS+proxy connection. While ≥1 connection is
+            // live we leave them — a sibling may still need them, and each connect()
+            // re-asserts/clears authoritatively from the current proxy state. Under the
+            // shared props lock so the clear can't land mid socket-creation of another
+            // props-sensitive connect (e.g. the BYD cloud subscriber).
+            if (publishers.isEmpty()) {
+                synchronized (ProxyHelper.SOCKS_PROPS_LOCK) {
+                    System.clearProperty("socksProxyHost");
+                    System.clearProperty("socksProxyPort");
+                }
+            }
         }
     }
 
@@ -237,14 +291,14 @@ public class MqttConnectionManager {
      * The scheduler is passed in (not looked up) so a trailing cycle from a scheduler that has
      * since been replaced by a restart can't queue work onto the new one — it simply no-ops.
      */
-    private void scheduleNext(String connectionId, ScheduledExecutorService scheduler, long delaySeconds) {
+    private void scheduleNext(String connectionId, ScheduledExecutorService scheduler, long delayMs) {
         if (scheduler == null || scheduler.isShutdown()) return;
         // This scheduler was swapped out by a restart — drop the reschedule.
         if (schedulers.get(connectionId) != scheduler) return;
 
         try {
             ScheduledFuture<?> task = scheduler.schedule(() -> runPublishCycle(connectionId, scheduler),
-                    delaySeconds, TimeUnit.SECONDS);
+                    Math.max(1L, delayMs), TimeUnit.MILLISECONDS);
             scheduledTasks.put(connectionId, task);
         } catch (RejectedExecutionException ignored) {
             // Scheduler was shut down between the guard above and schedule() — connection is
@@ -263,6 +317,7 @@ public class MqttConnectionManager {
         if (publisher == null || !publisher.isRunning()) return;
 
         MqttConnectionConfig config = publisher.getConfig();
+        long payloadCabinExpiresAtMs = 0L;
 
         // Active health check, decoupled from whether a publish is due. The change-gated
         // publish loop can skip idle cycles for up to maxIntervalSeconds, during which a
@@ -278,7 +333,9 @@ public class MqttConnectionManager {
 
         try {
             // Collect telemetry (shared across all connections)
-            JSONObject payload = collectTelemetry();
+            CollectedTelemetry telemetry = collectTelemetry();
+            JSONObject payload = telemetry.payload;
+            payloadCabinExpiresAtMs = telemetry.cabinExpiresAtMs;
 
             // Supply vehicle identity for Home Assistant discovery (cheap; updated each cycle
             // because VIN only appears once the BYD SDK has been read at least once).
@@ -296,16 +353,45 @@ public class MqttConnectionManager {
 
         // The cycle runs at the min-interval floor; the differ enforces the heartbeat
         // ceiling and skips idle cycles, so the old parked multiplier is no longer needed.
-        long nextInterval = Math.max(1, config.minIntervalSeconds);
+        long nextDelayMs = Math.max(1, config.minIntervalSeconds) * 1000L;
 
         // Apply backoff if failing
         long backoff = publisher.getBackoffSeconds();
-        if (backoff > nextInterval) {
-            nextInterval = backoff;
+        if (backoff * 1000L > nextDelayMs) {
+            nextDelayMs = backoff * 1000L;
         }
 
+        nextDelayMs = Math.min(nextDelayMs,
+                delayUntilCabinExpiryMs(payloadCabinExpiresAtMs, System.currentTimeMillis()));
+
         // Schedule next on the same scheduler this cycle ran on.
-        scheduleNext(connectionId, scheduler, nextInterval);
+        scheduleNext(connectionId, scheduler, nextDelayMs);
+    }
+
+    private long currentCabinExpiryDelayMs() {
+        try {
+            BydDataCollector collector = BydDataCollector.getInstance();
+            BydVehicleData data = collector.isInitialized() ? collector.getData() : null;
+            return delayUntilCabinExpiryMs(cabinExpiryAtMs(data), System.currentTimeMillis());
+        } catch (Throwable ignored) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    private static long delayUntilCabinExpiryMs(long expiresAtMs, long nowMs) {
+        if (expiresAtMs <= nowMs) return Long.MAX_VALUE;
+        return expiresAtMs - nowMs;
+    }
+
+    private static long cabinExpiryAtMs(BydVehicleData data) {
+        if (data == null || data.insideTempReadAt <= 0L
+                || (Double.isNaN(data.insideTempC) && Double.isNaN(data.insideTempCelsius))) {
+            return 0L;
+        }
+        if (data.insideTempReadAt > Long.MAX_VALUE - BydVehicleData.CABIN_TEMP_MAX_AGE_MS) {
+            return Long.MAX_VALUE;
+        }
+        return data.insideTempReadAt + BydVehicleData.CABIN_TEMP_MAX_AGE_MS;
     }
 
     // ==================== CRUD OPERATIONS (called from IPC) ====================
@@ -314,6 +400,29 @@ public class MqttConnectionManager {
      * Add a new MQTT connection.
      * @return the added config (with generated ID), or null if max reached
      */
+    /**
+     * Enqueue lifecycle work on the control executor, tolerating the shutdown race:
+     * stopAll() calls controlExecutor.shutdownNow(), after which execute() throws
+     * RejectedExecutionException — and the IPC server can still dispatch MQTT CRUD
+     * for a moment during daemon shutdown (stopAll() runs before the servers stop).
+     * Uncaught, the REE aborted the CRUD method mid-way: deleteConnection() lost its
+     * store.delete(), and add/update returned an error for a store change that had
+     * already persisted. Dropping the LIVE-connection side effect is correct here —
+     * the store change survives and takes effect on the next daemon start.
+     *
+     * @return true if enqueued, false if the manager is stopped (work skipped)
+     */
+    private boolean submitControl(Runnable task) {
+        if (stopped) return false;
+        try {
+            controlExecutor.execute(task);
+            return true;
+        } catch (RejectedExecutionException e) {
+            logger.info("Manager stopped — skipping queued connection lifecycle work");
+            return false;
+        }
+    }
+
     public MqttConnectionConfig addConnection(JSONObject configJson) {
         MqttConnectionConfig config = MqttConnectionConfig.fromJson(configJson);
         // Ensure fresh ID
@@ -324,7 +433,7 @@ public class MqttConnectionManager {
 
         // Auto-start if enabled — off the caller's thread (connect() blocks).
         if (added.enabled && added.isConfigured()) {
-            controlExecutor.execute(() -> startConnection(added));
+            submitControl(() -> startConnection(added));
         }
 
         return added;
@@ -350,7 +459,7 @@ public class MqttConnectionManager {
         final MqttConnectionConfig config = store.getById(id);
         if (config != null) {
             final boolean retractHa = wasHa && !config.homeAssistantDiscovery;
-            controlExecutor.execute(() -> {
+            submitControl(() -> {
                 // If HA discovery was just turned off, retract the device while still connected.
                 if (retractHa) {
                     MqttPublisherService pub = publishers.get(id);
@@ -377,7 +486,10 @@ public class MqttConnectionManager {
         MqttConnectionConfig cfg = store.getById(id);
         final boolean ha = cfg != null && cfg.isHomeAssistant();
         final String prefix = cfg != null ? cfg.discoveryPrefix : "homeassistant";
-        controlExecutor.execute(() -> {
+        // submitControl (vs raw execute) so a shutdown race can't throw past the
+        // store.delete below — the config removal must persist even when the live
+        // teardown is skipped (stopAll() is tearing everything down anyway).
+        submitControl(() -> {
             MqttPublisherService pub = publishers.get(id);
             if (pub != null && ha) {
                 pub.removeDiscovery(prefix);
@@ -438,7 +550,7 @@ public class MqttConnectionManager {
      * Get the latest telemetry snapshot (for UI preview).
      */
     public JSONObject getLatestTelemetry() {
-        return collectTelemetry();
+        return collectTelemetry().payload;
     }
 
     // ==================== TELEMETRY COLLECTION ====================
@@ -475,7 +587,7 @@ public class MqttConnectionManager {
      * Collect telemetry from all data sources.
      * Same fields as ABRP Gold Standard payload for consistency.
      */
-    private synchronized JSONObject collectTelemetry() {
+    private synchronized CollectedTelemetry collectTelemetry() {
         long now = System.currentTimeMillis();
 
         // If we collected data less than 2 seconds ago, return the cached copy immediately.
@@ -487,13 +599,22 @@ public class MqttConnectionManager {
         // gaps in HA). Refresh just the position fields onto a COPY of the cached snapshot so the
         // track publishes at the full publish-cycle rate. Copy, not mutate: the cached object is
         // shared with other connections that read it concurrently.
-        if (lastCachedTelemetry != null && (now - lastCollectionTimeMs) < TELEMETRY_CACHE_TTL_MS) {
-            return withLiveGps(lastCachedTelemetry);
+        if (lastCachedTelemetry != null && (now - lastCollectionTimeMs) < TELEMETRY_CACHE_TTL_MS
+                && (lastCachedCabinExpiresAtMs <= 0L || now < lastCachedCabinExpiresAtMs)) {
+            return new CollectedTelemetry(
+                    withLiveGps(lastCachedTelemetry), lastCachedCabinExpiresAtMs);
         }
 
         JSONObject payload = new JSONObject();
+        long cabinExpiresAtMs = 0L;
 
         try {
+            // These are retained Home Assistant topics. Keep explicit tombstones in every
+            // snapshot, including collector startup/failure, so an old cabin value cannot remain
+            // visible while this publisher is online without a current vehicle snapshot.
+            payload.put("cabin_temp", JSONObject.NULL);
+            payload.put("inside_temp", JSONObject.NULL);
+
             // Read BYD data from cached snapshot (refreshed by BydDataCollector's 5s polling timer)
             BydDataCollector collector = BydDataCollector.getInstance();
             BydVehicleData vd = collector.isInitialized() ? collector.getData() : null;
@@ -557,15 +678,25 @@ public class MqttConnectionManager {
             // is_charging — BMS state primary, with gun-connected + power-flowing
             // as a fallback for PHEVs that leave BMS state at IDLE while charging.
             ChargingStateData chargingState = vehicleDataMonitor.getChargingState();
+            // A CV taper IS charging: the BMS reports FINISHED while current still flows, so a bare
+            // status test published is_charging=0 (and charge_power=0) for the whole tail.
             boolean isCharging = chargingState != null
-                    && chargingState.status == ChargingStateData.ChargingStatus.CHARGING;
+                    && (chargingState.status == ChargingStateData.ChargingStatus.CHARGING
+                        || chargingState.isTaperCharging);
             if (!isCharging && vd != null) {
+                // AC_DC (4) is charging-capable and was missing here, so a combo-gun session that fell
+                // through to this fallback reported not-charging. 5 is V2L (pack DISCHARGING) and stays
+                // excluded. Same set the monitor's own gate uses.
                 boolean gunConnected = vd.chargingGunState == 2
-                        || vd.chargingGunState == 3;
-                boolean powerFlowing = (!Double.isNaN(vd.externalChargingPowerKw)
-                                && vd.externalChargingPowerKw > 0.15)
-                        || (!Double.isNaN(vd.chargingPowerKw)
-                                && vd.chargingPowerKw > 0.15);
+                        || vd.chargingGunState == 3
+                        || vd.chargingGunState == 4;
+                // Test for FLOW via the resolver, not for a non-zero raw value. Those raw fields may
+                // hold a cumulative kWh counter on some firmware, and a counter stays non-zero after
+                // the charge ends — so a bare "> 0.15" test kept reporting is_charging=1 on a
+                // finished-but-plugged car for the rest of the session.
+                boolean powerFlowing = chargingState != null
+                        && !Double.isNaN(chargingState.chargingPowerKW)
+                        && chargingState.chargingPowerKW > 0.15;
                 if (gunConnected && powerFlowing) isCharging = true;
             }
             payload.put("is_charging", isCharging ? 1 : 0);
@@ -591,17 +722,22 @@ public class MqttConnectionManager {
             // charging state and a sane upper bound; 0 otherwise.
             double chargeKw = 0;
             if (isCharging && !v2l) {
-                if (vd != null && !Double.isNaN(vd.chargePowerKw)
-                        && vd.chargePowerKw > 0.1 && vd.chargePowerKw <= 300) {
-                    chargeKw = vd.chargePowerKw;
-                } else if (chargingState != null
-                        // !isEstimated: keep the nominal placeholder (3.3/7.0 kW) and inferred
-                        // engine-power figures out of the MQTT/Home-Assistant feed, which charts
-                        // this as measured charge power. The raw HAL getter above is unaffected.
+                // Prefer the RESOLVED figure over any raw getter. Raw accessors are stored
+                // unscaled and their unit is decided at runtime (a value may be a cumulative kWh
+                // counter rather than a rate), so only the resolver's output is guaranteed to be
+                // kW. Publishing a raw getter here would send a counter reading to Home Assistant
+                // as instantaneous power.
+                //
+                // !isEstimated keeps the nominal placeholder (3.3/7.0 kW) and the inferred
+                // engine-power figure out of a feed that charts this as measured.
+                //
+                // Bound is the SDK's rate domain (500), not 300: a 350 kW DC session is real and
+                // the old cap silently published 0 for it.
+                if (chargingState != null
                         && !chargingState.isEstimated
                         && !Double.isNaN(chargingState.chargingPowerKW)
                         && chargingState.chargingPowerKW > 0.1
-                        && chargingState.chargingPowerKW <= 300) {
+                        && chargingState.chargingPowerKW <= 500) {
                     chargeKw = chargingState.chargingPowerKW;
                 }
             }
@@ -661,6 +797,19 @@ public class MqttConnectionManager {
                 payload.put("soh", sohEstimator.getDisplaySoh());
             }
 
+            // Only publish generic charge-limit state once the matching
+            // charge-stop backend has been write/read-back verified. These
+            // state topics drive HA's controllable entities and must never
+            // inherit a PHEV SOC-hold or a raw unsupported register value.
+            if (Boolean.TRUE.equals(collector.isChargeCapSupported())) {
+                int capPercent = collector.getChargeCapPercent();
+                int capEnabled = collector.getChargeCapEnabled();
+                if (isVerifiedChargeCapState(Boolean.TRUE, capPercent, capEnabled)) {
+                    payload.put("charge_cap_percent", capPercent);
+                    payload.put("charge_cap_enabled", capEnabled);
+                }
+            }
+
             // capacity (remaining kWh) — single source of truth (SOC×nominal×SOH on
             // PHEV; gated raw on BEV). NEVER raw vd.remainKwh, which on PHEV is the
             // unreliable/frozen getter and would diverge ~35% from the UI.
@@ -694,6 +843,10 @@ public class MqttConnectionManager {
 
             // ==================== EXTENDED TELEMETRY (BYD API overhaul) ====================
             if (vd != null) {
+                long observedCabinExpiryAtMs = cabinExpiryAtMs(vd);
+                boolean cabinTemperatureFresh = observedCabinExpiryAtMs > now;
+                if (cabinTemperatureFresh) cabinExpiresAtMs = observedCabinExpiryAtMs;
+
                 // OEM SOH (raw value from BMS, separate from SohEstimator)
                 if (!Double.isNaN(vd.sohPercent)) payload.put("soh_oem", vd.sohPercent);
 
@@ -721,7 +874,9 @@ public class MqttConnectionManager {
                 if (vd.elecRangeKm != BydVehicleData.UNAVAILABLE) payload.put("ev_range_km", vd.elecRangeKm);
 
                 // Cabin temp
-                if (!Double.isNaN(vd.insideTempCelsius)) payload.put("cabin_temp", vd.insideTempCelsius);
+                payload.put("cabin_temp",
+                        cabinTemperatureFresh && !Double.isNaN(vd.insideTempCelsius)
+                                ? vd.insideTempCelsius : JSONObject.NULL);
 
                 // ==================== FULL PARITY (every remaining BydVehicleData field) ====================
                 // Identity
@@ -764,8 +919,9 @@ public class MqttConnectionManager {
                 // genuinely hot parked cabin (85 C) was published as cabin_temp while inside_temp
                 // silently held its last <=80 value, leaving two HA entities from one sensor
                 // reporting different temperatures.
-                if (!Double.isNaN(vd.insideTempC))
-                    payload.put("inside_temp", vd.insideTempC);
+                payload.put("inside_temp",
+                        cabinTemperatureFresh && !Double.isNaN(vd.insideTempC)
+                                ? vd.insideTempC : JSONObject.NULL);
 
                 // 12V battery (voltage12v is already source-validated to 8.0–16.0V in BydDataCollector)
                 if (!Double.isNaN(vd.voltage12v)) payload.put("volt_12v", vd.voltage12v);
@@ -821,9 +977,23 @@ public class MqttConnectionManager {
                 if (vd.chargingPercent != BydVehicleData.UNAVAILABLE
                         && vd.chargingPercent >= 0 && vd.chargingPercent <= 100)
                     payload.put("charging_pct", vd.chargingPercent);
-                if (!Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0
-                        && vd.chargingCapacityKwh <= 1000)
+                // Per-session charged energy, kWh — the WRAP-CORRECTED running total, not the raw
+                // counter. The vehicle's counter is 16-bit at 1 Wh (full scale 65.534 kWh) and wraps
+                // on any session larger than that, so an 82 kWh pack taking ~66 kWh published ~0.5
+                // here: a subscriber charting cumulative energy saw it collapse to near zero
+                // mid-charge. The accumulator already tracks wraps, so publish its total and fall
+                // back to the raw reading only when no session is open to attribute it to.
+                double sessionKwh = -1;
+                try {
+                    sessionKwh = com.overdrive.app.monitor.SocHistoryDatabase.getInstance()
+                            .getOpenChargingSessionEnergyKwh();
+                } catch (Throwable ignored) {}
+                if (sessionKwh >= 0) {
+                    payload.put("charging_capacity_kwh", Math.round(sessionKwh * 1000.0) / 1000.0);
+                } else if (!Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0
+                        && vd.chargingCapacityKwh <= 65.534) {
                     payload.put("charging_capacity_kwh", vd.chargingCapacityKwh);
+                }
                 payload.put("charging_v2l", vd.vtolCharging ? 1 : 0);
                 if (vd.wirelessChargingLeftState != BydVehicleData.UNAVAILABLE) payload.put("wireless_charging_left", vd.wirelessChargingLeftState);
                 if (vd.wirelessChargingRightState != BydVehicleData.UNAVAILABLE) payload.put("wireless_charging_right", vd.wirelessChargingRightState);
@@ -945,6 +1115,14 @@ public class MqttConnectionManager {
                     for (int s : vd.seatCool) a.put(s);
                     payload.put("seat_cool", a);
                 }
+                // Steering-wheel heater readback (raw setting-HAL 2=on / 1=off) normalized to
+                // 1/0 for the steering_heat control switch's state topic. Publish only a
+                // confident read — getSteeringWheelHeatingState already rejects 0/65535 rails,
+                // so anything else means "never answered" and the topic stays absent (the
+                // switch's optimistic command echo is then its only feeder), rather than a
+                // wrong retained "off" reverting a successful cloud toggle.
+                if (vd.steeringWheelHeat == 2 || vd.steeringWheelHeat == 1)
+                    payload.put("steering_wheel_heat", vd.steeringWheelHeat == 2 ? 1 : 0);
 
                 // Bodywork
                 if (vd.wiperState != BydVehicleData.UNAVAILABLE) payload.put("wiper_state", vd.wiperState);
@@ -1016,8 +1194,20 @@ public class MqttConnectionManager {
         // Update the cache
         lastCachedTelemetry = payload;
         lastCollectionTimeMs = now;
+        lastCachedCabinExpiresAtMs = cabinExpiresAtMs;
 
-        return payload;
+        return new CollectedTelemetry(payload, cabinExpiresAtMs);
+    }
+
+    /**
+     * Generic charge-cap values become telemetry only after the charge-stop backend has been
+     * verified and both readable values are complete. This prevents raw unsupported/unprobed
+     * register values from becoming Home Assistant state.
+     */
+    static boolean isVerifiedChargeCapState(Boolean supported, int percent, int enabled) {
+        return Boolean.TRUE.equals(supported)
+                && percent >= 50 && percent <= 100
+                && (enabled == 0 || enabled == 1);
     }
 
     /** True if any enabled connection has vehicle control turned on. */

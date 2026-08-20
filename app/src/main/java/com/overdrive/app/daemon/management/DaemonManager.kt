@@ -6,6 +6,7 @@ import com.overdrive.app.config.ConfigManager
 import com.overdrive.app.config.DaemonConfig
 import com.overdrive.app.config.DaemonType
 import com.overdrive.app.logging.LogManager
+import com.overdrive.app.util.DaemonHttpClient
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -209,21 +210,70 @@ class DaemonManager private constructor(
     }
     
     private fun stopCameraDaemon(callback: DaemonCallback?) {
-        adbLauncher.killDaemon(object : AdbDaemonLauncher.LaunchCallback {
-            override fun onLog(message: String) {
-                logManager.debug(TAG, "[CAMERA] $message")
-                callback?.onLog(DaemonType.CAMERA, message)
+        Thread {
+            val prepareError = prepareCameraRestart()
+            if (prepareError != null) {
+                logManager.error(TAG, "[CAMERA] Stop aborted: $prepareError")
+                callback?.onError(DaemonType.CAMERA, prepareError)
+                return@Thread
             }
-            
-            override fun onLaunched() {
-                updateDaemonState(DaemonType.CAMERA, false)
-                callback?.onStopped(DaemonType.CAMERA)
+
+            adbLauncher.killDaemon(object : AdbDaemonLauncher.LaunchCallback {
+                override fun onLog(message: String) {
+                    logManager.debug(TAG, "[CAMERA] $message")
+                    callback?.onLog(DaemonType.CAMERA, message)
+                }
+
+                override fun onLaunched() {
+                    updateDaemonState(DaemonType.CAMERA, false)
+                    callback?.onStopped(DaemonType.CAMERA)
+                }
+
+                override fun onError(error: String) {
+                    abortCameraRestart()
+                    callback?.onError(DaemonType.CAMERA, error)
+                }
+            })
+        }.start()
+    }
+
+    /**
+     * Returns null only after the daemon confirms its active trip and media
+     * pipeline are restart-safe. Any transport or non-2xx result blocks SIGKILL.
+     */
+    private fun prepareCameraRestart(): String? {
+        var connection: java.net.HttpURLConnection? = null
+        return try {
+            val conn = DaemonHttpClient.open(
+                "/api/surveillance/prepare-restart", "POST", 3000, 10000)
+            connection = conn
+            conn.doOutput = true
+            conn.outputStream.use { it.write(byteArrayOf()) }
+            val code = conn.responseCode
+            if (code in 200..299) null else "prepare-restart returned HTTP $code"
+        } catch (e: Exception) {
+            "prepare-restart failed: ${e.message ?: e.javaClass.simpleName}"
+        } finally {
+            try { connection?.disconnect() } catch (_: Exception) {}
+        }
+    }
+
+    private fun abortCameraRestart() {
+        Thread {
+            var connection: java.net.HttpURLConnection? = null
+            try {
+                val conn = DaemonHttpClient.open(
+                    "/api/surveillance/abort-restart", "POST", 2000, 2000)
+                connection = conn
+                conn.doOutput = true
+                conn.outputStream.use { it.write(byteArrayOf()) }
+                conn.responseCode
+            } catch (_: Exception) {
+                // Best effort: the original launcher error remains authoritative.
+            } finally {
+                try { connection?.disconnect() } catch (_: Exception) {}
             }
-            
-            override fun onError(error: String) {
-                callback?.onError(DaemonType.CAMERA, error)
-            }
-        })
+        }.start()
     }
     
     private fun startSentryDaemon(callback: DaemonCallback?) {

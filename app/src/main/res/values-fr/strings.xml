@@ -21,7 +21,7 @@
     <string name="action_cancel">Annuler</string>
     <string name="action_clear_plain">Effacer</string>
     <string name="action_select_all">Sélectionnez tous</string>
-    <string name="action_select_all_short">Tout le monde</string>
+    <string name="action_select_all_short">Tout sélectionner</string>
     <string name="action_delete">Supprimer</string>
     <string name="action_share">Partager</string>
     <string name="action_done">C\' est fait</string>
@@ -206,10 +206,10 @@
     <string name="onboarding_authorize_retry_title">Toujours non connecté</string>
     <string name="onboarding_authorize_retry_body">L\'aide n\'est pas encore en cours d\'exécution. La permission Android a peut-être été rejetée. Essayez à nouveau et n\'oubliez pas de cocher <b>Toujours autoriser</b>.</string>
     <string name="onboarding_authorize_retry_button">Réessayez</string>
-    <string name="onboarding_mode_title">Quand Overdrive doit-il fonctionner ?</string>
-    <string name="onboarding_mode_body">Choisissez le comportement d\'Overdrive après l\'arrêt de la voiture.\n\n<b>Allumée &amp; éteinte</b> continue de surveiller pendant le stationnement — la surveillance et le suivi en arrière-plan restent actifs, la voiture consomme donc un peu d\'énergie pendant la nuit.\n\n<b>Allumée uniquement</b> arrête complètement Overdrive dès que vous partez. La dashcam, les trajets et la recharge fonctionnent toujours pendant que vous conduisez, et tout redémarre automatiquement lorsque vous allumez la voiture. Vous pouvez modifier ceci à tout moment dans les Paramètres.</string>
-    <string name="onboarding_mode_on_off_button">Allumée &amp; éteinte</string>
-    <string name="onboarding_mode_on_only_button">Allumée uniquement</string>
+    <string name="onboarding_mode_title">Quand la surcharge doit-elle être exécutée ?</string>
+    <string name="onboarding_mode_body">Choisissez comment se comporte la Surcharge après avoir éteint la voiture.\n\n<b>Sur &amp; Off</b> continue à surveiller pendant que vous stationnez — la surveillance et la surveillance de fond restent actives, la voiture attire un peu de puissance du jour au lendemain.\n\n<b>On Only</b> ferme complètement Overdrive une fois que vous partiez. Dashcam, les trajets et le chargement fonctionnent encore pendant que vous conduisez, et tout recommence automatiquement lorsque vous allumez la voiture. Vous pouvez modifier cela à tout moment dans les paramètres.</string>
+    <string name="onboarding_mode_on_off_button">Sur &amp; Désactivé</string>
+    <string name="onboarding_mode_on_only_button">Activé uniquement</string>
     <!-- Camera mapping chapter -->
     <string name="onboarding_camera_step_label">Caméra · Etape %1$d de %2$d</string>
     <string name="onboarding_camera_intro_title">Configurez vos caméras</string>
@@ -1327,19 +1327,19 @@
     <string name="toast_cloudflared_saved_settings">Paramètres Cloudflared enregistrés</string>
     <!-- Projection feature -->
     <string name="projection_hero_title">Projection</string>
-    <string name="projection_hero_subtitle">Diffusez une application sur le combiné d\'instruments du conducteur et reflétez-la ici.</string>
-    <string name="projection_pick_app">Choisissez une application à projeter</string>
-    <string name="projection_cast">Diffuser sur le combiné d\'instruments</string>
+    <string name="projection_hero_subtitle">Placer une application sur le cluster de pilotes et la mettre en miroir ici.</string>
+    <string name="projection_pick_app">Choisir une application à projeter</string>
+    <string name="projection_cast">Diffuser vers le cluster</string>
     <string name="projection_stop">Arrêter</string>
-    <string name="projection_cast_failed">Impossible de diffuser cette application sur le combiné d\'instruments.</string>
-    <string name="projection_status_idle">Aucune projection en cours.</string>
-    <string name="projection_status_live">Miroir en direct — touchez et balayez pour contrôler.</string>
-    <string name="projection_status_preview">Mode aperçu (fréquence d\'images réduite sur ce véhicule).</string>
-    <string name="projection_status_none">Rien n\'est encore projeté — choisissez une application et diffusez-la.</string>
-    <string name="projection_status_unsupported">Le miroir en direct n\'est pas pris en charge sur ce véhicule. L\'application est toujours projetée sur le combiné d\'instruments.</string>
-    <string name="projection_note_single_app">Une seule application peut être projetée sur le combiné d\'instruments à la fois.</string>
+    <string name="projection_cast_failed">Impossible de convertir cette application vers le cluster.</string>
+    <string name="projection_status_idle">Pas de projection.</string>
+    <string name="projection_status_live">Miroir en direct — touchez et glissez pour contrôler.</string>
+    <string name="projection_status_preview">Mode d\'aperçu (taux d\'images réduit sur ce véhicule).</string>
+    <string name="projection_status_none">Rien n’est projeté pour le moment — choisissez une application et lancez.</string>
+    <string name="projection_status_unsupported">Le miroir en direct n\'est pas pris en charge sur ce véhicule. L\'application est toujours projetée sur le cluster.</string>
+    <string name="projection_note_single_app">Une application peut être projetée sur le cluster à la fois.</string>
     <string name="projection_adjust_bounds">Ajuster la zone</string>
-    <string name="projection_done_adjusting">Terminé</string>
+    <string name="projection_done_adjusting">Fait</string>
     <string name="projection_bounds_hint_idle">Zone du miroir</string>
     <string name="projection_status_adjust">Faites glisser pour déplacer · faites glisser un coin pour redimensionner.</string>
     <string name="projection_scale_title">Mise à l\'échelle</string>
@@ -1355,4 +1355,18 @@
     <string name="projection_autostart_conflict_confirm">Utiliser cette application</string>
     <string name="projection_app_uninstalled">Cette application n\'est plus installée.</string>
     <string name="projection_status_service_down">Le service de miroir n\'est pas prêt — redémarrez l\'application (ou le démon de la caméra) et réessayez.</string>
+    <string name="cd_replay_status">Statut de relecture instantanée</string>
+    <string name="recording_lib_type_replay">REJOUER</string>
+    <string name="settings_overlay_replay_title">Indicateur de relecture instantanée</string>
+    <string name="settings_overlay_replay_subtitle">Afficher le badge CLIP: vert pendant un enregistrement de rediffusion, bleu pendant 5 secondes une fois enregistré, rouge quand il échoue. N\'apparaît que lorsqu\'une liaison ou une automatisation de relecture existe.</string>
+    <string name="recordings_segment_replays">Rediffusions</string>
+    <string name="recordings_segment_replays_count">Rediffusions · %d</string>
+    <string name="vehicle_model_seagull">BYD Seagull</string>
+    <string name="projection_window_title">Fenêtre de cluster</string>
+    <string name="projection_window_desc">Positionnez l\'application de conversion sur le cluster de pilotes. Les préréglages l\'accrochent aux mises en page courantes; La fenêtre de redimensionnement vous permet de la déplacer librement.</string>
+    <string name="projection_preset_full">Plein</string>
+    <string name="projection_preset_left">Moitié gauche</string>
+    <string name="projection_preset_right">Moitié droite</string>
+    <string name="projection_preset_center">Centrer</string>
+    <string name="projection_lock_aspect">Garder l\'aspect du cluster</string>
 </resources>

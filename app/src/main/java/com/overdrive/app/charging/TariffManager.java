@@ -10,7 +10,10 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 
 /**
  * Location-aware electricity tariffs — CRUD + the match that prices a session.
@@ -57,6 +60,11 @@ public class TariffManager {
     private static final String SECTION = "chargingAnalytics";
     private static final String KEY_TARIFFS = "tariffs";
     private static final String KEY_DEFAULT_ID = "defaultTariffId";
+    private static final String KEY_PENDING_REPRICES = "pendingTariffReprices";
+    private static final String KEY_PENDING_REPRICE_TOKENS =
+            "pendingTariffRepriceTokens";
+    private static final String REPRICE_ALL = "*";
+    private static final String LEGACY_REPRICE_TOKEN = "legacy";
 
     /** Cap the list so a runaway UI can't bloat the config file. */
     public static final int MAX_PROFILES = 40;
@@ -77,12 +85,12 @@ public class TariffManager {
     private volatile List<TariffProfile> profiles = Collections.emptyList();
     /** Profile applied when the charge location matches nothing. Empty = none. */
     private volatile String defaultTariffId = "";
+    private volatile List<String> pendingRepriceKeys = Collections.emptyList();
+    private volatile Map<String, String> pendingRepriceTokens =
+            Collections.emptyMap();
     private volatile boolean loaded = false;
-    /** Debounce window for persisting usage counters (see markUsed). */
-    private static final long MARK_USED_FLUSH_MS = 5 * 60 * 1000L;
-    private long lastUsageFlushMs = 0;
-    private boolean usageFlushPending = false;
-
+    private volatile String lastLoadFailure = "";
+    private boolean replayingPendingReprices = false;
     private TariffManager() {}
 
     public static TariffManager getInstance() {
@@ -99,72 +107,345 @@ public class TariffManager {
      * POST path calls it after every edit so the daemon-side view can't drift
      * from what the UI just wrote).
      */
-    public synchronized void load() {
-        try {
-            JSONObject cfg = UnifiedConfigManager.loadConfig();
-            JSONObject section = cfg != null ? cfg.optJSONObject(SECTION) : null;
-            List<TariffProfile> parsed = new ArrayList<>();
-            String defId = "";
-            if (section != null) {
-                defId = section.optString(KEY_DEFAULT_ID, "");
-                JSONArray arr = section.optJSONArray(KEY_TARIFFS);
-                if (arr != null) {
-                    for (int i = 0; i < arr.length() && parsed.size() < MAX_PROFILES; i++) {
-                        JSONObject o = arr.optJSONObject(i);
-                        if (o != null) parsed.add(new TariffProfile(o));
-                    }
-                }
+    public boolean load() {
+        synchronized (this) {
+            try {
+                loadStrict();
+            } catch (Exception e) {
+                logger.error("Tariff load error: " + e.getMessage());
+                // Keep the previous complete snapshot published, but leave the manager UNLOADED.
+                // Session-closing callers use loadStrict() and will retry instead of freezing
+                // a fallback/global price after a transient config read failure.
+                loaded = false;
+                lastLoadFailure = e.getMessage() != null
+                        ? e.getMessage() : e.getClass().getSimpleName();
+                return false;
             }
-            // Single atomic publish — never an empty intermediate state (see the
-            // `profiles` field doc).
-            profiles = Collections.unmodifiableList(parsed);
-            // Drop a dangling default (profile deleted out from under it) so
-            // resolve() can't keep pointing at a ghost.
-            defaultTariffId = findById(defId) != null ? defId : "";
-            loaded = true;
-            logger.info("Loaded " + parsed.size() + " tariff profiles, default="
-                    + (defaultTariffId.isEmpty() ? "none" : defaultTariffId));
-        } catch (Exception e) {
-            logger.error("Tariff load error: " + e.getMessage());
-            loaded = true;   // don't retry-storm on a malformed file
+        }
+
+        // Database repricing is synchronized on SocHistoryDatabase. Never carry
+        // this manager's monitor into it: database metadata replay enters
+        // TariffManager in the opposite direction.
+        replayPendingReprices();
+        return true;
+    }
+
+    /** Parse and atomically publish one verified durable config snapshot. */
+    private synchronized void loadStrict() throws Exception {
+        JSONObject cfg = loadVerifiedConfig();
+        PublishedImage image =
+                imageFromSection(cfg.optJSONObject(SECTION));
+        publishImage(image);
+        lastLoadFailure = "";
+        logger.info("Loaded " + image.profiles.size() + " tariff profiles, default="
+                + (defaultTariffId.isEmpty() ? "none" : defaultTariffId));
+    }
+
+    /** Return the exact durable root parsed under UnifiedConfigManager's stable lock. */
+    public static JSONObject loadVerifiedConfig() throws Exception {
+        return UnifiedConfigManager.readDurableConfigStrict();
+    }
+
+    /** Caller must hold UnifiedConfigManager's cross-process lock. */
+    private static JSONObject readDurableConfigLocked() {
+        return UnifiedConfigManager.readDurableConfigStrict();
+    }
+
+    private boolean ensureLoaded() {
+        // load() serializes publication itself, then releases the tariff monitor
+        // before replaying database work.
+        if (!loaded && !load()) return false;
+        return loaded;
+    }
+
+    private interface LockedTariffMutation {
+        StagedMutation apply(TariffDocument document) throws Exception;
+    }
+
+    private static final class TariffDocument {
+        final JSONObject root;
+        final JSONObject section;
+        JSONArray tariffs;
+
+        TariffDocument(JSONObject root) {
+            this.root = root;
+            JSONObject existing = root.optJSONObject(SECTION);
+            this.section = existing != null ? existing : new JSONObject();
+            JSONArray existingTariffs = section.optJSONArray(KEY_TARIFFS);
+            this.tariffs = existingTariffs != null ? existingTariffs : new JSONArray();
         }
     }
 
-    private void ensureLoaded() {
-        // Double-checked: load() is synchronized, so without the inner re-test two
-        // threads racing the first call would each run a full reload.
-        if (!loaded) {
-            synchronized (this) {
-                if (!loaded) load();
-            }
+    private static final class PublishedImage {
+        final List<TariffProfile> profiles;
+        final String defaultTariffId;
+        final List<String> pendingRepriceKeys;
+        final Map<String, String> pendingRepriceTokens;
+
+        PublishedImage(
+                List<TariffProfile> profiles,
+                String defaultTariffId,
+                List<String> pendingRepriceKeys,
+                Map<String, String> pendingRepriceTokens) {
+            this.profiles = profiles;
+            this.defaultTariffId = defaultTariffId;
+            this.pendingRepriceKeys = pendingRepriceKeys;
+            this.pendingRepriceTokens = pendingRepriceTokens;
+        }
+    }
+
+    private static final class StagedMutation {
+        final boolean accepted;
+        final TariffProfile profile;
+        final String failure;
+
+        private StagedMutation(boolean accepted, TariffProfile profile, String failure) {
+            this.accepted = accepted;
+            this.profile = profile;
+            this.failure = failure;
+        }
+
+        static StagedMutation accepted(TariffProfile profile) {
+            return new StagedMutation(true, profile, "");
+        }
+
+        static StagedMutation rejected(String failure) {
+            return new StagedMutation(false, null, failure);
+        }
+    }
+
+    private static final class MutationCommit {
+        final boolean committed;
+        final TariffProfile profile;
+        final PublishedImage image;
+        final String failure;
+
+        private MutationCommit(
+                boolean committed,
+                TariffProfile profile,
+                PublishedImage image,
+                String failure) {
+            this.committed = committed;
+            this.profile = profile;
+            this.image = image;
+            this.failure = failure;
+        }
+
+        static MutationCommit committed(TariffProfile profile, PublishedImage image) {
+            return new MutationCommit(true, profile, image, "");
+        }
+
+        static MutationCommit rejected(PublishedImage image, String failure) {
+            return new MutationCommit(false, null, image, failure);
+        }
+
+        static MutationCommit failed(String failure) {
+            return new MutationCommit(false, null, null, failure);
         }
     }
 
     /**
-     * Persist profiles + default id into {@code chargingAnalytics}, preserving
-     * every other key in that section (read-modify-write, since
-     * {@link UnifiedConfigManager#updateSection} replaces the whole object).
+     * Apply one operation-specific tariff patch to a fresh durable root while holding the same
+     * cross-process lock for read, mutation and save. The process-local list is never a write base.
      */
-    private synchronized boolean save() {
+    private synchronized MutationCommit commitMutation(LockedTariffMutation mutation) {
+        return commitMutation(null, mutation);
+    }
+
+    private synchronized MutationCommit commitMutation(
+            String repriceKey,
+            LockedTariffMutation mutation) {
+        MutationCommit result;
         try {
-            // Write a DELTA and let updateSection merge it. loadConfig() returns
-            // the cached JSONObject itself, so mutating the section it hands back
-            // would race any other writer holding the same nested instance
-            // (ChargingConfig.save does the same read-modify-write). updateSection
-            // already copies each key of `data` into the existing section under a
-            // cross-process file lock, so siblings are preserved either way.
-            JSONObject delta = new JSONObject();
-            JSONArray arr = new JSONArray();
-            for (TariffProfile p : profiles) arr.put(p.toJson());
-            delta.put(KEY_TARIFFS, arr);
-            delta.put(KEY_DEFAULT_ID, defaultTariffId);
-            boolean ok = UnifiedConfigManager.updateSection(SECTION, delta);
-            if (!ok) logger.error("Tariff save rejected by UnifiedConfigManager");
-            return ok;
+            result = UnifiedConfigManager.runUnderConfigLock(() -> {
+                try {
+                    TariffDocument document =
+                            new TariffDocument(readDurableConfigLocked());
+                    PublishedImage base = imageFromSection(document.section);
+                    StagedMutation staged = mutation.apply(document);
+                    if (!staged.accepted) {
+                        return MutationCommit.rejected(base, staged.failure);
+                    }
+
+                    document.section.put(KEY_TARIFFS, document.tariffs);
+                    normalizeDefaultId(document);
+                    if (repriceKey != null) {
+                        queuePendingReprice(document.section, repriceKey);
+                    }
+                    document.root.put(SECTION, document.section);
+                    if (!UnifiedConfigManager.saveConfig(document.root)) {
+                        return MutationCommit.rejected(
+                                base, "config persistence rejected tariff mutation");
+                    }
+                    return MutationCommit.committed(
+                            staged.profile, imageFromSection(document.section));
+                } catch (Exception e) {
+                    return MutationCommit.failed(
+                            e.getMessage() != null
+                                    ? e.getMessage() : e.getClass().getSimpleName());
+                }
+            });
         } catch (Exception e) {
-            logger.error("Tariff save error: " + e.getMessage());
-            return false;
+            result = MutationCommit.failed(
+                    e.getMessage() != null
+                            ? e.getMessage() : e.getClass().getSimpleName());
         }
+
+        if (result.image != null) {
+            publishImage(result.image);
+        } else {
+            loaded = false;
+        }
+        if (result.committed) {
+            lastLoadFailure = "";
+        } else {
+            lastLoadFailure = result.failure;
+            logger.error("Tariff mutation rejected: " + result.failure);
+        }
+        return result;
+    }
+
+    private static PublishedImage imageFromSection(JSONObject section) {
+        List<TariffProfile> parsed = new ArrayList<>();
+        List<String> pending = pendingRepricesFromSection(section);
+        String requestedDefault = "";
+        if (section != null) {
+            requestedDefault = section.optString(KEY_DEFAULT_ID, "");
+            JSONArray tariffs = section.optJSONArray(KEY_TARIFFS);
+            if (tariffs != null) {
+                for (int i = 0; i < tariffs.length()
+                        && parsed.size() < MAX_PROFILES; i++) {
+                    JSONObject profile = tariffs.optJSONObject(i);
+                    if (profile != null) parsed.add(new TariffProfile(profile));
+                }
+            }
+        }
+        String publishedDefault = "";
+        for (TariffProfile profile : parsed) {
+            if (requestedDefault.equals(profile.getId())) {
+                publishedDefault = requestedDefault;
+                break;
+            }
+        }
+        return new PublishedImage(
+                Collections.unmodifiableList(parsed),
+                publishedDefault,
+                Collections.unmodifiableList(pending),
+                Collections.unmodifiableMap(
+                        pendingRepriceTokensFromSection(section)));
+    }
+
+    private void publishImage(PublishedImage image) {
+        profiles = image.profiles;
+        defaultTariffId = image.defaultTariffId;
+        pendingRepriceKeys = image.pendingRepriceKeys;
+        pendingRepriceTokens = image.pendingRepriceTokens;
+        loaded = true;
+    }
+
+    private static List<String> pendingRepricesFromSection(JSONObject section) {
+        List<String> pending = new ArrayList<>();
+        JSONArray encoded = section != null
+                ? section.optJSONArray(KEY_PENDING_REPRICES) : null;
+        if (encoded == null) return pending;
+        for (int i = 0; i < encoded.length(); i++) {
+            String key = encoded.optString(i, "");
+            if (key.isEmpty() || pending.contains(key)) continue;
+            if (REPRICE_ALL.equals(key)) {
+                pending.clear();
+                pending.add(REPRICE_ALL);
+                break;
+            }
+            pending.add(key);
+        }
+        return pending;
+    }
+
+    private static Map<String, String> pendingRepriceTokensFromSection(
+            JSONObject section) {
+        Map<String, String> tokens = new HashMap<>();
+        JSONObject encoded = section != null
+                ? section.optJSONObject(KEY_PENDING_REPRICE_TOKENS) : null;
+        if (encoded != null) {
+            java.util.Iterator<String> keys = encoded.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                String token = encoded.optString(key, "");
+                if (!key.isEmpty() && !token.isEmpty()) {
+                    tokens.put(key, token);
+                }
+            }
+        }
+        for (String key : pendingRepricesFromSection(section)) {
+            if (!tokens.containsKey(key)) {
+                tokens.put(key, LEGACY_REPRICE_TOKEN);
+            }
+        }
+        return tokens;
+    }
+
+    private static void queuePendingReprice(
+            JSONObject section, String tariffId) throws Exception {
+        String requested = normalizeRepriceKey(tariffId);
+        List<String> pending = pendingRepricesFromSection(section);
+        Map<String, String> tokens =
+                pendingRepriceTokensFromSection(section);
+        String token = UUID.randomUUID().toString();
+        if (REPRICE_ALL.equals(requested)) {
+            pending.clear();
+            pending.add(REPRICE_ALL);
+            tokens.clear();
+            tokens.put(REPRICE_ALL, token);
+        } else if (pending.contains(REPRICE_ALL)) {
+            // The wildcard will replay this newer edit too. Rotate its token so
+            // an older in-flight wildcard cannot clear the newer obligation.
+            tokens.put(REPRICE_ALL, token);
+        } else {
+            if (!pending.contains(requested)) pending.add(requested);
+            tokens.put(requested, token);
+        }
+        section.put(KEY_PENDING_REPRICES, new JSONArray(pending));
+        section.put(
+                KEY_PENDING_REPRICE_TOKENS,
+                new JSONObject(tokens));
+    }
+
+    private static String normalizeRepriceKey(String tariffId) {
+        return tariffId == null || tariffId.isEmpty()
+                ? REPRICE_ALL : tariffId;
+    }
+
+    private static void normalizeDefaultId(TariffDocument document) throws Exception {
+        String requested = document.section.optString(KEY_DEFAULT_ID, "");
+        if (!requested.isEmpty() && findProfileIndex(document.tariffs, requested) < 0) {
+            requested = "";
+        }
+        document.section.put(KEY_DEFAULT_ID, requested);
+    }
+
+    private static int findProfileIndex(JSONArray tariffs, String id) {
+        if (id == null || id.isEmpty()) return -1;
+        for (int i = 0; i < tariffs.length(); i++) {
+            JSONObject profile = tariffs.optJSONObject(i);
+            if (profile != null && id.equals(profile.optString("id", ""))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** Preserve fields added by another process while replacing canonical profile fields. */
+    static JSONObject mergeCanonicalProfile(
+            JSONObject durableProfile, TariffProfile profile) throws Exception {
+        JSONObject merged = durableProfile != null
+                ? new JSONObject(durableProfile.toString()) : new JSONObject();
+        JSONObject canonical = profile.toJson();
+        java.util.Iterator<String> keys = canonical.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            merged.put(key, canonical.get(key));
+        }
+        return merged;
     }
 
     // ========================================================================
@@ -180,31 +461,27 @@ public class TariffManager {
      */
     public synchronized TariffProfile add(String label, double lat, double lng, int radiusM,
                             double acRate, double dcRate, String currency) {
-        ensureLoaded();
-        List<TariffProfile> cur = profiles;
-        if (cur.size() >= MAX_PROFILES) {
-            logger.warn("Tariff cap reached (" + MAX_PROFILES + ")");
-            return null;
-        }
         TariffProfile p = new TariffProfile(label, lat, lng, radiusM, acRate, dcRate, currency);
-        List<TariffProfile> next = new ArrayList<>(cur);
-        next.add(p);
-        String prevDefault = defaultTariffId;
-        profiles = Collections.unmodifiableList(next);   // atomic publish
         // NOT auto-promoted to default. Auto-promoting the first profile meant that
         // adding one tariff silently made it the catch-all for every charge that
         // matched no circle — including every pre-v3 history row, whose
         // start_lat/start_lng default to 0. Combined with re-pricing that restated
         // the user's entire cost history from one innocuous action. The default is
         // now only ever set by an explicit tap on the star (setDefault).
-        if (!save()) {
-            profiles = cur;                 // roll back both, keep file and RAM in step
-            defaultTariffId = prevDefault;
+        MutationCommit commit = commitMutation(p.getId(), document -> {
+            if (document.tariffs.length() >= MAX_PROFILES) {
+                return StagedMutation.rejected(
+                        "tariff cap reached (" + MAX_PROFILES + ")");
+            }
+            document.tariffs.put(p.toJson());
+            return StagedMutation.accepted(p);
+        });
+        if (!commit.committed) {
             return null;
         }
         logger.info("Added tariff '" + p.getLabel() + "' ac=" + acRate + " dc=" + dcRate
                 + " @" + lat + "," + lng + " r=" + p.getRadiusMeters());
-        return p;
+        return commit.profile;
     }
 
     /**
@@ -216,71 +493,72 @@ public class TariffManager {
      * old longitude) and miss the charge it was meant to price.
      */
     public synchronized boolean update(String id, JSONObject updates) {
-        ensureLoaded();
-        List<TariffProfile> cur = profiles;
-        int idx = -1;
-        for (int i = 0; i < cur.size(); i++) {
-            if (cur.get(i).getId().equals(id)) { idx = i; break; }
-        }
-        if (idx < 0 || updates == null) return false;
+        if (id == null || id.isEmpty() || updates == null) return false;
+        MutationCommit commit = commitMutation(id, document -> {
+            int idx = findProfileIndex(document.tariffs, id);
+            if (idx < 0) return StagedMutation.rejected("tariff not found");
 
-        TariffProfile p = new TariffProfile(cur.get(idx).toJson());   // detached copy
-        if (updates.has("label")) p.setLabel(updates.optString("label"));
-        if (updates.has("lat")) p.setLatitude(updates.optDouble("lat"));
-        if (updates.has("lng")) p.setLongitude(updates.optDouble("lng"));
-        if (updates.has("radiusM")) p.setRadiusMeters(updates.optInt("radiusM"));
-        if (updates.has("acRate")) p.setAcRate(updates.optDouble("acRate"));
-        if (updates.has("dcRate")) p.setDcRate(updates.optDouble("dcRate"));
-        if (updates.has("currency")) p.setCurrency(updates.optString("currency"));
-        if (updates.has("enabled")) p.setEnabled(updates.optBoolean("enabled"));
-
-        List<TariffProfile> next = new ArrayList<>(cur);
-        next.set(idx, p);
-        profiles = Collections.unmodifiableList(next);
-        if (!save()) { profiles = cur; return false; }
-        logger.info("Updated tariff '" + p.getLabel() + "'");
+            JSONObject durable = document.tariffs.getJSONObject(idx);
+            TariffProfile profile = new TariffProfile(durable);
+            if (updates.has("label")) profile.setLabel(updates.optString("label"));
+            if (updates.has("lat")) profile.setLatitude(updates.optDouble("lat"));
+            if (updates.has("lng")) profile.setLongitude(updates.optDouble("lng"));
+            if (updates.has("radiusM")) profile.setRadiusMeters(updates.optInt("radiusM"));
+            if (updates.has("acRate")) profile.setAcRate(updates.optDouble("acRate"));
+            if (updates.has("dcRate")) profile.setDcRate(updates.optDouble("dcRate"));
+            if (updates.has("currency")) profile.setCurrency(updates.optString("currency"));
+            if (updates.has("enabled")) profile.setEnabled(updates.optBoolean("enabled"));
+            if (!profile.hasAnyRate()) {
+                return StagedMutation.rejected("tariff has no usable rate");
+            }
+            document.tariffs.put(
+                    idx, mergeCanonicalProfile(durable, profile));
+            return StagedMutation.accepted(profile);
+        });
+        if (!commit.committed) return false;
+        logger.info("Updated tariff '" + commit.profile.getLabel() + "'");
         return true;
     }
 
     public synchronized boolean remove(String id) {
-        ensureLoaded();
-        List<TariffProfile> cur = profiles;
-        TariffProfile p = null;
-        List<TariffProfile> next = new ArrayList<>(cur.size());
-        for (TariffProfile c : cur) {
-            if (c.getId().equals(id)) p = c; else next.add(c);
-        }
-        if (p == null) return false;
-
-        String prevDefault = defaultTariffId;
-        profiles = Collections.unmodifiableList(next);
-        if (id.equals(defaultTariffId)) {
+        if (id == null || id.isEmpty()) return false;
+        MutationCommit commit = commitMutation(REPRICE_ALL, document -> {
+            int idx = findProfileIndex(document.tariffs, id);
+            if (idx < 0) return StagedMutation.rejected("tariff not found");
+            TariffProfile removed =
+                    new TariffProfile(document.tariffs.getJSONObject(idx));
+            JSONArray retained = new JSONArray();
+            for (int i = 0; i < document.tariffs.length(); i++) {
+                if (i != idx) retained.put(document.tariffs.get(i));
+            }
+            document.tariffs = retained;
+            if (id.equals(document.section.optString(KEY_DEFAULT_ID, ""))) {
             // Clear the pin — do NOT promote a survivor. Auto-promotion silently
             // made an unrelated place the catch-all, and because the re-price that
             // follows a delete resolves the orphaned rows leniently, every session
             // the deleted tariff owned was restated at that other place's rate
             // (e.g. 40 home charges re-priced at a motorway DC rate). The pin is
             // only ever set by an explicit setDefault(), same as add().
-            defaultTariffId = "";
-        }
-        if (!save()) { profiles = cur; defaultTariffId = prevDefault; return false; }
-        logger.info("Removed tariff '" + p.getLabel() + "'");
+                document.section.put(KEY_DEFAULT_ID, "");
+            }
+            return StagedMutation.accepted(removed);
+        });
+        if (!commit.committed) return false;
+        logger.info("Removed tariff '" + commit.profile.getLabel() + "'");
         return true;
     }
 
     /** Pin the fallback profile. Pass "" to clear. */
     public synchronized boolean setDefault(String id) {
-        ensureLoaded();
-        String prev = defaultTariffId;
-        if (id == null || id.isEmpty()) {
-            defaultTariffId = "";
-            if (!save()) { defaultTariffId = prev; return false; }
-            return true;
-        }
-        if (findById(id) == null) return false;
-        defaultTariffId = id;
-        if (!save()) { defaultTariffId = prev; return false; }
-        return true;
+        final String requested = id != null ? id : "";
+        return commitMutation(REPRICE_ALL, document -> {
+            if (!requested.isEmpty()
+                    && findProfileIndex(document.tariffs, requested) < 0) {
+                return StagedMutation.rejected("tariff not found");
+            }
+            document.section.put(KEY_DEFAULT_ID, requested);
+            return StagedMutation.accepted(null);
+        }).committed;
     }
 
     public String getDefaultId() {
@@ -295,6 +573,7 @@ public class TariffManager {
 
     public TariffProfile findById(String id) {
         if (id == null || id.isEmpty()) return null;
+        ensureLoaded();
         for (TariffProfile p : profiles) {
             if (p.getId().equals(id)) return p;
         }
@@ -343,6 +622,28 @@ public class TariffManager {
     }
 
     /**
+     * Monetary-snapshot variant of {@link #resolve}; a config read failure is an error, not "no tariff".
+     */
+    public synchronized TariffProfile resolveStrict(double lat, double lng, int isDc) {
+        try {
+            // Monetary snapshots re-verify the durable source even when a cache is already
+            // published. A transient read failure must defer the close, not freeze stale pricing.
+            loadStrict();
+        } catch (Exception e) {
+            loaded = false;
+            lastLoadFailure = e.getMessage() != null
+                    ? e.getMessage() : e.getClass().getSimpleName();
+            throw new IllegalStateException(
+                    "tariff config unavailable: " + lastLoadFailure, e);
+        }
+        TariffProfile inCircle = resolveInCircleLoaded(lat, lng, isDc);
+        if (inCircle != null) return inCircle;
+        TariffProfile def = findById(defaultTariffId);
+        if (def != null && def.isEnabled() && def.rateFor(isDc) > 0) return def;
+        return null;
+    }
+
+    /**
      * Strict geofence match: the tariff whose circle actually CONTAINS
      * {@code (lat,lng)} and which prices this gun type, or {@code null}. Unlike
      * {@link #resolve} this never falls back to the pinned default.
@@ -357,7 +658,28 @@ public class TariffManager {
      */
     public TariffProfile resolveInCircle(double lat, double lng, int isDc) {
         ensureLoaded();
-        List<TariffProfile> snapshot = profiles;   // volatile read: never empty mid-reload
+        return resolveInCircleLoaded(lat, lng, isDc);
+    }
+
+    public synchronized TariffProfile resolveInCircleStrict(double lat, double lng, int isDc) {
+        try {
+            loadStrict();
+        } catch (Exception e) {
+            loaded = false;
+            lastLoadFailure = e.getMessage() != null
+                    ? e.getMessage() : e.getClass().getSimpleName();
+            throw new IllegalStateException(
+                    "tariff config unavailable: " + lastLoadFailure, e);
+        }
+        return resolveInCircleLoaded(lat, lng, isDc);
+    }
+
+    private TariffProfile resolveInCircleLoaded(double lat, double lng, int isDc) {
+        return resolveInCircleSnapshot(profiles, lat, lng, isDc);
+    }
+
+    private static TariffProfile resolveInCircleSnapshot(
+            List<TariffProfile> snapshot, double lat, double lng, int isDc) {
         if (snapshot.isEmpty()) return null;
         // (0,0) is the "no GPS fix at the charge edge" sentinel, not the Atlantic.
         if (lat == 0 && lng == 0) return null;
@@ -384,70 +706,328 @@ public class TariffManager {
     }
 
     /**
-     * Note that {@code id} priced a session and persist the counter. Called from
-     * the session-end path; failure to persist is non-fatal (the rate itself is
-     * already snapshotted onto the row).
+     * Remove one config-side repricing intent only after the database operation
+     * has completed. A wildcard completion subsumes every targeted intent.
      */
-    /**
-     * Note that a tariff priced a session.
-     *
-     * <p>Persistence is DEBOUNCED: this is called at every session close, and
-     * finalizeStaleOpenSessions() can close a backlog of them serially at boot, so
-     * writing the whole config file per call meant N cross-process-locked file
-     * writes in a burst on the SoC thread. The counters are display-only
-     * provenance, so an in-memory update with a coalesced write is the right
-     * trade; the priced rate itself is already persisted on the session row.
-     */
-    public synchronized void markUsed(String id, long whenMs) {
-        List<TariffProfile> cur = profiles;
-        int idx = -1;
-        for (int i = 0; i < cur.size(); i++) {
-            if (cur.get(i).getId().equals(id)) { idx = i; break; }
+    static final class RepriceIntent {
+        final String key;
+        final String token;
+
+        RepriceIntent(String key, String token) {
+            this.key = key;
+            this.token = token;
         }
-        if (idx < 0) return;
-        // Mutate a copy and swap, so a concurrent toJson()/resolve() on the
-        // published profile can't observe a torn lastUsedAt/useCount, and the
-        // non-atomic useCount++ can't lose an increment.
-        TariffProfile copy = new TariffProfile(cur.get(idx).toJson());
-        copy.markUsed(whenMs);
-        List<TariffProfile> next = new ArrayList<>(cur);
-        next.set(idx, copy);
-        profiles = Collections.unmodifiableList(next);
-        // Coalesce: at most one usage-counter flush per MARK_USED_FLUSH_MS.
-        //
-        // Clock note: whenMs is a session END TIME supplied by the caller and can be
-        // 0/absent, so it cannot drive the debounce window on its own — deriving
-        // `now` from it made the first-ever call compare 0-0 and never flush, and a
-        // backdated session could push lastUsageFlushMs into the past. Use the wall
-        // clock for the window, and treat lastUsageFlushMs == 0 as "never flushed"
-        // so the first call always persists.
-        long nowMs = System.currentTimeMillis();
-        boolean due = (lastUsageFlushMs == 0) || (nowMs - lastUsageFlushMs >= MARK_USED_FLUSH_MS);
-        if (due) {
-            if (save()) {
-                lastUsageFlushMs = nowMs;
-                usageFlushPending = false;
-            } else {
-                profiles = cur;   // roll back the counter bump
+
+        String tariffId() {
+            return REPRICE_ALL.equals(key) ? "" : key;
+        }
+    }
+
+    synchronized RepriceIntent pendingRepriceIntent(String tariffId) {
+        String requested = normalizeRepriceKey(tariffId);
+        String key = pendingRepriceKeys.contains(REPRICE_ALL)
+                ? REPRICE_ALL : requested;
+        if (!pendingRepriceKeys.contains(key)) return null;
+        String token = pendingRepriceTokens.get(key);
+        return token == null || token.isEmpty()
+                ? null : new RepriceIntent(key, token);
+    }
+
+    public synchronized boolean completePendingReprice(String tariffId) {
+        RepriceIntent intent = pendingRepriceIntent(tariffId);
+        return intent == null || completePendingReprice(intent);
+    }
+
+    synchronized boolean completePendingReprice(RepriceIntent intent) {
+        if (intent == null) return false;
+        try {
+            PublishedImage committed = UnifiedConfigManager.runUnderConfigLock(() -> {
+                try {
+                    JSONObject root = readDurableConfigLocked();
+                    JSONObject section = root.optJSONObject(SECTION);
+                    if (section == null) return imageFromSection(null);
+                    List<String> pending = pendingRepricesFromSection(section);
+                    Map<String, String> tokens =
+                            pendingRepriceTokensFromSection(section);
+                    if (!intent.token.equals(tokens.get(intent.key))) {
+                        return null;
+                    }
+                    boolean changed;
+                    if (REPRICE_ALL.equals(intent.key)) {
+                        // A wildcard completion subsumes every pending intent.
+                        // Clearing the tokens alone is not enough: a "*" key left
+                        // in the pending list would be re-issued a legacy token on
+                        // the next load (pendingRepriceTokensFromSection backfills
+                        // token-less pending keys), resurrecting the intent and
+                        // looping the replay forever.
+                        changed = !pending.isEmpty();
+                        pending.clear();
+                        tokens.clear();
+                    } else {
+                        changed = pending.remove(intent.key);
+                        tokens.remove(intent.key);
+                    }
+                    if (!changed) return imageFromSection(section);
+                    section.put(KEY_PENDING_REPRICES, new JSONArray(pending));
+                    section.put(
+                            KEY_PENDING_REPRICE_TOKENS,
+                            new JSONObject(tokens));
+                    root.put(SECTION, section);
+                    if (!UnifiedConfigManager.saveConfig(root)) return null;
+                    return imageFromSection(section);
+                } catch (Exception e) {
+                    throw new IllegalStateException(
+                            "tariff repricing intent cleanup failed", e);
+                }
+            });
+            if (committed == null) return false;
+            publishImage(committed);
+            lastLoadFailure = "";
+            return true;
+        } catch (Exception e) {
+            lastLoadFailure = e.getMessage() != null
+                    ? e.getMessage() : e.getClass().getSimpleName();
+            logger.warn("Could not clear completed tariff repricing intent: "
+                    + lastLoadFailure);
+            return false;
+        }
+    }
+
+    private synchronized boolean beginPendingRepriceReplay() {
+        if (replayingPendingReprices || pendingRepriceKeys.isEmpty()) return false;
+        replayingPendingReprices = true;
+        return true;
+    }
+
+    private synchronized RepriceIntent nextPendingRepriceIntent() {
+        if (pendingRepriceKeys.isEmpty()) return null;
+        String key = pendingRepriceKeys.get(0);
+        String token = pendingRepriceTokens.get(key);
+        return token == null || token.isEmpty()
+                ? null : new RepriceIntent(key, token);
+    }
+
+    private synchronized void finishPendingRepriceReplay() {
+        replayingPendingReprices = false;
+    }
+
+    private void replayPendingReprices() {
+        if (!beginPendingRepriceReplay()) return;
+        String lastCompletedKey = null;
+        String lastCompletedToken = null;
+        try {
+            while (true) {
+                RepriceIntent intent = nextPendingRepriceIntent();
+                if (intent == null) return;
+                // No-progress guard: a completion that reports success must
+                // actually retire the intent. If the identical key+token comes
+                // back, cleanup is not making durable progress; looping would
+                // re-run the full repricing forever. Abort and surface it.
+                if (intent.key.equals(lastCompletedKey)
+                        && intent.token.equals(lastCompletedToken)) {
+                    logger.error("Tariff repricing replay made no progress for "
+                            + intent.key + "; aborting replay to avoid a loop");
+                    return;
+                }
+                try {
+                    com.overdrive.app.monitor.SocHistoryDatabase database =
+                            com.overdrive.app.monitor.SocHistoryDatabase.getInstance();
+                    if (database == null) return;
+                    // This call takes the database monitor. The tariff monitor was
+                    // released after nextPendingRepriceIntent() captured the
+                    // generation token.
+                    database.repriceSessionsForTariff(intent.tariffId());
+                    // Cleanup re-enters the tariff monitor and removes the intent
+                    // only if its durable token still matches. A concurrent edit
+                    // rotates the token and therefore survives this older replay.
+                    if (!completePendingReprice(intent)) {
+                        return;
+                    }
+                    lastCompletedKey = intent.key;
+                    lastCompletedToken = intent.token;
+                } catch (Throwable deferred) {
+                    logger.warn("Pending tariff repricing replay deferred for "
+                            + intent.key + ": " + deferred.getMessage());
+                    return;
+                }
             }
-        } else {
-            usageFlushPending = true;
+        } finally {
+            finishPendingRepriceReplay();
         }
     }
 
     /**
-     * Flush a debounced usage-counter update, if one is pending. Called from the
-     * config-change path and from load(), so counters reach disk without a write
-     * per session close. Losing a pending counter on an abrupt power cut only
-     * costs display provenance, never a price.
+     * Reconcile display-only usage metadata to the authoritative charging-session rows.
+     *
+     * <p>This is intentionally an assignment, not an increment. Re-running it after an uncertain
+     * charging close produces the same profile image and is therefore idempotent.
+     */
+    public synchronized boolean reconcileUsage(
+            String id, long lastUsedAt, int useCount) {
+        if (id == null || id.isEmpty()) return true;
+        int normalizedCount = Math.max(0, useCount);
+        long normalizedLastUsed = Math.max(0, lastUsedAt);
+        UsageReconcileResult result;
+        try {
+            result = UnifiedConfigManager.runUnderConfigLock(() -> {
+                try {
+                    // Read the durable root only after taking the same lock used by every
+                    // config writer. A pre-lock load can become stale before saveConfig()
+                    // acquires its nested lock and overwrite a concurrent tariff/default edit.
+                    JSONObject root =
+                            UnifiedConfigManager.readDurableConfigStrict();
+                    JSONObject section = root.optJSONObject(SECTION);
+                    JSONArray tariffs = section != null
+                            ? section.optJSONArray(KEY_TARIFFS) : null;
+                    JSONObject target = null;
+                    if (tariffs != null) {
+                        for (int i = 0; i < tariffs.length(); i++) {
+                            JSONObject candidate = tariffs.optJSONObject(i);
+                            if (candidate != null
+                                    && id.equals(candidate.optString("id", ""))) {
+                                target = candidate;
+                                break;
+                            }
+                        }
+                    }
+
+                    // A historical row may reference a profile the user later deleted.
+                    // The fresh durable snapshot is already the committed result.
+                    if (target == null) {
+                        return usageSnapshot(section, false);
+                    }
+                    if (target.optInt("useCount", 0) == normalizedCount
+                            && target.optLong("lastUsedAt", 0L) == normalizedLastUsed) {
+                        return usageSnapshot(section, false);
+                    }
+
+                    // Patch the current durable profile in place so unknown fields, peer
+                    // tariff edits, and the current defaultTariffId all survive unchanged.
+                    target.put("useCount", normalizedCount);
+                    target.put("lastUsedAt", normalizedLastUsed);
+                    if (!UnifiedConfigManager.saveConfig(root)) {
+                        return UsageReconcileResult.failure(
+                                "config persistence rejected usage replay");
+                    }
+                    return usageSnapshot(section, true);
+                } catch (Exception e) {
+                    return UsageReconcileResult.failure(
+                            e.getMessage() != null
+                                    ? e.getMessage() : e.getClass().getSimpleName());
+                }
+            });
+        } catch (Exception unavailable) {
+            loaded = false;
+            lastLoadFailure = unavailable.getMessage() != null
+                    ? unavailable.getMessage()
+                    : unavailable.getClass().getSimpleName();
+            return false;
+        }
+        if (!result.success) {
+            loaded = false;
+            lastLoadFailure = result.failure;
+            return false;
+        }
+
+        // Publish only the detached image read (and, when needed, persisted) under
+        // the lock. A failed save leaves the previous complete snapshot untouched.
+        profiles = result.profiles;
+        defaultTariffId = result.defaultTariffId;
+        loaded = true;
+        lastLoadFailure = "";
+        return true;
+    }
+
+    /** Build an immutable manager image detached from the root passed to saveConfig(). */
+    private static UsageReconcileResult usageSnapshot(
+            JSONObject section, boolean persisted) {
+        List<TariffProfile> parsed = new ArrayList<>();
+        String requestedDefault = "";
+        if (section != null) {
+            requestedDefault = section.optString(KEY_DEFAULT_ID, "");
+            JSONArray tariffs = section.optJSONArray(KEY_TARIFFS);
+            if (tariffs != null) {
+                for (int i = 0; i < tariffs.length()
+                        && parsed.size() < MAX_PROFILES; i++) {
+                    JSONObject profile = tariffs.optJSONObject(i);
+                    if (profile != null) parsed.add(new TariffProfile(profile));
+                }
+            }
+        }
+        String publishedDefault = "";
+        for (TariffProfile profile : parsed) {
+            if (requestedDefault.equals(profile.getId())) {
+                publishedDefault = requestedDefault;
+                break;
+            }
+        }
+        return UsageReconcileResult.success(
+                Collections.unmodifiableList(parsed), publishedDefault, persisted);
+    }
+
+    private static final class UsageReconcileResult {
+        final boolean success;
+        final List<TariffProfile> profiles;
+        final String defaultTariffId;
+        final boolean persisted;
+        final String failure;
+
+        private UsageReconcileResult(
+                boolean success,
+                List<TariffProfile> profiles,
+                String defaultTariffId,
+                boolean persisted,
+                String failure) {
+            this.success = success;
+            this.profiles = profiles;
+            this.defaultTariffId = defaultTariffId;
+            this.persisted = persisted;
+            this.failure = failure;
+        }
+
+        static UsageReconcileResult success(
+                List<TariffProfile> profiles,
+                String defaultTariffId,
+                boolean persisted) {
+            return new UsageReconcileResult(
+                    true, profiles, defaultTariffId, persisted, "");
+        }
+
+        static UsageReconcileResult failure(String failure) {
+            return new UsageReconcileResult(
+                    false, Collections.emptyList(), "", false, failure);
+        }
+    }
+
+    /**
+     * Note that a tariff priced a session.
+     *
+     * <p>Current close paths replay authoritative aggregate counts through
+     * {@link #reconcileUsage}. This compatibility entry point still performs an
+     * increment, but patches only the current durable profile under the config
+     * lock; it never serializes the process-local tariff array.
+     */
+    public synchronized void markUsed(String id, long whenMs) {
+        if (id == null || id.isEmpty()) return;
+        commitMutation(document -> {
+            int idx = findProfileIndex(document.tariffs, id);
+            if (idx < 0) return StagedMutation.rejected("tariff not found");
+            JSONObject durable = document.tariffs.getJSONObject(idx);
+            TariffProfile profile = new TariffProfile(durable);
+            profile.markUsed(whenMs);
+            document.tariffs.put(
+                    idx, mergeCanonicalProfile(durable, profile));
+            return StagedMutation.accepted(profile);
+        });
+    }
+
+    /**
+     * Compatibility no-op. Usage metadata is now persisted either immediately by
+     * {@link #markUsed} or idempotently from database aggregates by
+     * {@link #reconcileUsage}; there is no process-local full-array buffer to flush.
      */
     public synchronized void flushPendingUsage() {
-        if (!usageFlushPending) return;
-        if (save()) {
-            usageFlushPending = false;
-            lastUsageFlushMs = System.currentTimeMillis();
-        }
-        // On failure keep the flag set so a later flush retries.
+        // Intentionally empty.
     }
 
     /**
@@ -477,26 +1057,66 @@ public class TariffManager {
      * location is known, which profile currently matches — that's what lets the
      * UI show "auto-applies here" against the live position.
      */
-    public JSONObject toStatusJson(double lat, double lng) {
+    public synchronized JSONObject toStatusJson(double lat, double lng)
+            throws Exception {
+        return toStatusJson(loadVerifiedConfig(), lat, lng);
+    }
+
+    /**
+     * Build tariff status from the caller's already-verified root without
+     * publishing it into manager state. This lets an API derive tariffs and
+     * global fallbacks from one revision without letting a delayed GET regress
+     * a newer mutation.
+     */
+    public synchronized JSONObject toStatusJson(
+            JSONObject verifiedRoot, double lat, double lng)
+            throws Exception {
+        PublishedImage image = imageFromSection(
+                verifiedRoot != null
+                        ? verifiedRoot.optJSONObject(SECTION) : null);
         JSONObject out = new JSONObject();
-        try {
-            JSONArray arr = new JSONArray();
-            for (TariffProfile p : getProfilesForDisplay()) arr.put(p.toJson());
-            out.put("tariffs", arr);
-            out.put("defaultTariffId", getDefaultId());
-            out.put("maxTariffs", MAX_PROFILES);
-            if (!(lat == 0 && lng == 0)) {
-                out.put("lat", lat);
-                out.put("lng", lng);
-                // Report the AC match — the gun is unknown until a cable is in,
-                // and AC is the base case the label describes.
-                TariffProfile m = resolve(lat, lng, 0);
-                out.put("matchedTariffId", m != null ? m.getId() : JSONObject.NULL);
-            } else {
-                out.put("matchedTariffId", JSONObject.NULL);
+        JSONArray arr = new JSONArray();
+        List<TariffProfile> ordered = new ArrayList<>(image.profiles);
+        Collections.sort(ordered, new Comparator<TariffProfile>() {
+            @Override
+            public int compare(TariffProfile a, TariffProfile b) {
+                if (a.getLastUsedAt() != b.getLastUsedAt()) {
+                    return Long.compare(b.getLastUsedAt(), a.getLastUsedAt());
+                }
+                if (a.getUseCount() != b.getUseCount()) {
+                    return Integer.compare(b.getUseCount(), a.getUseCount());
+                }
+                return Long.compare(b.getCreatedAt(), a.getCreatedAt());
             }
-        } catch (Exception e) {
-            logger.error("toStatusJson error: " + e.getMessage());
+        });
+        for (TariffProfile p : ordered) arr.put(p.toJson());
+        out.put("tariffs", arr);
+        out.put("defaultTariffId", image.defaultTariffId);
+        out.put("maxTariffs", MAX_PROFILES);
+        if (!(lat == 0 && lng == 0)) {
+            out.put("lat", lat);
+            out.put("lng", lng);
+            // Report the AC match — the gun is unknown until a cable is in,
+            // and AC is the base case the label describes.
+            TariffProfile match =
+                    resolveInCircleSnapshot(image.profiles, lat, lng, 0);
+            if (match == null) {
+                TariffProfile fallback = null;
+                for (TariffProfile candidate : image.profiles) {
+                    if (candidate.getId().equals(image.defaultTariffId)) {
+                        fallback = candidate;
+                        break;
+                    }
+                }
+                if (fallback != null && fallback.isEnabled()
+                        && fallback.rateFor(0) > 0) {
+                    match = fallback;
+                }
+            }
+            out.put("matchedTariffId",
+                    match != null ? match.getId() : JSONObject.NULL);
+        } else {
+            out.put("matchedTariffId", JSONObject.NULL);
         }
         return out;
     }

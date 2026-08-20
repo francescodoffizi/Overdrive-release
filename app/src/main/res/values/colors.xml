@@ -12,23 +12,23 @@
     <color name="white">#FFFFFFFF</color>
 
     <!-- Brand (slightly deeper for AA contrast on light surfaces) -->
-    <color name="brand_primary">#00876C</color>
-    <color name="brand_secondary">#00658F</color>
+    <color name="brand_primary">@color/md_sys_color_primary</color>
+    <color name="brand_secondary">@color/md_sys_color_tertiary</color>
     <color name="brand_cyan">@color/brand_primary</color>
-    <color name="brand_cyan_glow">#3300876C</color>
+    <color name="brand_cyan_glow">#33007A62</color>
 
     <!-- Backgrounds — M3 light surface stack -->
-    <color name="bg_base">#F7FAF7</color>
-    <color name="bg_surface">#ECEFEC</color>
-    <color name="bg_elevated">#E6E9E6</color>
-    <color name="bg_hover">#E0E4E1</color>
+    <color name="bg_base">@color/md_sys_color_background</color>
+    <color name="bg_surface">@color/md_sys_color_surface_container</color>
+    <color name="bg_elevated">@color/md_sys_color_surface_container_high</color>
+    <color name="bg_hover">@color/md_sys_color_surface_container_highest</color>
 
     <color name="surface_variant">@color/bg_elevated</color>
 
     <!-- Text — dark on light -->
-    <color name="text_primary">#181C1A</color>
-    <color name="text_secondary">#3F4944</color>
-    <color name="text_muted">#6F7975</color>
+    <color name="text_primary">@color/md_sys_color_on_surface</color>
+    <color name="text_secondary">@color/md_sys_color_on_surface_variant</color>
+    <color name="text_muted">@color/md_sys_color_outline</color>
 
     <!-- Borders -->
     <color name="border_default">#26000000</color>
@@ -39,14 +39,14 @@
          translucent pearl pill with a faint brand-tinted ring; the night
          variants live in values-night/colors.xml. -->
     <color name="overlay_pill_background">#E6F7FAF7</color>
-    <color name="overlay_pill_stroke">#3300876C</color>
+    <color name="overlay_pill_stroke">#33007A62</color>
 
     <!-- Status — AA on light surfaces -->
-    <color name="status_success">#1F7A3F</color>
-    <color name="status_warning">#A6601C</color>
-    <color name="status_danger">#BA1A1A</color>
+    <color name="status_success">@color/overdrive_status_success</color>
+    <color name="status_warning">@color/overdrive_status_warning</color>
+    <color name="status_danger">@color/overdrive_status_danger</color>
     <!-- Informational/confirmation blue — the overlay's "replay saved" hold. -->
-    <color name="status_info">#0B57D0</color>
+    <color name="status_info">@color/overdrive_status_info</color>
     <color name="status_running">@color/status_success</color>
     <color name="status_stopped">@color/text_muted</color>
     <color name="status_error">@color/status_danger</color>

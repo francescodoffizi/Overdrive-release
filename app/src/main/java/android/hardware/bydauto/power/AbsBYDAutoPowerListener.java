@@ -8,7 +8,7 @@ import android.hardware.IBYDAutoListener;
  * processes via the classpath in DaemonLauncher.kt. This stub exists so
  * AccSentryDaemon can subclass at compile time.
  *
- * Source signal we care about (from esco bk/C1478c.java:71-75):
+ * Source signal we care about (from oem bk/C1478c.java:71-75):
  *   onPowerCtlStatusChanged(eventId, value)
  *     eventId = -1728053193 (0x99000037) → ACC state event
  *       value 0 → ACC OFF

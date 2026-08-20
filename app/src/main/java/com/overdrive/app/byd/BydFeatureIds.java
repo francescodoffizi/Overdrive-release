@@ -8,6 +8,16 @@ package com.overdrive.app.byd;
  */
 public final class BydFeatureIds {
 
+    /**
+     * Fallback for a register this SDK does not publish at all. Not a valid feature id — every
+     * read/write helper must SKIP an id equal to this rather than send it, because the HAL would
+     * answer an unavailable sentinel that a magnitude test could mistake for real data.
+     *
+     * <p>Better than inventing a plausible-looking literal: an invented id is indistinguishable at
+     * runtime from a correct one, so the feature silently reads as "nothing happening" forever.
+     */
+    public static final int UNRESOLVED_ID = Integer.MIN_VALUE;
+
     // ==================== BODYWORK ====================
     /** Battery metric from bodywork (doubleValue, no transform) */
     public static final int BODYWORK_BATTERY_METRIC = 300941320;
@@ -174,6 +184,16 @@ public final class BydFeatureIds {
     public static final int CHARGING_WIRELESS_RIGHT_STATE = resolveOrFallback("Charging.WIRELESS_CHARGING_RIGHT_STATE", 890241052);
     public static final int CHARGING_CHARGER_WORK_STATE = resolveOrFallback("Charging.CHARGING_CHARGER_WORK_STATE", 666894346);
     public static final int CHARGING_BATTERY_DEVICE_STATE = resolveOrFallback("Charging.CHARGING_BATTERRY_DEVICE_STATE", 876609560);
+    /**
+     * Per-session charged-energy counter, in kWh, on the charging device. Rises monotonically
+     * while a charge is delivering and resets when a new session starts; the BMS keeps it across
+     * a head-unit power cycle, so it is not tied to daemon uptime.
+     *
+     * <p>Read as a DOUBLE (the HAL's float accessor width). Domain is the SDK's
+     * {@code CHARGING_CAPACITY_MIN/MAX} = [0.0, 65.534] kWh — 0xFFFE/1000, i.e. a 16-bit
+     * counter at 1 Wh resolution.
+     */
+    public static final int CHARGING_CHARGE_CAPACITY = resolveOrFallback("Charging.CHARGING_CHARGE_CAPACITY", 666894360);
 
     // ==================== ENGINE (EXTENDED) ====================
     public static final int ENGINE_SPEED = resolveOrFallback("Engine.ENGINE_SPEED", 339738642);
@@ -195,17 +215,16 @@ public final class BydFeatureIds {
     public static final int TAILGATE_DOWN_BACK_DOOR_POSITION = resolveOrFallback("Tailgate.DOWN_BACK_DOOR_CURRENT_POSITION", 365953044);
 
     // ==================== MIRROR ====================
-    // These two are the ONLY mirror ids the OEM SDK defines (verified against the reference
-    // app's bundled BYDAutoFeatureIds: its Mirror class has exactly these fields).
+    // Command ids exposed by the reference controller SDK.
     public static final int MIRROR_HAVE_AUTO_FOLD = resolveOrFallback("Mirror.HAVE_REARVIEW_MIRROR_AUTO_FOLD", 1081081882);
     public static final int MIRROR_REARVIEW_SET = resolveOrFallback("Mirror.BODYWORK_REARVIEW_MIRROR_SET", 1324556304);
-    // REMOVED: MIRROR_OUTSIDE_FOLD_SET / "Setting.SET_OUTSIDE_REARVIEW_MIRROR_FOLD_SET"
-    // (0x4C10A028). No such field or value exists anywhere in the OEM SDK, so
-    // resolveOrFallback ALWAYS silently substituted the invented literal — and 0x4C10A0xx is
-    // an Instrument-block range (cf. Instrument.NAVI_TYPE_SET = 0x4C10A018), not a mirror one.
-    // setMirrorsFolded was writing that foreign id to two devices and, because the generic
-    // write's success test is `code >= 0`, reading the result as success. Real mirror writes
-    // live at 0x4EF32010 (MIRROR_REARVIEW_SET above) on the bodywork device.
+    // The connected framework's dedicated rear-view-mirror device reads this state feature.
+    public static final int MIRROR_REARVIEW_STATE =
+            resolveOrFallback("Rear.REAR_VIEW_MIRROR_STATE", 960495624);
+    // The connected DiCar config_2.bin profile maps this write-only command to interface 1
+    // (BYDAutoSettingDevice / device type 1023). It is distinct from the legacy bodywork command.
+    public static final int SETTING_OUTSIDE_REARVIEW_MIRROR_FOLD_SET =
+            resolveOrFallback("Setting.SET_OUTSIDE_REARVIEW_MIRROR_FOLD_SET", 1276157992);
     // ==================== HUD ====================
     // HUD on/off is a DEDICATED Setting feature-id write on the newer OEM firmware —
     // separate from HUD brightness. It is written as a BYDAutoEventValue via
@@ -324,6 +343,11 @@ public final class BydFeatureIds {
     public static final int INVALID_VALUE = -2147482645;
     /** Invalid value from get(int[], Class) signature */
     public static final int INVALID_VALUE_2 = -2147482648;
+
+    /** Whether {@code id} is a real, sendable feature id. */
+    public static boolean isResolved(int id) {
+        return id != UNRESOLVED_ID;
+    }
 
     /**
      * Try to resolve a feature ID from the real BYDAutoFeatureIds class on the device.

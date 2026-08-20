@@ -71,6 +71,18 @@
     }
 }
 
+[dir="rtl"] .bottom-tabs {
+    left: 0;
+    right: var(--sidebar-width, 260px);
+}
+
+@media (max-width: 768px) {
+    [dir="rtl"] .bottom-tabs {
+        left: 0;
+        right: 0;
+    }
+}
+
 .bottom-tabs::before {
     /* Identity accent stripe above the bar — mirrors the toolbar accent
        on the native side and the sidebar / app-bar accents in app-shell.css.
@@ -97,6 +109,7 @@
        a few dp of breathing room. */
     flex: 1 1 0;
     min-width: 0;
+    min-height: 48px;
     padding: 4px 6px;
     border: 0;
     background: transparent;
@@ -174,11 +187,20 @@ body.ot-tabs-on .toast-container { bottom: calc(96px + var(--safe-bottom, 0px));
     display: flex;
     align-items: center;
     align-self: center;
-    height: 44px;            /* matches the inner button on tablet+ */
+    height: 48px;
     margin-left: 8px;
     padding-left: 12px;
     border-left: 1px solid var(--outline-variant);
     flex-shrink: 0;
+}
+
+[dir="rtl"] .bottom-tab-action {
+    margin-left: 0;
+    margin-right: 8px;
+    padding-left: 0;
+    padding-right: 12px;
+    border-left: 0;
+    border-right: 1px solid var(--outline-variant);
 }
 
 .bottom-tab-action.is-hidden {
@@ -196,7 +218,7 @@ body.ot-tabs-on .toast-container { bottom: calc(96px + var(--safe-bottom, 0px));
 .bottom-tab-action .btn,
 .bottom-tab-action #btnApply,
 .bottom-tab-action .bottom-tab-action-btn {
-    height: 44px;
+    height: 48px;
     padding: 0 18px;
     border-radius: var(--radius-md, 14px);
     font-weight: 600;
@@ -223,18 +245,24 @@ body.ot-tabs-on .toast-container { bottom: calc(96px + var(--safe-bottom, 0px));
     .bottom-tab-action {
         margin-left: 4px;
         padding-left: 6px;
-        height: 40px;
+        height: 48px;
+    }
+    [dir="rtl"] .bottom-tab-action {
+        margin-left: 0;
+        margin-right: 4px;
+        padding-left: 0;
+        padding-right: 6px;
     }
     .bottom-tab-action #btnApply,
     .bottom-tab-action .btn {
-        height: 40px;
+        height: 48px;
         /* Equal padding + zero gap so the icon sits dead-center inside the
            pill. The previous `gap: 8px` (inherited from .btn) added 8px of
            leading whitespace AFTER the icon for the now-hidden label, which
            pushed the check-mark to the left of center. */
         padding: 0;
-        width: 40px;
-        min-width: 40px;
+        width: 48px;
+        min-width: 48px;
         gap: 0;
         font-size: 0; /* hide text */
         justify-content: center;

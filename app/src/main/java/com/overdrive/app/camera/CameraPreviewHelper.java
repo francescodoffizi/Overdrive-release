@@ -160,7 +160,7 @@ public final class CameraPreviewHelper {
             if (p == null) return null;
             com.overdrive.app.camera.PanoramicCameraGpu cam = p.getCamera();
             if (cam == null) return null;
-            if (cam.isUsingEscoSurfaceTexturePath()) {
+            if (cam.isUsingOemSurfaceTexturePath()) {
                 // 2x2-native HAL on DiLink 4. Slice → role → Variant A
                 // corner+flip mapping. Reads Dilink4Constants so this stays in
                 // lockstep with recorder / stream / blind-spot / AI-downscaler /

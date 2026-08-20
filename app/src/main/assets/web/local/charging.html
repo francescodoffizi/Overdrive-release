@@ -9,9 +9,9 @@
     <link rel="apple-touch-icon" href="../shared/app-icon-dark.webp">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="theme-color" content="#0EA5E9">
+    <meta name="theme-color" content="#007A62">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <!--
       Bottom-tab manifest for Charging. Tabs apply to the LIST VIEW only;
       the DETAIL VIEW (#chargingDetail) is a sequential drill-in and ignores
@@ -28,9 +28,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <style>
         /* ===== OLD WEBVIEW COMPAT (Chrome <88, Android 7.x) ===== */
         /* Flexbox gap is Grid-only on old Chrome — fall back to margin via > * + *. */
@@ -126,6 +124,7 @@
         /* Calendar toggle button + popup — mirrors the events page picker. */
         .calendar-toggle {
             display: inline-flex; align-items: center;
+            min-height: 48px;
             padding: 9px 14px; border-radius: var(--radius-full);
             background: var(--bg-surface); border: 1px solid var(--border-subtle);
             color: var(--text-primary); font-size: 13px; font-weight: 600; cursor: pointer;
@@ -162,7 +161,7 @@
         .calendar-nav { display: flex; }
         .calendar-nav button + button { margin-left: 8px; }   /* gap ignored on Chrome-58 */
         .calendar-nav button {
-            width: 32px; height: 32px; border-radius: var(--radius-sm);
+            width: 48px; height: 48px; border-radius: var(--radius-sm);
             background: var(--bg-elevated); color: var(--text-secondary);
             display: flex; align-items: center; justify-content: center; transition: all 0.2s;
         }
@@ -175,10 +174,10 @@
                collapse to text height. The grid track (repeat(7,1fr)) sets the
                width; pin the height to 40px as the fallback square so the
                layout matches modern Chrome (where aspect-ratio takes over). */
-            aspect-ratio: 1; height: 40px; display: flex; align-items: center; justify-content: center;
+            aspect-ratio: 1; height: 48px; display: flex; align-items: center; justify-content: center;
             border-radius: var(--radius-sm); font-size: 13px; font-weight: 500;
             color: var(--text-secondary); cursor: pointer; position: relative;
-            transition: all 0.2s; min-height: 40px;
+            transition: all 0.2s; min-height: 48px;
             -webkit-tap-highlight-color: transparent; touch-action: manipulation;
         }
         .calendar-day:hover { background: var(--bg-hover); }
@@ -187,10 +186,11 @@
         .calendar-day.today { background: var(--bg-elevated); color: var(--text-primary); font-weight: 600; }
         .calendar-day.selected { background: var(--brand-primary); color: var(--bg-base); }
         /* In-range days between From and To get a subtle fill. */
-        .calendar-day.in-range { background: rgba(14,165,233,0.16); color: var(--text-primary); }
+        .calendar-day.in-range { background: var(--status-info-container); color: var(--text-primary); }
         .calendar-day.disabled { color: var(--text-muted); opacity: 0.3; cursor: not-allowed; pointer-events: none; }
         .calendar-close {
             margin-top: 8px; padding: 10px; background: var(--bg-elevated);
+            min-height: 48px;
             border-radius: var(--radius-md); color: var(--text-secondary);
             font-size: 13px; font-weight: 500; text-align: center; cursor: pointer; transition: all 0.2s;
         }
@@ -212,7 +212,7 @@
             position: relative;
             background: var(--bg-surface);
             border: 1px solid var(--border-subtle);
-            border-radius: 20px;
+            border-radius: var(--radius-lg);
             padding: 20px;
             cursor: pointer;
             /* Match the Trips card motion: lift + glow on the same easing curve. */
@@ -221,7 +221,7 @@
         }
         .session-card:hover {
             background: var(--bg-elevated);
-            border-color: rgba(0,212,170,0.4);
+            border-color: var(--primary);
             transform: translateY(-4px);
             box-shadow: 0 10px 30px var(--panel-overlay-bg-soft);
         }
@@ -253,18 +253,18 @@
             flex: 0 0 auto;
         }
         /* DC fast — electric blue. */
-        .session-type-dc   { background: rgba(14,165,233,0.16);  color: #0EA5E9; border-color: rgba(14,165,233,0.35); }
+        .session-type-dc   { background: var(--status-info-container); color: var(--status-info); border-color: var(--status-info); }
         /* AC fast (wallbox) — teal. */
-        .session-type-fast { background: rgba(0,212,170,0.16);   color: #00D4AA; border-color: rgba(0,212,170,0.35); }
+        .session-type-fast { background: var(--status-success-container); color: var(--status-success); border-color: var(--status-success); }
         /* AC slow (trickle) — amber. */
-        .session-type-slow { background: rgba(245,158,11,0.16);  color: #F59E0B; border-color: rgba(245,158,11,0.35); }
+        .session-type-slow { background: var(--status-warning-container); color: var(--status-warning); border-color: var(--status-warning); }
         .session-type-unk  { background: var(--bg-elevated);     color: var(--text-muted); }
         .session-date { font-size: 12px; color: var(--text-muted); flex: 0 0 auto; white-space: nowrap; }
         /* "Charging now" live badge for the open in-progress session. */
         .session-live { display: inline-flex; align-items: center; flex: 0 0 auto; white-space: nowrap;
-            font-size: 12px; font-weight: 600; color: #00D4AA; }
+            font-size: 12px; font-weight: 600; color: var(--status-success); }
         .session-live > * + * { margin-left: 6px; }   /* dot → text (gap ignored on Chrome-58) */
-        .session-live-dot { width: 7px; height: 7px; border-radius: 50%; background: #00D4AA;
+        .session-live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--status-success);
             box-shadow: 0 0 0 0 rgba(0,212,170,0.6); animation: chgLivePulse 1.6s ease-out infinite; }
         @keyframes chgLivePulse {
             0%   { box-shadow: 0 0 0 0 rgba(0,212,170,0.55); }
@@ -308,14 +308,14 @@
         /* Per-card delete (hover-reveal trash, mirrors trip-delete-btn). */
         .session-delete-btn {
             position: absolute; top: 12px; right: 12px;
-            width: 30px; height: 30px; padding: 0;
+            width: 48px; height: 48px; padding: 0;
             display: flex; align-items: center; justify-content: center;
             border: none; border-radius: var(--radius-sm);
             background: transparent; color: var(--text-muted);
             cursor: pointer; opacity: 0; transition: opacity .15s, background .15s, color .15s;
         }
         .session-card:hover .session-delete-btn { opacity: 1; }
-        .session-delete-btn:hover { background: rgba(239,68,68,0.16); color: #EF4444; }
+        .session-delete-btn:hover { background: var(--status-danger-container); color: var(--status-danger); }
         .session-delete-btn svg { width: 15px; height: 15px; }
         /* Touch devices have no hover — keep the trash faintly visible. */
         @media (hover: none) { .session-delete-btn { opacity: .55; } }
@@ -397,7 +397,7 @@
            or they collapse to 0 (or balloon) in WebView 58. */
         .tariff-icon-btn svg { width: 18px; height: 18px; }
         .tariff-icon-btn.on { border-color: var(--brand-primary); color: var(--brand-primary); }
-        .tariff-icon-btn.danger { color: var(--danger, #EF4444); }
+        .tariff-icon-btn.danger { color: var(--status-danger); }
         .tariff-row .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 
         /* ===== SUMMARY / DETAIL STAT GRID ===== */
@@ -449,8 +449,8 @@
             margin-left: auto;
             display: inline-flex; align-items: center;   /* svg+span spacing via sibling margin (Chrome-58: flex gap unsupported) */
             padding: 8px 14px; border-radius: var(--radius-full);
-            border: 1px solid rgba(239,68,68,0.4); background: rgba(239,68,68,0.08);
-            color: #EF4444; font-weight: 600; cursor: pointer;
+            border: 1px solid var(--status-danger); background: var(--status-danger-container);
+            color: var(--status-danger); font-weight: 600; cursor: pointer;
         }
         .ch-detail-delete-btn:hover { background: rgba(239,68,68,0.18); }
         .ch-detail-delete-btn svg { width: 16px; height: 16px; }
@@ -807,7 +807,7 @@
                                     <span id="tariffLocText" style="font-size:12px;color:var(--text-muted);">--</span>
                                 </div>
                             </div>
-                            <div id="tariffError" class="ch-note" style="display:none;color:var(--danger, #EF4444);"></div>
+                            <div id="tariffError" class="ch-note" style="display:none;color:var(--status-danger);"></div>
                             <div class="settings-button-row" style="margin-top:12px;">
                                 <button class="btn btn-primary" id="tariffSaveBtn" onclick="CHARGING.saveTariff()" style="flex:1;" data-i18n="common.save">Save</button>
                                 <button class="btn btn-secondary" onclick="CHARGING.closeTariffEditor()" style="flex:1;" data-i18n="common.cancel">Cancel</button>
@@ -837,7 +837,7 @@
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
                             <span data-i18n="charge.detail_back">Back to sessions</span>
                         </button>
-                        <button class="ch-detail-delete-btn" onclick="CHARGING.deleteCurrent()" title="Delete session">
+                        <button id="detailDeleteBtn" class="ch-detail-delete-btn" onclick="CHARGING.deleteCurrent()" title="Delete session">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                             <span data-i18n="charge.detail_delete">Delete</span>
                         </button>
@@ -905,9 +905,9 @@
     <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
     <div id="toastContainer" class="toast-container"></div>
 
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/charging.js?v=28"></script>
+    <script src="../shared/charging.js?v=31"></script>
     <script>
         function toggleSidebar() {
             var sb = document.getElementById('sidebar');

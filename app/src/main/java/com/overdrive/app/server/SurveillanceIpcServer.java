@@ -254,10 +254,19 @@ public class SurveillanceIpcServer implements Runnable {
                 // ==================== TELEGRAM DAEMON COMMANDS ====================
                 // These commands are sent by TelegramBotDaemon for remote control
                 
-                case "START":
-                    // Start surveillance (from Telegram /start command)
-                    com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true);
-                    if (!com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                case "START": {
+                    // Start surveillance (from Telegram /start command).
+                    // Persist result is load-bearing — the ACC-OFF arm dispatch
+                    // re-reads it, so a failed write means nothing arms. Telling
+                    // the user "enabled" there is the bug this reports instead.
+                    boolean accOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
+                    if (!com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true)) {
+                        logger.warn("Failed to persist surveillanceEnabled=true via Telegram IPC");
+                        response.put("success", false);
+                        response.put("error", "Failed to save the surveillance setting");
+                        break;
+                    }
+                    if (!accOn) {
                         CameraDaemon.enableSurveillance();   // fires OEM recalc
                         logger.info("Surveillance started via Telegram IPC");
                     } else {
@@ -268,21 +277,37 @@ public class SurveillanceIpcServer implements Runnable {
                     }
                     response.put("success", true);
                     response.put("enabled", true);
-                    response.put("message", "Surveillance enabled");
+                    response.put("deferred", accOn);
+                    response.put("message", accOn
+                            ? "Surveillance will start when the vehicle is next turned off"
+                            : "Surveillance enabled");
                     break;
+                }
 
-                case "STOP":
-                    // Stop surveillance (from Telegram /stop command)
-                    CameraDaemon.disableSurveillance();   // fires OEM recalc
-                    com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false);
+                case "STOP": {
+                    // Stop surveillance (from Telegram /stop command). ACC-gated:
+                    // nothing is armed while ACC is ON, and the pipeline call
+                    // would re-apply the dashcam layout under a live recording.
+                    boolean accOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
+                    if (!accOn) {
+                        CameraDaemon.disableSurveillance();   // fires OEM recalc
+                    }
+                    if (!com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false)) {
+                        logger.warn("Failed to persist surveillanceEnabled=false via Telegram IPC");
+                        response.put("success", false);
+                        response.put("error", "Failed to save the surveillance setting");
+                        break;
+                    }
                     // Second recalc post-write so resolver sees the new master toggle.
                     try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
                     catch (Throwable ignored) {}
                     logger.info("Surveillance stopped via Telegram IPC");
                     response.put("success", true);
                     response.put("enabled", false);
+                    response.put("deferred", accOn);
                     response.put("message", "Surveillance stopped");
                     break;
+                }
                     
                 case "STATUS": {
                     // Get surveillance status (from Telegram /status command)
@@ -302,37 +327,66 @@ public class SurveillanceIpcServer implements Runnable {
                 
                 case "ENABLE_SURVEILLANCE":
                     // Persist preference only — surveillance will auto-start on next ACC OFF
-                    com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true);
+                    if (!com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true)) {
+                        logger.warn("Failed to persist surveillanceEnabled=true via app-UI IPC");
+                        response.put("success", false);
+                        response.put("error", "Failed to save the surveillance setting");
+                        break;
+                    }
                     // OEM resolver: survSuppressed depends on master toggle.
                     try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
                     catch (Throwable ignored) {}
                     logger.info("Surveillance preference set to ENABLED (will activate on ACC OFF)");
                     response.put("success", true);
                     response.put("enabled", true);
+                    // This door NEVER arms directly (persist-only by design), so the
+                    // effect is always deferred to the next ACC OFF.
+                    response.put("deferred", true);
                     break;
 
-                case "DISABLE_SURVEILLANCE":
-                    // Persist preference and stop if currently running
-                    com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false);
-                    CameraDaemon.disableSurveillance();   // fires OEM recalc internally
+                case "DISABLE_SURVEILLANCE": {
+                    // Persist preference and stop if currently running. ACC-gated
+                    // teardown — see the STOP case above for why.
+                    boolean accOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
+                    if (!com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false)) {
+                        logger.warn("Failed to persist surveillanceEnabled=false via app-UI IPC");
+                        response.put("success", false);
+                        response.put("error", "Failed to save the surveillance setting");
+                        break;
+                    }
+                    if (!accOn) {
+                        CameraDaemon.disableSurveillance();   // fires OEM recalc internally
+                    } else {
+                        try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
+                        catch (Throwable ignored) {}
+                    }
                     logger.info("Surveillance preference set to DISABLED and stopped");
                     response.put("success", true);
                     response.put("enabled", false);
+                    response.put("deferred", accOn);
                     break;
+                }
                 
                 case "GET_CONFIG":
                     response.put("success", true);
                     response.put("config", getDefaultConfig());
                     break;
                     
-                case "SET_CONFIG":
+                case "SET_CONFIG": {
                     JSONObject config = request.optJSONObject("config");
-                    if (config != null) {
-                        applyConfig(config);
+                    String applyError = (config != null) ? applyConfig(config) : null;
+                    if (applyError != null) {
+                        // A load-bearing write failed (see applyConfig). AccSentryDaemon
+                        // keys its retry loop on success=false, so reporting honestly
+                        // here is what lets the arm actually be retried.
+                        response.put("success", false);
+                        response.put("error", applyError);
+                        break;
                     }
                     response.put("success", true);
                     response.put("message", "Config updated");
                     break;
+                }
 
                 // Generic config write forwarded by the APP process (UID 10xxx)
                 // via UnifiedConfigManager.routeWriteIfApp. The app cannot do an
@@ -706,11 +760,18 @@ public class SurveillanceIpcServer implements Runnable {
      */
     private static final Object CONFIG_LOCK = new Object();
 
-    private void applyConfig(JSONObject config) {
-        synchronized (CONFIG_LOCK) { applyConfigLocked(config); }
+    /**
+     * @return null on success, or a human-readable reason when a LOAD-BEARING
+     *         write failed and the caller must not acknowledge the change.
+     *         Only the surveillance master toggle reports this way today: the
+     *         ACC-OFF arm dispatch re-reads the persisted flag, so a silently
+     *         dropped write means surveillance never arms on the next park.
+     */
+    private String applyConfig(JSONObject config) {
+        synchronized (CONFIG_LOCK) { return applyConfigLocked(config); }
     }
 
-    private void applyConfigLocked(JSONObject config) {
+    private String applyConfigLocked(JSONObject config) {
         try {
             com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline =
                 CameraDaemon.getGpuPipeline();
@@ -784,8 +845,14 @@ public class SurveillanceIpcServer implements Runnable {
             // Check if enabled state changed
             if (config.has("enabled")) {
                 boolean enabled = config.getBoolean("enabled");
-                // Persist to unified config so ACC OFF respects user preference
-                com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(enabled);
+                // Persist to unified config so ACC OFF respects user preference.
+                // A failed write means the ACC-OFF arm dispatch (which re-reads the
+                // persisted flag) will not see this intent — surface it rather than
+                // acknowledging a change that won't survive.
+                if (!com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(enabled)) {
+                    logger.warn("Failed to persist surveillanceEnabled=" + enabled + " via IPC");
+                    return "Failed to save the surveillance setting";
+                }
                 if (enabled) {
                     // RACE CONDITION FIX: Only enable surveillance if ACC is actually OFF.
                     // AccSentryDaemon's retry loop may send this IPC after ACC turned ON.
@@ -797,9 +864,17 @@ public class SurveillanceIpcServer implements Runnable {
                         try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
                         catch (Throwable ignored) {}
                     }
-                } else {
+                } else if (!com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                    // ACC-gated like the other preference doors: nothing is armed
+                    // while ACC is ON. (The stopSurveillance primitive below is a
+                    // session stop, not a preference change, and stays unconditional
+                    // so battery protection can always tear a live sentry down.)
                     CameraDaemon.disableSurveillance();   // fires OEM recalc
                     logger.info("Surveillance disabled via IPC");
+                } else {
+                    logger.info("Surveillance preference disabled via IPC — ACC is ON, nothing armed to stop");
+                    try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
+                    catch (Throwable ignored) {}
                 }
             }
             
@@ -1238,8 +1313,9 @@ public class SurveillanceIpcServer implements Runnable {
         } catch (Exception e) {
             logger.error("Failed to apply config", e);
         }
+        return null;
     }
-    
+
     /**
      * Apply ROI configuration to surveillance system.
      */
@@ -1493,6 +1569,11 @@ public class SurveillanceIpcServer implements Runnable {
         json.put("isError", data.isError);
         json.put("errorType", data.errorType);
         json.put("chargingPowerKW", data.chargingPowerKW);
+            // isEstimated travels WITH the number. getChargingState() substitutes a nominal
+            // 3.3/7.0 kW placeholder (or an inferred engine-power figure) whenever nothing has
+            // resolved a real rate, so a consumer receiving the value alone cannot tell a
+            // measurement from a guess and will render the guess as measured power.
+            json.put("isEstimated", data.isEstimated);
         json.put("isDischarging", data.isDischarging);
         json.put("timestamp", data.timestamp);
         return json;
@@ -1507,6 +1588,11 @@ public class SurveillanceIpcServer implements Runnable {
         
         JSONObject json = new JSONObject();
         json.put("chargingPowerKW", data.chargingPowerKW);
+            // isEstimated travels WITH the number. getChargingState() substitutes a nominal
+            // 3.3/7.0 kW placeholder (or an inferred engine-power figure) whenever nothing has
+            // resolved a real rate, so a consumer receiving the value alone cannot tell a
+            // measurement from a guess and will render the guess as measured power.
+            json.put("isEstimated", data.isEstimated);
         json.put("isDischarging", data.isDischarging);
         json.put("timestamp", data.timestamp);
         return json;
@@ -1554,10 +1640,15 @@ public class SurveillanceIpcServer implements Runnable {
             // daemon-side gate treats as "no monotonic basis" and falls back to the
             // send-time age (prior behavior, no regression).
             long fixElapsedMs = request.optLong("fixElapsedMs", 0L);
+            // Vertical accuracy + altitude source (elevation pipeline). Older
+            // sidecars omit them → 0/false, meaning "unreported / ellipsoidal".
+            float verticalAccuracy = (float) request.optDouble("vAcc", 0.0);
+            boolean altitudeIsMsl = request.optBoolean("altMsl", false);
 
             // Directly update GpsMonitor
             com.overdrive.app.monitor.GpsMonitor.getInstance()
-                .updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude, fixElapsedMs);
+                .updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude, fixElapsedMs,
+                        verticalAccuracy, altitudeIsMsl);
             
         } catch (Exception e) {
             logger.error("Failed to update GPS", e);

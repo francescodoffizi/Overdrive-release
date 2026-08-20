@@ -12,23 +12,23 @@
     <color name="white">#FFFFFFFF</color>
 
     <!-- Brand -->
-    <color name="brand_primary">#5DDBB6</color>
-    <color name="brand_secondary">#85CFFF</color>
+    <color name="brand_primary">@color/md_sys_color_primary</color>
+    <color name="brand_secondary">@color/md_sys_color_tertiary</color>
     <color name="brand_cyan">@color/brand_primary</color>
     <color name="brand_cyan_glow">#335DDBB6</color>
 
     <!-- Backgrounds — M3 surface tonal stack -->
-    <color name="bg_base">#0E1311</color>
-    <color name="bg_surface">#1A1F1D</color>
-    <color name="bg_elevated">#242927</color>
-    <color name="bg_hover">#2F3432</color>
+    <color name="bg_base">@color/md_sys_color_background</color>
+    <color name="bg_surface">@color/md_sys_color_surface_container</color>
+    <color name="bg_elevated">@color/md_sys_color_surface_container_high</color>
+    <color name="bg_hover">@color/md_sys_color_surface_container_highest</color>
 
     <color name="surface_variant">@color/bg_elevated</color>
 
     <!-- Text -->
-    <color name="text_primary">#DEE4E0</color>
-    <color name="text_secondary">#BFC9C3</color>
-    <color name="text_muted">#899692</color>
+    <color name="text_primary">@color/md_sys_color_on_surface</color>
+    <color name="text_secondary">@color/md_sys_color_on_surface_variant</color>
+    <color name="text_muted">@color/md_sys_color_outline</color>
 
     <!-- Borders -->
     <color name="border_default">#26FFFFFF</color>
@@ -39,11 +39,11 @@
     <color name="overlay_pill_stroke">#335DDBB6</color>
 
     <!-- Status -->
-    <color name="status_success">#5BD382</color>
-    <color name="status_warning">#FFB870</color>
-    <color name="status_danger">#FFB4AB</color>
+    <color name="status_success">@color/overdrive_status_success</color>
+    <color name="status_warning">@color/overdrive_status_warning</color>
+    <color name="status_danger">@color/overdrive_status_danger</color>
     <!-- Informational/confirmation blue — the overlay's "replay saved" hold. -->
-    <color name="status_info">#A8C7FA</color>
+    <color name="status_info">@color/overdrive_status_info</color>
     <color name="status_running">@color/status_success</color>
     <color name="status_stopped">@color/text_muted</color>
     <color name="status_error">@color/status_danger</color>

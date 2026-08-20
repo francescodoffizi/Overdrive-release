@@ -6,20 +6,18 @@ import static org.junit.Assert.assertTrue;
 import org.junit.Test;
 
 /**
- * Pins {@link BydDataCollector#scaleClusterChargePowerKw(double)}.
+ * Pins {@link BydDataCollector#scaleClusterChargePowerKw(double)} as an IDENTITY.
  *
- * <p>The cluster charge-power feature id (0x32300018) is reported in TWO different units
- * depending on firmware family — hectowatts on the family where a 1.8 kW charge reads ~189.5,
- * and plain kW on others. There is no unit flag, so the scale has to be inferred from the
- * magnitude, and getting it wrong is silent: the result is a plausible-looking but wrong number
- * on the top-priority charging-power source.
+ * <p>This function previously divided any reading above 22 by 100, inferring the unit from the
+ * magnitude. That inference is unsound: the same numeric band holds both a genuine DC-charging
+ * rate (60-500 kW) and a plausible cumulative-counter value, so no threshold can separate them.
+ * Applying it displayed a real 150 kW session as 1.5 kW, and it was only contained by restricting
+ * the field to one drivetrain — which denied the other drivetrain the vehicle's own dash figure.
  *
- * <p>The boundary is a genuine judgement call, not a derivable fact: our only field evidence
- * (a Seal U DM-i reporting ~221.7 raw for a ~1.9 kW charge) says hectowatts, while the OEM app
- * reads this same feature id with NO division at all and accepts 0..500 as kW. Both cannot hold
- * for one firmware, so the split is: at or below the AC/onboard-charger ceiling (22 kW) the
- * value is taken as kW; above it, as hectowatts. These tests pin that split exactly, so the
- * accepted trade-off stays deliberate instead of drifting on a later edit.
+ * <p>The unit question now belongs to {@link ChargeSourceClassifier}, which decides from how a
+ * value MOVES across a charge (a counter only rises; a rate dips). These tests exist to stop the
+ * magnitude heuristic being reintroduced: any scaling here is a regression, because a caller
+ * cannot tell a scaled value from an unscaled one and would silently price the difference.
  */
 public class ClusterChargePowerScaleTest {
 
@@ -27,69 +25,51 @@ public class ClusterChargePowerScaleTest {
         return BydDataCollector.scaleClusterChargePowerKw(raw);
     }
 
-    /** The field-observed case: a 1.8 kW AC charge reports ~189.5 raw (hectowatts). */
+    /** Values are passed through untouched — no divide, no multiply, at any magnitude. */
     @Test
-    public void hectowattReadingScalesDown() {
-        assertEquals(1.895, kw(189.5), 1e-6);
-        assertEquals(0.5, kw(50.0000001), 0.01);   // just above the AC ceiling → hectowatts
-        assertEquals(1.2, kw(120.0), 1e-6);
+    public void readingIsNeverScaled() {
+        assertEquals(1.8, kw(1.8), 1e-9);
+        assertEquals(22.0, kw(22.0), 1e-9);
+        assertEquals(23.0, kw(23.0), 1e-9);       // old code: 0.23
+        assertEquals(60.0, kw(60.0), 1e-9);       // old code: 0.60
+        assertEquals(119.0, kw(119.0), 1e-9);     // the field-captured counter value
+        assertEquals(189.5, kw(189.5), 1e-9);     // old code: 1.895
+        assertEquals(250.0, kw(250.0), 1e-9);     // a real DC rate; old code: 2.50
+        assertEquals(359.4, kw(359.4), 1e-9);
     }
 
     /**
-     * A DC fast charge expressed in HECTOWATTS must scale to the right kW.
+     * A genuine DC fast-charge rate survives intact.
      *
-     * <p>Note what this does NOT claim. The 22..500 raw band is resolved as hectowatts by
-     * design — see {@code scaleClusterChargePowerKw}'s javadoc: our only field evidence
-     * (a Seal U DM-i reporting ~221.7 raw for a ~1.9 kW charge) is hectowatts, so a raw 60 is
-     * read as 0.6 kW, not 60 kW.
-     *
-     * <p>That residual ambiguity is contained by the CONSUMER rather than here:
-     * {@code VehicleDataMonitor.getChargingState()} uses this value on PHEV only, and a PHEV
-     * onboard charger cannot reach the ambiguous band, so the guess can never be wrong on the
-     * drivetrain that consumes it. A BEV keeps using {@code chargePowerKw}, which needs no
-     * scale guess. This test pins the chosen conversion exactly so the trade stays a deliberate
-     * decision rather than drifting.
-     *
-     * <p>(An earlier version of this test asserted `out >= 0.2` over that band and claimed it
-     * guarded a "60 → 0.6" bug — it could not: 0.6 satisfies 0.2. Assert exact values.)
+     * <p>This is the case the old heuristic could not express: on the drivetrain that can
+     * actually DC-charge, every rate from 22 kW up landed in the "divide by 100" band.
      */
     @Test
-    public void dcFastChargeInHectowattsScalesCorrectly() {
-        assertEquals(60.0, kw(6000.0), 1e-6);     // 60 kW as hectowatts
-        assertEquals(150.0, kw(15000.0), 1e-6);   // 150 kW as hectowatts
-        assertEquals(250.0, kw(25000.0), 1e-6);   // 250 kW as hectowatts
-
-        // The 22..500 band is hectowatts by design — pin the exact conversions.
-        assertEquals(0.23, kw(23.0), 1e-9);
-        assertEquals(0.60, kw(60.0), 1e-9);
-        assertEquals(2.50, kw(250.0), 1e-9);
+    public void dcFastChargeRateIsPreserved() {
+        assertEquals(60.0, kw(60.0), 1e-9);
+        assertEquals(150.0, kw(150.0), 1e-9);
+        assertEquals(250.0, kw(250.0), 1e-9);
     }
 
-    /** At or below the AC/onboard-charger ceiling the value is already kW. */
+    /**
+     * Sentinels are rejected by the caller's bounds, not by arithmetic here.
+     *
+     * <p>Worth pinning: the old code divided 104857.5 into 1048.575, which fell outside the
+     * accept band only by luck of that particular constant. Unscaled, every documented sentinel
+     * is far outside the +/-500 envelope the admission gate enforces, so rejection no longer
+     * depends on what a division happens to produce.
+     */
     @Test
-    public void acRangeIsTakenAsKw() {
-        assertEquals(1.8, kw(1.8), 1e-6);
-        assertEquals(2.9, kw(2.9), 1e-6);
-        assertEquals(7.13, kw(7.13), 1e-6);
-        assertEquals(11.0, kw(11.0), 1e-6);
-        assertEquals(22.0, kw(22.0), 1e-6);        // exactly the ceiling → kW
+    public void sentinelsStayOutOfBand() {
+        assertTrue("104857.5 must stay out of the +/-500 envelope", Math.abs(kw(104857.5)) > 500);
+        assertTrue("65535 must stay out of the +/-500 envelope", Math.abs(kw(65535.0)) > 500);
+        assertTrue("-10011 must stay out of the +/-500 envelope", Math.abs(kw(-10011.0)) > 500);
     }
 
-    /** Above the max plausible kW the value can only be a smaller unit. */
-    @Test
-    public void impossiblyLargeRawIsHectowatts() {
-        assertEquals(60.0, kw(6000.0), 1e-6);
-        assertEquals(120.0, kw(12000.0), 1e-6);
-        // The BYD sentinel: whatever it scales to must be out of the caller's accept band
-        // (>0.1 && <=500), so it can never be published.
-        double sentinel = kw(104857.5);
-        assertTrue("sentinel must not land in the accept band", sentinel > 500 || sentinel <= 0.1);
-    }
-
-    /** Sign is preserved — a negative reading must not silently become positive power. */
+    /** Sign is preserved — a discharge reading must not become positive charging power. */
     @Test
     public void signIsPreserved() {
-        assertTrue(kw(-189.5) < 0);
-        assertTrue(kw(-5.0) < 0);
+        assertEquals(-189.5, kw(-189.5), 1e-9);
+        assertEquals(-5.0, kw(-5.0), 1e-9);
     }
 }

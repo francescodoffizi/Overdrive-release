@@ -9,9 +9,11 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import androidx.core.view.doOnLayout
 import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -19,6 +21,7 @@ import com.overdrive.app.ui.adapter.RecordingAdapter
 import com.overdrive.app.ui.model.RecordingFile
 import com.overdrive.app.ui.util.RecordingScanner
 import com.overdrive.app.ui.util.RecordingSectionHeaderDecoration
+import com.overdrive.app.ui.util.RecordingLibraryFilterState
 import com.overdrive.app.ui.util.RecordingsApiClient
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.button.MaterialButton
@@ -70,6 +73,9 @@ class RecordingLibraryFragment : Fragment() {
          * counts (only matters if the warmup never finishes).
          */
         private const val WARMING_POLL_MAX_ATTEMPTS_FOR_BACKOFF = 8
+        private const val STATE_SELECT_MODE = "recording_library.select_mode"
+        private const val STATE_SELECTED_PATHS = "recording_library.selected_paths"
+        private const val STATE_SELECT_ALL_PENDING = "recording_library.select_all_pending"
 
         /** When true, the fragment hides its internal filter bar — used when a
          *  parent (RecordingsFragment) drives the filter via its own segmented
@@ -108,6 +114,12 @@ class RecordingLibraryFragment : Fragment() {
     private lateinit var recyclerRecordings: RecyclerView
     private lateinit var tvEmptyState: TextView
     private var emptyStateContainer: LinearLayout? = null
+    private var initialLoadingContainer: View? = null
+    private var loadStatusBar: View? = null
+    private var loadStatusProgress: ProgressBar? = null
+    private var tvLoadStatus: TextView? = null
+    private var btnLoadRetry: View? = null
+    private var btnEmptyRetry: View? = null
 
     // -------- Multi-select (now a docked bottom action bar) --------
     private var selectToolbar: View? = null
@@ -116,6 +128,10 @@ class RecordingLibraryFragment : Fragment() {
     private var btnDeleteSelected: View? = null
     private var btnCancelSelect: View? = null
     private var btnShareSelected: View? = null
+    private var pendingRestoredSelectionPaths: Set<String> = emptySet()
+    private var pendingSelectAll = false
+    private var allMatchingSelected = false
+    private var selectionLoadInProgress = false
 
     // -------- Empty state CTA (filter clear) --------
     private var btnEmptyClearFilters: View? = null
@@ -217,6 +233,9 @@ class RecordingLibraryFragment : Fragment() {
 
     private var pagingState: RecordingPagingState = RecordingPagingState()
 
+    private enum class RetryTarget { FIRST_PAGE, NEXT_PAGE }
+    private var retryTarget: RetryTarget? = null
+
     /** True after we've installed [pagingScrollListener] on the recycler. */
     private var pagingScrollListenerAttached: Boolean = false
 
@@ -311,6 +330,7 @@ class RecordingLibraryFragment : Fragment() {
 
         initViews(view)
         setupRecordingsList()
+        restoreSelectionState(savedInstanceState)
         setupClickListeners()
 
         // When the parent drives filters via its own segmented control, also
@@ -327,8 +347,50 @@ class RecordingLibraryFragment : Fragment() {
 
         checkPermissionsAndScan()
 
+        // No load here: standalone mode loads in onResume, embedded mode via the
+        // parent's applyAllFiltersTo → applyAll. Loading here made both modes
+        // fetch twice, and embedded used this fragment's stale date state.
         updateDateHeader()
         renderActiveFilters()
+    }
+
+    private fun restoreSelectionState(savedInstanceState: Bundle?) {
+        if (savedInstanceState == null) return
+        val selectMode = savedInstanceState.getBoolean(STATE_SELECT_MODE, false)
+        pendingSelectAll = selectMode &&
+            savedInstanceState.getBoolean(STATE_SELECT_ALL_PENDING, false)
+        allMatchingSelected = false
+        pendingRestoredSelectionPaths = if (selectMode) {
+            savedInstanceState.getStringArrayList(STATE_SELECTED_PATHS)
+                .orEmpty()
+                .filter(String::isNotEmpty)
+                .toSet()
+        } else {
+            emptySet()
+        }
+        recordingAdapter.restoreSelection(
+            selectMode = selectMode,
+            selectedPaths = emptySet()
+        )
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        if (::recordingAdapter.isInitialized) {
+            outState.putBoolean(STATE_SELECT_MODE, recordingAdapter.selectMode)
+            val restoreAll = pendingSelectAll || allMatchingSelected
+            outState.putBoolean(STATE_SELECT_ALL_PENDING, restoreAll)
+            val selectedPaths = when {
+                restoreAll -> emptySet()
+                pendingRestoredSelectionPaths.isNotEmpty() ->
+                    pendingRestoredSelectionPaths
+                else -> recordingAdapter.getSelectedPaths()
+            }
+            outState.putStringArrayList(
+                STATE_SELECTED_PATHS,
+                ArrayList(selectedPaths)
+            )
+        }
+        super.onSaveInstanceState(outState)
     }
 
     /**
@@ -338,7 +400,6 @@ class RecordingLibraryFragment : Fragment() {
     private fun checkPermissionsAndScan() {
         setupStorageDirectories()
         RecordingScanner.invalidateCache()
-        loadRecordingsForSelectedDate()
     }
 
     private fun setupStorageDirectories() {
@@ -393,6 +454,12 @@ class RecordingLibraryFragment : Fragment() {
         tvEmptyStateBody = view.findViewById(R.id.tvEmptyStateBody)
         emptyStateContainer = view.findViewById(R.id.emptyStateContainer)
         btnEmptyClearFilters = view.findViewById(R.id.btnEmptyClearFilters)
+        initialLoadingContainer = view.findViewById(R.id.initialLoadingContainer)
+        loadStatusBar = view.findViewById(R.id.loadStatusBar)
+        loadStatusProgress = view.findViewById(R.id.loadStatusProgress)
+        tvLoadStatus = view.findViewById(R.id.tvLoadStatus)
+        btnLoadRetry = view.findViewById(R.id.btnLoadRetry)
+        btnEmptyRetry = view.findViewById(R.id.btnEmptyRetry)
 
         // Multi-select bottom action bar
         selectToolbar = view.findViewById(R.id.selectToolbar)
@@ -402,7 +469,7 @@ class RecordingLibraryFragment : Fragment() {
         btnCancelSelect = view.findViewById(R.id.btnCancelSelect)
         btnShareSelected = view.findViewById(R.id.btnShareSelected)
 
-        btnSelectAll?.setOnClickListener { recordingAdapter.selectAll() }
+        btnSelectAll?.setOnClickListener { selectAllRecordings() }
         btnDeleteSelected?.setOnClickListener { confirmBatchDelete() }
         btnCancelSelect?.setOnClickListener { exitSelectMode() }
         btnShareSelected?.setOnClickListener { shareSelectedRecordings() }
@@ -412,6 +479,8 @@ class RecordingLibraryFragment : Fragment() {
         // via [onClearAllFiltersRequested]; standalone callers (no parent)
         // get an in-fragment fallback that drops actor/severity/date.
         btnEmptyClearFilters?.setOnClickListener { handleClearFiltersRequested() }
+        btnLoadRetry?.setOnClickListener { retryFailedLoad() }
+        btnEmptyRetry?.setOnClickListener { retryFailedLoad() }
     }
 
     /**
@@ -430,6 +499,8 @@ class RecordingLibraryFragment : Fragment() {
         actorClassFilter.clear()
         severityFilter.clear()
         placeFilter.clear()
+        storageFilter.clear()
+        placeContainsQuery = ""
         // Drop date narrowing too — the user's intent is "show me anything".
         dateNarrowed = false
         renderActiveFilters()
@@ -483,7 +554,10 @@ class RecordingLibraryFragment : Fragment() {
         severityFilter.clear()
         severityFilter.addAll(severity.map { it.uppercase() })
         placeFilter.clear()
-        placeFilter.addAll(places.map { it.lowercase() })
+        places.asSequence()
+            .map { it.trim().lowercase() }
+            .firstOrNull { it.isNotEmpty() }
+            ?.let(placeFilter::add)
         storageFilter.clear()
         storageFilter.addAll(storages.map { it.uppercase() })
         placeContainsQuery = placeContains?.trim()?.lowercase() ?: ""
@@ -514,7 +588,16 @@ class RecordingLibraryFragment : Fragment() {
         val sheet = BottomSheetDialog(ctx, R.style.Theme_Overdrive_M3_BottomSheet)
         val sheetView = LayoutInflater.from(ctx)
             .inflate(R.layout.sheet_recording_library_filters, null, false)
+        // M3 sheets are edge-to-edge: without this the Apply button sits
+        // behind the system navigation bar on the head unit.
+        com.overdrive.app.ui.util.SheetInsets.padForNavigationBar(sheetView)
         sheet.setContentView(sheetView)
+        // Standalone library mode only owns actor/severity filters. The host
+        // RecordingsFragment owns type/place/storage and wires those sections
+        // when it opens the same recording-specific sheet.
+        sheetView.findViewById<View>(R.id.sheetTypeSection)?.visibility = View.GONE
+        sheetView.findViewById<View>(R.id.sheetPlaceSection)?.visibility = View.GONE
+        sheetView.findViewById<View>(R.id.sheetStorageSection)?.visibility = View.GONE
 
         sheetChipActorAny      = sheetView.findViewById(R.id.chipActorAny)
         sheetChipActorPerson   = sheetView.findViewById(R.id.chipActorPerson)
@@ -791,10 +874,20 @@ class RecordingLibraryFragment : Fragment() {
             onShare = { recording -> shareSingleRecording(recording) }
         )
 
+        val landscape =
+            resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        val gridLayoutManager = GridLayoutManager(context, if (landscape) 1 else 2)
         recyclerRecordings.apply {
-            layoutManager = GridLayoutManager(context, 2)
+            layoutManager = gridLayoutManager
             adapter = recordingAdapter
             setHasFixedSize(true)
+        }
+        if (!landscape) {
+            recyclerRecordings.doOnLayout { list ->
+                val minTileWidth = (220 * resources.displayMetrics.density).toInt()
+                val available = list.width - list.paddingStart - list.paddingEnd
+                gridLayoutManager.spanCount = (available / minTileWidth).coerceIn(1, 3)
+            }
         }
 
         // Sticky time-of-day section headers. Decoration reads `currentList`
@@ -815,10 +908,169 @@ class RecordingLibraryFragment : Fragment() {
     }
 
     private fun onSelectionChanged(count: Int) {
+        if (!selectionLoadInProgress) {
+            allMatchingSelected = count > 0 &&
+                !pagingState.hasMore &&
+                count == currentList.size
+        }
         tvSelectedCount?.text = getString(R.string.recording_lib_selected_count, count)
         if (recordingAdapter.selectMode && selectToolbar?.visibility != View.VISIBLE) {
             selectToolbar?.visibility = View.VISIBLE
         }
+    }
+
+    private fun selectAllRecordings() {
+        if (!::recordingAdapter.isInitialized ||
+            !recordingAdapter.selectMode ||
+            recordingAdapter.itemCount == 0 ||
+            selectionLoadInProgress ||
+            pagingState.loading
+        ) {
+            return
+        }
+        val allRowsLoaded = pagingState.fallbackActive ||
+            !pagingState.hasMore ||
+            pagingState.accumulated.size >= pagingState.totalCount
+        if (allRowsLoaded) {
+            pendingSelectAll = false
+            recordingAdapter.selectAllLoaded()
+            return
+        }
+        loadAllForSelection(restoredPaths = null)
+    }
+
+    private fun resolveRestoredSelectionIfNeeded() {
+        val requested = pendingRestoredSelectionPaths
+        if (requested.isEmpty() || !recordingAdapter.selectMode) {
+            pendingRestoredSelectionPaths = emptySet()
+            return
+        }
+
+        val loadedPaths = currentList.mapTo(mutableSetOf()) { it.path }
+        if (loadedPaths.containsAll(requested)) {
+            pendingRestoredSelectionPaths = emptySet()
+            recordingAdapter.restoreSelection(true, requested)
+            return
+        }
+
+        if (pagingState.fallbackActive || !pagingState.hasMore) {
+            pendingRestoredSelectionPaths = emptySet()
+            recordingAdapter.restoreSelection(true, requested.intersect(loadedPaths))
+            return
+        }
+        loadAllForSelection(restoredPaths = requested)
+    }
+
+    /**
+     * Selection is the only workflow that needs a complete result set.
+     * Normal browsing remains paged; "All" and restored off-page selections
+     * resolve every matching row before batch actions are enabled.
+     */
+    private fun loadAllForSelection(restoredPaths: Set<String>?) {
+        if (selectionLoadInProgress || scanExecutor.isShutdown) return
+
+        pendingSelectAll = restoredPaths == null
+        selectionLoadInProgress = true
+        setSelectionActionsEnabled(false)
+        showLoadStatus(
+            message = getString(R.string.recording_library_loading_more),
+            showProgress = true,
+            retry = null
+        )
+        val generation = pagingState.generation
+        val filter = pagingState.currentFilter
+
+        scanExecutor.submit {
+            val all = try {
+                RecordingsApiClient.fetchAllRecordings(filter)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Selection expansion failed: ${t.message}")
+                null
+            }
+
+            activity?.runOnUiThread {
+                if (!isAdded || view == null) return@runOnUiThread
+                if (generation != pagingState.generation) return@runOnUiThread
+                if (!recordingAdapter.selectMode) {
+                    pendingRestoredSelectionPaths = emptySet()
+                    pendingSelectAll = false
+                    allMatchingSelected = false
+                    finishSelectionLoad(showError = false)
+                    return@runOnUiThread
+                }
+
+                if (all == null ||
+                    (all.isEmpty() && pagingState.totalCount > 0)
+                ) {
+                    if (restoredPaths != null) {
+                        val loadedPaths = currentList.mapTo(mutableSetOf()) { it.path }
+                        pendingRestoredSelectionPaths = emptySet()
+                        recordingAdapter.restoreSelection(
+                            true,
+                            restoredPaths.intersect(loadedPaths)
+                        )
+                    }
+                    pendingSelectAll = false
+                    allMatchingSelected = false
+                    finishSelectionLoad(showError = true)
+                    return@runOnUiThread
+                }
+
+                pagingState.accumulated.clear()
+                pagingState.accumulated.addAll(all)
+                pagingState.totalCount = all.size
+                pagingState.hasMore = false
+                val availablePaths = all.mapTo(linkedSetOf()) { it.path }
+                val selectedPaths = restoredPaths?.intersect(availablePaths)
+                    ?: availablePaths
+                pendingRestoredSelectionPaths = emptySet()
+                pendingSelectAll = false
+
+                renderRecordings(all) selectionCommit@{
+                    if (!isAdded ||
+                        view == null
+                    ) {
+                        return@selectionCommit
+                    }
+                    if (generation != pagingState.generation) return@selectionCommit
+                    if (!recordingAdapter.selectMode) {
+                        finishSelectionLoad(showError = false)
+                        return@selectionCommit
+                    }
+                    recordingAdapter.restoreSelection(true, selectedPaths)
+                    allMatchingSelected = restoredPaths == null
+                    finishSelectionLoad(showError = false)
+                }
+            }
+        }
+    }
+
+    private fun setSelectionActionsEnabled(enabled: Boolean) {
+        btnSelectAll?.isEnabled = enabled
+        btnDeleteSelected?.isEnabled = enabled
+        btnShareSelected?.isEnabled = enabled
+    }
+
+    private fun finishSelectionLoad(showError: Boolean) {
+        selectionLoadInProgress = false
+        setSelectionActionsEnabled(true)
+        hideLoadStatus()
+        if (showError) {
+            context?.let {
+                Toast.makeText(
+                    it,
+                    R.string.recording_library_page_error,
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    fun enterSelectionMode() {
+        if (!::recordingAdapter.isInitialized || recordingAdapter.itemCount == 0) return
+        recordingAdapter.enterSelectMode()
+        selectToolbar?.visibility = View.VISIBLE
+        onSelectionChanged(0)
     }
 
     /**
@@ -840,13 +1092,27 @@ class RecordingLibraryFragment : Fragment() {
      * with the new criteria.
      */
     private fun resetPaging() {
+        if (::recordingAdapter.isInitialized && recordingAdapter.selectMode) {
+            if (allMatchingSelected) {
+                pendingSelectAll = true
+            } else if (pendingRestoredSelectionPaths.isEmpty()) {
+                pendingRestoredSelectionPaths = recordingAdapter.getSelectedPaths()
+            }
+        }
         pagingState.generation += 1
+        if (selectionLoadInProgress) {
+            selectionLoadInProgress = false
+            setSelectionActionsEnabled(true)
+        }
+        allMatchingSelected = false
         pagingState.page = 1
         pagingState.hasMore = true
         pagingState.loading = false
         pagingState.totalCount = 0
         pagingState.accumulated.clear()
         pagingState.fallbackActive = false
+        retryTarget = null
+        hideLoadStatus()
         warmupPollRunnable?.let { mainHandler.removeCallbacks(it) }
         warmupPollRunnable = null
     }
@@ -908,18 +1174,27 @@ class RecordingLibraryFragment : Fragment() {
                 selectedDay
             )
         } else null
-        val severitySet = severityFilter.toSet()  // already uppercased by applyAll
-        val placeStr = placeFilter.firstOrNull()  // server takes one exact label
+        val filterState = currentNarrowingState()
         return RecordingsApiClient.Filter(
             type = typeStr,
             types = typesParam,
             date = dateStr,
-            classes = actorClassFilter.toSet(),  // already lowercased
-            severities = severitySet,
-            place = placeStr,
-            storages = storageFilter.toSet()  // already uppercased by applyAll
+            classes = filterState.normalizedActorClasses,
+            severities = filterState.normalizedSeverities,
+            place = filterState.exactPlace,
+            placeContains = filterState.normalizedPlaceContains.takeIf { it.isNotEmpty() },
+            storages = filterState.normalizedStorages
         )
     }
+
+    private fun currentNarrowingState() = RecordingLibraryFilterState(
+        actorClasses = actorClassFilter,
+        severities = severityFilter,
+        places = placeFilter,
+        placeContains = placeContainsQuery,
+        storages = storageFilter,
+        dateNarrowed = dateNarrowed
+    )
 
     /**
      * Fetch page 1 with the current filter and render. Routes to fallback
@@ -934,6 +1209,7 @@ class RecordingLibraryFragment : Fragment() {
         pagingState.currentFilter = filter
         pagingState.page = 1
         pagingState.loading = true
+        showFirstPageLoading()
         val gen = pagingState.generation
         val pageNum = 1
         val pageSize = pagingState.pageSize
@@ -1004,6 +1280,7 @@ class RecordingLibraryFragment : Fragment() {
                 // Server tells us totalPages directly — no need to guess.
                 pagingState.hasMore = pageNum < page.totalPages
                 renderRecordings(pagingState.accumulated.toList())
+                hideLoadStatus()
 
                 // Server says it's reconciling (storage hot-plug, type-
                 // switch, etc.). Empty list now, but reconcile is in flight
@@ -1031,6 +1308,11 @@ class RecordingLibraryFragment : Fragment() {
         if (pagingState.loading || !pagingState.hasMore || pagingState.fallbackActive) return
 
         pagingState.loading = true
+        showLoadStatus(
+            message = getString(R.string.recording_library_loading_more),
+            showProgress = true,
+            retry = null
+        )
         val gen = pagingState.generation
         val pageNum = pagingState.page + 1
         val pageSize = pagingState.pageSize
@@ -1050,11 +1332,13 @@ class RecordingLibraryFragment : Fragment() {
                 pagingState.loading = false
 
                 if (page == null) {
-                    // Mid-paging transport failure: stop paging quietly,
-                    // keep what we have. Don't switch to fallback — that
-                    // would replace the visible list with a different
-                    // (possibly larger) set and reset the user's scroll.
-                    pagingState.hasMore = false
+                    // Keep loaded clips and leave paging retryable.
+                    pagingState.hasMore = true
+                    showLoadStatus(
+                        message = getString(R.string.recording_library_page_error),
+                        showProgress = false,
+                        retry = RetryTarget.NEXT_PAGE
+                    )
                     return@runOnUiThread
                 }
                 // Mid-paging warmup is rare but possible (index rebuild
@@ -1062,7 +1346,12 @@ class RecordingLibraryFragment : Fragment() {
                 // go down mid-scroll. Either way: stop appending, keep the
                 // rows already on screen rather than clearing them.
                 if (page.warming || page.indexUnavailable) {
-                    pagingState.hasMore = false
+                    pagingState.hasMore = true
+                    showLoadStatus(
+                        message = getString(R.string.recording_library_page_unavailable),
+                        showProgress = false,
+                        retry = RetryTarget.NEXT_PAGE
+                    )
                     return@runOnUiThread
                 }
 
@@ -1071,6 +1360,7 @@ class RecordingLibraryFragment : Fragment() {
                 pagingState.accumulated.addAll(page.recordings)
                 pagingState.hasMore = pageNum < page.totalPages
                 renderRecordings(pagingState.accumulated.toList())
+                hideLoadStatus()
             }
         }
     }
@@ -1105,9 +1395,18 @@ class RecordingLibraryFragment : Fragment() {
      * library. [scheduleWarmupRetry] polls us out of it on recovery.
      */
     private fun showIndexDownState() {
+        if (currentList.isNotEmpty()) {
+            showLoadStatus(
+                message = getString(R.string.recording_lib_index_down_title),
+                showProgress = false,
+                retry = RetryTarget.FIRST_PAGE
+            )
+            return
+        }
         currentList = emptyList()
         recordingAdapter.submitList(emptyList())
         recyclerRecordings.visibility = View.GONE
+        initialLoadingContainer?.visibility = View.GONE
         emptyStateContainer?.visibility = View.VISIBLE
         tvEmptyState.visibility = View.VISIBLE
         tvEmptyState.text = getString(R.string.recording_lib_index_down_title)
@@ -1116,6 +1415,8 @@ class RecordingLibraryFragment : Fragment() {
         // Filters aren't the reason the list is empty — hide the clear-filters
         // affordance so the user isn't sent down a dead end.
         btnEmptyClearFilters?.visibility = View.GONE
+        btnEmptyRetry?.visibility = View.VISIBLE
+        retryTarget = RetryTarget.FIRST_PAGE
         tvDayClipCount?.visibility = View.GONE
     }
 
@@ -1125,9 +1426,22 @@ class RecordingLibraryFragment : Fragment() {
      * counter only. Hides the recycler.
      */
     private fun showWarmingState(done: Int, total: Int) {
+        if (currentList.isNotEmpty()) {
+            showLoadStatus(
+                message = if (total > 0) {
+                    getString(R.string.recording_lib_building_index_progress, done, total)
+                } else {
+                    getString(R.string.recording_lib_building_index_title)
+                },
+                showProgress = true,
+                retry = null
+            )
+            return
+        }
         currentList = emptyList()
         recordingAdapter.submitList(emptyList())
         recyclerRecordings.visibility = View.GONE
+        initialLoadingContainer?.visibility = View.GONE
         emptyStateContainer?.visibility = View.VISIBLE
         tvEmptyState.visibility = View.VISIBLE
         tvEmptyState.text = getString(R.string.recording_lib_building_index_title)
@@ -1138,6 +1452,7 @@ class RecordingLibraryFragment : Fragment() {
             getString(R.string.recording_lib_building_index_body)
         }
         btnEmptyClearFilters?.visibility = View.GONE
+        btnEmptyRetry?.visibility = View.GONE
         // Reset day-clip pill — it would otherwise show the previous count.
         tvDayClipCount?.visibility = View.GONE
     }
@@ -1192,34 +1507,17 @@ class RecordingLibraryFragment : Fragment() {
                 extraFilter?.let { include(it) }
                 val typeFiltered = allRecordings.filter { it.type in acceptedTypes }
 
-                val recordings = if (actorClassFilter.isEmpty()
-                        && severityFilter.isEmpty()
-                        && placeFilter.isEmpty()
-                        && storageFilter.isEmpty()) {
-                    typeFiltered
-                } else {
-                    typeFiltered.filter { rec ->
-                        // Storage filter applies regardless of sidecar presence —
-                        // every clip has a derivable storageType (or null, which
-                        // never matches a non-empty filter, so an unclassifiable
-                        // clip is hidden only when the user actively narrows).
-                        val storageOk = storageFilter.isEmpty() ||
-                            (rec.storageType?.uppercase() in storageFilter)
-                        if (!storageOk) return@filter false
-                        val hasSidecar = rec.peakSeverity != null ||
-                            rec.actorClasses.isNotEmpty()
-                        val placeOk = placeFilter.isEmpty() || run {
-                            val short = rec.placeShortLabel?.lowercase()
-                            short != null && short in placeFilter
-                        }
-                        if (!placeOk) return@filter false
-                        if (!hasSidecar) return@filter true
-                        val classOk = actorClassFilter.isEmpty()
-                                || rec.actorClasses.any { it.lowercase() in actorClassFilter }
-                        val sevOk = severityFilter.isEmpty()
-                                || (rec.peakSeverity?.uppercase() in severityFilter)
-                        classOk && sevOk
-                    }
+                val filterState = currentNarrowingState()
+                val recordings = typeFiltered.filter { rec ->
+                    filterState.matchesFallback(
+                        storageType = rec.storageType,
+                        placeShortLabel = rec.placeShortLabel,
+                        placeMediumLabel = rec.placeMediumLabel,
+                        placeDisplayName = rec.placeDisplayName,
+                        actorClasses = rec.actorClasses,
+                        peakSeverity = rec.peakSeverity,
+                        hasSidecar = rec.peakSeverity != null || rec.actorClasses.isNotEmpty()
+                    )
                 }
 
                 activity?.runOnUiThread {
@@ -1229,14 +1527,24 @@ class RecordingLibraryFragment : Fragment() {
                     pagingState.accumulated.addAll(recordings)
                     pagingState.totalCount = recordings.size
                     renderRecordings(recordings)
+                    hideLoadStatus()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Fallback scan error", e)
+                activity?.runOnUiThread {
+                    if (!isAdded || view == null || gen != pagingState.generation) {
+                        return@runOnUiThread
+                    }
+                    showFatalLoadState()
+                }
             }
         }
     }
 
-    private fun renderRecordings(recordings: List<RecordingFile>) {
+    private fun renderRecordings(
+        recordings: List<RecordingFile>,
+        onCommitted: (() -> Unit)? = null
+    ) {
         currentList = recordings
 
         // Day clip count pill on the date jump card. Only meaningful while
@@ -1266,6 +1574,7 @@ class RecordingLibraryFragment : Fragment() {
 
         if (recordings.isEmpty()) {
             recyclerRecordings.visibility = View.GONE
+            initialLoadingContainer?.visibility = View.GONE
             emptyStateContainer?.visibility = View.VISIBLE
             tvEmptyState.visibility = View.VISIBLE
 
@@ -1276,10 +1585,8 @@ class RecordingLibraryFragment : Fragment() {
             // The segment selector itself (currentFilter) doesn't count —
             // dropping that just sends the user to the other tab and the
             // disk could still be empty there too.
-            val hasFilters = dateNarrowed
-                || actorClassFilter.isNotEmpty()
-                || severityFilter.isNotEmpty()
-                || placeFilter.isNotEmpty()
+            val hasFilters = currentNarrowingState().hasActiveNarrowing
+            btnEmptyRetry?.visibility = View.GONE
             if (hasFilters) {
                 tvEmptyState.text = getString(R.string.recording_lib_empty_title)
                 tvEmptyStateBody?.visibility = View.VISIBLE
@@ -1291,16 +1598,97 @@ class RecordingLibraryFragment : Fragment() {
                 tvEmptyStateBody?.text = getString(R.string.recording_lib_empty_disk_body)
                 btnEmptyClearFilters?.visibility = View.GONE
             }
-            recordingAdapter.submitList(emptyList())
+            recordingAdapter.submitList(emptyList()) {
+                onRenderedListCommitted()
+                onCommitted?.invoke()
+            }
         } else {
             recyclerRecordings.visibility = View.VISIBLE
+            initialLoadingContainer?.visibility = View.GONE
             emptyStateContainer?.visibility = View.GONE
             tvEmptyState.visibility = View.GONE
             recordingAdapter.submitList(recordings) {
                 // After the diff applies, the decoration reads `currentList`
                 // and re-paints sections.
                 recyclerRecordings.invalidateItemDecorations()
+                onRenderedListCommitted()
+                onCommitted?.invoke()
             }
+        }
+    }
+
+    private fun onRenderedListCommitted() {
+        if (!::recordingAdapter.isInitialized) return
+        if (pendingSelectAll && recordingAdapter.selectMode) {
+            selectAllRecordings()
+        } else if (pendingRestoredSelectionPaths.isNotEmpty()) {
+            resolveRestoredSelectionIfNeeded()
+        } else if (!selectionLoadInProgress && recordingAdapter.selectMode) {
+            recordingAdapter.retainSelection(
+                currentList.mapTo(mutableSetOf()) { it.path }
+            )
+        }
+    }
+
+    private fun showFirstPageLoading() {
+        retryTarget = null
+        btnEmptyRetry?.visibility = View.GONE
+        if (currentList.isEmpty()) {
+            recyclerRecordings.visibility = View.GONE
+            emptyStateContainer?.visibility = View.GONE
+            initialLoadingContainer?.visibility = View.VISIBLE
+            hideLoadStatus()
+        } else {
+            showLoadStatus(
+                message = getString(R.string.recording_library_refreshing),
+                showProgress = true,
+                retry = null
+            )
+        }
+    }
+
+    private fun showFatalLoadState() {
+        retryTarget = RetryTarget.FIRST_PAGE
+        if (currentList.isNotEmpty()) {
+            showLoadStatus(
+                message = getString(R.string.recording_library_refresh_error),
+                showProgress = false,
+                retry = RetryTarget.FIRST_PAGE
+            )
+            return
+        }
+        initialLoadingContainer?.visibility = View.GONE
+        recyclerRecordings.visibility = View.GONE
+        emptyStateContainer?.visibility = View.VISIBLE
+        tvEmptyState.text = getString(R.string.recording_library_fatal_title)
+        tvEmptyStateBody?.text = getString(R.string.recording_library_fatal_body)
+        tvEmptyStateBody?.visibility = View.VISIBLE
+        btnEmptyClearFilters?.visibility = View.GONE
+        btnEmptyRetry?.visibility = View.VISIBLE
+    }
+
+    private fun showLoadStatus(
+        message: String,
+        showProgress: Boolean,
+        retry: RetryTarget?
+    ) {
+        retryTarget = retry
+        loadStatusBar?.visibility = View.VISIBLE
+        loadStatusProgress?.visibility = if (showProgress) View.VISIBLE else View.GONE
+        tvLoadStatus?.text = message
+        btnLoadRetry?.visibility = if (retry != null) View.VISIBLE else View.GONE
+    }
+
+    private fun hideLoadStatus() {
+        retryTarget = null
+        loadStatusBar?.visibility = View.GONE
+        btnLoadRetry?.visibility = View.GONE
+    }
+
+    private fun retryFailedLoad() {
+        when (retryTarget) {
+            RetryTarget.NEXT_PAGE -> loadNextPage()
+            RetryTarget.FIRST_PAGE, null -> loadFirstPage()
         }
     }
 
@@ -1329,11 +1717,11 @@ class RecordingLibraryFragment : Fragment() {
             // newest) and "next" / auto-advance lands on the NEWER clip while
             // the on-screen library stays descending.
             val ordered = currentList.asReversed()
-            val paths = ordered.map { it.path }.toTypedArray()
+            val paths = ordered.map { it.playbackSource }.toTypedArray()
             val titles = ordered.map { it.name }.toTypedArray()
             val idx = ordered.indexOfFirst { it.path == recording.path }
             val bundle = Bundle().apply {
-                putString(VideoPlayerFragment.ARG_VIDEO_PATH, recording.path)
+                putString(VideoPlayerFragment.ARG_VIDEO_PATH, recording.playbackSource)
                 putString(VideoPlayerFragment.ARG_VIDEO_TITLE, recording.name)
                 if (paths.isNotEmpty()) {
                     putStringArray(VideoPlayerFragment.ARG_PLAYLIST_PATHS, paths)
@@ -1440,14 +1828,27 @@ class RecordingLibraryFragment : Fragment() {
     }
 
     private fun deleteRecording(recording: RecordingFile) {
-        if (RecordingScanner.deleteRecording(recording)) {
-            Toast.makeText(context, getString(R.string.toast_recording_deleted), Toast.LENGTH_SHORT).show()
-            loadRecordingsForSelectedDate()
-            // Notify the parent so its chip-derivation scan re-runs and
-            // chip rows / segment counters reflect the deletion.
-            onContentChanged?.invoke()
-        } else {
-            Toast.makeText(context, getString(R.string.toast_recording_delete_failed), Toast.LENGTH_SHORT).show()
+        if (scanExecutor.isShutdown) return
+        scanExecutor.submit {
+            val deleted = RecordingScanner.deleteRecording(recording)
+            activity?.runOnUiThread {
+                if (!isAdded || view == null) return@runOnUiThread
+                if (deleted) {
+                    Toast.makeText(
+                        context,
+                        getString(R.string.toast_recording_deleted),
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                    loadRecordingsForSelectedDate()
+                    onContentChanged?.invoke()
+                } else {
+                    Toast.makeText(
+                        context,
+                        getString(R.string.toast_recording_delete_failed),
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
         }
     }
 
@@ -1500,6 +1901,12 @@ class RecordingLibraryFragment : Fragment() {
     }
 
     private fun exitSelectMode() {
+        pendingRestoredSelectionPaths = emptySet()
+        pendingSelectAll = false
+        allMatchingSelected = false
+        selectionLoadInProgress = false
+        setSelectionActionsEnabled(true)
+        hideLoadStatus()
         recordingAdapter.exitSelectMode()
         selectToolbar?.visibility = View.GONE
     }
@@ -1516,9 +1923,9 @@ class RecordingLibraryFragment : Fragment() {
     }
 
     override fun onDestroyView() {
-        super.onDestroyView()
         // Lifecycle-safe: dismiss any open sheet & clear decoration ref so
         // the GC can collect the fragment cleanly.
+        filterSheet?.setOnDismissListener(null)
         filterSheet?.dismiss()
         filterSheet = null
         sectionHeaderDecoration?.let { recyclerRecordings.removeItemDecoration(it) }
@@ -1529,9 +1936,19 @@ class RecordingLibraryFragment : Fragment() {
         }
         warmupPollRunnable?.let { mainHandler.removeCallbacks(it) }
         warmupPollRunnable = null
+        pendingRestoredSelectionPaths = emptySet()
+        pendingSelectAll = false
+        allMatchingSelected = false
+        selectionLoadInProgress = false
         // Bump generation so any in-flight background result lands as stale.
         pagingState.generation += 1
         // shutdownNow so a stuck disk walk doesn't hold the fragment alive.
         scanExecutor.shutdownNow()
+        if (::recordingAdapter.isInitialized) {
+            recyclerRecordings.adapter = null
+            recordingAdapter.dispose()
+        }
+        currentList = emptyList()
+        super.onDestroyView()
     }
 }

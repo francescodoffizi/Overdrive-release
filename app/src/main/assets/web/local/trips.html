@@ -11,7 +11,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
-    <script src="../shared/app-shell.js?v=2"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
     <!--
       Bottom-tab manifest for Trips. Tabs apply to the LIST VIEW only;
       the DETAIL VIEW (#tripDetailView) is a sequential drill-in and
@@ -28,9 +28,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <link rel="stylesheet" href="../shared/leaflet.css" />
     <style>
         /* ===== OLD WEBVIEW COMPAT (Chrome <88, Android 7.x) ===== */
@@ -840,6 +838,23 @@
             color: var(--brand-primary);
             flex-shrink: 0;
         }
+        /* Electric / petrol leg icons (Material-Symbols-outlined shapes) that replaced the
+           ⚡/⛽ emoji. Each leg keeps its OWN colour (the cost-split rows are --warning),
+           unlike .trip-capsule svg which is brand-tinted. vertical-align keeps the glyph on
+           the text baseline in the non-flex rows it also appears in.
+           The `.trip-capsule` prefix and `color: inherit` are REQUIRED, not redundant: the
+           card's cost-split lives INSIDE a .trip-capsule, so `.trip-capsule svg` (0,1,1)
+           outranks a bare `.trip-leg-icon` (0,1,0) and would repaint these glyphs brand-teal
+           against their amber text. The two-class form is (0,2,0), which wins outright —
+           so stroke="currentColor" resolves to the surrounding text colour. */
+        .trip-capsule .trip-leg-icon,
+        .trip-leg-icon {
+            width: 14px;
+            height: 14px;
+            flex-shrink: 0;
+            vertical-align: -2px;
+            color: inherit;
+        }
         /* Delete icon on trip card */
         .trip-delete-btn {
             position: absolute;
@@ -1357,7 +1372,7 @@
                                 <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;line-height:1;">
                                     <span style="font-size:20px;margin-bottom:2px;">⚡</span>
                                     <span id="rangeCircleValue" style="font-family:'JetBrains Mono',monospace;font-size:30px;font-weight:700;color:var(--text-primary);">--</span>
-                                    <span style="font-size:12px;color:var(--text-muted);margin-top:2px;">km</span>
+                                    <span id="rangeCircleUnit" style="font-size:12px;color:var(--text-muted);margin-top:2px;">km</span>
                                 </div>
                             </div>
                             <div id="rangeDeltaCapsule" class="range-delta-capsule neutral" style="display:none;"></div>
@@ -1686,6 +1701,12 @@
                             <div class="slider-range-labels">
                                 <span>100 MB</span>
                                 <span>100 GB</span>
+                            </div>
+                            <!-- Combined-limit advisory — see recording.html for the
+                                 rationale; same shared renderer, same server payload. -->
+                            <div class="storage-fallback-banner" id="tripBudgetBanner" style="display:none;" role="status" aria-live="polite">
+                                <span class="sd-status-dot" style="background:#f0a020;"></span>
+                                <span data-budget-text></span>
                             </div>
                             <div style="margin-top:12px;display:flex;gap:8px;">
                                 <button class="btn btn-primary" id="storageApplyBtn" onclick="TRIPS.applyStorageSettings()" style="flex:1;" disabled data-i18n="common.apply_changes">Apply Changes</button>
@@ -2060,9 +2081,10 @@
     <script src="../shared/leaflet.js"></script>
     <script src="../shared/auth.js"></script>
     <script src="../shared/pwa-init.js?v=index1"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/trips.js?v=tripsfix2"></script>
+    <script src="../shared/storage-budget.js?v=8"></script>
+    <script src="../shared/trips.js?v=budget9"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

@@ -17,6 +17,7 @@ plus device logs `log_X5RRX996` (Sealion/Tang-class DM-i PHEV, 21.5 kWh nominal,
 | **C2** Fused detect | `ChargingDetector` | `isCharging()` verdict (L1 BMS edge, L2 `Power.isCharging`, L3 inference) |
 | **C3** Resolve | `VehicleDataMonitor.getChargingState()` | `chargingPowerKW` + `isEstimated` |
 | **C4** Estimate | `ChargingPowerEstimator` | SOC/counter-derivative fallback kW |
+| **C4a** Unit calibration | `CounterScaleCalibrator` (fed from `BydDataCollector`, same tick as C4) | per-source register-width factor + pre-verdict suspicion (see I8) |
 | **C5** Persist | `ChargingSessionManager.sampleOnce` → `SocHistoryDatabase` | CPS ramp curve → `energy_added_kwh`, `avg_power_kw`, `session_cost` |
 
 ## Invariants
@@ -54,7 +55,23 @@ plus device logs `log_X5RRX996` (Sealion/Tang-class DM-i PHEV, 21.5 kWh nominal,
   of `dcRate`), and both charging graphs rendered empty. Ordering the UNFLAGGED
   measured-from-counter value first is what restores persistence; re-flagging or reordering it
   back reopens all three symptoms.
-  Those THREE are the only knowingly BEV-visible changes; anything else touching BEV is a
+  **Fourth sanctioned exception — the C3 SCALE gate is PHEV-contained.** `isEstimated` doubles as
+  "do not persist", so any gate that sets it on a BEV reopens the exception above through a second
+  door. The scale gate was the only one of the four unit-ambiguity gates without a `phev` term —
+  `contradictedByCounter`, `shouldWithholdUnverifiedDirectRate` and
+  `shouldDeferExternalToGroundedEstimate` all have one, and `contradictedByCounter` states the
+  reason: a BEV DC session has no observation comparable to the documented EVSE-rated behaviour.
+  Its promise that "the flag clears once a yardstick exists" cannot hold on BEV, because the
+  pack-flow reference runs through `hasComparablePhevPackFlow`, which opens `return phev && ...`;
+  on a trim whose `getChargingCapacity` counter reads a flat 0.000 there is no second yardstick
+  either. A real ~100 kW DC charge (`log_5HVWKT2M`, 59→100%) therefore published a correct 91–104 kW
+  to the card while flagging all 38 ticks estimated, and reproduced the same triple: `peak_power_kw`
+  0, `deriveIsDc` → -1 (`?`, base rate instead of `dcRate`), empty curve. Do NOT re-verify by
+  feeding the ring estimator to `isScaleVerified`: it is a smoothed-window slope, so it lags a
+  stepping rate and 8 of 37 ticks fell outside `DIRECT_SCALE_CORROBORATION_FACTOR` (1.35) at the
+  taper knees, holing the curve and resetting the trapezoid chain at each one. That factor is the
+  bar for LATCHING a divisor; loosening it weakens divisor latching everywhere.
+  Those FOUR are the only knowingly BEV-visible changes; anything else touching BEV is a
   regression.
 - **I2 — Never publish a confidently-wrong measured-looking value.** An honest
   estimate flagged `isEstimated` beats a precise-looking wrong number. A *stuck*
@@ -81,6 +98,18 @@ plus device logs `log_X5RRX996` (Sealion/Tang-class DM-i PHEV, 21.5 kWh nominal,
 - **I7 — V2L / regen is not charging.** Gun state `5` = V2L (pack discharging);
   only `2` (AC), `3` (DC), `4` (AC_DC) are charging-plausible. A falling counter
   is never charging power.
+- **I8 — The yardstick is not exempt from verification.** `getChargingCapacity`'s kWh unit is
+  *documented*, and the whole scale-checking apparatus treated that as proof — `isScaleVerified`
+  returned `true` for `SRC_CAPACITY` unconditionally and `referenceRateKw()` fed its slope to every
+  other source's veto. Log `AL37RNJ9` (BEV, 2026-08-09) disproves the premise: the register advanced
+  10.675 kWh while remaining pack energy advanced 20.200 kWh over the same 1.900 h. Because the
+  faulty source WAS the yardstick, its 5.61 kW slope vetoed the three accessors reading ~10.05 kW
+  (ratio 1.79 > `RATE_VS_COUNTER_MAX_RATIO` 1.35) — the broken sensor suppressed exactly the evidence
+  that would have exposed it, then got priced. Any source used to judge others must itself be
+  judged; `CounterScaleCalibrator` does it against remaining pack energy, which the counter does not
+  feed. **Withholding is the safe direction:** while a fault is suspected but unproven, publish
+  nothing rather than a probably-wrong figure — the cascade falls to another source or a flagged
+  estimate, both recoverable, whereas a factor error is billed.
 
 ## Load-bearing asymmetries (do NOT "simplify")
 
@@ -244,6 +273,45 @@ plus device logs `log_X5RRX996` (Sealion/Tang-class DM-i PHEV, 21.5 kWh nominal,
    handle IDENTITY, not a bare "already done" flag: if the platform genuinely returns new objects
    the old registrations are orphaned and re-registering is mandatory, so only identity
    distinguishes "duplicate" from "required".
+
+24. **A threshold whose denominator the bug corrupts is a ratchet, not a guard.**
+   `SessionEnergyResolver`'s `HALF_SCALE_MAX_RATIO = 0.55` tests `metered / socEstimate`, but
+   `socEstimate` is `socDelta x nominal x SOH/100` — and every halved session drags SOH down, which
+   shrinks the estimate and moves the ratio UP, away from the band. Log `AL37RNJ9` measured 0.58 on a
+   counter independently proven to be running at exactly half: past the band, so the session was
+   priced at ~half AND offered for calibration, where it computed 55.8% pack health (only the
+   `MIN_PLAUSIBLE_SOH_PERCENT` floor rejected it — the guardrail caught it, the logic did not). Each
+   such session makes the next one harder to catch. A scale test must key off something the fault
+   cannot move: hence `counterScaleSuspect`, decided against a register the SOH never touches. The
+   band remains as a fallback, not as the only defence.
+25. **Two figures sharing one fault are not a cross-check — but check which way that fails.**
+   `integrateSessionEnergyKwh` sums the PUBLISHED `power_kw` samples, and the counter's own slope can
+   win the power cascade, so on a half-scale trim the integral is halved too. The instinct is to gate
+   the counter-vs-integral test on independence — but that is **wrong**, and the existing tests catch
+   it: reaching `metered/integrated <= 0.55` REQUIRES the integral to be ~2x the counter, which a
+   contaminated integral cannot be. Contamination costs a MISS, never a false correction, so the test
+   is self-validating and needs no flag; the miss is covered by I8's behavioural verdict instead.
+   Before adding an independence guard, work out whether the shared fault produces a false POSITIVE
+   or merely a false negative — only the former needs gating.
+26. **A cumulative counter's correction belongs at the READ boundary, not inside the accumulator.**
+   `ChargeCounterAccumulator`'s wrap/saturation/reset arithmetic keys off the register's real modulus,
+   and `counter_energy_kwh` round-trips through the database in the counter's own frame — so scaling
+   inside `observe()` would corrupt wrap detection and double-apply on every restore. All four close
+   paths (session end, feature-disable, stale-finalize, live in-progress) therefore convert through
+   one helper (`meteredEnergyKwh` / `correctStoredCounterEnergy`), which is also what keeps the live
+   card from disagreeing with the row it becomes.
+27. **Suspicion floors must clear the registers' quantisation skew.** The two registers step at
+   different quanta (~0.1 kWh vs ~0.2 kWh observed), so whichever ticks first makes the opening ratio
+   wildly wrong on hardware with NO fault — 0.09 against 0.20 reads as 2.2x. Since suspicion
+   *withholds* the published rate, a noise-floor threshold would blank the power card for the first
+   minutes of every charge on healthy trims. `MIN_SUSPICION_KWH = 0.5` per series is deliberately far
+   above `MIN_STEP_KWH`; simulation over the captured series shows the real fault is still suspected
+   at ~6 min and decided at ~21 min, with the correct 10 kW sources covering the interim.
+28. **Process-wide verdict caches leak across test classes.** Gradle shares one JVM, so calibrating
+   the real `SRC_CAPACITY` key in a calibrator test doubled the yardstick for every suite feeding
+   `observeCounterForScale(SRC_CAPACITY, ...)` and failed four unrelated power tests. Use a private
+   source key and reset before AND after each test. Same hazard as `ChargeSourceClassifier`'s
+   persisted verdicts.
 
 ## Accepted bounded residuals
 

@@ -6,7 +6,30 @@
  * Compatibility: Chrome 58+ (BYD DiLink Android 7.1 WebView)
  * - No ES modules, no import maps, no optional chaining, no nullish coalescing
  * - Uses UMD globals: THREE, THREE.GLTFLoader, THREE.OrbitControls, gsap
+ *
+ * LITE MODE: when vehicle-control.html boots with window.VC_LITE (persisted
+ * preference 'vc.viewMode' != 'immersive'), none of the vendor globals exist.
+ * init() takes a controls-only path — no scene, no model, no render loop —
+ * and every control still works (they're plain DOM + fetch).
  */
+
+// ---- Lite-mode THREE stub ----
+// All VFX entry points already no-op without a loaded car model, but several
+// click handlers construct `new THREE.Color(...)` inline as ARGUMENTS —
+// evaluated before the callee's guard can bail. This inert Color stub absorbs
+// those constructions in lite mode; nothing else from THREE is reachable
+// (initThreeJS / loadModel / animate are skipped entirely). Scoped strictly
+// to VC_LITE so immersive keeps real failure detection ("3D engine failed to
+// load") when the vendor bundle is genuinely missing.
+if (window.VC_LITE && typeof THREE === 'undefined') {
+    window.THREE = {
+        _vcLiteStub: true,
+        Color: function () {
+            this.convertSRGBToLinear = function () { return this; };
+            this.copy = function () { return this; };
+        }
+    };
+}
 
 var VC = {
     // Three.js core (initialized in init())
@@ -39,13 +62,42 @@ var VC = {
         acTemp: 22,
         acFan: 3,
         seatHeat: [0, 0],  // [driver, passenger]; 0=off, 1=low, 2=high
-        seatCool: [0, 0]
+        seatCool: [0, 0],
+        // null = not read yet. The wheel heater is on/off only (no low/high), and
+        // an unread state must not render as "off" — see updateSteeringHeatUI.
+        steeringHeat: null,
+        // Cloud-only readback; null until a fresh snapshot reports it.
+        batteryHeat: null
     },
 
     pollInterval: null,
     cloudStatusInterval: null,
     cloudLockInterval: null,
     _toastTimer: null,
+    // Command and fetch generations keep an older asynchronous result from
+    // overwriting a newer action or a user edit.
+    _windowCommandRevisions: {},
+    _climatePowerRevision: 0,
+    _climateTempRevision: 0,
+    _climateFanRevision: 0,
+    _climatePending: { power: 0, temp: 0, fan: 0 },
+    _seatCommandRevision: 0,
+    _seatPending: 0,
+    _steeringHeatRevision: 0,
+    _steeringHeatPending: 0,
+    _batteryHeatRevision: 0,
+    _batteryHeatPending: 0,
+    _climateScheduleRevision: 0,
+    _climateScheduleFetchRevision: 0,
+    _climateScheduleDirty: false,
+    _climateSchedulePending: null,
+    _chargeCapRevision: 0,
+    _chargeCapFetchRevision: 0,
+    _chargeCapPendingRevision: 0,
+    _chargingScheduleRevision: 0,
+    _chargingScheduleFetchRevision: 0,
+    _scheduleDirty: false,
+    _smartChargePending: null,
     stateGlows: {},  // persistent glow lights keyed by position name
     _3dViewActive: false,
     _skySphere: null,
@@ -81,6 +133,9 @@ var VC = {
 
     init: function() {
         var self = this;
+        // Lite = controls-only boot. Set FIRST so every later branch (and
+        // any handler that fires early) can consult it.
+        this.liteMode = !!window.VC_LITE;
         // Model ids are global, but their badges can be market-specific
         // (for example, Seagull is sold as Dolphin Mini in Brazil). Refresh
         // the already-built picker when the user changes the web locale.
@@ -95,20 +150,30 @@ var VC = {
                 self.updateCloudControlAvailability();
             });
         }
-        // Default: Aurora White (converted to linear so it matches the rest
-        // of the colour pipeline; see applyColor() for the rationale).
-        this.baseColor = new THREE.Color(0xE8E8EC).convertSRGBToLinear();
-        this.initThreeJS();
-        this.initColorPicker();
+        if (this.liteMode) {
+            this.initLiteMode();
+        } else {
+            // Default: Aurora White (converted to linear so it matches the rest
+            // of the colour pipeline; see applyColor() for the rationale).
+            this.baseColor = new THREE.Color(0xE8E8EC).convertSRGBToLinear();
+            this.initThreeJS();
+            this.initColorPicker();
+        }
         this.bindControls();
         this.startStateSync();
         this.startCloudStatusSync();
         this.requestCloudLockRefresh();
         this.startCloudLockSync();
-        this.animate();
-        this.init3dButton();
+        if (!this.liteMode) {
+            this.animate();
+            this.init3dButton();
+        }
         this.initCloudModal();
         this.initVisibilitySync();
+        this.initViewModeToggle();
+        // Lite stops here: no appearance manifest, no persisted-model fetch,
+        // no GLB download — the entire block below belongs to the 3D scene.
+        if (this.liteMode) return;
 
         // Vehicle appearance (model + color) is stored unified server-side so AVN
         // and phone-over-tunnel access show the same car. Fetch manifest + persisted
@@ -149,6 +214,52 @@ var VC = {
         // We deliberately do NOT kick off a model reload here — the user's current
         // selection is still valid; if they want the new model they'll pick it.
         this._kickManifestRefresh();
+    },
+
+    // ==================== LITE MODE ====================
+
+    /**
+     * Controls-only viewport chrome. The html.vc-mode-lite CSS already
+     * swaps the canvas for the static hero before first paint; this hides
+     * the engine-owned affordances (loading overlay, paint/model pickers,
+     * 3D surround toggle) that have no meaning without a scene. Inline
+     * styles as belt-and-braces alongside the CSS rules.
+     */
+    initLiteMode: function() {
+        var loading = document.getElementById('vcLoading');
+        if (loading) loading.style.display = 'none';
+        var hide = ['colorPicker', 'modelPicker', 'btn3dView'];
+        for (var i = 0; i < hide.length; i++) {
+            var el = document.getElementById(hide[i]);
+            if (el) el.style.display = 'none';
+        }
+    },
+
+    /**
+     * Lite ↔ immersive switcher. Persists to localStorage 'vc.viewMode'
+     * (read by the vehicle-control.html bootstrap on every load) then does
+     * a full reload — the honest switch: the vendor bundle is loaded (or
+     * dropped) and the page boots cleanly in the target mode, with no
+     * half-torn GL context or injected-script ordering races. Null-safe:
+     * without the button (older cached HTML) nothing binds and both modes
+     * keep working.
+     */
+    initViewModeToggle: function() {
+        var self = this;
+        var btn = document.getElementById('btnViewMode');
+        if (!btn) return;
+        var label = document.getElementById('btnViewModeLabel');
+        if (label) label.textContent = this.liteMode ? 'Immersive' : 'Lite';
+        btn.title = this.liteMode
+            ? 'Switch to immersive 3D view'
+            : 'Switch to lightweight view';
+        btn.addEventListener('click', function() {
+            try {
+                localStorage.setItem(
+                    'vc.viewMode', self.liteMode ? 'immersive' : 'lite');
+            } catch (e) {}
+            location.reload();
+        });
     },
 
     _kickManifestRefresh: function() {
@@ -1421,13 +1532,19 @@ var VC = {
         // Open the panel container — Windows needs extra vertical space for
         // the per-window preset rows.
         panel.classList.add('open');
-        // Tall panels: Windows (4×5 preset grid), Charging (schedule + cap stacked).
-        if (panelId === 'panelWindows' || panelId === 'panelCharging') panel.classList.add('vc-panel-tall');
-        else panel.classList.remove('vc-panel-tall');
+        // Tall panels: Windows (4×5 preset grid), Charging (schedule + cap stacked),
+        // Climate (controls + remote preconditioning row).
+        if (panelId === 'panelWindows' || panelId === 'panelCharging'
+                || panelId === 'panelClimate') {
+            panel.classList.add('vc-panel-tall');
+        } else panel.classList.remove('vc-panel-tall');
         this._activePanel = panelId;
         if (panelId === 'panelCharging') {
             this.fetchChargingSchedule();
             this.fetchChargeCap();
+        }
+        if (panelId === 'panelClimate') {
+            this.fetchClimateSchedule();
         }
         if (panelId === 'panelSound') {
             this.fetchEngineSoundState();
@@ -1532,12 +1649,10 @@ var VC = {
             });
         });
 
-        // Trunk open — composite: cloud unlock → SDK tailgate motor.
+        // Trunk open — use the local motor when the vehicle is awake; the
+        // router only requests cloud if it actually needs the remote fallback.
         this.bindBtn('btnTrunkOpen', function() {
-            if (!self.requireCloud()) return;
             self.setPending('btnTrunkOpen', true);
-            self.toast(BYD.i18n.t('vehicle.unlocking_car'), 'info');
-            self.triggerUnlockVFX();
             self.apiPost('/api/vehicle/trunk', { action: 'open' }).then(function(result) {
                 self.setPending('btnTrunkOpen', false);
                 if (result.success) self.triggerTrunkVFX(true);
@@ -1580,21 +1695,33 @@ var VC = {
             });
         });
 
-        // Battery preconditioning heat — cloud-only. We render the toggle
-        // optimistically; the server message resolves cloud-required prompt
-        // automatically when not connected (per memory: tap-to-discover).
+        // Battery preconditioning heat — cloud-only in both directions. The state
+        // now comes from the cloud snapshot via /api/vehicle/state, so the tile
+        // reflects reality across reloads; previously it was write-only, and after
+        // a reload every tap re-sent "on" with no way to switch it off.
         this.bindBtn('btnBatteryHeat', function() {
             if (!self.requireCloud()) return;
             var current = !!(self.vehicleState && self.vehicleState.batteryHeat);
             var next = !current;
+            var revision = ++self._batteryHeatRevision;
+            self._batteryHeatPending = revision;
             self.setPending('btnBatteryHeat', true);
             self.apiPost('/api/vehicle/battery-heat', { enabled: next }).then(function(result) {
+                if (revision !== self._batteryHeatRevision) return;
+                self._batteryHeatPending = 0;
                 self.setPending('btnBatteryHeat', false);
                 if (result.success) {
                     if (!self.vehicleState) self.vehicleState = {};
                     self.vehicleState.batteryHeat = next;
+                    self.updateBatteryHeatUI();
                 }
                 self.toastFromResult(result, BYD.i18n.t('vehicle_control.battery_heat_label'), null);
+            }).catch(function(e) {
+                if (revision !== self._batteryHeatRevision) return;
+                self._batteryHeatPending = 0;
+                self.setPending('btnBatteryHeat', false);
+                self.toastFromResult({ success: false, error: e.message }, null,
+                    BYD.i18n.t('vehicle_control.battery_heat_label'));
             });
         });
 
@@ -1612,19 +1739,25 @@ var VC = {
                         btn.addEventListener('click', function() {
                             var target = parseInt(btn.getAttribute('data-preset'), 10);
                             var current = self.vehicleState.windows[area];
-                            // VFX: only show direction if we know the current
-                            // position; otherwise skip the animation (target
-                            // alone doesn't tell us which way it'll move).
-                            if (typeof current === 'number' && current >= 0) {
-                                if (Math.abs(current - target) > 5) {
-                                    self.triggerWindowVFX(area, target > current);
-                                }
-                            }
-                            // Visually mark the chosen preset; live position
-                            // tracking will reconcile this on the next state poll.
-                            self.markWindowPreset(area, target);
+                            var revision = (self._windowCommandRevisions[area] || 0) + 1;
+                            self._windowCommandRevisions[area] = revision;
                             self.apiPost('/api/vehicle/window',
-                                { area: areaNum, targetPercent: target });
+                                { area: areaNum, targetPercent: target }).then(function(result) {
+                                if (self._windowCommandRevisions[area] !== revision) return;
+                                if (result && result.success) {
+                                    // Only animate and select a target once the server accepted it.
+                                    // A later live position update remains authoritative.
+                                    if (typeof current === 'number' && current >= 0
+                                            && Math.abs(current - target) > 5) {
+                                        self.triggerWindowVFX(area, target > current);
+                                    }
+                                    self.markWindowPreset(area, target);
+                                } else {
+                                    self.updateWindowBars();
+                                    self.fetchState();
+                                }
+                                self.toastFromResult(result, null, null);
+                            });
                         });
                     })(presets[pi]);
                 }
@@ -1635,15 +1768,35 @@ var VC = {
         // (per-window % requires per-window polling, no SDK batch primitive).
         // Loop over the 4 side windows only — `area:0` does not control sunroof/sunshade.
         this.bindBtn('btnWinAllOpen', function() {
-            for (var j = 0; j < 4; j++) self.triggerWindowVFX(areas[j], true);
-            self.apiPost('/api/vehicle/window', { area: 0, command: 1 });
-            self.toast(BYD.i18n.t('vehicle.windows_all_opening'), 'info');
+            self.apiPost('/api/vehicle/window', { area: 0, command: 1 }).then(function(result) {
+                if (result.success) {
+                    for (var j = 0; j < 4; j++) self.triggerWindowVFX(areas[j], true);
+                }
+                self.toastFromResult(result, BYD.i18n.t('vehicle.windows_all_opening'),
+                    BYD.i18n.t('vehicle.windows_all_opening'));
+            });
         });
-        // Routed CLOUD_FIRST on the server (area=0+command=2 → CLOSEWINDOW),
-        // so this works while the car is asleep with SDK fallback.
+        // OPENWINDOW has only a ventilation-crack semantic in the BYD cloud.
+        // It is deliberately separate from the all-open control above, and is
+        // cloud-only — the neighbouring 0/100 presets have local SDK paths, this
+        // one does not, so it explains itself instead of failing opaquely.
+        this.bindBtn('btnWinAllVent', function() {
+            if (!self.requireCloud()) return;
+            self.apiPost('/api/vehicle/window', { action: 'vent' }).then(function(result) {
+                if (result.success) {
+                    for (var j = 0; j < 4; j++) self.triggerWindowVFX(areas[j], true);
+                }
+                self.toastFromResult(result,
+                    BYD.i18n.t('vehicle.windows_venting'),
+                    BYD.i18n.t('vehicle.windows_vent_failed'));
+            });
+        });
+        // Routed SDK_FIRST on the server, with CLOSEWINDOW only as a fallback.
         this.bindBtn('btnWinAllClose', function() {
-            for (var j = 0; j < 4; j++) self.triggerWindowVFX(areas[j], false);
             self.apiPost('/api/vehicle/window', { area: 0, command: 2 }).then(function(result) {
+                if (result.success) {
+                    for (var j = 0; j < 4; j++) self.triggerWindowVFX(areas[j], false);
+                }
                 self.toastFromResult(result, BYD.i18n.t('vehicle.windows_all_closing'), BYD.i18n.t('vehicle.windows_all_closing'));
             });
         });
@@ -1721,20 +1874,46 @@ var VC = {
                 endChargeTime: '06:00',
                 chargeWay: 'e',
                 untilFull: false,
-                days: []
+                days: [],
+                smartJourneyDto: null,
+                supported: null
             };
         }
         // Master switch — wraps changeChargeStatue.
         this.bindBtn('btnSmartChargeToggle', function() {
             if (!self.requireCloud()) return;
+            if (!self.beginSmartChargeRequest('toggle', 'btnSmartChargeToggle')) return;
             var cur = !!(self.vehicleState.chargingSchedule && self.vehicleState.chargingSchedule.enabled);
             var enable = !cur;
             self.apiPost('/api/vehicle/charging-schedule', { enabled: enable }).then(function(result) {
-                if (result.success) {
-                    self.vehicleState.chargingSchedule.enabled = enable;
-                    self.updateChargingUI();
+                if (self.finishSmartChargeRequest('toggle')) {
+                    if (result.success) {
+                        self.vehicleState.chargingSchedule.enabled = enable;
+                        self.updateChargingUI();
+                    }
+                    self.toastFromResult(result, null, null);
                 }
-                self.toastFromResult(result, null, null);
+            }).catch(function(e) {
+                if (self.finishSmartChargeRequest('toggle')) {
+                    self.toastFromResult({ success: false, error: e.message }, null, null);
+                }
+            });
+        });
+        // Immediate charge start is terminally confirmed by the cloud. There
+        // is intentionally no paired "stop now" button: BYD can acknowledge
+        // status=0 without actually stopping an active charge session.
+        this.bindBtn('btnStartCharging', function() {
+            if (!self.requireCloud()) return;
+            if (!self.beginSmartChargeRequest('start', 'btnStartCharging')) return;
+            self.apiPost('/api/vehicle/start-charging', {}).then(function(result) {
+                if (self.finishSmartChargeRequest('start')) {
+                    self.toastFromResult(result, null, null);
+                    if (result.success) self.fetchChargingSchedule();
+                }
+            }).catch(function(e) {
+                if (self.finishSmartChargeRequest('start')) {
+                    self.toastFromResult({ success: false, error: e.message }, null, null);
+                }
             });
         });
         // Repeat segmented control — three exclusive modes.
@@ -1745,6 +1924,7 @@ var VC = {
         for (var i = 0; i < segs.length; i++) {
             (function(seg) {
                 seg.addEventListener('click', function() {
+                    if (self._smartChargePending) return;
                     var mode = seg.getAttribute('data-mode');
                     var s = self.vehicleState.chargingSchedule;
                     if (mode === 'once') { s.chargeWay = 's'; s.days = []; }
@@ -1756,6 +1936,7 @@ var VC = {
                         }
                         s.chargeWay = self._computeCustomChargeWay(s.days);
                     }
+                    self.markScheduleDirty();
                     self.updateChargingUI();
                 });
             })(segs[i]);
@@ -1767,6 +1948,7 @@ var VC = {
             for (var j = 0; j < chips.length; j++) {
                 (function(chip) {
                     chip.addEventListener('click', function() {
+                        if (self._smartChargePending) return;
                         var day = parseInt(chip.getAttribute('data-day'), 10);
                         var s = self.vehicleState.chargingSchedule;
                         if (!s.days) s.days = [];
@@ -1775,6 +1957,7 @@ var VC = {
                         else s.days.push(day);
                         s.days.sort(function(a, b) { return a - b; });
                         s.chargeWay = self._computeCustomChargeWay(s.days);
+                        self.markScheduleDirty();
                         self.updateChargingUI();
                     });
                 })(chips[j]);
@@ -1782,32 +1965,39 @@ var VC = {
         }
         // "Until full" preset → endChargeTime sentinel.
         this.bindBtn('btnChargeUntilFull', function() {
+            if (self._smartChargePending) return;
             var s = self.vehicleState.chargingSchedule;
             s.untilFull = !s.untilFull;
+            self.markScheduleDirty();
             self.updateChargingUI();
         });
         // Time inputs — write directly to local state; no API call until Save.
         var startInput = document.getElementById('chargeStartTime');
         if (startInput) {
             startInput.addEventListener('change', function() {
+                if (self._smartChargePending) return;
                 self.vehicleState.chargingSchedule.startChargeTime = startInput.value || '22:00';
+                self.markScheduleDirty();
             });
         }
         var endInput = document.getElementById('chargeEndTime');
         if (endInput) {
             endInput.addEventListener('change', function() {
+                if (self._smartChargePending) return;
                 self.vehicleState.chargingSchedule.endChargeTime = endInput.value || '06:00';
                 // Editing the time clears the "until full" sentinel.
                 if (self.vehicleState.chargingSchedule.untilFull) {
                     self.vehicleState.chargingSchedule.untilFull = false;
                     self.updateChargingUI();
                 }
+                self.markScheduleDirty();
             });
         }
         // Save — writes saveOrUpdate. Schedule save carries its own status,
         // so the master toggle isn't a precondition.
         this.bindBtn('btnChargeScheduleSave', function() {
             if (!self.requireCloud()) return;
+            if (self._smartChargePending) return;
             var s = self.vehicleState.chargingSchedule;
             var way = s.chargeWay || 'e';
             // Custom mode with no days picked is a no-op — refuse to send.
@@ -1824,14 +2014,23 @@ var VC = {
                 chargeWay: way,
                 enabled: s.enabled !== false
             };
+            if (!self.beginSmartChargeRequest('save', 'btnChargeScheduleSave')) return;
             self.apiPost('/api/vehicle/charging-schedule', payload).then(function(result) {
-                if (result.success) {
-                    s.enabled = payload.enabled;
-                    self.updateChargingUI();
+                if (self.finishSmartChargeRequest('save')) {
+                    if (result.success) {
+                        s.enabled = payload.enabled;
+                        self._scheduleDirty = false;
+                        self.updateChargingUI();
+                    }
+                    self.toastFromResult(result,
+                        BYD.i18n.t('vehicle_control.schedule_saved'),
+                        BYD.i18n.t('vehicle_control.schedule_save_failed'));
                 }
-                self.toastFromResult(result,
-                    BYD.i18n.t('vehicle_control.schedule_saved'),
-                    BYD.i18n.t('vehicle_control.schedule_save_failed'));
+            }).catch(function(e) {
+                if (self.finishSmartChargeRequest('save')) {
+                    self.toastFromResult({ success: false, error: e.message },
+                        null, BYD.i18n.t('vehicle_control.schedule_save_failed'));
+                }
             });
         });
         this.fetchChargingSchedule();
@@ -1842,45 +2041,92 @@ var VC = {
         // doesn't honor the value (the documented Seal HAL behavior) the GET
         // returns supported=false and we hide the section.
         if (!this.vehicleState.chargeCap) {
-            this.vehicleState.chargeCap = { percent: 70, enabled: null, supported: null };
+            this.vehicleState.chargeCap = { percent: null, enabled: null, supported: null };
         }
         this.bindBtn('btnChargeCapToggle', function() {
             var s = self.vehicleState.chargeCap;
             var enable = !s.enabled;
+            var revision = ++self._chargeCapRevision;
+            self._chargeCapPendingRevision = revision;
             self.apiPost('/api/vehicle/charge-cap', { enabled: enable }).then(function(result) {
-                if (result.success) {
-                    s.enabled = enable;
+                if (revision !== self._chargeCapRevision) return;
+                self._chargeCapPendingRevision = 0;
+                if (result && result.success) {
+                    s.enabled = typeof result.enabled === 'boolean' ? result.enabled : null;
                     if (typeof result.supported === 'boolean') s.supported = result.supported;
+                    if (typeof result.minimumPercent === 'number') s.minimumPercent = result.minimumPercent;
+                    if (typeof result.maximumPercent === 'number') s.maximumPercent = result.maximumPercent;
+                    if (typeof result.controlKind === 'string') s.controlKind = result.controlKind;
                     self.updateChargeCapUI();
+                } else {
+                    // The toggle has no optimistic state, but a failed response can
+                    // invalidate capability/readback state. Reconcile it exactly as
+                    // a rejected request does, while this revision still owns the UI.
+                    self.updateChargeCapUI();
+                    self.fetchChargeCap();
                 }
                 self.toastFromResult(result, null, null);
+            }).catch(function(e) {
+                if (revision !== self._chargeCapRevision) return;
+                self._chargeCapPendingRevision = 0;
+                self.updateChargeCapUI();
+                self.fetchChargeCap();
+                self.toastFromResult({ success: false, error: e.message }, null, null);
             });
         });
         var capSlider = document.getElementById('chargeCapSlider');
         if (capSlider) {
             var capDebounce = null;
+            var capRevision = 0;
             capSlider.addEventListener('input', function() {
                 var v = parseInt(capSlider.value, 10);
-                self.vehicleState.chargeCap.percent = v;
+                var revision = ++capRevision;
+                var stateRevision = ++self._chargeCapRevision;
+                self._chargeCapPendingRevision = stateRevision;
                 var readout = document.getElementById('chargeCapReadout');
                 if (readout) readout.textContent = v + '%';
                 if (capDebounce) clearTimeout(capDebounce);
                 capDebounce = setTimeout(function() {
                     self.apiPost('/api/vehicle/charge-cap', { percent: v }).then(function(result) {
+                        // A newer drag supersedes this request's visual result.
+                        // The later request is responsible for publishing the
+                        // currently selected verified charge-stop limit.
+                        if (revision !== capRevision || stateRevision !== self._chargeCapRevision) return;
+                        self._chargeCapPendingRevision = 0;
                         if (result.success) {
-                            // The server echoes the EFFECTIVE cap — the SOC-target
-                            // path caps at 70, so a requested 90 may come back 70.
-                            // Reflect the truth in the slider/readout.
+                            // Only reflect a charge-stop value confirmed by the
+                            // server's direct register readback.
                             if (typeof result.percent === 'number'
-                                    && result.percent >= 15 && result.percent <= 100) {
+                                    && result.percent >= 50 && result.percent <= 100) {
                                 self.vehicleState.chargeCap.percent = result.percent;
                             }
                             if (typeof result.supported === 'boolean') {
                                 self.vehicleState.chargeCap.supported = result.supported;
                             }
+                            if (typeof result.minimumPercent === 'number') {
+                                self.vehicleState.chargeCap.minimumPercent = result.minimumPercent;
+                            }
+                            if (typeof result.maximumPercent === 'number') {
+                                self.vehicleState.chargeCap.maximumPercent = result.maximumPercent;
+                            }
+                            if (typeof result.controlKind === 'string') {
+                                self.vehicleState.chargeCap.controlKind = result.controlKind;
+                            }
                             self.updateChargeCapUI();
+                        } else {
+                            // The state remains the last direct-readback value;
+                            // restore it before an optional refresh that may fail.
+                            self.updateChargeCapUI();
+                            self.fetchChargeCap();
                         }
                         self.toastFromResult(result, null, null);
+                    }).catch(function(e) {
+                        if (revision !== capRevision || stateRevision !== self._chargeCapRevision) return;
+                        self._chargeCapPendingRevision = 0;
+                        console.debug('[VC] charge-cap POST threw', e);
+                        // Keep a rejected request from leaving its drag preview
+                        // in the DOM when no response object is available.
+                        self.updateChargeCapUI();
                     });
                 }, 350);
             });
@@ -1888,57 +2134,245 @@ var VC = {
         this.fetchChargeCap();
 
         // === CLIMATE CONTROLS ===
+        function submitClimateValue(field, next, request) {
+            var property = field === 'temp' ? 'acTemp' : 'acFan';
+            var previous = self.vehicleState[property];
+            var revision = self.beginClimateMutation(field);
+            self.vehicleState[property] = next;
+            self.updateClimateUI();
+            self.apiPost('/api/vehicle/climate', request).then(function(result) {
+                if (!self.finishClimateMutation(field, revision)) return;
+                if (!result || !result.success) {
+                    self.vehicleState[property] = previous;
+                    self.updateClimateUI();
+                    self.fetchState();
+                    self.toastFromResult(result || { success: false },
+                        null, BYD.i18n.t('vehicle.ac_command_failed'));
+                }
+            }).catch(function(e) {
+                if (!self.finishClimateMutation(field, revision)) return;
+                self.vehicleState[property] = previous;
+                self.updateClimateUI();
+                self.fetchState();
+                self.toastFromResult({ success: false, error: e.message },
+                    null, BYD.i18n.t('vehicle.ac_command_failed'));
+            });
+        }
+
+        function submitClimatePower(next, request) {
+            var previous = self.vehicleState.acOn;
+            var revision = self.beginClimateMutation('power');
+            self.apiPost('/api/vehicle/climate', request).then(function(result) {
+                if (!self.finishClimateMutation('power', revision)) return;
+                self.vehicleState.acOn = result && result.success ? next : previous;
+                self.updateClimateUI();
+                if (!result || !result.success) self.fetchState();
+                self.toastFromResult(result || { success: false },
+                    next ? BYD.i18n.t('vehicle.ac_on') : BYD.i18n.t('vehicle.ac_off'),
+                    BYD.i18n.t('vehicle.ac_command_failed'));
+            }).catch(function(e) {
+                if (!self.finishClimateMutation('power', revision)) return;
+                self.vehicleState.acOn = previous;
+                self.updateClimateUI();
+                self.fetchState();
+                self.toastFromResult({ success: false, error: e.message },
+                    null, BYD.i18n.t('vehicle.ac_command_failed'));
+            });
+        }
+
         this.bindBtn('btnAcOn', function() {
             self.triggerSonarVFX(0, 0.6, 0.2, new THREE.Color(0x38BDF8));
             self.triggerSonarVFX(0, 0.6, -0.2, new THREE.Color(0x38BDF8));
             self.flashBodyColor(new THREE.Color(0x38BDF8), 0.1, 2, null);
-            self.apiPost('/api/vehicle/climate', { action: 'power_on', temp: self.vehicleState.acTemp }).then(function(r) {
-                if (r.success) { self.vehicleState.acOn = true; self.updateClimateUI(); }
-                self.toastFromResult(r, BYD.i18n.t('vehicle.ac_on'), BYD.i18n.t('vehicle.ac_command_failed'));
+            // remoteDurationMinutes only bites when the car is asleep and the router
+            // falls through to OPENAIR — a timed remote session. It shares BYD's
+            // timeSpan wire field with the booking below, so one control sets both
+            // rather than the page hardcoding the 20-minute default.
+            submitClimatePower(true, {
+                action: 'power_on',
+                temp: self.vehicleState.acTemp,
+                remoteDurationMinutes: self._remoteSessionMinutes()
             });
         });
         this.bindBtn('btnAcOff', function() {
             self.flashBodyColor(new THREE.Color(0x71717A), 0.15, 1, null);
-            self.apiPost('/api/vehicle/climate', { action: 'power_off' }).then(function(r) {
-                if (r.success) { self.vehicleState.acOn = false; self.updateClimateUI(); }
-                self.toastFromResult(r, BYD.i18n.t('vehicle.ac_off'), BYD.i18n.t('vehicle.ac_command_failed'));
-            });
+            submitClimatePower(false, { action: 'power_off' });
         });
         this.bindBtn('btnTempUp', function() {
             var t = Math.min(33, self.vehicleState.acTemp + 1);
-            self.vehicleState.acTemp = t;
-            self.updateClimateUI();
             // Warm pulse for temp up
             self.triggerSonarVFX(0, 0.6, 0, new THREE.Color(t > 25 ? 0xFF6B35 : 0x38BDF8));
-            self.apiPost('/api/vehicle/climate', { action: 'set_temp', zone: 1, temp: t });
+            submitClimateValue('temp', t, { action: 'set_temp', zone: 1, temp: t });
         });
         this.bindBtn('btnTempDown', function() {
             var t = Math.max(17, self.vehicleState.acTemp - 1);
-            self.vehicleState.acTemp = t;
-            self.updateClimateUI();
             // Cool pulse for temp down
             self.triggerSonarVFX(0, 0.6, 0, new THREE.Color(t < 20 ? 0x38BDF8 : 0x00D4AA));
-            self.apiPost('/api/vehicle/climate', { action: 'set_temp', zone: 1, temp: t });
+            submitClimateValue('temp', t, { action: 'set_temp', zone: 1, temp: t });
         });
         this.bindBtn('btnFanUp', function() {
             var f = Math.min(7, self.vehicleState.acFan + 1);
-            self.vehicleState.acFan = f;
-            self.updateClimateUI();
             // Multiple sonar rings for higher fan — more rings = more wind
             for (var fi = 0; fi < Math.min(f, 3); fi++) {
                 (function(delay) {
                     setTimeout(function() { self.triggerSonarVFX(0, 0.5, 0.3 - delay * 0.3, new THREE.Color(0x00D4AA)); }, delay * 80);
                 })(fi);
             }
-            self.apiPost('/api/vehicle/climate', { action: 'set_fan', fan: f });
+            submitClimateValue('fan', f, { action: 'set_fan', fan: f });
         });
         this.bindBtn('btnFanDown', function() {
             var f = Math.max(1, self.vehicleState.acFan - 1);
-            self.vehicleState.acFan = f;
-            self.updateClimateUI();
             self.triggerSonarVFX(0, 0.5, 0, new THREE.Color(0x52525B));
-            self.apiPost('/api/vehicle/climate', { action: 'set_fan', fan: f });
+            submitClimateValue('fan', f, { action: 'set_fan', fan: f });
         });
+
+        // === REMOTE PRECONDITIONING SCHEDULE (cloud BOOKINGAIR) ===
+        // One booking: time-of-day + whole-degree temp + one of five OEM session
+        // lengths. Editing an existing booking sends "update" with its id; Save
+        // with no known id sends "create". Cloud-only — no SDK equivalent exists.
+        if (!this.vehicleState.climateSchedule) {
+            this.vehicleState.climateSchedule = {
+                bookingId: null,
+                time: '07:30',
+                temp: 22,
+                durationMinutes: 20,
+                supported: null,
+                // Cloud accepted a booking but reported no id for it — see the note
+                // rendering in updateClimateScheduleUI.
+                savedUnconfirmed: false,
+                reportedTime: null,
+                reportedTemp: null,
+                reportedDuration: null
+            };
+        }
+        var bookingTimeInput = document.getElementById('climateBookingTime');
+        if (bookingTimeInput) {
+            bookingTimeInput.addEventListener('change', function() {
+                if (self._climateSchedulePending) return;
+                self.vehicleState.climateSchedule.time = bookingTimeInput.value || '07:30';
+                self._climateScheduleDirty = true;
+            });
+        }
+        var durationSegs = document.querySelectorAll('#climateDurationSegmented .vc-seg');
+        for (var di = 0; di < durationSegs.length; di++) {
+            (function(seg) {
+                seg.addEventListener('click', function() {
+                    if (self._climateSchedulePending) return;
+                    var minutes = parseInt(seg.getAttribute('data-duration'), 10);
+                    if (isNaN(minutes)) return;
+                    self.vehicleState.climateSchedule.durationMinutes = minutes;
+                    self._climateScheduleDirty = true;
+                    self.updateClimateScheduleUI();
+                });
+            })(durationSegs[di]);
+        }
+        // BOOKINGAIR accepts whole degrees 15..31 — a narrower band than the local
+        // dial's 17..33, so clamp to the cloud's domain rather than the dial's.
+        this.bindBtn('btnBookingTempUp', function() {
+            if (self._climateSchedulePending) return;
+            var s = self.vehicleState.climateSchedule;
+            s.temp = Math.min(31, (s.temp || 22) + 1);
+            self._climateScheduleDirty = true;
+            self.updateClimateScheduleUI();
+        });
+        this.bindBtn('btnBookingTempDown', function() {
+            if (self._climateSchedulePending) return;
+            var s = self.vehicleState.climateSchedule;
+            s.temp = Math.max(15, (s.temp || 22) - 1);
+            self._climateScheduleDirty = true;
+            self.updateClimateScheduleUI();
+        });
+        this.bindBtn('btnClimateScheduleSave', function() {
+            if (!self.requireCloud()) return;
+            if (self._climateSchedulePending) return;
+            var s = self.vehicleState.climateSchedule;
+            var epoch = self._nextOccurrenceEpochSeconds(s.time);
+            if (epoch === null) {
+                self.toastFromResult({ success: false,
+                    error: BYD.i18n.t('vehicle.precondition_bad_time') }, null, null);
+                return;
+            }
+            var payload = {
+                action: s.bookingId ? 'update' : 'create',
+                bookingTime: epoch,
+                temp: s.temp || 22,
+                durationMinutes: s.durationMinutes || 20
+            };
+            var wasUpdate = !!s.bookingId;
+            if (wasUpdate) payload.bookingId = s.bookingId;
+            if (!self.beginClimateScheduleRequest('save', 'btnClimateScheduleSave')) return;
+            self.apiPost('/api/vehicle/climate-schedule', payload).then(function(result) {
+                if (!self.finishClimateScheduleRequest('save')) return;
+                if (result && result.success) {
+                    // A create is not echoed an id (BYD's response body isn't surfaced),
+                    // so the id is learned from the follow-up list read below. When the
+                    // server DOES echo one it is decimal TEXT — 64-bit booking ids exceed
+                    // JS's exact-integer range, so never coerce to Number.
+                    if (typeof result.bookingId === 'string' && result.bookingId) {
+                        s.bookingId = result.bookingId;
+                    }
+                    // Cleared again by the list read below if it returns a real id.
+                    s.savedUnconfirmed = !s.bookingId;
+                    self._climateScheduleDirty = false;
+                    self.updateClimateScheduleUI();
+                    self.fetchClimateSchedule();
+                } else if (wasUpdate) {
+                    // An update against an id the cloud no longer honours would fail
+                    // identically forever, and Clear would fail too — the editor would be
+                    // wedged for the session. Drop the id so the next Save creates afresh,
+                    // and re-read to recover the real one if the booking does still exist.
+                    s.bookingId = null;
+                    s.reportedTime = null;
+                    s.reportedTemp = null;
+                    s.reportedDuration = null;
+                    // The user's pending edit is preserved, but the dirty flag must not
+                    // keep blocking the reconciling read.
+                    self._climateScheduleDirty = false;
+                    self.updateClimateScheduleUI();
+                    self.fetchClimateSchedule();
+                }
+                self.toastFromResult(result || { success: false },
+                    BYD.i18n.t('vehicle.precondition_saved'),
+                    BYD.i18n.t('vehicle.precondition_save_failed'));
+            }).catch(function(e) {
+                if (!self.finishClimateScheduleRequest('save')) return;
+                self.toastFromResult({ success: false, error: e.message },
+                    null, BYD.i18n.t('vehicle.precondition_save_failed'));
+            });
+        });
+        this.bindBtn('btnClimateScheduleClear', function() {
+            if (!self.requireCloud()) return;
+            if (self._climateSchedulePending) return;
+            var s = self.vehicleState.climateSchedule;
+            // Delete is only meaningful against a known id. The button is hidden
+            // without one, so this is a guard, not a reachable UI state.
+            if (!s.bookingId) return;
+            if (!self.beginClimateScheduleRequest('clear', 'btnClimateScheduleClear')) return;
+            self.apiPost('/api/vehicle/climate-schedule',
+                { action: 'delete', bookingId: s.bookingId }).then(function(result) {
+                if (!self.finishClimateScheduleRequest('clear')) return;
+                // Either the delete succeeded, or the id is one the cloud will not act
+                // on — in both cases keeping it would only wedge every later Save and
+                // Clear against a booking we cannot address. Drop it and re-read; a
+                // booking that genuinely survives comes back with its real id.
+                s.bookingId = null;
+                s.reportedTime = null;
+                s.reportedTemp = null;
+                s.reportedDuration = null;
+                s.savedUnconfirmed = false;
+                self._climateScheduleDirty = false;
+                self.updateClimateScheduleUI();
+                self.fetchClimateSchedule();
+                self.toastFromResult(result || { success: false },
+                    BYD.i18n.t('vehicle.precondition_cleared'),
+                    BYD.i18n.t('vehicle.precondition_clear_failed'));
+            }).catch(function(e) {
+                if (!self.finishClimateScheduleRequest('clear')) return;
+                self.toastFromResult({ success: false, error: e.message },
+                    null, BYD.i18n.t('vehicle.precondition_clear_failed'));
+            });
+        });
+        this.updateClimateScheduleUI();
 
         // === EXTERIOR SPEAKER (AVAS) CONTROLS ===
         // Tone tiles carry data-avas-pattern; POST the index to /api/audio/avas-tone.
@@ -1990,64 +2424,161 @@ var VC = {
             1: { x: 0.5, y: 0.4, z: 0.2 },   // driver
             2: { x: -0.5, y: 0.4, z: 0.2 }    // passenger
         };
+        function seatLevelFeedbackMessage(kind, level) {
+            var levelLabel = level === 1
+                ? (BYD.i18n.t('vehicle.level_low') || 'Low')
+                : (BYD.i18n.t('vehicle.level_high') || 'High');
+            if (kind === 'heating') {
+                if (level > 0) {
+                    return BYD.i18n.t('vehicle.seat_heat_level', {
+                        level: levelLabel
+                    });
+                }
+                return BYD.i18n.t('vehicle.seat_heat_off');
+            }
+            if (level > 0) {
+                return BYD.i18n.t('vehicle.seat_cool_level', {
+                    level: levelLabel
+                });
+            }
+            return BYD.i18n.t('vehicle.seat_cool_off');
+        }
+
+        function showSeatLevelVfx(pos, kind, level) {
+            var sp = seatPositions[pos];
+            if (!sp || level <= 0) return;
+            if (kind === 'heating') {
+                var heatColor = level === 2 ? 0xFF4500 : 0xFF8C00;
+                self.triggerSonarVFX(sp.x, sp.y, sp.z, new THREE.Color(heatColor));
+                if (level === 2) {
+                    setTimeout(function() {
+                        self.triggerSonarVFX(sp.x, sp.y + 0.2, sp.z, new THREE.Color(0xFF4500));
+                    }, 120);
+                }
+            } else {
+                var coolColor = level === 2 ? 0x00BFFF : 0x87CEEB;
+                self.triggerSonarVFX(sp.x, sp.y, sp.z, new THREE.Color(coolColor));
+                if (level === 2) {
+                    setTimeout(function() {
+                        self.triggerSonarVFX(sp.x, sp.y + 0.2, sp.z, new THREE.Color(0x00BFFF));
+                    }, 120);
+                }
+            }
+        }
+
+        function submitSeatLevel(pos, kind, level, previous) {
+            var revision = ++self._seatCommandRevision;
+            self._seatPending = revision;
+            self.apiPost('/api/vehicle/seat', {
+                action: kind, position: pos, level: level,
+                driverHeat: self.vehicleState.seatHeat[0] || 0,
+                driverVent: self.vehicleState.seatCool[0] || 0,
+                passengerHeat: self.vehicleState.seatHeat[1] || 0,
+                passengerVent: self.vehicleState.seatCool[1] || 0
+            }).then(function(result) {
+                if (revision !== self._seatCommandRevision) return;
+                self._seatPending = 0;
+                if (result && result.success) {
+                    var feedbackMessage = seatLevelFeedbackMessage(kind, level);
+                    self.toastFromResult({
+                        success: true,
+                        path: result.path,
+                        latencyMs: result.latencyMs,
+                        outcome: result.outcome,
+                        message: feedbackMessage || result.message
+                    }, feedbackMessage, BYD.i18n.t('vehicle.ac_command_failed'));
+                    // Acknowledgement is independent of the optional 3D effect:
+                    // even if the scene is unavailable, the command result is visible.
+                    showSeatLevelVfx(pos, kind, level);
+                    return;
+                }
+                self.vehicleState.seatHeat = previous.heat;
+                self.vehicleState.seatCool = previous.cool;
+                self.updateSeatUI();
+                self.updateSeatGlows();
+                self.fetchState();
+                self.toastFromResult(result || { success: false }, null,
+                    BYD.i18n.t('vehicle.ac_command_failed'));
+            }).catch(function(e) {
+                if (revision !== self._seatCommandRevision) return;
+                self._seatPending = 0;
+                self.vehicleState.seatHeat = previous.heat;
+                self.vehicleState.seatCool = previous.cool;
+                self.updateSeatUI();
+                self.updateSeatGlows();
+                self.fetchState();
+                self.toastFromResult({ success: false, error: e.message }, null,
+                    BYD.i18n.t('vehicle.ac_command_failed'));
+            });
+        }
+
         for (var si = 1; si <= 2; si++) {
             (function(pos) {
                 self.bindBtn('btnSeatHeat' + pos, function() {
+                    var previous = {
+                        heat: self.vehicleState.seatHeat.slice(0),
+                        cool: self.vehicleState.seatCool.slice(0)
+                    };
                     var cur = self.vehicleState.seatHeat[pos - 1] || 0;
                     var next = (cur + 1) % 3;
                     self.vehicleState.seatHeat[pos - 1] = next;
                     self.vehicleState.seatCool[pos - 1] = 0;
                     self.updateSeatUI();
                     self.updateSeatGlows();
-                    // Heat VFX — warm sonar at seat, intensity scales with level
-                    var sp = seatPositions[pos];
-                    if (next > 0) {
-                        var heatColor = next === 2 ? 0xFF4500 : 0xFF8C00;
-                        self.triggerSonarVFX(sp.x, sp.y, sp.z, new THREE.Color(heatColor));
-                        if (next === 2) {
-                            setTimeout(function() { self.triggerSonarVFX(sp.x, sp.y + 0.2, sp.z, new THREE.Color(0xFF4500)); }, 120);
-                        }
-                        self.toast(BYD.i18n.t('vehicle.seat_heat_level', {level: next === 1 ? BYD.i18n.t('vehicle.level_low') : BYD.i18n.t('vehicle.level_high')}), 'success');
-                    } else {
-                        self.toast(BYD.i18n.t('vehicle.seat_heat_off'), 'info');
-                    }
-                    self.apiPost('/api/vehicle/seat', {
-                        action: 'heating', position: pos, level: next,
-                        driverHeat: self.vehicleState.seatHeat[0] || 0,
-                        driverVent: self.vehicleState.seatCool[0] || 0,
-                        passengerHeat: self.vehicleState.seatHeat[1] || 0,
-                        passengerVent: self.vehicleState.seatCool[1] || 0
-                    });
+                    submitSeatLevel(pos, 'heating', next, previous);
                 });
                 self.bindBtn('btnSeatCool' + pos, function() {
+                    var previous = {
+                        heat: self.vehicleState.seatHeat.slice(0),
+                        cool: self.vehicleState.seatCool.slice(0)
+                    };
                     var cur = self.vehicleState.seatCool[pos - 1] || 0;
                     var next = (cur + 1) % 3;
                     self.vehicleState.seatCool[pos - 1] = next;
                     self.vehicleState.seatHeat[pos - 1] = 0;
                     self.updateSeatUI();
                     self.updateSeatGlows();
-                    // Cool VFX — blue sonar at seat
-                    var sp = seatPositions[pos];
-                    if (next > 0) {
-                        var coolColor = next === 2 ? 0x00BFFF : 0x87CEEB;
-                        self.triggerSonarVFX(sp.x, sp.y, sp.z, new THREE.Color(coolColor));
-                        if (next === 2) {
-                            setTimeout(function() { self.triggerSonarVFX(sp.x, sp.y + 0.2, sp.z, new THREE.Color(0x00BFFF)); }, 120);
-                        }
-                        self.toast(BYD.i18n.t('vehicle.seat_cool_level', {level: next === 1 ? BYD.i18n.t('vehicle.level_low') : BYD.i18n.t('vehicle.level_high')}), 'success');
-                    } else {
-                        self.toast(BYD.i18n.t('vehicle.seat_cool_off'), 'info');
-                    }
-                    self.apiPost('/api/vehicle/seat', {
-                        action: 'ventilation', position: pos, level: next,
-                        driverHeat: self.vehicleState.seatHeat[0] || 0,
-                        driverVent: self.vehicleState.seatCool[0] || 0,
-                        passengerHeat: self.vehicleState.seatHeat[1] || 0,
-                        passengerVent: self.vehicleState.seatCool[1] || 0
-                    });
+                    submitSeatLevel(pos, 'ventilation', next, previous);
                 });
             })(si);
         }
+
+        // Steering-wheel heater — a plain on/off surface (no low/high), routed
+        // SDK-first with a composite cloud fallback. `steeringHeat` is null until
+        // a reading arrives, so the first tap targets ON rather than assuming OFF.
+        this.bindBtn('btnSteeringHeat', function() {
+            var previous = self.vehicleState.steeringHeat;
+            var next = !previous;
+            var revision = ++self._steeringHeatRevision;
+            // The pending flag — not the revision alone — is what protects the
+            // in-flight window. The routed write can take up to the cloud budget,
+            // and the 3s poll would otherwise read the not-yet-updated server
+            // state and revert the tile while the command is still succeeding.
+            self._steeringHeatPending = revision;
+            self.vehicleState.steeringHeat = next;
+            self.updateSteeringHeatUI();
+            self.apiPost('/api/vehicle/climate',
+                { action: next ? 'steering_heat_on' : 'steering_heat_off' }).then(function(result) {
+                if (revision !== self._steeringHeatRevision) return;
+                self._steeringHeatPending = 0;
+                if (!result || !result.success) {
+                    self.vehicleState.steeringHeat = previous;
+                    self.updateSteeringHeatUI();
+                    self.fetchState();
+                }
+                self.toastFromResult(result || { success: false },
+                    BYD.i18n.t(next ? 'vehicle.steering_heat_on' : 'vehicle.steering_heat_off'),
+                    BYD.i18n.t('vehicle.ac_command_failed'));
+            }).catch(function(e) {
+                if (revision !== self._steeringHeatRevision) return;
+                self._steeringHeatPending = 0;
+                self.vehicleState.steeringHeat = previous;
+                self.updateSteeringHeatUI();
+                self.fetchState();
+                self.toastFromResult({ success: false, error: e.message }, null,
+                    BYD.i18n.t('vehicle.ac_command_failed'));
+            });
+        });
 
         // Seat memory positions — driver-side (BYD SDK supports up to 2 stored slots).
         // TAP = recall the stored slot (move seat to it); LONG-PRESS = save the
@@ -2208,6 +2739,67 @@ var VC = {
         }
     },
 
+    beginClimateMutation: function(field) {
+        var revisionKey = field === 'power' ? '_climatePowerRevision'
+            : field === 'temp' ? '_climateTempRevision'
+            : '_climateFanRevision';
+        var revision = (this[revisionKey] || 0) + 1;
+        this[revisionKey] = revision;
+        this._climatePending[field] = revision;
+        return revision;
+    },
+
+    isClimateMutationCurrent: function(field, revision) {
+        return this._climatePending[field] === revision;
+    },
+
+    finishClimateMutation: function(field, revision) {
+        if (!this.isClimateMutationCurrent(field, revision)) return false;
+        this._climatePending[field] = 0;
+        return true;
+    },
+
+    markScheduleDirty: function() {
+        this._scheduleDirty = true;
+        this._chargingScheduleRevision++;
+    },
+
+    beginSmartChargeRequest: function(kind, buttonId) {
+        if (this._smartChargePending) return false;
+        this._smartChargePending = { kind: kind, buttonId: buttonId };
+        this._chargingScheduleRevision++;
+        this.setPending(buttonId, true);
+        this.updateChargingUI();
+        return true;
+    },
+
+    finishSmartChargeRequest: function(kind) {
+        var pending = this._smartChargePending;
+        if (!pending || pending.kind !== kind) return false;
+        this._smartChargePending = null;
+        this.setPending(pending.buttonId, false);
+        this.updateChargingUI();
+        return true;
+    },
+
+    beginClimateScheduleRequest: function(kind, buttonId) {
+        if (this._climateSchedulePending) return false;
+        this._climateSchedulePending = { kind: kind, buttonId: buttonId };
+        this._climateScheduleRevision++;
+        this.setPending(buttonId, true);
+        this.updateClimateScheduleUI();
+        return true;
+    },
+
+    finishClimateScheduleRequest: function(kind) {
+        var pending = this._climateSchedulePending;
+        if (!pending || pending.kind !== kind) return false;
+        this._climateSchedulePending = null;
+        this.setPending(pending.buttonId, false);
+        this.updateClimateScheduleUI();
+        return true;
+    },
+
     // ==================== STATE SYNC ====================
 
     startStateSync: function() {
@@ -2243,6 +2835,11 @@ var VC = {
 
     fetchState: function() {
         var self = this;
+        var climatePowerRevision = this._climatePowerRevision;
+        var climateFanRevision = this._climateFanRevision;
+        var seatCommandRevision = this._seatCommandRevision;
+        var steeringHeatRevision = this._steeringHeatRevision;
+        var batteryHeatRevision = this._batteryHeatRevision;
         fetch('/api/vehicle/state').then(function(resp) {
             return resp.json();
         }).then(function(data) {
@@ -2287,13 +2884,19 @@ var VC = {
             // Windows
             if (data.windows) {
                 var w = data.windows;
+                // Keep -1 ("no reading") distinct from 0 ("closed"). Coercing it to 0 asserted
+                // "window closed" for a window we could not read — and it made the '--%' branch in
+                // updateWindowBars unreachable, so an unreadable window rendered as fully shut.
+                var winPct = function(v) {
+                    return (typeof v === 'number' && v >= 0 && v <= 100) ? v : -1;
+                };
                 self.vehicleState.windows = {
-                    lf: w.lf >= 0 ? w.lf : 0,
-                    rf: w.rf >= 0 ? w.rf : 0,
-                    lr: w.lr >= 0 ? w.lr : 0,
-                    rr: w.rr >= 0 ? w.rr : 0,
-                    sunroof: w.sunroof >= 0 ? w.sunroof : 0,
-                    sunshade: w.sunshade >= 0 ? w.sunshade : 0
+                    lf: winPct(w.lf),
+                    rf: winPct(w.rf),
+                    lr: winPct(w.lr),
+                    rr: winPct(w.rr),
+                    sunroof: winPct(w.sunroof),
+                    sunshade: winPct(w.sunshade)
                 };
             }
 
@@ -2305,8 +2908,22 @@ var VC = {
 
             // Climate
             if (data.climate) {
-                if (data.climate.acOn !== undefined) self.vehicleState.acOn = data.climate.acOn;
-                if (data.climate.fanLevel !== undefined && data.climate.fanLevel >= 1 && data.climate.fanLevel <= 7) {
+                // A remote OPENAIR session is valid while the local SDK reports
+                // the sleeping vehicle as off. Prefer that explicit cloud-backed
+                // signal, but retain local AC state when no remote session exists.
+                if (data.climate.remoteClimateActive === true
+                        && climatePowerRevision === self._climatePowerRevision
+                        && !self._climatePending.power) {
+                    self.vehicleState.acOn = true;
+                } else if (climatePowerRevision === self._climatePowerRevision
+                        && !self._climatePending.power
+                        && data.climate.acOn !== undefined) {
+                    self.vehicleState.acOn = data.climate.acOn;
+                }
+                if (climateFanRevision === self._climateFanRevision
+                        && !self._climatePending.fan
+                        && data.climate.fanLevel !== undefined
+                        && data.climate.fanLevel >= 1 && data.climate.fanLevel <= 7) {
                     self.vehicleState.acFan = data.climate.fanLevel;
                 }
                 if (data.climate.insideTempC !== undefined && data.climate.insideTempC > 0) {
@@ -2323,8 +2940,25 @@ var VC = {
             if (data.adas) self.vehicleState.adas = data.adas;
             if (data.setting) self.vehicleState.setting = data.setting;
 
-            if (data.seats && data.seats.heat) self.vehicleState.seatHeat = data.seats.heat;
-            if (data.seats && data.seats.cool) self.vehicleState.seatCool = data.seats.cool;
+            if (seatCommandRevision === self._seatCommandRevision && !self._seatPending) {
+                if (data.seats && data.seats.heat) self.vehicleState.seatHeat = data.seats.heat;
+                if (data.seats && data.seats.cool) self.vehicleState.seatCool = data.seats.cool;
+            }
+            // Steering-wheel heat is omitted from the payload when neither the SDK
+            // nor a fresh cloud snapshot could read it — leave the state null in
+            // that case rather than rendering an unknown wheel as "off".
+            if (steeringHeatRevision === self._steeringHeatRevision
+                    && !self._steeringHeatPending
+                    && data.seats && typeof data.seats.steeringHeat === 'boolean') {
+                self.vehicleState.steeringHeat = data.seats.steeringHeat;
+            }
+            // Cloud-only, and omitted when no fresh snapshot reported it — so an
+            // absent key leaves the previous reading rather than asserting "off".
+            if (batteryHeatRevision === self._batteryHeatRevision
+                    && !self._batteryHeatPending
+                    && typeof data.batteryHeat === 'boolean') {
+                self.vehicleState.batteryHeat = data.batteryHeat;
+            }
             if (data.seats && data.seats.ventilatedSupported === false) {
                 // Trim lacks ventilated seats — disable the cool buttons.
                 // Cars without the hardware return hasFeature=0 from SDK and
@@ -2345,6 +2979,8 @@ var VC = {
             self.updateWindowGlows();
             self.updateClimateUI();
             self.updateSeatUI();
+            self.updateSteeringHeatUI();
+            self.updateBatteryHeatUI();
             self.updateSeatGlows();
             self.updateTabIndicators();
             self.updateLightsUI();
@@ -2380,6 +3016,10 @@ var VC = {
                 : 'not_configured';
             self.updateCloudIndicator();
             self.updateCloudControlAvailability();
+            // Remote preconditioning is offered on the strength of the account alone
+            // (see updateClimateScheduleUI), so re-render once that status is known —
+            // otherwise the row waits on a booking-list read that may never land.
+            self.updateClimateScheduleUI();
         }).catch(function(e) {
             // A failed probe means "status unknown", not "account gone". Clearing
             // cloudConfigured here would lock out every cloud control for 30s on
@@ -2650,18 +3290,9 @@ var VC = {
         }
     },
 
-    /** Update persistent glow for trunk open state */
+    /** Clear the trunk glow until a verified tailgate-position source exists. */
     updateTrunkIndicator: function() {
-        // doorLockStatus[4] = trunk: 1=locked/closed, 2=unlocked/open
-        var trunkVal = -1;
-        if (this.vehicleState.doors && this.vehicleState.doors.trunk !== undefined) {
-            trunkVal = this.vehicleState.doors.trunk;
-        }
-        if (trunkVal === 2) {
-            this.setStateGlow('trunk', { x: 0, y: 0.8, z: -2.2 }, 0x00D4AA); // green glow
-        } else {
-            this.removeStateGlow('trunk');
-        }
+        this.removeStateGlow('trunk');
     },
 
     /** Update persistent glow for open windows */
@@ -2826,6 +3457,27 @@ var VC = {
         }
     },
 
+    /**
+     * Steering-wheel heater tile. Binary, so it reuses the heat tile's `on2`
+     * highlight rather than inventing a level. A null state (nothing read yet)
+     * renders unlit — the same "unknown" presentation as an off wheel, but the
+     * click handler still targets ON, so the first tap is never a no-op.
+     */
+    updateSteeringHeatUI: function() {
+        var btn = document.getElementById('btnSteeringHeat');
+        if (!btn) return;
+        btn.classList.remove('on1', 'on2');
+        if (this.vehicleState.steeringHeat === true) btn.classList.add('on2');
+    },
+
+    /** Battery preconditioning tile. Unlit for both "off" and "not yet read". */
+    updateBatteryHeatUI: function() {
+        var btn = document.getElementById('btnBatteryHeat');
+        if (!btn) return;
+        if (this.vehicleState.batteryHeat === true) btn.classList.add('on');
+        else btn.classList.remove('on');
+    },
+
     updateLightsUI: function() {
         if (!this.vehicleState.lights) return;
         var btnDRL = document.getElementById('btnDRL');
@@ -2888,24 +3540,41 @@ var VC = {
 
     updateChargingUI: function() {
         var s = this.vehicleState.chargingSchedule || {};
+        var unsupported = s.supported === false;
+        var pending = !!this._smartChargePending;
         var btn = document.getElementById('btnSmartChargeToggle');
-        if (btn) { if (s.enabled === true) btn.classList.add('on'); else btn.classList.remove('on'); }
+        if (btn) {
+            if (s.enabled === true) btn.classList.add('on'); else btn.classList.remove('on');
+            btn.disabled = unsupported || pending;
+        }
+        var startNowBtn = document.getElementById('btnStartCharging');
+        if (startNowBtn) startNowBtn.disabled = unsupported || pending;
 
         var startInput = document.getElementById('chargeStartTime');
-        if (startInput && s.startChargeTime) startInput.value = s.startChargeTime;
+        if (startInput) {
+            startInput.value = s.startChargeTime || '';
+            startInput.disabled = unsupported || pending;
+        }
 
         var endInput = document.getElementById('chargeEndTime');
-        if (endInput && s.endChargeTime && s.endChargeTime !== 'full') endInput.value = s.endChargeTime;
-        if (endInput) endInput.disabled = !!s.untilFull;
+        if (endInput) {
+            endInput.value = (s.endChargeTime && s.endChargeTime !== 'full')
+                ? s.endChargeTime : '';
+            endInput.disabled = unsupported || pending || !!s.untilFull;
+        }
 
         var fullBtn = document.getElementById('btnChargeUntilFull');
-        if (fullBtn) { if (s.untilFull) fullBtn.classList.add('on'); else fullBtn.classList.remove('on'); }
+        if (fullBtn) {
+            if (s.untilFull) fullBtn.classList.add('on'); else fullBtn.classList.remove('on');
+            fullBtn.disabled = unsupported || pending;
+        }
 
         var mode = this._scheduleMode(s.chargeWay);
         var segs = document.querySelectorAll('#repeatSegmented .vc-seg');
         for (var k = 0; k < segs.length; k++) {
             if (segs[k].getAttribute('data-mode') === mode) segs[k].classList.add('on');
             else segs[k].classList.remove('on');
+            segs[k].disabled = unsupported || pending;
         }
 
         var dayChips = document.getElementById('chargeDayChips');
@@ -2924,8 +3593,11 @@ var VC = {
                 var d = parseInt(chips[i].getAttribute('data-day'), 10);
                 if (selected.indexOf(d) >= 0) chips[i].classList.add('on');
                 else chips[i].classList.remove('on');
+                chips[i].disabled = unsupported || pending;
             }
         }
+        var saveBtn = document.getElementById('btnChargeScheduleSave');
+        if (saveBtn) saveBtn.disabled = unsupported || pending;
     },
 
     updateChargeCapUI: function() {
@@ -2936,11 +3608,22 @@ var VC = {
         if (section) section.style.display = (s.supported === false) ? 'none' : '';
 
         var btn = document.getElementById('btnChargeCapToggle');
-        if (btn) { if (s.enabled === true) btn.classList.add('on'); else btn.classList.remove('on'); }
+        if (btn) {
+            if (s.enabled === true) btn.classList.add('on'); else btn.classList.remove('on');
+            // The master switch must never operate before a capacity write has
+            // verified that this trim honors the charge-stop backend.
+            btn.disabled = s.supported !== true;
+        }
 
         var slider = document.getElementById('chargeCapSlider');
         var readout = document.getElementById('chargeCapReadout');
-        if (slider && typeof s.percent === 'number') slider.value = s.percent;
+        if (slider) {
+            slider.min = (typeof s.minimumPercent === 'number') ? s.minimumPercent : 50;
+            slider.max = (typeof s.maximumPercent === 'number') ? s.maximumPercent : 100;
+            slider.disabled = s.supported === false;
+            if (typeof s.percent === 'number') slider.value = s.percent;
+            else slider.value = slider.min;
+        }
         if (readout) {
             readout.textContent = (typeof s.percent === 'number') ? (s.percent + '%') : '--';
         }
@@ -2948,45 +3631,69 @@ var VC = {
 
     fetchChargeCap: function() {
         var self = this;
+        var fetchRevision = ++this._chargeCapFetchRevision;
+        var stateRevision = this._chargeCapRevision;
         fetch('/api/vehicle/charge-cap').then(function(resp) {
             return resp.json();
         }).then(function(data) {
+            if (fetchRevision !== self._chargeCapFetchRevision
+                    || stateRevision !== self._chargeCapRevision
+                    || self._chargeCapPendingRevision) return;
             if (!data || !data.success) {
                 console.debug('[VC] charge-cap GET failed', data);
                 return;
             }
             if (!self.vehicleState.chargeCap) self.vehicleState.chargeCap = {};
             var s = self.vehicleState.chargeCap;
-            // Only accept a physically valid cap (15..100). A HAL sentinel that
+            // Only accept a verified charge-stop limit (50..100). A HAL sentinel that
             // slipped past the server (e.g. 65535) is ignored so the readout
             // shows '--' rather than "65535%".
-            if (typeof data.percent === 'number' && data.percent >= 15 && data.percent <= 100) {
-                s.percent = data.percent;
-            }
-            if (typeof data.enabled === 'boolean') s.enabled = data.enabled;
+            s.percent = (typeof data.percent === 'number'
+                    && data.percent >= 50 && data.percent <= 100) ? data.percent : null;
+            s.enabled = typeof data.enabled === 'boolean' ? data.enabled : null;
             if (typeof data.supported === 'boolean') s.supported = data.supported;
             else s.supported = null;
+            s.minimumPercent = typeof data.minimumPercent === 'number' ? data.minimumPercent : null;
+            s.maximumPercent = typeof data.maximumPercent === 'number' ? data.maximumPercent : null;
+            s.controlKind = typeof data.controlKind === 'string' ? data.controlKind : null;
             self.updateChargeCapUI();
         }).catch(function(e) { console.debug('[VC] charge-cap GET threw', e); });
     },
 
     fetchChargingSchedule: function() {
         var self = this;
+        var fetchRevision = ++this._chargingScheduleFetchRevision;
+        var stateRevision = this._chargingScheduleRevision;
         fetch('/api/vehicle/charging-schedule').then(function(resp) {
             return resp.json();
         }).then(function(data) {
+            // A user edit or confirmed action that happened after this request
+            // started owns the UI. Do not let this older cloud snapshot erase it.
+            if (fetchRevision !== self._chargingScheduleFetchRevision
+                    || stateRevision !== self._chargingScheduleRevision
+                    || self._scheduleDirty
+                    || self._smartChargePending) return;
             if (!data || !data.success) {
                 console.debug('[VC] charging-schedule GET failed', data);
                 return;
             }
-            // Tab stays visible even when cloud isn't configured — tapping
-            // surfaces the cloud-setup modal via requireCloud().
-            if (data.supported === false) {
-                console.debug('[VC] charging-schedule cloud not ready — reason:', data.reason || 'unsupported');
-                return;
-            }
             if (!self.vehicleState.chargingSchedule) self.vehicleState.chargingSchedule = {};
             var s = self.vehicleState.chargingSchedule;
+            // Reset first: an authoritative cloud response with omitted DTOs
+            // means no schedule, never "keep showing the old one".
+            s.enabled = null;
+            s.startChargeTime = null;
+            s.endChargeTime = null;
+            s.untilFull = false;
+            s.chargeWay = null;
+            s.days = [];
+            s.smartJourneyDto = null;
+            s.supported = data.supported !== false;
+            if (data.supported === false) {
+                console.debug('[VC] charging-schedule cloud not ready — reason:', data.reason || 'unsupported');
+                self.updateChargingUI();
+                return;
+            }
             if (data.enabled === true || data.enabled === false) s.enabled = data.enabled;
             if (typeof data.startChargeTime === 'string' && data.startChargeTime) {
                 s.startChargeTime = data.startChargeTime;
@@ -3003,8 +3710,268 @@ var VC = {
                 s.chargeWay = data.chargeWay;
                 s.days = self._parseChargeWay(data.chargeWay);
             }
+            if (data.smartJourneyDto && typeof data.smartJourneyDto === 'object') {
+                s.smartJourneyDto = data.smartJourneyDto;
+            }
             self.updateChargingUI();
         }).catch(function(e) { console.debug('[VC] charging-schedule GET threw', e); });
+    },
+
+    /**
+     * Resolve an "HH:MM" wall-clock time to the next epoch-second occurrence.
+     * BOOKINGAIR takes an absolute instant, and the server refuses anything less
+     * than 30 s ahead, so a time that already passed today rolls to tomorrow.
+     * Returns null for unparseable input.
+     */
+    _nextOccurrenceEpochSeconds: function(hhmm) {
+        if (typeof hhmm !== 'string') return null;
+        var parts = hhmm.split(':');
+        if (parts.length < 2) return null;
+        var hour = parseInt(parts[0], 10);
+        var minute = parseInt(parts[1], 10);
+        if (isNaN(hour) || isNaN(minute) || hour < 0 || hour > 23
+                || minute < 0 || minute > 59) {
+            return null;
+        }
+        var now = new Date();
+        var target = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
+            hour, minute, 0, 0);
+        // 60 s of headroom over the server's 30 s floor, so a booking saved for
+        // "one minute from now" isn't rejected by the time the request lands.
+        if (target.getTime() - now.getTime() < 60 * 1000) {
+            // Roll over by incrementing the DATE, not by adding 86400000 ms: a fixed
+            // day of milliseconds does not re-normalize the wall clock across a
+            // DST transition, which would book an hour early or late.
+            target = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1,
+                hour, minute, 0, 0);
+        }
+        return Math.floor(target.getTime() / 1000);
+    },
+
+    /** Render an epoch-second booking instant as local "HH:MM". */
+    _epochSecondsToLocalTime: function(epochSeconds) {
+        var d = new Date(epochSeconds * 1000);
+        var h = d.getHours();
+        var m = d.getMinutes();
+        return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
+    },
+
+    updateClimateScheduleUI: function() {
+        var s = this.vehicleState.climateSchedule || {};
+        var section = document.getElementById('climateScheduleSection');
+        // Shown whenever the feature could work: an explicit supported=false from the
+        // server hides it, and so does having no cloud account at all. A not-yet-probed
+        // state (null) with cloud linked still shows — gating on a completed probe meant
+        // the row never appeared when the booking-list read couldn't reach the car.
+        if (section) {
+            var canSchedule = s.supported !== false
+                    && (s.supported === true || this.vehicleState.cloudConfigured);
+            section.style.display = canSchedule ? '' : 'none';
+        }
+        var pending = !!this._climateSchedulePending;
+
+        var timeInput = document.getElementById('climateBookingTime');
+        if (timeInput) {
+            timeInput.value = s.time || '07:30';
+            timeInput.disabled = pending;
+        }
+
+        var tempReadout = document.getElementById('climateBookingTemp');
+        if (tempReadout) {
+            tempReadout.textContent = (typeof s.temp === 'number' ? s.temp : 22) + '°';
+        }
+        var tempUp = document.getElementById('btnBookingTempUp');
+        var tempDown = document.getElementById('btnBookingTempDown');
+        if (tempUp) tempUp.disabled = pending;
+        if (tempDown) tempDown.disabled = pending;
+
+        var minutes = s.durationMinutes || 20;
+        var segs = document.querySelectorAll('#climateDurationSegmented .vc-seg');
+        for (var i = 0; i < segs.length; i++) {
+            var v = parseInt(segs[i].getAttribute('data-duration'), 10);
+            if (v === minutes) segs[i].classList.add('on');
+            else segs[i].classList.remove('on');
+            segs[i].disabled = pending;
+        }
+
+        var saveBtn = document.getElementById('btnClimateScheduleSave');
+        if (saveBtn) saveBtn.disabled = pending;
+        // Clear only exists against a known booking id.
+        var clearBtn = document.getElementById('btnClimateScheduleClear');
+        if (clearBtn) {
+            clearBtn.style.display = s.bookingId ? '' : 'none';
+            clearBtn.disabled = pending;
+        }
+
+        var note = document.getElementById('climateScheduleNote');
+        if (note) {
+            if (s.bookingId && s.reportedTime) {
+                note.style.display = '';
+                note.textContent = BYD.i18n.t('vehicle.precondition_booked', {
+                    time: s.reportedTime,
+                    temp: (typeof s.reportedTemp === 'number' ? s.reportedTemp : s.temp),
+                    minutes: s.reportedDuration || minutes
+                });
+            } else if (s.bookingId) {
+                // A booking exists but the cloud didn't report its details in a
+                // shape we recognise. Say only what is known.
+                note.style.display = '';
+                note.textContent = BYD.i18n.t('vehicle.precondition_booked_unknown');
+            } else if (s.savedUnconfirmed) {
+                // The cloud accepted a booking but its list read came back empty —
+                // documented behaviour, not proof the booking is gone. Saying "no
+                // schedule" here would be a lie, and Clear can't be offered without
+                // an id, so warn that a repeat Save adds a second booking.
+                note.style.display = '';
+                note.textContent = BYD.i18n.t('vehicle.precondition_saved_unconfirmed');
+            } else {
+                note.style.display = 'none';
+                note.textContent = '';
+            }
+        }
+    },
+
+    /**
+     * Read the cloud's BOOKINGAIR list. An empty list is NOT proof of deletion —
+     * the endpoint can omit a live booking — so an empty response never clears a
+     * locally known booking id, it only leaves the editor as-is.
+     */
+    fetchClimateSchedule: function() {
+        var self = this;
+        var fetchRevision = ++this._climateScheduleFetchRevision;
+        var stateRevision = this._climateScheduleRevision;
+        fetch('/api/vehicle/climate-schedule').then(function(resp) {
+            return resp.json();
+        }).then(function(data) {
+            // A user edit or confirmed write that started after this request owns
+            // the UI; an older cloud snapshot must not overwrite it.
+            if (fetchRevision !== self._climateScheduleFetchRevision
+                    || stateRevision !== self._climateScheduleRevision
+                    || self._climateScheduleDirty
+                    || self._climateSchedulePending) return;
+            if (!data || !data.success) {
+                console.debug('[VC] climate-schedule GET failed', data);
+                return;
+            }
+            if (!self.vehicleState.climateSchedule) self.vehicleState.climateSchedule = {};
+            var s = self.vehicleState.climateSchedule;
+            s.supported = data.supported !== false;
+            if (data.supported === false) {
+                console.debug('[VC] climate-schedule cloud not ready — reason:',
+                    data.reason || 'unsupported');
+                self.updateClimateScheduleUI();
+                return;
+            }
+            // The car was unreachable, so there is no list to reconcile against. Leave the
+            // last known booking and its details exactly as they were — treating this as an
+            // empty list would drop a live booking's ID.
+            if (data.bookingsUnavailable === true) {
+                console.debug('[VC] climate-schedule bookings unavailable —',
+                    data.reason || 'unknown');
+                self.updateClimateScheduleUI();
+                return;
+            }
+            var entries = (data.bookings && data.bookings.listInfo) || null;
+            var first = (entries && entries.length > 0) ? entries[0] : null;
+            // The REPORTED details are cleared before re-reading: they describe what the
+            // cloud last said, so a response that omits them must not leave the previous
+            // values on screen asserting a booking time the cloud no longer reports. The
+            // editor's own time/temp/duration are the user's working values, not cloud
+            // claims, so those are left alone.
+            s.reportedTime = null;
+            s.reportedTemp = null;
+            s.reportedDuration = null;
+            // An empty list clears a known booking ID only when the server does NOT flag
+            // the response as possibly-stale. BYD documents returning an empty object for
+            // a live booking, so while that flag is set an empty list proves nothing and
+            // the ID is kept.
+            if (!first && s.bookingId && data.emptyBookingsMayBeStale !== true) {
+                s.bookingId = null;
+                s.savedUnconfirmed = false;
+            }
+            if (first) {
+                // Only `listInfo[].bookingId` is a verified key on this response (the
+                // server normalizes it to decimal text because 64-bit ids exceed JS's
+                // exact-integer range). The remaining fields are read through a small
+                // set of candidate spellings and simply stay unset when absent, so an
+                // unexpected shape degrades to "booked, details not reported" instead
+                // of showing an invented time or temperature.
+                if (typeof first.bookingId === 'string' && first.bookingId) {
+                    s.bookingId = first.bookingId;
+                    // A real id supersedes the "accepted but unreported" state.
+                    s.savedUnconfirmed = false;
+                }
+                // Epoch SECONDS only. BYD's own envelopes carry millisecond stamps, and
+                // a ms value would decode to a plausible-looking wrong time and then
+                // overwrite the user's pick — so bound it to a sane seconds window.
+                var when = self._positiveInteger(
+                    self._firstPresent(first, ['bookingTime', 'bookTime', 'appointmentTime']));
+                if (when !== null && when > 1000000000 && when < 4000000000) {
+                    s.reportedTime = self._epochSecondsToLocalTime(when);
+                    s.time = s.reportedTime;
+                }
+                // Wire temperature is the raw HVAC scale (15C = 1), same as OPENAIR.
+                // Only the primary spelling is verified to be raw; the alternates could
+                // be plain Celsius, and the two domains overlap at 15/16/17. Accept the
+                // raw decode only from the verified key so an alternate spelling can
+                // never turn a 17C booking into 31C.
+                var rawTemp = self._positiveInteger(first.mainSettingTemp);
+                if (rawTemp !== null && rawTemp >= 1 && rawTemp <= 17) {
+                    s.reportedTemp = rawTemp + 14;
+                    s.temp = s.reportedTemp;
+                }
+                var span = self._positiveInteger(
+                    self._firstPresent(first, ['timeSpan', 'timespan']));
+                if (span !== null && span >= 1 && span <= 5) {
+                    s.reportedDuration = span * 5 + 5;   // timeSpan 1..5 → 10..30 min
+                    s.durationMinutes = s.reportedDuration;
+                }
+            }
+            self.updateClimateScheduleUI();
+        }).catch(function(e) { console.debug('[VC] climate-schedule GET threw', e); });
+    },
+
+    /**
+     * Session length for a REMOTE AC start, in minutes. Shares the duration the
+     * preconditioning row shows, since BYD carries both on the same timeSpan
+     * field. Falls back to the OEM default when the value isn't one of the five
+     * accepted lengths — the server refuses anything else outright.
+     */
+    _remoteSessionMinutes: function() {
+        var s = this.vehicleState.climateSchedule;
+        var m = s ? s.durationMinutes : null;
+        if (m === 10 || m === 15 || m === 20 || m === 25 || m === 30) return m;
+        return 20;
+    },
+
+    /** First key present on `obj` with a non-null value, else null. */
+    _firstPresent: function(obj, keys) {
+        for (var i = 0; i < keys.length; i++) {
+            var v = obj[keys[i]];
+            if (v !== undefined && v !== null && v !== '') return v;
+        }
+        return null;
+    },
+
+    /**
+     * Accept a positive WHOLE number from a JSON number or its decimal text.
+     * Integrality is required, not cosmetic: the server refuses a fractional temp
+     * or a non-OEM duration outright, and the +/- steppers move by 1, so a
+     * fractional seed would leave the editor permanently unable to save.
+     */
+    _positiveInteger: function(value) {
+        var n;
+        if (typeof value === 'number') {
+            n = value;
+        } else if (typeof value === 'string' && /^\d+$/.test(value)) {
+            // Digits only — parseInt would truncate "8.5" to 8 and report a
+            // temperature the cloud never sent.
+            n = parseInt(value, 10);
+        } else {
+            return null;
+        }
+        if (isNaN(n) || n <= 0 || n !== Math.floor(n)) return null;
+        return n;
     },
 
     updateSeatGlows: function() {
@@ -4684,20 +5651,36 @@ var VC = {
             box.setAttribute('data-state', state);
 
             var psiEl  = box.querySelector('.vc-tyre-psi-val');
+            var unitEl = box.querySelector('.vc-tyre-psi-unit');
             var kpaEl  = box.querySelector('.vc-tyre-kpa');
             var tempEl = box.querySelector('.vc-tyre-temp-val');
             var tempBox = box.querySelector('.vc-tyre-temp');
             var stateEl = box.querySelector('.vc-tyre-state');
 
+            // Unit-aware rendering via BYD.units (fed from /status.pressureUnit).
+            // Guarded so a cached pre-pressure core.js falls back to the
+            // historical PSI-primary / kPa-secondary layout.
+            var U = (window.BYD && BYD.units && BYD.units.pressureLabel) ? BYD.units : null;
+            var mode = U ? U.pressureMode : 'psi';
+            if (unitEl) unitEl.textContent = U ? U.pressureLabel() : 'PSI';
+
             if (data.available && typeof data.psi === 'number') {
-                // Server returns PSI to one decimal place. Display kPa next
-                // to it so a user with metric calibration in mind can still
-                // cross-check.
-                if (psiEl)  psiEl.textContent  = data.psi.toFixed(1);
-                if (kpaEl)  kpaEl.textContent  = (data.kPa || 0) + ' kPa';
+                // Big value in the user's display unit; the sub-line keeps a
+                // second unit as a cross-check — kPa normally, PSI when the
+                // user's primary IS kPa. All threshold comparisons above
+                // stay kPa, so colouring is unit-independent.
+                if (psiEl) {
+                    psiEl.textContent = U ? U.pressureVal(data.kPa || 0)
+                                          : data.psi.toFixed(1);
+                }
+                if (kpaEl) {
+                    kpaEl.textContent = (mode === 'kpa')
+                        ? data.psi.toFixed(1) + ' PSI'
+                        : (data.kPa || 0) + ' kPa';
+                }
             } else {
                 if (psiEl)  psiEl.textContent  = '--';
-                if (kpaEl)  kpaEl.textContent  = '-- kPa';
+                if (kpaEl)  kpaEl.textContent  = (mode === 'kpa') ? '-- PSI' : '-- kPa';
             }
             if (typeof data.temperatureC === 'number') {
                 if (tempEl)  tempEl.textContent  = data.temperatureC;
@@ -4727,6 +5710,16 @@ var VC = {
     toast: function(message, type) {
         var el = document.getElementById('vcToast');
         if (!el) return;
+        if (message == null || message === '') {
+            var tr = BYD.i18n && BYD.i18n.t ? BYD.i18n.t.bind(BYD.i18n) : null;
+            if (type === 'success') {
+                message = (tr && tr('toast.fallback_success')) || 'Done';
+            } else if (type === 'error') {
+                message = (tr && tr('toast.fallback_error')) || 'Something went wrong';
+            } else {
+                message = (tr && tr('toast.fallback_info')) || 'Done';
+            }
+        }
         el.textContent = message;
         el.className = 'vc-toast show ' + (type || 'info');
         clearTimeout(this._toastTimer);
@@ -4777,5 +5770,13 @@ var VC = {
     }
 };
 
-// Boot when DOM is ready
-document.addEventListener('DOMContentLoaded', function() { VC.init(); });
+// Boot when DOM is ready. This script is injected dynamically by
+// vehicle-control.html's mode-gated loader, and dynamically injected
+// scripts do NOT block DOMContentLoaded — it may already have fired by
+// the time we execute, in which case boot immediately. (Also correct for
+// any legacy page that still includes this file with a static tag.)
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function() { VC.init(); });
+} else {
+    VC.init();
+}

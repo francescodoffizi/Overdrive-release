@@ -164,7 +164,7 @@
     "tyre_wheel_reading": "{0} — {1}",
     "tyre_fast_leak": "Hızlı kaçak algılandı",
     "tyre_slow_leak": "Yavaş kaçak algılandı",
-    "tyre_wheel_pressure": "{0} ({1} kPa)"
+    "tyre_wheel_pressure": "{0} ({1})"
   },
   "telegram": {
     "recording_caption": " Kayıt ({0}) - {1}s",
@@ -486,6 +486,9 @@
     "close_all_windows_label": "Tüm pencereleri kapat ."
   },
   "automation": {
+    "wait_until_state_description": "Seçilen bir açık/kapalı sinyali bir duruma ulaşana veya zaman aşımına uğrayana kadar kalan eylemleri duraklatın. Örnek: devam etmeden önce Indicators = Off olana kadar bekleyin.",
+    "wait_timeout": "Zaman aşımı (saniye)",
+    "wait_until_description": "Seçilen bir sinyal bir karşılaştırmayı karşılayana veya zaman aşımına uğrayana kadar kalan eylemleri duraklatın. Örnek: camları kapatmadan önce Speed = 0 olana kadar bekleyin.",
     "set_slw": "SLW Durumunu Ayarla",
     "control_automation": "Otomasyonu Kontrol Et",
     "control_automation_description": "Başka bir otomasyonu etkinleştirin, devre dışı bırakın veya değiştirin — bir kuraldan bir rutini devreye alın ya da devreden çıkarın.",
@@ -904,7 +907,7 @@
     "auto_lights": "Otomatik Farlar",
     "auto_lights_description": "Işık sensörlü otomatik farlar açıldığında veya kapandığında tetiklenir — aracın sunduğu 'karanlık' sinyaline en yakın olanı.",
     "occupant": "Koltuk Doluluğu",
-    "occupant_description": "Ön yolcu koltuğu dolduğunda veya boşaldığında tetiklenir.",
+    "occupant_description": "Ön yolcu koltuğu dolduğunda veya boşaldığında tetiklenir. Araçta doluluk sinyali yoksa durum, yolcu emniyet kemeri hatırlatıcısı ve kemer tokasından tahmin edilir. Boş bir koltukta kemer takılıysa veya hatırlatıcı sessize alındıysa bu tahmin yanlış olabilir.",
     "occupied": "Dolu",
     "empty": "Boş",
     "boot": "Sistem Açılışı",
@@ -1083,10 +1086,7 @@
     "mqtt_trigger": "MQTT Mesajı",
     "mqtt_trigger_description": "MQTT aracınız <base>/automation/<channel> konusuna yayın yaptığında tetiklenir (ör. Home Assistant'tan). Kanal adını girin ve değerini eşleştirin.",
     "mqtt_channel": "Kanal",
-    "mqtt_value": "Değer",
-    "wait_until_description": "Seçilen bir sinyal bir karşılaştırmayı karşılayana veya zaman aşımına uğrayana kadar kalan eylemleri duraklatın. Örnek: camları kapatmadan önce Speed = 0 olana kadar bekleyin.",
-    "wait_timeout": "Zaman aşımı (saniye)",
-    "wait_until_state_description": "Seçilen bir açık/kapalı sinyali bir duruma ulaşana veya zaman aşımına uğrayana kadar kalan eylemleri duraklatın. Örnek: devam etmeden önce Indicators = Off olana kadar bekleyin."
+    "mqtt_value": "Değer"
   },
   "messages": {
     "logged_out": "Çıkış .",
@@ -1114,5 +1114,10 @@
     "update_installing_finishing": " baş ünitesinin kurulması kısa süre sonra tekrar çevrimiçi hale gelecek.",
     "update_install_failed": "Kurulum başarısız oldu",
     "update_install_crashed": "Kurulum bozuldu"
+  },
+  "units": {
+    "bar": "bar",
+    "kpa": "kPa",
+    "psi": "PSI"
   }
 }

@@ -11,7 +11,6 @@ import android.graphics.PixelFormat;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.provider.Settings;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.LayoutInflater;
@@ -245,6 +244,16 @@ public class StatusOverlayService extends Service {
     // interfere. ──
     public static final String ACTION_CAMVIEW_STATE = "com.overdrive.app.action.CAMVIEW_STATE";
 
+    // ── Blind-spot close button ────────────────────────────────────────────
+    // The blind-spot card renders into the SAME daemon-owned SurfaceControl lane as the
+    // camera view (no input channel), so its ✕ is a second app overlay window driven the
+    // same way: a daemon open/close edge broadcast + a /status poll reconcile. Kept fully
+    // separate from the camview ✕ (own window, flag, receiver) because the two views can
+    // never be on screen together but their lifecycles are independent. Tapping it POSTs
+    // /api/bs/hide, which DISMISSES the current card WITHOUT disabling the feature — the
+    // next turn signal re-shows it. Head-unit only (same cluster limit as camview).
+    public static final String ACTION_BS_STATE = "com.overdrive.app.action.BS_STATE";
+
     // ── Instant-replay clip segment ───────────────────────────────────────
     // Edge signal from the daemon's ManualClipService (`am broadcast`, same
     // shell/UID-2000 → app pattern as ACTION_CAMVIEW_STATE). The /status
@@ -286,6 +295,17 @@ public class StatusOverlayService extends Service {
     private android.view.View camCloseButton;
     private WindowManager.LayoutParams camCloseParams;
     private boolean camCloseAttached = false;
+    // Suppresses the poll-driven ✕ reconcile briefly after a user tap, so a poll landing
+    // between the tap and the daemon actually clearing camViewActive can't flicker the
+    // button back. The tap's own failure path re-shows it deliberately if the hide didn't
+    // land, and the reconcile resumes after this window either way.
+    private volatile long camCloseReconcileAfterMs = 0L;
+    // Longer than POLL_INTERVAL_MS (3000): the reconcile gate is evaluated when a payload
+    // is PARSED, not when it was fetched, so a request already in flight at tap time can
+    // deliver a pre-tap snapshot (camViewActive=true) after the window lapses and flicker
+    // the button back. Covering a full poll period plus the request's own latency means
+    // any snapshot parsed after the window was necessarily fetched after the tap.
+    private static final long CAM_CLOSE_TAP_SETTLE_MS = 4500L;
     private boolean camCloseReceiverRegistered = false;
     private final android.content.BroadcastReceiver camCloseReceiver = new android.content.BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -294,9 +314,166 @@ public class StatusOverlayService extends Service {
             // Head-unit only — the cluster is a separate display we can't overlay.
             String target = intent.getStringExtra("target");
             boolean headUnit = target == null || !"cluster".equals(target);
-            setCamCloseVisible(active && headUnit);
+            camViewWantsClose = active && headUnit;
+            // Adopt the rect carried on the show edge BEFORE reconciling, so the ✕ is
+            // placed clear of the card on its very first frame rather than waiting for
+            // the next /status poll to correct it.
+            adoptLaneRectFromIntent(intent);
+            reconcileCloseButtons();
         }
     };
+
+    // Blind-spot ✕ — parallel to the camview one above. See ACTION_BS_STATE.
+    private android.view.View bsCloseButton;
+    private WindowManager.LayoutParams bsCloseParams;
+    private boolean bsCloseAttached = false;
+    // Suppresses the poll reconcile briefly after a tap (same rationale + duration as
+    // CAM_CLOSE_TAP_SETTLE_MS): a /status snapshot fetched before the tap but parsed
+    // after it would otherwise flicker the ✕ back.
+    private volatile long bsCloseReconcileAfterMs = 0L;
+    private boolean bsCloseReceiverRegistered = false;
+    private final android.content.BroadcastReceiver bsCloseReceiver = new android.content.BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (intent == null || !ACTION_BS_STATE.equals(intent.getAction())) return;
+            boolean active = intent.getBooleanExtra("active", false);
+            // Head-unit only — the cluster is a separate display we can't overlay.
+            String target = intent.getStringExtra("target");
+            boolean headUnit = target == null || !"cluster".equals(target);
+            bsCardWantsClose = active && headUnit;
+            // See camCloseReceiver: adopt the show-edge rect before reconciling.
+            adoptLaneRectFromIntent(intent);
+            reconcileCloseButtons();
+        }
+    };
+
+    // ── Single-slot arbitration for the two ✕ buttons ──────────────────────
+    // The camera-view ✕ and blind-spot ✕ share the SAME top-right slot, and the two
+    // programs share ONE SurfaceControl lane — so at most ONE view is ever on screen,
+    // and at most one ✕ may be attached. These remember the latest head-unit-adjusted
+    // truth from each channel (the two receivers + the /status poll); reconcileClose-
+    // Buttons() turns them into a single visible button under blind-spot priority.
+    // When blind-spot is DISABLED, bsCardWantsClose is always false, so the camera-view
+    // ✕ behaves byte-identically to before this arbitration existed.
+    private volatile boolean camViewWantsClose = false;
+    private volatile boolean bsCardWantsClose = false;
+
+    // ── Card rect, so the ✕ is never composited UNDER the card ─────────────
+    // The card renders on a daemon-owned SurfaceControl layer at Integer.MAX_VALUE - 1,
+    // which is ABOVE every app window — including a TYPE_APPLICATION_OVERLAY. So a ✕ that
+    // OVERLAPS the card is drawn behind it and simply cannot be seen (it is still
+    // tappable: the SC layer has no input channel, so touches fall through). The fixed
+    // top-right slot sat fully INSIDE the blind-spot card's default rect (corner "tr",
+    // 24px inset, 40% width), which is why the blind-spot ✕ appeared to be missing
+    // entirely. The camera view escaped it only because its default corner is "center".
+    // These hold the daemon's live lane rect in PANEL PX (null = unknown → fixed corner).
+    private volatile int[] laneRectPx = null;
+    /** Gap between the card edge and the ✕, in dp. */
+    private static final int CLOSE_BTN_GAP_DP = 8;
+
+    /**
+     * Place the ✕ params just OUTSIDE the card's rect so the SurfaceControl layer can't
+     * occlude it, preferring the card's top-right-outside corner and falling back through
+     * left / below when the card is flush with a screen edge. Params use TOP|END gravity,
+     * so x grows leftward from the right edge and y downward from the top.
+     *
+     * <p>No rect (or a card that fills the panel) keeps the pre-existing fixed inset.
+     */
+    private void positionCloseParams(WindowManager.LayoutParams p) {
+        if (p == null) return;
+        final int gap = camDp(CLOSE_BTN_GAP_DP);
+        final int size = camDp(40);
+        final int inset = camDp(16);
+        int[] r = laneRectPx;
+        if (r == null) { p.x = inset; p.y = inset; return; }
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        int panelW = dm.widthPixels, panelH = dm.heightPixels;
+        int cardL = r[0], cardT = r[1], cardR = r[0] + r[2], cardB = r[1] + r[3];
+        // TOP|END x is measured from the RIGHT edge, so a right-anchored card needs the
+        // button pushed further left than the card's own right margin.
+        int xFromRight = Math.max(0, panelW - cardR);
+        // A card can legitimately extend PAST a panel edge: presetRect derives the height
+        // from the width at a fixed 4:3, so a large sizePct on a 16:9 panel overflows
+        // vertically (90% → 1296px tall on a 1080px panel, cardT negative). Aligning the
+        // ✕ to a negative cardT put it OFF SCREEN — worse than the occlusion this fixes.
+        // So clamp both axes to the panel at the end, whichever branch was taken.
+        if (cardT >= size + gap) {                       // room ABOVE the card
+            p.x = xFromRight;
+            p.y = cardT - size - gap;
+        } else if (panelW - cardR >= size + gap) {       // room RIGHT of the card
+            p.x = xFromRight - size - gap;
+            p.y = cardT;
+        } else if (cardL >= size + gap) {                // room LEFT of the card
+            p.x = (panelW - cardL) + gap;
+            p.y = cardT;
+        } else if (panelH - cardB >= size + gap) {        // room BELOW the card
+            p.x = xFromRight;
+            p.y = cardB + gap;
+        } else {
+            // Card effectively fills the panel: overlap is unavoidable, so sit at the
+            // card's inner top-right. Still under the layer, but this is the degenerate
+            // near-full-screen case rather than the default one.
+            p.x = xFromRight + gap;
+            p.y = cardT + gap;
+        }
+        // Keep the whole button on screen (x is inset from the RIGHT edge, y from the top).
+        p.x = Math.max(0, Math.min(p.x, panelW - size));
+        p.y = Math.max(0, Math.min(p.y, panelH - size));
+    }
+
+    /**
+     * Adopt the card rect carried on a show-edge broadcast. Absent extras (an older daemon,
+     * or a hide edge) leave the remembered rect untouched — the /status poll remains the
+     * catch-up channel, and a null rect just means "use the fixed corner".
+     */
+    private void adoptLaneRectFromIntent(Intent intent) {
+        if (intent == null || !intent.hasExtra("rectW")) return;
+        int w = intent.getIntExtra("rectW", 0), h = intent.getIntExtra("rectH", 0);
+        if (w <= 0 || h <= 0) return;   // degenerate: keep whatever we had
+        laneRectPx = new int[]{ intent.getIntExtra("rectX", 0),
+                                intent.getIntExtra("rectY", 0), w, h };
+    }
+
+    /** Re-apply {@link #positionCloseParams} to whichever ✕ is attached (main thread). */
+    private void repositionAttachedCloseButtons() {
+        handler.post(() -> {
+            if (windowManager == null) return;
+            try {
+                if (bsCloseAttached && bsCloseButton != null && bsCloseParams != null) {
+                    positionCloseParams(bsCloseParams);
+                    windowManager.updateViewLayout(bsCloseButton, bsCloseParams);
+                }
+                if (camCloseAttached && camCloseButton != null && camCloseParams != null) {
+                    positionCloseParams(camCloseParams);
+                    windowManager.updateViewLayout(camCloseButton, camCloseParams);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "reposition ✕ failed: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Resolve which single ✕ (if any) is attached, from the remembered per-channel
+     * state, under BLIND-SPOT PRIORITY: when the BS card owns the head-unit lane its ✕
+     * takes the slot and the camera-view ✕ (masked, not rendering) is suppressed. The
+     * two {@code setXCloseVisible} calls are idempotent + attach-state-guarded, so
+     * calling this on every edge/poll costs nothing when nothing changed. Mirrors the
+     * daemon arbiter, where BS priority means only one program drives the lane at a time.
+     */
+    private void reconcileCloseButtons() {
+        // Bail once the service is torn down. Both tap handlers re-drive this from the
+        // poll executor (handler.post) on a failed hide POST — a call that can outlive
+        // the service, landing after onDestroy() ran removeCallbacksAndMessages(null) +
+        // detached the windows. Re-adding a view to a dead service would leak/throw. The
+        // executor+HTTP callers are off-main, so read the flag here (it's the single
+        // chokepoint) rather than only in onDestroy's window teardown. The receivers and
+        // the in-tick poll path run on main, where running is already false post-destroy.
+        if (!running.get()) return;
+        boolean bsVisible = bsCardWantsClose;
+        boolean camVisible = camViewWantsClose && !bsCardWantsClose;
+        setBsCloseVisible(bsVisible);
+        setCamCloseVisible(camVisible);
+    }
 
 
     @Override
@@ -326,7 +503,7 @@ public class StatusOverlayService extends Service {
             Log.w(TAG, "parked-marker gate failed (" + t.getMessage() + ") — proceeding");
         }
 
-        if (!Settings.canDrawOverlays(this)) {
+        if (!OverlayPermissionChecker.isGranted(this)) {
             Log.w(TAG, "SYSTEM_ALERT_WINDOW not granted — stopping");
             stopSelf();
             return START_NOT_STICKY;
@@ -341,6 +518,8 @@ public class StatusOverlayService extends Service {
 
         // Arm the camera-view close-button receiver once (idempotent across restarts).
         registerCamCloseReceiver();
+        // Arm the blind-spot close-button receiver once (idempotent across restarts).
+        registerBsCloseReceiver();
         // Arm the instant-replay state receiver once (idempotent across restarts).
         registerReplayStateReceiver();
 
@@ -565,11 +744,15 @@ public class StatusOverlayService extends Service {
      *  add/removeView requirement); the broadcast receiver already runs on main. */
     private void setCamCloseVisible(boolean visible) {
         handler.post(() -> {
-            if (!Settings.canDrawOverlays(this)) return;
+            if (visible && !camCloseAttached
+                    && !OverlayPermissionChecker.isGranted(this)) return;
             buildCamCloseButton();
             if (camCloseButton == null || windowManager == null) return;
             try {
                 if (visible && !camCloseAttached) {
+                    // See setBsCloseVisible: position before attach so the ✕ never lands
+                    // under the card's SurfaceControl layer.
+                    positionCloseParams(camCloseParams);
                     windowManager.addView(camCloseButton, camCloseParams);
                     camCloseAttached = true;
                 } else if (!visible && camCloseAttached) {
@@ -583,22 +766,153 @@ public class StatusOverlayService extends Service {
     }
 
     private void onCamCloseTapped() {
-        setCamCloseVisible(false); // immediate feedback; daemon confirms via broadcast
+        // Hold off the poll reconcile while the hide is in flight (see the field's note).
+        camCloseReconcileAfterMs =
+            android.os.SystemClock.elapsedRealtime() + CAM_CLOSE_TAP_SETTLE_MS;
+        camViewWantsClose = false;          // optimistic; daemon confirms via broadcast/poll
+        reconcileCloseButtons();            // immediate feedback
         executor.execute(() -> {
             java.net.HttpURLConnection conn = null;
+            boolean ok = false;
             try {
                 conn = com.overdrive.app.util.DaemonHttpClient.open("/api/camview/hide", "POST", 1500, 3000);
-                conn.getResponseCode();
+                int code = conn.getResponseCode();
+                ok = (code >= 200 && code < 300);
             } catch (Exception e) {
                 Log.w(TAG, "camview hide failed: " + e.getMessage());
             } finally {
                 if (conn != null) conn.disconnect();
+            }
+            // RESTORE the ✕ if the hide did not land. We remove it optimistically for
+            // instant feedback, but a refused/timed-out POST (daemon busy holding its
+            // lane lock, or mid-restart) leaves the view still rendering — and the daemon
+            // only broadcasts camview state on EDGES, so nothing would ever bring the
+            // button back. That stranded the view on screen with no way to dismiss it.
+            if (!ok) {
+                // Lift the suppression first so the next poll is free to correct us in
+                // EITHER direction: if the view really did go away despite the error, the
+                // reconcile removes the button again rather than leaving it orphaned.
+                camCloseReconcileAfterMs = 0L;
+                camViewWantsClose = true;
+                handler.post(this::reconcileCloseButtons);
+                Log.w(TAG, "camview hide did not confirm — restoring ✕ so the view stays dismissable");
             }
         });
     }
 
     private int camDp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
+    // ── Blind-spot close button (parallel to the camera-view one above) ─────
+
+    /** Register the blind-spot-state broadcast receiver once. Same exported contract as
+     *  {@link #registerCamCloseReceiver()} (daemon sender is shell/UID-2000). */
+    private void registerBsCloseReceiver() {
+        if (bsCloseReceiverRegistered) return;
+        try {
+            android.content.IntentFilter f = new android.content.IntentFilter(ACTION_BS_STATE);
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(bsCloseReceiver, f, Context.RECEIVER_EXPORTED);
+            } else {
+                registerReceiver(bsCloseReceiver, f);
+            }
+            bsCloseReceiverRegistered = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "bsClose receiver register failed: " + t.getMessage());
+        }
+    }
+
+    /** Lazily build the blind-spot ✕ button + its params (once). Identical styling to
+     *  the camview ✕ so the two feel like one control; separate instance so they never
+     *  share attach state. */
+    private void buildBsCloseButton() {
+        if (bsCloseButton != null) return;
+        TextView tv = new TextView(this);
+        tv.setText("✕");
+        tv.setTextColor(android.graphics.Color.WHITE);
+        tv.setTextSize(20);
+        tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER);
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        bg.setColor(android.graphics.Color.parseColor("#CC000000"));
+        bg.setStroke(2, android.graphics.Color.parseColor("#80FFFFFF"));
+        tv.setBackground(bg);
+        int pad = camDp(6);
+        tv.setPadding(pad, pad, pad, pad);
+        tv.setOnClickListener(v -> onBsCloseTapped());
+        bsCloseButton = tv;
+
+        int size = camDp(40);
+        bsCloseParams = new WindowManager.LayoutParams(
+                size, size,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT);
+        bsCloseParams.gravity = Gravity.TOP | Gravity.END;
+        bsCloseParams.x = camDp(16);
+        bsCloseParams.y = camDp(16);
+    }
+
+    /** Attach/detach the blind-spot ✕ window (main thread; WindowManager requirement). */
+    private void setBsCloseVisible(boolean visible) {
+        handler.post(() -> {
+            if (visible && !bsCloseAttached
+                    && !OverlayPermissionChecker.isGranted(this)) return;
+            buildBsCloseButton();
+            if (bsCloseButton == null || windowManager == null) return;
+            try {
+                if (visible && !bsCloseAttached) {
+                    // Place it clear of the card BEFORE attaching, so it is never drawn
+                    // (even for one frame) underneath the SurfaceControl layer.
+                    positionCloseParams(bsCloseParams);
+                    windowManager.addView(bsCloseButton, bsCloseParams);
+                    bsCloseAttached = true;
+                } else if (!visible && bsCloseAttached) {
+                    windowManager.removeView(bsCloseButton);
+                    bsCloseAttached = false;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "setBsCloseVisible(" + visible + ") failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void onBsCloseTapped() {
+        // Hold off the poll reconcile while the dismiss is in flight (see the field note).
+        bsCloseReconcileAfterMs =
+            android.os.SystemClock.elapsedRealtime() + CAM_CLOSE_TAP_SETTLE_MS;
+        bsCardWantsClose = false;           // optimistic; daemon confirms via broadcast/poll
+        reconcileCloseButtons();            // immediate feedback
+        executor.execute(() -> {
+            java.net.HttpURLConnection conn = null;
+            boolean ok = false;
+            try {
+                conn = com.overdrive.app.util.DaemonHttpClient.open("/api/bs/hide", "POST", 1500, 3000);
+                int code = conn.getResponseCode();
+                ok = (code >= 200 && code < 300);
+                // NOTE: the {dismissed} field in the reply is intentionally not consulted.
+                // dismissed=false means the card had already auto-hidden in the tap→POST
+                // gap — in which case the daemon's own edge/poll already drives the button
+                // away, and we must NOT restore it. Only a transport failure (ok=false)
+                // needs the restore below, so a 2xx of either dismissed value is success.
+            } catch (Exception e) {
+                Log.w(TAG, "bs hide failed: " + e.getMessage());
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+            // Restore the ✕ ONLY on a refused/timed-out POST (ok=false): the dismiss never
+            // landed, so the card is still rendering and needs its button back. On success
+            // the daemon's broadcast/poll owns the button state. Lift the suppression first
+            // so the next poll is free to correct us in either direction.
+            if (!ok) {
+                bsCloseReconcileAfterMs = 0L;
+                bsCardWantsClose = true;
+                handler.post(this::reconcileCloseButtons);
+                Log.w(TAG, "bs hide did not confirm — restoring ✕ so the card stays dismissable");
+            }
+        });
     }
 
     @Override
@@ -632,6 +946,11 @@ public class StatusOverlayService extends Service {
             try { unregisterReceiver(camCloseReceiver); } catch (Throwable ignored) {}
             camCloseReceiverRegistered = false;
         }
+        // Tear down the blind-spot close button + its receiver.
+        if (bsCloseReceiverRegistered) {
+            try { unregisterReceiver(bsCloseReceiver); } catch (Throwable ignored) {}
+            bsCloseReceiverRegistered = false;
+        }
         if (replayReceiverRegistered) {
             try { unregisterReceiver(replayStateReceiver); } catch (Throwable ignored) {}
             replayReceiverRegistered = false;
@@ -639,6 +958,10 @@ public class StatusOverlayService extends Service {
         if (camCloseAttached && camCloseButton != null && windowManager != null) {
             try { windowManager.removeView(camCloseButton); } catch (Throwable ignored) {}
             camCloseAttached = false;
+        }
+        if (bsCloseAttached && bsCloseButton != null && windowManager != null) {
+            try { windowManager.removeView(bsCloseButton); } catch (Throwable ignored) {}
+            bsCloseAttached = false;
         }
         removeOverlay();
         super.onDestroy();
@@ -1465,6 +1788,48 @@ public class StatusOverlayService extends Service {
                 recordingWedged = recStatus.optBoolean("wedged", false);
                 currentGear = recStatus.optString("gear", "P");
                 accOn = recStatus.optBoolean("accOn", false);
+                // Reconcile the floating ✕ from the poll. The daemon broadcasts camview
+                // state on EDGES only, and an `am broadcast` is simply dropped if this
+                // service wasn't running / lacked overlay permission at that moment — so a
+                // missed edge used to strand a rendering view with no way to close it (or
+                // leave an orphaned ✕ over nothing). Gated on has() so an older daemon
+                // without these fields keeps the pure edge-driven behaviour unchanged.
+                // setCamCloseVisible is idempotent + attach-state guarded, so re-asserting
+                // every poll costs nothing.
+                // Refresh the remembered per-channel truth from the poll, each gated on
+                // its own tap-settle window so an in-flight pre-tap snapshot can't flicker
+                // the button back, then arbitrate ONCE. Each field is has()-gated so an
+                // older daemon lacking it keeps the pre-existing edge-driven behaviour.
+                boolean reconcile = false;
+                long nowMs = android.os.SystemClock.elapsedRealtime();
+                if (recStatus.has("camViewActive") && nowMs >= camCloseReconcileAfterMs) {
+                    boolean cvActive = recStatus.optBoolean("camViewActive", false);
+                    String cvTarget = recStatus.optString("camViewTarget", "head_unit");
+                    // Head-unit only: the cluster is a separate display we can't overlay.
+                    camViewWantsClose = cvActive && !"cluster".equals(cvTarget);
+                    reconcile = true;
+                }
+                if (recStatus.has("bsCardShowing") && nowMs >= bsCloseReconcileAfterMs) {
+                    boolean bsShowing = recStatus.optBoolean("bsCardShowing", false);
+                    String bsTarget = recStatus.optString("bsCardTarget", "head_unit");
+                    bsCardWantsClose = bsShowing && !"cluster".equals(bsTarget);
+                    reconcile = true;
+                }
+                // Track the card's on-screen rect so the ✕ stays clear of it after a
+                // resize / corner change / side flip. Absent on an older daemon → null,
+                // which positionCloseParams treats as "use the fixed corner" (the
+                // pre-existing behaviour). Reposition only on a real change, and only
+                // when a button is actually attached.
+                org.json.JSONObject lrJson = recStatus.optJSONObject("laneRect");
+                int[] newLaneRect = (lrJson != null)
+                        ? new int[]{ lrJson.optInt("x"), lrJson.optInt("y"),
+                                     lrJson.optInt("w"), lrJson.optInt("h") }
+                        : null;
+                if (!java.util.Arrays.equals(newLaneRect, laneRectPx)) {
+                    laneRectPx = newLaneRect;
+                    repositionAttachedCloseButtons();
+                }
+                if (reconcile) reconcileCloseButtons();
             } else {
                 // Fallback: old daemon without recordingStatus field
                 // Use existing "recording" array (non-empty = recording) and "acc" field
@@ -2122,7 +2487,7 @@ public class StatusOverlayService extends Service {
     // ==================== STATIC HELPERS ====================
 
     public static boolean hasOverlayPermission(Context context) {
-        boolean has = Settings.canDrawOverlays(context);
+        boolean has = OverlayPermissionChecker.isGranted(context);
         Log.i(TAG, "hasOverlayPermission: " + has);
         return has;
     }

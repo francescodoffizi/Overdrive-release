@@ -59,7 +59,9 @@
                 android:orientation="vertical"
                 android:paddingBottom="12dp">
 
-                <!-- Accessible alternative to the horizontal expand/collapse swipe. -->
+                <!-- Accessible alternative to the horizontal expand/collapse swipe.
+                     MainActivity rotates + translates this as the rail expands
+                     (see the portrait variant's note); one chevron asset only. -->
                 <ImageButton
                     android:id="@+id/railExpandButton"
                     android:layout_width="48dp"
@@ -133,6 +135,11 @@
                     android:layout_height="wrap_content" />
                 <include
                     android:id="@+id/railDestMap"
+                    layout="@layout/item_rail_destination"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+                <include
+                    android:id="@+id/railDestNetwork"
                     layout="@layout/item_rail_destination"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content" />
@@ -245,6 +252,7 @@
                             android:clickable="true"
                             android:focusable="true"
                             android:gravity="center_vertical"
+                            android:minHeight="48dp"
                             android:orientation="horizontal"
                             android:paddingHorizontal="14dp"
                             android:paddingVertical="6dp"
@@ -278,8 +286,8 @@
 
                             <ImageButton
                                 android:id="@+id/btnCopyUrl"
-                                android:layout_width="28dp"
-                                android:layout_height="28dp"
+                                android:layout_width="48dp"
+                                android:layout_height="48dp"
                                 android:layout_marginStart="6dp"
                                 android:background="?attr/selectableItemBackgroundBorderless"
                                 android:contentDescription="@string/cd_copy_url"

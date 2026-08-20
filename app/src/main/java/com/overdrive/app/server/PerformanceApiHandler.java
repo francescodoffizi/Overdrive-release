@@ -20,6 +20,7 @@ import java.io.OutputStream;
  * - GET /api/performance         - Get current performance snapshot
  * - GET /api/performance/history - Get performance history (60 samples)
  * - GET /api/performance/full    - Get full report (current + history)
+ * - GET /api/performance/top     - One bounded Android top process snapshot
  * - POST /api/performance/connect    - Register client connection (starts monitoring)
  * - POST /api/performance/disconnect - Unregister client (stops monitoring if last)
  * - POST /api/performance/heartbeat  - Keep client connection alive
@@ -38,6 +39,15 @@ public class PerformanceApiHandler {
      * @return true if request was handled
      */
     public static boolean handle(String method, String path, String body, OutputStream out) throws Exception {
+
+        // GET /api/performance/top?limit=12 - request-scoped process snapshot.
+        // TopSnapshotCollector exits the shell command before this response is
+        // returned; no persistent sampler is owned by the backend.
+        if ((path.equals("/api/performance/top")
+                || path.startsWith("/api/performance/top?"))
+                && method.equals("GET")) {
+            return handleTopSnapshot(path, out);
+        }
         
         // GET /api/performance - Current snapshot
         if (path.equals("/api/performance") && method.equals("GET")) {
@@ -152,6 +162,25 @@ public class PerformanceApiHandler {
         }
 
         return false;
+    }
+
+    private static boolean handleTopSnapshot(String path, OutputStream out) throws Exception {
+        try {
+            int limit = parseIntQueryParam(path, "limit", 12);
+            JSONObject snapshot =
+                com.overdrive.app.monitor.TopSnapshotCollector.capture(limit);
+            HttpResponse.sendJson(out, snapshot.toString());
+            return true;
+        } catch (Exception e) {
+            logger.error("Failed to capture top snapshot", e);
+            JSONObject error = new JSONObject();
+            error.put("available", false);
+            error.put("error", e.getMessage() == null
+                    ? e.getClass().getSimpleName()
+                    : e.getMessage());
+            HttpResponse.sendJson(out, error.toString());
+            return true;
+        }
     }
 
     /** GET the last N days of data usage (default 30). See DataUsageMonitor.getUsage. */
@@ -719,21 +748,27 @@ public class PerformanceApiHandler {
                         case "trips": {
                             com.overdrive.app.trips.TripAnalyticsManager mgr =
                                 com.overdrive.app.daemon.CameraDaemon.getTripAnalyticsManager();
-                            // Refuse if a trip is being recorded right now —
-                            // wiping mid-trip would leave the in-memory
-                            // TripBuilder writing to a freshly-empty DB and
-                            // create a phantom one-row history. User can
-                            // turn the car off and try again.
-                            if (mgr != null && mgr.isTripActive()) {
+                            if (mgr == null) {
+                                r.put("success", false);
+                                r.put("rowsDeleted", -1);
+                                break;
+                            }
+                            // Refuse mid-drive: the active trip would be
+                            // re-inserted on finalize after the wipe.
+                            if (mgr.isTripActive()) {
                                 r.put("success", false);
                                 r.put("error", Messages.get("errors.reset_trip_in_progress"));
                                 break;
                             }
-                            com.overdrive.app.trips.TripDatabase db =
-                                (mgr != null) ? mgr.getDatabase() : null;
-                            long n = (db != null) ? db.resetAll() : -1;
-                            r.put("success", n >= 0);
-                            r.put("rowsDeleted", n);
+                            com.overdrive.app.trips.TripDatabase tripDb = mgr.getDatabase();
+                            if (tripDb == null) {
+                                r.put("success", false);
+                                r.put("rowsDeleted", -1);
+                                break;
+                            }
+                            long tripRows = tripDb.resetAll();
+                            r.put("success", tripRows >= 0);
+                            r.put("rowsDeleted", tripRows);
                             break;
                         }
                         case "socHistory": {
@@ -772,7 +807,10 @@ public class PerformanceApiHandler {
                             break;
                         }
                         case "bydCloud": {
+                            com.overdrive.app.byd.routing.VehicleCommandRouter.getInstance()
+                                    .clearRemoteClimateSession();
                             com.overdrive.app.byd.cloud.BydCloudConfig.clearCredentials();
+                            com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance().reset();
                             r.put("success", true);
                             break;
                         }

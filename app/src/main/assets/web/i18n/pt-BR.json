@@ -187,6 +187,21 @@
     "warn_mode_visual": "Visual",
     "warn_mode_audio": "Áudio",
     "warn_mode_both": "Ambos",
+    "warn_channel": "Canal de som",
+    "warn_channel_desc": "O canal de áudio em que o alerta toca. Navegação usa o canal de orientação do carro, reduzindo a música em vez de competir com ela e seguindo o volume da navegação.",
+    "warn_channel_navigation": "Navegação",
+    "warn_channel_media": "Mídia",
+    "warn_channel_voice": "Voz",
+    "warn_channel_alarm": "Alarme",
+    "warn_volume": "Volume do alerta",
+    "warn_volume_desc": "Define o nível máximo dos alertas RoadSense. Alertas leves e moderados permanecem mais suaves que os graves.",
+    "warn_volume_min": "Baixo",
+    "warn_volume_max": "Alto",
+    "warn_test": "Testar o alerta",
+    "warn_test_desc": "Reproduz agora o alerta mais forte no canal selecionado para conferir o máximo escolhido. O alerta real só toca ao dirigir em direção a um perigo que o RoadSense já conhece.",
+    "warn_test_btn": "Reproduzir alerta",
+    "warn_test_playing": "Alerta enviado no volume RoadSense selecionado",
+    "warn_test_failed": "Não foi possível enviar o alerta",
     "warn_lead": "Tempo de antecedência",
     "warn_lead_desc": "Quantos segundos antes do perigo o aviso dispara. Valores maiores dão mais tempo de reação; valores menores disparam mais perto do perigo.",
     "warn_lead_min": "2s",
@@ -400,7 +415,22 @@
     "min_importance_sub": "Um piso geral aplicado a todas as categorias acima no dispositivo. Aumente este nível para silenciar notificações push de menor importância em um único lugar — ex: \"Apenas Alertas\" descarta todas as notificações de Aviso/Info (vigilância rotineira, recarga iniciada/interrompida) enquanto mantém Alertas e Críticos. Os níveis desativados ainda são registrados no log.",
     "min_info": "Tudo",
     "min_warn": "Avisos e acima",
-    "min_critical": "Somente crítico"
+    "min_critical": "Somente crítico",
+    "tyre_limits": "Limite de pressão dos pneus",
+    "tyre_limits_sub": "Defina a faixa de pressão normal para cada eixo. Um pneu abaixo do mínimo ou acima do máximo gera um aviso; abaixo do valor crítico, gera um alerta de pneu murcho. Usado para notificações push e Telegram e para as cores de cada pneu no Controle do Veículo. Os valores padrão servem para os pneus originais — altere-os caso as pressões da plaqueta do seu veículo sejam diferentes.",
+    "tyre_front": "Eixo frontal",
+    "tyre_rear": "Eixo traseiro",
+    "tyre_axle_note": "Intervalo normal — mínimo e máximo.",
+    "tyre_critical": "Crítico (murcho)",
+    "tyre_critical_note": "Em ou abaixo deste valor, o alerta é elevado para crítico. Aplica-se a todos os quatro pneus e não pode exceder o mínimo de nenhum dos eixos.",
+    "tyre_reset": "Restaurar padrões",
+    "tyre_reset_hint": "Padrões restaurados — pressione Salvar para aplicar.",
+    "tyre_saved": "Limites de pressão dos pneus salvos",
+    "tyre_save_failed": "Não foi possível salvar os limites de pressão dos pneus",
+    "tyre_load_failed": "Não foi possível carregar os limites salvos — mostrando padrões.",
+    "tyre_err_range": "Insira um número natural entre {min} e {max} kPa.",
+    "tyre_err_order": "O máximo deve ser superior ao mínimo.",
+    "tyre_err_critical": "O valor crítico não deve exceder o mínimo de eixos."
   },
   "charge": {
     "title": "Carregamento",
@@ -510,7 +540,50 @@
     "save_failed": "Não foi possível salvar as configurações de carregamento",
     "saved": "Configurações de carregamento salvas",
     "applying": "Aplicando…",
-    "load_more": "Carregar Mais"
+    "load_more": "Carregar Mais",
+    "tariff_repriced": {
+      "one": "{count} recargas anteriores recalculadas",
+      "other": "{count} recargas anteriores recalculadas"
+    },
+    "tariffs_title": "Tarifas por Localização",
+    "tariffs_desc": "Salve uma tarifa para um local — as recargas feitas lá são precificadas com ela automaticamente. As tarifas acima se aplicam a todos os outros locais.",
+    "tariffs_empty": "Nenhuma tarifa por local ainda",
+    "tariffs_empty_hint": "Adicione uma onde você normalmente recarrega e cada cobrança lá será precificada automaticamente",
+    "tariff_add_here": "Adicionar tarifa para este local",
+    "tariff_label": "Descrição",
+    "tariff_ac_rate": "Tarifa AC",
+    "tariff_dc_rate": "Tarifa DC (opcional)",
+    "tariff_dc_rate_hint": "Deixar vazio quando este lugar cobra DC com a mesma tarifa",
+    "tariff_radius": "Raio de correspondência",
+    "tariff_radius_hint": "Quão próxima uma recarga deve estar para usar esta tarifa",
+    "tariff_location": "Local",
+    "tariff_ac_short": "AC",
+    "tariff_dc_short": "DC",
+    "tariff_no_rate": "Sem tarifa definida",
+    "tariff_unnamed": "Tarifa sem nome",
+    "tariff_pill_here": "auto aqui",
+    "tariff_pill_default": "padrão",
+    "tariff_set_default": "Usar quando nada corresponder",
+    "tariff_used_count": "{count}× usado",
+    "tariff_no_gps": "Aguardando o GPS…",
+    "tariff_limit": "Limite de tarifa atingido",
+    "tariff_saved": "Tarifa salva",
+    "tariff_deleted": "Tarifa apagada",
+    "tariff_confirm_delete": "Excluir esta tarifa? As recargas precificadas com ela utilizarão as suas outras tarifas como alternativa.",
+    "tariff_err_no_rate": "Insira uma tarifa de AC ou DC",
+    "tariff_err_no_gps": "Sem sinal de GPS — uma tarifa precisa de uma localização para servir de referência",
+    "tariff_err_save": "Não foi possível salvar a tarifa",
+    "tariff_err_delete": "Não foi possível excluir a tarifa",
+    "detail_tariff": "Tarifa",
+    "tariff_err_rate_range": "As tarifas devem estar entre 0 e 100000",
+    "tariff_err_radius": "O raio de correspondência deve estar entre 25 e 2000 m",
+    "tariff_err_label": "A definição é muito longa",
+    "tariff_err_dupe_label": "Já existe uma tarifa com essa definição",
+    "tariff_fallback_default": "As recargas fora de qualquer tarifa utilizam “{label}”.",
+    "tariff_fallback_global": "As recargas fora de qualquer tarifa utilizam  {rate}/kWh.",
+    "tariff_auto_hint": "Salvo. Recargas dentro de {radius} m daqui usarão esta tarifa automaticamente.",
+    "tariff_label_placeholder": "Residencial",
+    "per_kwh_unit": "/kWh"
   },
   "trip": {
     "tab_trips": "Viagens",
@@ -634,7 +707,10 @@
       "storage_usage": "Uso de Armazenamento",
       "storage_path_default": "Telemetria salva em Overdrive/Viagens",
       "storage_limit": "Limite de Armazenamento",
-      "storage_limit_desc": "Excluir automaticamente os mais antigos quando o limite for atingido"
+      "storage_limit_desc": "Excluir automaticamente os mais antigos quando o limite for atingido",
+      "rate_source_note": "As viagens são calculadas com a taxa da sua última recarga em um local de tarifa salva. Esta tarifa se aplica até então.",
+      "rate_from_charge": "As viagens são calculadas com base na sua última recarga: {rate}/kWh.",
+      "rate_from_charge_named": "As viagens são calculadas com base na sua última recarga: {rate}/kWh ({label})."
     },
     "recover": {
       "title": "Recuperar Viagens Ausentes",
@@ -826,7 +902,11 @@
       "hilly": "️ Montanhoso",
       "climb": "🏔️ Subida",
       "descent": "⬇️ Descida"
-    }
+    },
+    "enable_now": "Ativar gravação de viagem",
+    "rate_from_charge_title": "Precificado com base na tarifa da sua última recarga",
+    "cost_ev_label": "EV",
+    "cost_petrol_label": "Gasolina"
   },
   "automation": {
     "tab_automations": "Automações",
@@ -962,7 +1042,21 @@
     "backup_imported": "{0} automações importadas",
     "backup_import_failed": "Não foi possível importar automações",
     "backup_import_invalid": "Esse arquivo não é um backup de automações válido",
-    "option_unavailable": "(indisponível neste dispositivo)"
+    "option_unavailable": "(indisponível neste dispositivo)",
+    "option_invalid_here": "— não é válido para este sinal, por favor, escolha novamente",
+    "audio_upload_replaced": "Substituiu um som existente com o mesmo nome",
+    "zone_none": "nenhum — fora de todas as áreas",
+    "zone_new": "+ Nova área…",
+    "zone_hint": "Corresponde ao nome de uma área de Local Seguro ou “nenhum” quando o veículo estiver fora de todas as áreas. Escolha uma área ou crie uma abaixo.",
+    "zone_name": "Nome da área",
+    "zone_lat": "Latitude",
+    "zone_lng": "Longitude",
+    "zone_radius": "Raio (m)",
+    "zone_save": "Salvar área",
+    "zone_err_name": "Insira um nome para a área",
+    "zone_err_coords": "Digite uma latitude (-90..90) e longitude (-180..180) válidas.",
+    "zone_err_radius": "O raio deve situar-se entre 15 e 5 000 metros.",
+    "zone_err_save": "Não foi possível salvar a área."
   },
   "community": {
     "tab_community": "Comunidade",
@@ -1239,7 +1333,9 @@
     "telemetry_field_lowBeam": "Farol baixo",
     "telemetry_field_highBeam": "Farol alto",
     "telemetry_field_location": "Localização GPS",
-    "telemetry_field_vin": "VIN (chassi)"
+    "telemetry_field_vin": "VIN (chassi)",
+    "telemetry_fields_label": "Campos para adicionar",
+    "telemetry_fields_desc": "Escolha o que a sobreposição exibe nas gravações manuais e de viagens."
   },
   "events": {
     "select_date": "Selecionar Data",
@@ -1752,7 +1848,11 @@
     "low_power_save_failed": "Não foi possível salvar o modo de economia",
     "confirm_disable_all_classes_title": "Desativar todas as classes de objeto?",
     "confirm_disable_all_classes": "A detecção por IA é desativada por completo: os eventos serão acionados apenas por movimento bruto e as novas gravações serão limitadas a uma a cada 30 segundos. Eventos reais podem ser perdidos.",
-    "confirm_disable_all_classes_ok": "Desativar mesmo assim"
+    "confirm_disable_all_classes_ok": "Desativar mesmo assim",
+    "motion_salience": "Gravar ao detectar movimento brusco",
+    "motion_salience_desc": "Dispara ao detectar objetos grandes, próximos e em movimento, mesmo quando a IA não conseguir identificá-los",
+    "motion_salience_hint": "Captura eventos que a IA deixa passar — alguém se aproximando do veículo com pouca luz ou um veículo grande encostando perto, onde o reconhecimento de objetos não identifica nada. Dispara apenas quando o movimento for grande, próximo e se deslocar de forma constante pela cena por cerca de um segundo, para que galhos balançados pelo vento, sombras, chuva e fachos de farol continuem sendo ignorados. Espere por algumas gravações extras sem pessoa ou veículo identificado: elas são mantidas mesmo com “Descartar gravações sem atores” ativado, pois um vídeo que a IA não conseguiu classificar é o último que deveria ser excluído automaticamente.",
+    "telemetry_fields_desc": "Escolha o que a sobreposição exibe nas gravações de vigilância."
   },
   "mqtt": {
     "tab_connections": "Conexões",
@@ -2216,12 +2316,12 @@
     "view_3d_off": "Visualização 3D desligada",
     "loading_model": "Carregando modelo...",
     "loading_model_pct": "Carregando modelo... {pct}%",
-    "cloud_connected": "Conectado à nuvem",
-    "cloud_not_configured": "Nuvem não configurada",
+    "cloud_connected": "Conta BYD conectada",
+    "cloud_not_configured": "Conta BYD não configurada",
     "locked": "Trancado",
     "checking": "Checando...",
     "cloud_required": "Conta na Nuvem Necessária",
-    "cloud_required_text": "Esta ação requer uma conta conectada ao BYD Cloud. Vá para as Configurações de Vigilância para vincular suas credenciais.",
+    "cloud_required_text": "Esta ação requer uma conta BYD conectada. Vá para as Configurações →  Integrações →  BYD Cloud para conectar.",
     "got_it": "Entendi",
     "lock": "Trancar",
     "unlock": "Destrancar",
@@ -2298,7 +2398,10 @@
     "fuel": "Combustível",
     "personalized_label": "Personalizado",
     "combined_label": "🔋⛽ Combinado",
-    "soh_label": "SOH"
+    "soh_label": "SOH",
+    "cloud_unavailable": "Status da nuvem indisponível",
+    "driver_door_locked": "Porta do motorista trancada",
+    "driver_door_unlocked": "Porta do motorista destrancada"
   },
   "roi": {
     "editing": "EDITANDO",
@@ -2363,7 +2466,11 @@
     "deterrent_confirm_ok": "Ativar",
     "deterrent_horn_sent": "Buzina e faróis ativados",
     "deterrent_flash_sent": "Faróis piscados",
-    "deterrent_failed": "Não foi possível enviar o comando"
+    "deterrent_failed": "Não foi possível enviar o comando",
+    "expand_map": "Expandir mapa",
+    "back_to_cameras": "Voltar para câmeras",
+    "my_location": "Exibir minha localização",
+    "directions": "Direções para o veículo"
   },
   "map": {
     "your_vehicle": "Seu Veículo",
@@ -2434,7 +2541,7 @@
     "view_name_2": "Dir.",
     "view_name_3": "Traseira",
     "view_name_4": "Esq.",
-    "view_name_5": "Raw",
+    "view_name_5": "Todas",
     "view_name_6": "Dashcam OEM"
   },
   "auth": {
@@ -2470,6 +2577,7 @@
     "restore_failed": "Restauração falhou."
   },
   "about": {
+    "ack_chimes": "Avisos sonoros do RoadSense — sons da Biblioteca de Som do Google, licenciados sob",
     "page_title": "Sobre — OverDrive",
     "page_title_short": "Sobre",
     "contributors_title": "Colaboradores",
@@ -2478,7 +2586,6 @@
     "supporters_sub": "Pessoas que mantiveram os commits da madrugada cafeinados.",
     "acknowledgements_title": "Agradecimentos",
     "acknowledgements_sub": "Recursos de terceiros usados no OverDrive, com suas licenças.",
-    "ack_chimes": "Avisos sonoros do RoadSense — sons da Biblioteca de Som do Google, licenciados sob",
     "empty": "A lista é preenchida à medida que as pessoas contribuem.",
     "support": {
       "section": "Movido por pessoas como você",
@@ -2574,7 +2681,10 @@
     "auto_start_acc_off": "Iniciação automática quando o veículo está desligado",
     "auto_start_acc_off_desc": "Inicia o daemon do bot do Telegram automaticamente quando o veículo vai para ACC OFF, para que os comandos funcionem enquanto estacionado. O daemon para quando o veículo é ligado.",
     "daemon_start_pointer": "Pode-se iniciar / parar manualmente o daemon na página Daemons no aplicativo nativo.",
-    "delivery_pointer": "Preferências de entrega (quais eventos chegam ao chat) estão disponíveis na aba Notificações → Telegram."
+    "delivery_pointer": "Preferências de entrega (quais eventos chegam ao chat) estão disponíveis na aba Notificações → Telegram.",
+    "tyre_alerts": "Alertas de pressão dos pneus",
+    "tyre_alerts_desc": "Enviar uma mensagem ao Telegram quando um pneu fica fora do seu intervalo de pressão configurado, ou quando o TPMS reporta um vazamento. Usa os limites definidos nos limites de pressão de pneus.",
+    "always_on_note": "O serviço em segundo plano está ativado na tela de Serviços nativa, portanto continuará em execução independentemente de este botão estar ativado ou não — inclusive com o veículo estacionado. Desative-o lá para interrompê-lo."
   },
   "dashboard": {
     "heading": "Painel",
@@ -2679,7 +2789,8 @@
     "native_dvr_status_disabled": "Status: Desativado pelo OverDrive",
     "native_dvr_disable_toast": "DVR nativo desativado. O OverDrive agora controla a câmera.",
     "native_dvr_enable_toast": "DVR nativo reativado.",
-    "start_timeout": "Início do Pipeline expirou - verifique os logs do daemon"
+    "start_timeout": "Início do Pipeline expirou - verifique os logs do daemon",
+    "telemetry_fields_desc": "Escolha o que a sobreposição exibe nas gravações da dashcam OEM."
   },
   "notiflog": {
     "load_failed": "Não foi possível carregar as notificações",

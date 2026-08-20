@@ -24,7 +24,7 @@ window.BYD = window.BYD || {};
 // item). 'other' is always forced last regardless of this list.
 BYD.AUTOMATION_CATEGORY_ORDER = [
     'vehicle', 'climate', 'windows_body', 'lighting', 'adas_safety', 'drive',
-    'media', 'displays', 'sensors', 'surveillance', 'system', 'flow', 'other',
+    'media', 'displays', 'sensors', 'surveillance', 'advanced', 'system', 'flow', 'other',
 ];
 
 // Fallback control-flow (If / Loop) nesting cap, used only until the schema loads. The
@@ -61,13 +61,32 @@ function escapeHtml(value) {
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// ── List sort ──────────────────────────────────────────────────────────────
+// Persisted sort order for the local automation list (automations.html). Pure
+// client-side reordering of what /api/automations/list returned — 'default'
+// preserves the daemon's map order byte-for-byte, so pre-feature behaviour is
+// the default. The choice lives in localStorage (per-browser, like the active
+// bottom-tab record) so it survives reloads without a backend field.
+const AUTOMATION_SORT_KEY = 'automations.listSort';
+const AUTOMATION_SORT_MODES = ['default', 'name_az', 'name_za', 'recent', 'runs', 'enabled', 'disabled'];
+
 BYD.automations = {
     automations: {},
     schema: [],
     formData: {},
     editingId: null,
+    sortMode: 'default',
 
     init() {
+        // Restore the persisted list sort before the first render. An unknown
+        // stored value (from a newer/older build) degrades to 'default'.
+        try {
+            const savedSort = localStorage.getItem(AUTOMATION_SORT_KEY);
+            if (savedSort && AUTOMATION_SORT_MODES.indexOf(savedSort) >= 0) this.sortMode = savedSort;
+        } catch (_) { /* storage unavailable → session default */ }
+        const sortSel = document.getElementById('automationSortSelect');
+        if (sortSel) sortSel.value = this.sortMode;
+
         this.loadAutomations();
         this.loadAutomationSchema();
         this.loadSettings();
@@ -257,21 +276,128 @@ BYD.automations = {
         const list = document.getElementById('automationList');
         const empty = document.getElementById('emptyState');
         const head = document.getElementById('listHead');
+        const sortRow = document.getElementById('automationSortRow');
         if (!list || !empty) return;
 
-        if (Object.keys(this.automations).length === 0) {
+        const entries = Object.entries(this.automations);
+        if (entries.length === 0) {
             list.innerHTML = '';
             empty.style.display = 'block';
             if (head) head.style.display = 'none';
+            if (sortRow) sortRow.style.display = 'none';
             return;
         }
 
         empty.style.display = 'none';
         if (head) head.style.display = '';
+        // A single card has nothing to sort — keep the row out of the way until
+        // it's useful, so the pre-feature layout is untouched for small sets.
+        if (sortRow) sortRow.style.display = entries.length >= 2 ? '' : 'none';
         list.innerHTML = '';
-        for (let [key, automation] of Object.entries(this.automations)) {
+        for (let [key, automation] of this.sortEntries(entries)) {
             list.append(this.createAutomationElement(key, automation));
         }
+    },
+
+    /** Change the list sort (select onchange), persist it, and re-render. */
+    setSort(mode) {
+        if (AUTOMATION_SORT_MODES.indexOf(mode) < 0) mode = 'default';
+        this.sortMode = mode;
+        try { localStorage.setItem(AUTOMATION_SORT_KEY, mode); } catch (_) { /* best-effort */ }
+        this.render();
+    },
+
+    // Backward-compatible mode derivation. Manual-only is stored with disabled=true
+    // so older builds fail safe; the extra marker lets this build distinguish it
+    // from a fully disabled rule.
+    getAutomationMode(automation) {
+        if (automation && automation.manualOnly) return 'manual';
+        return automation && automation.disabled ? 'disabled' : 'automatic';
+    },
+
+    applyModeToForm(mode) {
+        if (mode === 'manual') {
+            this.formData.disabled = true;
+            this.formData.manualOnly = true;
+        } else if (mode === 'disabled') {
+            this.formData.disabled = true;
+            delete this.formData.manualOnly;
+        } else {
+            this.formData.disabled = false;
+            delete this.formData.manualOnly;
+        }
+    },
+
+    // Locale-aware, numeric-smart name comparator ("Auto 2" < "Auto 10"), built
+    // lazily and cached — Intl.Collator construction is not free and render()
+    // runs on every save/toggle. Falls back to a plain compare if Intl is absent.
+    _sortCollator: null,
+    _collator() {
+        if (!this._sortCollator) {
+            try {
+                const lang = document.documentElement.lang || undefined;
+                this._sortCollator = new Intl.Collator(lang, { numeric: true, sensitivity: 'base' });
+            } catch (_) {
+                this._sortCollator = { compare: (a, b) => (a < b ? -1 : a > b ? 1 : 0) };
+            }
+        }
+        return this._sortCollator;
+    },
+
+    /**
+     * Order the [key, automation] entries per this.sortMode. In place; returns
+     * the same array. 'default' is a no-op so the daemon's order round-trips
+     * untouched. Every mode is a total order with deterministic tiebreaks, and
+     * Array.prototype.sort is stable, so equal automations keep their stored
+     * relative order — the list never shuffles between renders.
+     *
+     * Name semantics: the name is OPTIONAL metadata, so unnamed automations sink
+     * below named ones on the name sorts (their card has no bold heading to scan
+     * for) and keep their stored order among themselves.
+     */
+    sortEntries(entries) {
+        const mode = this.sortMode;
+        if (mode === 'default') return entries;
+
+        const col = this._collator();
+        const nameOf = (a) => (a && a.name ? String(a.name).trim() : '');
+        // dir: 1 = A→Z, -1 = Z→A. Unnamed sort AFTER named in both directions.
+        const byName = (ea, eb, dir) => {
+            const an = nameOf(ea[1]), bn = nameOf(eb[1]);
+            if (!an && !bn) return 0;
+            if (!an) return 1;
+            if (!bn) return -1;
+            return dir * col.compare(an, bn);
+        };
+        const lastRun = (e) => e[1].lastTriggered || 0;
+        const runs = (e) => e[1].triggerCount || 0;
+        const modeRank = (e) => {
+            const m = this.getAutomationMode(e[1]);
+            return m === 'automatic' ? 0 : (m === 'manual' ? 1 : 2);
+        };
+
+        switch (mode) {
+            case 'name_az':
+                entries.sort((a, b) => byName(a, b, 1));
+                break;
+            case 'name_za':
+                entries.sort((a, b) => byName(a, b, -1));
+                break;
+            case 'recent':
+                // Most recently run first; never-run (0) sink to the bottom together.
+                entries.sort((a, b) => (lastRun(b) - lastRun(a)) || byName(a, b, 1));
+                break;
+            case 'runs':
+                entries.sort((a, b) => (runs(b) - runs(a)) || (lastRun(b) - lastRun(a)) || byName(a, b, 1));
+                break;
+            case 'enabled':
+                entries.sort((a, b) => (modeRank(a) - modeRank(b)) || byName(a, b, 1));
+                break;
+            case 'disabled':
+                entries.sort((a, b) => (modeRank(b) - modeRank(a)) || byName(a, b, 1));
+                break;
+        }
+        return entries;
     },
 
     createAutomationElement(key, automation) {
@@ -280,8 +406,10 @@ BYD.automations = {
         // classList.add. Sanitize to a token, and stash the real id on a
         // data-attribute for anything that needs it back.
         const token = sanitizeToken(key);
+        const runMode = this.getAutomationMode(automation);
         const automationDiv = document.createElement('div');
-        automationDiv.classList.add(token + '-card', 'card', automation.disabled ? 'disabled' : 'enabled');
+        automationDiv.classList.add(
+            token + '-card', 'card', runMode === 'automatic' ? 'enabled' : runMode);
         automationDiv.setAttribute('data-automation-id', key);
 
         const automationHeader = document.createElement('div');
@@ -336,27 +464,28 @@ BYD.automations = {
         automationBody.append(statusText);
 
         const statusDot = document.createElement('span');
-        statusDot.classList.add(token + '-status-dot', 'status-dot', automation.disabled ? 'off' : 'connected');
+        statusDot.classList.add(
+            token + '-status-dot', 'status-dot',
+            runMode === 'automatic' ? 'connected' : (runMode === 'manual' ? 'manual' : 'off'));
         statusText.append(statusDot);
 
         const statusMessage = document.createElement('span');
         statusMessage.classList.add(token + '-status-message', 'status-message');
-        statusMessage.textContent = BYD.i18n.t('common.' + (automation.disabled ? 'disabled' : 'enabled'));
+        statusMessage.textContent = BYD.i18n.t('automation.mode_' + runMode);
         statusText.append(statusMessage);
 
-        const statusToggle = document.createElement('label');
-        statusToggle.classList.add(token + '-toggle-switch', 'toggle-switch');
-        automationBody.append(statusToggle);
-
-        const statusCheckbox = document.createElement('input');
-        statusCheckbox.type = 'checkbox';
-        statusCheckbox.checked = !automation.disabled;
-        statusCheckbox.addEventListener('change', () => this.disableAutomation(key, !statusCheckbox.checked));
-        statusToggle.append(statusCheckbox);
-
-        const statusSlider = document.createElement('span');
-        statusSlider.classList.add(token + '-toggle-slider', 'toggle-slider');
-        statusToggle.append(statusSlider);
+        const modeSelect = document.createElement('select');
+        modeSelect.classList.add(token + '-mode-select', 'select-control', 'automation-mode-select');
+        modeSelect.setAttribute('aria-label', BYD.i18n.t('automation.mode_label'));
+        for (const mode of ['automatic', 'manual', 'disabled']) {
+            const option = document.createElement('option');
+            option.value = mode;
+            option.textContent = BYD.i18n.t('automation.mode_' + mode);
+            modeSelect.append(option);
+        }
+        modeSelect.value = runMode;
+        modeSelect.addEventListener('change', () => this.setAutomationMode(key, modeSelect.value));
+        automationBody.append(modeSelect);
 
         return automationDiv;
     },
@@ -508,6 +637,12 @@ BYD.automations = {
         const grid = document.getElementById('formGrid');
         if (!grid) return;
 
+        // A tapped-open description tooltip is now persistent (was hover-only), but this
+        // rebuild discards the icon that owns it — so dismiss it and drop the owner, or it
+        // would linger with stale content pinned to a removed row.
+        this.hideDescriptionTooltip();
+        this._tipOwner = null;
+
         const sections = this.schemaSections();
         if (!sections.length) {
             grid.innerHTML = '';
@@ -519,6 +654,10 @@ BYD.automations = {
         }
 
         grid.innerHTML = '';
+        // Execution mode is top-level metadata rather than part of the action/condition
+        // schema. Manual-only keeps the configured On Change rule for a future switch
+        // back to Automatic, but the daemon does not subscribe to or evaluate it.
+        grid.append(this.createModeField());
         // Optional friendly name — a top-level field (not schema-driven) so a user can
         // label an automation ("Arm sentry at night") for the list and the
         // "Control Automation" picker. Absent/blank → the field is simply not emitted,
@@ -613,6 +752,29 @@ BYD.automations = {
         };
         for (const l of lists) { if (walk(l)) return true; }
         return false;
+    },
+
+    createModeField() {
+        const section = document.createElement('div');
+        section.classList.add('mode-section', 'section');
+
+        const label = document.createElement('div');
+        label.classList.add('row-label');
+        label.textContent = BYD.i18n.t('automation.mode_label');
+        section.append(label);
+
+        const select = document.createElement('select');
+        select.classList.add('select-control', 'automation-form-mode-select');
+        for (const mode of ['automatic', 'manual', 'disabled']) {
+            const option = document.createElement('option');
+            option.value = mode;
+            option.textContent = BYD.i18n.t('automation.mode_' + mode);
+            select.append(option);
+        }
+        select.value = this.getAutomationMode(this.formData);
+        select.addEventListener('change', () => this.applyModeToForm(select.value));
+        section.append(select);
+        return section;
     },
 
     // A single free-text "Name" input bound to formData.name. Trimmed on input; an
@@ -1141,7 +1303,7 @@ BYD.automations = {
         for (const opt of options) {
             const o = document.createElement('option');
             o.value = opt.value;
-            o.textContent = opt.label || opt.value;
+            o.textContent = this.optionLabel({ id: opt.value, label: opt.label });
             if (opt.value === current) o.selected = true;
             selector.appendChild(o);
         }
@@ -1406,6 +1568,311 @@ BYD.automations = {
         };
     },
 
+    // ── Live signal state (editor hints) ───────────────────────────────────────
+    // "What does this signal read RIGHT NOW?" — the single biggest source of confusion when
+    // building a rule was having to guess a signal's vocabulary (is gear "p" or "park"? is a
+    // toggle "on" or "true"?) and whether it is even being published on this car. The daemon
+    // exposes its live state map read-only at /api/automations/state, keyed by the same
+    // ${signal:…} address the editor emits, so a hint can be shown next to every picker.
+    //
+    // Polled only while an editor is actually on screen (startStatePolling/stopStatePolling), so
+    // a parked head unit with no form open does no work.
+    _signalState: {},            // address -> current value
+    _statePollTimer: null,
+    _stateFetchInFlight: false,
+
+    STATE_POLL_MS: 3000,
+
+    async fetchSignalState() {
+        // Guarded against overlap: a slow daemon must not queue up requests behind a 3s timer.
+        if (this._stateFetchInFlight) return;
+        this._stateFetchInFlight = true;
+        try {
+            const resp = await fetch('/api/automations/state', { cache: 'no-store' });
+            const data = await resp.json();
+            if (data && data.success && data.state && typeof data.state === 'object') {
+                this._signalState = data.state;
+                this.refreshSignalHints();
+            }
+        } catch (e) {
+            // Daemon down / transport hiccup — keep the last known values rather than blanking
+            // every hint, which would read as "no signals available".
+        } finally {
+            this._stateFetchInFlight = false;
+        }
+    },
+
+    // True when at least one hint is actually on screen (not on a hidden tab) and the page is
+    // foregrounded — the single condition under which polling is worth anything.
+    signalHintsVisible() {
+        if (document.hidden) return false;
+        // ANY visible hint, not just the first: hints live in BOTH the automation form
+        // (#formCard, data-tab="add") and the action-group editor (#groupEditor,
+        // data-tab="groups"), whose nested action rows use the same signal picker. Testing
+        // only querySelector('.signal-hint') would find the automation form's hint — hidden
+        // while the user is on the Groups tab — and wrongly stop polling, freezing the group
+        // editor's values. The list is tiny (a handful of rows), so this is cheap.
+        const hints = document.querySelectorAll('.signal-hint');
+        for (let i = 0; i < hints.length; i++) {
+            if (hints[i].offsetParent !== null) return true;
+        }
+        return false;
+    },
+
+    // Begin polling live values. Idempotent, so every editor open / tab return can call it.
+    //
+    // Deliberately NOT gated on visibility here. The gate lives ONLY in the interval below, which
+    // is what stops a parked head unit polling forever. Gating the START too was wrong and is why
+    // no request was ever made: hints are built by renderForm()/renderGroupForm() while their tab
+    // is still hidden, so the very first call always saw offsetParent === null and bailed — and on
+    // a wide/desktop layout there is no `.bottom-tabs` element, so the tap listener that was meant
+    // to re-arm it never fires either. Starting unconditionally costs one request; the interval
+    // then decides whether to keep going.
+    startStatePolling() {
+        this.fetchSignalState();
+        if (this._statePollTimer) return;
+        this._statePollTimer = setInterval(() => {
+            // Self-stopping, gated on VISIBILITY not mere existence. Bottom-tab switching
+            // (app-tabs.js) only toggles the `hidden` ATTRIBUTE — the populated form stays in
+            // the document — so a presence test (`querySelector('.signal-hint')`) kept matching
+            // and this poll ran every 3s forever after the user left the editor via the tab bar
+            // instead of Cancel/Save. `[data-tab][hidden]` is `display:none !important`, so
+            // offsetParent is null for a hidden hint; that is the cheap Chrome-58-safe test.
+            // Also stop while the page itself is backgrounded.
+            //
+            // Requires several CONSECUTIVE hidden ticks, not one: a hint can read hidden
+            // transiently (mid-render, a layout the tab system doesn't manage, an ancestor being
+            // rebuilt), and retiring on the first such tick is what made the poll die before it
+            // ever fetched. A genuinely closed editor stays hidden, so it still retires promptly.
+            if (this.signalHintsVisible()) {
+                this._stateHiddenTicks = 0;
+            } else {
+                this._stateHiddenTicks = (this._stateHiddenTicks || 0) + 1;
+                if (this._stateHiddenTicks >= 3) { this.stopStatePolling(); return; }
+            }
+            this.fetchSignalState();
+        }, this.STATE_POLL_MS);
+    },
+
+    stopStatePolling() {
+        if (this._statePollTimer) { clearInterval(this._statePollTimer); this._statePollTimer = null; }
+        this._stateHiddenTicks = 0;
+    },
+
+    // The live value for a ${signal:…} token (or a bare address), or undefined when the signal
+    // has never been observed / has expired. Accepts the same shapes signalEnumOptions does.
+    // Pre-catalog flat ids, mapped to the ATTRIBUTED address the daemon actually keys on.
+    // MUST mirror AutomationCondition.LEGACY_SIGNAL_IDS on the server. Note these map to a
+    // full address, NOT to a bare type: the daemon publishes speed under "speed:units=kmph",
+    // never "speed", so mapping speedKmph->"speed" (as the type-only LEGACY map used for
+    // vocabulary lookups does) finds nothing and the hint wrongly reads "not reported yet"
+    // while the car is moving.
+    LEGACY_SIGNAL_ADDRESSES: {
+        speedKmph: 'speed:units=kmph',
+        speedMph:  'speed:units=mph',
+        turnLeft:  'turnSignal:side=left',
+        turnRight: 'turnSignal:side=right',
+        lowBeam:   'lights:area=lowBeam',
+        highBeam:  'lights:area=highBeam',
+        hazard:    'lights:area=hazard',
+        drl:       'lights:area=drl'
+    },
+
+    liveSignalValue(addressValue) {
+        let sig = (typeof addressValue === 'string') ? addressValue.trim() : '';
+        if (!sig) return undefined;
+        if (sig.indexOf('${signal:') === 0 && sig.charAt(sig.length - 1) === '}') {
+            sig = sig.substring(9, sig.length - 1).trim();
+        }
+        if (!sig) return undefined;
+        // A saved automation may still address a signal by its pre-catalog flat id; translate
+        // to the daemon's key before looking anything up.
+        if (this.LEGACY_SIGNAL_ADDRESSES[sig]) sig = this.LEGACY_SIGNAL_ADDRESSES[sig];
+        const st = this._signalState || {};
+        if (Object.prototype.hasOwnProperty.call(st, sig)) return st[sig];
+        // Attribute order can differ between what the user built and what the daemon keyed on
+        // (the daemon sorts them). Retry with a sorted attribute list before giving up.
+        const colon = sig.indexOf(':');
+        if (colon < 0) return undefined;
+        const type = sig.substring(0, colon);
+        const attrs = sig.substring(colon + 1).split(',').map(s => s.trim()).filter(Boolean).sort();
+        const norm = type + ':' + attrs.join(',');
+        return Object.prototype.hasOwnProperty.call(st, norm) ? st[norm] : undefined;
+    },
+
+    // The human-readable vocabulary line for a signal: its allowed words (enum), or its numeric
+    // range, plus the unit/MQTT cross-reference when the catalog carries one. Returns '' when
+    // nothing useful is known, so callers can skip the row entirely.
+    signalVocabularyText(addressValue) {
+        const opts = this.signalEnumOptions(addressValue);
+        if (opts && opts.length) {
+            return BYD.i18n.t('automation.signal_allowed')
+                + ' ' + opts.map(o => this.optionLabel(o)).join(' · ');
+        }
+        const spec = this.signalValueSpec(addressValue);
+        if (spec && spec.type === 'int' && spec.min != null && spec.max != null) {
+            return BYD.i18n.t('automation.signal_range')
+                .replace('{0}', String(spec.min)).replace('{1}', String(spec.max));
+        }
+        if (spec && spec.type === 'string') return BYD.i18n.t('automation.signal_text_valued');
+        return '';
+    },
+
+    // The catalog `value` schema for the signal an address names (enum options, int min/max, …).
+    signalValueSpec(addressValue) {
+        let sig = (typeof addressValue === 'string') ? addressValue.trim() : '';
+        if (!sig) return null;
+        if (sig.indexOf('${signal:') === 0 && sig.charAt(sig.length - 1) === '}') {
+            sig = sig.substring(9, sig.length - 1).trim();
+        }
+        const colon = sig.indexOf(':');
+        if (colon >= 0) sig = sig.substring(0, colon).trim();
+        const LEGACY = {
+            speedKmph: 'speed', speedMph: 'speed', turnLeft: 'turnSignal', turnRight: 'turnSignal',
+            lowBeam: 'lights', highBeam: 'lights', hazard: 'lights', drl: 'lights'
+        };
+        if (LEGACY[sig]) sig = LEGACY[sig];
+        const opt = this.conditionCatalog().find(o => o && o.id === sig);
+        return (opt && opt.value) ? opt.value : null;
+    },
+
+    // Build (or refresh) the hint block under a signal picker: "now: p" + the vocabulary line.
+    // `host` is the element to fill; `getAddress` returns the current token, so the same block
+    // can be refreshed in place by the poll without re-rendering the form.
+    buildSignalHint(host, getAddress) {
+        if (!host) return;
+        host.classList.add('signal-hint');
+        host._odGetAddress = getAddress;      // claimed by refreshSignalHints() below
+        this.paintSignalHint(host);
+        // A hint existing IS the signal that an editor is open, so this is the one place that
+        // needs to start the poll. It retires itself once no hint is VISIBLE on the page.
+        this.startStatePolling();
+        // Resume after the poll retired itself because the page was backgrounded or the user
+        // was on another tab. Bound once; re-entering startStatePolling is idempotent, and it
+        // no-ops immediately if nothing is visible.
+        if (!this._stateVisBound) {
+            this._stateVisBound = true;
+            // A live language switch swaps the catalog and calls hydrate(), but these hints are
+            // built IMPERATIVELY, so hydrate() cannot repair their text — and the repaint dedup
+            // below would otherwise suppress the rebuild because the address+value never
+            // changed, leaving the old language's "NOW"/"Allowed:" labels on screen. Drop every
+            // dedup key and force a repaint instead.
+            if (window.BYD && BYD.i18n && typeof BYD.i18n.onChange === 'function') {
+                BYD.i18n.onChange(() => {
+                    const hints = document.querySelectorAll('.signal-hint');
+                    for (let i = 0; i < hints.length; i++) hints[i]._odLastKey = null;
+                    this.refreshSignalHints();
+                });
+            }
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) this.startStatePolling();
+            });
+            // Tab switches don't fire visibilitychange, so also resume on any tap in the
+            // bottom tab bar. Cheap: startStatePolling exits at once when no hint is visible.
+            document.addEventListener('click', (ev) => {
+                if (ev.target && ev.target.closest && ev.target.closest('.bottom-tabs')) {
+                    setTimeout(() => this.startStatePolling(), 0);
+                }
+            });
+        }
+    },
+
+    paintSignalHint(host) {
+        const getAddress = host && host._odGetAddress;
+        if (typeof getAddress !== 'function') return;
+        const address = getAddress();
+        const live = this.liveSignalValue(address);
+        // Skip the rebuild when nothing observable changed. refreshSignalHints() runs on every
+        // 3s tick, and in steady state the value is identical — so without this the hint
+        // destroyed and recreated its whole subtree (plus 2-4 catalog scans and i18n lookups)
+        // forever, for no visual difference. NUL-joined so an address/value pair can't alias.
+        const key = String(address) + ' '
+                + (live == null ? 'undef' : String(live));
+        if (host._odLastKey === key) return;
+        host._odLastKey = key;
+
+        host.innerHTML = '';
+        if (!address) { host.style.display = 'none'; return; }
+        host.style.display = '';
+        // The hint JUST became visible (an unchosen signal renders display:none, so it had no
+        // offsetParent and the visibility gate refused to start the poll). Selecting a signal
+        // only repaints — nothing else re-arms — so without this the first signal picked inside
+        // an already-open editor showed a frozen "not reported yet" forever. Idempotent and
+        // self-gating: startStatePolling early-returns when a timer already exists, and the
+        // dedup guard above means this line only runs on a real change, not every 3s tick.
+        this.startStatePolling();
+
+        const nowRow = document.createElement('div');
+        nowRow.classList.add('signal-hint-now');
+        const label = document.createElement('span');
+        label.classList.add('signal-hint-label');
+        label.textContent = BYD.i18n.t('automation.signal_now');
+        const val = document.createElement('span');
+        val.classList.add('signal-hint-value');
+        if (live === undefined || live === null) {
+            // Never observed on this car (or expired). Say so plainly — an empty hint would
+            // read as "no value", and a fabricated default would be worse.
+            val.classList.add('unknown');
+            val.textContent = BYD.i18n.t('automation.signal_unknown');
+        } else if (live === '') {
+            // A real, SET-but-empty value (a variable assigned ""), which the daemon reports
+            // distinctly from absent. Calling it "not reported yet" was a lie: `eq ""` does
+            // match it at run time. Shown in the muted style but named for what it is.
+            val.classList.add('unknown');
+            val.textContent = BYD.i18n.t('automation.signal_empty');
+        } else {
+            val.textContent = this.formatLiveSignalValue(address, live);
+        }
+        nowRow.append(label, val);
+        host.append(nowRow);
+
+        const vocab = this.signalVocabularyText(address);
+        if (vocab) {
+            const vRow = document.createElement('div');
+            vRow.classList.add('signal-hint-vocab');
+            vRow.textContent = vocab;
+            host.append(vRow);
+        }
+        // The MQTT twin key, when the signal has one — the same read-only cross-reference the
+        // description tooltip carries, surfaced here for users wiring Home Assistant too.
+        const spec = this.conditionCatalog().find(o => o && o.id === this.signalTypeOf(address));
+        if (spec && spec.mqtt) {
+            const mRow = document.createElement('div');
+            mRow.classList.add('signal-hint-mqtt');
+            mRow.textContent = BYD.i18n.t('automation.signal_mqtt').replace('{0}', spec.mqtt);
+            host.append(mRow);
+        }
+    },
+
+    // Bare signal type from any address shape.
+    signalTypeOf(addressValue) {
+        let sig = (typeof addressValue === 'string') ? addressValue.trim() : '';
+        if (sig.indexOf('${signal:') === 0 && sig.charAt(sig.length - 1) === '}') {
+            sig = sig.substring(9, sig.length - 1).trim();
+        }
+        const colon = sig.indexOf(':');
+        return colon >= 0 ? sig.substring(0, colon).trim() : sig;
+    },
+
+    // Show an enum value using its FRIENDLY label rather than the raw stored word, so the hint
+    // matches what the dropdowns say ("Park", not "p").
+    formatLiveSignalValue(address, live) {
+        const opts = this.signalEnumOptions(address);
+        if (opts && opts.length) {
+            const hit = opts.find(o => o && String(o.id) === String(live));
+            if (hit) return this.optionLabel(hit) + ' (' + String(live) + ')';
+        }
+        return String(live);
+    },
+
+    // Repaint every hint currently on screen (called after each poll).
+    refreshSignalHints() {
+        const hosts = document.querySelectorAll('.signal-hint');
+        for (let i = 0; i < hosts.length; i++) {
+            if (hosts[i]._odGetAddress) this.paintSignalHint(hosts[i]);
+        }
+    },
+
     // The vocabulary of the signal a flow-action LHS address names: its catalog `value`
     // options when that signal is ENUM-valued, else null (numeric signal, unknown id,
     // nothing chosen yet, or a "variable" LHS). One source of truth for every
@@ -1539,12 +2006,7 @@ BYD.automations = {
         ph.value = ''; ph.textContent = BYD.i18n.t('automation.cond_signal_placeholder');
         ph.disabled = true; ph.selected = true; ph.hidden = true;
         sel.append(ph);
-        for (const opt of pickable) {
-            const o = document.createElement('option');
-            o.value = opt.id;
-            o.textContent = opt.label || opt.id;
-            sel.append(o);
-        }
+        this.appendSortedCatalogOptions(sel, pickable);
         // A stored id that isn't in the catalog (a legacy flat id like "speedKmph", or a
         // signal this trim doesn't expose) is preserved as its own option, so merely opening
         // the form can't silently blank a working automation.
@@ -1568,9 +2030,11 @@ BYD.automations = {
         // It converges after one pass, but re-rendering mid-build risks losing focus and is
         // needless churn; the value still lands in formData either way.
         let quiet = false;
-        const emit = () => {
+        // Current address as this widget would emit it — shared by emit() and the live hint so
+        // the two can never disagree about which instance is addressed.
+        const currentAddress = () => {
             const sig = sel.value;
-            if (!sig) { onChange('', quiet); return; }
+            if (!sig) return '';
             const opt = pickable.find(o => o.id === sig);
             const vars = (opt && Array.isArray(opt.variables)) ? opt.variables : [];
             const parts = [];
@@ -1578,7 +2042,15 @@ BYD.automations = {
                 const val = attrState[v.id];
                 if (val != null && val !== '') parts.push(v.id + '=' + val);
             }
-            onChange(sig + (parts.length ? ':' + parts.join(',') : ''), quiet);
+            return sig + (parts.length ? ':' + parts.join(',') : '');
+        };
+        // Declared before renderAttrs() so the synchronous change listener its attribute inputs
+        // fire at build can repaint it without hitting a temporal dead zone.
+        const hint = document.createElement('div');
+        const emit = () => {
+            const sig = sel.value;
+            if (!sig) { onChange('', quiet); return; }
+            onChange(currentAddress(), quiet);
         };
         const renderAttrs = () => {
             attrBox.innerHTML = '';
@@ -1591,6 +2063,8 @@ BYD.automations = {
                 const inp = this.createInput(v, attrState[v.id], (el, value) => {
                     attrState[v.id] = value;
                     emit();
+                    // The attribute selects the INSTANCE, so the live value changes with it.
+                    this.paintSignalHint(hint);
                 });
                 inp.classList.add('cond-signal-attr');
                 attrBox.append(inp);
@@ -1612,6 +2086,7 @@ BYD.automations = {
             renderAttrs();
             emit();
             syncValid();
+            this.paintSignalHint(hint);
         });
         renderAttrs();
         // Seed formData from the stored value at BUILD time (the enum picker did this via its
@@ -1619,6 +2094,10 @@ BYD.automations = {
         // this variable — and any attribute defaulted by renderAttrs above would be lost.
         if (init.sig) { quiet = true; emit(); quiet = false; }
         syncValid();
+        // Live value + vocabulary for the chosen signal, under the picker. Same block the
+        // condition-value editor uses, refreshed in place by the poll.
+        wrap.append(hint);
+        this.buildSignalHint(hint, currentAddress);
         return wrap;
     },
 
@@ -1708,12 +2187,7 @@ BYD.automations = {
                 ph.value = ''; ph.textContent = BYD.i18n.t('automation.cond_signal_placeholder');
                 ph.disabled = true; ph.selected = true; ph.hidden = true;
                 sel.append(ph);
-                for (const opt of signalPickable) {
-                    const o = document.createElement('option');
-                    o.value = opt.id;
-                    o.textContent = opt.label || opt.id;
-                    sel.append(o);
-                }
+                this.appendSortedCatalogOptions(sel, signalPickable);
                 // A saved signal token (e.g. a hand-edited/imported attributed one) that
                 // isn't in the pickable list: keep it as a "(missing)" option so opening the
                 // form does NOT silently blank the stored value. Only a real user change
@@ -1738,6 +2212,13 @@ BYD.automations = {
                 const attrBox = document.createElement('div');
                 attrBox.classList.add('cond-signal-attrs');
                 body.append(attrBox);
+
+                // Declared HERE, before renderAttrs() can run: the attribute inputs
+                // createInput() builds fire their change listener SYNCHRONOUSLY at build (see the
+                // note after renderAttrs below), and that listener repaints this hint — so a
+                // `const hint` declared further down would be in its temporal dead zone on the
+                // very first render. Populated by buildSignalHint() once `sel` exists.
+                const hint = document.createElement('div');
 
                 // Build the token from the current type + attribute selections and emit it.
                 // Attribute keys are emitted in the signal's declared variable order so the
@@ -1771,19 +2252,41 @@ BYD.automations = {
                         const inp = this.createInput(v, attrState[v.id], (el, value) => {
                             attrState[v.id] = value;
                             emitSignal();
+                            // The attribute picks the INSTANCE (speed units, seatbelt seat,
+                            // window area), so the live value changes with it.
+                            this.paintSignalHint(hint);
                         });
                         inp.classList.add('cond-signal-attr');
                         attrBox.append(inp);
                     }
                 };
 
+                // Live-value + vocabulary hint for the chosen signal (element declared above the
+                // attribute renderer). Reads the token straight back out of the widget state, so
+                // the poll can repaint it without re-rendering the form.
+                body.append(hint);
+                this.buildSignalHint(hint, () => {
+                    const sig = sel.value;
+                    if (!sig) return '';
+                    const opt = signalPickable.find(o => o.id === sig);
+                    const vars = (opt && Array.isArray(opt.variables)) ? opt.variables : [];
+                    const parts = [];
+                    for (const v of vars) {
+                        const val = attrState[v.id];
+                        if (val != null && val !== '') parts.push(v.id + '=' + val);
+                    }
+                    return sig + (parts.length ? ':' + parts.join(',') : '');
+                });
+
                 sel.addEventListener('change', () => {
                     // New signal type → drop stale attributes from the previous type.
                     for (const k of Object.keys(attrState)) delete attrState[k];
                     renderAttrs();
                     emitSignal();
+                    this.paintSignalHint(hint);
                 });
                 renderAttrs();
+                this.paintSignalHint(hint);
                 // Note: the attribute enum inputs createInput() builds fire their change
                 // listener synchronously at build, so an already-attributed signal may
                 // re-emit its token here on initial render — but that is harmless because
@@ -1840,11 +2343,34 @@ BYD.automations = {
                 const icon = document.createElement('div');
                 icon.classList.add(token + '-description-tooltip', 'description-icon');
                 icon.innerHTML = infoIcon;
-                icon.addEventListener('mouseover', () => {
+                const showAt = () => {
                     const currentPosition = icon.getBoundingClientRect();
                     this.showDescriptionTooltip(selected, currentPosition.left, currentPosition.bottom + window.scrollY);
-                });
+                };
+                icon.addEventListener('mouseover', showAt);
                 icon.addEventListener('mouseout', () => this.hideDescriptionTooltip());
+                // TAP support. The hover pair above is unreachable on the head unit and on
+                // a phone — both are touch-only — so the description (and the MQTT
+                // telemetry key it carries) could never be read there. Tap toggles it, and
+                // the next tap anywhere dismisses it. stopPropagation keeps this tap from
+                // immediately hitting the document dismiss handler below.
+                icon.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    ev.preventDefault();
+                    const tip = document.querySelector('.description-tooltip');
+                    const open = tip && tip.classList.contains('visible') && this._tipOwner === icon;
+                    if (open) { this.hideDescriptionTooltip(); this._tipOwner = null; return; }
+                    showAt();
+                    this._tipOwner = icon;
+                    if (!this._tipDismissBound) {
+                        // One document-level dismiss for every icon on the page.
+                        document.addEventListener('click', () => {
+                            this.hideDescriptionTooltip();
+                            this._tipOwner = null;
+                        });
+                        this._tipDismissBound = true;
+                    }
+                });
                 typeSelectorContainer.append(icon);
             }
             const selectedVars = (selected.variables && selected.variables.length) ? selected.variables : [];
@@ -2034,14 +2560,31 @@ BYD.automations = {
         return rowDescription;
     },
 
-    showDescriptionTooltip({ description }, x, y) {
+    showDescriptionTooltip({ description, mqtt }, x, y) {
         let tooltip = document.querySelector('.description-tooltip');
         if (!tooltip) {
             tooltip = document.createElement('div');
             tooltip.classList.add('description-tooltip');
             document.body.append(tooltip);
         }
+        // textContent (not innerHTML) so a description stays inert, exactly as before.
+        // This assignment also REPLACES all children, which is what clears the MQTT line
+        // below — the tooltip node is reused across options, so without that reset a stale
+        // key would stick to the next signal that has none. Keep it above that block.
         tooltip.textContent = description;
+        // Signals that also publish over MQTT name their telemetry key here — a read-only
+        // cross-reference for users wiring the same car through Home Assistant. Absent for
+        // actions and for signals with no twin, in which case the tooltip is unchanged.
+        if (mqtt) {
+            const line = document.createElement('div');
+            line.classList.add('description-mqtt');
+            const caption = document.createElement('span');
+            caption.textContent = BYD.i18n.t('automation.mqtt_topic') + ' ';
+            const key = document.createElement('code');
+            key.textContent = mqtt;
+            line.append(caption, key);
+            tooltip.append(line);
+        }
         tooltip.style.left = x + 'px';
         tooltip.style.top = y + 'px';
         const position = tooltip.getBoundingClientRect();
@@ -2081,6 +2624,73 @@ BYD.automations = {
         return String(cat).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
     },
 
+    // Append a catalog to an existing <select>, grouped by the same category
+    // headings as the main automation pickers and alphabetized within each group.
+    // Callers add their own placeholder before invoking this helper.
+    appendSortedCatalogOptions(selector, options) {
+        const list = (options || []).filter(o => o && o.id);
+        if (!list.length) return;
+        const makeOption = (option) => {
+            const el = document.createElement('option');
+            el.value = option.id;
+            el.textContent = this.optionLabel(option);
+            return el;
+        };
+        const compare = (a, b) => {
+            const byLabel = this._collator().compare(
+                this.optionLabel(a), this.optionLabel(b));
+            return byLabel || String(a.id).localeCompare(String(b.id));
+        };
+        const grouped = list.some(o => o.category);
+        if (!grouped) {
+            for (const option of list.slice().sort(compare)) {
+                selector.append(makeOption(option));
+            }
+            return;
+        }
+
+        const buckets = new Map();
+        for (const option of list) {
+            const cat = option.category || 'other';
+            if (!buckets.has(cat)) buckets.set(cat, []);
+            buckets.get(cat).push(option);
+        }
+        const order = (window.BYD && BYD.AUTOMATION_CATEGORY_ORDER) || [];
+        const rank = (cat) => {
+            if (cat === 'other') return Number.MAX_SAFE_INTEGER;
+            const i = order.indexOf(cat);
+            return i < 0 ? Number.MAX_SAFE_INTEGER - 1 : i;
+        };
+        const categories = Array.from(buckets.keys()).sort((a, b) => {
+            const byRank = rank(a) - rank(b);
+            return byRank || this._collator().compare(
+                this.categoryLabel(a), this.categoryLabel(b));
+        });
+        for (const cat of categories) {
+            const group = document.createElement('optgroup');
+            group.label = this.categoryLabel(cat);
+            for (const option of buckets.get(cat).slice().sort(compare)) {
+                group.append(makeOption(option));
+            }
+            selector.append(group);
+        }
+    },
+
+    // An option's display text, guarded against an UNRESOLVED server label. Labels are
+    // translated daemon-side (Label.getLabel -> Messages.get) and Messages returns the KEY
+    // itself on a miss, so a catalog that lacks the key put a raw "automation.camera_left" in
+    // the dropdown. Retry against the web catalog (which carries most of the same keys) and
+    // otherwise humanise the id, so the control is always readable even if a catalog is stale.
+    optionLabel(option) {
+        const label = option && option.label;
+        if (typeof label !== 'string' || !label) return String((option && option.id) || '');
+        if (!/^[a-z_]+(\.[A-Za-z0-9_]+)+$/.test(label)) return label;  // a real translation
+        const t = BYD.i18n.t(label);
+        if (t && t !== label) return t;
+        const tail = label.substring(label.lastIndexOf('.') + 1);
+        return tail.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    },
+
     createInput(data, defaultValue, eventListener) {
         switch (data.type) {
             case 'enum': return this.createEnumInput(data, defaultValue, eventListener);
@@ -2113,6 +2723,16 @@ BYD.automations = {
     createEnumInput(data, defaultValue, eventListener) {
         const selector = document.createElement('select');
         selector.classList.add('input', 'enum');
+        // The field name lives in a hidden placeholder <option>, so it disappears the
+        // moment a value is chosen — a row then reads "Speed / Greater than / 60" with
+        // no captions. Mirror it onto title + aria-label so the name is still
+        // recoverable (long-press / hover) and is announced by assistive tech. Purely
+        // additive: no DOM structure change, so the callers that add classes to this
+        // node and the '#formGrid .invalid' Save gate are unaffected.
+        if (data.label != null && data.label !== '') {
+            selector.title = data.label;
+            selector.setAttribute('aria-label', data.label);
+        }
         const placeholder = document.createElement('option');
         placeholder.value = data.id;
         placeholder.textContent = data.label;
@@ -2130,7 +2750,7 @@ BYD.automations = {
         const mkOption = (option) => {
             const optionElement = document.createElement('option');
             optionElement.value = option.id;
-            optionElement.textContent = option.label;
+            optionElement.textContent = this.optionLabel(option);
             return optionElement;
         };
         if (grouped) {
@@ -2154,7 +2774,12 @@ BYD.automations = {
             for (const cat of cats) {
                 const group = document.createElement('optgroup');
                 group.label = this.categoryLabel(cat);
-                for (const option of buckets.get(cat)) group.append(mkOption(option));
+                const items = buckets.get(cat).slice().sort((a, b) => {
+                    const byLabel = this._collator().compare(
+                        this.optionLabel(a), this.optionLabel(b));
+                    return byLabel || String(a.id).localeCompare(String(b.id));
+                });
+                for (const option of items) group.append(mkOption(option));
                 selector.append(group);
             }
         } else {
@@ -2372,7 +2997,7 @@ BYD.automations = {
 
     automationValueToText(spec, rawVal) {
         const option = spec && spec.options && spec.options.find(o => o.id === rawVal);
-        if (option && option.label != null) return option.label;
+        if (option && option.label != null) return this.optionLabel(option);
         if (spec && spec.type === 'time' && rawVal != null && !isNaN(rawVal)) return this.timeToString(rawVal);
         if (spec && spec.type === 'app' && rawVal != null) {
             // Prefer the friendly label if the app list is already cached; else the package name.
@@ -2782,6 +3407,10 @@ BYD.automations = {
         this.renderForm();
         this._syncSaveDisabled();
         this._switchTab('add');
+        // AFTER the tab switch: the hints were built by renderForm() while this tab was still
+        // hidden, so the visibility gate in startStatePolling correctly refused to start then.
+        // Now that the form is on screen, start it.
+        this.startStatePolling();
     },
 
     hideForm() {
@@ -2873,12 +3502,12 @@ BYD.automations = {
         this.toast(BYD.i18n.t('errors.delete_failed'), 'error');
     },
 
-    async disableAutomation(key, disabled) {
+    async setAutomationMode(key, mode) {
         try {
-            const resp = await fetch('/api/automations/disable/' + encodeURIComponent(key), {
+            const resp = await fetch('/api/automations/mode/' + encodeURIComponent(key), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ disabled })
+                body: JSON.stringify({ mode })
             });
             const result = await resp.json();
             if (result.success) {
@@ -2890,6 +3519,11 @@ BYD.automations = {
         // the real backend value instead of staying stuck in the flipped position the user just clicked.
         this.render();
         this.toast(BYD.i18n.t('errors.save_failed'), 'error');
+    },
+
+    // Legacy internal helper retained for any older inline caller.
+    disableAutomation(key, disabled) {
+        return this.setAutomationMode(key, disabled ? 'disabled' : 'automatic');
     },
 
     // ── Action Groups ────────────────────────────────────────────────────────────
@@ -2925,6 +3559,71 @@ BYD.automations = {
         try {
             if (this.automations && Object.keys(this.automations).length) this.render();
         } catch (_) {}
+    },
+
+    // Export all action groups. Same client-side-Blob download as exportAll() above (no
+    // server file is written, so it works over the tunnel too); the envelope key is
+    // `actionGroups`, distinct from the automation backup's `automations`, so the two
+    // backups can never be imported into the wrong store.
+    async exportGroups() {
+        try {
+            const resp = await fetch('/api/action-groups/export', { cache: 'no-store' });
+            if (!resp.ok) { this.toast(BYD.i18n.t('automation.groups_backup_export_failed'), 'error'); return; }
+            const text = await resp.text();
+            const blob = new Blob([text], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'overdrive-action-groups.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            this.toast(BYD.i18n.t('automation.groups_backup_exported'), 'success');
+        } catch (e) {
+            this.toast(BYD.i18n.t('automation.groups_backup_export_failed'), 'error');
+        }
+    },
+
+    // Import an action-group backup (merge). Mirrors importFile(): FileReader rather than
+    // Blob.text() (Chrome 58 WebView), a local JSON.parse for a clean early error, and the
+    // daemon validates every group's actions before storing so a bad file changes nothing.
+    importGroupsFile(file) {
+        if (!file) return;
+        const input = document.getElementById('groupImportFile');
+        const done = () => { if (input) input.value = ''; }; // re-select same file re-fires onchange
+        const reader = new FileReader();
+        reader.onerror = () => { this.toast(BYD.i18n.t('automation.groups_backup_import_failed'), 'error'); done(); };
+        reader.onload = () => {
+            const text = String(reader.result || '');
+            try {
+                JSON.parse(text);
+            } catch (parseErr) {
+                this.toast(BYD.i18n.t('automation.groups_backup_import_invalid'), 'error');
+                done();
+                return;
+            }
+            fetch('/api/action-groups/import', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: text
+            })
+            .then(resp => resp.json().catch(() => null))
+            .then(data => {
+                if (data && data.success) {
+                    // Refreshes the group list AND re-renders the automation cards, so an
+                    // "Action Group" action shows the imported group's name, not its UUID.
+                    this.loadGroups();
+                    this.toast(BYD.i18n.t('automation.groups_backup_imported')
+                        .replace('{0}', String(data.imported)), 'success');
+                } else {
+                    this.toast((data && data.error) ? data.error : BYD.i18n.t('automation.groups_backup_import_failed'), 'error');
+                }
+            })
+            .catch(() => this.toast(BYD.i18n.t('automation.groups_backup_import_failed'), 'error'))
+            .then(done);
+        };
+        reader.readAsText(file);
     },
 
     renderGroupList() {
@@ -2982,6 +3681,10 @@ BYD.automations = {
         const ls = document.getElementById('groupListSection');
         if (ed) ed.style.display = '';
         if (ls) ls.style.display = 'none';
+        // AFTER the reveal, for the same reason showForm() does: renderGroupForm() built any
+        // signal hints while this editor was still display:none, so the visibility gate
+        // correctly refused to start the live-value poll then.
+        this.startStatePolling();
     },
 
     hideGroupForm() {
@@ -3068,6 +3771,8 @@ BYD.automations = {
         if (this._hasInvalidManualClip([acts])) {
             return this.toast(BYD.i18n.t('automation.clip_window_invalid'), 'error');
         }
+        // Declared outside the try so the catch/fallthrough toast below can still read it.
+        let serverError = '';
         try {
             const id = this.groupData.id;
             const path = id ? '/api/action-groups/' + encodeURIComponent(id) : '/api/action-groups';
@@ -3082,8 +3787,12 @@ BYD.automations = {
                 this.hideGroupForm();
                 return this.toast(BYD.i18n.t('toast.saved'), 'success');
             }
+            // Surface the daemon's own reason when it sent one — a persistence failure explains
+            // that the group is live NOW but would be lost on restart, which the generic
+            // "save failed" hides (the import path already does this).
+            if (result && result.error) serverError = result.error;
         } catch (e) {}
-        this.toast(BYD.i18n.t('errors.save_failed'), 'error');
+        this.toast(serverError || BYD.i18n.t('errors.save_failed'), 'error');
     },
 
     async deleteGroup(id, name) {
@@ -3097,6 +3806,7 @@ BYD.automations = {
               })
             : confirm(BYD.i18n.t('confirm.delete'));
         if (!ok) return;
+        let serverError = '';
         try {
             const resp = await fetch('/api/action-groups/' + encodeURIComponent(id), { method: 'DELETE' });
             const result = await resp.json();
@@ -3104,8 +3814,9 @@ BYD.automations = {
                 await this.loadGroups();
                 return this.toast(BYD.i18n.t('toast.deleted'), 'success');
             }
+            if (result && result.error) serverError = result.error;
         } catch (e) {}
-        this.toast(BYD.i18n.t('errors.delete_failed'), 'error');
+        this.toast(serverError || BYD.i18n.t('errors.delete_failed'), 'error');
     },
 
     toast(message, type) {

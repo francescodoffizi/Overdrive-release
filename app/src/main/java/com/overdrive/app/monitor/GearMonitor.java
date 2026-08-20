@@ -1,6 +1,7 @@
 package com.overdrive.app.monitor;
 
 import android.content.Context;
+import android.os.SystemClock;
 
 import com.overdrive.app.daemon.CameraDaemon;
 import com.overdrive.app.logging.DaemonLogger;
@@ -30,6 +31,7 @@ public class GearMonitor {
     public static final int GEAR_S = 6;
     
     private static final long POLL_INTERVAL_MS = 200;  // 5 Hz polling
+    private static final long CACHED_GEAR_MAX_AGE_MS = 1000L;
     
     private static GearMonitor instance;
     
@@ -115,13 +117,26 @@ public class GearMonitor {
             getGearMethod = gearboxClass.getMethod("getGearboxAutoModeType");
             
             // Get initial gear state
-            currentGear = (int) getGearMethod.invoke(gearboxDevice);
+            int initialGearRead =
+                    (int) getGearMethod.invoke(gearboxDevice);
+            if (!isValidGearMode(initialGearRead)) {
+                logger.error("Invalid initial gear read: "
+                        + initialGearRead);
+                gearboxDevice = null;
+                getGearMethod = null;
+                return;
+            }
+            currentGear = initialGearRead;
             lastUpdateTime = System.currentTimeMillis();
             logger.info("Initial gear: " + gearToString(currentGear));
             
             isRunning = true;
             
-            // Start polling thread
+            // Build the poller first, but publish the hardware state before it
+            // can run. Starting the thread first allowed a fast P -> D shift to
+            // update currentGear before this initial callback, permanently
+            // collapsing the P edge during async trip-manager startup.
+            final int initialGear = currentGear;
             pollThread = new Thread(() -> {
                 while (isRunning) {
                     try {
@@ -134,8 +149,18 @@ public class GearMonitor {
                         com.overdrive.app.telemetry.TelemetryDataCollector src = telemetrySource;
                         com.overdrive.app.telemetry.TelemetrySnapshot snap =
                             (src != null) ? src.getLatestSnapshot() : null;
-                        if (snap != null && (System.currentTimeMillis() - snap.timestampMs) < 1000) {
-                            // Snapshot is fresh (< 1 second old) — use its gear value
+                        long gearAgeMs = snap != null
+                                && snap.gearReadElapsedRealtimeMs >= 0L
+                                ? SystemClock.elapsedRealtime()
+                                        - snap.gearReadElapsedRealtimeMs
+                                : Long.MAX_VALUE;
+                        if (snap != null
+                                && snap.gearValid
+                                && isValidGearMode(snap.gearMode)
+                                && gearAgeMs >= 0L
+                                && gearAgeMs
+                                        < CACHED_GEAR_MAX_AGE_MS) {
+                            // Only a recent successful gear read is cacheable.
                             gear = snap.gearMode;
                         } else {
                             // Snapshot the reflection refs to locals: stop() is
@@ -149,6 +174,11 @@ public class GearMonitor {
                             gear = (int) getter.invoke(device);
                         }
 
+                        if (!isValidGearMode(gear)) {
+                            logger.debug("Ignoring invalid gear read: "
+                                    + gear);
+                            continue;
+                        }
                         if (gear != currentGear) {
                             logger.info("Gear changed: " + gearToString(currentGear) + " -> " + gearToString(gear));
                             currentGear = gear;
@@ -165,12 +195,11 @@ public class GearMonitor {
                 }
             }, "GearPoll");
             pollThread.setDaemon(true);
+            // Notify initial state
+            CameraDaemon.onGearChanged(initialGear);
             pollThread.start();
             
             logger.info("Gear monitor started successfully");
-            
-            // Notify initial state
-            CameraDaemon.onGearChanged(currentGear);
             
         } catch (Exception e) {
             logger.error("Failed to start gear monitor: " + e.getMessage());
@@ -230,5 +259,9 @@ public class GearMonitor {
             case GEAR_S: return "S";
             default: return "UNKNOWN(" + gear + ")";
         }
+    }
+
+    private static boolean isValidGearMode(int gear) {
+        return gear >= GEAR_P && gear <= GEAR_S;
     }
 }

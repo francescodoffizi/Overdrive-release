@@ -71,8 +71,17 @@ window.KM = (function () {
         // AC temperature — RELATIVE step, the natural fit for a hardware key: one press = one
         // degree warmer/cooler from wherever the dial is now. ${v} carries the signed delta.
         // (An absolute "set to 22" binding would need one key per temperature.)
+        // No zone → both dials (the OEM's own default).
         { id: 'ac_temp_step',    i18n: 'keymap.act_ac_temp_step',     kind: 'api',
           method: 'POST', path: '/api/vehicle/climate', body: '{"action":"step_temp","delta":${v}}',
+          payloads: [ { v: '1', i18n: 'keymap.temp_warmer' }, { v: '-1', i18n: 'keymap.temp_cooler' } ] },
+        // Per-dial steps: zone 1 = driver, zone 2 = passenger. The daemon reads that dial,
+        // steps it, and writes only that zone (see /api/vehicle/climate step_temp).
+        { id: 'ac_temp_step_driver', i18n: 'keymap.act_ac_temp_step_driver', kind: 'api',
+          method: 'POST', path: '/api/vehicle/climate', body: '{"action":"step_temp","zone":1,"delta":${v}}',
+          payloads: [ { v: '1', i18n: 'keymap.temp_warmer' }, { v: '-1', i18n: 'keymap.temp_cooler' } ] },
+        { id: 'ac_temp_step_passenger', i18n: 'keymap.act_ac_temp_step_passenger', kind: 'api',
+          method: 'POST', path: '/api/vehicle/climate', body: '{"action":"step_temp","zone":2,"delta":${v}}',
           payloads: [ { v: '1', i18n: 'keymap.temp_warmer' }, { v: '-1', i18n: 'keymap.temp_cooler' } ] },
         // AC auto / fan-only / steering-wheel heater. ${v} carries the on|off suffix into
         // the /api/vehicle/climate action string (auto_on, fan_only_off, …).
@@ -122,6 +131,10 @@ window.KM = (function () {
         // button to alternate fold/unfold on each press.
         { id: 'mirror_fold',     i18n: 'keymap.act_mirror_fold',     kind: 'catalog', key: 'mirror_fold',
           payloads: [ { v: 'on', i18n: 'keymap.mirror_fold' }, { v: 'off', i18n: 'keymap.mirror_unfold' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
+        // OEM native panorama application. These AUTO_VIDEO_BUTTON view choices do not use
+        // OverDrive's camera overlay.
+        { id: 'native_camera_view', i18n: 'keymap.act_native_camera_view', kind: 'catalog', key: 'native_camera_view',
+          payloads: [ { v: 'front', i18n: 'keymap.camera_front' }, { v: 'front_wide', i18n: 'keymap.camera_front_wide' }, { v: 'rear', i18n: 'keymap.camera_rear' }, { v: 'rear_wide', i18n: 'keymap.camera_rear_wide' }, { v: 'left', i18n: 'keymap.camera_left' }, { v: 'right', i18n: 'keymap.camera_right' }, { v: 'left_right', i18n: 'keymap.camera_left_right' } ] },
         // Camera views on the native SurfaceControl lane (shares blind-spot pipeline;
         // BS has priority). A button picks WHICH camera; it shows centered on the
         // head-unit at a chosen SIZE (small/medium/large/full). ${v} = size % → the
@@ -141,6 +154,22 @@ window.KM = (function () {
           payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
         { id: 'camview_right',   i18n: 'keymap.act_camview_right',   kind: 'api',
           method: 'POST', path: '/api/camview/show?cam=right&target=head_unit&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        // Composite rear+side views — the same render the blind-spot card uses, shown on
+        // demand with no turn signal. Side is explicit per action. They follow the SHARED
+        // blind-spot settings, so "Cameras shown" (rear+side / side / rear), fisheye and
+        // rotation reshape these too.
+        { id: 'camview_side_rear_left',  i18n: 'keymap.act_camview_side_rear_left',  kind: 'api',
+          method: 'POST', path: '/api/camview/show?cam=side_rear_left&target=head_unit&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        { id: 'camview_side_rear_right', i18n: 'keymap.act_camview_side_rear_right', kind: 'api',
+          method: 'POST', path: '/api/camview/show?cam=side_rear_right&target=head_unit&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        // Resize the normal camera-view card currently selected for its saved display.
+        // Unlike the camera choices above, this keeps the current feed and its corner;
+        // it is also useful as a pre-set for the next camera view.
+        { id: 'camview_resize', i18n: 'keymap.act_camview_resize', kind: 'api',
+          method: 'POST', path: '/api/camview/geometry/size/${v}', body: '',
           payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
         { id: 'camview_hide',    i18n: 'keymap.act_camview_hide',    kind: 'api',
           method: 'POST', path: '/api/camview/hide', body: '' },
@@ -163,6 +192,38 @@ window.KM = (function () {
         { id: 'camview_right_cluster', i18n: 'keymap.act_camview_right_cluster', kind: 'api',
           method: 'POST', path: '/api/camview/show?cam=right&target=cluster&preset=${v}/center', body: '',
           payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        { id: 'camview_side_rear_left_cluster',  i18n: 'keymap.act_camview_side_rear_left_cluster',  kind: 'api',
+          method: 'POST', path: '/api/camview/show?cam=side_rear_left&target=cluster&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        { id: 'camview_side_rear_right_cluster', i18n: 'keymap.act_camview_side_rear_right_cluster', kind: 'api',
+          method: 'POST', path: '/api/camview/show?cam=side_rear_right&target=cluster&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        // ── Blind-spot card tweaks (allowlisted /api/bs/tweak; persists + applies live) ──
+        // Fisheye correction for the SINGLE-camera side/rear views. Two actions: pick an
+        // absolute level, or bind one button to nudge it up/down by a step each press
+        // (the daemon steps off the stored value and clamps to 0-100).
+        { id: 'bs_fisheye',      i18n: 'keymap.act_bs_fisheye',      kind: 'api',
+          method: 'POST', path: '/api/bs/tweak?fisheye=${v}', body: '',
+          payloads: [ { v: '0', i18n: 'keymap.off' }, { v: '25', i18n: 'keymap.level_25' }, { v: '50', i18n: 'keymap.level_50' }, { v: '75', i18n: 'keymap.level_75' }, { v: '100', i18n: 'keymap.level_100' } ] },
+        { id: 'bs_fisheye_step', i18n: 'keymap.act_bs_fisheye_step', kind: 'api',
+          method: 'POST', path: '/api/bs/tweak?fisheye=${v}', body: '',
+          payloads: [ { v: 'up', i18n: 'keymap.bs_fisheye_more' }, { v: 'down', i18n: 'keymap.bs_fisheye_less' } ] },
+        // Which camera(s) fill the card: merged rear+side, or one camera at full FOV.
+        { id: 'bs_cameras',      i18n: 'keymap.act_bs_cameras',      kind: 'api',
+          method: 'POST', path: '/api/bs/tweak?cameras=${v}', body: '',
+          payloads: [ { v: 'both', i18n: 'keymap.bs_cameras_both' }, { v: 'side', i18n: 'keymap.bs_cameras_side' }, { v: 'rear', i18n: 'keymap.bs_cameras_rear' } ] },
+        // Card rotation, applied to BOTH mirror-imaged sides (a button binds one angle;
+        // per-side angles are set on the Road Sense page). Single-camera views only.
+        { id: 'bs_rotation',     i18n: 'keymap.act_bs_rotation',     kind: 'api',
+          method: 'POST', path: '/api/bs/tweak?rotation=${v}&side=both', body: '',
+          payloads: [ { v: '0', i18n: 'keymap.bs_rotation_0' }, { v: '90', i18n: 'keymap.bs_rotation_90' }, { v: '180', i18n: 'keymap.bs_rotation_180' }, { v: '270', i18n: 'keymap.bs_rotation_270' }, { v: 'auto', i18n: 'keymap.bs_rotation_auto' } ] },
+        // Feature master switch, and a dismiss that leaves the feature armed (the next
+        // turn signal shows the card again).
+        { id: 'bs_enable',       i18n: 'keymap.act_bs_enable',       kind: 'api',
+          method: 'POST', path: '/api/bs/tweak?enabled=${v}', body: '',
+          payloads: [ { v: 'true', i18n: 'keymap.on' }, { v: 'false', i18n: 'keymap.off' } ] },
+        { id: 'bs_dismiss',      i18n: 'keymap.act_bs_dismiss',      kind: 'api',
+          method: 'POST', path: '/api/bs/hide', body: '' },
         { id: 'seat_heat_driver',    i18n: 'keymap.act_seat_heat_driver',    kind: 'catalog', key: 'seat_heat_driver',
           payloads: [ { v: 'off', i18n: 'keymap.off' }, { v: 'low', i18n: 'keymap.low' }, { v: 'high', i18n: 'keymap.high' } ] },
         { id: 'seat_heat_passenger', i18n: 'keymap.act_seat_heat_passenger', kind: 'catalog', key: 'seat_heat_passenger',
@@ -171,14 +232,23 @@ window.KM = (function () {
           payloads: [ { v: '1', i18n: 'keymap.on' }, { v: '0', i18n: 'keymap.off' } ] },
         { id: 'wireless_charging', i18n: 'keymap.act_wireless_charging', kind: 'catalog', key: 'wireless_charging',
           payloads: [ { v: '1', i18n: 'keymap.on' }, { v: '0', i18n: 'keymap.off' } ] },
+        { id: 'wireless_charging_left', i18n: 'keymap.act_wireless_charging_left', kind: 'catalog', key: 'wireless_charging_left',
+          payloads: [ { v: '1', i18n: 'keymap.on' }, { v: '0', i18n: 'keymap.off' } ] },
+        { id: 'wireless_charging_right', i18n: 'keymap.act_wireless_charging_right', kind: 'catalog', key: 'wireless_charging_right',
+          payloads: [ { v: '1', i18n: 'keymap.on' }, { v: '0', i18n: 'keymap.off' } ] },
         { id: 'drive_mode',      i18n: 'keymap.act_drive_mode',       kind: 'catalog', key: 'drive_mode',
           payloads: [ { v: 'normal', i18n: 'keymap.mode_normal' }, { v: 'eco', i18n: 'keymap.mode_eco' }, { v: 'sport', i18n: 'keymap.mode_sport' } ] },
+        // Only the field-validated user-writable energy modes are offered here.
         { id: 'powertrain_mode', i18n: 'keymap.act_powertrain_mode',  kind: 'catalog', key: 'powertrain_mode',
           payloads: [ { v: 'ev', i18n: 'keymap.mode_ev' }, { v: 'hev', i18n: 'keymap.mode_hev' } ] },
-        // Hold battery at current charge — one-tap alias for "switch to HEV" (the only
-        // SDK lever; no settable target-SOC). Single payload so a button just does it.
+        // "Engine mode" — one-tap switch to HEV. Does NOT hold the pack: on a DM-i this starts
+        // the ICE and RECHARGES it. Use battery_hold below for a genuine hold.
         { id: 'hold_battery',    i18n: 'keymap.act_hold_battery',    kind: 'catalog', key: 'hold_battery',
           payloads: [ { v: 'on', i18n: 'keymap.on' } ] },
+        // The REAL battery hold: writes setSOCTarget + setSocSaveSwitch together.
+        // at_current = keep the charge I have (Highway), at_floor = let it deplete (City).
+        { id: 'battery_hold',    i18n: 'keymap.act_battery_hold',    kind: 'catalog', key: 'battery_hold',
+          payloads: [ { v: 'at_current', i18n: 'keymap.battery_hold_at_current' }, { v: 'at_floor', i18n: 'keymap.battery_hold_at_floor' }, { v: 'off', i18n: 'keymap.off' } ] },
         // regen / steering / brake feel: no telemetry readback exists, so "toggle"
         // CYCLES to the next option (daemon tracks the last-commanded value) — ideal
         // for a single button that flips between the two modes on each press.
@@ -249,6 +319,10 @@ window.KM = (function () {
         { id: 'screen_power', i18n: 'keymap.act_screen_power', kind: 'api',
           method: 'POST', path: '/api/vehicle/media', body: '{"target":"screen_power","value":${v}}',
           payloads: [ { v: '0', i18n: 'keymap.off' }, { v: '1', i18n: 'keymap.on' } ] },
+        // Physical centre-screen orientation through BYDAutoSettingDevice.setPadRotation.
+        // Toggle cycles horizontal/vertical from the daemon's last-commanded cache.
+        { id: 'infotainment_rotation', i18n: 'keymap.act_infotainment_rotation', kind: 'catalog', key: 'infotainment_rotation',
+          payloads: [ { v: 'horizontal', i18n: 'keymap.orientation_horizontal' }, { v: 'vertical', i18n: 'keymap.orientation_vertical' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
         // Media volume on a fixed channel — a button binds ONE channel + one level.
         // Separate curated entries per channel keep the two-dropdown form to a single
         // value picker (the channel is baked into the body).
@@ -344,6 +418,12 @@ window.KM = (function () {
         // 'automation' kind, NOT the API path — /api/automations is off the allowlist.
         { id: 'run_automation', i18n: 'keymap.act_run_automation', kind: 'automation',
           dynamicPayloads: 'automation' },
+        // Run a reusable ACTION GROUP on a keypress. Same live-picker shape as
+        // run_automation but sourced from /api/action-groups/list; the stored binding is
+        // { kind:'actionGroup', id, name }. Unlike an automation a group has no conditions
+        // and no run-stats, so it fires unconditionally — which is what a button should do.
+        { id: 'run_action_group', i18n: 'keymap.act_run_action_group', kind: 'actionGroup',
+          dynamicPayloads: 'actionGroup' },
         // Radio toggles (WiFi / Bluetooth / mobile-data). kind:'radio' → daemon runs
         // `svc <radio> enable|disable`; WiFi-off also sets the keep-alive suppression
         // flag so the watchdog doesn't auto-re-enable it. The `radio` id is fixed per
@@ -390,6 +470,22 @@ window.KM = (function () {
                 return out;
             }
         },
+        // Reusable action groups. /api/action-groups/list already returns the [{id,name}]
+        // picker shape, so this needs no new endpoint.
+        actionGroup: {
+            url: '/api/action-groups/list',
+            loading: 'keymap.loading_action_groups',
+            none: 'keymap.no_action_groups',
+            missing: 'keymap.action_group_missing',
+            extract: function (j) {
+                var out = [];
+                var arr = Array.isArray(j) ? j : [];
+                for (var i = 0; i < arr.length; i++) {
+                    if (arr[i] && arr[i].id) out.push({ value: arr[i].id, text: arr[i].name || arr[i].id });
+                }
+                return out;
+            }
+        },
         // Installed launchable apps, for the "Cast app to cluster" binding. Same source
         // as the openApp picker (/api/apps/list); the stored payload is the package name.
         apps: {
@@ -421,7 +517,9 @@ window.KM = (function () {
         window_lr: 'windows_body', window_rr: 'windows_body', tailgate: 'windows_body',
         sunroof: 'windows_body', sunshade: 'windows_body', child_lock: 'windows_body',
         mirror_fold: 'windows_body', wireless_charging: 'windows_body',
+        wireless_charging_left: 'windows_body', wireless_charging_right: 'windows_body',
         climate: 'climate', ac_fan: 'climate', ac_temp_step: 'climate',
+        ac_temp_step_driver: 'climate', ac_temp_step_passenger: 'climate',
         ac_auto: 'climate', fan_only: 'climate', steering_heat: 'climate', recirculation: 'climate',
         defrost_front: 'climate', defrost_rear: 'climate',
         seat_heat_driver: 'climate', seat_heat_passenger: 'climate',
@@ -436,16 +534,22 @@ window.KM = (function () {
         adas_rctb: 'adas_safety', adas_fctb: 'adas_safety', adas_fcw: 'adas_safety',
         adas_aeb: 'adas_safety',
         drive_mode: 'drive', powertrain_mode: 'drive', hold_battery: 'drive', regen_level: 'drive',
-        steering_mode: 'drive', brake_feel: 'drive',
+        steering_mode: 'drive', brake_feel: 'drive', battery_hold: 'drive',
         volume_media: 'media', volume_navigation: 'media', volume_step: 'media',
         media_control: 'media', play_audio: 'media', play_video: 'media', stop_audio: 'media', speak: 'media',
         screen_brightness: 'displays', cluster_brightness: 'displays',
         hud_brightness: 'displays', hud_power: 'displays', screen_power: 'displays',
+        infotainment_rotation: 'displays',
         camview_all: 'surveillance', camview_front: 'surveillance', camview_rear: 'surveillance',
         camview_left: 'surveillance', camview_right: 'surveillance', camview_hide: 'surveillance',
         camview_all_cluster: 'surveillance', camview_front_cluster: 'surveillance', camview_rear_cluster: 'surveillance',
         camview_left_cluster: 'surveillance', camview_right_cluster: 'surveillance',
+        camview_side_rear_left: 'surveillance', camview_side_rear_right: 'surveillance',
+        camview_side_rear_left_cluster: 'surveillance', camview_side_rear_right_cluster: 'surveillance',
         surveillance: 'surveillance', recording: 'surveillance', manual_clip: 'surveillance',
+        bs_fisheye: 'surveillance', bs_fisheye_step: 'surveillance', bs_cameras: 'surveillance',
+        bs_rotation: 'surveillance', bs_enable: 'surveillance', bs_dismiss: 'surveillance',
+        native_camera_view: 'surveillance',
         seat_recall: 'system', seat_save: 'system',
         ui_nav: 'system', screenshot: 'system', show_toast: 'system',
         cast_app_cluster: 'system', cluster_cast_stop: 'system',
@@ -456,8 +560,15 @@ window.KM = (function () {
     // inline so key-mapping.js works even if automations.js isn't loaded on this page.
     var KM_CATEGORY_ORDER = [
         'vehicle', 'climate', 'windows_body', 'lighting', 'adas_safety', 'drive',
-        'media', 'displays', 'sensors', 'surveillance', 'system', 'flow', 'other'
+        'media', 'displays', 'sensors', 'surveillance', 'advanced', 'system', 'flow', 'other'
     ];
+    var HYBRID_ONLY_CURATED = {
+        powertrain_mode: 1,
+        hold_battery: 1,
+        battery_hold: 1,
+        charge_cap_enabled: 1,
+        charge_cap_percent: 1
+    };
     function kmCategoryLabel(cat) {
         var key = 'automation.category_' + cat;
         var t = tr(key);
@@ -512,6 +623,12 @@ window.KM = (function () {
         doubleTapWindowMs: 450,
         bindings: [],
         a11yEnabled: false,
+        // The daemon's stronger "AMS has actually bound the service" signal. undefined until
+        // a response carries it, so a11yReady() can fall back to the precondition on an
+        // older daemon rather than reading a hardcoded false as "never ready".
+        a11yBound: undefined,
+        // undefined until the daemon has a reliable drivetrain verdict.
+        fuelCapableHybrid: undefined,
         restartRequired: false
     };
     var capturing = false;
@@ -546,9 +663,17 @@ window.KM = (function () {
     // and leave the nudge card up — the user acts via "Open accessibility settings".
     // Without this cap, recheckA11y()->scheduleA11yRecheck() re-armed every 5.5s for
     // the life of the page, and each GET spawned a server-side settings-exec heal.
+    //
+    // The budget covers a COLD CAR START, not just a settings write. Opening this page
+    // right after power-on races AMS binding the app-process service: the daemon's
+    // ~4-5s heal is only the first step, and until the bind lands the key filter is
+    // inert, so capture can't see a hardware button. 3 rechecks gave up after ~16.5s
+    // and left the nudge up on a unit that was about to work — the "binding a key takes
+    // too long after car on" report. 8 covers ~44s, past a cold boot, and still
+    // terminates on a genuinely un-enabled service.
     var a11yRecheckPending = false;
     var a11yRechecksLeft = 0;
-    var A11Y_RECHECK_BUDGET = 3;
+    var A11Y_RECHECK_BUDGET = 8;
 
     function load() {
         fetch('/api/keymap/config', { cache: 'no-store' })
@@ -559,6 +684,13 @@ window.KM = (function () {
                 if (typeof s.doubleTapWindowMs === 'number') state.doubleTapWindowMs = s.doubleTapWindowMs;
                 state.bindings = (s.bindings && s.bindings.length) ? s.bindings : [];
                 state.a11yEnabled = !!s.a11yEnabled;
+                if (typeof s.a11yBound === 'boolean') state.a11yBound = s.a11yBound;
+                if (typeof s.fuelCapableHybrid === 'boolean') {
+                    var wasDirty = formDirty;
+                    state.fuelCapableHybrid = s.fuelCapableHybrid;
+                    buildCuratedOptions();
+                    formDirty = wasDirty;
+                }
                 state.restartRequired = !!s.restartRequired;
                 paint();
                 // Fresh foreground load — refill the recheck budget so the
@@ -567,6 +699,9 @@ window.KM = (function () {
                 scheduleA11yRecheck();
             })
             .catch(function () { toast(tr('keymap.load_failed'), 'error'); });
+        // Independent section, independent fetch: a quick-control list failure must not
+        // stop the key bindings from painting (and vice-versa).
+        loadQuickControls();
     }
 
     // Client-side half of the daemon's load-time self-heal
@@ -585,8 +720,19 @@ window.KM = (function () {
     // "adding a new binding deletes the older one" bug. So recheckA11y() reads the
     // config but adopts only a11yEnabled, leaving the user's working binding list
     // and toggles untouched.
+    // Whether key filtering is actually live. a11yEnabled is only the OS BIND
+    // PRECONDITION (component listed + master flag on); AMS binds the app-process service
+    // asynchronously, and until that lands onKeyEvent never fires — so keys are dead and
+    // capture sees nothing even though a11yEnabled reads true. The daemon reports the
+    // stronger a11yBound for exactly this reason; treat "ready" as bound when the daemon
+    // tells us, and fall back to the precondition on an older build that omits the field.
+    function a11yReady() {
+        if (typeof state.a11yBound === 'boolean') return state.a11yBound;
+        return state.a11yEnabled;
+    }
+
     function scheduleA11yRecheck() {
-        if (state.enabled && !state.a11yEnabled && !a11yRecheckPending && a11yRechecksLeft > 0) {
+        if (state.enabled && !a11yReady() && !a11yRecheckPending && a11yRechecksLeft > 0) {
             a11yRecheckPending = true;
             a11yRechecksLeft--;
             setTimeout(function () { a11yRecheckPending = false; recheckA11y(); }, 5500);
@@ -599,14 +745,36 @@ window.KM = (function () {
             .then(function (s) {
                 // Adopt ONLY the a11y status — do NOT touch bindings/enabled/allowAdvanced.
                 state.a11yEnabled = !!s.a11yEnabled;
+                if (typeof s.a11yBound === 'boolean') state.a11yBound = s.a11yBound;
                 // Refresh just the nudge card, not the whole list (paint() re-renders
                 // from the untouched state.bindings, so it's safe, but keep it minimal).
-                var card = $('kmA11yCard');
-                if (card) card.style.display = (state.enabled && !state.a11yEnabled) ? '' : 'none';
-                // If still not enabled, arm one more recheck (self-terminates once it flips).
+                updateA11yCard();
+                // If still not ready, arm one more recheck (self-terminates once it flips).
                 scheduleA11yRecheck();
             })
             .catch(function () { /* transient — leave the nudge as-is */ });
+    }
+
+    // Show/hide the nudge from the honest readiness signal, and say WHICH state we're in:
+    // "enabling…" while the OS precondition is met but the bind hasn't landed (the cold-boot
+    // window, which resolves itself), versus the actionable nudge when the service is simply
+    // not enabled. Without the distinction a user waiting out a normal boot is told to go
+    // change system settings. Both elements are optional so an older page still works.
+    function updateA11yCard() {
+        var show = state.enabled && !a11yReady();
+        // "Starting up" = the OS precondition is met but the bind hasn't landed. Nothing for the
+        // user to do, so the amber "you must enable it" note AND the settings button are hidden;
+        // the two notes are mutually exclusive. Showing both (the amber one had no id, so nothing
+        // could hide it) gave contradictory advice during a normal car power-on.
+        var starting = show && state.a11yEnabled;
+        var card = $('kmA11yCard');
+        if (card) card.style.display = show ? '' : 'none';
+        var needed = $('kmA11yNeeded');
+        if (needed) needed.style.display = (show && !starting) ? '' : 'none';
+        var pending = $('kmA11yPending');
+        if (pending) pending.style.display = starting ? '' : 'none';
+        var openBtn = $('kmA11yOpenBtn');
+        if (openBtn) openBtn.style.display = (show && !starting) ? '' : 'none';
     }
 
     function paint() {
@@ -642,8 +810,9 @@ window.KM = (function () {
             badge.className = 'status-badge inactive';
         }
 
-        // Show the a11y nudge only when mapping is enabled but the OS service is off.
-        $('kmA11yCard').style.display = (state.enabled && !state.a11yEnabled) ? '' : 'none';
+        // Show the a11y nudge only while mapping is enabled but key filtering isn't live yet
+        // (see a11yReady — bound, not merely the OS precondition).
+        updateA11yCard();
         paintRestartWarning();
 
         renderList();
@@ -857,6 +1026,9 @@ window.KM = (function () {
             // still reads. (The daemon always resolves by id, not this label.)
             return tr('keymap.act_run_automation') + ': ' + (a.name || a.id || '');
         }
+        if (a.kind === 'actionGroup') {
+            return tr('keymap.act_run_action_group') + ': ' + (a.name || a.id || '');
+        }
         if (a.kind === 'radio') {
             var rc = matchCuratedByRadio(a.radio);
             var rlabel = rc ? tr(curatedById(rc).i18n) : (a.radio || 'radio');
@@ -921,10 +1093,18 @@ window.KM = (function () {
               // just auto-enabled the service on the enable edge), so adopt it and
               // let paint() hide the nag without waiting for a full reload.
               if (d && typeof d.a11yEnabled !== 'undefined') state.a11yEnabled = !!d.a11yEnabled;
+              if (d && typeof d.a11yBound === 'boolean') state.a11yBound = d.a11yBound;
               if (d && d.success && typeof d.restartRequired !== 'undefined') {
                   state.restartRequired = !!d.restartRequired;
                   paintRestartWarning();
               }
+              // An enable-edge save reports the precondition true but the bind not yet
+              // landed (AMS binds asynchronously). Refresh the card from the honest signal
+              // and arm the recheck so it clears itself once the service is really up,
+              // instead of leaving a stale nudge until the next manual reload.
+              updateA11yCard();
+              a11yRechecksLeft = A11Y_RECHECK_BUDGET;
+              scheduleA11yRecheck();
               if (cb) cb(!!(d && d.success));
           })
           .catch(function () { if (cb) cb(false); });
@@ -1211,11 +1391,14 @@ window.KM = (function () {
 
     function buildCuratedOptions() {
         var sel = $('kmCuratedAction');
+        var selected = sel.value;
         sel.innerHTML = '';
-        // Bucket options by category (preserving CURATED order within each bucket).
+        // Bucket options by category. Confirmed BEVs omit controls that require an engine.
         var buckets = {};
         var i;
         for (i = 0; i < CURATED.length; i++) {
+            if (state.fuelCapableHybrid === false
+                    && HYBRID_ONLY_CURATED[CURATED[i].id]) continue;
             var cat = KM_CATEGORY[CURATED[i].id] || 'other';
             if (!buckets[cat]) buckets[cat] = [];
             buckets[cat].push(CURATED[i]);
@@ -1231,7 +1414,11 @@ window.KM = (function () {
         for (i = 0; i < cats.length; i++) {
             var group = document.createElement('optgroup');
             group.label = kmCategoryLabel(cats[i]);
-            var items = buckets[cats[i]];
+            var items = buckets[cats[i]].slice().sort(function (a, b) {
+                var byLabel = String(tr(a.i18n)).localeCompare(
+                    String(tr(b.i18n)), undefined, { sensitivity: 'base', numeric: true });
+                return byLabel || String(a.id).localeCompare(String(b.id));
+            });
             for (var j = 0; j < items.length; j++) {
                 var o = document.createElement('option');
                 o.value = items[j].id;
@@ -1239,6 +1426,10 @@ window.KM = (function () {
                 group.appendChild(o);
             }
             sel.appendChild(group);
+        }
+        if (selected && curatedById(selected)
+                && !(state.fuelCapableHybrid === false && HYBRID_ONLY_CURATED[selected])) {
+            sel.value = selected;
         }
         onCuratedChange();
     }
@@ -1492,6 +1683,14 @@ window.KM = (function () {
                 var nm = (selEl && selEl.selectedIndex >= 0) ? selEl.options[selEl.selectedIndex].textContent : '';
                 return { kind: 'automation', id: payload, name: nm };
             }
+            if (c.kind === 'actionGroup') {
+                // Same shape as the automation kind: payload is the group id, name is
+                // carried for display only (the daemon resolves by id at fire time).
+                if (!payload) { toast(tr('keymap.need_action_group'), 'error'); return null; }
+                var grpEl = $('kmPayload');
+                var grpNm = (grpEl && grpEl.selectedIndex >= 0) ? grpEl.options[grpEl.selectedIndex].textContent : '';
+                return { kind: 'actionGroup', id: payload, name: grpNm };
+            }
             if (c.kind === 'radio') {
                 // radio id is fixed per curated action; payload is the on/off state.
                 return { kind: 'radio', radio: c.radio, state: payload || 'on' };
@@ -1554,6 +1753,165 @@ window.KM = (function () {
         seqSteps.push(a);
         clearActionForm();
         renderSteps();
+    }
+
+    // ── Quick controls (dashboard buttons) ────────────────────────────────────
+    // A quick-control button stores the SAME action payload a key binding does, so the
+    // whole action builder above is reused verbatim: compose the action (single or
+    // sequence) exactly as for a key, then save it as a button instead of to a keycode.
+    // The daemon fires both through one executor, so a button can never do more than a key.
+
+    var qcButtons = [];
+
+    function loadQuickControls() {
+        fetch('/api/quick-controls').then(function (r) { return r.json(); }).then(function (j) {
+            qcButtons = (j && j.success && j.buttons) ? j.buttons : [];
+            renderQuickControls();
+        }).catch(function () { renderQuickControls(); });
+    }
+
+    function renderQuickControls() {
+        var host = $('kmQcList');
+        if (!host) return;
+        host.textContent = '';
+        var empty = $('kmQcEmpty');
+        if (empty) empty.style.display = qcButtons.length ? 'none' : '';
+        for (var i = 0; i < qcButtons.length; i++) {
+            var b = qcButtons[i];
+            if (!b) continue;
+            var row = document.createElement('div');
+            row.className = 'km-binding';
+            var label = document.createElement('span');
+            // textContent, never innerHTML — the label is user-authored free text.
+            label.textContent = (b.label || b.id) + ' — ' + describeAction(b.action);
+            row.appendChild(label);
+            var del = document.createElement('button');
+            del.className = 'btn btn-danger btn-sm';
+            del.type = 'button';
+            del.textContent = tr('keymap.qc_delete');
+            // Address by stable id, never by render-time index: the list re-renders only
+            // when the save POST echoes back, so a second click before that lands would
+            // read a stale index and delete a DIFFERENT button.
+            del.setAttribute('data-qc-id', b.id);
+            del.addEventListener('click', function () {
+                removeQuickControl(this.getAttribute('data-qc-id'));
+            });
+            row.appendChild(del);
+            host.appendChild(row);
+        }
+    }
+
+    // Save the composed action as a dashboard button. Uses the in-progress sequence when
+    // one exists (same precedence addBinding uses), else the current single selection.
+    function saveQuickControl() {
+        var labelEl = $('kmQcLabel');
+        var label = labelEl ? labelEl.value.trim() : '';
+        if (!label) { toast(tr('keymap.qc_need_label'), 'error'); return; }
+        var action;
+        if (seqSteps.length) {
+            // Fold the pending form selection ONLY if the user actually edited it —
+            // the same formDirty gate addBinding uses, and for the same reason:
+            // buildActionFromForm() never returns null, so after addStep() blanks the
+            // form it still yields CURATED[0] ("lock"). Without this gate a button built
+            // from "Add step" presses silently gained a trailing lock-the-car step.
+            var steps = seqSteps.slice();
+            if (formDirty) {
+                var pending = buildActionFromForm();
+                if (pending) steps.push(pending);
+            }
+            action = steps.length === 1 ? steps[0] : { kind: 'sequence', steps: steps };
+        } else {
+            // buildActionFromForm already toasts a specific reason when it refuses (e.g.
+            // "choose an automation"), so don't stack a generic message on top of it.
+            action = buildActionFromForm();
+            if (!action) return;
+        }
+        if (!action) { toast(tr('keymap.qc_need_action'), 'error'); return; }
+        if (action.kind === 'manualClip' || (action.kind === 'sequence' && hasManualClip(action.steps))) {
+            // Same constraint the daemon enforces for sequences: a replay completes
+            // asynchronously and must be a direct binding.
+            toast(tr('keymap.clip_sequence_unsupported'), 'warning');
+            return;
+        }
+        // id is generated, never user-supplied — it is what the fire endpoint resolves.
+        var id = 'qc' + Date.now() + Math.floor(Math.random() * 1000);
+        qcButtons.push({ id: id, label: label, action: action });
+        persistQuickControls(function () {
+            if (labelEl) labelEl.value = '';
+            // BOTH, in this order. resetForm() ends any half-finished KEY binding session —
+            // without it editIndex and the captured keycode stay armed, so the next "Save"
+            // press would overwrite the binding being edited with this blanked form. It does
+            // not touch the action selects, which clearActionForm() then resets.
+            resetForm();
+            clearActionForm();
+        });
+    }
+
+    function hasManualClip(steps) {
+        if (!steps || !steps.length) return false;
+        for (var i = 0; i < steps.length; i++) {
+            if (steps[i] && steps[i].kind === 'manualClip') return true;
+        }
+        return false;
+    }
+
+    function removeQuickControl(id) {
+        if (!id) return;
+        var index = -1;
+        for (var i = 0; i < qcButtons.length; i++) {
+            if (qcButtons[i] && qcButtons[i].id === id) { index = i; break; }
+        }
+        if (index < 0) return;
+        function doDelete() {
+            // Re-resolve by id: the confirm modal is async, so the array may have changed
+            // (another delete landed, or the daemon echo re-rendered) since it opened.
+            for (var j = 0; j < qcButtons.length; j++) {
+                if (qcButtons[j] && qcButtons[j].id === id) {
+                    qcButtons.splice(j, 1);
+                    // Re-render at once so the row can't be clicked again during the POST.
+                    renderQuickControls();
+                    persistQuickControls();
+                    return;
+                }
+            }
+        }
+        // Confirm first — deleting is destructive and one stray tap would otherwise remove a
+        // button with no undo. Same themed modal (with native fallback) removeBinding uses.
+        if (window.BYD && BYD.utils && BYD.utils.confirmDialog) {
+            BYD.utils.confirmDialog({
+                title: tr('keymap.qc_delete'),
+                body: tr('keymap.qc_confirm_delete'),
+                confirmLabel: tr('keymap.qc_delete'),
+                cancelLabel: tr('common.cancel'),
+                danger: true
+            }).then(function (ok) { if (ok) doDelete(); });
+        } else if (window.confirm(tr('keymap.qc_confirm_delete'))) {
+            doDelete();
+        }
+    }
+
+    // Wholesale replace, mirroring the keymap section: a removed button must actually
+    // disappear rather than linger from a key-merge. Re-render from the daemon's echo so
+    // the list always shows what was really persisted (labels are clamped server-side).
+    function persistQuickControls(onOk) {
+        fetch('/api/quick-controls', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ buttons: qcButtons })
+        }).then(function (r) { return r.json(); }).then(function (j) {
+            if (!j || !j.success) {
+                toast((j && j.error) || tr('keymap.qc_save_failed'), 'error');
+                loadQuickControls();
+                return;
+            }
+            qcButtons = j.buttons || qcButtons;
+            renderQuickControls();
+            toast(tr('keymap.qc_saved'), 'success');
+            if (onOk) onOk();
+        }).catch(function () {
+            toast(tr('keymap.qc_save_failed'), 'error');
+            loadQuickControls();
+        });
     }
 
     // Reset only the action inputs (not keycode/pressType, which describe the key
@@ -1857,6 +2215,15 @@ window.KM = (function () {
             onCuratedChange(a.id || undefined);
             return;
         }
+        // Run-action-group: identical restore path, different curated id + live list.
+        if (a.kind === 'actionGroup') {
+            if (kindSel) kindSel.value = 'curated';
+            onKindChange();
+            var grpSel = $('kmCuratedAction');
+            if (grpSel) grpSel.value = 'run_action_group';
+            onCuratedChange(a.id || undefined);
+            return;
+        }
         // Radio toggle: match the curated entry by its fixed `radio` id, restore the
         // on/off state as the payload.
         if (a.kind === 'radio') {
@@ -2028,6 +2395,26 @@ window.KM = (function () {
         // means other than the edit pencil (see onTabChanged) — closes the edit trap.
         document.addEventListener('ot-tabs:active-changed', function (e) {
             try { onTabChanged(e && e.detail ? e.detail.id : null); } catch (_) {}
+            // Re-arm the readiness poll on any tab switch. The budget is finite (~44s), so on a
+            // boot slower than that the nudge would otherwise sit there until a manual reload
+            // even though the service came up. Cheap: the guard below no-ops once ready, and
+            // scheduleA11yRecheck already collapses repeats into one timer.
+            try {
+                if (state.enabled && !a11yReady()) {
+                    a11yRechecksLeft = A11Y_RECHECK_BUDGET;
+                    scheduleA11yRecheck();
+                }
+            } catch (_) {}
+        }, false);
+        // Same re-arm when the page returns to the foreground: the head unit does not reliably
+        // deliver Page Visibility, so listen for both and let the guards dedupe.
+        document.addEventListener('visibilitychange', function () {
+            try {
+                if (!document.hidden && state.enabled && !a11yReady()) {
+                    a11yRechecksLeft = A11Y_RECHECK_BUDGET;
+                    scheduleA11yRecheck();
+                }
+            } catch (_) {}
         }, false);
         // Mark the Add-form touched when the user edits the free-text / payload
         // inputs directly (the two <select>s already flag via their onchange
@@ -2077,6 +2464,8 @@ window.KM = (function () {
         onClipWindowChange: onClipWindowChange,
         addStep: addStep,
         addBinding: addBinding,
+        loadQuickControls: loadQuickControls,
+        saveQuickControl: saveQuickControl,
         toggleBinding: toggleBinding,
         goAdd: goAdd,
         openA11ySettings: openA11ySettings

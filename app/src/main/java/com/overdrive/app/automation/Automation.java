@@ -15,6 +15,13 @@ import java.util.Map;
 import java.util.Objects;
 
 public class Automation {
+    // Runtime execution modes. "manual" is intentionally serialized with
+    // disabled=true as well, so an older build that does not understand
+    // manualOnly treats the automation as safely disabled instead of arming it.
+    public static final String MODE_AUTOMATIC = "automatic";
+    public static final String MODE_MANUAL = "manual";
+    public static final String MODE_DISABLED = "disabled";
+
     // Condition-combining logic. "AND" (default) = every condition must match;
     // "OR" = any one condition matching is enough. Stored as a String so the JSON
     // schema stays open and an unknown/absent value degrades safely to AND — which
@@ -44,10 +51,12 @@ public class Automation {
     // branch behaves exactly as before. Never null.
     private final List<AutomationAction> elseActions;
 
-    // volatile: written from HTTP request threads (setDisabled) and read from the telemetry thread
-    // (stateChanged) and the queue worker thread (triggerActions) with no shared lock, so a plain field
-    // could let those threads observe a stale enabled/disabled state and fire a just-disabled automation.
-    private volatile boolean disabled;
+    // volatile: written from HTTP request threads (setMode/setDisabled) and read from the
+    // telemetry thread (stateChanged), explicit-run thread, and queue worker with no shared
+    // lock. A plain field could let those threads observe a stale mode and fire after a change.
+    private volatile String mode;
+    /** Changes on every runtime mode mutation, including a disable-enable cycle. */
+    private volatile long enabledStateRevision;
 
     // Optional user-given name (a label shown in the list + the automation-control
     // target picker). Empty for automations created before this feature — the UI then
@@ -123,7 +132,7 @@ public class Automation {
         this.delay = Objects.requireNonNullElse(delay, 0);
         this.actions = actions;
         this.elseActions = elseActions != null ? elseActions : new ArrayList<>();
-        this.disabled = disabled;
+        this.mode = disabled ? MODE_DISABLED : MODE_AUTOMATIC;
     }
 
     /**
@@ -191,12 +200,41 @@ public class Automation {
     }
 
     /**
-     * Whether this automation is currently disabled
-     *
-     * @return Whether this automation is currently disabled
+     * Whether this automation is excluded from autonomous event processing.
+     * Both manual-only and fully disabled modes return true.
      */
     public boolean isDisabled() {
-        return disabled;
+        return !MODE_AUTOMATIC.equals(mode);
+    }
+
+    /**
+     * Whether this automation is armed only for an explicit user invocation.
+     * Manual-only automations are deliberately considered disabled by
+     * {@link #isDisabled()} so they contribute no event polling or queue worker.
+     */
+    public boolean isManualOnly() {
+        return MODE_MANUAL.equals(mode);
+    }
+
+    /** Whether neither automatic nor explicit execution is allowed. */
+    public boolean isFullyDisabled() {
+        return MODE_DISABLED.equals(mode);
+    }
+
+    /** Whether Run now / key mapping may explicitly execute this automation. */
+    public boolean allowsExplicitRun() {
+        return !isFullyDisabled();
+    }
+
+    /** Normalized execution mode: automatic, manual, or disabled. */
+    public String getMode() {
+        return mode;
+    }
+
+    public static boolean isValidMode(String value) {
+        return MODE_AUTOMATIC.equals(value)
+                || MODE_MANUAL.equals(value)
+                || MODE_DISABLED.equals(value);
     }
 
     /**
@@ -297,7 +335,21 @@ public class Automation {
      * @param disabled Whether this should be disabled
      */
     public void setDisabled(boolean disabled) {
-        this.disabled = disabled;
+        setMode(disabled ? MODE_DISABLED : MODE_AUTOMATIC);
+    }
+
+    /**
+     * Change the runtime execution mode. Callers validate the input before mutation;
+     * an invalid value is ignored in the safe direction.
+     */
+    public void setMode(String mode) {
+        if (!isValidMode(mode)) return;
+        enabledStateRevision++;
+        this.mode = mode;
+    }
+
+    long enabledStateRevision() {
+        return enabledStateRevision;
     }
 
     /**
@@ -368,7 +420,10 @@ public class Automation {
                 elseActionsJson.put(action.toJson());
             }
             json.put("elseActions", elseActionsJson);
+            // Compatibility contract: old builds know only `disabled`. Manual-only
+            // must look disabled to them or a downgrade could arm the rule.
             json.put("disabled", isDisabled());
+            if (isManualOnly()) json.put("manualOnly", true);
             // Optional name + run stats — emitted only when set, so an automation
             // created before this feature serializes with no new keys (byte-identical).
             if (!getName().isEmpty()) json.put("name", getName());
@@ -518,6 +573,14 @@ public class Automation {
                 for (int i = 0; i < groupsJson.length(); i++) {
                     ConditionGroup g = ConditionGroup.fromJson(groupsJson.getJSONObject(i), MAX_GROUP_DEPTH);
                     if (g == null) return null;
+                    // DROP a term-less group instead of keeping it. evaluate() returns true for a
+                    // group with no leaves and no children, so under conditionLogic "OR" it makes
+                    // the whole condition set vacuously true — the automation then fires on every
+                    // trigger with its real conditions bypassed, actuating the vehicle. The editor
+                    // produces exactly this when a user adds a group and deletes its only row.
+                    // Dropping (not rejecting) keeps the user's other conditions, which is the
+                    // safe direction: a preserved gate beats a lost automation.
+                    if (g.getConditions().isEmpty() && g.getGroups().isEmpty()) continue;
                     conditionGroups.add(g);
                 }
             }
@@ -541,9 +604,13 @@ public class Automation {
             }
 
             boolean disabled = input.optBoolean("disabled", false);
+            // manualOnly wins over a conflicting disabled=false in a hand-edited file.
+            // The safe interpretation is never to arm an explicitly manual rule.
+            boolean manualOnly = input.optBoolean("manualOnly", false);
 
             Automation a = new Automation(triggers, conditions, conditionLogic, conditionGroups,
                     delay, actions, elseActions, disabled);
+            if (manualOnly) a.setMode(MODE_MANUAL);
             // Optional name + run stats (absent on pre-feature automations → defaults).
             a.setName(input.optString("name", ""));
             a.setStats(input.optLong("lastTriggered", 0L), input.optLong("triggerCount", 0L));

@@ -42,6 +42,10 @@
         android:icon="@drawable/ic_roadsense"
         android:title="@string/rail_roadsense" />
     <item
+        android:id="@+id/networkFragment"
+        android:icon="@drawable/ic_hotspot"
+        android:title="@string/rail_network" />
+    <item
         android:id="@+id/diagnosticsFragment"
         android:icon="@drawable/ic_diagnostics"
         android:title="@string/rail_diagnostics" />

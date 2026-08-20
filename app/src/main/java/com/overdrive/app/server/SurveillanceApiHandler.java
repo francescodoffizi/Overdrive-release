@@ -81,6 +81,8 @@ public class SurveillanceApiHandler {
             // and the daemon survives, this lets the client unstick the
             // shutdown latch so future preview requests work again without
             // needing a manual daemon restart.
+            // Nothing to resume on the trip side: prepare-restart only
+            // flushed telemetry and left the trip open and sampling.
             shutdownInProgress = false;
             CameraDaemon.log("abort-restart: shutdown latch cleared");
             HttpResponse.sendJsonSuccess(out);
@@ -473,6 +475,9 @@ public class SurveillanceApiHandler {
         // Keep ONLY the USB/data rail powered after ACC OFF (cameras unaffected).
         // Default true; read by AccSentryDaemon on the next ACC-OFF cycle.
         config.put("keepUsbPowerOnAccOff", survConfig.optBoolean("keepUsbPowerOnAccOff", true));
+        // Parked cellular keep-alive. Default FALSE (opt-in) — see the daemon's
+        // keep-alive loop; only needed where the data module sleeps after ACC OFF.
+        config.put("mobileDataKeepAlive", survConfig.optBoolean("mobileDataKeepAlive", false));
         // HV-battery SoC surveillance cutoff (%). Lives in the "power" section
         // (the key SocCutoffMonitor reads), NOT "surveillance" — surface it on
         // the surveillance config so the General-tab slider can hydrate. 0=Off.
@@ -517,6 +522,7 @@ public class SurveillanceApiHandler {
             config.put("discardEmptyBrightMotionEvents", sentryConfig.isDiscardEmptyBrightMotionEvents());
             config.put("discardEmptyMotionAtNight", sentryConfig.isDiscardEmptyMotionAtNight());
             config.put("motionSalienceEnabled", sentryConfig.isMotionSalienceEnabled());
+            config.put("postParkVigilanceEnabled", sentryConfig.isPostParkVigilanceEnabled());
             config.put("telegramSendStartPing", sentryConfig.isTelegramSendStartPing());
             // Per-tier filter now lives in the telegram unified-config section
             // (see UnifiedTelegramConfig.K_TIER_*). Wire format on
@@ -650,6 +656,7 @@ public class SurveillanceApiHandler {
             config.put("discardEmptyBrightMotionEvents", false);
             config.put("discardEmptyMotionAtNight", false);
             config.put("motionSalienceEnabled", false);
+            config.put("postParkVigilanceEnabled", true);
             config.put("telegramSendStartPing", false);
             // Tier toggles live on the telegram unified-config section, so
             // they're available even when SurveillanceConfig isn't loaded.
@@ -1196,6 +1203,23 @@ public class SurveillanceApiHandler {
                         + " (takes effect next ACC-OFF cycle)");
             }
 
+            // Parked cellular keep-alive. Same pure-persist contract as the USB toggle
+            // above: the daemon snapshots this when the next parked session starts, so
+            // an in-flight session keeps whatever it armed with. Default FALSE.
+            if (configJson.has("mobileDataKeepAlive")) {
+                boolean dataKeepAlive = configJson.optBoolean("mobileDataKeepAlive", false);
+                boolean persisted = com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                        "surveillance",
+                        java.util.Collections.singletonMap("mobileDataKeepAlive", dataKeepAlive));
+                if (!persisted) {
+                    CameraDaemon.log("Failed to persist mobileDataKeepAlive=" + dataKeepAlive);
+                    HttpResponse.sendJsonError(out, "Failed to save mobile-data setting");
+                    return;
+                }
+                CameraDaemon.log("Mobile-data keep-alive while parked set to: " + dataKeepAlive
+                        + " (takes effect next ACC-OFF cycle)");
+            }
+
             // HV-battery SoC surveillance cutoff (%). Routed to the "power"
             // section — power.lowSocCutoffPercent is the EXACT key
             // SocCutoffMonitor.cutoffPercent() reads, so the slider must land
@@ -1421,6 +1445,11 @@ public class SurveillanceApiHandler {
             if (configJson.has("motionSalienceEnabled")) {
                 sentryConfig.setMotionSalienceEnabled(
                         configJson.optBoolean("motionSalienceEnabled", false));
+                configChanged = true;
+            }
+            if (configJson.has("postParkVigilanceEnabled")) {
+                sentryConfig.setPostParkVigilanceEnabled(
+                        configJson.optBoolean("postParkVigilanceEnabled", true));
                 configChanged = true;
             }
             if (configJson.has("discardEmptyMotionAtNight")) {
@@ -1746,7 +1775,7 @@ public class SurveillanceApiHandler {
             }
 
             // Camera ingestion mode: "default" (legacy ImageReader + 4-strip
-            // → 2x2 rearrangement) vs "dilink4" (esco SurfaceTexture +
+            // → 2x2 rearrangement) vs "dilink4" (oem SurfaceTexture +
             // passthrough). Persisted under camera.cameraMode and read by
             // PanoramicCameraGpu / GpuSurveillancePipeline at init. Save
             // triggers the same prepare-restart flow as a manual cam-id
@@ -1865,7 +1894,17 @@ public class SurveillanceApiHandler {
     private static void handleEnable(OutputStream out) throws Exception {
         // SOTA: Only persist the preference. Surveillance should only activate on ACC OFF.
         // Starting motion detection while driving wastes CPU/GPU and is meaningless.
-        com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true);
+        //
+        // The persist result is LOAD-BEARING, not advisory: the ACC-OFF arm
+        // dispatch re-reads the persisted flag, so a failed write (EACCES on
+        // app-UID writes is the common case here) means surveillance will NOT
+        // arm on the next park. Reporting success there is what makes an
+        // automation look like it ran while nothing was ever armed.
+        if (!com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true)) {
+            CameraDaemon.log("Failed to persist surveillanceEnabled=true — surveillance will NOT arm on next ACC OFF");
+            HttpResponse.sendJsonError(out, Messages.get("errors.surveillance_persist_failed"));
+            return;
+        }
 
         // Only actually start surveillance if ACC is currently OFF (sentry mode)
         boolean accIsOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
@@ -1884,20 +1923,48 @@ public class SurveillanceApiHandler {
                 com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
             } catch (Throwable ignored) {}
         }
-        HttpResponse.sendJsonSuccess(out);
+        // deferred=true means "preference stored, nothing armed yet" — the
+        // caller (automation / web toggle / key mapping) can say so instead of
+        // reporting a plain success the user reads as "surveillance is on now".
+        JSONObject response = new JSONObject();
+        response.put("success", true);
+        response.put("deferred", accIsOn);
+        HttpResponse.sendJson(out, response.toString());
     }
 
     private static void handleDisable(OutputStream out) throws Exception {
-        CameraDaemon.disableSurveillance();   // fires OEM recalc internally
-        com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false);
+        // ACC-GATED teardown. While ACC is ON no sentry is armed, so
+        // disableSurveillance() has nothing to tear down — its only effects are
+        // gpuPipeline.disableSurveillance() and clearing the in-memory
+        // `surveillanceEnabled` intent field. The pipeline call is the hazard:
+        // it forces currentMode IDLE (GpuSurveillancePipeline:3855) and pushes
+        // the dashcam layout profile, so an automation firing "surveillance off"
+        // mid-drive re-applies the layout under a live CONTINUOUS/DRIVE_MODE
+        // recording for no reason. The ACC-ON path already clears the intent
+        // field itself, so skipping the whole call here loses nothing.
+        boolean accIsOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
+        if (!accIsOn) {
+            CameraDaemon.disableSurveillance();   // fires OEM recalc internally
+        }
+        if (!com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false)) {
+            CameraDaemon.log("Failed to persist surveillanceEnabled=false — surveillance may re-arm on next ACC OFF");
+            HttpResponse.sendJsonError(out, Messages.get("errors.surveillance_persist_failed"));
+            return;
+        }
         // disableSurveillance ran BEFORE the UCM write, so its recalc saw the
         // old surveillanceEnabled=true. Fire a second recalc post-write so
         // the resolver picks up the now-disabled master toggle and applies
         // survSuppressed=true to any in-flight surv=continuous recording.
+        // Also the ONLY recalc on the ACC-ON path, where the disable above is
+        // skipped — the resolver still has to see the new master toggle.
         try {
             com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
         } catch (Throwable ignored) {}
-        HttpResponse.sendJsonSuccess(out);
+        JSONObject response = new JSONObject();
+        response.put("success", true);
+        // Nothing was armed to stop, so the write only affects the next park.
+        response.put("deferred", accIsOn);
+        HttpResponse.sendJson(out, response.toString());
     }
 
     /**
@@ -1924,12 +1991,11 @@ public class SurveillanceApiHandler {
         // before stop() — running stop() concurrently with start() leaks
         // encoder/EGL.
         //
-        // If cold-start is still in flight after 3 s, we ABANDON this
-        // prepare-restart instead of force-taking the flag (which would
-        // race the still-running start and corrupt the encoder anyway).
-        // The dialog proceeds with kill+relaunch; the fresh JVM recovers
-        // cleanly. Worst case: one corrupt MP4 from the kill, no worse
-        // than racing a half-initialized pipeline.
+        // If cold-start is still in flight after 3 s, reject this prepare
+        // instead of force-taking the flag (which would race the still-running
+        // start and corrupt the encoder). The client must not SIGKILL unless
+        // this endpoint confirms that both startup ownership and trip
+        // durability are settled.
         long deadline = System.currentTimeMillis() + 3000;
         boolean tookFlag = false;
         while (true) {
@@ -1939,7 +2005,7 @@ public class SurveillanceApiHandler {
             }
             if (System.currentTimeMillis() > deadline) {
                 CameraDaemon.log("prepare-restart: cold-start still in flight after 3s — "
-                        + "abandoning graceful stop, dialog will SIGKILL anyway");
+                        + "rejecting restart");
                 break;
             }
             try {
@@ -1950,7 +2016,13 @@ public class SurveillanceApiHandler {
             }
         }
         if (!tookFlag) {
-            HttpResponse.sendJsonSuccess(out);
+            shutdownInProgress = false;
+            JSONObject failure = new JSONObject();
+            failure.put("success", false);
+            failure.put("error", "Camera startup is still in progress; restart was not prepared");
+            failure.put("retryable", true);
+            failure.put("retryAfterMs", 1000);
+            HttpResponse.sendJson(out, 503, failure.toString());
             return;
         }
         // CHECKPOINT any in-progress trip before the caller SIGKILLs us. The
@@ -1959,24 +2031,60 @@ public class SurveillanceApiHandler {
         // here and the trip would otherwise lose everything buffered since the
         // last periodic flush.
         //
-        // Deliberately checkpointActiveTrip(), NOT shutdown(). shutdown() would
+        // Deliberately prepareForProcessRestart(), NOT shutdown(). shutdown() would
         // finalizeActiveTrip() → apply the 60s/0.2km floors → discardTrip() →
         // DELETE the telemetry file, destroying a short trip that previously
         // survived the kill as a recoverable file. It would also flip
         // initialized/enabled false and close the H2 store, which strands trips
         // dead for the rest of the process whenever the caller's SIGKILL fails
         // (the abort-restart endpoint exists precisely because it can).
-        // Best-effort and fully guarded — never block the restart.
+        // A positive result is mandatory. Reporting success after a timed-out
+        // or failed flush lets the caller kill the only process holding the
+        // telemetry tail and is indistinguishable from data loss.
+        boolean tripCheckpointDurable = true;
+        // Carried into the 503 body. Without it every distinct cause below
+        // reached the updater as an indistinguishable "HTTP 503".
+        String tripCheckpointFailure = null;
         try {
             com.overdrive.app.trips.TripAnalyticsManager tam =
                 CameraDaemon.getTripAnalyticsManager();
-            if (tam != null && tam.isEnabled() && tam.isInitialized()) {
+            if (tam == null || !tam.isInitialized()) {
+                tripCheckpointDurable = false;
+                // Trip analytics initializes on its own thread while HTTP is
+                // already serving, so this is a startup race, not a fault.
+                tripCheckpointFailure = "trip analytics is still starting up";
+                CameraDaemon.log("prepare-restart: trip manager is not ready");
+            } else if (tam.isEnabled()) {
                 CameraDaemon.log("prepare-restart: checkpointing active trip before kill");
+                // Flush buffered telemetry so the on-disk .jsonl.gz covers
+                // everything sampled so far. The trip is left OPEN — next boot
+                // rebuilds the row from the file. Best-effort by contract, so
+                // there is no verdict to gate the restart on.
                 tam.checkpointActiveTrip();
             }
         } catch (Throwable t) {
             CameraDaemon.log("prepare-restart: trip checkpoint failed: " + t.getMessage());
+            tripCheckpointDurable = false;
+            tripCheckpointFailure = "trip checkpoint threw "
+                    + t.getClass().getSimpleName();
         }
+        if (!tripCheckpointDurable) {
+            coldStartInProgress.set(false);
+            shutdownInProgress = false;
+            JSONObject failure = new JSONObject();
+            failure.put("success", false);
+            failure.put("error", tripCheckpointFailure != null
+                    ? "Active trip could not be durably checkpointed: "
+                            + tripCheckpointFailure
+                    : "Active trip could not be durably checkpointed");
+            // Every cause here clears on its own within a few seconds (spool
+            // drain, startup, final flush), so the client should retry.
+            failure.put("retryable", true);
+            failure.put("retryAfterMs", 1000);
+            HttpResponse.sendJson(out, 503, failure.toString());
+            return;
+        }
+        boolean pipelinePrepared = true;
         try {
             GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
             if (pipeline != null && pipeline.isRunning()) {
@@ -1985,8 +2093,24 @@ public class SurveillanceApiHandler {
             }
         } catch (Exception e) {
             CameraDaemon.log("prepare-restart: pipeline.stop failed: " + e.getMessage());
+            pipelinePrepared = false;
         } finally {
             coldStartInProgress.set(false);
+        }
+        if (!pipelinePrepared) {
+            // No trip state to undo: the checkpoint above only flushed
+            // telemetry and left the trip open and recording.
+            shutdownInProgress = false;
+            JSONObject failure = new JSONObject();
+            failure.put("success", false);
+            failure.put("error", "Camera pipeline could not be stopped safely");
+            // Deliberately NOT retryable: pipeline.stop() catches its own
+            // per-step failures, so reaching here means teardown threw out of
+            // the whole block. Retrying that would re-enter stop() on a
+            // half-torn-down encoder rather than wait out a transient state.
+            failure.put("retryable", false);
+            HttpResponse.sendJson(out, 503, failure.toString());
+            return;
         }
         HttpResponse.sendJsonSuccess(out);
     }

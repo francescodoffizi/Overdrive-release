@@ -403,31 +403,25 @@ object RecordingsApiClient {
      * {success:true}. Body of the DELETE response is otherwise ignored.
      */
     fun deleteRecording(filename: String): Boolean {
-        return deleteRecordingUrl("$BASE_URL/api/recordings/${enc(filename)}", filename)
+        return deleteRecording(filename, null)
     }
 
-    fun deleteRecording(recording: RecordingFile): Boolean {
-        val id = recording.recordingId
-        val url = if (!id.isNullOrEmpty()) {
-            "$BASE_URL/api/recordings/id/${enc(id)}"
-        } else {
-            "$BASE_URL/api/recordings/${enc(recording.file.name)}"
-        }
-        return deleteRecordingUrl(url, recording.file.name)
-    }
-
-    private fun deleteRecordingUrl(url: String, label: String): Boolean {
+    fun deleteRecording(filename: String, absolutePath: String?): Boolean {
         return try {
-            if (label.isEmpty() || label.contains("..") || label.contains("/")) {
+            if (filename.isEmpty() || filename.contains("..") || filename.contains("/")) {
                 return false
             }
+            val pathQuery = absolutePath
+                ?.takeIf(String::isNotEmpty)
+                ?.let { "?path=${enc(it)}" }
+                .orEmpty()
             val req = Request.Builder()
-                .url(url)
+                .url("$BASE_URL/api/recordings/${enc(filename)}$pathQuery")
                 .delete()
                 .build()
             http.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "deleteRecording HTTP ${resp.code} for $label")
+                    Log.w(TAG, "deleteRecording HTTP ${resp.code} for $filename")
                     return false
                 }
                 val body = resp.body?.string() ?: return false
@@ -437,6 +431,32 @@ object RecordingsApiClient {
         } catch (t: Throwable) {
             Log.w(TAG, "deleteRecording failed: ${t.message}")
             false
+        }
+    }
+
+    fun fetchThumbnail(url: String): ByteArray? {
+        return try {
+            val req = Request.Builder().url(absoluteUrl(url)).get().build()
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val contentType = resp.header("Content-Type").orEmpty()
+                if (!contentType.startsWith("image/")) return null
+                resp.body?.bytes()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "fetchThumbnail failed: ${t.message}")
+            null
+        }
+    }
+
+    fun fetchTimelineForVideo(videoUrl: String): String? {
+        val absoluteVideoUrl = absoluteUrl(videoUrl)
+        if (!absoluteVideoUrl.contains("/video/")) return null
+        return try {
+            httpGet(absoluteVideoUrl.replaceFirst("/video/", "/api/events/"))
+        } catch (t: Throwable) {
+            Log.w(TAG, "fetchTimelineForVideo failed: ${t.message}")
+            null
         }
     }
 
@@ -467,7 +487,17 @@ object RecordingsApiClient {
     }
 
     private fun enc(s: String): String =
-        try { URLEncoder.encode(s, "UTF-8") } catch (_: Throwable) { s }
+        try {
+            URLEncoder.encode(s, "UTF-8").replace("+", "%20")
+        } catch (_: Throwable) {
+            s
+        }
+
+    private fun absoluteUrl(url: String): String = when {
+        url.startsWith("http://") || url.startsWith("https://") -> url
+        url.startsWith("/") -> BASE_URL + url
+        else -> "$BASE_URL/$url"
+    }
 
     /**
      * Map one JSON row from /api/recordings to a {@link RecordingFile}.
@@ -502,9 +532,13 @@ object RecordingsApiClient {
         // mirrors. If we can't find it on disk, leave heroThumbnailFile
         // null — adapters tolerate that and fall back to the daemon's
         // thumbnail endpoint anyway.
-        val heroName = rec.optString("heroThumbnailName").takeIf { it.isNotEmpty() }
-            ?: rec.optString("heroThumbnailUrl").takeIf { it.isNotEmpty() }
-        val heroThumbnailFile = heroName?.let { resolveHeroJpeg(it, absPath) }
+        val heroThumbnailFile = rec.optString("heroThumbnailUrl")
+            .takeIf { it.isNotEmpty() }
+            ?.let { resolveHeroJpeg(it, absPath) }
+        val thumbnailUrl = rec.optString("heroThumbnailUrl")
+            .takeIf { it.isNotEmpty() }
+            ?: rec.optString("thumbnailUrl").takeIf { it.isNotEmpty() }
+        val videoUrl = rec.optString("videoUrl").takeIf { it.isNotEmpty() }
 
         val actorsArr = rec.optJSONArray("actors")
         val actorClasses = if (actorsArr != null && actorsArr.length() > 0) {
@@ -561,12 +595,8 @@ object RecordingsApiClient {
             startLng = startLng,
             bucketLabel = bucketLabel,
             storageType = storageType,
-            recordingId = rec.optString("id").takeIf { it.isNotEmpty() },
-            videoUrl = rec.optString("videoUrl").takeIf { it.isNotEmpty() },
-            thumbnailUrl = rec.optString("thumbnailUrl").takeIf { it.isNotEmpty() },
-            deleteUrl = rec.optString("deleteUrl").takeIf { it.isNotEmpty() },
-            eventUrl = rec.optString("eventUrl").takeIf { it.isNotEmpty() },
-            available = rec.optBoolean("available", true)
+            videoUrl = videoUrl?.let(::absoluteUrl),
+            thumbnailUrl = thumbnailUrl?.let(::absoluteUrl),
         )
     }
 
@@ -578,9 +608,10 @@ object RecordingsApiClient {
      */
     private fun resolveHeroJpeg(heroUrl: String, mp4AbsPath: String): File? {
         return try {
-            val slash = heroUrl.lastIndexOf('/')
-            val heroName = if (slash >= 0 && slash + 1 < heroUrl.length)
-                heroUrl.substring(slash + 1) else heroUrl
+            val heroPath = heroUrl.substringBefore('?')
+            val slash = heroPath.lastIndexOf('/')
+            val heroName = if (slash >= 0 && slash + 1 < heroPath.length)
+                heroPath.substring(slash + 1) else heroPath
             if (heroName.isEmpty() || heroName.contains("..") || heroName.contains("/")) return null
 
             // Try the mp4's parent first — most heros sit right next to it.

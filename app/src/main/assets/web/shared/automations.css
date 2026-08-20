@@ -21,12 +21,59 @@
     margin-bottom: 16px;
 }
 .automations-section-head > * + * { margin-left: 12px; }   /* flex gap ignored on Chrome-58 */
+/* Multiple trailing buttons in a section header (Groups: Export / Import / New).
+   Wraps on a narrow head unit rather than squeezing the title. */
+.automations-section-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+.automations-section-actions > * + * { margin-left: 8px; }
 .automations-section-title {
     font-size: 12px; font-weight: 600;
     letter-spacing: 0.08em; text-transform: uppercase;
     color: var(--text-secondary);
     margin: 0;
 }
+
+/* ===== LIST SORT ROW ===== */
+/* Mirrors .community-sort-row / .community-sort-select (community-automations.css)
+   so the two automation surfaces read identically. Duplicated (not reused) so this
+   stylesheet stays self-contained — the community CSS is a separate feature file. */
+.automations-sort-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 16px;
+}
+.automations-sort-row > * + * { margin-left: 10px; }   /* flex gap ignored on Chrome-58 */
+.automations-sort-label {
+    font-size: 13px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+.automations-sort-select {
+    flex: 1;
+    max-width: 280px;
+    padding: 9px 12px;
+    border-radius: var(--radius-md, 12px);
+    background: var(--bg-elevated, #1a1a1a);
+    border: 1px solid var(--border-default, #333);
+    color: var(--text-primary, #fff);
+    font-size: 14px;
+    font-family: inherit;
+    -webkit-appearance: none;
+    appearance: none;
+}
+.automations-sort-select:focus {
+    outline: none;
+    border-color: var(--primary, #3b82f6);
+}
+.automations-sort-select option {
+    background: var(--bg-elevated, #1a1a1a);
+    color: var(--text-primary, #fff);
+}
+[dir="rtl"] .automations-sort-row > * + * { margin-left: 0; margin-right: 10px; }
 
 /* ===== EMPTY STATE ===== */
 .empty-state { text-align: center; padding: 48px 24px; color: var(--text-muted); }
@@ -49,11 +96,12 @@
     flex: 0 0 100%;
     display: flex;
     flex-direction: column;
-    gap: 8px;
     margin: 10px 0;
     padding: 0 5px;
     box-sizing: border-box;
 }
+/* field → warning box (flex gap ignored on Chrome-58). */
+.form-grid .row .inputs > .string-with-warning > * + * { margin-top: 8px; }
 /* The textarea now lives inside the wrapper, so the `.inputs > textarea`
    full-width rule no longer reaches it — restore its size here. */
 .string-with-warning > textarea {
@@ -63,23 +111,32 @@
     box-sizing: border-box;
 }
 .field-warning {
-    display: flex; gap: 8px; align-items: flex-start;
+    display: flex; align-items: flex-start;
     padding: 8px 12px; border-radius: 10px;
     background: rgba(255, 179, 0, 0.10);
     border: 1px solid rgba(255, 179, 0, 0.35);
     font-size: 12px; line-height: 1.45; color: var(--text-secondary);
 }
+/* icon → text (flex gap ignored on Chrome-58, which butted the glyph against the copy). */
+.field-warning > * + * { margin-left: 8px; }
+/* min-width:0 so the message wraps inside the box instead of widening the row. */
+.field-warning > span { min-width: 0; }
 .field-warning svg { width: 16px; height: 16px; flex: none; color: #ffb300; margin-top: 1px; }
 
 /* Neutral (info) note — same shape as .field-warning but calm blue, used for the
    "How variables work" help under the Set Variable action / Variable condition. */
 .field-help {
-    display: flex; gap: 8px; align-items: flex-start;
+    display: flex; align-items: flex-start;
     padding: 8px 12px; border-radius: 10px; margin-top: 8px;
     background: rgba(59, 130, 246, 0.10);
     border: 1px solid rgba(59, 130, 246, 0.30);
     font-size: 12px; line-height: 1.5; color: var(--text-secondary);
 }
+/* icon → prose (flex gap ignored on Chrome-58). The icon-less variants of this box
+   (zone hint, .cloud-warning) hold a bare text node, so this matches nothing there. */
+.field-help > * + * { margin-left: 8px; }
+/* min-width:0 so the prose wraps inside the box rather than widening its row. */
+.field-help > div { min-width: 0; }
 .field-help svg { width: 16px; height: 16px; flex: none; color: #3b82f6; margin-top: 1px; }
 .field-help p { margin: 0 0 4px; }
 .field-help p:last-child { margin-bottom: 0; }
@@ -207,34 +264,44 @@
     flex: 1;
     align-items: center;
 }
-/* Each input claims a quarter-row on wide viewports; sibling margins give the
-   inter-input spacing (flex gap is ignored on Chrome-58). The negative row
-   margin cancels the outer inputs' side margins so the grid stays flush. */
+/* Inter-input spacing is a sibling margin (flex gap is ignored on Chrome-58); the
+   negative row inset cancels the outermost children's side margins so the grid stays
+   flush with the card edge. */
 .form-grid .row .inputs { margin-left: -5px; margin-right: -5px; }
 .form-grid .row .inputs > *, .form-grid .row > .input {
-    /* Horizontal margin (not just vertical) so sibling dropdowns — e.g. the
-       condition's type + comparator + value selects — have an even gap between
-       them instead of sitting flush. flex-basis subtracts the 10px total side
-       margin so 4 still fit per row (the .inputs -5px side inset cancels the
-       outermost children's side margins, keeping the grid flush at the edges). */
-    flex: 0 0 calc(25% - 10px);
+    /* INTRINSIC wrapping, not viewport breakpoints. The old rule stepped
+       25% → 50% → 100% on @media (max-width), which asks "how wide is the SCREEN?"
+       when the real question is "how wide is THIS cell?" — and the two diverge badly,
+       because a cell sits inside the sidebar offset, .page-body padding, .card padding
+       and (for a nested If/Loop or condition group) one or more .nested-actions /
+       .condition-group insets. At the head unit's landscape width the media query
+       picked the 50% branch while the actual space suited one field per line, and every
+       nesting level shrank the cell further with no floor to stop it.
+       `flex: 1 1 200px` instead means: take 200px if you can, share the surplus, wrap
+       when you can't — so the row reflows on ACTUAL available width at any nesting
+       depth, on a 360px phone, and on a desktop browser, with no breakpoints to keep in
+       sync. min-width lets a cell dip slightly under the basis before wrapping rather
+       than overflowing the card (which is overflow:hidden, so overflow would CLIP). */
+    flex: 1 1 200px;
+    min-width: 160px;
+    max-width: 100%;
     margin: 5px;
     box-sizing: border-box;
 }
+/* A textarea (and the shell field's wrapper) always claims its own full line —
+   flex-basis:100% beats the 200px basis above and forces a wrap on both sides. */
 .form-grid .row .inputs > textarea {
-    flex: 0 0 100%;
+    flex: 1 1 100%;
     margin: 10px 0;
     min-height: 6em;
     resize: vertical;
 }
-@media (max-width: 1279px) {
+/* Very narrow cabins / phones in portrait: drop the floor so a single field can still
+   fit its line instead of being forced wider than the card. */
+@media (max-width: 420px) {
     .form-grid .row .inputs > *, .form-grid .row > .input {
-        flex: 0 0 calc(50% - 10px);
-    }
-}
-@media (max-width: 773px) {
-    .form-grid .row .inputs > *, .form-grid .row > .input {
-        flex: 0 0 calc(100% - 10px);
+        flex: 1 1 100%;
+        min-width: 0;
     }
 }
 /* Every dropdown/field in an inputs row fills its flex cell, so a row of
@@ -251,9 +318,9 @@
     display: flex;
     align-items: center;
 }
-/* The type-selector shares its 25% cell between the dropdown and an optional
-   info icon; let the dropdown take the remaining space so it lines up in width
-   with the sibling value dropdowns. */
+/* The type-selector shares its cell between the dropdown and an optional info icon;
+   let the dropdown take the remaining space so it lines up in width with the sibling
+   value dropdowns. */
 .form-grid .row .inputs > .type-selector > select,
 .form-grid .row .inputs > .type-selector > .input {
     flex: 1 1 auto;
@@ -262,11 +329,18 @@
 .form-grid .row .inputs > .type-selector > .description-icon {
     width: 20px;
     height: 20px;
-    margin-left: 3px;   /* selector → info icon (flex gap ignored on Chrome-58) */
-    margin-right: 3px;
     color: var(--text-muted);
     cursor: pointer;
     flex: 0 0 auto;
+    /* The glyph stays 20px, but the TAP target grows to 34px via padding that is pulled
+       back out with negative margins, so the icon is reachable on a moving car without
+       changing the row's visual metrics. box-sizing:content-box keeps the SVG at its
+       declared 20px rather than shrinking it to fit the padding. The side values are the
+       original 3px gap minus the 7px padding (= -4px), preserving the previous spacing. */
+    box-sizing: content-box;
+    padding: 7px;
+    margin: -7px -4px;
+    -webkit-tap-highlight-color: transparent;
 }
 .form-grid .row .inputs > .type-selector > .description-icon:hover { color: var(--text-primary); }
 .description-tooltip {
@@ -320,6 +394,23 @@
 }
 .description-tooltip.visible {
     opacity: 1;
+}
+/* MQTT twin line inside the signal tooltip — a quiet footnote under the description,
+   separated by the same hairline the panels use. Muted caption + monospace key so the
+   telemetry key is copyable-looking without competing with the description text. */
+.description-tooltip .description-mqtt {
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.description-tooltip .description-mqtt code {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    color: var(--text-secondary);
+    /* wrap rather than overflow the 260px tooltip: an `area`-addressed signal lists
+       several keys, and Chrome-58 has no `overflow-wrap: anywhere`. */
+    word-break: break-all;
 }
 .form-grid .row .inputs > .type-selector > .input {
     flex: 1;
@@ -408,6 +499,31 @@
     color: var(--text-secondary);
 }
 #automationList .status-text > * + * { margin-left: 8px; }
+#automationList .status-dot.manual {
+    background: var(--warning);
+    animation: none;
+}
+.automation-mode-select {
+    min-width: 132px;
+    max-width: 168px;
+}
+.automation-form-mode-select {
+    min-width: 180px;
+}
+@media (max-width: 420px) {
+    #automationList .body {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+    #automationList .body > * + * {
+        margin-left: 0;
+        margin-top: 10px;
+    }
+    .automation-mode-select {
+        width: 100%;
+        max-width: none;
+    }
+}
 
 /* Nested condition groups — a bordered card per group so the (A AND B) OR (…)
    structure reads visually. Purely presentational; the flat conditions above are
@@ -428,13 +544,19 @@
 }
 .condition-group-header .label { font-weight: 600; }
 .condition-group .logic-select { margin-bottom: 8px; }
+/* Both nested rows also carry the `row` class, so their .inputs children already get
+   `margin: 5px` from the generic `.form-grid .row .inputs > *` rule. The `gap: 8px`
+   these two used to declare was therefore dead on the Chrome-58 head unit AND
+   double-counted (5px margins + 8px gap = 13px) on modern engines — the two surfaces
+   disagreed. Dropping it leaves the SAME sibling-margin spacing the flat rows use, so
+   nested and flat rows line up identically everywhere. */
 .condition-group-row {
     display: flex;
     align-items: flex-start;
-    gap: 8px;
     margin-bottom: 8px;
 }
-.condition-group-row .inputs { flex: 1; display: flex; flex-wrap: wrap; gap: 8px; }
+.condition-group-row > * + * { margin-left: 8px; }   /* inputs → delete button */
+.condition-group-row .inputs { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; }
 .add-group-button { margin-top: 4px; }
 
 /* Nested action editors (loop body, if then/else). Indented bordered block so the
@@ -455,10 +577,10 @@
 .nested-action-row {
     display: flex;
     align-items: flex-start;
-    gap: 8px;
     margin-bottom: 8px;
 }
-.nested-action-row .inputs { flex: 1; display: flex; flex-wrap: wrap; gap: 8px; }
+.nested-action-row > * + * { margin-left: 8px; }   /* inputs → reorder/delete controls */
+.nested-action-row .inputs { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; }
 
 /* Dynamic condition-value editor (expression engine). The value box gains a small
    segmented mode toggle: Value (constant) / Variable (${var:…}) / Signal (${signal:…}).
@@ -496,6 +618,53 @@
     margin-top: 4px;
     margin-right: 6px;
 }
+
+/* ===== LIVE SIGNAL HINT =====
+   "reads X right now" + the signal's allowed values, under a signal picker. Read-only
+   affordance: muted, non-interactive, and it collapses when no signal is chosen so an
+   unconfigured row looks exactly as it did before. */
+.signal-hint {
+    /* FULL-WIDTH BLOCK, always below the picker — never a flex sibling beside it.
+       .cond-value-body is `display:flex` (a ROW), so an un-styled hint div became a second
+       column and squeezed the signal <select> into a narrow strip. flex-basis:100% +
+       order:99 pushes it onto its own line after the control, in both that row container
+       and the column container used by the flow-action picker. */
+    flex: 0 0 100%;
+    order: 99;
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 6px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    /* Theme-tracking well over the card. Deliberately NOT the `var(--surface-2, …)`
+       pattern used by some siblings here: --surface-2 is undefined in design-tokens.css,
+       so those silently fall back to white-alpha and nearly vanish on the light theme. */
+    background: var(--surface-container-high);
+    font-size: 11px;
+    line-height: 1.45;
+}
+.signal-hint:empty { display: none; }
+.signal-hint-now { display: flex; align-items: baseline; }
+.signal-hint-label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary, #9aa);
+    margin-right: 6px;
+}
+.signal-hint-value {
+    font-weight: 600;
+    /* Tabular-ish: a ticking number must not reflow the row on every poll. */
+    font-variant-numeric: tabular-nums;
+}
+.signal-hint-value.unknown { font-weight: 400; opacity: 0.55; font-style: italic; }
+.signal-hint-vocab, .signal-hint-mqtt {
+    color: var(--text-secondary, #9aa);
+    margin-top: 2px;
+    word-break: break-word;
+}
+/* 11px, not 10px: the page's smallest existing label is 12px, and this is read at
+   arm's length in a car. */
+.signal-hint-mqtt { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; }
 .cond-mode-toggle {
     /* inline-flex + align-self:flex-start so the pill HUGS its 2-3 buttons instead of
        stretching to the full cell width (that stretch was the "elongated dark
@@ -529,7 +698,9 @@
 }
 /* Body fills the cell width so the value input/select lines up with sibling
    dropdowns in the row, while the toggle above stays compact. */
-.cond-value-body { display: flex; width: 100%; }
+/* flex-wrap so the full-width .signal-hint below the control can move to its own line
+   instead of competing with the input for horizontal space. */
+.cond-value-body { display: flex; flex-wrap: wrap; width: 100%; }
 .cond-value-body > .input,
 .cond-value-body > select,
 .cond-value-body > input { width: 100%; min-width: 0; box-sizing: border-box; }
@@ -625,3 +796,18 @@
     color: var(--text-secondary, #9aa);
     margin-bottom: 6px;
 }
+
+/* ── RTL ──────────────────────────────────────────────────────────────────────
+   Mirror the horizontal sibling-margin shims that stand in for flex `gap`. `gap` is
+   direction-aware; a bare margin-left is not, so under <html dir="rtl"> (Arabic
+   ships — see RTL_LANGS in core.js) the icon/label space would sit on the wrong side.
+   Covers the shims added for the info/warning notes and the two nested editor rows;
+   the pre-existing shims above keep their current behaviour. */
+[dir="rtl"] .field-warning > * + *,
+[dir="rtl"] .field-help > * + *,
+[dir="rtl"] .condition-group-row > * + *,
+[dir="rtl"] .nested-action-row > * + *,
+[dir="rtl"] .automations-section-actions > * + * { margin-left: 0; margin-right: 8px; }
+/* Same reason, on the live-signal hint's label→value pair (a flex row, so RTL
+   reverses the order and a bare margin-right would land on the outer edge). */
+[dir="rtl"] .signal-hint-label { margin-right: 0; margin-left: 6px; }

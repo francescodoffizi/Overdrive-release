@@ -1,7 +1,9 @@
 package com.overdrive.app.automation;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Purely-presentational category tagging for the automation action / trigger /
@@ -36,6 +38,7 @@ public final class AutomationCategories {
     public static final String DISPLAYS      = "displays";     // brightness/screen/HUD
     public static final String SYSTEM        = "system";       // apps/shell/notification
     public static final String SURVEILLANCE  = "surveillance"; // recording/camera
+    public static final String ADVANCED      = "advanced";     // calibration / legacy detail controls
     public static final String FLOW          = "flow";         // pause/wait/variables
     public static final String VEHICLE       = "vehicle";      // lock/flash/find-car
     public static final String SENSORS       = "sensors";      // read-only trigger/condition signals
@@ -47,17 +50,18 @@ public final class AutomationCategories {
      */
     public static final String[] ORDER = {
         VEHICLE, CLIMATE, WINDOWS_BODY, LIGHTING, ADAS_SAFETY, DRIVE, MEDIA,
-        DISPLAYS, SENSORS, SURVEILLANCE, SYSTEM, FLOW, OTHER,
+        DISPLAYS, SENSORS, SURVEILLANCE, ADVANCED, SYSTEM, FLOW, OTHER,
     };
 
     // id → category. Shared by actions, triggers, and conditions (an id like "drl" or
     // "speed" means the same feature whether set or sensed). Missing → OTHER.
     private static final Map<String, String> CAT = new HashMap<>();
+    private static final Set<String> HYBRID_ONLY = new HashSet<>();
     static {
         // ── Vehicle composite (remote-ish) ──
         put(VEHICLE, "lock", "unlock", "flash", "findCar", "find_car");
         // ── Climate ──
-        put(CLIMATE, "setAc", "setAcTemp", "setAcFan", "ac", "temperature", "outsideTemp",
+        put(CLIMATE, "setAc", "setAcTemp", "stepAcTemp", "setAcFan", "ac", "temperature", "outsideTemp",
                 "seat", "seatClimate", "seat_heat_driver", "seat_heat_passenger",
                 "seat_vent_driver", "seat_vent_passenger",
                 "acAuto", "acAutoOff", "fanOnly", "steeringHeat", "recirculation",
@@ -65,7 +69,8 @@ public final class AutomationCategories {
         // ── Windows / body / openings ──
         put(WINDOWS_BODY, "windows", "windowsAll", "windowsPreset", "windowState",
                 "windowOpenPercent", "sunroof", "sunshade", "tailgate", "mirror_fold",
-                "child_lock", "doorState", "wireless_charging", "wireless_charging_state",
+                "mirror_auto_follow_up", "child_lock", "doorState", "wireless_charging",
+                "wireless_charging_state", "wireless_charging_left", "wireless_charging_right",
                 // Seat/mirror GEOMETRY — physically moving the body, unlike the seat
                 // heating/venting ids above, which are climate.
                 "seatPosition", "seatSave", "applySeatPosition");
@@ -79,7 +84,7 @@ public final class AutomationCategories {
                 "welcomeLight", "readingLight", "ambientMusic", "headlightLevel");
         // ── ADAS / safety ──
         put(ADAS_SAFETY, "adas_slw", "slw", "esp_control", "esp_state", "itac",
-                "lane_assist", "cpd", "adas_cpd", "emergencyAlarm", "tyrePressureWarn",
+                "lane_assist", "cpd", "adas_cpd", "tyrePressureWarn",
                 "tyreLeakWarn", "seatbelt", "occupant", "radarNearest", "blindSpot",
                 // Expanded ADAS matrix
                 "adas_bsd", "adas_tsr", "adas_rcta", "adas_fcta", "adas_tla", "adas_dow",
@@ -88,7 +93,10 @@ public final class AutomationCategories {
         // ── Drive / powertrain dynamics ──
         put(DRIVE, "drive_mode", "driveMode", "powertrain_mode", "powertrainMode",
                 "hold_battery", "regen_level", "energyRegen", "steering_mode", "brake_feel",
-                "gear", "speed", "accelerator", "brake", "steeringAngle", "slope");
+                "gear", "speed", "accelerator", "brake", "steeringAngle", "slope",
+                // The real SOC-hold pair, alongside hold_battery so users comparing the two
+                // find them together (hold_battery is only an energy-mode HEV alias).
+                "charge_cap_enabled", "charge_cap_percent", "battery_hold");
         // ── Media / audio ──
         put(MEDIA, "mediaVolume", "channelVolume", "volumeStep", "mediaControl",
                 "playAudio", "playVideo", "stopAudio", "speak");
@@ -103,15 +111,31 @@ public final class AutomationCategories {
                 "uiNav", "screenshot", "moveAppToDisplay", "stopClusterCast");
         // ── Surveillance / recording / camera ──
         put(SURVEILLANCE, "surveillance", "recording", "manualClip",
-                "showCameraView", "hideCameraView",
-                "surveillanceArmed", "surveillanceThreat", "surveillanceObject");
+                "showCameraFeed", "setCameraViewSize", "setBlindSpotOverlaySize", "hideCameraView",
+                "surveillanceArmed", "surveillanceThreat", "surveillanceObject",
+                // Blind-spot CARD actions (OverDrive's own rear+side view). The OEM ADAS
+                // blind-spot WARNING condition keeps the "blindSpot" id under ADAS above —
+                // different feature, hence the distinct blindSpotEnable id here.
+                "blindSpotEnable", "blindSpotDismiss");
+        // ── Advanced calibration / legacy detail controls ──
+        // Existing action ids remain supported exactly as before; this only keeps
+        // calibration knobs out of the intent-based Surveillance picker.
+        put(ADVANCED, "showCameraView", "showBlindSpotCameraFeed", "blindSpotFisheye",
+                "blindSpotFisheyeStep", "blindSpotCameras", "blindSpotRotation");
         // ── Flow control / variables ──
         put(FLOW, "pause", "waitUntil", "waitUntilState", "setVariable", "incrementVariable",
-                "computeVariable", "variable", "loop", "if", "actionGroup", "automationControl");
+                "computeVariable", "captureVariable", "variable", "loop", "if", "actionGroup",
+                "automationControl");
         // ── Sensor-only signals (triggers/conditions with no matching action) ──
-        put(SENSORS, "batteryLevel", "estimatedRange", "chargingState", "chargeGun",
+        put(SENSORS, "batteryLevel", "targetSoc", "estimatedRange", "chargingState", "chargeGun",
                 "batterySoh", "keyBattery", "aux12vBattery", "fuelLevel", "pm25",
                 "autoWiper", "wiperActive", "rainProbability", "callState");
+
+        // Keep existing saved automations resolvable, but omit engine-dependent items from new
+        // pickers once the collector has positively identified the current car as BEV.
+        java.util.Collections.addAll(HYBRID_ONLY,
+                "powertrainMode", "powertrain_mode", "hold_battery", "battery_hold",
+                "charge_cap_enabled", "charge_cap_percent");
     }
 
     private static void put(String category, String... ids) {
@@ -123,5 +147,23 @@ public final class AutomationCategories {
         if (id == null) return OTHER;
         String c = CAT.get(id);
         return c != null ? c : OTHER;
+    }
+
+    public static boolean isHybridOnly(String id) {
+        return id != null && HYBRID_ONLY.contains(id);
+    }
+
+    /**
+     * Whether fuel-capable-hybrid items should be advertised for the current vehicle.
+     * Unknown startup state stays permissive so a slow HAL probe cannot hide valid controls.
+     */
+    public static boolean supportsHybridOnlyItemsOnCurrentVehicle() {
+        try {
+            com.overdrive.app.byd.BydDataCollector collector =
+                    com.overdrive.app.byd.BydDataCollector.getInstance();
+            return !collector.isInitialized() || collector.isFuelCapableHybridPublic();
+        } catch (Throwable unavailable) {
+            return true;
+        }
     }
 }

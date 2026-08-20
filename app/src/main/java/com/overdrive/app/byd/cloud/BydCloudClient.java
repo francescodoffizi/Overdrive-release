@@ -10,11 +10,9 @@ import org.json.JSONObject;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.util.Iterator;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * High-level BYD cloud API client.
@@ -35,35 +33,11 @@ public final class BydCloudClient {
     private BydCloudSession session;
     private boolean commandsVerified = false;
 
-    /**
-     * Single-thread executor used to run best-effort, diagnostic-only cloud
-     * confirmation polls off the request path so they never consume the
-     * caller's cloud timeout budget. Lazily created; daemon (non-blocking).
-     */
-    private volatile ExecutorService confirmExecutor;
-
-    private synchronized ExecutorService confirmExecutor() {
-        if (confirmExecutor == null) {
-            // Build the ThreadPoolExecutor directly (NOT Executors.newSingleThreadExecutor,
-            // which wraps the pool in a FinalizableDelegatedExecutorService that can't be
-            // downcast to ThreadPoolExecutor — so setKeepAliveTime/allowCoreThreadTimeOut
-            // would be unreachable). corePoolSize=1, allowCoreThreadTimeOut so the sole
-            // worker self-terminates after 30s idle: a discarded client (reconnect /
-            // stale-creds rebuild after a schedule save ran a confirm poll) then leaks no
-            // lingering thread. Thread is a daemon regardless, so it never blocks exit.
-            ThreadPoolExecutor tpe = new ThreadPoolExecutor(
-                    1, 1, 30L, TimeUnit.SECONDS,
-                    new LinkedBlockingQueue<Runnable>(),
-                    r -> {
-                        Thread t = new Thread(r, "byd-cloud-confirm");
-                        t.setDaemon(true);
-                        return t;
-                    });
-            tpe.allowCoreThreadTimeOut(true);
-            confirmExecutor = tpe;
-        }
-        return confirmExecutor;
-    }
+    private static final long CAPABILITY_CACHE_TTL_MS = 30L * 60L * 1000L;
+    private volatile CloudCapabilities cloudCapabilities;
+    static final String SMART_CHARGE_REQUEST_ORDER_KEY =
+            "__overdriveSmartChargeRequestOrder";
+    private static final AtomicLong smartChargeRequestOrder = new AtomicLong();
 
     public BydCloudClient(BydCloudConfig config) {
         this.config = config;
@@ -157,6 +131,8 @@ public final class BydCloudClient {
         }
 
         session = new BydCloudSession(userId, signToken, encryToken, superId);
+        // The cloud binds control-PIN verification to the session token.
+        commandsVerified = false;
         logger.info("Login succeeded: userId=***" + userId.substring(Math.max(0, userId.length() - 4)));
     }
 
@@ -168,13 +144,21 @@ public final class BydCloudClient {
      * issue logins, invalidating the first caller's token.
      */
     public synchronized BydCloudSession ensureSession() throws IOException {
+        throwIfInterrupted();
         if (session == null || session.isExpired()) {
             try {
                 login();
             } catch (IOException e) {
+                throwIfInterrupted();
                 // On transient server error, retry once after a brief pause
                 if (e.getMessage() != null && e.getMessage().contains("1009")) {
-                    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+                    try {
+                        Thread.sleep(3000);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new InterruptedIOException("BYD cloud session request cancelled");
+                    }
+                    throwIfInterrupted();
                     login();  // Second attempt — if this fails, propagate the exception
                 } else {
                     throw e;
@@ -182,6 +166,12 @@ public final class BydCloudClient {
             }
         }
         return session;
+    }
+
+    private static void throwIfInterrupted() throws InterruptedIOException {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedIOException("BYD cloud session request cancelled");
+        }
     }
 
     // ── Vehicle List ────────────────────────────────────────────────────
@@ -198,6 +188,25 @@ public final class BydCloudClient {
      * Fetch all vehicles and return [VIN, energyType].
      */
     public String[] fetchFirstVinAndEnergyType() throws IOException {
+        JSONArray list = fetchVehicleList();
+
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject vehicle = list.optJSONObject(i);
+            if (vehicle != null) {
+                String vin = vehicle.optString("vin", "");
+                if (!vin.isEmpty()) {
+                    String energyType = vehicle.optString("energyType", "");
+                    logger.info("Found vehicle: VIN=***" + vin.substring(Math.max(0, vin.length() - 4))
+                            + " energyType=" + energyType);
+                    return new String[]{vin, energyType};
+                }
+            }
+        }
+
+        throw new IOException("No vehicle with VIN found");
+    }
+
+    private JSONArray fetchVehicleList() throws IOException {
         BydCloudSession s = ensureSession();
         long nowMs = System.currentTimeMillis();
 
@@ -240,20 +249,73 @@ public final class BydCloudClient {
             throw new IOException("No vehicles found on account");
         }
 
-        for (int i = 0; i < list.length(); i++) {
-            JSONObject vehicle = list.optJSONObject(i);
-            if (vehicle != null) {
-                String vin = vehicle.optString("vin", "");
-                if (!vin.isEmpty()) {
-                    String energyType = vehicle.optString("energyType", "");
-                    logger.info("Found vehicle: VIN=***" + vin.substring(Math.max(0, vin.length() - 4))
-                            + " energyType=" + energyType);
-                    return new String[]{vin, energyType};
+        return list;
+    }
+
+    /** Return cached capability data when it still belongs to {@code vin}. */
+    public CloudCapabilities getCachedCloudCapabilities(String vin) {
+        CloudCapabilities cached = cloudCapabilities;
+        if (cached == null || !cached.isForVin(vin)) return null;
+        if (System.currentTimeMillis() - cached.getFetchedAtMs() > CAPABILITY_CACHE_TTL_MS) return null;
+        return cached;
+    }
+
+    /**
+     * Fetch BYD's per-VIN cloud command configuration before a router-managed
+     * cloud feature is dispatched. A discovery failure leaves SDK-first
+     * controls local-only for that attempt and blocks cloud-only controls.
+     */
+    public synchronized CloudCapabilities fetchCloudCapabilities(String vin) throws IOException {
+        CloudCapabilities cached = getCachedCloudCapabilities(vin);
+        if (cached != null) return cached;
+        if (vin == null || vin.isEmpty()) throw new IOException("vin required");
+
+        JSONObject vehicle = null;
+        try {
+            JSONArray vehicles = fetchVehicleList();
+            for (int i = 0; i < vehicles.length(); i++) {
+                JSONObject candidate = vehicles.optJSONObject(i);
+                if (candidate != null && vin.equals(candidate.optString("vin", ""))) {
+                    vehicle = candidate;
+                    break;
                 }
             }
+        } catch (IOException e) {
+            // getLatestConfig still gives useful coarse gates. The learn-info
+            // refinement leaves OPENWINDOW unavailable until a later refresh
+            // positively proves this VIN can vent remotely.
+            logger.info("Capability vehicle metadata unavailable: " + e.getMessage());
         }
 
-        throw new IOException("No vehicle with VIN found");
+        BydCloudSession s = ensureSession();
+        long nowMs = System.currentTimeMillis();
+        JSONObject inner = buildInner(nowMs);
+        try {
+            inner.put("appConfigVersion", "2");
+            inner.put("terminalType", "0");
+            JSONArray vinList = new JSONArray();
+            vinList.put(vin);
+            inner.put("vinList", vinList.toString());
+        } catch (Exception e) {
+            throw new IOException("Failed to build latest-config request", e);
+        }
+        TokenEnvelope env = buildTokenOuterEnvelope(nowMs, s, inner);
+        JSONObject response = transport.postSecure("/vehicle/vehicleswitch/getLatestConfig", env.outer);
+        String code = response.optString("code", "");
+        if (!"0".equals(code)) {
+            throw new IOException("Latest-config fetch failed: code=" + code + " "
+                    + response.optString("message", ""));
+        }
+        JSONObject decoded = decodeRespondData(response, env.contentKey);
+        if (decoded == null) throw new IOException("Latest-config response was empty");
+        JSONObject perVin = decoded.optJSONObject(vin);
+        if (perVin == null) {
+            throw new IOException("Latest-config response missing requested VIN");
+        }
+        CloudCapabilities parsed = CloudCapabilities.fromResponses(
+                vin, perVin, vehicle, System.currentTimeMillis());
+        cloudCapabilities = parsed;
+        return parsed;
     }
 
     // ── Control PIN Verification ────────────────────────────────────────
@@ -353,18 +415,7 @@ public final class BydCloudClient {
      * remote_mode=4 (cool/heat auto), default time_span=3 (20 min).
      */
     public boolean startClimate(String vin, double tempCelsius) throws IOException {
-        int t = (int) Math.round(Math.max(17, Math.min(33, tempCelsius)));
-        JSONObject extra = new JSONObject();
-        try {
-            extra.put("temperature", String.valueOf(t));
-            extra.put("copilot_temperature", String.valueOf(t));
-            extra.put("cycle_mode", "2");
-            extra.put("time_span", "3");
-            extra.put("remote_mode", "4");
-        } catch (Exception e) {
-            throw new IOException("Failed to build OPENAIR params", e);
-        }
-        return executeRemoteCommand(vin, "OPENAIR", extra, true).success;
+        return executeRemoteCommand(vin, "OPENAIR", climateStartParams(tempCelsius), true).success;
     }
 
     /**
@@ -381,6 +432,11 @@ public final class BydCloudClient {
         return executeRemoteCommand(vin, "CLOSEWINDOW", null, true).success;
     }
 
+    /** Cloud OPENWINDOW only cracks all windows for ventilation; it is not a full-open command. */
+    public boolean ventAllWindows(String vin) throws IOException {
+        return executeRemoteCommand(vin, "OPENWINDOW", null, true).success;
+    }
+
     /**
      * Toggle traction battery preconditioning heat.
      * BATTERYHEAT: batteryHeatSwitch=1 enables, 0 disables.
@@ -388,11 +444,140 @@ public final class BydCloudClient {
     public boolean setBatteryHeat(String vin, boolean on) throws IOException {
         JSONObject extra = new JSONObject();
         try {
-            extra.put("batteryHeatSwitch", on ? "1" : "0");
+            extra.put("batteryHeatSwitch", on ? 1 : 0);
         } catch (Exception e) {
             throw new IOException("Failed to build BATTERYHEAT params", e);
         }
         return executeRemoteCommand(vin, "BATTERYHEAT", extra, true).success;
+    }
+
+    /** Build pyBYD-compatible OPENAIR controlParamsMap with the OEM default 20-minute session. */
+    public static JSONObject climateStartParams(double tempCelsius) throws IOException {
+        return climateStartParams(tempCelsius, 20);
+    }
+
+    /**
+     * Build pyBYD-compatible OPENAIR controlParamsMap.
+     *
+     * <p>The remote app exposes five fixed session lengths. Keep that discrete BYD
+     * wire contract rather than accepting a minute count that would be rounded or ignored.
+     */
+    public static JSONObject climateStartParams(double tempCelsius, int durationMinutes)
+            throws IOException {
+        int celsius = (int) Math.round(Math.max(15, Math.min(31, tempCelsius)));
+        int rawTemp = celsius - 14; // BYD raw HVAC scale: 15C=1 .. 31C=17
+        int timeSpan = climateDurationToTimeSpan(durationMinutes);
+        JSONObject params = new JSONObject();
+        try {
+            params.put("mainSettingTemp", rawTemp);
+            params.put("copilotSettingTemp", rawTemp);
+            params.put("cycleMode", 2);
+            params.put("timeSpan", timeSpan);
+            params.put("remoteMode", 4);
+            params.put("airAccuracy", 1);
+            params.put("airConditioningMode", 1);
+            params.put("airSet", JSONObject.NULL);
+        } catch (Exception e) {
+            throw new IOException("Failed to build OPENAIR control parameters", e);
+        }
+        return params;
+    }
+
+    /**
+     * Build a pyBYD-compatible BOOKINGAIR payload.
+     *
+     * <p>{@code remoteMode}: 1=create, 2=modify, 3=remove. The cloud expects the
+     * normal HVAC defaults even for a removal, while temperature/time-span are meaningful only
+     * for create/modify.
+     */
+    public static JSONObject climateScheduleParams(int remoteMode, Long bookingId,
+                                                    Long bookingTimeSeconds,
+                                                    Double tempCelsius,
+                                                    Integer durationMinutes)
+            throws IOException {
+        if (remoteMode < 1 || remoteMode > 3) {
+            throw new IOException("BOOKINGAIR remoteMode must be 1, 2, or 3");
+        }
+        if ((remoteMode == 2 || remoteMode == 3)
+                && (bookingId == null || bookingId.longValue() <= 0L)) {
+            throw new IOException("BOOKINGAIR modify/remove requires bookingId");
+        }
+        if (remoteMode != 3 && (bookingTimeSeconds == null
+                || bookingTimeSeconds.longValue() <= 0L)) {
+            throw new IOException("BOOKINGAIR create/modify requires bookingTime");
+        }
+        int timeSpan = 0;
+        if (remoteMode != 3) {
+            if (tempCelsius == null) throw new IOException("BOOKINGAIR temperature is required");
+            if (durationMinutes == null) throw new IOException("BOOKINGAIR duration is required");
+            timeSpan = climateDurationToTimeSpan(durationMinutes.intValue());
+        }
+        try {
+            JSONObject params = new JSONObject();
+            // ClimateScheduleParams inherits these defaults from ClimateStartParams.
+            params.put("cycleMode", 2);
+            params.put("remoteMode", remoteMode);
+            params.put("airAccuracy", 1);
+            params.put("airConditioningMode", 1);
+            params.put("acSwitch", 0);
+            if (bookingId != null) params.put("bookingId", bookingId.longValue());
+            if (bookingTimeSeconds != null) params.put("bookingTime", bookingTimeSeconds.longValue());
+            if (remoteMode != 3) {
+                int celsius = (int) Math.round(tempCelsius.doubleValue());
+                if (celsius < 15 || celsius > 31) {
+                    throw new IOException("BOOKINGAIR temperature must be 15..31 C");
+                }
+                int rawTemp = celsius - 14;
+                params.put("mainSettingTemp", rawTemp);
+                params.put("copilotSettingTemp", rawTemp);
+                params.put("timeSpan", timeSpan);
+            }
+            return params;
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("Failed to build BOOKINGAIR control parameters", e);
+        }
+    }
+
+    private static int climateDurationToTimeSpan(int durationMinutes) throws IOException {
+        switch (durationMinutes) {
+            case 10: return 1;
+            case 15: return 2;
+            case 20: return 3;
+            case 25: return 4;
+            case 30: return 5;
+            default: throw new IOException("BOOKINGAIR duration must be 10, 15, 20, 25, or 30 minutes");
+        }
+    }
+
+    /**
+     * Read BOOKINGAIR entries. The endpoint can return an empty object despite an existing booking,
+     * so callers must treat an empty response as "none reported", not a deletion confirmation.
+     */
+    public JSONObject fetchClimateBookingList(String vin) throws IOException {
+        BydCloudSession session = ensureSession();
+        long nowMs = System.currentTimeMillis();
+        JSONObject inner = buildInner(nowMs);
+        try {
+            inner.put("vin", vin);
+        } catch (Exception e) {
+            throw new IOException("Failed to build BOOKINGAIR list request", e);
+        }
+        TokenEnvelope env = buildTokenOuterEnvelope(nowMs, session, inner);
+        JSONObject response = transport.postSecure("/control/getBookingList", env.outer);
+        String code = response.optString("code", "");
+        if (!"0".equals(code)) {
+            throw new IOException("BOOKINGAIR list failed: code=" + code
+                    + " message=" + response.optString("message", ""));
+        }
+        String respondData = response.optString("respondData", "");
+        if (respondData.isEmpty()) return new JSONObject();
+        try {
+            return BydCloudTransport.decryptRespondData(respondData, env.contentKey);
+        } catch (Exception e) {
+            throw new IOException("Failed to decode BOOKINGAIR list response", e);
+        }
     }
 
     /**
@@ -416,41 +601,113 @@ public final class BydCloudClient {
     public boolean setSeatClimate(String vin, String chairType,
                                    int driverHeatUi, int driverVentUi,
                                    int passengerHeatUi, int passengerVentUi) throws IOException {
-        JSONObject extra = new JSONObject();
-        try {
-            extra.put("chairType", chairType);
-            extra.put("remoteMode", "1");
-            extra.put("mainHeat", String.valueOf(uiToWireSeatLevel(driverHeatUi)));
-            extra.put("mainVentilation", String.valueOf(uiToWireSeatLevel(driverVentUi)));
-            extra.put("copilotHeat", String.valueOf(uiToWireSeatLevel(passengerHeatUi)));
-            extra.put("copilotVentilation", String.valueOf(uiToWireSeatLevel(passengerVentUi)));
-            // Rear + steering: 0 = not applicable (we don't track these locally)
-            extra.put("lrSeatHeatState", "0");
-            extra.put("lrSeatVentilationState", "0");
-            extra.put("rrSeatHeatState", "0");
-            extra.put("rrSeatVentilationState", "0");
-            extra.put("steeringWheelHeatState", "3");
-        } catch (Exception e) {
-            throw new IOException("Failed to build VENTILATIONHEATING params", e);
+        // Retained for callers built before the router supplied a confirmed
+        // steering-wheel state. New routed calls must use the overload below:
+        // wire value 3 is an explicit steering-wheel OFF command.
+        return setSeatClimate(vin, chairType, driverHeatUi, driverVentUi,
+                passengerHeatUi, passengerVentUi, 3);
+    }
+
+    /**
+     * Send a complete, state-preserving front-seat command. The steering-wheel
+     * field is also part of BYD's composite payload, so it must be a known wire
+     * state (1=on or 3=off), never an assumed default.
+     */
+    public boolean setSeatClimate(String vin, String chairType,
+                                   int driverHeatUi, int driverVentUi,
+                                   int passengerHeatUi, int passengerVentUi,
+                                   int steeringWheelHeatWireState) throws IOException {
+        driverHeatUi = normalizeLegacyUiSeatLevel(driverHeatUi);
+        driverVentUi = normalizeLegacyUiSeatLevel(driverVentUi);
+        passengerHeatUi = normalizeLegacyUiSeatLevel(passengerHeatUi);
+        passengerVentUi = normalizeLegacyUiSeatLevel(passengerVentUi);
+        if (!isUiSeatLevel(driverHeatUi) || !isUiSeatLevel(driverVentUi)
+                || !isUiSeatLevel(passengerHeatUi) || !isUiSeatLevel(passengerVentUi)) {
+            throw new IOException("Seat climate levels must be 0=off, 1=low, or 2=high");
         }
+        JSONObject extra = seatClimateParams(chairType, driverHeatUi, driverVentUi,
+                passengerHeatUi, passengerVentUi, steeringWheelHeatWireState);
         logger.info("VENTILATIONHEATING request extra=" + extra.toString());
         return executeRemoteCommand(vin, "VENTILATIONHEATING", extra, true).success;
     }
 
-    /** Translate UI level (0=off, 1=low, 2=high) to BYD wire level (3=off, 2=low, 1=high). */
-    private static int uiToWireSeatLevel(int uiLevel) {
-        switch (uiLevel) {
-            case 1: return 2;  // low
-            case 2: return 1;  // high
-            case 0:
-            default: return 3; // off
+    /**
+     * Build pyBYD-compatible VENTILATIONHEATING parameters. BYD's current
+     * API model declares the level and mode fields as JSON numbers; only
+     * chairType is a string selector.
+     */
+    static JSONObject seatClimateParams(String chairType,
+                                        int driverHeatUi, int driverVentUi,
+                                        int passengerHeatUi, int passengerVentUi) throws IOException {
+        return seatClimateParams(chairType, driverHeatUi, driverVentUi,
+                passengerHeatUi, passengerVentUi, 3);
+    }
+
+    static JSONObject seatClimateParams(String chairType,
+                                        int driverHeatUi, int driverVentUi,
+                                        int passengerHeatUi, int passengerVentUi,
+                                        int steeringWheelHeatWireState) throws IOException {
+        if (!isUiSeatLevel(driverHeatUi) || !isUiSeatLevel(driverVentUi)
+                || !isUiSeatLevel(passengerHeatUi) || !isUiSeatLevel(passengerVentUi)) {
+            throw new IOException("Seat climate levels must be 0=off, 1=low, or 2=high");
         }
+        if (steeringWheelHeatWireState != 1 && steeringWheelHeatWireState != 3) {
+            throw new IOException("Steering wheel heat must be a known wire state (1=on or 3=off)");
+        }
+        JSONObject extra = new JSONObject();
+        try {
+            extra.put("chairType", chairType);
+            extra.put("remoteMode", 1);
+            extra.put("mainHeat", uiToWireSeatLevel(driverHeatUi));
+            extra.put("mainVentilation", uiToWireSeatLevel(driverVentUi));
+            extra.put("copilotHeat", uiToWireSeatLevel(passengerHeatUi));
+            extra.put("copilotVentilation", uiToWireSeatLevel(passengerVentUi));
+            // Rear seats are not locally modeled. Zero is the documented
+            // no-data/no-action value for those fields. Steering-wheel heat
+            // differs: 3 explicitly turns it off, so its known current value
+            // is supplied by the router above.
+            extra.put("lrSeatHeatState", 0);
+            extra.put("lrSeatVentilationState", 0);
+            extra.put("lrThirdHeatState", 0);
+            extra.put("lrThirdVentilationState", 0);
+            extra.put("rrSeatHeatState", 0);
+            extra.put("rrSeatVentilationState", 0);
+            extra.put("rrThirdHeatState", 0);
+            extra.put("rrThirdVentilationState", 0);
+            extra.put("steeringWheelHeatState", steeringWheelHeatWireState);
+        } catch (Exception e) {
+            throw new IOException("Failed to build VENTILATIONHEATING params", e);
+        }
+        return extra;
+    }
+
+    /**
+     * Translate UI level (0=off, 1=low, 2=high) to BYD wire level
+     * (3=off, 2=low, 1=high). Legacy local level 3 is accepted as high.
+     */
+    static int uiToWireSeatLevel(int uiLevel) {
+        switch (uiLevel) {
+            case 0: return 3;  // off
+            case 1: return 2;  // low
+            case 2:
+            case 3: return 1;  // high; 3 is the legacy local four-level "high"
+            default: throw new IllegalArgumentException("Invalid seat climate level: " + uiLevel);
+        }
+    }
+
+    private static int normalizeLegacyUiSeatLevel(int uiLevel) {
+        return uiLevel == 3 ? 2 : uiLevel;
+    }
+
+    private static boolean isUiSeatLevel(int uiLevel) {
+        return uiLevel >= 0 && uiLevel <= 2;
     }
 
     // ── Smart Charging ──────────────────────────────────────────────────
     // Smart-charge endpoints are config writes, not /control/remoteControl
     // commands. They use the same token-envelope path as data fetches and do
-    // NOT require commandPwd or polling. Port of pyBYD _api/smart_charging.
+    // NOT require commandPwd. Schedule and immediate-charge writes do require
+    // a changeResult terminal confirmation.
 
     /**
      * BYD response code 1001 has overloaded semantics — pyBYD documents this
@@ -463,16 +720,27 @@ public final class BydCloudClient {
      * server-side state issue, etc. — and must surface as a normal failure.
      */
     private static final String CLOUD_CODE_ENDPOINT_NOT_SUPPORTED = "1001";
+    /** Smart-charge write accepted by the cloud but the vehicle is currently unreachable. */
+    private static final String CLOUD_CODE_VEHICLE_UNREACHABLE = "6002";
 
     /** Thrown only when a READ endpoint reports 1001 (genuine "not supported on this region/account"). */
     public static final class SmartChargeNotSupportedException extends IOException {
         public SmartChargeNotSupportedException(String msg) { super(msg); }
     }
 
+    /** A retryable smart-charge write failure; callers must not retry physical commands for us. */
+    public static final class SmartChargeVehicleUnreachableException extends IOException {
+        public SmartChargeVehicleUnreachableException(String operation, String message) {
+            super(operation + ": vehicle unreachable (BYD cloud code 6002)"
+                    + (message == null || message.isEmpty() ? "" : ": " + message));
+        }
+    }
+
     /**
      * Toggle smart charging on/off via cloud.
      * Endpoint: /control/smartCharge/changeChargeStatue
-     * Field: smartChargeSwitch="1"|"0"
+     * Field: smartChargeSwitch="1"|"0". This is the schedule master switch,
+     * not the unsupported "stop charging now" operation.
      */
     public boolean toggleSmartCharging(String vin, boolean enable) throws IOException {
         BydCloudSession s = ensureSession();
@@ -493,11 +761,86 @@ public final class BydCloudClient {
             String detail = decodeRespondDataSafe(response, env.contentKey);
             logger.warn("smartCharge toggle failed: code=" + code + " message=" + msg
                     + " respondData=" + detail + " fullResponse=" + response.toString());
+            if (CLOUD_CODE_VEHICLE_UNREACHABLE.equals(code)) {
+                throw new SmartChargeVehicleUnreachableException("smartCharge toggle", msg);
+            }
             // 1001 on write endpoints = generic rejection, NOT "unsupported".
             return false;
         }
-        SmartChargeCache.setEnabled(enable);
-        return true;
+        // The outer ACK only proves receipt. Confirm the master switch from
+        // homePage before updating cache or reporting success.
+        for (int attempt = 0; attempt < SMART_CHARGE_CONFIRM_ATTEMPTS; attempt++) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IOException("smartCharge toggle cancelled");
+            }
+            try {
+                JSONObject homePage = fetchSmartChargingStatus(vin);
+                Boolean effective = SmartChargeCache.cloudEnabled(homePage);
+                if (effective != null && effective.booleanValue() == enable) {
+                    // A confirmed toggle supersedes a prior schedule save's
+                    // propagation grace. Otherwise a recent save can reject
+                    // this confirmed enabled-state change for two minutes.
+                    SmartChargeCache.confirmEnabled(vin, enable);
+                    SmartChargeCache.updateFromCloud(vin, homePage);
+                    return true;
+                }
+            } catch (IOException e) {
+                logger.info("smartCharge toggle confirmation read failed: " + e.getMessage());
+            }
+            if (attempt < SMART_CHARGE_CONFIRM_ATTEMPTS - 1) {
+                try {
+                    Thread.sleep(SMART_CHARGE_CONFIRM_SLEEP_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("smartCharge toggle cancelled", e);
+                }
+            }
+        }
+        logger.warn("smartCharge toggle was acknowledged but homePage did not confirm enabled=" + enable);
+        return false;
+    }
+
+    /**
+     * Start charging now. The cloud's status="0" counterpart is not exposed:
+     * it can report success while leaving the vehicle charging.
+     */
+    public boolean startChargingNow(String vin) throws IOException {
+        BydCloudSession s = ensureSession();
+        long nowMs = System.currentTimeMillis();
+        JSONObject inner = buildInner(nowMs);
+        try {
+            inner.put("vin", vin);
+            inner.put("timeZone", "");
+            inner.put("status", "1");
+        } catch (Exception e) {
+            throw new IOException("Failed to build immediate-charge request", e);
+        }
+        TokenEnvelope env = buildTokenOuterEnvelope(nowMs, s, inner);
+        JSONObject response = transport.postSecure("/control/smartCharge/changeChargeStatue", env.outer);
+        String code = response.optString("code", "");
+        if (!"0".equals(code)) {
+            String msg = response.optString("message", "");
+            logger.warn("Immediate charge start failed: code=" + code + " message=" + msg);
+            if (CLOUD_CODE_VEHICLE_UNREACHABLE.equals(code)) {
+                throw new SmartChargeVehicleUnreachableException("immediate charge start", msg);
+            }
+            return false;
+        }
+        String requestSerial = extractRequestSerial(response, env.contentKey);
+        if (requestSerial == null) {
+            logger.warn("Immediate charge start accepted without requestSerial; cannot confirm completion");
+            return false;
+        }
+        boolean confirmed = pollSmartChargeResult(vin, requestSerial,
+                SMART_CHARGE_CONFIRM_ATTEMPTS, SMART_CHARGE_CONFIRM_SLEEP_MS);
+        if (confirmed) {
+            try {
+                SmartChargeCache.updateFromCloud(vin, fetchSmartChargingStatus(vin));
+            } catch (Exception e) {
+                logger.info("Immediate charge start confirmed; smart-charge refresh failed: " + e.getMessage());
+            }
+        }
+        return confirmed;
     }
 
     /**
@@ -588,48 +931,52 @@ public final class BydCloudClient {
             String detail = decodeRespondDataSafe(response, env.contentKey);
             logger.warn("smartCharge save failed: code=" + code + " message=" + msg
                     + " respondData=" + detail + " fullResponse=" + response.toString());
+            if (CLOUD_CODE_VEHICLE_UNREACHABLE.equals(code)) {
+                throw new SmartChargeVehicleUnreachableException("smartCharge save", msg);
+            }
             return false;
         }
 
-        // BYD returned code 0 → the write was ACCEPTED. Treat that as success:
-        // mirror it into the local cache and return true immediately. We do NOT
-        // gate the user-visible result on the changeResult poll for two reasons:
-        //   1. The poll's own terminal "success" (res==2) is documented (pyBYD) to
-        //      reflect cloud acceptance only, not the actual vehicle state — so it
-        //      was never authoritative.
-        //   2. A full 12×1s poll can exceed the router's CLOUD_TIMEOUT_MS (12s)
-        //      once the saveOrUpdate POST + session setup are included, which made
-        //      every non-instant save surface as "save failed" even though BYD
-        //      had accepted it. Returning on acceptance removes that false negative.
         String requestSerial = extractRequestSerial(response, env.contentKey);
-        SmartChargeCache.setSchedule(startChargeTime, endChargeTime, chargeWay, enabled);
         if (requestSerial == null || requestSerial.isEmpty()) {
-            logger.info("smartCharge save accepted (no requestSerial) — cached, treating as success");
-            return true;
+            logger.warn("smartCharge save accepted without requestSerial; cannot confirm completion");
+            return false;
         }
-        // Best-effort confirmation only — used purely for diagnostics. Run it on a
-        // background daemon thread so its sequential changeResult POSTs + sleeps can
-        // never consume the caller's cloud timeout budget (which already made
-        // non-instant saves surface as false negatives). An explicit terminal
-        // rejection is logged as a warning; it does not flip the already-accepted
-        // result and no caller waits on it.
-        final String confirmSerial = requestSerial;
-        confirmExecutor().submit(() -> {
-            try {
-                boolean confirmed = pollSmartChargeResult(vin, confirmSerial,
-                        SMART_CHARGE_CONFIRM_ATTEMPTS, SMART_CHARGE_CONFIRM_SLEEP_MS);
-                logger.info("smartCharge save accepted; changeResult confirmed=" + confirmed
-                        + " (result cached regardless)");
-            } catch (Exception e) {
-                logger.info("smartCharge save confirm poll failed (ignored): " + e.getMessage());
+        boolean confirmed = pollSmartChargeResult(vin, requestSerial,
+                SMART_CHARGE_CONFIRM_ATTEMPTS, SMART_CHARGE_CONFIRM_SLEEP_MS);
+        if (!confirmed) return false;
+        SmartChargeCache.setSchedule(vin, startChargeTime, endChargeTime, chargeWay, enabled);
+        try {
+            JSONObject homePage = fetchSmartChargingStatus(vin);
+            if (confirmsSavedSchedule(homePage, startChargeTime, endChargeTime, chargeWay, enabled)) {
+                SmartChargeCache.updateFromCloud(vin, homePage);
+            } else {
+                logger.info("smartCharge save confirmed; homePage has not caught up, preserving confirmed cache");
             }
-        });
+        } catch (Exception e) {
+            logger.info("smartCharge save confirmed; homePage refresh failed: " + e.getMessage());
+        }
         return true;
     }
 
-    /** Bounded confirmation poll after a save is already accepted (diagnostic only). */
-    private static final int SMART_CHARGE_CONFIRM_ATTEMPTS = 4;
-    private static final long SMART_CHARGE_CONFIRM_SLEEP_MS = 700L;
+    /** Bounded terminal confirmation for saveOrUpdate and immediate start. */
+    private static final int SMART_CHARGE_CONFIRM_ATTEMPTS = 6;
+    private static final long SMART_CHARGE_CONFIRM_SLEEP_MS = 2_000L;
+
+    /** True only once homePage reflects the complete confirmed simple schedule. */
+    static boolean confirmsSavedSchedule(JSONObject homePage, String start, String end,
+                                         String chargeWay, boolean enabled) {
+        JSONObject schedule = new JSONObject();
+        try {
+            schedule.put("startChargeTime", start);
+            schedule.put("endChargeTime", end);
+            schedule.put("chargeWay", chargeWay);
+            schedule.put("enabled", enabled);
+        } catch (Exception ignored) {
+            return false;
+        }
+        return SmartChargeCache.homePageMatchesSchedule(homePage, schedule);
+    }
 
     /**
      * Poll /control/smartCharge/changeResult until res != 1 (terminal).
@@ -703,14 +1050,11 @@ public final class BydCloudClient {
      * Fetch the smart-charging home page (charging-state telemetry).
      * Endpoint: /control/smartCharge/homePage
      *
-     * <p>Per pyBYD's ChargingStatus model, this returns charging telemetry only —
-     * elecPercent (SoC), connectState, chargingState, fullHour, fullMinute,
-     * waitStatus, time. It does NOT echo back the configured schedule fields or
-     * smartChargeSwitch. Treat it as read-only telemetry; the schedule itself
-     * has no documented read endpoint, so we mirror writes locally
-     * (UnifiedConfigManager "chargingSchedule" section) for UI hydration.
+     * <p>The page also carries smartChargeDto and smartJourneyDto when the
+     * account supports scheduled charging.
      */
     public JSONObject fetchSmartChargingStatus(String vin) throws IOException {
+        long requestOrder = nextSmartChargeRequestOrder();
         BydCloudSession s = ensureSession();
         long nowMs = System.currentTimeMillis();
         JSONObject inner = buildInner(nowMs);
@@ -724,10 +1068,15 @@ public final class BydCloudClient {
             String detail = decodeRespondDataSafe(response, env.contentKey);
             logger.warn("smartCharge fetch failed: code=" + code + " message=" + msg
                     + " respondData=" + detail);
+            if (CLOUD_CODE_ENDPOINT_NOT_SUPPORTED.equals(code)) {
+                SmartChargeCache.invalidate(vin, requestOrder);
+                throw new SmartChargeNotSupportedException(
+                        "smartCharge homePage is unsupported for this account");
+            }
             throw new IOException("smartCharge fetch failed: code=" + code + " " + msg);
         }
         String respondData = response.optString("respondData", "");
-        if (respondData.isEmpty()) return new JSONObject();
+        if (respondData.isEmpty()) return tagSmartChargeResponse(new JSONObject(), requestOrder);
         JSONObject decoded = BydCloudTransport.decryptRespondData(respondData, env.contentKey);
         // Log the keys (not values — could contain SoC/PII) so we can confirm
         // what fields BYD's homePage actually exposes for this account.
@@ -740,7 +1089,27 @@ public final class BydCloudClient {
             }
             logger.info("smartCharge homePage keys=[" + keys + "]");
         } catch (Exception ignored) {}
-        return decoded;
+        return tagSmartChargeResponse(decoded, requestOrder);
+    }
+
+    private static long nextSmartChargeRequestOrder() {
+        while (true) {
+            long previous = smartChargeRequestOrder.get();
+            long next = Math.max(System.currentTimeMillis(), previous + 1L);
+            if (smartChargeRequestOrder.compareAndSet(previous, next)) {
+                return next;
+            }
+        }
+    }
+
+    private static JSONObject tagSmartChargeResponse(JSONObject homePage, long requestOrder) {
+        try {
+            homePage.put(SMART_CHARGE_REQUEST_ORDER_KEY, requestOrder);
+        } catch (Exception ignored) {
+            // A cache-order hint must never invalidate an otherwise usable
+            // cloud response.
+        }
+        return homePage;
     }
 
     /**
@@ -777,6 +1146,9 @@ public final class BydCloudClient {
     private CloudCommandResult executeRemoteCommand(String vin, String commandType,
                                                     JSONObject extraParams,
                                                     boolean waitForResult) throws IOException {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new IOException("remote command cancelled");
+        }
         if (!commandsVerified) {
             throw new IOException("Control PIN not verified. Call verifyControlPassword() first.");
         }
@@ -796,19 +1168,19 @@ public final class BydCloudClient {
             inner.put("timeStamp", String.valueOf(nowMs));
             inner.put("version", config.appInnerVersion);
             inner.put("vin", vin);
-            if (extraParams != null) {
-                Iterator<String> keys = extraParams.keys();
-                while (keys.hasNext()) {
-                    String k = keys.next();
-                    inner.put(k, extraParams.opt(k));
-                }
-            }
+            // BYD remote-control parameters are a JSON-encoded map. Sending
+            // them as top-level fields makes OPENAIR, BATTERYHEAT and seat
+            // commands look accepted while the vehicle ignores the payload.
+            if (extraParams != null) inner.put("controlParamsMap", extraParams.toString());
         } catch (Exception e) {
             throw new IOException("Failed to build command request", e);
         }
 
         TokenEnvelope env = buildTokenOuterEnvelope(nowMs, s, inner);
         JSONObject response = transport.postSecure("/control/remoteControl", env.outer);
+        if (Thread.currentThread().isInterrupted()) {
+            throw new IOException("remote command cancelled");
+        }
 
         String code = response.optString("code", "");
         if (!"0".equals(code)) {
@@ -819,39 +1191,60 @@ public final class BydCloudClient {
             return new CloudCommandResult(false, code, msg);
         }
 
-        // Extract requestSerial for polling
+        // Trigger responses are occasionally already terminal. A waited
+        // command is successful only after a terminal success result.
         String respondData = response.optString("respondData", "");
         String requestSerial = null;
+        JSONObject triggerResult = null;
         if (!respondData.isEmpty()) {
             try {
-                JSONObject rd = BydCloudTransport.decryptRespondData(respondData, env.contentKey);
-                requestSerial = rd.optString("requestSerial", null);
+                triggerResult = BydCloudTransport.decryptRespondData(respondData, env.contentKey);
+                requestSerial = triggerResult.optString("requestSerial", null);
             } catch (Exception e) {
                 logger.debug("Could not parse remoteControl respondData: " + e.getMessage());
             }
         }
 
-        // Poll for result (up to 5 attempts) — only if caller wants to wait
-        if (requestSerial != null && waitForResult) {
+        if (waitForResult) {
+            int triggerState = remoteControlTerminalState(triggerResult);
+            if (triggerState != 0) {
+                return new CloudCommandResult(triggerState == 1, "0", "");
+            }
+            if (requestSerial == null || requestSerial.isEmpty()) {
+                logger.warn("Remote command " + commandType
+                        + " did not provide a terminal result or requestSerial");
+                return new CloudCommandResult(false, "0", "missing requestSerial");
+            }
             boolean ok = pollRemoteControlResult(vin, requestSerial, commandType, s);
             return new CloudCommandResult(ok, "0", "");
         }
 
-        logger.info("Remote command " + commandType + " dispatched" + (waitForResult ? " (no serial)" : " (fire-and-forget)"));
+        logger.info("Remote command " + commandType + " dispatched (fire-and-forget)");
         return new CloudCommandResult(true, "0", "");
+    }
+
+    /** 0=pending/unknown, 1=success, 2=failure. Supports both BYD result shapes. */
+    private static int remoteControlTerminalState(JSONObject result) {
+        if (result == null) return 0;
+        if (result.has("controlState")) {
+            int controlState = result.optInt("controlState", 0);
+            if (controlState == 1) return 1;
+            if (controlState == 2) return 2;
+            return 0;
+        }
+        if (result.has("res")) {
+            int res = result.optInt("res", 1);
+            if (res == 1) return 0;
+            return res == 2 ? 1 : 2;
+        }
+        return 0;
     }
 
     private boolean pollRemoteControlResult(String vin, String requestSerial,
                                             String commandType, BydCloudSession s) throws IOException {
-        int consecutiveServerErrors = 0;
-        
-        for (int attempt = 1; attempt <= 5; attempt++) {
+        for (int attempt = 1; attempt <= 10; attempt++) {
             try {
-                // Use exponential backoff on server errors to avoid spamming
-                long delay = consecutiveServerErrors > 0 
-                    ? Math.min(2000L * (1L << consecutiveServerErrors), 10000L)  // 4s, 8s, 10s...
-                    : 2000L;
-                Thread.sleep(delay);
+                Thread.sleep(1500L);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return false;
@@ -883,43 +1276,33 @@ public final class BydCloudClient {
                 JSONObject response = transport.postSecure("/control/remoteControlResult", env.outer);
                 String code = response.optString("code", "");
                 
-                // Server-side errors — back off and retry
-                if ("1008".equals(code) || "1009".equals(code)) {
-                    consecutiveServerErrors++;
-                    if (consecutiveServerErrors >= 3) {
-                        logger.info("Remote command result polling stopped after " + 
-                            consecutiveServerErrors + " server errors (code=" + code + 
-                            ") — command was dispatched successfully");
-                        return true;  // Optimistic: command was dispatched
-                    }
-                    continue;
-                }
-                
-                consecutiveServerErrors = 0;
-                
                 if (!"0".equals(code)) continue;
 
                 String rd = response.optString("respondData", "");
                 if (rd.isEmpty()) continue;
 
                 JSONObject result = BydCloudTransport.decryptRespondData(rd, env.contentKey);
-                int controlState = result.optInt("controlState", 0);
-                // 0=pending, 1=success, 2=failure
-                if (controlState == 1) {
+                int terminalState = remoteControlTerminalState(result);
+                if (terminalState == 1) {
                     logger.info("Remote command succeeded (attempt " + attempt + ")");
                     return true;
-                } else if (controlState == 2) {
-                    logger.warn("Remote command failed (controlState=2)");
+                } else if (terminalState == 2) {
+                    logger.warn("Remote command failed with terminal result");
                     return false;
                 }
-                // controlState=0 → still pending, continue polling
+                // Pending/unknown → continue polling.
             } catch (Exception e) {
                 logger.debug("Poll attempt " + attempt + " failed: " + e.getMessage());
             }
         }
 
-        logger.info("Remote command polling timed out — command may still execute");
-        return true; // Optimistic: command was dispatched
+        logger.warn("Remote command polling timed out without terminal success");
+        return false;
+    }
+
+    /** Cancel a timed-out router worker's active transport call, if any. */
+    public void cancelRequestForThread(Thread worker) {
+        if (transport != null) transport.cancelCallForThread(worker);
     }
 
     // ── Vehicle Realtime Data ──────────────────────────────────────────

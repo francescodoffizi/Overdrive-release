@@ -123,6 +123,18 @@ public class DetectionBaseline {
         public long lastSeenMs;
         public int hitCount;
         public final int quadrant;
+        /**
+         * True iff this entry was CREATED by a live motion event (mid-event
+         * {@link #promoteStaticActor} or event-end {@link #updateFromEventEnd})
+         * — i.e. the object ARRIVED while sentry was watching. False for the
+         * sentry-start seed and the lighting-transition refresh, whose objects
+         * were already present when observation began. Consumed by the
+         * post-park vigilance channel ({@link #hasFreshParkedVehicleNear}):
+         * only a vehicle that was WATCHED arriving is a "fresh parker" whose
+         * occupants are expected to exit shortly. Never flips true later —
+         * refresh paths only bump hits on the existing entry.
+         */
+        public boolean fromLiveEvent = false;
 
         public Entry(int classId, float cx, float cy, float w, float h, int quadrant) {
             this.classId = classId;
@@ -409,7 +421,9 @@ public class DetectionBaseline {
             if (matchAndRefresh(quadrant, det.getClassId(), cx, cy, w, h)) {
                 refreshed++;
             } else {
-                baselines[quadrant].add(new Entry(det.getClassId(), cx, cy, w, h, quadrant));
+                Entry e = new Entry(det.getClassId(), cx, cy, w, h, quadrant);
+                e.fromLiveEvent = true;  // arrived while sentry was watching
+                baselines[quadrant].add(e);
                 added++;
             }
         }
@@ -452,8 +466,57 @@ public class DetectionBaseline {
         if (overlapsRecentPerson(quadrant, cx, cy, w, h)) return;
 
         if (!matchAndRefresh(quadrant, classId, cx, cy, w, h)) {
-            baselines[quadrant].add(new Entry(classId, cx, cy, w, h, quadrant));
+            Entry e = new Entry(classId, cx, cy, w, h, quadrant);
+            e.fromLiveEvent = true;  // arrived while sentry was watching
+            baselines[quadrant].add(e);
         }
+    }
+
+    // ==================== POST-PARK VIGILANCE ANCHOR ====================
+
+    /**
+     * Whether a FRESH PARKER anchor exists near a point: a CONFIRMED vehicle
+     * entry that was created BY A LIVE EVENT (watched arriving — never the
+     * sentry-start seed or a lighting refresh) within {@code maxAgeMs}, whose
+     * foot-point is within {@code radiusNorm} of ({@code nx},{@code ny}) in
+     * normalized quadrant coordinates.
+     *
+     * <p>Consumed by SurveillanceEngineGpu's post-park vigilance channel: a
+     * person exiting a just-parked car is a high-prior event, but the parked
+     * car itself is now baseline-suppressed, so the exit sequence's only class
+     * evidence is a YOLO person box that fisheye/occlusion frequently denies.
+     * This anchor lets motion AT that specific spot earn a lowered trigger bar
+     * and an exemption from the far-unconfirmed gate — evidence-scoped (I3):
+     * only this spot, only this quadrant, only while the entry is young.
+     *
+     * <p>FP posture (I9 — an adding-only channel fails CLOSED): confirmed
+     * entries only, so a single-frame YOLO hallucination can never open a
+     * vigilance zone; a parking event supplies the hits naturally via
+     * promoteStaticActor. Any error → false (no anchor, no lowered bar).
+     *
+     * <p>Coordinate-space note: callers pass QUADRANT-normalized coords. The
+     * anchors they match are quadrant-space too, because vehicle entries only
+     * reach confirmed status via the mosaic-space paths — promoteStaticActor
+     * skips foveated frames outright, and a foveated event-end entry's
+     * crop-window coords "don't refer to a stable physical region" (see the
+     * promote call site), so it never accrues the hits to confirm. An
+     * unconfirmable foveated entry is therefore inert here — fail-closed.
+     */
+    public synchronized boolean hasFreshParkedVehicleNear(int quadrant,
+            float nx, float ny, float radiusNorm, long maxAgeMs) {
+        if (quadrant < 0 || quadrant >= NUM_QUADRANTS) return false;
+        long now = System.currentTimeMillis();
+        for (Entry e : baselines[quadrant]) {
+            if (!e.fromLiveEvent || !e.isConfirmed()) continue;
+            int canonical = canonicalClass(e.classId);
+            if (canonical != 2 && canonical != 1) continue;  // vehicles only (car/bus/truck, bike/moto)
+            long age = now - e.addedAtMs;
+            if (age < 0 || age > maxAgeMs) continue;
+            float dx = nx - e.footX();
+            float dy = ny - e.footY();
+            if (Math.sqrt(dx * dx + dy * dy) <= radiusNorm) return true;
+        }
+        return false;
     }
 
     /**

@@ -164,7 +164,7 @@
     "tyre_wheel_reading": "{0} — {1}",
     "tyre_fast_leak": "Phát hiện rò nhanh",
     "tyre_slow_leak": "Phát hiện rò chậm",
-    "tyre_wheel_pressure": "{0} ({1} kPa)"
+    "tyre_wheel_pressure": "{0} ({1})"
   },
   "telegram": {
     "recording_caption": " Đăng ký ({0}) - {1}s",
@@ -486,6 +486,9 @@
     "close_all_windows_label": "Đóng tất cả các cửa sổ"
   },
   "automation": {
+    "wait_until_state_description": "Tạm dừng các hành động còn lại cho đến khi một tín hiệu bật/tắt đã chọn đạt một trạng thái, hoặc hết thời gian chờ. Ví dụ: chờ đến khi Indicators = Off trước khi tiếp tục.",
+    "wait_timeout": "Thời gian chờ (giây)",
+    "wait_until_description": "Tạm dừng các hành động còn lại cho đến khi một tín hiệu đã chọn đáp ứng một phép so sánh, hoặc hết thời gian chờ. Ví dụ: chờ đến khi Speed = 0 trước khi đóng cửa sổ.",
     "control_automation": "Điều khiển tự động hóa",
     "control_automation_description": "Bật, tắt hoặc bật/tắt một tự động hóa khác — kích hoạt hoặc hủy kích hoạt một quy trình từ một quy tắc.",
     "control_target": "Tự động hóa",
@@ -904,7 +907,7 @@
     "auto_lights": "Đèn pha tự động",
     "auto_lights_description": "Kích hoạt khi đèn pha tự động theo cảm biến ánh sáng bật hoặc tắt — tín hiệu 'trời tối' gần nhất mà xe cung cấp.",
     "occupant": "Ghế có người",
-    "occupant_description": "Kích hoạt khi ghế phụ phía trước có người hoặc trống.",
+    "occupant_description": "Kích hoạt khi ghế phụ phía trước có người hoặc trống. Nếu xe không có tín hiệu cảm biến ghế, trạng thái được ước tính từ nhắc dây an toàn và chốt dây của hành khách. Ước tính có thể sai nếu dây được cài trên ghế trống hoặc lời nhắc bị tắt tiếng.",
     "occupied": "Có người",
     "empty": "Trống",
     "boot": "Khởi động hệ thống",
@@ -1083,10 +1086,7 @@
     "mqtt_trigger": "Tin nhắn MQTT",
     "mqtt_trigger_description": "Kích hoạt khi broker MQTT của bạn đăng tới <base>/automation/<channel> (ví dụ từ Home Assistant). Nhập tên kênh và khớp với giá trị của nó.",
     "mqtt_channel": "Kênh",
-    "mqtt_value": "Giá trị",
-    "wait_until_description": "Tạm dừng các hành động còn lại cho đến khi một tín hiệu đã chọn đáp ứng một phép so sánh, hoặc hết thời gian chờ. Ví dụ: chờ đến khi Speed = 0 trước khi đóng cửa sổ.",
-    "wait_timeout": "Thời gian chờ (giây)",
-    "wait_until_state_description": "Tạm dừng các hành động còn lại cho đến khi một tín hiệu bật/tắt đã chọn đạt một trạng thái, hoặc hết thời gian chờ. Ví dụ: chờ đến khi Indicators = Off trước khi tiếp tục."
+    "mqtt_value": "Giá trị"
   },
   "messages": {
     "logged_out": "Tham gia.",
@@ -1114,5 +1114,10 @@
     "update_installing_finishing": "Việc lắp đặt bộ phận đầu sẽ sớm trở lại mạng.",
     "update_install_failed": "Thiết lập thất bại",
     "update_install_crashed": "Lắp đặt bị hỏng"
+  },
+  "units": {
+    "bar": "bar",
+    "kpa": "kPa",
+    "psi": "PSI"
   }
 }

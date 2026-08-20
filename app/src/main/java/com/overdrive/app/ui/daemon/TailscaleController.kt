@@ -100,6 +100,20 @@ class TailscaleController(
         tailscaleLauncher.isProxyEnabled(callback)
     }
 
+    /** Remote ADB over the tailnet — opt-in, grants UID-2000 shell to tailnet peers. */
+    fun saveAdbSettings(enabled: Boolean, callback: ((Boolean) -> Unit)? = null) {
+        tailscaleLauncher.saveAdbSettings(enabled, callback)
+    }
+
+    fun isAdbEnabled(callback: ((Boolean) -> Unit)) {
+        tailscaleLauncher.isAdbEnabled(callback)
+    }
+
+    /** "100.x.y.z:5555" to paste into `adb connect`, or null when unavailable. */
+    fun getAdbEndpoint(callback: (String?) -> Unit) {
+        tailscaleLauncher.getAdbEndpoint(callback)
+    }
+
     override fun cleanup() {
         // ps+awk+kill instead of pkill -f. executeShellCommand wraps in
         // `sh -c "<cmd>"`; the wrapper's argv contains the literal

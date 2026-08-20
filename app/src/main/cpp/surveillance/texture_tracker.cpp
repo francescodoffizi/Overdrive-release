@@ -191,6 +191,19 @@ static float matchInMicroRoi(
 void tracker_init(TrackerState* state) {
     memset(state, 0, sizeof(TrackerState));
     state->initialized = true;
+#ifdef USE_OPENCV_IMGPROC
+    // Confine OpenCV's internal parallel_for_ to the calling thread (audit
+    // R3b, detector-native F6 LOW): the MOG2-side confinement
+    // (confineOpenCvToCallingThread in native_motion.cpp) only ever runs
+    // when the stationary-revival channel is config-enabled — with it off,
+    // this tracker's matchTemplate/resize kept fanning out onto
+    // default-priority OpenMP workers across the encoder's cores for the
+    // whole process lifetime. tracker_init runs on EVERY smart-mode arm
+    // (NativeMotion.initTracker from enable()), so it is the always-run
+    // hook. Idempotent and cheap; the tracker's own workload (64×64
+    // template over a micro-ROI) is single-digit-ms single-threaded.
+    cv::setNumThreads(1);
+#endif
 }
 
 int tracker_startTrack(

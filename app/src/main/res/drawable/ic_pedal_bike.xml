@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Material icon: pedal_bike (24px) — actor-class filter chip glyph -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="?attr/colorOnSurfaceVariant">
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M18.18,10l-1.7,-4.68C16.19,4.53 15.44,4 14.6,4L12,4v2h2.6l1.46,4h-4.81l-0.36,-1L12.1,9L12.1,7L7,7v2h2.75l1.82,5L11,14h-0.83C9.7,11.85 7.79,10.26 5.47,10.03C2.56,9.75 0,12.06 0,15c0,2.76 2.24,5 5,5c2.42,0 4.44,-1.72 4.9,-4h4.2c0.42,2.24 2.39,3.94 4.77,4c2.83,0.07 5.18,-2.28 5.13,-5.11C23.95,12.11 21.68,10 18.9,10L18.18,10zM7.82,16c-0.4,1.17 -1.49,2 -2.82,2c-1.68,0 -3,-1.32 -3,-3s1.32,-3 3,-3c1.33,0 2.42,0.83 2.82,2L5,14v2L7.82,16zM14.1,14h-1.4l-0.73,-2L15,12C14.56,12.58 14.24,13.25 14.1,14zM19,18c-1.68,0 -3,-1.32 -3,-3c0,-0.93 0.41,-1.73 1.05,-2.28l0.96,2.64c0.19,0.52 0.76,0.79 1.28,0.6c0.52,-0.19 0.79,-0.76 0.6,-1.28l-0.97,-2.67c0.03,0 0.06,-0.01 0.09,-0.01c1.68,0 3,1.32 3,3S20.68,18 19,18z"/>
+</vector>

@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title data-i18n="app.communicate_title">Communicate - OverDrive</title>
+    <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#00876C">
+    <script src="../shared/theme.js?v=5"></script>
+    <script src="../shared/app-shell.js?v=5"></script>
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
+    <link rel="stylesheet" href="../shared/communicate.css?v=3">
+</head>
+<body class="communicate-page">
+    <div class="app-layout">
+        <div id="app-shell-mount"></div>
+        <main class="main-content">
+            <div class="mobile-header">
+                <button class="menu-toggle" type="button" onclick="toggleSidebar()" aria-label="Open menu">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <line x1="4" x2="20" y1="12" y2="12"/>
+                        <line x1="4" x2="20" y1="6" y2="6"/>
+                        <line x1="4" x2="20" y1="18" y2="18"/>
+                    </svg>
+                </button>
+                <span class="communicate-mobile-title" data-i18n="communicate.title">Communicate</span>
+                <div class="communicate-mobile-state" id="mobileConnectionDot" aria-hidden="true"></div>
+            </div>
+
+            <header class="page-header communicate-header">
+                <h1 class="page-title" data-i18n="communicate.title">Communicate</h1>
+                <div class="communicate-availability" id="availability" role="status" aria-live="polite">
+                    <span class="communicate-availability-dot" id="availabilityDot"></span>
+                    <span id="availabilityText">Checking car...</span>
+                </div>
+            </header>
+
+            <div class="communicate-mobile-tabs" role="tablist" aria-label="Communication mode">
+                <button type="button" class="communicate-tab is-active" id="talkTab" role="tab" aria-selected="true" aria-controls="talkPanel">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3M8 22h8"/>
+                    </svg>
+                    <span data-i18n="communicate.talk">Talk</span>
+                </button>
+                <button type="button" class="communicate-tab" id="messageTab" role="tab" aria-selected="false" aria-controls="messagePanel">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4Z"/>
+                    </svg>
+                    <span data-i18n="communicate.message">Message</span>
+                </button>
+            </div>
+
+            <div class="page-body communicate-body">
+                <div class="communicate-grid">
+                    <section class="communicate-tool talk-tool is-mobile-active" id="talkPanel" aria-labelledby="talkHeading">
+                        <div class="communicate-tool-header">
+                            <h2 id="talkHeading" data-i18n="communicate.talk">Talk</h2>
+                            <span class="talk-live-badge" id="liveBadge">
+                                <span class="talk-live-dot"></span>
+                                <span>LIVE</span>
+                            </span>
+                        </div>
+
+                        <div class="talk-stage">
+                            <button type="button" class="ptt-button is-disabled" id="pttButton" aria-label="Hold to talk" aria-disabled="true">
+                                <span class="ptt-ring" aria-hidden="true"></span>
+                                <svg class="ptt-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                                    <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3M8 22h8"/>
+                                </svg>
+                            </button>
+
+                            <div class="talk-state-copy" aria-live="polite">
+                                <div class="talk-state-title" id="talkStateTitle">Checking car...</div>
+                                <div class="talk-state-reason" id="talkStateReason"></div>
+                                <div class="talk-state-guidance" id="talkStateGuidance"></div>
+                            </div>
+
+                            <div class="talk-meter" id="talkMeter" aria-label="Microphone level">
+                                <div class="talk-meter-track">
+                                    <div class="talk-meter-fill" id="talkMeterFill"></div>
+                                </div>
+                            </div>
+
+                            <div class="talk-timing">
+                                <span id="elapsedTime">0:00</span>
+                                <span class="talk-timing-separator">/</span>
+                                <span>0:30</span>
+                            </div>
+                            <div class="talk-countdown" id="talkCountdown" aria-live="assertive"></div>
+
+                            <div class="talk-output-control">
+                                <div class="talk-output-option">
+                                    <label for="remoteOutputOverride" data-i18n="communicate.output_override">Use custom voice level</label>
+                                    <label class="toggle-switch talk-output-toggle">
+                                        <input type="checkbox" id="remoteOutputOverride" aria-label="Use custom voice level" disabled>
+                                        <span class="toggle-slider"></span>
+                                    </label>
+                                </div>
+                                <div class="talk-output-slider-row">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                                        <path d="M11 5 6 9H2v6h4l5 4V5Z"/>
+                                        <path d="M15.5 8.5a5 5 0 0 1 0 7"/>
+                                        <path d="M18.5 5.5a9 9 0 0 1 0 13"/>
+                                    </svg>
+                                    <input
+                                        type="range"
+                                        class="slider talk-output-slider"
+                                        id="remoteOutputLevel"
+                                        min="0"
+                                        max="100"
+                                        step="5"
+                                        value="70"
+                                        aria-label="Voice output level"
+                                        disabled>
+                                    <output id="remoteOutputValue" for="remoteOutputLevel">70%</output>
+                                </div>
+                                <div class="talk-output-status" id="remoteOutputStatus" role="status" aria-live="polite"></div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="communicate-tool message-tool" id="messagePanel" aria-labelledby="messageHeading">
+                        <div class="communicate-tool-header">
+                            <h2 id="messageHeading" data-i18n="communicate.message">Message</h2>
+                            <div class="message-ack" id="messageAck" role="status" aria-live="polite"></div>
+                        </div>
+
+                        <form id="messageForm" novalidate>
+                            <div class="message-readiness" id="messageReadiness" hidden>
+                                <div class="message-readiness-title" id="messageReadinessTitle"></div>
+                                <div class="message-readiness-reason" id="messageReadinessReason"></div>
+                                <div class="message-readiness-guidance" id="messageReadinessGuidance"></div>
+                            </div>
+
+                            <fieldset class="message-fieldset">
+                                <legend data-i18n="communicate.presentation">Presentation</legend>
+                                <div class="communicate-segmented" id="messageKind" role="radiogroup" aria-label="Message presentation">
+                                    <button type="button" class="is-selected" data-value="toast" role="radio" aria-checked="true" data-i18n="communicate.toast">Toast</button>
+                                    <button type="button" data-value="dialog" role="radio" aria-checked="false" data-i18n="communicate.dialog">Dialog</button>
+                                </div>
+                            </fieldset>
+
+                            <label class="message-label" for="messageText" data-i18n="communicate.message">Message</label>
+                            <div class="message-input-wrap">
+                                <textarea id="messageText" maxlength="200" rows="5" required></textarea>
+                                <span class="message-counter" id="messageCounter">0 / 200</span>
+                            </div>
+
+                            <div class="message-options">
+                                <label>
+                                    <span data-i18n="communicate.severity">Severity</span>
+                                    <select id="messageSeverity">
+                                        <option value="info" data-i18n="communicate.info">Info</option>
+                                        <option value="warning" data-i18n="communicate.warning">Warning</option>
+                                        <option value="alert" data-i18n="communicate.alert">Alert</option>
+                                    </select>
+                                </label>
+                                <label>
+                                    <span data-i18n="communicate.position">Position</span>
+                                    <select id="messagePosition">
+                                        <option value="top" data-i18n="communicate.top">Top</option>
+                                        <option value="center" data-i18n="communicate.center">Center</option>
+                                        <option value="bottom" selected data-i18n="communicate.bottom">Bottom</option>
+                                    </select>
+                                </label>
+                                <label>
+                                    <span data-i18n="communicate.duration">Duration</span>
+                                    <select id="messageDuration">
+                                        <option value="short" data-i18n="communicate.short">Short</option>
+                                        <option value="long" data-i18n="communicate.long">Long</option>
+                                    </select>
+                                </label>
+                            </div>
+
+                            <div class="message-actions">
+                                <button type="submit" class="btn btn-primary message-send" id="messageSend" disabled>
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                                        <path d="m22 2-7 20-4-9-9-4Z"/>
+                                        <path d="M22 2 11 13"/>
+                                    </svg>
+                                    <span data-i18n="communicate.send">Send</span>
+                                </button>
+                            </div>
+                        </form>
+                    </section>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script src="../shared/auth.js"></script>
+    <script src="../shared/core.js?v=18"></script>
+    <script src="../shared/communicate.js?v=3"></script>
+    <script>
+        function toggleSidebar() {
+            var sidebar = document.getElementById('sidebar');
+            var overlay = document.getElementById('sidebarOverlay');
+            if (sidebar) sidebar.classList.toggle('open');
+            if (overlay) overlay.classList.toggle('show');
+        }
+        BYD.i18n.init().then(function () {
+            BYD.core.init();
+            CommunicatePage.init();
+        });
+    </script>
+</body>
+</html>

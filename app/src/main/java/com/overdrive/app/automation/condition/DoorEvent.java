@@ -49,11 +49,17 @@ public final class DoorEvent {
     static final String DOOR_TYPE = "doorState";
 
     private static volatile boolean started = false;
+    private static final long POLL_MS = 1000L;
+    private static final ConditionalPoller poller = new ConditionalPoller(
+            "door fallback",
+            POLL_MS,
+            DoorEvent::shouldPoll,
+            () -> BydDataCollector.getInstance().pollDoorStatesNow());
 
     // Track each opening's last published state so the "any" aggregate can be recomputed
-    // correctly (any-open = at least one opening currently open). Single writer (the
-    // bodywork callback thread) → a plain map guarded by the instance is enough, but use
-    // a concurrent map defensively since reads could race a teardown.
+    // correctly (any-open = at least one opening currently open). The callback and parked
+    // getter-poll threads can both publish, so onDoorStateChanged synchronizes the update and
+    // aggregate calculation.
     private static final Map<Integer, Integer> areaState = new java.util.concurrent.ConcurrentHashMap<>();
 
     private DoorEvent() {}
@@ -65,22 +71,20 @@ public final class DoorEvent {
     /** Subscribe to raw door edges. Idempotent; call once at startup. */
     public static synchronized void start() {
         if (started) return;
-        started = true;
         BydDataCollector.getInstance().addDoorStateListener(DoorEvent::onDoorStateChanged);
+        started = true;
         logger.info("DoorEvent: subscribed to door state edges");
     }
 
-    private static void onDoorStateChanged(int area, int state) {
+    static synchronized void onDoorStateChanged(int area, int state) {
         // Only open/close are meaningful; ignore other raw states (e.g. -1 unknown).
         if (state != BodyworkConstants.STATE_OPEN && state != BodyworkConstants.STATE_CLOSED) return;
-        // Zero-cost when no automation is enabled (Automations.update also guards, but
-        // skipping the area bookkeeping too keeps it a true no-op).
-        if (Automations.isDisabled()) return;
+        if (!shouldPoll() && !Automations.editorSeedActive()) return;
 
         boolean open = state == BodyworkConstants.STATE_OPEN;
         EventData key = keyForArea(area);
         if (key != null) {
-            Automations.update(key, open ? "open" : "closed");
+            Automations.update(key, open ? "open" : "closed", true);
         }
 
         // Recompute the "any opening open" aggregate from the tracked per-area states.
@@ -89,7 +93,31 @@ public final class DoorEvent {
         for (Integer s : areaState.values()) {
             if (s != null && s == BodyworkConstants.STATE_OPEN) { anyOpen = true; break; }
         }
-        Automations.update(DOOR_ANY, anyOpen ? "open" : "closed");
+        Automations.update(DOOR_ANY, anyOpen ? "open" : "closed", true);
+    }
+
+    /** Whether a door getter poll is currently useful. */
+    public static boolean shouldPoll() {
+        return Automations.isEventReferenced(DOOR_DRIVER)
+                || Automations.isEventReferenced(DOOR_PASSENGER)
+                || Automations.isEventReferenced(DOOR_REAR_LEFT)
+                || Automations.isEventReferenced(DOOR_REAR_RIGHT)
+                || Automations.isEventReferenced(DOOR_HOOD)
+                || Automations.isEventReferenced(DOOR_TRUNK)
+                || Automations.isEventReferenced(DOOR_FUEL_CAP)
+                || Automations.isEventReferenced(DOOR_ANY);
+    }
+
+    public static void refresh() {
+        poller.refresh();
+    }
+
+    public static void seedForEditor() {
+        try {
+            BydDataCollector.getInstance().pollDoorStatesNow();
+        } catch (Throwable t) {
+            logger.warn("DoorEvent editor seed failed: " + t.getMessage());
+        }
     }
 
     /**

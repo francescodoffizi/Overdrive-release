@@ -7,10 +7,22 @@
 const TRIPS = {
     // State
     currentOffset: 0,
+    currentCursor: null,
     currentDays: 7,
     pageSize: 20,
     trips: [],
     currentTripId: null,
+    _detailRequestSequence: 0,
+    _activeDetailRequest: null,
+    _detailAbortController: null,
+    _listRequestSequence: 0,
+    _activeListKey: null,
+    _listAbortController: null,
+    _listLoadMoreInFlight: false,
+    _summaryRequestSequence: 0,
+    _activeSummaryKey: null,
+    _summaryAbortController: null,
+    _lastSummaryPayload: null,
     leafletMap: null,
     routeLayer: null,
     sliderMarker: null,
@@ -134,6 +146,16 @@ const TRIPS = {
         consistency:     { icon: '📐', i18n: 'consistency' }
     },
 
+    // ── Energy-leg icons (Material-Symbols-outlined shapes) ─────────────────
+    // Inline stroke SVG, matching the battery / tank / odometer capsule icons
+    // already used in the trip rows: 24-unit viewBox, stroke=currentColor so the
+    // glyph inherits the surrounding colour. Deliberately NOT the Material
+    // Symbols webfont — that would add a network fetch the head unit may not
+    // have, and ligature names render as raw text until the font loads.
+    // `bolt` (electric) and `local_gas_station` (petrol).
+    ICON_ELECTRIC: '<svg class="trip-leg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>',
+    ICON_PETROL: '<svg class="trip-leg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 22h13M5 22V8a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v14"/><path d="M15 6V4a1 1 0 0 1 1-1h0a1 1 0 0 1 1 1v10a2 2 0 0 0 2 2h0a2 2 0 0 0 2-2V8.5"/><path d="M7 10h6"/></svg>',
+
     /** Resolve a criterion field (label/desc/tip) through i18n. */
     criterion: function (key, field) {
         var info = this.criteriaInfo[key];
@@ -166,7 +188,7 @@ const TRIPS = {
         // detail back to the list whenever the active tab changes.
         var self = this;
         document.addEventListener('ot-tabs:active-changed', function () {
-            if (self.currentTripId != null) self.hideDetail();
+            if (self.currentTripId != null || self._activeDetailRequest) self.hideDetail();
         });
 
         // Render skeletons immediately so the user sees something while the
@@ -182,6 +204,14 @@ const TRIPS = {
         // returns an unsuccessful payload — worst-case behaviour is
         // unchanged.
         let usedBootstrap = false;
+        // The bootstrap trip page participates in the same generation scheme as
+        // filter/list requests. If the user changes the filter while this
+        // composite request is in flight, its config/storage slices may still be
+        // useful, but its stale trip page must not replace the chosen window.
+        const bootstrapListRequest = this._beginListRequest(
+            this._daysListKey(this.currentDays), 0, false, false);
+        const bootstrapSummaryRequest = this._beginSummaryRequest(
+            this._daysSummaryKey(this.currentDays), false);
         try {
             const bootstrapResp = await fetch('/api/trips/bootstrap');
             const bootstrapData = await bootstrapResp.json();
@@ -190,9 +220,9 @@ const TRIPS = {
                 if (b.config)  this._applyConfigPayload(b.config);
                 if (b.storage) this._applyStoragePayload(b.storage);
                 if (b.dna)     this._applyDnaPayload(b.dna);
-                if (b.summary) this._applySummaryPayload(b.summary);
+                if (b.summary) this._applySummaryPayload(b.summary, bootstrapSummaryRequest);
                 if (b.range)   this._applyRangePayload(b.range);
-                if (b.trips)   this._applyTripsPayload(b.trips, 0);
+                if (b.trips)   this._applyTripsPayload(b.trips, 0, bootstrapListRequest);
                 usedBootstrap = true;
             }
         } catch (e) {
@@ -203,16 +233,115 @@ const TRIPS = {
             await this.loadConfig();
             await this.loadStorageSettings();
             await this.loadDna();
-            await this.loadSummary(7);
+            if (this._isCurrentSummaryRequest(bootstrapSummaryRequest)) {
+                await this.loadSummary(this.currentDays);
+            }
             await this.loadRange();
-            await this.loadTrips(this.currentDays, 0);
+            // A user-selected filter/range owns a newer list generation.
+            if (this._isCurrentListRequest(bootstrapListRequest)) {
+                await this.loadTrips(this.currentDays, 0);
+            }
+        } else {
+            this._finishListRequest(bootstrapListRequest);
+            this._finishSummaryRequest(bootstrapSummaryRequest);
         }
 
         // CDR info is a separate /api/storage/external endpoint, not part
         // of the trips bootstrap. Small enough that one extra RTT after
         // first paint doesn't matter.
         await this.loadCdrInfo();
+        this._startStorageRefresh();
+        // Repaint when the unit preference changes elsewhere (core.js's /status
+        // poll, or another page). Idempotent guard: init() can run more than once.
+        if (!this._unitListenerBound) {
+            this._unitListenerBound = true;
+            var self = this;
+            window.addEventListener('byd:units-changed', function (event) {
+                self._repaintForUnitChange(
+                    event && event.detail ? event.detail.mode : null);
+            });
+        }
         console.log('[Trips] Initialized (bootstrap=' + usedBootstrap + ')');
+    },
+
+    /**
+     * Periodic + on-focus refresh of the storage payload.
+     *
+     * WHY trips needs one (recording.js and surveillance.js already had theirs):
+     * the combined-limit banner is a function of the OTHER categories' limits —
+     * `configuredMb` is Σ over every category on this volume — so it goes stale from
+     * actions this page cannot see. Lower the recordings limit on another tab and,
+     * without this, the trips banner asserts an overcommit the user already fixed,
+     * with no way out but a manual reload. The inverse is worse: raise a peer limit
+     * until the volume is overcommitted and the trips page silently keeps claiming
+     * everything is fine.
+     *
+     * Refreshes the BANNER + volume availability ONLY — see _refreshBudgetOnly. It
+     * must not go through
+     * loadStorageSettings()/_applyStoragePayload(), which rewrite the whole storage
+     * card: on a 10s cadence that reset the shared Apply button (silently killing
+     * unsaved COST edits, whose inputs only call showApplyNeeded and so are invisible
+     * to any storage-dirty guard), re-ran loadCdrInfo() (snapping the three CDR
+     * sliders back under the user's finger), and rewrote slider.value. Reading a
+     * payload and touching nothing but the advisory has none of those side effects,
+     * so it needs no dirty-guard at all.
+     */
+    _startStorageRefresh() {
+        if (this._storageRefreshTimer) return;   // idempotent
+        var self = this;
+        this._storageRefreshTimer = setInterval(function () {
+            if (document.visibilityState !== 'visible') return;
+            self._refreshBudgetOnly();
+        }, 10000);
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible') self._refreshBudgetOnly();
+        });
+    },
+
+    /**
+     * Re-read the storage budget + volume availability and re-render both,
+     * touching NO user-editable control.
+     *
+     * `storageMeta` is patched key-by-key rather than replaced: the fields left
+     * alone (limitMb, storageType) back the slider value and the selected
+     * button, and overwriting those mid-edit would fight the user. The banner
+     * tracks the OTHER categories' limits, so it must follow changes made on the
+     * recording / surveillance pages; availability and the per-volume ceilings
+     * are server truth that a card insert/eject can change at any moment. The
+     * user's own picks stay theirs until they Apply.
+     */
+    async _refreshBudgetOnly() {
+        try {
+            const resp = await fetch('/api/trips/storage');
+            const data = await resp.json();
+            const s = data && data.storage;
+            if (!s) return;
+            if (!this.storageMeta) this.storageMeta = {};
+            // Volume availability + its capacity ceilings are server truth, not
+            // user edits, so they refresh every tick — a card inserted after page
+            // load has to be able to re-enable its button (see
+            // _paintVolumeAvailability). The ceilings ride along because
+            // setStorageType/tripsMaxFor clamp the slider against them, and a
+            // freshly-mounted volume's real max only arrives with this payload.
+            this.storageMeta.sdCardAvailable   = s.sdCardAvailable;
+            this.storageMeta.usbAvailable      = s.usbAvailable;
+            this.storageMeta.sdCardFreeSpace   = s.sdCardFreeSpace;
+            this.storageMeta.sdCardTotalSpace  = s.sdCardTotalSpace;
+            this.storageMeta.usbFreeSpace      = s.usbFreeSpace;
+            this.storageMeta.usbTotalSpace     = s.usbTotalSpace;
+            // Deliberately NOT patching maxLimitMbSdCard/maxLimitMbUsb. The server
+            // reads the ceilings and the availability flags at different instants,
+            // so a volume that remounts mid-response yields available=true beside a
+            // ceiling computed as if it were absent (which collapses to internal's
+            // ~8GB). Adopting that pair would make the NEXT setStorageType() click
+            // clamp the slider — and Apply then persists ~8GB over the user's real
+            // retention cap. The full-render path owns these; nothing the poll
+            // repaints reads them.
+            this._paintVolumeAvailability(s);
+            if (!s.storageBudget) return;
+            this.storageMeta.storageBudget = s.storageBudget;
+            this.updateBudgetBanner();
+        } catch (e) { /* advisory only — a failed poll just leaves the last render */ }
     },
 
     /**
@@ -283,10 +412,13 @@ const TRIPS = {
         this.updateDistanceUnitButtons(distUnit);
         // If trips/summary already rendered before config arrived,
         // re-render so values pick up the persisted unit on first load.
-        if (this.currentTrips && this.currentTrips.length > 0) {
-            this.renderTripCards(this.currentTrips);
+        if (this.trips && this.trips.length > 0) {
+            this.renderTripList(this.trips);
         }
         this.updatePeriodSummary();
+        if (this.rangeFromMs == null && this._lastSummaryPayload) {
+            this._applySummaryPayload(this._lastSummaryPayload);
+        }
         this.updateCostHero();
         // Update currency icons
         this.updateCurrencyIcons();
@@ -327,7 +459,14 @@ const TRIPS = {
                 body: JSON.stringify({ enabled: true })
             });
         } catch (e) { console.warn('[Trips] Enable failed:', e); }
-        try { this.loadTrips(); } catch (e) { /* list refresh is best-effort */ }
+        try {
+            if (this.rangeFromMs != null) {
+                this.loadTripsBetween(
+                    this.rangeFromMs, this.rangeToMs, 0);
+            } else {
+                this.loadTrips(this.currentDays, 0);
+            }
+        } catch (e) { /* list refresh is best-effort */ }
     },
 
     async saveCostConfig() {
@@ -367,8 +506,8 @@ const TRIPS = {
             this.updateCostHero();
             // Reload the visible trips so detail breakdowns reflect new
             // tank/price values via the server's enrichTripEnergy path.
-            if (this.currentTrips && this.currentTrips.length > 0) {
-                this.renderTripCards(this.currentTrips);
+            if (this.trips && this.trips.length > 0) {
+                this.renderTripList(this.trips);
             }
         } catch (e) { console.warn('[Trips] Save cost config failed:', e); }
     },
@@ -493,13 +632,42 @@ const TRIPS = {
             });
             // Refresh all displays that show distance/speed values
             this.updatePeriodSummary();
+            if (this.rangeFromMs == null && this._lastSummaryPayload) {
+                this._applySummaryPayload(this._lastSummaryPayload);
+            }
             this.updateCostHero();
-            if (this.currentTrips && this.currentTrips.length > 0) {
-                this.renderTripCards(this.currentTrips);
+            if (this.trips && this.trips.length > 0) {
+                this.renderTripList(this.trips);
             }
             // Force a status refresh so the left nav range updates immediately
             if (BYD.core) BYD.core.refreshStatus();
         } catch (e) { console.warn('[Trips] Set distance unit failed:', e); }
+    },
+
+    /**
+     * Repaint everything that renders a distance/speed value or unit label.
+     *
+     * Called when the unit changes from OUTSIDE this page — core.js's ~1 Hz
+     * /status poll adopts the server's preference, which would otherwise flip
+     * every value while the labels (written only by updateDistanceUnitButtons)
+     * kept the old unit, and leave already-rendered trip cards stale until reload.
+     * Read-only w.r.t. user state: it re-renders from cached payloads and touches
+     * no editable control.
+     */
+    _repaintForUnitChange(unit) {
+        try {
+            this.updateDistanceUnitButtons(unit || BYD.units.mode);
+            if (this.trips && this.trips.length > 0) {
+                this.renderTripList(this.trips);
+            }
+            this.updatePeriodSummary();
+            if (this.rangeFromMs == null && this._lastSummaryPayload) {
+                this._applySummaryPayload(this._lastSummaryPayload);
+            }
+            this.updateCostHero();
+        } catch (e) {
+            console.warn('[Trips] Unit repaint failed:', e);
+        }
     },
 
     updateDistanceUnitButtons(unit) {
@@ -633,16 +801,9 @@ const TRIPS = {
         const sdBtn = document.getElementById('storageSdCard');
         const usbBtn = document.getElementById('storageUsb');
         if (intBtn) intBtn.classList.toggle('active', s.storageType === 'INTERNAL');
-        if (sdBtn) {
-            sdBtn.classList.toggle('active', s.storageType === 'SD_CARD');
-            sdBtn.disabled = !s.sdCardAvailable;
-            sdBtn.title = s.sdCardAvailable ? '' : BYD.i18n.t('recording.sd_card_unavailable');
-        }
-        if (usbBtn) {
-            usbBtn.classList.toggle('active', s.storageType === 'USB');
-            usbBtn.disabled = !s.usbAvailable;
-            usbBtn.title = s.usbAvailable ? '' : BYD.i18n.t('recording.usb_unavailable');
-        }
+        if (sdBtn) sdBtn.classList.toggle('active', s.storageType === 'SD_CARD');
+        if (usbBtn) usbBtn.classList.toggle('active', s.storageType === 'USB');
+        this._paintVolumeAvailability(s);
         const slider = document.getElementById('storageLimitSlider');
         const sliderMax = this.tripsMaxFor(s.storageType, s);
         if (slider) {
@@ -659,6 +820,48 @@ const TRIPS = {
             if (s.storageType === 'SD_CARD') pathEl.textContent = BYD.i18n.t('trip.sd_path_default');
             else if (s.storageType === 'USB') pathEl.textContent = BYD.i18n.t('trip.usb_path_default');
             else pathEl.textContent = BYD.i18n.t('trip.internal_path_default');
+        }
+
+        // CDR cleanup card is SD-only (BYD's built-in dashcam)
+        const cdrCard = document.getElementById('tripCdrCleanupCard');
+        if (cdrCard) cdrCard.style.display = s.storageType === 'SD_CARD' ? 'block' : 'none';
+        if (s.storageType === 'SD_CARD') this.loadCdrInfo();
+
+        this.pendingStorageType = null;
+        this.pendingStorageLimit = null;
+        this.resetApplyButton();
+        // AFTER clearing pending*: the render inside updateLimitLabel above ran while
+        // a stale pending volume was still set, so it evaluated fresh server limits
+        // against the volume the user had picked but not applied. Re-render now that
+        // the baseline is the server's truth, or the banner keeps naming a volume the
+        // buttons no longer show as selected.
+        this.updateBudgetBanner();
+    },
+
+    /**
+     * Paint the SD/USB availability chrome: the two picker buttons' enabled
+     * state plus the always-visible status rows (dot, label, free/total).
+     *
+     * Split out of _applyStoragePayload so the 10s poll can refresh it too.
+     * It writes only display state and the `disabled` flag — never a slider
+     * value, the Apply button, or the CDR sliders — so unlike the rest of the
+     * storage card it needs no dirty-guard and can run under the user's hands.
+     * That matters because the SD button starts disabled when the card isn't
+     * detected, and a disabled button cannot POST the type change whose mount
+     * attempt would make it available: without a poll-driven repaint, a card
+     * inserted after page load stayed unselectable until a manual reload.
+     */
+    _paintVolumeAvailability(s) {
+        if (!s) return;
+        const sdBtn = document.getElementById('storageSdCard');
+        const usbBtn = document.getElementById('storageUsb');
+        if (sdBtn) {
+            sdBtn.disabled = !s.sdCardAvailable;
+            sdBtn.title = s.sdCardAvailable ? '' : BYD.i18n.t('recording.sd_card_unavailable');
+        }
+        if (usbBtn) {
+            usbBtn.disabled = !s.usbAvailable;
+            usbBtn.title = s.usbAvailable ? '' : BYD.i18n.t('recording.usb_unavailable');
         }
 
         // SD card status row — always visible so the user sees the
@@ -711,15 +914,6 @@ const TRIPS = {
                 if (usbSpaceInfo) usbSpaceInfo.style.display = 'none';
             }
         }
-
-        // CDR cleanup card is SD-only (BYD's built-in dashcam)
-        const cdrCard = document.getElementById('tripCdrCleanupCard');
-        if (cdrCard) cdrCard.style.display = s.storageType === 'SD_CARD' ? 'block' : 'none';
-        if (s.storageType === 'SD_CARD') this.loadCdrInfo();
-
-        this.pendingStorageType = null;
-        this.pendingStorageLimit = null;
-        this.resetApplyButton();
     },
 
     /**
@@ -779,6 +973,8 @@ const TRIPS = {
 
         const cdrCard = document.getElementById('tripCdrCleanupCard');
         if (cdrCard) cdrCard.style.display = type === 'SD_CARD' ? 'block' : 'none';
+        // The destination volume changed, so re-evaluate against ITS capacity.
+        this.updateBudgetBanner();
         this.showApplyNeeded();
     },
 
@@ -796,6 +992,43 @@ const TRIPS = {
         const v = parseInt(val);
         const label = v >= 1000 ? (v / 1000) + ' GB' : v + ' MB';
         if (el) el.textContent = label;
+        // Hooked here rather than in setStorageLimit: the slider fires oninput →
+        // updateLimitLabel on every drag frame but onchange → setStorageLimit only
+        // on release, and the advisory should track the drag. Safe to call from the
+        // programmatic paths too — the background refresh only swaps storageBudget and
+        // never writes a control, so there is no drag state to protect.
+        this.updateBudgetBanner(v);
+    },
+
+    /**
+     * Render the combined-limit advisory. `pendingMb` defaults to the pending or
+     * saved limit so callers that aren't mid-drag get the right baseline; the
+     * storage-type pick is passed so switching volumes retargets the warning.
+     */
+    updateBudgetBanner(pendingMb) {
+        if (!BYD.storageBudget) return;
+        const meta = this.storageMeta || {};
+        // Baseline, most-live first. The SLIDER's DOM value is the authority when no
+        // explicit value was passed: the slider only assigns pendingStorageLimit on
+        // release (onchange), so during a drag both pendingStorageLimit and
+        // meta.limitMb still hold the OLD number — a background refresh firing then
+        // would re-render against it and hide the very warning the user is reading
+        // with the slider still parked past the limit. recording/surveillance don't
+        // need this because their oninput handler commits to this.config first.
+        let mb = pendingMb;
+        if (mb == null) {
+            const slider = document.getElementById('storageLimitSlider');
+            const live = slider ? parseInt(slider.value, 10) : NaN;
+            mb = !isNaN(live) ? live
+               : (this.pendingStorageLimit != null ? this.pendingStorageLimit : meta.limitMb);
+        }
+        // ONLY a genuine unsaved pick counts as pending. Passing meta.storageType here
+        // made every render look like a volume switch whenever storageMeta was stale
+        // relative to storageBudget (the background refresh updates only the budget):
+        // render() would compare the stale type against the fresh grouping, conclude
+        // the category had moved, and warn about the volume it just left.
+        const type = this.pendingStorageType || null;
+        BYD.storageBudget.render('tripBudgetBanner', meta.storageBudget, 'trips', mb, type);
     },
 
     showApplyNeeded() {
@@ -935,6 +1168,13 @@ const TRIPS = {
                 // to the Trips tab so they're actually visible.
                 const RECOVER_WINDOW_DAYS = 3650;
                 this.currentDays = RECOVER_WINDOW_DAYS;
+                this.currentOffset = 0;
+                this.currentCursor = null;
+                this.rangeFromMs = null;
+                this.rangeToMs = null;
+                this._invalidateSummaryRequests();
+                const rangeRow = document.getElementById('tripRangeRow');
+                if (rangeRow) rangeRow.classList.remove('open');
                 try { document.querySelectorAll('.filter-tab').forEach(el => el.classList.remove('active')); } catch (e) {}
                 Promise.resolve()
                     .then(() => this.loadTrips(RECOVER_WINDOW_DAYS, 0)).catch(() => {})
@@ -989,7 +1229,8 @@ const TRIPS = {
             if (!data.success) return;
 
             // SD status row (tripSdCardStatus/tripSdStatusDot/tripSdStatusText/
-            // tripSdSpaceInfo) is owned by loadStorageSettings() and reads from
+            // tripSdSpaceInfo) is owned by _paintVolumeAvailability() — reached
+            // from both the initial load and the 10s poll — and reads from
             // /api/trips/storage → StorageManager.isSdCardAvailable(). Don't
             // paint it here: ExternalStorageCleaner keeps its own cached
             // sdCardAvailable flag and on some firmwares diverges from
@@ -1072,6 +1313,7 @@ const TRIPS = {
         });
         this.currentDays = days;
         this.currentOffset = 0;
+        this.currentCursor = null;
         this.trips = [];
         this.rangeFromMs = null;   // leaving custom-range mode
         this.rangeToMs = null;
@@ -1113,7 +1355,9 @@ const TRIPS = {
         this.rangeFromMs = fromMs != null ? fromMs : 0;
         this.rangeToMs = toMs;   // null = open-ended (daemon treats as no upper bound)
         this.currentOffset = 0;
+        this.currentCursor = null;
         this.trips = [];
+        this._invalidateSummaryRequests();
         this.renderTripList([]);
         const empty = document.getElementById('tripEmptyState');
         if (empty) empty.style.display = 'none';
@@ -1124,24 +1368,39 @@ const TRIPS = {
         this.loadTripsBetween(this.rangeFromMs, this.rangeToMs, 0);
     },
 
-    // Fetch one page of the active custom range. offset=0 resets the list;
-    // non-zero appends (Load More). Bounds are held on the instance so
-    // loadMore() can page without re-deriving them.
-    async loadTripsBetween(fromMs, toMs, offset) {
+    // Fetch one page of the active custom range. New servers use the stable
+    // cursor; offset remains in the request so an older daemon can still page.
+    async loadTripsBetween(fromMs, toMs, offset, cursor) {
         const off = offset || 0;
+        const pageCursor = typeof cursor === 'string' && cursor ? cursor : null;
+        const isLoadMore = pageCursor != null || off > 0;
+        if (isLoadMore && this._listLoadMoreInFlight) return;
+        const key = this._rangeListKey(fromMs, toMs);
+        if (isLoadMore && this._activeListKey !== key) return;
+        if (!isLoadMore) this.currentCursor = null;
+
+        const request = this._beginListRequest(
+            key, off, isLoadMore, true, pageCursor);
         try {
             let q = '/api/trips?from=' + fromMs;
             if (toMs != null) q += '&to=' + toMs;
             q += '&limit=' + this.pageSize + '&offset=' + off;
-            const resp = await fetch(q);
+            if (pageCursor != null) q += '&cursor=' + pageCursor;
+            const resp = request.controller
+                ? await fetch(q, { signal: request.controller.signal })
+                : await fetch(q);
             const data = await resp.json();
-            this._applyTripsPayload(data, off);
+            if (!this._isCurrentListRequest(request)) return;
+            this._applyTripsPayload(data, off, request);
         } catch (e) {
+            if (!this._isCurrentListRequest(request) || this._isAbortError(e)) return;
             console.warn('[Trips] Load trips for range failed:', e);
             const skel = document.getElementById('tripListSkeleton');
             if (skel) skel.style.display = 'none';
             const empty = document.getElementById('tripEmptyState');
             if (empty) empty.style.display = 'flex';
+        } finally {
+            this._finishListRequest(request);
         }
     },
 
@@ -1305,67 +1564,203 @@ const TRIPS = {
 
     // ==================== TRIP LIST ====================
 
-    async loadTrips(days, offset) {
-        const off = offset || 0;
+    _daysListKey(days) {
+        return 'days:' + String(days);
+    },
+
+    _rangeListKey(fromMs, toMs) {
+        return 'range:' + String(fromMs) + ':' + (toMs == null ? '' : String(toMs));
+    },
+
+    _newAbortController() {
         try {
-            const resp = await fetch('/api/trips?days=' + days
-                + '&limit=' + this.pageSize
-                + '&offset=' + off);
-            const data = await resp.json();
-            this._applyTripsPayload(data, off);
+            return typeof AbortController !== 'undefined' ? new AbortController() : null;
         } catch (e) {
+            return null;
+        }
+    },
+
+    _isAbortError(error) {
+        return !!(error && error.name === 'AbortError');
+    },
+
+    /**
+     * Start a list request and invalidate every older page/filter response.
+     * AbortController is optional because the head-unit's legacy WebView does
+     * not expose it; the generation/key check remains the correctness guard.
+     */
+    _beginListRequest(key, offset, loadMore, cancellable, cursor) {
+        if (this._listAbortController) {
+            try { this._listAbortController.abort(); } catch (e) {}
+        }
+
+        const controller = cancellable === false ? null : this._newAbortController();
+        const request = {
+            sequence: ++this._listRequestSequence,
+            key: key,
+            offset: offset || 0,
+            cursor: cursor || null,
+            loadMore: !!loadMore,
+            controller: controller
+        };
+        this._activeListKey = key;
+        this._listAbortController = controller;
+        this._listLoadMoreInFlight = request.loadMore;
+
+        const btn = document.getElementById('loadMoreBtn');
+        if (btn) btn.disabled = request.loadMore;
+        return request;
+    },
+
+    _isCurrentListRequest(request) {
+        return !!request
+            && request.sequence === this._listRequestSequence
+            && request.key === this._activeListKey;
+    },
+
+    _finishListRequest(request) {
+        if (!this._isCurrentListRequest(request)) return;
+        if (this._listAbortController === request.controller) {
+            this._listAbortController = null;
+        }
+        this._listLoadMoreInFlight = false;
+        const btn = document.getElementById('loadMoreBtn');
+        if (btn) btn.disabled = false;
+    },
+
+    _invalidateListRequests() {
+        if (this._listAbortController) {
+            try { this._listAbortController.abort(); } catch (e) {}
+        }
+        this._listRequestSequence++;
+        this._listAbortController = null;
+        this._listLoadMoreInFlight = false;
+        const btn = document.getElementById('loadMoreBtn');
+        if (btn) btn.disabled = false;
+    },
+
+    _tripIdKey(trip) {
+        if (!trip || trip.id == null) return null;
+        const raw = String(trip.id).trim();
+        if (!raw) return null;
+        const numeric = Number(raw);
+        return isFinite(numeric) ? 'n:' + String(numeric) : 's:' + raw;
+    },
+
+    _mergeTripsById(existing, incoming, reset) {
+        const merged = [];
+        const seen = Object.create(null);
+        const append = (trip) => {
+            const key = this._tripIdKey(trip);
+            // Preserve legacy/malformed rows without IDs; there is no stable
+            // identity by which they can safely be collapsed.
+            if (key == null || !seen[key]) {
+                merged.push(trip);
+                if (key != null) seen[key] = true;
+            }
+        };
+        if (!reset && existing) existing.forEach(append);
+        if (incoming) incoming.forEach(append);
+        return merged;
+    },
+
+    async loadTrips(days, offset, cursor) {
+        const requestedDays = days == null ? this.currentDays : days;
+        const off = offset || 0;
+        const pageCursor = typeof cursor === 'string' && cursor ? cursor : null;
+        const isLoadMore = pageCursor != null || off > 0;
+        if (isLoadMore && this._listLoadMoreInFlight) return;
+        const key = this._daysListKey(requestedDays);
+        if (isLoadMore && this._activeListKey !== key) return;
+        if (!isLoadMore) this.currentCursor = null;
+
+        const request = this._beginListRequest(
+            key, off, isLoadMore, true, pageCursor);
+        try {
+            let url = '/api/trips?days=' + requestedDays
+                + '&limit=' + this.pageSize
+                + '&offset=' + off;
+            if (pageCursor != null) url += '&cursor=' + pageCursor;
+            const resp = request.controller
+                ? await fetch(url, { signal: request.controller.signal })
+                : await fetch(url);
+            const data = await resp.json();
+            if (!this._isCurrentListRequest(request)) return;
+            this._applyTripsPayload(data, off, request);
+        } catch (e) {
+            if (!this._isCurrentListRequest(request) || this._isAbortError(e)) return;
             console.warn('[Trips] Load trips failed:', e);
             const skel = document.getElementById('tripListSkeleton');
             if (skel) skel.style.display = 'none';
+        } finally {
+            this._finishListRequest(request);
         }
     },
 
     /**
-     * Apply a /api/trips list response. {@code offset} is the offset that
-     * was sent to the server: zero resets {@code this.trips}, non-zero
-     * appends. The bootstrap path always passes {@code offset=0} (matching
-     * the server-side default in {@link TripApiHandler#handleGetBootstrap}).
+     * Apply a /api/trips list response. Cursor-aware requests use the request's
+     * loadMore flag; offset remains the fallback consumed-row count for older
+     * servers.
      */
-    _applyTripsPayload(data, offset) {
+    _applyTripsPayload(data, offset, request) {
+        if (request && !this._isCurrentListRequest(request)) return false;
         const off = offset || 0;
         const skel = document.getElementById('tripListSkeleton');
         if (skel) skel.style.display = 'none';
 
         const btn = document.getElementById('loadMoreBtn');
         const empty = document.getElementById('tripEmptyState');
+        if (!data || data.error || !Array.isArray(data.trips)) {
+            console.warn('[Trips] Trip list response failed:',
+                data && data.error ? data.error : 'invalid response');
+            return false;
+        }
+        const page = data.trips;
+        const reset = request ? !request.loadMore : off === 0;
+        const hasMore = typeof data.hasMore === 'boolean'
+            ? data.hasMore : page.length >= this.pageSize;
+        this.currentCursor = typeof data.nextCursor === 'string'
+            && data.nextCursor ? data.nextCursor : null;
 
-        if (data && data.trips && data.trips.length > 0) {
-            if (off === 0) this.trips = [];
-            this.trips = this.trips.concat(data.trips);
-            this.currentOffset = this.trips.length;
+        if (page.length > 0) {
+            this.trips = this._mergeTripsById(this.trips, page, reset);
+            // The server offset tracks consumed rows, not rendered unique
+            // cards. Otherwise an overlapping page makes the next request
+            // repeat rows forever after client-side deduplication.
+            this.currentOffset = off + page.length;
             this.renderTripList(this.trips);
-            // Short page → no more rows in this window. Server returns
-            // exactly `pageSize` only when there's at least one more page
-            // to fetch, so this is the canonical "has more" signal.
-            if (btn) btn.style.display = data.trips.length >= this.pageSize ? 'block' : 'none';
+            if (btn) btn.style.display = hasMore ? 'block' : 'none';
             if (empty) empty.style.display = 'none';
-        } else if (off === 0) {
+        } else if (reset) {
             // No trips for this period — clear the list and show empty state.
             this.trips = [];
+            this.currentOffset = 0;
+            this.currentCursor = null;
             this.renderTripList([]);
             if (empty) empty.style.display = 'flex';
             if (btn) btn.style.display = 'none';
         } else {
             // Paginating past end-of-data (data.success but no more rows).
             // Don't touch this.trips; just hide the button.
+            this.currentCursor = null;
             if (btn) btn.style.display = 'none';
         }
+        return true;
     },
 
     loadMore() {
+        if (this._listLoadMoreInFlight) return;
         // Paginate through the same time window — don't widen `currentDays`,
         // that would re-fetch the same head rows under a larger cutoff and
         // produce duplicates relative to what we already have. When a custom
         // range is active, page through it instead of the days window.
         if (this.rangeFromMs != null) {
-            this.loadTripsBetween(this.rangeFromMs, this.rangeToMs, this.currentOffset);
+            this.loadTripsBetween(
+                this.rangeFromMs, this.rangeToMs,
+                this.currentOffset, this.currentCursor);
         } else {
-            this.loadTrips(this.currentDays, this.currentOffset);
+            this.loadTrips(
+                this.currentDays, this.currentOffset, this.currentCursor);
         }
     },
 
@@ -1510,13 +1905,20 @@ const TRIPS = {
         const litresVal = trip.litresUsed || trip.litres_used || 0;
         let breakdownStr = '';
         if (!recovered && fuelCostVal > 0 && electricCost > 0) {
-            breakdownStr = '⚡ ' + cur + electricCost.toFixed(2)
-                + '  +  ⛽ ' + cur + fuelCostVal.toFixed(2);
+            breakdownStr = this.ICON_ELECTRIC + ' ' + cur + electricCost.toFixed(2)
+                + '  +  ' + this.ICON_PETROL + ' ' + cur + fuelCostVal.toFixed(2);
         } else if (!recovered && fuelCostVal > 0) {
             // Petrol-only leg (charge-sustain / empty battery): label it so the
             // cost isn't mistaken for an electricity charge.
-            breakdownStr = '⛽ ' + cur + fuelCostVal.toFixed(2)
-                + (litresVal > 0 ? ' · ' + litresVal.toFixed(2) + ' L' : '');
+            // Respect the fuel-unit preference, as the detail tile already does —
+            // otherwise the same trip reads "4.20 L" on its card and "1.11 gal"
+            // when opened.
+            breakdownStr = this.ICON_PETROL + ' ' + cur + fuelCostVal.toFixed(2)
+                + (litresVal > 0
+                    ? ' · ' + (this.fuelUnit === 'gal'
+                        ? (litresVal / this.LITRES_PER_GAL).toFixed(2) + ' gal'
+                        : litresVal.toFixed(2) + ' L')
+                    : '');
         }
 
         // Rate provenance: name the tariff the electricity was priced at, since a
@@ -1540,7 +1942,7 @@ const TRIPS = {
             : (trip.fuel_pct_end != null) ? trip.fuel_pct_end : -1;
         let fuelStr = '';
         if (fuelStart >= 0 && fuelEnd >= 0) {
-            fuelStr = '<span class="trip-capsule" style="color:var(--warning);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 22h13M5 22V8a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v14"/><path d="M15 6V4a1 1 0 0 1 1-1h0a1 1 0 0 1 1 1v10a2 2 0 0 0 2 2h0a2 2 0 0 0 2-2V8.5"/></svg> ⛽ '
+            fuelStr = '<span class="trip-capsule" style="color:var(--warning);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 22h13M5 22V8a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v14"/><path d="M15 6V4a1 1 0 0 1 1-1h0a1 1 0 0 1 1 1v10a2 2 0 0 0 2 2h0a2 2 0 0 0 2-2V8.5"/></svg> '
                 + fuelStart.toFixed(2) + '→' + fuelEnd.toFixed(2) + '%</span>';
         }
 
@@ -1633,13 +2035,69 @@ const TRIPS = {
         if (data.dna.overall !== undefined) this.renderScoreCircle(data.dna.overall);
     },
 
+    _daysSummaryKey(days) {
+        return 'days:' + String(days);
+    },
+
+    _beginSummaryRequest(key, cancellable) {
+        if (this._summaryAbortController) {
+            try { this._summaryAbortController.abort(); } catch (e) {}
+        }
+        if (key !== this._activeSummaryKey) {
+            this._lastSummaryPayload = null;
+            this._resetCoreSummary();
+        }
+        const controller = cancellable === false ? null : this._newAbortController();
+        const request = {
+            sequence: ++this._summaryRequestSequence,
+            key: key,
+            controller: controller
+        };
+        this._activeSummaryKey = key;
+        this._summaryAbortController = controller;
+        return request;
+    },
+
+    _isCurrentSummaryRequest(request) {
+        return !!request
+            && request.sequence === this._summaryRequestSequence
+            && request.key === this._activeSummaryKey;
+    },
+
+    _finishSummaryRequest(request) {
+        if (!this._isCurrentSummaryRequest(request)) return;
+        if (this._summaryAbortController === request.controller) {
+            this._summaryAbortController = null;
+        }
+    },
+
+    _invalidateSummaryRequests() {
+        if (this._summaryAbortController) {
+            try { this._summaryAbortController.abort(); } catch (e) {}
+        }
+        this._summaryRequestSequence++;
+        this._activeSummaryKey = null;
+        this._summaryAbortController = null;
+        this._lastSummaryPayload = null;
+    },
+
     async loadSummary(days) {
-        const d = days || 7;
+        const d = days == null ? 7 : days;
+        const request = this._beginSummaryRequest(this._daysSummaryKey(d), true);
         try {
-            const resp = await fetch('/api/trips/summary?days=' + d);
+            const url = '/api/trips/summary?days=' + d;
+            const resp = request.controller
+                ? await fetch(url, { signal: request.controller.signal })
+                : await fetch(url);
             const data = await resp.json();
-            this._applySummaryPayload(data);
-        } catch (e) { console.warn('[Trips] Summary load failed:', e); }
+            if (!this._isCurrentSummaryRequest(request)) return;
+            this._applySummaryPayload(data, request);
+        } catch (e) {
+            if (!this._isCurrentSummaryRequest(request) || this._isAbortError(e)) return;
+            console.warn('[Trips] Summary load failed:', e);
+        } finally {
+            this._finishSummaryRequest(request);
+        }
     },
 
     /**
@@ -1647,8 +2105,27 @@ const TRIPS = {
      * Server returns an array of weekly rollups; we only render the most
      * recent one (matching the legacy loadSummary behaviour).
      */
-    _applySummaryPayload(data) {
-        if (!data || !data.summary || data.summary.length === 0) return;
+    _applySummaryPayload(data, request) {
+        if (request && !this._isCurrentSummaryRequest(request)) return false;
+        if (!data || !Array.isArray(data.summary)) return false;
+        this._lastSummaryPayload = data;
+        if (data.summary.length === 0) {
+            this.setEl('summaryTrips', 0);
+            this.setEl('summaryDistance', '0.0');
+            this.setEl('summaryTime', '0.0');
+            this.setEl('summaryEfficiency', '--');
+            // Clear the energy/cost half of the card too. Writing only the four
+            // fields above left the previous window's numbers on screen, so
+            // narrowing the range to one with no trips showed "0 trips / 0.0 km"
+            // beside a stale "47.2 kWh / $6.80".
+            this.setEl('summaryEnergy', '--');
+            this.setEl('summaryConsumption', '--');
+            this.setEl('summaryEfficiency2', '--');
+            this.setEl('summaryCost', '--');
+            const emptyFuelTile = document.getElementById('summaryFuelTile');
+            if (emptyFuelTile) emptyFuelTile.style.display = 'none';
+            return true;
+        }
         const s = data.summary[0];
         this.setEl('summaryTrips', s.tripCount || s.trip_count || 0);
         this.setEl('summaryDistance', BYD.units.distVal(s.totalDistanceKm || s.total_distance_km || 0).toFixed(1));
@@ -1660,6 +2137,14 @@ const TRIPS = {
         const sE = s.avgEfficiencyScore || s.avg_efficiency_score || 0;
         const sC = s.avgConsistency || s.avg_consistency || 0;
         this.setEl('summaryEfficiency', Math.floor((sA + sS + sSD + sE + sC) / 5));
+        return true;
+    },
+
+    _resetCoreSummary() {
+        this.setEl('summaryTrips', '--');
+        this.setEl('summaryDistance', '--');
+        this.setEl('summaryTime', '--');
+        this.setEl('summaryEfficiency', '--');
     },
 
     // ==================== CLIENT-SIDE SUMMARY ====================
@@ -1723,10 +2208,15 @@ const TRIPS = {
             totalFuelCost += t.fuelCost || t.fuel_cost || 0;
         });
 
-        this.setEl('summaryTrips', trips.length);
-        this.setEl('summaryDistance', BYD.units.distVal(totalDist).toFixed(1));
-        this.setEl('summaryTime', (totalDur / 3600).toFixed(1));
-        this.setEl('summaryEfficiency', trips.length > 0 ? Math.floor(scoreSum / trips.length) : '--');
+        // Preset-day core totals come from /api/trips/summary and represent the
+        // complete server-side period. Only a custom range is client-owned;
+        // otherwise pagination would replace full totals with the loaded subset.
+        if (this.rangeFromMs != null) {
+            this.setEl('summaryTrips', trips.length);
+            this.setEl('summaryDistance', BYD.units.distVal(totalDist).toFixed(1));
+            this.setEl('summaryTime', (totalDur / 3600).toFixed(1));
+            this.setEl('summaryEfficiency', trips.length > 0 ? Math.floor(scoreSum / trips.length) : '--');
+        }
         this.setEl('summaryEnergy', totalEnergy > 0 ? totalEnergy.toFixed(1) : '--');
 
         // Average consumption: kWh/100km or kWh/100mi (works for BEV and PHEV)
@@ -1941,8 +2431,10 @@ const TRIPS = {
 
                 content.innerHTML = '';
 
-                // Update circle value
+                // Update circle value. The unit label ships as a literal "km" in
+                // the markup, so set it too — `predicted` is already converted.
                 this.setEl('rangeCircleValue', predicted);
+                this.setEl('rangeCircleUnit', distLbl);
                 // Fill = personalized vs projected (built-in). Full ring when you
                 // match or beat the factory baseline; partial when below it.
                 const rangePct = builtInKm > 0
@@ -2120,7 +2612,7 @@ const TRIPS = {
         var totalDisplay = (totalRangeKm != null && totalRangeKm > 0)
             ? BYD.units.distVal(totalRangeKm) : null;
 
-        var html = '<span style="color:var(--warning);">⛽ '
+        var html = '<span style="color:var(--warning);">' + this.ICON_PETROL + ' '
             + BYD.i18n.t('trip.range_petrol_label', { km: petrolDisplay, unit: distLbl })
             + '</span>';
         if (totalDisplay != null) {
@@ -2134,15 +2626,236 @@ const TRIPS = {
 
     // ==================== TRIP DETAIL ====================
 
+    _beginDetailRequest(tripId) {
+        if (this._detailAbortController) {
+            try { this._detailAbortController.abort(); } catch (e) {}
+        }
+
+        const controller = this._newAbortController();
+        const request = {
+            sequence: ++this._detailRequestSequence,
+            tripId: String(tripId),
+            controller: controller
+        };
+        this._activeDetailRequest = request;
+        this._detailAbortController = controller;
+        // currentTripId is reserved for the summary actually on screen. It is
+        // assigned only after this request's summary has rendered completely.
+        this.currentTripId = null;
+        this._resetDetailViewState();
+        return request;
+    },
+
+    _isCurrentDetailRequest(request) {
+        return !!request
+            && !!this._activeDetailRequest
+            && request.sequence === this._detailRequestSequence
+            && request.sequence === this._activeDetailRequest.sequence
+            && request.tripId === this._activeDetailRequest.tripId;
+    },
+
+    _cancelDetailRequest() {
+        if (this._detailAbortController) {
+            try { this._detailAbortController.abort(); } catch (e) {}
+        }
+        this._detailAbortController = null;
+        this._activeDetailRequest = null;
+        this._detailRequestSequence++;
+        this.currentTripId = null;
+    },
+
+    _clearDetailCanvas(id) {
+        const canvas = document.getElementById(id);
+        if (!canvas) return;
+        canvas.onmousemove = null;
+        canvas.onmouseleave = null;
+        canvas.ontouchstart = null;
+        canvas.ontouchmove = null;
+        canvas.ontouchend = null;
+        // Assigning width resets pixels plus the complete Canvas2D state and is
+        // supported by the legacy WebView.
+        canvas.width = canvas.width;
+    },
+
+    _clearDetailTimer(name) {
+        if (this[name] != null) {
+            clearTimeout(this[name]);
+            this[name] = null;
+        }
+    },
+
+    _resetDetailTelemetryState(request) {
+        if (request && !this._isCurrentDetailRequest(request)) return;
+
+        this.telemetryCache = null;
+        this.currentTripData = null;
+        this._timelineAxis = null;
+        this.routeLayer = null;
+        this.sliderMarker = null;
+        this._mapRetries = 0;
+        this._layoutRetries = 0;
+
+        this._clearDetailTimer('_detailMapTimer');
+        this._clearDetailTimer('_mapRetryTimer');
+        this._clearDetailTimer('_mapHeadingTimer');
+        if (this._mapInvalidateTimers) {
+            this._mapInvalidateTimers.forEach(function(timer) { clearTimeout(timer); });
+        }
+        this._mapInvalidateTimers = [];
+
+        if (this._sliderMarkerReadyHandler) {
+            try {
+                document.removeEventListener('app-shell:ready', this._sliderMarkerReadyHandler);
+            } catch (e) {}
+            this._sliderMarkerReadyHandler = null;
+        }
+        if (this._sliderMarker3d) {
+            try { this._sliderMarker3d.dispose(); } catch (e) {}
+            this._sliderMarker3d = null;
+        }
+        if (this.leafletMap) {
+            try { this.leafletMap.remove(); } catch (e) {}
+            this.leafletMap = null;
+        }
+
+        const mapContainer = document.getElementById('tripMap');
+        if (mapContainer) mapContainer.innerHTML = '';
+
+        this._clearDetailCanvas('timelineChart');
+        this._clearDetailCanvas('speedHistogram');
+        this.setEl('tlAccelPct', '--%');
+        this.setEl('tlCoastPct', '--%');
+        this.setEl('tlBrakePct', '--%');
+        const histSummary = document.getElementById('speedHistSummary');
+        if (histSummary) histSummary.innerHTML = '';
+
+        const sliderCard = document.getElementById('timelineSliderCard');
+        if (sliderCard) sliderCard.style.display = 'none';
+        const slider = document.getElementById('timelineSlider');
+        if (slider) {
+            slider.min = 0;
+            slider.max = 0;
+            slider.value = 0;
+            if (slider.parentElement) slider.parentElement.onmousemove = null;
+        }
+        this.setEl('sliderSpeed', '--');
+        this.setEl('sliderAccel', '--');
+        this.setEl('sliderBrake', '--');
+        this.setEl('sliderSoc', '--');
+        this.setEl('sliderStartTime', '0:00');
+        this.setEl('sliderCurrentTime', '--:--');
+        this.setEl('sliderEndTime', '--:--');
+    },
+
+    _resetRouteComparisonState() {
+        this._routeMapRequestSequence = (this._routeMapRequestSequence || 0) + 1;
+        this._clearDetailTimer('_routeSparklineTimer');
+        if (this.routeCompareMapInstance) {
+            try { this.routeCompareMapInstance.remove(); } catch (e) {}
+            this.routeCompareMapInstance = null;
+        }
+        const card = document.getElementById('routeComparisonCard');
+        const content = document.getElementById('routeComparisonContent');
+        const overlay = document.getElementById('routeMapOverlay');
+        const map = document.getElementById('routeCompareMap');
+        const legend = document.getElementById('routeMapLegend');
+        if (card) card.style.display = 'none';
+        if (content) content.innerHTML = '';
+        if (overlay) overlay.style.display = 'none';
+        if (map) map.innerHTML = '';
+        if (legend) legend.innerHTML = '';
+    },
+
+    _resetDetailViewState() {
+        this._resetDetailTelemetryState();
+        this._resetRouteComparisonState();
+
+        [
+            'detailTitle', 'detailSubtitle', 'detailDistance', 'detailDuration',
+            'detailSocDelta', 'detailEfficiency', 'detailConsumption',
+            'detailEfficiency2', 'detailAvgSpeed', 'detailMaxSpeed',
+            'detailSocStart', 'detailSocEnd', 'detailOdoStart', 'detailOdoEnd',
+            'detailFuelStart', 'detailFuelEnd', 'detailLitresUsed', 'detailTemp',
+            'detailCost', 'detailElevGain', 'detailElevLoss'
+        ].forEach((id) => this.setEl(id, '--'));
+
+        [
+            'detailOdoStartTile', 'detailOdoEndTile', 'detailFuelStartTile',
+            'detailFuelEndTile', 'detailLitresUsedTile'
+        ].forEach(function(id) {
+            const el = document.getElementById(id);
+            if (el) el.style.display = 'none';
+        });
+        const grad = document.getElementById('detailGradientPill');
+        if (grad) {
+            grad.style.display = 'none';
+            grad.textContent = '';
+        }
+        const cost = document.getElementById('costBreakdown');
+        if (cost) {
+            cost.style.display = 'none';
+            cost.innerHTML = '';
+        }
+        const moments = document.getElementById('microMomentsList');
+        if (moments) moments.innerHTML = '';
+
+        [
+            ['scoreAnticipation', 'scoreAnticipationVal'],
+            ['scoreSmoothness', 'scoreSmoothnessVal'],
+            ['scoreSpeedDisc', 'scoreSpeedDiscVal'],
+            ['scoreEfficiency', 'scoreEfficiencyVal'],
+            ['scoreConsistency', 'scoreConsistencyVal']
+        ].forEach(function(ids) {
+            const fill = document.getElementById(ids[0]);
+            const value = document.getElementById(ids[1]);
+            if (fill) {
+                fill.style.width = '0%';
+                fill.classList.remove('low', 'mid');
+            }
+            if (value) value.textContent = '--';
+        });
+        this.applyRecoveredDetailState(false);
+
+        const deleteBtn = document.getElementById('detailDeleteBtn');
+        if (deleteBtn) deleteBtn.disabled = true;
+    },
+
+    _hasTelemetryArtifact(trip) {
+        if (!trip) return false;
+        const path = trip.telemetryFilePath || trip.telemetry_file_path || '';
+        // Backup imports intentionally carry stats only. The non-empty sentinel
+        // keeps database recovery from reaping them; it is not a fetchable file.
+        return !!path && path.indexOf('imported://') !== 0;
+    },
+
+    _isUsableTelemetry(samples) {
+        if (!Array.isArray(samples) || samples.length === 0) return false;
+        const axis = this._selectTimelineAxis(samples);
+        if (axis.key === 'e') return true;
+        // Legacy telemetry has no monotonic field and remains valid as long as
+        // its original wall timestamps are numeric. A malformed wall timeline
+        // cannot be plotted safely and is treated as unavailable.
+        for (let i = 0; i < samples.length; i++) {
+            if (!samples[i] || typeof samples[i].t !== 'number'
+                    || !isFinite(samples[i].t)) return false;
+        }
+        return true;
+    },
+
     async showDetail(tripId) {
-        this.currentTripId = tripId;
+        const detailRequest = this._beginDetailRequest(tripId);
+        let summaryBound = false;
         document.getElementById('tripListView').classList.add('hidden');
         document.getElementById('tripDetail').classList.add('active');
         window.scrollTo(0, 0);
 
         try {
-            const tripResp = await fetch('/api/trips/' + tripId);
+            const tripUrl = '/api/trips/' + tripId;
+            const tripResp = detailRequest.controller
+                ? await fetch(tripUrl, { signal: detailRequest.controller.signal })
+                : await fetch(tripUrl);
             const tripData = await tripResp.json();
+            if (!this._isCurrentDetailRequest(detailRequest)) return;
             if (!tripData.success || !tripData.trip) return;
             const trip = tripData.trip;
 
@@ -2303,19 +3016,46 @@ const TRIPS = {
             }
 
             this.renderMicroMoments(trip.microMomentsJson || trip.micro_moments_json);
-            this.loadRouteComparison(trip);
+            if (!this._isCurrentDetailRequest(detailRequest)) return;
+
+            // Bind deletion only after this request's complete summary is on
+            // screen. JavaScript runs this synchronous render atomically, so a
+            // click can never observe trip B's summary with trip A's ID.
+            this.currentTripId = trip.id != null ? trip.id : tripId;
+            summaryBound = true;
+            const deleteBtn = document.getElementById('detailDeleteBtn');
+            if (deleteBtn) deleteBtn.disabled = false;
+
+            this.loadRouteComparison(trip, detailRequest);
 
             // Fetch telemetry (may be unavailable for older trips)
             console.log('[Trips] Trip telemetry path:', trip.telemetryFilePath || trip.telemetry_file_path || 'NONE');
-            if (trip.telemetryFilePath || trip.telemetry_file_path) {
-                try {
-                    console.log('[Trips] Fetching telemetry for trip ' + tripId);
-                    const telResp = await fetch('/api/trips/' + tripId + '/telemetry');
-                    console.log('[Trips] Telemetry response status:', telResp.status);
-                    if (telResp.ok) {
-                        const telData = await telResp.json();
-                        console.log('[Trips] Telemetry data: success=' + telData.success + ' samples=' + (telData.telemetry ? telData.telemetry.length : 0));
-                        if (telData.success && telData.telemetry && telData.telemetry.length > 0) {
+            if (!this._hasTelemetryArtifact(trip)) {
+                this._resetDetailTelemetryState(detailRequest);
+                return;
+            }
+
+            try {
+                console.log('[Trips] Fetching telemetry for trip ' + tripId);
+                const telemetryUrl = '/api/trips/' + tripId + '/telemetry';
+                const telResp = detailRequest.controller
+                    ? await fetch(telemetryUrl, { signal: detailRequest.controller.signal })
+                    : await fetch(telemetryUrl);
+                if (!this._isCurrentDetailRequest(detailRequest)) return;
+                console.log('[Trips] Telemetry response status:', telResp.status);
+                if (!telResp.ok) {
+                    this._resetDetailTelemetryState(detailRequest);
+                    return;
+                }
+
+                const telData = await telResp.json();
+                if (!this._isCurrentDetailRequest(detailRequest)) return;
+                console.log('[Trips] Telemetry data: success=' + telData.success + ' samples=' + (telData.telemetry ? telData.telemetry.length : 0));
+                if (!telData.success || !this._isUsableTelemetry(telData.telemetry)) {
+                    this._resetDetailTelemetryState(detailRequest);
+                    return;
+                }
+
                 const samples = telData.telemetry;
                 this.telemetryCache = samples;
                 this.currentTripData = trip;
@@ -2331,12 +3071,23 @@ const TRIPS = {
                 const ribbonCanvas = document.getElementById('timelineChart');
                 if (ribbonCanvas) {
                     try { this.renderTimeline(ribbonCanvas, samples); }
-                    catch (e) { console.error('[Trips] renderTimeline failed:', e.message || e); }
+                    catch (e) {
+                        this._clearDetailCanvas('timelineChart');
+                        this.setEl('tlAccelPct', '--%');
+                        this.setEl('tlCoastPct', '--%');
+                        this.setEl('tlBrakePct', '--%');
+                        console.error('[Trips] renderTimeline failed:', e.message || e);
+                    }
                 }
                 const histCanvas = document.getElementById('speedHistogram');
                 if (histCanvas) {
                     try { this.renderSpeedHistogram(histCanvas, samples); }
-                    catch (e) { console.error('[Trips] renderSpeedHistogram failed:', e.message || e); }
+                    catch (e) {
+                        this._clearDetailCanvas('speedHistogram');
+                        const summary = document.getElementById('speedHistSummary');
+                        if (summary) summary.innerHTML = '';
+                        console.error('[Trips] renderSpeedHistogram failed:', e.message || e);
+                    }
                 }
                 const mapContainer = document.getElementById('tripMap');
                 console.log('[Trips] Map container:', mapContainer ? (mapContainer.offsetWidth + 'x' + mapContainer.offsetHeight) : 'NOT FOUND');
@@ -2345,32 +3096,68 @@ const TRIPS = {
                     // Delay map render to ensure container is visible and has dimensions.
                     // renderRouteMap has its own retry logic for Leaflet loading and
                     // container layout, so we just need a small initial delay.
-                    setTimeout(() => {
+                    this._detailMapTimer = setTimeout(() => {
+                        this._detailMapTimer = null;
+                        if (!this._isCurrentDetailRequest(detailRequest)) return;
                         console.log('[Trips] Calling renderRouteMap with ' + samples.length + ' samples');
-                        this.renderRouteMap(mapContainer, samples);
+                        this.renderRouteMap(mapContainer, samples, detailRequest);
                     }, 150);
                 }
-                        }
-                    }
-                } catch (e) {
-                    console.error('[Trips] Telemetry/map error:', e.message || e);
-                }
+            } catch (e) {
+                if (!this._isCurrentDetailRequest(detailRequest) || this._isAbortError(e)) return;
+                this._resetDetailTelemetryState(detailRequest);
+                console.error('[Trips] Telemetry/map error:', e.message || e);
             }
-        } catch (e) { console.warn('[Trips] Detail load failed:', e); }
+        } catch (e) {
+            if (!this._isCurrentDetailRequest(detailRequest) || this._isAbortError(e)) return;
+            if (summaryBound) this._resetDetailTelemetryState(detailRequest);
+            else this._resetDetailViewState();
+            console.warn('[Trips] Detail load failed:', e);
+        }
     },
 
     hideDetail() {
-        this.currentTripId = null;
-        this.telemetryCache = null;
-        this.currentTripData = null;
-        this.sliderMarker = null;
-        document.getElementById('tripDetail').classList.remove('active');
-        document.getElementById('tripListView').classList.remove('hidden');
-        document.getElementById('timelineSliderCard').style.display = 'none';
-        if (this.leafletMap) { this.leafletMap.remove(); this.leafletMap = null; }
+        this._cancelDetailRequest();
+        this._resetDetailViewState();
+        const detail = document.getElementById('tripDetail');
+        const list = document.getElementById('tripListView');
+        if (detail) detail.classList.remove('active');
+        if (list) list.classList.remove('hidden');
     },
 
     // ==================== TIMELINE SLIDER ====================
+
+    _selectTimelineAxis(samples) {
+        let useElapsed = !!(samples && samples.length);
+        let previousElapsed = -1;
+        for (let i = 0; useElapsed && i < samples.length; i++) {
+            const elapsed = samples[i] && samples[i].e;
+            if (typeof elapsed !== 'number' || !isFinite(elapsed)
+                    || elapsed < 0 || (i > 0 && elapsed < previousElapsed)) {
+                useElapsed = false;
+                break;
+            }
+            previousElapsed = elapsed;
+        }
+
+        const key = useElapsed ? 'e' : 't';
+        const start = samples && samples.length ? samples[0][key] : 0;
+        const end = samples && samples.length ? samples[samples.length - 1][key] : start;
+        return {
+            samples: samples,
+            key: key,
+            start: start,
+            end: end,
+            range: end - start || 1
+        };
+    },
+
+    _timelineAxisFor(samples) {
+        if (!this._timelineAxis || this._timelineAxis.samples !== samples) {
+            this._timelineAxis = this._selectTimelineAxis(samples);
+        }
+        return this._timelineAxis;
+    },
 
     setupTimelineSlider(samples) {
         const card = document.getElementById('timelineSliderCard');
@@ -2378,12 +3165,12 @@ const TRIPS = {
         card.style.display = 'block';
 
         const slider = document.getElementById('timelineSlider');
+        if (!slider) return;
         slider.max = samples.length - 1;
         slider.value = 0;
 
-        const tStart = samples[0].t;
-        const tEnd = samples[samples.length - 1].t;
-        const durMin = Math.round((tEnd - tStart) / 60000);
+        const axis = this._timelineAxisFor(samples);
+        const durMin = Math.round((axis.end - axis.start) / 60000);
         this.setEl('sliderStartTime', '0:00');
         this.setEl('sliderEndTime', durMin + ' min');
 
@@ -2456,8 +3243,8 @@ const TRIPS = {
         const samples = this.telemetryCache;
         if (!samples || idx >= samples.length) return;
         const s = samples[idx];
-        const tStart = samples[0].t;
-        const elapsed = (s.t - tStart) / 1000;
+        const axis = this._timelineAxisFor(samples);
+        const elapsed = (s[axis.key] - axis.start) / 1000;
         const min = Math.floor(elapsed / 60);
         const sec = Math.floor(elapsed % 60);
 
@@ -2538,7 +3325,8 @@ const TRIPS = {
 
     // ==================== ROUTE COMPARISON ====================
 
-    async loadRouteComparison(trip) {
+    async loadRouteComparison(trip, detailRequest) {
+        if (!this._isCurrentDetailRequest(detailRequest)) return;
         const card = document.getElementById('routeComparisonCard');
         const content = document.getElementById('routeComparisonContent');
         if (!card || !content) return;
@@ -2548,8 +3336,12 @@ const TRIPS = {
 
         try {
             const tripId = trip.id;
-            const resp = await fetch('/api/trips/' + tripId + '/similar');
+            const url = '/api/trips/' + tripId + '/similar';
+            const resp = detailRequest.controller
+                ? await fetch(url, { signal: detailRequest.controller.signal })
+                : await fetch(url);
             const data = await resp.json();
+            if (!this._isCurrentDetailRequest(detailRequest)) return;
             if (!data.success || data.count === 0) { card.style.display = 'none'; return; }
 
             card.style.display = 'block';
@@ -2605,14 +3397,14 @@ const TRIPS = {
             // This trip
             html += '<div style="padding:12px;background:var(--bg-elevated);border-radius:10px;border:1px solid var(--border-subtle);">';
             html += '<div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;">This trip</div>';
-            if (tripEnergy > 0) html += '<div style="font-size:13px;color:var(--text-primary);margin-bottom:4px;">⚡ ' + tripEnergy.toFixed(1) + ' kWh</div>';
+            if (tripEnergy > 0) html += '<div style="font-size:13px;color:var(--text-primary);margin-bottom:4px;">' + this.ICON_ELECTRIC + ' ' + tripEnergy.toFixed(1) + ' kWh</div>';
             html += '<div style="font-size:13px;color:var(--text-primary);margin-bottom:4px;">⏱ ' + Math.round(tripDur/60) + ' min</div>';
             if (tripCost > 0) html += '<div style="font-size:13px;color:var(--text-primary);">💰 ' + currency + tripCost.toFixed(1) + '</div>';
             html += '</div>';
             // Route avg
             html += '<div style="padding:12px;background:var(--bg-elevated);border-radius:10px;border:1px solid var(--border-subtle);">';
             html += '<div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;">Route average</div>';
-            if (avgEnergy > 0) html += '<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;">⚡ ' + avgEnergy.toFixed(1) + ' kWh</div>';
+            if (avgEnergy > 0) html += '<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;">' + this.ICON_ELECTRIC + ' ' + avgEnergy.toFixed(1) + ' kWh</div>';
             html += '<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;">⏱ ' + Math.round(avgDur/60) + ' min</div>';
             if (avgCost > 0) html += '<div style="font-size:13px;color:var(--text-secondary);">💰 ' + currency + avgCost.toFixed(1) + '</div>';
             html += '</div>';
@@ -2649,9 +3441,14 @@ const TRIPS = {
             if (similar.length >= 2) {
                 var energyPoints = similar.slice().reverse().map(function(t) { return t.energyUsedKwh || t.energy_used_kwh || 0; });
                 energyPoints.push(tripEnergy);
-                setTimeout(function() { TRIPS.drawRouteSparkline(energyPoints); }, 50);
+                this._routeSparklineTimer = setTimeout(function() {
+                    TRIPS._routeSparklineTimer = null;
+                    if (!TRIPS._isCurrentDetailRequest(detailRequest)) return;
+                    TRIPS.drawRouteSparkline(energyPoints);
+                }, 50);
             }
         } catch (e) {
+            if (!this._isCurrentDetailRequest(detailRequest) || this._isAbortError(e)) return;
             console.warn('[Trips] Route comparison error:', e);
             card.style.display = 'none';
         }
@@ -2694,6 +3491,19 @@ const TRIPS = {
     routeCompareMapInstance: null,
 
     async showRouteMapComparison(currentId, bestId, worstId) {
+        const detailRequest = this._activeDetailRequest;
+        if (!this._isCurrentDetailRequest(detailRequest)
+                || this.currentTripId == null
+                || String(this.currentTripId) !== String(currentId)) return;
+        const routeMapSequence = (this._routeMapRequestSequence || 0) + 1;
+        this._routeMapRequestSequence = routeMapSequence;
+        const isCurrentRouteMap = () => {
+            return routeMapSequence === this._routeMapRequestSequence
+                && this._isCurrentDetailRequest(detailRequest)
+                && this.currentTripId != null
+                && String(this.currentTripId) === String(currentId);
+        };
+
         const overlay = document.getElementById('routeMapOverlay');
         const mapDiv = document.getElementById('routeCompareMap');
         const legend = document.getElementById('routeMapLegend');
@@ -2710,12 +3520,19 @@ const TRIPS = {
 
         try {
             // Fetch GPS traces in parallel
-            const fetches = [fetch('/api/trips/' + currentId + '/gps')];
-            if (bestId > 0) fetches.push(fetch('/api/trips/' + bestId + '/gps'));
-            if (worstId > 0 && worstId !== bestId) fetches.push(fetch('/api/trips/' + worstId + '/gps'));
+            const fetchGps = (id) => {
+                const url = '/api/trips/' + id + '/gps';
+                return detailRequest.controller
+                    ? fetch(url, { signal: detailRequest.controller.signal })
+                    : fetch(url);
+            };
+            const fetches = [fetchGps(currentId)];
+            if (bestId > 0) fetches.push(fetchGps(bestId));
+            if (worstId > 0 && worstId !== bestId) fetches.push(fetchGps(worstId));
 
             const responses = await Promise.all(fetches);
             const data = await Promise.all(responses.map(function(r) { return r.json(); }));
+            if (!isCurrentRouteMap()) return;
 
             const currentGps = data[0].success ? data[0].gps : [];
             const bestGps = data[1] && data[1].success ? data[1].gps : [];
@@ -2779,11 +3596,16 @@ const TRIPS = {
             map.fitBounds(bounds, { padding: [20, 20] });
 
             // Legend
+            if (!isCurrentRouteMap()) {
+                map.remove();
+                return;
+            }
             legend.innerHTML = '<span style="display:flex;align-items:center;gap:4px;"><span style="width:20px;height:4px;background:#6366F1;border-radius:2px;"></span>' + BYD.i18n.t('trip.route_legend_current') + '</span>' +
                 '<span style="display:flex;align-items:center;gap:4px;"><span style="width:20px;height:4px;background:#22C55E;border-radius:2px;"></span>' + BYD.i18n.t('trip.route_legend_best') + '</span>' +
                 (worstGps.length > 0 ? '<span style="display:flex;align-items:center;gap:4px;"><span style="width:20px;height:4px;background:#EF4444;border-radius:2px;"></span>' + BYD.i18n.t('trip.route_legend_worst') + '</span>' : '');
 
         } catch (e) {
+            if (!isCurrentRouteMap() || this._isAbortError(e)) return;
             console.warn('[Trips] Route map error:', e);
             mapDiv.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">' + BYD.i18n.t('trip.routes_load_failed') + '</div>';
         }
@@ -2880,7 +3702,7 @@ const TRIPS = {
 
         if (electricCost > 0) {
             rows.push('<div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-secondary);margin-bottom:4px;">'
-                + '<span>⚡ ' + esc(BYD.i18n.t('trip.cost_electric_line', {
+                + '<span>' + this.ICON_ELECTRIC + ' ' + esc(BYD.i18n.t('trip.cost_electric_line', {
                     kwh: energyKwh.toFixed(1),
                     rate: currency + rate.toFixed(2)
                   })) + '</span>'
@@ -2889,7 +3711,7 @@ const TRIPS = {
         }
         if (fuelCost > 0) {
             rows.push('<div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text-secondary);margin-bottom:4px;">'
-                + '<span>⛽ ' + esc(BYD.i18n.t('trip.cost_petrol_line', {
+                + '<span>' + this.ICON_PETROL + ' ' + esc(BYD.i18n.t('trip.cost_petrol_line', {
                     litres: litres.toFixed(2),
                     rate: currency + fuelPrice.toFixed(2)
                   })) + '</span>'
@@ -2915,9 +3737,46 @@ const TRIPS = {
             var lp100 = (litres * 100) / distKm;
             foot.push(BYD.i18n.t('trip.consumption_l_per_100km', { value: lp100.toFixed(1) }));
         }
-        if (iceSec > 0 && dur > 0) {
+        // HEV mode share. Prefer DISTANCE: the engine idles in traffic and runs at low speed, so
+        // its share of the trip's TIME badly understates how far the car actually moved on it —
+        // a time-based "HEV mode 18%" on a 9 km trip reads as 1.6 km when ~6 km was driven on the
+        // engine. iceDistanceKm is 0 on trips finalised before it was recorded; those fall back to
+        // the time share, LABELLED as time so it can't be misread as distance.
+        var iceKm = trip.iceDistanceKm || trip.ice_distance_km || 0;
+        if (iceKm > 0 && distKm > 0.1) {
+            var iceKmShown = Math.min(iceKm, distKm);
+            var kmPct = Math.round(iceKmShown / distKm * 100);
+            // The distance and the percentage round INDEPENDENTLY (BYD.units.distVal rounds to a
+            // whole km/mi), so either can hit 0 while the other doesn't — "0 km (6%)" on a short
+            // trip, "1 km (0%)" on a long one. Both are self-contradictory, so the combined line
+            // requires BOTH to be >= 1, and each single-value fallback is used only when THAT
+            // value is the meaningful one.
+            var kmShownVal = BYD.units.distVal(iceKmShown);
+            if (kmShownVal >= 1 && kmPct >= 1) {
+                foot.push(BYD.i18n.t('trip.ice_share_distance_label', {
+                    pct: kmPct,
+                    km: kmShownVal,
+                    unit: BYD.units.distLabel()
+                }));
+            } else if (kmShownVal >= 1) {
+                // A whole unit or more, but under 1% of a long trip — state the DISTANCE only.
+                foot.push(BYD.i18n.t('trip.ice_share_distance_km_only', {
+                    km: kmShownVal,
+                    unit: BYD.units.distLabel()
+                }));
+            } else if (kmPct >= 1) {
+                // A meaningful share but under a whole unit — state the PERCENTAGE only.
+                // "<1%" would be false here (0.5 km of 9 km is 6%), and the distance reads "0".
+                foot.push(BYD.i18n.t('trip.ice_share_distance_pct_only', { pct: kmPct }));
+            } else {
+                // Under a whole unit AND under 1% — a brief engine burst on a hard acceleration.
+                // Say "<1%" rather than printing a zero: the engine DID run, so staying silent
+                // would make this read as a pure-EV trip.
+                foot.push(BYD.i18n.t('trip.ice_share_distance_minimal'));
+            }
+        } else if (iceSec > 0 && dur > 0) {
             var pct = Math.round((iceSec / dur) * 100);
-            if (pct > 0) foot.push(BYD.i18n.t('trip.ice_share_label', { pct: pct }));
+            if (pct > 0) foot.push(BYD.i18n.t('trip.ice_share_time_label', { pct: pct }));
         }
         var footHtml = foot.length > 0
             ? '<div style="font-size:11px;color:var(--text-muted);margin-top:8px;">' + foot.join(' · ') + '</div>'
@@ -3340,9 +4199,10 @@ const TRIPS = {
         ctx.clearRect(0, 0, w, h);
         if (!telemetry || telemetry.length < 2) return;
 
-        const tStart = telemetry[0].t;
-        const tEnd = telemetry[telemetry.length - 1].t;
-        const tRange = tEnd - tStart || 1;
+        const axis = this._timelineAxisFor(telemetry);
+        const axisKey = axis.key;
+        const tStart = axis.start;
+        const tRange = axis.range;
         const maxSpeed = Math.max(10, ...telemetry.map(s => s.s || 0));
 
         // Grid lines
@@ -3364,7 +4224,7 @@ const TRIPS = {
         ctx.beginPath();
         ctx.moveTo(pad.left, pad.top + ch);
         telemetry.forEach((s, i) => {
-            const x = pad.left + ((s.t - tStart) / tRange) * cw;
+            const x = pad.left + ((s[axisKey] - tStart) / tRange) * cw;
             const y = pad.top + ch - ((s.b || 0) / 100) * ch;
             ctx.lineTo(x, y);
         });
@@ -3377,7 +4237,7 @@ const TRIPS = {
         ctx.beginPath();
         ctx.moveTo(pad.left, pad.top + ch);
         telemetry.forEach((s, i) => {
-            const x = pad.left + ((s.t - tStart) / tRange) * cw;
+            const x = pad.left + ((s[axisKey] - tStart) / tRange) * cw;
             const y = pad.top + ch - ((s.a || 0) / 100) * ch;
             ctx.lineTo(x, y);
         });
@@ -3389,7 +4249,7 @@ const TRIPS = {
         // Speed line
         ctx.beginPath();
         telemetry.forEach((s, i) => {
-            const x = pad.left + ((s.t - tStart) / tRange) * cw;
+            const x = pad.left + ((s[axisKey] - tStart) / tRange) * cw;
             const y = pad.top + ch - ((s.s || 0) / maxSpeed) * ch;
             if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
         });
@@ -3428,8 +4288,8 @@ const TRIPS = {
             // SoC line
             ctx.beginPath();
             telemetry.forEach((s, i) => {
-                const x = pad.left + ((s.t - tStart) / tRange) * cw;
-                const progress = (s.t - tStart) / tRange;
+                const x = pad.left + ((s[axisKey] - tStart) / tRange) * cw;
+                const progress = (s[axisKey] - tStart) / tRange;
                 const soc = socStart + (socEnd - socStart) * progress;
                 const y = pad.top + ch - ((soc - socMin) / socRange) * ch;
                 if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
@@ -3460,7 +4320,7 @@ const TRIPS = {
         // Highlight scrubber
         if (highlightIdx !== undefined && highlightIdx < telemetry.length) {
             const s = telemetry[highlightIdx];
-            const x = pad.left + ((s.t - tStart) / tRange) * cw;
+            const x = pad.left + ((s[axisKey] - tStart) / tRange) * cw;
 
             ctx.beginPath();
             ctx.moveTo(x, pad.top);
@@ -3495,22 +4355,27 @@ const TRIPS = {
             ctx.fillStyle = '#fff';
             ctx.font = '11px Inter, sans-serif';
             ctx.textAlign = 'left';
-            ctx.fillText('Speed: ' + (s.s || 0) + ' ' + BYD.units.speedLabel(), tx + 8, ty + 15);
+            // Convert: telemetry samples are km/h, and speedLabel() follows the
+            // user's unit — printing the raw value under an "mph" label disagreed
+            // with the HUD above by ~61% for the same sample.
+            ctx.fillText('Speed: '
+                    + Math.round(BYD.units.speedVal(s.s || 0))
+                    + ' ' + BYD.units.speedLabel(), tx + 8, ty + 15);
             ctx.fillText('Accel: ' + (s.a || 0) + '%', tx + 8, ty + 30);
             ctx.fillText('Brake: ' + (s.b || 0) + '%', tx + 8, ty + 45);
             // SoC interpolated
             if (hasSoc) {
-                const progress = (s.t - tStart) / tRange;
+                const progress = (s[axisKey] - tStart) / tRange;
                 const socAtPoint = socStart + (socEnd - socStart) * progress;
                 ctx.fillStyle = 'rgba(245,158,11,0.8)';
                 ctx.fillText('SoC: ' + socAtPoint.toFixed(1) + '%', tx + 8, ty + 60);
             }
         } else {
-            this.setupChartHover(canvas, telemetry, tStart, tRange, cw, pad);
+            this.setupChartHover(canvas, telemetry, axisKey, tStart, tRange, cw, pad);
         }
     },
 
-    setupChartHover(canvas, telemetry, tStart, tRange, cw, pad) {
+    setupChartHover(canvas, telemetry, axisKey, tStart, tRange, cw, pad) {
         const self = this;
 
         // Desktop: mousemove
@@ -3523,7 +4388,7 @@ const TRIPS = {
             const targetT = tStart + (relX / cw) * tRange;
             let closest = 0, minDiff = Infinity;
             for (let i = 0; i < telemetry.length; i++) {
-                const diff = Math.abs(telemetry[i].t - targetT);
+                const diff = Math.abs(telemetry[i][axisKey] - targetT);
                 if (diff < minDiff) { minDiff = diff; closest = i; }
             }
             self.renderTimeline(canvas, telemetry, closest);
@@ -3557,7 +4422,7 @@ const TRIPS = {
                 const targetT = tStart + (relX / cw) * tRange;
                 let closest = 0, minDiff = Infinity;
                 for (let i = 0; i < telemetry.length; i++) {
-                    const diff = Math.abs(telemetry[i].t - targetT);
+                    const diff = Math.abs(telemetry[i][axisKey] - targetT);
                     if (diff < minDiff) { minDiff = diff; closest = i; }
                 }
                 self.renderTimeline(canvas, telemetry, closest);
@@ -3729,7 +4594,11 @@ const TRIPS = {
 
     // ==================== ROUTE MAP ====================
 
-    renderRouteMap(container, telemetry) {
+    renderRouteMap(container, telemetry, detailRequest) {
+        if (detailRequest && !this._isCurrentDetailRequest(detailRequest)) return;
+        const isCurrentMap = () => {
+            return !detailRequest || this._isCurrentDetailRequest(detailRequest);
+        };
         console.log('[Trips] renderRouteMap called, telemetry=' + (telemetry ? telemetry.length : 'null'));
         if (this.leafletMap) { this.leafletMap.remove(); this.leafletMap = null; }
         // Dispose the previous slider-marker 3D scene before the
@@ -3753,7 +4622,10 @@ const TRIPS = {
             if (!this._mapRetries) this._mapRetries = 0;
             if (this._mapRetries < 5) {
                 this._mapRetries++;
-                setTimeout(() => this.renderRouteMap(container, telemetry), 1000);
+                this._mapRetryTimer = setTimeout(() => {
+                    this._mapRetryTimer = null;
+                    if (isCurrentMap()) this.renderRouteMap(container, telemetry, detailRequest);
+                }, 1000);
             } else {
                 console.error('[Trips] Leaflet never loaded after 5 retries');
             }
@@ -3770,7 +4642,10 @@ const TRIPS = {
             if (!this._layoutRetries) this._layoutRetries = 0;
             if (this._layoutRetries < 10) {
                 this._layoutRetries++;
-                setTimeout(() => this.renderRouteMap(container, telemetry), 300);
+                this._mapRetryTimer = setTimeout(() => {
+                    this._mapRetryTimer = null;
+                    if (isCurrentMap()) this.renderRouteMap(container, telemetry, detailRequest);
+                }, 300);
             } else {
                 console.error('[Trips] Map container never got dimensions after 10 retries');
             }
@@ -3896,6 +4771,7 @@ const TRIPS = {
         // different trip and we tear down this map.
         var self3d = this;
         var mountTripsCar3d = function () {
+            if (!isCurrentMap()) return;
             var canvas = document.getElementById('tripSliderCarCanvas');
             if (!canvas) return;
             var shell = window.OverdriveAppShell;
@@ -3905,6 +4781,7 @@ const TRIPS = {
         if (window.OverdriveAppShell && window.OverdriveAppShell.mountVehicleCanvas) {
             mountTripsCar3d();
         } else {
+            this._sliderMarkerReadyHandler = mountTripsCar3d;
             document.addEventListener('app-shell:ready', mountTripsCar3d, { once: true });
         }
 
@@ -3936,7 +4813,9 @@ const TRIPS = {
                 initHeading = Math.atan2(y, x) * 180 / Math.PI;
             }
             if (initHeading !== null) {
-                setTimeout(function() {
+                this._mapHeadingTimer = setTimeout(function() {
+                    self3d._mapHeadingTimer = null;
+                    if (!isCurrentMap() || self3d.leafletMap !== mapRef) return;
                     // Target the trip-map wrapper specifically. A
                     // global '.car-icon-wrapper' selector would also
                     // match the live-view map's marker on pages where
@@ -3950,12 +4829,19 @@ const TRIPS = {
         // Force Leaflet to recalculate container size (old WebView may report
         // stale dimensions right after display:none → block transition)
         var mapRef = this.leafletMap;
-        setTimeout(function() { if (mapRef) mapRef.invalidateSize(); }, 200);
-        setTimeout(function() { if (mapRef) mapRef.invalidateSize(); }, 800);
+        this._mapInvalidateTimers = [
+            setTimeout(function() {
+                if (isCurrentMap() && self3d.leafletMap === mapRef) mapRef.invalidateSize();
+            }, 200),
+            setTimeout(function() {
+                if (isCurrentMap() && self3d.leafletMap === mapRef) mapRef.invalidateSize();
+            }, 800)
+        ];
 
         // Click/tap on map to jump to nearest point
         const self = this;
         this.leafletMap.on('click', function(e) {
+            if (!isCurrentMap()) return;
             const clickLat = e.latlng.lat;
             const clickLon = e.latlng.lng;
             let closestIdx = 0, minDist = Infinity;
@@ -3980,16 +4866,35 @@ const TRIPS = {
             const resp = await fetch('/api/trips/' + tripId, { method: 'DELETE' });
             const data = await resp.json();
             if (data.success) {
-                const id = Number(tripId);
-                this.trips = this.trips.filter(t => t.id !== id);
+                this._invalidateListRequests();
+                this.currentCursor = null;
+                const deletedKey = this._tripIdKey({ id: tripId });
+                const previousLength = this.trips.length;
+                this.trips = this.trips.filter((trip) => {
+                    return deletedKey == null || this._tripIdKey(trip) !== deletedKey;
+                });
+                const removedCount = previousLength - this.trips.length;
+                if (removedCount > 0) {
+                    this.currentOffset = Math.max(0, this.currentOffset - removedCount);
+                }
                 this.renderTripList(this.trips);
-                if (this.currentTripId == tripId) this.hideDetail();
+                const currentKey = this.currentTripId == null
+                    ? null : this._tripIdKey({ id: this.currentTripId });
+                if (currentKey != null && currentKey === deletedKey) this.hideDetail();
+                if (this.rangeFromMs == null) {
+                    this.loadTrips(this.currentDays, 0);
+                    this.loadSummary(this.currentDays);
+                } else {
+                    this._invalidateSummaryRequests();
+                    this.loadTripsBetween(
+                        this.rangeFromMs, this.rangeToMs, 0);
+                }
             }
         } catch (e) { console.warn('[Trips] Delete failed:', e); }
     },
 
     deleteCurrentTrip() {
-        if (this.currentTripId) this.deleteTrip(this.currentTripId);
+        if (this.currentTripId != null) this.deleteTrip(this.currentTripId);
     },
 
     // ==================== HELPERS ====================

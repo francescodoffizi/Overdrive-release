@@ -80,6 +80,10 @@ public class WebSocketStreamServer extends WebSocketServer
      */
     public synchronized void registerExternalClient() {
         externalClientCount++;
+        // An idle callback may have been queued immediately before this
+        // subscription. If its lifecycle re-check sees us and cancels the
+        // shutdown, the next disconnect must still be able to arm a timer.
+        idleShutdownTriggered = false;
         cancelIdleTimer();
         logger.info("External client registered (total: " + externalClientCount + ")");
     }

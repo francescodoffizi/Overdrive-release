@@ -33,11 +33,9 @@
         };
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
-    <link rel="stylesheet" href="../shared/automations.css?v=av44">
-    <link rel="stylesheet" href="../shared/community-automations.css?v=3">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
+    <link rel="stylesheet" href="../shared/automations.css?v=av53">
+    <link rel="stylesheet" href="../shared/community-automations.css?v=4">
 </head>
 <body>
     <div class="app-layout">
@@ -80,6 +78,23 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                         <span data-i18n="automation.add_automation">Add Automation</span>
                     </button>
+                </div>
+
+                <!-- Sort control for the list. Client-side only (the daemon's map
+                     order is 'Default order'); the choice persists in localStorage.
+                     Shown only when there are 2+ automations (see automations.js
+                     render()) — a single card has nothing to sort. -->
+                <div class="automations-sort-row" id="automationSortRow" data-tab="automations" style="display:none;">
+                    <label class="automations-sort-label" for="automationSortSelect" data-i18n="automation.sort_by">Sort by</label>
+                    <select id="automationSortSelect" class="automations-sort-select" onchange="AutomationSettings.setSort(this.value)">
+                        <option value="default" data-i18n="automation.sort_default">Default order</option>
+                        <option value="name_az" data-i18n="automation.sort_name_az">Name A&#8594;Z</option>
+                        <option value="name_za" data-i18n="automation.sort_name_za">Name Z&#8594;A</option>
+                        <option value="recent" data-i18n="automation.sort_recent">Recently run</option>
+                        <option value="runs" data-i18n="automation.sort_runs">Most runs</option>
+                        <option value="enabled" data-i18n="automation.sort_enabled_first">Enabled first</option>
+                        <option value="disabled" data-i18n="automation.sort_disabled_first">Disabled first</option>
+                    </select>
                 </div>
 
                 <!-- Automation List -->
@@ -228,10 +243,24 @@
                 <div id="groupListSection" data-tab="groups">
                     <div class="automations-section-head">
                         <h2 class="automations-section-title" data-i18n="automation.groups_title">Action groups</h2>
-                        <button class="btn btn-secondary" onclick="AutomationSettings.showGroupForm(null)">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                            <span data-i18n="automation.new_group">New group</span>
-                        </button>
+                        <div class="automations-section-actions">
+                            <!-- Export / import the group set. Backend: GET /api/action-groups/export
+                                 + POST /api/action-groups/import (validates every group before
+                                 storing), mirroring the automation backup on the Settings tab. -->
+                            <button class="btn btn-secondary" onclick="AutomationSettings.exportGroups()" data-i18n-attr="title:automation.groups_backup_export_hint">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                                <span data-i18n="automation.backup_export">Export</span>
+                            </button>
+                            <input type="file" id="groupImportFile" accept="application/json,.json" style="display:none;" onchange="AutomationSettings.importGroupsFile(this.files[0])">
+                            <button class="btn btn-secondary" onclick="document.getElementById('groupImportFile').click()" data-i18n-attr="title:automation.groups_backup_import_hint">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                                <span data-i18n="automation.backup_import">Import</span>
+                            </button>
+                            <button class="btn btn-secondary" onclick="AutomationSettings.showGroupForm(null)">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                <span data-i18n="automation.new_group">New group</span>
+                            </button>
+                        </div>
                     </div>
                     <div id="groupList"></div>
                     <div id="groupEmpty" class="card" style="display:none;">
@@ -268,11 +297,11 @@
     <div id="toastContainer" class="toast-container"></div>
 
     <script src="../shared/auth.js"></script>
-    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/core.js?v=18"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/automations.js?v=av51"></script>
+    <script src="../shared/automations.js?v=av62"></script>
     <script src="../shared/audio-library.js?v=2"></script>
-    <script src="../shared/community-automations.js?v=6"></script>
+    <script src="../shared/community-automations.js?v=7"></script>
     <script src="../shared/cluster-projection.js?v=1"></script>
     <script>
         function toggleSidebar() {

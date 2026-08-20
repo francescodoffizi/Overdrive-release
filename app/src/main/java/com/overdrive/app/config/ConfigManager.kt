@@ -228,9 +228,8 @@ class ConfigManager private constructor(private val context: Context) {
                     cleanupIntervalHours = logging.optInt("cleanupIntervalHours", 4),
                     maxFileSizeMB = logging.optInt("maxFileSizeMB", 5),
                     rotationCount = logging.optInt("rotationCount", 3),
-                    // "minLevel": "DEBUG" is how a field debug session is switched on
-                    // without a rebuild — the only lever that makes the verbose ADB
-                    // command tracing visible. Omitted or misspelled ⇒ INFO.
+                    // "minLevel": "DEBUG" switches on a field debug session without a
+                    // rebuild. Omitted or misspelled ⇒ INFO.
                     minLevel = parseMinLevel(logging.optString("minLevel").takeIf { it.isNotEmpty() })
                 )
                 if (config.isValid()) {
@@ -270,12 +269,9 @@ class ConfigManager private constructor(private val context: Context) {
     }
 
     /**
-     * Read a persisted/imported [LogLevel] name, falling back to INFO.
-     *
-     * Unrecognised input must NOT throw: this is the one setting a user is likely to
-     * hand-edit or push in over ADB while chasing a bug, and a typo that bricks config
-     * load would take the whole app's logging with it. An unparseable value simply
-     * leaves verbose logging off, which is the safe direction.
+     * Read a persisted/imported [LogLevel] name, falling back to INFO. Unrecognised input
+     * must NOT throw — this is the one setting a user is likely to hand-edit over ADB, and
+     * a typo that broke config load would take the whole app's logging with it.
      */
     private fun parseMinLevel(name: String?): LogLevel =
         name?.let { runCatching { LogLevel.valueOf(it.uppercase()) }.getOrNull() } ?: LogLevel.INFO

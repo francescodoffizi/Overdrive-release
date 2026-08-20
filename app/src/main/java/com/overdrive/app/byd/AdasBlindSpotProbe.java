@@ -269,6 +269,9 @@ public final class AdasBlindSpotProbe {
             if (e.side != null) o.put("side", e.side);
             o.put("raw", raw);
             o.put("readable", raw != -1);
+            // An id the SDK does not publish at all: nothing was sent, so "unreadable" here is a
+            // statement about this firmware's register set, not about the radar or the read path.
+            o.put("resolved", BydFeatureIds.isResolved(e.id));
             // Same id read through the OEM's overload. CarSetting.apk reads these via
             // HalGetter -> BYDAutoADASDevice.get(int[], Class); callGetSingle uses
             // get(int,int), a different overload that answers -10011 here.

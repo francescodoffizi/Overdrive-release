@@ -65,6 +65,26 @@ public class ProxyHelper {
     private static volatile int proxyPort = PROXY_PORT;
     private static volatile long lastProbeTime = 0;
 
+    /**
+     * Guards the process-global {@code socksProxyHost}/{@code socksProxyPort} JVM
+     * properties across the window where they matter: from the set/clear until the
+     * connection's underlying socket has been created (Paho reads them at socket
+     * creation, not afterwards). Two connect paths touch or depend on them:
+     *  - WS/WSS + proxy (MqttPublisherService): must SET them (Paho bug #573 bypasses
+     *    the SocketFactory for WebSockets) and needs them to survive until its socket
+     *    is created.
+     *  - Any DIRECT (no-proxy) connect using a default socket factory: must CLEAR them
+     *    (leftover props would misroute the direct socket through a dead proxy) and
+     *    needs them to stay cleared until its socket is created.
+     * Without a shared lock, two connections connecting concurrently on their own
+     * scheduler threads can interleave set/clear mid-window (ProxyHelper's negative
+     * cache and invalidateCache() let them disagree about proxy state). Hold this lock
+     * from the property mutation through the blocking connect() call. Factory-proxied
+     * connects (explicit {@code new Socket(proxy)}) ignore the props entirely and must
+     * NOT take this lock — connects are serialized only when the props are in play.
+     */
+    public static final Object SOCKS_PROPS_LOCK = new Object();
+
     private ProxyHelper() {} // Utility class
 
     /**

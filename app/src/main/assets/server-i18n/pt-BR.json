@@ -49,7 +49,7 @@
     "tyres_order": "A pressão máxima deve ser maior que a mínima em cada eixo",
     "tyres_critical_order": "A pressão crítica não deve exceder a mínima de nenhum dos eixos",
     "tyres_nothing_to_update": "Nada para atualizar",
-    "tyres_persist_failed": "Falha ao salvar os limites dos pneus",
+    "tyres_persist_failed": "Falha ao salvar os limites de pressão dos pneus",
     "mqtt_invalid_connection_id": "Id de conexão inválido",
     "ipc_communication_failed": "Falha ao se comunicar com o daemon",
     "invalid_request_body_with_detail": "Corpo do pedido inválido: {0}",
@@ -118,7 +118,8 @@
     "max_connections_reached": "Máximo de conexões alcançado ({0})",
     "missing_connection_id": "Id de conexão faltante",
     "connection_not_found": "Conexão não encontrada: {0}",
-    "surveillance_all_classes_off": "Esta salvamento desativará todas as classes de objetos, desligando a detecção por IA por completo. Confirme para prosseguir."
+    "surveillance_all_classes_off": "Esta salvamento desativará todas as classes de objetos, desligando a detecção por IA por completo. Confirme para prosseguir.",
+    "tyres_invalid_unit": "pressureUnit deve ser kpa, psi ou bar"
   },
   "notifications": {
     "charging_started": "Carregamento iniciado",
@@ -150,7 +151,7 @@
     "tyre_wheel_reading": "{0} — {1}",
     "tyre_fast_leak": "Vazamento rápido detectado",
     "tyre_slow_leak": "Vazamento lento detectado",
-    "tyre_wheel_pressure": "{0} ({1} kPa)",
+    "tyre_wheel_pressure": "{0} ({1})",
     "door_opened": "Porta {0} aberta",
     "door_closed": "Porta {0} fechada",
     "while_parked": "Enquanto estacionado",
@@ -486,6 +487,7 @@
     "close_all_windows_label": "Fechar todas as janelas"
   },
   "automation": {
+    "wait_timeout": "Tempo limite (segundos)",
     "control_automation": "Controlar Automação",
     "control_automation_description": "Ativa, desativa ou alterna outra automação - ativa ou desativa uma rotina através de uma regra.",
     "control_target": "Automação",
@@ -619,7 +621,7 @@
     "outside_temperature_description": "A temperatura externa/ambiente em Celsius — o sensor externo, com fallback para a previsão do tempo local. Ao contrário do indicador de Temperatura, este nunca usa o sensor da cabine.",
     "celsius": "Celsius",
     "set_ac": "Ligar AC",
-    "set_ac_description": "Ligar ou desligar o Ar-Condicionado. Este controle não funciona quando o veículo estiver desligado.",
+    "set_ac_description": "Liga ou desliga o Ar-Condicionado. Este controle não funciona enquanto o veículo estiver desligado. Configure \"Desligar após\" para rodar o ar-condicionado por um tempo determinado e fazê-lo desligar sozinho — útil para que o pré-condicionamento ou a ventilação da cabine não descarreguem a bateria caso você se esqueça. \"Sem temporizador\" simplesmente não define um prazo aqui; para cancelar um temporizador que já esteja em contagem regressiva, use a ação Temporizador para Desligar o Ar-Condicionado.",
     "set_ac_temp": "Definir Temperatura do AC",
     "set_ac_temp_description": "Alterar a temperatura atual do Ar-Condicionado. Este controle não funciona quando o veículo estiver desligado.",
     "speed": "Velocidade",
@@ -656,7 +658,7 @@
     "set_powertrain_mode": "Configurar o modo de tração",
     "set_powertrain_mode_description": "Alterna entre EV e HEV (híbrido) em veículos DM/PHEV.",
     "hold_battery": "Manter a Carga da Bateria",
-    "hold_battery_description": "Alternar para HEV para que o motor a combustão tracione o veículo em vez da bateria. (Apenas PHEV.) Observação: em algumas versões o motor ainda recarrega a bateria em HEV — se você quiser manter a carga em um nível definido, use o controle Charge Limit (Limite de Carga).",
+    "hold_battery_description": "Alternar para HEV para que o motor a combustão tracione o veículo em vez da bateria (apenas PHEV.). Observação: em algumas versões o motor ainda recarrega a bateria em HEV — se você quiser manter a carga em um nível definido, use o controle Limite de Carga.",
     "set_regen": "Definir a recuperação de energia",
     "set_regen_description": "Define a força do freio regenerativo.",
     "set_steering": "Definir o modo da direção assistida",
@@ -846,22 +848,22 @@
     "auto_lights": "Faróis Automáticos",
     "auto_lights_description": "Dispara quando o sensor de luz dos faróis automáticos ligam ou desligam — o sinal mais próximo de 'está escuro' que o carro expõe.",
     "occupant": "Ocupação de Assento",
-    "occupant_description": "Dispara quando o assento do passageiro dianteiro se torna ocupado ou vazio.",
+    "occupant_description": "Dispara quando um assento se torna ocupado ou vago. O assento do passageiro usa o sensor de ocupação quando disponível. Sem esse sinal, o estado é estimado pelo aviso e pelo fecho do cinto do passageiro; a estimativa pode estar errada se um cinto estiver afivelado em um assento vazio ou se o aviso estiver silenciado. O assento do motorista não possui sensor, portanto informa apenas Ocupado, uma vez por viagem, e nunca Vago. Para variações do cinto use o gatilho Cinto de Segurança.",
     "occupied": "Ocupado",
     "empty": "Vazio",
     "boot": "Inicialização do Sistema",
     "boot_description": "Dispara uma vez após a central multimídia ser ligada.",
     "compute_variable": "Calcular Variável",
-    "compute_variable_description": "Calcular um número e armazená-lo em uma variável. Suporta + - * / %, parênteses e as funções min, max, clamp, round, floor, ceil, abs, sqrt e pow. Use ${signal:NAME} para um valor do veículo em tempo real e ${var:NAME} para outra variável — ex.: 500 + (${signal:batteryLevel} - 20) * 3.75. Se um valor não puder ser lido (um sinal que ainda não reportou), a variável permanece inalterada.",
+    "compute_variable_description": "Calcula um número e o armazena em uma variável. Suporta + - * / % , parênteses e as funções min, max, clamp, round, floor, ceil, abs, sqrt e pow. Use ${signal:NAME} para um valor do veículo em tempo real e ${var:NAME} para outra variável — ex.: 500 + (${signal:batteryLevel} - 20) * 3.75. Se um valor não puder ser lido (um sinal que ainda não tenha sido informado), a variável permanece inalterada.",
     "variable_expression": "Expressão",
     "blind_spot": "Alerta de Ponto Cego",
-    "blind_spot_description": "Se o aviso de ponto cego do radar está alertando para um lado. Abrange os avisos de ponto cego, de troca de faixa e de tráfego transversal. Os alertas são breves, portanto o sinal permanece ligado por alguns segundos após o último aviso.",
+    "blind_spot_description": "Se o alerta de ponto cego por radar está ativo para um dos lados. Cobre alertas de ponto cego, mudança de faixa e tráfego cruzado. Como os alertas são breves, o sinal é mantido ativo por alguns segundos após o último aviso.",
     "side_left": "Esquerda",
     "side_right": "Direita",
     "ambient_state": "Luz Ambiente",
     "ambient_state_description": "Dispara quando a luz ambiente interior liga ou desliga, independentemente de como foi acionada. Disponível apenas em veículos que informam o estado da luz ambiente.",
     "set_ac_auto_off": "Temporizador de Desligamento do AC",
-    "set_ac_auto_off_description": "Desligar o Ar-Condicionado automaticamente após um tempo definido, sem alterá-lo agora. Escolha \"Sem temporizador\" aqui para cancelar uma contagem que já esteja em andamento. Executar esta etapa novamente reinicia a contagem em vez de criar uma segunda; desligar o AC manualmente também a cancela. A contagem sobrevive a uma reinicialização, portanto o AC continua sendo desligado depois que o carro é estacionado.",
+    "set_ac_auto_off_description": "Desliga o ar-condicionado automaticamente após um tempo determinado, sem alterá-lo agora. Escolha \"Sem temporizador\" aqui para cancelar uma contagem regressiva que já esteja em andamento. Executar este passo novamente reinicia a contagem regressiva em vez de adicionar uma segunda; desligar o ar-condicionado manualmente também a cancela. A contagem regressiva permanece ativa mesmo após reiniciar, portanto ela ainda desligará o ar-condicionado depois que o carro for estacionado.",
     "ac_auto_off": "Desligar após (ao ligar)",
     "ac_auto_off_never": "Sem temporizador",
     "ac_auto_off_10": "10 minutos",
@@ -1085,7 +1087,6 @@
     "set_rear_defrost": "Desembaçador Traseiro",
     "set_rear_defrost_description": "Liga ou desliga o desembaçador do parabrisa traseiro. Este controle não funciona quando o veículo está desligado.",
     "wait_until_description": "Pausar as ações restantes até que um sinal escolhido atenda a uma comparação, ou o tempo limite se esgote. Exemplo: aguarde até Velocidade = 0 antes de fechar as janelas.",
-    "wait_timeout": "Tempo limite (segundos)",
     "wait_until_state_description": "Pausar as ações restantes até o sinal de liga/desliga escolhido atingir um estado, ou o tempo de espera se esgote. Exemplo: espere até que as setas = desligado antes de continuar."
   },
   "messages": {
@@ -1114,5 +1115,10 @@
     "update_installing_finishing": "Instalando — a central multimídia estará online novamente em breve.",
     "update_install_failed": "Instalação falhou",
     "update_install_crashed": "Instalação travou"
+  },
+  "units": {
+    "bar": "bar",
+    "kpa": "kPa",
+    "psi": "PSI"
   }
 }

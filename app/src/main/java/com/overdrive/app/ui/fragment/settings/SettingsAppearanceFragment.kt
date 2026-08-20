@@ -5,15 +5,21 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentManager
 import com.overdrive.app.R
 import com.overdrive.app.server.LocaleManager
+import com.overdrive.app.ui.MainActivity
 import com.overdrive.app.ui.dialog.LanguagePickerDialog
 import com.overdrive.app.ui.fragment.WebViewFragment
+import com.overdrive.app.ui.navigation.NavigationRailCatalog
 import com.overdrive.app.ui.util.PreferencesManager
+import com.google.android.material.switchmaterial.SwitchMaterial
 import java.util.Locale
 
 /**
@@ -47,6 +53,7 @@ class SettingsAppearanceFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
         setupThemePicker(view)
         setupLanguagePicker(view)
+        setupNavigationPicker(view)
     }
 
     private fun setupThemePicker(view: View) {
@@ -158,6 +165,69 @@ class SettingsAppearanceFragment : Fragment() {
                 .replaceFirstChar {
                     if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString()
                 }
+        }
+    }
+
+    private fun setupNavigationPicker(root: View) {
+        renderNavigationOptions(root)
+        root.findViewById<View>(R.id.navigationResetButton).setOnClickListener {
+            PreferencesManager.resetNavigationVisibility()
+            renderNavigationOptions(root)
+            (activity as? MainActivity)?.refreshNavigationRailVisibility()
+            Toast.makeText(
+                requireContext(),
+                R.string.settings_navigation_reset_done,
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
+    private fun renderNavigationOptions(root: View) {
+        val container = root.findViewById<LinearLayout>(R.id.navigationOptionsContainer)
+        container.removeAllViews()
+        val visibleKeys = PreferencesManager.getVisibleNavigationKeys(
+            NavigationRailCatalog.customizableKeys
+        )
+
+        NavigationRailCatalog.customizableOptions.forEach { option ->
+            val row = layoutInflater.inflate(
+                R.layout.item_navigation_toggle,
+                container,
+                false,
+            )
+            row.findViewById<ImageView>(R.id.navigationOptionIcon)
+                .setImageResource(option.iconRes)
+            row.findViewById<TextView>(R.id.navigationOptionLabel)
+                .setText(option.labelRes)
+            val toggle = row.findViewById<SwitchMaterial>(R.id.navigationOptionSwitch)
+            toggle.isChecked = option.key in visibleKeys
+
+            fun updateAccessibility(checked: Boolean) {
+                row.contentDescription = getString(
+                    R.string.settings_navigation_option_state,
+                    getString(option.labelRes),
+                    getString(
+                        if (checked) R.string.settings_navigation_shown
+                        else R.string.settings_navigation_hidden
+                    ),
+                )
+            }
+
+            fun persist(checked: Boolean) {
+                if (toggle.isChecked != checked) toggle.isChecked = checked
+                updateAccessibility(checked)
+                PreferencesManager.setNavigationItemVisible(
+                    option.key,
+                    checked,
+                    NavigationRailCatalog.customizableKeys,
+                )
+                (activity as? MainActivity)?.refreshNavigationRailVisibility()
+            }
+
+            updateAccessibility(toggle.isChecked)
+            toggle.setOnCheckedChangeListener { _, checked -> persist(checked) }
+            row.setOnClickListener { toggle.toggle() }
+            container.addView(row)
         }
     }
 }

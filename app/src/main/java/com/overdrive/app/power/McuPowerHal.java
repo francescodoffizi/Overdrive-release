@@ -33,9 +33,9 @@ import java.lang.reflect.Method;
  *   <li>BYDAutoSpecialDevice lives in <b>one of two packages</b> depending on
  *       the trim, so it is probed in order — see
  *       {@link #SPECIAL_CLASS_CANDIDATES}. The {@code .bydauto.special.} form
- *       was verified on DiLink 3.0; the Escort reference app
- *       (com.yrdata.escort_auto) uses the bare {@code .special.} form, verified
- *       in its raw dex string table. Hardcoding only the former made every
+ *       was verified on DiLink 3.0; the reference OEM dashcam app uses the bare
+ *       {@code .special.} form, verified in its raw dex string table.
+ *       Hardcoding only the former made every
  *       sentry-mode write a silent no-op on trims that ship the latter.</li>
  * </ul>
  *
@@ -61,7 +61,7 @@ public final class McuPowerHal {
     /**
      * Candidate FQNs for BYDAutoSpecialDevice, probed in declaration order.
      *
-     * <p>The {@code .bydauto.special.} form was verified on DiLink 3.0. The Escort
+     * <p>The {@code .bydauto.special.} form was verified on DiLink 3.0. The reference
      * reference app ships the BARE {@code .special.} form — confirmed in its raw dex
      * string table ({@code /Landroid/hardware/special/BYDAutoSpecialDevice;}), and
      * corroborated by the BYD SDK javadoc in {@code doc/}, which lists 20

@@ -28,10 +28,10 @@ import com.overdrive.app.roadsense.store.RoadSenseStore
  *  4. we haven't already warned for THIS hazard id on this approach (dedupe)
  *
  * ## Audio
- * Uses [ToneGenerator] on STREAM_MUSIC — the same mechanism the project's
- * AudioTestApiHandler uses for beeps. Severity picks the tone so the driver can
- * tell a minor bump from a severe pothole without looking. Visual cues are
- * delegated to a [VisualSink] the overlay implements, keeping this class
+ * Uses the injected [AudioCue]. The production controller installs
+ * [BridgedAudioCue] to play the bundled severity chime through the selected OEM
+ * audio channels; [ToneAudioCue] remains the standalone fallback. Visual cues
+ * are delegated to a [VisualSink] the overlay implements, keeping this class
  * overlay-agnostic + unit-testable.
  *
  * Not thread-safe; called from the single controller tick thread.

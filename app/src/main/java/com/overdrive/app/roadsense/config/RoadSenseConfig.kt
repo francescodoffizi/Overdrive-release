@@ -41,6 +41,8 @@ object RoadSenseConfig {
     private const val K_ENABLED = "enabled"
     private const val K_WARN_ENABLED = "warnEnabled"
     private const val K_WARN_MODE = "warnMode"                 // "visual" | "audio" | "both"
+    private const val K_WARN_AUDIO_CHANNEL = "warnAudioChannel" // chime audio channel (see Snapshot)
+    private const val K_WARN_AUDIO_VOLUME = "warnAudioVolume"   // severe-chime ceiling, percent
     private const val K_WARN_LEAD_S = "warnLeadSeconds"        // t_w (D-010)
     private const val K_WARN_FLOOR_M = "warnFloorMeters"
     private const val K_WARN_CONF = "warnConfidenceThreshold"  // 0..1, default 0 (D-015)
@@ -79,6 +81,14 @@ object RoadSenseConfig {
         val enabled: Boolean,
         val warnEnabled: Boolean,
         val warnMode: WarnMode,
+        /** Audio channel the approach chime plays on: "navigation" (default), "media",
+         *  "voice" or "alarm" — the same channel names the Play Audio action uses.
+         *  "navigation" puts the chime on the OEM guidance stream (STREAM_NAVI, 14), so
+         *  it ducks music instead of competing with it and follows the nav volume knob. */
+        val warnAudioChannel: String,
+        /** Master chime level in percent. Severe uses this ceiling; lower severities
+         *  are scaled by [RoadSenseChimeLevels] so they remain gentler. */
+        val warnAudioVolume: Int,
         val warnLeadSeconds: Float,
         val warnFloorMeters: Float,
         val warnConfidenceThreshold: Float,
@@ -161,6 +171,13 @@ object RoadSenseConfig {
             enabled = s.optBoolean(K_ENABLED, false),
             warnEnabled = s.optBoolean(K_WARN_ENABLED, true),
             warnMode = WarnMode.from(s.optString(K_WARN_MODE, "both")),
+            // Validated against the supported set so a hand-edited value can't send the
+            // chime to a stream MediaPlaybackService doesn't map (it would fall back to
+            // STREAM_MUSIC there and silently land on the media amp).
+            warnAudioChannel = RoadSenseAudioChannels.normalize(s.optString(K_WARN_AUDIO_CHANNEL, "")),
+            warnAudioVolume = RoadSenseChimeLevels.normalizeMasterPercent(
+                s.optInt(K_WARN_AUDIO_VOLUME, RoadSenseChimeLevels.DEFAULT_MASTER_PERCENT)
+            ),
             warnLeadSeconds = s.optDouble(K_WARN_LEAD_S, 4.0).toFloat(),
             warnFloorMeters = s.optDouble(K_WARN_FLOOR_M, 30.0).toFloat(),
             warnConfidenceThreshold = s.optDouble(K_WARN_CONF, 0.0).toFloat(),

@@ -29,7 +29,7 @@ import java.io.OutputStream;
  * Endpoints:
  *   GET  /api/keymap/config — { enabled, allowAdvanced, bindings[],
  *                               a11yEnabled, a11yBound, a11yPending,
- *                               restartRequired }
+ *                               restartRequired, fuelCapableHybrid? }
  *       a11yEnabled = OS bind PRECONDITION (listed + master-on, or in-proc).
  *       a11yBound   = service ACTUALLY bound/live (in-proc isRunning, or a live
  *                     ServiceRecord via dumpsys) — the honest "keys will fire" truth.
@@ -44,29 +44,39 @@ import java.io.OutputStream;
  *
  * Action kinds (mirror the settings UI's curated picker + advanced escape hatch):
  *   { "kind":"catalog", "key":"drl", "sub":null, "payload":"on" }
- *       Resolve against {@link VehicleControlCatalog} and executeSdkOnly — the
- *       full curated set (drl, sunroof, sunshade, windows_all, tailgate, seat_*,
- *       climate, charge_cap_*, child_lock, wireless_charging, adas_*).
+ *       Resolve against {@link VehicleControlCatalog}. SDK-only commands stay
+ *       local; declared SDK-first commands use the cloud only as a fallback.
+ *       The full curated set includes drl, sunroof, sunshade, windows_all,
+ *       tailgate, seat_*, climate, charge_cap_*, child_lock,
+ *       wireless_charging, and adas_*.
  *   { "kind":"vehicle", "action":"lock|unlock|flash|find_car" }
- *       Composite cloud-first commands not registered in the catalog.
+ *       Terminally confirmed cloud commands not registered in the catalog.
  *   { "kind":"api", "method":"POST", "path":"/api/...", "body":"{...}" }
- *       Fire an internal API action (surveillance, recording mode) for
- *       features that have no VehicleControlCatalog/SDK entity. Routed through
- *       {@link HttpServer#automationApiRequest} — the SAME auth-free, allowlisted
- *       path automations use — so it can only ever reach the curated control
- *       surface (/api/vehicle, /api/surveillance, /api/recording/mode), never the
- *       sensitive /api/debug|backup|update|... endpoints.
+ *       Fire an internal API action (surveillance, recording mode, camera view,
+ *       blind spot) for features that have no VehicleControlCatalog/SDK entity.
+ *       Routed through {@link HttpServer#automationApiRequest} — the SAME auth-free,
+ *       allowlisted path automations use — so it can only ever reach the curated
+ *       control surface, never the sensitive /api/debug|backup|update|... endpoints.
+ *       The authoritative reachable set is HttpServer.AUTOMATION_ALLOWED_PREFIXES;
+ *       don't restate it here, it drifts.
  *   { "kind":"automation", "id":"&lt;uuid&gt;" }
  *       Run a saved automation's actions on a keypress — the physical-key
- *       equivalent of the automation's trigger. Enqueued on the shared
- *       {@link com.overdrive.app.automation.AutomationQueue} (checkConditions=true,
- *       so the automation's own conditions still gate it, and its run-stats update),
- *       NOT run inline — a chain may block for minutes on pause/waitUntil and must
- *       never tie up this HTTP worker. Deliberately NOT routed through the automation
- *       API allowlist (which excludes /api/automations on purpose): this is a
- *       dedicated in-process call, like {@code manualClip}. An unknown id is rejected;
- *       a disabled automation still enqueues but the worker skips it (logged no-op),
- *       matching how a disabled automation ignores its normal trigger.
+ *       equivalent of the automation's trigger. Automatic rules use the shared
+ *       {@link com.overdrive.app.automation.AutomationQueue} (their conditions still
+ *       gate them); manual-only rules use the serialized explicit-run worker and fire
+ *       their primary actions unconditionally. Neither path runs inline — a chain may
+ *       block for minutes on pause/waitUntil and must never tie up this HTTP worker.
+ *       Deliberately NOT routed through the automation API allowlist (which excludes
+ *       /api/automations on purpose): this is a dedicated in-process call, like
+ *       {@code manualClip}. Unknown ids are rejected; fully disabled rules retain the
+ *       legacy accepted no-op behavior.
+ *   { "kind":"actionGroup", "id":"&lt;uuid&gt;" }
+ *       Run a reusable action group's actions on a keypress. Dispatched to a daemon
+ *       thread (a group may pause/waitUntil for minutes and must not hold this HTTP
+ *       worker). A group has no conditions and no run-stats, so it fires
+ *       unconditionally. Like {@code manualClip}, a dedicated in-process call —
+ *       deliberately NOT via the automation API allowlist, which excludes
+ *       /api/action-groups on purpose.
  *   { "kind":"openApp", "package":"com.foo.bar", "label":"Foo" }
  *       Launch an installed app (resolves its launcher activity). Not gated —
  *       opening an app is no more privileged than a user tapping its icon.
@@ -414,6 +424,14 @@ public final class KeymapApiHandler {
         resp.put("a11yPending", a11yOn && !a11yBound);
         resp.put("restartRequired", ManualClipService.getInstance()
                 .isCameraDaemonRestartRequired(section));
+        try {
+            BydDataCollector collector = BydDataCollector.getInstance();
+            if (collector.isInitialized()) {
+                resp.put("fuelCapableHybrid", collector.isFuelCapableHybridPublic());
+            }
+        } catch (Throwable ignored) {
+            // Capability is optional; an unknown drivetrain keeps all choices visible.
+        }
         HttpResponse.sendJson(out, resp.toString());
 
         // Load-time self-heal: the reported on-car state is an already-enabled
@@ -780,12 +798,43 @@ public final class KeymapApiHandler {
      * client keeps the nudge / "enabling…" state rather than falsely hiding it),
      * matching {@link #isAccessibilityServiceEnabled()}'s conservative reporting.
      */
+    /**
+     * Short-lived cache for the {@code dumpsys} bind probe below. The probe shells out with a 2s
+     * ceiling and is called on EVERY config GET and POST, so an unbound service (exactly the
+     * cold-boot case the client polls through) charged every request up to 2s — the "binding a key
+     * takes too long right after car on" report. A bind state cannot flip meaningfully faster than
+     * this window, and a POSITIVE result is never cached at all (see below), so the freshness that
+     * matters is preserved. Volatile pair, written last-wins: a duplicated probe is harmless.
+     */
+    // Must EXCEED the client's 5500ms recheck cadence (key-mapping.js scheduleA11yRecheck), or the
+    // entry expires just before every poll and the cache serves nobody — which is what a 2s and
+    // then a 5s TTL did: each recheck still paid the full 2s dumpsys. 8s covers the cadence with
+    // margin while staying short enough that a bind landing mid-window is reported on the next
+    // poll. Only NEGATIVE results are cached, so this never delays observing a teardown.
+    private static final long A11Y_BOUND_PROBE_TTL_MS = 8_000L;
+    // MONOTONIC (elapsedRealtime), not wall clock: an RTC/NTP step is routine seconds after car
+    // power-on, which is exactly when this cache is hot. A wall-clock age can jump or go
+    // negative across that step; elapsedRealtime cannot, so the TTL means what it says. Matches
+    // the clock choice in StreamingApiHandler for the same head-unit hazard.
+    private static volatile long a11yBoundProbeAtMs = 0L;
+    private static volatile boolean a11yBoundProbeResult = false;
+
     private static boolean isAccessibilityServiceBound() {
         try {
             // In-proc ground truth: onServiceConnected sets the instance, onDestroy
             // clears it, so this is precisely "bound right now".
             if (com.overdrive.app.services.KeepAliveAccessibilityService.isRunning()) return true;
         } catch (Throwable ignored) { /* class may be absent in a stripped build */ }
+        // Serve a recent NEGATIVE probe from cache. Only negatives are cached: a false is what
+        // costs a full 2s shell-out (nothing to match, so the dump is read to EOF), and it is the
+        // state a polling client hammers while AMS is still binding. A true is cheap and must stay
+        // instantaneous — caching it could report "bound" for up to the TTL after a teardown,
+        // which would hide a genuinely dead key filter.
+        long age = android.os.SystemClock.elapsedRealtime() - a11yBoundProbeAtMs;
+        if (a11yBoundProbeAtMs != 0L && age >= 0 && age < A11Y_BOUND_PROBE_TTL_MS
+                && !a11yBoundProbeResult) {
+            return false;
+        }
         // Daemon path (UID 2000): an active ServiceRecord for the component proves
         // AMS has bound it. Mirrors ServiceLauncher.isLocationSidecarRunning's
         // "non-empty && !app=null" test. 2s ceiling so a slow dumpsys can never
@@ -805,10 +854,22 @@ public final class KeymapApiHandler {
             // A bound service shows a ServiceRecord referencing our component and a
             // non-null hosting app. "app=null" means the record exists but nothing
             // is bound (not live) — reject it, matching the sidecar probe.
-            return dump.contains("ServiceRecord")
+            boolean bound = dump.contains("ServiceRecord")
                     && dump.contains("KeepAliveAccessibilityService")
                     && !dump.contains("app=null");
+            // Publish RESULT before TIMESTAMP, and never the other way round. The two volatiles
+            // are unsynchronised, so a concurrent reader can observe a torn pair; this order
+            // makes the only possible tear "new result, old timestamp", which just expires the
+            // entry and re-probes. The reverse order could pair a fresh stamp with the PREVIOUS
+            // result and serve a stale negative for a full TTL after the bind landed.
+            a11yBoundProbeResult = bound;
+            a11yBoundProbeAtMs = android.os.SystemClock.elapsedRealtime();
+            return bound;
         } catch (Throwable t) {
+            // Cache the failure too: a wedged/absent dumpsys otherwise re-pays its timeout on
+            // every request. Fail-safe value is unchanged (false).
+            a11yBoundProbeResult = false;
+            a11yBoundProbeAtMs = android.os.SystemClock.elapsedRealtime();
             return false;
         }
     }
@@ -820,17 +881,13 @@ public final class KeymapApiHandler {
             // Anything else is a single action. The advanced-shell
             // 403 is signalled by a runStep result with httpStatus=403 so the
             // gate behaves the same whether shell is a lone binding or a step.
-            if ("sequence".equals(req.optString("kind", ""))) {
-                HttpResponse.sendJson(out, runSequence(req).toString());
+            JSONObject r = runBoundAction(req);
+            int status = r.optInt("httpStatus", 200);
+            r.remove("httpStatus");
+            if (status != 200) {
+                HttpResponse.sendError(out, status, r.optString("error", "Refused"));
             } else {
-                JSONObject r = runStep(req);
-                int status = r.optInt("httpStatus", 200);
-                r.remove("httpStatus");
-                if (status != 200) {
-                    HttpResponse.sendError(out, status, r.optString("error", "Refused"));
-                } else {
-                    HttpResponse.sendJson(out, r.toString());
-                }
+                HttpResponse.sendJson(out, r.toString());
             }
         } catch (Exception e) {
             logger.warn("Keymap fire failed: " + e.getMessage());
@@ -839,6 +896,28 @@ public final class KeymapApiHandler {
             response.put("error", e.getMessage());
             HttpResponse.sendJson(out, response.toString());
         }
+    }
+
+    /**
+     * Run one bound action — a {@code sequence} or a single step — and return its result JSON
+     * (never writes to the socket). The shared entry point for every surface that fires a
+     * stored action payload: the physical-key {@code /api/keymap/fire} route above and the
+     * user-defined quick-control buttons ({@link QuickControlsApiHandler}).
+     *
+     * <p>Routing through ONE method is what guarantees a quick-control button carries exactly
+     * the physical key's privileges — same curated resolution, same API allowlist, same
+     * {@code allowAdvanced} shell gate — instead of a parallel actuation path that could drift.
+     * A refusal is reported via {@code httpStatus} in the result, which the caller may translate
+     * to an HTTP status; it is never thrown.
+     */
+    static JSONObject runBoundAction(JSONObject req) throws org.json.JSONException {
+        if (req == null) {
+            JSONObject r = new JSONObject();
+            r.put("success", false);
+            r.put("error", "Missing action");
+            return r;
+        }
+        return "sequence".equals(req.optString("kind", "")) ? runSequence(req) : runStep(req);
     }
 
     /**
@@ -854,6 +933,7 @@ public final class KeymapApiHandler {
             case "vehicle": return runVehicle(req);
             case "api":     return runApi(req);
             case "automation": return runAutomation(req);
+            case "actionGroup": return runActionGroup(req);
             case "radio":   return runRadio(req);
             case "manualClip": return runManualClip(req);
             case "openApp": return runOpenApp(req);
@@ -1029,18 +1109,13 @@ public final class KeymapApiHandler {
             return response;
         }
 
-        // Route selection: a key press is normally SDK-only (instant, offline — no cloud
-        // round-trip). But some catalog commands have NO working local path on this
-        // generation and are cloud-first/cloud-only by design — e.g. all-windows CLOSE
-        // (anti-pinch blocks the local 4-window raise; only the cloud CLOSEWINDOW works),
-        // and lock/unlock/flash/find-car. For those, executeSdkOnly silently no-ops (the
-        // reported "windows-up mapping does nothing" bug). So use the full execute() —
-        // which tries SDK then falls back to cloud (or goes straight to cloud) — whenever
-        // the command can't be satisfied SDK-only. Genuine SDK commands (drl, sunroof,
-        // seat, climate, …) still take the instant SDK-only path.
-        boolean needsCloud = !action.command.hasSdkPath()
-                || action.command.defaultPreference() == VehicleCommandRouter.RoutePreference.CLOUD_ONLY
-                || action.command.defaultPreference() == VehicleCommandRouter.RoutePreference.CLOUD_FIRST;
+        // Key mappings preserve the SDK as the first leg, but must use the
+        // full router when a command declares a cloud fallback. This lets a
+        // sleeping vehicle use its proven remote path without changing the
+        // immediate local behavior while it is awake. MQTT remains explicitly
+        // local-only in MqttCommandRouter.
+        boolean needsCloud = action.command.hasCloudPath()
+                && action.command.defaultPreference() != VehicleCommandRouter.RoutePreference.SDK_ONLY;
         VehicleCommandRouter.CommandResult r = needsCloud
                 ? VehicleCommandRouter.getInstance().execute(action.command)
                 : VehicleCommandRouter.getInstance().executeSdkOnly(action.command);
@@ -1061,7 +1136,7 @@ public final class KeymapApiHandler {
 
     /**
      * Composite vehicle commands not registered in the catalog. These are
-     * cloud-first (lock/flash have no local SDK path on this generation), so
+     * cloud-only (lock/flash have no local SDK path on this generation), so
      * unlike the catalog path they route through the full {@code execute()}
      * capability matrix rather than SDK-only.
      */
@@ -1094,9 +1169,11 @@ public final class KeymapApiHandler {
      * SDK entity (surveillance enable/disable, recording mode). Routes through the
      * same auth-free, allowlisted in-process path automations use
      * ({@link HttpServer#automationApiRequest}), so the keymap can reach exactly the
-     * control surface the allowlist permits and nothing more. Not advanced-gated:
-     * the reachable paths are curated (the UI only offers the fixed surveillance /
-     * recording actions), unlike the arbitrary-command shell escape hatch.
+     * control surface the allowlist permits and nothing more. Not advanced-gated: the
+     * allowlist — NOT this handler — is the boundary, and everything on it is a curated
+     * vehicle/camera control, unlike the arbitrary-command shell escape hatch. Note a
+     * hand-written binding may name any allowlisted path, not just the ones the UI
+     * offers; see HttpServer.AUTOMATION_ALLOWED_PREFIXES for the authoritative set.
      */
     private static JSONObject runApi(JSONObject req) throws org.json.JSONException {
         JSONObject response = new JSONObject();
@@ -1121,7 +1198,13 @@ public final class KeymapApiHandler {
         // + body), or null when the path is outside the automation allowlist, the
         // route is unhandled, or the handler threw. A non-null "HTTP/1.1 2xx" is success.
         String httpResponse = server.automationApiRequest(method, path, body);
-        boolean ok = httpResponse != null && isSuccessStatus(httpResponse);
+        // ...but the status line ALONE is not enough: HttpResponse.sendJsonError replies
+        // 200 with {"success":false}, so a rejected request (a bad value, a feature that
+        // declined) looked identical to a working one and was logged as SUCCESS. Treat an
+        // explicit success:false body as failure too, matching ApiAction.logFailure. An
+        // async {"starting":true} is a "come back later", not a failure.
+        boolean ok = httpResponse != null && isSuccessStatus(httpResponse)
+                && !isDeclinedBody(httpResponse);
         logger.info("Keymap api '" + method + " " + path + "' -> " + (ok ? "SUCCESS" : "FAILED"));
 
         response.put("success", ok);
@@ -1133,12 +1216,11 @@ public final class KeymapApiHandler {
     }
 
     /**
-     * Run a saved automation on a keypress. Enqueues the automation id on the shared
-     * {@link com.overdrive.app.automation.AutomationQueue} with zero delay so it drains
-     * on the singleton worker thread (never this HTTP worker — a chain may block for
-     * minutes) and its own conditions/run-stats still apply, exactly as an
-     * event-triggered fire would. Rejects an unknown id up front so a stale binding
-     * reports a clear error rather than silently enqueuing nothing.
+     * Run a saved automation on a keypress. Automatic rules enqueue on the normal
+     * singleton worker, preserving their existing conditions/run-stat behavior.
+     * Manual-only rules dispatch to the serialized explicit-run worker, where the
+     * keypress itself is the trigger and the primary branch runs unconditionally.
+     * Rejects an unknown id up front so a stale binding reports a clear error.
      */
     private static JSONObject runAutomation(JSONObject req) throws org.json.JSONException {
         JSONObject response = new JSONObject();
@@ -1153,12 +1235,88 @@ public final class KeymapApiHandler {
             response.put("error", "Unknown automation: " + id);
             return response;
         }
+        if (com.overdrive.app.automation.Automations.isManualOnly(id)) {
+            AutomationApiHandler.dispatchExplicitAutomation(id, true);
+            logger.info("Keymap manual-only automation dispatched: " + id);
+            response.put("success", true);
+            return response;
+        }
         // Enqueue with no delay — the worker checks conditions and records stats.
         com.overdrive.app.automation.AutomationQueue.addToQueue(id, 0);
         logger.info("Keymap automation enqueued: " + id);
         response.put("success", true);
         return response;
     }
+
+    /**
+     * Run a reusable action group on a keypress — the group equivalent of {@link #runAutomation}.
+     *
+     * <p>Dispatched to a daemon thread rather than run inline, for the same reason the automation
+     * kind enqueues instead of running: a group may contain a {@code pause}/{@code waitUntil}
+     * step that blocks for minutes, and this executes on the HTTP worker thread. Unlike an
+     * automation there is no AutomationQueue entry to use (a group has no id in that store, no
+     * conditions and no run-stats), so a group fires unconditionally — matching what a user
+     * pressing a button expects.
+     *
+     * <p>Like {@code manualClip}, this is a dedicated in-process call and deliberately NOT
+     * routed through the automation API allowlist, which excludes /api/action-groups on purpose.
+     */
+    private static JSONObject runActionGroup(JSONObject req) throws org.json.JSONException {
+        JSONObject response = new JSONObject();
+        String id = req.optString("id", "");
+        if (id == null || id.isBlank()) {
+            response.put("success", false);
+            response.put("error", "Missing action group id");
+            return response;
+        }
+        if (!com.overdrive.app.automation.ActionGroups.exists(id)) {
+            response.put("success", false);
+            response.put("error", "Unknown action group: " + id);
+            return response;
+        }
+        // IN-FLIGHT GUARD. A physical button gets mashed, and each press would otherwise spawn
+        // another thread running the same list CONCURRENTLY — interleaving vehicle commands, and
+        // piling up threads for minutes if the group contains a pause/waitUntil. The automation
+        // kind gets this free (AutomationQueue dedupes by id); a group has no queue, so it is
+        // enforced here. A repeat press while the group is still running is a logged no-op, which
+        // is what the automation path does too.
+        if (!GROUPS_IN_FLIGHT.add(id)) {
+            logger.info("Keymap action group " + id + " already running — ignoring repeat press");
+            response.put("success", true);
+            response.put("message", "Already running");
+            return response;
+        }
+        Thread t = new Thread(() -> {
+            try {
+                com.overdrive.app.automation.Automations.runActionList(
+                        com.overdrive.app.automation.ActionGroups.getActions(id));
+            } catch (Throwable e) {
+                logger.error("Keymap action group " + id + " failed", e);
+            } finally {
+                GROUPS_IN_FLIGHT.remove(id);
+            }
+        }, "KeymapActionGroup");
+        t.setDaemon(true);
+        try {
+            t.start();
+        } catch (Throwable e) {
+            // The runnable never ran, so its finally never will either — release the guard here or
+            // this group stays "in flight" for the life of the process and becomes unrunnable.
+            // Realistic trigger: OutOfMemoryError creating a native thread on a starved daemon.
+            GROUPS_IN_FLIGHT.remove(id);
+            logger.error("Keymap action group " + id + ": could not start worker", e);
+            response.put("success", false);
+            response.put("error", "Could not start action group");
+            return response;
+        }
+        logger.info("Keymap action group dispatched: " + id);
+        response.put("success", true);
+        return response;
+    }
+
+    /** Action-group ids currently executing from a keypress — see {@link #runActionGroup}. */
+    private static final java.util.Set<String> GROUPS_IN_FLIGHT =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /**
      * Toggle a device radio (WiFi / Bluetooth / mobile-data) on a keypress. Delegates
@@ -1207,6 +1365,31 @@ public final class KeymapApiHandler {
         response.put("success", ok);
         if (!ok) response.put("error", "Could not launch " + pkg);
         return response;
+    }
+
+    /**
+     * True if a raw HTTP response's JSON body explicitly DECLINED the request, i.e.
+     * carries {@code "success":false} without the async {@code "starting":true} marker.
+     * Needed because the daemon's JSON error helper replies 200, so the status line alone
+     * cannot distinguish "applied" from "rejected". A body we can't parse, or one with no
+     * {@code success} key, is left alone (not treated as a failure).
+     */
+    private static boolean isDeclinedBody(String httpResponse) {
+        try {
+            // Anchor on the header/body separator rather than the first '{': a brace in a
+            // header would otherwise start the parse mid-headers, and a top-level JSON
+            // ARRAY would parse its first element and let one item's success flag speak
+            // for the whole response.
+            int sep = httpResponse.indexOf("\r\n\r\n");
+            if (sep < 0) return false;
+            String body = httpResponse.substring(sep + 4).trim();
+            if (!body.startsWith("{") || !body.contains("\"success\"")) return false;
+            org.json.JSONObject json = new org.json.JSONObject(body);
+            if (json.optBoolean("starting", false)) return false;
+            return !json.optBoolean("success", true);
+        } catch (Exception e) {
+            return false;   // unparseable → fail OPEN (pre-fix behaviour)
+        }
     }
 
     /** True if a raw HTTP response string carries a 2xx status line. */

@@ -612,6 +612,40 @@ BYD.units = {
     /** Round a km/h threshold (40, 80) to the user's unit for legend labels. */
     speedThreshold(kmh) {
         return this.mode === 'mi' ? Math.round(kmh * this.KM_TO_MI) : kmh;
+    },
+
+    // ── Tyre pressure ────────────────────────────────────────────────
+    // Canonical unit is kPa everywhere on the wire and in every threshold
+    // comparison (see TyreLimitsApiHandler); these helpers convert at the
+    // last render step only. pressureMode mirrors /status.pressureUnit the
+    // same way `mode` mirrors distanceUnit. Default 'psi' matches what the
+    // UI displayed before the preference existed.
+    pressureMode: 'psi',  // 'kpa' | 'psi' | 'bar' — updated from /status.pressureUnit
+    KPA_TO_PSI: 0.1450377,
+
+    /**
+     * Convert a kPa reading to the display value (number string, no label).
+     * Decimals per unit: kPa integer (TPMS step ≈ 3 kPa), PSI one decimal
+     * (matches the server's psi field rounding), bar two decimals.
+     */
+    pressureVal(kPa) {
+        if (kPa == null || isNaN(kPa)) return '--';
+        if (this.pressureMode === 'kpa') return String(Math.round(kPa));
+        if (this.pressureMode === 'bar') return (kPa / 100).toFixed(2);
+        return (kPa * this.KPA_TO_PSI).toFixed(1);
+    },
+
+    /** Format a kPa reading with its unit label, e.g. "36.5 PSI". */
+    pressure(kPa) {
+        if (kPa == null || isNaN(kPa)) return '--';
+        return this.pressureVal(kPa) + ' ' + this.pressureLabel();
+    },
+
+    /** Return just the pressure unit label. */
+    pressureLabel() {
+        if (this.pressureMode === 'kpa') return 'kPa';
+        if (this.pressureMode === 'bar') return 'bar';
+        return 'PSI';
     }
 };
 
@@ -757,9 +791,30 @@ BYD.core = {
             const hadData = !!(status.soc || status.range || status.charging);
             if (hadData) this.hasEverHadVehicleData = true;
 
-            // Distance unit preference (from user setting / auto-detect)
+            // Distance unit preference (from user setting / auto-detect).
+            // Announce a real CHANGE: this poll runs at ~1 Hz and silently
+            // swapped the mode, so every already-rendered value flipped to the
+            // new unit while its label — written only when the page itself
+            // handles a unit switch — kept saying the old one. Pages listen for
+            // this and repaint; the guard means a steady-state poll fires nothing.
             if (status.distanceUnit) {
+                var previousDistanceUnit = BYD.units.mode;
                 BYD.units.mode = status.distanceUnit;
+                if (previousDistanceUnit !== status.distanceUnit) {
+                    try {
+                        window.dispatchEvent(new CustomEvent('byd:units-changed', {
+                            detail: { mode: status.distanceUnit }
+                        }));
+                    } catch (e) { /* CustomEvent unsupported — values still convert */ }
+                }
+            }
+
+            // Tyre pressure display unit — same delivery pattern as
+            // distanceUnit. Guarded to the known tokens so an older/newer
+            // server can't push a value the formatters don't understand.
+            if (status.pressureUnit === 'kpa' || status.pressureUnit === 'psi'
+                    || status.pressureUnit === 'bar') {
+                BYD.units.pressureMode = status.pressureUnit;
             }
 
             // Locale sync — ONLY in the Android WebView, where the app's
@@ -796,7 +851,13 @@ BYD.core = {
             // 12V Battery
             if (status.battery) {
                 const el = document.getElementById('batteryValue');
-                if (el) el.textContent = (status.battery.voltage || 0).toFixed(1) + 'V';
+                const voltage = Number(status.battery.voltage);
+                const voltageFresh = status.battery.available !== false
+                    && status.battery.isStale !== true
+                    && isFinite(voltage)
+                    && voltage > 0;
+                if (el) el.textContent = voltageFresh
+                    ? voltage.toFixed(1) + 'V' : '--';
             }
 
             // ACC status
@@ -1022,28 +1083,37 @@ BYD.core = {
             var stateName = status.charging.stateName || '';
             powerKW = status.charging.chargingPowerKW || 0;
             var isEstimated = status.charging.isEstimated || false;
+            var powerSource = status.charging.powerSource || 'none';
             
-            // Determine if actively charging
-            var chargingStates = ['Charging', 'DC Charging', 'AC Charging', 'Fast Charging'];
-            isCharging = chargingStates.some(function(s) { return stateName.toLowerCase().indexOf(s.toLowerCase()) >= 0; }) || powerKW > 0;
+            // Determine if actively charging. TRUST THE SERVER'S OWN VERDICT when it sends one: it
+            // fuses BMS state, the power MCU and the CV-taper flag, none of which can be re-derived
+            // from a state name here. Re-deriving it locally rendered a live taper as "not charging",
+            // because the taper deliberately keeps the FINISHED state name and its rate can be
+            // unresolved (0) early on. The name/power test remains as a fallback for older daemons
+            // that do not send the field.
+            if (typeof status.charging.charging === 'boolean') {
+                isCharging = status.charging.charging;
+            } else {
+                var chargingStates = ['Charging', 'DC Charging', 'AC Charging', 'Fast Charging'];
+                isCharging = chargingStates.some(function(s) { return stateName.toLowerCase().indexOf(s.toLowerCase()) >= 0; }) || powerKW > 0;
+            }
+            // Never let a carried positive value survive an authoritative stop.
+            if (!isCharging) powerKW = 0;
         }
 
         // Update power display
         if (evPower) {
             if (isCharging) {
-                if (powerKW > 0 && !isEstimated) {
-                    // Real measured charging power.
-                    evPower.textContent = powerKW.toFixed(1) + ' kW';
+                if (powerKW > 0 && powerSource !== 'nominalPlaceholder') {
+                    evPower.textContent = (isEstimated ? '~' : '')
+                        + powerKW.toFixed(1) + ' kW';
                 } else {
-                    // No live power reading yet (estimate or 0). Don't fabricate a
-                    // precise kW — a made-up "~7.0 kW" reads as a real measurement
-                    // and was wrong vs the actual charger. Show the charging state
-                    // without a number until the typed instrument listener delivers
-                    // a live value, then the branch above takes over.
+                    // The nominal placeholder is not a measurement. Keep the charging
+                    // state visible until a direct or data-derived value is available.
                     evPower.textContent = BYD.i18n.t('status.charging') || 'Charging';
                 }
             } else {
-                evPower.textContent = powerKW > 0 ? powerKW.toFixed(1) + ' kW' : '-- kW';
+                evPower.textContent = '-- kW';
             }
         }
 
@@ -1164,6 +1234,103 @@ BYD.core = {
      * the petrol leg appear on the next status refresh rather than after
      * a full page reload.
      */
+    _parseRangeEstimate(node) {
+        if (!node) return null;
+        function positive(camelKey, snakeKey) {
+            var raw = node[camelKey];
+            if (raw === undefined || raw === null) raw = node[snakeKey];
+            var value = Number(raw);
+            return isFinite(value) && value > 0 ? value : 0;
+        }
+
+        var predictedKm = positive('predictedRangeKm', 'predicted_range_km');
+        if (predictedKm <= 0) return null;
+        var lowerKm = positive('lowerBoundKm', 'lower_bound_km') || predictedKm;
+        var upperKm = positive('upperBoundKm', 'upper_bound_km') || predictedKm;
+        if (lowerKm > upperKm) {
+            var swap = lowerKm;
+            lowerKm = upperKm;
+            upperKm = swap;
+        }
+        var sampleCount = Number(node.sampleCount);
+        if (!isFinite(sampleCount) || sampleCount < 0) sampleCount = 0;
+
+        return {
+            predictedKm: predictedKm,
+            lowerKm: lowerKm,
+            upperKm: upperKm,
+            sampleCount: Math.round(sampleCount)
+        };
+    },
+
+    _buildPersonalizedRangeSnapshot() {
+        function positive(value) {
+            return typeof value === 'number' && isFinite(value) && value > 0
+                ? value : 0;
+        }
+
+        var hal = this._lastRange || {};
+        var evEstimate = this._personalizedEvEstimate || null;
+        var fuelEstimate = this._personalizedFuelEstimate || null;
+        var halEvKm = positive(hal.elecRangeKm);
+        var halFuelKm = positive(hal.fuelRangeKm);
+        var halTotalKm = positive(hal.totalRangeKm);
+        var isPhev = hal.isPhev === true
+            || halFuelKm > 0
+            || fuelEstimate !== null
+            || (typeof hal.fuelPercent === 'number' && isFinite(hal.fuelPercent));
+        var hasLearnedRange = evEstimate !== null || fuelEstimate !== null;
+        var resolvedEvKm = evEstimate ? evEstimate.predictedKm : halEvKm;
+        var resolvedFuelKm = isPhev
+            ? (fuelEstimate ? fuelEstimate.predictedKm : halFuelKm) : 0;
+        var vehicleKm = isPhev
+            ? (halTotalKm || (halEvKm + halFuelKm))
+            : (halTotalKm || halEvKm);
+        var personalizedKm = 0;
+        if (hasLearnedRange) {
+            personalizedKm = isPhev
+                ? (positive(this._personalizedTotalKm)
+                    || (resolvedEvKm + resolvedFuelKm))
+                : (evEstimate ? evEstimate.predictedKm : 0);
+        }
+
+        var lowerKm = 0;
+        var upperKm = 0;
+        if (personalizedKm > 0) {
+            if (isPhev) {
+                lowerKm = (evEstimate ? evEstimate.lowerKm : halEvKm)
+                    + (fuelEstimate ? fuelEstimate.lowerKm : halFuelKm);
+                upperKm = (evEstimate ? evEstimate.upperKm : halEvKm)
+                    + (fuelEstimate ? fuelEstimate.upperKm : halFuelKm);
+            } else if (evEstimate) {
+                lowerKm = evEstimate.lowerKm;
+                upperKm = evEstimate.upperKm;
+            }
+        }
+
+        return {
+            available: hasLearnedRange && personalizedKm > 0,
+            isPhev: isPhev,
+            personalizedKm: personalizedKm,
+            vehicleKm: vehicleKm,
+            resolvedEvKm: resolvedEvKm,
+            resolvedFuelKm: resolvedFuelKm,
+            lowerKm: lowerKm,
+            upperKm: upperKm,
+            sampleCount: (evEstimate ? evEstimate.sampleCount : 0)
+                + (fuelEstimate ? fuelEstimate.sampleCount : 0)
+        };
+    },
+
+    _publishPersonalizedRange() {
+        var snapshot = this._buildPersonalizedRangeSnapshot();
+        this.personalizedRangeSnapshot = snapshot;
+        if (BYD.dashboard
+                && typeof BYD.dashboard.updatePersonalizedRange === 'function') {
+            BYD.dashboard.updatePersonalizedRange(snapshot);
+        }
+    },
+
     async updatePersonalizedRange() {
         const pRow = document.getElementById('evPersonalizedRow');
         const pVal = document.getElementById('evPersonalizedRange');
@@ -1190,13 +1357,17 @@ BYD.core = {
             this._personalizedRangeKm = 0;
             this._personalizedFuelKm = 0;
             this._personalizedTotalKm = 0;
-            if (data.success && data.range) {
-                const predicted = Math.round(data.range.predictedRangeKm || data.range.predicted_range_km || 0);
-                if (predicted > 0) this._personalizedRangeKm = predicted;
+            this._personalizedEvEstimate = data.success
+                ? this._parseRangeEstimate(data.range) : null;
+            this._personalizedFuelEstimate = data.success
+                ? this._parseRangeEstimate(data.fuelRange) : null;
+            if (this._personalizedEvEstimate) {
+                this._personalizedRangeKm =
+                    Math.round(this._personalizedEvEstimate.predictedKm);
             }
-            if (data.success && data.fuelRange) {
-                const petrol = Math.round(data.fuelRange.predictedRangeKm || data.fuelRange.predicted_range_km || 0);
-                if (petrol > 0) this._personalizedFuelKm = petrol;
+            if (this._personalizedFuelEstimate) {
+                this._personalizedFuelKm =
+                    Math.round(this._personalizedFuelEstimate.predictedKm);
             }
             if (data.success && data.totalRangeKm > 0) {
                 this._personalizedTotalKm = Math.round(data.totalRangeKm);
@@ -1205,6 +1376,7 @@ BYD.core = {
         } catch (e) {
             this._personalizedRangeFetched = true;
             this._personalizedRangeFetchedAt = now;
+            this._renderPersonalizedRange();
         }
     },
 
@@ -1265,6 +1437,7 @@ BYD.core = {
                 cRow.style.display = 'none';
             }
         }
+        this._publishPersonalizedRange();
     },
 
     /**
@@ -1318,6 +1491,63 @@ BYD.core = {
 // Expose toast globally for convenience
 BYD.utils = BYD.utils || {};
 BYD.utils.toast = (msg, type) => BYD.core.toast(msg, type);
+
+/**
+ * Scroll the page back to the top of a list after it is replaced under the
+ * user — paging a catalog, applying a filter, changing a sort. Landing on
+ * page 2 still scrolled halfway down shows the middle of the new list, and
+ * the user has to scroll up to find out where they are.
+ *
+ * `anchor` (optional) is the list container. When the page scroller is the
+ * DOCUMENT (the usual case in this layout: html/body/.app-layout/.main-content
+ * are all min-height only, so nothing is height-bounded and no ancestor
+ * establishes an internal scroller), scrolling to absolute 0 would hide the
+ * pagination controls and the filter bar. Instead we scroll so the anchor's
+ * top sits just under the sticky .page-header — the user sees the first row of
+ * the new page with its controls still in view.
+ *
+ * Resets every plausible scroller (window + documentElement + body + any
+ * height-bounded ancestor of the anchor), because which one is live depends on
+ * the page. Same belt-and-braces approach as the tab switcher in app-tabs.js.
+ * Instant, never smooth: a smooth scroll would race the list re-render.
+ */
+BYD.utils.scrollToTop = function (anchor) {
+    // 1. Any real overflow scroller between the anchor and the document. A page
+    //    that DOES bound its list height (e.g. a two-pane layout) scrolls here,
+    //    and the document reset below would be a no-op for it.
+    var el = anchor && anchor.parentNode ? anchor.parentNode : null;
+    for (var hops = 0; el && el.nodeType === 1 && hops < 12; hops++) {
+        if (el.scrollHeight > el.clientHeight + 1) {
+            var oy = '';
+            try { oy = window.getComputedStyle(el).overflowY; } catch (e) { oy = ''; }
+            if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') { el.scrollTop = 0; break; }
+        }
+        el = el.parentNode;
+    }
+
+    // 2. The document scroller. Offset by the sticky header so the list's own
+    //    controls stay on screen; absolute 0 when there's no anchor to align to.
+    var top = 0;
+    if (anchor && anchor.getBoundingClientRect) {
+        var doc = document.documentElement;
+        var cur = window.pageYOffset || (doc ? doc.scrollTop : 0) || (document.body ? document.body.scrollTop : 0) || 0;
+        var header = document.querySelector('.page-header');
+        var headerH = header ? header.getBoundingClientRect().height : 0;
+        // Absolute document offset of the anchor, less the sticky header that
+        // would otherwise cover its first rows, less a small breathing margin.
+        top = Math.max(0, cur + anchor.getBoundingClientRect().top - headerH - 12);
+        // Already at or above the target (short list, or the user never scrolled)
+        // → don't scroll DOWN to it; that would feel like a jump for no reason.
+        if (cur <= top) top = cur;
+    }
+    try { window.scrollTo(0, top); } catch (e) { /* ignore */ }
+    if (document.documentElement) document.documentElement.scrollTop = top;
+    if (document.body) document.body.scrollTop = top;
+    // Defensive: .page-body is a declared overflow-y:auto container, so reset it
+    // too in case a page ever makes it height-bounded and thus actually scroll.
+    var pageBody = document.querySelector('.page-body');
+    if (pageBody) pageBody.scrollTop = 0;
+};
 
 /**
  * Themed alert/confirm replacements. Native window.alert / window.confirm

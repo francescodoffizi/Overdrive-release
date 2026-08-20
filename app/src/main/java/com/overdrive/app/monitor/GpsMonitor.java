@@ -1,5 +1,7 @@
 package com.overdrive.app.monitor;
 
+import android.os.SystemClock;
+
 import com.overdrive.app.daemon.CameraDaemon;
 import org.json.JSONObject;
 
@@ -35,28 +37,15 @@ public class GpsMonitor {
     // Command to start the sidecar service
     private static final String START_CMD = "am start-foreground-service -n com.overdrive.app/.services.LocationSidecarService";
 
-    private volatile double latitude = 0.0;
-    private volatile double longitude = 0.0;
-    private volatile float speed = 0.0f;
-    private volatile float heading = 0.0f;
-    private volatile float accuracy = 0.0f;
-    private volatile double altitude = 0.0;
-    private volatile long lastUpdate = 0;
-    // MONOTONIC since-boot fix timestamp (SystemClock.elapsedRealtime ms from the
-    // sidecar) — distinct from lastUpdate (send/receive-time, refreshed by the 4s
-    // keep-alive even when the fix is unchanged). Geo-tagging ages this against the
-    // daemon's OWN elapsedRealtime() so a stale re-sent fix reads stale, without
-    // crossing the device-RTC clock domain (wrong at cold boot). 0 = no monotonic
-    // basis (older sidecar, or cache-loaded after a reboot where it's incomparable);
-    // the gate then falls back to send-time aging.
-    private volatile long fixElapsedMs = 0;
+    private volatile GpsFixSnapshot fixSnapshot =
+            GpsFixSnapshot.empty();
     private volatile boolean isRunning = false;
-    private volatile boolean loadedFromCache = false;
     private volatile long lastLoggedAt = 0;
     private static final long LOG_INTERVAL_MS = 30_000;
+    private static final long LIVE_SPEED_FIX_MAX_AGE_MS = 5_000L;
 
     // Cache-write throttle. The on-disk cache exists ONLY for restart recovery
-    // (all live consumers read the in-memory volatile fields, which are always
+    // (all live consumers read the in-memory immutable snapshot, which is always
     // fresh). Writing it on every ~1-2 Hz IPC update is thousands of flash
     // writes per drive for no benefit. Persist at most every CACHE_WRITE_MIN_MS
     // OR when the fix moves > CACHE_WRITE_MIN_MOVE_M — so a parked car writes
@@ -70,6 +59,64 @@ public class GpsMonitor {
 
     private GpsMonitor() {}
 
+    /**
+     * One immutable publication of every field belonging to a GPS fix.
+     * Consumers must retain one instance for the duration of a sample instead
+     * of combining values obtained from separate IPC publications.
+     */
+    public static final class GpsFixSnapshot {
+        public final double latitude;
+        public final double longitude;
+        public final float speed;
+        public final float heading;
+        public final float accuracy;
+        public final double altitude;
+        // Reported 1-sigma vertical accuracy (m); 0 = unreported by this fix
+        // (older sidecar / HAL without the field). Elevation gate input.
+        public final float verticalAccuracy;
+        // True when `altitude` is MSL (geoid-corrected) rather than WGS84-
+        // ellipsoidal. Per-fix: a source flip mid-trip is a datum step the
+        // elevation pipeline must reset on, not integrate.
+        public final boolean altitudeIsMsl;
+        public final long lastUpdate;
+        // MONOTONIC since-boot fix timestamp from the sidecar. A zero value
+        // means an older sidecar or a cache-loaded, cross-boot fix.
+        public final long fixElapsedMs;
+        public final boolean loadedFromCache;
+
+        private GpsFixSnapshot(
+                double latitude, double longitude,
+                float speed, float heading, float accuracy,
+                double altitude, float verticalAccuracy, boolean altitudeIsMsl,
+                long lastUpdate, long fixElapsedMs, boolean loadedFromCache) {
+            this.latitude = latitude;
+            this.longitude = longitude;
+            this.speed = speed;
+            this.heading = heading;
+            this.accuracy = accuracy;
+            this.altitude = altitude;
+            this.verticalAccuracy = verticalAccuracy;
+            this.altitudeIsMsl = altitudeIsMsl;
+            this.lastUpdate = lastUpdate;
+            this.fixElapsedMs = fixElapsedMs;
+            this.loadedFromCache = loadedFromCache;
+        }
+
+        private static GpsFixSnapshot empty() {
+            return new GpsFixSnapshot(
+                    0.0, 0.0, 0.0f, 0.0f, 0.0f,
+                    0.0, 0.0f, false, 0L, 0L, false);
+        }
+
+        public boolean hasLocation() {
+            return latitude != 0.0 || longitude != 0.0;
+        }
+
+        public boolean isMoving() {
+            return speed > 1.0f;
+        }
+    }
+
     public static GpsMonitor getInstance() {
         if (instance == null) {
             synchronized (lock) {
@@ -82,8 +129,11 @@ public class GpsMonitor {
     public void init(android.content.Context ctx) {
         // Load cached GPS on init - try multiple locations
         loadFromCache();
+        GpsFixSnapshot fix = fixSnapshot;
         CameraDaemon.log(TAG + ": Initialized (IPC mode)" + 
-            (hasLocation() ? " - cached: " + latitude + ", " + longitude + " (loadedFromCache=" + loadedFromCache + ")" : " - no cached location"));
+            (fix.hasLocation() ? " - cached: " + fix.latitude + ", " + fix.longitude
+                    + " (loadedFromCache=" + fix.loadedFromCache + ")"
+                    : " - no cached location"));
     }
 
     public void start() {
@@ -109,20 +159,24 @@ public class GpsMonitor {
     }
 
     public void updateFromIpc(double lat, double lng, float speed, float heading, float accuracy, long time, double altitude, long fixElapsedMs) {
+        // Back-compat overload: no vertical accuracy / altitude source → 0 =
+        // unreported, false = ellipsoidal (prior behavior).
+        updateFromIpc(lat, lng, speed, heading, accuracy, time, altitude, fixElapsedMs,
+                0.0f, false);
+    }
+
+    public void updateFromIpc(double lat, double lng, float speed, float heading, float accuracy,
+                              long time, double altitude, long fixElapsedMs,
+                              float verticalAccuracy, boolean altitudeIsMsl) {
         // Reject invalid coordinates (0,0 is in the ocean, not a real location)
         if (lat == 0.0 && lng == 0.0) {
             return;
         }
 
-        this.latitude = lat;
-        this.longitude = lng;
-        this.speed = speed;
-        this.heading = heading;
-        this.accuracy = accuracy;
-        this.altitude = altitude;
-        this.lastUpdate = time;
-        this.fixElapsedMs = fixElapsedMs;
-        this.loadedFromCache = false; // We have live data now
+        GpsFixSnapshot fix = new GpsFixSnapshot(
+                lat, lng, speed, heading, accuracy, altitude, verticalAccuracy, altitudeIsMsl,
+                time, fixElapsedMs, false);
+        this.fixSnapshot = fix;
 
         // Persist to cache file — throttled (see CACHE_WRITE_MIN_MS). Live
         // consumers read the in-memory fields above; the disk cache is only for
@@ -142,7 +196,7 @@ public class GpsMonitor {
         // whenever a 2-second IPC update happened to land inside a fixed
         // 2s window, which produced bursts of identical log lines.
         long now = System.currentTimeMillis();
-        if (hasLocation() && now - lastLoggedAt >= LOG_INTERVAL_MS) {
+        if (fix.hasLocation() && now - lastLoggedAt >= LOG_INTERVAL_MS) {
             lastLoggedAt = now;
             CameraDaemon.log(TAG + ": GPS: " + lat + ", " + lng + " (speed=" + speed + "m/s)");
         }
@@ -177,17 +231,20 @@ public class GpsMonitor {
 
     private void saveToCache() {
         // Only save if we have a valid location
-        if (!hasLocation()) return;
+        GpsFixSnapshot fix = fixSnapshot;
+        if (!fix.hasLocation()) return;
         
         try {
             JSONObject json = new JSONObject();
-            json.put("lat", latitude);
-            json.put("lng", longitude);
-            json.put("speed", speed);
-            json.put("heading", heading);
-            json.put("accuracy", accuracy);
-            json.put("altitude", altitude);
-            json.put("time", lastUpdate);
+            json.put("lat", fix.latitude);
+            json.put("lng", fix.longitude);
+            json.put("speed", fix.speed);
+            json.put("heading", fix.heading);
+            json.put("accuracy", fix.accuracy);
+            json.put("altitude", fix.altitude);
+            json.put("vAcc", fix.verticalAccuracy);
+            json.put("altMsl", fix.altitudeIsMsl);
+            json.put("time", fix.lastUpdate);
             // Deliberately NOT persisting fixElapsedMs: elapsedRealtime resets at
             // reboot, so a value from a prior boot is meaningless to compare. A
             // cache-loaded fix is loadedFromCache=true and the geo gate rejects it
@@ -235,15 +292,17 @@ public class GpsMonitor {
     private void loadFromCache() {
         // Try primary cache first (daemon tmp)
         if (loadFromCacheFile(CACHE_FILE)) {
-            CameraDaemon.log(TAG + ": Loaded GPS from primary cache: " + latitude + ", " + longitude);
-            loadedFromCache = true;
+            GpsFixSnapshot fix = fixSnapshot;
+            CameraDaemon.log(TAG + ": Loaded GPS from primary cache: "
+                    + fix.latitude + ", " + fix.longitude);
             return;
         }
         
         // Try secondary cache (app data directory - written by LocationSidecarService)
         if (loadFromCacheFile(CACHE_FILE_APP)) {
-            CameraDaemon.log(TAG + ": Loaded GPS from app cache: " + latitude + ", " + longitude);
-            loadedFromCache = true;
+            GpsFixSnapshot fix = fixSnapshot;
+            CameraDaemon.log(TAG + ": Loaded GPS from app cache: "
+                    + fix.latitude + ", " + fix.longitude);
             return;
         }
         
@@ -273,17 +332,21 @@ public class GpsMonitor {
             // Always use cached location if valid — better than nothing
             // Fresh IPC updates from sidecar will overwrite this
             if (lat != 0.0 || lng != 0.0) {
-                this.latitude = lat;
-                this.longitude = lng;
-                this.speed = (float) json.optDouble("speed", 0.0);
-                this.heading = (float) json.optDouble("heading", 0.0);
-                this.accuracy = (float) json.optDouble("accuracy", 0.0);
-                this.altitude = json.optDouble("altitude", 0.0);
-                this.lastUpdate = json.optLong("time", 0);
                 // No monotonic basis for a cache-loaded fix (elapsedRealtime is
                 // cross-boot-incomparable); leave 0. The fix is loadedFromCache=true
                 // so the geo gate rejects it without needing an age anyway.
-                this.fixElapsedMs = 0L;
+                this.fixSnapshot = new GpsFixSnapshot(
+                        lat,
+                        lng,
+                        (float) json.optDouble("speed", 0.0),
+                        (float) json.optDouble("heading", 0.0),
+                        (float) json.optDouble("accuracy", 0.0),
+                        json.optDouble("altitude", 0.0),
+                        (float) json.optDouble("vAcc", 0.0),
+                        json.optBoolean("altMsl", false),
+                        json.optLong("time", 0),
+                        0L,
+                        true);
                 return true;
             }
             return false;
@@ -303,19 +366,24 @@ public class GpsMonitor {
     // ==================== PUBLIC GETTERS ====================
 
     public boolean isRunning() { return isRunning; }
-    public double getLatitude() { return latitude; }
-    public double getLongitude() { return longitude; }
-    public float getSpeed() { return speed; }
-    public float getHeading() { return heading; }
-    public float getAccuracy() { return accuracy; }
-    public double getAltitude() { return altitude; }
-    public long getLastUpdate() { return lastUpdate; }
+    public GpsFixSnapshot getFixSnapshot() { return fixSnapshot; }
+    public double getLatitude() { return fixSnapshot.latitude; }
+    public double getLongitude() { return fixSnapshot.longitude; }
+    public float getSpeed() { return fixSnapshot.speed; }
+    public float getHeading() { return fixSnapshot.heading; }
+    public float getAccuracy() { return fixSnapshot.accuracy; }
+    public double getAltitude() { return fixSnapshot.altitude; }
+    /** Reported 1-sigma vertical accuracy (m); 0 = unreported by the current fix. */
+    public float getVerticalAccuracy() { return fixSnapshot.verticalAccuracy; }
+    /** True when the current fix's altitude is MSL (geoid-corrected). */
+    public boolean isAltitudeMsl() { return fixSnapshot.altitudeIsMsl; }
+    public long getLastUpdate() { return fixSnapshot.lastUpdate; }
     /** Monotonic since-boot fix timestamp (elapsedRealtime ms) — what geo-tagging
      *  ages against the daemon's own elapsedRealtime(). 0 = no monotonic basis
      *  (older sidecar / cache-loaded); callers then fall back to send-time aging. */
-    public long getFixElapsedMs() { return fixElapsedMs; }
+    public long getFixElapsedMs() { return fixSnapshot.fixElapsedMs; }
     public String getProvider() { return "sidecar"; }
-    public boolean isMoving() { return speed > 1.0f; }
+    public boolean isMoving() { return fixSnapshot.isMoving(); }
 
     /**
      * True while the current fix originated from the persisted cache file (loaded at
@@ -325,32 +393,55 @@ public class GpsMonitor {
      * address). Cleared the moment a real IPC update lands (see {@link #updateFromIpc}).
      * Cheaper than {@link #getLocationJson()} for the recorder hot path.
      */
-    public boolean isLoadedFromCache() { return loadedFromCache; }
+    public boolean isLoadedFromCache() {
+        return fixSnapshot.loadedFromCache;
+    }
 
     public boolean hasLocation() {
-        return latitude != 0.0 || longitude != 0.0;
+        return fixSnapshot.hasLocation();
     }
 
     public JSONObject getLocationJson() {
+        GpsFixSnapshot fix = fixSnapshot;
         JSONObject json = new JSONObject();
         try {
-            json.put("lat", latitude);
-            json.put("lng", longitude);
-            json.put("speed", speed);
-            json.put("heading", heading);
-            json.put("accuracy", accuracy);
-            json.put("altitude", altitude);
-            json.put("lastUpdate", lastUpdate);
+            json.put("lat", fix.latitude);
+            json.put("lng", fix.longitude);
+            json.put("speed", fix.speed);
+            json.put("heading", fix.heading);
+            json.put("accuracy", fix.accuracy);
+            json.put("altitude", fix.altitude);
+            json.put("lastUpdate", fix.lastUpdate);
             json.put("provider", "sidecar");
-            json.put("isMoving", isMoving());
-            json.put("hasLocation", hasLocation());
+            json.put("isMoving", fix.isMoving());
+            json.put("hasLocation", fix.hasLocation());
             
-            // Add staleness indicator - location is stale if no update in 30 seconds
-            long ageMs = System.currentTimeMillis() - lastUpdate;
+            // Location and speed have different freshness contracts. The one-second
+            // sidecar keepalive intentionally refreshes lastUpdate even when the
+            // provider has not produced a new fix, so receive age is suitable for
+            // connection/location display but not for a live speed readout.
+            long ageMs = System.currentTimeMillis() - fix.lastUpdate;
+            long fixAgeMs;
+            if (fix.loadedFromCache) {
+                fixAgeMs = -1L;
+            } else if (fix.fixElapsedMs > 0L) {
+                fixAgeMs = Math.max(
+                        0L, SystemClock.elapsedRealtime() - fix.fixElapsedMs);
+            } else {
+                // Compatibility with an older sidecar that did not send the
+                // monotonic provider-fix timestamp.
+                fixAgeMs = Math.max(0L, ageMs);
+            }
             json.put("ageMs", ageMs);
             json.put("isStale", ageMs > 30000);
-            json.put("isCached", ageMs > 60000 || loadedFromCache); // Cached = no update in 60s OR loaded from cache file
-            json.put("loadedFromCache", loadedFromCache); // Explicitly indicate if loaded from persistent cache
+            json.put("isCached", ageMs > 60000 || fix.loadedFromCache); // Cached = no update in 60s OR loaded from cache file
+            json.put("loadedFromCache", fix.loadedFromCache); // Explicitly indicate if loaded from persistent cache
+            json.put("fixAgeMs",
+                    fixAgeMs >= 0L ? fixAgeMs : JSONObject.NULL);
+            json.put("isFixStale",
+                    fix.loadedFromCache
+                            || fixAgeMs < 0L
+                            || fixAgeMs > LIVE_SPEED_FIX_MAX_AGE_MS);
         } catch (Exception e) {
             // Ignore
         }
@@ -358,7 +449,10 @@ public class GpsMonitor {
     }
 
     public String getGoogleMapsUrl() {
-        if (!hasLocation()) return null;
-        return "https://www.google.com/maps/dir/?api=1&destination=" + latitude + "," + longitude + "&travelmode=driving";
+        GpsFixSnapshot fix = fixSnapshot;
+        if (!fix.hasLocation()) return null;
+        return "https://www.google.com/maps/dir/?api=1&destination="
+                + fix.latitude + "," + fix.longitude
+                + "&travelmode=driving";
     }
 }

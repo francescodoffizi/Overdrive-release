@@ -57,7 +57,10 @@ BYD.recording = {
         // Dynamic per-volume ceilings; server pulls these from live StatFs.
         maxLimitMb: 100000,
         maxLimitMbSdCard: 100000,
-        maxLimitMbUsb: 100000
+        maxLimitMbUsb: 100000,
+        // Combined-limit advisory (one entry per targeted volume). See
+        // shared/storage-budget.js — rendered, never enforced.
+        storageBudget: []
     },
     cdrInfo: null,
     savedConfig: null,
@@ -92,16 +95,20 @@ BYD.recording = {
         
         // Reload config when page becomes visible (user switches back to tab)
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible' && !this.hasUnsavedChanges) {
+            // reloadConfig self-gates on hasUnsavedChanges (and falls back to the
+            // banner-only refresh when dirty), so no second gate here — returning to a
+            // dirty tab should still pick up a peer page's limit change.
+            if (document.visibilityState === 'visible') {
                 this.reloadConfig();
             }
         });
         
         // SOTA: More frequent config refresh (every 10s) to catch app UI changes quickly
         setInterval(() => {
-            if (!this.hasUnsavedChanges) {
-                this.reloadConfig();
-            }
+            // Unconditional: reloadConfig self-gates on hasUnsavedChanges and, when
+            // dirty, refreshes only the overcommit banner (which writes no control).
+            // Gating here as well would leave a dirty page's banner stale forever.
+            this.reloadConfig();
             // Skip 2 of every 3 ticks while the recordings index is down
             // (10s → 30s effective) so a permanently-down index doesn't get
             // polled 6×/min for as long as the page stays open.
@@ -137,8 +144,16 @@ BYD.recording = {
     
     async reloadConfig() {
         // Only reload if no unsaved changes
-        if (this.hasUnsavedChanges) return;
-        
+        if (this.hasUnsavedChanges) {
+            // ...but the overcommit advisory still must track PEER pages: it's a
+            // function of the other categories' limits, so a dirty page would
+            // otherwise keep asserting an overcommit the user already fixed elsewhere
+            // (or stay silent about a new one) for as long as it stays dirty. Safe to
+            // run while dirty because it writes no control — only the banner.
+            this.refreshBudgetOnly();
+            return;
+        }
+
         try {
             const resp = await fetch('/api/settings/quality');
             const data = await resp.json();
@@ -422,6 +437,7 @@ BYD.recording = {
                 // fallback to internal; drives the honest banner copy below.
                 this.storageInfo.recordingsEffectiveLimitMb = data.recordingsEffectiveLimitMb || 0;
                 this.storageInfo.recordingsPath = data.recordingsPath || '';
+                this.storageInfo.storageBudget = data.storageBudget || [];
 
                 this.updateStorageLimitUI();
                 this.updateStorageTypeUI();
@@ -494,8 +510,11 @@ BYD.recording = {
                 };
 
                 // Used = everything the recordings quota actually holds
-                // (cam_* + replay_*), matching the server-side reaper.
-                const usedBytes = (counts.normal.bytes || 0) + (counts.replay.bytes || 0);
+                // (cam_*/dvr_* + replay_* + proximity_*), matching the server-side
+                // reaper. Proximity shares the recordings cap, so leaving it out made
+                // the bar read "in cap" while dashcam clips were being deleted.
+                const usedBytes = (counts.normal.bytes || 0) + (counts.replay.bytes || 0)
+                    + (counts.proximity.bytes || 0);
                 if (usedEl) usedEl.textContent = BYD.i18n.t('recording.storage_used', {size: this.formatSize(usedBytes)});
 
                 const limitMb = this.config.recordingsLimitMb || 500;
@@ -585,6 +604,37 @@ BYD.recording = {
         const maxLabel = document.getElementById('recLimitMax');
         if (minLabel) minLabel.textContent = BYD.i18n.t('recording.unit_mb', {n: 100});
         if (maxLabel) maxLabel.textContent = maxLimit >= 1000 ? BYD.i18n.t('recording.unit_gb', {n: (maxLimit / 1000)}) : BYD.i18n.t('recording.unit_mb', {n: maxLimit});
+
+        this.updateBudgetBanner();
+    },
+
+    /**
+     * Render the combined-limit advisory. Passes the CURRENT (possibly unsaved)
+     * slider value as pending so the warning appears while dragging, not only
+     * after Apply. Guarded on the shared module being present so a cached page
+     * without the new script tag doesn't throw.
+     */
+    updateBudgetBanner() {
+        if (!BYD.storageBudget) return;
+        BYD.storageBudget.render('recBudgetBanner', this.storageInfo.storageBudget,
+            'recordings', this.config.recordingsLimitMb, this.config.recordingsStorageType);
+    },
+
+    /**
+     * Re-read ONLY the storage budget and re-render the advisory — for the dirty-page
+     * case, where the full reloadConfig is (correctly) suppressed to protect unsaved
+     * edits. Writes no control, so it is safe with edits in flight; the pending slider
+     * value in this.config is what the banner renders against either way.
+     */
+    async refreshBudgetOnly() {
+        if (!BYD.storageBudget) return;
+        try {
+            const resp = await fetch('/api/settings/storage');
+            const data = await resp.json();
+            if (!data || !data.success || !data.storageBudget) return;
+            this.storageInfo.storageBudget = data.storageBudget;
+            this.updateBudgetBanner();
+        } catch (e) { /* advisory only — keep the last render */ }
     },
     
     updateStorageTypeUI() {
@@ -941,6 +991,9 @@ BYD.recording = {
         this.config.recordingsLimitMb = parseInt(value);
         const v = parseInt(value);
         document.getElementById('recLimitValue').textContent = v >= 1000 ? BYD.i18n.t('recording.unit_gb', {n: (v / 1000)}) : BYD.i18n.t('recording.unit_mb', {n: v});
+        // Live advisory while dragging — the point at which the user crosses the
+        // volume's capacity is exactly when they need to know.
+        this.updateBudgetBanner();
         this.markChanged();
     },
 

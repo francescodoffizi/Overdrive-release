@@ -52,6 +52,13 @@ public class LocationSidecarService extends Service implements LocationListener 
     private volatile float heading = 0.0f;
     private volatile float accuracy = 0.0f;
     private volatile double altitude = 0.0;
+    // Reported 1-sigma vertical accuracy (m); 0 = unreported by this fix. Flows
+    // to the daemon so the trip recorder can gate elevation on it.
+    private volatile float verticalAccuracy = 0.0f;
+    // True when `altitude` is MSL (geoid-corrected) rather than ellipsoidal.
+    // Per-fix flag: an intermittent HAL can flip sources mid-trip, and the
+    // ~tens-of-metres geoid step must reset elevation deltas, not bank as climb.
+    private volatile boolean altitudeIsMsl = false;
     // MONOTONIC since-boot timestamp (SystemClock.elapsedRealtime ms) of the GPS
     // fix currently published — distinct from the "time" field we send (send/
     // receive-time, on purpose, for the RoadSense 5s cutoff + puck dead-reckon
@@ -460,8 +467,20 @@ public class LocationSidecarService extends Service implements LocationListener 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
                 && location.hasMslAltitude()) {
             altitude = location.getMslAltitudeMeters();
+            altitudeIsMsl = true;
         } else {
             altitude = location.hasAltitude() ? location.getAltitude() : 0.0;
+            altitudeIsMsl = false;
+        }
+        // Vertical accuracy: MSL fixes carry their own figure; otherwise use the
+        // standard per-fix vertical accuracy. 0 = unreported (consumers treat it
+        // as "no gate available", never as a perfect fix).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+                && location.hasMslAltitude() && location.hasMslAltitudeAccuracy()) {
+            verticalAccuracy = location.getMslAltitudeAccuracyMeters();
+        } else {
+            verticalAccuracy = location.hasVerticalAccuracy()
+                    ? location.getVerticalAccuracyMeters() : 0.0f;
         }
         // Fix age basis = the MONOTONIC since-boot clock, NOT UTC getTime(). The
         // earlier attempt used location.getTime() (GNSS-UTC) and aged it against
@@ -520,8 +539,13 @@ public class LocationSidecarService extends Service implements LocationListener 
 
             if (isFirstFix) {
                 Log.i(TAG, "First location fix: " + latitude + ", " + longitude);
-            } else if (com.overdrive.app.BuildConfig.DEBUG) {
-                // Individual fixes go to DEBUG; only shown if explicitly requested in logcat.
+            } else if (Log.isLoggable(TAG, Log.DEBUG)) {
+                // Opt-in per fix. The gate has to be isLoggable, not BuildConfig.DEBUG: that
+                // is a compile-time constant which is true for every debug build, so the line
+                // always ran at the provider's 1 Hz, and Log.d reaches logcat regardless —
+                // there was no mechanism behind "only shown if explicitly requested". Enable
+                // at runtime, no reinstall:
+                //   adb shell setprop log.tag.LocationSidecar DEBUG
                 Log.d(TAG, "Location update (moved=" + String.format("%.1f", distanceMoved) + "m): " + latitude + ", " + longitude);
             }
             
@@ -695,6 +719,11 @@ public class LocationSidecarService extends Service implements LocationListener 
             json.put("heading", heading);
             json.put("accuracy", accuracy);
             json.put("altitude", altitude);
+            // Vertical accuracy + altitude source for the elevation pipeline
+            // (TripTelemetryRecorder → ElevationEstimator). Older daemons ignore
+            // unknown keys; a missing key on the daemon side defaults to 0/false.
+            json.put("vAcc", verticalAccuracy);
+            json.put("altMsl", altitudeIsMsl);
             // SEND-TIME (receive-time), NOT the GPS fix's own getTime(). This field flows
             // to GpsMonitor.lastUpdate, which LocationSource.latest() ages against a 5 s
             // cutoff (DEFAULT_MAX_FIX_AGE_MS); a fresh re-send must read as fresh. Stamping

@@ -21,11 +21,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Main Camera Daemon - orchestrates all camera operations.
- * 
+ *
  * Runs as a standalone process via app_process:
  *   adb shell "CLASSPATH=/data/app/.../base.apk app_process / \
  *       com.overdrive.app.daemon.CameraDaemon [outputDir] [nativeLibDir]"
- * 
+ *
  * Components:
  * - TcpCommandServer: JSON commands on port 19876
  * - HttpServer: Web UI and H.264 streaming on port 8080
@@ -36,7 +36,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class CameraDaemon {
 
     private static final String TAG = "CameraDaemon";
-    
+
     // ==================== ENCRYPTED CONSTANTS (SOTA Java obfuscation) ====================
     // Decrypted at runtime via Safe.s() - AES-256-CBC with stack-based key reconstruction
     /** com.overdrive.app */
@@ -49,13 +49,13 @@ public class CameraDaemon {
     private static String PATH_STREAM_MODE_FILE() { return Safe.s("ZHx6IP38aGV/Q7iMCCcxz4A79W/sQd0NkqiGs/MIZWo="); }
     /** /data/local/tmp/.byd_device_id */
     private static String PATH_DEVICE_ID_FILE() { return Safe.s("ZHx6IP38aGV/Q7iMCCcxz8mvs/gQENVv3FEZ6OVKD54="); }
-    
+
     // ==================== CONFIGURATION ====================
     public static final int TCP_PORT = 19876;
     public static final int HTTP_PORT = 8080;
     public static String STREAM_DIR() { return PATH_CAMERA_STREAM_DIR(); }
     public static final String APP_STREAM_DIR = "/storage/emulated/0/Android/data/com.overdrive.app/files/stream";
-    
+
     // Recording config defaults. Runtime panoramic geometry comes from
     // CameraConfigResolver; these stay as legacy-profile fallbacks for code
     // paths that still read the daemon constants directly.
@@ -69,29 +69,35 @@ public class CameraDaemon {
     public static final int BITRATE = 4_000_000;
     public static final int KEYFRAME_INTERVAL = 2;
     public static final long SEGMENT_DURATION_MS = 2 * 60 * 1000;
-    
+
     // Streaming config (SIM-optimized)
     public static final int STREAM_WIDTH = 640;
     public static final int STREAM_HEIGHT = 480;
     public static final int STREAM_JPEG_QUALITY = 70;  // Increased from 40 for better quality
     public static final long STREAM_INTERVAL_MS = 100;
-    
+
     // ==================== STATE ====================
     private static final AtomicBoolean running = new AtomicBoolean(true);
+    private static final AtomicBoolean shutdownStarted = new AtomicBoolean(false);
+    private static final AtomicBoolean forceTerminationStarted = new AtomicBoolean(false);
+    private static final long TERMINAL_SHUTDOWN_BUDGET_MS = 20_000L;
+    private static final Object TERMINAL_SHUTDOWN_GUARD_LOCK = new Object();
+    private static Thread terminalShutdownGuard;
+    private static Runnable terminalShutdownHandlerCallback;
     private static Handler mainHandler;
     private static String outputDir = null; // Initialized in main()
     private static String nativeLibDir = null; // Initialized in parseArguments()
-    
+
     // ==================== LOGGING ====================
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
-    
+
     // ==================== SERVERS ====================
     private static TcpCommandServer tcpServer;
     private static HttpServer httpServer;
     private static SurveillanceIpcServer ipcServer;
     private static com.overdrive.app.server.AacIngestServer aacIngestServer;
     private static AccMonitor accMonitor;
-    
+
     // ==================== SURVEILLANCE ====================
     // Volatile because static onAccStateChanged / onGearChanged / IPC
     // handlers + pendingAccOff drain read this from arbitrary threads
@@ -132,15 +138,20 @@ public class CameraDaemon {
     // Mutually exclusive with pendingAccOff — setting one always clears the
     // other so the drain order is unambiguous.
     private static volatile boolean pendingAccOn = false;
+    // Generation of the ACC transition represented by the pending flag. A
+    // drain must claim this token and revalidate it before replaying; otherwise
+    // an old init/retry drain can resurrect the opposite state after a newer
+    // edge has already arrived.
+    private static long pendingAccTransitionGeneration = 0L;
 
-    // DiLink 4 post-ACC-OFF camera-open grace duration. esco hardcodes 60 s
+    // DiLink 4 post-ACC-OFF camera-open grace duration. oem hardcodes 60 s
     // (FlameoutService p111dh/C4995i.java:407 m22726w(60_000L)). Earlier
     // AVMCamera.open races the MCU/ISP power-down and yields all-zero
     // frames forever. The actual gate lives in PanoramicCameraGpu and
     // covers ALL open paths (sentry, streaming, OEM, recording-mode).
     // Legacy fleet never arms it.
     private static final long DILINK4_SENTRY_DEFER_MS = 60_000L;
-    
+
     // ==================== DOOR LOCK GATE (surveillance arm/disarm) ====================
     // Lock detection runs in CameraDaemon's process where cloud MQTT is active.
     // Surveillance is only armed after doors are locked (reduces false triggers from owner exiting).
@@ -163,23 +174,43 @@ public class CameraDaemon {
     // even when MQTT is healthy), so device-SDK and polling exist as
     // independent backups rather than as a fallback chain.
     private static com.overdrive.app.byd.cloud.BydCloudDataProvider.CloudLockStateListener cloudLockListener = null;
+    private static final long MANAGED_THREAD_JOIN_MS = 500L;
+    private static final Object unlockPollThreadLock = new Object();
     private static Thread unlockPollThread = null;
+    private static long unlockPollThreadGeneration;
+    private static final Object doorLockTimeoutLock = new Object();
+    private static Thread doorLockTimeoutThread = null;
+    private static long doorLockTimeoutGeneration;
     // Reverse watchdog: periodically queries hardware ACC state and force-
     // disables surveillance if ACC went ON without an event reaching us.
     // Symmetric counterpart to the ACC-OFF DoorLockTimeout that force-arms.
+    private static final Object accOnDisarmWatchdogLock = new Object();
     private static Thread accOnDisarmWatchdog = null;
+    private static long accOnDisarmWatchdogGeneration;
     private static final long ACC_ON_DISARM_POLL_INTERVAL_MS = 5_000;
     private static final long DOOR_LOCK_ARM_TIMEOUT_MS = 60_000;  // 60s grace period
     private static final long UNLOCK_POLL_INTERVAL_MS = 5_000;
     private static final int DOOR_STATE_INVALID = 0;
     private static final int DOOR_STATE_UNLOCK = 1;
     private static final int DOOR_STATE_LOCK = 2;
-    
+    private static final long DOOR_LOCK_QUERY_TIMEOUT_MS = 750L;
+    private static final long HARDWARE_QUERY_RECOVERY_GRACE_MS = 2_000L;
+    private static final java.util.concurrent.atomic.AtomicReference<Thread>
+            DOOR_LOCK_QUERY_WORKER = new java.util.concurrent.atomic.AtomicReference<>();
+    private static final java.util.concurrent.atomic.AtomicLong
+            DOOR_LOCK_QUERY_STUCK_DEADLINE_NANOS =
+                new java.util.concurrent.atomic.AtomicLong();
+
     // ==================== RECORDING MODE MANAGER ====================
     // Volatile: read by static onGearChanged/onAccStateChanged/onSafeZoneEnter
     // from arbitrary threads. See gpuPipeline volatile rationale.
     private static volatile com.overdrive.app.recording.RecordingModeManager recordingModeManager;
-    
+    // Published immediately before the fully constructed manager reference for the current
+    // pipeline, and cleared before either owner begins teardown/replacement. Probe handoff may
+    // only be promised while this ownership pair is intact.
+    private static volatile com.overdrive.app.surveillance.GpuSurveillancePipeline
+        recordingModeManagerPipelineOwner;
+
     // ==================== AVC HAL KEEP-ALIVE ====================
     // Keeps com.byd.avc alive while ACC is ON and pipeline is running.
     // Prevents BYD system from killing the camera app, which destabilizes
@@ -191,19 +222,19 @@ public class CameraDaemon {
     // gets stopped (the field holds only the second instance).
     private static volatile com.overdrive.app.camera.AvcHalWarmup avcHalWarmup;
     private static final Object AVC_WARMUP_INIT_LOCK = new Object();
-    
+
     // ==================== STREAM MODE ====================
     public static final String STREAM_MODE_PRIVATE = "private";  // Local H.264 only
     public static final String STREAM_MODE_PUBLIC = "public";    // Tunnel access
     // Volatile: read/written from HTTP threads + boot init thread.
     private static volatile String streamMode = STREAM_MODE_PRIVATE;
-    
+
     // ==================== DEVICE ID ====================
     // Volatile: written once at boot, read from many threads. Volatile
     // documents the contract and protects future refactors that might read
     // it before the writing thread starts a worker.
     private static volatile String deviceId = "unknown";
-    
+
     // ==================== ABRP TELEMETRY ====================
     // All four below are volatile for the same reason as gpuPipeline /
     // recordingModeManager: cross-thread reads from IPC + HTTP + monitor
@@ -218,6 +249,17 @@ public class CameraDaemon {
     // ==================== TRIP ANALYTICS ====================
     private static volatile com.overdrive.app.trips.TripAnalyticsManager tripAnalyticsManager;
     private static volatile java.util.concurrent.CompletableFuture<Void> tripAnalyticsInitFuture;
+    private static final Object TRIP_ANALYTICS_LIFECYCLE_LOCK = new Object();
+    private static final java.util.concurrent.atomic.AtomicBoolean
+            TRIP_ANALYTICS_SHUTDOWN_REQUESTED =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    // Camera/EGL watchdog restarts are not trip ends. The coordinator checkpoints
+    // the open journal before setting this flag; the shutdown hook then releases
+    // camera resources without finalizing the trip into a separate card.
+    private static final java.util.concurrent.atomic.AtomicBoolean
+            PROCESS_RESTART_REQUESTED = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static volatile boolean processRestartIntent;
 
     // ==================== CHARGING ANALYTICS ====================
     private static volatile com.overdrive.app.charging.ChargingSessionManager chargingSessionManager;
@@ -247,6 +289,37 @@ public class CameraDaemon {
     // the re-publication has no happens-before guarantee for arbitrary
     // readers (HTTP, monitors, IPC).
     private static volatile android.content.Context sharedAppContext = null;
+
+    // Raw ACC probes must never call AccMonitor.probeAccState(): that API writes the global ACC
+    // cache and dispatches panel/cluster effects before CameraDaemon can validate its observation
+    // generation. This lock serializes side-effect-free bodywork reads instead.
+    private static final Object ACC_HARDWARE_PROBE_LOCK = new Object();
+    private static final long RAW_ACC_PROBE_CALL_TIMEOUT_MS = 1_000L;
+    private static final java.util.concurrent.atomic.AtomicReference<Thread>
+            RAW_ACC_PROBE_WORKER = new java.util.concurrent.atomic.AtomicReference<>();
+    private static final java.util.concurrent.atomic.AtomicLong
+            RAW_ACC_PROBE_STUCK_DEADLINE_NANOS =
+                new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicBoolean
+            HARDWARE_QUERY_PROCESS_RECOVERY_REQUESTED =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static final java.util.concurrent.atomic.AtomicBoolean
+            DEFERRED_ACC_VALIDATION_IN_FLIGHT =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static volatile java.lang.reflect.Method rawAccGetInstanceMethod;
+    private static volatile java.lang.reflect.Method rawAccGetPowerLevelMethod;
+    private static volatile boolean rawAccReflectionResolved;
+    private static volatile boolean rawAccReflectionFailed;
+
+    private static final class AccProbeResult {
+        final boolean accIsOff;
+        final boolean trustworthy;
+
+        AccProbeResult(boolean accIsOff, boolean trustworthy) {
+            this.accIsOff = accIsOff;
+            this.trustworthy = trustworthy;
+        }
+    }
 
     // ==================== INIT-SURVEILLANCE RETRY (audit R2) ====================
     // Cold-boot transients (AssetManager cookie=0, GpuSurveillancePipeline
@@ -282,24 +355,15 @@ public class CameraDaemon {
     private static final long CONTEXT_WATCHDOG_POLL_INTERVAL_MS = 2_000L;
     private static final long CONTEXT_WATCHDOG_MAX_DURATION_MS = 60_000L;
 
-    // CAS guard so at most one ACC-ON external-remount thread is alive at a time.
-    // The remount blocks up to the per-class mount ceiling (~15s), so a rapid ACC
-    // OFF→ON→OFF→ON flap (stop-start, cranking) — each genuine ON edge passing the
-    // onAccStateChanged dedup — would otherwise spawn a fresh thread per edge and
-    // pile up overlapping `sm mount`s. One in flight is enough; a drop that
-    // happens while it runs is caught by the free-running VolumeWatchdog anyway.
-    private static final java.util.concurrent.atomic.AtomicBoolean accOnRemountInFlight =
-        new java.util.concurrent.atomic.AtomicBoolean(false);
-    
     /** Get the shared app context (for use by other components in this process). */
     public static android.content.Context getAppContext() { return sharedAppContext; }
-    
+
     /** Check if the shared context is a broken fallback (null base). */
     private static boolean isContextBroken() {
         if (sharedAppContext == null) return true;
         return isContextBrokenFor(sharedAppContext);
     }
-    
+
     /** Check if a given context is a broken fallback (null base). */
     private static boolean isContextBrokenFor(android.content.Context ctx) {
         if (ctx == null) return true;
@@ -313,7 +377,7 @@ public class CameraDaemon {
         }
         return false;
     }
-    
+
     /**
      * Re-initialize components that depend on a valid app context.
      * Called on ACC ON after successfully recreating a broken context.
@@ -335,7 +399,7 @@ public class CameraDaemon {
         } catch (Exception e) {
             log("Cloud subscriber start failed: " + e.getMessage());
         }
-        
+
         // Re-init GearMonitor with valid context
         try {
             com.overdrive.app.monitor.GearMonitor gearMonitor = com.overdrive.app.monitor.GearMonitor.getInstance();
@@ -347,7 +411,7 @@ public class CameraDaemon {
         } catch (Exception e) {
             log("ACC ON: GearMonitor re-init failed: " + e.getMessage());
         }
-        
+
         // Re-init TelemetryDataCollector (BYD speed/gear/light devices were unavailable)
         try {
             if (telemetryDataCollector != null) {
@@ -357,67 +421,40 @@ public class CameraDaemon {
         } catch (Exception e) {
             log("ACC ON: TelemetryDataCollector re-init failed: " + e.getMessage());
         }
-        
+
         // Re-init RecordingModeManager if it wasn't created (sharedAppContext was null at init time)
         if (recordingModeManager == null && gpuPipeline != null) {
             try {
-                recordingModeManager = new com.overdrive.app.recording.RecordingModeManager(
-                    sharedAppContext, gpuPipeline);
+                com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline = gpuPipeline;
+                com.overdrive.app.recording.RecordingModeManager manager =
+                    new com.overdrive.app.recording.RecordingModeManager(
+                        sharedAppContext, pipeline);
+                recordingModeManagerPipelineOwner = pipeline;
+                recordingModeManager = manager;
                 log("ACC ON: RecordingModeManager created with valid context");
 
-                // FIX (audit R1, finding "Boot probe vs initSurveillance early-return
-                // when sharedAppContext null"): drain queued pendingAccOn/Off into the
-                // freshly-created rmm. Without this, the boot-time queue (drains at
-                // initSurveillance + boot-probe at :898) sits stagnant until the
-                // user toggles ACC again. Mirrors the dispatch shape used by the
-                // initSurveillance drains; gpuPipeline is non-null in this branch.
                 try {
-                    if (pendingAccOn) {
-                        log("ACC ON: replaying pending ACC ON to newly-created rmm");
-                        pendingAccOn = false;
-                        recordingModeManager.onAccStateChanged(true);
-                        // FIX (audit R7, finding "reinitContextDependentComponents
-                        // drain bypasses daemon-level ACC-ON side-effects"):
-                        // the daemon-level onAccStateChanged(true) path also
-                        // starts GearMonitor and forwards current gear so
-                        // DRIVE_MODE recording can fire on gear changes. The
-                        // direct rmm replay above skips that, so DRIVE_MODE
-                        // would be wedged until the next AccSentry 30 s
-                        // heartbeat re-runs the full daemon chain. Start
-                        // GearMonitor and replay current gear here so
-                        // DRIVE_MODE recording is live immediately.
-                        try {
-                            com.overdrive.app.monitor.GearMonitor gm =
-                                com.overdrive.app.monitor.GearMonitor.getInstance();
-                            if (!gm.isRunning()) {
-                                try {
-                                    gm.start();
-                                    log("ACC ON drain: GearMonitor started (was not running)");
-                                } catch (Exception e) {
-                                    log("ACC ON drain: GearMonitor start failed: " + e.getMessage());
-                                }
-                            }
-                            if (gm.isRunning()) {
-                                int curGear = gm.getCurrentGear();
-                                log("ACC ON drain: replaying current gear=" + curGear + " to rmm");
-                                recordingModeManager.onGearChanged(curGear);
-                            }
-                        } catch (Throwable gt) {
-                            log("WARN: GearMonitor drain on context-recreate failed: " + gt.getMessage());
+                    long pendingGeneration = claimPendingAccState(false);
+                    if (pendingGeneration != 0L) {
+                        log("ACC ON: replaying pending full ACC ON transition");
+                        onAccStateChanged(false, pendingGeneration);
+                    } else {
+                        pendingGeneration = claimPendingAccState(true);
+                        if (pendingGeneration != 0L) {
+                            log("ACC ON: replaying pending full ACC OFF transition");
+                            onAccStateChanged(true, pendingGeneration);
                         }
-                    } else if (pendingAccOff) {
-                        log("ACC ON: replaying pending ACC OFF to newly-created rmm");
-                        pendingAccOff = false;
-                        recordingModeManager.onAccStateChanged(false);
                     }
                 } catch (Throwable t) {
                     log("WARN: rmm drain on context-recreate failed: " + t.getMessage());
+                    forceLatestAccStateReconciliation(
+                        "context-recreate pending replay failure");
                 }
             } catch (Exception e) {
                 log("ACC ON: RecordingModeManager creation failed: " + e.getMessage());
             }
         }
-        
+
         // Re-init VehicleDataMonitor
         try {
             com.overdrive.app.monitor.VehicleDataMonitor vehicleMonitor =
@@ -443,6 +480,27 @@ public class CameraDaemon {
             initNotifications();
         } catch (Exception e) {
             log("ACC ON: notifications re-init failed: " + e.getMessage());
+        }
+    }
+
+    /** Context watchdog re-entry is asynchronous to ACC IPC delivery. */
+    private static void reinitContextDependentComponentsForCurrentAccState() {
+        final long generation;
+        final Boolean accIsOff;
+        synchronized (parkTerminateLock) {
+            generation = accTransitionGeneration;
+            accIsOff = latestAccIsOff;
+        }
+        if (accIsOff != null
+                && !isAccTransitionCurrent(generation, accIsOff.booleanValue())) {
+            log("Context-dependent reinit skipped — ACC transition was superseded");
+            return;
+        }
+        reinitContextDependentComponents();
+        if (accIsOff != null
+                && !isAccTransitionCurrent(generation, accIsOff.booleanValue())) {
+            forceLatestAccStateReconciliation(
+                "stale context-dependent component reinitialization");
         }
     }
 
@@ -517,13 +575,18 @@ public class CameraDaemon {
         // Global exception handler - NEVER let the daemon die from uncaught exceptions
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
             if (!(throwable instanceof ThreadDeath)) {
-                log("FATAL: Uncaught exception in " + thread.getName() + ": " + throwable.getMessage());
-                if (throwable.getCause() != null) {
-                    log("  Cause: " + throwable.getCause().getMessage());
-                }
-                // Log stack trace
-                for (StackTraceElement element : throwable.getStackTrace()) {
-                    log("    at " + element.toString());
+                log("FATAL: Uncaught exception in " + thread.getName() + ": " + throwable);
+                Throwable current = throwable;
+                int depth = 0;
+                while (current != null && depth < 8) {
+                    if (depth > 0) {
+                        log("  Caused by: " + current);
+                    }
+                    for (StackTraceElement element : current.getStackTrace()) {
+                        log("    at " + element);
+                    }
+                    current = current.getCause();
+                    depth++;
                 }
                 // DO NOT kill the daemon - just log and continue
                 // The daemon should stay alive even if individual operations fail
@@ -535,12 +598,12 @@ public class CameraDaemon {
 
         // Parse arguments (sets outputDir if provided)
         parseArguments(args);
-        
+
         // Initialize outputDir if not set by arguments
         if (outputDir == null) {
             outputDir = PATH_CAMERA_OUTPUT_DIR();
         }
-        
+
         // Load native libraries
         loadNativeLibraries();
 
@@ -567,13 +630,13 @@ public class CameraDaemon {
         new File(outputDir).mkdirs();
         new File(STREAM_DIR()).mkdirs();
         new File(APP_STREAM_DIR).mkdirs();
-        
+
         // Generate device ID
         generateDeviceId();
-        
+
         log("Output dir: " + outputDir);
         log("Device ID: " + deviceId);
-        
+
         // Camera scan disabled — opening/closing all camera IDs can briefly
         // disrupt the BYD dashcam. Camera ID is auto-detected in GpuSurveillancePipeline.init()
         // scanCameras();
@@ -638,10 +701,21 @@ public class CameraDaemon {
         // when ACC is confirmed OFF, so !it is our ON signal. turnOn() self-skips
         // when the screen already reads on, so this is a no-op on a normal boot.
         // Off-thread so we never delay HTTP/IPC startup on binder reflection.
+        final long panelProbeGeneration = captureAccObservationGeneration();
         new Thread(() -> {
             try {
-                if (!probeAccStateWithBackoff("panel-recovery")) {
+                AccProbeResult probe = probeAccStateWithBackoff("panel-recovery");
+                if (!probe.trustworthy) {
+                    log("Panel boot recovery skipped — ACC hardware state was not trustworthy");
+                } else if (!probe.accIsOff
+                        && isAccObservationCurrent(panelProbeGeneration)) {
                     com.overdrive.app.power.StealthPanel.turnOn(sharedAppContext);
+                    if (!isAccObservationCurrent(panelProbeGeneration)) {
+                        forceLatestAccStateReconciliation(
+                            "stale panel-recovery effect");
+                    }
+                } else if (!isAccObservationCurrent(panelProbeGeneration)) {
+                    log("Panel boot recovery skipped — ACC changed during hardware probe");
                 }
             } catch (Throwable t) {
                 log("Panel boot recovery failed: " + t.getMessage());
@@ -917,82 +991,32 @@ public class CameraDaemon {
         // the config object is in sync and handles any settings that need runtime application
         applyPersistedSettings();
 
-        // FIX (audit R1): drains were reading AccMonitor.isAccOn() which
-        // defaults to false BEFORE the AccMonitor::start IPC seed and BEFORE
-        // the recovery HW probe at :883. On daemon restart with ACC actually
-        // ON, the race-guard branch silently discarded pendingAccOn. Probe
-        // hardware directly here so the guard reflects ground truth, not the
-        // uninitialised AccMonitor cache. probeAccState returns accIsOff
-        // (true == OFF); invert for accIsOn semantics used below.
+        // The pending-ACC drain used to run HERE, as a ~100-line synchronous
+        // block on the startup thread. Field evidence (SD-outage review): the
+        // drain's onAccStateChanged dispatch can block for minutes on a
+        // wedged SD/USB volume — the daemon then never reaches "Daemon
+        // ready", the BYD collector never initialises, and every vehicle
+        // automation fails.
         //
-        // FIX (audit R4): probeAccState's sentinel branch returns `!accOn`,
-        // and at daemon boot accOn defaults to false → sentinel reading
-        // (powerLevel=4 FAKE_OK or 255 INVALID) lies "ACC OFF" and the
-        // pendingAccOn drain at :727 gets discarded falsely. Loop the probe
-        // up to 3× 200ms so transient HAL bluffs settle to a real reading
-        // before we treat probeAccState as authoritative.
-        boolean hwAccIsOff_drain = probeAccStateWithBackoff("drain");
-        boolean hwAccIsOn_drain = !hwAccIsOff_drain;
-
-        // If ACC went OFF before pipeline was ready, apply it now
-        // RACE CONDITION FIX: Also verify ACC is still OFF before applying.
-        // If ACC turned ON during pipeline init, the pending state is stale.
+        // It is now routed through the existing AccStateReconciler worker:
+        // reconcilePendingAccStateFromHardware() already implements the exact
+        // drain semantics (trustworthy HW probe + generation-current check +
+        // claimPendingAccState + agree→onAccStateChanged /
+        // disagree→onObservedAccStateChanged + resetPowerEdge), serialized
+        // and with bounded retries on an untrustworthy probe — strictly
+        // better than the one-shot inline block, which PRESERVED pending
+        // state on a bad probe and then had nobody to replay it.
         //
-        // FIX (audit R1, finding "Boot probe vs initSurveillance early-return
-        // when sharedAppContext null"): also gate the drain on
-        // recordingModeManager != null. initSurveillance() can leave gpuPipeline
-        // non-null while rmm is null when sharedAppContext could not be created
-        // (system_server transient at daemon respawn). Without this gate the
-        // drain would clear pendingAccOff/On and call onAccStateChanged on a
-        // pipeline whose rmm is still null — the side-effects fire but no
-        // recording gets started, and the flag is lost so the boot probe at
-        // :898 can't recover it. Preserve the pending flag so the boot probe
-        // (and any future rmm-init re-entry) can replay it.
-        if (pendingAccOff && gpuPipeline != null && recordingModeManager != null) {
-            if (!hwAccIsOn_drain) {
-                log("Applying pending ACC OFF surveillance request (HW-probed)...");
-                pendingAccOff = false;
-                onAccStateChanged(true);
-            } else {
-                log("Pending ACC OFF discarded — HW probe shows ACC ON (race condition guard)");
-                pendingAccOff = false;
-            }
-        } else if (pendingAccOff && gpuPipeline != null && recordingModeManager == null) {
-            log("WARN: Pending ACC OFF preserved — recordingModeManager null "
-                + "(initSurveillance early-return); deferring to boot probe / re-init");
-        }
-
-        // Symmetric drain: if an ACC ON IPC was queued while gpuPipeline was
-        // null (cold-boot dispatch ordering), fire it now so RecordingModeManager
-        // gets seeded and pano recording starts. Mirrors the ACC OFF drain
-        // above with the inverse hardware-state guard. gpuPipeline is non-null
-        // here, so onAccStateChanged takes the full dispatch path (no recursion
-        // back into this branch).
-        //
-        // FIX (audit R1, same finding as ACC OFF drain): preserve pendingAccOn
-        // when rmm is null. Otherwise dispatch's :3173 "recordingModeManager
-        // null on ACC ON — recording disabled" warning fires and the queued ON
-        // state is lost; the boot probe's `!pendingAccOn` gate at :903 then
-        // evaluates true on stale data and the recovery seed never fires.
-        if (pendingAccOn && gpuPipeline != null && recordingModeManager != null) {
-            if (hwAccIsOn_drain) {
-                log("Applying pending ACC ON request (HW-probed)...");
-                pendingAccOn = false;
-                onAccStateChanged(false);
-            } else {
-                log("Pending ACC ON discarded — HW probe shows ACC OFF (race condition guard)");
-                pendingAccOn = false;
-            }
-        } else if (pendingAccOn && gpuPipeline != null && recordingModeManager == null) {
-            log("WARN: Pending ACC ON preserved — recordingModeManager null "
-                + "(initSurveillance early-return); deferring to boot probe / re-init");
-        }
-        
-        // tcpServer / httpServer / ipcServer threads were spawned at the very top
-        // of main() (recovery-first startup). The ACC monitor is started here
-        // because the pendingAccOff check above must run first — otherwise an
-        // ACC OFF that arrives during initSurveillance() can be missed.
-        new Thread(accMonitor::start, "AccMonitor").start();
+        // Ordering note: the old comment demanded the drain run before
+        // accMonitor.start() so an ACC OFF arriving during initSurveillance()
+        // couldn't be missed. AccMonitor.start() is a documented NO-OP
+        // ("passive mode — ACC detection by AccSentryDaemon"), so there is no
+        // observer to order against; the reconciler's generation guards
+        // handle any live IPC event racing the replay. tcpServer /
+        // httpServer / ipcServer threads were spawned at the very top of
+        // main() (recovery-first startup).
+        requestAccTransitionReconciliation(true);
+        accMonitor.start();  // no-op (passive mode); kept for the log line
 
         // Initialize GPS monitor with app context for standard LocationManager access
         initGpsMonitor();
@@ -1055,6 +1079,9 @@ public class CameraDaemon {
         try {
             sohEstimator = new SohEstimator();
             sohEstimator.init();
+            if (!sohEstimator.isInitializationReady()) {
+                log("SohEstimator init deferred; auto-detection remains blocked");
+            }
         } catch (Exception e) {
             log("SohEstimator init error: " + e.getMessage());
         }
@@ -1080,53 +1107,18 @@ public class CameraDaemon {
                     com.overdrive.app.trips.TripAnalyticsManager tam =
                             new com.overdrive.app.trips.TripAnalyticsManager();
                     tam.init(sharedAppContext, telemetryDataCollector, sohEstSnapshot);
-                    tripAnalyticsManager = tam;
-                    // initSurveillance() runs synchronously on the main
-                    // thread BEFORE this thread is spawned, so
-                    // telemetryDataCollector is already published. Re-read
-                    // the volatile and forward defensively in case a future
-                    // refactor moves the parallel kick earlier — the
-                    // setTelemetryDataCollector call is idempotent.
-                    com.overdrive.app.telemetry.TelemetryDataCollector tdc = telemetryDataCollector;
-                    if (tdc != null) {
-                        try { tam.setTelemetryDataCollector(tdc); }
-                        catch (Throwable ignored) {}
+                    boolean initializedEnabled = tam.isEnabled();
+                    if (!publishTripAnalyticsManager(
+                            tam, sohEstSnapshot)) {
+                        log("Trip Analytics initialized after shutdown admission; "
+                                + "closing it without publication");
+                        tam.shutdown();
+                        return;
                     }
                     log("Trip Analytics initialized in "
                             + (System.currentTimeMillis() - t0) + "ms (enabled="
-                            + tam.isEnabled() + ")");
+                            + initializedEnabled + ")");
 
-                    // ONE-TIME migration: clear poisoned consumption buckets
-                    // if this is a PHEV and the migration hasn't been done.
-                    java.io.File bucketMigrationMarker = new java.io.File("/data/local/tmp/overdrive_bucket_migration_done");
-                    if (sohEstSnapshot != null && sohEstSnapshot.getNominalCapacityKwh() > 0
-                            && sohEstSnapshot.getNominalCapacityKwh() < 30.0
-                            && tam.getDatabase() != null
-                            && !bucketMigrationMarker.exists()) {
-                        tam.getDatabase().clearConsumptionBuckets();
-                        log("One-time PHEV bucket migration: cleared poisoned consumption data");
-                        try {
-                            new java.io.FileWriter(bucketMigrationMarker).close();
-                        } catch (Exception e) {
-                            log("WARNING: Could not write bucket migration marker: " + e.getMessage());
-                        }
-                    }
-
-                    // AUTO-START: if gear is non-P, start trip recording
-                    // (handles mid-drive daemon restart).
-                    if (tam.isEnabled()) {
-                        try {
-                            int currentGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
-                            if (currentGear != com.overdrive.app.monitor.GearMonitor.GEAR_P) {
-                                log("Trip Analytics: non-P gear detected at startup (gear="
-                                        + com.overdrive.app.monitor.GearMonitor.gearToString(currentGear)
-                                        + ") — auto-starting trip recording");
-                                tam.onGearChanged(currentGear);
-                            }
-                        } catch (Exception e) {
-                            log("Trip Analytics gear probe error: " + e.getMessage());
-                        }
-                    }
                 } catch (Exception e) {
                     log("Trip Analytics init error: " + e.getMessage());
                 } finally {
@@ -1158,12 +1150,27 @@ public class CameraDaemon {
         // Now that BydDataCollector is ready, detect car model for accurate capacity
         try {
             if (sohEstimator != null) {
-                sohEstimator.autoDetectCarModel(sharedAppContext);
-                sohEstimator.seedInitialEstimate();
-                log("SohEstimator: " + (sohEstimator.hasEstimate()
-                        ? String.format("%.1f%%", sohEstimator.getCurrentSoh())
-                        : "no estimate")
-                    + " (capacity: " + String.format("%.2f kWh", sohEstimator.getNominalCapacityKwh()) + ")");
+                if (!sohEstimator.isInitializationReady()) {
+                    // UnifiedConfig may have been briefly unavailable during
+                    // early boot. Retry the authoritative read, but never let
+                    // heuristics run while user-nominal authority is unknown.
+                    sohEstimator.init();
+                }
+                if (sohEstimator.isInitializationReady()) {
+                    sohEstimator.autoDetectCarModel(sharedAppContext);
+                    sohEstimator.seedInitialEstimate();
+                    // DB initialization happened above. Re-publish now that an
+                    // auto nominal may exist so startup calibration replay gets
+                    // another deterministic opportunity.
+                    com.overdrive.app.monitor.SocHistoryDatabase
+                        .getInstance().setSohEstimator(sohEstimator);
+                    log("SohEstimator: " + (sohEstimator.hasEstimate()
+                            ? String.format("%.1f%%", sohEstimator.getCurrentSoh())
+                            : "no estimate")
+                        + " (capacity: " + String.format("%.2f kWh", sohEstimator.getNominalCapacityKwh()) + ")");
+                } else {
+                    log("SohEstimator auto-detection deferred; config authority unavailable");
+                }
             }
         } catch (Exception e) {
             log("SohEstimator autoDetect error: " + e.getMessage());
@@ -1174,7 +1181,7 @@ public class CameraDaemon {
             log("Initializing ABRP telemetry...");
             AbrpConfig abrpConfig = new AbrpConfig();
             abrpConfig.load();
-            
+
             // Auto-set car_model in ABRP config if not already set
             if (sohEstimator != null && (abrpConfig.getCarModel() == null || abrpConfig.getCarModel().isEmpty())) {
                 double cap = sohEstimator.getNominalCapacityKwh();
@@ -1185,13 +1192,13 @@ public class CameraDaemon {
                     log("Auto-detected car model for ABRP: " + model + " (" + cap + " KWh)");
                 }
             }
-            
+
             abrpTelemetryService = new AbrpTelemetryService(abrpConfig, sohEstimator);
             abrpTelemetryService.init(sharedAppContext);
-            
+
             // Set IPC references so SurveillanceIpcServer can access ABRP
             SurveillanceIpcServer.setAbrpReferences(abrpConfig, abrpTelemetryService);
-            
+
             if (abrpConfig.isEnabled() && abrpConfig.isConfigured()) {
                 abrpTelemetryService.start();
                 log("ABRP telemetry started (token: " + abrpConfig.getMaskedToken() + ")");
@@ -1253,11 +1260,18 @@ public class CameraDaemon {
             // returns `!accOn` on sentinel power levels. Looping settles
             // transient HAL bluffs before we drop pano CONTINUOUS / DRIVE_MODE
             // mid-drive into a false sentry entry.
-            boolean accIsOff = probeAccStateWithBackoff("recovery");
-            if (accIsOff) {
+            long recoveryProbeGeneration = captureAccObservationGeneration();
+            AccProbeResult recoveryProbe = probeAccStateWithBackoff("recovery");
+            boolean accIsOff = recoveryProbe.accIsOff;
+            if (!recoveryProbe.trustworthy) {
+                log("RECOVERY: hardware probe was not trustworthy; awaiting live ACC admission");
+                requestTrustedAccHardwareRecovery("untrustworthy startup recovery probe");
+            } else if (!isAccObservationCurrent(recoveryProbeGeneration)) {
+                log("RECOVERY: hardware probe superseded by live ACC admission");
+            } else if (accIsOff) {
                 log("RECOVERY: Hardware probe shows ACC OFF — entering sentry mode");
-                onAccStateChanged(true);  // true = accIsOff
-            } else if (!pendingAccOn
+                onObservedAccStateChanged(true, recoveryProbeGeneration, "startup-recovery");
+            } else if (!hasPendingAccState(false)
                     && recordingModeManager != null
                     && !recordingModeManager.isAccOn()) {
                 // Symmetric ACC ON recovery: daemon restarted while car is on.
@@ -1274,7 +1288,7 @@ public class CameraDaemon {
                 // restart). lastDispatchedAccIsOff is null on cold boot, so the
                 // dedup short-circuit can't fire and the full chain runs once.
                 log("RECOVERY: Hardware probe shows ACC ON — dispatching full ACC ON chain");
-                onAccStateChanged(false);
+                onObservedAccStateChanged(false, recoveryProbeGeneration, "startup-recovery");
             } else if (!accIsOff && recordingModeManager == null) {
                 // FIX (audit R1): initSurveillance early-returned with
                 // sharedAppContext null, leaving rmm uncreated. The previous
@@ -1286,9 +1300,9 @@ public class CameraDaemon {
                 // the false default before any IPC arrives.
                 log("RECOVERY: Hardware probe shows ACC ON but RMM null — "
                     + "queuing pendingAccOn for delayed seed");
-                com.overdrive.app.monitor.AccMonitor.setAccState(true);
-                pendingAccOn = true;
-                pendingAccOff = false;
+                onObservedAccStateChanged(
+                    false, recoveryProbeGeneration,
+                    "startup-recovery/deferred");
             }
         } catch (Exception e) {
             log("ACC hardware probe error: " + e.getMessage());
@@ -1374,13 +1388,13 @@ public class CameraDaemon {
             }
         }
     }
-    
+
     /**
      * Applies persisted settings to the GPU pipeline after initialization.
      */
     private static void applyPersistedSettings() {
         if (gpuPipeline == null) return;
-        
+
         try {
             // Apply bitrate setting to config and encoder
             String bitrate = HttpServer.getRecordingBitrate();
@@ -1388,7 +1402,7 @@ public class CameraDaemon {
                 setRecordingBitrate(bitrate);
                 log("Applied persisted bitrate: " + bitrate);
             }
-            
+
             // Apply codec setting to config (encoder already created with this codec)
             String codec = HttpServer.getRecordingCodec();
             if (codec != null) {
@@ -1408,14 +1422,14 @@ public class CameraDaemon {
                 gpuPipeline.getConfig().setVideoCodec(videoCodec);
                 log("Applied persisted codec: " + codec);
             }
-            
+
             // Apply quality settings
             String recQuality = HttpServer.getRecordingQuality();
             if (recQuality != null) {
                 setRecordingQuality(recQuality);
                 log("Applied persisted recording quality: " + recQuality);
             }
-            
+
             String streamQuality = HttpServer.getStreamingQuality();
             if (streamQuality != null) {
                 setStreamingQuality(streamQuality);
@@ -1427,15 +1441,15 @@ public class CameraDaemon {
     }
 
     // ==================== CAMERA MANAGEMENT ====================
-    
+
     public static void startCamera(int viewId, boolean enableStreaming, boolean viewOnly) {
         if (viewId < 1 || viewId > 4) {
             log("ERROR: Invalid view ID: " + viewId);
             return;
         }
-        
+
         log("Starting camera " + viewId + " (GPU mosaic recording, viewOnly=" + viewOnly + ")");
-        
+
         // GPU pipeline handles all cameras together
         if (gpuPipeline != null && !gpuPipeline.isRunning()) {
             // If ACC is ON, warm up the camera HAL first on a background thread
@@ -1459,7 +1473,7 @@ public class CameraDaemon {
             }
         }
     }
-    
+
     /**
      * Internal: starts the GPU pipeline after any warmup delay.
      */
@@ -1468,16 +1482,16 @@ public class CameraDaemon {
         try {
             gpuPipeline.start(!viewOnly);
             log("GPU pipeline started for camera " + viewId);
-            
+
             if (!viewOnly) {
                 log("Auto-recording enabled (will start when recorder ready)");
             } else {
                 log("View-only mode - recording NOT started");
             }
-            
+
             // Start AVC keep-alive if ACC is ON
             startAvcKeepAliveIfNeeded();
-            
+
         } catch (Exception e) {
             log("ERROR: Failed to start GPU pipeline: " + e.getMessage());
         }
@@ -1486,7 +1500,7 @@ public class CameraDaemon {
     public static void stopCamera(int viewId) {
         stopCamera(viewId, false);
     }
-    
+
     /**
      * Stop a camera view.
      * @param viewId The view ID (1-4)
@@ -1495,7 +1509,7 @@ public class CameraDaemon {
     public static void stopCamera(int viewId, boolean forceStop) {
         try {
             log("Stopping camera " + viewId + " (GPU pipeline)");
-            
+
             // GPU pipeline handles all cameras
             // Only stop if forcing
             if (forceStop && gpuPipeline != null) {
@@ -1507,7 +1521,7 @@ public class CameraDaemon {
             log("ERROR: Exception in stopCamera(" + viewId + "): " + e.getMessage());
         }
     }
-    
+
     /**
      * Force stop a camera, even if recording.
      * Use this when user explicitly wants to stop everything.
@@ -1519,7 +1533,7 @@ public class CameraDaemon {
     public static void stopAllCameras() {
         stopAllCameras(true);
     }
-    
+
     /**
      * Stop all cameras.
      * @param forceStop If true, stops all cameras. If false, only stops non-recording cameras.
@@ -1531,12 +1545,12 @@ public class CameraDaemon {
             stopAvcKeepAlive();
         }
     }
-    
-    
+
+
     // GPU pipeline handles camera internally - no separate camera management needed
-    
+
     // ==================== AVC HAL KEEP-ALIVE ====================
-    
+
     /**
      * Starts the AVC keep-alive watchdog.
      *
@@ -1670,54 +1684,30 @@ public class CameraDaemon {
     }
 
     /**
-     * FIX (audit R4): wrap AccMonitor.probeAccState in a 3× 200ms backoff
-     * loop. probeAccState returns `!accOn` on sentinel HAL readings (powerLevel
-     * = 4 FAKE_OK or 255 INVALID), and at daemon boot accOn defaults to false,
-     * so a single sentinel read falsely reports "ACC OFF" — dropping pano
-     * CONTINUOUS / DRIVE_MODE recording into sentry mid-drive.
-     *
-     * Loops up to 3 attempts, 200ms apart, treating the first non-sentinel
-     * reading as authoritative. We can't see the raw power level from here
-     * (probeAccState is a boolean API) so we use a stability heuristic: if
-     * three successive readings agree, we trust the result. If they ever
-     * disagree, we keep the last reading (HAL is converging) and warn.
-     *
-     * Returns the same boolean as probeAccState (true == ACC OFF). On
-     * exception, falls back to the AccMonitor cache as before.
+     * Read bodywork power without mutating AccMonitor. A definitive result is admitted later via
+     * onObservedAccStateChanged(), which is the same generation-linearized path used by IPC edges.
      */
-    private static boolean probeAccStateWithBackoff(String tag) {
-        boolean lastReading = false;
-        boolean firstReadingSet = false;
-        int agreementCount = 0;
+    private static AccProbeResult probeAccStateWithBackoff(String tag) {
+        boolean lastReading = !com.overdrive.app.monitor.AccMonitor.isAccOn();
         for (int attempt = 0; attempt < 3; attempt++) {
-            try {
-                boolean reading = com.overdrive.app.monitor.AccMonitor
-                    .probeAccState(sharedAppContext);
-                if (!firstReadingSet) {
-                    lastReading = reading;
-                    firstReadingSet = true;
-                    agreementCount = 1;
-                } else if (reading == lastReading) {
-                    agreementCount++;
-                } else {
+            Integer level;
+            synchronized (ACC_HARDWARE_PROBE_LOCK) {
+                level = readRawAccPowerLevelBounded();
+            }
+            if (level != null && level >= 0 && level <= 3) {
+                boolean reading = level < 2;
+                if (reading != lastReading && attempt > 0) {
                     log("WARN: ACC HW probe (" + tag + ") disagreed across attempts "
                         + "(was=" + lastReading + " now=" + reading + " attempt="
-                        + attempt + ") — keeping latest");
-                    lastReading = reading;
-                    agreementCount = 1;
+                        + attempt + ")");
                 }
-                // Two agreeing reads is enough to short-circuit.
-                if (agreementCount >= 2) {
-                    if (attempt > 0) {
-                        log("ACC HW probe (" + tag + ") settled to accIsOff="
-                            + lastReading + " after " + (attempt + 1) + " attempts");
-                    }
-                    return lastReading;
-                }
-            } catch (Throwable t) {
-                log("WARN: ACC HW probe (" + tag + ") attempt " + attempt
-                    + " failed: " + t.getMessage());
+                lastReading = reading;
+                log("ACC HW probe (" + tag + ") returned trustworthy accIsOff="
+                    + reading + " level=" + level + " on attempt " + (attempt + 1));
+                return new AccProbeResult(reading, true);
             }
+            log("WARN: ACC HW probe (" + tag + ") attempt " + attempt
+                + " returned no clean power level; retrying");
             try {
                 Thread.sleep(200);
             } catch (InterruptedException ie) {
@@ -1725,17 +1715,176 @@ public class CameraDaemon {
                 break;
             }
         }
-        if (!firstReadingSet) {
-            // Every attempt threw — fall back to AccMonitor cache (same
-            // behaviour as the prior single-attempt catch branch).
-            boolean cacheFallback = !com.overdrive.app.monitor.AccMonitor.isAccOn();
-            log("WARN: ACC HW probe (" + tag + ") all attempts failed — "
-                + "falling back to AccMonitor cache accIsOff=" + cacheFallback);
-            return cacheFallback;
+        boolean cacheFallback = !com.overdrive.app.monitor.AccMonitor.isAccOn();
+        log("WARN: ACC HW probe (" + tag + ") remained untrustworthy; "
+            + "preserving state instead of admitting accIsOff=" + cacheFallback);
+        return new AccProbeResult(cacheFallback, false);
+    }
+
+    /**
+     * Deferred lock/schedule effects must not trust AccMonitor's potentially stale cache.
+     * The raw Binder read is isolated behind the existing bounded worker; an unavailable or
+     * ambiguous read fails closed and leaves the periodic watchdog/retry path to try again.
+     */
+    private static boolean validateAccOffForDeferredEffect(
+            long transitionGeneration, String tag) {
+        if (!isAccTransitionCurrent(transitionGeneration, true)) {
+            return false;
         }
-        log("WARN: ACC HW probe (" + tag + ") never reached agreement after 3 attempts; "
-            + "using last reading accIsOff=" + lastReading);
-        return lastReading;
+        if (!DEFERRED_ACC_VALIDATION_IN_FLIGHT.compareAndSet(false, true)) {
+            log("Skipping deferred " + tag
+                + " effect — ACC hardware validation already in flight");
+            return false;
+        }
+        long observationGeneration = captureAccObservationGeneration();
+        try {
+            Integer level;
+            synchronized (ACC_HARDWARE_PROBE_LOCK) {
+                level = readRawAccPowerLevelBounded();
+            }
+            if (!isAccObservationCurrent(observationGeneration)
+                    || observationGeneration != transitionGeneration) {
+                return false;
+            }
+            if (level == null || level < 0 || level > 3) {
+                log("Skipping deferred " + tag
+                    + " effect — current ACC hardware state is unavailable");
+                return false;
+            }
+            boolean accIsOff = level < 2;
+            if (!accIsOff) {
+                log("Skipping deferred " + tag
+                    + " effect — bounded hardware probe shows ACC ON");
+                onObservedAccStateChanged(
+                    false, observationGeneration, "deferred-" + tag);
+                return false;
+            }
+            return isAccTransitionCurrent(transitionGeneration, true);
+        } finally {
+            DEFERRED_ACC_VALIDATION_IN_FLIGHT.set(false);
+        }
+    }
+
+    private static Integer readRawAccPowerLevelBounded() {
+        Thread existing = RAW_ACC_PROBE_WORKER.get();
+        if (existing != null && existing.isAlive()) {
+            existing.interrupt();
+            escalateStuckHardwareQueryIfExpired(
+                RAW_ACC_PROBE_STUCK_DEADLINE_NANOS,
+                "raw ACC Binder query");
+            return null;
+        }
+        RAW_ACC_PROBE_STUCK_DEADLINE_NANOS.set(0L);
+
+        java.util.concurrent.atomic.AtomicReference<Integer> result =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        final Thread worker;
+        try {
+            worker = new Thread(() -> {
+                try {
+                    result.set(readRawAccPowerLevel());
+                } catch (Throwable failure) {
+                    log("Raw ACC power probe failed: " + failure.getMessage());
+                } finally {
+                    RAW_ACC_PROBE_WORKER.compareAndSet(
+                        Thread.currentThread(), null);
+                }
+            }, "RawAccPowerProbe");
+            worker.setDaemon(true);
+        } catch (Throwable creationFailure) {
+            log("Raw ACC power probe worker creation failed: "
+                + creationFailure.getMessage());
+            return null;
+        }
+        if (!RAW_ACC_PROBE_WORKER.compareAndSet(existing, worker)) {
+            return null;
+        }
+        try {
+            worker.start();
+        } catch (Throwable startFailure) {
+            RAW_ACC_PROBE_WORKER.compareAndSet(worker, null);
+            log("Raw ACC power probe worker start failed: "
+                + startFailure.getMessage());
+            return null;
+        }
+        try {
+            worker.join(RAW_ACC_PROBE_CALL_TIMEOUT_MS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            worker.interrupt();
+            return null;
+        }
+        if (worker.isAlive()) {
+            worker.interrupt();
+            armHardwareQueryRecoveryDeadline(
+                RAW_ACC_PROBE_STUCK_DEADLINE_NANOS);
+            log("Raw ACC power probe exceeded "
+                + RAW_ACC_PROBE_CALL_TIMEOUT_MS + "ms");
+            return null;
+        }
+        RAW_ACC_PROBE_WORKER.compareAndSet(worker, null);
+        RAW_ACC_PROBE_STUCK_DEADLINE_NANOS.set(0L);
+        return result.get();
+    }
+
+    private static void armHardwareQueryRecoveryDeadline(
+            java.util.concurrent.atomic.AtomicLong deadline) {
+        long recoveryDeadline = System.nanoTime()
+            + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                HARDWARE_QUERY_RECOVERY_GRACE_MS);
+        deadline.compareAndSet(0L, recoveryDeadline);
+    }
+
+    private static void escalateStuckHardwareQueryIfExpired(
+            java.util.concurrent.atomic.AtomicLong deadline,
+            String label) {
+        long value = deadline.get();
+        if (value == 0L) {
+            armHardwareQueryRecoveryDeadline(deadline);
+            return;
+        }
+        if (System.nanoTime() - value >= 0L) {
+            requestHardwareQueryProcessRecovery(
+                label + " remained stuck after "
+                    + HARDWARE_QUERY_RECOVERY_GRACE_MS + "ms");
+        }
+    }
+
+    private static void requestHardwareQueryProcessRecovery(
+            String reason) {
+        if (!HARDWARE_QUERY_PROCESS_RECOVERY_REQUESTED.compareAndSet(
+                false, true)) {
+            return;
+        }
+        log("Requesting trip-safe daemon restart: " + reason);
+        requestProcessRestartPreservingTrip(
+            "hardware query recovery: " + reason);
+    }
+
+    private static Integer readRawAccPowerLevel() throws Exception {
+        if (!rawAccReflectionResolved && !rawAccReflectionFailed) {
+            synchronized (CameraDaemon.class) {
+                if (!rawAccReflectionResolved && !rawAccReflectionFailed) {
+                    try {
+                        Class<?> cls = Class.forName(
+                            "android.hardware.bydauto.bodywork.BYDAutoBodyworkDevice");
+                        rawAccGetInstanceMethod = cls.getMethod(
+                            "getInstance", android.content.Context.class);
+                        rawAccGetPowerLevelMethod = cls.getMethod("getPowerLevel");
+                        rawAccReflectionResolved = true;
+                    } catch (Exception reflectionFailure) {
+                        rawAccReflectionFailed = true;
+                        throw reflectionFailure;
+                    }
+                }
+            }
+        }
+        if (!rawAccReflectionResolved) return null;
+        Object device = rawAccGetInstanceMethod.invoke(null, sharedAppContext);
+        if (device == null) return null;
+        Object value = rawAccGetPowerLevelMethod.invoke(device);
+        return value instanceof Number
+            ? Integer.valueOf(((Number) value).intValue()) : null;
     }
 
     private static boolean isDilink4ModeActive() {
@@ -1819,14 +1968,14 @@ public class CameraDaemon {
             log("writeCameraActiveLease failed: " + t.getMessage());
         }
     }
-    
+
     // ==================== GETTERS ====================
-    
+
     public static java.util.Map<Integer, Object> getVirtualViews() {
         // GPU pipeline doesn't use VirtualView - return empty map for compatibility
         return new java.util.HashMap<>();
     }
-    
+
     public static boolean isRunning() {
         return running.get();
     }
@@ -2016,7 +2165,7 @@ public class CameraDaemon {
      * To re-enable, delete this file and start the watchdog script again.
      */
     private static final String DISABLE_SENTINEL = "/data/local/tmp/camera_daemon.disabled";
-    
+
     public static void shutdown() {
         shutdownInternal(true);
     }
@@ -2034,33 +2183,444 @@ public class CameraDaemon {
      * corrupt.
      */
     public static void parkTerminate() {
+        final long generation;
+        synchronized (parkTerminateLock) {
+            if (!Boolean.TRUE.equals(latestAccIsOff)) {
+                log("parkTerminate ignored — latest admitted ACC state is not OFF");
+                return;
+            }
+            generation = accTransitionGeneration;
+        }
+        parkTerminate(generation);
+    }
+
+    private static boolean parkTerminate(long expectedGeneration) {
         log("onOnly parkTerminate — planting parked-shutdown marker + graceful shutdown");
-        writeParkedShutdownMarker();
-        shutdownInternal(false);
+        // Run any automation already triggered by this ACC-off edge (notably a "when power turns
+        // off" rule) BEFORE killing the process. The queue's worker is a daemon thread, so without
+        // this the trigger fires and the actions are lost to the exit. Twelve seconds covers one
+        // older serialized bridge attempt plus the latest command's bounded launch, physical
+        // readback and daemon fallback path, while still capping pauses/waits in unrelated action
+        // chains. Only already-due items run (a delayed rule cannot be honoured by a process that
+        // is about to exit).
+        try {
+            com.overdrive.app.automation.AutomationQueue.ShutdownDrainResult drain =
+                com.overdrive.app.automation.AutomationQueue.drainDueNowResult(12_000L);
+            if (drain.completed > 0) {
+                log("Ran " + drain.completed + " due automation(s) before park shutdown");
+            }
+            if (!drain.mayCommitShutdown()) {
+                log("parkTerminate deferred — automation drain still owns queued or running work");
+                abortUncommittedAutomationDrain("automation drain not quiescent");
+                markCurrentAccApplyRetry();
+                requestAccTransitionReconciliation(false);
+                return false;
+            }
+        } catch (Throwable t) {
+            log("Automation shutdown drain failed: " + t.getMessage());
+            abortUncommittedAutomationDrain("shutdown drain failure");
+            markCurrentAccApplyRetry();
+            requestAccTransitionReconciliation(false);
+            return false;
+        }
+
+        final boolean supersededAfterDrain;
+        synchronized (parkTerminateLock) {
+            supersededAfterDrain = expectedGeneration != accTransitionGeneration
+                || !Boolean.TRUE.equals(latestAccIsOff)
+                || !running.get();
+        }
+        if (supersededAfterDrain) {
+            log("parkTerminate canceled — ACC generation changed during shutdown drain");
+            abortUncommittedAutomationDrain("ACC changed during shutdown drain");
+            return false;
+        }
+
+        java.util.concurrent.atomic.AtomicBoolean markerAttempted =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+        boolean committed =
+            com.overdrive.app.automation.AutomationQueue.commitShutdownIfQuiescent(() -> {
+                markerAttempted.set(true);
+                if (!commitParkedShutdownMarker(expectedGeneration)) {
+                    return false;
+                }
+                // Keep AutomationQueue's commit lock until process termination. No producer can
+                // enqueue a due action after the final empty check and lose it to this exit.
+                shutdownInternal(false);
+                return true;
+            });
+        if (committed) {
+            return true;
+        }
+
+        abortUncommittedAutomationDrain(markerAttempted.get()
+            ? "parked marker commit failure"
+            : "automation queue changed before marker commit");
+        markCurrentAccApplyRetry();
+        requestAccTransitionReconciliation(false);
+        return false;
     }
 
     /**
-     * Write the parked-shutdown marker (epoch millis, chmod 666) so the watchdog scripts
-     * and the app-side health-check keep the stack down while parked. Distinct from the
-     * `.disabled` sentinel (see ParkedShutdown / writeDisableSentinel).
+     * Freeze ACC admission across the marker's atomic publication. The marker rename is the
+     * cross-process commit point; because onAccStateChanged also needs parkTerminateLock, no
+     * OFF->ON->OFF generation can cross that point or inherit another generation's commit.
      */
-    private static void writeParkedShutdownMarker() {
+    private static boolean commitParkedShutdownMarker(long expectedGeneration) {
+        synchronized (parkMarkerIoLock) {
+            synchronized (parkTerminateLock) {
+                if (expectedGeneration != accTransitionGeneration
+                        || !Boolean.TRUE.equals(latestAccIsOff)
+                        || !running.get() || parkShutdownCommitted) {
+                    return false;
+                }
+                if (!armTerminalShutdownDeadline()) {
+                    log("parkTerminate deferred — terminal deadline could not be armed");
+                    return false;
+                }
+
+                // Commit the exact OFF generation before the atomic rename can make the marker
+                // visible to another process. ACC admission stays frozen by parkTerminateLock.
+                parkShutdownCommitted = true;
+                parkShutdownCommitGeneration = expectedGeneration;
+                running.set(false);
+
+                boolean markerWritten =
+                    writeParkedShutdownMarker(expectedGeneration);
+                if (!markerWritten) {
+                    parkMarkerWriteFailed = true;
+                    boolean currentMarkerVisible =
+                        parkedShutdownMarkerBelongsToGeneration(
+                            expectedGeneration);
+                    boolean cleared = !currentMarkerVisible
+                        || clearParkedShutdownMarker();
+                    parkMarkerClearFailed = !cleared;
+                    if (currentMarkerVisible && !cleared) {
+                        // The current-generation marker crossed the atomic visibility point. Keep
+                        // the already-published generation commit and guarantee process exit.
+                        log("Parked marker rollback failed; retaining current OFF generation commit");
+                        parkMarkerWriteFailed = false;
+                        return true;
+                    }
+
+                    parkShutdownCommitted = false;
+                    parkShutdownCommitGeneration = 0L;
+                    running.set(true);
+                    disarmTerminalShutdownDeadline();
+                    log("parkTerminate deferred — parked marker was not durably written");
+                    return false;
+                }
+                parkMarkerWriteFailed = false;
+                parkMarkerClearFailed = false;
+                return true;
+            }
+        }
+    }
+
+    private static void abortUncommittedAutomationDrain(String reason) {
+        com.overdrive.app.automation.AutomationQueue.ShutdownDrainCancelResult result =
+            com.overdrive.app.automation.AutomationQueue.abortShutdownDrain(
+                2_000L, () -> forceLatestAccStateReconciliation(
+                    "late uncommitted-drain quiescence after " + reason));
+        if (result
+                == com.overdrive.app.automation.AutomationQueue.ShutdownDrainCancelResult.TIMED_OUT) {
+            log("Uncommitted automation drain is still quiescing after " + reason);
+        }
+    }
+
+    private static boolean isParkShutdownCommitted() {
+        synchronized (parkTerminateLock) {
+            return parkShutdownCommitted;
+        }
+    }
+
+    private static boolean isParkShutdownCommittedForGeneration(long generation) {
+        synchronized (parkTerminateLock) {
+            return parkShutdownCommitted
+                && parkShutdownCommitGeneration == generation;
+        }
+    }
+
+    private static boolean parkedShutdownMarkerExists() {
+        try {
+            return new java.io.File(
+                com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH).exists();
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    /**
+     * Reconcile marker state for an admitted ON transition. A committed shutdown remains
+     * irreversible; clearing only allows the supervisor to recover the now-active vehicle.
+     */
+    private static boolean reconcileParkedShutdownMarkerOn(long generation) {
+        boolean staleAfterClear = false;
+        boolean restored = true;
+        synchronized (parkMarkerIoLock) {
+            if (!isAccTransitionCurrent(generation, false)) return false;
+            if (!parkedShutdownMarkerExists()) {
+                synchronized (parkTerminateLock) {
+                    parkMarkerClearFailed = false;
+                }
+                return true;
+            }
+            boolean cleared = clearParkedShutdownMarker();
+            synchronized (parkTerminateLock) {
+                parkMarkerClearFailed = !cleared;
+            }
+            if (!cleared) {
+                markCurrentAccApplyRetry();
+                return false;
+            }
+            if (isAccTransitionCurrent(generation, false)) {
+                return true;
+            }
+
+            staleAfterClear = true;
+            // OFF won while delete() was in flight. Restore a committed marker before
+            // releasing the I/O lock. An uncommitted newer OFF will write its own marker
+            // after this transaction.
+            boolean latestOff;
+            boolean shutdownCommitted;
+            long latestGeneration;
+            long committedGeneration;
+            synchronized (parkTerminateLock) {
+                latestOff = Boolean.TRUE.equals(latestAccIsOff);
+                shutdownCommitted = parkShutdownCommitted;
+                latestGeneration = accTransitionGeneration;
+                committedGeneration = parkShutdownCommitGeneration;
+            }
+            if (latestOff && shutdownCommitted
+                    && latestGeneration == committedGeneration) {
+                restored = writeParkedShutdownMarker(
+                    committedGeneration);
+                synchronized (parkTerminateLock) {
+                    parkMarkerWriteFailed = !restored;
+                }
+            }
+        }
+        if (staleAfterClear) {
+            forceLatestAccStateReconciliation(
+                restored
+                    ? "stale parked-marker clear"
+                    : "failed parked-marker restoration");
+        }
+        return false;
+    }
+
+    private static boolean reconcileCommittedParkedShutdownOff(long generation) {
+        synchronized (parkMarkerIoLock) {
+            if (!isAccTransitionCurrent(generation, true)
+                    || !isParkShutdownCommittedForGeneration(generation)) {
+                return false;
+            }
+            if (parkedShutdownMarkerBelongsToGeneration(generation)) {
+                synchronized (parkTerminateLock) {
+                    parkMarkerWriteFailed = false;
+                }
+                return true;
+            }
+            boolean written = writeParkedShutdownMarker(generation);
+            synchronized (parkTerminateLock) {
+                parkMarkerWriteFailed = !written;
+            }
+            if (!written) {
+                markCurrentAccApplyRetry();
+                return false;
+            }
+            if (!isAccTransitionCurrent(generation, true)) {
+                forceLatestAccStateReconciliation(
+                    "stale committed parked-marker write");
+                return false;
+            }
+            return true;
+        }
+    }
+
+    private static boolean writeParkedShutdownMarker(long generation) {
+        String path = com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH;
+        java.io.File marker = new java.io.File(path);
+        java.io.File parent = marker.getParentFile();
+        java.io.File temporary = new java.io.File(
+            parent, marker.getName() + ".tmp." + android.os.Process.myPid()
+                + "." + Thread.currentThread().getId());
+        try {
+            if (parkedShutdownMarkerBelongsToGeneration(generation)) {
+                try (java.io.RandomAccessFile existing =
+                        new java.io.RandomAccessFile(marker, "rw")) {
+                    existing.getFD().sync();
+                }
+                if (!forceDirectorySync(parent)) {
+                    log("WARNING: Existing parked marker directory sync failed: " + path);
+                    return false;
+                }
+                return true;
+            }
+            // Existing app/shell readers consume the entire file as a decimal epoch-millis
+            // value. Keep generation ownership in process; putting keyed metadata in this file
+            // makes the stale-marker fail-safe treat a valid marker as unparseable forever.
+            long timestampMs = System.currentTimeMillis();
+            byte[] contents = (Long.toString(timestampMs) + "\n")
+                .getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            try (java.io.FileOutputStream output =
+                    new java.io.FileOutputStream(temporary, false)) {
+                output.write(contents);
+                output.flush();
+                output.getFD().sync();
+            }
+            java.nio.file.Files.move(
+                temporary.toPath(),
+                marker.toPath(),
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            if (!forceDirectorySync(parent)) {
+                java.nio.file.Files.deleteIfExists(marker.toPath());
+                forceDirectorySync(parent);
+                parkMarkerGeneration = 0L;
+                parkMarkerTimestampMs = 0L;
+                log("WARNING: Parked marker rename was not durably committed: " + path);
+                return false;
+            }
+            try {
+                marker.setReadable(true, false);
+                marker.setWritable(true, false);
+            } catch (Exception ignored) {}
+            if (!marker.exists() || marker.length() == 0L) {
+                log("WARNING: Parked-shutdown marker write could not be verified: " + path);
+                return false;
+            }
+            parkMarkerGeneration = generation;
+            parkMarkerTimestampMs = timestampMs;
+            log("Parked-shutdown marker written: " + path);
+            return true;
+        } catch (Throwable e) {
+            try { java.nio.file.Files.deleteIfExists(temporary.toPath()); }
+            catch (Throwable ignored) {}
+            log("WARNING: Failed to write parked-shutdown marker: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean parkedShutdownMarkerBelongsToGeneration(
+            long generation) {
+        if (generation != parkMarkerGeneration || parkMarkerTimestampMs <= 0L) {
+            return false;
+        }
+        String path =
+            com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH;
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.FileReader(path))) {
+            String value = reader.readLine();
+            return value != null
+                && Long.parseLong(value.trim()) == parkMarkerTimestampMs
+                && reader.readLine() == null;
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private static boolean forceDirectorySync(java.io.File directory) {
+        if (directory == null) return false;
+        try (java.nio.channels.FileChannel channel =
+                java.nio.channels.FileChannel.open(
+                    directory.toPath(), java.nio.file.StandardOpenOption.READ)) {
+            channel.force(true);
+            return true;
+        } catch (Throwable t) {
+            log("WARNING: Directory fsync failed for " + directory + ": " + t.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean clearParkedShutdownMarker() {
         String path = com.overdrive.app.ui.model.ParkedShutdown.MARKER_PATH;
         try {
-            java.io.FileWriter fw = new java.io.FileWriter(path);
-            fw.write(String.valueOf(System.currentTimeMillis()));
-            fw.close();
-            try { new java.io.File(path).setReadable(true, false);
-                  new java.io.File(path).setWritable(true, false); } catch (Exception ignored) {}
-            log("Parked-shutdown marker written: " + path);
-        } catch (Exception e) {
-            log("WARNING: Failed to write parked-shutdown marker: " + e.getMessage());
+            java.io.File marker = new java.io.File(path);
+            java.io.File parent = marker.getParentFile();
+            if (!marker.exists()) {
+                boolean synced = forceDirectorySync(parent);
+                if (synced) {
+                    parkMarkerGeneration = 0L;
+                    parkMarkerTimestampMs = 0L;
+                }
+                return synced;
+            }
+            if (!java.nio.file.Files.deleteIfExists(marker.toPath()) || marker.exists()) {
+                log("WARNING: ACC ON could not clear parked-shutdown marker: " + path);
+                return false;
+            }
+            boolean synced = forceDirectorySync(parent);
+            if (synced) {
+                parkMarkerGeneration = 0L;
+                parkMarkerTimestampMs = 0L;
+            }
+            return synced;
+        } catch (Throwable t) {
+            log("WARNING: ACC ON parked-marker clear failed: " + t.getMessage());
+            return false;
         }
     }
 
     private static void shutdownInternal(boolean writeDisableSentinel) {
-        log("Shutdown requested (writeDisableSentinel=" + writeDisableSentinel + ") — cleaning up...");
-        running.set(false);
+        synchronized (TRIP_ANALYTICS_LIFECYCLE_LOCK) {
+            if (!shutdownStarted.compareAndSet(false, true)) {
+                return;
+            }
+            TRIP_ANALYTICS_SHUTDOWN_REQUESTED.set(true);
+        }
+        Thread accOwner;
+        Thread surveillanceOwner;
+        synchronized (parkTerminateLock) {
+            running.set(false);
+            accOwner = activeAccTransitionThread;
+            surveillanceOwner = activeSurveillanceEnableThread;
+            activeAccTransitionGeneration = 0L;
+            activeAccTransitionLease = 0L;
+            activeAccTransitionDeadlineNanos = 0L;
+            activeAccTransitionThread = null;
+            activeSurveillanceEnableGeneration = 0L;
+            activeSurveillanceEnableRevision = 0L;
+            activeSurveillanceEnableLease = 0L;
+            activeSurveillanceEnableDeadlineNanos = 0L;
+            activeSurveillanceEnableThread = null;
+            invalidateAccCompletionLocked();
+        }
+        if (accOwner != null && accOwner != Thread.currentThread()) {
+            accOwner.interrupt();
+        }
+        if (surveillanceOwner != null
+                && surveillanceOwner != Thread.currentThread()) {
+            surveillanceOwner.interrupt();
+        }
+        // Arm the independent kill path before any logging, marker or service I/O can block.
+        if (!armTerminalShutdownDeadline()) {
+            shutdownTripAnalyticsBeforeBlockingCleanup();
+            forceTerminateProcess("terminal shutdown guard unavailable");
+            return;
+        }
+        try {
+            log("Shutdown requested (writeDisableSentinel="
+                + writeDisableSentinel + ") — cleaning up...");
+        } catch (Throwable ignored) {}
+
+        // Publish restart suppression before any external cleanup can block.
+        if (writeDisableSentinel) {
+            writeDisableSentinel();
+        }
+
+        // Trip state is the first durable subsystem boundary. Camera, HAL and
+        // server teardown below can block until the terminal guard fires; by
+        // closing trips here, an active drive is checkpointed while its
+        // telemetry monitors and database are still available.
+        shutdownTripAnalyticsBeforeBlockingCleanup();
+
+        try {
+        // Stop the wrapper before service cleanup can block. The already-durable disable/park
+        // marker prevents restart if this best-effort process cleanup itself stalls.
+        try { killWatchdogWrapper(); }
+        catch (Throwable t) { log("Watchdog wrapper shutdown error: " + t.getMessage()); }
+        stopScheduleChecker();
+        cleanupDoorLockGate();
 
         // Stop AVC keep-alive immediately (force, daemon teardown)
         stopAvcKeepAliveForShutdown();
@@ -2078,43 +2638,58 @@ public class CameraDaemon {
             geoBackfillScheduler = null;
         }
 
-        // Write disable sentinel FIRST — this tells the shell watchdog wrapper
-        // to NOT restart the daemon after we exit. Without this, the wrapper
-        // sees exit code 0 and respawns us immediately. In the onOnly parkTerminate
-        // path the PARKED marker (written by writeParkedShutdownMarker before this)
-        // already stops the watchdog, and we must NOT write the user `.disabled`
-        // sentinel (wrong semantics + it would be wiped by clearStaleSentinels), so
-        // the caller passes writeDisableSentinel=false.
-        if (writeDisableSentinel) {
-            writeDisableSentinel();
-        }
-        
         // Cancel PermissionGranter to stop orphaned pm grant processes
         PermissionGranter.cancel();
-        
-        // Stop RoadSense (releases IMU sidecar, stores, warning audio) AND deregister
-        // its live-toggle config listener. detach() = stop() + remove listener, the
-        // inverse of attach(); safe even if the controller was never started (disabled).
-        // Early so its warning-tick can't fire against tearing-down state.
-        if (roadSense != null) {
-            try { roadSense.detach(); } catch (Exception e) { log("RoadSense detach error: " + e.getMessage()); }
+
+        // killProcess/halt do not run Java shutdown hooks. Perform the safety-critical hook-only
+        // cleanup here while the terminal deadline independently guarantees process exit.
+        try {
+            com.overdrive.app.surveillance.ScreenDeterrent.getInstance().cancel();
+            java.util.Map<String, Object> reset = new java.util.HashMap<>();
+            reset.put("screenDeterrentActiveUntilMs", 0L);
+            reset.put("screenDeterrentForceStop", false);
+            com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                "surveillance", reset);
+        } catch (Throwable t) {
+            log("Screen deterrent shutdown error: " + t.getMessage());
+        }
+        try {
+            com.overdrive.app.receiver.CastPackageWatcher.unregister(getAppContext());
+            com.overdrive.app.surveillance.ClusterViewMirrorService
+                .forceDetachIfActive("daemon-shutdown");
+            com.overdrive.app.surveillance.ClusterMirrorController.shutdownIfActive();
+            com.overdrive.app.surveillance.ClusterProjectionController.shutdownIfActive();
+        } catch (Throwable t) {
+            log("Cluster shutdown error: " + t.getMessage());
+        }
+        try {
+            com.overdrive.app.camera.OemDashcamPipeline oem = getOemDashcamPipeline();
+            if (oem != null && oem.isRunning()) {
+                try { oem.stopRecording(); } catch (Throwable ignored) {}
+                oem.stop();
+                setOemDashcamPipeline(null);
+            }
+        } catch (Throwable t) {
+            log("OEM dashcam shutdown error: " + t.getMessage());
         }
 
-        // Stop RecordingModeManager BEFORE the pipeline so its periodic
-        // resync ticker can't fire one more activateMode() call against a
-        // tearing-down pipeline. Idempotent w.r.t. modeActive bookkeeping;
-        // safe even if the manager's pipeline state is already half-torn.
-        if (recordingModeManager != null) {
-            try { recordingModeManager.shutdown(); }
-            catch (Exception e) { log("RecordingModeManager shutdown error: " + e.getMessage()); }
-        }
+        // Stop RoadSense + RecordingModeManager (shared with the JVM shutdown
+        // hook). Early so their tickers can't fire against tearing-down state.
+        detachRoadSenseAndRecordingMode();
 
         // Stop cameras and GPU pipeline
-        stopAllCameras();
+        try { stopAllCameras(); }
+        catch (Throwable t) { log("Camera shutdown error: " + t.getMessage()); }
         if (gpuPipeline != null) {
             try { gpuPipeline.stop(); } catch (Exception e) { log("GPU pipeline stop error: " + e.getMessage()); }
         }
-        
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline
+                .shutdownStreamEncoderReleaseExec(4_000L);
+        } catch (Throwable t) {
+            log("Stream encoder release shutdown error: " + t.getMessage());
+        }
+
         // Stop all monitors
         try { com.overdrive.app.monitor.VehicleDataMonitor.getInstance().stop(); } catch (Exception ignored) {}
         try { com.overdrive.app.monitor.GpsMonitor.getInstance().stop(); } catch (Exception ignored) {}
@@ -2125,7 +2700,7 @@ public class CameraDaemon {
         try { com.overdrive.app.monitor.SocHistoryDatabase.getInstance().stop(); } catch (Exception ignored) {}
         try { com.overdrive.app.monitor.DataUsageMonitor.getInstance().shutdown(); } catch (Exception ignored) {}
         try { com.overdrive.app.notifications.NotificationStore.getInstance().stop(); } catch (Exception ignored) {}
-        
+
         // Stop services. Both the trip analytics + recordings index inits
         // run on parallel threads (see main()); join with a short timeout
         // before tearing down so we don't close a half-opened H2
@@ -2145,7 +2720,11 @@ public class CameraDaemon {
         } catch (Exception e) {
             log("Data layer init join error: " + e.getMessage());
         }
-        if (tripAnalyticsManager != null) tripAnalyticsManager.shutdown();
+        try {
+            if (tripAnalyticsManager != null) tripAnalyticsManager.shutdown();
+        } catch (Throwable t) {
+            log("Trip analytics shutdown error: " + t.getMessage());
+        }
         // Tear down RecordingsIndex AFTER trips so any in-flight upserts
         // from the recorder have already drained. stop() the watcher
         // first to silence inotify callbacks before close() yanks the
@@ -2155,29 +2734,188 @@ public class CameraDaemon {
         catch (Exception e) { log("RecordingsIndexFileWatcher stop error: " + e.getMessage()); }
         try { com.overdrive.app.server.RecordingsIndex.getInstance().close(); }
         catch (Exception e) { log("RecordingsIndex close error: " + e.getMessage()); }
-        if (abrpTelemetryService != null) abrpTelemetryService.stop();
-        if (mqttConnectionManager != null) mqttConnectionManager.stopAll();
-        if (tcpServer != null) tcpServer.stop();
-        if (httpServer != null) httpServer.stop();
-        if (ipcServer != null) ipcServer.stop();
-        if (aacIngestServer != null) aacIngestServer.stop();
+        try { if (abrpTelemetryService != null) abrpTelemetryService.stop(); }
+        catch (Throwable t) { log("ABRP shutdown error: " + t.getMessage()); }
+        try { if (mqttConnectionManager != null) mqttConnectionManager.stopAll(); }
+        catch (Throwable t) { log("MQTT shutdown error: " + t.getMessage()); }
+        try { if (tcpServer != null) tcpServer.stop(); }
+        catch (Throwable t) { log("TCP shutdown error: " + t.getMessage()); }
+        try { if (httpServer != null) httpServer.stop(); }
+        catch (Throwable t) { log("HTTP shutdown error: " + t.getMessage()); }
+        try { if (ipcServer != null) ipcServer.stop(); }
+        catch (Throwable t) { log("IPC shutdown error: " + t.getMessage()); }
+        try { if (aacIngestServer != null) aacIngestServer.stop(); }
+        catch (Throwable t) { log("AAC shutdown error: " + t.getMessage()); }
 
         // Shutdown StorageManager (schedulers, executors)
         try { com.overdrive.app.storage.StorageManager.getInstance().shutdown(); } catch (Exception ignored) {}
-        
+
         // Release singleton lock
         releaseSingletonLock();
-        
-        log("Daemon shutdown complete — killing self (watchdog will NOT restart)");
-        
-        // Also kill the shell watchdog wrapper process directly.
-        // The sentinel file prevents restart, but killing the wrapper ensures
-        // it doesn't linger as an idle process.
-        killWatchdogWrapper();
-        
-        android.os.Process.killProcess(android.os.Process.myPid());
+
+        log("Daemon shutdown cleanup complete");
+        } catch (Throwable t) {
+            log("Daemon shutdown cleanup aborted: " + t.getClass().getSimpleName()
+                + ": " + t.getMessage());
+        } finally {
+            forceTerminateProcess("shutdown cleanup complete");
+        }
     }
-    
+
+    private static boolean armTerminalShutdownDeadline() {
+        synchronized (TERMINAL_SHUTDOWN_GUARD_LOCK) {
+            if (terminalShutdownHandlerCallback != null) {
+                return true;
+            }
+            if (terminalShutdownGuard != null
+                    && terminalShutdownGuard.isAlive()) {
+                // An interrupted guard belongs to a rolled-back marker attempt. Do not claim that
+                // its canceled deadline protects a new fsync, and do not allocate over it.
+                return !terminalShutdownGuard.isInterrupted();
+            }
+
+            boolean armed = false;
+            try {
+                Thread guard = new Thread(() -> {
+                    try {
+                        Thread.sleep(TERMINAL_SHUTDOWN_BUDGET_MS);
+                        forceTerminateProcess("shutdown deadline exceeded");
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        synchronized (TERMINAL_SHUTDOWN_GUARD_LOCK) {
+                            if (terminalShutdownGuard == Thread.currentThread()) {
+                                terminalShutdownGuard = null;
+                            }
+                        }
+                    }
+                }, "TerminalShutdownGuard");
+                guard.setDaemon(false);
+                terminalShutdownGuard = guard;
+                guard.start();
+                armed = true;
+            } catch (Throwable t) {
+                terminalShutdownGuard = null;
+                try { log("Could not start terminal shutdown guard: " + t.getMessage()); }
+                catch (Throwable ignored) {}
+            }
+
+            Handler handler = mainHandler;
+            if (handler != null) {
+                Runnable callback =
+                    () -> forceTerminateProcess("main-loop shutdown deadline exceeded");
+                try {
+                    if (handler.postDelayed(
+                            callback, TERMINAL_SHUTDOWN_BUDGET_MS)) {
+                        terminalShutdownHandlerCallback = callback;
+                        armed = true;
+                    }
+                } catch (Throwable ignored) {}
+            }
+            return armed;
+        }
+    }
+
+    /**
+     * Shared RoadSense + RecordingModeManager teardown, used by BOTH the normal
+     * shutdown path (shutdownInternal) and the JVM shutdown hook. Must run
+     * before GPU, monitor and database teardown.
+     *
+     * <p>RoadSense: detach() — not merely stop() — because it also removes the
+     * live-toggle config listener (the inverse of attach()); it releases the
+     * ticker, sync worker, IMU sidecar, warning audio and H2 stores. Safe even
+     * if the controller was never started (disabled). Early so its warning-tick
+     * can't fire against tearing-down state.
+     *
+     * <p>RecordingModeManager: stopped BEFORE the pipeline so its periodic
+     * resync ticker can't fire one more activateMode() call against a
+     * tearing-down pipeline. Idempotent w.r.t. modeActive bookkeeping; safe
+     * even if the manager's pipeline state is already half-torn.
+     */
+    private static void detachRoadSenseAndRecordingMode() {
+        if (roadSense != null) {
+            try { roadSense.detach(); }
+            catch (Throwable t) { log("RoadSense detach error: " + t.getMessage()); }
+        }
+        recordingModeManagerPipelineOwner = null;
+        if (recordingModeManager != null) {
+            try { recordingModeManager.shutdown(); }
+            catch (Throwable t) { log("RecordingModeManager shutdown error: " + t.getMessage()); }
+        }
+    }
+
+    private static void shutdownTripAnalyticsBeforeBlockingCleanup() {
+        markTripAnalyticsShutdownRequested();
+        try {
+            java.util.concurrent.CompletableFuture<Void> initFuture =
+                    tripAnalyticsInitFuture;
+            if (initFuture != null) {
+                initFuture.get(
+                        5, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } catch (Exception initFailure) {
+            log("Early trip analytics init join error: "
+                    + initFailure.getMessage());
+        }
+        try {
+            com.overdrive.app.trips.TripAnalyticsManager manager;
+            synchronized (TRIP_ANALYTICS_LIFECYCLE_LOCK) {
+                manager = tripAnalyticsManager;
+            }
+            if (shouldFinalizeTripsOnShutdown() && manager != null
+                    && manager.isInitialized()) {
+                manager.shutdown();
+            } else if (manager != null && manager.isInitialized()) {
+                // A camera/EGL restart is not a trip end. Checkpoint the open
+                // trip instead so it is not split into a separate card.
+                manager.checkpointActiveTrip();
+            }
+        } catch (Throwable tripFailure) {
+            log("Early trip analytics shutdown error: "
+                    + tripFailure.getMessage());
+        }
+    }
+
+    private static void disarmTerminalShutdownDeadline() {
+        final Thread guard;
+        synchronized (TERMINAL_SHUTDOWN_GUARD_LOCK) {
+            if (shutdownStarted.get()) return;
+            guard = terminalShutdownGuard;
+            Runnable callback = terminalShutdownHandlerCallback;
+            terminalShutdownHandlerCallback = null;
+            Handler handler = mainHandler;
+            if (callback != null && handler != null) {
+                try { handler.removeCallbacks(callback); }
+                catch (Throwable ignored) {}
+            }
+        }
+        if (guard != null) {
+            guard.interrupt();
+            try {
+                guard.join(MANAGED_THREAD_JOIN_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            if (!guard.isAlive()) {
+                synchronized (TERMINAL_SHUTDOWN_GUARD_LOCK) {
+                    if (terminalShutdownGuard == guard) {
+                        terminalShutdownGuard = null;
+                    }
+                }
+            }
+        }
+    }
+
+    private static void forceTerminateProcess(String reason) {
+        if (!forceTerminationStarted.compareAndSet(false, true)) return;
+        try {
+            try { android.os.Process.killProcess(android.os.Process.myPid()); }
+            catch (Throwable ignored) {}
+        } finally {
+            Runtime.getRuntime().halt(0);
+        }
+    }
+
     /**
      * Write the disable sentinel file that tells the shell watchdog wrapper
      * to stop restarting the daemon.
@@ -2185,7 +2923,7 @@ public class CameraDaemon {
     private static void writeDisableSentinel() {
         try {
             java.io.FileWriter fw = new java.io.FileWriter(DISABLE_SENTINEL);
-            fw.write("disabled at " + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", 
+            fw.write("disabled at " + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
                 java.util.Locale.US).format(new java.util.Date()) + "\n");
             fw.write("pid=" + android.os.Process.myPid() + "\n");
             fw.close();
@@ -2194,7 +2932,7 @@ public class CameraDaemon {
             log("WARNING: Failed to write disable sentinel: " + e.getMessage());
         }
     }
-    
+
     /**
      * Kill the shell watchdog wrapper process (start_cam_daemon.sh).
      * Uses the PID file if available, falls back to pkill.
@@ -2217,7 +2955,7 @@ public class CameraDaemon {
             log("Watchdog wrapper kill error (non-fatal): " + e.getMessage());
         }
     }
-    
+
     /**
      * Check if the daemon has been intentionally disabled.
      * Called by the shell watchdog wrapper before restarting.
@@ -2226,7 +2964,7 @@ public class CameraDaemon {
     public static boolean isDisabledBySentinel() {
         return new java.io.File(DISABLE_SENTINEL).exists();
     }
-    
+
     /**
      * Acquire a file lock to ensure only one daemon instance runs at a time.
      * Uses Java NIO FileLock which is process-safe.
@@ -2236,10 +2974,10 @@ public class CameraDaemon {
             File lockFileObj = new File(LOCK_FILE);
             lockFile = new java.io.RandomAccessFile(lockFileObj, "rw");
             java.nio.channels.FileChannel channel = lockFile.getChannel();
-            
+
             // Try to acquire exclusive lock (non-blocking)
             fileLock = channel.tryLock();
-            
+
             if (fileLock == null) {
                 // Another process holds the lock — check if it's actually alive
                 // AND that it's actually a CameraDaemon. We treat the following
@@ -2314,20 +3052,20 @@ public class CameraDaemon {
                     try { lockFile.close(); } catch (Exception ignored) {}
                     return false;
                 }
-                
+
                 if (stale) {
                     log("Singleton: stale lock (" + reason + ") — cleaning up");
                     try { lockFile.close(); } catch (Exception ignored) {}
                     lockFileObj.delete();
-                    
+
                     // Small delay so the kernel releases the inode lock before retry
                     try { Thread.sleep(200); } catch (InterruptedException ignored) {}
-                    
+
                     // Retry lock acquisition on the new inode
                     lockFile = new java.io.RandomAccessFile(lockFileObj, "rw");
                     channel = lockFile.getChannel();
                     fileLock = channel.tryLock();
-                    
+
                     if (fileLock == null) {
                         log("Singleton: retry after stale-lock cleanup still failed");
                         try { lockFile.close(); } catch (Exception ignored) {}
@@ -2336,14 +3074,14 @@ public class CameraDaemon {
                     // Fall through to write PID and register shutdown hook
                 }
             }
-            
+
             // Write our PID to the lock file for debugging
             lockFile.seek(0);
             lockFile.setLength(0);
             lockFile.writeBytes(String.valueOf(android.os.Process.myPid()));
-            
+
             log("Acquired singleton lock (PID: " + android.os.Process.myPid() + ")");
-            
+
             // Register shutdown hook to release lock and clean up ALL resources on process termination.
             // CRITICAL: System.exit(0) from the GL watchdog skips normal cleanup.
             // Without this, the MediaCodec encoder, EGL context, camera HAL connection,
@@ -2351,26 +3089,23 @@ public class CameraDaemon {
             // the Adreno 610 runs out of GPU contexts and the hardware encoder exhausts
             // its codec instance limit, causing system-level freezes.
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                markTripAnalyticsShutdownRequested();
                 log("Shutdown hook: cleaning up all resources...");
 
-                // -1. URGENT: Finalize active trip FIRST — before anything that
-                //     might block (GPU pipeline stop, cluster projection restore).
-                //     Trip finalization does a local H2 insert + gzip flush (<50ms)
-                //     and MUST complete before the VM dies. Without this, a
-                //     System.exit(0) from the GL watchdog loses the in-progress
-                //     trip's DB row entirely (the .jsonl.gz survives on disk but
-                //     has no row — only recoverable via POST /api/trips/recover
-                //     or the new auto-recovery at next startup).
-                //     This is defense-in-depth: if TripAnalyticsManager isn't
-                //     initialized yet (async init on parallel thread), skip
-                //     gracefully — the trip hadn't started anyway.
+                // -1. URGENT: quiesce active trip storage before anything that
+                //     might block. RESTART-AWARE: a trip-safe process restart
+                //     (System.exit from requestProcessRestartPreservingTrip) is
+                //     NOT a trip end — manager.shutdown() would finalize the
+                //     active trip and, on a short leg, route it to discardTrip()
+                //     which DELETES the telemetry file. The helper checkpoints
+                //     the open journal instead when processRestartIntent is set.
                 try {
-                    if (tripAnalyticsManager != null && tripAnalyticsManager.isInitialized()) {
-                        tripAnalyticsManager.shutdown();
-                        log("Shutdown hook: trip analytics finalized (early)");
-                    }
+                    shutdownTripAnalyticsBeforeBlockingCleanup();
+                    log("Shutdown hook: trip analytics quiesced (early, "
+                            + (shouldFinalizeTripsOnShutdown()
+                                    ? "finalized" : "checkpointed for restart") + ")");
                 } catch (Exception e) {
-                    log("Shutdown hook: early trip finalize error: " + e.getMessage());
+                    log("Shutdown hook: early trip teardown error: " + e.getMessage());
                 }
 
                 // 0. Tear down any in-progress ScreenDeterrent FIRST. The
@@ -2432,6 +3167,23 @@ public class CameraDaemon {
                     log("Shutdown hook: cluster projection cleanup error: " + e.getMessage());
                 }
 
+                // 0.7 Stop RoadSense + RecordingModeManager (shared helper, same
+                //     ordering as shutdownInternal: AFTER the screen-deterrent
+                //     flag reset and cluster gauge restoration — those are
+                //     safety-critical and must land even if this teardown wedges
+                //     and the terminal guard halts us — but BEFORE GPU, monitor
+                //     and database teardown. detach() removes the live config
+                //     listener and releases the ticker, sync worker, IMU
+                //     sidecar, warning audio and H2 stores; without it a
+                //     watchdog System.exit leaks the sidecar and lets the
+                //     warning-tick fire against tearing-down state.
+                try {
+                    detachRoadSenseAndRecordingMode();
+                    log("Shutdown hook: RoadSense detached, recording mode manager stopped");
+                } catch (Exception e) {
+                    log("Shutdown hook: RoadSense/RMM teardown error: " + e.getMessage());
+                }
+
                 // 1. Stop PermissionGranter — prevent orphaned pm grant processes
                 //    from continuing to hammer PMS after we exit
                 try {
@@ -2450,7 +3202,7 @@ public class CameraDaemon {
                 } catch (Exception e) {
                     log("Shutdown hook: GeoCache flush error: " + e.getMessage());
                 }
-                
+
                 // 1.6 Stop the OEM Dashcam pipeline outright. Pano's stop()
                 //     also cascades to OEM (when pano is running), but if a
                 //     user runs OEM standalone (recordingMode=continuous,
@@ -2503,7 +3255,7 @@ public class CameraDaemon {
                 } catch (Exception e) {
                     log("Shutdown hook: stream encoder exec drain error: " + e.getMessage());
                 }
-                
+
                 // 3. Stop all monitors (VehicleDataMonitor, GpsMonitor, GearMonitor,
                 //    PerformanceMonitor) — these hold BYD device listeners and schedulers
                 try {
@@ -2518,7 +3270,7 @@ public class CameraDaemon {
                 try {
                     com.overdrive.app.monitor.PerformanceMonitor.getInstance().stop();
                 } catch (Exception e) { /* may not be initialized */ }
-                
+
                 // 4. Close SOC History Database (H2 JDBC connection + scheduler).
                 // Stop the geo backfill scheduler so an in-flight blocking
                 // resolveBlocking / sidecar write doesn't run during teardown.
@@ -2538,7 +3290,7 @@ public class CameraDaemon {
                 try {
                     com.overdrive.app.notifications.NotificationStore.getInstance().stop();
                 } catch (Exception e) { /* may not be initialized */ }
-                
+
                 // 5. Stop services (MQTT, ABRP, Trip Analytics).
                 // Trip Analytics + RecordingsIndex were inited on parallel
                 // threads — join briefly so we don't tear down a half-opened
@@ -2559,8 +3311,15 @@ public class CameraDaemon {
                 try {
                     if (abrpTelemetryService != null) abrpTelemetryService.stop();
                 } catch (Exception e) { /* ignore */ }
+                // RESTART-AWARE: same rule as the early quiesce above — never
+                // finalize the active trip when a trip-safe restart is in
+                // progress (the coordinator already checkpointed it). A no-op
+                // when the early quiesce already shut the manager down.
                 try {
-                    if (tripAnalyticsManager != null) tripAnalyticsManager.shutdown();
+                    if (shouldFinalizeTripsOnShutdown()
+                            && tripAnalyticsManager != null) {
+                        tripAnalyticsManager.shutdown();
+                    }
                 } catch (Exception e) { /* ignore */ }
                 // RecordingsIndex teardown — same ordering as shutdown():
                 // unregister observers first so late inotify events don't
@@ -2588,14 +3347,14 @@ public class CameraDaemon {
                 try {
                     com.overdrive.app.storage.StorageManager.getInstance().shutdown();
                 } catch (Exception e) { /* ignore */ }
-                
+
                 // 8. Release singleton lock (must be last)
                 releaseSingletonLock();
                 log("Shutdown hook: cleanup complete");
             }, "DaemonShutdown"));
-            
+
             return true;
-            
+
         } catch (java.nio.channels.OverlappingFileLockException e) {
             // Lock already held by this JVM (shouldn't happen but handle it)
             log("Lock already held by this process");
@@ -2609,7 +3368,7 @@ public class CameraDaemon {
             return false;
         }
     }
-    
+
     /** Result of inspecting /proc/<pid>/cmdline for singleton-lock validation. */
     private enum CmdlineMatch {
         /** cmdline matches a CameraDaemon process — real conflict. */
@@ -2716,7 +3475,7 @@ public class CameraDaemon {
             log("Error releasing singleton lock: " + e.getMessage());
         }
     }
-    
+
     /**
      * Check if a port is already in use (fallback check).
      */
@@ -2728,21 +3487,237 @@ public class CameraDaemon {
             return true;
         }
     }
-    
+
     public static Handler getMainHandler() {
         return mainHandler;
     }
-    
+
     public static String getOutputDir() {
         return outputDir;
     }
-    
+
     public static String getDeviceId() {
         return deviceId;
     }
-    
+
     public static com.overdrive.app.trips.TripAnalyticsManager getTripAnalyticsManager() {
         return tripAnalyticsManager;
+    }
+
+    private static boolean publishTripAnalyticsManager(
+            com.overdrive.app.trips.TripAnalyticsManager manager,
+            SohEstimator sohEstimatorSnapshot) {
+        synchronized (TRIP_ANALYTICS_LIFECYCLE_LOCK) {
+            if (manager == null
+                    || TRIP_ANALYTICS_SHUTDOWN_REQUESTED.get()
+                    || shutdownStarted.get()
+                    || !running.get()) {
+                return false;
+            }
+
+            try {
+                // Complete every operation that can touch the newly
+                // initialized manager before releasing the admission lock.
+                // Shutdown marks its intent under this same lock, so it cannot
+                // close the manager mid-publication.
+                runTripConsumptionBucketMigration(
+                        manager, sohEstimatorSnapshot);
+
+                // initSurveillance() currently runs before this thread starts.
+                // Re-read the volatile defensively so a future ordering change
+                // still binds the final collector before shutdown intervenes.
+                com.overdrive.app.telemetry.TelemetryDataCollector collector =
+                        telemetryDataCollector;
+                if (collector != null) {
+                    try {
+                        manager.setTelemetryDataCollector(collector);
+                    } catch (Throwable bindFailure) {
+                        log("Trip Analytics collector bind failed: "
+                                + bindFailure.getMessage());
+                    }
+                }
+
+                // Publish only after all startup dependencies are wired.
+                // A gear edge that arrived before the database finished opening
+                // is recovered by the ACC-ON gear probe in onAccOn(), and by
+                // GearMonitor's next notification.
+                tripAnalyticsManager = manager;
+                return true;
+            } catch (Exception e) {
+                log("Trip Analytics publication failed: "
+                        + e.getMessage());
+                return false;
+            }
+        }
+    }
+
+    private static void runTripConsumptionBucketMigration(
+            com.overdrive.app.trips.TripAnalyticsManager manager,
+            SohEstimator sohEstimatorSnapshot) {
+        // ONE-TIME migration: clear poisoned consumption buckets if this is a
+        // PHEV and the migration has not already completed.
+        try {
+            java.io.File marker = new java.io.File(
+                    "/data/local/tmp/overdrive_bucket_migration_done");
+            if (sohEstimatorSnapshot == null
+                    || sohEstimatorSnapshot.getNominalCapacityKwh() <= 0
+                    || sohEstimatorSnapshot.getNominalCapacityKwh() >= 30.0
+                    || manager.getDatabase() == null
+                    || marker.exists()) {
+                return;
+            }
+            manager.getDatabase().clearConsumptionBuckets();
+            com.overdrive.app.trips.RangeEstimator estimator =
+                    manager.getRangeEstimator();
+            if (estimator == null) {
+                log("WARNING: PHEV bucket migration could not request "
+                        + "backfill; marker not written");
+                return;
+            }
+            log("One-time PHEV bucket migration: cleared poisoned "
+                    + "consumption data; buckets refill as trips complete");
+            try {
+                new java.io.FileWriter(marker).close();
+            } catch (Exception markerFailure) {
+                log("WARNING: Could not write bucket migration marker: "
+                        + markerFailure.getMessage());
+            }
+        } catch (Throwable migrationFailure) {
+            log("WARNING: PHEV bucket migration failed: "
+                    + migrationFailure.getMessage());
+        }
+    }
+
+    private static void markTripAnalyticsShutdownRequested() {
+        synchronized (TRIP_ANALYTICS_LIFECYCLE_LOCK) {
+            TRIP_ANALYTICS_SHUTDOWN_REQUESTED.set(true);
+        }
+    }
+
+    /**
+     * Request a process restart for an unrecoverable camera/EGL failure without
+     * ending the current drive. Only this method may service camera watchdog
+     * exits: it waits for trip initialization, durably checkpoints the active
+     * recorder and journal, then lets the JVM shutdown hook release resources.
+     *
+     * <p>If storage is temporarily unavailable, the non-daemon coordinator keeps
+     * retrying while telemetry collection remains alive. A hard halt/kill is
+     * never used BEFORE the checkpoint is durable because it would bypass both
+     * the journal checkpoint and the resource cleanup hook. AFTER the checkpoint
+     * commits, the terminal shutdown guard is armed just before System.exit so a
+     * shutdown hook wedged on the failed camera/GL state cannot hold the process
+     * open forever — at that point a forced halt loses nothing.
+     */
+    public static void requestProcessRestartPreservingTrip(String reason) {
+        if (!PROCESS_RESTART_REQUESTED.compareAndSet(false, true)) {
+            return;
+        }
+
+        final Thread coordinator;
+        try {
+            coordinator = new Thread(() -> {
+                int attempts = 0;
+                while (!processRestartIntent) {
+                    attempts++;
+                    if (prepareTripsForProcessRestart(reason)) {
+                        processRestartIntent = true;
+                        log("Trip-safe process restart prepared: " + reason);
+                        // Arm the independent kill path BEFORE System.exit: the
+                        // shutdown hook it triggers can wedge on the very
+                        // GL/H2/monitor state that forced this restart, and a
+                        // wedged hook would otherwise hold the process open
+                        // forever. The trip is already durably checkpointed, so
+                        // a forced halt after the budget loses nothing.
+                        boolean guardArmed = armTerminalShutdownDeadline();
+                        if (!guardArmed) {
+                            log("Trip-safe restart: terminal shutdown guard could not be armed; "
+                                    + "exiting anyway (hook wedge would require external kill)");
+                        }
+                        try {
+                            System.exit(0);
+                        } catch (Throwable t) {
+                            processRestartIntent = false;
+                            PROCESS_RESTART_REQUESTED.set(false);
+                            HARDWARE_QUERY_PROCESS_RECOVERY_REQUESTED.set(false);
+                            if (guardArmed) {
+                                // Exit did not happen; don't let the armed
+                                // deadline halt a process we chose to keep.
+                                disarmTerminalShutdownDeadline();
+                            }
+                            // The checkpoint left the trip open and recording,
+                            // so there is no prepared state to undo here.
+                            log("Trip-safe System.exit failed; process left running: "
+                                    + t.getMessage());
+                        }
+                        return;
+                    }
+
+                    if (attempts == 1 || attempts % 10 == 0) {
+                        log("Deferring camera process restart until trip checkpoint is durable"
+                                + " (attempt=" + attempts + ", reason=" + reason + ")");
+                    }
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        PROCESS_RESTART_REQUESTED.set(false);
+                        HARDWARE_QUERY_PROCESS_RECOVERY_REQUESTED.set(false);
+                        return;
+                    }
+                }
+            }, "TripSafeProcessRestart");
+        } catch (Throwable creationFailure) {
+            PROCESS_RESTART_REQUESTED.set(false);
+            HARDWARE_QUERY_PROCESS_RECOVERY_REQUESTED.set(false);
+            log("Could not create trip-safe process restart coordinator: "
+                    + creationFailure.getMessage());
+            return;
+        }
+        try {
+            coordinator.setDaemon(false);
+            coordinator.start();
+        } catch (Throwable startFailure) {
+            PROCESS_RESTART_REQUESTED.set(false);
+            HARDWARE_QUERY_PROCESS_RECOVERY_REQUESTED.set(false);
+            log("Could not start trip-safe process restart coordinator: "
+                    + startFailure.getMessage());
+        }
+    }
+
+    private static boolean prepareTripsForProcessRestart(String reason) {
+        java.util.concurrent.CompletableFuture<Void> initFuture = tripAnalyticsInitFuture;
+        if (initFuture == null || !initFuture.isDone()) {
+            return false;
+        }
+
+        com.overdrive.app.trips.TripAnalyticsManager manager = tripAnalyticsManager;
+        if (manager == null) {
+            // Initialization completed without publishing a manager, so this
+            // process cannot own an active in-memory trip. Any older journal
+            // remains untouched for the wrapper's next process.
+            return true;
+        }
+        if (!manager.isInitialized()) {
+            return false;
+        }
+        if (!manager.isEnabled()) {
+            return true;
+        }
+        try {
+            // Flush buffered telemetry and leave the trip OPEN. Next boot
+            // rebuilds the row from the on-disk file, so a camera restart
+            // mid-drive does not end the trip.
+            manager.checkpointActiveTrip();
+            return true;
+        } catch (Throwable t) {
+            log("Trip checkpoint before camera restart failed (" + reason + "): "
+                    + t.getMessage());
+            return false;
+        }
+    }
+
+    static boolean shouldFinalizeTripsOnShutdown() {
+        return !processRestartIntent;
     }
 
     public static com.overdrive.app.charging.ChargingSessionManager getChargingSessionManager() {
@@ -2750,49 +3725,49 @@ public class CameraDaemon {
     }
 
     // ==================== STREAMING CONTROL (REMOVED - VPS functionality removed) ====================
-    
+
     /**
      * Start streaming a camera (DISABLED - VPS streaming removed).
      */
     public static void startStreaming(int viewId) {
         log("startStreaming(" + viewId + ") - VPS streaming removed, use local HTTP streaming instead");
     }
-    
+
     /**
      * Stop streaming a camera (DISABLED - VPS streaming removed).
      */
     public static void stopStreaming(int viewId) {
         log("stopStreaming(" + viewId + ") - VPS streaming removed");
     }
-    
+
     /**
      * Start streaming all cameras (DISABLED - VPS streaming removed).
      */
     public static void startAllStreaming() {
         log("startAllStreaming() - VPS streaming removed, use local HTTP streaming instead");
     }
-    
+
     /**
      * Stop all streaming (DISABLED - VPS streaming removed).
      */
     public static void stopAllStreaming() {
         log("stopAllStreaming() - VPS streaming removed");
     }
-    
+
     /**
      * Check if streaming is enabled (always false - VPS streaming removed).
      */
     public static boolean isStreamingEnabled() {
         return false;
     }
-    
+
     /**
      * Get list of cameras currently streaming (empty - VPS streaming removed).
      */
     public static java.util.List<Integer> getStreamingCameras() {
         return new java.util.ArrayList<>();
     }
-    
+
     // ==================== SURVEILLANCE CONTROL ====================
 
     /**
@@ -2816,9 +3791,10 @@ public class CameraDaemon {
             File eventDir = storageManager.getSurveillanceDir();
 
             // Create GPU pipeline with resolved profile dimensions
+            recordingModeManagerPipelineOwner = null;
             gpuPipeline = new com.overdrive.app.surveillance.GpuSurveillancePipeline(
                 resolvedCamera.getPanoWidth(), resolvedCamera.getPanoHeight(), eventDir);
-            
+
             // Get AssetManager from the app's APK
             // Since we're running as app_process, load model from filesystem
             android.content.res.AssetManager assetManager = null;
@@ -2826,7 +3802,7 @@ public class CameraDaemon {
                 // Try to create AssetManager from APK path
                 String classpath = System.getenv("CLASSPATH");
                 log("CLASSPATH: " + classpath);
-                
+
                 // Extract the app APK path (not framework jars)
                 String apkPath = null;
                 if (classpath != null) {
@@ -2838,17 +3814,17 @@ public class CameraDaemon {
                         }
                     }
                 }
-                
+
                 if (apkPath != null) {
                     android.content.res.AssetManager mgr = android.content.res.AssetManager.class.newInstance();
                     java.lang.reflect.Method addAssetPath = android.content.res.AssetManager.class
                         .getDeclaredMethod("addAssetPath", String.class);
                     int cookie = (Integer) addAssetPath.invoke(mgr, apkPath);
-                    
+
                     if (cookie != 0) {
                         assetManager = mgr;
                         log("AssetManager created from APK: " + apkPath);
-                        
+
                         // Extract web assets for HTTP server
                         HttpServer.extractWebAssets(assetManager);
                     } else {
@@ -2861,7 +3837,7 @@ public class CameraDaemon {
                 log("Could not create AssetManager: " + e.getMessage());
                 e.printStackTrace();
             }
-            
+
             // Apply persisted settings to config BEFORE init
             // IMPORTANT: Set codec FIRST, then bitrate (so bitrate is calculated for correct codec)
             String persistedCodec = HttpServer.getRecordingCodec();
@@ -2881,7 +3857,7 @@ public class CameraDaemon {
                 gpuPipeline.getConfig().setVideoCodec(videoCodec);
                 log("Pre-init: Set codec to " + persistedCodec);
             }
-            
+
             // Prefer the canonical recordingQuality tier (ECONOMY..MAX) over
             // the legacy recordingBitrate (LOW/MEDIUM/HIGH) — applyPersistedSettings
             // will later apply recordingQuality, and if pre-init used the
@@ -2921,15 +3897,15 @@ public class CameraDaemon {
                         gpuPipeline.getConfig().getVideoCodec() + ")");
                 }
             }
-            
+
             gpuPipeline.init(assetManager, com.overdrive.app.daemon.DaemonBootstrap.getContext());
-            
+
             log("GPU Surveillance initialized: profile=" + resolvedCamera.getProfile().getDisplayName()
                 + ", panoCam=" + resolvedCamera.getPanoCameraId()
                 + ", size=" + resolvedCamera.getPanoWidth() + "x" + resolvedCamera.getPanoHeight()
                 + " -> " + resolvedCamera.getProfile().getEncoderWidth()
                 + "x" + resolvedCamera.getProfile().getEncoderHeight() + " (mosaic)");
-            
+
             // Clean up orphaned .tmp files from previous crashed recordings
             try {
                 com.overdrive.app.storage.StorageManager sm = com.overdrive.app.storage.StorageManager.getInstance();
@@ -2938,17 +3914,21 @@ public class CameraDaemon {
             } catch (Exception e) {
                 log("Tmp cleanup error: " + e.getMessage());
             }
-            
+
             // Initialize TelemetryDataCollector for overlay (needs app context)
             // Moved after RecordingModeManager init since sharedAppContext may not exist yet
-            
+
             // Initialize RecordingModeManager
             if (sharedAppContext == null) {
                 sharedAppContext = createAppContext();
             }
             if (sharedAppContext != null) {
-                recordingModeManager = new com.overdrive.app.recording.RecordingModeManager(
-                    sharedAppContext, gpuPipeline);
+                com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline = gpuPipeline;
+                com.overdrive.app.recording.RecordingModeManager manager =
+                    new com.overdrive.app.recording.RecordingModeManager(
+                        sharedAppContext, pipeline);
+                recordingModeManagerPipelineOwner = pipeline;
+                recordingModeManager = manager;
                 log("RecordingModeManager initialized");
 
                 // Create AVC HAL warmup instance (shared with RecordingModeManager)
@@ -2980,14 +3960,14 @@ public class CameraDaemon {
                         log("AVC keep-alive started at daemon boot (dilink4)");
                     }
                 }
-                
+
                 // Now initialize TelemetryDataCollector (context is guaranteed available)
                 try {
                     telemetryDataCollector =
                         new com.overdrive.app.telemetry.TelemetryDataCollector();
                     telemetryDataCollector.init(sharedAppContext);
                     gpuPipeline.setTelemetryCollector(telemetryDataCollector);
-                    
+
                     // Apply persisted overlay enabled state. The resolver
                     // honours per-flow keys (panoEnabled / oemDashcamEnabled)
                     // and falls back to legacy `enabled` for pano so older
@@ -3059,6 +4039,7 @@ public class CameraDaemon {
             }
             // Print stack trace to logcat
             e.printStackTrace();
+            recordingModeManagerPipelineOwner = null;
             gpuPipeline = null;
             // FIX (audit R2, finding "initSurveillance() exception → permanent
             // gpuPipeline=null with no retry path"): kick a bounded
@@ -3122,25 +4103,63 @@ public class CameraDaemon {
                     // before replay so we don't seed RMM with a stale flag.
                     // Mirrors the main() drain shape at lines 731-769.
                     try {
-                        boolean hwAccIsOff_replay = probeAccStateWithBackoff("retry-replay");
+                        long replayProbeGeneration =
+                            captureAccObservationGeneration();
+                        AccProbeResult replayProbe =
+                            probeAccStateWithBackoff("retry-replay");
+                        boolean hwAccIsOff_replay = replayProbe.accIsOff;
                         boolean hwAccIsOn_replay = !hwAccIsOff_replay;
-                        if (pendingAccOff && recordingModeManager != null) {
+                        if (!replayProbe.trustworthy) {
+                            log("initSurveillance retry: hardware probe was not trustworthy; "
+                                + "preserving pending ACC state");
+                            requestTrustedAccHardwareRecovery(
+                                "untrustworthy init-surveillance replay probe");
+                            return;
+                        }
+                        if (!isAccObservationCurrent(replayProbeGeneration)) {
+                            log("initSurveillance retry: hardware probe superseded; "
+                                + "preserving pending ACC state");
+                            return;
+                        }
+                        if (hasPendingAccState(true) && recordingModeManager != null) {
+                            long pendingGeneration = claimPendingAccState(true);
                             if (hwAccIsOff_replay) {
-                                log("initSurveillance retry: replaying pending ACC OFF (HW-probed)");
-                                pendingAccOff = false;
-                                onAccStateChanged(true);
+                                if (pendingGeneration != 0L) {
+                                    log("initSurveillance retry: replaying pending ACC OFF (HW-probed)");
+                                    onAccStateChanged(true, pendingGeneration);
+                                }
                             } else {
-                                log("initSurveillance retry: pending ACC OFF discarded — HW probe shows ACC ON");
-                                pendingAccOff = false;
+                                if (pendingGeneration != 0L) {
+                                    log("initSurveillance retry: pending ACC OFF discarded — HW probe shows ACC ON");
+                                    onObservedAccStateChanged(
+                                        false,
+                                        replayProbeGeneration,
+                                        "retry-replay");
+                                    // Release the power latch the queued edge already set, same as the
+                                    // main() drain — otherwise a retracted "off" keeps suppressing the
+                                    // true state until the next ACC dispatch.
+                                    com.overdrive.app.automation.condition.BydEvent
+                                        .resetPowerEdge(false);
+                                }
                             }
-                        } else if (pendingAccOn && recordingModeManager != null) {
+                        } else if (hasPendingAccState(false) && recordingModeManager != null) {
+                            long pendingGeneration = claimPendingAccState(false);
                             if (hwAccIsOn_replay) {
-                                log("initSurveillance retry: replaying pending ACC ON (HW-probed)");
-                                pendingAccOn = false;
-                                onAccStateChanged(false);
+                                if (pendingGeneration != 0L) {
+                                    log("initSurveillance retry: replaying pending ACC ON (HW-probed)");
+                                    onAccStateChanged(false, pendingGeneration);
+                                }
                             } else {
-                                log("initSurveillance retry: pending ACC ON discarded — HW probe shows ACC OFF");
-                                pendingAccOn = false;
+                                if (pendingGeneration != 0L) {
+                                    log("initSurveillance retry: pending ACC ON discarded — HW probe shows ACC OFF");
+                                    onObservedAccStateChanged(
+                                        true,
+                                        replayProbeGeneration,
+                                        "retry-replay");
+                                    // Symmetric to the ACC OFF replay above — release the retracted edge.
+                                    com.overdrive.app.automation.condition.BydEvent
+                                        .resetPowerEdge(true);
+                                }
                             }
                         }
                     } catch (Throwable th) {
@@ -3159,7 +4178,18 @@ public class CameraDaemon {
             }
         }, "InitSurveillanceRetry");
         t.setDaemon(true);
-        t.start();
+        try {
+            t.start();
+        } catch (Throwable startFailure) {
+            initSurveillanceRetryInFlight.set(false);
+            log("initSurveillance retry worker could not start: "
+                + startFailure.getMessage());
+            Handler handler = mainHandler;
+            if (handler != null) {
+                handler.postDelayed(
+                    CameraDaemon::scheduleInitSurveillanceRetry, 1_000L);
+            }
+        }
     }
 
     /**
@@ -3187,7 +4217,7 @@ public class CameraDaemon {
                                 sharedAppContext = ctx;
                                 log("sharedAppContext watchdog: context created — "
                                     + "invoking reinitContextDependentComponents to drain queue");
-                                reinitContextDependentComponents();
+                                reinitContextDependentComponentsForCurrentAccState();
                                 return;
                             }
                         } catch (Throwable th) {
@@ -3199,7 +4229,7 @@ public class CameraDaemon {
                         // job by running the rmm-creation drain.
                         log("sharedAppContext watchdog: context now non-null but rmm null — "
                             + "invoking reinitContextDependentComponents");
-                        reinitContextDependentComponents();
+                        reinitContextDependentComponentsForCurrentAccState();
                         return;
                     } else {
                         // rmm already exists — nothing left to do.
@@ -3216,26 +4246,53 @@ public class CameraDaemon {
                     + "next ACC IPC will retry via existing isContextBroken path");
             } finally {
                 contextWatchdogInFlight.set(false);
+                if (running.get() && recordingModeManager == null
+                        && gpuPipeline != null) {
+                    Handler handler = mainHandler;
+                    if (handler != null) {
+                        handler.postDelayed(
+                            CameraDaemon::scheduleSharedContextWatchdog,
+                            30_000L);
+                    }
+                }
             }
         }, "SharedContextWatchdog");
         t.setDaemon(true);
-        t.start();
+        try {
+            t.start();
+        } catch (Throwable startFailure) {
+            contextWatchdogInFlight.set(false);
+            log("sharedAppContext watchdog worker could not start: "
+                + startFailure.getMessage());
+            Handler handler = mainHandler;
+            if (handler != null) {
+                handler.postDelayed(
+                    CameraDaemon::scheduleSharedContextWatchdog, 1_000L);
+            }
+        }
     }
-    
+
     /**
      * Enable surveillance mode.
      */
     public static void enableSurveillance() {
-        // RACE CONDITION FIX: Reject surveillance enable if ACC is ON.
-        // This is the primary guard against the race where AccSentryDaemon's
-        // enableSurveillance() retry loop or the 45-second fallback timer fires
-        // AFTER ACC has already turned ON. AccMonitor is the source of truth
-        // because it's updated synchronously by onAccStateChanged() on the IPC thread.
-        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-            log("enableSurveillance() REJECTED — ACC is ON (race condition guard)");
-            return;  // No recalc — resolver will fire from the ACC transition.
+        long generation = captureCurrentAccOffGenerationForSurveillance();
+        if (generation < 0L) {
+            log("enableSurveillance() REJECTED — ACC is ON or not yet authoritatively known");
+            return;
         }
+        enableSurveillanceForAccGeneration(generation, "public/deferred request");
+    }
 
+    private static boolean enableSurveillanceForAccGeneration(
+            long expectedGeneration, String source) {
+        SurveillanceEnableLease lease =
+            claimSurveillanceEnableLease(expectedGeneration);
+        if (lease == null) {
+            log("enableSurveillance() skipped (" + source
+                + ") — ACC OFF generation is no longer current");
+            return false;
+        }
         // OEM Dashcam: every non-ACC-rejected exit path of this method must
         // fire a recalc, because the user-facing surveillance state may have
         // changed (suppression cleared, schedule window opened, lock-gate
@@ -3244,69 +4301,215 @@ public class CameraDaemon {
         // try/finally guarantees the recalc fires even when an exception
         // propagates out of the surveillance start path.
         try {
-            if (gpuPipeline == null) {
+            if (stopStaleSurveillanceEnable(lease, source + " admission")) {
+                return false;
+            }
+            com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline =
+                gpuPipeline;
+            if (pipeline == null) {
                 log("GPU pipeline not ready — queuing surveillance enable for when pipeline initializes");
-                // FIX (audit R5): mirror dispatch-path discipline at :3124-3130.
-                // pendingAccOff and pendingAccOn are mutually exclusive; setting
-                // one MUST clear the other or a stale ACC ON queued from an
-                // earlier path can survive into the post-init drain and fire
-                // an unwanted ACC ON after we just queued ACC OFF here.
-                pendingAccOff = true;
-                pendingAccOn = false;
-                return;
+                markCurrentAccApplyDeferred();
+                invalidateLatestAccCompletionForCompensation();
+                if (!queuePendingAccState(true, lease.generation)) {
+                    log("GPU pipeline queue skipped — ACC OFF phase was superseded");
+                    requestAccTransitionReconciliation(true);
+                }
+                if (!isAccTransitionCurrent(lease.generation, true)) {
+                    forceLatestAccStateReconciliation(
+                        "stale pipeline-null surveillance deferral");
+                }
+                return false;
             }
 
             // SOTA: Safe Location check — don't start camera if parked at safe zone
             com.overdrive.app.surveillance.SafeLocationManager safeMgr =
                 com.overdrive.app.surveillance.SafeLocationManager.getInstance();
             if (safeMgr.isInSafeZone()) {
+                if (stopStaleSurveillanceEnable(
+                        lease, source + " safe-zone lookup")) {
+                    return false;
+                }
                 log("SAFE ZONE: Surveillance suppressed — " + safeMgr.getCurrentZoneName()
                     + " (dist=" + Math.round(safeMgr.getDistanceToNearestZone()) + "m)");
                 surveillanceEnabled = true;   // Mark intent so it auto-starts when leaving zone
                 safeZoneSuppressed = true;
-                return;  // Camera never opens. Zero resources.
+                if (stopStaleSurveillanceEnable(
+                        lease, source + " safe-zone suppression commit")) {
+                    return false;
+                }
+                return false;  // Camera never opens. Zero resources.
             }
 
-            log("Enabling GPU surveillance (pipeline=" + (gpuPipeline != null) +
-                ", running=" + (gpuPipeline != null && gpuPipeline.isRunning()) +
-                ", sentry=" + (gpuPipeline != null && gpuPipeline.getSentry() != null) + ")");
+            log("Enabling GPU surveillance (pipeline=true"
+                + ", running=" + pipeline.isRunning()
+                + ", sentry=" + (pipeline.getSentry() != null) + ")");
             surveillanceEnabled = true;
             safeZoneSuppressed = false;
 
             try {
-                if (!gpuPipeline.isRunning()) {
+                if (!pipeline.isRunning()) {
                     log("Pipeline not running — starting...");
-                    gpuPipeline.start();
+                    pipeline.start();
+                    if (stopStaleSurveillanceEnable(
+                            lease, source + " pipeline start")) {
+                        return false;
+                    }
                 }
                 // Enable surveillance mode (motion detection)
-                gpuPipeline.enableSurveillance();
+                pipeline.enableSurveillance();
+                if (stopStaleSurveillanceEnable(
+                        lease, source + " surveillance activation")) {
+                    return false;
+                }
                 // AVC keep-alive: same 60s `am start com.byd.avc` poke we use on
                 // the ACC-ON / streaming / recording-mode flows. Without it, BYD
                 // reaps com.byd.avc during a multi-hour park, the AVM HAL goes
                 // cold, frames stall, and the GL watchdog drops into the restart
                 // cascade that eventually trips MAX_RETRIES on the wrapper.
                 startAvcKeepAliveIfNeeded();
+                if (stopStaleSurveillanceEnable(
+                        lease, source + " AVC keep-alive")) {
+                    return false;
+                }
                 log("Surveillance mode activated successfully (AVC keep-alive on)");
-            } catch (Exception e) {
+                return true;
+            } catch (Throwable e) {
                 log("ERROR: Failed to enable surveillance: " + e.getMessage());
+                markCurrentAccApplyRetry();
+                forceLatestAccStateReconciliation(
+                    "failed surveillance enable (" + source + ")");
+                return false;
             }
         } finally {
+            releaseSurveillanceEnableLease(lease);
             try {
                 com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
             } catch (Throwable ignored) {}
         }
     }
-    
+
+    private static long captureCurrentAccOffGenerationForSurveillance() {
+        synchronized (parkTerminateLock) {
+            if (latestAccIsOff == null) {
+                // The daemon exposes HTTP before the startup hardware recovery probe. Do not turn
+                // AccMonitor's default cache value into a synthetic OFF generation in that window.
+                return -1L;
+            }
+            return latestAccIsOff.booleanValue()
+                ? accTransitionGeneration : -1L;
+        }
+    }
+
+    private static SurveillanceEnableLease claimSurveillanceEnableLease(
+            long expectedGeneration) {
+        AccApplyContext accContext = ACC_APPLY_CONTEXT.get();
+        synchronized (parkTerminateLock) {
+            if (expectedGeneration != accTransitionGeneration
+                    || !Boolean.TRUE.equals(latestAccIsOff)
+                    || parkShutdownCommitted
+                    || !running.get()) {
+                return null;
+            }
+            if (activeSurveillanceEnableLease != 0L) {
+                if (activeSurveillanceEnableGeneration != expectedGeneration
+                        || leaseExpired(activeSurveillanceEnableDeadlineNanos)) {
+                    revokeActiveSurveillanceEnableLocked(
+                        activeSurveillanceEnableGeneration != expectedGeneration
+                            ? "newer surveillance generation"
+                            : "enable deadline");
+                } else {
+                    return null;
+                }
+            }
+            // Revoking a prior surveillance owner invalidates the reconciliation revision.
+            // Recompute nesting afterward so a stale ACC owner cannot bypass lease exclusion.
+            boolean nestedInCurrentAccOwner = accContext != null
+                && activeAccTransitionGeneration == accContext.generation
+                && activeAccTransitionLease == accContext.lease
+                && accContext.revision == accReconciliationRevision;
+            if (activeAccTransitionLease != 0L
+                    && !nestedInCurrentAccOwner) {
+                if (activeAccTransitionGeneration != expectedGeneration
+                        || leaseExpired(activeAccTransitionDeadlineNanos)) {
+                    revokeActiveAccTransitionLocked(
+                        activeAccTransitionGeneration != expectedGeneration
+                            ? "newer surveillance generation"
+                            : "effect deadline");
+                } else {
+                    return null;
+                }
+            }
+            long token = ++nextSurveillanceEnableLease;
+            activeSurveillanceEnableGeneration = expectedGeneration;
+            activeSurveillanceEnableRevision = accReconciliationRevision;
+            activeSurveillanceEnableLease = token;
+            activeSurveillanceEnableDeadlineNanos = System.nanoTime()
+                + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                    SURVEILLANCE_ENABLE_LEASE_MAX_MS);
+            activeSurveillanceEnableThread = Thread.currentThread();
+            return new SurveillanceEnableLease(
+                expectedGeneration, accReconciliationRevision, token);
+        }
+    }
+
+    private static boolean stopStaleSurveillanceEnable(
+            SurveillanceEnableLease lease, String phase) {
+        synchronized (parkTerminateLock) {
+            if (lease.generation == accTransitionGeneration
+                    && Boolean.TRUE.equals(latestAccIsOff)
+                    && lease.revision == accReconciliationRevision
+                    && activeSurveillanceEnableGeneration == lease.generation
+                    && activeSurveillanceEnableRevision == lease.revision
+                    && activeSurveillanceEnableLease == lease.token
+                    && running.get()
+                    && !parkShutdownCommitted) {
+                return false;
+            }
+        }
+        log("Surveillance enable gen=" + lease.generation
+            + " became stale during " + phase);
+        markCurrentAccApplyRetry();
+        forceLatestAccStateReconciliation(
+            "stale surveillance effect (" + phase + ")");
+        return true;
+    }
+
+    private static void releaseSurveillanceEnableLease(
+            SurveillanceEnableLease lease) {
+        boolean retryLatestState = false;
+        synchronized (parkTerminateLock) {
+            if (activeSurveillanceEnableGeneration == lease.generation
+                    && activeSurveillanceEnableRevision == lease.revision
+                    && activeSurveillanceEnableLease == lease.token) {
+                activeSurveillanceEnableGeneration = 0L;
+                activeSurveillanceEnableRevision = 0L;
+                activeSurveillanceEnableLease = 0L;
+                activeSurveillanceEnableDeadlineNanos = 0L;
+                activeSurveillanceEnableThread = null;
+                retryLatestState = running.get()
+                    && !parkShutdownCommitted
+                    && latestAccIsOff != null
+                    && !isCurrentAccTransitionCompletedLocked();
+            } else {
+                // A revoked owner may have landed an effect after its replacement completed.
+                retryLatestState = running.get()
+                    && !parkShutdownCommitted && latestAccIsOff != null;
+            }
+        }
+        if (retryLatestState) {
+            requestAccTransitionReconciliation(false);
+        }
+    }
+
     /**
      * Ensure camera is running for surveillance (called by SurveillanceEngine when it becomes active).
      * This avoids circular calls between CameraDaemon and SurveillanceEngine.
      */
     public static void ensureCameraForSurveillance() {
         log("ensureCameraForSurveillance called");
-        surveillanceEnabled = true;
         enableSurveillance();
     }
-    
+
     /**
      * Disable surveillance mode.
      */
@@ -3337,20 +4540,24 @@ public class CameraDaemon {
             com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
         } catch (Throwable ignored) {}
     }
-    
+
     // ==================== DOOR LOCK GATE ====================
     // Surveillance is only armed after doors are locked. This prevents false motion
     // events from the owner exiting the car. Cloud lock detection is primary (MQTT
     // subscriber runs in this process), device SDK is fallback, 60s timeout is last resort.
-    
+
     /**
      * Register door lock listener and arm surveillance when doors lock.
      * Called from ACC OFF path after all other gates (user enabled, safe zone, schedule) pass.
-     * 
-     * RACE CONDITION SAFETY: Every callback and timeout checks AccMonitor.isAccOn()
+     *
+     * RACE CONDITION SAFETY: Every callback and timeout validates current hardware ACC state
      * before arming. If ACC turns ON during the lock wait, surveillance is NOT armed.
      */
-    private static void registerDoorLockListenerAndArmOnLock() {
+    private static void registerDoorLockListenerAndArmOnLock(long transitionGeneration) {
+        if (stopStaleAccTransition(
+                transitionGeneration, true, "door-lock gate setup")) {
+            return;
+        }
         doorLockListenerArmed = false;
         // Reset the fallback signal for this ACC-off cycle. Flipped true by
         // applyLockEvent() the first time any source delivers a definite
@@ -3377,9 +4584,9 @@ public class CameraDaemon {
         // arm or disarm. attachDeviceLockSource() is now a no-op stub kept
         // for symmetry with attachCloudLockSource and the poll thread.
 
-        attachCloudLockSource();
+        attachCloudLockSource(transitionGeneration);
         attachDeviceLockSource();
-        startUnlockPollThread();
+        startUnlockPollThread(transitionGeneration);
 
         // Initial state probe — priority order: device (OTA-fast-path) BEFORE
         // cloud. The OTA device exposes LF state ACC=OFF with sub-second
@@ -3389,9 +4596,13 @@ public class CameraDaemon {
         // Both calls are gate-idempotent so order only matters for the
         // log line that reports which source decided.
         Boolean deviceInitial = currentDeviceLockState();
-        if (deviceInitial != null) applyLockEvent(deviceInitial, "device-initial");
+        if (deviceInitial != null) {
+            applyLockEvent(deviceInitial, "device-initial", transitionGeneration);
+        }
         Boolean cloudInitial = currentCloudLockState();
-        if (cloudInitial != null) applyLockEvent(cloudInitial, "cloud-initial");
+        if (cloudInitial != null) {
+            applyLockEvent(cloudInitial, "cloud-initial", transitionGeneration);
+        }
 
         // Force-arm deadline (lock-mode FALLBACK for trims that can't read lock
         // state): DOOR_LOCK_ARM_TIMEOUT_MS (60s) after ACC-OFF, if lock state was
@@ -3410,17 +4621,22 @@ public class CameraDaemon {
         // unlocked car should select power mode.
         //
         // Still gated on ACC — if ACC came back ON in the meantime we must not arm.
-        new Thread(() -> {
+        Thread timeoutThread = new Thread(() -> {
             try {
-                Thread.sleep(DOOR_LOCK_ARM_TIMEOUT_MS);
-            } catch (InterruptedException ignored) {
-                log("LOCK GATE TIMEOUT: thread interrupted before deadline — not arming");
-                return;
-            }
-            if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-                log("LOCK GATE TIMEOUT: ACC is ON — not arming");
-                return;
-            }
+                try {
+                    Thread.sleep(DOOR_LOCK_ARM_TIMEOUT_MS);
+                } catch (InterruptedException ignored) {
+                    log("LOCK GATE TIMEOUT: thread interrupted before deadline — not arming");
+                    return;
+                }
+                if (stopStaleAccTransition(
+                        transitionGeneration, true, "door-lock timeout")) {
+                    return;
+                }
+                if (!validateAccOffForDeferredEffect(
+                        transitionGeneration, "door-lock-timeout")) {
+                    return;
+                }
             // Authoritative, not a flag check: set armed + call enableSurveillance()
             // directly. Idempotent — a no-op if the pipeline is already running, and
             // enableSurveillance() itself still honors safe-zone / schedule
@@ -3435,7 +4651,11 @@ public class CameraDaemon {
             // disableSurveillance() — leaving surveillance off though we intended
             // to arm. Holding the lock makes "set flag + enable + verify" atomic
             // w.r.t. every other lock-event source.
-            synchronized (CameraDaemon.class) {
+                if (stopStaleAccTransition(
+                        transitionGeneration, true, "door-lock timeout commit")) {
+                    return;
+                }
+                synchronized (CameraDaemon.class) {
                 // FAST-PATH EXIT: if a lock source already detected the lock and
                 // armed us during the grace window (the common case — OTA reports
                 // LOCKED within ~1s of ACC-off), this force-arm is a redundant
@@ -3447,7 +4667,7 @@ public class CameraDaemon {
                     log("LOCK GATE: already armed via lock detection — force-arm deadline is a no-op");
                     return;
                 }
-                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                if (!isAccTransitionCurrent(transitionGeneration, true)) {
                     log("LOCK GATE TIMEOUT: ACC turned ON before force-arm — not arming");
                     return;
                 }
@@ -3487,9 +4707,13 @@ public class CameraDaemon {
                 log("LOCK GATE TIMEOUT: " + (DOOR_LOCK_ARM_TIMEOUT_MS / 1000)
                     + "s elapsed and lock state never readable on this trim — "
                     + "force-arming surveillance (lock-mode fallback)");
-                doorLockListenerArmed = true;
-                safeZoneSuppressed = false;  // cleared if/when enableSurveillance() actually starts
-                enableSurveillance();
+                if (stopStaleAccTransition(
+                        transitionGeneration, true, "door-lock force-arm")) {
+                    return;
+                }
+                boolean enabled = enableSurveillanceForAccGeneration(
+                    transitionGeneration, "door-lock timeout");
+                doorLockListenerArmed = enabled;
                 // Consistency guard: enableSurveillance() can decline to start the
                 // pipeline for two reasons — (1) ACC turned ON in the gap before its
                 // internal re-check (see :2787), or (2) we're parked in a safe zone
@@ -3499,7 +4723,7 @@ public class CameraDaemon {
                 // surveillance isn't running) and a later unlock would call a
                 // spurious disableSurveillance(). Revert the flag if the pipeline did
                 // not actually start.
-                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                if (!isAccTransitionCurrent(transitionGeneration, true)) {
                     log("LOCK GATE TIMEOUT: ACC turned ON during force-arm — reverting doorLockListenerArmed");
                     doorLockListenerArmed = false;
                 } else if (safeZoneSuppressed
@@ -3508,68 +4732,160 @@ public class CameraDaemon {
                         + "(safeZone=" + safeZoneSuppressed + ") — reverting doorLockListenerArmed");
                     doorLockListenerArmed = false;
                 }
+                }
+            } finally {
+                boolean ownedSlot = false;
+                synchronized (doorLockTimeoutLock) {
+                    if (doorLockTimeoutThread == Thread.currentThread()) {
+                        doorLockTimeoutThread = null;
+                        doorLockTimeoutGeneration = 0L;
+                        ownedSlot = true;
+                    }
+                }
+                long currentOffGeneration =
+                    captureCurrentAccOffGenerationForSurveillance();
+                if (ownedSlot && running.get()
+                        && currentOffGeneration >= 0L
+                        && currentOffGeneration
+                            != transitionGeneration) {
+                    requestManagedAccWorkerRecovery(
+                        "stale door-lock timeout exited");
+                }
             }
-        }, "DoorLockTimeout").start();
+        }, "DoorLockTimeout");
+        timeoutThread.setDaemon(true);
+        Thread previousTimeout;
+        synchronized (doorLockTimeoutLock) {
+            previousTimeout = doorLockTimeoutThread;
+            if (previousTimeout != null
+                    && previousTimeout.isAlive()
+                    && doorLockTimeoutGeneration
+                        == transitionGeneration) {
+                startAccOnDisarmWatchdog(
+                    transitionGeneration);
+                return;
+            }
+        }
+        if (previousTimeout != null
+                && previousTimeout.isAlive()
+                && !interruptAndJoinManagedThread(
+                    previousTimeout, "door-lock timeout")) {
+            requestManagedAccWorkerRecovery(
+                "stuck door-lock timeout");
+            return;
+        }
+        synchronized (doorLockTimeoutLock) {
+            Thread current = doorLockTimeoutThread;
+            if (current != null && current.isAlive()
+                    && current != previousTimeout) {
+                return;
+            }
+            doorLockTimeoutThread = timeoutThread;
+            doorLockTimeoutGeneration = transitionGeneration;
+        }
+        try {
+            timeoutThread.start();
+        } catch (Throwable t) {
+            synchronized (doorLockTimeoutLock) {
+                if (doorLockTimeoutThread == timeoutThread) {
+                    doorLockTimeoutThread = null;
+                    doorLockTimeoutGeneration = 0L;
+                }
+            }
+            log("LOCK GATE TIMEOUT: worker could not start: " + t.getMessage());
+            requestManagedAccWorkerRecovery(
+                "door-lock timeout start failure");
+        }
 
         // Reverse fallback: ACC-ON disarm watchdog. Periodically queries
         // hardware ACC state directly. If ACC turned ON without any IPC
         // event reaching us (rare but seen during AccSentryDaemon restart
         // races), this thread force-disables surveillance.
-        startAccOnDisarmWatchdog();
+        startAccOnDisarmWatchdog(transitionGeneration);
     }
 
     /**
      * Single arm/disarm path. Idempotent: redundant calls in the same state
      * are no-ops. Every lock-event source flows through here.
      */
-    private static synchronized void applyLockEvent(boolean locked, String source) {
-        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-            log("LOCK GATE [" + source + "]: " + (locked ? "LOCKED" : "UNLOCKED")
-                + " but ACC is ON — ignoring");
+    private static void applyLockEvent(
+            boolean locked, String source, long transitionGeneration) {
+        if (stopStaleAccTransition(
+                transitionGeneration, true, "door-lock event " + source)) {
             return;
         }
-        // A definite reading arrived (this method is only ever called with a real
-        // LOCKED/UNLOCKED value — INVALID/unknown reads are filtered upstream in
-        // the poll and cloud sources). Record it so the 60s force-arm fallback
-        // knows lock state is READABLE on this trim and must NOT override a
-        // genuine unlock.
-        sawValidLockReading = true;
-        // Publish the central-lock state to the AUTOMATION engine — this is the single
-        // funnel every definite lock reading (SDK OTA poll + cloud) converges through, so
-        // a "when the car locks/unlocks" trigger and a "only while locked" condition both
-        // get every real edge here. Done BEFORE the arm-gate early-returns below so a lock
-        // automation fires regardless of whether surveillance was already armed. Level-
-        // triggered + deduped in Automations.update, so a repeated same-state read no-ops.
-        try {
-            com.overdrive.app.automation.Automations.update(
-                    com.overdrive.app.automation.condition.BydEvent.LOCK,
-                    locked ? "locked" : "unlocked");
-        } catch (Throwable t) {
-            log("lock automation publish failed: " + t.getMessage());
+        if (!validateAccOffForDeferredEffect(
+                transitionGeneration, "door-lock-" + source)) {
+            return;
         }
-        if (locked) {
-            if (doorLockListenerArmed) return;
-            log("LOCK GATE [" + source + "]: LOCKED — arming surveillance");
-            doorLockListenerArmed = true;
-            enableSurveillance();
-        } else {
-            if (!doorLockListenerArmed) return;
-            log("LOCK GATE [" + source + "]: UNLOCKED — disarming surveillance (owner returning)");
-            disableSurveillance();
-            doorLockListenerArmed = false;
-        }
+        synchronized (CameraDaemon.class) {
+                if (!isAccTransitionCurrent(transitionGeneration, true)) {
+                    log("LOCK GATE [" + source + "]: "
+                        + (locked ? "LOCKED" : "UNLOCKED")
+                        + " but ACC is ON — ignoring");
+                    return;
+                }
+                // A definite reading arrived (this method is only ever called with a real
+                // LOCKED/UNLOCKED value — INVALID/unknown reads are filtered upstream in
+                // the poll and cloud sources). Record it so the 60s force-arm fallback
+                // knows lock state is READABLE on this trim and must NOT override a
+                // genuine unlock.
+                sawValidLockReading = true;
+                // Publish the central-lock state to the AUTOMATION engine — this is the single
+                // funnel every definite lock reading (SDK OTA poll + cloud) converges through, so
+                // a "when the car locks/unlocks" trigger and a "only while locked" condition both
+                // get every real edge here. Done BEFORE the arm-gate early-returns below so a lock
+                // automation fires regardless of whether surveillance was already armed. Level-
+                // triggered + deduped in Automations.update, so a repeated same-state read no-ops.
+                try {
+                    com.overdrive.app.automation.AutomationQueue.runLatestStatePublication(
+                        com.overdrive.app.automation.AutomationQueue.LatestStateStream.LOCK,
+                        () -> com.overdrive.app.automation.AutomationQueue
+                            .runLatestStateMutation(
+                                com.overdrive.app.automation.AutomationQueue
+                                    .LatestStateStream.LOCK,
+                                () -> com.overdrive.app.automation.Automations.update(
+                                    com.overdrive.app.automation.condition.BydEvent.LOCK,
+                                    locked ? "locked" : "unlocked")));
+                } catch (Throwable t) {
+                    log("lock automation publish failed: " + t.getMessage());
+                }
+                if (locked) {
+                    if (doorLockListenerArmed) return;
+                    log("LOCK GATE [" + source + "]: LOCKED — arming surveillance");
+                    boolean enabled = enableSurveillanceForAccGeneration(
+                        transitionGeneration, "door-lock event/" + source);
+                    doorLockListenerArmed = enabled;
+                    if (!enabled) {
+                        requestAccTransitionReconciliation(false);
+                    }
+                } else {
+                    if (!doorLockListenerArmed) return;
+                    log("LOCK GATE [" + source
+                        + "]: UNLOCKED — disarming surveillance (owner returning)");
+                    disableSurveillance();
+                    doorLockListenerArmed = false;
+                    if (stopStaleAccTransition(
+                            transitionGeneration,
+                            true,
+                            "door-unlock surveillance disable")) {
+                        return;
+                    }
+                }
+            }
     }
 
     /** Cloud (MQTT) lock-event source. Always attached — runs in parallel
      *  with the device-SDK source. No primary/fallback toggle. */
-    private static void attachCloudLockSource() {
+    private static void attachCloudLockSource(long transitionGeneration) {
         try {
             com.overdrive.app.byd.cloud.BydCloudDataProvider cloudProvider =
                 com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance();
             if (cloudLockListener != null) {
                 cloudProvider.removeLockStateListener(cloudLockListener);
             }
-            cloudLockListener = (locked, timestampMs) -> applyLockEvent(locked, "cloud");
+            cloudLockListener = (locked, timestampMs) ->
+                applyLockEvent(locked, "cloud", transitionGeneration);
             cloudProvider.addLockStateListener(cloudLockListener);
             log("LOCK GATE: Cloud lock listener attached");
         } catch (Exception e) {
@@ -3616,82 +4932,136 @@ public class CameraDaemon {
     /**
      * ACC-ON disarm watchdog. While surveillance is active during ACC OFF,
      * polls hardware ACC state every few seconds. If hardware says ACC ON
-     * but AccMonitor still says OFF (IPC missed, AccSentryDaemon restarting),
-     * force-disables surveillance directly. Symmetric counterpart to the
-     * ACC-OFF arm timeout.
+     * but the normal IPC was missed, admits that observation through the same
+     * generation-linearized ACC path as an IPC edge.
      */
-    private static void startAccOnDisarmWatchdog() {
-        if (accOnDisarmWatchdog != null && accOnDisarmWatchdog.isAlive()) return;
-        accOnDisarmWatchdog = new Thread(() -> {
-            log("ACC-ON disarm watchdog started");
-            while (true) {
-                try {
-                    Thread.sleep(ACC_ON_DISARM_POLL_INTERVAL_MS);
-                } catch (InterruptedException ie) {
-                    return;
-                }
-                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-                    log("ACC-ON disarm watchdog exiting (AccMonitor=ON)");
-                    return;
-                }
-                if (sharedAppContext == null) continue;
-                try {
-                    // BUGFIX (surv disarms after ~1 event w/ USB-power OFF):
-                    // The old code called the SINGLE-SHOT probeAccState here.
-                    // On a sentinel HAL reading (FAKE_OK=4 / INVALID=255) with a
-                    // non-authoritative AccMonitor cache, probeAccState returns
-                    // false = "ACC ON safe default" (AccMonitor:283-285). With the
-                    // "Keep USB powered" toggle OFF the AP is allowed to sleep, so
-                    // AccSentryDaemon's setAccState IPC heartbeats stop arriving and
-                    // accOnAuthoritative goes stale/false — making that safe-default
-                    // path reachable on any transient sentinel read. The watchdog
-                    // then mistook the bluff for real ignition-on and force-disarmed
-                    // surveillance (badge → OFF, sentry listener torn down), with no
-                    // re-arm until a manual restart / web re-enable.
-                    //
-                    // Two guards:
-                    //   1. Use the 3× stability probe (probeAccStateWithBackoff),
-                    //      not the single shot, so one transient sentinel can't trip it.
-                    //   2. Only disarm on a CLEAN (trustworthy) reading. A real
-                    //      ignition-on always reads a clean bodywork power level (≥2);
-                    //      a sentinel (FAKE_OK=4 / INVALID=255) that merely DEFAULTS to
-                    //      ACC-ON must NOT disarm a parked session. With "Keep USB
-                    //      powered" OFF the AP sleeps and AccSentryDaemon's ACC-state
-                    //      IPC stops, so the HAL frequently returns sentinels — the old
-                    //      single-shot probe treated those as ACC-ON and force-disarmed
-                    //      surveillance with no re-arm. wasLastProbeTrustworthy() is
-                    //      false on any sentinel/error/default path, true only on a
-                    //      clean level read — so a REAL ACC-ON (clean read) still
-                    //      disarms promptly, while bluffs are ignored.
-                    boolean hwSaysAccOff = probeAccStateWithBackoff("disarm-watchdog");
-                    boolean trustworthy = com.overdrive.app.monitor.AccMonitor
-                        .wasLastProbeTrustworthy();
-                    if (!hwSaysAccOff && trustworthy && surveillanceEnabled) {
-                        log("ACC-ON DISARM WATCHDOG: hardware says ACC ON (clean read) "
-                            + "but surveillance still active — force-disabling");
-                        disableSurveillance();
-                        doorLockListenerArmed = false;
-                        return;
-                    } else if (!hwSaysAccOff && !trustworthy && surveillanceEnabled) {
-                        // Probe returned ACC-ON but via a sentinel/default (untrustworthy).
-                        // Do NOT disarm — stay armed and let a clean read (or a genuine
-                        // ACC-ON IPC via setAccState) decide. Logged so a recurring
-                        // disarm investigation can see this path was taken.
-                        log("ACC-ON disarm watchdog: probe returned ACC-ON but reading "
-                            + "is a sentinel/default (untrustworthy — likely parked w/ "
-                            + "USB-power off) — staying armed");
-                    }
-                } catch (Exception ignored) {}
+    private static void startAccOnDisarmWatchdog(long transitionGeneration) {
+        Thread previous;
+        synchronized (accOnDisarmWatchdogLock) {
+            previous = accOnDisarmWatchdog;
+            if (previous != null && previous.isAlive()
+                    && accOnDisarmWatchdogGeneration
+                        == transitionGeneration) {
+                return;
             }
-        }, "AccOnDisarmWatchdog");
-        accOnDisarmWatchdog.setDaemon(true);
-        accOnDisarmWatchdog.start();
+        }
+        if (previous != null && previous.isAlive()
+                && !interruptAndJoinManagedThread(
+                    previous, "ACC-ON disarm watchdog")) {
+            log("ACC-ON disarm watchdog replacement deferred; old worker is still alive");
+            requestManagedAccWorkerRecovery(
+                "stuck ACC-ON disarm watchdog");
+            return;
+        }
+
+        final Thread worker;
+        try {
+            worker = new Thread(() -> {
+                try {
+                    log("ACC-ON disarm watchdog started");
+                    while (true) {
+                        try {
+                            Thread.sleep(
+                                ACC_ON_DISARM_POLL_INTERVAL_MS);
+                        } catch (InterruptedException interrupted) {
+                            return;
+                        }
+                        if (!isAccTransitionCurrent(
+                                transitionGeneration, true)) {
+                            return;
+                        }
+                        if (sharedAppContext == null) {
+                            continue;
+                        }
+
+                        long observationGeneration =
+                            captureAccObservationGeneration();
+                        if (observationGeneration
+                                != transitionGeneration) {
+                            return;
+                        }
+                        AccProbeResult probe =
+                            probeAccStateWithBackoff(
+                                "disarm-watchdog");
+                        if (!isAccObservationCurrent(
+                                observationGeneration)) {
+                            return;
+                        }
+                        if (!probe.accIsOff && probe.trustworthy) {
+                            log("ACC-ON disarm watchdog: clean hardware ON observation");
+                            onObservedAccStateChanged(
+                                false,
+                                observationGeneration,
+                                "disarm-watchdog");
+                            return;
+                        }
+                        if (!probe.accIsOff && !probe.trustworthy
+                                && surveillanceEnabled) {
+                            log("ACC-ON disarm watchdog: ignoring untrustworthy ON default");
+                        }
+                    }
+                } finally {
+                    boolean ownedSlot = false;
+                    synchronized (accOnDisarmWatchdogLock) {
+                        if (accOnDisarmWatchdog
+                                == Thread.currentThread()) {
+                            accOnDisarmWatchdog = null;
+                            accOnDisarmWatchdogGeneration = 0L;
+                            ownedSlot = true;
+                        }
+                    }
+                    if (ownedSlot && running.get()
+                            && isAccTransitionCurrent(
+                                transitionGeneration, true)) {
+                        requestManagedAccWorkerRecovery(
+                            "ACC-ON disarm watchdog exited");
+                    }
+                }
+            }, "AccOnDisarmWatchdog");
+            worker.setDaemon(true);
+        } catch (Throwable creationFailure) {
+            requestManagedAccWorkerRecovery(
+                "ACC-ON disarm watchdog creation failure");
+            return;
+        }
+
+        synchronized (accOnDisarmWatchdogLock) {
+            Thread current = accOnDisarmWatchdog;
+            if (current != null && current.isAlive()
+                    && current != previous) {
+                return;
+            }
+            accOnDisarmWatchdog = worker;
+            accOnDisarmWatchdogGeneration =
+                transitionGeneration;
+        }
+        try {
+            worker.start();
+        } catch (Throwable startFailure) {
+            synchronized (accOnDisarmWatchdogLock) {
+                if (accOnDisarmWatchdog == worker) {
+                    accOnDisarmWatchdog = null;
+                    accOnDisarmWatchdogGeneration = 0L;
+                }
+            }
+            requestManagedAccWorkerRecovery(
+                "ACC-ON disarm watchdog start failure");
+        }
     }
 
     private static void stopAccOnDisarmWatchdog() {
-        if (accOnDisarmWatchdog != null && accOnDisarmWatchdog.isAlive()) {
-            accOnDisarmWatchdog.interrupt();
-            accOnDisarmWatchdog = null;
+        Thread worker;
+        synchronized (accOnDisarmWatchdogLock) {
+            worker = accOnDisarmWatchdog;
+        }
+        if (interruptAndJoinManagedThread(
+                worker, "ACC-ON disarm watchdog")) {
+            synchronized (accOnDisarmWatchdogLock) {
+                if (accOnDisarmWatchdog == worker) {
+                    accOnDisarmWatchdog = null;
+                    accOnDisarmWatchdogGeneration = 0L;
+                }
+            }
         }
     }
 
@@ -3710,48 +5080,47 @@ public class CameraDaemon {
     // cycle entirely.
     private static final Object probeEdgeLock = new Object();
 
-    // Ownership token for the probe-edge dispatch gate. 0 == free; any other
-    // value is the generation of the worker that currently owns it.
-    //
-    // WHY A TOKEN AND NOT AN AtomicBoolean (audit R2 defect #2): the gate has to
-    // be STEALABLE (a wedged ACC chain must not block edges forever) but a plain
-    // boolean has no notion of who owns it — a stolen worker's finally would
-    // clear the flag while the thief's worker is still live, leaving the gate
-    // reading "free" with a dispatch running. The next tick then admits a third
-    // worker concurrently with the second, and so on: concurrent ACC chains with
-    // OPPOSITE accIsOff values (gpuPipeline.start() racing stop()). With a
-    // generation token a worker only releases the gate if it still owns it, so a
-    // steal transfers ownership exactly once and over-admission is impossible.
+    // Serialized ownership for probe-driven ACC dispatch. A latest-request mailbox absorbs
+    // observations while one worker is active; no replacement is started until that worker exits.
     private static final java.util.concurrent.atomic.AtomicLong probeEdgeDispatchOwner =
         new java.util.concurrent.atomic.AtomicLong(0L);
 
     // Monotonic source of ownership generations. Never reset.
     private static final java.util.concurrent.atomic.AtomicLong probeEdgeDispatchGen =
         new java.util.concurrent.atomic.AtomicLong(0L);
+    private static final long PROBE_EDGE_DISPATCH_LEASE_MS = 20_000L;
+    private static long probeEdgeDispatchDeadlineNanos;
+    private static long probeEdgeDispatchObservationGeneration;
+    private static Boolean probeEdgeDispatchAccIsOff;
+    private static Thread probeEdgeDispatchThread;
+    private static final long PROBE_EDGE_REVOCATION_GRACE_MS = 2_000L;
+    private static boolean probeEdgeDispatchRevoked;
+    private static long probeEdgeDispatchRevocationDeadlineNanos;
+    private static ProbeEdgeDispatchRequest pendingProbeEdgeDispatch;
+    private static boolean probeEdgeRetryPosted;
 
-    // When the currently-owning dispatch started (0 = none). Read by a later
-    // prober to decide whether the owner is wedged.
-    //
-    // GUARDED BY probeEdgeLock for BOTH reads and writes — including the release
-    // in the worker's finally. It must never be written outside the lock: the
-    // release used to CAS `owner` and then write `since = 0` as a separate
-    // unsynchronized step, so this interleaving was possible —
-    //   W1 releases owner (gen1 -> 0) | P2 claims (owner=gen2, since=T2) |
-    //   W1's late `since = 0` lands
-    // leaving owner=gen2 (busy) with since=0. The stuck test requires since > 0,
-    // so the 5-min steal could then NEVER fire, and every subsequent probe took
-    // the "deferring" branch and decremented the confirm counter — arming starved
-    // for as long as that owner lived, and permanently if it too wedged. Keeping
-    // (owner, since) mutated only under the lock makes them a single unit.
-    private static long probeEdgeDispatchSinceMs = 0L;
+    private static final class ProbeEdgeDispatchRequest {
+        final boolean accIsOff;
+        final String reason;
+        final long observationGeneration;
+        final com.overdrive.app.recording.RecordingModeManager managerOwner;
+        final com.overdrive.app.surveillance.GpuSurveillancePipeline pipelineOwner;
+        final boolean handoffPromised;
 
-    // How long a probe-edge dispatch may own the gate before a later prober
-    // steals it. The ACC chain can legitimately take tens of seconds (trip
-    // finalize, ensureSdCardMounted ~15s, ~4s AVC warmup, pipeline start), and
-    // RecordingModeManager documents a real multi-minute lifecycleSerializer
-    // stall — so this must be generous. 5 min is far past any healthy chain but
-    // still recovers a genuinely wedged one within one park instead of never.
-    private static final long PROBE_EDGE_DISPATCH_STUCK_MS = 300_000L;
+        ProbeEdgeDispatchRequest(
+                boolean accIsOff, String reason,
+                long observationGeneration,
+                com.overdrive.app.recording.RecordingModeManager managerOwner,
+                com.overdrive.app.surveillance.GpuSurveillancePipeline pipelineOwner,
+                boolean handoffPromised) {
+            this.accIsOff = accIsOff;
+            this.reason = reason;
+            this.observationGeneration = observationGeneration;
+            this.managerOwner = managerOwner;
+            this.pipelineOwner = pipelineOwner;
+            this.handoffPromised = handoffPromised;
+        }
+    }
 
     // How many CONSECUTIVE probe observations of "the ACC chain's state disagrees
     // with hardware" are required before dispatching from the path where
@@ -3865,8 +5234,8 @@ public class CameraDaemon {
      * {@link #PROBE_EDGE_CONFIRM_MIN_MS} of wall-clock, so a probe — or a burst of
      * them from the off-cadence callers — landing inside a genuine in-flight IPC's
      * dedup window cannot spawn a duplicate chain; a
-     * generation-token gate so a stolen dispatch can't be released by its
-     * displaced owner; and {@link #PROBE_EDGE_RETRY_BACKOFF_MS}, so a chain that
+     * revocable, two-slot generation-token gate so a blocked dispatch cannot multiply
+     * effect threads or suppress a newer observation; and {@link #PROBE_EDGE_RETRY_BACKOFF_MS}, so a chain that
      * keeps failing to arm is retried with escalating spacing instead of re-running
      * the heavy ACC-OFF prologue every 30s forever. On a healthy system the whole
      * method is a silent two-volatile-read no-op.
@@ -3895,15 +5264,21 @@ public class CameraDaemon {
         // against a concurrent shutdownInternal (bounded by the killProcess that
         // follows), matching the pre-existing pattern on this path.
         if (!running.get()) return false;
+        final long observationGeneration = captureAccObservationGeneration();
         synchronized (probeEdgeLock) {
-            return dispatchProbedAccEdgeLocked(accIsOff, reason);
+            return dispatchProbedAccEdgeLocked(
+                accIsOff, reason, observationGeneration);
         }
     }
 
     /** Body of {@link #dispatchProbedAccEdge}; caller holds {@link #probeEdgeLock}.
      *  Never calls into RecordingModeManager or the pipeline — the ACC chain runs
      *  on the thread this spawns — so the lock stays a leaf. */
-    private static boolean dispatchProbedAccEdgeLocked(boolean accIsOff, String reason) {
+    private static boolean dispatchProbedAccEdgeLocked(
+            boolean accIsOff, String reason, long observationGeneration) {
+        if (!isAccObservationCurrent(observationGeneration)) {
+            return false;
+        }
         // The ACC CHAIN's own record — NOT AccMonitor. If the chain has already
         // processed this state, there is nothing to drive and the caller should do
         // its own local sync (return false). If it hasn't, we may dispatch — even
@@ -3981,107 +5356,276 @@ public class CameraDaemon {
             return false;
         }
 
-        // If the pipeline isn't up, onAccStateChanged only queues pendingAccOff/On
-        // and returns WITHOUT reaching recordingModeManager.onAccStateChanged — so
+        // If the published manager/pipeline pair isn't intact, onAccStateChanged only queues
+        // pendingAccOff/On (or can race manager teardown) and returns WITHOUT safely reaching
+        // recordingModeManager.onAccStateChanged — so
         // we must not claim a handoff the chain won't honour, or the caller would
         // skip its own local ACC sync for that tick (audit R3). Dispatch anyway
         // (the queue + post-init drain is the whole point) but report no handoff.
-        // Read inside this synchronized method and used for the return value only;
-        // if init completes in the gap the caller merely does one redundant local
-        // sync, which its own dedup absorbs.
-        boolean canDriveRmm = gpuPipeline != null;
+        com.overdrive.app.recording.RecordingModeManager managerOwner =
+            recordingModeManager;
+        com.overdrive.app.surveillance.GpuSurveillancePipeline pipelineOwner =
+            gpuPipeline;
+        boolean canDriveRmm = managerOwner != null
+            && pipelineOwner != null
+            && recordingModeManagerPipelineOwner == pipelineOwner
+            && running.get();
 
-        // Claim the gate. Free (0) → claim; owned → steal only once the owner has
-        // clearly wedged. Ownership is a generation token so the displaced worker
-        // cannot release a gate it no longer owns (audit R2 defect #2).
-        long myGen = probeEdgeDispatchGen.incrementAndGet();
-        long owner = probeEdgeDispatchOwner.get();
-        if (owner != 0L) {
-            long since = probeEdgeDispatchSinceMs;
-            // Defence in depth: an owned gate with no start time is a corrupt pair
-            // that must not read as "healthy forever" — that is precisely the state
-            // that used to disable the steal permanently. Re-anchor it to now so the
-            // stuck timer starts running instead of never firing.
-            if (since <= 0L) {
-                log("ACC probe edge (" + reason + "): owned gate had no start time — "
-                    + "re-anchoring the stuck timer");
-                probeEdgeDispatchSinceMs = nowMs;
-                since = nowMs;
-            }
-            boolean stuck = (nowMs - since) > PROBE_EDGE_DISPATCH_STUCK_MS;
-            if (!stuck) {
-                log("ACC probe edge (" + reason + "): dispatch already in flight — "
-                    + "deferring (next probe re-drives; chain state is still "
-                    + (last == null ? "unset" : (last.booleanValue() ? "OFF" : "ON")) + ")");
-                // Roll back the confirm counter by one so the deferral doesn't
-                // consume this observation — the next probe re-confirms. The
-                // first-seen stamp is deliberately NOT rolled back: the
-                // disagreement really has persisted since then, and re-anchoring
-                // it here would let a long in-flight dispatch keep resetting the
-                // time floor.
-                if (probeEdgeBehindTicks > 0) probeEdgeBehindTicks--;
-                return false;
-            }
-            log("ACC probe edge (" + reason + "): previous dispatch owned the gate for "
-                + (nowMs - since) + "ms (threshold " + PROBE_EDGE_DISPATCH_STUCK_MS
-                + "ms) — treating as wedged and taking ownership (gen " + myGen + ")");
-        }
-        probeEdgeDispatchOwner.set(myGen);
-        probeEdgeDispatchSinceMs = nowMs;
-
-        boolean spawned = false;
-        try {
-            Thread t = new Thread(() -> {
-                try {
-                    log("ACC probe edge (" + reason + "): AccSentry IPC absent — dispatching "
-                        + "full ACC " + (accIsOff ? "OFF" : "ON") + " chain from hardware probe");
-                    onAccStateChanged(accIsOff);
-                } catch (Throwable th) {
-                    log("ACC probe edge dispatch failed (" + reason + "): " + th.getMessage());
-                } finally {
-                    // Release ONLY if we still own the gate, and do it UNDER
-                    // probeEdgeLock so (owner, since) move together. If a later
-                    // prober stole the gate (we wedged), the CAS fails and the new
-                    // owner's timestamp stands untouched — see the field comment on
-                    // probeEdgeDispatchSinceMs for the starvation this ordering
-                    // prevents. Taking the lock here is safe: it is a leaf, and the
-                    // ACC chain above has already completed.
-                    synchronized (probeEdgeLock) {
-                        if (probeEdgeDispatchOwner.compareAndSet(myGen, 0L)) {
-                            probeEdgeDispatchSinceMs = 0L;
-                        }
-                    }
-                }
-            }, "ProbedAccEdge");
-            // Daemon thread, matching every other long-lived spawn on this path
-            // (AccOnDisarmWatchdog, UnlockPoll) — must never hold the VM alive.
-            t.setDaemon(true);
-            t.start();
-            spawned = true;
-        } catch (Throwable th) {
-            log("ACC probe edge dispatch spawn failed (" + reason + "): " + th.getMessage());
-        } finally {
-            // Only release here if the thread never started — otherwise the
-            // worker's own finally owns it. A spawn failure leaves
-            // lastDispatchedAccIsOff untouched, so a later probe retries.
-            if (!spawned && probeEdgeDispatchOwner.compareAndSet(myGen, 0L)) {
-                probeEdgeDispatchSinceMs = 0L;
-            }
-        }
-
-        if (spawned) {
-            // Arm the backoff for the NEXT retry of this same edge, and reset the
-            // confirm counter so a re-dispatch has to re-confirm.
-            int idx = Math.min(probeEdgeRetryCount, PROBE_EDGE_RETRY_BACKOFF_MS.length - 1);
-            probeEdgeRetryNextAllowedMs = nowMs + PROBE_EDGE_RETRY_BACKOFF_MS[idx];
-            probeEdgeRetryCount++;
-            probeEdgeBehindTicks = 0;
-            probeEdgeBehindFirstNanos = 0L;
-            probeEdgeBehindFor = null;
-        }
+        boolean spawned = startProbeEdgeDispatchLocked(
+            new ProbeEdgeDispatchRequest(
+                accIsOff, reason, observationGeneration,
+                managerOwner, pipelineOwner, canDriveRmm));
         // Handoff is promised ONLY when a dispatch is running AND the chain can
         // actually reach RMM (see canDriveRmm above).
         return spawned && canDriveRmm;
+    }
+
+    /** Caller holds {@link #probeEdgeLock}. */
+    private static boolean startProbeEdgeDispatchLocked(
+            ProbeEdgeDispatchRequest request) {
+        long owner = probeEdgeDispatchOwner.get();
+        if (owner != 0L) {
+            Thread active = probeEdgeDispatchThread;
+            boolean sameObservation =
+                probeEdgeDispatchObservationGeneration
+                        == request.observationGeneration
+                && probeEdgeDispatchAccIsOff != null
+                && probeEdgeDispatchAccIsOff.booleanValue()
+                        == request.accIsOff;
+            boolean ownerSuperseded = !sameObservation
+                || leaseExpired(probeEdgeDispatchDeadlineNanos);
+
+            // AUDIT FIX (daemon-restart loop, part 2 — redundant lease
+            // supersession): a dispatch over its lease but (a) driving the
+            // SAME observation and (b) alive in the storage phase is neither
+            // wedged nor stale — it IS the requested work, waiting on a slow
+            // mount. Cancelling it can never land (monitor entry is not
+            // interruptible; interrupt() only sets a flag) and re-dispatching
+            // would queue an identical chain behind the same lock. Re-arm
+            // the lease and keep the owner.
+            if (ownerSuperseded && sameObservation
+                    && isThreadInStoragePhase(active)) {
+                probeEdgeDispatchDeadlineNanos = System.nanoTime()
+                    + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                        PROBE_EDGE_DISPATCH_LEASE_MS);
+                log("ACC probe edge (" + request.reason
+                    + "): dispatch over lease but storage-bound on the same"
+                    + " observation — lease re-armed, not cancelling");
+                ownerSuperseded = false;
+            }
+
+            if (!ownerSuperseded) {
+                log("ACC probe edge (" + request.reason
+                    + "): matching dispatch already owns this observation");
+                if (probeEdgeBehindTicks > 0) {
+                    probeEdgeBehindTicks--;
+                }
+                return false;
+            }
+            pendingProbeEdgeDispatch = request;
+
+            if (!probeEdgeDispatchRevoked) {
+                probeEdgeDispatchRevoked = true;
+                probeEdgeDispatchRevocationDeadlineNanos =
+                    System.nanoTime()
+                        + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                            PROBE_EDGE_REVOCATION_GRACE_MS);
+                if (active != null) active.interrupt();
+                log("ACC probe edge (" + request.reason
+                    + "): requested stale dispatch cancellation; "
+                    + "latest observation retained");
+            } else if (leaseExpired(
+                    probeEdgeDispatchRevocationDeadlineNanos)) {
+                // AUDIT FIX (daemon-restart loop, part 1 — the remedy was
+                // wildly disproportionate to the fault): process recovery
+                // exists for a dispatch wedged in a HAL binder query — the
+                // fault a restart actually fixes. A dispatch blocked on
+                // STORAGE (mount lock, slow SD) is not that: restarting
+                // doesn't unwedge the card, drops 21-63s of recording, and
+                // the post-restart boot work worsens the storage pressure
+                // that caused the stall (the field log showed this exact
+                // loop 10× in 68 minutes). Extend the grace and keep
+                // waiting — the storage internals are individually bounded,
+                // so the thread WILL exit; the pending request + retry
+                // supervisor then dispatch the latest observation.
+                if (isThreadInStoragePhase(active)) {
+                    probeEdgeDispatchRevocationDeadlineNanos =
+                        System.nanoTime()
+                            + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                                PROBE_EDGE_REVOCATION_GRACE_MS);
+                    log("ACC probe edge (" + request.reason
+                        + "): revoked dispatch is storage-bound — extending"
+                        + " grace instead of process recovery (restart cannot"
+                        + " fix slow storage)");
+                } else {
+                    requestHardwareQueryProcessRecovery(
+                        "probe-edge dispatch ignored cancellation");
+                }
+            }
+            scheduleProbeEdgeStartRetryLocked();
+            return false;
+        }
+
+        final long token = probeEdgeDispatchGen.incrementAndGet();
+        final Thread worker;
+        try {
+            worker = new Thread(() -> {
+                try {
+                    if (!running.get()
+                            || !isAccObservationCurrent(
+                                request.observationGeneration)) {
+                        log("ACC probe edge (" + request.reason
+                            + "): observation superseded before dispatch");
+                        return;
+                    }
+                    if (request.handoffPromised
+                            && !isProbeHandoffOwnerCurrent(request)) {
+                        // The daemon still owns this accepted hardware edge. Drive it through
+                        // the current lifecycle; applyAccTransitionEffects will queue the edge
+                        // if the replacement manager/pipeline is not ready yet.
+                        log("ACC probe edge (" + request.reason
+                            + "): manager/pipeline ownership changed; "
+                            + "redirecting dispatch to latest lifecycle");
+                    }
+                    log("ACC probe edge (" + request.reason
+                        + "): dispatching full ACC "
+                        + (request.accIsOff ? "OFF" : "ON")
+                        + " chain from hardware observation");
+                    onObservedAccStateChanged(
+                        request.accIsOff,
+                        request.observationGeneration,
+                        "probe-edge/" + request.reason);
+                } catch (Throwable failure) {
+                    log("ACC probe edge dispatch failed ("
+                        + request.reason + "): "
+                        + failure.getMessage());
+                } finally {
+                    finishProbeEdgeDispatch(
+                        token, Thread.currentThread());
+                }
+            }, "ProbedAccEdge");
+            worker.setDaemon(true);
+        } catch (Throwable creationFailure) {
+            pendingProbeEdgeDispatch = request;
+            scheduleProbeEdgeStartRetryLocked();
+            log("ACC probe edge dispatch creation failed ("
+                + request.reason + "): "
+                + creationFailure.getMessage());
+            return false;
+        }
+
+        probeEdgeDispatchOwner.set(token);
+        probeEdgeDispatchDeadlineNanos = System.nanoTime()
+            + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                PROBE_EDGE_DISPATCH_LEASE_MS);
+        probeEdgeDispatchObservationGeneration =
+            request.observationGeneration;
+        probeEdgeDispatchAccIsOff =
+            Boolean.valueOf(request.accIsOff);
+        probeEdgeDispatchThread = worker;
+        probeEdgeDispatchRevoked = false;
+        probeEdgeDispatchRevocationDeadlineNanos = 0L;
+        pendingProbeEdgeDispatch = null;
+        try {
+            worker.start();
+        } catch (Throwable startFailure) {
+            if (probeEdgeDispatchOwner.compareAndSet(token, 0L)) {
+                probeEdgeDispatchDeadlineNanos = 0L;
+                probeEdgeDispatchObservationGeneration = 0L;
+                probeEdgeDispatchAccIsOff = null;
+                probeEdgeDispatchThread = null;
+                probeEdgeDispatchRevoked = false;
+                probeEdgeDispatchRevocationDeadlineNanos = 0L;
+            }
+            pendingProbeEdgeDispatch = request;
+            scheduleProbeEdgeStartRetryLocked();
+            log("ACC probe edge dispatch start failed ("
+                + request.reason + "): "
+                + startFailure.getMessage());
+            return false;
+        }
+
+        int index = Math.min(
+            probeEdgeRetryCount,
+            PROBE_EDGE_RETRY_BACKOFF_MS.length - 1);
+        probeEdgeRetryNextAllowedMs = System.currentTimeMillis()
+            + PROBE_EDGE_RETRY_BACKOFF_MS[index];
+        probeEdgeRetryCount++;
+        probeEdgeBehindTicks = 0;
+        probeEdgeBehindFirstNanos = 0L;
+        probeEdgeBehindFor = null;
+        return true;
+    }
+
+    private static boolean isProbeHandoffOwnerCurrent(
+            ProbeEdgeDispatchRequest request) {
+        return request.managerOwner != null
+            && request.pipelineOwner != null
+            && recordingModeManager == request.managerOwner
+            && gpuPipeline == request.pipelineOwner
+            && recordingModeManagerPipelineOwner == request.pipelineOwner;
+    }
+
+    private static void finishProbeEdgeDispatch(
+            long token, Thread worker) {
+        boolean compensate;
+        synchronized (probeEdgeLock) {
+            compensate = probeEdgeDispatchRevoked
+                && probeEdgeDispatchThread == worker;
+            if (probeEdgeDispatchOwner.compareAndSet(token, 0L)) {
+                probeEdgeDispatchDeadlineNanos = 0L;
+                probeEdgeDispatchObservationGeneration = 0L;
+                probeEdgeDispatchAccIsOff = null;
+                probeEdgeDispatchThread = null;
+                probeEdgeDispatchRevoked = false;
+                probeEdgeDispatchRevocationDeadlineNanos = 0L;
+            }
+        }
+        if (compensate) {
+            forceLatestAccStateReconciliation(
+                "revoked probe-edge dispatch returned");
+        }
+        retryPendingProbeEdgeDispatch();
+    }
+
+    private static void retryPendingProbeEdgeDispatch() {
+        synchronized (probeEdgeLock) {
+            probeEdgeRetryPosted = false;
+            ProbeEdgeDispatchRequest pending =
+                pendingProbeEdgeDispatch;
+            if (pending == null) {
+                return;
+            }
+            if (!running.get()
+                    || !isAccObservationCurrent(
+                        pending.observationGeneration)) {
+                pendingProbeEdgeDispatch = null;
+                return;
+            }
+            startProbeEdgeDispatchLocked(pending);
+        }
+    }
+
+    /** Caller holds {@link #probeEdgeLock}. */
+    private static void scheduleProbeEdgeStartRetryLocked() {
+        if (probeEdgeRetryPosted) return;
+        try {
+            Thread retry = new Thread(() -> {
+                try {
+                    Thread.sleep(ACC_RECONCILE_DELAYS_MS[0]);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+                retryPendingProbeEdgeDispatch();
+            }, "ProbeEdgeDispatchSupervisor");
+            retry.setDaemon(true);
+            probeEdgeRetryPosted = true;
+            retry.start();
+        } catch (Throwable startFailure) {
+            probeEdgeRetryPosted = false;
+            requestHardwareQueryProcessRecovery(
+                "probe-edge retry supervisor unavailable");
+        }
     }
 
 
@@ -4108,6 +5652,67 @@ public class CameraDaemon {
      *         or {@link #DOOR_STATE_LOCK}(2).
      */
     private static int readDoorLockStatus() {
+        Thread existing = DOOR_LOCK_QUERY_WORKER.get();
+        if (existing != null && existing.isAlive()) {
+            existing.interrupt();
+            escalateStuckHardwareQueryIfExpired(
+                DOOR_LOCK_QUERY_STUCK_DEADLINE_NANOS,
+                "door-lock Binder query");
+            return DOOR_STATE_INVALID;
+        }
+        DOOR_LOCK_QUERY_STUCK_DEADLINE_NANOS.set(0L);
+
+        java.util.concurrent.atomic.AtomicInteger result =
+            new java.util.concurrent.atomic.AtomicInteger(
+                DOOR_STATE_INVALID);
+        final Thread worker;
+        try {
+            worker = new Thread(() -> {
+                try {
+                    result.set(readDoorLockStatusUnbounded());
+                } finally {
+                    DOOR_LOCK_QUERY_WORKER.compareAndSet(
+                        Thread.currentThread(), null);
+                }
+            }, "DoorLockHardwareQuery");
+            worker.setDaemon(true);
+        } catch (Throwable creationFailure) {
+            log("Door-lock query worker creation failed: "
+                + creationFailure.getMessage());
+            return DOOR_STATE_INVALID;
+        }
+        if (!DOOR_LOCK_QUERY_WORKER.compareAndSet(existing, worker)) {
+            return DOOR_STATE_INVALID;
+        }
+        try {
+            worker.start();
+        } catch (Throwable startFailure) {
+            DOOR_LOCK_QUERY_WORKER.compareAndSet(worker, null);
+            log("Door-lock query worker start failed: "
+                + startFailure.getMessage());
+            return DOOR_STATE_INVALID;
+        }
+        try {
+            worker.join(DOOR_LOCK_QUERY_TIMEOUT_MS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            worker.interrupt();
+            return DOOR_STATE_INVALID;
+        }
+        if (worker.isAlive()) {
+            worker.interrupt();
+            armHardwareQueryRecoveryDeadline(
+                DOOR_LOCK_QUERY_STUCK_DEADLINE_NANOS);
+            log("Door-lock hardware query exceeded "
+                + DOOR_LOCK_QUERY_TIMEOUT_MS + "ms");
+            return DOOR_STATE_INVALID;
+        }
+        DOOR_LOCK_QUERY_WORKER.compareAndSet(worker, null);
+        DOOR_LOCK_QUERY_STUCK_DEADLINE_NANOS.set(0L);
+        return result.get();
+    }
+
+    private static int readDoorLockStatusUnbounded() {
         if (sharedAppContext == null) return DOOR_STATE_INVALID;
         try {
             Object otaDevice = com.overdrive.app.byd.BydDeviceHelper.getDevice(
@@ -4128,7 +5733,7 @@ public class CameraDaemon {
         }
         return DOOR_STATE_INVALID;
     }
-    
+
     // BYDAutoDoorLockDevice listener path removed — it never fired on any
     // firmware in the field. OTA polling (readDoorLockStatus) is the
     // primary lock signal now; cloud is the secondary.
@@ -4139,10 +5744,28 @@ public class CameraDaemon {
      * Uses getDoorLockStatus(1) for the driver's door.
      * Polls every 5s while ACC is off.
      */
-    private static void startUnlockPollThread() {
-        stopUnlockPollThread();
+    private static void startUnlockPollThread(long transitionGeneration) {
+        Thread previous;
+        synchronized (unlockPollThreadLock) {
+            previous = unlockPollThread;
+            if (previous != null && previous.isAlive()
+                    && unlockPollThreadGeneration
+                        == transitionGeneration) {
+                return;
+            }
+        }
+        if (previous != null && previous.isAlive()
+                && !interruptAndJoinManagedThread(
+                    previous, "unlock poller")) {
+            requestManagedAccWorkerRecovery(
+                "stuck unlock poller");
+            return;
+        }
 
-        unlockPollThread = new Thread(() -> {
+        final Thread worker;
+        try {
+            worker = new Thread(() -> {
+            try {
             log("Unlock poll thread started (5s polling getDoorLockStatus + REST fallback)");
 
             int restPollCounter = 0;
@@ -4154,13 +5777,15 @@ public class CameraDaemon {
             // and a missed lock is already backstopped by the force-arm timeout.
             int consecutiveUnlockReads = 0;
 
-            while (!com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+            while (isAccTransitionCurrent(transitionGeneration, true)) {
                 try {
                     Thread.sleep(UNLOCK_POLL_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     return;
                 }
-                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) return;
+                if (!isAccTransitionCurrent(transitionGeneration, true)) {
+                    return;
+                }
 
                 // Source 1: OTA device poll (BYDAutoOtaDevice.getLFDoorLockState).
                 // Works ACC=OFF with sub-second latency for the LF (driver) door —
@@ -4171,11 +5796,11 @@ public class CameraDaemon {
                     int state = readDoorLockStatus();
                     if (state == DOOR_STATE_LOCK) {
                         consecutiveUnlockReads = 0;
-                        applyLockEvent(true, "ota-poll");
+                        applyLockEvent(true, "ota-poll", transitionGeneration);
                     } else if (state == DOOR_STATE_UNLOCK) {
                         consecutiveUnlockReads++;
                         if (consecutiveUnlockReads >= 2) {
-                            applyLockEvent(false, "ota-poll");
+                            applyLockEvent(false, "ota-poll", transitionGeneration);
                         } else {
                             log("LOCK GATE [ota-poll]: single UNLOCK read — "
                                 + "debouncing (need 2 consecutive before disarm)");
@@ -4210,24 +5835,77 @@ public class CameraDaemon {
                 }
             }
             log("Unlock poll thread exiting (ACC ON)");
+            } finally {
+                boolean ownedSlot = false;
+                synchronized (unlockPollThreadLock) {
+                    if (unlockPollThread
+                            == Thread.currentThread()) {
+                        unlockPollThread = null;
+                        unlockPollThreadGeneration = 0L;
+                        ownedSlot = true;
+                    }
+                }
+                if (ownedSlot && running.get()
+                        && isAccTransitionCurrent(
+                            transitionGeneration, true)) {
+                    requestManagedAccWorkerRecovery(
+                        "unlock poller exited");
+                }
+            }
         }, "UnlockPoll");
-        unlockPollThread.setDaemon(true);
-        unlockPollThread.start();
-    }
-    
-    private static void stopUnlockPollThread() {
-        if (unlockPollThread != null && unlockPollThread.isAlive()) {
-            unlockPollThread.interrupt();
-            unlockPollThread = null;
+            worker.setDaemon(true);
+        } catch (Throwable creationFailure) {
+            requestManagedAccWorkerRecovery(
+                "unlock poller creation failure");
+            return;
+        }
+
+        synchronized (unlockPollThreadLock) {
+            Thread current = unlockPollThread;
+            if (current != null && current.isAlive()
+                    && current != previous) {
+                return;
+            }
+            unlockPollThread = worker;
+            unlockPollThreadGeneration = transitionGeneration;
+        }
+        try {
+            worker.start();
+        } catch (Throwable startFailure) {
+            synchronized (unlockPollThreadLock) {
+                if (unlockPollThread == worker) {
+                    unlockPollThread = null;
+                    unlockPollThreadGeneration = 0L;
+                }
+            }
+            requestManagedAccWorkerRecovery(
+                "unlock poller start failure");
         }
     }
-    
+
+    private static void stopUnlockPollThread() {
+        Thread worker;
+        synchronized (unlockPollThreadLock) {
+            worker = unlockPollThread;
+        }
+        if (interruptAndJoinManagedThread(
+                worker, "unlock poller")) {
+            synchronized (unlockPollThreadLock) {
+                if (unlockPollThread == worker) {
+                    unlockPollThread = null;
+                    unlockPollThreadGeneration = 0L;
+                }
+            }
+        }
+    }
+
     /**
      * Clean up all door lock gate resources. Called on ACC ON.
      */
     private static void cleanupDoorLockGate() {
         doorLockListenerArmed = false;
         sawValidLockReading = false;
+        stopDoorLockTimeoutThread();
 
         // Detach all three lock-event sources
         if (cloudLockListener != null) {
@@ -4243,10 +5921,61 @@ public class CameraDaemon {
         // Stop the reverse-fallback ACC-ON disarm watchdog
         stopAccOnDisarmWatchdog();
     }
-    
+
+    private static void stopDoorLockTimeoutThread() {
+        Thread timeout;
+        synchronized (doorLockTimeoutLock) {
+            timeout = doorLockTimeoutThread;
+        }
+        if (interruptAndJoinManagedThread(
+                timeout, "door-lock timeout")) {
+            synchronized (doorLockTimeoutLock) {
+                if (doorLockTimeoutThread == timeout) {
+                    doorLockTimeoutThread = null;
+                    doorLockTimeoutGeneration = 0L;
+                }
+            }
+        }
+    }
+
+    private static boolean interruptAndJoinManagedThread(
+            Thread worker, String label) {
+        if (worker == null) return true;
+        if (worker == Thread.currentThread()) {
+            worker.interrupt();
+            return false;
+        }
+        if (!worker.isAlive()) return true;
+        worker.interrupt();
+        try {
+            worker.join(MANAGED_THREAD_JOIN_MS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        if (worker.isAlive()) {
+            log(label + " did not stop within "
+                + MANAGED_THREAD_JOIN_MS + "ms; retaining its slot");
+            return false;
+        }
+        return true;
+    }
+
+    private static void requestManagedAccWorkerRecovery(
+            String reason) {
+        if (ACC_APPLY_CONTEXT.get() != null) {
+            markCurrentAccApplyRetry();
+        } else {
+            invalidateLatestAccCompletionForCompensation();
+        }
+        requestAccTransitionReconciliation(false);
+        log("ACC managed-worker recovery requested after "
+            + reason);
+    }
+
     /**
      * Notify surveillance of ACC state change.
-     * 
+     *
      * ACC OFF (sentry mode): Start pipeline with surveillance enabled
      * ACC ON (normal mode): Stop pipeline completely to save power
      */
@@ -4258,34 +5987,1231 @@ public class CameraDaemon {
     // first call is never elided. Volatile for cross-thread reads from IPC +
     // heartbeat threads.
     private static volatile Boolean lastDispatchedAccIsOff = null;
+    private static final Object parkTerminateLock = new Object();
+    private static final Object parkMarkerIoLock = new Object();
+    private static long accTransitionGeneration =
+            newProcessAccGenerationBase();
 
-    public static void onAccStateChanged(boolean accIsOff) {
-        // FIX (audit R1): drop redundant heartbeat re-dispatches. We still let
-        // the very first dispatch through (lastDispatchedAccIsOff == null) and
-        // any state change (Boolean.equals false). Down-stream consumers
-        // (RecordingModeManager, OEM resolver) already short-circuit on their
-        // own caches but the work to GET there (DB writes, snapshot capture,
-        // GearMonitor restart, etc.) is non-trivial and not all idempotent.
-        if (lastDispatchedAccIsOff != null && lastDispatchedAccIsOff.booleanValue() == accIsOff) {
-            log("onAccStateChanged: no-op (already " + (accIsOff ? "OFF" : "ON")
-                + ", duplicate IPC / heartbeat)");
-            // Still refresh AccMonitor so any consumer reading the cache sees
-            // the asserted value — this is cheap and idempotent.
-            com.overdrive.app.monitor.AccMonitor.setAccState(!accIsOff);
+    private static long newProcessAccGenerationBase() {
+        long random =
+                java.util.UUID.randomUUID()
+                        .getLeastSignificantBits()
+                        & 0x000003ffffffffffL;
+        return (1L << 62) | random;
+    }
+    /**
+     * Bumped whenever a stale or failed external effect may have landed after a newer attempt.
+     * Every lease captures this value, so an already-issued attempt cannot publish completion
+     * after a compensation request races its finalization.
+     */
+    private static long accReconciliationRevision;
+    /** Latest ACC edge admitted at method ingress, including one still running its side effects. */
+    private static Boolean latestAccIsOff;
+    /** True once parked shutdown has planted its marker and made teardown irreversible. */
+    private static boolean parkShutdownCommitted;
+    /** Exact OFF generation whose marker crossed the terminal commit point. */
+    private static long parkShutdownCommitGeneration;
+    /** Sticky diagnostics/retry state; cleared only after the corresponding I/O succeeds. */
+    private static boolean parkMarkerWriteFailed;
+    private static boolean parkMarkerClearFailed;
+    /** In-process identity for the numeric, reader-compatible marker written by this daemon. */
+    private static long parkMarkerGeneration;
+    private static long parkMarkerTimestampMs;
+    /** Generation currently attempting the full effect chain; guarded by parkTerminateLock. */
+    private static long activeAccTransitionGeneration;
+    /** Revocable ownership token for the current effect attempt. */
+    private static long activeAccTransitionLease;
+    private static long activeAccTransitionDeadlineNanos;
+    private static Thread activeAccTransitionThread;
+    private static long nextAccTransitionLease;
+    /** Only a successful, still-current lease is published as completed. */
+    private static long completedAccTransitionGeneration;
+    private static long completedAccTransitionLease;
+    private static long completedAccTransitionRevision;
+
+    private static final long ACC_EFFECT_LEASE_MAX_MS = 20_000L;
+    private static final long SURVEILLANCE_ENABLE_LEASE_MAX_MS = 15_000L;
+
+    // Durable/non-idempotent effects distinguish an in-progress attempt from a committed one.
+    // Failed attempts release their claim so reconciliation can retry.
+    private static final int ACC_EFFECT_LEDGER_SIZE = 64;
+    private static final AccEffectLedger persistedAccEventGenerations =
+        new AccEffectLedger();
+    private static final AccEffectLedger notifiedTripAccGenerations =
+        new AccEffectLedger();
+
+    /** Revocable serialized ownership for public and deferred surveillance starts. */
+    private static long nextSurveillanceEnableLease;
+    private static long activeSurveillanceEnableLease;
+    private static long activeSurveillanceEnableGeneration;
+    private static long activeSurveillanceEnableRevision;
+    private static long activeSurveillanceEnableDeadlineNanos;
+    private static Thread activeSurveillanceEnableThread;
+
+    private static final Object accReconcileLock = new Object();
+    private static final long[] ACC_RECONCILE_DELAYS_MS = {100L, 500L, 2_000L, 5_000L};
+    private static Thread accReconcileWorker;
+    private static boolean accReconcileRequested;
+    private static boolean accReconcileImmediate;
+    private static boolean accReconcileFallbackPosted;
+    private static volatile int accReconcileAttempt;
+    private static volatile boolean trustedAccHardwareRecoveryRequested;
+
+    private static final class AccEffectLedger {
+        final java.util.ArrayDeque<Long> committedOrder = new java.util.ArrayDeque<>();
+        final java.util.HashSet<Long> committed = new java.util.HashSet<>();
+        final java.util.HashMap<Long, AccEffectInProgress> inProgress =
+            new java.util.HashMap<>();
+        long nextToken;
+    }
+
+    private static final class AccEffectInProgress {
+        final long token;
+        final Thread owner;
+
+        AccEffectInProgress(long token, Thread owner) {
+            this.token = token;
+            this.owner = owner;
+        }
+    }
+
+    private static final class AccEffectClaim {
+        final AccEffectLedger ledger;
+        final long generation;
+        final long token;
+
+        AccEffectClaim(
+                AccEffectLedger ledger, long generation,
+                long token) {
+            this.ledger = ledger;
+            this.generation = generation;
+            this.token = token;
+        }
+    }
+
+
+    private static final class AccApplyContext {
+        final long generation;
+        final boolean accIsOff;
+        final long lease;
+        final long revision;
+        boolean retry;
+        boolean deferred;
+
+        AccApplyContext(
+                long generation, boolean accIsOff, long lease, long revision) {
+            this.generation = generation;
+            this.accIsOff = accIsOff;
+            this.lease = lease;
+            this.revision = revision;
+        }
+    }
+
+    private static final ThreadLocal<AccApplyContext> ACC_APPLY_CONTEXT = new ThreadLocal<>();
+
+    private static final class AccTransitionLease {
+        final long generation;
+        final boolean accIsOff;
+        final long token;
+        final long revision;
+
+        AccTransitionLease(
+                long generation, boolean accIsOff, long token, long revision) {
+            this.generation = generation;
+            this.accIsOff = accIsOff;
+            this.token = token;
+            this.revision = revision;
+        }
+    }
+
+    private static final class SurveillanceEnableLease {
+        final long generation;
+        final long revision;
+        final long token;
+
+        SurveillanceEnableLease(long generation, long revision, long token) {
+            this.generation = generation;
+            this.revision = revision;
+            this.token = token;
+        }
+    }
+
+    private static boolean isAccTransitionCurrent(long generation, boolean accIsOff) {
+        synchronized (parkTerminateLock) {
+            return running.get()
+                && !parkShutdownCommitted
+                && generation == accTransitionGeneration
+                && latestAccIsOff != null
+                && latestAccIsOff.booleanValue() == accIsOff;
+        }
+    }
+
+    private static boolean isAccOnRequestedOrCached() {
+        synchronized (parkTerminateLock) {
+            if (latestAccIsOff != null) {
+                return !latestAccIsOff.booleanValue();
+            }
+        }
+        return com.overdrive.app.monitor.AccMonitor.isAccOn();
+    }
+
+    private static long captureAccObservationGeneration() {
+        synchronized (parkTerminateLock) {
+            return accTransitionGeneration;
+        }
+    }
+
+    private static boolean isAccObservationCurrent(long observationGeneration) {
+        synchronized (parkTerminateLock) {
+            return running.get()
+                && !parkShutdownCommitted
+                && observationGeneration == accTransitionGeneration;
+        }
+    }
+
+    private static boolean isCurrentAccApplyLease(AccApplyContext context) {
+        if (context == null) return true;
+        synchronized (parkTerminateLock) {
+            return running.get()
+                && !parkShutdownCommitted
+                && context.generation == accTransitionGeneration
+                && latestAccIsOff != null
+                && latestAccIsOff.booleanValue() == context.accIsOff
+                && context.revision == accReconciliationRevision
+                && ((activeAccTransitionGeneration == context.generation
+                        && activeAccTransitionLease == context.lease)
+                    || (completedAccTransitionGeneration == context.generation
+                        && completedAccTransitionLease == context.lease
+                        && completedAccTransitionRevision == context.revision));
+        }
+    }
+
+    private static boolean stopStaleAccTransition(
+            long generation, boolean accIsOff, String phase) {
+        AccApplyContext context = ACC_APPLY_CONTEXT.get();
+        if (isAccTransitionCurrent(generation, accIsOff)
+                && isCurrentAccApplyLease(context)) {
+            return false;
+        }
+        log("ACC " + (accIsOff ? "OFF" : "ON") + " transition gen=" + generation
+            + " superseded during " + phase + " — stopping stale side effects");
+        if (context != null) {
+            context.retry = true;
+        }
+        invalidateLatestAccCompletionForCompensation();
+        requestAccTransitionReconciliation(true);
+        return true;
+    }
+
+    private static void invalidateLatestAccCompletionForCompensation() {
+        synchronized (parkTerminateLock) {
+            invalidateAccCompletionLocked();
+        }
+    }
+
+    private static void invalidateAccCompletionLocked() {
+        accReconciliationRevision++;
+        completedAccTransitionGeneration = 0L;
+        completedAccTransitionLease = 0L;
+        completedAccTransitionRevision = 0L;
+        lastDispatchedAccIsOff = null;
+    }
+
+    private static boolean leaseExpired(long deadlineNanos) {
+        return deadlineNanos != 0L
+            && System.nanoTime() - deadlineNanos >= 0L;
+    }
+
+    private static void revokeActiveAccTransitionLocked(String reason) {
+        Thread owner = activeAccTransitionThread;
+        if (activeAccTransitionLease == 0L) return;
+        log("Revoking ACC effect lease gen=" + activeAccTransitionGeneration
+            + " after " + reason);
+        activeAccTransitionGeneration = 0L;
+        activeAccTransitionLease = 0L;
+        activeAccTransitionDeadlineNanos = 0L;
+        activeAccTransitionThread = null;
+        invalidateAccCompletionLocked();
+        if (owner != null && owner != Thread.currentThread()) {
+            owner.interrupt();
+        }
+    }
+
+    private static void revokeActiveSurveillanceEnableLocked(String reason) {
+        Thread owner = activeSurveillanceEnableThread;
+        if (activeSurveillanceEnableLease == 0L) return;
+        log("Revoking surveillance-enable lease gen="
+            + activeSurveillanceEnableGeneration + " after " + reason);
+        activeSurveillanceEnableGeneration = 0L;
+        activeSurveillanceEnableRevision = 0L;
+        activeSurveillanceEnableLease = 0L;
+        activeSurveillanceEnableDeadlineNanos = 0L;
+        activeSurveillanceEnableThread = null;
+        invalidateAccCompletionLocked();
+        if (owner != null && owner != Thread.currentThread()) {
+            owner.interrupt();
+        }
+    }
+
+    private static void forceLatestAccStateReconciliation(String reason) {
+        log("ACC latest-state compensation requested after " + reason);
+        invalidateLatestAccCompletionForCompensation();
+        requestAccTransitionReconciliation(true);
+    }
+
+    private static void requestTrustedAccHardwareRecovery(String reason) {
+        log("ACC trusted hardware recovery requested after " + reason);
+        trustedAccHardwareRecoveryRequested = true;
+        requestAccTransitionReconciliation(false);
+    }
+
+    private static AccTransitionLease claimAccTransitionLease(
+            long generation, boolean accIsOff) {
+        synchronized (parkTerminateLock) {
+            if (!running.get()
+                    || parkShutdownCommitted
+                    || generation != accTransitionGeneration
+                    || latestAccIsOff == null
+                    || latestAccIsOff.booleanValue() != accIsOff) {
+                return null;
+            }
+            if (completedAccTransitionGeneration == generation
+                    && completedAccTransitionRevision == accReconciliationRevision
+                    && lastDispatchedAccIsOff != null
+                    && lastDispatchedAccIsOff.booleanValue() == accIsOff) {
+                return null;
+            }
+            if (activeAccTransitionLease != 0L) {
+                if (activeAccTransitionGeneration != generation
+                        || leaseExpired(activeAccTransitionDeadlineNanos)) {
+                    revokeActiveAccTransitionLocked(
+                        activeAccTransitionGeneration != generation
+                            ? "newer ACC generation"
+                            : "effect deadline");
+                } else {
+                    return null;
+                }
+            }
+            if (activeSurveillanceEnableLease != 0L) {
+                if (!accIsOff
+                        || activeSurveillanceEnableGeneration != generation
+                        || leaseExpired(activeSurveillanceEnableDeadlineNanos)) {
+                    revokeActiveSurveillanceEnableLocked(
+                        !accIsOff ? "ACC ON admission"
+                            : (activeSurveillanceEnableGeneration != generation
+                                ? "newer ACC generation"
+                                : "enable deadline"));
+                } else {
+                    return null;
+                }
+            }
+            long token = ++nextAccTransitionLease;
+            activeAccTransitionGeneration = generation;
+            activeAccTransitionLease = token;
+            activeAccTransitionDeadlineNanos = System.nanoTime()
+                + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                    ACC_EFFECT_LEASE_MAX_MS);
+            activeAccTransitionThread = Thread.currentThread();
+            return new AccTransitionLease(
+                generation, accIsOff, token, accReconciliationRevision);
+        }
+    }
+
+    private static void markCurrentAccApplyRetry() {
+        AccApplyContext context = ACC_APPLY_CONTEXT.get();
+        if (context != null) context.retry = true;
+    }
+
+    private static void markCurrentAccApplyDeferred() {
+        AccApplyContext context = ACC_APPLY_CONTEXT.get();
+        if (context != null) context.deferred = true;
+    }
+
+    // ==================== ACC-chain storage-phase tracking ====================
+    // (audit: daemon-restart loop.) The probe-edge lease/revocation machinery
+    // exists to catch a dispatch wedged in a HAL binder query — the one fault
+    // a process restart actually fixes. A dispatch thread that is merely
+    // executing STORAGE work (mount, lock wait, FS probe) must not trip that
+    // hammer: restarting the daemon doesn't unwedge a slow SD card, costs
+    // 21-63s of recording, and the post-restart boot work (remounts, index
+    // warmup, boot reap) makes the storage pressure WORSE — the log showed
+    // this looping 10× in 68 minutes. Threads mark themselves around
+    // storage-bound ACC work; the escalation branch checks the mark and
+    // waits instead of killing the process. The set self-heals: entries are
+    // removed in finally, and a dead thread is ignored by the reader.
+    private static final java.util.Set<Thread> ACC_STORAGE_PHASE_THREADS =
+        java.util.Collections.newSetFromMap(
+            new java.util.concurrent.ConcurrentHashMap<Thread, Boolean>());
+
+    static void enterAccStoragePhase() {
+        ACC_STORAGE_PHASE_THREADS.add(Thread.currentThread());
+    }
+
+    static void exitAccStoragePhase() {
+        ACC_STORAGE_PHASE_THREADS.remove(Thread.currentThread());
+    }
+
+    private static boolean isThreadInStoragePhase(Thread t) {
+        return t != null && t.isAlive() && ACC_STORAGE_PHASE_THREADS.contains(t);
+    }
+
+    // Single-flight latch for the ACC-ON background remount. Repeat ON chains
+    // (probe re-dispatch, reconciler retry) must not stack workers that would
+    // just queue on the mount lock behind each other.
+    private static final java.util.concurrent.atomic.AtomicBoolean accOnRemountInFlight =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * Fire-and-forget ACC-ON external remount (audit: daemon-restart loop —
+     * this ran inline on the ACC dispatch thread and blocked it for 50-281s
+     * against a 20s lease). The ON transition proceeds immediately on
+     * internal storage; when the mount lands, StorageManager's centralized
+     * came-online path re-points the recorder and reindexes. Failures are
+     * the VolumeWatchdog's to retry — the transition is NOT marked for
+     * retry on mount failure anymore, because re-running the ON chain
+     * wouldn't do anything the watchdog isn't already doing.
+     */
+    private static void startAccOnRemountAsync() {
+        if (!accOnRemountInFlight.compareAndSet(false, true)) {
+            log("ACC ON: external remount already in flight — not stacking another worker");
             return;
         }
-        // FIX (audit R2, finding "Dedup short-circuit eats drain dispatch when
-        // IPC queued during init"): do NOT mark this state as "dispatched"
-        // yet. If gpuPipeline is null, we'll only enqueue pendingAccOn/Off and
-        // bail; the post-init drain at :673/:699 then re-enters this method
-        // and would otherwise hit the dedup guard above and short-circuit
-        // before fully running side-effects (RMM seed, OEM recalc, context
-        // recreate, sentry segment finalize). Move the cache update to AFTER
-        // the queuing branch so a queued IPC + later drain runs the full
-        // dispatch chain exactly once.
+        try {
+            Thread worker = new Thread(() -> {
+                try {
+                    enterAccStoragePhase();
+                    boolean ok = com.overdrive.app.storage.StorageManager.getInstance()
+                        .remountExternalOnAccOn();
+                    if (!ok) {
+                        log("ACC ON: external remount incomplete — VolumeWatchdog continues retrying");
+                    }
+                } catch (Throwable t) {
+                    log("ACC ON: external remount failed: " + t.getMessage());
+                } finally {
+                    exitAccStoragePhase();
+                    accOnRemountInFlight.set(false);
+                }
+            }, "AccOnRemount");
+            worker.setDaemon(true);
+            worker.start();
+        } catch (Throwable spawnFailure) {
+            accOnRemountInFlight.set(false);
+            log("ACC ON: external remount worker spawn failed: " + spawnFailure.getMessage()
+                + " — VolumeWatchdog remains the recovery path");
+        }
+    }
 
-        // Update AccMonitor state for HTTP API responses
-        com.overdrive.app.monitor.AccMonitor.setAccState(!accIsOff);
+    // Ceiling for the ACC-OFF SD force-mount while it runs on the ACC
+    // dispatch path (usually the single AccStateReconciler worker). The
+    // mount's internals are individually bounded (sm drains, StatFs probes,
+    // dir init), so a healthy attempt finishes well inside this; the ceiling
+    // only caps the pathological stacked-worst-case so the reconciler can't
+    // be occupied indefinitely by one wedged volume.
+    private static final long ACC_OFF_SD_MOUNT_TIMEOUT_MS = 30_000L;
+
+    /**
+     * Timeout-bounded wrapper around {@code ensureSdCardMounted(true)} for
+     * the ACC-OFF prologue. Same daemon-thread + bounded-join idiom as
+     * {@code GpuSurveillancePipeline.ensureStorageReadyBounded}. Returns
+     * false on failure OR timeout — the caller marks the transition for
+     * retry either way, and a late-landing abandoned mount makes the retry
+     * pass a fast no-op.
+     */
+    private static boolean ensureSdCardMountedBounded(
+            com.overdrive.app.storage.StorageManager storage) {
+        final boolean[] ok = {false};
+        Thread worker = new Thread(() -> {
+            try {
+                ok[0] = storage.ensureSdCardMounted(true);
+            } catch (Throwable t) {
+                log("ACC-OFF SD force mount threw: " + t.getMessage());
+            }
+        }, "AccOffSdMount");
+        worker.setDaemon(true);
+        worker.start();
+        // The bounded join is itself a storage-bound wait on the ACC dispatch
+        // thread — mark it so the probe-edge lease machinery treats an
+        // overstay here as "slow storage", never "wedged HAL" (see
+        // ACC_STORAGE_PHASE_THREADS).
+        enterAccStoragePhase();
+        try {
+            worker.join(ACC_OFF_SD_MOUNT_TIMEOUT_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            // AUDIT FIX (silent interrupt): this branch used to return with
+            // no log line — 32 of 50 mount attempts in the field log left no
+            // trace because a probe-edge revocation interrupted the waiting
+            // dispatch thread right here.
+            log("WARNING: ACC-OFF SD force mount wait interrupted (probe-edge revocation"
+                + " or shutdown) — mount worker continues in background, reporting failure"
+                + " to caller");
+            return false;
+        } finally {
+            exitAccStoragePhase();
+        }
+        if (worker.isAlive()) {
+            log("WARNING: ACC-OFF SD force mount exceeded " + ACC_OFF_SD_MOUNT_TIMEOUT_MS
+                + "ms — abandoning worker (mount continues in background), marking retry");
+            return false;
+        }
+        return ok[0];
+    }
+
+    private static void finishAccTransitionLease(AccApplyContext context) {
+        boolean scheduleRetry = false;
+        synchronized (parkTerminateLock) {
+            boolean ownsLease = activeAccTransitionGeneration == context.generation
+                && activeAccTransitionLease == context.lease;
+            boolean current = context.generation == accTransitionGeneration
+                && latestAccIsOff != null
+                && latestAccIsOff.booleanValue() == context.accIsOff
+                && context.revision == accReconciliationRevision;
+
+            if (ownsLease) {
+                activeAccTransitionGeneration = 0L;
+                activeAccTransitionLease = 0L;
+                activeAccTransitionDeadlineNanos = 0L;
+                activeAccTransitionThread = null;
+            }
+            if (ownsLease && current && !context.retry && !context.deferred) {
+                completedAccTransitionGeneration = context.generation;
+                completedAccTransitionLease = context.lease;
+                completedAccTransitionRevision = context.revision;
+                lastDispatchedAccIsOff = Boolean.valueOf(context.accIsOff);
+                accReconcileAttempt = 0;
+            } else if (context.retry || !context.deferred || !ownsLease) {
+                // The abandoned lease may have completed an external side effect after a
+                // newer lease published success. Invalidate that publication so reconciliation
+                // cannot short-circuit and the latest state is forcibly applied again.
+                invalidateAccCompletionLocked();
+                scheduleRetry = true;
+            }
+        }
+        if (scheduleRetry) {
+            requestAccTransitionReconciliation(false);
+        }
+    }
+
+    private static boolean isCurrentAccTransitionCompletedLocked() {
+        return latestAccIsOff != null
+            && completedAccTransitionGeneration == accTransitionGeneration
+            && completedAccTransitionRevision == accReconciliationRevision
+            && lastDispatchedAccIsOff != null
+            && lastDispatchedAccIsOff.booleanValue() == latestAccIsOff.booleanValue();
+    }
+
+    private static boolean isCurrentAccTransitionDeferredLocked() {
+        if (latestAccIsOff == null) return false;
+        return latestAccIsOff.booleanValue() ? pendingAccOff : pendingAccOn;
+    }
+
+    /**
+     * Re-drive only the latest admitted state. The retry thread never owns transition effects, so
+     * a blocked HAL/Binder call cannot hold admission or prevent a newer generation from running.
+     */
+    private static void requestAccTransitionReconciliation(boolean immediate) {
+        boolean runInline = false;
+        synchronized (accReconcileLock) {
+            accReconcileRequested = true;
+            accReconcileImmediate |= immediate;
+            if (accReconcileWorker != null && accReconcileWorker.isAlive()) {
+                accReconcileLock.notifyAll();
+                return;
+            }
+            try {
+                Thread worker = new Thread(
+                    CameraDaemon::runAccReconciliationWorker,
+                    "AccStateReconciler");
+                worker.setDaemon(true);
+                accReconcileWorker = worker;
+                worker.start();
+            } catch (Throwable startFailure) {
+                accReconcileWorker = null;
+                log("ACC state reconciler could not start: " + startFailure.getMessage());
+                boolean currentOwnsEffects = ACC_APPLY_CONTEXT.get() != null;
+                synchronized (parkTerminateLock) {
+                    currentOwnsEffects |=
+                        activeSurveillanceEnableThread == Thread.currentThread();
+                }
+                if (currentOwnsEffects) {
+                    // The owner cannot recurse into its own effect chain. Make its eventual lease
+                    // release schedule another attempt, and add a main-loop nudge for the
+                    // surveillance-only case where no ACC apply context exists.
+                    markCurrentAccApplyRetry();
+                    Handler handler = mainHandler;
+                    if (handler != null && !accReconcileFallbackPosted) {
+                        accReconcileFallbackPosted = true;
+                        boolean posted = false;
+                        try {
+                            posted = handler.postDelayed(() -> {
+                                synchronized (accReconcileLock) {
+                                    accReconcileFallbackPosted = false;
+                                }
+                                requestAccTransitionReconciliation(false);
+                            }, ACC_RECONCILE_DELAYS_MS[0]);
+                        } catch (Throwable ignored) {}
+                        if (!posted) {
+                            accReconcileFallbackPosted = false;
+                        }
+                    }
+                } else {
+                    // Thread creation can fail transiently under memory pressure. The requesting
+                    // thread becomes the reconciler so the request has no terminal failure path.
+                    accReconcileWorker = Thread.currentThread();
+                    runInline = true;
+                }
+            }
+        }
+        if (runInline) {
+            runAccReconciliationWorker();
+        }
+    }
+
+    private static void runAccReconciliationWorker() {
+        try {
+            runAccReconciliationLoop();
+        } catch (Throwable failure) {
+            log("ACC state reconciler exited unexpectedly: "
+                + failure.getMessage());
+        } finally {
+            synchronized (accReconcileLock) {
+                if (accReconcileWorker
+                        == Thread.currentThread()) {
+                    accReconcileWorker = null;
+                }
+            }
+            boolean retry;
+            synchronized (parkTerminateLock) {
+                retry = running.get() && !parkShutdownCommitted
+                    && (trustedAccHardwareRecoveryRequested
+                        || (latestAccIsOff != null
+                            && !isCurrentAccTransitionCompletedLocked()
+                            && !isCurrentAccTransitionDeferredLocked()));
+            }
+            if (retry) {
+                requestAccTransitionReconciliation(false);
+            }
+        }
+    }
+
+    private static void runAccReconciliationLoop() {
+        while (true) {
+            final boolean immediate;
+            final long delayMs;
+            synchronized (accReconcileLock) {
+                if (!accReconcileRequested) {
+                    if (accReconcileWorker == Thread.currentThread()) {
+                        accReconcileWorker = null;
+                    }
+                    return;
+                }
+                immediate = accReconcileImmediate;
+                accReconcileRequested = false;
+                accReconcileImmediate = false;
+                int index = Math.min(
+                    accReconcileAttempt, ACC_RECONCILE_DELAYS_MS.length - 1);
+                delayMs = immediate ? 0L : ACC_RECONCILE_DELAYS_MS[index];
+                if (!immediate && accReconcileAttempt
+                        < ACC_RECONCILE_DELAYS_MS.length - 1) {
+                    accReconcileAttempt++;
+                }
+            }
+
+            if (delayMs > 0L) {
+                try {
+                    Thread.sleep(delayMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    synchronized (accReconcileLock) {
+                        if (accReconcileWorker == Thread.currentThread()) {
+                            accReconcileWorker = null;
+                        }
+                    }
+                    return;
+                }
+            }
+
+            final long generation;
+            final Boolean accIsOff;
+            final boolean pendingReplay;
+            final boolean recoverUnknownState;
+            synchronized (parkTerminateLock) {
+                if (!running.get() || parkShutdownCommitted) {
+                    continue;
+                }
+                if (isCurrentAccTransitionCompletedLocked()) {
+                    trustedAccHardwareRecoveryRequested = false;
+                    continue;
+                }
+                pendingReplay = isCurrentAccTransitionDeferredLocked()
+                    && gpuPipeline != null && recordingModeManager != null;
+                recoverUnknownState = latestAccIsOff == null
+                    && trustedAccHardwareRecoveryRequested;
+                if (isCurrentAccTransitionDeferredLocked() && !pendingReplay) {
+                    continue;
+                }
+                if (latestAccIsOff == null && !recoverUnknownState) {
+                    continue;
+                }
+                generation = accTransitionGeneration;
+                accIsOff = latestAccIsOff;
+            }
+
+            boolean trustedRecoveryRetry = false;
+            if (pendingReplay) {
+                trustedRecoveryRetry = !reconcilePendingAccStateFromHardware();
+            } else if (recoverUnknownState) {
+                AccProbeResult probe =
+                    probeAccStateWithBackoff("autonomous-recovery");
+                if (!isAccObservationCurrent(generation)) {
+                    trustedAccHardwareRecoveryRequested = false;
+                } else if (!probe.trustworthy) {
+                    trustedRecoveryRetry = true;
+                } else {
+                    trustedAccHardwareRecoveryRequested = false;
+                    onObservedAccStateChanged(
+                        probe.accIsOff, generation, "autonomous-recovery");
+                }
+            } else if (accIsOff != null) {
+                onAccStateChanged(accIsOff.booleanValue(), generation);
+            }
+
+            boolean retry;
+            synchronized (parkTerminateLock) {
+                retry = running.get() && !parkShutdownCommitted
+                    && ((trustedRecoveryRetry
+                            && trustedAccHardwareRecoveryRequested)
+                        || (!isCurrentAccTransitionCompletedLocked()
+                            && !isCurrentAccTransitionDeferredLocked()));
+            }
+            if (retry) {
+                synchronized (accReconcileLock) {
+                    accReconcileRequested = true;
+                }
+            }
+        }
+    }
+
+    /**
+     * Resolve one deferred replay only from a trustworthy probe bound to the
+     * generation sampled before it. False requests another bounded reconciler pass.
+     */
+    private static boolean reconcilePendingAccStateFromHardware() {
+        final long observationGeneration;
+        final boolean pendingIsOff;
+        synchronized (parkTerminateLock) {
+            if (!pendingAccOff && !pendingAccOn) {
+                return true;
+            }
+            observationGeneration = accTransitionGeneration;
+            pendingIsOff = pendingAccOff;
+        }
+
+        AccProbeResult probe =
+            probeAccStateWithBackoff("pending-reconcile");
+        if (!isAccObservationCurrent(observationGeneration)) {
+            trustedAccHardwareRecoveryRequested = false;
+            return true;
+        }
+        if (!probe.trustworthy) {
+            trustedAccHardwareRecoveryRequested = true;
+            return false;
+        }
+        trustedAccHardwareRecoveryRequested = false;
+
+        long pendingGeneration = claimPendingAccState(pendingIsOff);
+        if (pendingGeneration == 0L) {
+            return true;
+        }
+        if (probe.accIsOff == pendingIsOff) {
+            onAccStateChanged(pendingIsOff, pendingGeneration);
+            return true;
+        }
+
+        onObservedAccStateChanged(
+            probe.accIsOff,
+            observationGeneration,
+            "pending-reconcile");
+        com.overdrive.app.automation.condition.BydEvent
+            .resetPowerEdge(!pendingIsOff);
+        return true;
+    }
+
+    private static AccEffectClaim claimAccEffectOnce(
+            AccEffectLedger ledger, long generation) {
+        boolean busy = false;
+        synchronized (ledger) {
+            if (ledger.committed.contains(generation)) {
+                return null;
+            }
+            AccEffectInProgress existing =
+                ledger.inProgress.get(generation);
+            if (existing != null
+                    && existing.owner != null
+                    && existing.owner.isAlive()) {
+                busy = true;
+            } else {
+                long token = ++ledger.nextToken;
+                ledger.inProgress.put(
+                    generation,
+                    new AccEffectInProgress(
+                        token, Thread.currentThread()));
+                return new AccEffectClaim(
+                    ledger, generation, token);
+            }
+        }
+        if (busy) {
+            // Do not duplicate a durable/non-idempotent call. The exact owner will either commit
+            // or release; this transition remains retryable until one of those happens.
+            markCurrentAccApplyRetry();
+        }
+        return null;
+    }
+
+    private static void commitAccEffect(
+            AccEffectClaim claim) {
+        boolean staleClaim = false;
+        synchronized (claim.ledger) {
+            AccEffectInProgress inProgress =
+                claim.ledger.inProgress.get(claim.generation);
+            if (inProgress == null
+                    || inProgress.token != claim.token
+                    || inProgress.owner
+                        != Thread.currentThread()) {
+                staleClaim = true;
+            } else {
+                claim.ledger.inProgress.remove(
+                    claim.generation);
+                if (claim.ledger.committed.add(
+                        claim.generation)) {
+                    claim.ledger.committedOrder.addLast(
+                        claim.generation);
+                }
+                while (claim.ledger.committedOrder.size()
+                        > ACC_EFFECT_LEDGER_SIZE) {
+                    Long removed =
+                        claim.ledger.committedOrder.removeFirst();
+                    claim.ledger.committed.remove(removed);
+                }
+            }
+        }
+        if (staleClaim) {
+            forceLatestAccStateReconciliation(
+                "stale durable-effect claimant returned");
+        }
+    }
+
+    private static void releaseAccEffect(
+            AccEffectClaim claim) {
+        synchronized (claim.ledger) {
+            AccEffectInProgress inProgress =
+                claim.ledger.inProgress.get(claim.generation);
+            if (inProgress != null
+                    && inProgress.token == claim.token
+                    && inProgress.owner
+                        == Thread.currentThread()) {
+                claim.ledger.inProgress.remove(
+                    claim.generation);
+            }
+        }
+    }
+
+    private static boolean isAccEffectCommitted(
+            AccEffectLedger ledger, long generation) {
+        synchronized (ledger) {
+            return ledger.committed.contains(generation);
+        }
+    }
+
+    /**
+     * Deliver an ACC edge to trip analytics. Duplicate/heartbeat IPC is already
+     * filtered by the caller's generation check, so one real edge reaches the
+     * manager once: BYD's power HAL repeats ACC OFF while parked, and finalizing
+     * on every repeat would split one drive into several cards.
+     */
+    private static void notifyTripAnalyticsManager(boolean accIsOff) {
+        com.overdrive.app.trips.TripAnalyticsManager manager =
+                tripAnalyticsManager;
+        if (manager == null) return;
+        try {
+            if (accIsOff) {
+                manager.onAccOff();
+            } else {
+                manager.onAccOn();
+            }
+        } catch (Throwable failure) {
+            log("Trip Analytics ACC " + (accIsOff ? "OFF" : "ON")
+                    + " error: " + failure.getMessage());
+        }
+    }
+
+    /**
+     * Queue a transition whose generation has already been admitted.
+     */
+    private static boolean queuePendingAccState(
+            boolean accIsOff, long transitionGeneration) {
+        synchronized (parkTerminateLock) {
+            if (transitionGeneration != accTransitionGeneration
+                    || latestAccIsOff == null
+                    || latestAccIsOff.booleanValue() != accIsOff) {
+                return false;
+            }
+            pendingAccOff = accIsOff;
+            pendingAccOn = !accIsOff;
+            pendingAccTransitionGeneration = transitionGeneration;
+            return true;
+        }
+    }
+
+    /**
+     * Atomically remove a pending state and return the generation it belongs to.
+     * Zero means no current pending transition was available.
+     */
+    private static long claimPendingAccState(boolean accIsOff) {
+        synchronized (parkTerminateLock) {
+            boolean pending = accIsOff ? pendingAccOff : pendingAccOn;
+            if (!pending) {
+                return 0L;
+            }
+            if (accIsOff) {
+                pendingAccOff = false;
+            } else {
+                pendingAccOn = false;
+            }
+            long generation = pendingAccTransitionGeneration;
+            if (generation != accTransitionGeneration
+                    || latestAccIsOff == null
+                    || latestAccIsOff.booleanValue() != accIsOff) {
+                log("Discarding stale pending ACC " + (accIsOff ? "OFF" : "ON")
+                    + " transition gen=" + generation);
+                return 0L;
+            }
+            return generation;
+        }
+    }
+
+    private static boolean hasPendingAccState(boolean accIsOff) {
+        synchronized (parkTerminateLock) {
+            return accIsOff ? pendingAccOff : pendingAccOn;
+        }
+    }
+
+    private static void stopTripRequiredPollersForAccOff(
+            long transitionGeneration) {
+        if (!isAccTransitionCurrent(transitionGeneration, true)) {
+            return;
+        }
+
+        if (telemetryDataCollector != null) {
+            telemetryDataCollector.setOverlayRecordingActive(false);
+            telemetryDataCollector.forceStopPolling();
+            log("TelemetryDataCollector force-stopped (confirmed ACC OFF)");
+        }
+        if (stopStaleAccTransition(
+                transitionGeneration, true, "telemetry poller teardown")) {
+            return;
+        }
+
+        com.overdrive.app.monitor.GearMonitor.getInstance().stop();
+        log("GearMonitor stopped (confirmed ACC OFF)");
+        if (stopStaleAccTransition(
+                transitionGeneration, true, "gear poller teardown")) {
+            return;
+        }
+
+        com.overdrive.app.byd.BydDataCollector.getInstance()
+                .setAccState(false);
+        stopStaleAccTransition(
+            transitionGeneration, true, "BYD poller teardown");
+    }
+
+    private static boolean markAccTransitionDispatched(
+            long generation, boolean accIsOff) {
+        synchronized (parkTerminateLock) {
+            if (generation != accTransitionGeneration
+                    || latestAccIsOff == null
+                    || latestAccIsOff.booleanValue() != accIsOff) {
+                return false;
+            }
+            if (accIsOff) {
+                pendingAccOff = false;
+            } else {
+                pendingAccOn = false;
+            }
+            return true;
+        }
+    }
+
+    private static void clearAccDispatchForRetry(
+            long generation, boolean accIsOff, String reason) {
+        synchronized (parkTerminateLock) {
+            if (generation != accTransitionGeneration
+                    || latestAccIsOff == null
+                    || latestAccIsOff.booleanValue() != accIsOff) {
+                return;
+            }
+            log(reason);
+            accReconciliationRevision++;
+            lastDispatchedAccIsOff = null;
+            completedAccTransitionGeneration = 0L;
+            completedAccTransitionLease = 0L;
+            completedAccTransitionRevision = 0L;
+        }
+        markCurrentAccApplyRetry();
+        requestAccTransitionReconciliation(false);
+    }
+
+    public static void onAccStateChanged(boolean accIsOff) {
+        onAccStateChanged(accIsOff, 0L);
+    }
+
+    /**
+     * @param requiredGeneration zero for a newly observed edge, or the token
+     *        claimed from a pending queue replay
+     */
+    private static void onAccStateChanged(boolean accIsOff, long requiredGeneration) {
+        final long transitionGeneration;
+        synchronized (parkTerminateLock) {
+            if (requiredGeneration != 0L
+                    && (requiredGeneration != accTransitionGeneration
+                        || latestAccIsOff == null
+                        || latestAccIsOff.booleanValue() != accIsOff)) {
+                log("Skipping stale pending ACC " + (accIsOff ? "OFF" : "ON")
+                    + " replay gen=" + requiredGeneration);
+                return;
+            }
+            trustedAccHardwareRecoveryRequested = false;
+
+            Boolean previousRequestedState = latestAccIsOff;
+            boolean transitionChanged = requiredGeneration == 0L
+                && (previousRequestedState == null
+                    || previousRequestedState.booleanValue() != accIsOff);
+            latestAccIsOff = Boolean.valueOf(accIsOff);
+            if (transitionChanged) {
+                accTransitionGeneration++;
+                // The old latch describes the previous completed phase. Clear
+                // it until this generation finishes so a heartbeat can retry if
+                // this invocation is interrupted before publishing completion.
+                lastDispatchedAccIsOff = null;
+                // A newer opposite edge invalidates the old pending replay.
+                if (accIsOff) {
+                    pendingAccOn = false;
+                } else {
+                    pendingAccOff = false;
+                }
+            }
+            transitionGeneration = accTransitionGeneration;
+        }
+        runAdmittedAccTransition(accIsOff, transitionGeneration);
+    }
+
+    /**
+     * Apply a hardware observation only if no newer ACC admission occurred after the sample was
+     * scheduled. Unlike a pending replay, the observed state may legitimately differ from the
+     * current state, so admission and generation increment happen here after the base-token check.
+     */
+    private static void onObservedAccStateChanged(
+            boolean accIsOff, long observationGeneration, String source) {
+        final long transitionGeneration;
+        synchronized (parkTerminateLock) {
+            if (observationGeneration != accTransitionGeneration) {
+                log("Ignoring stale ACC hardware observation (" + source + ") baseGen="
+                    + observationGeneration + " currentGen=" + accTransitionGeneration);
+                requestAccTransitionReconciliation(true);
+                return;
+            }
+            trustedAccHardwareRecoveryRequested = false;
+            Boolean previousRequestedState = latestAccIsOff;
+            boolean changed = previousRequestedState == null
+                || previousRequestedState.booleanValue() != accIsOff;
+            latestAccIsOff = Boolean.valueOf(accIsOff);
+            if (changed) {
+                accTransitionGeneration++;
+                lastDispatchedAccIsOff = null;
+                if (accIsOff) {
+                    pendingAccOn = false;
+                } else {
+                    pendingAccOff = false;
+                }
+            }
+            transitionGeneration = accTransitionGeneration;
+        }
+        runAdmittedAccTransition(accIsOff, transitionGeneration);
+    }
+
+    private static void runAdmittedAccTransition(
+            boolean accIsOff, long transitionGeneration) {
+        AccTransitionLease lease = claimAccTransitionLease(
+            transitionGeneration, accIsOff);
+        if (lease == null) {
+            synchronized (parkTerminateLock) {
+                if (completedAccTransitionGeneration == transitionGeneration
+                        && completedAccTransitionRevision == accReconciliationRevision
+                        && lastDispatchedAccIsOff != null
+                        && lastDispatchedAccIsOff.booleanValue() == accIsOff) {
+                    log("onAccStateChanged: no-op (completed "
+                        + (accIsOff ? "OFF" : "ON") + ", duplicate IPC / heartbeat)");
+                    return;
+                }
+            }
+            requestAccTransitionReconciliation(false);
+            return;
+        }
+
+        AccApplyContext context = new AccApplyContext(
+            transitionGeneration, accIsOff, lease.token, lease.revision);
+        ACC_APPLY_CONTEXT.set(context);
+        try {
+            applyAccTransitionEffects(accIsOff, transitionGeneration);
+        } catch (Throwable t) {
+            context.retry = true;
+            log("ACC " + (accIsOff ? "OFF" : "ON")
+                + " transition failed: " + t.getClass().getSimpleName()
+                + ": " + t.getMessage());
+        } finally {
+            ACC_APPLY_CONTEXT.remove();
+            finishAccTransitionLease(context);
+        }
+    }
+
+    private static void applyAccTransitionEffects(
+            boolean accIsOff, long transitionGeneration) {
+            if (stopStaleAccTransition(
+                    transitionGeneration, accIsOff, "effect lease admission")) {
+                return;
+            }
+            // This call may dispatch panel/cluster work. It is intentionally not
+            // protected by a monitor held across external IPC; a newer generation
+            // can run immediately, and the post-call currency check re-drives it.
+            com.overdrive.app.monitor.AccMonitor.setAccState(!accIsOff);
+            if (stopStaleAccTransition(
+                    transitionGeneration, accIsOff, "ACC cache publication")) {
+                return;
+            }
+
+        // Re-open a terminal OFF drain before publishing ON. Enqueues are retained while the
+        // drain gate is active, but ordering cancellation first also prevents the ON edge from
+        // sitting behind stale drain work.
+        if (!accIsOff) {
+            com.overdrive.app.automation.AutomationQueue.ShutdownDrainCancelResult cancelResult =
+                com.overdrive.app.automation.AutomationQueue.cancelShutdownDrain(
+                    2_000L, () -> forceLatestAccStateReconciliation(
+                        "late shutdown-drain quiescence"));
+            if (cancelResult
+                    != com.overdrive.app.automation.AutomationQueue.ShutdownDrainCancelResult.NO_DRAIN) {
+                log("ACC ON canceled parked-shutdown automation drain ("
+                    + cancelResult + ")");
+            }
+            if (stopStaleAccTransition(
+                    transitionGeneration, false, "shutdown-drain cancellation")) {
+                return;
+            }
+        }
+
+        // Publish the "power" automation trigger on the EDGE. It otherwise rides the telemetry
+        // snapshot only, which is 90s while parked — so "when power turns off" fired up to 90s
+        // late, and in onOnly mode never at all (parkTerminate below kills the process first).
+        // Placed here deliberately: after the dedup guard (so it can't double-fire on a repeat
+        // heartbeat), but before both the gpuPipeline==null early return and parkTerminate.
+        // Publishes the same lowercase vocabulary as the snapshot path, and Automations.update
+        // is edge-triggered, so a later snapshot carrying the same value is a no-op.
+        boolean powerPublished = false;
+        final AccApplyContext publicationContext = ACC_APPLY_CONTEXT.get();
+        try {
+            powerPublished =
+                com.overdrive.app.automation.AutomationQueue
+                    .runLatestStatePublicationGuarded(
+                        com.overdrive.app.automation.AutomationQueue
+                            .LatestStateStream.POWER,
+                        publicationCommit -> {
+                            synchronized (parkTerminateLock) {
+                                // Name the failed admission check: a rejected power edge is a
+                                // missed "power on/off" automation until a retry (or the
+                                // snapshot grace-window fallback in BydEvent.publishPower)
+                                // delivers it, and field logs previously showed nothing at all
+                                // for this — the 2026-08 "power on never fires" report was
+                                // undiagnosable from a device log.
+                                String rejection =
+                                    !running.get() ? "daemon not running"
+                                    : parkShutdownCommitted ? "park shutdown committed"
+                                    : publicationContext == null ? "no apply context"
+                                    : publicationContext.generation != transitionGeneration
+                                        ? "context generation stale"
+                                    : publicationContext.accIsOff != accIsOff
+                                        ? "context ACC side mismatch"
+                                    : publicationContext.revision != accReconciliationRevision
+                                        ? "reconciliation revision stale"
+                                    : transitionGeneration != accTransitionGeneration
+                                        ? "transition generation superseded"
+                                    : latestAccIsOff == null ? "no observed ACC state"
+                                    : latestAccIsOff.booleanValue() != accIsOff
+                                        ? "observed ACC state contradicts edge"
+                                    : activeAccTransitionGeneration != transitionGeneration
+                                        ? "active transition superseded"
+                                    : activeAccTransitionLease != publicationContext.lease
+                                        ? "transition lease superseded"
+                                    : activeAccTransitionThread != Thread.currentThread()
+                                        ? "transition thread superseded"
+                                    : null;
+                                if (rejection != null) {
+                                    log("ACC edge: power automation publication REJECTED ("
+                                        + rejection + ") for ACC "
+                                        + (accIsOff ? "OFF" : "ON")
+                                        + " gen=" + transitionGeneration
+                                        + " — will retry via reconciliation");
+                                    return false;
+                                }
+                                publicationCommit.publish();
+                                return true;
+                            }
+                        },
+                        () -> com.overdrive.app.automation.condition.BydEvent
+                            .publishPowerEdge(!accIsOff));
+        } catch (Throwable t) {
+            log("ACC edge: power automation publish failed: " + t.getMessage());
+            markCurrentAccApplyRetry();
+        }
+        if (!powerPublished) {
+            log("ACC edge: 'power' NOT published for ACC " + (accIsOff ? "OFF" : "ON")
+                + " gen=" + transitionGeneration
+                + " — power automations will not fire until a retry or the snapshot "
+                + "fallback delivers this edge");
+            if (!stopStaleAccTransition(
+                    transitionGeneration, accIsOff,
+                    "power automation publication admission")) {
+                markCurrentAccApplyRetry();
+                requestAccTransitionReconciliation(false);
+            }
+            return;
+        }
+        if (stopStaleAccTransition(
+                transitionGeneration, accIsOff, "power automation publication")) {
+            return;
+        }
+
+        if (!accIsOff) {
+            if (!reconcileParkedShutdownMarkerOn(transitionGeneration)) {
+                if (isAccTransitionCurrent(transitionGeneration, false)) {
+                    markCurrentAccApplyRetry();
+                }
+                return;
+            }
+            // Marker removal makes a committed shutdown recoverable, but teardown itself
+            // is irreversible. Do not restart components in a process already shutting down.
+            if (isParkShutdownCommitted()) {
+                return;
+            }
+        } else if (isParkShutdownCommittedForGeneration(
+                transitionGeneration)) {
+            reconcileCommittedParkedShutdownOff(transitionGeneration);
+            return;
+        } else if (isParkShutdownCommitted()) {
+            // A committed OFF1 cannot be inherited by OFF2. This process is already under its
+            // terminal deadline; a fresh process will recover and run OFF2 before committing it.
+            log("Ignoring parked-marker transfer to newer OFF generation "
+                + transitionGeneration);
+            return;
+        }
 
         // CRITICAL: Capture the BydVehicleData snapshot and record the ACC
         // transition BEFORE any pipeline/teardown work. The OFF event must
@@ -4298,48 +7224,56 @@ public class CameraDaemon {
         //
         // Wrapped in try/catch — must NEVER throw out of onAccStateChanged
         // because that would break the daemon's state machine.
-        try {
-            com.overdrive.app.byd.BydVehicleData accSnapshot = null;
+        AccEffectClaim persistedEventClaim =
+            claimAccEffectOnce(
+                persistedAccEventGenerations,
+                transitionGeneration);
+        if (persistedEventClaim != null) {
             try {
-                com.overdrive.app.byd.BydDataCollector collector =
-                    com.overdrive.app.byd.BydDataCollector.getInstance();
-                if (collector != null && collector.isInitialized()) {
-                    accSnapshot = collector.getData();
+                com.overdrive.app.byd.BydVehicleData accSnapshot = null;
+                try {
+                    com.overdrive.app.byd.BydDataCollector collector =
+                        com.overdrive.app.byd.BydDataCollector.getInstance();
+                    if (collector != null && collector.isInitialized()) {
+                        accSnapshot = collector.getData();
+                    }
+                } catch (Throwable t) {
+                    // Collector not initialized yet on cold boot, etc. — pass
+                    // null snapshot, the row will still be recorded with the
+                    // event type so future correlation is possible.
                 }
+                com.overdrive.app.monitor.SocHistoryDatabase.getInstance()
+                    .recordAccEvent(accIsOff ? "OFF" : "ON", accSnapshot);
+                commitAccEffect(persistedEventClaim);
             } catch (Throwable t) {
-                // Collector not initialized yet on cold boot, etc. — pass
-                // null snapshot, the row will still be recorded with the
-                // event type so future correlation is possible.
+                log("recordAccEvent failed (non-fatal): " + t.getMessage());
+                releaseAccEffect(persistedEventClaim);
+                markCurrentAccApplyRetry();
             }
-            com.overdrive.app.monitor.SocHistoryDatabase.getInstance()
-                .recordAccEvent(accIsOff ? "OFF" : "ON", accSnapshot);
-        } catch (Throwable t) {
-            log("recordAccEvent failed (non-fatal): " + t.getMessage());
         }
 
-        // ALWAYS notify TripAnalyticsManager regardless of GPU pipeline state.
-        // Trip detection depends on ACC events and must not be blocked by pipeline readiness.
-        if (tripAnalyticsManager != null) {
-            try {
-                if (accIsOff) {
-                    tripAnalyticsManager.onAccOff();
-                } else {
-                    tripAnalyticsManager.onAccOn();
-                }
-            } catch (Exception e) {
-                log("Trip Analytics ACC " + (accIsOff ? "OFF" : "ON") + " error: " + e.getMessage());
-            }
+        if (stopStaleAccTransition(
+                transitionGeneration, accIsOff, "event persistence")) {
+            return;
         }
-        
-        if (gpuPipeline == null) {
-            if (accIsOff) {
-                log("ACC OFF but GPU pipeline not ready — queuing for when pipeline initializes");
-                pendingAccOff = true;
-                pendingAccOn = false;
+
+        // ALWAYS notify trip analytics, regardless of GPU pipeline state: trip
+        // detection depends on ACC edges and must not be blocked by pipeline
+        // readiness. Reached only on a leased (non-duplicate) transition, so a
+        // repeated ACC-OFF heartbeat cannot finalize the same drive twice.
+        notifyTripAnalyticsManager(accIsOff);
+
+        if (gpuPipeline == null || recordingModeManager == null) {
+            log("ACC " + (accIsOff ? "OFF" : "ON")
+                + " dependencies not ready (pipeline="
+                + (gpuPipeline != null) + ", rmm="
+                + (recordingModeManager != null)
+                + ") — queuing full transition replay");
+            if (!queuePendingAccState(accIsOff, transitionGeneration)) {
+                log("ACC " + (accIsOff ? "OFF" : "ON")
+                    + " became stale before its pending state could be queued");
             } else {
-                log("ACC ON but GPU pipeline not ready — queuing for when pipeline initializes");
-                pendingAccOn = true;
-                pendingAccOff = false;
+                markCurrentAccApplyDeferred();
             }
             // NOTE: leave lastDispatchedAccIsOff unset so the post-init drain
             // can re-enter this method and run the full side-effect chain.
@@ -4348,10 +7282,14 @@ public class CameraDaemon {
 
         // Mark this state as fully dispatched only AFTER passing the
         // gpuPipeline-null queuing branch. See dedup comment above.
-        lastDispatchedAccIsOff = Boolean.valueOf(accIsOff);
+        if (!markAccTransitionDispatched(transitionGeneration, accIsOff)) {
+            log("ACC " + (accIsOff ? "OFF" : "ON")
+                + " became stale before dispatch latch publication");
+            return;
+        }
 
         log("ACC state changed: " + (accIsOff ? "OFF (entering sentry)" : "ON (exiting sentry)"));
-        
+
         if (accIsOff) {
             // ACC OFF - Start pipeline for sentry mode
             try {
@@ -4363,6 +7301,10 @@ public class CameraDaemon {
                 if (recordingModeManager != null) {
                     log("ACC OFF - notifying RecordingModeManager to finalize active recording...");
                     recordingModeManager.onAccStateChanged(false);
+                }
+                if (stopStaleAccTransition(
+                        transitionGeneration, true, "recording finalization")) {
+                    return;
                 }
                 // OEM Dashcam ACC-off behaviour. accOffMode='off' (default)
                 // tears down the pipeline so the encoder + camera handle
@@ -4427,41 +7369,46 @@ public class CameraDaemon {
                     }
                 } catch (Throwable t) {
                     log("OEM Dashcam ACC OFF dispatch failed: " + t.getMessage());
+                    markCurrentAccApplyRetry();
                 }
-                
-                // CRITICAL: Force-stop TelemetryDataCollector when ACC goes off.
-                // No consumer needs it when the car is off (no overlay, no trip recording).
-                // This prevents refcount leaks from keeping the poller alive during sentry mode.
-                if (telemetryDataCollector != null) {
-                    telemetryDataCollector.setOverlayRecordingActive(false);
-                    telemetryDataCollector.forceStopPolling();
-                    log("TelemetryDataCollector force-stopped (ACC OFF)");
+
+                boolean onOnly = com.overdrive.app.config.UnifiedConfigManager
+                        .isVehicleOnOnlyMode();
+                // The trip was already finalized synchronously above, so the
+                // pollers it needed can be released immediately.
+                stopTripRequiredPollersForAccOff(transitionGeneration);
+
+                if (stopStaleAccTransition(
+                        transitionGeneration, true, "parked monitor teardown")) {
+                    return;
                 }
-                
-                // Stop GearMonitor polling — gear is always P when ACC is off.
-                // It will be restarted on ACC ON.
-                com.overdrive.app.monitor.GearMonitor.getInstance().stop();
-                log("GearMonitor stopped (ACC OFF)");
-                
-                // Tell BydDataCollector to skip speed/engine/gearbox polling (always 0 when parked)
-                com.overdrive.app.byd.BydDataCollector.getInstance().setAccState(false);
-                
+
                 // CRITICAL: FORCE remount SD card when ACC goes off — BEFORE any early returns.
                 // Even if surveillance is disabled or suppressed by safe zone, the SD card must stay
                 // mounted so the HTTP server can serve existing recordings/events/trips.
                 // Android/BYD system unmounts SD card when ACC is off, so we MUST force remount.
-                com.overdrive.app.storage.StorageManager storage = 
+                com.overdrive.app.storage.StorageManager storage =
                     com.overdrive.app.storage.StorageManager.getInstance();
-                boolean anyStorageOnSd = 
+                boolean anyStorageOnSd =
                     storage.getSurveillanceStorageType() == com.overdrive.app.storage.StorageManager.StorageType.SD_CARD ||
                     storage.getRecordingsStorageType() == com.overdrive.app.storage.StorageManager.StorageType.SD_CARD ||
                     storage.getTripsStorageType() == com.overdrive.app.storage.StorageManager.StorageType.SD_CARD;
                 if (anyStorageOnSd) {
                     log("FORCE mounting SD card (ACC OFF, SD card configured for storage)...");
-                    if (storage.ensureSdCardMounted(true)) {
+                    // BOUNDED (audit: a wedged filesystem must not occupy the
+                    // sole AccStateReconciler worker). This dispatch now runs
+                    // on the reconciler thread; an unbounded mount here would
+                    // block every subsequent ACC transition. On timeout the
+                    // worker is abandoned (it holds no daemon locks the ACC
+                    // path needs; its internals are individually bounded so
+                    // it drains on its own) and the transition marks retry —
+                    // if the abandoned mount later lands, the retry pass sees
+                    // the card mounted and completes instantly.
+                    if (ensureSdCardMountedBounded(storage)) {
                         log("SD card force mounted");
                     } else {
-                        log("WARNING: SD card mount failed - using internal storage");
+                        log("WARNING: SD card mount failed or timed out - using internal storage");
+                        markCurrentAccApplyRetry();
                     }
                     // Watchdog already started at daemon boot in main(); calling
                     // startSdCardWatchdog() again is idempotent (it stops any
@@ -4469,7 +7416,12 @@ public class CameraDaemon {
                     // defensive re-arm in case the previous instance died.
                     storage.startSdCardWatchdog();
                 }
-                
+
+                if (stopStaleAccTransition(
+                        transitionGeneration, true, "ACC OFF storage remount")) {
+                    return;
+                }
+
                 // Check if user has enabled surveillance in config.
                 // GATE (G2): also short-circuit when the "Vehicle ON only" operating
                 // mode is selected — no post-vehicle-OFF surveillance may arm. This gate
@@ -4480,7 +7432,6 @@ public class CameraDaemon {
                 // is skipped. Defense-in-depth with AccSentryDaemon's G1 gate (separate
                 // process, reached by a different IPC path). Fail-open: false → arm as usual.
                 boolean userEnabled = com.overdrive.app.config.UnifiedConfigManager.isSurveillanceEnabled();
-                boolean onOnly = com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode();
                 if (onOnly) {
                     // "Vehicle ON only": all mandatory ACC-off bookkeeping above has now
                     // completed (recordAccEvent, trip finalize, recording segment finalize,
@@ -4490,41 +7441,72 @@ public class CameraDaemon {
                     // kills own watchdog + self). AccSentryDaemon's reaper terminates the rest
                     // of the stack and enforces the marker. Nothing recovers until the ACC-on
                     // edge clears the marker. This call does not return (kills the process).
+                    if (stopStaleAccTransition(
+                            transitionGeneration, true, "parked shutdown commit")) {
+                        return;
+                    }
                     log("onOnly mode — ACC-off finalize complete; parkTerminate (full shutdown, sleep while parked)");
-                    parkTerminate();
-                    return;  // unreachable (process killed), kept for clarity
+                    if (!parkTerminate(transitionGeneration)
+                            && isAccTransitionCurrent(transitionGeneration, true)) {
+                        markCurrentAccApplyRetry();
+                    }
+                    return;
                 }
                 if (!userEnabled) {
                     log("Surveillance NOT enabled in config — skipping auto-start on ACC OFF");
                     return;  // SD card is mounted + watchdog running
                 }
-                
+
                 // Safe zone check — don't start surveillance if parked at home/work
                 com.overdrive.app.surveillance.SafeLocationManager safeMgr =
                     com.overdrive.app.surveillance.SafeLocationManager.getInstance();
                 if (safeMgr.isInSafeZone()) {
+                    if (stopStaleAccTransition(
+                            transitionGeneration, true, "safe-zone suppression")) {
+                        return;
+                    }
                     log("SAFE ZONE: Surveillance suppressed on ACC OFF — " + safeMgr.getCurrentZoneName()
                         + " (dist=" + Math.round(safeMgr.getDistanceToNearestZone()) + "m)");
                     surveillanceEnabled = true;   // Mark intent so it auto-starts when leaving zone
                     safeZoneSuppressed = true;
+                    if (stopStaleAccTransition(
+                            transitionGeneration,
+                            true,
+                            "safe-zone suppression commit")) {
+                        return;
+                    }
                     return;  // SD card is mounted + watchdog running, just skip surveillance
                 }
-                
+
                 // Schedule check — don't start surveillance outside configured time windows
                 try {
-                    com.overdrive.app.surveillance.SurveillanceSchedule schedule = 
+                    com.overdrive.app.surveillance.SurveillanceSchedule schedule =
                         com.overdrive.app.config.UnifiedConfigManager.getSurveillanceSchedule();
                     if (schedule != null && schedule.isEnabled() && !schedule.isActiveNow()) {
+                        if (stopStaleAccTransition(
+                                transitionGeneration, true, "schedule suppression")) {
+                            return;
+                        }
                         log("SCHEDULE: Surveillance suppressed on ACC OFF — outside time window (" +
                             schedule.getSummary() + ")");
                         surveillanceEnabled = true;  // Mark intent so periodic checker can start it later
+                        if (stopStaleAccTransition(
+                                transitionGeneration,
+                                true,
+                                "schedule suppression commit")) {
+                            return;
+                        }
                         return;  // SD card is mounted + watchdog running, just skip surveillance
                     }
                 } catch (Exception e) {
                     log("Schedule check error (proceeding with surveillance): " + e.getMessage());
                 }
-                
+
                 Runnable startSentryPipeline = () -> {
+                    if (stopStaleAccTransition(
+                            transitionGeneration, true, "sentry pipeline start")) {
+                        return;
+                    }
                     if (!gpuPipeline.isRunning()) {
                         log("Starting pipeline for sentry mode...");
                         try { gpuPipeline.start(); } catch (Exception e) {
@@ -4535,16 +7517,28 @@ public class CameraDaemon {
                             // short-circuits at the dedup guard (:3451) and arming is
                             // never retried — aiProcessed stays 0 forever. Clear the
                             // flag so the next heartbeat re-runs the full dispatch.
-                            log("WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs sentry arming");
-                            lastDispatchedAccIsOff = null;
+                            clearAccDispatchForRetry(
+                                transitionGeneration,
+                                true,
+                                "WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs sentry arming");
                             return;
                         }
+                    }
+                    if (stopStaleAccTransition(
+                            transitionGeneration, true, "sentry pipeline initialization")) {
+                        return;
                     }
                     gpuPipeline.setRecordingMode(
                         com.overdrive.app.surveillance.GpuPipelineConfig.RecordingMode.SENTRY);
                     // AVC keep-alive for sentry — same 60s poke we use during ACC-ON
                     // and streaming/recording-mode. See enableSurveillance() for why.
                     startAvcKeepAliveIfNeeded();
+                    if (stopStaleAccTransition(
+                            transitionGeneration,
+                            true,
+                            "sentry recording-mode activation")) {
+                        return;
+                    }
                     // Arm mode decides WHEN we arm after ACC-off:
                     //   "power" — arm immediately, no lock gate. Disarm is handled
                     //             by the ACC-ON path (cleanupDoorLockGate +
@@ -4557,13 +7551,15 @@ public class CameraDaemon {
                     String armMode = com.overdrive.app.config.UnifiedConfigManager
                         .getSurveillanceArmMode();
                     if ("power".equals(armMode)) {
+                        if (stopStaleAccTransition(
+                                transitionGeneration, true, "power-mode arm")) {
+                            return;
+                        }
                         log("Pipeline started in sentry mode — arm mode=power, arming immediately");
-                        // Mark armed and enable now. doorLockListenerArmed is the
-                        // runtime "surveillance is live" truth consumed by the
-                        // mode-switch re-arm path; set it so power mode participates
-                        // in that logic identically to a lock-gate arm.
-                        doorLockListenerArmed = true;
-                        enableSurveillance();
+                        // Publish the armed flag only after the enable lease actually succeeds.
+                        doorLockListenerArmed =
+                            enableSurveillanceForAccGeneration(
+                                transitionGeneration, "ACC OFF power arm");
                         // Consistency guard: enableSurveillance() can decline to
                         // start (ACC flipped ON, or safe-zone suppression). If the
                         // pipeline isn't actually running, revert the flag so it
@@ -4577,7 +7573,7 @@ public class CameraDaemon {
                         }
                         // Still need the ACC-ON disarm watchdog as the reverse
                         // fallback (ACC turns ON without an IPC reaching us).
-                        startAccOnDisarmWatchdog();
+                        startAccOnDisarmWatchdog(transitionGeneration);
                     } else {
                         // Door lock gate: surveillance is armed after doors lock,
                         // disarmed on unlock, force-armed at 60s if lock state is
@@ -4587,14 +7583,14 @@ public class CameraDaemon {
                         // 5s OTA poll); ACC-ON disarm watchdog runs as reverse
                         // fallback.
                         log("Pipeline started in sentry mode — arm mode=lock, waiting for door lock to arm surveillance");
-                        registerDoorLockListenerAndArmOnLock();
+                        registerDoorLockListenerAndArmOnLock(transitionGeneration);
                     }
 
                     // SOTA: Periodic schedule checker — monitors time window transitions
                     // during active sentry. If the schedule window ends, surveillance stops.
                     // If the window starts (e.g., user parked before the window), surveillance starts.
                     // Runs every 5 minutes. Only active when ACC is off.
-                    startScheduleChecker();
+                    startScheduleChecker(transitionGeneration);
 
                     log("Pipeline started in sentry mode");
                 };
@@ -4639,8 +7635,10 @@ public class CameraDaemon {
                 // is never retried (aiProcessed=0 forever). Mirror the ACC-ON self-heal
                 // (:3867/:3916/:3956): clear the dedup flag so the next heartbeat re-runs
                 // the full sentry-arming dispatch once initSurveillance recovers the pipeline.
-                log("WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs sentry arming");
-                lastDispatchedAccIsOff = null;
+                clearAccDispatchForRetry(
+                    transitionGeneration,
+                    true,
+                    "WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs sentry arming");
             }
         } else {
             // ACC ON. We intentionally leave the SD-card watchdog running here:
@@ -4660,38 +7658,29 @@ public class CameraDaemon {
             // even tries a remount and then races the 4-15s slow-mount tail of the
             // re-powering reader → a 30s+ window where the card reads "not
             // detected" with the car ON. remountExternalOnAccOn() drives it back
-            // at wake and resets the two-strikes counters. Run OFF this thread:
-            // it blocks up to the per-class mount ceiling (the ACC-OFF branch
-            // blocks on the same call, but the ACC-ON handler has latency-
-            // sensitive camera-handoff work below that must not wait on vold).
-            // No-ops fully when all storage is INTERNAL. CAS-guarded so a rapid
-            // ACC flap can't pile up overlapping remount threads (each blocks
-            // ~15s); one in flight is enough, and the VolumeWatchdog covers any
-            // drop that lands while it runs.
-            if (accOnRemountInFlight.compareAndSet(false, true)) {
-                boolean spawned = false;
-                try {
-                    new Thread(() -> {
-                        try {
-                            com.overdrive.app.storage.StorageManager.getInstance()
-                                .remountExternalOnAccOn();
-                        } catch (Throwable t) {
-                            log("ACC ON: external remount failed: " + t.getMessage());
-                        } finally {
-                            accOnRemountInFlight.set(false);
-                        }
-                    }, "AccOnRemount").start();
-                    spawned = true;
-                } finally {
-                    // If Thread construction/start() threw (OOM / thread-limit)
-                    // the runnable's finally never runs — clear the guard here so
-                    // a failed spawn can't wedge the flag true and permanently
-                    // suppress every future ACC-ON remount for the daemon's life.
-                    if (!spawned) accOnRemountInFlight.set(false);
-                }
-            } else {
-                log("ACC ON: external remount already in flight — skipping duplicate");
+            // at wake and resets the two-strikes counters.
+            //
+            // ASYNC (audit: daemon-restart loop). This used to run INLINE on
+            // the ACC dispatch thread ("may block, but holds no transition
+            // monitor") — and field logs showed mounts of 50-90s (worst 281s)
+            // against the 20s probe-edge dispatch lease. The lease expiry
+            // interrupted a thread parked on the mount lock (monitor entry is
+            // not interruptible — the cancel can never land), the 2s grace
+            // always expired, and requestHardwareQueryProcessRecovery killed
+            // the daemon: 10 of 12 restarts in one 68-min drive, each costing
+            // 21-63s of recording. The remount is best-effort side work, not
+            // a precondition of the ON transition: resolveActive falls back
+            // to internal until the mount lands, and the landing itself
+            // triggers dir init + active-dir update + the index notify via
+            // the centralized came-online path. So: fire it on a dedicated
+            // worker and let the dispatch thread move on. Single-flight —
+            // repeat ON chains must not stack workers that would serialize
+            // on the mount lock behind each other.
+            if (stopStaleAccTransition(
+                    transitionGeneration, false, "ACC ON external remount start")) {
+                return;
             }
+            startAccOnRemountAsync();
 
             // Stop schedule checker (only runs during ACC OFF sentry mode)
             stopScheduleChecker();
@@ -4726,43 +7715,62 @@ public class CameraDaemon {
                 log("Clearing safeZoneSuppressed flag on ACC ON (was set during last sentry suppression)");
                 safeZoneSuppressed = false;
             }
-            
+
             // Recreate app context if it was broken (system server was dead during init).
-            // ACC ON means the head unit is awake and binder services should be available.
-            // Run on a background thread because createAppContext() can block up to 10s
-            // (systemMain timeout) — must not freeze the ACC ON handler.
+            // createAppContext() can block, but no transition monitor is held; a newer
+            // generation can proceed and the post-call lease check compensates it.
             if (isContextBroken()) {
-                new Thread(() -> {
-                    log("ACC ON: sharedAppContext is broken — attempting recreation...");
-                    android.content.Context newContext = createAppContext();
-                    if (newContext != null && !isContextBrokenFor(newContext)) {
-                        sharedAppContext = newContext;
-                        log("ACC ON: App context recreated successfully");
-                        
-                        // Re-init components that failed with the broken context
-                        reinitContextDependentComponents();
-                        
-                        // Now start GearMonitor if it still isn't running
-                        com.overdrive.app.monitor.GearMonitor gm = com.overdrive.app.monitor.GearMonitor.getInstance();
-                        if (!gm.isRunning()) {
-                            try {
-                                gm.start();
-                                log("ACC ON: GearMonitor started after context recreation");
-                            } catch (Exception e) {
-                                log("ACC ON: GearMonitor start failed after recreation: " + e.getMessage());
-                            }
-                        }
-                        
-                        // Notify RecordingModeManager of current gear now that GearMonitor works
-                        if (recordingModeManager != null && gm.isRunning()) {
-                            recordingModeManager.onGearChanged(gm.getCurrentGear());
-                        }
-                    } else {
-                        log("ACC ON: Context recreation failed — system services may still be starting");
+                if (stopStaleAccTransition(
+                        transitionGeneration, false, "context recreation start")) {
+                    return;
+                }
+                log("ACC ON: sharedAppContext is broken — attempting recreation...");
+                android.content.Context newContext = createAppContext();
+                if (stopStaleAccTransition(
+                        transitionGeneration, false, "context recreation lookup")) {
+                    return;
+                }
+                if (newContext != null && !isContextBrokenFor(newContext)) {
+                    sharedAppContext = newContext;
+                    log("ACC ON: App context recreated successfully");
+
+                    // Re-init components that failed with the broken context
+                    reinitContextDependentComponents();
+                    if (stopStaleAccTransition(
+                            transitionGeneration, false, "context-dependent reinit")) {
+                        return;
                     }
-                }, "ContextRecreate").start();
+
+                    // Now start GearMonitor if it still isn't running
+                    com.overdrive.app.monitor.GearMonitor gm =
+                        com.overdrive.app.monitor.GearMonitor.getInstance();
+                    if (!gm.isRunning()) {
+                        try {
+                            gm.start();
+                            log("ACC ON: GearMonitor started after context recreation");
+                        } catch (Exception e) {
+                            log("ACC ON: GearMonitor start failed after recreation: "
+                                + e.getMessage());
+                            markCurrentAccApplyRetry();
+                        }
+                    }
+
+                    // Notify RecordingModeManager of current gear now that GearMonitor works
+                    if (recordingModeManager != null && gm.isRunning()) {
+                        recordingModeManager.onGearChanged(gm.getCurrentGear());
+                        if (stopStaleAccTransition(
+                                transitionGeneration,
+                                false,
+                                "context-recreate gear publication")) {
+                            return;
+                        }
+                    }
+                } else {
+                    log("ACC ON: Context recreation failed — system services may still be starting");
+                    markCurrentAccApplyRetry();
+                }
             }
-            
+
             // Restart GearMonitor (stopped on ACC OFF)
             com.overdrive.app.monitor.GearMonitor gearMonitor = com.overdrive.app.monitor.GearMonitor.getInstance();
             if (!gearMonitor.isRunning()) {
@@ -4771,12 +7779,18 @@ public class CameraDaemon {
                     log("GearMonitor restarted (ACC ON)");
                 } catch (Exception e) {
                     log("GearMonitor restart failed (ACC ON): " + e.getMessage());
+                    markCurrentAccApplyRetry();
                 }
             }
-            
+
             // Tell BydDataCollector to resume full polling (speed/engine/gearbox)
             com.overdrive.app.byd.BydDataCollector.getInstance().setAccState(true);
-            
+
+            if (stopStaleAccTransition(
+                    transitionGeneration, false, "active monitor restoration")) {
+                return;
+            }
+
             // If pipeline is currently in SURVEILLANCE mode, gracefully exit it:
             // finalize any in-progress sentry recording, flush the encoder, drop
             // out of SURVEILLANCE, and reopen the camera so BYD's native AVM app
@@ -4787,6 +7801,10 @@ public class CameraDaemon {
             if (gpuPipeline != null && gpuPipeline.isSurveillanceMode()) {
                 try {
                     gpuPipeline.onAccOn();
+                    if (stopStaleAccTransition(
+                            transitionGeneration, false, "surveillance exit")) {
+                        return;
+                    }
                 } catch (Exception e) {
                     log("gpuPipeline.onAccOn() error: " + e.getMessage()
                         + " — forcing pipeline.stop() to clear wedge state");
@@ -4813,8 +7831,10 @@ public class CameraDaemon {
                     // and reruns the full chain (including
                     // recordingModeManager.onAccStateChanged(true) / RMM
                     // wedge-resync) against the now-cleanly-stopped pipeline.
-                    log("WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs full ACC ON dispatch");
-                    lastDispatchedAccIsOff = null;
+                    clearAccDispatchForRetry(
+                        transitionGeneration,
+                        false,
+                        "WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs full ACC ON dispatch");
                 }
             } else if (gpuPipeline != null && gpuPipeline.isRecording()) {
                 // FIX (false-GREEN PROX pill at ACC-ON): NOT in surveillance
@@ -4839,6 +7859,11 @@ public class CameraDaemon {
                     gpuPipeline.stopRecording();
                 } catch (Throwable t) {
                     log("Stale-recording drain on ACC ON failed: " + t.getMessage());
+                    markCurrentAccApplyRetry();
+                }
+                if (stopStaleAccTransition(
+                        transitionGeneration, false, "stale-recording drain")) {
+                    return;
                 }
             }
 
@@ -4858,11 +7883,18 @@ public class CameraDaemon {
                 // dedup guard at the top of this method.
                 try {
                     recordingModeManager.onAccStateChanged(true);
+                    if (stopStaleAccTransition(
+                            transitionGeneration, false, "recording-mode restoration")) {
+                        return;
+                    }
                 } catch (Throwable t) {
                     log("WARN: recordingModeManager.onAccStateChanged(true) threw: "
                         + t.getMessage()
                         + " — clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs");
-                    lastDispatchedAccIsOff = null;
+                    clearAccDispatchForRetry(
+                        transitionGeneration,
+                        false,
+                        "WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs full ACC ON dispatch");
                 }
             }
             // OEM Dashcam ACC-on hook. The ACC boundary itself is a state
@@ -4880,6 +7912,7 @@ public class CameraDaemon {
                 }
             } catch (Throwable t) {
                 log("OEM Dashcam ACC ON dispatch failed: " + t.getMessage());
+                markCurrentAccApplyRetry();
             }
             if (recordingModeManager == null) {
                 // Previously this branch tore down the pipeline as "legacy
@@ -4901,24 +7934,29 @@ public class CameraDaemon {
                 // and the new R8 RMM-throw pattern above) so the dedup guard
                 // doesn't suppress the heartbeat after watchdog/ContextRecreate
                 // eventually creates rmm.
-                log("WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs full ACC ON dispatch");
-                lastDispatchedAccIsOff = null;
+                clearAccDispatchForRetry(
+                    transitionGeneration,
+                    false,
+                    "WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs full ACC ON dispatch");
             }
         }
     }
-    
+
     /**
      * Notify of gear state change.
-     * 
+     *
      * Used by PROXIMITY_GUARD mode to activate/deactivate based on gear position.
      * When gear != P, proximity guard starts monitoring.
      * When gear = P, proximity guard stops (ADAS sensors go to ABNORMAL which is expected).
-     * 
+     *
      * @param gear The new gear position (1=P, 2=R, 3=N, 4=D, 5=M, 6=S)
      */
     private static volatile int lastNotifiedGear = Integer.MIN_VALUE;
 
     public static void onGearChanged(int gear) {
+        long observedElapsedMs =
+                android.os.SystemClock.elapsedRealtime();
+        long observedEpochMs = System.currentTimeMillis();
         String gearName = com.overdrive.app.recording.RecordingModeManager.gearToString(gear);
 
         // GearMonitor primes the system with one initial notification on
@@ -4932,13 +7970,25 @@ public class CameraDaemon {
             log("Gear changed to: " + gearName);
         }
 
+        // Feed trip detection before recording-mode callbacks can block. A gear
+        // edge arriving before the trip database finishes opening is dropped
+        // here; the detector re-probes the live gear on publication.
+        com.overdrive.app.trips.TripAnalyticsManager tripManager =
+                tripAnalyticsManager;
+        if (tripManager != null) {
+            try {
+                tripManager.onGearChanged(gear);
+            } catch (Throwable failure) {
+                log("Trip Analytics gear " + gearName + " error: "
+                        + failure.getMessage());
+            }
+        }
+
         if (recordingModeManager != null) {
             recordingModeManager.onGearChanged(gear);
         } else if (!redundant) {
             log("RecordingModeManager not initialized - gear change ignored");
         }
-
-        if (tripAnalyticsManager != null) tripAnalyticsManager.onGearChanged(gear);
 
         // Feed the AUTOMATION engine too, off the FAST GearMonitor path (200ms, runs
         // regardless of ACC). Previously the automation GEAR event was published ONLY
@@ -4960,14 +8010,14 @@ public class CameraDaemon {
             if (!redundant) log("gear automation publish failed: " + t.getMessage());
         }
     }
-    
+
     /**
      * Check if surveillance is enabled.
      */
     public static boolean isSurveillanceEnabled() {
         return surveillanceEnabled;
     }
-    
+
     /** True if surveillance was requested but suppressed because car is in a safe zone. */
     public static boolean isSafeZoneSuppressed() {
         return safeZoneSuppressed;
@@ -4985,34 +8035,66 @@ public class CameraDaemon {
     public static boolean isDoorLockArmed() {
         return doorLockListenerArmed;
     }
-    
+
     public static void setSafeZoneSuppressed(boolean suppressed) {
         safeZoneSuppressed = suppressed;
     }
-    
+
     // ==================== SCHEDULE CHECKER ====================
-    
+
+    private static final Object scheduleCheckerLock =
+        new Object();
     private static Thread scheduleCheckerThread = null;
-    
+    private static long scheduleCheckerGeneration;
+
     /**
      * Starts the periodic schedule checker that monitors time window transitions.
      * Runs every 5 minutes while ACC is off. Stops when ACC turns on.
      */
-    private static void startScheduleChecker() {
-        stopScheduleChecker();
-        scheduleCheckerThread = new Thread(new Runnable() {
+    private static void startScheduleChecker(long transitionGeneration) {
+        Thread previous;
+        synchronized (scheduleCheckerLock) {
+            previous = scheduleCheckerThread;
+            if (previous != null && previous.isAlive()
+                    && scheduleCheckerGeneration
+                        == transitionGeneration) {
+                return;
+            }
+        }
+        if (previous != null && previous.isAlive()
+                && !interruptAndJoinManagedThread(
+                    previous, "schedule checker")) {
+            requestManagedAccWorkerRecovery(
+                "stuck schedule checker");
+            return;
+        }
+
+        final Thread worker;
+        try {
+            worker = new Thread(new Runnable() {
             public void run() {
+                try {
                 log("Schedule checker started (5-min interval)");
-                while (!Thread.currentThread().isInterrupted()) {
+                while (!Thread.currentThread().isInterrupted()
+                        && isAccTransitionCurrent(transitionGeneration, true)) {
                     try {
                         Thread.sleep(5 * 60 * 1000);  // 5 minutes
                     } catch (InterruptedException e) {
                         break;
                     }
-                    
+
                     // Only check when ACC is off
-                    if (com.overdrive.app.monitor.AccMonitor.isAccOn()) continue;
-                    
+                    if (!isAccTransitionCurrent(transitionGeneration, true)) {
+                        break;
+                    }
+                    if (!validateAccOffForDeferredEffect(
+                            transitionGeneration, "schedule-check")) {
+                        if (!isAccTransitionCurrent(transitionGeneration, true)) {
+                            break;
+                        }
+                        continue;
+                    }
+
                     try {
                         com.overdrive.app.surveillance.SurveillanceSchedule schedule =
                             com.overdrive.app.config.UnifiedConfigManager.getSurveillanceSchedule();
@@ -5042,33 +8124,50 @@ public class CameraDaemon {
                                 && gpuPipeline.isRunning() && gpuPipeline.isSurveillanceMode();
                             if (intendWatching && !actuallyRunning
                                     && com.overdrive.app.config.UnifiedConfigManager.isSurveillanceEnabled()) {
+                                if (!isAccTransitionCurrent(transitionGeneration, true)) {
+                                    break;
+                                }
                                 log("SELF-HEAL: surveillance armed but pipeline not in sentry mode "
                                     + "(pipeline=" + (gpuPipeline != null)
                                     + ", running=" + (gpuPipeline != null && gpuPipeline.isRunning())
                                     + ", survMode=" + (gpuPipeline != null && gpuPipeline.isSurveillanceMode())
                                     + ") — re-enabling");
-                                enableSurveillance();
+                                enableSurveillanceForAccGeneration(
+                                    transitionGeneration, "schedule self-heal");
                             }
                             continue;
                         }
 
                         boolean withinWindow = schedule.isActiveNow();
-                        boolean currentlyActive = surveillanceEnabled && gpuPipeline != null 
+                        boolean currentlyActive = surveillanceEnabled && gpuPipeline != null
                                 && gpuPipeline.isSurveillanceMode();
-                        
+
                         if (!withinWindow && currentlyActive) {
                             // Schedule window ended — stop surveillance
-                            log("SCHEDULE: Time window ended (" + schedule.getSummary() + 
+                            if (!isAccTransitionCurrent(transitionGeneration, true)) {
+                                break;
+                            }
+                            log("SCHEDULE: Time window ended (" + schedule.getSummary() +
                                 ") — stopping surveillance");
                             disableSurveillance();
+                            if (stopStaleAccTransition(
+                                    transitionGeneration,
+                                    true,
+                                    "schedule surveillance disable")) {
+                                break;
+                            }
                         } else if (withinWindow && !currentlyActive && !safeZoneSuppressed) {
                             // Schedule window started — enable surveillance if other conditions met
                             boolean userEnabled = com.overdrive.app.config.UnifiedConfigManager
                                 .isSurveillanceEnabled();
                             if (userEnabled) {
-                                log("SCHEDULE: Time window started (" + schedule.getSummary() + 
+                                if (!isAccTransitionCurrent(transitionGeneration, true)) {
+                                    break;
+                                }
+                                log("SCHEDULE: Time window started (" + schedule.getSummary() +
                                     ") — enabling surveillance");
-                                enableSurveillance();
+                                enableSurveillanceForAccGeneration(
+                                    transitionGeneration, "schedule window start");
                             }
                         }
                     } catch (Exception e) {
@@ -5076,29 +8175,81 @@ public class CameraDaemon {
                     }
                 }
                 log("Schedule checker stopped");
+                } finally {
+                    boolean ownedSlot = false;
+                    synchronized (scheduleCheckerLock) {
+                        if (scheduleCheckerThread
+                                == Thread.currentThread()) {
+                            scheduleCheckerThread = null;
+                            scheduleCheckerGeneration = 0L;
+                            ownedSlot = true;
+                        }
+                    }
+                    if (ownedSlot && running.get()
+                            && isAccTransitionCurrent(
+                                transitionGeneration, true)) {
+                        requestManagedAccWorkerRecovery(
+                            "schedule checker exited");
+                    }
+                }
             }
         }, "ScheduleChecker");
-        scheduleCheckerThread.setDaemon(true);
-        scheduleCheckerThread.start();
+            worker.setDaemon(true);
+        } catch (Throwable creationFailure) {
+            requestManagedAccWorkerRecovery(
+                "schedule checker creation failure");
+            return;
+        }
+
+        synchronized (scheduleCheckerLock) {
+            Thread current = scheduleCheckerThread;
+            if (current != null && current.isAlive()
+                    && current != previous) {
+                return;
+            }
+            scheduleCheckerThread = worker;
+            scheduleCheckerGeneration = transitionGeneration;
+        }
+        try {
+            worker.start();
+        } catch (Throwable startFailure) {
+            synchronized (scheduleCheckerLock) {
+                if (scheduleCheckerThread == worker) {
+                    scheduleCheckerThread = null;
+                    scheduleCheckerGeneration = 0L;
+                }
+            }
+            requestManagedAccWorkerRecovery(
+                "schedule checker start failure");
+        }
     }
-    
+
     /**
      * Stops the periodic schedule checker.
      */
     private static void stopScheduleChecker() {
-        if (scheduleCheckerThread != null) {
-            scheduleCheckerThread.interrupt();
-            scheduleCheckerThread = null;
+        Thread worker;
+        synchronized (scheduleCheckerLock) {
+            worker = scheduleCheckerThread;
+        }
+        if (interruptAndJoinManagedThread(
+                worker, "schedule checker")) {
+            synchronized (scheduleCheckerLock) {
+                if (scheduleCheckerThread == worker) {
+                    scheduleCheckerThread = null;
+                    scheduleCheckerGeneration = 0L;
+                }
+            }
         }
     }
-    
+
     /**
      * Check if surveillance is actively processing.
      */
     public static boolean isSurveillanceActive() {
         return gpuPipeline != null && gpuPipeline.isRunning();
     }
-    
+
     /**
      * Set recording quality tier — single user-facing knob that bundles
      * bitrate + perceptual quality. Accepts the new tier names
@@ -5122,20 +8273,20 @@ public class CameraDaemon {
             + " (" + effectiveBitrate / 1_000_000 + " Mbps for "
             + gpuPipeline.getConfig().getVideoCodec() + ")");
     }
-    
+
     /**
      * Set streaming quality.
      */
     public static void setStreamingQuality(String quality) {
         if (gpuPipeline == null) return;
-        
+
         com.overdrive.app.surveillance.GpuPipelineConfig.StreamingQuality streamQuality =
             com.overdrive.app.surveillance.GpuPipelineConfig.StreamingQuality.fromString(quality);
-        
+
         gpuPipeline.setStreamingQuality(streamQuality);
         log("Streaming quality set to: " + streamQuality.displayName);
     }
-    
+
     /**
      * @deprecated use {@link #setRecordingQuality(String)} with one of
      *             ECONOMY / STANDARD / HIGH / PREMIUM / MAX. Old LOW/MEDIUM/
@@ -5154,7 +8305,7 @@ public class CameraDaemon {
         log("setRecordingBitrate(" + bitrate + ") → mapping to recordingQuality=" + tier);
         setRecordingQuality(tier);
     }
-    
+
     /**
      * Set recording codec (H.264 or H.265).
      * Note: Codec change requires encoder restart.
@@ -5164,7 +8315,7 @@ public class CameraDaemon {
             log("setRecordingCodec: gpuPipeline is null, skipping");
             return;
         }
-        
+
         try {
             com.overdrive.app.surveillance.GpuPipelineConfig.VideoCodec videoCodec;
             switch (codec.toUpperCase()) {
@@ -5178,12 +8329,12 @@ public class CameraDaemon {
                     videoCodec = com.overdrive.app.surveillance.GpuPipelineConfig.VideoCodec.H264;
                     break;
             }
-            
+
             if (gpuPipeline.getConfig() == null) {
                 log("setRecordingCodec: config is null, skipping");
                 return;
             }
-            
+
             gpuPipeline.getConfig().setVideoCodec(videoCodec);
             gpuPipeline.applyCodecChange(videoCodec);
             log("Recording codec set to: " + codec + " (" + videoCodec.displayName + ") - restart recording to apply");
@@ -5192,7 +8343,7 @@ public class CameraDaemon {
             e.printStackTrace();
         }
     }
-    
+
     /**
      * Get current recording quality tier (ECONOMY..MAX).
      * Canonical accessor — prefer this over the deprecated bitrate alias.
@@ -5217,10 +8368,10 @@ public class CameraDaemon {
      */
     public static String getRecordingCodec() {
         if (gpuPipeline == null) return "H264";
-        return gpuPipeline.getConfig().getVideoCodec() == 
+        return gpuPipeline.getConfig().getVideoCodec() ==
             com.overdrive.app.surveillance.GpuPipelineConfig.VideoCodec.H265 ? "H265" : "H264";
     }
-    
+
     /**
      * Get GPU pipeline instance.
      */
@@ -5294,9 +8445,9 @@ public class CameraDaemon {
             return false;
         }
     }
-    
+
     // ==================== RECORDING MODE CONTROL ====================
-    
+
     /**
      * Set recording mode (NONE, CONTINUOUS, DRIVE_MODE, PROXIMITY_GUARD).
      */
@@ -5305,7 +8456,7 @@ public class CameraDaemon {
             log("ERROR: RecordingModeManager not initialized");
             return;
         }
-        
+
         try {
             com.overdrive.app.recording.RecordingModeManager.Mode modeEnum =
                 com.overdrive.app.recording.RecordingModeManager.Mode.valueOf(mode.toUpperCase());
@@ -5315,7 +8466,7 @@ public class CameraDaemon {
             log("ERROR: Invalid recording mode: " + mode);
         }
     }
-    
+
     /**
      * Get current recording mode.
      */
@@ -5325,20 +8476,20 @@ public class CameraDaemon {
         }
         return recordingModeManager.getCurrentMode().name();
     }
-    
+
     /**
      * Get recording mode manager instance.
      */
     public static com.overdrive.app.recording.RecordingModeManager getRecordingModeManager() {
         return recordingModeManager;
     }
-    
+
     /**
      * Get surveillance status for API.
      */
     public static java.util.Map<String, Object> getSurveillanceStatus() {
         java.util.Map<String, Object> status = new java.util.HashMap<>();
-        
+
         if (gpuPipeline != null) {
             status.put("initialized", gpuPipeline.isInitialized());
             status.put("enabled", surveillanceEnabled);
@@ -5346,7 +8497,7 @@ public class CameraDaemon {
             status.put("recording", gpuPipeline.getSentry() != null && gpuPipeline.getSentry().isRecording());
             status.put("frameCount", gpuPipeline.getCamera() != null ? gpuPipeline.getCamera().getFrameCount() : 0);
             status.put("encoderType", "gpu-zero-copy");
-            
+
             // Grid motion stats (for UI display)
             if (gpuPipeline.getSentry() != null) {
                 status.put("activeBlocks", gpuPipeline.getSentry().getLastActiveBlocksCount());
@@ -5354,7 +8505,7 @@ public class CameraDaemon {
                 status.put("baselineBlocks", gpuPipeline.getSentry().getBaselineNoiseBlocks());
                 status.put("blockSensitivity", gpuPipeline.getSentry().getBlockSensitivity());
                 status.put("requiredBlocks", gpuPipeline.getSentry().getRequiredActiveBlocks());
-                
+
                 // SOTA: Enhanced motion detection stats
                 status.put("temporalBlocks", gpuPipeline.getSentry().getLastTemporalBlocksCount());
                 status.put("estimatedDistance", gpuPipeline.getSentry().getLastEstimatedDistance());
@@ -5364,7 +8515,7 @@ public class CameraDaemon {
                     status.put("motionMaxY", bounds[1]);
                 }
             }
-            
+
             // Get today's events with details
             java.util.List<java.util.Map<String, Object>> events = getTodaysEvents();
             status.put("totalEventsToday", events.size());
@@ -5377,17 +8528,17 @@ public class CameraDaemon {
             status.put("totalEventsToday", 0);
             status.put("events", new java.util.ArrayList<>());
         }
-        
+
         // SOTA: Safe Location status
         com.overdrive.app.surveillance.SafeLocationManager safeMgr =
             com.overdrive.app.surveillance.SafeLocationManager.getInstance();
         status.put("safeZoneSuppressed", safeZoneSuppressed);
         status.put("inSafeZone", safeMgr.isInSafeZone());
         status.put("safeZoneName", safeMgr.getCurrentZoneName());
-        
+
         // SOTA: BYD camera coordinator status
         if (gpuPipeline != null && gpuPipeline.getCamera() != null) {
-            com.overdrive.app.camera.BydCameraCoordinator coordinator = 
+            com.overdrive.app.camera.BydCameraCoordinator coordinator =
                 gpuPipeline.getCamera().getCameraCoordinator();
             if (coordinator != null) {
                 status.put("cameraServiceRegistered", coordinator.isRegistered());
@@ -5398,17 +8549,17 @@ public class CameraDaemon {
                 status.put("nativeAppActive", coordinator.isNativeAppActive());
                 status.put("cameraEventCallback", coordinator.isEventCallbackActive());
             }
-            
+
             // SOTA: Camera probe status
             com.overdrive.app.camera.PanoramicCameraGpu cam = gpuPipeline.getCamera();
             status.put("probeComplete", cam.isProbeComplete());
             status.put("activeCameraId", cam.getCameraId());
             status.put("activeSurfaceMode", cam.getCameraSurfaceMode());
         }
-        
+
         return status;
     }
-    
+
     /**
      * Count event recordings from today.
      * Looks for files matching pattern: event_YYYYMMDD_*.mp4 in sentry_events directory
@@ -5416,7 +8567,7 @@ public class CameraDaemon {
     private static int countTodaysEvents() {
         return getTodaysEvents().size();
     }
-    
+
     /** Map battery capacity to ABRP car model name */
     private static String capacityToModelName(double capacityKwh) {
         if (capacityKwh >= 105) return "byd:seal:23:108";     // Tang EV
@@ -5429,55 +8580,55 @@ public class CameraDaemon {
         if (capacityKwh >= 36) return "byd:seagull:23:38";    // Seagull
         return null;
     }
-    
+
     /**
      * Get list of today's events with timestamps.
      * Returns list of event info maps with filename, time, and size.
      */
     public static java.util.List<java.util.Map<String, Object>> getTodaysEvents() {
         java.util.List<java.util.Map<String, Object>> events = new java.util.ArrayList<>();
-        
+
         try {
             // Get today's date prefix (e.g., "event_20260111_")
             String todayPrefix = "event_" + new java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(new java.util.Date()) + "_";
-            
+
             // SOTA: Use StorageManager for surveillance directory
             com.overdrive.app.storage.StorageManager storageManager =
                 com.overdrive.app.storage.StorageManager.getInstance();
             java.io.File sentryDir = storageManager.getSurveillanceDir();
             java.io.File[] files = null;
-            
+
             if (sentryDir.exists() && sentryDir.isDirectory()) {
-                files = sentryDir.listFiles((dir, name) -> 
+                files = sentryDir.listFiles((dir, name) ->
                     name.startsWith(todayPrefix) && name.endsWith(".mp4"));
             }
-            
+
             // Fallback to legacy locations for backward compatibility
             if (files == null || files.length == 0) {
                 sentryDir = new java.io.File(outputDir, "sentry_events");
                 if (sentryDir.exists() && sentryDir.isDirectory()) {
-                    files = sentryDir.listFiles((dir, name) -> 
+                    files = sentryDir.listFiles((dir, name) ->
                         name.startsWith(todayPrefix) && name.endsWith(".mp4"));
                 }
             }
-            
+
             if (files == null || files.length == 0) {
                 sentryDir = new java.io.File("/storage/emulated/0/Android/data/com.overdrive.app/files/sentry_events");
                 if (sentryDir.exists() && sentryDir.isDirectory()) {
-                    files = sentryDir.listFiles((dir, name) -> 
+                    files = sentryDir.listFiles((dir, name) ->
                         name.startsWith(todayPrefix) && name.endsWith(".mp4"));
                 }
             }
-            
+
             if (files != null) {
                 // Sort by filename (which includes timestamp) descending (newest first)
                 java.util.Arrays.sort(files, (a, b) -> b.getName().compareTo(a.getName()));
-                
+
                 for (java.io.File file : files) {
                     java.util.Map<String, Object> event = new java.util.HashMap<>();
                     event.put("filename", file.getName());
                     event.put("size", file.length() / 1024); // KB
-                    
+
                     // Extract time from filename: event_YYYYMMDD_HHMMSS.mp4
                     String name = file.getName();
                     if (name.length() >= 22) {
@@ -5487,17 +8638,17 @@ public class CameraDaemon {
                     } else {
                         event.put("time", "--:--:--");
                     }
-                    
+
                     events.add(event);
                 }
             }
         } catch (Exception e) {
             log("Error getting today's events: " + e.getMessage());
         }
-        
+
         return events;
     }
-    
+
     /**
      * Get comprehensive streaming status (VPS streaming removed).
      * Returns a map with streaming state info for API responses.
@@ -5510,19 +8661,19 @@ public class CameraDaemon {
         status.put("publisherCount", 0);
         status.put("mode", streamMode);
         status.put("note", "VPS streaming removed - use local HTTP streaming");
-        
+
         // Per-camera status (all false)
         Map<Integer, Boolean> cameraStatus = new java.util.HashMap<>();
         for (int i = 1; i <= 4; i++) {
             cameraStatus.put(i, false);
         }
         status.put("cameras", cameraStatus);
-        
+
         return status;
     }
 
     // ==================== STREAM MODE CONTROL ====================
-    
+
     /**
      * Set stream mode: "private" (local only) or "public" (tunnel access).
      * Both modes now use tunnel URLs for remote access.
@@ -5532,17 +8683,17 @@ public class CameraDaemon {
             log("ERROR: Invalid stream mode: " + mode);
             return;
         }
-        
+
         String oldMode = streamMode;
         streamMode = mode;
-        
+
         // Persist to file
         saveStreamMode(mode);
-        
+
         log("Stream mode changed: " + oldMode + " -> " + mode);
         // VPS heartbeat removed - both modes use tunnel URLs now
     }
-    
+
     /**
      * Save stream mode to file for persistence.
      */
@@ -5555,7 +8706,7 @@ public class CameraDaemon {
             log("Failed to save stream mode: " + e.getMessage());
         }
     }
-    
+
     /**
      * Load stream mode from file.
      */
@@ -5566,7 +8717,7 @@ public class CameraDaemon {
                 java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(file));
                 String mode = reader.readLine();
                 reader.close();
-                
+
                 if (STREAM_MODE_PUBLIC.equals(mode)) {
                     log("Restored stream mode: PUBLIC");
                     setStreamMode(STREAM_MODE_PUBLIC);
@@ -5579,21 +8730,21 @@ public class CameraDaemon {
             log("Failed to load stream mode: " + e.getMessage());
         }
     }
-    
+
     /**
      * Get current stream mode.
      */
     public static String getStreamMode() {
         return streamMode;
     }
-    
+
     /**
      * Check if public streaming is enabled.
      */
     public static boolean isPublicMode() {
         return STREAM_MODE_PUBLIC.equals(streamMode);
     }
-    
+
     /**
      * Get list of recording cameras (helper for status).
      */
@@ -5610,7 +8761,7 @@ public class CameraDaemon {
     }
 
     // ==================== INITIALIZATION ====================
-    
+
     private static void generateDeviceId() {
         // FIRST: Try to read from shared file (written by app with context)
         // This ensures daemon uses the same ID as the app
@@ -5641,7 +8792,7 @@ public class CameraDaemon {
         } catch (Exception e) {
             log("WARN: Could not read device ID from file: " + e.getMessage());
         }
-        
+
         // No existing file: mint a fresh device id. This is the sole seed for
         // CredentialCipher's AES key (protects the Telegram bot token, BYD
         // Cloud password, NavMap routing key), so it must be unpredictable —
@@ -5660,7 +8811,7 @@ public class CameraDaemon {
         saveDeviceId(deviceId);
         log("Device ID generated randomly: " + deviceId);
     }
-    
+
     private static void saveDeviceId(String id) {
         try {
             File idFile = new File(PATH_DEVICE_ID_FILE());
@@ -5681,19 +8832,19 @@ public class CameraDaemon {
             log("WARN: Could not save device ID to file: " + e.getMessage());
         }
     }
-    
+
     private static void parseArguments(String[] args) {
         if (args.length > 0) {
             outputDir = args[0];
             log("Arg[0] outputDir: " + outputDir);
         }
-        
+
         if (args.length > 1) {
             nativeLibDir = args[1];  // Use class field
             log("Arg[1] nativeLibDir: " + nativeLibDir);
         }
     }
-    
+
     private static void loadNativeLibraries() {
         try {
             try { System.loadLibrary("nativehelper"); } catch (Throwable t) {}
@@ -5705,7 +8856,7 @@ public class CameraDaemon {
         } catch (Throwable e) {
             log("WARN: System lib warning: " + e.getMessage());
         }
-        
+
         // Load surveillance library - try default path first
         if (!com.overdrive.app.surveillance.NativeMotion.isLibraryLoaded()) {
             // Try explicit path using nativeLibDir
@@ -5717,7 +8868,7 @@ public class CameraDaemon {
                     loadSurveillanceFromPath(nativeLibDir);
                 }
             }
-            
+
             // Final check
             if (com.overdrive.app.surveillance.NativeMotion.isLibraryLoaded()) {
                 log("Surveillance library loaded successfully");
@@ -5738,7 +8889,7 @@ public class CameraDaemon {
             log("od native lib loaded (daemon): " + odLoaded);
         }
     }
-    
+
     private static void loadSurveillanceFromPath(String nativeLibDir) {
         // Load surveillance library
         String[] surveillancePaths = {
@@ -5746,7 +8897,7 @@ public class CameraDaemon {
             nativeLibDir.replace("/arm64", "/arm64-v8a") + "/libsurveillance.so",
             nativeLibDir + "-v8a/libsurveillance.so"
         };
-        
+
         for (String libPath : surveillancePaths) {
             if (new File(libPath).exists()) {
                 try {
@@ -5759,7 +8910,7 @@ public class CameraDaemon {
             }
         }
     }
-    
+
     private static void scanCameras() {
         log("--- CAMERA SCAN ---");
         try {
@@ -5781,7 +8932,7 @@ public class CameraDaemon {
         } catch (Exception e) {
             log("WARN: BmmCamera scan failed: " + e.getMessage());
         }
-        
+
         // Probe AVMCamera IDs 0-5 to find which cameras exist on this device
         try {
             Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
@@ -5791,7 +8942,7 @@ public class CameraDaemon {
             mOpen.setAccessible(true);
             java.lang.reflect.Method mClose = avmClass.getDeclaredMethod("close");
             mClose.setAccessible(true);
-            
+
             for (int id = 0; id <= 5; id++) {
                 try {
                     Object cam = ctor.newInstance(id);
@@ -5811,12 +8962,12 @@ public class CameraDaemon {
         } catch (Exception e) {
             log("WARN: AVMCamera probe failed: " + e.getMessage());
         }
-        
+
         log("--- END SCAN ---");
     }
 
     // ==================== LOGGING ====================
-    
+
     private static void initFileLogging() {
         // Configure DaemonLogger for daemon context (enable stdout for app_process)
         DaemonLogger.Config cfg = DaemonLogger.Config.defaults()
@@ -5835,7 +8986,7 @@ public class CameraDaemon {
         DaemonLogger.configure(cfg);
         log("=== CameraDaemon Log Started ===");
     }
-    
+
     public static void log(String message) {
         logger.info(message);
     }
@@ -5951,7 +9102,7 @@ public class CameraDaemon {
     }
 
     // ==================== GPS MONITOR ====================
-    
+
     /**
      * Initialize GPS Monitor with app context for standard LocationManager access.
      * Uses PermissionBypassContext to access location services without runtime permission prompts.
@@ -5959,25 +9110,25 @@ public class CameraDaemon {
     private static void initGpsMonitor() {
         try {
             log("Initializing GPS Monitor with app context...");
-            
+
             // Location permissions are already granted by PermissionGranter on its
             // background thread. No need to duplicate those 3 synchronous pm grant
             // calls here — they were blocking initGpsMonitor for several seconds
             // and adding redundant load to PackageManagerService.
-            
+
             // Try to get or create shared app context
             if (sharedAppContext == null) {
                 sharedAppContext = createAppContext();
             }
-            
+
             if (sharedAppContext == null) {
                 log("WARNING: Could not create app context for GpsMonitor, falling back to daemon mode");
                 com.overdrive.app.monitor.GpsMonitor.getInstance().init(null);
                 return;
             }
-            
+
             log("Got app context: " + sharedAppContext.getClass().getName());
-            
+
             // Verify LocationManager is accessible
             Object locMgr = sharedAppContext.getSystemService(android.content.Context.LOCATION_SERVICE);
             if (locMgr == null) {
@@ -5986,26 +9137,26 @@ public class CameraDaemon {
                 return;
             }
             log("LocationManager available: " + locMgr.getClass().getName());
-            
+
             com.overdrive.app.monitor.GpsMonitor gpsMonitor =
                 com.overdrive.app.monitor.GpsMonitor.getInstance();
-            
+
             gpsMonitor.init(sharedAppContext);
             gpsMonitor.start();  // Start GPS tracking immediately
-            
+
             log("GPS Monitor initialized with Context mode");
-            
+
             // Initialize NetworkMonitor for WiFi/Mobile Data status in sidebar
             com.overdrive.app.monitor.NetworkMonitor.init(sharedAppContext);
             log("Network Monitor initialized");
-            
+
         } catch (Exception e) {
             log("Failed to initialize GPS Monitor with context: " + e.getMessage());
             log("Falling back to daemon mode (shell commands)");
             com.overdrive.app.monitor.GpsMonitor.getInstance().init(null);
         }
     }
-    
+
     /**
      * Grant location permissions to the app via shell commands.
      * The daemon runs with elevated privileges so it can grant permissions.
@@ -6016,9 +9167,9 @@ public class CameraDaemon {
             "android.permission.ACCESS_COARSE_LOCATION",
             "android.permission.ACCESS_BACKGROUND_LOCATION"
         };
-        
+
         log("Granting location permissions...");
-        
+
         for (String perm : permissions) {
             try {
                 Process process = Runtime.getRuntime().exec(
@@ -6034,9 +9185,9 @@ public class CameraDaemon {
             }
         }
     }
-    
+
     // ==================== VEHICLE DATA MONITOR ====================
-    
+
     /**
      * Initialize Vehicle Data Monitor for EV battery and charging data.
      * Reuses shared app context with PermissionBypassContext for BYD hardware access.
@@ -6044,25 +9195,25 @@ public class CameraDaemon {
     private static void initVehicleDataMonitor() {
         try {
             log("Initializing Vehicle Data Monitor...");
-            
+
             // Reuse shared context if available, otherwise create new
             if (sharedAppContext == null) {
                 sharedAppContext = createAppContext();
             }
-            
+
             if (sharedAppContext == null) {
                 log("WARNING: Could not create app context for VehicleDataMonitor");
                 return;
             }
-            
+
             com.overdrive.app.monitor.VehicleDataMonitor vehicleMonitor =
                 com.overdrive.app.monitor.VehicleDataMonitor.getInstance();
-            
+
             vehicleMonitor.init(sharedAppContext);
             vehicleMonitor.start();
-            
+
             log("Vehicle Data Monitor initialized successfully");
-            
+
             // Initialize Universal BYD Data Collector (runs alongside existing monitors)
             try {
                 com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
@@ -6072,7 +9223,7 @@ public class CameraDaemon {
             } catch (Exception e) {
                 log("BYD Data Collector init error (non-fatal): " + e.getMessage());
             }
-            
+
             // Initialize Gear Monitor for PROXIMITY_GUARD mode
             com.overdrive.app.monitor.GearMonitor gearMonitor =
                 com.overdrive.app.monitor.GearMonitor.getInstance();
@@ -6087,9 +9238,9 @@ public class CameraDaemon {
             } catch (Exception e) {
                 log("GearMonitor start failed (will retry on ACC ON): " + e.getMessage());
             }
-            
+
             log("Gear Monitor initialized successfully");
-            
+
             // Initialize Performance Monitor for system instrumentation.
             // init() only resolves pid/uid/context — it does NOT start polling.
             // Polling is ON-DEMAND: it starts when a client opens the perf page
@@ -6107,12 +9258,15 @@ public class CameraDaemon {
             perfMonitor.init(sharedAppContext);
 
             log("Performance Monitor initialized successfully (polling on-demand)");
-            
+
             // Initialize SOC History Database for persistent battery tracking
             com.overdrive.app.monitor.SocHistoryDatabase socDb =
                 com.overdrive.app.monitor.SocHistoryDatabase.getInstance();
-            socDb.setSohEstimator(sohEstimator);
             socDb.init();
+            // setSohEstimator triggers pending calibration replay. It must run
+            // after init(), otherwise replay exits on isInitialized=false and
+            // startup has no guaranteed retry.
+            socDb.setSohEstimator(sohEstimator);
             socDb.start();
 
             log("SOC History Database initialized successfully");
@@ -6132,31 +9286,36 @@ public class CameraDaemon {
             }
 
             // Fix stale kWh records from before PHEV capacity was correctly
-            // detected. Runs on a background thread — this is a one-shot data
-            // migration over the soc_history table that has been observed to
+            // detected. Runs on a background thread. The database transaction
+            // owns a durable version marker and per-row format marker, so the
+            // migration cannot be reapplied later using a newer SOH. It has been observed to
             // take 100+ seconds on a long-running install (full table scan
             // with per-row arithmetic). Blocking the main init thread here
             // delayed ABRP / MQTT / TripAnalytics by the same 100+ s, which
             // is exactly the "trips loading 3-4 min" symptom users hit.
             //
-            // The migration is idempotent (rows that already match the
-            // formula are no-ops); SocHistoryDatabase's periodic recorder
-            // tolerates concurrent UPDATE on the same connection (H2
-            // serializes internally) and the migration runs once per
-            // daemon lifetime.
-            final com.overdrive.app.abrp.SohEstimator sohEstSnapshotForMigration = sohEstimator;
-            if (sohEstSnapshotForMigration != null
-                    && sohEstSnapshotForMigration.getNominalCapacityKwh() > 0
-                    && sohEstSnapshotForMigration.getNominalCapacityKwh() < 30.0) {
+            // SocHistoryDatabase serializes the shared H2 connection and
+            // revalidates this immutable capacity/SOH token immediately before
+            // commit. If reset or nominal-capacity mutation races the scan, the
+            // transaction rolls back and retries with a fresh token.
+            final com.overdrive.app.abrp.SohEstimator.CapacitySohSnapshot
+                    capacitySohSnapshotForMigration = sohEstimator != null
+                            ? sohEstimator.getCapacitySohSnapshot() : null;
+            if (capacitySohSnapshotForMigration != null
+                    && capacitySohSnapshotForMigration.getNominalCapacityKwh() > 0
+                    && capacitySohSnapshotForMigration.getNominalCapacityKwh() < 30.0) {
                 Thread migration = new Thread(() -> {
                     try {
                         long t0 = System.currentTimeMillis();
                         log("Fixing stale kWh records for PHEV (nominal="
-                                + sohEstSnapshotForMigration.getNominalCapacityKwh()
-                                + " kWh) — async");
-                        socDb.fixStaleRemainingKwh(sohEstSnapshotForMigration.getNominalCapacityKwh());
-                        log("Stale kWh migration done in "
-                                + (System.currentTimeMillis() - t0) + "ms");
+                                + capacitySohSnapshotForMigration.getNominalCapacityKwh()
+                                + " kWh) - async");
+                        if (socDb.fixStaleRemainingKwh(capacitySohSnapshotForMigration)) {
+                            log("Stale kWh migration done in "
+                                    + (System.currentTimeMillis() - t0) + "ms");
+                        } else {
+                            log("Stale kWh migration deferred; no version marker committed");
+                        }
                     } catch (Throwable t) {
                         log("Stale kWh migration failed: " + t.getMessage());
                     }
@@ -6165,13 +9324,13 @@ public class CameraDaemon {
                 migration.setPriority(Thread.MIN_PRIORITY);
                 migration.start();
             }
-            
+
         } catch (Exception e) {
             log("Failed to initialize Vehicle Data Monitor: " + e.getMessage());
             e.printStackTrace();
         }
     }
-    
+
     /**
      * Create app context with permission bypass for BYD hardware access.
      */
@@ -6207,7 +9366,7 @@ public class CameraDaemon {
                 systemMainThread.setDaemon(true);
                 systemMainThread.start();
                 systemMainThread.join(10_000); // 10 second timeout
-                
+
                 if (systemMainThread.isAlive()) {
                     log("createAppContext: systemMain TIMED OUT (10s)");
                     systemMainThread.interrupt();
@@ -6225,19 +9384,19 @@ public class CameraDaemon {
                     log("createAppContext: systemMain = " + activityThread);
                 }
             }
-            
+
             // Strategy 3: Prepare looper manually + create ActivityThread via constructor
             if (activityThread == null) {
                 log("createAppContext: Trying manual ActivityThread creation...");
                 try {
                     // Ensure main looper exists (idempotent if already prepared)
                     try { android.os.Looper.prepareMainLooper(); } catch (Exception ignored) {}
-                    
+
                     // Create ActivityThread via default constructor
                     java.lang.reflect.Constructor<?> ctor = activityThreadClass.getDeclaredConstructor();
                     ctor.setAccessible(true);
                     activityThread = ctor.newInstance();
-                    
+
                     // Set as the current thread via sCurrentActivityThread field
                     try {
                         java.lang.reflect.Field sField = activityThreadClass.getDeclaredField("sCurrentActivityThread");
@@ -6250,7 +9409,7 @@ public class CameraDaemon {
                             // If we got here, the field layout is different — just proceed
                         } catch (Exception ignored) {}
                     }
-                    
+
                     log("createAppContext: manual ActivityThread = " + activityThread);
                 } catch (Exception e) {
                     log("createAppContext: manual creation failed: " + e.getMessage());
@@ -6266,7 +9425,7 @@ public class CameraDaemon {
             java.lang.reflect.Method getSystemContext = activityThreadClass.getMethod("getSystemContext");
             android.content.Context systemContext = (android.content.Context) getSystemContext.invoke(activityThread);
             log("createAppContext: systemContext = " + systemContext);
-            
+
             if (systemContext == null) {
                 log("createAppContext: systemContext is null, trying fallback...");
                 return createFallbackContext();
@@ -6277,12 +9436,12 @@ public class CameraDaemon {
             android.content.Context appContext = systemContext.createPackageContext(packageName,
                     android.content.Context.CONTEXT_INCLUDE_CODE | android.content.Context.CONTEXT_IGNORE_SECURITY);
             log("createAppContext: appContext = " + appContext);
-            
+
             if (appContext == null) {
                 log("createAppContext: appContext is null, trying fallback...");
                 return createFallbackContext();
             }
-            
+
             PermissionBypassContext wrapped = new PermissionBypassContext(appContext);
             log("createAppContext: Success, returning PermissionBypassContext");
             return wrapped;
@@ -6292,7 +9451,7 @@ public class CameraDaemon {
             return createFallbackContext();
         }
     }
-    
+
     /**
      * Fallback context creation when ActivityThread is completely unavailable.
      * Creates a minimal context via ContextImpl reflection that's enough for
@@ -6302,10 +9461,10 @@ public class CameraDaemon {
         try {
             // Try to create ContextImpl directly
             Class<?> contextImplClass = Class.forName("android.app.ContextImpl");
-            
+
             // Try createSystemContext() — available on most Android versions
             try {
-                java.lang.reflect.Method createSystemContext = contextImplClass.getDeclaredMethod("createSystemContext", 
+                java.lang.reflect.Method createSystemContext = contextImplClass.getDeclaredMethod("createSystemContext",
                     Class.forName("android.app.ActivityThread"));
                 createSystemContext.setAccessible(true);
                 // Pass null ActivityThread — some versions tolerate this
@@ -6317,7 +9476,7 @@ public class CameraDaemon {
             } catch (Exception e) {
                 log("createFallbackContext: createSystemContext failed: " + e.getMessage());
             }
-            
+
             // Try createAppContext with minimal params
             try {
                 java.lang.reflect.Method[] methods = contextImplClass.getDeclaredMethods();
@@ -6329,19 +9488,19 @@ public class CameraDaemon {
                     }
                 }
             } catch (Exception ignored) {}
-            
+
             // Last resort: use a bare PermissionBypassContext with a dummy base
             // This creates a context that returns PERMISSION_GRANTED for all checks
             // and delegates everything else to the system
             log("createFallbackContext: Using null-safe PermissionBypassContext as last resort");
             return new PermissionBypassContext(null);
-            
+
         } catch (Exception e) {
             log("createFallbackContext failed completely: " + e.getMessage());
             return new PermissionBypassContext(null);
         }
     }
-    
+
     /**
      * Context wrapper that bypasses permission checks and handles null base context.
      * Required for accessing BYD hardware services without signature permissions.
@@ -6349,7 +9508,7 @@ public class CameraDaemon {
      */
     private static class PermissionBypassContext extends android.content.ContextWrapper {
         public PermissionBypassContext(android.content.Context base) { super(base); }
-        
+
         @Override public void enforceCallingOrSelfPermission(String permission, String message) {}
         @Override public void enforcePermission(String permission, int pid, int uid, String message) {}
         @Override public void enforceCallingPermission(String permission, String message) {}
@@ -6362,7 +9521,7 @@ public class CameraDaemon {
         @Override public int checkSelfPermission(String permission) {
             return android.content.pm.PackageManager.PERMISSION_GRANTED;
         }
-        
+
         // Null-safe overrides for when base context is null (fallback mode).
         // CRITICAL: getMainLooper() must be overridden — BYDAutoDeviceManager calls
         // context.getMainLooper() in its constructor, and ContextWrapper delegates

@@ -56,6 +56,8 @@ public final class AudioPlaybackController {
     // literal the Screen Deterrent / sidecars use in their `am` execs.
     private static final String AUDIO_SERVICE =
             "com.overdrive.app/.services.MediaPlaybackService";
+    private static final String CHIME_SERVICE =
+            "com.overdrive.app/.services.RoadSenseChimePlaybackService";
     private static final String VIDEO_ACTIVITY =
             "com.overdrive.app/.ui.VideoPlaybackActivity";
     /** Broadcast the audio service + video activity both stop on. */
@@ -80,9 +82,10 @@ public final class AudioPlaybackController {
     }
 
     /**
-     * Play a video with its PICTURE on the head-unit screen (audio on {@code channel}).
-     * Launches the app-process {@code VideoPlaybackActivity}; the activity self-manages
-     * from there.
+     * Play a video with its PICTURE on the head-unit screen. Video audio always uses the
+     * Media channel: the TextureView player's default media attributes are the only
+     * configuration proven not to stall video frames on this DiLink build. Launches the
+     * app-process {@code VideoPlaybackActivity}; the activity self-manages from there.
      *
      * <p><b>Return contract: true means DISPATCHED, not "playing".</b> The launch is
      * deliberately asynchronous — {@code am start} takes 2-3s on a cold app spawn, and
@@ -93,8 +96,54 @@ public final class AudioPlaybackController {
      * logs its own prepare/play result; that pair is the source of truth when a clip
      * doesn't appear. False is returned only for an unusable path.
      */
-    public static boolean playVideoOnScreen(String path, String channel, boolean loop) {
-        return dispatchPlay(path, channel, loop, true);
+    public static boolean playVideoOnScreen(String path, boolean loop) {
+        return dispatchPlay(path, "media", loop, true);
+    }
+
+    /**
+     * Play a BUNDLED {@code res/raw} asset (by resource name, extension-agnostic) on
+     * {@code channel} at {@code volumePercent} (1..100). Used by RoadSense approach chimes.
+     *
+     * <p>Why the chimes come through here rather than a daemon-side SoundPool: a
+     * SoundPool/MediaPlayer in the daemon process can't decode (the {@code 0x80000000}
+     * prepare failure documented above), and — the actual point — only an app-process
+     * player knows how to reach the OEM-extended nav/voice streams (both
+     * {@code setLegacyStreamType} and {@code setAudioStreamType}, plus a legacy
+     * stream-typed focus request; see {@code MediaPlaybackService.applyChannelRouting}).
+     * Routing a chime "to the navigation channel" is exactly that recipe, so the chime
+     * uses the same proven routing recipe as Play Audio. It runs in a dedicated service
+     * so a warning cannot replace looping Automation Audio (and vice versa).
+     *
+     * <p><b>Extras are DELIBERATELY limited to {@code --es}/{@code --ez}</b> — the exact
+     * flag set the audible {@link #play} path uses. A chime dispatched with an additional
+     * {@code --ei} extra was silent on device while {@code play} on the same channel was
+     * audible, and an `am` option this firmware's {@code Intent.parseCommandArgs} doesn't
+     * accept throws and aborts the WHOLE command before any extra is read — invisibly,
+     * because we don't wait on it (the {@code --activity-new-task} failure mode). Volume
+     * therefore rides as a STRING and is parsed app-side. Do not add typed extras here
+     * without verifying on device.
+     *
+     * <p>Uses {@link #execLogged} rather than fire-and-forget {@code exec}: a chime that
+     * never plays is otherwise indistinguishable from one that played silently, since the
+     * daemon log only ever recorded "dispatched".
+     */
+    public static boolean playRawResource(String resName, String channel, int volumePercent) {
+        if (resName == null || resName.trim().isEmpty()) {
+            logger.warn("playRawResource: empty resource name");
+            return false;
+        }
+        String ch = (channel == null || channel.trim().isEmpty()) ? "media" : channel.trim();
+        int pct = Math.max(1, Math.min(100, volumePercent));
+        execLogged("am start-foreground-service -n " + CHIME_SERVICE
+                + " --es action chime"
+                + " --es resName " + q(resName.trim())
+                + " --es channel " + q(ch)
+                + " --es volumePercent " + q(String.valueOf(pct))
+                + " --ez loop false",
+                "playRawResource");
+        logger.info("playRawResource: dispatched " + resName.trim()
+                + " (channel=" + ch + " vol=" + pct + "%)");
+        return true;
     }
 
     /**
@@ -118,11 +167,11 @@ public final class AudioPlaybackController {
 
     /** Stop any audio or video started by a play above. Idempotent. */
     public static void stop() {
-        // Stop the audio service, and broadcast a stop the video activity honours.
-        // Both are no-ops if the target isn't running.
+        // Stop user-started automation/keymap audio and video. RoadSense warning chimes
+        // are isolated safety cues and intentionally do not share this cancellation path.
         exec("am stopservice -n " + AUDIO_SERVICE);
         exec("am broadcast -a " + ACTION_STOP + " -p " + PKG);
-        logger.info("stop: dispatched service stop + stop broadcast");
+        logger.info("stop: dispatched automation audio stop + video stop broadcast");
     }
 
     // ── internals ───────────────────────────────────────────────────────────
@@ -138,7 +187,12 @@ public final class AudioPlaybackController {
             return false;
         }
         File f = new File(path.trim());
-        String ch = (channel == null || channel.trim().isEmpty()) ? "media" : channel.trim();
+        String requestedChannel = (channel == null || channel.trim().isEmpty())
+                ? "media" : channel.trim();
+        // The video player must use MediaPlayer's untouched default media attributes.
+        // Enforce that here too, so a future API caller cannot reintroduce a channel that
+        // the fullscreen player cannot safely honour.
+        String ch = onScreen ? "media" : requestedChannel;
 
         // Decide transport: library name (streamed) vs direct file path. Keep the two as
         // discrete values (libName XOR filePath) so both the Intent path and the shell
@@ -178,7 +232,8 @@ public final class AudioPlaybackController {
             // unconditionally adds FLAG_ACTIVITY_NEW_TASK itself. --activity-clear-task is
             // also dropped: the activity is singleTask and its onNewIntent already swaps
             // the clip in place, whereas clear-task would destroy the instance instead.
-            // Extras carry the clip + channel + loop. MAIN (not VIEW), no --user 0 (am
+            // Extras carry the clip + loop. Video audio is intentionally fixed to Media, so
+            // no channel extra is sent. MAIN (not VIEW), no --user 0 (am
             // defaults to the current user).
             //
             // Output is captured (not >/dev/null) so a future launch failure is
@@ -186,7 +241,6 @@ public final class AudioPlaybackController {
             execLogged("am start -n " + VIDEO_ACTIVITY
                     + " -a android.intent.action.MAIN"
                     + " " + srcArgs
-                    + " --es channel " + q(ch)
                     + " --ez loop " + loop,
                     "playVideoOnScreen");
             logger.info("playVideoOnScreen: dispatched to VideoPlaybackActivity via am start (channel=" + ch + " loop=" + loop + ")");

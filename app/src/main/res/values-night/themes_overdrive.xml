@@ -7,64 +7,64 @@
 
     <style name="Theme.Overdrive.M3" parent="Theme.Material3.Dark.NoActionBar">
         <!-- Primary -->
-        <item name="colorPrimary">@color/md_sys_color_primary_dark</item>
-        <item name="colorOnPrimary">@color/md_sys_color_on_primary_dark</item>
-        <item name="colorPrimaryContainer">@color/md_sys_color_primary_container_dark</item>
-        <item name="colorOnPrimaryContainer">@color/md_sys_color_on_primary_container_dark</item>
+        <item name="colorPrimary">@color/md_sys_color_primary</item>
+        <item name="colorOnPrimary">@color/md_sys_color_on_primary</item>
+        <item name="colorPrimaryContainer">@color/md_sys_color_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/md_sys_color_on_primary_container</item>
 
         <!-- Secondary -->
-        <item name="colorSecondary">@color/md_sys_color_secondary_dark</item>
-        <item name="colorOnSecondary">@color/md_sys_color_on_secondary_dark</item>
-        <item name="colorSecondaryContainer">@color/md_sys_color_secondary_container_dark</item>
-        <item name="colorOnSecondaryContainer">@color/md_sys_color_on_secondary_container_dark</item>
+        <item name="colorSecondary">@color/md_sys_color_secondary</item>
+        <item name="colorOnSecondary">@color/md_sys_color_on_secondary</item>
+        <item name="colorSecondaryContainer">@color/md_sys_color_secondary_container</item>
+        <item name="colorOnSecondaryContainer">@color/md_sys_color_on_secondary_container</item>
 
         <!-- Tertiary -->
-        <item name="colorTertiary">@color/md_sys_color_tertiary_dark</item>
-        <item name="colorOnTertiary">@color/md_sys_color_on_tertiary_dark</item>
-        <item name="colorTertiaryContainer">@color/md_sys_color_tertiary_container_dark</item>
-        <item name="colorOnTertiaryContainer">@color/md_sys_color_on_tertiary_container_dark</item>
+        <item name="colorTertiary">@color/md_sys_color_tertiary</item>
+        <item name="colorOnTertiary">@color/md_sys_color_on_tertiary</item>
+        <item name="colorTertiaryContainer">@color/md_sys_color_tertiary_container</item>
+        <item name="colorOnTertiaryContainer">@color/md_sys_color_on_tertiary_container</item>
 
         <!-- Error -->
-        <item name="colorError">@color/md_sys_color_error_dark</item>
-        <item name="colorOnError">@color/md_sys_color_on_error_dark</item>
-        <item name="colorErrorContainer">@color/md_sys_color_error_container_dark</item>
-        <item name="colorOnErrorContainer">@color/md_sys_color_on_error_container_dark</item>
+        <item name="colorError">@color/md_sys_color_error</item>
+        <item name="colorOnError">@color/md_sys_color_on_error</item>
+        <item name="colorErrorContainer">@color/md_sys_color_error_container</item>
+        <item name="colorOnErrorContainer">@color/md_sys_color_on_error_container</item>
 
         <!-- Background / surface -->
-        <item name="android:colorBackground">@color/md_sys_color_background_dark</item>
-        <item name="colorOnBackground">@color/md_sys_color_on_background_dark</item>
-        <item name="colorSurface">@color/md_sys_color_surface_dark</item>
-        <item name="colorOnSurface">@color/md_sys_color_on_surface_dark</item>
-        <item name="colorSurfaceVariant">@color/md_sys_color_surface_variant_dark</item>
-        <item name="colorOnSurfaceVariant">@color/md_sys_color_on_surface_variant_dark</item>
-        <item name="colorSurfaceDim">@color/md_sys_color_surface_dim_dark</item>
-        <item name="colorSurfaceBright">@color/md_sys_color_surface_bright_dark</item>
-        <item name="colorSurfaceContainerLowest">@color/md_sys_color_surface_container_lowest_dark</item>
-        <item name="colorSurfaceContainerLow">@color/md_sys_color_surface_container_low_dark</item>
-        <item name="colorSurfaceContainer">@color/md_sys_color_surface_container_dark</item>
-        <item name="colorSurfaceContainerHigh">@color/md_sys_color_surface_container_high_dark</item>
-        <item name="colorSurfaceContainerHighest">@color/md_sys_color_surface_container_highest_dark</item>
+        <item name="android:colorBackground">@color/md_sys_color_background</item>
+        <item name="colorOnBackground">@color/md_sys_color_on_background</item>
+        <item name="colorSurface">@color/md_sys_color_surface</item>
+        <item name="colorOnSurface">@color/md_sys_color_on_surface</item>
+        <item name="colorSurfaceVariant">@color/md_sys_color_surface_variant</item>
+        <item name="colorOnSurfaceVariant">@color/md_sys_color_on_surface_variant</item>
+        <item name="colorSurfaceDim">@color/md_sys_color_surface_dim</item>
+        <item name="colorSurfaceBright">@color/md_sys_color_surface_bright</item>
+        <item name="colorSurfaceContainerLowest">@color/md_sys_color_surface_container_lowest</item>
+        <item name="colorSurfaceContainerLow">@color/md_sys_color_surface_container_low</item>
+        <item name="colorSurfaceContainer">@color/md_sys_color_surface_container</item>
+        <item name="colorSurfaceContainerHigh">@color/md_sys_color_surface_container_high</item>
+        <item name="colorSurfaceContainerHighest">@color/md_sys_color_surface_container_highest</item>
 
         <!-- Outline -->
-        <item name="colorOutline">@color/md_sys_color_outline_dark</item>
-        <item name="colorOutlineVariant">@color/md_sys_color_outline_variant_dark</item>
+        <item name="colorOutline">@color/md_sys_color_outline</item>
+        <item name="colorOutlineVariant">@color/md_sys_color_outline_variant</item>
 
         <!-- Inverse / scrim -->
-        <item name="colorSurfaceInverse">@color/md_sys_color_inverse_surface_dark</item>
-        <item name="colorOnSurfaceInverse">@color/md_sys_color_inverse_on_surface_dark</item>
-        <item name="colorPrimaryInverse">@color/md_sys_color_inverse_primary_dark</item>
-        <item name="scrimBackground">@color/md_sys_color_scrim_dark</item>
+        <item name="colorSurfaceInverse">@color/md_sys_color_inverse_surface</item>
+        <item name="colorOnSurfaceInverse">@color/md_sys_color_inverse_on_surface</item>
+        <item name="colorPrimaryInverse">@color/md_sys_color_inverse_primary</item>
+        <item name="scrimBackground">@color/md_sys_color_scrim</item>
 
         <!-- System bars -->
-        <item name="android:statusBarColor">@color/md_sys_color_surface_container_dark</item>
-        <item name="android:navigationBarColor">@color/md_sys_color_surface_container_dark</item>
+        <item name="android:statusBarColor">@color/md_sys_color_surface_container</item>
+        <item name="android:navigationBarColor">@color/md_sys_color_surface_container</item>
         <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
-        <item name="android:windowBackground">@color/md_sys_color_background_dark</item>
+        <item name="android:windowBackground">@color/md_sys_color_background</item>
 
         <!-- Text colors driven by M3 roles -->
-        <item name="android:textColorPrimary">@color/md_sys_color_on_surface_dark</item>
-        <item name="android:textColorSecondary">@color/md_sys_color_on_surface_variant_dark</item>
-        <item name="android:textColorHint">@color/md_sys_color_outline_dark</item>
+        <item name="android:textColorPrimary">@color/md_sys_color_on_surface</item>
+        <item name="android:textColorSecondary">@color/md_sys_color_on_surface_variant</item>
+        <item name="android:textColorHint">@color/md_sys_color_outline</item>
 
         <!-- Inherited component styles -->
         <item name="materialCardViewStyle">@style/Widget.Overdrive.M3.CardView</item>
@@ -75,6 +75,18 @@
         <item name="bottomSheetDialogTheme">@style/Theme.Overdrive.M3.BottomSheet</item>
         <item name="materialAlertDialogTheme">@style/ThemeOverlay.Overdrive.M3.MaterialAlertDialog</item>
         <item name="alertDialogTheme">@style/ThemeOverlay.Overdrive.M3.MaterialAlertDialog</item>
+
+        <!-- Keep the same typography contract in night mode. A style with the
+             same name in values-night replaces rather than extends the default
+             declaration, so these references must be repeated explicitly. -->
+        <item name="textAppearanceDisplaySmall">@style/TextAppearance.Overdrive.DisplaySmall</item>
+        <item name="textAppearanceHeadlineLarge">@style/TextAppearance.Overdrive.HeadlineLarge</item>
+        <item name="textAppearanceHeadlineMedium">@style/TextAppearance.Overdrive.HeadlineMedium</item>
+        <item name="textAppearanceHeadlineSmall">@style/TextAppearance.Overdrive.HeadlineSmall</item>
+        <item name="textAppearanceTitleLarge">@style/TextAppearance.Overdrive.TitleLarge</item>
+        <item name="textAppearanceTitleMedium">@style/TextAppearance.Overdrive.TitleMedium</item>
+        <item name="textAppearanceLabelLarge">@style/TextAppearance.Overdrive.LabelLarge</item>
+        <item name="textAppearanceLabelMedium">@style/TextAppearance.Overdrive.LabelMedium</item>
     </style>
 
 </resources>

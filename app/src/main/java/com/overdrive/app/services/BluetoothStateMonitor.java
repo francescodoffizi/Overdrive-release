@@ -76,6 +76,9 @@ public final class BluetoothStateMonitor {
     // truth with the dedup BYPASSED. It's cheap and safe: the daemon's update() is edge-gated,
     // so a same-value re-assert fires no trigger — it only reseeds the map.
     private static final long REASSERT_SECONDS = 60;
+    // Delay for the post-connect name re-resolve (see scheduleNameRecheck). Long enough for the
+    // profile/SDP handshake to publish the friendly name, short enough to feel immediate.
+    private static final long NAME_RECHECK_MS = 1200L;
     private final ScheduledExecutorService reassert = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "bt-state-reassert");
         t.setDaemon(true);
@@ -156,13 +159,38 @@ public final class BluetoothStateMonitor {
             receiver = new BroadcastReceiver() {
                 @Override public void onReceive(Context c, Intent intent) {
                     // Any BT edge — re-resolve ground truth and relay if it changed.
-                    publish(false);
+                    //
+                    // Pass the device the broadcast CARRIES as a name hint. On a fresh connect
+                    // the hidden getConnectDevices() can still be empty and getName() can still
+                    // be null for seconds while the profile/SDP handshake finishes, so resolving
+                    // purely from the adapter reported "" (or the old name) and the real name only
+                    // landed on the 60s re-assert — the reported 5-10s+ device-name lag. The
+                    // EXTRA_DEVICE on an ACL_CONNECTED already identifies the device that just
+                    // connected, and its cached name is usually populated from bonding.
+                    BluetoothDevice hint = null;
+                    try {
+                        hint = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                    } catch (Throwable ignored) { /* malformed extra — fall back to the adapter */ }
+                    String action = intent.getAction();
+                    boolean connectEdge = BluetoothDevice.ACTION_ACL_CONNECTED.equals(action);
+                    publish(false, connectEdge ? hint : null);
+                    // A connect whose name is still unresolved gets one short retry, so the name
+                    // lands in ~1s instead of waiting for the next periodic re-assert.
+                    if (connectEdge) scheduleNameRecheck();
                 }
             };
             IntentFilter filter = new IntentFilter();
             filter.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
             filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
             filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+            // Profile-level connection edges. ACL is the raw link; a head unit's phone connect
+            // completes A2DP/HFP slightly later, and it is that moment the friendly name is
+            // reliably readable. Registering both means whichever arrives first publishes, and
+            // the later one corrects the name if it changed.
+            filter.addAction("android.bluetooth.a2dp.profile.action.CONNECTION_STATE_CHANGED");
+            filter.addAction("android.bluetooth.headset.profile.action.CONNECTION_STATE_CHANGED");
+            // The name itself can arrive after the connect (fetched over SDP post-bond).
+            filter.addAction(BluetoothDevice.ACTION_NAME_CHANGED);
             appContext.registerReceiver(receiver, filter);
         } catch (Throwable t) {
             Log.w(TAG, "registerReceiver failed: " + t.getMessage());
@@ -207,6 +235,17 @@ public final class BluetoothStateMonitor {
      *     state map is re-seeded); a broadcast-driven publish passes false to skip no-ops.
      */
     private void publish(boolean force) {
+        publish(force, null);
+    }
+
+    /**
+     * @param hint the device carried by an ACL_CONNECTED broadcast, or null. Used only to answer
+     *     "connected, and what is it called" while the adapter's own view is still catching up:
+     *     a fresh connect can leave {@code getConnectDevices()} empty and {@code getName()} null
+     *     for several seconds. The hint is authoritative for the CONNECTED case only — a
+     *     disconnect must always be resolved from the adapter.
+     */
+    private void publish(boolean force, BluetoothDevice hint) {
         boolean connected;
         String name;
         try {
@@ -216,8 +255,11 @@ public final class BluetoothStateMonitor {
                 name = "";
             } else {
                 BluetoothDevice dev = firstConnectedDevice(adapter);
+                if (dev == null && hint != null) dev = hint;   // adapter lagging the edge
                 connected = dev != null;
                 name = connected ? deviceName(dev) : "";
+                // Adapter resolved the device but not yet its name, and the broadcast named it.
+                if (connected && name.isEmpty() && hint != null) name = deviceName(hint);
             }
         } catch (Throwable t) {
             // Never let a stack hiccup crash the always-alive a11y process; skip this edge.
@@ -232,6 +274,21 @@ public final class BluetoothStateMonitor {
         // relays run on the single-threaded io executor, so this ordering is preserved.)
         relay("btDeviceName", name, force);
         relay("btState", connected ? "on" : "off", force);
+    }
+
+    /**
+     * One short re-resolve after a connect edge, for the case where the device was known but its
+     * friendly name was not yet readable (name fetched over SDP after the link comes up). Without
+     * it, a connect that published an empty/stale name had to wait for the 60s re-assert — the
+     * reported device-name lag. Cheap and idempotent: relay() dedups, so if the name was already
+     * correct this sends nothing.
+     */
+    private void scheduleNameRecheck() {
+        try {
+            reassert.schedule(() -> publish(false), NAME_RECHECK_MS, TimeUnit.MILLISECONDS);
+        } catch (Throwable ignored) {
+            // Executor shutting down — the periodic re-assert still covers it.
+        }
     }
 
     /**
@@ -312,6 +369,26 @@ public final class BluetoothStateMonitor {
     }
 
     /**
+     * Whether the daemon's JSON reply says it actually published the event. Absent/unparseable
+     * body is treated as ACCEPTED: older daemons that answered 2xx with no body were accepting,
+     * and failing closed here would re-POST the same value every edge forever.
+     */
+    private static boolean readSuccess(HttpURLConnection conn) {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(conn.getInputStream(),
+                        java.nio.charset.StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            String body = sb.toString().trim();
+            if (body.isEmpty()) return true;
+            return new JSONObject(body).optBoolean("success", true);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /**
      * Relay one whitelisted event to the daemon, deduping identical consecutive values.
      * The value is JSON-encoded (a device name may contain quotes / backslashes / unicode),
      * so — unlike {@link CallStateMonitor}'s fixed-enum body — this must not concatenate.
@@ -357,11 +434,23 @@ public final class BluetoothStateMonitor {
                 int code = conn.getResponseCode();
                 // Commit the dedup memory only once the daemon has actually accepted it, so a
                 // startup-race failure retries on the next edge instead of being latched.
+                //
+                // A 2xx is NOT acceptance on its own: /api/automations/event answers
+                // 200 {"success":false} when publishExternalEvent rejects the value (unknown
+                // event key, or a btState that is not exactly "on"/"off"). Latching the dedup on
+                // that reply marked a value as delivered that the daemon never stored, and since
+                // the receiver only re-relays on a CHANGE, the correct value could then never be
+                // resent — the device name stayed stale until the next 60s force re-assert.
+                boolean accepted = false;
                 if (code >= 200 && code < 300) {
-                    if ("btState".equals(event)) lastState = v;
-                    else if ("btDeviceName".equals(event)) lastName = v;
+                    accepted = readSuccess(conn);
+                    if (accepted) {
+                        if ("btState".equals(event)) lastState = v;
+                        else if ("btDeviceName".equals(event)) lastName = v;
+                    }
                 }
-                Log.i(TAG, "relayed " + event + "=" + v + " -> HTTP " + code);
+                Log.i(TAG, "relayed " + event + "=" + v + " -> HTTP " + code
+                        + (accepted ? "" : " (not accepted)"));
             } catch (Throwable t) {
                 Log.w(TAG, "relay failed (" + event + "): " + t.getMessage());
             } finally {

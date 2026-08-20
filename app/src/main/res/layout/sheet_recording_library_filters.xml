@@ -1,166 +1,296 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  Bottom sheet hosting the actor + severity filter chip rows extracted from
-  fragment_recording_library.xml. Same chip IDs preserved exactly so existing
-  Kotlin findViewById and click logic in RecordingLibraryFragment continue to
-  work unchanged: chipActorAny / Person / Vehicle / Bike / Animal,
-  chipSevAny / Alert / Critical, and the actorChipGroup / severityChipGroup
-  containers.
--->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
-    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="?attr/colorSurface"
-    android:orientation="vertical"
-    android:paddingHorizontal="20dp"
-    android:paddingTop="8dp"
-    android:paddingBottom="20dp">
+    android:fillViewport="true">
 
-    <!-- Drag handle -->
-    <View
-        android:layout_width="32dp"
-        android:layout_height="4dp"
-        android:layout_gravity="center_horizontal"
-        android:layout_marginBottom="12dp"
-        android:background="@drawable/recording_lib_count_pill"
-        android:alpha="0.5" />
-
-    <!-- Header -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:paddingBottom="12dp">
+        android:orientation="vertical"
+        android:paddingHorizontal="20dp"
+        android:paddingTop="8dp"
+        android:paddingBottom="20dp">
 
-        <TextView
-            android:layout_width="0dp"
+        <View
+            android:layout_width="32dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="12dp"
+            android:alpha="0.5"
+            android:background="@drawable/recording_lib_count_pill" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/recording_lib_filter_sheet_title"
-            android:textColor="?attr/colorOnSurface"
-            android:textSize="18sp"
-            android:fontFamily="sans-serif-medium" />
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingBottom="8dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:accessibilityHeading="true"
+                android:fontFamily="sans-serif-medium"
+                android:text="@string/recording_lib_filter_sheet_title"
+                android:textColor="?attr/colorOnSurface"
+                android:textSize="18sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnFilterReset"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="48dp"
+                android:text="@string/recording_lib_filter_reset"
+                android:textAllCaps="false" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/sheetTypeSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingTop="8dp"
+                android:paddingBottom="6dp"
+                android:text="@string/recording_lib_filter_section_type"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:textSize="12sp" />
+
+            <com.google.android.material.chip.ChipGroup
+                android:id="@+id/typeChipGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:chipSpacingHorizontal="8dp"
+                app:singleLine="false">
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipTypeNormal"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_type_normal" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipTypeProximity"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_type_proximity" />
+            </com.google.android.material.chip.ChipGroup>
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/sheetActorSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingTop="16dp"
+                android:paddingBottom="6dp"
+                android:text="@string/recording_lib_filter_section_what"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:textSize="12sp" />
+
+            <com.google.android.material.chip.ChipGroup
+                android:id="@+id/actorChipGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:chipSpacingHorizontal="8dp"
+                app:chipSpacingVertical="6dp"
+                app:singleLine="false">
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipActorAny"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_any" />
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipActorPerson"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_person"
+                    app:chipIcon="@drawable/ic_person"
+                    app:chipIconSize="16dp"
+                    app:chipIconTint="?attr/colorOnSurfaceVariant"
+                    app:chipIconVisible="true" />
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipActorVehicle"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_vehicle"
+                    app:chipIcon="@drawable/ic_directions_car"
+                    app:chipIconSize="16dp"
+                    app:chipIconTint="?attr/colorOnSurfaceVariant"
+                    app:chipIconVisible="true" />
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipActorBike"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_bike"
+                    app:chipIcon="@drawable/ic_pedal_bike"
+                    app:chipIconSize="16dp"
+                    app:chipIconTint="?attr/colorOnSurfaceVariant"
+                    app:chipIconVisible="true" />
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipActorAnimal"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_animal"
+                    app:chipIcon="@drawable/ic_pets"
+                    app:chipIconSize="16dp"
+                    app:chipIconTint="?attr/colorOnSurfaceVariant"
+                    app:chipIconVisible="true" />
+            </com.google.android.material.chip.ChipGroup>
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/sheetSeveritySection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingTop="16dp"
+                android:paddingBottom="6dp"
+                android:text="@string/recording_lib_filter_section_severity"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:textSize="12sp" />
+
+            <com.google.android.material.chip.ChipGroup
+                android:id="@+id/severityChipGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:chipSpacingHorizontal="8dp"
+                app:singleLine="false">
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipSevAny"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_any" />
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipSevAlert"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_alert"
+                    app:chipIcon="@drawable/ic_warning"
+                    app:chipIconSize="16dp"
+                    app:chipIconTint="?attr/colorOnSurfaceVariant"
+                    app:chipIconVisible="true" />
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipSevCritical"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_critical"
+                    app:chipIcon="@drawable/ic_error"
+                    app:chipIconSize="16dp"
+                    app:chipIconTint="?attr/colorOnSurfaceVariant"
+                    app:chipIconVisible="true" />
+            </com.google.android.material.chip.ChipGroup>
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/sheetPlaceSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingTop="16dp"
+                android:paddingBottom="6dp"
+                android:text="@string/recording_lib_filter_section_place"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:textSize="12sp" />
+
+            <com.google.android.material.chip.ChipGroup
+                android:id="@+id/sheetPlaceChipGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:chipSpacingHorizontal="8dp"
+                app:chipSpacingVertical="6dp"
+                app:singleLine="false"
+                app:singleSelection="true" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/sheetStorageSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingTop="16dp"
+                android:paddingBottom="6dp"
+                android:text="@string/recording_lib_filter_section_storage"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:textSize="12sp" />
+
+            <com.google.android.material.chip.ChipGroup
+                android:id="@+id/storageChipGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:chipSpacingHorizontal="8dp"
+                app:singleLine="false">
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipStorageAny"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_chip_any" />
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipStorageInternal"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_storage_filter_internal" />
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipStorageSd"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_storage_filter_sd" />
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chipStorageUsb"
+                    style="@style/Widget.Material3.Chip.Filter"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/recording_lib_storage_filter_usb" />
+            </com.google.android.material.chip.ChipGroup>
+        </LinearLayout>
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnFilterReset"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="36dp"
-            android:text="@string/recording_lib_filter_reset"
-            android:textSize="13sp"
-            android:minHeight="36dp"
-            android:insetTop="0dp"
-            android:insetBottom="0dp" />
+            android:id="@+id/btnFilterApply"
+            style="@style/Widget.Material3.Button"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:layout_marginTop="20dp"
+            android:text="@string/recording_lib_filter_apply"
+            android:textAllCaps="false"
+            app:cornerRadius="8dp" />
     </LinearLayout>
-
-    <!-- WHAT (actor class) -->
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="@string/recording_lib_filter_section_what"
-        android:textColor="?attr/colorOnSurfaceVariant"
-        android:textSize="12sp"
-        android:fontFamily="sans-serif-medium"
-        android:letterSpacing="0.08"
-        android:textAllCaps="true"
-        android:paddingTop="4dp"
-        android:paddingBottom="8dp" />
-
-    <com.google.android.material.chip.ChipGroup
-        android:id="@+id/actorChipGroup"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        app:chipSpacingHorizontal="6dp"
-        app:chipSpacingVertical="6dp"
-        app:singleLine="false">
-
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipActorAny"
-            style="@style/Widget.Material3.Chip.Filter"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/recording_lib_chip_any"
-            android:checked="true" />
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipActorPerson"
-            style="@style/Widget.Material3.Chip.Filter"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/recording_lib_chip_person" />
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipActorVehicle"
-            style="@style/Widget.Material3.Chip.Filter"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/recording_lib_chip_vehicle" />
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipActorBike"
-            style="@style/Widget.Material3.Chip.Filter"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/recording_lib_chip_bike" />
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipActorAnimal"
-            style="@style/Widget.Material3.Chip.Filter"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/recording_lib_chip_animal" />
-    </com.google.android.material.chip.ChipGroup>
-
-    <!-- SEVERITY -->
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="@string/recording_lib_filter_section_severity"
-        android:textColor="?attr/colorOnSurfaceVariant"
-        android:textSize="12sp"
-        android:fontFamily="sans-serif-medium"
-        android:letterSpacing="0.08"
-        android:textAllCaps="true"
-        android:paddingTop="20dp"
-        android:paddingBottom="8dp" />
-
-    <com.google.android.material.chip.ChipGroup
-        android:id="@+id/severityChipGroup"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        app:chipSpacingHorizontal="6dp"
-        app:chipSpacingVertical="6dp"
-        app:singleLine="false">
-
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipSevAny"
-            style="@style/Widget.Material3.Chip.Filter"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/recording_lib_chip_any"
-            android:checked="true" />
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipSevAlert"
-            style="@style/Widget.Material3.Chip.Filter"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/recording_lib_chip_alert" />
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipSevCritical"
-            style="@style/Widget.Material3.Chip.Filter"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/recording_lib_chip_critical" />
-    </com.google.android.material.chip.ChipGroup>
-
-    <!-- Apply button -->
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/btnFilterApply"
-        style="@style/Widget.Material3.Button"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:layout_marginTop="24dp"
-        android:text="@string/recording_lib_filter_apply"
-        android:textSize="14sp"
-        app:cornerRadius="24dp" />
-
-</LinearLayout>
+</androidx.core.widget.NestedScrollView>

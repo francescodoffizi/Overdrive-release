@@ -416,7 +416,7 @@ public class GpuStreamScaler {
      * matches the encoder's configured {@code KEY_FRAME_RATE}, but on the BYD
      * byd_apa HAL the camera emits at its own fixed ~4.5 fps and refuses
      * {@code setCameraFps} entirely (it returns false for every value; the OEM app
-     * and DiPlus both discard that return). A 15 fps-configured encoder fed an
+     * and other OEM-derived players both discard that return). A 15 fps-configured encoder fed an
      * unstamped 4.5 fps source produces near-empty P-frames with no usable
      * timing, which renders as a frozen picture after the first keyframe.
      *
@@ -715,6 +715,11 @@ public class GpuStreamScaler {
      */
     public void setViewMode(int mode) {
         if (mode < 0 || mode > 8) return;
+        if (mode != 6) {
+            synchronized (oemViewLock) {
+                oemViewRequested = false;
+            }
+        }
         if (mode != 7 && mode != 8 && mode == this.currentViewMode) return;   // idempotent — no upload needed (BS modes 7/8 always re-apply side sign)
         this.currentViewMode = mode;
         // Resolve the sampler coefficients for the active side (7 = -1, 8 = +1).
@@ -816,22 +821,36 @@ public class GpuStreamScaler {
      * {@link #publishOemTexMatrix}.
      */
     public void bindOemSource(int oemTextureId, android.graphics.SurfaceTexture oemSt) {
-        this.oemTextureId = oemTextureId;
-        this.oemSurfaceTexture = oemSt;
-        this.oemSourceActive = true;
-        this.oemBindingDirty.set(true);
+        synchronized (oemViewLock) {
+            boolean sourceChanged = !this.oemSourceActive
+                || this.oemTextureId != oemTextureId
+                || this.oemSurfaceTexture != oemSt;
+            // A transform only belongs to the SurfaceTexture that published it.
+            // Do not activate view 6 from an earlier OEM instance's matrix while
+            // the newly bound producer has not delivered a frame yet.
+            if (sourceChanged) {
+                this.oemTexMatrixSnapshot = null;
+            }
+            this.oemTextureId = oemTextureId;
+            this.oemSurfaceTexture = oemSt;
+            this.oemSourceActive = true;
+            this.oemBindingDirty.set(true);
+        }
         logger.info("OEM source bound to streamScaler (tex=" + oemTextureId + ")");
     }
 
     public void unbindOemSource() {
-        this.oemSourceActive = false;
-        this.oemTextureId = 0;
-        this.oemSurfaceTexture = null;
-        // Drop the snapshot — without this, the OEM ping-pong matrix buffer
-        // remains reachable from the scaler indefinitely, pinning OEM's
-        // pipeline graph if the scaler outlives an OEM teardown.
-        this.oemTexMatrixSnapshot = null;
-        this.oemBindingDirty.set(true);
+        synchronized (oemViewLock) {
+            this.oemSourceActive = false;
+            this.oemTextureId = 0;
+            this.oemSurfaceTexture = null;
+            // Drop the snapshot — without this, the OEM ping-pong matrix buffer
+            // remains reachable from the scaler indefinitely, pinning OEM's
+            // pipeline graph if the scaler outlives an OEM teardown.
+            this.oemTexMatrixSnapshot = null;
+            oemViewRequested = false;
+            this.oemBindingDirty.set(true);
+        }
         logger.info("OEM source unbound from streamScaler");
     }
 
@@ -867,6 +886,14 @@ public class GpuStreamScaler {
     // and never touches the buffer again, so a torn read across the
     // 16-float / 2-cache-line span can't happen.
     private volatile float[] oemTexMatrixSnapshot;
+    // Serializes first-frame activation against a non-DVR selection. Without
+    // it, publishOemTexMatrix could observe a stale pending request immediately
+    // before a user selects another camera, then switch back to DVR afterward.
+    private final Object oemViewLock = new Object();
+    // A view-6 request may bind an allocated OEM texture before its first
+    // updateTexImage publishes a transform. Keep the valid AVM view on-screen
+    // until that snapshot arrives rather than falling through to the mosaic.
+    private boolean oemViewRequested;
 
     /** Publish the OEM SurfaceTexture's transform matrix. Called from the
      *  OEM pipeline's GL thread immediately after updateTexImage. The
@@ -877,7 +904,36 @@ public class GpuStreamScaler {
      *  read on the consumer side. */
     public void publishOemTexMatrix(float[] matrix) {
         if (matrix != null && matrix.length >= 16) {
-            this.oemTexMatrixSnapshot = matrix;
+            synchronized (oemViewLock) {
+                if (!oemSourceActive) return;
+                this.oemTexMatrixSnapshot = matrix;
+                // The first real OEM frame is the only safe handoff point.
+                // setViewMode marks uniforms dirty, so the next pano draw uploads
+                // uViewMode=6 and uOemActive=1 together.
+                if (oemViewRequested && oemTextureId != 0 && oemSurfaceTexture != null) {
+                    oemViewRequested = false;
+                    setViewMode(6);
+                }
+            }
+        }
+    }
+
+    /**
+     * Select the OEM view only after the attached source has published its
+     * first SurfaceTexture transform. Returns false while activation is
+     * deferred; publishOemTexMatrix completes the handoff automatically.
+     */
+    public boolean requestOemViewWhenReady() {
+        synchronized (oemViewLock) {
+            boolean ready = oemSourceActive && oemTextureId != 0
+                && oemSurfaceTexture != null && oemTexMatrixSnapshot != null;
+            if (!ready) {
+                oemViewRequested = oemSourceActive;
+                return false;
+            }
+            oemViewRequested = false;
+            setViewMode(6);
+            return true;
         }
     }
     
@@ -978,7 +1034,7 @@ public class GpuStreamScaler {
      * Enables or disables the GL red-overlay suppression on the live stream.
      * Mirrors GpuMosaicRecorder.setRedMaskEnabled. Off by default.
      */
-    /** APA center inset (esco APACropFilter parity). See {@link
+    /** APA center inset (oem APACropFilter parity). See {@link
      *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
     public void setApaCenterInset(float inset) {
         float clamped = Math.max(0.0f, Math.min(0.20f, inset));
@@ -1378,6 +1434,13 @@ public class GpuStreamScaler {
             "    if (uViewMode == 6 && uOemActive == 1) {\n" +
             "        vec2 oemTc = (uOemTexMatrix * vec4(vUnit, 0.0, 1.0)).xy;\n" +
             "        gl_FragColor = texture2D(uOemTex, oemTc);\n" +
+            "        return;\n" +
+            "    }\n" +
+            // During an OEM restart the requested DVR mode can outlive its
+            // source by one or more frames. Never fall through to the AVM
+            // mosaic while view 6 has no valid external texture.
+            "    if (uViewMode == 6) {\n" +
+            "        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n" +
             "        return;\n" +
             "    }\n" +
             "    vec2 samplePos;\n" +

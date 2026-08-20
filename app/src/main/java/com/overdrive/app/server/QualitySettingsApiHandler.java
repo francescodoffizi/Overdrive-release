@@ -10,6 +10,8 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.OutputStream;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Quality Settings API Handler - manages recording and streaming quality settings.
@@ -23,6 +25,10 @@ import java.io.OutputStream;
  * - POST /api/settings/storage - Update storage limit settings
  */
 public class QualitySettingsApiHandler {
+
+    private static final int MAX_ROAD_SENSE_VOLUME_WRITERS = 512;
+    private static final Map<String, Long> roadSenseVolumeSequences =
+            new LinkedHashMap<>();
     
     // Stored quality settings
     // Single user-facing recording quality tier (ECONOMY/STANDARD/HIGH/PREMIUM/MAX).
@@ -336,6 +342,13 @@ public class QualitySettingsApiHandler {
         response.put("internalFreeFormatted", StorageManager.formatSize(intFree));
         response.put("internalTotalFormatted", StorageManager.formatSize(intTotal));
 
+        // Combined-limit advisory. Every category's slider tops out at the FULL volume
+        // and each picks its volume independently, so Σ(limits on one volume) can exceed
+        // that volume's capacity. Advisory only — computed once here (and echoed by
+        // /api/trips/storage) so all settings pages warn from one source of truth.
+        // Includes proximity, which has no slider of its own but does consume a limit.
+        response.put("storageBudget", storage.getStorageBudgetJson());
+
         HttpResponse.sendJson(out, response.toString());
     }
 
@@ -571,12 +584,75 @@ public class QualitySettingsApiHandler {
                 return;
             }
 
-            // Route through UnifiedConfigManager so the in-memory cache stays
-            // consistent and registered listeners fire. The previous direct
-            // file-read/merge/write bypassed the cache: any other writer
-            // (StorageManager, ExternalStorageCleaner) within the same mtime
-            // second could merge into a stale cache and clobber this section.
-            boolean ok = com.overdrive.app.config.UnifiedConfigManager.updateSection(section, data);
+            // Blind-spot speed bounds: REJECT out-of-range / non-numeric input rather
+            // than persisting it. The daemon gate clamps defensively too, but silently
+            // storing e.g. 900 would show "900" back in the UI while the gate treated it
+            // as "no bound" — the setting would read armed and behave disarmed. An
+            // INVERTED pair (min > max) is an unsatisfiable window that would hide the
+            // card forever, so it's a validation error, not a value to store.
+            //
+            // Validated INSIDE the config file lock, and the write nested in the same
+            // lock: validateBsSpeedWindow resolves a bound the request omits from the
+            // PERSISTED sibling (updateSection merges), so a check outside the lock is a
+            // TOCTOU — two concurrent single-key POSTs ({min:90} and {max:30}) would each
+            // validate against the stored 0 and together commit an inverted window. The
+            // lock is per-thread reentrant, so updateSection's own acquire just nests.
+            boolean ok;
+            if ("roadSense".equals(section)
+                    && (data.has("warnAudioVolume")
+                    || data.has("warnAudioVolumeWriter")
+                    || data.has("warnAudioVolumeSequence"))) {
+                final String[] err = new String[1];
+                ok = com.overdrive.app.config.UnifiedConfigManager.runUnderConfigLock(() -> {
+                    try {
+                        err[0] = validateRoadSenseAudioSettings(data);
+                    } catch (Exception e) {
+                        err[0] = "Invalid RoadSense chime volume settings";
+                    }
+                    if (err[0] != null) return false;
+                    if (data.has("warnAudioVolumeWriter")) {
+                        String writer = data.optString("warnAudioVolumeWriter", "");
+                        long sequence = data.optLong("warnAudioVolumeSequence", 0L);
+                        data.remove("warnAudioVolumeWriter");
+                        data.remove("warnAudioVolumeSequence");
+                        synchronized (roadSenseVolumeSequences) {
+                            Long previous = roadSenseVolumeSequences.get(writer);
+                            // A duplicate/older request from this page is a successful
+                            // no-op: its newer request already carried the intended value.
+                            if (previous != null && sequence <= previous) return true;
+                            boolean saved = com.overdrive.app.config.UnifiedConfigManager
+                                    .updateSection(section, data);
+                            if (saved) rememberRoadSenseVolumeSequence(writer, sequence);
+                            return saved;
+                        }
+                    }
+                    return com.overdrive.app.config.UnifiedConfigManager
+                            .updateSection(section, data);
+                });
+                if (err[0] != null) {
+                    HttpResponse.sendJsonError(out, err[0]);
+                    return;
+                }
+            } else if ("blindspot".equals(section)
+                    && (data.has("minSpeedKmh") || data.has("maxSpeedKmh"))) {
+                final String[] err = new String[1];
+                ok = com.overdrive.app.config.UnifiedConfigManager.runUnderConfigLock(() -> {
+                    err[0] = validateBsSpeedWindow(data);
+                    if (err[0] != null) return false;
+                    return com.overdrive.app.config.UnifiedConfigManager.updateSection(section, data);
+                });
+                if (err[0] != null) {
+                    HttpResponse.sendJsonError(out, err[0]);
+                    return;
+                }
+            } else {
+                // Route through UnifiedConfigManager so the in-memory cache stays
+                // consistent and registered listeners fire. The previous direct
+                // file-read/merge/write bypassed the cache: any other writer
+                // (StorageManager, ExternalStorageCleaner) within the same mtime
+                // second could merge into a stale cache and clobber this section.
+                ok = com.overdrive.app.config.UnifiedConfigManager.updateSection(section, data);
+            }
             if (!ok) {
                 HttpResponse.sendJsonError(out, "updateSection returned false");
                 return;
@@ -773,6 +849,121 @@ public class QualitySettingsApiHandler {
         } catch (Exception e) {
             CameraDaemon.log("Error updating unified config: " + e.getMessage());
             HttpResponse.sendJsonError(out, e.getMessage());
+        }
+    }
+
+    /**
+     * Validate a blind-spot speed-window delta. Returns an error string to reject
+     * the whole POST, or null when the values are storable.
+     *
+     * <p>Both bounds are whole km/h in 0..{@code BS_SPEED_MAX_KMH}, where 0 means "no
+     * bound on that end". Non-integers and out-of-range values are rejected outright
+     * rather than clamped, so the UI can never show a number the gate doesn't honor.
+     *
+     * <p>CROSS-KEY: {@code updateSection} MERGES the delta into the persisted section,
+     * so a POST carrying only {@code maxSpeedKmh} still has to be checked against the
+     * STORED {@code minSpeedKmh} — otherwise "set max=20" against a stored min=60
+     * would commit an inverted, unsatisfiable window that hides the card forever.
+     * Resolve each missing side from the persisted config before comparing.
+     *
+     * <p>MUST be called while holding the config file lock (see the call site): the
+     * cross-key read below is only sound if no peer write can land between it and the
+     * merge. Equal bounds are ALLOWED — min==max is a coherent (if narrow) window.
+     */
+    private static String validateBsSpeedWindow(JSONObject data) {
+        final int cap = com.overdrive.app.config.UnifiedConfigManager.BS_SPEED_MAX_KMH;
+        // forceReload for an under-lock read: the sibling bound may have been written by
+        // the app/web UID, and the mtime-gated cache could otherwise serve it stale.
+        com.overdrive.app.config.UnifiedConfigManager.forceReload();
+        org.json.JSONObject stored = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+        int[] bounds = new int[2];
+        String[] keys = { "minSpeedKmh", "maxSpeedKmh" };
+        for (int i = 0; i < keys.length; i++) {
+            if (data.has(keys[i])) {
+                Object raw = data.opt(keys[i]);
+                // Reject a fractional/garbage value instead of truncating it silently.
+                if (!(raw instanceof Number) || ((Number) raw).doubleValue() != ((Number) raw).intValue()) {
+                    return Messages.get("errors.bs_speed_range", "0", String.valueOf(cap));
+                }
+                int v = ((Number) raw).intValue();
+                if (v < 0 || v > cap) {
+                    return Messages.get("errors.bs_speed_range", "0", String.valueOf(cap));
+                }
+                bounds[i] = v;
+                // Normalise the value we accepted back into the delta so the merge
+                // persists a plain int: an integral double (30.0) would otherwise be
+                // stored verbatim. Both readers coerce it, so this is only about not
+                // writing odd literals into the config file.
+                try { data.put(keys[i], v); } catch (Exception ignored) {}
+            } else {
+                bounds[i] = com.overdrive.app.config.UnifiedConfigManager
+                    .clampBsSpeedBound(stored.optInt(keys[i], 0));
+            }
+        }
+        // 0 disarms an end, so only a both-armed pair can be inverted.
+        if (bounds[0] > 0 && bounds[1] > 0 && bounds[0] > bounds[1]) {
+            return Messages.get("errors.bs_speed_order");
+        }
+        return null;
+    }
+
+    /**
+     * Validate and canonicalize RoadSense audio values before updateSection persists
+     * them. Package-visible for focused JVM tests of the unified-settings boundary.
+     */
+    static String validateRoadSenseAudioSettings(JSONObject data) throws Exception {
+        if (data == null) return null;
+        boolean hasVolume = data.has("warnAudioVolume");
+        boolean hasWriter = data.has("warnAudioVolumeWriter");
+        boolean hasSequence = data.has("warnAudioVolumeSequence");
+        if (!hasVolume) {
+            return (hasWriter || hasSequence)
+                    ? "RoadSense chime volume sequencing requires a volume"
+                    : null;
+        }
+        Integer volume = com.overdrive.app.roadsense.config.RoadSenseChimeLevels
+                .validatedMasterPercent(data.opt("warnAudioVolume"));
+        if (volume == null) {
+            return "RoadSense chime volume must be a whole number from 10 to 100";
+        }
+        // Store one canonical JSON type even when a client sent an integral double.
+        data.put("warnAudioVolume", volume);
+        if (hasWriter != hasSequence) {
+            return "RoadSense chime volume writer and sequence must be provided together";
+        }
+        if (hasWriter) {
+            if (data.length() != 3) {
+                return "Sequenced RoadSense chime volume updates cannot include other settings";
+            }
+            Object rawWriter = data.opt("warnAudioVolumeWriter");
+            if (!(rawWriter instanceof String)
+                    || !((String) rawWriter).matches("[0-9a-f]{32}")) {
+                return "RoadSense chime volume writer is invalid";
+            }
+            Object rawSequence = data.opt("warnAudioVolumeSequence");
+            if (!(rawSequence instanceof Number)) {
+                return "RoadSense chime volume sequence must be a positive integer";
+            }
+            Number number = (Number) rawSequence;
+            double value = number.doubleValue();
+            long integer = number.longValue();
+            if (!Double.isFinite(value)
+                    || value != (double) integer
+                    || integer < 1L
+                    || integer > 9_007_199_254_740_991L) {
+                return "RoadSense chime volume sequence must be a positive integer";
+            }
+            data.put("warnAudioVolumeSequence", integer);
+        }
+        return null;
+    }
+
+    private static void rememberRoadSenseVolumeSequence(String writer, long sequence) {
+        roadSenseVolumeSequences.remove(writer);
+        roadSenseVolumeSequences.put(writer, sequence);
+        while (roadSenseVolumeSequences.size() > MAX_ROAD_SENSE_VOLUME_WRITERS) {
+            String eldest = roadSenseVolumeSequences.keySet().iterator().next();
+            roadSenseVolumeSequences.remove(eldest);
         }
     }
 
@@ -1202,8 +1393,8 @@ public class QualitySettingsApiHandler {
                     // restart:true path (OemDashcamApiHandler.java around line 618-625).
                     com.overdrive.app.server.OemDashcamApiHandler.LIFECYCLE_EXEC.execute(() -> {
                         try {
-                            com.overdrive.app.server.OemDashcamApiHandler.applyLifecycle(false);
-                            com.overdrive.app.server.OemDashcamApiHandler.applyTriggerLifecycleFromUcm();
+                            com.overdrive.app.server.OemDashcamApiHandler
+                                .forceRestartPipelineFromCurrentIntent();
                         } catch (Exception e) {
                             // Best-effort — quality apply itself already succeeded; restart
                             // failure leaves the user with their old encoder settings until

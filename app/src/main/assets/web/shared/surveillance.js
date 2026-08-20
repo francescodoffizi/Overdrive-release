@@ -86,6 +86,10 @@ BYD.surveillance = {
         // off lets just that rail sleep on the next ACC-OFF cycle to save the 12V
         // battery. Does NOT affect the cameras — parked surveillance is unaffected.
         keepUsbPowerOnAccOff: true,
+        // Parked cellular keep-alive. Default false = opt-in; only needed on models
+        // whose data module sleeps after ACC OFF. Hydrated from /api/surveillance/config
+        // and persisted immediately on toggle (no Apply).
+        mobileDataKeepAlive: false,
         // Low-power-while-parked master toggle (mirrors camera.surveillanceIdleThrottle
         // + oemDashcam.idleThrottleWhenParked, which are driven together). Default
         // false = today's behaviour (full idle frame rate). Hydrated from
@@ -126,7 +130,10 @@ BYD.surveillance = {
         // Dynamic per-volume ceilings (live StatFs from server)
         maxLimitMb: 100000,
         maxLimitMbSdCard: 100000,
-        maxLimitMbUsb: 100000
+        maxLimitMbUsb: 100000,
+        // Combined-limit advisory (one entry per targeted volume). See
+        // shared/storage-budget.js — rendered, never enforced.
+        storageBudget: []
     },
     cdrInfo: null,
     cdrConfig: {
@@ -226,7 +233,10 @@ BYD.surveillance = {
         
         // Reload config when page becomes visible (user switches back to tab)
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible' && !this.hasUnsavedChanges) {
+            // reloadConfig self-gates on hasUnsavedChanges (and falls back to the
+            // banner-only refresh when dirty), so no second gate here — returning to a
+            // dirty tab should still pick up a peer page's limit change.
+            if (document.visibilityState === 'visible') {
                 this.reloadConfig();
             }
             // Stop heatmap polling when page is hidden
@@ -265,8 +275,14 @@ BYD.surveillance = {
     
     async reloadConfig() {
         // Don't reload if user has unsaved changes
-        if (this.hasUnsavedChanges) return;
-        
+        if (this.hasUnsavedChanges) {
+            // ...but keep the overcommit advisory current: it depends on the OTHER
+            // categories' limits, so a dirty page would otherwise show a stale verdict
+            // indefinitely. Writes no control, so it's safe with edits in flight.
+            this.refreshBudgetOnly();
+            return;
+        }
+
         try {
             const resp = await fetch('/api/surveillance/config');
             const data = await resp.json();
@@ -457,6 +473,7 @@ BYD.surveillance = {
                 this.storageInfo.maxLimitMbSdCard = data.maxLimitMbSdCard || 100000;
                 this.storageInfo.maxLimitMbUsb    = data.maxLimitMbUsb    || 100000;
                 this.storageInfo.surveillancePath = data.surveillancePath || '';
+                this.storageInfo.storageBudget = data.storageBudget || [];
 
                 this.updateStorageLimitUI();
                 this.updateStorageTypeUI();
@@ -648,6 +665,35 @@ BYD.surveillance = {
         const maxLabel = document.getElementById('survLimitMax');
         if (minLabel) minLabel.textContent = BYD.i18n.t('surveillance.limit_min_default');
         if (maxLabel) maxLabel.textContent = maxLimit >= 1000 ? (maxLimit / 1000) + ' GB' : maxLimit + ' MB';
+
+        this.updateBudgetBanner();
+    },
+
+    /**
+     * Render the combined-limit advisory. Passes the CURRENT (possibly unsaved)
+     * slider value and storage-type pick so the warning tracks the controls live
+     * rather than only after Apply.
+     */
+    updateBudgetBanner() {
+        if (!BYD.storageBudget) return;
+        BYD.storageBudget.render('survBudgetBanner', this.storageInfo.storageBudget,
+            'surveillance', this.config.surveillanceLimitMb, this.config.surveillanceStorageType);
+    },
+
+    /**
+     * Re-read ONLY the storage budget and re-render the advisory — for the dirty-page
+     * case, where the full reloadConfig is (correctly) suppressed to protect unsaved
+     * edits. Writes no control, so it is safe with edits in flight.
+     */
+    async refreshBudgetOnly() {
+        if (!BYD.storageBudget) return;
+        try {
+            const resp = await fetch('/api/settings/storage');
+            const data = await resp.json();
+            if (!data || !data.success || !data.storageBudget) return;
+            this.storageInfo.storageBudget = data.storageBudget;
+            this.updateBudgetBanner();
+        } catch (e) { /* advisory only — keep the last render */ }
     },
     
     updateStorageTypeUI() {
@@ -1009,6 +1055,9 @@ BYD.surveillance = {
         this.config.surveillanceLimitMb = parseInt(value);
         const v = parseInt(value);
         document.getElementById('survLimitValue').textContent = v >= 1000 ? (v / 1000) + ' GB' : v + ' MB';
+        // Live advisory while dragging — the point at which the user crosses the
+        // volume's capacity is exactly when they need to know.
+        this.updateBudgetBanner();
         this.markChanged();
         var _su = document.getElementById('storageUnsaved'); if (_su) _su.classList.add('show');
     },
@@ -1029,9 +1078,10 @@ BYD.surveillance = {
         
         // Config refresh (every 10s) to catch external changes (Telegram, IPC)
         setInterval(() => {
-            if (!this.hasUnsavedChanges) {
-                this.reloadConfig();
-            }
+            // Unconditional: reloadConfig self-gates on hasUnsavedChanges and, when
+            // dirty, refreshes only the overcommit banner (which writes no control).
+            // Gating here as well would leave a dirty page's banner stale forever.
+            this.reloadConfig();
             // Back off to every 3rd tick (10s → 30s) while the recordings
             // index is down, same rationale as recording.js.
             this._statsSkip = (this._statsSkip || 0) + 1;
@@ -1285,11 +1335,30 @@ BYD.surveillance = {
     async toggleSurveillance() {
         const enabled = document.getElementById('survEnabled').checked;
         try {
-            await fetch(enabled ? '/api/surveillance/enable' : '/api/surveillance/disable', { method: 'POST' });
+            const res = await fetch(enabled ? '/api/surveillance/enable' : '/api/surveillance/disable', { method: 'POST' });
+            // The endpoint answers {"success":false,"error":...} when the config
+            // write fails — previously the response was discarded, so a failed
+            // persist showed a green "Surveillance enabled" toast and the
+            // checkbox stayed on while nothing would arm on the next park.
+            const body = await res.json().catch(() => null);
+            if (body && body.success === false) {
+                document.getElementById('survEnabled').checked = !enabled;
+                if (BYD.utils && BYD.utils.toast) {
+                    BYD.utils.toast(body.error || BYD.i18n.t('surveillance.toggle_failed'), 'error');
+                }
+                return;
+            }
             this.config.enabled = enabled;
             this.savedConfig.enabled = enabled;
             this.updateUI();
-            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(enabled ? BYD.i18n.t('surveillance.enabled') : BYD.i18n.t('surveillance.disabled'), 'success');
+            if (BYD.utils && BYD.utils.toast) {
+                // deferred=true → the vehicle is on, so the preference is stored
+                // but nothing is armed yet. Say that instead of a bare "enabled".
+                const msg = (body && body.deferred)
+                    ? BYD.i18n.t(enabled ? 'surveillance.enabled_deferred' : 'surveillance.disabled_deferred')
+                    : BYD.i18n.t(enabled ? 'surveillance.enabled' : 'surveillance.disabled');
+                BYD.utils.toast(msg, 'success');
+            }
         } catch (e) {
             if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('surveillance.toggle_failed'), 'error');
         }
@@ -1661,7 +1730,7 @@ BYD.surveillance = {
             if (h) { h.style.opacity = inert ? '0.45' : ''; }
         };
         // Post-OFF surveillance controls (all inert when onOnly).
-        ['survEnabled', 'survKeepUsbPower', 'survLowPowerMode', 'lowSocCutoffSlider']
+        ['survEnabled', 'survKeepUsbPower', 'survMobileDataKeepAlive', 'survLowPowerMode', 'lowSocCutoffSlider']
             .forEach(dimRow);
         dimHint('lowSocCutoffHint');
         // Arm-mode + ACC-off-mode are btn-groups (no single input id) — dim by their
@@ -1681,7 +1750,7 @@ BYD.surveillance = {
         dimHint('armModeHint');
         dimHint('accOffModeHint');
         // Disable the underlying inputs too (defensive — not touch-only).
-        ['survEnabled', 'survKeepUsbPower', 'survLowPowerMode', 'lowSocCutoffSlider']
+        ['survEnabled', 'survKeepUsbPower', 'survMobileDataKeepAlive', 'survLowPowerMode', 'lowSocCutoffSlider']
             .forEach(function (id) { const el = document.getElementById(id); if (el) el.disabled = inert; });
         // Explanatory note (shown only when inert).
         const note = document.getElementById('postOffDisabledNotice');
@@ -1959,6 +2028,47 @@ BYD.surveillance = {
                 BYD.utils.toast(t('surveillance.low_power_save_failed', 'Could not save low-power mode'), 'error');
             }
         });
+    },
+
+    /**
+     * Parked cellular keep-alive toggle. Default OFF: on some models the mobile-data
+     * module sleeps a while after ACC OFF, dropping cellular while WiFi survives; when
+     * ON the daemon re-asserts the data master switch each parked tick. Persists
+     * immediately (no Apply) to /api/surveillance/config, optimistic with
+     * revert-on-failure. Pure persist — the daemon snapshots it when the next parked
+     * session starts, so an in-flight session is unaffected.
+     */
+    toggleMobileDataKeepAlive() {
+        const el = document.getElementById('survMobileDataKeepAlive');
+        if (!el) return;
+        const on = el.checked;
+        const self = this;
+        const t = (k, fb) => (BYD.i18n && BYD.i18n.t ? (BYD.i18n.t(k) || fb) : fb);
+
+        this.config.mobileDataKeepAlive = on;
+
+        fetch('/api/surveillance/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mobileDataKeepAlive: on })
+        }).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+          .then(function () {
+              if (self.savedConfig) self.savedConfig.mobileDataKeepAlive = on;
+              if (BYD.utils && BYD.utils.toast) {
+                  const msg = on
+                      ? t('surveillance.mobile_data_keepalive_saved_on', 'Mobile data will stay awake while parked (next ACC-OFF)')
+                      : t('surveillance.mobile_data_keepalive_saved_off', 'Mobile data will be left alone while parked');
+                  BYD.utils.toast(msg, 'success');
+              }
+          }).catch(function () {
+              // Revert so the toggle never diverges from persisted state.
+              self.config.mobileDataKeepAlive = !on;
+              if (el) el.checked = !on;
+              if (BYD.utils && BYD.utils.toast) {
+                  BYD.utils.toast(t('surveillance.mobile_data_keepalive_save_failed',
+                      'Could not save mobile-data setting'), 'error');
+              }
+          });
     },
 
     /**
@@ -2708,6 +2818,10 @@ BYD.surveillance = {
         // (older config / opt-in feature) so the switch shows the real default.
         const lowPower = document.getElementById('survLowPowerMode');
         if (lowPower) lowPower.checked = (this.config.lowPowerWhileParked === true);
+
+        // Parked cellular keep-alive. Default OFF when absent (opt-in feature).
+        const mobileData = document.getElementById('survMobileDataKeepAlive');
+        if (mobileData) mobileData.checked = (this.config.mobileDataKeepAlive === true);
 
         // Low-battery (HV SoC) cutoff slider. 0 renders as "Off".
         const socCutoff = document.getElementById('lowSocCutoffSlider');

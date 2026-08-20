@@ -6,21 +6,12 @@ import java.util.concurrent.RejectedExecutionException
 /**
  * Submit policy for work whose owning executor may have been shut down under it.
  *
- * `AdbShellExecutor` holds a per-instance executor that dies with its owning
- * `DaemonStartupManager`. `initializeOnAppLaunch()` shuts the previous manager's executor
- * down during the bootManager→Activity handoff, and the daemon-start paths are *chains* —
- * each ADB reply drives the next command — so a chain in flight at that moment loses every
- * remaining step.
+ * The per-instance executor dies with its owning DaemonStartupManager, and
+ * `initializeOnAppLaunch()` shuts the previous manager's down during the
+ * bootManager→Activity handoff. Ownership transfer is not process teardown, so the
+ * in-flight commands are still live and dropping them loses a daemon start.
  *
- * The distinction the original code missed is that **ownership transfer is not process
- * teardown**. "The executor is dead, so the remaining commands are moot" holds when the app
- * is exiting and is wrong when a new owner has just taken over: the commands are exactly as
- * live as they were a millisecond earlier, and dropping them is how a daemon silently fails
- * to start.
- *
- * Kept as a pure function over two injected [Executor]s so the policy is unit-testable
- * without a Context, an ADB connection, or a real thread pool — same reasoning as
- * `DaemonStopGate`.
+ * Pure function over two injected [Executor]s so the policy is unit-testable.
  */
 object ExecutorFallback {
 
@@ -39,13 +30,10 @@ object ExecutorFallback {
     /**
      * Try [owner] first, then [shared].
      *
-     * Never throws: [RejectedExecutionException] from either executor is converted into an
-     * [Outcome]. That is load-bearing, not defensive — `AdbShellExecutor.execute()` is
-     * called from inside onSuccess/onError callbacks running on a worker thread, where an
-     * uncaught rejection kills the process.
-     *
-     * Only [RejectedExecutionException] is caught. Anything else (an executor whose
-     * thread factory throws, say) is a real defect and must not be silently rerouted.
+     * Never throws: an uncaught rejection would kill the process, because
+     * `AdbShellExecutor.execute()` is called from inside onSuccess/onError on a worker
+     * thread. Only [RejectedExecutionException] is caught — a thread factory that throws
+     * is a real defect and must not be silently rerouted.
      */
     fun submit(task: Runnable, owner: Executor, shared: Executor): Outcome {
         try {

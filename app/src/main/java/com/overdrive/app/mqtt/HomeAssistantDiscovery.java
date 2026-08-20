@@ -141,7 +141,15 @@ public final class HomeAssistantDiscovery {
             // ----- control components (only when vehicle control is enabled) -----
             if (includeControls) {
                 BydVehicleData snap = currentVehicleData();
+                // The charge-stop setter is present on trims where it is a no-op. Do not
+                // advertise a controllable HA entity until telemetry contains the complete
+                // readback pair from a write/read-back verified backend.
+                boolean verifiedChargeCap = MqttPublisherService.hasVerifiedChargeCapState(snapshot);
                 for (VehicleControlCatalog.ControlEntity ent : VehicleControlCatalog.all()) {
+                    if (VehicleControlCatalog.isGenericChargeCapControl(ent.key)
+                            && !verifiedChargeCap) {
+                        continue;
+                    }
                     if (!ent.isAvailable(snap)) continue;
                     JSONObject comp = ent.component(baseTopic, node);
                     if (comp != null) cmps.put("ctl_" + ent.key, comp);

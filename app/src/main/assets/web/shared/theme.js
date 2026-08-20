@@ -216,9 +216,9 @@
     };
 
     // ─── Step 5: floating theme picker ──────────────────────────────────────
-    // SOTA mini-picker injected once per page so the user can toggle without
-    // navigating to a settings panel. Kept tiny (~36px button → 3-tile popup)
-    // and collision-free with the camera top bar / vehicle-control bar by
+    // Mini-picker injected once per page so the user can toggle without
+    // navigating to a settings panel. Its 48px target remains collision-free
+    // with the camera top bar / vehicle-control bar by
     // anchoring to bottom-right with backdrop-filter glass.
     function injectPickerStyles() {
         if (document.getElementById('byd-theme-picker-style')) return;
@@ -231,9 +231,9 @@
         // come from data attributes set by applyPickerAnchor().
         s.textContent = [
             '#bydThemePicker { position: fixed; z-index: 9000;',
-            '   font-family: Inter, system-ui, sans-serif; }',
+            '   font-family: var(--family-sans, system-ui, sans-serif); }',
             '#bydThemePicker .byd-theme-fab {',
-            '   width: 36px; height: 36px; border-radius: 50%;',
+            '   width: 48px; height: 48px; border-radius: 50%;',
             '   display: flex; align-items: center; justify-content: center;',
             '   background: var(--bg-elevated, #1E1E24);',
             '   color: var(--text-primary, #fff);',
@@ -243,36 +243,40 @@
             '   -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }',
             '#bydThemePicker .byd-theme-fab:hover { transform: scale(1.08); }',
             '#bydThemePicker .byd-theme-fab:active { transform: scale(0.94); }',
+            '#bydThemePicker .byd-theme-fab:focus { outline: 2px solid var(--primary, #5DDBB6); outline-offset: 2px; }',
             '#bydThemePicker .byd-theme-fab svg { width: 18px; height: 18px; }',
             // Idle dim — fade the picker to 0.45 when the user isn\'t hovering
             // so it never competes with content underneath. Comes back to full
             // opacity on hover/focus AND while the popup is open.
             '#bydThemePicker:not(:hover):not(.open) .byd-theme-fab { opacity: 0.55; }',
             '#bydThemePicker .byd-theme-popup {',
-            '   position: absolute; display: none; flex-direction: column; gap: 4px;',
+            '   position: absolute; display: none; flex-direction: column;',
             '   padding: 6px; min-width: 140px;',
             '   background: var(--bg-elevated, #1E1E24);',
             '   border: 1px solid var(--border-default, rgba(255,255,255,0.1));',
             '   border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.3); }',
             // Popup anchored above the FAB (default).
-            '#bydThemePicker[data-popup="up"] .byd-theme-popup { right: 0; bottom: 44px; }',
+            '#bydThemePicker[data-popup="up"] .byd-theme-popup { right: 0; bottom: 56px; }',
             // Popup anchored below the FAB (used when picker sits high on the page).
-            '#bydThemePicker[data-popup="down"] .byd-theme-popup { right: 0; top: 44px; }',
+            '#bydThemePicker[data-popup="down"] .byd-theme-popup { right: 0; top: 56px; }',
             // Left-aligned variants (when picker is at left edge of screen).
-            '#bydThemePicker[data-popup="up-left"] .byd-theme-popup { left: 0; bottom: 44px; }',
-            '#bydThemePicker[data-popup="down-left"] .byd-theme-popup { left: 0; top: 44px; }',
+            '#bydThemePicker[data-popup="up-left"] .byd-theme-popup { left: 0; bottom: 56px; }',
+            '#bydThemePicker[data-popup="down-left"] .byd-theme-popup { left: 0; top: 56px; }',
             '#bydThemePicker.open .byd-theme-popup { display: flex; }',
             '#bydThemePicker .byd-theme-opt {',
-            '   display: flex; align-items: center; gap: 10px;',
+            '   display: flex; align-items: center; min-height: 48px;',
             '   padding: 8px 12px; border-radius: 8px;',
             '   color: var(--text-secondary, #A1A1AA); font-size: 13px; font-weight: 500;',
             '   cursor: pointer; transition: background .12s ease, color .12s ease; }',
+            '#bydThemePicker .byd-theme-opt + .byd-theme-opt { margin-top: 4px; }',
+            '#bydThemePicker .byd-theme-opt > * + * { margin-left: 10px; }',
+            '[dir="rtl"] #bydThemePicker .byd-theme-opt > * + * { margin-left: 0; margin-right: 10px; }',
             '#bydThemePicker .byd-theme-opt:hover {',
             '   background: var(--bg-hover, rgba(255,255,255,0.06));',
             '   color: var(--text-primary, #fff); }',
             '#bydThemePicker .byd-theme-opt.active {',
-            '   background: rgba(0, 212, 170, 0.12);',
-            '   color: var(--brand-primary, #00D4AA); }',
+            '   background: var(--status-success-container, rgba(91, 211, 130, 0.14));',
+            '   color: var(--primary, #5DDBB6); }',
             '#bydThemePicker .byd-theme-opt svg { width: 16px; height: 16px; flex-shrink: 0; }'
         ].join(' ');
         document.head.appendChild(s);

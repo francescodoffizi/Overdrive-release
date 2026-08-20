@@ -11,8 +11,17 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.lang.reflect.Method;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.util.EnumSet;
 import java.util.Properties;
+import java.util.Set;
 
 /**
  * Shape B SOH estimator.
@@ -34,6 +43,84 @@ public class SohEstimator {
     private String nominalSource = "unset"; // "user" | "auto" | "unset"
 
     private static final String SOH_FILE = "/data/local/tmp/abrp_soh_estimate.properties";
+    private final File sohFile;
+    private final PersistenceWriter persistenceWriter;
+    private final UserNominalConfig userNominalConfig;
+
+    enum PersistenceOutcome {
+        FAILED,
+        COMMITTED_DURABILITY_UNCERTAIN,
+        DURABLE;
+
+        boolean wasCommitted() {
+            return this != FAILED;
+        }
+    }
+
+    interface PersistenceWriter {
+        PersistenceOutcome write(File destination, Properties properties)
+                throws IOException;
+    }
+
+    interface UserNominalConfig {
+        boolean write(Object value);
+        double read();
+
+        default void runUnderConfigLock(Runnable work) {
+            work.run();
+        }
+    }
+
+    private static final UserNominalConfig DEFAULT_USER_NOMINAL_CONFIG =
+            new UserNominalConfig() {
+                @Override
+                public boolean write(Object value) {
+                    return UnifiedConfigManager.updateValues(
+                        "vehicle",
+                        java.util.Collections.singletonMap(
+                            "nominalKwh", value));
+                }
+
+                @Override
+                public double read() {
+                    return UnifiedConfigManager.readVehicleNominalKwhStrict();
+                }
+
+                @Override
+                public void runUnderConfigLock(Runnable work) {
+                    UnifiedConfigManager.runUnderConfigLock(() -> {
+                        work.run();
+                        return null;
+                    });
+                }
+            };
+
+    public SohEstimator() {
+        this(new File(SOH_FILE));
+    }
+
+    SohEstimator(File sohFile) {
+        this(
+            sohFile,
+            SohEstimator::persistPropertiesWithOutcome,
+            DEFAULT_USER_NOMINAL_CONFIG);
+    }
+
+    SohEstimator(
+            File sohFile,
+            PersistenceWriter persistenceWriter,
+            UserNominalConfig userNominalConfig) {
+        if (sohFile == null) {
+            throw new IllegalArgumentException("SOH persistence file is required");
+        }
+        if (persistenceWriter == null || userNominalConfig == null) {
+            throw new IllegalArgumentException(
+                "SOH persistence and config adapters are required");
+        }
+        this.sohFile = sohFile;
+        this.persistenceWriter = persistenceWriter;
+        this.userNominalConfig = userNominalConfig;
+    }
 
     private static final String PROP_SOH_PERCENT = "soh_percent";
     private static final String PROP_LAST_UPDATED = "last_updated";
@@ -50,6 +137,10 @@ public class SohEstimator {
     private static final String PROP_PEAK_REMAIN_KWH_TS = "peak_remain_kwh_ts";
     private static final String PROP_PEAK_REMAIN_KWH_NOTIFIED = "peak_remain_kwh_notified";
     private static final String PROP_SCHEMA_VERSION = "schema_version";
+    private static final String PROP_STATE_CLEARED = "state_cleared";
+    private static final String PROP_NOMINAL_IDENTITY = "nominal_identity";
+    private static final String PROP_RESET_MODEL_EPOCH = "reset_model_epoch";
+    private static final int CLEAR_TOMBSTONE_DURABILITY_ATTEMPTS = 3;
     // v3: PHEV peak-charge anchor — derives full-charge kWh by tracking max
     // remainKwh observed at SOC≥99%, giving a noise-robust SOH source on small
     // packs. remainKwh is gross-framed (corrected at the HAL read boundary), so
@@ -147,35 +238,144 @@ public class SohEstimator {
     // notification would re-fire every daemon restart.
     private boolean peakMismatchNotified = false;
 
+    // Reset, seed, nominal-frame/source, and calibration mutations advance
+    // this token. Long-running consumers can reject stale work even when a
+    // reset/reseed cycle returns to the same numeric capacity and SOH.
+    private long estimatorGeneration = 0;
+
+    // Durable lineage for reset and nominal/model identity invalidations.
+    // Unlike estimatorGeneration, this survives daemon restarts. Zero means
+    // no durable lineage has been established and is never published by a
+    // successfully initialized estimator.
+    private long resetModelEpoch = 0;
+
+    private enum InitializationState {
+        NOT_STARTED,
+        DEFERRED,
+        READY
+    }
+
+    // A config read failure leaves user-nominal authority unknown. Keep that
+    // state explicit so no heuristic can replace a preserved user-bound
+    // snapshot before a later init() obtains an authoritative config read.
+    private InitializationState initializationState =
+        InitializationState.NOT_STARTED;
+
     // BYD Blade LFP reference cell voltage. 3.22 V derived from BYD's
     // published kWh / Ah / cellCount specs.
     private static final double BYD_BLADE_REFERENCE_CELL_VOLTAGE = 3.22;
 
     public void setNominalCapacityKwh(double capacityKwh) {
         synchronized (autoDetectLock) {
-            // Drivetrain-aware floor. The flat BEV floor (15 kWh) made it IMPOSSIBLE for
-            // auto-detect to land a real PHEV pack: this is the setter every auto path
-            // funnels through (model table, pack-voltage estimate, BMS exact capacity), so a
-            // legitimate DM-i value below 15 was rejected and a stale/wrong nominal stayed
-            // in place. PHEV packs start at ~8 kWh, hence MIN_PLAUSIBLE_KWH_PHEV. On BEV the
-            // strict floor is retained — there it genuinely means "this detect is junk".
-            double floor = isPhevForCapacityFloor() ? MIN_PLAUSIBLE_KWH_PHEV : MIN_PLAUSIBLE_KWH;
-            if (capacityKwh >= floor && capacityKwh <= MAX_PLAUSIBLE_KWH) {
-                this.nominalCapacityKwh = capacityKwh;
-                // Only mark "auto" if a user override isn't currently active. The
-                // auto-detect path otherwise overwrites a user pick when it runs
-                // after a config change.
-                if (!"user".equals(nominalSource)) {
-                    this.nominalSource = "auto";
-                }
-                logger.info("Nominal capacity set to " + capacityKwh + " KWh (source="
-                    + nominalSource + ")");
-                persistEstimate();
-            } else {
-                logger.warn("Rejecting implausible nominal capacity: " + capacityKwh
-                    + " kWh (valid range: " + floor + "-" + MAX_PLAUSIBLE_KWH + ")");
-            }
+            setAutoNominalCapacityKwhLocked(capacityKwh, "auto");
         }
+    }
+
+    /**
+     * Commit an auto-derived nominal as a nominal-only snapshot, then publish
+     * the matching in-memory identity and cleared estimate state under the same
+     * lock. A failed write leaves both the previous identity and its anchors
+     * untouched.
+     */
+    private boolean setAutoNominalCapacityKwhLocked(
+            double capacityKwh, String source) {
+        if (initializationState != InitializationState.READY) {
+            logger.warn("Auto nominal ignored while SOH initialization is "
+                + initializationState);
+            return false;
+        }
+        // Re-check user authority inside the mutation lock. Pack-voltage
+        // detection performs work before reaching this method; a user write can
+        // win during that work and must never be overwritten while retaining a
+        // misleading "user" source.
+        if ("user".equals(nominalSource)) {
+            logger.info("Auto nominal ignored because a user override is active");
+            return false;
+        }
+
+        // Drivetrain-aware floor. The flat BEV floor (15 kWh) made it impossible
+        // for auto-detect to land a real PHEV pack.
+        double floor = isPhevForCapacityFloor()
+            ? MIN_PLAUSIBLE_KWH_PHEV : MIN_PLAUSIBLE_KWH;
+        if (capacityKwh < floor || capacityKwh > MAX_PLAUSIBLE_KWH) {
+            logger.warn("Rejecting implausible nominal capacity: " + capacityKwh
+                + " kWh (valid range: " + floor + "-" + MAX_PLAUSIBLE_KWH + ")");
+            return false;
+        }
+
+        String normalizedSource =
+            source == null || source.isEmpty() ? "auto" : source;
+        boolean identityChanged =
+            !sameNominal(nominalCapacityKwh, capacityKwh)
+                || !normalizedSource.equals(nominalSource);
+        if (!identityChanged) return true;
+
+        long replacementEpoch =
+            nextResetModelEpoch(resetModelEpoch);
+        RestoredState replacementState = new RestoredState();
+        replacementState.nominalCapacityKwh = capacityKwh;
+        replacementState.nominalSource = normalizedSource;
+        replacementState.resetModelEpoch = replacementEpoch;
+        Properties replacement =
+            nominalOnlyProperties(replacementState, false);
+        try {
+            PersistenceOutcome outcome =
+                publishPropertiesWithDurabilityRetries(
+                    replacement, "change auto nominal identity");
+            if (!outcome.wasCommitted()) return false;
+            if (outcome != PersistenceOutcome.DURABLE) {
+                initializationState = InitializationState.DEFERRED;
+            }
+        } catch (IOException writeFailure) {
+            logger.error("Auto nominal persistence failed; retaining prior "
+                + "identity: " + writeFailure.getMessage());
+            return false;
+        }
+
+        double previous = nominalCapacityKwh;
+        nominalCapacityKwh = capacityKwh;
+        nominalSource = normalizedSource;
+        clearEstimateStateLocked(true);
+        resetModelEpoch = replacementEpoch;
+        estimatorGeneration++;
+        if (previous > 0 && !sameNominal(previous, capacityKwh)) {
+            invalidateActiveTripKwhBaseline("auto nominal changed "
+                + String.format("%.1f", previous) + "→"
+                + String.format("%.1f", capacityKwh) + " kWh");
+        }
+        logger.info("Nominal capacity set to " + capacityKwh
+            + " KWh (source=" + nominalSource + ")");
+        return true;
+    }
+
+    private boolean clearAutoNominalLocked(String operation) {
+        long replacementEpoch =
+            nextResetModelEpoch(resetModelEpoch);
+        PersistenceOutcome outcome =
+            persistClearedStateTombstoneWithDurabilityRetries(
+                operation, replacementEpoch);
+        if (!outcome.wasCommitted()) {
+            logger.error("Auto nominal clear deferred because its tombstone "
+                + "could not be committed");
+            return false;
+        }
+
+        double previous = nominalCapacityKwh;
+        nominalCapacityKwh = 0;
+        nominalSource = "unset";
+        clearEstimateStateLocked(true);
+        resetModelEpoch = replacementEpoch;
+        estimatorGeneration++;
+        if (previous > 0) {
+            invalidateActiveTripKwhBaseline(operation);
+        }
+        if (outcome != PersistenceOutcome.DURABLE) {
+            // Memory follows the committed rename, but no new auto state may be
+            // published until init() re-reads the tombstone and establishes a
+            // fresh durability boundary.
+            initializationState = InitializationState.DEFERRED;
+        }
+        return true;
     }
 
     /**
@@ -210,57 +410,104 @@ public class SohEstimator {
      * if that probe fails the conservative BEV floor wins.
      */
     public void setNominalCapacityKwhFromUser(double capacityKwh) {
-        synchronized (autoDetectLock) {
-            boolean isPhev = false;
-            try {
-                com.overdrive.app.byd.BydDataCollector col =
-                    com.overdrive.app.byd.BydDataCollector.getInstance();
-                if (col != null && col.isInitialized()) {
-                    isPhev = col.isPhevPublic();
-                }
-            } catch (Throwable ignored) { /* default isPhev=false → BEV floor */ }
-            double floor = isPhev ? MIN_PLAUSIBLE_KWH_PHEV : MIN_PLAUSIBLE_KWH;
-            if (capacityKwh < floor || capacityKwh > MAX_PLAUSIBLE_KWH) {
-                logger.warn("Rejecting user nominal " + capacityKwh + " kWh — outside "
-                    + floor + "-" + MAX_PLAUSIBLE_KWH + " range (drivetrain="
-                    + (isPhev ? "PHEV" : "BEV") + ")");
-                return;
+        boolean isPhev = false;
+        try {
+            com.overdrive.app.byd.BydDataCollector col =
+                com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (col != null && col.isInitialized()) {
+                isPhev = col.isPhevPublic();
             }
-            double previous = this.nominalCapacityKwh;
-            this.nominalCapacityKwh = capacityKwh;
-            this.nominalSource = "user";
-            // SOH was computed against the previous nominal. Carrying it
-            // forward would make getBatteryRemainPowerKwh / SoC-fallback
-            // energy math drift until live SOH re-converges. Drop it so
-            // consumers see a clean slate and re-seed against the new pack.
-            if (Math.abs(previous - capacityKwh) > 0.01) {
-                this.currentSoh = -1;
-                this.calibrationSoh = -1;
-                this.calibrationTimestampMs = 0;
-                // Capacity-Ah anchor was computed against the old nominal Ah —
-                // carrying it forward would mismatch the new pack. Wipe along
-                // with currentSoh so the next BMS Ah read re-anchors cleanly.
-                this.capacityAhSoh = -1;
-                this.capacityAhTimestampMs = 0;
-                this.lastCapacityAhReading = -1;
-                this.capacityAhNameplateMatchCount = 0;
-                this.capacityAhDisabled = false;
-                this.capacityAhFirstSocSeen = -1;
-                this.capacityAhFirstAhSeen = -1;
-                this.capacityAhSocCoupledCount = 0;
-                this.liveHistory.clear();
-                this.saturationStreak = 0;
-                invalidateActiveTripKwhBaseline("user nominal changed " +
-                    String.format("%.1f", previous) + "→" + String.format("%.1f", capacityKwh) + " kWh");
-            }
+        } catch (Throwable ignored) { /* default isPhev=false -> BEV floor */ }
+        double floor = isPhev ? MIN_PLAUSIBLE_KWH_PHEV : MIN_PLAUSIBLE_KWH;
+        if (capacityKwh < floor || capacityKwh > MAX_PLAUSIBLE_KWH) {
+            logger.warn("Rejecting user nominal " + capacityKwh + " kWh — outside "
+                + floor + "-" + MAX_PLAUSIBLE_KWH + " range (drivetrain="
+                + (isPhev ? "PHEV" : "BEV") + ")");
+            return;
+        }
+
+        final boolean[] shouldSeed = {false};
+        userNominalConfig.runUnderConfigLock(() -> {
+            final boolean configSaved;
             try {
-                UnifiedConfigManager.updateValues("vehicle",
-                    java.util.Collections.singletonMap("nominalKwh", (Object) capacityKwh));
+                // UnifiedConfig is the authority. Its stable lock is acquired
+                // before autoDetectLock and held through the matching SOH
+                // identity publication.
+                configSaved = userNominalConfig.write(capacityKwh);
             } catch (Throwable t) {
-                logger.warn("Failed to persist user nominalKwh to UnifiedConfig: " + t.getMessage());
+                throw new IllegalStateException(
+                    "Failed to persist user nominalKwh to UnifiedConfig", t);
             }
-            persistEstimate();
-            logger.info("User-set nominal capacity: " + capacityKwh + " kWh");
+            if (!configSaved) {
+                throw new IllegalStateException(
+                    "User nominal update deferred because UnifiedConfig is unavailable");
+            }
+
+            synchronized (autoDetectLock) {
+                double previous = this.nominalCapacityKwh;
+                String previousSource = this.nominalSource;
+                boolean capacityChanged =
+                    Math.abs(previous - capacityKwh) > 0.01;
+                boolean identityChanged =
+                    capacityChanged || !"user".equals(previousSource);
+                long replacementEpoch = identityChanged
+                    ? nextResetModelEpoch(resetModelEpoch)
+                    : resetModelEpoch;
+
+                PersistenceOutcome identityOutcome = PersistenceOutcome.DURABLE;
+                if (identityChanged) {
+                    RestoredState replacement = new RestoredState();
+                    replacement.nominalCapacityKwh = capacityKwh;
+                    replacement.nominalSource = "user";
+                    replacement.resetModelEpoch = replacementEpoch;
+                    try {
+                        identityOutcome =
+                            publishPropertiesWithDurabilityRetries(
+                                nominalOnlyProperties(replacement, false),
+                                "change user nominal identity");
+                    } catch (IOException writeFailure) {
+                        identityOutcome = PersistenceOutcome.FAILED;
+                    }
+                    if (!identityOutcome.wasCommitted()) {
+                        initializationState = InitializationState.DEFERRED;
+                        throw new IllegalStateException(
+                            "User nominal identity persistence was not committed");
+                    }
+                }
+
+                this.nominalCapacityKwh = capacityKwh;
+                this.nominalSource = "user";
+                this.resetModelEpoch = replacementEpoch;
+                initializationState =
+                    identityOutcome == PersistenceOutcome.DURABLE
+                        ? InitializationState.READY
+                        : InitializationState.DEFERRED;
+                if (identityChanged) {
+                    clearEstimateStateLocked(true);
+                }
+                if (capacityChanged) {
+                    invalidateActiveTripKwhBaseline("user nominal changed " +
+                        String.format("%.1f", previous) + "→" +
+                        String.format("%.1f", capacityKwh) + " kWh");
+                }
+                if (identityChanged) {
+                    estimatorGeneration++;
+                } else {
+                    persistEstimate();
+                }
+                logger.info("User-set nominal capacity: " + capacityKwh + " kWh");
+                shouldSeed[0] = identityChanged || currentSoh <= 0;
+                if (identityOutcome
+                        == PersistenceOutcome.COMMITTED_DURABILITY_UNCERTAIN) {
+                    throw new IllegalStateException(
+                        "User nominal identity committed but durability is uncertain");
+                }
+            }
+        });
+
+        // VehicleDataMonitor and drivetrain probes must run without carrying
+        // autoDetectLock into another subsystem.
+        if (shouldSeed[0]) {
             try {
                 seedInitialEstimate();
             } catch (Throwable t) {
@@ -275,71 +522,67 @@ public class SohEstimator {
      * identify from BMS / SOC / model / voltage.
      */
     public void clearUserNominal() {
-        synchronized (autoDetectLock) {
+        userNominalConfig.runUnderConfigLock(() -> {
+            final boolean configCleared;
             try {
-                JSONObject vehicle = UnifiedConfigManager.getVehicle();
-                if (vehicle.has("nominalKwh")) {
-                    vehicle.remove("nominalKwh");
-                    UnifiedConfigManager.setVehicle(vehicle);
-                }
+                configCleared = userNominalConfig.write(JSONObject.NULL);
             } catch (Throwable t) {
-                logger.warn("Failed to clear user nominalKwh: " + t.getMessage());
+                throw new IllegalStateException(
+                    "Failed to clear user nominalKwh from UnifiedConfig", t);
             }
-            double previous = this.nominalCapacityKwh;
-            this.nominalCapacityKwh = 0;
-            this.nominalSource = "unset";
-            this.currentSoh = -1;
-            this.calibrationSoh = -1;
-            this.calibrationTimestampMs = 0;
-            this.capacityAhSoh = -1;
-            this.capacityAhTimestampMs = 0;
-            this.lastCapacityAhReading = -1;
-            this.capacityAhNameplateMatchCount = 0;
-            this.capacityAhDisabled = false;
-            this.capacityAhFirstSocSeen = -1;
-            this.capacityAhFirstAhSeen = -1;
-            this.capacityAhSocCoupledCount = 0;
-            this.liveHistory.clear();
-            this.saturationStreak = 0;
-            // Peak frame anchor is an empirical BMS observation, independent
-            // of nominal — but clearUserNominal is a deliberate "start over"
-            // entrypoint, so wipe it too to match user expectation.
-            this.peakRemainKwhAtFull = -1;
-            this.peakRemainKwhSamples = 0;
-            this.peakRemainKwhTimestampMs = 0;
-            this.peakMismatchNotified = false;
-            if (previous > 0) {
-                invalidateActiveTripKwhBaseline("user nominal cleared (was "
-                    + String.format("%.1f", previous) + " kWh)");
+            if (!configCleared) {
+                throw new IllegalStateException(
+                    "User nominal clear deferred because UnifiedConfig is unavailable");
             }
-            // persistEstimate() early-returns when both currentSoh and nominalCapacityKwh
-            // are <= 0, so the stale keys would survive on disk. Strip them explicitly.
-            try {
-                File f = new File(SOH_FILE);
-                if (f.exists()) {
-                    Properties p = new Properties();
-                    try (FileInputStream fis = new FileInputStream(f)) { p.load(fis); }
-                    p.remove(PROP_NOMINAL_CAPACITY);
-                    p.remove(PROP_NOMINAL_SOURCE);
-                    try (FileOutputStream fos = new FileOutputStream(f)) { p.store(fos, "ABRP SOH Estimate"); }
+
+            synchronized (autoDetectLock) {
+                long replacementEpoch =
+                    nextResetModelEpoch(resetModelEpoch);
+                PersistenceOutcome tombstoneOutcome =
+                    persistClearedStateTombstoneWithDurabilityRetries(
+                        "clear user nominal", replacementEpoch);
+                if (!tombstoneOutcome.wasCommitted()) {
+                    initializationState = InitializationState.DEFERRED;
+                    throw new IllegalStateException(
+                        "User nominal clear tombstone was not committed");
                 }
-            } catch (Exception ignored) {}
-            persistEstimate();
-            try {
-                android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
-                autoDetectCarModel(ctx);
-            } catch (Throwable t) {
-                logger.warn("Re-detect after clearUserNominal failed: " + t.getMessage());
+
+                double previous = this.nominalCapacityKwh;
+                this.nominalCapacityKwh = 0;
+                this.nominalSource = "unset";
+                clearEstimateStateLocked(true);
+                resetModelEpoch = replacementEpoch;
+                estimatorGeneration++;
+                initializationState =
+                    tombstoneOutcome == PersistenceOutcome.DURABLE
+                        ? InitializationState.READY
+                        : InitializationState.DEFERRED;
+                if (previous > 0) {
+                    invalidateActiveTripKwhBaseline("user nominal cleared (was "
+                        + String.format("%.1f", previous) + " kWh)");
+                }
+                if (tombstoneOutcome != PersistenceOutcome.DURABLE) {
+                    throw new IllegalStateException(
+                        "User nominal clear committed but durability is uncertain");
+                }
             }
+        });
+
+        try {
+            android.content.Context ctx =
+                com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            autoDetectCarModel(ctx);
+        } catch (Throwable t) {
+            logger.warn("Re-detect after clearUserNominal failed: " + t.getMessage());
         }
     }
 
     public double getNominalCapacityKwh() {
-        return nominalCapacityKwh;
+        return getNominalSnapshot().getNominalCapacityKwh();
     }
 
     public String getNominalSource() {
-        return nominalSource;
+        return getNominalSnapshot().getNominalSource();
     }
 
     /**
@@ -349,23 +592,28 @@ public class SohEstimator {
      */
     public void autoDetectFromPackVoltage(double packVoltage, BydVehicleData vd) {
         if (packVoltage < 200 || packVoltage > 900) return;
-        if ("user".equals(nominalSource)) return;
-        if (nominalCapacityKwh > 0) {
-            logger.debug("Pack voltage " + String.format("%.1f", packVoltage) +
-                "V ignored — capacity already detected: " + nominalCapacityKwh + " kWh");
-            return;
-        }
-        double cellVoltage = 3.2;
-        int cellCount = (int) Math.round(packVoltage / cellVoltage);
-        double capacity = mapCellCountToCapacity(cellCount);
-        if (capacity > 0) {
-            setNominalCapacityKwh(capacity);
-            logger.info("Pack Voltage Capacity: " + capacity + " kWh (voltage=" +
-                String.format("%.1f", packVoltage) + "V, nominal cellV=3.2V" +
-                ", cells≈" + cellCount + "s)");
-        } else {
-            logger.debug("Pack voltage " + String.format("%.1f", packVoltage) + "V → " +
-                cellCount + " cells — no matching BYD pack");
+        synchronized (autoDetectLock) {
+            if (initializationState != InitializationState.READY
+                    || "user".equals(nominalSource)) {
+                return;
+            }
+            if (nominalCapacityKwh > 0) {
+                logger.debug("Pack voltage " + String.format("%.1f", packVoltage) +
+                    "V ignored — capacity already detected: " + nominalCapacityKwh + " kWh");
+                return;
+            }
+            double cellVoltage = 3.2;
+            int cellCount = (int) Math.round(packVoltage / cellVoltage);
+            double capacity = mapCellCountToCapacity(cellCount);
+            if (capacity > 0
+                    && setAutoNominalCapacityKwhLocked(capacity, "auto")) {
+                logger.info("Pack Voltage Capacity: " + capacity + " kWh (voltage=" +
+                    String.format("%.1f", packVoltage) + "V, nominal cellV=3.2V" +
+                    ", cells≈" + cellCount + "s)");
+            } else if (capacity <= 0) {
+                logger.debug("Pack voltage " + String.format("%.1f", packVoltage) + "V → " +
+                    cellCount + " cells — no matching BYD pack");
+            }
         }
     }
 
@@ -637,12 +885,37 @@ public class SohEstimator {
     private final Object autoDetectLock = new Object();
 
     public void autoDetectCarModel(android.content.Context context) {
-        synchronized (autoDetectLock) {
-            autoDetectCarModelInternal(context);
+        try {
+            UnifiedConfigManager.runUnderConfigLock(() -> {
+                double modelKwh = readModelNominalFromManifest();
+                autoDetectCarModelFromConfigSnapshot(context, modelKwh);
+                return null;
+            });
+        } catch (com.overdrive.app.server.ModelsApiHandler
+                .SelectedModelConfigUnavailableException unavailable) {
+            logger.warn("Model-based capacity detection deferred: "
+                + unavailable.getMessage());
         }
     }
 
-    private void autoDetectCarModelInternal(android.content.Context context) {
+    /**
+     * Run detection from a model nominal captured while the caller held the
+     * stable config lock. This method never reads UnifiedConfig.
+     */
+    public void autoDetectCarModelFromConfigSnapshot(
+            android.content.Context context, double modelKwh) {
+        synchronized (autoDetectLock) {
+            if (initializationState != InitializationState.READY) {
+                logger.warn("autoDetectCarModel deferred while SOH initialization is "
+                    + initializationState);
+                return;
+            }
+            autoDetectCarModelInternal(context, modelKwh);
+        }
+    }
+
+    private void autoDetectCarModelInternal(
+            android.content.Context context, double modelKwh) {
         // User override always wins — never let auto-detect demote it.
         if ("user".equals(nominalSource) && nominalCapacityKwh > 0) {
             logger.info("autoDetectCarModel skipped — user override active ("
@@ -657,13 +930,13 @@ public class SohEstimator {
         // car they have, but weaker than an explicit kWh value because
         // model variants exist (Seal Standard 61.4 kWh vs Premium 82.5 kWh).
         try {
-            double modelKwh = readModelNominalFromManifest();
             if (modelKwh >= MIN_PLAUSIBLE_KWH && modelKwh <= MAX_PLAUSIBLE_KWH) {
-                nominalCapacityKwh = modelKwh;
-                nominalSource = "user_model";
-                logger.info("autoDetectCarModel: nominal " + modelKwh
-                    + " kWh from user-selected model");
-                return;
+                if (setAutoNominalCapacityKwhLocked(
+                        modelKwh, "user_model")) {
+                    logger.info("autoDetectCarModel: nominal " + modelKwh
+                        + " kWh from user-selected model");
+                    return;
+                }
             }
         } catch (Throwable t) {
             logger.debug("Model-manifest nominalKwh lookup failed: " + t.getMessage());
@@ -687,8 +960,9 @@ public class SohEstimator {
         if (context != null) {
             double exactKwh = tryBmsExactCapacity(context);
             if (exactKwh > 0 && !contradictedBySocRatio(exactKwh)) {
-                setNominalCapacityKwh(exactKwh);
-                return;
+                if (setAutoNominalCapacityKwhLocked(exactKwh, "auto")) {
+                    return;
+                }
             }
         }
 
@@ -726,17 +1000,20 @@ public class SohEstimator {
                     double matched = matchNearestCapacity(
                         estimatedCapacity, packV, socData.socPercent);
                     if (matched > 0) {
-                        setNominalCapacityKwh(matched);
-                        double snapDelta = Math.abs(estimatedCapacity - matched);
-                        boolean snapped = snapDelta > 0.5;
-                        logger.info("SOC-derived nominal capacity: " + matched + " kWh"
-                            + (snapped
-                                ? " (estimated " + String.format("%.1f", estimatedCapacity)
-                                  + " kWh, snapped to nearest known pack)"
-                                : "")
-                            + " [SOC=" + String.format("%.1f", socData.socPercent) + "%, remain="
-                            + String.format("%.1f", remainingKwh) + " kWh]");
-                        return;
+                        if (setAutoNominalCapacityKwhLocked(
+                                matched, "auto")) {
+                            double snapDelta =
+                                Math.abs(estimatedCapacity - matched);
+                            boolean snapped = snapDelta > 0.5;
+                            logger.info("SOC-derived nominal capacity: " + matched + " kWh"
+                                + (snapped
+                                    ? " (estimated " + String.format("%.1f", estimatedCapacity)
+                                      + " kWh, snapped to nearest known pack)"
+                                    : "")
+                                + " [SOC=" + String.format("%.1f", socData.socPercent) + "%, remain="
+                                + String.format("%.1f", remainingKwh) + " kWh]");
+                            return;
+                        }
                     }
                 }
             }
@@ -751,9 +1028,11 @@ public class SohEstimator {
             if (carType != null && !carType.isEmpty()) {
                 double mapped = mapCarTypeToCapacity(carType);
                 if (mapped > 0) {
-                    setNominalCapacityKwh(mapped);
-                    logger.info("Model-Mapped Capacity (" + carType + "): " + mapped + " kWh");
-                    return;
+                    if (setAutoNominalCapacityKwhLocked(
+                            mapped, "auto")) {
+                        logger.info("Model-Mapped Capacity (" + carType + "): " + mapped + " kWh");
+                        return;
+                    }
                 }
             }
         } catch (Exception e) { /* ignore */ }
@@ -761,8 +1040,10 @@ public class SohEstimator {
         if (context != null) {
             double fuzzyKwh = tryBmsFuzzyCapacity(context);
             if (fuzzyKwh > 0 && !contradictedBySocRatio(fuzzyKwh)) {
-                setNominalCapacityKwh(fuzzyKwh);
-                return;
+                if (setAutoNominalCapacityKwhLocked(
+                        fuzzyKwh, "auto")) {
+                    return;
+                }
             }
         }
 
@@ -775,11 +1056,13 @@ public class SohEstimator {
                 int cellCount = (int) Math.round(voltage / cellVoltage);
                 double capacity = mapCellCountToCapacity(cellCount);
                 if (capacity > 0) {
-                    setNominalCapacityKwh(capacity);
-                    logger.info("Pack Voltage Capacity: " + capacity + " kWh (voltage=" +
-                        String.format("%.1f", voltage) + "V, nominal cellV=3.2V" +
-                        ", cells≈" + cellCount + "s)");
-                    return;
+                    if (setAutoNominalCapacityKwhLocked(
+                            capacity, "auto")) {
+                        logger.info("Pack Voltage Capacity: " + capacity + " kWh (voltage=" +
+                            String.format("%.1f", voltage) + "V, nominal cellV=3.2V" +
+                            ", cells≈" + cellCount + "s)");
+                        return;
+                    }
                 }
             }
         } catch (Exception e) {
@@ -789,10 +1072,7 @@ public class SohEstimator {
         if (nominalCapacityKwh > 0 && contradictedBySocRatio(nominalCapacityKwh)) {
             logger.warn("Persisted nominal " + nominalCapacityKwh
                 + " kWh contradicted by current SOC ratio — clearing for re-detection on next cycle");
-            nominalCapacityKwh = 0;
-            nominalSource = "unset";
-            currentSoh = -1;
-            persistEstimate();
+            clearAutoNominalLocked("discard contradicted auto nominal");
         }
 
         logger.warn("Capacity detection failed" +
@@ -954,8 +1234,17 @@ public class SohEstimator {
      * isn't blank waiting for the first SocHistoryDatabase tick.
      */
     public void seedInitialEstimate() {
-        if (hasEstimate()) return;
-        if (nominalCapacityKwh <= 0) return;
+        final long seedGeneration;
+        final double seedNominalKwh;
+        synchronized (autoDetectLock) {
+            if (initializationState != InitializationState.READY
+                    || currentSoh > 0 || nominalCapacityKwh <= 0) {
+                return;
+            }
+            seedGeneration = estimatorGeneration;
+            seedNominalKwh = nominalCapacityKwh;
+        }
+
         try {
             VehicleDataMonitor vdm = VehicleDataMonitor.getInstance();
             BatterySocData socData = vdm.getBatterySoc();
@@ -975,24 +1264,22 @@ public class SohEstimator {
                 if (col != null && col.isInitialized()) isPhevForSeed = col.isPhevPublic();
             } catch (Throwable ignored) {}
 
-            boolean energySeedFired = false;
+            double candidateSoh = -1;
             if (!isPhevForSeed
                     && vd != null && !Double.isNaN(vd.remainKwh) && vd.remainKwh > 0
                     && socData != null
                     && socData.socPercent >= 10 && socData.socPercent <= 100) {
                 double rawRemainKwh = vd.remainKwh;
                 double impliedCap = rawRemainKwh / (socData.socPercent / 100.0);
-                double ratio = impliedCap / nominalCapacityKwh;
+                double ratio = impliedCap / seedNominalKwh;
                 // Refuse junk BMS readings (ratio outside plausible band).
                 if (ratio >= 0.5 && ratio <= 1.12) {
                     double highCellV = Double.isNaN(vd.highCellVoltage) ? Double.NaN : vd.highCellVoltage;
-                    double soh = computeLiveSoh(rawRemainKwh, socData.socPercent, highCellV);
-                    if (soh > 0) {
-                        currentSoh = soh;
-                        persistEstimate();
-                        energySeedFired = true;
-                        logger.info("Initial SOH seeded: " + String.format("%.1f", soh) + "%");
-                    }
+                    candidateSoh = computeSeedSoh(
+                        rawRemainKwh,
+                        socData.socPercent,
+                        highCellV,
+                        seedNominalKwh);
                 }
             }
 
@@ -1005,7 +1292,7 @@ public class SohEstimator {
             // soon as the user does a real charging session, and live SOH
             // updateFromEnergy() takes over once vd.remainKwh becomes
             // trustworthy (e.g. when getBatteryPowerHEV starts reporting).
-            if (!hasEstimate()) {
+            if (candidateSoh <= 0) {
                 String why;
                 if (socData == null) {
                     why = "no SOC data";
@@ -1019,150 +1306,324 @@ public class SohEstimator {
                     why = "energy reading rejected by ratio gate";
                 }
                 logger.info("Seeding SOH at 100% baseline (" + why + ") — nominal="
-                    + String.format("%.2f", nominalCapacityKwh) + " kWh");
-                currentSoh = 100.0;
-                persistEstimate();
+                    + String.format("%.2f", seedNominalKwh) + " kWh");
+                candidateSoh = 100.0;
+            }
+
+            if (tryCommitInitialSeed(
+                    seedGeneration, seedNominalKwh, candidateSoh)) {
+                logger.info("Initial SOH seeded: "
+                    + String.format("%.1f", candidateSoh) + "%");
             }
         } catch (Exception e) {
             logger.debug("Initial SOH seed failed: " + e.getMessage());
         }
     }
 
+    private static double computeSeedSoh(
+            double remainKwh,
+            double socPercent,
+            double highCellVoltage,
+            double nominalKwh) {
+        if (nominalKwh <= 0 || socPercent <= 0 || socPercent > 100
+                || remainKwh <= 0) {
+            return -1;
+        }
+        double scale = displayToAbsoluteSocScale(highCellVoltage);
+        double absSoc = scaleDisplaySoc(socPercent, scale);
+        double rawSoh =
+            ((remainKwh / (absSoc / 100.0)) / nominalKwh) * 100.0;
+        if (rawSoh < MIN_SOH) return MIN_SOH;
+        if (rawSoh > MAX_SOH) return MAX_SOH;
+        return rawSoh;
+    }
+
+    private boolean tryCommitInitialSeed(
+            long expectedGeneration,
+            double expectedNominalKwh,
+            double candidateSoh) {
+        synchronized (autoDetectLock) {
+            if (initializationState != InitializationState.READY
+                    || estimatorGeneration != expectedGeneration
+                    || Double.doubleToLongBits(nominalCapacityKwh)
+                        != Double.doubleToLongBits(expectedNominalKwh)
+                    || currentSoh > 0
+                    || candidateSoh <= 0) {
+                return false;
+            }
+            currentSoh = candidateSoh;
+            estimatorGeneration++;
+            persistEstimate();
+            return true;
+        }
+    }
+
     // ==================== LIFECYCLE ====================
 
     public void init() {
-        // 1. User override from UnifiedConfigManager. Restore floor matches
-        //    setNominalCapacityKwhFromUser: PHEV-aware. We can't always probe
-        //    BydDataCollector here (init runs before drivetrain classification
-        //    has settled), so we accept the wider PHEV floor at restore-time
-        //    — the value already passed strict per-drivetrain validation when
-        //    it was originally set, and a stale value would still need
-        //    affirmative user action to persist.
         try {
-            JSONObject vehicle = UnifiedConfigManager.getVehicle();
-            double userKwh = vehicle.optDouble("nominalKwh", 0);
-            if (userKwh >= MIN_PLAUSIBLE_KWH_PHEV && userKwh <= MAX_PLAUSIBLE_KWH) {
-                nominalCapacityKwh = userKwh;
-                nominalSource = "user";
-                logger.info("Restored user nominal capacity: " + userKwh + " kWh");
-            }
+            userNominalConfig.runUnderConfigLock(() -> {
+                final double configuredUserKwh;
+                try {
+                    configuredUserKwh =
+                        validateConfiguredUserNominal(userNominalConfig.read());
+                } catch (Throwable t) {
+                    markInitializationDeferred();
+                    logger.warn("UnifiedConfig vehicle.nominalKwh read deferred: "
+                        + t.getMessage());
+                    return;
+                }
+
+                synchronized (autoDetectLock) {
+                    initializationState = InitializationState.DEFERRED;
+                    if (initLocked(configuredUserKwh)) {
+                        initializationState = InitializationState.READY;
+                    }
+                }
+            });
         } catch (Throwable t) {
-            logger.debug("UnifiedConfig vehicle.nominalKwh read failed: " + t.getMessage());
+            markInitializationDeferred();
+            logger.warn("UnifiedConfig lock unavailable during SOH init: "
+                + t.getMessage());
+        }
+    }
+
+    public boolean isInitializationReady() {
+        synchronized (autoDetectLock) {
+            return initializationState == InitializationState.READY;
+        }
+    }
+
+    private void markInitializationDeferred() {
+        synchronized (autoDetectLock) {
+            initializationState = InitializationState.DEFERRED;
+        }
+    }
+
+    private boolean initLocked(double configuredUserKwh) {
+        RestoredState restored = new RestoredState();
+        if (configuredUserKwh > 0) {
+            restored.nominalCapacityKwh = configuredUserKwh;
+            restored.nominalSource = "user";
         }
 
-        // 2. Properties-file restore (auto-detected nominal + currentSoh + calibration).
-        try {
-            File sohFile = new File(SOH_FILE);
-            if (!sohFile.exists()) return;
+        if (!sohFile.exists()) {
+            restored.resetModelEpoch = initialResetModelEpoch();
+            try {
+                PersistenceOutcome initialEpochOutcome =
+                    publishPropertiesWithDurabilityRetries(
+                        nominalOnlyProperties(restored, true),
+                        "establish initial reset/model epoch");
+                if (initialEpochOutcome != PersistenceOutcome.DURABLE) {
+                    return false;
+                }
+            } catch (IOException writeFailure) {
+                logger.error("Failed to establish initial reset/model epoch: "
+                    + writeFailure.getMessage());
+                return false;
+            }
+            publishRestoredStateLocked(restored);
+            if (configuredUserKwh > 0) {
+                logger.info("Restored user nominal capacity: "
+                    + configuredUserKwh + " kWh");
+            }
+            return true;
+        }
 
-            Properties props = new Properties();
+        Properties props = new Properties();
+        try {
             try (FileInputStream fis = new FileInputStream(sohFile)) {
                 props.load(fis);
             }
+        } catch (Exception readFailure) {
+            logger.error("Failed to read SOH snapshot: "
+                + readFailure.getMessage());
+            return false;
+        }
 
-            int persistedVersion = 0;
+        final boolean legacyEpochMissing =
+            !props.containsKey(PROP_RESET_MODEL_EPOCH);
+        if (legacyEpochMissing) {
+            // Never expose zero for a legacy image: DB rows created before the
+            // epoch contract have NULL/zero and must not compare equal to the
+            // first current lineage.
+            restored.resetModelEpoch = initialResetModelEpoch();
+        } else {
             try {
-                persistedVersion = Integer.parseInt(props.getProperty(PROP_SCHEMA_VERSION, "0"));
-            } catch (NumberFormatException ignored) {
-                persistedVersion = 0;
+                restored.resetModelEpoch = Long.parseLong(
+                    props.getProperty(PROP_RESET_MODEL_EPOCH));
+            } catch (NumberFormatException malformedEpoch) {
+                logger.error("Failed to load SOH: malformed reset/model epoch");
+                return false;
             }
+            if (restored.resetModelEpoch <= 0) {
+                logger.error("Failed to load SOH: reset/model epoch must be positive");
+                return false;
+            }
+        }
 
-            // Migration tiers:
-            //   < v2 → harsh migration: SOH semantics changed in v2, drop state.
-            //   v2 → soft upgrade to v3: peak frame anchor is a NEW additive
-            //        field, existing SOH/calibration semantics unchanged.
-            //        Just fall through to the normal load path; persistEstimate
-            //        will rewrite with schema_version=3 on the next update.
+        final int persistedVersion;
+        String versionValue = props.getProperty(PROP_SCHEMA_VERSION);
+        if (versionValue == null) {
+            persistedVersion = 0;
+        } else {
+            try {
+                persistedVersion = Integer.parseInt(versionValue);
+            } catch (NumberFormatException malformedVersion) {
+                logger.error("Failed to load SOH: malformed schema_version");
+                return false;
+            }
+        }
+        if (persistedVersion == CURRENT_SCHEMA_VERSION) {
+            String lastUpdatedValue = props.getProperty(PROP_LAST_UPDATED);
+            if (lastUpdatedValue != null) {
+                try {
+                    restored.persistedLastUpdatedMs = Math.max(
+                        0L, Long.parseLong(lastUpdatedValue));
+                } catch (NumberFormatException malformedTimestamp) {
+                    logger.error("Failed to load SOH: malformed last_updated");
+                    return false;
+                }
+            }
+        }
+
+        try {
             if (persistedVersion < 2) {
-                // Legacy file: preserve nominal so auto-detect doesn't restart cold,
-                // but drop SOH state — its semantics may have shifted across versions.
-                if (!"user".equals(nominalSource)) {
+                // Legacy SOH semantics are incompatible. Preserve only a valid
+                // non-user nominal when UnifiedConfig has no user override.
+                if (configuredUserKwh <= 0) {
                     String capStr = props.getProperty(PROP_NOMINAL_CAPACITY);
                     if (capStr != null) {
-                        try {
-                            double savedCap = Double.parseDouble(capStr);
-                            if (savedCap >= MIN_PLAUSIBLE_KWH && savedCap <= MAX_PLAUSIBLE_KWH) {
-                                nominalCapacityKwh = savedCap;
-                                // Legacy "user" sources are not authoritative — the
-                                // source-of-truth for user overrides is now
-                                // UnifiedConfigManager (read earlier). Downgrade to
-                                // "auto" so a stray legacy "user" string can't pin
-                                // a nominal that has no corresponding override.
-                                String savedSrc = props.getProperty(PROP_NOMINAL_SOURCE);
-                                nominalSource = (savedSrc != null && !savedSrc.isEmpty() && !"user".equals(savedSrc))
-                                    ? savedSrc : "auto";
-                            }
-                        } catch (NumberFormatException ignored2) {}
+                        double savedCap = Double.parseDouble(capStr);
+                        if (!Double.isNaN(savedCap)
+                                && !Double.isInfinite(savedCap)
+                                && savedCap >= MIN_PLAUSIBLE_KWH
+                                && savedCap <= MAX_PLAUSIBLE_KWH) {
+                            restored.nominalCapacityKwh = savedCap;
+                            String savedSource =
+                                props.getProperty(PROP_NOMINAL_SOURCE);
+                            restored.nominalSource =
+                                savedSource != null
+                                    && !savedSource.isEmpty()
+                                    && !"user".equals(savedSource)
+                                        ? savedSource : "auto";
+                        }
                     }
                 }
-                currentSoh = -1;
-                calibrationSoh = -1;
-                calibrationTimestampMs = 0;
-                liveHistory.clear();
+                if (!legacyEpochMissing) {
+                    restored.resetModelEpoch =
+                        nextResetModelEpoch(restored.resetModelEpoch);
+                }
+                PersistenceOutcome outcome =
+                    publishPropertiesWithDurabilityRetries(
+                        nominalOnlyProperties(restored, true),
+                        "migrate legacy SOH schema");
+                if (outcome != PersistenceOutcome.DURABLE) return false;
+                publishRestoredStateLocked(restored);
                 logger.info("SOH file migrated from legacy schema (v" + persistedVersion
                     + " → v" + CURRENT_SCHEMA_VERSION
                     + ") — currentSoh/calibration cleared, will re-seed from BMS data");
-                // persistEstimate() short-circuits when every field is empty,
-                // which would leave schema_version unwritten and re-trigger
-                // migration every boot. Stamp the new schema unconditionally.
-                writeSchemaStamp();
-                return;
+                return true;
             }
             if (persistedVersion == 2 && CURRENT_SCHEMA_VERSION >= 3) {
                 logger.info("SOH file soft-upgraded v2 → v" + CURRENT_SCHEMA_VERSION
                     + " (peak frame anchor added, existing state preserved)");
-                // Fall through to the normal load path below.
+            }
+
+            if (configuredUserKwh <= 0) {
+                restorePersistedNominal(props, restored);
+            }
+
+            if (persistedNominalIdentityDiffers(
+                    props,
+                    restored.nominalCapacityKwh,
+                    restored.nominalSource)) {
+                logger.warn("Discarding persisted SOH because its nominal identity "
+                    + "changed");
+                RestoredState cleared = new RestoredState();
+                if (configuredUserKwh > 0) {
+                    cleared.nominalCapacityKwh = configuredUserKwh;
+                    cleared.nominalSource = "user";
+                }
+                cleared.resetModelEpoch =
+                    nextResetModelEpoch(restored.resetModelEpoch);
+                return publishClearedRestoreStateLocked(
+                    cleared, "discard changed nominal identity");
+            }
+
+            if (!persistedStateMatchesNominal(
+                    props,
+                    restored.nominalCapacityKwh,
+                    restored.nominalSource)) {
+                logger.warn("Discarding persisted SOH because its nominal identity "
+                    + "does not match UnifiedConfig");
+                RestoredState cleared = restored;
+                if (configuredUserKwh <= 0) {
+                    cleared = new RestoredState();
+                }
+                cleared.resetModelEpoch =
+                    nextResetModelEpoch(restored.resetModelEpoch);
+                return publishClearedRestoreStateLocked(
+                    cleared, "discard stale nominal-bound SOH");
             }
 
             String sohStr = props.getProperty(PROP_SOH_PERCENT);
             if (sohStr != null) {
                 double persistedSoh = Double.parseDouble(sohStr);
-                // Accept up to the old 110 rail (older builds persisted up to 110),
-                // but re-cap to MAX_SOH (100) on restore so a value written under
-                // the old >100% behaviour doesn't keep inflating the display.
                 if (persistedSoh >= MIN_SOH && persistedSoh <= 110) {
-                    currentSoh = Math.min(persistedSoh, MAX_SOH);
-                    logger.info("Restored SOH: " + currentSoh + "%"
+                    restored.currentSoh =
+                        Math.min(persistedSoh, MAX_SOH);
+                    logger.info("Restored SOH: " + restored.currentSoh + "%"
                         + (persistedSoh > MAX_SOH ? " (capped from " + persistedSoh + "%)" : ""));
                 } else {
-                    logger.info("Discarding persisted SOH " + persistedSoh + " — out of valid range " + MIN_SOH + "-110");
-                    sohFile.delete();
+                    logger.info("Discarding persisted SOH " + persistedSoh
+                        + " — out of valid range " + MIN_SOH + "-110");
+                    RestoredState cleared = new RestoredState();
+                    if (configuredUserKwh > 0) {
+                        cleared.nominalCapacityKwh = configuredUserKwh;
+                        cleared.nominalSource = "user";
+                    }
+                    cleared.resetModelEpoch =
+                        nextResetModelEpoch(restored.resetModelEpoch);
+                    return publishClearedRestoreStateLocked(
+                        cleared, "discard invalid persisted SOH");
                 }
             }
 
             String calStr = props.getProperty(PROP_CALIBRATION_SOH);
+            String calTsStr = props.getProperty(PROP_CALIBRATION_TIMESTAMP);
+            if ((calStr == null) != (calTsStr == null)) {
+                throw new IllegalStateException(
+                    "Calibration SOH and timestamp must be persisted together");
+            }
             if (calStr != null) {
                 double cal = Double.parseDouble(calStr);
-                if (cal >= MIN_SOH && cal <= 110) {
-                    calibrationSoh = Math.min(cal, MAX_SOH);
+                long calibrationAtMs = Long.parseLong(calTsStr);
+                if (Double.isNaN(cal) || Double.isInfinite(cal)
+                        || cal < MIN_SOH || cal > 110
+                        || calibrationAtMs <= 0) {
+                    throw new IllegalStateException(
+                        "Persisted calibration anchor is invalid");
                 }
-            }
-            String calTsStr = props.getProperty(PROP_CALIBRATION_TIMESTAMP);
-            if (calTsStr != null) {
-                try {
-                    calibrationTimestampMs = Long.parseLong(calTsStr);
-                } catch (NumberFormatException ignored) {}
+                restored.calibrationSoh = Math.min(cal, MAX_SOH);
+                restored.calibrationTimestampMs = calibrationAtMs;
             }
 
             String capAhStr = props.getProperty(PROP_CAPACITY_AH_SOH);
             if (capAhStr != null) {
-                try {
-                    double cah = Double.parseDouble(capAhStr);
-                    if (cah >= MIN_SOH && cah <= 110) capacityAhSoh = Math.min(cah, MAX_SOH);
-                } catch (NumberFormatException ignored) {}
+                double cah = Double.parseDouble(capAhStr);
+                if (cah >= MIN_SOH && cah <= 110) {
+                    restored.capacityAhSoh = Math.min(cah, MAX_SOH);
+                }
             }
             String capAhTsStr = props.getProperty(PROP_CAPACITY_AH_TIMESTAMP);
             if (capAhTsStr != null) {
-                try {
-                    capacityAhTimestampMs = Long.parseLong(capAhTsStr);
-                } catch (NumberFormatException ignored) {}
+                restored.capacityAhTimestampMs =
+                    Math.max(0L, Long.parseLong(capAhTsStr));
             }
-            // Restore the latched-off flag so a firmware confirmed
-            // not-coulomb-counting in a previous session doesn't re-trigger
-            // the same detection cycle on every reboot.
             String capAhDisStr = props.getProperty(PROP_CAPACITY_AH_DISABLED);
             if ("true".equalsIgnoreCase(capAhDisStr)) {
-                capacityAhDisabled = true;
+                restored.capacityAhDisabled = true;
                 logger.info("Capacity-Ah anchor restored as disabled (persisted)");
             }
 
@@ -1173,91 +1634,308 @@ public class SohEstimator {
                     for (String p : parts) {
                         String trimmed = p.trim();
                         if (trimmed.isEmpty()) continue;
-                        // Re-cap on restore: a pre-cap (≤110) properties file could
-                        // otherwise reintroduce >100 samples into the median.
                         double v = Double.parseDouble(trimmed);
-                        if (v >= MIN_SOH && v <= 110) liveHistory.addLast(Math.min(v, MAX_SOH));
+                        if (v >= MIN_SOH && v <= 110) {
+                            restored.liveHistory.addLast(
+                                Math.min(v, MAX_SOH));
+                        }
                     }
-                    while (liveHistory.size() > LIVE_HISTORY_SIZE) {
-                        liveHistory.pollFirst();
+                    while (restored.liveHistory.size() > LIVE_HISTORY_SIZE) {
+                        restored.liveHistory.pollFirst();
                     }
                 } catch (Exception ignored) {
-                    liveHistory.clear();
+                    restored.liveHistory.clear();
                 }
             }
 
-            // Peak frame anchor restore (v3+). Missing on v2 files — fields stay -1/0
-            // and observePeakAtFullCharge will re-seed on the next SOC≥99% tick.
             String peakStr = props.getProperty(PROP_PEAK_REMAIN_KWH);
             if (peakStr != null) {
-                try {
-                    double peak = Double.parseDouble(peakStr);
-                    if (peak > 0 && peak <= MAX_PLAUSIBLE_KWH) {
-                        peakRemainKwhAtFull = peak;
-                    }
-                } catch (NumberFormatException ignored) {}
+                double peak = Double.parseDouble(peakStr);
+                if (peak > 0 && peak <= MAX_PLAUSIBLE_KWH) {
+                    restored.peakRemainKwhAtFull = peak;
+                }
             }
             String peakSamplesStr = props.getProperty(PROP_PEAK_REMAIN_KWH_SAMPLES);
             if (peakSamplesStr != null) {
-                try {
-                    peakRemainKwhSamples = Math.min(
-                        Integer.parseInt(peakSamplesStr), PEAK_REMAIN_KWH_REQUIRED_SAMPLES);
-                } catch (NumberFormatException ignored) {}
+                restored.peakRemainKwhSamples = Math.max(
+                    0,
+                    Math.min(
+                        Integer.parseInt(peakSamplesStr),
+                        PEAK_REMAIN_KWH_REQUIRED_SAMPLES));
             }
             String peakTsStr = props.getProperty(PROP_PEAK_REMAIN_KWH_TS);
             if (peakTsStr != null) {
-                try {
-                    peakRemainKwhTimestampMs = Long.parseLong(peakTsStr);
-                } catch (NumberFormatException ignored) {}
+                restored.peakRemainKwhTimestampMs =
+                    Math.max(0L, Long.parseLong(peakTsStr));
             }
             String peakNotifiedStr = props.getProperty(PROP_PEAK_REMAIN_KWH_NOTIFIED);
             if ("true".equalsIgnoreCase(peakNotifiedStr)) {
-                peakMismatchNotified = true;
+                restored.peakMismatchNotified = true;
             }
-            if (peakRemainKwhAtFull > 0) {
+            if (restored.peakRemainKwhAtFull > 0) {
                 logger.info("Restored peak frame anchor: "
-                    + String.format("%.2f", peakRemainKwhAtFull) + " kWh ("
-                    + peakRemainKwhSamples + "/"
+                    + String.format("%.2f", restored.peakRemainKwhAtFull) + " kWh ("
+                    + restored.peakRemainKwhSamples + "/"
                     + PEAK_REMAIN_KWH_REQUIRED_SAMPLES + " samples)"
-                    + (peakMismatchNotified ? " [mismatch already notified]" : ""));
+                    + (restored.peakMismatchNotified
+                        ? " [mismatch already notified]" : ""));
             }
 
-            if (!"user".equals(nominalSource)) {
-                String capStr = props.getProperty(PROP_NOMINAL_CAPACITY);
-                if (capStr != null) {
-                    double savedCap = Double.parseDouble(capStr);
-                    // Floor must match whatever gate ACCEPTED this value in the first place,
-                    // or a legitimately-stored nominal is destroyed on the next boot. A
-                    // user-entered PHEV pack (e.g. 12.9 kWh) passes the PHEV floor at entry
-                    // (setNominalCapacityKwhFromUser) but was then discarded here by the
-                    // stricter BEV floor — so the setting silently reverted on every restart
-                    // and every capacity-derived number went wrong again. Use the PHEV floor
-                    // for a persisted "user" value; keep the strict BEV floor for "auto",
-                    // which is what actually guards against a bad auto-detect.
-                    String savedSrcForFloor = props.getProperty(PROP_NOMINAL_SOURCE);
-                    double restoreFloor = "user".equals(savedSrcForFloor)
-                            ? MIN_PLAUSIBLE_KWH_PHEV : MIN_PLAUSIBLE_KWH;
-                    if (savedCap >= restoreFloor && savedCap <= MAX_PLAUSIBLE_KWH) {
-                        nominalCapacityKwh = savedCap;
-                        String savedSrc = props.getProperty(PROP_NOMINAL_SOURCE);
-                        nominalSource = (savedSrc != null && !savedSrc.isEmpty()) ? savedSrc : "auto";
-                        logger.info("Restored nominal capacity: " + savedCap + " kWh (source="
-                            + nominalSource + ")");
-                    } else if (savedCap > 0) {
-                        logger.warn("Discarding persisted nominal " + savedCap
-                            + " kWh — outside plausible range");
-                        if (currentSoh > 0) {
-                            currentSoh = -1;
-                        }
-                    }
-                }
+            boolean stateCleared =
+                "true".equalsIgnoreCase(
+                    props.getProperty(PROP_STATE_CLEARED))
+                && !hasPersistedEstimateState(props);
+            PersistenceOutcome checkpointOutcome =
+                publishPropertiesWithDurabilityRetries(
+                    completePersistenceProperties(restored, stateCleared),
+                    legacyEpochMissing
+                        ? "bootstrap legacy reset/model epoch"
+                        : "re-establish SOH snapshot durability");
+            if (checkpointOutcome != PersistenceOutcome.DURABLE) {
+                return false;
             }
 
-            if (currentSoh > 0) {
-                logger.info("SOH init complete: " + currentSoh + "%");
+            publishRestoredStateLocked(restored);
+            if (configuredUserKwh > 0) {
+                logger.info("Restored user nominal capacity: "
+                    + configuredUserKwh + " kWh");
+            } else if (restored.nominalCapacityKwh > 0) {
+                logger.info("Restored nominal capacity: "
+                    + restored.nominalCapacityKwh + " kWh (source="
+                    + restored.nominalSource + ")");
             }
+            if (restored.currentSoh > 0) {
+                logger.info("SOH init complete: "
+                    + restored.currentSoh + "%");
+            }
+            return true;
         } catch (Exception e) {
             logger.error("Failed to load SOH: " + e.getMessage());
+            // Every parse above targets only RestoredState. A malformed optional
+            // property therefore leaves the previously published estimator
+            // snapshot untouched and keeps auto-detection blocked.
+            return false;
+        }
+    }
+
+    private void restorePersistedNominal(
+            Properties props, RestoredState restored) {
+        String persistedSource =
+            props.getProperty(PROP_NOMINAL_SOURCE, "unset");
+        if ("user".equals(persistedSource)) {
+            // Only UnifiedConfig may establish a user identity.
+            return;
+        }
+        String capacity = props.getProperty(PROP_NOMINAL_CAPACITY);
+        if (capacity == null) return;
+
+        double persistedNominal = Double.parseDouble(capacity);
+        if (Double.isNaN(persistedNominal)
+                || Double.isInfinite(persistedNominal)
+                || persistedNominal < MIN_PLAUSIBLE_KWH
+                || persistedNominal > MAX_PLAUSIBLE_KWH) {
+            throw new IllegalArgumentException(
+                "persisted nominal outside plausible range: "
+                    + persistedNominal);
+        }
+        restored.nominalCapacityKwh = persistedNominal;
+        restored.nominalSource =
+            persistedSource == null || persistedSource.isEmpty()
+                || "unset".equals(persistedSource)
+                    ? "auto" : persistedSource;
+    }
+
+    private boolean persistedStateMatchesNominal(
+            Properties props, double activeNominal, String activeSource) {
+        double persistedNominal;
+        try {
+            persistedNominal = Double.parseDouble(
+                props.getProperty(PROP_NOMINAL_CAPACITY, "0"));
+        } catch (NumberFormatException malformedNominal) {
+            return false;
+        }
+        String persistedSource =
+            props.getProperty(PROP_NOMINAL_SOURCE, "unset");
+        String persistedIdentity =
+            props.getProperty(PROP_NOMINAL_IDENTITY);
+        boolean hasEstimateState = hasPersistedEstimateState(props);
+
+        if ("user".equals(activeSource) && activeNominal > 0) {
+            if (!hasEstimateState) return true;
+            String activeIdentity =
+                nominalIdentity(activeNominal, activeSource);
+            if (persistedIdentity != null) {
+                return activeIdentity.equals(persistedIdentity);
+            }
+            return "user".equals(persistedSource)
+                && sameNominal(persistedNominal, activeNominal);
+        }
+
+        if ("user".equals(persistedSource)) return false;
+        if (hasEstimateState && activeNominal <= 0) return false;
+        if (!hasEstimateState) return true;
+        if (persistedIdentity == null) return true;
+        return persistedIdentity.equals(
+            nominalIdentity(activeNominal, activeSource));
+    }
+
+    private boolean persistedNominalIdentityDiffers(
+            Properties props, double activeNominal, String activeSource) {
+        String persistedIdentity =
+            props.getProperty(PROP_NOMINAL_IDENTITY);
+        String persistedCapacity =
+            props.getProperty(PROP_NOMINAL_CAPACITY);
+        if (persistedIdentity == null && persistedCapacity == null) {
+            // A reset tombstone deliberately carries only the already-advanced
+            // epoch. UnifiedConfig may restore the same user nominal in memory
+            // without causing another advance on every daemon restart.
+            return false;
+        }
+
+        if (persistedIdentity != null) {
+            return !persistedIdentity.equals(
+                nominalIdentity(activeNominal, activeSource));
+        }
+
+        final double persistedNominal;
+        try {
+            persistedNominal = Double.parseDouble(persistedCapacity);
+        } catch (NumberFormatException malformedNominal) {
+            return true;
+        }
+        String persistedSource =
+            props.getProperty(PROP_NOMINAL_SOURCE, "unset");
+        return !sameNominal(persistedNominal, activeNominal)
+            || !persistedSource.equals(activeSource);
+    }
+
+    private static boolean hasPersistedEstimateState(Properties props) {
+        return props.containsKey(PROP_SOH_PERCENT)
+            || props.containsKey(PROP_CALIBRATION_SOH)
+            || props.containsKey(PROP_CALIBRATION_TIMESTAMP)
+            || props.containsKey(PROP_CAPACITY_AH_SOH)
+            || props.containsKey(PROP_CAPACITY_AH_TIMESTAMP)
+            || props.containsKey(PROP_CAPACITY_AH_DISABLED)
+            || props.containsKey(PROP_LIVE_HISTORY)
+            || props.containsKey(PROP_PEAK_REMAIN_KWH)
+            || props.containsKey(PROP_PEAK_REMAIN_KWH_SAMPLES)
+            || props.containsKey(PROP_PEAK_REMAIN_KWH_TS)
+            || props.containsKey(PROP_PEAK_REMAIN_KWH_NOTIFIED);
+    }
+
+    private boolean publishClearedRestoreStateLocked(
+            RestoredState restored, String operation) {
+        PersistenceOutcome outcome;
+        try {
+            outcome = publishPropertiesWithDurabilityRetries(
+                nominalOnlyProperties(
+                    restored,
+                    !"user".equals(restored.nominalSource)
+                        || restored.nominalCapacityKwh <= 0),
+                operation);
+        } catch (Exception writeFailure) {
+            logger.error("Failed to " + operation + ": "
+                + writeFailure.getMessage());
+            return false;
+        }
+        if (outcome != PersistenceOutcome.DURABLE) return false;
+        publishRestoredStateLocked(restored);
+        return true;
+    }
+
+    private static final class RestoredState {
+        long persistedLastUpdatedMs = 0;
+        double nominalCapacityKwh = 0;
+        String nominalSource = "unset";
+        long resetModelEpoch = 0;
+        double currentSoh = -1;
+        double calibrationSoh = -1;
+        long calibrationTimestampMs = 0;
+        double capacityAhSoh = -1;
+        long capacityAhTimestampMs = 0;
+        boolean capacityAhDisabled = false;
+        final java.util.ArrayDeque<Double> liveHistory =
+            new java.util.ArrayDeque<>(LIVE_HISTORY_SIZE);
+        double peakRemainKwhAtFull = -1;
+        int peakRemainKwhSamples = 0;
+        long peakRemainKwhTimestampMs = 0;
+        boolean peakMismatchNotified = false;
+    }
+
+    private void publishRestoredStateLocked(RestoredState restored) {
+        nominalCapacityKwh = restored.nominalCapacityKwh;
+        nominalSource = restored.nominalSource;
+        resetModelEpoch = restored.resetModelEpoch;
+        currentSoh = restored.currentSoh;
+        calibrationSoh = restored.calibrationSoh;
+        calibrationTimestampMs = restored.calibrationTimestampMs;
+        capacityAhSoh = restored.capacityAhSoh;
+        capacityAhTimestampMs = restored.capacityAhTimestampMs;
+        capacityAhDisabled = restored.capacityAhDisabled;
+        liveHistory.clear();
+        liveHistory.addAll(restored.liveHistory);
+        peakRemainKwhAtFull = restored.peakRemainKwhAtFull;
+        peakRemainKwhSamples = restored.peakRemainKwhSamples;
+        peakRemainKwhTimestampMs = restored.peakRemainKwhTimestampMs;
+        peakMismatchNotified = restored.peakMismatchNotified;
+
+        lastCapacityAhReading = -1;
+        capacityAhNameplateMatchCount = 0;
+        capacityAhFirstSocSeen = -1;
+        capacityAhFirstAhSeen = -1;
+        capacityAhSocCoupledCount = 0;
+        saturationStreak = 0;
+        fuelSignalsLookBev = false;
+        estimatorGeneration++;
+    }
+
+    private static boolean sameNominal(double first, double second) {
+        return Math.abs(first - second) <= 0.000001;
+    }
+
+    private static long initialResetModelEpoch() {
+        long now = System.currentTimeMillis();
+        return now > 0 && now < Long.MAX_VALUE ? now : 1L;
+    }
+
+    private static long nextResetModelEpoch(long currentEpoch) {
+        if (currentEpoch <= 0) {
+            throw new IllegalStateException(
+                "SOH reset/model epoch is not initialized");
+        }
+        if (currentEpoch == Long.MAX_VALUE) {
+            throw new IllegalStateException(
+                "SOH reset/model epoch is exhausted");
+        }
+        return currentEpoch + 1L;
+    }
+
+    private static String nominalIdentity(double nominalKwh, String source) {
+        String normalizedSource =
+            source == null || source.isEmpty() ? "unset" : source;
+        return normalizedSource + ":"
+            + Long.toHexString(Double.doubleToLongBits(nominalKwh));
+    }
+
+    private void clearEstimateStateLocked(boolean clearPeakAnchor) {
+        currentSoh = -1;
+        calibrationSoh = -1;
+        calibrationTimestampMs = 0;
+        capacityAhSoh = -1;
+        capacityAhTimestampMs = 0;
+        lastCapacityAhReading = -1;
+        capacityAhNameplateMatchCount = 0;
+        capacityAhDisabled = false;
+        capacityAhFirstSocSeen = -1;
+        capacityAhFirstAhSeen = -1;
+        capacityAhSocCoupledCount = 0;
+        liveHistory.clear();
+        saturationStreak = 0;
+        if (clearPeakAnchor) {
+            peakRemainKwhAtFull = -1;
+            peakRemainKwhSamples = 0;
+            peakRemainKwhTimestampMs = 0;
+            peakMismatchNotified = false;
         }
     }
 
@@ -1301,21 +1979,82 @@ public class SohEstimator {
     public void updateFromCalibration(double energyEnteredBatteryKwh, double socDelta,
                                       double packTempCelsius, boolean isAcCharge,
                                       double highCellVoltage) {
+        applyCalibration(
+                energyEnteredBatteryKwh, socDelta, packTempCelsius, isAcCharge,
+                highCellVoltage, System.currentTimeMillis(), false);
+    }
+
+    public enum CalibrationReplayOutcome {
+        APPLIED,
+        PERMANENTLY_REJECTED,
+        RETRY_LATER
+    }
+
+    /**
+     * Replay one committed charging calibration with a stable identity/timestamp.
+     *
+     * <p>Returns false when initialization or validation rejects the payload, or when the anchor could
+     * not be persisted. Repeating the same timestamp and payload is a no-op; an older replay is already
+     * superseded by a newer calibration. This lets the charging row's applied flag be updated only after
+     * the external metadata effect is durable.
+     */
+    public boolean applyCalibrationReplay(
+            double energyEnteredBatteryKwh, double socDelta,
+            double packTempCelsius, boolean isAcCharge,
+            double highCellVoltage, long calibrationAtMs) {
+        return applyCalibrationReplayWithOutcome(
+                energyEnteredBatteryKwh, socDelta, packTempCelsius, isAcCharge,
+                highCellVoltage, calibrationAtMs)
+            == CalibrationReplayOutcome.APPLIED;
+    }
+
+    public CalibrationReplayOutcome applyCalibrationReplayWithOutcome(
+            double energyEnteredBatteryKwh, double socDelta,
+            double packTempCelsius, boolean isAcCharge,
+            double highCellVoltage, long calibrationAtMs) {
+        if (calibrationAtMs <= 0L) {
+            return CalibrationReplayOutcome.PERMANENTLY_REJECTED;
+        }
+        return applyCalibration(
+                energyEnteredBatteryKwh, socDelta, packTempCelsius, isAcCharge,
+                highCellVoltage, calibrationAtMs, true);
+    }
+
+    private CalibrationReplayOutcome applyCalibration(
+            double energyEnteredBatteryKwh, double socDelta,
+            double packTempCelsius, boolean isAcCharge,
+            double highCellVoltage, long calibrationAtMs,
+            boolean requireDurablePersistence) {
         synchronized (autoDetectLock) {
-            if (nominalCapacityKwh <= 0) {
+            if (Double.isNaN(nominalCapacityKwh)
+                    || Double.isInfinite(nominalCapacityKwh)
+                    || nominalCapacityKwh <= 0) {
                 logger.debug("Calibration rejected: nominal capacity not yet detected");
-                return;
+                return CalibrationReplayOutcome.RETRY_LATER;
+            }
+            if (Double.isNaN(energyEnteredBatteryKwh)
+                    || Double.isInfinite(energyEnteredBatteryKwh)
+                    || energyEnteredBatteryKwh <= 0
+                    || Double.isNaN(socDelta)
+                    || Double.isInfinite(socDelta)
+                    || socDelta > 100.0
+                    || Double.isNaN(packTempCelsius)
+                    || Double.isInfinite(packTempCelsius)
+                    || (!Double.isNaN(highCellVoltage)
+                        && Double.isInfinite(highCellVoltage))) {
+                logger.debug("Calibration rejected: non-finite or non-positive payload");
+                return CalibrationReplayOutcome.PERMANENTLY_REJECTED;
             }
             // DC charging is accepted now; cluster-displayed energy/SOC remains accurate enough for SOH math, the AC-only gate was over-cautious.
             if (packTempCelsius < 15.0 || packTempCelsius > 35.0) {
                 logger.debug("Calibration rejected: Pack temperature (" +
                     String.format("%.1f", packTempCelsius) + "°C) outside optimal SOH window (15-35°C).");
-                return;
+                return CalibrationReplayOutcome.PERMANENTLY_REJECTED;
             }
             if (socDelta < 25.0) {
                 logger.debug("Calibration rejected: SOC delta " + String.format("%.1f", socDelta) +
                     "% < 25% minimum for LFP accuracy");
-                return;
+                return CalibrationReplayOutcome.PERMANENTLY_REJECTED;
             }
 
             double scale = displayToAbsoluteSocScale(highCellVoltage);
@@ -1323,24 +2062,84 @@ public class SohEstimator {
             double actualCapacity = energyEnteredBatteryKwh / (absSocDelta / 100.0);
             double calibratedSoh = (actualCapacity / nominalCapacityKwh) * 100.0;
 
+            // KNOWN, BOUNDED, ONE-DIRECTIONAL BIAS. The energy handed in is the best SOC-independent
+            // figure available, which on trims exposing the vehicle's charged-energy counter is that
+            // counter. Whether that counter meters at the pack or at the charger inlet is NOT
+            // established — the parameter name assumes the pack. If it is charger-side, this divides
+            // wall energy by a pack-side SOC delta and OVERSTATES health by the conversion-loss
+            // fraction (~5-15% on AC): a true 82% pack could read ~91%.
+            //
+            // Deliberately NOT "corrected" by a guessed loss constant — that would be the same class
+            // of unfounded fudge factor this subsystem was built to remove, and it would corrupt the
+            // pack-side case where no loss applies. Two things bound the damage instead: the error is
+            // one-directional (it can only flatter the pack, never invent degradation), and the
+            // MAX_SOH clamp below caps the visible result. Recorded here so a future capture that
+            // settles the metering point knows exactly what to revisit.
+
             // Reject genuinely-implausible calibrations; clamp a slightly-high one
             // to the 100% ceiling (a full charge can measure a touch above nominal).
             if (calibratedSoh < MIN_SOH || calibratedSoh > 130.0) {
                 logger.warn("Calibration SOH out of range: " + String.format("%.1f", calibratedSoh) + "% — rejected");
-                return;
+                return CalibrationReplayOutcome.PERMANENTLY_REJECTED;
             }
             if (calibratedSoh > MAX_SOH) calibratedSoh = MAX_SOH;
 
+            if (requireDurablePersistence) {
+                if (calibrationTimestampMs > calibrationAtMs) {
+                    return persistEstimateDurably()
+                        ? CalibrationReplayOutcome.APPLIED
+                        : CalibrationReplayOutcome.RETRY_LATER;
+                }
+                if (calibrationTimestampMs == calibrationAtMs) {
+                    if (!sameCalibration(calibrationSoh, calibratedSoh)) {
+                        return CalibrationReplayOutcome.PERMANENTLY_REJECTED;
+                    }
+                    return persistEstimateDurably()
+                        ? CalibrationReplayOutcome.APPLIED
+                        : CalibrationReplayOutcome.RETRY_LATER;
+                }
+            }
+
             // Anchor only — never blends into currentSoh.
+            double previousSoh = calibrationSoh;
+            long previousTimestampMs = calibrationTimestampMs;
+            boolean calibrationChanged =
+                !sameCalibration(previousSoh, calibratedSoh)
+                    || previousTimestampMs != calibrationAtMs;
             calibrationSoh = calibratedSoh;
-            calibrationTimestampMs = System.currentTimeMillis();
-            persistEstimate();
+            calibrationTimestampMs = calibrationAtMs;
+            PersistenceOutcome persistenceOutcome =
+                persistEstimateWithOutcome();
+            if (requireDurablePersistence
+                    && persistenceOutcome == PersistenceOutcome.FAILED) {
+                calibrationSoh = previousSoh;
+                calibrationTimestampMs = previousTimestampMs;
+                return CalibrationReplayOutcome.RETRY_LATER;
+            }
+            if (calibrationChanged) {
+                estimatorGeneration++;
+            }
+            if (requireDurablePersistence
+                    && persistenceOutcome
+                        == PersistenceOutcome.COMMITTED_DURABILITY_UNCERTAIN) {
+                // The rename is already visible. Keep memory aligned with the
+                // committed destination and let replay retry directory
+                // durability instead of rolling back behind the file.
+                return CalibrationReplayOutcome.RETRY_LATER;
+            }
 
             logger.info("Calibration anchor: " + String.format("%.1f", calibratedSoh) + "% (temp=" +
                 String.format("%.1f", packTempCelsius) + "°C, " +
                 String.format("%.1f", energyEnteredBatteryKwh) + " kWh / " +
                 String.format("%.1f", socDelta) + "% display delta)");
+            return CalibrationReplayOutcome.APPLIED;
         }
+    }
+
+    private static boolean sameCalibration(
+            double calibrationSoh, double candidateSoh) {
+        return Double.doubleToLongBits(calibrationSoh)
+                == Double.doubleToLongBits(candidateSoh);
     }
 
     public void updateFromCalibration(double energyEnteredBatteryKwh, double socDelta) {
@@ -1644,10 +2443,8 @@ public class SohEstimator {
      *
      * <p>Priority order:
      * <ul>
-     *   <li>PHEV: frame_anchor &gt; capacity_ah (when not disabled) &gt;
-     *       live &gt; calibration</li>
-     *   <li>BEV: live &gt; calibration &gt; capacity_ah (final fallback,
-     *       when not disabled)</li>
+     *   <li>PHEV: OEM &gt; frame anchor &gt; calibration &gt; live</li>
+     *   <li>BEV: live &gt; calibration</li>
      * </ul>
      *
      * <p>Returns {@code -1} when no source has a real value yet.
@@ -1658,55 +2455,176 @@ public class SohEstimator {
      * effort, falling back to BEV behaviour when the collector isn't ready.
      */
     public double getDisplaySoh() {
-        // Look up PHEV status *outside* autoDetectLock — BydDataCollector has
-        // its own internal locking and isPhevPublic() can ultimately call back
-        // into other subsystems. Acquiring autoDetectLock around an external
-        // call invites deadlock if those subsystems ever need this estimator.
+        return getCapacitySohSnapshot().getDisplaySoh();
+    }
+
+    /** Immutable nominal/source publication captured under autoDetectLock. */
+    public static final class NominalSnapshot {
+        private final double nominalCapacityKwh;
+        private final String nominalSource;
+        private final long resetModelEpoch;
+
+        private NominalSnapshot(
+                double nominalCapacityKwh,
+                String nominalSource,
+                long resetModelEpoch) {
+            this.nominalCapacityKwh = nominalCapacityKwh;
+            this.nominalSource = nominalSource;
+            this.resetModelEpoch = resetModelEpoch;
+        }
+
+        public double getNominalCapacityKwh() {
+            return nominalCapacityKwh;
+        }
+
+        public String getNominalSource() {
+            return nominalSource;
+        }
+
+        public long getResetModelEpoch() {
+            return resetModelEpoch;
+        }
+    }
+
+    /**
+     * Publish nominal capacity and source from one estimator generation. This
+     * method intentionally performs no drivetrain or collector probing.
+     */
+    public NominalSnapshot getNominalSnapshot() {
+        synchronized (autoDetectLock) {
+            return new NominalSnapshot(
+                nominalCapacityKwh,
+                nominalSource,
+                resetModelEpoch);
+        }
+    }
+
+    /**
+     * Immutable pair used by energy/session consumers that must not combine a
+     * nominal capacity from one estimator generation with display SOH from
+     * another.
+     */
+    public static final class CapacitySohSnapshot {
+        private final double nominalCapacityKwh;
+        private final double displaySoh;
+        private final long estimatorGeneration;
+        private final long resetModelEpoch;
+
+        private CapacitySohSnapshot(
+                double nominalCapacityKwh,
+                double displaySoh,
+                long estimatorGeneration,
+                long resetModelEpoch) {
+            this.nominalCapacityKwh = nominalCapacityKwh;
+            this.displaySoh = displaySoh;
+            this.estimatorGeneration = estimatorGeneration;
+            this.resetModelEpoch = resetModelEpoch;
+        }
+
+        public double getNominalCapacityKwh() {
+            return nominalCapacityKwh;
+        }
+
+        public double getDisplaySoh() {
+            return displaySoh;
+        }
+
+        public long getEstimatorGeneration() {
+            return estimatorGeneration;
+        }
+
+        public long getResetModelEpoch() {
+            return resetModelEpoch;
+        }
+
+        public boolean hasDisplaySoh() {
+            return displaySoh > 0;
+        }
+    }
+
+    /**
+     * Checked operation executed while the estimator generation is held stable.
+     *
+     * <p>The callback must be short and must not call back into vehicle collectors. It exists for
+     * external commits whose final generation validation and durability boundary must be atomic.
+     */
+    @FunctionalInterface
+    public interface GenerationGuardedWork {
+        void run() throws Exception;
+    }
+
+    /**
+     * Run {@code work} under {@code autoDetectLock} only when the expected generation is current.
+     *
+     * @return false without invoking {@code work} when the generation is stale
+     */
+    public boolean runWithEstimatorGenerationGuard(
+            long expectedGeneration, GenerationGuardedWork work) throws Exception {
+        if (work == null) {
+            throw new IllegalArgumentException("generation-guarded work is required");
+        }
+        synchronized (autoDetectLock) {
+            if (estimatorGeneration != expectedGeneration) return false;
+            work.run();
+            return true;
+        }
+    }
+
+    /**
+     * Run one model-lineage transaction while holding the estimator mutation
+     * lock. Callers that also mutate UnifiedConfig must acquire its stable lock
+     * first, matching ConfigBackupService's config -> estimator lock order.
+     */
+    public void runWithEstimatorLock(Runnable work) {
+        if (work == null) {
+            throw new IllegalArgumentException("estimator-locked work is required");
+        }
+        synchronized (autoDetectLock) {
+            work.run();
+        }
+    }
+
+    /**
+     * Capture nominal capacity and the display-SOH selected from the same
+     * lock-held estimator generation.
+     *
+     * <p>Collector lookups happen before {@code autoDetectLock}: collector code
+     * has its own locks and may call into other subsystems. Once those external
+     * hints are local values, all estimator fields and the resulting pair are
+     * read/computed while holding {@code autoDetectLock}.
+     */
+    public CapacitySohSnapshot getCapacitySohSnapshot() {
         boolean phev = false;
         try {
             com.overdrive.app.byd.BydDataCollector col =
                 com.overdrive.app.byd.BydDataCollector.getInstance();
-            if (col != null && col.isInitialized()) phev = col.isPhevPublic();
+            if (col != null && col.isInitialized()) {
+                phev = col.isPhevPublic();
+            }
         } catch (Throwable ignored) {}
+        final double oemSoh = phev ? readOemSohPercent() : -1;
 
-        // Snapshot all six fields under autoDetectLock so the priority chain
-        // sees a mutually consistent view. The fields aren't volatile (writers
-        // hold this same lock), so without acquiring here a cross-thread reader
-        // could see torn or stale values — e.g. currentSoh from before init
-        // while capacityAhSoh has already been written by the auto-detect path.
-        double frameSoh, curSoh, calSoh;
+        return captureCapacitySohSnapshot(phev, oemSoh);
+    }
+
+    private CapacitySohSnapshot captureCapacitySohSnapshot(
+            boolean phev, double oemSoh) {
         synchronized (autoDetectLock) {
-            frameSoh = getFrameAnchorSohLocked();
-            curSoh = currentSoh;
-            calSoh = calibrationSoh;
+            return new CapacitySohSnapshot(
+                nominalCapacityKwh,
+                getDisplaySohLocked(phev, oemSoh),
+                estimatorGeneration,
+                resetModelEpoch);
         }
+    }
 
-        // Keep this chain in sync with the displaySoh logic in getStatus().
-        // PHEV: OEM index > frame_anchor (never fed) > calibration > 100% default.
-        // BEV: live (currentSoh) > calibration > unavailable — unchanged.
-        //
-        // OEM FIRST ON PHEV. Everything else on the PHEV chain is unusable in practice:
-        // the live energy formula is deliberately gated OFF for PHEV (the DM-i BMS
-        // remainKwh is half/stale/frame-ambiguous — see the seed path), the frame anchor
-        // is never fed, and calibration needs a ≥25% charge session at 15-35°C. So PHEV
-        // SOH sat pinned at the 100% seed forever: a healthy pack and a badly degraded
-        // one both read exactly 100.0%, which is worse than a rough number because it
-        // looks like a measurement. The vehicle's OWN health index
-        // (STATISTIC_BATTERY_HEALTHY_INDEX, already a 0..100 percent and already
-        // validated at the collector) is a real reading and needs no capacity/frame
-        // assumptions at all, so on PHEV it outranks the computed chain.
-        //
-        // NOTE: this signal was historically unobservable — the collector read it through
-        // a wrapper Class the HAL doesn't match, so the feature-ID path returned nothing
-        // (see BydDeviceHelper.callGet). With that fixed the value should now arrive; it
-        // is used only when actually present and in range, so a trim that never reports
-        // it degrades to exactly the previous behaviour.
-        double oemSoh = readOemSohPercent();
+    private double getDisplaySohLocked(boolean phev, double oemSoh) {
+        double frameSoh = getFrameAnchorSohLocked();
         if (phev && oemSoh > 0) return oemSoh;
         if (phev && frameSoh > 0) return frameSoh;
-        if (phev && calSoh > 0) return calSoh;
-        if (curSoh > 0) return curSoh;
-        if (calSoh > 0) return calSoh;
+        if (phev && calibrationSoh > 0) return calibrationSoh;
+        if (currentSoh > 0) return currentSoh;
+        if (calibrationSoh > 0) return calibrationSoh;
         return -1;
     }
 
@@ -1752,7 +2670,9 @@ public class SohEstimator {
     }
 
     /** True when {@link #getDisplaySoh()} would return a real value. */
-    public boolean hasDisplaySoh() { return getDisplaySoh() > 0; }
+    public boolean hasDisplaySoh() {
+        return getCapacitySohSnapshot().hasDisplaySoh();
+    }
 
     public double getCalibrationSoh() { return calibrationSoh; }
     public long getCalibrationTimestampMs() { return calibrationTimestampMs; }
@@ -1764,71 +2684,126 @@ public class SohEstimator {
     public boolean hasEstimate() { return currentSoh > 0; }
 
     public double getEstimatedCapacityKwh() {
-        if (nominalCapacityKwh <= 0) return -1;
+        CapacitySohSnapshot snapshot = getCapacitySohSnapshot();
+        if (snapshot.getNominalCapacityKwh() <= 0) return -1;
         // Use the DISPLAYED SOH (capped, anchored) so the estimated-capacity kWh
         // on the health card agrees with the SOH percent shown right beside it —
         // previously this used currentSoh (live median) while the percent used
         // getDisplaySoh, so the card could read "100% / 20.0 kWh of 21.5" (=93%).
-        double s = hasDisplaySoh() ? getDisplaySoh() : currentSoh;
+        double s = snapshot.getDisplaySoh();
         if (s <= 0) return -1;
-        return (s / 100.0) * nominalCapacityKwh;
+        return (s / 100.0) * snapshot.getNominalCapacityKwh();
     }
 
     // ==================== RESET ====================
 
     public void reset() {
+        userNominalConfig.runUnderConfigLock(() -> {
+            ConfigNominalSnapshot configuredUser =
+                readConfiguredUserNominalSnapshot();
+            synchronized (autoDetectLock) {
+                resetLocked(configuredUser);
+            }
+        });
+    }
+
+    /**
+     * Reset from a strict immutable config snapshot. Callers may hold the
+     * estimator lock already, but must have captured this value before taking
+     * it and while holding the stable config lock.
+     */
+    public void resetFromConfigSnapshot(double configuredUserKwh) {
+        double validated = validateConfiguredUserNominal(configuredUserKwh);
         synchronized (autoDetectLock) {
-            double previous = nominalCapacityKwh;
-            currentSoh = -1;
-            calibrationSoh = -1;
-            calibrationTimestampMs = 0;
-            capacityAhSoh = -1;
-            capacityAhTimestampMs = 0;
-            lastCapacityAhReading = -1;
-            capacityAhNameplateMatchCount = 0;
-            capacityAhDisabled = false;
-            capacityAhFirstSocSeen = -1;
-            capacityAhFirstAhSeen = -1;
-            capacityAhSocCoupledCount = 0;
-            nominalCapacityKwh = 0;
-            nominalSource = "unset";
-            liveHistory.clear();
-            saturationStreak = 0;
-            // Peak frame anchor wiped on reset — see clearUserNominal note.
-            peakRemainKwhAtFull = -1;
-            peakRemainKwhSamples = 0;
-            peakRemainKwhTimestampMs = 0;
-            peakMismatchNotified = false;
-            if (previous > 0) {
-                invalidateActiveTripKwhBaseline("SohEstimator.reset()");
-            }
+            resetLocked(ConfigNominalSnapshot.available(validated));
+        }
+    }
 
-            File sohFile = new File(SOH_FILE);
-            if (sohFile.exists()) {
-                sohFile.delete();
-            }
+    private void resetLocked(ConfigNominalSnapshot configuredUser) {
+        long replacementEpoch =
+            nextResetModelEpoch(resetModelEpoch);
+        // Retry a committed-but-unsynced rename before acknowledging the
+        // reset. A normal return therefore means the old estimate cannot
+        // reappear after a crash.
+        PersistenceOutcome tombstoneOutcome =
+            persistClearedStateTombstoneWithDurabilityRetries(
+                "reset SOH estimator", replacementEpoch);
+        if (!tombstoneOutcome.wasCommitted()) {
+            throw new IllegalStateException(
+                "Could not commit reset SOH estimator tombstone");
+        }
 
-            // Restore the user's persisted nominal from UnifiedConfig. The
-            // properties file got wiped above, but UnifiedConfig holds the
-            // user's manual override — autoDetectCarModel checks the
-            // in-memory nominalSource field, so without re-reading here it
-            // falls through to heuristics and produces a different (often
-            // wrong) capacity even though the user explicitly set one.
-            try {
-                JSONObject vehicle = UnifiedConfigManager.getVehicle();
-                double userKwh = vehicle.optDouble("nominalKwh", 0);
-                // PHEV-aware floor on restore — see note in init().
-                if (userKwh >= MIN_PLAUSIBLE_KWH_PHEV && userKwh <= MAX_PLAUSIBLE_KWH) {
-                    nominalCapacityKwh = userKwh;
-                    nominalSource = "user";
-                    logger.info("SOH estimation RESET — local data cleared, user nominal " +
-                        userKwh + " kWh restored from UnifiedConfig.");
-                    return;
-                }
-            } catch (Throwable t) {
-                logger.debug("Reset: UnifiedConfig user nominal read failed: " + t.getMessage());
-            }
+        double previous = nominalCapacityKwh;
+        clearEstimateStateLocked(true);
+        nominalCapacityKwh = 0;
+        nominalSource = "unset";
+        resetModelEpoch = replacementEpoch;
+        estimatorGeneration++;
+        if (previous > 0) {
+            invalidateActiveTripKwhBaseline("SohEstimator.reset()");
+        }
+
+        if (configuredUser.available && configuredUser.value > 0) {
+            nominalCapacityKwh = configuredUser.value;
+            nominalSource = "user";
+            estimatorGeneration++;
+        }
+        initializationState = configuredUser.available
+            ? InitializationState.READY : InitializationState.DEFERRED;
+
+        if (tombstoneOutcome != PersistenceOutcome.DURABLE) {
+            initializationState = InitializationState.DEFERRED;
+            throw new IllegalStateException(
+                "Reset SOH estimator tombstone was committed but not durable");
+        }
+
+        if ("user".equals(nominalSource)) {
+            logger.info("SOH estimation RESET — local data cleared, user nominal " +
+                nominalCapacityKwh + " kWh restored from UnifiedConfig.");
+        } else {
             logger.info("SOH estimation RESET — local data cleared (no user nominal set).");
+        }
+    }
+
+    private ConfigNominalSnapshot readConfiguredUserNominalSnapshot() {
+        try {
+            return ConfigNominalSnapshot.available(
+                validateConfiguredUserNominal(userNominalConfig.read()));
+        } catch (Throwable t) {
+            logger.debug("Reset: UnifiedConfig user nominal read failed: "
+                + t.getMessage());
+            return ConfigNominalSnapshot.unavailable();
+        }
+    }
+
+    private static double validateConfiguredUserNominal(double configuredUserKwh) {
+        if (Double.isNaN(configuredUserKwh)
+                || Double.isInfinite(configuredUserKwh)
+                || configuredUserKwh < 0
+                || configuredUserKwh > MAX_PLAUSIBLE_KWH
+                || (configuredUserKwh > 0
+                    && configuredUserKwh < MIN_PLAUSIBLE_KWH_PHEV)) {
+            throw new IllegalStateException(
+                "UnifiedConfig nominalKwh is invalid: " + configuredUserKwh);
+        }
+        return configuredUserKwh;
+    }
+
+    private static final class ConfigNominalSnapshot {
+        final boolean available;
+        final double value;
+
+        private ConfigNominalSnapshot(boolean available, double value) {
+            this.available = available;
+            this.value = value;
+        }
+
+        static ConfigNominalSnapshot available(double value) {
+            return new ConfigNominalSnapshot(true, value);
+        }
+
+        static ConfigNominalSnapshot unavailable() {
+            return new ConfigNominalSnapshot(false, 0);
         }
     }
 
@@ -1836,23 +2811,38 @@ public class SohEstimator {
 
     public org.json.JSONObject getStatus() {
         org.json.JSONObject status = new org.json.JSONObject();
-        // Read the OEM health index BEFORE taking autoDetectLock below. It reaches into
-        // BydDataCollector, which has its own locking and can call back into other
-        // subsystems — doing that while holding autoDetectLock is the deadlock pattern this
-        // class warns about in getDisplaySoh(). Hoisted here so the value is just a local by
-        // the time the locked section needs it.
-        final double oemSohSnapshot = readOemSohPercent();
+        boolean phev = false;
         try {
-            status.put("soh", currentSoh > 0 ? Math.round(currentSoh * 10) / 10.0 : -1);
-            status.put("nominalCapacityKwh", nominalCapacityKwh);
-            double estCap = getEstimatedCapacityKwh();
-            status.put("estimatedCapacityKwh", estCap > 0 ? Math.round(estCap * 10) / 10.0 : -1);
-            status.put("hasEstimate", hasEstimate());
-            status.put("nominalSource", nominalSource);
+            com.overdrive.app.byd.BydDataCollector col =
+                com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (col != null && col.isInitialized()) {
+                phev = col.isPhevPublic();
+            }
+        } catch (Throwable ignored) {}
+        final double oemSoh = phev ? readOemSohPercent() : -1;
+
+        String modelId = null;
+        try {
+            modelId = UnifiedConfigManager.getSelectedVehicleModelId();
+        } catch (Throwable ignored) {}
+
+        final StatusSnapshot snapshot =
+            captureStatusSnapshot(phev, oemSoh);
+        try {
+            status.put("soh", roundedOrUnavailable(snapshot.currentSoh));
+            status.put(
+                "nominalCapacityKwh", snapshot.nominalCapacityKwh);
+            status.put(
+                "estimatedCapacityKwh",
+                roundedOrUnavailable(snapshot.estimatedCapacityKwh));
+            status.put("hasEstimate", snapshot.currentSoh > 0);
+            status.put("nominalSource", snapshot.nominalSource);
 
             org.json.JSONObject calibration = new org.json.JSONObject();
-            calibration.put("soh", calibrationSoh > 0 ? Math.round(calibrationSoh * 10) / 10.0 : -1);
-            calibration.put("timestampMs", calibrationTimestampMs);
+            calibration.put(
+                "soh", roundedOrUnavailable(snapshot.calibrationSoh));
+            calibration.put(
+                "timestampMs", snapshot.calibrationTimestampMs);
             status.put("calibration", calibration);
 
             // Capacity-Ah anchor — RETIRED as a SOH source (getBatteryCapacity is
@@ -1872,71 +2862,68 @@ public class SohEstimator {
             // whether the user's nominal entry matches the BMS's frame
             // (~1.0 = match) or differs (~0.6 on Tang DM-i nameplate vs usable).
             org.json.JSONObject frameAnchor = new org.json.JSONObject();
-            double frameSoh = getFrameAnchorSoh();
-            frameAnchor.put("soh", frameSoh > 0 ? Math.round(frameSoh * 10) / 10.0 : -1);
-            frameAnchor.put("peakKwh", peakRemainKwhAtFull > 0
-                ? Math.round(peakRemainKwhAtFull * 100) / 100.0 : -1);
-            frameAnchor.put("samples", peakRemainKwhSamples);
+            frameAnchor.put(
+                "soh", roundedOrUnavailable(snapshot.frameSoh));
+            frameAnchor.put(
+                "peakKwh",
+                snapshot.peakRemainKwhAtFull > 0
+                    ? Math.round(snapshot.peakRemainKwhAtFull * 100) / 100.0
+                    : -1);
+            frameAnchor.put("samples", snapshot.peakRemainKwhSamples);
             frameAnchor.put("requiredSamples", PEAK_REMAIN_KWH_REQUIRED_SAMPLES);
-            frameAnchor.put("timestampMs", peakRemainKwhTimestampMs);
-            double frameRatio = (peakRemainKwhAtFull > 0 && nominalCapacityKwh > 0)
-                ? peakRemainKwhAtFull / nominalCapacityKwh : -1;
-            frameAnchor.put("ratio", frameRatio > 0 ? Math.round(frameRatio * 100) / 100.0 : -1);
+            frameAnchor.put(
+                "timestampMs", snapshot.peakRemainKwhTimestampMs);
+            frameAnchor.put(
+                "ratio",
+                snapshot.frameRatio > 0
+                    ? Math.round(snapshot.frameRatio * 100) / 100.0
+                    : -1);
             // Frame mismatch threshold: < 0.85 means user nominal is ~17%+
             // larger than BMS's full-charge reading. The most common cause is
             // user-entered nameplate (e.g. 21.5 kWh Tang DM-i) vs BMS-reported
             // usable (~12.9 kWh). Set when the anchor has stabilized.
             frameAnchor.put("mismatch",
-                frameRatio > 0 && frameRatio < 0.85
-                    && peakRemainKwhSamples >= PEAK_REMAIN_KWH_REQUIRED_SAMPLES);
+                snapshot.frameRatio > 0 && snapshot.frameRatio < 0.85
+                    && snapshot.peakRemainKwhSamples
+                        >= PEAK_REMAIN_KWH_REQUIRED_SAMPLES);
             status.put("frameAnchor", frameAnchor);
 
-            // Display fallback chain.
-            //
-            // BEV: live > calibration > unavailable. frame_anchor is never
-            // computed for BEV (early-returns on !isPhev).
-            //
-            // PHEV: frame_anchor > calibration > live(=100% default) > unavailable.
-            // The capacity-Ah anchor has been retired as a PHEV SOH source (see
-            // the displaySoh block below and SocHistoryDatabase feed site). The
-            // frame anchor is retained in the chain but is currently never fed
-            // (no live caller of observePeakAtFullCharge), so in practice PHEV
-            // resolves to calibration when a real charge session exists, else the
-            // honest 100% seeded default.
-            boolean phev = false;
-            try {
-                com.overdrive.app.byd.BydDataCollector col =
-                    com.overdrive.app.byd.BydDataCollector.getInstance();
-                if (col != null && col.isInitialized()) phev = col.isPhevPublic();
-            } catch (Throwable ignored) {}
+            status.put(
+                "displaySoh",
+                roundedOrUnavailable(snapshot.displaySoh));
+            status.put("displaySource", snapshot.displaySource);
+            // Surface the OEM index itself (-1 when the trim doesn't report it) so
+            // /api/performance/soh answers "is there a real vehicle-reported SOH here?"
+            // without needing a logcat capture. This is the value the PHEV chain prefers.
+            status.put("oemSoh", roundedOrUnavailable(snapshot.oemSoh));
 
-            // Keep this in sync with getDisplaySoh().
-            // PHEV: frame_anchor (retained, currently never fed) > calibration
-            //   > 100% default (currentSoh, seeded and never lowered by the
-            //   gated-off live formula). The capacity-Ah anchor is retired: on
-            //   DM-i firmware getBatteryCapacity() is a STATIC nameplate Ah, not
-            //   a live coulomb count, so it reported phantom degradation (e.g.
-            //   76% on a healthy ~7k-km pack) and no cell-count fix can make a
-            //   constant track health. A real ≥25% charge-session calibration is
-            //   the only trusted PHEV signal below 100%.
-            // BEV: live > calibration > unavailable — unchanged.
+            if (modelId != null && !modelId.isEmpty()) {
+                status.put("modelId", modelId);
+            } else {
+                status.put("modelId", JSONObject.NULL);
+            }
+            if (snapshot.lastUpdatedMs > 0) {
+                status.put("lastUpdated", snapshot.lastUpdatedMs);
+            }
+        } catch (Exception e) {
+            logger.error("Failed to build SOH status: " + e.getMessage());
+        }
+        return status;
+    }
+
+    private StatusSnapshot captureStatusSnapshot(
+            boolean phev, double oemSoh) {
+        synchronized (autoDetectLock) {
+            double frameSoh = getFrameAnchorSohLocked();
             double displaySoh;
             String displaySource;
-            // OEM index first on PHEV — kept in sync with getDisplaySoh(). See that method
-            // for why: every capacity-derived PHEV route is gated off or unreachable, so the
-            // chain otherwise pins at the 100% seed and a degraded pack reads as healthy.
-            // Snapshot taken before the lock (see top of method).
-            double oemSoh = oemSohSnapshot;
-            boolean preferOem = phev && oemSoh > 0;
-            boolean preferFrameAnchor = phev && frameSoh > 0;
-            boolean preferCalibration = phev && calibrationSoh > 0;
-            if (preferOem) {
+            if (phev && oemSoh > 0) {
                 displaySoh = oemSoh;
                 displaySource = "oem";
-            } else if (preferFrameAnchor) {
+            } else if (phev && frameSoh > 0) {
                 displaySoh = frameSoh;
                 displaySource = "frame_anchor";
-            } else if (preferCalibration) {
+            } else if (phev && calibrationSoh > 0) {
                 displaySoh = calibrationSoh;
                 displaySource = "calibration";
             } else if (currentSoh > 0) {
@@ -1949,83 +2936,362 @@ public class SohEstimator {
                 displaySoh = -1;
                 displaySource = "unavailable";
             }
-            status.put("displaySoh", displaySoh > 0 ? Math.round(displaySoh * 10) / 10.0 : -1);
-            status.put("displaySource", displaySource);
-            // Surface the OEM index itself (-1 when the trim doesn't report it) so
-            // /api/performance/soh answers "is there a real vehicle-reported SOH here?"
-            // without needing a logcat capture. This is the value the PHEV chain prefers.
-            status.put("oemSoh", oemSoh > 0 ? Math.round(oemSoh * 10) / 10.0 : -1);
 
-            // Read fresh — model can change without touching SOH state.
-            try {
-                String modelId = UnifiedConfigManager.getSelectedVehicleModelId();
-                if (modelId != null && !modelId.isEmpty()) {
-                    status.put("modelId", modelId);
-                } else {
-                    status.put("modelId", JSONObject.NULL);
-                }
-            } catch (Throwable t) {
-                status.put("modelId", JSONObject.NULL);
-            }
-
-            File sohFile = new File(SOH_FILE);
-            if (sohFile.exists()) {
-                Properties props = new Properties();
-                try (FileInputStream fis = new FileInputStream(sohFile)) {
-                    props.load(fis);
-                }
-                String lastUpdated = props.getProperty(PROP_LAST_UPDATED);
-                if (lastUpdated != null) {
-                    status.put("lastUpdated", Long.parseLong(lastUpdated));
-                }
-            }
-        } catch (Exception e) {
-            logger.error("Failed to build SOH status: " + e.getMessage());
+            double frameRatio =
+                peakRemainKwhAtFull > 0 && nominalCapacityKwh > 0
+                    ? peakRemainKwhAtFull / nominalCapacityKwh
+                    : -1;
+            double estimatedCapacityKwh =
+                displaySoh > 0 && nominalCapacityKwh > 0
+                    ? displaySoh / 100.0 * nominalCapacityKwh
+                    : -1;
+            return new StatusSnapshot(
+                currentSoh,
+                nominalCapacityKwh,
+                nominalSource,
+                estimatedCapacityKwh,
+                calibrationSoh,
+                calibrationTimestampMs,
+                peakRemainKwhAtFull,
+                peakRemainKwhSamples,
+                peakRemainKwhTimestampMs,
+                frameSoh,
+                frameRatio,
+                displaySoh,
+                displaySource,
+                oemSoh,
+                readPersistedLastUpdatedLocked());
         }
-        return status;
+    }
+
+    private long readPersistedLastUpdatedLocked() {
+        if (!sohFile.exists()) return 0;
+        try {
+            Properties props = new Properties();
+            try (FileInputStream fis = new FileInputStream(sohFile)) {
+                props.load(fis);
+            }
+            return Long.parseLong(
+                props.getProperty(PROP_LAST_UPDATED, "0"));
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    private static double roundedOrUnavailable(double value) {
+        return value > 0 ? Math.round(value * 10) / 10.0 : -1;
+    }
+
+    private static final class StatusSnapshot {
+        final double currentSoh;
+        final double nominalCapacityKwh;
+        final String nominalSource;
+        final double estimatedCapacityKwh;
+        final double calibrationSoh;
+        final long calibrationTimestampMs;
+        final double peakRemainKwhAtFull;
+        final int peakRemainKwhSamples;
+        final long peakRemainKwhTimestampMs;
+        final double frameSoh;
+        final double frameRatio;
+        final double displaySoh;
+        final String displaySource;
+        final double oemSoh;
+        final long lastUpdatedMs;
+
+        StatusSnapshot(
+                double currentSoh,
+                double nominalCapacityKwh,
+                String nominalSource,
+                double estimatedCapacityKwh,
+                double calibrationSoh,
+                long calibrationTimestampMs,
+                double peakRemainKwhAtFull,
+                int peakRemainKwhSamples,
+                long peakRemainKwhTimestampMs,
+                double frameSoh,
+                double frameRatio,
+                double displaySoh,
+                String displaySource,
+                double oemSoh,
+                long lastUpdatedMs) {
+            this.currentSoh = currentSoh;
+            this.nominalCapacityKwh = nominalCapacityKwh;
+            this.nominalSource = nominalSource;
+            this.estimatedCapacityKwh = estimatedCapacityKwh;
+            this.calibrationSoh = calibrationSoh;
+            this.calibrationTimestampMs = calibrationTimestampMs;
+            this.peakRemainKwhAtFull = peakRemainKwhAtFull;
+            this.peakRemainKwhSamples = peakRemainKwhSamples;
+            this.peakRemainKwhTimestampMs = peakRemainKwhTimestampMs;
+            this.frameSoh = frameSoh;
+            this.frameRatio = frameRatio;
+            this.displaySoh = displaySoh;
+            this.displaySource = displaySource;
+            this.oemSoh = oemSoh;
+            this.lastUpdatedMs = lastUpdatedMs;
+        }
     }
 
     // ==================== PERSISTENCE ====================
 
+    private static Properties newPersistenceProperties(
+            boolean stateCleared, long resetModelEpoch) {
+        return newPersistenceProperties(
+            stateCleared, resetModelEpoch, System.currentTimeMillis());
+    }
+
+    private static Properties newPersistenceProperties(
+            boolean stateCleared, long resetModelEpoch, long lastUpdatedMs) {
+        if (resetModelEpoch <= 0) {
+            throw new IllegalStateException(
+                "A positive reset/model epoch is required for persistence");
+        }
+        Properties props = new Properties();
+        props.setProperty(
+            PROP_SCHEMA_VERSION, String.valueOf(CURRENT_SCHEMA_VERSION));
+        props.setProperty(
+            PROP_LAST_UPDATED,
+            String.valueOf(lastUpdatedMs > 0
+                ? lastUpdatedMs : System.currentTimeMillis()));
+        props.setProperty(
+            PROP_RESET_MODEL_EPOCH,
+            String.valueOf(resetModelEpoch));
+        if (stateCleared) {
+            props.setProperty(PROP_STATE_CLEARED, "true");
+        }
+        return props;
+    }
+
+    private static Properties nominalOnlyProperties(
+            RestoredState restored, boolean stateCleared) {
+        Properties properties =
+            newPersistenceProperties(
+                stateCleared,
+                restored.resetModelEpoch,
+                restored.persistedLastUpdatedMs);
+        if (restored.nominalCapacityKwh > 0) {
+            putNominalIdentity(
+                properties,
+                restored.nominalCapacityKwh,
+                restored.nominalSource);
+        }
+        return properties;
+    }
+
+    private static Properties completePersistenceProperties(
+            RestoredState restored, boolean stateCleared) {
+        Properties props =
+            nominalOnlyProperties(restored, stateCleared);
+        if (restored.currentSoh > 0 && restored.currentSoh <= 110) {
+            props.setProperty(
+                PROP_SOH_PERCENT,
+                String.valueOf(restored.currentSoh));
+        }
+        if (restored.calibrationSoh > 0) {
+            props.setProperty(
+                PROP_CALIBRATION_SOH,
+                String.valueOf(restored.calibrationSoh));
+        }
+        if (restored.calibrationTimestampMs > 0) {
+            props.setProperty(
+                PROP_CALIBRATION_TIMESTAMP,
+                String.valueOf(restored.calibrationTimestampMs));
+        }
+        if (restored.capacityAhSoh > 0) {
+            props.setProperty(
+                PROP_CAPACITY_AH_SOH,
+                String.valueOf(restored.capacityAhSoh));
+        }
+        if (restored.capacityAhTimestampMs > 0) {
+            props.setProperty(
+                PROP_CAPACITY_AH_TIMESTAMP,
+                String.valueOf(restored.capacityAhTimestampMs));
+        }
+        if (restored.capacityAhDisabled) {
+            props.setProperty(PROP_CAPACITY_AH_DISABLED, "true");
+        }
+        if (!restored.liveHistory.isEmpty()) {
+            StringBuilder history = new StringBuilder();
+            for (Double value : restored.liveHistory) {
+                if (history.length() > 0) history.append(',');
+                history.append(value);
+            }
+            props.setProperty(PROP_LIVE_HISTORY, history.toString());
+        }
+        if (restored.peakRemainKwhAtFull > 0) {
+            props.setProperty(
+                PROP_PEAK_REMAIN_KWH,
+                String.valueOf(restored.peakRemainKwhAtFull));
+            props.setProperty(
+                PROP_PEAK_REMAIN_KWH_SAMPLES,
+                String.valueOf(restored.peakRemainKwhSamples));
+            props.setProperty(
+                PROP_PEAK_REMAIN_KWH_TS,
+                String.valueOf(restored.peakRemainKwhTimestampMs));
+        }
+        if (restored.peakMismatchNotified) {
+            props.setProperty(PROP_PEAK_REMAIN_KWH_NOTIFIED, "true");
+        }
+        return props;
+    }
+
+    private RestoredState captureRestoredStateLocked() {
+        RestoredState state = new RestoredState();
+        state.nominalCapacityKwh = nominalCapacityKwh;
+        state.nominalSource = nominalSource;
+        state.resetModelEpoch = resetModelEpoch;
+        state.currentSoh = currentSoh;
+        state.calibrationSoh = calibrationSoh;
+        state.calibrationTimestampMs = calibrationTimestampMs;
+        state.capacityAhSoh = capacityAhSoh;
+        state.capacityAhTimestampMs = capacityAhTimestampMs;
+        state.capacityAhDisabled = capacityAhDisabled;
+        state.liveHistory.addAll(liveHistory);
+        state.peakRemainKwhAtFull = peakRemainKwhAtFull;
+        state.peakRemainKwhSamples = peakRemainKwhSamples;
+        state.peakRemainKwhTimestampMs = peakRemainKwhTimestampMs;
+        state.peakMismatchNotified = peakMismatchNotified;
+        return state;
+    }
+
+    private static void putNominalIdentity(
+            Properties properties, double nominalKwh, String source) {
+        properties.setProperty(
+            PROP_NOMINAL_CAPACITY, String.valueOf(nominalKwh));
+        properties.setProperty(PROP_NOMINAL_SOURCE, source);
+        properties.setProperty(
+            PROP_NOMINAL_IDENTITY,
+            nominalIdentity(nominalKwh, source));
+    }
+
     /**
-     * Write a minimal properties file with just schema_version + last_updated.
-     * Used by the migration path so the schema bump persists even when no
-     * SOH/calibration/nominal data survived the migration.
+     * Atomically replace every persisted estimate with a minimal clear marker.
+     * Success includes syncing the replacement file and its parent directory.
+     */
+    private PersistenceOutcome persistClearedStateTombstone()
+            throws IOException {
+        return persistClearedStateTombstone(resetModelEpoch);
+    }
+
+    private PersistenceOutcome persistClearedStateTombstone(
+            long replacementEpoch) throws IOException {
+        synchronized (autoDetectLock) {
+            return publishProperties(
+                newPersistenceProperties(true, replacementEpoch));
+        }
+    }
+
+    private PersistenceOutcome
+            persistClearedStateTombstoneWithDurabilityRetries(
+                    String operation) {
+        return persistClearedStateTombstoneWithDurabilityRetries(
+            operation, resetModelEpoch);
+    }
+
+    private PersistenceOutcome
+            persistClearedStateTombstoneWithDurabilityRetries(
+                    String operation, long replacementEpoch) {
+        Properties tombstone =
+            newPersistenceProperties(true, replacementEpoch);
+        try {
+            return publishPropertiesWithDurabilityRetries(
+                tombstone, operation);
+        } catch (IOException impossible) {
+            return PersistenceOutcome.FAILED;
+        }
+    }
+
+    private PersistenceOutcome publishPropertiesWithDurabilityRetries(
+            Properties properties, String operation) throws IOException {
+        boolean committed = false;
+        String lastFailure = null;
+        for (int attempt = 1;
+                attempt <= CLEAR_TOMBSTONE_DURABILITY_ATTEMPTS;
+                attempt++) {
+            try {
+                PersistenceOutcome outcome =
+                    publishProperties(properties);
+                if (outcome == PersistenceOutcome.DURABLE) {
+                    return outcome;
+                }
+                committed = true;
+                lastFailure = "parent directory sync remained uncertain";
+            } catch (IOException e) {
+                lastFailure = e.getMessage();
+            }
+
+            if (attempt < CLEAR_TOMBSTONE_DURABILITY_ATTEMPTS) {
+                logger.warn("SOH " + operation + " durability "
+                    + "attempt " + attempt + " failed; retrying");
+            }
+        }
+
+        logger.error("Failed to durably " + operation + " after "
+            + CLEAR_TOMBSTONE_DURABILITY_ATTEMPTS + " attempts"
+            + (lastFailure == null ? "" : ": " + lastFailure));
+        return committed
+            ? PersistenceOutcome.COMMITTED_DURABILITY_UNCERTAIN
+            : PersistenceOutcome.FAILED;
+    }
+
+    private void persistClearedStateTombstoneOrThrow(String operation) {
+        PersistenceOutcome outcome =
+            persistClearedStateTombstoneWithDurabilityRetries(operation);
+        if (outcome != PersistenceOutcome.DURABLE) {
+            throw new IllegalStateException(
+                "Could not durably " + operation
+                    + (outcome.wasCommitted()
+                        ? " after committing the tombstone"
+                        : ""));
+        }
+    }
+
+    /**
+     * Write a fresh schema-reset snapshot, preserving only a validated nominal
+     * capacity when migration retained one.
      */
     private void writeSchemaStamp() {
-        try {
-            Properties props = new Properties();
-            File f = new File(SOH_FILE);
-            if (f.exists()) {
-                try (FileInputStream fis = new FileInputStream(f)) { props.load(fis); }
+        synchronized (autoDetectLock) {
+            try {
+                // Start fresh rather than loading and pruning the legacy file.
+                // Unknown/stale keys must not survive a schema reset and later
+                // become meaningful again.
+                long replacementEpoch = resetModelEpoch > 0
+                    ? nextResetModelEpoch(resetModelEpoch)
+                    : initialResetModelEpoch();
+                RestoredState replacement = new RestoredState();
+                replacement.nominalCapacityKwh = nominalCapacityKwh;
+                replacement.nominalSource = nominalSource;
+                replacement.resetModelEpoch = replacementEpoch;
+                Properties props =
+                    nominalOnlyProperties(replacement, true);
+                if (nominalCapacityKwh > 0) {
+                    putNominalIdentity(
+                        props, nominalCapacityKwh, nominalSource);
+                }
+                PersistenceOutcome outcome =
+                    publishPropertiesWithDurabilityRetries(
+                        props, "stamp SOH schema");
+                if (outcome.wasCommitted()) {
+                    resetModelEpoch = replacementEpoch;
+                }
+            } catch (Exception e) {
+                logger.error("Failed to stamp schema version: " + e.getMessage());
             }
-            props.setProperty(PROP_SCHEMA_VERSION, String.valueOf(CURRENT_SCHEMA_VERSION));
-            props.setProperty(PROP_LAST_UPDATED, String.valueOf(System.currentTimeMillis()));
-            // Drop legacy keys that no longer have meaning under v2 — currentSoh
-            // and calibration were already cleared in memory and persistEstimate
-            // would simply omit them on its next call, but on this path we may
-            // never get to a normal persistEstimate before another reboot.
-            props.remove(PROP_SOH_PERCENT);
-            props.remove(PROP_CALIBRATION_SOH);
-            props.remove(PROP_CALIBRATION_TIMESTAMP);
-            props.remove(PROP_CAPACITY_AH_SOH);
-            props.remove(PROP_CAPACITY_AH_TIMESTAMP);
-            props.remove(PROP_CAPACITY_AH_DISABLED);
-            props.remove(PROP_LIVE_HISTORY);
-            if (nominalCapacityKwh > 0) {
-                props.setProperty(PROP_NOMINAL_CAPACITY, String.valueOf(nominalCapacityKwh));
-                props.setProperty(PROP_NOMINAL_SOURCE, nominalSource);
-            }
-            try (FileOutputStream fos = new FileOutputStream(SOH_FILE)) {
-                props.store(fos, "ABRP SOH Estimate");
-            }
-            new File(SOH_FILE).setReadable(true, false);
-        } catch (Exception e) {
-            logger.error("Failed to stamp schema version: " + e.getMessage());
         }
     }
 
     private void persistEstimate() {
+        persistEstimateWithOutcome();
+    }
+
+    private boolean persistEstimateDurably() {
+        return persistEstimateWithOutcome()
+            == PersistenceOutcome.DURABLE;
+    }
+
+    private PersistenceOutcome persistEstimateWithOutcome() {
         synchronized (autoDetectLock) {
             if (currentSoh <= 0 && nominalCapacityKwh <= 0
                     && calibrationSoh <= 0 && calibrationTimestampMs <= 0
@@ -2033,60 +3299,130 @@ public class SohEstimator {
                     && !capacityAhDisabled
                     && peakRemainKwhAtFull <= 0 && peakRemainKwhSamples == 0
                     && !peakMismatchNotified) {
-                return;
+                return PersistenceOutcome.FAILED;
             }
             try {
-                Properties props = new Properties();
-                props.setProperty(PROP_SCHEMA_VERSION, String.valueOf(CURRENT_SCHEMA_VERSION));
-                if (currentSoh > 0 && currentSoh <= 110) {
-                    props.setProperty(PROP_SOH_PERCENT, String.valueOf(currentSoh));
-                }
-                props.setProperty(PROP_LAST_UPDATED, String.valueOf(System.currentTimeMillis()));
-                if (nominalCapacityKwh > 0) {
-                    props.setProperty(PROP_NOMINAL_CAPACITY, String.valueOf(nominalCapacityKwh));
-                    props.setProperty(PROP_NOMINAL_SOURCE, nominalSource);
-                }
-                if (calibrationSoh > 0) {
-                    props.setProperty(PROP_CALIBRATION_SOH, String.valueOf(calibrationSoh));
-                }
-                if (calibrationTimestampMs > 0) {
-                    props.setProperty(PROP_CALIBRATION_TIMESTAMP, String.valueOf(calibrationTimestampMs));
-                }
-                if (capacityAhSoh > 0) {
-                    props.setProperty(PROP_CAPACITY_AH_SOH, String.valueOf(capacityAhSoh));
-                }
-                if (capacityAhTimestampMs > 0) {
-                    props.setProperty(PROP_CAPACITY_AH_TIMESTAMP, String.valueOf(capacityAhTimestampMs));
-                }
-                if (capacityAhDisabled) {
-                    props.setProperty(PROP_CAPACITY_AH_DISABLED, "true");
-                }
-                if (!liveHistory.isEmpty()) {
-                    StringBuilder sb = new StringBuilder();
-                    boolean first = true;
-                    for (Double v : liveHistory) {
-                        if (!first) sb.append(',');
-                        sb.append(v);
-                        first = false;
-                    }
-                    props.setProperty(PROP_LIVE_HISTORY, sb.toString());
-                }
-                if (peakRemainKwhAtFull > 0) {
-                    props.setProperty(PROP_PEAK_REMAIN_KWH, String.valueOf(peakRemainKwhAtFull));
-                    props.setProperty(PROP_PEAK_REMAIN_KWH_SAMPLES, String.valueOf(peakRemainKwhSamples));
-                    props.setProperty(PROP_PEAK_REMAIN_KWH_TS, String.valueOf(peakRemainKwhTimestampMs));
-                }
-                if (peakMismatchNotified) {
-                    props.setProperty(PROP_PEAK_REMAIN_KWH_NOTIFIED, "true");
-                }
+                Properties props =
+                    completePersistenceProperties(
+                        captureRestoredStateLocked(), false);
 
-                try (FileOutputStream fos = new FileOutputStream(SOH_FILE)) {
-                    props.store(fos, "ABRP SOH Estimate");
+                PersistenceOutcome outcome =
+                    publishProperties(props);
+                if (outcome
+                        == PersistenceOutcome.COMMITTED_DURABILITY_UNCERTAIN) {
+                    logger.warn("SOH snapshot rename committed but parent "
+                        + "directory sync failed; retaining committed memory "
+                        + "and retrying on the next persistence event");
                 }
-                new File(SOH_FILE).setReadable(true, false);
+                return outcome;
             } catch (Exception e) {
                 logger.error("Failed to persist SOH: " + e.getMessage());
+                return PersistenceOutcome.FAILED;
             }
+        }
+    }
+
+    private PersistenceOutcome publishProperties(Properties properties)
+            throws IOException {
+        PersistenceOutcome outcome =
+            persistenceWriter.write(sohFile, properties);
+        if (outcome == null || outcome == PersistenceOutcome.FAILED) {
+            throw new IOException("SOH properties were not committed");
+        }
+        return outcome;
+    }
+
+    /**
+     * Publish one complete properties snapshot. The temp file is synced before
+     * rename and the parent directory is synced afterwards, so success means
+     * both file contents and the atomic name replacement were requested durable.
+     */
+    static void persistPropertiesAtomically(File destination, Properties props)
+            throws IOException {
+        PersistenceOutcome outcome =
+            persistPropertiesWithOutcome(destination, props);
+        if (outcome
+                == PersistenceOutcome.COMMITTED_DURABILITY_UNCERTAIN) {
+            throw new IOException(
+                "SOH properties committed, but directory sync failed");
+        }
+    }
+
+    private static PersistenceOutcome persistPropertiesWithOutcome(
+            File destination, Properties props) throws IOException {
+        File parent = destination.getParentFile();
+        if (parent == null || !parent.isDirectory()) {
+            throw new IOException("SOH persistence directory is unavailable");
+        }
+
+        Set<PosixFilePermission> retainedPermissions =
+                readRetainedPermissions(destination);
+        File temporary = File.createTempFile(
+                destination.getName() + ".", ".tmp", parent);
+        try {
+            applyRetainedPermissions(temporary, retainedPermissions);
+            try (FileOutputStream output = new FileOutputStream(temporary, false)) {
+                props.store(output, "ABRP SOH Estimate");
+                output.flush();
+                output.getFD().sync();
+            }
+
+            Files.move(
+                    temporary.toPath(),
+                    destination.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+            try {
+                forceDirectorySync(parent);
+                return PersistenceOutcome.DURABLE;
+            } catch (IOException directorySyncFailure) {
+                // Files.move completed successfully, so the destination now
+                // contains this snapshot even though crash durability of the
+                // directory entry is uncertain. Report that state explicitly;
+                // callers must retain matching memory and retry later.
+                return PersistenceOutcome.COMMITTED_DURABILITY_UNCERTAIN;
+            }
+        } finally {
+            try {
+                Files.deleteIfExists(temporary.toPath());
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    private static Set<PosixFilePermission> readRetainedPermissions(
+            File destination) throws IOException {
+        if (!destination.exists()) return null;
+        try {
+            Set<PosixFilePermission> retained =
+                    EnumSet.noneOf(PosixFilePermission.class);
+            retained.addAll(Files.getPosixFilePermissions(
+                    destination.toPath(), LinkOption.NOFOLLOW_LINKS));
+            return retained;
+        } catch (UnsupportedOperationException unsupported) {
+            return null;
+        }
+    }
+
+    private static void applyRetainedPermissions(
+            File temporary, Set<PosixFilePermission> retained)
+            throws IOException {
+        if (retained != null) {
+            retained.add(PosixFilePermission.OWNER_READ);
+            retained.add(PosixFilePermission.GROUP_READ);
+            retained.add(PosixFilePermission.OTHERS_READ);
+            Files.setPosixFilePermissions(temporary.toPath(), retained);
+            return;
+        }
+        if (!temporary.setReadable(true, false)) {
+            throw new IOException("Could not retain SOH file readability");
+        }
+    }
+
+    private static void forceDirectorySync(File directory) throws IOException {
+        try (FileChannel channel = FileChannel.open(
+                directory.toPath(), StandardOpenOption.READ)) {
+            channel.force(true);
         }
     }
 

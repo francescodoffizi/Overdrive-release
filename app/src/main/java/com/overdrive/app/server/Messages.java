@@ -23,6 +23,10 @@ public final class Messages {
 
     private static final Map<String, JSONObject> CATALOGS = new HashMap<>();
     private static final String DIR = "/data/local/tmp/web/server-i18n";
+    // Catalogs read from the running APK's assets, the fallback when the extracted copy on
+    // disk is stale or absent. Separate cache so neither source can shadow the other.
+    private static final Map<String, JSONObject> ASSET_CATALOGS = new HashMap<>();
+    private static final java.util.Set<String> ASSET_MISSES = new java.util.HashSet<>();
 
     private Messages() {}
 
@@ -32,6 +36,15 @@ public final class Messages {
         String lang = LocaleManager.get();
         String raw = lookup(lang, key);
         if (raw == null && !lang.equals("en")) raw = lookup("en", key);
+        // Last resort: the catalog COMPILED INTO the running APK. The lookups above read the
+        // extracted copy under /data/local/tmp/web/server-i18n, which HttpServer.extractWebAssets
+        // only refreshes when it could resolve the APK from $CLASSPATH — if that failed, the copy
+        // on disk is whatever an older build left behind. Keys shipped since then resolved to
+        // nothing and were returned verbatim, so automation dropdowns rendered raw ids like
+        // "automation.wireless_charging_left" while older keys still translated. The in-APK asset
+        // always matches the running code, so consult it before giving up.
+        if (raw == null) raw = lookupAsset(lang, key);
+        if (raw == null && !lang.equals("en")) raw = lookupAsset("en", key);
         if (raw == null) return key; // dev-visible miss
         if (args == null || args.length == 0) return raw;
         // Escapes lone apostrophes before formatting. Crowdin translators write
@@ -48,7 +61,11 @@ public final class Messages {
             if (cat != null) CATALOGS.put(lang, cat);
         }
         if (cat == null) return null;
-        // Walk dotted path: "errors.bydcloud_not_configured"
+        return walk(cat, key);
+    }
+
+    /** Walk a dotted path: "errors.bydcloud_not_configured". */
+    private static String walk(JSONObject cat, String key) {
         String[] parts = key.split("\\.");
         Object cur = cat;
         for (String p : parts) {
@@ -57,6 +74,46 @@ public final class Messages {
             if (cur == null) return null;
         }
         return cur instanceof String ? (String) cur : null;
+    }
+
+    /**
+     * Catalog lookup against the copy COMPILED INTO the running APK
+     * ({@code assets/server-i18n/<lang>.json}), used only when the extracted copy on disk
+     * lacks the key (stale or never written — see {@link #get}). Cached separately from the
+     * on-disk catalogs so a stale disk file can't shadow it and vice versa.
+     */
+    private static synchronized String lookupAsset(String lang, String key) {
+        JSONObject cat = ASSET_CATALOGS.get(lang);
+        if (cat == null) {
+            if (ASSET_MISSES.contains(lang)) return null; // don't re-open a known-absent asset
+            cat = loadAsset(lang);
+            if (cat == null) {
+                ASSET_MISSES.add(lang);
+                return null;
+            }
+            ASSET_CATALOGS.put(lang, cat);
+        }
+        return walk(cat, key);
+    }
+
+    private static JSONObject loadAsset(String lang) {
+        try {
+            android.content.Context ctx = com.overdrive.app.daemon.DaemonBootstrap.getContext();
+            if (ctx == null) return null;
+            android.content.res.AssetManager am = ctx.getAssets();
+            if (am == null) return null;
+            try (java.io.InputStream in = am.open("server-i18n/" + lang + ".json")) {
+                java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                return new JSONObject(new String(bos.toByteArray(), "UTF-8"));
+            }
+        } catch (Throwable t) {
+            // Absent asset / no usable Context (unit tests, early boot) — the caller falls
+            // back to returning the key, exactly as before.
+            return null;
+        }
     }
 
     private static JSONObject load(String lang) {
@@ -80,5 +137,11 @@ public final class Messages {
     }
 
     /** Hot-reload for the picker switch. */
-    public static synchronized void invalidate() { CATALOGS.clear(); }
+    public static synchronized void invalidate() {
+        CATALOGS.clear();
+        ASSET_CATALOGS.clear();
+        // Clear the negative cache too: assets become readable once a real Context exists, so a
+        // miss recorded during early boot must not persist for the process lifetime.
+        ASSET_MISSES.clear();
+    }
 }

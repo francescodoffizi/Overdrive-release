@@ -1353,10 +1353,27 @@ void v2_processFrame(
 // JNI Bridge
 // ============================================================================
 
+// PIPELINE MUTEX (audit R13-1b / ExtE-7). g_pipeline is mutated by THREE
+// entry points on different threads: processFrameV2 (engine/motion lane,
+// every frame), setQuadrantRoi (control thread, rewrites a quadrant's
+// blockRoiMask that processQuadrant scans mid-frame), and initPipelineV2
+// (control thread at arm, memsets the whole state an in-flight frame may be
+// reading/writing). Same UB class as the tracker globals — retired the same
+// way. Hold time is one frame's processing (~10-30ms) on the hot path;
+// ROI/init calls are rare user/arm actions, so contention is negligible.
+// No callee takes another lock and none calls back into Java — no ordering
+// cycle. (The CONFIG buffer race — Java rewriting the direct ByteBuffer
+// while this file memcpys it — is fixed Java-side by an immutable
+// buffer-swap in MotionPipelineV2.applyConfig; the memcpy here always reads
+// a buffer that is never rewritten after publication.)
+#include <mutex>
+static std::mutex g_pipeline_mutex;
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_overdrive_app_surveillance_NativeMotion_initPipelineV2(
     JNIEnv* env, jclass clazz)
 {
+    std::lock_guard<std::mutex> lock(g_pipeline_mutex);  // audit R13-1b
     v2_initPipeline(&g_pipeline);
 }
 
@@ -1386,7 +1403,10 @@ Java_com_overdrive_app_surveillance_NativeMotion_processFrameV2(
     
     // Process frame
     QuadrantResultV2 results[V2_NUM_QUADRANTS];
-    v2_processFrame(&g_pipeline, frame, width, height, &config, results);
+    {
+        std::lock_guard<std::mutex> lock(g_pipeline_mutex);  // audit R13-1b
+        v2_processFrame(&g_pipeline, frame, width, height, &config, results);
+    }
     
     // Serialize results to direct ByteBuffer
     uint8_t* resultBytes = (uint8_t*)env->GetDirectBufferAddress(resultBuffer);
@@ -1422,10 +1442,10 @@ Java_com_overdrive_app_surveillance_NativeMotion_setQuadrantRoi(
 {
     if (quadrant < 0 || quadrant >= V2_NUM_QUADRANTS) return;
     
-    QuadrantState& qs = g_pipeline.quadrants[quadrant];
-    
     if (blockMask == nullptr) {
         // Clear ROI — all blocks enabled
+        std::lock_guard<std::mutex> lock(g_pipeline_mutex);  // audit R13-1b
+        QuadrantState& qs = g_pipeline.quadrants[quadrant];
         qs.hasCustomRoi = false;
         for (int i = 0; i < V2_TOTAL_BLOCKS; i++) {
             qs.blockRoiMask[i] = true;
@@ -1442,9 +1462,13 @@ Java_com_overdrive_app_surveillance_NativeMotion_setQuadrantRoi(
     jbyte* mask = env->GetByteArrayElements(blockMask, nullptr);
     if (!mask) return;
     
-    qs.hasCustomRoi = true;
-    for (int i = 0; i < V2_TOTAL_BLOCKS; i++) {
-        qs.blockRoiMask[i] = (mask[i] != 0);
+    {
+        std::lock_guard<std::mutex> lock(g_pipeline_mutex);  // audit R13-1b
+        QuadrantState& qs = g_pipeline.quadrants[quadrant];
+        qs.hasCustomRoi = true;
+        for (int i = 0; i < V2_TOTAL_BLOCKS; i++) {
+            qs.blockRoiMask[i] = (mask[i] != 0);
+        }
     }
     
     env->ReleaseByteArrayElements(blockMask, mask, JNI_ABORT);
@@ -1455,14 +1479,36 @@ Java_com_overdrive_app_surveillance_NativeMotion_setQuadrantRoi(
 // ============================================================================
 
 #include "texture_tracker.h"
+#include <mutex>
 
 static TrackerState g_trackerState;
 static bool g_trackerInitialized = false;
+
+// TRACKER MUTEX (audit R13-1a / ExtE-2). g_trackerState is touched by FOUR
+// lanes: the motion/frame lane (trackerUpdate every recording/immunity
+// frame), the aiExecutor (startTrack/refreshTemplate/confirmHeartbeat after
+// inference), the engine tick (hasActiveTrack/getTrackBox/needsHeartbeat
+// queries, dropAllTrackerLocks at stop), and the control thread
+// (drop-on-toggle, initTracker at arm). Since round 8 this was carried as an
+// "accepted torn-POD" residual — TrackedObject is a fixed inline struct with
+// no pointers, so races could not UAF, only tear plain fields (one garbage
+// NCC frame, a lost fresh track). Every external audit round re-reported it
+// regardless, because unsynchronized concurrent access to non-atomic state
+// is C++ UB whatever the observed blast radius. Retired structurally: every
+// JNI entry point below holds this mutex for its full body. Hold times are
+// small (tracker_update ≈ a few ms of single-threaded NCC on a 64×64
+// template; start/refresh ≈ one 4KB memcpy + bookkeeping; queries are
+// field reads), contention is rare (lanes coincide only around heartbeats
+// and toggles), and none of the tracker_* functions call back out (no JNI
+// upcalls, no other locks — cv::setNumThreads(1) keeps matchTemplate on the
+// calling thread), so no ordering cycle is possible.
+static std::mutex g_tracker_mutex;
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_overdrive_app_surveillance_NativeMotion_initTracker(
     JNIEnv* env, jclass clazz)
 {
+    std::lock_guard<std::mutex> lock(g_tracker_mutex);
     tracker_init(&g_trackerState);
     g_trackerInitialized = true;
 }
@@ -1475,15 +1521,21 @@ Java_com_overdrive_app_surveillance_NativeMotion_trackerStartTrack(
     jint x, jint y, jint w, jint h,
     jlong nowMs)
 {
-    if (!g_trackerInitialized) return -1;
-    
     jbyte* frameData = env->GetByteArrayElements(frameRgb, nullptr);
     if (!frameData) return -1;
     
-    int result = tracker_startTrack(
-        &g_trackerState,
-        (const uint8_t*)frameData, width, height,
-        quadrant, classId, x, y, w, h, (long long)nowMs);
+    int result;
+    {
+        std::lock_guard<std::mutex> lock(g_tracker_mutex);  // audit R13-1a
+        if (!g_trackerInitialized) {
+            env->ReleaseByteArrayElements(frameRgb, frameData, JNI_ABORT);
+            return -1;
+        }
+        result = tracker_startTrack(
+            &g_trackerState,
+            (const uint8_t*)frameData, width, height,
+            quadrant, classId, x, y, w, h, (long long)nowMs);
+    }
     
     env->ReleaseByteArrayElements(frameRgb, frameData, JNI_ABORT);
     return result;
@@ -1495,15 +1547,18 @@ Java_com_overdrive_app_surveillance_NativeMotion_trackerUpdate(
     jbyteArray frameRgb, jint width, jint height,
     jint quadrant, jlong nowMs)
 {
-    if (!g_trackerInitialized) return;
-    
     jbyte* frameData = env->GetByteArrayElements(frameRgb, nullptr);
     if (!frameData) return;
     
-    tracker_update(
-        &g_trackerState,
-        (const uint8_t*)frameData, width, height,
-        quadrant, (long long)nowMs);
+    {
+        std::lock_guard<std::mutex> lock(g_tracker_mutex);  // audit R13-1a
+        if (g_trackerInitialized) {
+            tracker_update(
+                &g_trackerState,
+                (const uint8_t*)frameData, width, height,
+                quadrant, (long long)nowMs);
+        }
+    }
     
     env->ReleaseByteArrayElements(frameRgb, frameData, JNI_ABORT);
 }
@@ -1512,6 +1567,7 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_overdrive_app_surveillance_NativeMotion_trackerHasActiveTrack(
     JNIEnv* env, jclass clazz, jint quadrant)
 {
+    std::lock_guard<std::mutex> lock(g_tracker_mutex);  // audit R13-1a
     if (!g_trackerInitialized) return JNI_FALSE;
     return tracker_hasActiveTrack(&g_trackerState, quadrant) ? JNI_TRUE : JNI_FALSE;
 }
@@ -1521,12 +1577,14 @@ extern "C" JNIEXPORT jfloatArray JNICALL
 Java_com_overdrive_app_surveillance_NativeMotion_trackerGetTrackBox(
     JNIEnv* env, jclass clazz, jint quadrant)
 {
-    if (!g_trackerInitialized) return nullptr;
-    
     int x, y, w, h, classId;
     float confidence;
-    if (!tracker_getTrackBox(&g_trackerState, quadrant, &x, &y, &w, &h, &confidence, &classId)) {
-        return nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_tracker_mutex);  // audit R13-1a
+        if (!g_trackerInitialized) return nullptr;
+        if (!tracker_getTrackBox(&g_trackerState, quadrant, &x, &y, &w, &h, &confidence, &classId)) {
+            return nullptr;
+        }
     }
     
     jfloatArray result = env->NewFloatArray(7);
@@ -1539,6 +1597,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_overdrive_app_surveillance_NativeMotion_trackerDropTrack(
     JNIEnv* env, jclass clazz, jint quadrant)
 {
+    std::lock_guard<std::mutex> lock(g_tracker_mutex);  // audit R13-1a
     if (!g_trackerInitialized) return;
     tracker_dropTrack(&g_trackerState, quadrant);
 }
@@ -1547,6 +1606,7 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_overdrive_app_surveillance_NativeMotion_trackerNeedsYoloHeartbeat(
     JNIEnv* env, jclass clazz, jint quadrant)
 {
+    std::lock_guard<std::mutex> lock(g_tracker_mutex);  // audit R13-1a
     if (!g_trackerInitialized) return JNI_FALSE;
     return tracker_needsYoloHeartbeat(&g_trackerState, quadrant) ? JNI_TRUE : JNI_FALSE;
 }
@@ -1555,6 +1615,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_overdrive_app_surveillance_NativeMotion_trackerConfirmHeartbeat(
     JNIEnv* env, jclass clazz, jint quadrant, jlong nowMs)
 {
+    std::lock_guard<std::mutex> lock(g_tracker_mutex);  // audit R13-1a
     if (!g_trackerInitialized) return;
     tracker_confirmHeartbeat(&g_trackerState, quadrant, (long long)nowMs);
 }
@@ -1567,15 +1628,18 @@ Java_com_overdrive_app_surveillance_NativeMotion_trackerRefreshTemplate(
     jint newX, jint newY, jint newW, jint newH,
     jlong nowMs)
 {
-    if (!g_trackerInitialized) return;
-    
     jbyte* frameData = env->GetByteArrayElements(frameRgb, nullptr);
     if (!frameData) return;
     
-    tracker_refreshTemplate(
-        &g_trackerState,
-        (const uint8_t*)frameData, width, height,
-        quadrant, newX, newY, newW, newH, (long long)nowMs);
+    {
+        std::lock_guard<std::mutex> lock(g_tracker_mutex);  // audit R13-1a
+        if (g_trackerInitialized) {
+            tracker_refreshTemplate(
+                &g_trackerState,
+                (const uint8_t*)frameData, width, height,
+                quadrant, newX, newY, newW, newH, (long long)nowMs);
+        }
+    }
     
     env->ReleaseByteArrayElements(frameRgb, frameData, JNI_ABORT);
 }

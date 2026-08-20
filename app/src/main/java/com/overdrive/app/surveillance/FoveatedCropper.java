@@ -70,7 +70,7 @@ public class FoveatedCropper {
     // map and flip flags. 0 = no crop (default / legacy). On dilink4 the
     // pipeline pushes the producer-UV inset (e.g. 240/2560 = 0.09375).
     private volatile float apaCenterInset = 0.0f;
-    // 0 = legacy 4-strip (default); 3 = esco-parity 2x2 passthrough.
+    // 0 = legacy 4-strip (default); 3 = oem-parity 2x2 passthrough.
     // Volatile because the GL thread reads it inside crop() and the camera
     // thread (or pipeline init) writes it via setCameraLayout.
     private volatile int cameraLayout = 0;
@@ -109,6 +109,13 @@ public class FoveatedCropper {
     // not recomputed from the current call's centroid. Mirrors fenceSyncs[] /
     // pboQuadrant[] exactly (same head/tail lifecycle).
     private final float[][] ringCropAffine = new float[RING_SIZE][4];
+    // CAPTURE timestamp (System.nanoTime at QUEUE time) per slot (audit R4
+    // ExtB-8): the ring lag (1-2 service intervals ≈ 150-300ms+) was
+    // invisible to consumers because the slot's freshness stamp was taken
+    // at PUBLISH time — total pixel age could reach ~0.8s while passing a
+    // 500ms staleness check. Stamped/cleared with the same head/tail
+    // lifecycle as ringCropAffine.
+    private final long[] ringCaptureNanos = new long[RING_SIZE];
     private static final int PBO_BYTES = CROP_SIZE * CROP_SIZE * 4;
     // Head = next slot to render+queue into; tail = next slot to attempt
     // readback from. The ring is empty when head == tail and slots in
@@ -259,16 +266,21 @@ public class FoveatedCropper {
         public final float mapBx;
         public final float mapAy;
         public final float mapBy;
+        // CAPTURE time (System.nanoTime at queue/render time — audit R4
+        // ExtB-8). 0 = unknown (legacy ctor); consumers fall back to
+        // publish-time aging.
+        public final long captureNanos;
         public Result(byte[] rgb, int quadrant, int w, int h) {
             this(rgb, quadrant, w, h,
                  // Identity-ish fallback (only reached if a legacy caller uses
                  // the old ctor). 0.5 scale + no origin ≈ the OLD broken math,
                  // but the consumer FAILS SAFE (keep detection) when it detects
                  // an un-populated affine via the hasAffine() sentinel below.
-                 0f, 0f, 0f, 0f);
+                 0f, 0f, 0f, 0f, 0L);
         }
         public Result(byte[] rgb, int quadrant, int w, int h,
-                      float mapAx, float mapBx, float mapAy, float mapBy) {
+                      float mapAx, float mapBx, float mapAy, float mapBy,
+                      long captureNanos) {
             this.rgb = rgb;
             this.quadrant = quadrant;
             this.width = w;
@@ -277,6 +289,7 @@ public class FoveatedCropper {
             this.mapBx = mapBx;
             this.mapAy = mapAy;
             this.mapBy = mapBy;
+            this.captureNanos = captureNanos;
         }
         /** True iff a real foveated→block-grid affine was populated. A zero
          *  X-scale (mapAx==0) can never be a legitimate crop mapping (the
@@ -464,7 +477,7 @@ public class FoveatedCropper {
             yFlipOut = yFlip;
             centerX = quadLeft + localX * 0.5f;
             centerY = quadTop  + localY * 0.5f;
-            // APA center inset (esco APACropFilter parity, mirror of
+            // APA center inset (oem APACropFilter parity, mirror of
             // GlUtil.APA_CENTER_INSET_GLSL): horizontal-only remap of the
             // FULL producer x: [0, 1] -> [inset, 1 - inset]. Apply to
             // both centerX and the role's x-bounds so the crop window and
@@ -611,9 +624,9 @@ public class FoveatedCropper {
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
             GLES20.glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
             // Synchronous path: the bytes ARE this call's window, so the affine
-            // computed above is the exact match.
+            // computed above is the exact match (and the capture time is now).
             return new Result(dst, quadrant, CROP_SIZE, CROP_SIZE,
-                    mapAx, mapBx, mapAy, mapBy);
+                    mapAx, mapBx, mapAy, mapBy, System.nanoTime());
         }
 
         // ---- 2. Queue an async readback into the next PBO slot ----
@@ -644,6 +657,7 @@ public class FoveatedCropper {
             ringCropAffine[ringHead][1] = mapBx;
             ringCropAffine[ringHead][2] = mapAy;
             ringCropAffine[ringHead][3] = mapBy;
+            ringCaptureNanos[ringHead] = System.nanoTime();  // R4 ExtB-8
             ringHead = nextHead;
         } else {
             // Saturated ring — only attempt drain below.
@@ -700,7 +714,7 @@ public class FoveatedCropper {
                         }
                     }
                     result = new Result(dst, q, CROP_SIZE, CROP_SIZE,
-                            rAx, rBx, rAy, rBy);
+                            rAx, rBx, rAy, rBy, ringCaptureNanos[ringTail]);
                 } else {
                     GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER);
                     GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
@@ -715,6 +729,7 @@ public class FoveatedCropper {
                 ringCropAffine[ringTail][1] = 0f;
                 ringCropAffine[ringTail][2] = 0f;
                 ringCropAffine[ringTail][3] = 0f;
+                ringCaptureNanos[ringTail] = 0L;
                 ringTail = (ringTail + 1) % RING_SIZE;
             }
             // If sig == GL_TIMEOUT_EXPIRED we just leave the fence in
@@ -736,14 +751,14 @@ public class FoveatedCropper {
     /**
      * Selects between layouts:
      *   0 = legacy 4-strip (default — Seal/Atto/Dolphin).
-     *   3 = esco-parity 2x2 mosaic (DiLink 4 / byd_apa cars).
+     *   3 = oem-parity 2x2 mosaic (DiLink 4 / byd_apa cars).
      * Other values fall through to layout 0 in the math.
      * Volatile read/write — set once at pipeline init, no per-frame churn.
      */
     public void setCameraLayout(int layout) { this.cameraLayout = layout; }
 
     /** Enables the GL red-overlay suppression on AI thumbnails. Off by default. */
-    /** APA center inset (esco APACropFilter parity). See {@link
+    /** APA center inset (oem APACropFilter parity). See {@link
      *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
     public void setApaCenterInset(float inset) {
         // Reject NaN explicitly: the clamp does NOT filter it
@@ -819,6 +834,7 @@ public class FoveatedCropper {
             ringCropAffine[i][1] = 0f;
             ringCropAffine[i][2] = 0f;
             ringCropAffine[i][3] = 0f;
+            ringCaptureNanos[i] = 0L;
         }
         if (pboIds[0] != 0) {
             GLES30.glDeleteBuffers(RING_SIZE, pboIds, 0);

@@ -463,9 +463,11 @@ const MQTT = {
             case 'speed':
                 return BYD.units.speed(+v);
 
-            // Tyre pressure (kPa raw)
+            // Tyre pressure (kPa raw) — preview honours the display-unit
+            // preference like dist/speed above. The published MQTT payload
+            // stays kPa (Home Assistant converts via device_class).
             case 'tyre_p_fl': case 'tyre_p_fr': case 'tyre_p_rl': case 'tyre_p_rr':
-                return v + ' kPa';
+                return BYD.units.pressure ? BYD.units.pressure(+v) : v + ' kPa';
 
             // Coordinates
             case 'lat': case 'lon':
