@@ -257,3 +257,85 @@
 @media (prefers-reduced-motion: reduce) {
     .sp-batch.run .led { animation: none; }
 }
+
+/* ── what a position stores ─────────────────────────────────────────────────── */
+/* Two positions can now differ in KIND, not just in value, so the row says which. */
+.sp-parts-summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--tertiary);
+}
+.sp-dot { opacity: 0.5; }
+.sp-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    vertical-align: middle;
+    border: 1px solid var(--outline-variant);
+}
+
+/* ── save-parts chooser ─────────────────────────────────────────────────────── */
+.sp-parts { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.sp-part {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--outline-variant);
+    border-radius: 10px;
+    cursor: pointer;
+}
+.sp-part:hover { background: var(--surface-container-high); }
+.sp-part input { margin-top: 2px; flex: none; }
+.sp-part-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sp-part-label { font-weight: 600; font-size: 14px; }
+.sp-part-hint { font-size: 12px; color: var(--tertiary); }
+
+/* ── colour picker ──────────────────────────────────────────────────────────── */
+/* A gradient track rather than a swatch grid. The car exposes 6/30/63/126 colours by
+   trim and only the 30-colour hex ramp is known here, so swatches cannot be drawn for
+   a larger palette — but a gradient can, and it matches the continuous-looking control
+   the car's own screen uses. The slider still picks a discrete index. */
+.sp-colour-pick { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+.sp-colour-range {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 28px;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--outline-variant);
+    /* background is the palette gradient, set inline */
+    cursor: pointer;
+}
+.sp-colour-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: transparent;
+    /* A ring, not a fill: the colour under the thumb is the thing being chosen, so
+       covering it with a solid handle would hide the answer. */
+    border: 3px solid var(--on-surface);
+    box-shadow: 0 0 0 2px var(--surface);
+}
+.sp-colour-range::-moz-range-thumb {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: transparent;
+    border: 3px solid var(--on-surface);
+    box-shadow: 0 0 0 2px var(--surface);
+}
+.sp-colour-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+    font-family: var(--family-mono);
+    font-size: 12px;
+    color: var(--on-surface-variant);
+}
+.sp-colour-of { color: var(--outline); }

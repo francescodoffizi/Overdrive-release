@@ -28,8 +28,20 @@ import java.nio.file.Files;
  *     "source":   "captured" | "user",
  *     "createdAt": &lt;epoch ms&gt;,
  *     "updatedAt": &lt;epoch ms&gt;,   // user entries, set when the geometry is re-saved
- *     "axes":     { "HORIZONTAL":52, "BACKREST":56, ..., "LEFT_H":31, ... }
+ *     "alias":    "Pål",        // captured only; user's own name, survives re-capture
+ *     "axes":     { "HORIZONTAL":52, "BACKREST":56, ..., "LEFT_H":31, ... },
+ *     "ambient":  { "front":{"colour":2,"brightness":5}, "rear":{...}, "musicMode":false, ... }
  * } ] }</pre>
+ *
+ * <p><b>A position carries parts, and either one may be absent.</b> {@code axes} is the
+ * seat+mirror geometry, {@code ambient} the interior-light state. A captured entry always
+ * has both, because it mirrors the car. A user-created entry has whichever the user chose
+ * to save, so "just my lighting" and "just my seat" are both real positions.
+ *
+ * <p>Absent means absent: apply skips a part that is not stored rather than writing a
+ * default, so every position saved before ambient existed keeps behaving exactly as it
+ * did. This is why parts are separate keys rather than one merged blob with empty fields
+ * — an empty field would be indistinguishable from "the user wants it set to nothing".</p>
  *
  * <p>Ids are stable for the life of the entry. Automations reference a position by id, so a
  * rename must not change it, and re-capturing a native slot must land on the same id.
@@ -121,8 +133,13 @@ public final class PositionStore {
      * @param profile the DiLink account nickName (from content://com.byd.accountProvider), or
      *                "default" when unknown; identifies which profile these slots belong to.
      * @param name    display name, e.g. "&lt;profile&gt; - Posisjon 1".
+     * @param ambient interior-light state captured at the same moment, or null when the car
+     *                would not report it. A captured entry mirrors the car, so it always takes
+     *                both parts when both are readable — the pick-your-parts choice belongs to
+     *                user-created positions, not to a mirror of the car's own slot.
      */
-    public JSONObject upsertCaptured(String profile, int slot, String name, JSONObject axes, long nowMs) {
+    public JSONObject upsertCaptured(String profile, int slot, String name, JSONObject axes,
+                                     JSONObject ambient, long nowMs) {
         synchronized (LOCK) {
             JSONObject root = load();
             JSONArray arr = root.optJSONArray("positions");
@@ -153,6 +170,7 @@ public final class PositionStore {
                 entry.put("source", "captured");
                 entry.put("createdAt", nowMs);
                 entry.put("axes", axes != null ? axes : new JSONObject());
+                if (ambient != null && ambient.length() > 0) entry.put("ambient", ambient);
                 // Replace any existing captured entry for this slot.
                 JSONArray next = new JSONArray();
                 for (int i = 0; i < arr.length(); i++) {
@@ -177,11 +195,16 @@ public final class PositionStore {
      * name rather than an app label). Charset is the sanitize() output, [a-z0-9_-], which is
      * what the automation-side value validator accepts.
      *
-     * @return the stored entry, or null if the name is empty or over-long.
+     * <p>Takes the parts the user chose to save. Either may be null, but not both — a
+     * position that stores nothing would list and apply as a no-op, which reads as a bug
+     * rather than as an empty position.
+     *
+     * @return the stored entry, or null if the name is empty/over-long or no part was given.
      */
-    public JSONObject createUser(String name, JSONObject axes, long nowMs) {
+    public JSONObject createUser(String name, JSONObject axes, JSONObject ambient, long nowMs) {
         String clean = (name == null) ? "" : name.trim();
         if (clean.isEmpty() || clean.length() > 60) return null;
+        if (isEmpty(axes) && isEmpty(ambient)) return null;
         synchronized (LOCK) {
             JSONObject root = load();
             JSONArray arr = root.optJSONArray("positions");
@@ -194,7 +217,8 @@ public final class PositionStore {
                 entry.put("name", clean);
                 entry.put("source", "user");
                 entry.put("createdAt", nowMs);
-                entry.put("axes", axes != null ? axes : new JSONObject());
+                if (!isEmpty(axes)) entry.put("axes", axes);
+                if (!isEmpty(ambient)) entry.put("ambient", ambient);
                 arr.put(entry);
                 save(root);
             } catch (Throwable t) {
@@ -206,13 +230,79 @@ public final class PositionStore {
     }
 
     /**
-     * Replace the geometry of an existing USER entry, keeping its id and name. Captured entries
-     * mirror the car and are rejected — their geometry only ever comes from a capture.
+     * Save the given parts onto an existing USER entry, keeping its id and name. Captured
+     * entries mirror the car and are rejected — their contents only ever come from a capture.
+     *
+     * <p>A null part is left as it was, which is what makes "add my lighting to this seat
+     * position" a single save rather than a re-save of everything. Passing both nulls is a
+     * no-op rather than an error: nothing was asked for, so nothing changed.
      *
      * @return the updated entry, or null if absent or captured.
      */
-    public JSONObject updateAxes(String id, JSONObject axes, long nowMs) {
-        return mutate(id, axes, null, nowMs);
+    public JSONObject updateParts(String id, JSONObject axes, JSONObject ambient, long nowMs) {
+        if (id == null) return null;
+        synchronized (LOCK) {
+            JSONObject root = load();
+            JSONArray arr = root.optJSONArray("positions");
+            int i = indexOf(arr, id);
+            if (i < 0) return null;
+            JSONObject entry = arr.optJSONObject(i);
+            if (entry == null || !"user".equals(entry.optString("source"))) return null;
+            try {
+                if (!isEmpty(axes)) { entry.put("axes", axes); entry.put("updatedAt", nowMs); }
+                if (!isEmpty(ambient)) { entry.put("ambient", ambient); entry.put("updatedAt", nowMs); }
+                arr.put(i, entry);
+                save(root);
+            } catch (Throwable t) {
+                log("updateParts failed: " + t);
+                return null;
+            }
+            return entry;
+        }
+    }
+
+    /**
+     * Replace the stored ambient block on an entry, captured or user-created.
+     *
+     * <p>Unlike geometry, this is allowed on CAPTURED entries too. A captured entry's
+     * geometry is off-limits because it mirrors the car's own slot, but the ambient block is
+     * something OverDrive added on top — BYD's slots never stored it — so there is no car
+     * state being contradicted, and re-capture overwrites it from the car anyway.
+     *
+     * @return the updated entry, or null if absent or the block is empty.
+     */
+    public JSONObject setAmbient(String id, JSONObject ambient) {
+        if (id == null || isEmpty(ambient)) return null;
+        synchronized (LOCK) {
+            JSONObject root = load();
+            JSONArray arr = root.optJSONArray("positions");
+            int i = indexOf(arr, id);
+            if (i < 0) return null;
+            JSONObject entry = arr.optJSONObject(i);
+            if (entry == null) return null;
+            try {
+                entry.put("ambient", ambient);
+                arr.put(i, entry);
+                save(root);
+            } catch (Throwable t) {
+                log("setAmbient failed: " + t);
+                return null;
+            }
+            return entry;
+        }
+    }
+
+    /** Which parts an entry carries, for callers deciding what to apply or what to show. */
+    public static boolean hasGeometry(JSONObject entry) {
+        return entry != null && !isEmpty(entry.optJSONObject("axes"));
+    }
+
+    public static boolean hasAmbient(JSONObject entry) {
+        return entry != null && !isEmpty(entry.optJSONObject("ambient"));
+    }
+
+    private static boolean isEmpty(JSONObject o) {
+        return o == null || o.length() == 0;
     }
 
     /**
