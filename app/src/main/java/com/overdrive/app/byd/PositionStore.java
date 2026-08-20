@@ -128,10 +128,26 @@ public final class PositionStore {
             JSONArray arr = root.optJSONArray("positions");
             String prof = (profile == null || profile.trim().isEmpty()) ? "default" : profile.trim();
             String id = sanitize(prof) + "-slot-" + slot;
+            // The alias is the ONE field on a captured entry the user owns rather
+            // than the car. Everything else here is deliberately rebuilt from the
+            // DiLink provider on every capture, but re-capture happens whenever the
+            // seat is re-saved from a native UI, so wiping the alias would mean
+            // nudging the seat silently renames the position back to
+            // "<account> - Posisjon 2". Carried across the replace below.
+            String priorAlias = null;
+            int priorIdx = indexOf(arr, id);
+            if (priorIdx >= 0) {
+                JSONObject prior = arr.optJSONObject(priorIdx);
+                if (prior != null) {
+                    String a = prior.optString("alias", "").trim();
+                    if (!a.isEmpty()) priorAlias = a;
+                }
+            }
             JSONObject entry = new JSONObject();
             try {
                 entry.put("id", id);
                 entry.put("name", name != null ? name : (prof + " - Posisjon " + slot));
+                if (priorAlias != null) entry.put("alias", priorAlias);
                 entry.put("profile", prof);
                 entry.put("slot", slot);
                 entry.put("source", "captured");
@@ -208,6 +224,54 @@ public final class PositionStore {
         String clean = (name == null) ? "" : name.trim();
         if (clean.isEmpty() || clean.length() > 60) return null;
         return mutate(id, null, clean, 0L);
+    }
+
+    /**
+     * Set or clear the alias on a CAPTURED entry — the counterpart to {@link #rename} for the
+     * entries that mirror the car. A captured entry's name comes from the DiLink provider
+     * ("&lt;account&gt; - Posisjon 2") and is rebuilt on every capture, so it can't be edited in
+     * place; the alias sits alongside it and survives re-capture instead.
+     *
+     * <p>User entries are rejected: they are named when saved and renamed with {@link #rename},
+     * and giving them two competing display names would just raise the question of which wins.
+     *
+     * @param alias trimmed display name, max 60 chars (same bound as rename); null/empty clears
+     *              it and the entry falls back to the car's own name.
+     * @return the updated entry, or null if absent, not captured, or the alias is over-long.
+     */
+    public JSONObject setAlias(String id, String alias) {
+        if (id == null) return null;
+        String clean = (alias == null) ? "" : alias.trim();
+        if (clean.length() > 60) return null;
+        synchronized (LOCK) {
+            JSONObject root = load();
+            JSONArray arr = root.optJSONArray("positions");
+            int i = indexOf(arr, id);
+            if (i < 0) return null;
+            JSONObject entry = arr.optJSONObject(i);
+            if (entry == null || !"captured".equals(entry.optString("source"))) return null;
+            try {
+                if (clean.isEmpty()) entry.remove("alias");
+                else entry.put("alias", clean);
+                arr.put(i, entry);
+                save(root);
+            } catch (Throwable t) {
+                log("setAlias failed: " + t);
+                return null;
+            }
+            return entry;
+        }
+    }
+
+    /**
+     * What to show for an entry: the user's alias when they set one, otherwise the name the
+     * entry was created with. Kept here so every consumer (seat page, automation picker, home
+     * panel, capture toast) resolves it the same way rather than each deciding for itself.
+     */
+    public static String displayName(JSONObject entry) {
+        if (entry == null) return "";
+        String alias = entry.optString("alias", "").trim();
+        return !alias.isEmpty() ? alias : entry.optString("name", "");
     }
 
     /** Shared body of updateAxes/rename: find a user entry by id, apply what was passed, save. */

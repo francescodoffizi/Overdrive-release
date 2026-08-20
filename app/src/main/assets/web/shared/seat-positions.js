@@ -53,6 +53,7 @@ const SeatPositions = {
         dots: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>',
         link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>',
         pencil: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
+        undo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7v6h6"/><path d="M3.5 13a9 9 0 1 0 2.1-5.7L3 10"/></svg>',
         trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'
     },
 
@@ -315,6 +316,11 @@ const SeatPositions = {
                     (uses.length ? '<button class="sp-chip used-by" data-act="usedBy">' + this.ICONS.bolt +
                         this.esc(this.usesLabel(uses.length)) + '</button>' : '') +
                 '</div>' +
+                // Only when renamed: the alias replaces the car's name in the title, and the
+                // slot chip alone ("From car · slot 2") does not say which stored position
+                // that is. Shown here so an aliased row can still be matched against what the
+                // car's own UI calls it.
+                (p.carName ? '<div class="sp-carname">' + this.esc(p.carName) + '</div>' : '') +
                 '<div class="sp-axes">' + this.axesHtml(p.axes) + '</div>' +
             '</div>' +
             '<div class="sp-row-actions">' +
@@ -332,7 +338,17 @@ const SeatPositions = {
                             '<button data-act="rename">' + this.ICONS.pencil +
                                 this.esc(this.t('seatpos.rename', 'Rename')) + '</button>' +
                             '<button class="danger" data-act="delete">' + this.ICONS.trash +
-                                this.esc(this.t('seatpos.delete', 'Delete')) + '</button>' : '') +
+                                this.esc(this.t('seatpos.delete', 'Delete')) + '</button>'
+                        // A captured entry's name belongs to the car and comes back on every
+                        // capture, so it gets an alias instead of a rename. Clearing is a
+                        // separate item rather than "save an empty name": the entry always has
+                        // the car's name to fall back to, so this is a revert, not a delete.
+                        : '<div class="sp-menu-sep"></div>' +
+                            '<button data-act="alias">' + this.ICONS.pencil +
+                                this.esc(this.t('seatpos.set_alias', 'Rename in OverDrive')) + '</button>' +
+                            (p.carName ? '<button data-act="clearAlias">' + this.ICONS.undo +
+                                this.esc(this.t('seatpos.clear_alias', 'Use the car’s name')) +
+                                '</button>' : '')) +
                     '</div>' +
                 '</div>' +
             '</div>' +
@@ -418,6 +434,8 @@ const SeatPositions = {
         if (act === 'useInAutomation') return this.useInAutomation(p);
         if (act === 'saveHere') return this.saveHere(p);
         if (act === 'rename') return this.rename(p);
+        if (act === 'alias') return this.setAlias(p);
+        if (act === 'clearAlias') return this.clearAlias(p);
         if (act === 'delete') return this.remove(p);
     },
 
@@ -515,6 +533,37 @@ const SeatPositions = {
             '&name=' + encodeURIComponent(name)).catch(() => null);
         if (!res || res.error) {
             this.toast((res && res.error) || this.t('seatpos.rename_failed', 'Could not rename the position'), 'error');
+            return;
+        }
+        this.load();
+    },
+
+    /**
+     * Captured entries are rebuilt from the car on every capture, so their name cannot be edited
+     * in place — the alias is stored beside it and survives. Prefilled with whatever is showing:
+     * the current alias, or the car's name as a starting point when there is none yet.
+     */
+    async setAlias(p) {
+        const alias = await this.prompt(
+            this.t('seatpos.alias_title', 'Rename in OverDrive'),
+            this.t('seatpos.alias_body', 'The car keeps calling it {0}. This name is only used in OverDrive.')
+                .replace('{0}', p.carName || p.name),
+            p.name);
+        if (alias === null || alias === p.name) return;
+        const res = await this.post('/api/positions/alias?id=' + encodeURIComponent(p.id) +
+            '&alias=' + encodeURIComponent(alias)).catch(() => null);
+        if (!res || res.error) {
+            this.toast((res && res.error) || this.t('seatpos.alias_failed', 'Could not rename the position'), 'error');
+            return;
+        }
+        this.load();
+    },
+
+    async clearAlias(p) {
+        const res = await this.post('/api/positions/alias?id=' + encodeURIComponent(p.id) +
+            '&alias=').catch(() => null);
+        if (!res || res.error) {
+            this.toast((res && res.error) || this.t('seatpos.alias_failed', 'Could not rename the position'), 'error');
             return;
         }
         this.load();

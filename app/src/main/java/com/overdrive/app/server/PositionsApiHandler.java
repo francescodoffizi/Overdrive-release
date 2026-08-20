@@ -33,6 +33,7 @@ import java.util.Map;
  *   <li>{@code POST /api/positions/create?name=..}      — save the live geometry as a new user entry</li>
  *   <li>{@code POST /api/positions/save?id=..}          — overwrite a user entry with the live geometry</li>
  *   <li>{@code POST /api/positions/rename?id=..&name=..} — rename a user entry, id unchanged</li>
+ *   <li>{@code POST /api/positions/alias?id=..&alias=..} — alias a CAPTURED entry; empty clears</li>
  * </ul>
  *
  * <p>Only {@code /api/positions/apply} is reachable from an automation. Everything else here
@@ -82,7 +83,7 @@ public final class PositionsApiHandler {
         // GET /api/positions  (list)
         if (pathOnly.equals("/api/positions") && "GET".equals(method)) {
             JSONObject r = new JSONObject();
-            r.put("positions", PositionStore.getInstance().list());
+            r.put("positions", listWithResolvedNames());
             // Car state rides along with the list so the management page can gate its
             // buttons without a second round trip. Both are advisory for the UI — the
             // authority is still applyFull's own gate, which the UI cannot talk its way past.
@@ -131,6 +132,7 @@ public final class PositionsApiHandler {
         if (pathOnly.equals("/api/positions/create"))  return handleCreate(out, q, body);
         if (pathOnly.equals("/api/positions/save"))    return handleSave(out, q, body);
         if (pathOnly.equals("/api/positions/rename"))  return handleRename(out, q, body);
+        if (pathOnly.equals("/api/positions/alias"))   return handleAlias(out, q, body);
 
         HttpResponse.sendError(out, 404, "Unknown positions endpoint");
         return true;
@@ -316,6 +318,64 @@ public final class PositionsApiHandler {
             return true;
         }
         log("renamed " + id + " to " + name);
+        HttpResponse.sendJson(out, entry.toString());
+        return true;
+    }
+
+    /**
+     * The stored list with {@code name} resolved to the alias wherever one is set, and the car's
+     * own name preserved as {@code carName}.
+     *
+     * <p>Resolving here rather than in each client is what makes an alias show up everywhere at
+     * once — seat page, automation picker, capture toast and the home panel all read {@code name},
+     * and none of them should have to know that captured entries have a second display name. The
+     * raw {@code alias} still rides along so the management UI can prefill its editor and tell an
+     * aliased entry from a plain one.
+     *
+     * <p>The store itself is left alone: {@code getById} (what apply and the automation action
+     * use) keeps returning the car's name, because an automation resolves by id and its logs
+     * should say what the car calls the position.
+     */
+    private static JSONArray listWithResolvedNames() {
+        JSONArray src = PositionStore.getInstance().list();
+        JSONArray outArr = new JSONArray();
+        for (int i = 0; i < src.length(); i++) {
+            JSONObject p = src.optJSONObject(i);
+            if (p == null) continue;
+            String alias = p.optString("alias", "").trim();
+            if (alias.isEmpty()) { outArr.put(p); continue; }
+            try {
+                JSONObject copy = new JSONObject(p.toString());
+                copy.put("carName", p.optString("name", ""));
+                copy.put("name", alias);
+                outArr.put(copy);
+            } catch (Throwable t) {
+                outArr.put(p);
+            }
+        }
+        return outArr;
+    }
+
+    /**
+     * Set or clear the alias on a CAPTURED position. Separate from rename because the two act on
+     * disjoint halves of the store: a user entry is named when it is saved and renamed here, while
+     * a captured entry's name belongs to the car and is rebuilt on every capture, so the only way
+     * to call it something else is to hang an alias off it.
+     *
+     * <p>An absent or empty {@code alias} clears it, and the entry goes back to showing the name
+     * the car gave it.
+     */
+    private static boolean handleAlias(OutputStream out, Map<String, String> q, String body) throws Exception {
+        String id = param(q, body, "id");
+        if (id == null) { HttpResponse.sendJsonError(out, "alias needs an id"); return true; }
+        String alias = param(q, body, "alias");
+        JSONObject entry = PositionStore.getInstance().setAlias(id, alias);
+        if (entry == null) {
+            HttpResponse.sendJsonError(out,
+                "no captured position with id=" + id + ", or the alias is over 60 characters");
+            return true;
+        }
+        log((alias == null || alias.trim().isEmpty() ? "cleared alias on " : "aliased ") + id);
         HttpResponse.sendJson(out, entry.toString());
         return true;
     }
