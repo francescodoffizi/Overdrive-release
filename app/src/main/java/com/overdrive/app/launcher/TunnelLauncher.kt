@@ -16,13 +16,27 @@ class TunnelLauncher(
 ) {
     companion object {
         private const val TAG = "TunnelLauncher"
-        
+
         // Cloudflared paths
         private const val CLOUDFLARED_TMP_PATH = "/data/local/tmp/cloudflared"
         private const val CLOUDFLARED_LOG = "/data/local/tmp/cloudflared.log"
-        
+
         // Process name for identification
         private const val CLOUDFLARED_PROCESS = "cloudflared"
+
+        // Process-wide single-flight guard for cloudflared launches.
+        //
+        // The running-check (`ps | grep cloudflared`) and the spawn are two
+        // separate async ADB round-trips, and cloudflared takes ~1-2s to
+        // appear in `ps`. Multiple launch triggers fire during that window
+        // (boot brings up several AdbDaemonLauncher instances, each with its
+        // own TunnelLauncher), so every check returns "not running" and each
+        // spawns its own cloudflared — observed 3x to the same token on the
+        // 2026-07-06 reboot. A companion (static) flag is shared across all
+        // TunnelLauncher instances in the process, so concurrent requests
+        // collapse to one. It lives in memory only, so an app restart clears
+        // it — it can never wedge launches the way an on-disk lock could.
+        private val launchInProgress = java.util.concurrent.atomic.AtomicBoolean(false)
     }
     
     interface TunnelCallback {
@@ -56,6 +70,29 @@ class TunnelLauncher(
      * NOTE: Cloudflared and Zrok are mutually exclusive - this will kill zrok first.
      */
     fun launchCloudflared(callback: TunnelCallback) {
+        // Single-flight: if a launch is already in flight, drop this duplicate
+        // request instead of racing it into a second cloudflared process.
+        if (!launchInProgress.compareAndSet(false, true)) {
+            logManager.info(TAG, "Cloudflared launch already in progress — skipping duplicate request")
+            callback.onLog("Tunnel launch already in progress")
+            return
+        }
+        // Safety net: never leave the flag stuck if a terminal callback is
+        // missed (e.g. an exception inside a nested ADB callback). 90s is well
+        // beyond the 30-attempt (~30s) URL-wait plus kill/settle delays.
+        pollScheduler.schedule({ launchInProgress.set(false) }, 90, java.util.concurrent.TimeUnit.SECONDS)
+
+        // Clear the flag on every terminal outcome (URL obtained or error),
+        // while passing through non-terminal onLog calls untouched.
+        val guarded = object : TunnelCallback {
+            override fun onLog(message: String) { callback.onLog(message) }
+            override fun onTunnelUrl(url: String) { launchInProgress.set(false); callback.onTunnelUrl(url) }
+            override fun onError(error: String) { launchInProgress.set(false); callback.onError(error) }
+        }
+        launchCloudflaredGuarded(guarded)
+    }
+
+    private fun launchCloudflaredGuarded(callback: TunnelCallback) {
         logManager.info(TAG, "Launching Cloudflared tunnel...")
         callback.onLog("Checking for existing tunnel...")
         
