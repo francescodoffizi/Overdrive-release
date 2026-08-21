@@ -1,0 +1,583 @@
+package com.overdrive.app.byd;
+
+import android.content.Context;
+import android.content.ContextWrapper;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * READ-ONLY probe for {@code BYDAutoBodyworkDevice} feature-id getters — the
+ * absolute seat/steering geometry (System B, the profile/account positions the
+ * DiLink app applies) and the keyfob-identity ids.
+ *
+ * <p>WHY a new endpoint. Neither existing reach worked for these ids:
+ * <ul>
+ *   <li>the CarProperty bridge ({@code /api/debug/car-property/get}) goes through
+ *       DiCarServer's {@code ICarPropertyService}, which enforces the read
+ *       permission and returns statusCode 20004 "Permission not granted for
+ *       android.permission.BYDAUTO_BODYWORK_GET" with no permissive bypass on
+ *       that path;</li>
+ *   <li>the {@code sdk-getter} path only invokes no-arg methods, so a feature id
+ *       can't be passed.</li>
+ * </ul>
+ * The lever that DOES reach them is the same one the light/hazard write probe
+ * uses ({@link HazardLightProbe}): obtain the device singleton, swap a
+ * {@link PermissiveContext} into its cached {@code mContext} so the in-process
+ * gate-3 permission check is neutralised, then call the generic
+ * {@code get(int[], Class)} through {@link BydDeviceHelper}. {@code BatteryVoltageMonitor}
+ * already reads bodywork getters this way, so the read path itself is proven —
+ * this only exposes it for arbitrary ids over HTTP.
+ *
+ * <p>NOTHING here writes. There is no {@code set()} call and no {@code confirm}
+ * gate because there is nothing to actuate — every method reads. The seat does
+ * not move.
+ *
+ * <p>Feature ids are from the sub-41 decompile of CarSetting.apk (see
+ * {@code byd-projects} KB {@code interfaces.md} / {@code dead-ends.md}). Read ids
+ * differ from the write ids for the same axis; only READ ids belong here.
+ */
+public final class BodyworkSeatProbe {
+
+    public static final String BODYWORK_DEVICE =
+            "android.hardware.bydauto.bodywork.BYDAutoBodyworkDevice";
+
+    private BodyworkSeatProbe() {}
+
+    /** A labelled feature id to read. */
+    public static final class Id {
+        public final String label;
+        public final int featureId;
+        Id(String label, int featureId) { this.label = label; this.featureId = featureId; }
+    }
+
+    /**
+     * Absolute seat-geometry READ ids (doubles). These are the getters the
+     * DiLink seat manager ({@code spi.p7}) reads before it applies a stored
+     * profile position — the values that describe "where the seat physically is".
+     */
+    public static Id[] seatIds() {
+        return new Id[]{
+            new Id("SEAT_HORIZONTAL",   988807176),
+            new Id("SEAT_BACKREST",     988807184),
+            new Id("SEAT_HEIGHT",       988807192),
+            new Id("SEAT_SITPOINT",     988807200),
+            new Id("SEAT_LEGHOLDER",    988807208),
+            new Id("SEAT_HEADREST_H",   988807216),
+            new Id("SEAT_HEADREST_V",   988807224),
+        };
+    }
+
+    /**
+     * Keyfob / unlock-identity READ ids (expected int-valued) from CarSetting's
+     * {@code Body.java}. Whether any of these returns a stable, per-key-distinct
+     * value is the open question the sub-41 "keyfob-identity" dead-end candidate
+     * needs a real-car test to settle — this endpoint is that test's read side.
+     */
+    public static Id[] keyfobIds() {
+        return new Id[]{
+            new Id("BODYWORK_BT_KEY_CODE",     0x3E8FA010),
+            new Id("NFC_KEY_UNLOCK_SRC",       0x4036B020),
+            new Id("KEY_OPERATION_TYPE_LSB",   0x19C3D010),
+            new Id("KEY_OPERATION_TYPE_MSB",   0x19C3C010),
+            new Id("CARD_NFC_KEY_STATE",       0x40334013),
+        };
+    }
+
+    /**
+     * Read every id in the given list off the bodywork device and return a JSON
+     * report. Reads only. Each id is read BOTH as a double and as an int (two
+     * typed {@code get(int[], Class)} calls), because a {@code BYDAutoEventValue}
+     * fills only the field matching the requested type — reading one interpretation
+     * and printing the other would show a default 0 that looks valid (the trap the
+     * {@link BydDeviceHelper} javadoc warns about). Reporting both, with the type
+     * that actually returned non-null, lets the caller see the real width/scale.
+     *
+     * @param ctx daemon Context (BYD-capable — see {@code resolveContext} in the handler)
+     * @param ids the labelled ids to read
+     */
+    public static JSONObject readIds(Context ctx, Id[] ids) {
+        return readIdsOnDevice(ctx, BODYWORK_DEVICE, ids);
+    }
+
+    /**
+     * As {@link #readIds} but against an arbitrary BYD device class. Used to hunt the
+     * mirror device (`BYDAutoRearViewMirrorDevice`) and its read ids on-car: the exact
+     * fqcn and read ids aren't known from the decompile, so `?device=<fqcn>&ids=…`
+     * lets us probe candidates live without a rebuild.
+     */
+    public static JSONObject readIdsOnDevice(Context ctx, String deviceClass, Id[] ids) {
+        JSONObject r = new JSONObject();
+        JSONArray values = new JSONArray();
+        try {
+            r.put("uid", android.os.Process.myUid());
+            r.put("deviceClass", deviceClass);
+
+            Context permissive = new PermissiveContext(ctx.getApplicationContext() != null
+                    ? ctx.getApplicationContext() : ctx);
+            Object device = BydDeviceHelper.getDevice(deviceClass, permissive);
+            if (device == null) {
+                r.put("error", deviceClass + " null / not present on this firmware");
+                return r;
+            }
+            r.put("deviceClassResolved", device.getClass().getName());
+            // The singleton caches the FIRST context it was created with (likely a
+            // plain one from BydDataCollector), and the in-process permission gate
+            // runs against that cached mContext — so swap ours in, same as the
+            // light probe. Harmless for reads; required if any getter is gated.
+            r.put("permissiveContextInstalled", swapContext(device, permissive));
+
+            for (Id id : ids) {
+                values.put(readOne(device, id));
+            }
+            r.put("values", values);
+        } catch (Throwable t) {
+            try { r.put("exception", String.valueOf(t)); } catch (Exception ignored) {}
+        }
+        return r;
+    }
+
+    /**
+     * Candidate fully-qualified class names for the rear-view-mirror device, tried in
+     * order until one resolves. The bodywork device is
+     * {@code android.hardware.bydauto.bodywork.BYDAutoBodyworkDevice}, so these follow
+     * the same {@code android.hardware.bydauto.<sub>.BYDAuto…Device} shape. The handler
+     * reports which one resolved so we can pin it down.
+     */
+    public static final String[] MIRROR_DEVICE_CANDIDATES = {
+        "android.hardware.bydauto.rearviewmirror.BYDAutoRearViewMirrorDevice",
+        "android.hardware.bydauto.mirror.BYDAutoRearViewMirrorDevice",
+        "android.hardware.bydauto.rearview.BYDAutoRearViewMirrorDevice",
+        "android.hardware.bydauto.rvm.BYDAutoRearViewMirrorDevice",
+    };
+
+    /**
+     * Absolute seat-geometry WRITE ids (floats) — distinct from the read ids. From the
+     * sub-41 decompile. Used by {@link #writeAxes}. Steering (ST-H 1276207152 / ST-V
+     * 1276207160) is intentionally omitted: Pål's car has no electric steering column,
+     * and the HAL silently ignores those writes, so there is nothing to test here.
+     */
+    public static Id[] seatWriteIds() {
+        return new Id[]{
+            new Id("SEAT_HORIZONTAL",   1276203024),
+            new Id("SEAT_BACKREST",     1276203032),
+            new Id("SEAT_HEIGHT",       1276203040),
+            new Id("SEAT_SITPOINT",     1276203048),
+            new Id("SEAT_LEGHOLDER",    1276203056),
+            new Id("SEAT_HEADREST_H",   1276203064),
+            new Id("SEAT_HEADREST_V",   1276203072),
+        };
+    }
+
+    /** Resolve a seat-axis label (case-insensitive, SEAT_ prefix optional) to its WRITE id, or null. */
+    public static Integer writeIdForAxis(String axis) {
+        if (axis == null) return null;
+        String want = axis.trim().toUpperCase();
+        if (!want.startsWith("SEAT_")) want = "SEAT_" + want;
+        for (Id id : seatWriteIds()) {
+            if (id.label.equals(want)) return id.featureId;
+        }
+        return null;
+    }
+
+    /** The rear-view-mirror WRITE device (confirmed fqcn from CarSetting dex). */
+    public static final String MIRROR_WRITE_DEVICE =
+            "android.hardware.bydauto.doormirror.BYDAutoRearViewMirrorDevice";
+
+    /**
+     * Mirror WRITE ids (ints) on the doormirror device — from Body.java `_SET` constants.
+     * NOTE mirror READ ids (0x4B3.., 0x4BB.. on the bodywork device, doubles) differ from
+     * these WRITE ids, same read≠write split as the seat.
+     */
+    public static Id[] mirrorWriteIds() {
+        return new Id[]{
+            new Id("LEFT_H",  0x4C116010),
+            new Id("LEFT_V",  0x4C116018),
+            new Id("RIGHT_H", 0x4C116020),
+            new Id("RIGHT_V", 0x4C116028),
+        };
+    }
+
+    /** Resolve a mirror-axis label (LEFT_H/LEFT_V/RIGHT_H/RIGHT_V, case-insensitive) to its WRITE id, or null. */
+    public static Integer writeIdForMirror(String axis) {
+        if (axis == null) return null;
+        String want = axis.trim().toUpperCase();
+        for (Id id : mirrorWriteIds()) {
+            if (id.label.equals(want)) return id.featureId;
+        }
+        return null;
+    }
+
+    /**
+     * WRITE mirror geometry on the doormirror device: one batched
+     * {@code set(int[] ids, BYDAutoEventValue)} with {@code ev.intArrayValue} — the mirror
+     * counterpart of {@link #writeAxes}, matching spi.p7 (mirrors use int array, not float).
+     * MOVES THE MIRROR(S). Parked-gated like the seat write.
+     */
+    public static JSONObject writeMirror(Context ctx, int[] ids, int[] values, boolean force) {
+        JSONObject r = new JSONObject();
+        try {
+            r.put("uid", android.os.Process.myUid());
+            r.put("deviceClass", MIRROR_WRITE_DEVICE);
+            JSONArray reqIds = new JSONArray();
+            JSONArray reqVals = new JSONArray();
+            for (int i = 0; i < ids.length; i++) { reqIds.put(ids[i]); reqVals.put(values[i]); }
+            r.put("ids", reqIds);
+            r.put("values", reqVals);
+
+            boolean blocked = false;
+            try { blocked = com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked(); }
+            catch (Throwable t) { r.put("gateError", String.valueOf(t)); blocked = true; }
+            r.put("movementBlocked", blocked);
+            r.put("forced", force);
+            if (blocked && !force) {
+                r.put("skipped", true);
+                r.put("reason", "movement gate blocked — add force=YES only if certain the car is parked");
+                return r;
+            }
+
+            Context permissive = new PermissiveContext(ctx.getApplicationContext() != null
+                    ? ctx.getApplicationContext() : ctx);
+            Object device = BydDeviceHelper.getDevice(MIRROR_WRITE_DEVICE, permissive);
+            if (device == null) { r.put("error", MIRROR_WRITE_DEVICE + " null / not present"); return r; }
+            r.put("permissiveContextInstalled", swapContext(device, permissive));
+
+            Class<?> evClass = Class.forName("android.hardware.bydauto.BYDAutoEventValue");
+            Object ev = evClass.getConstructor().newInstance();
+            evClass.getField("intArrayValue").set(ev, values);
+            Method setM = device.getClass().getMethod("set", int[].class, evClass);
+            r.put("setMethod", setM.getDeclaringClass().getName() + ".set(int[],BYDAutoEventValue[intArrayValue])");
+
+            Object res = setM.invoke(device, ids, ev);
+            int code = (res instanceof Number) ? ((Number) res).intValue()
+                     : (res instanceof Boolean) ? (((Boolean) res) ? 0 : -1) : 0;
+            r.put("resultCode", code);
+            r.put("resultCodeHex", "0x" + Integer.toHexString(code));
+            r.put("accepted", code == 0);
+        } catch (Throwable t) {
+            try { r.put("exception", String.valueOf(t)); } catch (Exception ignored) {}
+        }
+        return r;
+    }
+
+    /**
+     * WRITE absolute seat geometry: one batched {@code set(int[] ids, float[] values)} on
+     * the bodywork device (the DiLink apply pattern), through the PermissiveContext. This
+     * MOVES THE SEAT.
+     *
+     * <p>Parked-gated: refuses unless {@link DrivingSafetyGuard#isMovementBlocked()} is
+     * false, matching the native app (which won't change a seat position while driving)
+     * and the sub-41 {@code s7.T()} gate. {@code force=true} bypasses the gate for a
+     * bench test where the ACC/gear state can't be resolved — caller must be certain the
+     * car is parked.
+     *
+     * @return JSON: the gate decision, the resolved set() method, and the raw SDK result code.
+     */
+    public static JSONObject writeAxes(Context ctx, int[] ids, float[] values, boolean force) {
+        JSONObject r = new JSONObject();
+        try {
+            r.put("uid", android.os.Process.myUid());
+            r.put("deviceClass", BODYWORK_DEVICE);
+            JSONArray reqIds = new JSONArray();
+            JSONArray reqVals = new JSONArray();
+            for (int i = 0; i < ids.length; i++) { reqIds.put(ids[i]); reqVals.put(values[i]); }
+            r.put("ids", reqIds);
+            r.put("values", reqVals);
+
+            boolean blocked = false;
+            try { blocked = com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked(); }
+            catch (Throwable t) { r.put("gateError", String.valueOf(t)); blocked = true; }
+            r.put("movementBlocked", blocked);
+            r.put("forced", force);
+            if (blocked && !force) {
+                r.put("skipped", true);
+                r.put("reason", "movement gate blocked (not parked / unknown state) — add force=YES only if certain the car is parked");
+                return r;
+            }
+
+            Context permissive = new PermissiveContext(ctx.getApplicationContext() != null
+                    ? ctx.getApplicationContext() : ctx);
+            Object device = BydDeviceHelper.getDevice(BODYWORK_DEVICE, permissive);
+            if (device == null) { r.put("error", "BYDAutoBodyworkDevice null on this firmware"); return r; }
+            r.put("permissiveContextInstalled", swapContext(device, permissive));
+
+            // AUTHORITATIVE write recipe (from BydDiLinkAccount spi.p7.i() — the DiLink seat
+            // manager's own apply): ONE batched set(int[] ids, BYDAutoEventValue) where the
+            // value is a parallel FLOAT ARRAY in ev.floatArrayValue — NOT per-axis, NOT
+            // ev.doubleValue. Gated by s7.T() (parked), no separate EXECUTE step. My earlier
+            // per-axis ev.doubleValue write returned code 0 but did NOT actuate — wrong field
+            // and wrong shape for these array-typed seat SET ids.
+            Class<?> evClass = Class.forName("android.hardware.bydauto.BYDAutoEventValue");
+            Object ev = evClass.getConstructor().newInstance();
+            evClass.getField("floatArrayValue").set(ev, values);   // float[] parallel to ids
+            Method setM = device.getClass().getMethod("set", int[].class, evClass);
+            r.put("setMethod", setM.getDeclaringClass().getName() + ".set(int[],BYDAutoEventValue[floatArrayValue])");
+
+            Object res = setM.invoke(device, ids, ev);
+            int code = (res instanceof Number) ? ((Number) res).intValue()
+                     : (res instanceof Boolean) ? (((Boolean) res) ? 0 : -1) : 0;
+            r.put("resultCode", code);
+            r.put("resultCodeHex", "0x" + Integer.toHexString(code));
+            r.put("accepted", code == 0);   // spi.p7: resultCode==0 == success (sa.b)
+        } catch (Throwable t) {
+            try { r.put("exception", String.valueOf(t)); } catch (Exception ignored) {}
+        }
+        return r;
+    }
+
+    private static JSONObject readOne(Object device, Id id) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("label", id.label);
+            o.put("id", id.featureId);
+            o.put("idHex", "0x" + Integer.toHexString(id.featureId));
+
+            // The real device exposes get(int[], Class); the Class arg selects the
+            // return shape. OverDrive's other reads pass a primitive TYPE (Double.TYPE
+            // etc.), while the DiLink decompile that this recipe came from passed the
+            // BYDAutoEventValue class itself. Both route through the SAME overload, so
+            // try all three and report which one the getter actually answers — that is
+            // the whole point of a read-test: settle the convention on the real car.
+            Object asDouble = BydDeviceHelper.callGet(device, id.featureId, Double.TYPE);
+            Object asInt = BydDeviceHelper.callGet(device, id.featureId, Integer.TYPE);
+            Object asEvent = null;
+            try {
+                Class<?> evc = Class.forName("android.hardware.bydauto.BYDAutoEventValue");
+                asEvent = BydDeviceHelper.callGet(device, id.featureId, evc);
+            } catch (Throwable ignored) {}
+
+            boolean read = false;
+            if (asDouble != null) {
+                double d = BydDeviceHelper.getDoubleValue(asDouble);
+                if (!Double.isNaN(d)) { o.put("doubleValue", d); read = true; }
+            }
+            if (asInt != null) {
+                int i = BydDeviceHelper.getIntValue(asInt);
+                if (i != Integer.MIN_VALUE) { o.put("intValue", i); read = true; }
+            }
+            if (asEvent != null) {
+                // A BYDAutoEventValue carries independent int/double/string fields;
+                // surface whichever the HAL filled so the caller sees the native shape.
+                double ed = BydDeviceHelper.getDoubleValue(asEvent);
+                int ei = BydDeviceHelper.getIntValue(asEvent);
+                String es = BydDeviceHelper.getStringValue(asEvent);
+                if (!Double.isNaN(ed)) { o.put("eventDoubleValue", ed); read = true; }
+                if (ei != Integer.MIN_VALUE) { o.put("eventIntValue", ei); read = true; }
+                if (es != null) { o.put("eventStringValue", es); read = true; }
+                o.put("eventClass", asEvent.getClass().getName());
+            }
+            o.put("read", read);
+            // Which typed calls returned a (non-null) object at all — independent of
+            // whether the extracted primitive was usable. Tells the conventions apart.
+            JSONArray accepted = new JSONArray();
+            if (asDouble != null) accepted.put("Double.TYPE");
+            if (asInt != null) accepted.put("Integer.TYPE");
+            if (asEvent != null) accepted.put("BYDAutoEventValue");
+            o.put("acceptedBy", accepted);
+        } catch (Throwable t) {
+            try { o.put("error", String.valueOf(t)); } catch (Exception ignored) {}
+        }
+        return o;
+    }
+
+    /**
+     * Parse a comma-separated {@code ids=} list of decimal or {@code 0x}-hex
+     * feature ids into a labelled array (label = the hex form). Returns an empty
+     * array for null/blank input. Unparseable tokens are skipped.
+     */
+    public static Id[] parseIds(String csv) {
+        Map<String, Integer> parsed = new LinkedHashMap<>();
+        if (csv != null && !csv.trim().isEmpty()) {
+            for (String tok : csv.split(",")) {
+                String s = tok.trim();
+                if (s.isEmpty()) continue;
+                try {
+                    int v = (s.startsWith("0x") || s.startsWith("0X"))
+                            ? (int) Long.parseLong(s.substring(2), 16)
+                            : Integer.parseInt(s);
+                    parsed.put("0x" + Integer.toHexString(v), v);
+                } catch (NumberFormatException ignored) {}
+            }
+        }
+        Id[] out = new Id[parsed.size()];
+        int i = 0;
+        for (Map.Entry<String, Integer> e : parsed.entrySet()) {
+            out[i++] = new Id(e.getKey(), e.getValue());
+        }
+        return out;
+    }
+
+    /**
+     * Read the full driver-position bundle (all {@link #fullAxes()} axes) as a JSON object of
+     * label -> current value (double, bodywork device). Axes that read a valid value are
+     * included; a not-equipped axis that reads NaN is stored as its 127.5 sentinel so a later
+     * apply round-trips faithfully. This is the read side of the capture-on-long-press feature.
+     */
+    public static JSONObject readFullBundle(Context ctx) {
+        JSONObject axes = new JSONObject();
+        try {
+            Context permissive = new PermissiveContext(ctx.getApplicationContext() != null
+                    ? ctx.getApplicationContext() : ctx);
+            Object device = BydDeviceHelper.getDevice(BODYWORK_DEVICE, permissive);
+            if (device == null) return axes;
+            swapContext(device, permissive);
+            for (Axis a : fullAxes()) {
+                Object rd = BydDeviceHelper.callGet(device, a.readId, Double.TYPE);
+                double d = BydDeviceHelper.getDoubleValue(rd);
+                axes.put(a.label, Double.isNaN(d) ? 127.5 : d);
+            }
+        } catch (Throwable ignored) {}
+        return axes;
+    }
+
+    /** One full-position axis: label + read id + write id + batch group (1=mirror/steering, 2=seat). */
+    public static final class Axis {
+        public final String label; public final int readId, writeId, group;
+        Axis(String l, int r, int w, int g) { label = l; readId = r; writeId = w; group = g; }
+    }
+
+    /**
+     * The complete driver-position axis table (from Body.java + spi.p7.m()). Group 1 =
+     * mirrors + steering (native batch 1); group 2 = the 7 seat axes (native batch 2).
+     * Read ids are doubles on the bodywork device; write ids also bodywork, floatArrayValue.
+     */
+    public static Axis[] fullAxes() {
+        return new Axis[]{
+            new Axis("LEFT_H",     0x4B300188, 0x4C116010, 1),
+            new Axis("LEFT_V",     0x4B300190, 0x4C116018, 1),
+            new Axis("RIGHT_H",    0x4BB00110, 0x4C116020, 1),
+            new Axis("RIGHT_V",    0x4BB00118, 0x4C116028, 1),
+            new Axis("ST_H",       0x4B300198, 0x4C116030, 1),
+            new Axis("ST_V",       0x4B3001A0, 0x4C116038, 1),
+            new Axis("HORIZONTAL", 0x3AF00008, 0x4C115010, 2),
+            new Axis("BACKREST",   0x3AF00010, 0x4C115018, 2),
+            new Axis("HEIGHT",     0x3AF00018, 0x4C115020, 2),
+            new Axis("SITPOINT",   0x3AF00020, 0x4C115028, 2),
+            new Axis("LEGHOLDER",  0x3AF00028, 0x4C115030, 2),
+            new Axis("HEADREST_H", 0x3AF00030, 0x4C115038, 2),
+            new Axis("HEADREST_V", 0x3AF00038, 0x4C115040, 2),
+        };
+    }
+
+    /**
+     * Apply a FULL driver position, replicating {@code spi.p7.m()} exactly: read current
+     * value for every axis, apply the caller's overrides (by label, case-insensitive), then
+     * write TWO bodywork floatArrayValue batches — group 1 (mirrors+steering), a 50 ms pause,
+     * then group 2 (7 seat axes). This is the real native apply sequence; a standalone mirror
+     * batch is accepted but does not actuate. MOVES THE SEAT AND MIRRORS. Parked-gated.
+     *
+     * @param overrides label -> value (e.g. {"LEFT_H":15}); axes not overridden keep their current read value.
+     */
+    public static JSONObject applyFull(Context ctx, Map<String, Float> overrides, boolean force) {
+        JSONObject r = new JSONObject();
+        try {
+            r.put("uid", android.os.Process.myUid());
+            boolean blocked = false;
+            try { blocked = com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked(); }
+            catch (Throwable t) { r.put("gateError", String.valueOf(t)); blocked = true; }
+            r.put("movementBlocked", blocked); r.put("forced", force);
+            if (blocked && !force) { r.put("skipped", true); r.put("reason", "movement gate blocked; add force=YES only if certain the car is parked"); return r; }
+
+            Context permissive = new PermissiveContext(ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx);
+            Object device = BydDeviceHelper.getDevice(BODYWORK_DEVICE, permissive);
+            if (device == null) { r.put("error", "BYDAutoBodyworkDevice null"); return r; }
+            r.put("permissiveContextInstalled", swapContext(device, permissive));
+
+            Class<?> evClass = Class.forName("android.hardware.bydauto.BYDAutoEventValue");
+            Method setM = device.getClass().getMethod("set", int[].class, evClass);
+
+            // Resolve current value per axis (double read), apply override.
+            Axis[] axes = fullAxes();
+            java.util.Map<String, Float> ov = new LinkedHashMap<>();
+            if (overrides != null) for (Map.Entry<String, Float> e : overrides.entrySet()) ov.put(e.getKey().trim().toUpperCase(), e.getValue());
+            JSONObject applied = new JSONObject();
+            float[] valByIdx = new float[axes.length];
+            for (int k = 0; k < axes.length; k++) {
+                Float o = ov.get(axes[k].label);
+                float v;
+                if (o != null) v = o;
+                else {
+                    Object rd = BydDeviceHelper.callGet(device, axes[k].readId, Double.TYPE);
+                    double d = BydDeviceHelper.getDoubleValue(rd);
+                    v = Double.isNaN(d) ? 127.5f : (float) d;   // 127.5 = not-equipped sentinel, matches native
+                }
+                valByIdx[k] = v;
+                applied.put(axes[k].label, v);
+            }
+            r.put("applied", applied);
+
+            // Batch 1: group 1 (mirrors + steering).
+            r.put("batch1", writeGroup(setM, evClass, device, axes, valByIdx, 1));
+            try { Thread.sleep(50L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            // Batch 2: group 2 (seat).
+            r.put("batch2", writeGroup(setM, evClass, device, axes, valByIdx, 2));
+        } catch (Throwable t) {
+            try { r.put("exception", String.valueOf(t)); } catch (Exception ignored) {}
+        }
+        return r;
+    }
+
+    private static JSONObject writeGroup(Method setM, Class<?> evClass, Object device, Axis[] axes, float[] valByIdx, int group) throws Exception {
+        java.util.List<Integer> ids = new java.util.ArrayList<>();
+        java.util.List<Float> vals = new java.util.ArrayList<>();
+        for (int k = 0; k < axes.length; k++) if (axes[k].group == group) { ids.add(axes[k].writeId); vals.add(valByIdx[k]); }
+        int[] idArr = new int[ids.size()]; float[] valArr = new float[vals.size()];
+        for (int k = 0; k < ids.size(); k++) { idArr[k] = ids.get(k); valArr[k] = vals.get(k); }
+        Object ev = evClass.getConstructor().newInstance();
+        evClass.getField("floatArrayValue").set(ev, valArr);
+        Object res = setM.invoke(device, idArr, ev);
+        int code = (res instanceof Number) ? ((Number) res).intValue() : (res instanceof Boolean) ? (((Boolean) res) ? 0 : -1) : 0;
+        JSONObject o = new JSONObject();
+        o.put("group", group); o.put("count", idArr.length); o.put("resultCode", code); o.put("accepted", code == 0);
+        return o;
+    }
+
+    /**
+     * Context that no-ops Android's permission enforcement so the BYD device's
+     * in-process gate-3 check passes. Same mechanism as
+     * {@link HazardLightProbe.PermissiveContext}; kept local so this read-only
+     * probe carries no dependency on the write probe's internals.
+     */
+    static final class PermissiveContext extends ContextWrapper {
+        PermissiveContext(Context base) { super(base); }
+        @Override public void enforceCallingOrSelfPermission(String permission, String message) { /* no-op */ }
+        @Override public void enforceCallingPermission(String permission, String message) { /* no-op */ }
+        @Override public void enforcePermission(String permission, int pid, int uid, String message) { /* no-op */ }
+        @Override public int checkCallingOrSelfPermission(String permission) {
+            return android.content.pm.PackageManager.PERMISSION_GRANTED;
+        }
+        @Override public int checkCallingPermission(String permission) {
+            return android.content.pm.PackageManager.PERMISSION_GRANTED;
+        }
+        @Override public int checkPermission(String permission, int pid, int uid) {
+            return android.content.pm.PackageManager.PERMISSION_GRANTED;
+        }
+    }
+
+    /**
+     * Reflectively replace {@code AbsBYDAutoDevice.mContext} on the device
+     * singleton with our PermissiveContext. Walks up the class hierarchy to find
+     * the private {@code mContext} field. Mirrors {@link HazardLightProbe#swapContext}.
+     */
+    static boolean swapContext(Object device, Context permissive) {
+        Class<?> cls = device.getClass();
+        while (cls != null) {
+            try {
+                Field f = cls.getDeclaredField("mContext");
+                f.setAccessible(true);
+                f.set(device, permissive);
+                return true;
+            } catch (NoSuchFieldException nsfe) {
+                cls = cls.getSuperclass();
+            } catch (Throwable t) {
+                return false;
+            }
+        }
+        return false;
+    }
+}

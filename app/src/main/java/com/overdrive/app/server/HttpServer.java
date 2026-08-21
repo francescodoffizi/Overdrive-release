@@ -569,6 +569,10 @@ public class HttpServer {
                 if (!serveStaticFile(out, "local/notifications.html")) {
                     HttpResponse.sendError(out, 404, "notifications.html not found");
                 }
+            } else if (path.equals("/seat-positions.html") || path.equals("/seat-positions")) {
+                if (!serveStaticFile(out, "local/seat-positions.html")) {
+                    HttpResponse.sendError(out, 404, "seat-positions.html not found");
+                }
             } else if (path.equals("/key-mapping.html") || path.equals("/key-mapping")) {
                 if (!serveStaticFile(out, "local/key-mapping.html")) {
                     HttpResponse.sendError(out, 404, "key-mapping.html not found");
@@ -657,6 +661,11 @@ public class HttpServer {
         "/api/recording/mode", // recording mode
         "/api/apps/launch",    // open-app action: launch a user-selected app (NOT /api/apps/list)
         "/api/camview/",       // camera-view show/hide (native lane, shares blind-spot pipeline)
+        // Saved seat/mirror position recall. EXACT path, not the /api/positions/ prefix: the
+        // sibling endpoints create, overwrite and delete stored positions, which an ApiAction
+        // has no business reaching. startsWith() on the query-stripped path matches
+        // /api/positions/apply?id=.. and nothing else under /api/positions/.
+        "/api/positions/apply",
         "/api/bs/",            // blind-spot: enable/disable/hide/view/geometry/target/tweak
                                // (same native camera lane as /api/camview/ above — the card's
                                // own on/off + view knobs, no new capability class)
@@ -968,6 +977,22 @@ public class HttpServer {
         // See LightDebugApiHandler / HazardLightProbe.
         if (path.startsWith("/api/debug/light/")) {
             return LightDebugApiHandler.handle(method, path, body, out);
+        }
+
+        // OverDrive-native seat/mirror POSITIONS store (feature: seat positions).
+        // list / capture (fired by the long-press a11y hook) / apply / delete.
+        // Runs in the daemon (only uid that can read/write BYD geometry).
+        if (path.startsWith("/api/positions")) {
+            return PositionsApiHandler.handle(method, path, body, out);
+        }
+
+        // Bodywork seat/keyfob feature-id READS — read-only probe of the
+        // absolute seat geometry (System B) and the keyfob-identity ids via
+        // BYDAutoBodyworkDevice.get(int[], Class) through a PermissiveContext,
+        // the reach the CarProperty bridge lacks. No writes; the seat never
+        // moves. See SeatDebugApiHandler / BodyworkSeatProbe.
+        if (path.startsWith("/api/debug/seat/")) {
+            return SeatDebugApiHandler.handle(method, path, body, out);
         }
 
         // Radar blind-spot ALERT register probe — read-only. The `blindSpot` automation

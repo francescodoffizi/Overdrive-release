@@ -7,12 +7,20 @@
       let onKeyEvent intercept hardware buttons (steering-wheel / dash keys) BEFORE
       the OEM handler, so the user can rebind them. This is a standard a11y
       capability — no root, no signature permission, no INJECT_EVENTS.
-  We keep accessibilityEventTypes empty: we observe NO window/view events, only
-  filter key events, so this adds no event-callback overhead.
+   3. Seat-position capture — typeViewLongClicked lets onAccessibilityEvent
+      notice the user long-pressing BYD's seat-position buttons
+      (com.byd.carsettings:id/location{1,2,3}) to save that geometry into
+      OverDrive's own position store. flagReportViewIds (already set) exposes
+      getViewIdResourceName() so the match is by resource-id, not localized
+      button text. The match reads the event source only — no getWindows(), no
+      extra window-retrieval flags.
+
+  Event types are the union of (2) and (3): key filtering needs no window events,
+  capture needs the long-click event, and neither disables the other.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"
-    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeViewLongClicked"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagRequestFilterKeyEvents|flagReportViewIds"
     android:canRequestFilterKeyEvents="true"

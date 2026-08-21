@@ -112,6 +112,18 @@
             android:defaultValue="/automations" />
     </fragment>
 
+    <!-- Seat Positions (web canonical) -->
+    <fragment
+        android:id="@+id/seatPositionsFragment"
+        android:name="com.overdrive.app.ui.fragment.WebViewFragment"
+        android:label="@string/rail_seat_positions"
+        tools:layout="@layout/fragment_webview">
+        <argument
+            android:name="page_path"
+            app:argType="string"
+            android:defaultValue="/seat-positions" />
+    </fragment>
+
     <!-- Key Mapping (web canonical) -->
     <fragment
         android:id="@+id/keyMappingFragment"

@@ -18,6 +18,7 @@ object NavigationRailCatalog {
     const val LIVE = "live"
     const val RECORDINGS = "recordings"
     const val VEHICLE = "vehicle"
+    const val SEAT_POSITIONS = "seat_positions"
     const val PROJECTION = "projection"
     const val TRIPS = "trips"
     const val CHARGING = "charging"
@@ -33,6 +34,7 @@ object NavigationRailCatalog {
         NavigationRailOption(LIVE, R.string.rail_live, R.drawable.ic_live),
         NavigationRailOption(RECORDINGS, R.string.rail_recordings, R.drawable.ic_recording),
         NavigationRailOption(VEHICLE, R.string.rail_vehicle, R.drawable.ic_vehicle_control),
+        NavigationRailOption(SEAT_POSITIONS, R.string.rail_seat_positions, R.drawable.ic_seat_positions),
         NavigationRailOption(PROJECTION, R.string.rail_projection, R.drawable.ic_projection),
         NavigationRailOption(TRIPS, R.string.rail_trips, R.drawable.ic_trips),
         NavigationRailOption(CHARGING, R.string.rail_charging, R.drawable.ic_charging),

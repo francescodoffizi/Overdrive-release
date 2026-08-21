@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title data-i18n="app.seat_positions_title">Seat Positions - OverDrive</title>
+    <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="../shared/app-icon-dark.webp">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#00876C">
+    <script src="../shared/theme.js?v=5"></script>
+    <script src="../shared/app-shell.js?v=2"></script>
+    <link rel="stylesheet" href="../shared/styles.css?v=20">
+    <link rel="stylesheet" href="../shared/seat-positions.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-layout">
+        <div id="app-shell-mount"></div>
+        <main class="main-content">
+            <div class="mobile-header">
+                <button class="menu-toggle" onclick="toggleSidebar()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/>
+                    </svg>
+                </button>
+                <span style="font-weight:600;" data-i18n="nav.seat_positions">Seat Positions</span>
+                <div style="width:40px;"></div>
+            </div>
+
+            <header class="page-header">
+                <h1 class="page-title" data-i18n="seatpos.page_title">Seat Positions</h1>
+                <div class="header-actions">
+                    <span class="status-badge inactive" id="spStateBadge" data-i18n="seatpos.state_acc_off">ACC off</span>
+                </div>
+            </header>
+
+            <div class="page-body">
+
+                <!-- ACC off is the one hard blocker: the seat motors are unpowered, so a
+                     write is accepted (result code 0) and does nothing. Without this the
+                     UI would report a success that never happened. -->
+                <div class="card" id="spGate" style="display:none;">
+                    <div class="card-body">
+                        <div class="info-box-note" style="background:rgba(255,179,0,0.10);border:1px solid rgba(255,179,0,0.35);">
+                            <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="#ffb300" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                            <div data-i18n="seatpos.gate_acc_off">The car is off, so the seat motors have no power. Applying or saving a position would be accepted and do nothing. Turn the car on to continue.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Gear-not-in-P blocks Apply. The gate is the GEAR, not motion: Pål confirmed
+                     the car refuses with the brake fully pressed and the car standing still, as
+                     long as the gear is out of P. DrivingSafetyGuard already keys on gear
+                     (NOT_PARK blocks; P only counts as parked below 2 km/h, to catch rolling in
+                     Park), so the signal was right and only this wording was wrong. The refusal
+                     is the VEHICLE's, not applyFull's gate, so force=YES buys nothing and only
+                     adds a native popup. Saving and renaming stay available; those only read. -->
+                <div class="card" id="spMoving" style="display:none;">
+                    <div class="card-body">
+                        <div class="info-box-note">
+                            <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="11"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                            <div data-i18n="seatpos.gate_moving">The car is not in Park. Seat positions can only be applied with the gear in P &mdash; the vehicle refuses otherwise, even standing still with the brake pressed. Saving and renaming still work.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Shown on any model the axis map has not been confirmed against, including a
+                     car whose owner never picked one. Informational, not a warning: reading and
+                     capturing are safe everywhere, and the values in the list are how an owner
+                     finds out whether the addresses fit their car. -->
+                <div class="card" id="spUnconfirmed" style="display:none;">
+                    <div class="card-body">
+                        <div class="info-box-note">
+                            <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="11"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                            <div id="spUnconfirmedText"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-body sp-hero">
+                        <div class="seat-frame hero-size" id="spCurrentGlyph"></div>
+                        <div class="sp-hero-main">
+                            <div class="sp-hero-top">
+                                <div>
+                                    <div class="sp-eyebrow" data-i18n="seatpos.current">Current position</div>
+                                    <div class="sp-match" id="spCurrentMatch"></div>
+                                </div>
+                                <button class="btn btn-primary" id="spSaveNew">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                    <span data-i18n="seatpos.save_as_new">Save as new</span>
+                                </button>
+                            </div>
+                            <div class="sp-axes" id="spCurrentAxes"></div>
+                            <div class="sp-batches" id="spBatches" style="display:none;">
+                                <span class="sp-batch" id="spBatch1"><span class="led"></span>batch 1 · mirrors</span>
+                                <span class="sp-batch" id="spBatch2"><span class="led"></span>batch 2 · seat</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="spList"></div>
+
+            </div>
+        </main>
+    </div>
+
+    <div class="modal-backdrop" id="spScrim" style="display:none;">
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="spDialogTitle">
+            <h3 id="spDialogTitle" style="margin:0 0 10px;font-size:17px;font-weight:650;"></h3>
+            <p id="spDialogBody" style="margin:0 0 14px;font-size:13.5px;color:var(--text-secondary);"></p>
+            <div id="spDialogHtml" style="margin-bottom:14px;"></div>
+            <input type="text" id="spDialogInput" class="input" maxlength="60" style="display:none;width:100%;margin-bottom:14px;">
+            <div style="display:flex;justify-content:flex-end;gap:8px;">
+                <button class="btn btn-secondary" id="spDialogCancel" data-i18n="common.cancel">Cancel</button>
+                <button class="btn btn-primary" id="spDialogConfirm"></button>
+            </div>
+        </div>
+    </div>
+
+    <script src="../shared/auth.js"></script>
+    <script src="../shared/pwa-init.js?v=index1"></script>
+    <script src="../shared/core.js?v=15"></script>
+    <script src="../shared/seat-positions.js"></script>
+    <script>
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+            document.getElementById('sidebarOverlay').classList.toggle('show');
+        }
+        document.addEventListener('DOMContentLoaded', function () {
+            BYD.i18n.init().then(function () {
+                BYD.core.init();
+                SeatPositions.init();
+            });
+        });
+    </script>
+</body>
+</html>

@@ -9,6 +9,11 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
 import com.overdrive.app.ui.daemon.DaemonStartupManager;
+import com.overdrive.app.util.DaemonHttpClient;
+
+import java.net.HttpURLConnection;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Minimal AccessibilityService that keeps the app process alive indefinitely.
@@ -79,7 +84,14 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         // Mirror the proven OEM config EXACTLY (no extra flags): subscribe to a
         // real event type + report-view-ids + filter-key-events. Adding more than
         // the known-good set risks a different firmware quirk, so match it 1:1.
-        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
+        // One addition on top of that shape: seat-position capture subscribes to
+        // TYPE_VIEW_LONG_CLICKED so onAccessibilityEvent sees the user long-pressing
+        // BYD's seat-position buttons. No extra flags — the handler reads the event
+        // source's resource-id, which flagReportViewIds already covers. eventTypes
+        // changes have regressed key delivery on this firmware before, so a build
+        // carrying this should re-verify that a mapped hardware key still fires.
+        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                | AccessibilityEvent.TYPE_VIEW_LONG_CLICKED;
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
         info.notificationTimeout = 100;
         info.flags |= AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
@@ -138,24 +150,138 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         }
     }
 
+    /**
+     * BYD exposes the SAME three profile positions from two different apps, and a long-press
+     * saves in both — so both have to be watched or capture silently misses half the ways the
+     * user actually saves a position.
+     *
+     * <p>{@code com.byd.carsettings} is the Settings "Sjåfør" dialog, ids {@code location1..3}.
+     *
+     * <p>{@code com.byd.diLinkAccount} is a floating widget that appears OVER whatever app is
+     * open, whenever the seat or mirrors are moved with the physical controls while the car is
+     * on and stationary. Confirmed as the window owner on the car (2026-08-11). Its layout is
+     * {@code window_glb_driver_pos} and its own prompt string reads "Long press the widget to
+     * save the seat/steering wheel/rearview mirror position, and tap the widget to apply the
+     * position" — i.e. the same save gesture, on the same three slots.
+     */
+    private static final String SEAT_POS_PKG = "com.byd.carsettings";
+    private static final String SEAT_POS_WIDGET_PKG = "com.byd.diLinkAccount";
+
+    /** Off-thread HTTP to the daemon so the a11y callback never blocks. */
+    private final ExecutorService captureExecutor = Executors.newSingleThreadExecutor();
+
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (event == null
-                || event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+        // Two consumers now share this callback, so dispatch on event type rather than
+        // assuming one. Upstream tracks the foreground package from window-state changes for
+        // conditional key mappings; seat capture watches for a long-press on BYD's own
+        // position buttons. Neither is interested in the other's event.
+        if (event == null) return;
+        final int type = event.getEventType();
+
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            try {
+                KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
+                        stringValue(event.getPackageName()));
+            } catch (Throwable t) {
+                // Foreground detection is advisory. Unknown must fail open so a
+                // conditional mapping never suppresses the vehicle's default key action.
+                KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+            }
             return;
         }
-        try {
-            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
-                    stringValue(event.getPackageName()));
-        } catch (Throwable t) {
-            // Foreground detection is advisory. Unknown must fail open so a
-            // conditional mapping never suppresses the vehicle's default key action.
-            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
-        }
+
+        // Only interested in the user long-pressing a BYD seat-position button (the
+        // "save current position" gesture). Everything else is ignored cheaply.
+        if (type != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return;
+        CharSequence pkg = event.getPackageName();
+        if (pkg == null) return;
+        if (!SEAT_POS_PKG.contentEquals(pkg) && !SEAT_POS_WIDGET_PKG.contentEquals(pkg)) return;
+        int slot = seatSlotFromEvent(event);
+        if (slot < 1) return;
+        Log.i(TAG, "seat-position long-press: slot " + slot + " — capturing geometry");
+        captureSeatPosition(slot);
     }
 
     private static String stringValue(CharSequence value) {
         return value != null ? value.toString() : null;
+    }
+
+    /**
+     * Resolve which native slot (1..3) was long-pressed, from the source view's resource-id.
+     * Resource-id is language-independent, unlike the button text ("Posisjon N").
+     *
+     * <p>Two id schemes, because the same three slots are presented by two apps:
+     * <ul>
+     *   <li>Settings dialog: {@code com.byd.carsettings:id/location1|2|3} — the number IS the slot.
+     *   <li>Floating widget: {@code com.byd.diLinkAccount:id/(iv|tv)_(drive|rest|standby)} —
+     *       named, not numbered. Both the image and the label carry an id, and which one the
+     *       long-press reports depends on where the finger lands, so accept either.
+     * </ul>
+     *
+     * <p>The widget's drive/rest/standby → 1/2/3 mapping is INFERRED from the order the three
+     * groups appear in {@code window_glb_driver_pos} matching the app's own "Position 1/2/3"
+     * strings. It is not proven. If it were wrong the mistake would be loud rather than silent:
+     * the daemon names a captured entry from {@code driverPos_N}, so pressing the top slot would
+     * visibly store it as "Posisjon 2". Worth a glance on the first widget capture.
+     *
+     * <p>Returns -1 if the long-press wasn't on a seat-position slot.
+     */
+    private int seatSlotFromEvent(AccessibilityEvent event) {
+        AccessibilityNodeInfo src = null;
+        try {
+            src = event.getSource();
+            if (src == null) return -1;
+            CharSequence rid = src.getViewIdResourceName();
+            if (rid == null) return -1;
+            String s = rid.toString();
+
+            // Settings dialog — numbered ids.
+            String prefix = SEAT_POS_PKG + ":id/location";
+            if (s.startsWith(prefix) && s.length() == prefix.length() + 1) {
+                char c = s.charAt(s.length() - 1);
+                if (c >= '1' && c <= '3') return c - '0';
+            }
+
+            // Floating widget — named ids, either the icon (iv_) or the label (tv_).
+            String widgetPrefix = SEAT_POS_WIDGET_PKG + ":id/";
+            if (s.startsWith(widgetPrefix)) {
+                String name = s.substring(widgetPrefix.length());
+                if (name.startsWith("iv_") || name.startsWith("tv_")) {
+                    String slot = name.substring(3);
+                    if ("drive".equals(slot)) return 1;
+                    if ("rest".equals(slot)) return 2;
+                    if ("standby".equals(slot)) return 3;
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "seatSlotFromEvent: " + t.getMessage());
+        } finally {
+            if (src != null) { try { src.recycle(); } catch (Throwable ignored) {} }
+        }
+        return -1;
+    }
+
+    /**
+     * Ask the daemon to read the live seat+mirror geometry and store it as the
+     * captured entry for this native slot. The a11y service runs in the app UI
+     * process (uid = app), which cannot read BYD geometry directly (signature-perm
+     * gated to uid 2000); the daemon on :8080 can, so we POST there — same pattern
+     * as KeyMapDispatcher.fire(). Runs off the a11y callback thread.
+     */
+    private void captureSeatPosition(int slot) {
+        captureExecutor.execute(() -> {
+            HttpURLConnection conn = null;
+            try {
+                conn = DaemonHttpClient.open("/api/positions/capture?slot=" + slot, "POST", 3000, 8000);
+                int code = conn.getResponseCode();
+                Log.i(TAG, "capture slot " + slot + " -> HTTP " + code);
+            } catch (Throwable t) {
+                Log.w(TAG, "capture slot " + slot + " failed: " + t.getMessage());
+            } finally {
+                if (conn != null) { try { conn.disconnect(); } catch (Throwable ignored) {} }
+            }
+        });
     }
 
     /**
