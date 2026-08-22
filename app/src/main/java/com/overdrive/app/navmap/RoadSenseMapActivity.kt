@@ -2893,6 +2893,40 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      * never have its title/result clobbered by the older callback (and the [alive]
      * guard drops a callback that lands after dismissal).
      */
+    /** Send a place to the car's built-in navigation (factory nav) — navigate or save-favourite. */
+    private fun sendToCarNav(result: SearchResult, navigate: Boolean) {
+        val name = result.label
+        val lat = result.lat
+        val lng = result.lng
+        android.widget.Toast.makeText(this, R.string.carnav_sending, android.widget.Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                if (navigate) {
+                    val ok = com.overdrive.app.telenav.TelenavActions.navigate(applicationContext, name, lat, lng)
+                    runOnUiThread {
+                        android.widget.Toast.makeText(
+                            this,
+                            if (ok) R.string.carnav_navigate_ok else R.string.carnav_navigate_fail,
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                } else {
+                    com.overdrive.app.telenav.TelenavActions.addFavorite(applicationContext, name, lat, lng, "Normal")
+                    runOnUiThread {
+                        android.widget.Toast.makeText(this, R.string.carnav_saved_ok, android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    android.widget.Toast.makeText(
+                        this, getString(R.string.carnav_failed, e.message ?: ""),
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }.start()
+    }
+
     private fun showPlaceSheet(
         result: SearchResult,
         isDroppedPin: Boolean,
@@ -2955,6 +2989,16 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         view.findViewById<MaterialButton>(R.id.btnPlaceSaveFav).setOnClickListener {
             sheet.dismiss()
             savePlace(SavedPlacesStore.KIND_CUSTOM, current)
+        }
+
+        // Hand the place to the car's built-in navigation (factory nav via Telenav bridge).
+        view.findViewById<MaterialButton>(R.id.btnCarNavNavigate).setOnClickListener {
+            sheet.dismiss()
+            sendToCarNav(current, navigate = true)
+        }
+        view.findViewById<MaterialButton>(R.id.btnCarNavSave).setOnClickListener {
+            sheet.dismiss()
+            sendToCarNav(current, navigate = false)
         }
 
         sheet.setOnDismissListener {

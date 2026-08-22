@@ -126,4 +126,40 @@
             app:iconGravity="textStart" />
     </LinearLayout>
 
+    <!-- Hand the place to the car's built-in navigation (factory nav) -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="18dp"
+        android:layout_marginBottom="6dp"
+        android:text="@string/carnav_section_header"
+        android:textAppearance="?attr/textAppearanceLabelMedium"
+        android:alpha="0.7" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:baselineAligned="false">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnCarNavNavigate"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="5dp"
+            android:paddingVertical="14dp"
+            android:text="@string/carnav_navigate" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnCarNavSave"
+            style="@style/Widget.Material3.Button.TonalButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="5dp"
+            android:paddingVertical="14dp"
+            android:text="@string/carnav_save_favourite" />
+    </LinearLayout>
+
 </LinearLayout>

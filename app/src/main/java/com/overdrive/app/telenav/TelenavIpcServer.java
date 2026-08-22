@@ -118,29 +118,13 @@ public final class TelenavIpcServer {
 
     /** Build a Telenav Place from a request. Coordinates are required; placeId must be non-null. */
     private static Place buildPlace(JSONObject req) throws JSONException {
-        final String name = req.optString("name", "");
-        final double lat = req.getDouble("lat");
-        final double lng = req.getDouble("lng");
-        final String formattedAddress = req.optString("formattedAddress", name);
-        final String favoriteType = req.optString("favoriteType", FavoriteType.Normal);
-        final String placeId = req.optString("placeId", "OD-" + lat + "_" + lng).trim();
-
-        Place place = new Place();
-        place.setPlaceId(placeId);
-        place.setSearchSourceType("ON_BOARD");
-        place.setPlaceName(name);
-        place.setPlaceDisplayLabel(name);
-        place.setPlaceType("ADDRESS");
-        place.setFavoriteType(favoriteType);
-        place.setGeoLatitude(lat);
-        place.setGeoLongitude(lng);
-        place.setNavLatitude(lat);
-        place.setNavLongitude(lng);
-        Address addr = new Address();
-        addr.setFormattedAddress(formattedAddress);
-        addr.setFullAddress(formattedAddress);
-        place.setAddress(addr);
-        return place;
+        return TelenavActions.buildPlace(
+                req.optString("name", ""),
+                req.getDouble("lat"),
+                req.getDouble("lng"),
+                req.optString("favoriteType", FavoriteType.Normal),
+                req.optString("placeId", null),
+                req.optString("formattedAddress", null));
     }
 
     private static JSONObject navigate(JSONObject req) throws Exception {

@@ -69,6 +69,15 @@ public final class TelenavClient {
                 binder -> op.run(IUserDataService.Stub.asInterface(binder)));
     }
 
+    /** Add a favourite of the given type. Blocking. */
+    public static void addFavorite(Context ctx, long timeoutMs, String favoriteType, Place place)
+            throws Exception {
+        withUserData(ctx, timeoutMs, svc -> {
+            svc.addFavorite(favoriteType, place);
+            return Boolean.TRUE;
+        });
+    }
+
     /** Start turn-by-turn navigation to a place. Returns Telenav's boolean result. */
     public static boolean startNavigation(Context ctx, long timeoutMs, Place place) throws Exception {
         Boolean r = withService(ctx, timeoutMs,
