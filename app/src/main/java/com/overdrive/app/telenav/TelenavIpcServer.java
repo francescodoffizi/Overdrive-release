@@ -107,9 +107,57 @@ public final class TelenavIpcServer {
         if ("addFavorite".equals(op)) {
             return addFavorite(req);
         }
+        if ("navigate".equals(op)) {
+            return navigate(req);
+        }
         JSONObject o = new JSONObject();
         o.put("success", false);
         o.put("error", "unknown op: " + op);
+        return o;
+    }
+
+    /** Build a Telenav Place from a request. Coordinates are required; placeId must be non-null. */
+    private static Place buildPlace(JSONObject req) throws JSONException {
+        final String name = req.optString("name", "");
+        final double lat = req.getDouble("lat");
+        final double lng = req.getDouble("lng");
+        final String formattedAddress = req.optString("formattedAddress", name);
+        final String favoriteType = req.optString("favoriteType", FavoriteType.Normal);
+        final String placeId = req.optString("placeId", "OD-" + lat + "_" + lng).trim();
+
+        Place place = new Place();
+        place.setPlaceId(placeId);
+        place.setSearchSourceType("ON_BOARD");
+        place.setPlaceName(name);
+        place.setPlaceDisplayLabel(name);
+        place.setPlaceType("ADDRESS");
+        place.setFavoriteType(favoriteType);
+        place.setGeoLatitude(lat);
+        place.setGeoLongitude(lng);
+        place.setNavLatitude(lat);
+        place.setNavLongitude(lng);
+        Address addr = new Address();
+        addr.setFormattedAddress(formattedAddress);
+        addr.setFullAddress(formattedAddress);
+        place.setAddress(addr);
+        return place;
+    }
+
+    private static JSONObject navigate(JSONObject req) throws Exception {
+        JSONObject o = new JSONObject();
+        if (appCtx == null) {
+            o.put("success", false);
+            o.put("error", "no app context");
+            return o;
+        }
+        Place place = buildPlace(req);
+        boolean started = TelenavClient.startNavigation(appCtx, 20_000, place);
+        o.put("success", started);
+        if (!started) o.put("error", "Telenav startNavigation returned false");
+        o.put("wrote", new JSONObject()
+                .put("name", req.optString("name", ""))
+                .put("lat", req.getDouble("lat"))
+                .put("lng", req.getDouble("lng")));
         return o;
     }
 
@@ -124,21 +172,7 @@ public final class TelenavIpcServer {
         final String name = req.optString("name", "");
         final double lat = req.getDouble("lat");
         final double lng = req.getDouble("lng");
-        final String formattedAddress = req.optString("formattedAddress", name);
-
-        final Place place = new Place();
-        place.setPlaceName(name);
-        place.setPlaceDisplayLabel(name);
-        place.setPlaceType("ADDRESS");
-        place.setFavoriteType(type);
-        place.setGeoLatitude(lat);
-        place.setGeoLongitude(lng);
-        place.setNavLatitude(lat);
-        place.setNavLongitude(lng);
-        Address addr = new Address();
-        addr.setFormattedAddress(formattedAddress);
-        addr.setFullAddress(formattedAddress);
-        place.setAddress(addr);
+        final Place place = buildPlace(req);
 
         // Read back the bucket after adding so we can confirm it landed + its type.
         JSONObject readback = TelenavClient.withUserData(appCtx, 20_000, svc -> {

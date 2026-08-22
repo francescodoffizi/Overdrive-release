@@ -28,28 +28,33 @@ public final class TelenavDebugApiHandler {
         int qIdx = path.indexOf('?');
         if (qIdx >= 0) pathOnly = path.substring(0, qIdx);
 
+        // Accept the stable /api/telenav/* path and the older /api/debug/telenav/*.
+        String p = pathOnly;
+        if (p.startsWith("/api/debug/telenav/")) p = "/api/telenav/" + p.substring("/api/debug/telenav/".length());
+
         final JSONObject req;
-        if (pathOnly.equals("/api/debug/telenav/favorites")) {
+        if (p.equals("/api/telenav/favorites")) {
             if (!"GET".equals(method)) {
                 HttpResponse.sendError(out, 405, "Method Not Allowed");
                 return true;
             }
             req = new JSONObject().put("op", "getFavorites");
-        } else if (pathOnly.equals("/api/debug/telenav/addFavorite")) {
+        } else if (p.equals("/api/telenav/addFavorite") || p.equals("/api/telenav/navigate")) {
             if (!"POST".equals(method)) {
                 HttpResponse.sendError(out, 405, "Method Not Allowed");
                 return true;
             }
             JSONObject in = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
+            String op = p.endsWith("/navigate") ? "navigate" : "addFavorite";
             req = new JSONObject()
-                    .put("op", "addFavorite")
+                    .put("op", op)
                     .put("favoriteType", in.optString("favoriteType", "Normal"))
                     .put("name", in.optString("name", ""))
                     .put("lat", in.getDouble("lat"))
                     .put("lng", in.getDouble("lng"))
                     .put("formattedAddress", in.optString("formattedAddress", in.optString("name", "")));
         } else {
-            HttpResponse.sendError(out, 404, "Unknown telenav debug endpoint");
+            HttpResponse.sendError(out, 404, "Unknown telenav endpoint");
             return true;
         }
 

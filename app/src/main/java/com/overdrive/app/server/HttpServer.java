@@ -998,7 +998,7 @@ public class HttpServer {
         // Telenav OEM user-data AIDL — READ-ONLY spike: bind TnNaviService and read
         // the favourite buckets + recents to confirm the bind and learn the heart's
         // FavoriteType. No writes. See TelenavDebugApiHandler / TelenavClient.
-        if (path.startsWith("/api/debug/telenav/")) {
+        if (path.startsWith("/api/debug/telenav/") || path.startsWith("/api/telenav/")) {
             return TelenavDebugApiHandler.handle(method, path, body, out);
         }
         // Radar blind-spot ALERT register probe — read-only. The `blindSpot` automation
