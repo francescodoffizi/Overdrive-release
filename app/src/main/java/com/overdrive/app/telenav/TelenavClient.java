@@ -44,6 +44,8 @@ public final class TelenavClient {
     // descriptor and startNavigation's transaction code. We raw-transact this one
     // method to avoid vendoring the whole navi/listener/model tree.
     private static final String NAV_DESCRIPTOR = "com.telenav.app.external.INavigationService";
+    private static final int TRANSACTION_getNavState = 1;
+    private static final int TRANSACTION_stopNav = 3;
     private static final int TRANSACTION_startNavigation = 8;
 
     private TelenavClient() {}
@@ -83,6 +85,40 @@ public final class TelenavClient {
         Boolean r = withService(ctx, timeoutMs,
                 IServiceManager::registerNavigationServiceCallback,
                 binder -> rawStartNavigation(binder, place));
+        return Boolean.TRUE.equals(r);
+    }
+
+    /** Current nav state (NavigationState int), or throws. */
+    public static int getNavState(Context ctx, long timeoutMs) throws Exception {
+        Integer r = withService(ctx, timeoutMs,
+                IServiceManager::registerNavigationServiceCallback,
+                binder -> {
+                    Parcel data = Parcel.obtain();
+                    Parcel reply = Parcel.obtain();
+                    try {
+                        data.writeInterfaceToken(NAV_DESCRIPTOR);
+                        binder.transact(TRANSACTION_getNavState, data, reply, 0);
+                        reply.readException();
+                        return reply.readInt();
+                    } finally { reply.recycle(); data.recycle(); }
+                });
+        return r == null ? Integer.MIN_VALUE : r;
+    }
+
+    /** Stop the active navigation. */
+    public static boolean stopNav(Context ctx, long timeoutMs) throws Exception {
+        Boolean r = withService(ctx, timeoutMs,
+                IServiceManager::registerNavigationServiceCallback,
+                binder -> {
+                    Parcel data = Parcel.obtain();
+                    Parcel reply = Parcel.obtain();
+                    try {
+                        data.writeInterfaceToken(NAV_DESCRIPTOR);
+                        binder.transact(TRANSACTION_stopNav, data, reply, 0);
+                        reply.readException();
+                        return reply.readInt() != 0;
+                    } finally { reply.recycle(); data.recycle(); }
+                });
         return Boolean.TRUE.equals(r);
     }
 

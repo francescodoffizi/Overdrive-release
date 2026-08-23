@@ -110,6 +110,19 @@ public final class TelenavIpcServer {
         if ("navigate".equals(op)) {
             return navigate(req);
         }
+        if ("navState".equals(op)) {
+            JSONObject o = new JSONObject();
+            if (appCtx == null) { o.put("success", false); o.put("error", "no app context"); return o; }
+            o.put("success", true);
+            o.put("navState", TelenavClient.getNavState(appCtx, 20_000));
+            return o;
+        }
+        if ("stopNav".equals(op)) {
+            JSONObject o = new JSONObject();
+            if (appCtx == null) { o.put("success", false); o.put("error", "no app context"); return o; }
+            o.put("success", TelenavClient.stopNav(appCtx, 20_000));
+            return o;
+        }
         JSONObject o = new JSONObject();
         o.put("success", false);
         o.put("error", "unknown op: " + op);
@@ -135,6 +148,11 @@ public final class TelenavIpcServer {
             return o;
         }
         Place place = buildPlace(req);
+        if (req.optBoolean("replace", false)) {
+            // Force a fresh route (REPLACE): stop any active nav first, then start.
+            try { TelenavClient.stopNav(appCtx, 20_000); } catch (Exception ignore) {}
+            try { Thread.sleep(1200); } catch (InterruptedException ignore) {}
+        }
         boolean started = TelenavClient.startNavigation(appCtx, 20_000, place);
         o.put("success", started);
         if (!started) o.put("error", "Telenav startNavigation returned false");

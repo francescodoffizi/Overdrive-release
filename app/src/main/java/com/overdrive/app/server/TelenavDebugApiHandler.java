@@ -39,6 +39,12 @@ public final class TelenavDebugApiHandler {
                 return true;
             }
             req = new JSONObject().put("op", "getFavorites");
+        } else if (p.equals("/api/telenav/navstate")) {
+            if (!"GET".equals(method)) { HttpResponse.sendError(out, 405, "Method Not Allowed"); return true; }
+            req = new JSONObject().put("op", "navState");
+        } else if (p.equals("/api/telenav/stopnav")) {
+            if (!"POST".equals(method)) { HttpResponse.sendError(out, 405, "Method Not Allowed"); return true; }
+            req = new JSONObject().put("op", "stopNav");
         } else if (p.equals("/api/telenav/addFavorite") || p.equals("/api/telenav/navigate")) {
             if (!"POST".equals(method)) {
                 HttpResponse.sendError(out, 405, "Method Not Allowed");
@@ -52,6 +58,7 @@ public final class TelenavDebugApiHandler {
                     .put("name", in.optString("name", ""))
                     .put("lat", in.getDouble("lat"))
                     .put("lng", in.getDouble("lng"))
+                    .put("replace", in.optBoolean("replace", false))
                     .put("formattedAddress", in.optString("formattedAddress", in.optString("name", "")));
         } else {
             HttpResponse.sendError(out, 404, "Unknown telenav endpoint");
