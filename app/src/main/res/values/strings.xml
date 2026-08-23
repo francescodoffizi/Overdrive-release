@@ -562,6 +562,9 @@
     <string name="daemons_count_pending">Loading services…</string>
     <!-- Subtitle on the Daemons hero header. %1$d running, %2$d total. -->
     <string name="daemons_count_fmt">%1$d of %2$d running</string>
+    <string name="daemons_wifi_auto_enable_title">Automatically enable Wi&#8209;Fi</string>
+    <string name="daemons_wifi_auto_enable_subtitle">OverDrive restores Wi&#8209;Fi while parked and when background services start. Turn this off to leave the current Wi&#8209;Fi state under vehicle control.</string>
+    <string name="daemons_wifi_auto_enable_save_failed">Could not save the Wi&#8209;Fi auto-enable setting.</string>
 
     <!-- dialog_time_window -->
 

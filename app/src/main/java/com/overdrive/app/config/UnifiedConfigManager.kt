@@ -2277,7 +2277,8 @@ object UnifiedConfigManager {
     fun setAutomationShellAllowed(allow: Boolean): Boolean =
         updateValues("automation", mapOf("allowShell" to allow))
 
-    /** Whether the user has explicitly turned WiFi OFF via an automation / key-mapping
+    /** Whether the user has explicitly disabled OverDrive's WiFi keep-alive via the
+     *  Background services setting or turned WiFi OFF via an automation / key-mapping
      *  radio action. The WiFi keep-alive watchdog (AccSentryDaemon.ensureWifiEnabled,
      *  SentryDaemon.enableWifi, ServiceLauncher.ensureWifiEnabled) checks this BEFORE
      *  running `svc wifi enable`, so a deliberate "WiFi off" rule is not immediately
@@ -2290,8 +2291,9 @@ object UnifiedConfigManager {
         try { (loadConfig().optJSONObject("radio")?.optBoolean("wifiUserOff", false)) ?: false }
         catch (t: Throwable) { false }
 
-    /** Persist the WiFi-off suppression flag. Set true when a radio action turns WiFi
-     *  off (so keep-alive stands down), cleared to false when WiFi is turned back on.
+    /** Persist the WiFi keep-alive suppression flag. Set true by the Background services
+     *  setting or when a radio action turns WiFi off (so keep-alive stands down), and
+     *  cleared to false when the setting is enabled or WiFi is turned back on.
      *  Single-key merge on the "radio" section, off the main looper (updateValues
      *  routes an app-process write to the daemon). */
     @JvmStatic
