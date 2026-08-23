@@ -102,13 +102,13 @@
     <string name="tailscale_scan_to_login">Escanegeu per a iniciar la sessió</string>
     <string name="tailscale_qr_waiting">S\'està esperant l\'URL d\'inici de sessió...</string>
     <string name="tailscale_enable_proxy">Habilita el servidor intermediari Tailscale</string>
-    <string name="tailscale_proxy_explainer">Routes MQTT through Tailscale so you can reach a private broker on your tailnet without port forwarding.</string>
+    <string name="tailscale_proxy_explainer">Encamina MQTT a través de Tailscale perquè pugueu arribar a un corredor privat a la vostra tailnet sense reenviament de ports.</string>
     <string name="tailscale_proxy_warning">While enabled, MQTT to public brokers (HiveMQ, AWS IoT, etc.) will fail — Tailscale only routes to your tailnet. Saving will restart the daemon.</string>
     <!-- Camera ingestion mode selector (Default vs DiLink 4) -->
     <string name="camera_mode_title">Ingestion Mode</string>
     <string name="camera_mode_subtitle">Trieu el camí que coincideixi amb la unitat principal. Per defecte s\'ajusta a la majoria dels models BYD; DiLink 4 és requerit en les versions més noves (Han / Tang 2024+) on l\'AVM HAL emet un mosaic 2x2 preencaixat.</string>
     <string name="camera_mode_option_default">Per defecte — funciona en Seal, Atto, Dolphin (la majoria dels cotxes)</string>
-    <string name="camera_mode_option_dilink4">DiLink 4 — newer Han / Tang variants</string>
+    <string name="camera_mode_option_dilink4">DiLink 4 — noves variants Han / Tang</string>
     <string name="camera_mode_current_default">Actual: per defecte</string>
     <string name="camera_mode_current_dilink4">Actual: DiLink 4</string>
     <string name="camera_mode_save">Aplica i reinicia</string>
@@ -1013,8 +1013,8 @@
     <string name="roadsense_sev_moderate">Moderar</string>
     <string name="roadsense_sev_severe">Sever</string>
     <string name="roadsense_type_breaker">Speed breaker</string>
-    <string name="roadsense_type_pothole">Pothole</string>
-    <string name="roadsense_type_hazard">Hazard</string>
+    <string name="roadsense_type_pothole">Sotrac</string>
+    <string name="roadsense_type_hazard">Perill</string>
     <string name="roadsense_type_rough">Rough section</string>
     <!-- "Moderate · Pothole" style line -->
     <string name="roadsense_hazard_format">%1$s · %2$s</string>
@@ -1070,15 +1070,15 @@
     <string name="roadsense_map_no_results">No s\'ha trobat cap lloc</string>
     <string name="roadsense_map_pick_destination">Trieu la destinació</string>
     <string name="roadsense_map_routing">S\'està cercant la ruta...</string>
-    <string name="roadsense_map_route_failed">Could not find a route. Try again.</string>
+    <string name="roadsense_map_route_failed">No s\'ha pogut trobar cap ruta. Torneu-ho a provar.</string>
     <string name="roadsense_map_need_key">Add a routing key in RoadSense settings to navigate.</string>
     <string name="roadsense_map_rerouting">Off route — recalculating…</string>
     <string name="roadsense_map_arrived">Heu arribat.</string>
     <string name="roadsense_map_nav_started">Navigating to %1$s</string>
     <string name="roadsense_map_nav_ended">Navigation ended</string>
     <string name="roadsense_map_end_nav">End navigation</string>
-    <string name="roadsense_map_zoom_in">Zoom in</string>
-    <string name="roadsense_map_zoom_out">Zoom out</string>
+    <string name="roadsense_map_zoom_in">Apropa\'t</string>
+    <string name="roadsense_map_zoom_out">Allunya\'t</string>
     <!-- Hazard visibility filter -->
     <string name="roadsense_map_hazards_filter">Visibilitat de perills</string>
     <string name="roadsense_map_hazards_all">Mostra tots els perills</string>
@@ -1093,7 +1093,7 @@
     <string name="roadsense_map_3d_off">Edificis 3D desactivats</string>
     <string name="roadsense_map_poi_loading">Trobant parades de recàrrega i combustible...</string>
     <string name="roadsense_map_poi_none">No s\'han trobat estacions properes</string>
-    <string name="roadsense_map_poi_need_route">Choose a destination first</string>
+    <string name="roadsense_map_poi_need_route">Trieu primer una destinació</string>
     <!-- POI tap action sheet -->
     <string name="roadsense_map_stop_added">S\'ha afegit una parada</string>
     <string name="roadsense_map_remove_stop_action">Suprimeix la parada</string>
@@ -1112,7 +1112,7 @@
     <string name="roadsense_map_pill_moderate">%1$d moderate</string>
     <string name="roadsense_map_pill_minor">%1$d minor</string>
     <!-- Shown briefly if the basemap can\'t be reached. -->
-    <string name="roadsense_map_offline">Map data unavailable offline</string>
+    <string name="roadsense_map_offline">Dades del mapa no disponibles fora de línia</string>
     <!-- Navigation: autocomplete + route options -->
     <string name="roadsense_map_clear_search">Neteja la cerca</string>
     <!-- Route-options sheet -->
@@ -1122,17 +1122,17 @@
     <!-- Per-route row label, %1$d is the 1-based route number. -->
     <string name="roadsense_map_route_option">Ruta %1$d</string>
     <string name="roadsense_map_fastest">Més ràpid</string>
-    <string name="roadsense_map_start">Start</string>
+    <string name="roadsense_map_start">Inicia</string>
     <!-- Stops / waypoints in the route-options sheet -->
     <string name="roadsense_map_your_location">La vostra ubicació</string>
     <string name="roadsense_map_add_stop">Afegeix una parada</string>
-    <string name="roadsense_map_add_stop_hint">Search a stop to add</string>
+    <string name="roadsense_map_add_stop_hint">Cerqueu una parada per afegir</string>
     <string name="roadsense_map_stop_removed">S\'ha eliminat la parada</string>
     <string name="roadsense_map_remove_stop">Suprimeix la parada</string>
     <string name="roadsense_map_move_stop_up">Mou la parada amunt</string>
     <string name="roadsense_map_move_stop_down">Mou la parada avall</string>
     <!-- %1$d is the maximum number of stops allowed. -->
-    <string name="roadsense_map_max_stops">Up to %1$d stops allowed</string>
+    <string name="roadsense_map_max_stops">Fins a %1$d parades permeses</string>
     <!-- Map day/night override (Auto → Light → Dark) -->
     <string name="roadsense_map_theme_toggle">Tema de mapa</string>
     <string name="roadsense_map_theme_auto">Tema de mapa: automàtic</string>
@@ -1162,7 +1162,7 @@
     <string name="roadsense_map_dropped_pin">Marcador col·locat</string>
     <string name="roadsense_map_navigate_here">Navega aquí</string>
     <!-- Shown after tapping an unset Home/Work chip: search picks the place to save. -->
-    <string name="roadsense_map_search_to_save">Search a place to set as %1$s</string>
+    <string name="roadsense_map_search_to_save">Cerqueu un lloc a establir com a %1$s</string>
     <!-- Shown when re-entering the map with a previously-set trip restored. -->
     <string name="roadsense_map_trip_restored">Viatge restaurat</string>
     <!-- dialog_cloudflared_settings -->
@@ -1343,4 +1343,17 @@
     <string name="network_behaviour_section">Comportament</string>
     <string name="network_warn_continue">Activa el punt d\'accés</string>
     <string name="network_warn_cancel">Cancel·la</string>
+    <string name="onboarding_expert_maps_body">Obriu el mapa per a la navegació amb indicacions completes — cerqueu una destinació, obteniu rutes i orientació en directe, a més de punts d\'interès propers i qualsevol perill a la carretera que RoadSense hagi registrat al llarg del camí. També podeu autoprojectar-ho a la pantalla del conductor quan comenceu a conduir — aquest commutador és a la pestanya Mapa de RoadSense.</string>
+    <string name="projection_hero_subtitle">Emet una aplicació a la pantalla del conductor i la clona aquí.</string>
+    <string name="projection_cast">Emet a la pantalla del conductor</string>
+    <string name="projection_cast_failed">No s\'ha pogut emetre aquesta aplicació a la pantalla del conductor.</string>
+    <string name="projection_status_unsupported">Clonatge en directe no està admès en aquest vehicle. L\'aplicació encara es projecta a la pantalla del conductor.</string>
+    <string name="projection_note_single_app">Es pot projectar una aplicació a la pantalla del conductor alhora.</string>
+    <string name="projection_window_title">Finestra de la pantalla del conductor</string>
+    <string name="projection_window_desc">Col·loqueu l\'aplicació d\'emissió a la pantalla del conductor. Els valors predefinits s\'ajusten a disposicions comunes; Redimensiona la finestra us permet arrossegar-la lliurement.</string>
+    <string name="projection_lock_aspect">Conserva l\'aspecte de la pantalla del conductor</string>
+    <string name="projection_scale_desc">Com el clonatge de la pantalla del conductor omple la vista prèvia en aquesta pantalla.</string>
+    <string name="projection_autostart_desc">Emet automàticament l\'última aplicació usada en la pantalla del conductor cada vegada que el cotxe s\'engegui. (El clonat s\'obre quan visiteu aquesta pantalla.)</string>
+    <string name="projection_autostart_conflict_title">RoadSense usa la pantalla del conductor</string>
+    <string name="projection_autostart_conflict_body">RoadSense està configurat per a autoprojectar el mapa a la pantalla del conductor quan el cotxe estigui activat. La pantalla del conductor només pot mostrar una cosa alhora. Voleu desactivar-ho i iniciar automàticament aquesta aplicació?</string>
 </resources>
