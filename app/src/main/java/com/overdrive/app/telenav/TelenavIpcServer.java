@@ -123,6 +123,20 @@ public final class TelenavIpcServer {
             o.put("success", TelenavClient.stopNav(appCtx, 20_000));
             return o;
         }
+        if ("showNavPrompt".equals(op)) {
+            // Deferred navigate: the daemon queued this while the car was off and, on
+            // ACC-on, asks us (app process) to draw the floating prompt. Must run on the
+            // main thread — WindowManager overlay + Telenav bind live here.
+            JSONObject o = new JSONObject();
+            if (appCtx == null) { o.put("success", false); o.put("error", "no app context"); return o; }
+            final String name = req.optString("name", "Shared location");
+            final double lat = req.getDouble("lat");
+            final double lng = req.getDouble("lng");
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(
+                    () -> NavPromptOverlay.show(appCtx, name, lat, lng));
+            o.put("success", true);
+            return o;
+        }
         JSONObject o = new JSONObject();
         o.put("success", false);
         o.put("error", "unknown op: " + op);

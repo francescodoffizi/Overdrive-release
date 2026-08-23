@@ -72,6 +72,24 @@ public final class TelenavDebugApiHandler {
         // here, before the app process runs startNavigation. Save-to-Favourites persists
         // silently and must NOT steal the screen, so it is deliberately excluded.
         if (p.equals("/api/telenav/navigate")) {
+            if (isAccOff()) {
+                // Car is off — foregrounding Telenav now is pointless (screen off). Queue
+                // the target; DeferredNavManager offers it as a prompt on the next ACC-on.
+                double qlat = req.optDouble("lat", Double.NaN);
+                double qlng = req.optDouble("lng", Double.NaN);
+                if (Double.isNaN(qlat) || Double.isNaN(qlng)) {
+                    HttpResponse.sendError(out, 400, "lat/lng required");
+                    return true;
+                }
+                com.overdrive.app.telenav.DeferredNavManager.storePending(
+                        req.optString("name", ""), qlat, qlng);
+                JSONObject queued = new JSONObject();
+                queued.put("success", true);
+                queued.put("queued", true);
+                queued.put("message", "Car is off — navigation will be offered on next start.");
+                HttpResponse.sendJson(out, 200, queued.toString());
+                return true;
+            }
             foregroundTelenav();
         }
 
@@ -86,6 +104,25 @@ public final class TelenavDebugApiHandler {
         }
         HttpResponse.sendJson(out, 200, resp);
         return true;
+    }
+
+    /**
+     * True when the car is off (ACC off). {@code sys.accanim.status} is "0" or empty while
+     * ACC is on; non-zero once the shutdown animation runs / the car is off. Same signal
+     * {@code AccMonitorController} polls. Unknown → treat as ON (navigate immediately),
+     * which is the safe default (never silently swallow a request into the queue).
+     */
+    private static boolean isAccOff() {
+        try {
+            Process pr = new ProcessBuilder("getprop", "sys.accanim.status")
+                    .redirectErrorStream(true).start();
+            String v = new BufferedReader(new InputStreamReader(pr.getInputStream())).readLine();
+            pr.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+            v = v == null ? "" : v.trim();
+            return !(v.isEmpty() || v.equals("0"));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**
