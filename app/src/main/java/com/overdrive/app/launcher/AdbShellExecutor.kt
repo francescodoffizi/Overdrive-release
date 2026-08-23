@@ -19,6 +19,13 @@ class AdbShellExecutor(private val context: Context) {
         private const val ADB_PORT = 5555
         private const val ADB_KEY_FILE = "adbkey"
         private const val ADB_PUB_KEY_FILE = "adbkey.pub"
+        // Dadb defaults both values to 0 (infinite). A stale loopback transport
+        // can therefore strand the single shell executor forever, leaving every
+        // daemon switch disabled at STARTING. Keep connection setup short and
+        // give legitimate longer shell commands (for example zrok's 30s probe)
+        // room to finish while still guaranteeing recovery from a dead socket.
+        private const val ADB_CONNECT_TIMEOUT_MS = 3_000
+        private const val ADB_SOCKET_TIMEOUT_MS = 45_000
         
         @Volatile
         private var cachedKeyPair: AdbKeyPair? = null
@@ -343,11 +350,10 @@ class AdbShellExecutor(private val context: Context) {
      * Try to connect with a timeout. Returns null if times out (auth pending).
      *
      * NOTE: java.net.Socket I/O is NOT interruptible — `Thread.interrupt()`
-     * does not unblock a thread blocked inside connect/read. The
-     * connectThread therefore keeps running until the OS times out the
-     * TCP handshake / SSL handshake (typically <75s on Android), or
-     * until the dadb internal socket aborts. We can't shorten that
-     * without rewriting the Dadb internals.
+     * does not unblock a thread blocked inside connect/read. Dadb 1.2.8 does,
+     * however, expose native connect + socket timeouts. Every connection below
+     * uses those bounds, so a probe thread that outlives this quick wrapper can
+     * survive for at most [ADB_SOCKET_TIMEOUT_MS], never indefinitely.
      *
      * Mitigation: mark the orphan thread as daemon + named so it
      *   (a) doesn't hold the JVM alive (Android process death is
@@ -358,7 +364,8 @@ class AdbShellExecutor(private val context: Context) {
      *   (c) is bounded — the thread terminates naturally when its
      *       blocked I/O times out.
      *
-     * Each timed-out call leaks ONE thread for ≤~75s. Under normal
+     * Each timed-out call can leave ONE daemon thread for at most
+     * [ADB_SOCKET_TIMEOUT_MS]. Under normal
      * operation (good ADB transport) this path is rarely hit.
      */
     private fun tryConnectWithTimeout(keyPair: AdbKeyPair, timeoutMs: Long): Dadb? {
@@ -373,7 +380,13 @@ class AdbShellExecutor(private val context: Context) {
 
         val connectThread = Thread({
             try {
-                val dadb = Dadb.create("127.0.0.1", ADB_PORT, keyPair)
+                val dadb = Dadb.create(
+                    "127.0.0.1",
+                    ADB_PORT,
+                    keyPair,
+                    ADB_CONNECT_TIMEOUT_MS,
+                    ADB_SOCKET_TIMEOUT_MS
+                )
                 val testResult = dadb.shell("echo ok")
                 if (testResult.exitCode == 0) {
                     result = dadb

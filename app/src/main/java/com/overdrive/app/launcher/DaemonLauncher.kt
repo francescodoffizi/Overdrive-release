@@ -383,12 +383,12 @@ class DaemonLauncher(
             // daemon is the highest-volume stdout logger, so real-time
             // bounding of cam_daemon.log (the UI-shown file) matters most here.
             val appProcessLine =
-                "  CLASSPATH=/system/framework/bmmcamera.jar:$apkPath app_process " +
-                "-Djava.library.path=$nativeLibDir:/system/lib64:/vendor/lib64:/product/lib64:/odm/lib64 " +
+                "  CLASSPATH=/system/framework/bmmcamera.jar:\$APK_PATH app_process " +
+                "-Djava.library.path=\$NATIVE_LIB_DIR:/system/lib64:/vendor/lib64:/product/lib64:/odm/lib64 " +
                 "${proxyArgs}/system/bin " +
                 "--nice-name=$CAMERA_DAEMON_PROCESS " +
                 "com.overdrive.app.daemon.CameraDaemon " +
-                "$outputDir $nativeLibDir >> \"\$LOG_FILE\" 2>&1 &"
+                "$outputDir \$NATIVE_LIB_DIR >> \"\$LOG_FILE\" 2>&1 &"
 
             return listOf(
                 "#!/system/bin/sh",
@@ -397,6 +397,8 @@ class DaemonLauncher(
                 "LOCK_FILE=\"/data/local/tmp/camera_daemon.lock\"",
                 "SENTINEL=\"/data/local/tmp/camera_daemon.disabled\"",
                 "PARKED=\"/data/local/tmp/overdrive_parked_shutdown\"",
+                "FALLBACK_APK_PATH=\"$apkPath\"",
+                "FALLBACK_NATIVE_LIB_DIR=\"$nativeLibDir\"",
                 "RETRY_COUNT=0",
                 "HEALTHY_UPTIME_SEC=300",
                 // Record THIS supervisor loop's PID so the kill-readers
@@ -415,7 +417,20 @@ class DaemonLauncher(
                 "    echo \"[\$(date)] Daemon disabled by user (sentinel file exists). Exiting watchdog.\" >> \"\$LOG_FILE\"",
                 "    exit 0",
                 "  fi",
-                "  echo \"[\$(date)] Starting CameraDaemon...\" >> \"\$LOG_FILE\"",
+                // Resolve the package path for every launch. `adb install -r`
+                // can move base.apk while this watchdog survives, so baking the
+                // path captured when the script was written can restart stale
+                // code or fail forever after an update.
+                "  APK_PATH=\$(pm path com.overdrive.app 2>/dev/null | grep '/base.apk\$' | head -n 1 | sed 's/^package://')",
+                "  if [ -z \"\$APK_PATH\" ] && [ -f \"\$FALLBACK_APK_PATH\" ]; then APK_PATH=\"\$FALLBACK_APK_PATH\"; fi",
+                "  if [ -z \"\$APK_PATH\" ]; then",
+                "    echo \"[\$(date)] Installed OverDrive APK not found, retrying in 10s...\" >> \"\$LOG_FILE\"",
+                "    sleep 10",
+                "    continue",
+                "  fi",
+                "  NATIVE_LIB_DIR=\"\${APK_PATH%/base.apk}/lib/arm64\"",
+                "  if [ ! -d \"\$NATIVE_LIB_DIR\" ] && [ \"\$APK_PATH\" = \"\$FALLBACK_APK_PATH\" ]; then NATIVE_LIB_DIR=\"\$FALLBACK_NATIVE_LIB_DIR\"; fi",
+                "  echo \"[\$(date)] Starting CameraDaemon from \$APK_PATH...\" >> \"\$LOG_FILE\"",
                 "  START_EPOCH=\$(awk '{print int(\$1)}' /proc/uptime 2>/dev/null || date +%s)",
                 "",
                 appProcessLine,
