@@ -87,4 +87,40 @@
         app:icon="@drawable/ic_directions"
         app:iconGravity="textStart" />
 
+    <!-- Hand the POI to the car's built-in navigation -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="18dp"
+        android:layout_marginBottom="6dp"
+        android:text="@string/carnav_section_header"
+        android:textAppearance="?attr/textAppearanceLabelMedium"
+        android:alpha="0.7" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:baselineAligned="false">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnPoiCarNavNavigate"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="5dp"
+            android:paddingVertical="14dp"
+            android:text="@string/carnav_navigate" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnPoiCarNavSave"
+            style="@style/Widget.Material3.Button.TonalButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="5dp"
+            android:paddingVertical="14dp"
+            android:text="@string/carnav_save_favourite" />
+    </LinearLayout>
+
 </LinearLayout>

@@ -2831,6 +2831,18 @@ open class RoadSenseMapActivity : AppCompatActivity() {
                 routeToResult(SearchResult(label, lat, lng)) // explicit navigate → destination
             }
 
+        // Hand the POI to the car's built-in navigation (factory nav via the Telenav bridge).
+        view.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnPoiCarNavNavigate)
+            ?.setOnClickListener {
+                sheet.dismiss()
+                sendToCarNav(SearchResult(label, lat, lng), navigate = true)
+            }
+        view.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnPoiCarNavSave)
+            ?.setOnClickListener {
+                sheet.dismiss()
+                sendToCarNav(SearchResult(label, lat, lng), navigate = false)
+            }
+
         sheet.setContentView(view)
         sheet.show()
     }
@@ -4048,6 +4060,16 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         }
         findViewById<com.google.android.material.button.MaterialButton>(R.id.btnRouteStart)
             ?.setOnClickListener { startSelectedRoute() }
+
+        // Hand the destination to the car's built-in navigation instead of OverDrive's route.
+        findViewById<com.google.android.material.button.MaterialButton>(R.id.btnRouteCarNavNavigate)
+            ?.setOnClickListener {
+                routeStops.lastOrNull()?.let { dest -> sendToCarNav(dest, navigate = true) }
+            }
+        findViewById<com.google.android.material.button.MaterialButton>(R.id.btnRouteCarNavSave)
+            ?.setOnClickListener {
+                routeStops.lastOrNull()?.let { dest -> sendToCarNav(dest, navigate = false) }
+            }
 
         // Build the ordered trip itinerary (origin → stops → destination + an
         // "Add stop" row) above the route candidates.
