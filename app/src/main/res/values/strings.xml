@@ -1630,6 +1630,8 @@
     <string name="roadsense_map_navigate_here">Navigate here</string>
     <string name="carnav_section_header">Send to car navigation</string>
     <string name="carnav_navigate">Navigate</string>
+    <string name="carnav_menu_navigate_here">Navigate here (replace route)</string>
+    <string name="carnav_menu_add_stop">Add as stop</string>
     <string name="carnav_save_favourite">Save to Favourites</string>
     <string name="carnav_sending">Sending to car navigation…</string>
     <string name="carnav_navigate_ok">Navigation started</string>

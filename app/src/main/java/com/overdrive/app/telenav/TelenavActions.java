@@ -88,7 +88,27 @@ public final class TelenavActions {
      * only engages while Telenav is on screen). Blocking; returns Telenav's result.
      */
     public static boolean navigate(Context ctx, String name, double lat, double lng) throws Exception {
+        return navigate(ctx, name, lat, lng, false);
+    }
+
+    /**
+     * Start navigation to a place, choosing how it combines with any active route.
+     *
+     * <p>Telenav's external {@code startNavigation(Place)} takes no mode: called while a
+     * route is active it ADDS the place as an intermediate waypoint; called idle it starts
+     * fresh. To force a fresh single-destination route ({@code replace = true}) we stop the
+     * active nav first, then start — verified live 2026-08-23.
+     *
+     * @param replace {@code true} = fresh route (stopNav + start); {@code false} = add as a
+     *                stop when navigating, or start fresh when idle (Telenav's own default).
+     */
+    public static boolean navigate(Context ctx, String name, double lat, double lng, boolean replace)
+            throws Exception {
         foregroundTelenav(ctx);
+        if (replace) {
+            try { TelenavClient.stopNav(ctx, TIMEOUT_MS); } catch (Exception ignore) {}
+            try { Thread.sleep(1200); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        }
         return TelenavClient.startNavigation(
                 ctx, TIMEOUT_MS, buildPlace(name, lat, lng, FavoriteType.Normal, null, null));
     }

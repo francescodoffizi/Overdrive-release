@@ -2833,9 +2833,8 @@ open class RoadSenseMapActivity : AppCompatActivity() {
 
         // Hand the POI to the car's built-in navigation (factory nav via the Telenav bridge).
         view.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnPoiCarNavNavigate)
-            ?.setOnClickListener {
-                sheet.dismiss()
-                sendToCarNav(SearchResult(label, lat, lng), navigate = true)
+            ?.setOnClickListener { anchor ->
+                showCarNavMenu(anchor, SearchResult(label, lat, lng), includeSave = false) { sheet.dismiss() }
             }
         view.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnPoiCarNavSave)
             ?.setOnClickListener {
@@ -2905,8 +2904,38 @@ open class RoadSenseMapActivity : AppCompatActivity() {
      * never have its title/result clobbered by the older callback (and the [alive]
      * guard drops a callback that lands after dismissal).
      */
+    /**
+     * Popup offering the three car-navigation actions for a place. Anchored on the tapped
+     * control so it stays visible regardless of sheet height (the earlier bottom-of-sheet
+     * buttons scrolled off the head unit's short landscape screen). [includeSave] adds the
+     * favourite action for surfaces that lack a separate Save control (the route sheet's
+     * header). [onChosen] runs before the action — used to dismiss the host sheet.
+     */
+    private fun showCarNavMenu(
+        anchor: View,
+        result: SearchResult?,
+        includeSave: Boolean,
+        onChosen: () -> Unit = {},
+    ) {
+        val target = result ?: return
+        val menu = androidx.appcompat.widget.PopupMenu(this, anchor)
+        menu.menu.add(0, 0, 0, getString(R.string.carnav_menu_navigate_here))
+        menu.menu.add(0, 1, 1, getString(R.string.carnav_menu_add_stop))
+        if (includeSave) menu.menu.add(0, 2, 2, getString(R.string.carnav_save_favourite))
+        menu.setOnMenuItemClickListener { item ->
+            onChosen()
+            when (item.itemId) {
+                0 -> sendToCarNav(target, navigate = true, replace = true)   // fresh route
+                1 -> sendToCarNav(target, navigate = true, replace = false)  // add as stop
+                else -> sendToCarNav(target, navigate = false)               // save favourite
+            }
+            true
+        }
+        menu.show()
+    }
+
     /** Send a place to the car's built-in navigation (factory nav) — navigate or save-favourite. */
-    private fun sendToCarNav(result: SearchResult, navigate: Boolean) {
+    private fun sendToCarNav(result: SearchResult, navigate: Boolean, replace: Boolean = false) {
         val name = result.label
         val lat = result.lat
         val lng = result.lng
@@ -2914,7 +2943,7 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         Thread {
             try {
                 if (navigate) {
-                    val ok = com.overdrive.app.telenav.TelenavActions.navigate(applicationContext, name, lat, lng)
+                    val ok = com.overdrive.app.telenav.TelenavActions.navigate(applicationContext, name, lat, lng, replace)
                     runOnUiThread {
                         android.widget.Toast.makeText(
                             this,
@@ -3004,9 +3033,8 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         }
 
         // Hand the place to the car's built-in navigation (factory nav via Telenav bridge).
-        view.findViewById<MaterialButton>(R.id.btnCarNavNavigate).setOnClickListener {
-            sheet.dismiss()
-            sendToCarNav(current, navigate = true)
+        view.findViewById<MaterialButton>(R.id.btnCarNavNavigate).setOnClickListener { anchor ->
+            showCarNavMenu(anchor, current, includeSave = false) { sheet.dismiss() }
         }
         view.findViewById<MaterialButton>(R.id.btnCarNavSave).setOnClickListener {
             sheet.dismiss()
@@ -4062,14 +4090,10 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             ?.setOnClickListener { startSelectedRoute() }
 
         // Hand the destination to the car's built-in navigation instead of OverDrive's route.
-        findViewById<com.google.android.material.button.MaterialButton>(R.id.btnRouteCarNavNavigate)
-            ?.setOnClickListener {
-                routeStops.lastOrNull()?.let { dest -> sendToCarNav(dest, navigate = true) }
-            }
-        findViewById<com.google.android.material.button.MaterialButton>(R.id.btnRouteCarNavSave)
-            ?.setOnClickListener {
-                routeStops.lastOrNull()?.let { dest -> sendToCarNav(dest, navigate = false) }
-            }
+        // In the header (always visible) so it never scrolls off the short landscape screen.
+        findViewById<View>(R.id.btnRouteCarNav)?.setOnClickListener { anchor ->
+            showCarNavMenu(anchor, routeStops.lastOrNull(), includeSave = true)
+        }
 
         // Build the ordered trip itinerary (origin → stops → destination + an
         // "Add stop" row) above the route candidates.

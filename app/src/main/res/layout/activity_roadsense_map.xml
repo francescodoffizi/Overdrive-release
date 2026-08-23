@@ -501,6 +501,18 @@
                     tools:text="Routes to Changi Airport" />
 
                 <ImageButton
+                    android:id="@+id/btnRouteCarNav"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:layout_marginEnd="4dp"
+                    android:background="@drawable/bg_nav_leading_icon"
+                    android:contentDescription="@string/carnav_section_header"
+                    android:padding="8dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_directions_car"
+                    app:tint="?attr/colorOnSurfaceVariant" />
+
+                <ImageButton
                     android:id="@+id/btnRouteSheetSave"
                     android:layout_width="40dp"
                     android:layout_height="40dp"
@@ -573,44 +585,8 @@
                 app:iconGravity="textStart"
                 app:iconPadding="10dp" />
 
-            <!-- Hand this destination to the car's built-in navigation instead -->
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="20dp"
-                android:layout_marginTop="16dp"
-                android:layout_marginBottom="6dp"
-                android:text="@string/carnav_section_header"
-                android:textAppearance="?attr/textAppearanceLabelMedium"
-                android:alpha="0.7" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginHorizontal="20dp"
-                android:layout_marginBottom="6dp"
-                android:baselineAligned="false"
-                android:orientation="horizontal">
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnRouteCarNavNavigate"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:layout_marginEnd="5dp"
-                    android:paddingVertical="14dp"
-                    android:text="@string/carnav_navigate" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnRouteCarNavSave"
-                    style="@style/Widget.Material3.Button.TonalButton"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:layout_marginStart="5dp"
-                    android:paddingVertical="14dp"
-                    android:text="@string/carnav_save_favourite" />
-            </LinearLayout>
+            <!-- "Send to car navigation" lives as a header icon (btnRouteCarNav) so it
+                 stays visible; the old bottom buttons scrolled off the short screen. -->
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 
