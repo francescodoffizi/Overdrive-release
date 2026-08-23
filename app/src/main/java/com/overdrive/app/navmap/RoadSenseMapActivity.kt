@@ -4110,6 +4110,21 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             skipCollapsed = true
             state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
         }
+
+        // Cap the scrollable middle so the whole sheet fits the short landscape
+        // screen: with many route candidates the content would otherwise push the
+        // sheet past the screen and the fixed header (with the car-nav icon) off the
+        // top. Capping lets the middle scroll while the header + Start stay pinned.
+        // Short content (a couple of routes) stays under the cap → sheet stays compact.
+        findViewById<androidx.core.widget.NestedScrollView>(R.id.routeSheetScroll)?.let { scroll ->
+            scroll.post {
+                val cap = (resources.displayMetrics.heightPixels * 0.45f).toInt()
+                if (scroll.height > cap) {
+                    scroll.layoutParams = scroll.layoutParams.apply { height = cap }
+                    scroll.requestLayout()
+                }
+            }
+        }
     }
 
     /** A route-options row (or its map line) was selected → re-highlight + remember. */
