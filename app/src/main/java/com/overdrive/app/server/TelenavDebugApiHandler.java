@@ -65,6 +65,16 @@ public final class TelenavDebugApiHandler {
             return true;
         }
 
+        // Navigate is a silent no-op unless Telenav is the foreground app (verified live
+        // 2026-08-23). This request arrives while the OverDrive app process is backgrounded,
+        // so it can't foreground an activity itself (background-activity-launch limits) — but
+        // this handler runs in the daemon (UID 2000), which can `am start` regardless. Do it
+        // here, before the app process runs startNavigation. Save-to-Favourites persists
+        // silently and must NOT steal the screen, so it is deliberately excluded.
+        if (p.equals("/api/telenav/navigate")) {
+            foregroundTelenav();
+        }
+
         String resp = forwardToApp(req.toString(), 25_000);
         if (resp == null) {
             JSONObject err = new JSONObject();
@@ -76,6 +86,27 @@ public final class TelenavDebugApiHandler {
         }
         HttpResponse.sendJson(out, 200, resp);
         return true;
+    }
+
+    /**
+     * Bring Telenav's map to the foreground from the daemon (UID 2000). Uses {@code am
+     * start} via {@code sh -c} — the same privileged path {@code ShellAction} uses — because
+     * the backgrounded app process is blocked from launching activities. Best effort: a
+     * failure here still lets the navigate command through (it just won't be visible).
+     */
+    private static void foregroundTelenav() {
+        try {
+            Process pr = new ProcessBuilder("sh", "-c",
+                    "am start -n com.telenav.app.arp/com.telenav.arp.module.map.MainActivity")
+                    .redirectErrorStream(true)
+                    .start();
+            pr.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
+            Thread.sleep(1000); // let Telenav reach the front before startNavigation binds
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } catch (Exception ignore) {
+            // Best effort — navigate still proceeds, just not visibly.
+        }
     }
 
     /** One line of JSON to the app-process listener, one line back. */
