@@ -49,13 +49,21 @@ public class ScreenshotPrivacyModeAssetTest {
     }
 
     @Test
-    public void changedPrPagesAllLoadTheSharedCore() throws IOException {
-        assertTrue(readRepositoryFile("app/src/main/assets/web/local/index.html")
-                .contains("../shared/core.js"));
-        assertTrue(readRepositoryFile("app/src/main/assets/web/local/events.html")
-                .contains("../shared/core.js"));
-        assertTrue(readRepositoryFile("app/src/main/assets/web/local/charging.html")
-                .contains("../shared/core.js"));
+    public void allCoreConsumersLoadThePrivacyBundleVersion() throws IOException {
+        String[] pages = {
+                "about.html", "abrp.html", "automations.html", "byd-cloud.html",
+                "charging.html", "communicate.html", "events.html", "index.html",
+                "key-mapping.html", "live-view.html", "login.html", "mqtt.html",
+                "network.html", "notifications.html", "performance.html",
+                "recording.html", "road-sense.html", "seat-positions.html",
+                "surveillance.html", "telegram.html", "trips.html",
+                "vehicle-control.html"
+        };
+        for (String page : pages) {
+            assertTrue(page, readRepositoryFile(
+                    "app/src/main/assets/web/local/" + page)
+                    .contains("../shared/core.js?v=20"));
+        }
     }
 
     @Test
