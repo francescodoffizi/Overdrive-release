@@ -129,13 +129,14 @@ object NavPromptOverlay {
                 }.start()
             }
         }
+        // Accept (primary) on the left, Decline on the right.
         row.addView(
-            cancel,
+            yes,
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 .apply { rightMargin = dp(6) },
         )
         row.addView(
-            yes,
+            cancel,
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 .apply { leftMargin = dp(6) },
         )
