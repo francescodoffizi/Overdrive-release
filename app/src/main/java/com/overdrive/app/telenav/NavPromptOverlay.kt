@@ -2,7 +2,7 @@ package com.overdrive.app.telenav
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.Color
+import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -12,26 +12,35 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import android.util.TypedValue
+import android.view.ContextThemeWrapper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.appcompat.app.AppCompatDelegate
+import com.google.android.material.R as MR
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.color.MaterialColors
+import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
 import kotlin.math.abs
 
 /**
- * Floating "Navigate to X? [Cancel] [Yes]" prompt drawn over everything via the
- * granted SYSTEM_ALERT_WINDOW (TYPE_APPLICATION_OVERLAY). Shown in the APP process
- * by [TelenavIpcServer] when the daemon's [DeferredNavManager] reports, on ACC-on,
- * a target that was queued while the car was off.
+ * Floating "Navigate in the car?" prompt drawn over everything via the granted
+ * SYSTEM_ALERT_WINDOW. Shown in the APP process by [TelenavIpcServer] when the
+ * daemon's [DeferredNavManager] reports, on ACC-on, a target queued while the car
+ * was off.
  *
- * Draggable by its header (position persisted to config so it reappears where the
- * user left it). Auto-dismisses after 20s. "Yes" runs the exact live navigate-here
- * path ([TelenavActions.navigate] with replace = fresh route). Must be shown on the
- * main thread.
+ * Styled with OverDrive's own Material 3 theme ([R.style.Theme_Overdrive_M3]) so it
+ * matches the rest of the app and flips day/night with the head unit: the views are
+ * built against a ContextThemeWrapper whose configuration carries the current night
+ * state, and colours are resolved from theme attributes (surface / onSurface /
+ * primary / outline), not hardcoded. Buttons are MaterialButtons.
+ *
+ * Draggable by its header (position persisted). Auto-dismisses after 20s. "Yes" runs
+ * the live navigate-here path. Must be shown on the main thread.
  */
 object NavPromptOverlay {
 
@@ -46,50 +55,74 @@ object NavPromptOverlay {
     @JvmStatic
     @SuppressLint("ClickableViewAccessibility")
     fun show(context: Context, name: String, lat: Double, lng: Double) {
-        val ctx = context.applicationContext
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(ctx)) {
+        val app = context.applicationContext
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(app)) {
             Log.w(TAG, "no draw-overlay permission — cannot show prompt")
             return
         }
         dismiss() // never stack two
 
+        // Theme the context: match OverDrive's night choice (AppCompatDelegate has no
+        // Activity here, so resolve it ourselves), then wrap in Theme.Overdrive.M3 so
+        // the same day/night palette as the rest of the app resolves from attributes.
+        val nightYes = when (AppCompatDelegate.getDefaultNightMode()) {
+            AppCompatDelegate.MODE_NIGHT_YES -> true
+            AppCompatDelegate.MODE_NIGHT_NO -> false
+            else -> (app.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                Configuration.UI_MODE_NIGHT_YES
+        }
+        val cfg = Configuration(app.resources.configuration).apply {
+            uiMode = (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                if (nightYes) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO
+        }
+        val ctx: Context = ContextThemeWrapper(
+            app.createConfigurationContext(cfg), R.style.Theme_Overdrive_M3,
+        )
+
         fun dp(v: Int): Int = TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), ctx.resources.displayMetrics,
         ).toInt()
+        fun attr(a: Int, fallback: Int): Int = MaterialColors.getColor(ctx, a, fallback)
+
+        val surface = attr(MR.attr.colorSurfaceContainer, attr(MR.attr.colorSurface, 0xFF2A2A2E.toInt()))
+        val onSurface = attr(MR.attr.colorOnSurface, 0xFFFFFFFF.toInt())
+        val onSurfaceVar = attr(MR.attr.colorOnSurfaceVariant, 0xFFDDDDDD.toInt())
+        val outline = attr(MR.attr.colorOutlineVariant, 0x55FFFFFF)
 
         val card = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(16), dp(20), dp(16))
             background = GradientDrawable().apply {
-                cornerRadius = dp(18).toFloat()
-                setColor(Color.parseColor("#F02A2A2E"))
-                setStroke(dp(1), Color.parseColor("#55FFFFFF"))
+                cornerRadius = dp(20).toFloat()
+                setColor(surface)
+                setStroke(dp(1), outline)
             }
+            elevation = dp(8).toFloat()
         }
         val title = TextView(ctx).apply {
-            text = "Navigate in the car?"
-            setTextColor(Color.WHITE)
+            text = ctx.getString(R.string.carnav_deferred_prompt_title)
+            setTextColor(onSurface)
             textSize = 16f
             typeface = Typeface.create(typeface, Typeface.BOLD)
         }
         val body = TextView(ctx).apply {
             text = name
-            setTextColor(Color.parseColor("#DDDDDD"))
+            setTextColor(onSurfaceVar)
             textSize = 14f
             setPadding(0, dp(4), 0, dp(14))
         }
         val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-        val cancel = Button(ctx).apply {
-            text = "Cancel"
+        val cancel = MaterialButton(ctx, null, MR.attr.materialButtonOutlinedStyle).apply {
+            text = ctx.getString(R.string.carnav_deferred_cancel)
             setOnClickListener { dismiss() }
         }
-        val yes = Button(ctx).apply {
-            text = "Yes, navigate"
+        val yes = MaterialButton(ctx).apply {
+            text = ctx.getString(R.string.carnav_deferred_yes)
             setOnClickListener {
                 dismiss()
                 Thread {
                     try {
-                        TelenavActions.navigate(ctx, name, lat, lng, true)
+                        TelenavActions.navigate(app, name, lat, lng, true)
                     } catch (t: Throwable) {
                         Log.w(TAG, "navigate failed: ${t.message}")
                     }
@@ -116,7 +149,7 @@ object NavPromptOverlay {
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
         }
         val lp = WindowManager.LayoutParams(
-            dp(300),
+            dp(320),
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
@@ -133,8 +166,7 @@ object NavPromptOverlay {
             }
         }
 
-        // Drag by the header (title + body). Buttons keep their own clicks because the
-        // drag listener is only on these two views, not the button row.
+        // Drag by the header (title + body); buttons keep their own clicks.
         val dragListener = object : View.OnTouchListener {
             private var startX = 0
             private var startY = 0
@@ -173,12 +205,12 @@ object NavPromptOverlay {
         title.setOnTouchListener(dragListener)
         body.setOnTouchListener(dragListener)
 
-        wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        wm = app.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         try {
             wm?.addView(card, lp)
             view = card
             main.postDelayed(dismissRunnable, AUTO_DISMISS_MS)
-            Log.i(TAG, "prompt shown for '$name'")
+            Log.i(TAG, "prompt shown for '$name' (night=$nightYes)")
         } catch (t: Throwable) {
             Log.w(TAG, "addView failed: ${t.message}")
             view = null

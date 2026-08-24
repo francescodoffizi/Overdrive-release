@@ -1632,6 +1632,9 @@
     <string name="carnav_navigate">Navigate</string>
     <string name="carnav_menu_navigate_here">Navigate here (replace route)</string>
     <string name="carnav_menu_add_stop">Add as stop</string>
+    <string name="carnav_deferred_prompt_title">Navigation offered</string>
+    <string name="carnav_deferred_yes">Accept</string>
+    <string name="carnav_deferred_cancel">Decline</string>
     <string name="carnav_save_favourite">Save to Favourites</string>
     <string name="carnav_sending">Sending to car navigation…</string>
     <string name="carnav_navigate_ok">Navigation started</string>
