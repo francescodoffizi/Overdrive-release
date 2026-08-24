@@ -103,23 +103,23 @@
     <string name="tailscale_qr_waiting">S\'està esperant l\'URL d\'inici de sessió...</string>
     <string name="tailscale_enable_proxy">Habilita el servidor intermediari Tailscale</string>
     <string name="tailscale_proxy_explainer">Encamina MQTT a través de Tailscale perquè pugueu arribar a un corredor privat a la vostra tailnet sense reenviament de ports.</string>
-    <string name="tailscale_proxy_warning">While enabled, MQTT to public brokers (HiveMQ, AWS IoT, etc.) will fail — Tailscale only routes to your tailnet. Saving will restart the daemon.</string>
+    <string name="tailscale_proxy_warning">Mentre està habilitat, MQTT als corredors públics (HiveMQ, AWS IoT, etc.) fallarà - Tailscale només enruta al seu tailnet. Desar reiniciarà el dimoni.</string>
     <!-- Camera ingestion mode selector (Default vs DiLink 4) -->
-    <string name="camera_mode_title">Ingestion Mode</string>
+    <string name="camera_mode_title">Mode d\'ingesta</string>
     <string name="camera_mode_subtitle">Trieu el camí que coincideixi amb la unitat principal. Per defecte s\'ajusta a la majoria dels models BYD; DiLink 4 és requerit en les versions més noves (Han / Tang 2024+) on l\'AVM HAL emet un mosaic 2x2 preencaixat.</string>
     <string name="camera_mode_option_default">Per defecte — funciona en Seal, Atto, Dolphin (la majoria dels cotxes)</string>
     <string name="camera_mode_option_dilink4">DiLink 4 — noves variants Han / Tang</string>
     <string name="camera_mode_current_default">Actual: per defecte</string>
     <string name="camera_mode_current_dilink4">Actual: DiLink 4</string>
     <string name="camera_mode_save">Aplica i reinicia</string>
-    <string name="camera_mode_hint">Changing the mode restarts the camera daemon. If video looks wrong (squished, missing quadrants, red overlay), try the other mode.</string>
+    <string name="camera_mode_hint">En canviar el mode es reinicia el dimoni de la càmera. Si el vídeo es veu malament (esquitxat, quadrants que manquen, superposició vermella), proveu amb l\'altre mode.</string>
     <!-- DiLink 4 quadrant tweaks (only effective when cameraMode = DiLink 4) -->
     <string name="camera_dilink4_tweaks_title">DiLink 4 Quadrant Tweaks</string>
-    <string name="camera_dilink4_tweaks_subtitle">Per-vehicle adjustments for the DiLink 4 path. Only effective when DiLink 4 mode is selected above.</string>
+    <string name="camera_dilink4_tweaks_subtitle">Ajustaments per vehicle per al camí de DiLink 4. Només és eficaç quan se selecciona el mode DiLink 4 a dalt.</string>
     <string name="camera_dilink4_save">Aplica</string>
     <string name="camera_dilink4_hint">Toggle these only if the HAL paints a red \"calibration failed\" chrome over the feed. Daemon restart applies the change.</string>
-    <string name="camera_dilink4_red_mask_label">Suppress red calibration overlay (GL)</string>
-    <string name="camera_dilink4_red_mask_subtitle">Adds a fragment-shader pass that detects bright-red HAL \"calibration failed\" pixels and replaces them with a neighbour sample (or luminance gray when the banner is too large to inpaint). Cosmetic only — does not affect the underlying calibration state.</string>
+    <string name="camera_dilink4_red_mask_label">Suprimeix la superposició de calibratge vermell (GL)</string>
+    <string name="camera_dilink4_red_mask_subtitle">Afegeix un fragment de pas que detecta píxels HAL de color vermell brillant \"calibració fallida\" i els reemplaça per una mostra veïna (o gris de luminància quan el bàner és massa gran per pintar). Només cosmètic — no afecta l\'estat de calibratge subjacent.</string>
     <!-- dialog_camera_selection -->
     <string name="camera_selection_title">Selecció de la càmera</string>
     <string name="camera_selection_subtitle">Seleccioneu la font de càmera panoràmica</string>
@@ -135,10 +135,10 @@
     <!-- OEM Dashcam camera ID picker (Phase 5: separate forward-sensor pipeline) -->
     <string name="camera_oem_dashcam_title">ID de la càmera OEM</string>
     <string name="camera_oem_dashcam_hint">"Trieu l\'id de AVMCamera que apunta al sensor davanter de la càmera de davantal. La càmera de davant és el contrari de pano: Seal/Han pano  = 1  → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. Deixeu-ho a Automàtic per a deixar que triï OverDrive."</string>
-    <string name="camera_oem_dashcam_auto_resolved">Auto — using id %1$d (pano is id %2$d)</string>
-    <string name="camera_oem_dashcam_auto_unavailable">Auto — pano id is %1$d, can\'t infer dashcam</string>
+    <string name="camera_oem_dashcam_auto_resolved">Automàtic - usant l\'ID %1$d (pano és l\'ID %2$d)</string>
+    <string name="camera_oem_dashcam_auto_unavailable">Automàtic — l\'identificador pano és %1$d, no es pot inferir la càmera</string>
     <string name="camera_oem_dashcam_save">Desa</string>
-    <string name="camera_concurrent_probe_label">Test dual-camera support on next boot</string>
+    <string name="camera_concurrent_probe_label">Prova el suport de càmera doble en la següent engegada</string>
     <string name="camera_concurrent_probe_subtitle">One-time check that opens both cameras at once to confirm this vehicle can run pano + dashcam concurrently. Runs once on the next restart while parked. Leave OFF unless recordings look wrong — it is not required and may briefly interrupt a recording if one is active when it runs.</string>
     <!-- Dashcam-side camera labels — REVERSE of the pano labels above. The
          OEM dashcam id is the opposite of the pano id, so the helpful
@@ -150,10 +150,10 @@
     <string name="camera_oem_option_1">Càmera 1 — Atto / Tang</string>
     <!-- Camera mapping dialog (multi-vehicle role-to-slice routing) -->
     <string name="camera_mapping_title">Mapatge de les càmeres</string>
-    <string name="camera_role_label">Role mapping</string>
+    <string name="camera_role_label">Mapatge del rol</string>
     <string name="camera_candidate_previous">Anterior</string>
     <string name="camera_candidate_next">Endavant</string>
-    <string name="camera_preview_unavailable">Preview unavailable yet. Try another candidate or refresh by reopening the dialog after the daemon restarts.</string>
+    <string name="camera_preview_unavailable">La vista prèvia encara no està disponible. Proveu amb un altre candidat o actualitzeu reobrint el diàleg després que el dimoni es reiniciï.</string>
     <string name="camera_mapping_save">Desa</string>
     <string name="camera_mapping_clear">Neteja el rol</string>
     <string name="camera_mapping_saved">S\'ha desat el mapatge de la càmera.</string>
@@ -162,9 +162,9 @@
     <string name="camera_mapping_summary_probing">Flux panoràmic: detecció automàtica antiga / sonda</string>
     <string name="camera_mapping_current_format">Mapatge actual: %1$s</string>
     <string name="camera_mapping_current_none">Mapatge actual: automàtic / predeterminat</string>
-    <string name="camera_mapping_hint">OverDrive keeps the legacy startup behavior by default, but now lets you calibrate the merged panoramic strip properly. Preview each raw merged slice, map the logical 360 roles to the slice that actually shows front/right/rear/left on your vehicle, and the daemon will reuse that layout for recording, streaming, and AI after restart.</string>
+    <string name="camera_mapping_hint">OverDrive manté per defecte el comportament d\'inici antic, però ara us permet calibrar correctament la tira panoràmica fusionada. Vista prèvia de cada segment fusionat en brut, assigna els rols lògics de 360 al segment que realment mostra frontal/dreta/posterior/esquerra al vehicle, i el dimoni reutilitzarà aquesta disposició per a l\'enregistrament, transmissió i IA després de reiniciar.</string>
     <!-- fragment_dashboard -->
-    <string name="dashboard_scan_to_connect">Scan to Connect</string>
+    <string name="dashboard_scan_to_connect">Escanegeu per a connectar</string>
     <string name="dashboard_qr_waiting">S\'està esperant el túnel...</string>
     <string name="dashboard_daemons_running_default">0/5 en execució</string>
     <string name="dashboard_device_id_loading">…</string>
@@ -185,7 +185,7 @@
     <string name="setup_autostart_body">Toqueu a continuació per a obrir l\'inici automàtic de BYD. Cerca OverDrive a la llista i desmarca la casella. BYD ho esborra en cada instal·lació — ho tornareu a fer després de les actualitzacions.</string>
     <string name="setup_autostart_button">Obre l\'inici automàtic de BYD</string>
     <string name="setup_overlay_title">Permet mostrar sobre altres aplicacions</string>
-    <string name="setup_overlay_body">Enable this to show a floating status indicator for recording and trip tracking on top of other apps.</string>
+    <string name="setup_overlay_body">Habiliteu-ho per a mostrar un indicador d\'estat flotant per a enregistraments i seguiment de viatges a sobre d\'altres aplicacions.</string>
     <string name="setup_overlay_button">Obre els paràmetres de superposició</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">Tanca</string>
@@ -208,15 +208,15 @@
     <string name="adb_output_header">Sortida</string>
     <string name="adb_output_ready">$ A punt per a les ordres...</string>
     <string name="adb_console_hero_title">Consola ADB</string>
-    <string name="adb_console_hero_subtitle">Run shell commands on the device</string>
+    <string name="adb_console_hero_subtitle">Executa ordres de terminal al dispositiu</string>
     <!-- fragment_webview -->
     <string name="webview_loading">S\'està carregant…</string>
     <string name="webview_camera_daemon_not_running">El dimoni de la càmera no s\'està executant</string>
-    <string name="webview_start_camera_daemon">Start the Camera Daemon from the Daemons screen to access this page.</string>
+    <string name="webview_start_camera_daemon">Inicieu el dimoni de la càmera des de la pantalla Dimonis per a accedir a aquesta pàgina.</string>
     <!-- dialog_roi_drawing -->
     <!-- dialog_zrok_token -->
     <string name="zrok_enable_token_hint">Habilita el testimoni</string>
-    <string name="zrok_token_storage_note">Token is stored securely and shared between app and daemon processes.</string>
+    <string name="zrok_token_storage_note">El testimoni s\'emmagatzema de manera segura i es comparteix entre els processos d\'aplicació i dimoni.</string>
     <string name="zrok_reset_environment">Restableix l\'entorn Zrok</string>
     <string name="zrok_reset_environment_desc">Elimina l\'entorn i el testimoni. Haureu de tornar a activar amb el vostre testimoni (usa un espai buit del dispositiu).</string>
     <!-- dialog_reset_data -->
@@ -224,23 +224,23 @@
     <string name="reset_subtitle">Esborra les dades acumulades per categoria</string>
     <string name="reset_warning">Això no es pot desfer. Els enregistraments, els viatges i l\'historial de la bateria s\'eliminaran permanentment.</string>
     <string name="reset_cat_trips">Viatges</string>
-    <string name="reset_cat_trips_desc">Trip history, routes, weekly/monthly rollups</string>
+    <string name="reset_cat_trips_desc">Historial de viatges, rutes, resums setmanals/mensuals</string>
     <string name="reset_cat_soc_history">Història SoC i 12V</string>
     <string name="reset_cat_soc_history_desc">Mostres SoC, sessions de càrrega, registres de voltatge</string>
     <string name="reset_cat_soh">Calibració SoH</string>
-    <string name="reset_cat_soh_desc">Re-detects nominal capacity, re-seeds estimate from BMS</string>
+    <string name="reset_cat_soh_desc">Torna a detectar la capacitat nominal, i torna a establir les llavors d\'estimació des de BMS</string>
     <string name="reset_cat_abrp_token">Testimoni ABRP</string>
-    <string name="reset_cat_abrp_token_desc">Disables ABRP telemetry until re-paired</string>
+    <string name="reset_cat_abrp_token_desc">Inhabilita la telemetria ABRP fins que es torni a aparellar</string>
     <string name="reset_cat_byd_cloud">Credencials BYD Cloud</string>
     <string name="reset_cat_byd_cloud_desc">Nom d\'usuari, clau d\'inici de sessió, VIN — cal tornar a iniciar la sessió</string>
     <string name="reset_cat_recordings">Enregistraments (vídeos)</string>
     <string name="reset_cat_recordings_desc">Tots els MP4 a la carpeta d\'enregistraments</string>
     <string name="reset_cat_sentry_events">Esdeveniments de vigilància</string>
-    <string name="reset_cat_sentry_events_desc">Surveillance event clips and JSON sidecars</string>
+    <string name="reset_cat_sentry_events_desc">Clips d\'esdeveniments de vigilància i JSON corresponents</string>
     <string name="reset_cat_proximity">Registres de proximitat</string>
     <string name="reset_cat_proximity_desc">Radar-triggered event MP4s</string>
-    <string name="reset_cat_trip_files">Trip telemetry files</string>
-    <string name="reset_cat_trip_files_desc">Per-trip JSON telemetry on disk</string>
+    <string name="reset_cat_trip_files">Fitxers de telemetria de viatge</string>
+    <string name="reset_cat_trip_files_desc">Telemetria JSON per viatge al disc</string>
     <!-- fragment_abrp_settings -->
     <!-- fragment_recording_library -->
     <string name="recording_lib_chip_any">Qualsevol</string>
@@ -282,17 +282,17 @@
     <string name="cd_clear_filter">Neteja el filtre</string>
     <!-- v5 redesign: SOTA empty state with CTA + tile type badges -->
     <string name="recording_lib_empty_title">No hi ha enregistraments coincidents</string>
-    <string name="recording_lib_empty_body">Try adjusting your date range or chip filters.</string>
+    <string name="recording_lib_empty_body">Proveu d\'ajustar el vostre interval de dates o filtres de clip.</string>
     <string name="recording_lib_empty_clear_filters">Neteja els filtres</string>
     <!-- Shown on the empty-state body when there are zero clips on disk
          (no filter is active). Sets a friendlier tone than "No recordings match". -->
     <string name="recording_lib_empty_disk_title">Encara no s\'ha enregistrat res</string>
-    <string name="recording_lib_empty_disk_body">Captures will appear here as soon as the dashcam or surveillance pipeline writes a clip.</string>
+    <string name="recording_lib_empty_disk_body">Les captures apareixeran aquí tan aviat com la càmera de davantal o el conducte de vigilància escrigui un clip.</string>
     <!-- Shown while the daemon is warming the H2 recording index on cold
          start. Includes a progress counter when the daemon reports done/total,
          otherwise a static body. The library re-polls every 1.5s and
          transitions out automatically once results land. -->
-    <string name="recording_lib_building_index_title">Building library index</string>
+    <string name="recording_lib_building_index_title">S\'està construint l\'índex de la biblioteca</string>
     <string name="recording_lib_building_index_body">Un moment mentre el dimoni escaneja els enregistraments.</string>
     <string name="recording_lib_building_index_progress">S\'han indexat %1$d de %2$d clips...</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
@@ -335,16 +335,16 @@
     <string name="soh_dialog_pack_capacity_label">Capacitat del paquet</string>
     <string name="soh_dialog_estimated_capacity_label">Capacitat efectiva</string>
     <string name="soh_dialog_calibration_anchor_label">Darrer calibratge</string>
-    <string name="soh_dialog_source_user">user-set</string>
+    <string name="soh_dialog_source_user">definit-per-l-usuari</string>
     <string name="soh_dialog_source_auto">detectat automàticament</string>
     <string name="soh_dialog_model_not_selected">No seleccionat</string>
     <string name="soh_dialog_capacity_not_detected">No detectat</string>
-    <string name="soh_dialog_calibration_format">%1$.1f%% on %2$s</string>
-    <string name="soh_dialog_frame_anchor_label">Observed full-charge</string>
-    <string name="soh_dialog_frame_anchor_format">%1$.2f kWh observed at full (%2$d/%3$d samples)</string>
-    <string name="soh_dialog_frame_anchor_pending_format">%1$.2f kWh observed at full (collecting %2$d/%3$d samples)</string>
+    <string name="soh_dialog_calibration_format">%1$.1f%% el %2$s</string>
+    <string name="soh_dialog_frame_anchor_label">Recàrrega completa observada</string>
+    <string name="soh_dialog_frame_anchor_format">%1$.2f kWh observat al complet (%2$d/%3$d mostres)</string>
+    <string name="soh_dialog_frame_anchor_pending_format">%1$.2f kWh observat al complet (recollint %2$d/%3$d mostres)</string>
     <string name="soh_dialog_frame_mismatch_title">Pack-capacity frame mismatch</string>
-    <string name="soh_dialog_frame_mismatch_format">Vehicle reports %1$.1f kWh at full charge but pack capacity is set to %2$.1f kWh. The number above may reflect a unit mismatch (nameplate vs usable), not real degradation. Consider entering %1$.1f kWh to match what the vehicle reports.</string>
+    <string name="soh_dialog_frame_mismatch_format">El vehicle informa de %1$.1f kWh a plena càrrega, però la capacitat del paquet s\'estableix a %2$.1f kWh. El nombre anterior pot reflectir un desajust d\'unitat (fabrica vs utilitzable), no una degradació real. Considereu introduir %1$.1f kWh per a fer coincidir amb el que informa el vehicle.</string>
     <string name="soh_dialog_use_observed_value">Usa el valor observat</string>
     <string name="soh_dialog_use_observed_value_pending">S\'està desant…</string>
     <string name="toast_soh_observed_value_saved">Capacitat del paquet actualitzada a %1$.1f kWh.</string>
@@ -406,36 +406,36 @@
     <string name="update_error_title">Ha fallat l\'actualització</string>
     <string name="update_error_daemon_down">El dimoni de la càmera no s\'està executant. Inicieu-lo des de la pantalla Dimonis i proveu d\'actualitzar-lo de nou.</string>
     <string name="update_error_start_failed">No s\'ha pogut iniciar l\'actualització: %1$s</string>
-    <string name="update_error_lost_headunit">Lost contact with the head unit before the install finished. On a tunnel? Check Telegram for the new URL, or use the local IP.</string>
+    <string name="update_error_lost_headunit">S\'ha perdut el contacte amb la unitat principal abans que finalitzes la instal·lació. En un túnel? Comproveu el Telegram per a la nova URL, o useu la IP local.</string>
     <string name="update_hide">Hide</string>
     <!-- Update channel selector (Settings → About) -->
     <string name="settings_update_channel_title">Canal d\'actualitzacions</string>
     <string name="settings_update_channel_alpha">Alfa</string>
     <string name="settings_update_channel_braveheart">Braveheart</string>
-    <string name="settings_update_channel_alpha_desc">The stable release. Every published version is kept — pick any to install (downgrades allowed). Recommended for everyday use.</string>
+    <string name="settings_update_channel_alpha_desc">La versió estable. Cada versió publicada es manté — escolliu-ne qualsevol per instal·lar (es permeten desactualitzacions). Recomanat per a ús quotidià.</string>
     <string name="settings_update_channel_braveheart_desc">Bleeding-edge builds, delivered the moment they\'re published. You get new features first, but they may be unstable or buggy. If something breaks, open the Daemons screen, tap a daemon\'s log, choose \"Upload &amp; get a code\", and share the code with us on the community channels.</string>
     <string name="settings_update_channel_save_failed">No s\'ha pogut desar el canal d\'actualització</string>
     <string name="settings_update_channel_braveheart_toast">S\'ha canviat a Braveheart. Els muntatges poden ser inestables — si alguna cosa es trenca, envieu el registre del dimoni i informeu-ne a Discord/GitHub/WhatsApp.</string>
     <!-- Community / report-a-bug links -->
     <string name="toast_storage_permission_required">Permís d\'emmagatzematge requerit per als enregistraments</string>
     <string name="toast_url_copied_short">S\'ha copiat l\'URL</string>
-    <string name="toast_camera_set_to_auto">Camera set to Auto</string>
+    <string name="toast_camera_set_to_auto">La càmera està configurada com a automàtica</string>
     <string name="toast_failed_to_save_short">Ha fallat en desar</string>
     <string name="toast_failed_with_message">Ha fallat: %1$s</string>
     <string name="toast_camera_id_set">Camera %1$d set — next ACC cycle</string>
-    <string name="toast_clearing_camera_config">Clearing camera config…</string>
-    <string name="toast_restarting_camera_daemon">Restarting camera daemon…</string>
-    <string name="toast_camera_daemon_restarting">Camera daemon restarting with full probe</string>
-    <string name="toast_camera_restart_failed">Config cleared but daemon restart failed. Please restart manually.</string>
-    <string name="toast_camera_settings_saved_restarting">Camera settings saved — restarting camera daemon…</string>
-    <string name="toast_camera_settings_restart_failed">Camera settings were saved, but daemon restart failed. Please restart it manually.</string>
+    <string name="toast_clearing_camera_config">S\'està netejant la configuració de la càmera...</string>
+    <string name="toast_restarting_camera_daemon">S\'està reiniciant el dimoni de la càmera...</string>
+    <string name="toast_camera_daemon_restarting">S\'està reiniciant el dimoni de la càmera amb una sonda completa</string>
+    <string name="toast_camera_restart_failed">S\'ha esborrat la configuració, però ha fallat el reinici del dimoni. Reinicieu manualment.</string>
+    <string name="toast_camera_settings_saved_restarting">S\'ha desat la configuració de la càmera — es reinicia el dimoni de la càmera...</string>
+    <string name="toast_camera_settings_restart_failed">S\'ha desat la configuració de la càmera, però ha fallat el reinici del dimoni. Reinicieu-lo manualment.</string>
     <string name="toast_failed_with_message_x">Ha fallat: %1$s</string>
     <string name="toast_soh_reset_success">Reinici de l\'estimació SOH — es recalcularà a partir de les dades següents</string>
-    <string name="toast_soh_reset_failed_no_daemon">Reset failed — daemon not responding and file not writable</string>
+    <string name="toast_soh_reset_failed_no_daemon">Ha fallat el restabliment — el dimoni no respon i el fitxer no es pot escriure</string>
     <string name="toast_soh_reset_failed_with_message">Ha fallat el restabliment: %1$s</string>
     <string name="toast_select_at_least_one_category">Seleccioneu almenys una categoria</string>
     <string name="toast_reset_failed_with_error">Ha fallat el restabliment: %1$s</string>
-    <string name="toast_traffic_monitor_changing">%1$s traffic monitor…</string>
+    <string name="toast_traffic_monitor_changing">%1$s monitor de trànsit...</string>
     <string name="dialog_close">Tanca</string>
     <string name="dialog_reset">Restableix</string>
     <string name="dialog_delete">Suprimeix</string>
@@ -448,7 +448,7 @@
     <string name="dialog_reset_selected">Restableix la selecció</string>
     <string name="dialog_reset_soh_title">Voleu restablir l\'estimació SOH?</string>
     <string name="dialog_reset_soh_message">Això netejarà totes les dades SOH i forçarà la reestimació des de zero.\n\nUseu això si:\n• S\'ha reemplaçat la bateria\n• La lectura SOH sembla incorrecta\n• Voleu recalibrar\n\nEl sistema es tornarà a sembrar a partir de la següent font de dades disponible (OEM, calibratge de recàrrega o lectura instantània).</string>
-    <string name="dialog_reset_following_title">Reset the following?</string>
+    <string name="dialog_reset_following_title">Voleu restablir el següent?</string>
     <string name="dialog_reset_following_message">Això no es pot desfer.\n\n%1$s</string>
     <string name="dialog_reset_complete_title">Reset complete</string>
     <string name="dialog_traffic_cannot_check_title">No es pot comprovar l\'estat</string>
@@ -456,7 +456,7 @@
     <string name="dialog_traffic_disable_title">Voleu desactivar el monitor de trànsit BYD?</string>
     <string name="dialog_traffic_disable_message">El Monitor de Trànsit BYD (com.byd.trafficmonitor) és una aplicació de sistema integrada que supervisa contínuament les condicions del trànsit rodat en segon pla.\n\nPer què desactivar-ho?\n\n• Consumeix dades mòbils (fins i tot quan està aparcat)\n• Usa CPU i bateria en segon pla\n• No és necessari si useu una aplicació de navegació separada\n• Pot interferir amb l\'ús de la xarxa de la dashcam\n\nAixò és segur de desactivar-ho — només afecta la superposició de trànsit integrada en el mapa. La navegació, el Bluetooth i totes les altres funcions del cotxe no es veuen afectades.\n\nEs requereix un reinici dur després d\'inhabilitar-ho (manteniu premut el botó de la consola central 5 segons).</string>
     <string name="dialog_traffic_enable_title">Voleu tornar a activar el monitor de trànsit BYD?</string>
-    <string name="dialog_traffic_enable_message">The BYD Traffic Monitor is currently disabled.\n\nRe-enabling it will restore the built-in traffic overlay on the navigation map. Note that it will run in the background and consume mobile data.\n\nA hard reboot is required after enabling (hold center console button 5 seconds).</string>
+    <string name="dialog_traffic_enable_message">El monitor de trànsit BYD està desactivat.\n\nSi es torna a activar, es restaurarà la superposició de trànsit incorporada en el mapa de navegació. Tingueu en compte que s\'executarà en segon pla i consumirà dades mòbils.\n\nEs requereix un reinici dur després d\'activar (manteniu premut el botó de la consola central 5 segons).</string>
     <string name="dialog_traffic_status_title">Monitor de trànsit %1$s</string>
     <string name="dialog_traffic_reboot_message">El canvi s\'ha aplicat.\n\nSi us plau, realitzeu un reinici dur ara:\nPremeu i manteniu premut el botó de la consola central durant 5 segons.</string>
     <string name="traffic_monitor_loading">Monitor de trànsit: comprovació...</string>
@@ -478,9 +478,9 @@
     <string name="toast_access_code_copied">Codi d\'accés copiat</string>
     <string name="dialog_regenerate_token_title">Regenera el testimoni</string>
     <string name="dialog_regenerate_token_message">Això invalidarà el testimoni actual. Es tancarà la sessió de totes les sessions actives. Voleu continuar?</string>
-    <string name="toast_token_regenerated_logged_out">New token generated. All sessions logged out.</string>
-    <string name="toast_token_regenerated_restart">Token regenerated. Daemon may need restart to apply.</string>
-    <string name="toast_token_regenerated_no_notify">Token regenerated. Could not notify daemon.</string>
+    <string name="toast_token_regenerated_logged_out">S\'ha generat un testimoni nou. S\'han tancat totes les sessions.</string>
+    <string name="toast_token_regenerated_restart">Testimoni regenerat. És possible que el dimoni necessiti reiniciar per a aplicar-ho.</string>
+    <string name="toast_token_regenerated_no_notify">Testimoni regenerat. No s\'ha pogut notificar al dimoni.</string>
     <string name="toast_token_regenerated">Testimoni regenerat</string>
     <string name="dashboard_no_tunnel">No hi ha cap túnel en execució</string>
     <string name="dashboard_starting_zrok">S\'està iniciant el túnel Zrok...</string>
@@ -511,9 +511,9 @@
     <string name="dialog_tailscale_settings_title">Configuració del túnel Tailscale</string>
     <string name="dialog_tailscale_settings_message">Configura tailscale</string>
     <string name="tailscale_failed_login_url">No s\'ha pogut generar l\'URL d\'inici de sessió</string>
-    <string name="tailscale_logged_in_relogin">Logged in. Click to login to a different account</string>
+    <string name="tailscale_logged_in_relogin">Heu iniciat la sessió. Feu clic per a iniciar la sessió amb un compte diferent</string>
     <string name="dialog_tailscale_proxy_enable_title">Voleu habilitar el servidor intermediari Tailscale?</string>
-    <string name="dialog_tailscale_proxy_enable_message">This routes MQTT through Tailscale so you can reach a private broker on your tailnet without port forwarding.\n\nWhile enabled:\n• MQTT to a tailnet broker works (e.g. Mosquitto on a device on your tailnet)\n• MQTT to public brokers (HiveMQ, AWS IoT, etc.) will fail — Tailscale only routes to your tailnet\n• The Tailscale daemon will restart to apply the change\n• Other app traffic and the rest of the device are not affected\n\nYou can turn this off anytime.</string>
+    <string name="dialog_tailscale_proxy_enable_message">Això encamina MQTT a través de Tailscale perquè pugueu arribar a un corredor privat a la vostra xarxa tailnet sense reenviament de ports.\n\nMentre està activat:\n• MQTT a un corredor de tailnet funciona (p. ex. Mosquitto en un dispositiu de la vostra tailnet)\n• MQTT a corredors públics (HiveMQ, AWS IoT, etc.) fallarà — Tailscale només encamina a la vostra xarxa tailnet\n• El dimoni Tailscale es reiniciarà per a aplicar el canvi\n• No afecta el trànsit d\'altres aplicacions i la resta del dispositiu\n\nPodeu desactivar-ho en qualsevol moment.</string>
     <string name="dialog_zrok_reset_title">Restableix l\'entorn Zrok</string>
     <string name="dialog_zrok_reset_message">Això:\n• Aturarà el túnel zrok si s\'executa\n• Eliminarà l\'entorn zrok d\'aquest dispositiu\n• Suprimirà el testimoni desat\n\nHaureu de tornar a introduir el vostre testimoni i tornar a activar. Això usa un dels vostres 5 ranures del dispositiu en zrok.io.\n\nN\'esteu segur?</string>
     <string name="toast_resetting_zrok">S\'està restablint l\'entorn zrok...</string>
@@ -537,8 +537,8 @@
     <string name="toast_log_empty_or_missing">El fitxer de registre està buit o no s\'ha trobat</string>
     <string name="toast_log_empty">El fitxer de registre és buit</string>
     <string name="toast_daemon_manager_unavailable">Daemon manager not ready, try again in a moment</string>
-    <string name="toast_log_save_failed">Failed to save log: %1$s</string>
-    <string name="toast_log_not_found">Log file not found or unreadable</string>
+    <string name="toast_log_save_failed">No s\'ha pogut desar el registre: %1$s</string>
+    <string name="toast_log_not_found">No s\'ha trobat el fitxer de registre o no es pot llegir</string>
     <string name="log_share_title">Registre %1$s - %2$s</string>
     <string name="log_share_chooser">Comparteix el registre %1$s</string>
     <string name="log_header_title">"=== Registre %1$s  ==="</string>
@@ -546,18 +546,18 @@
     <string name="log_header_exported">Exportat: %1$s</string>
     <string name="log_header_truncated">NOTA: registre truncat a les últimes 10000 línies (total: %1$d línies)</string>
     <!-- Braveheart log send (upload to Cloudflare or share-sheet) -->
-    <string name="logs_send_title">Send %1$s log</string>
-    <string name="logs_send_title_plain">Send daemon log</string>
-    <string name="logs_send_subtitle">%1$s · choose how to send it to us</string>
+    <string name="logs_send_title">Envia el registre %1$s</string>
+    <string name="logs_send_title_plain">Envia el registre del dimoni</string>
+    <string name="logs_send_subtitle">%1$s · trieu com enviar-nos-el</string>
     <string name="logs_send_upload">Puja i aconsegueix un codi</string>
-    <string name="logs_send_upload_desc">Sends the log to us and gives you a short code. Easiest for support.</string>
+    <string name="logs_send_upload_desc">Ens envia el registre i us dona un codi curt. Més fàcil per al suport.</string>
     <string name="logs_send_share">Comparteix el fitxer...</string>
-    <string name="logs_send_share_desc">Save or send the log yourself via the share sheet.</string>
+    <string name="logs_send_share_desc">Deseu o envieu el registre vosaltres mateixos a través del full de compartició.</string>
     <string name="logs_uploading_title">S\'està pujant el registre...</string>
-    <string name="logs_uploading_subtitle">Redacting secrets and sending securely</string>
+    <string name="logs_uploading_subtitle">Esborrat de secrets i enviament de forma segura</string>
     <string name="logs_uploaded_title">Registre pujat</string>
-    <string name="logs_uploaded_instructions">Share this code with us, along with a note on what you were doing when it broke. Post it on Discord, GitHub Issues or WhatsApp — links are on the About screen.</string>
-    <string name="logs_uploaded_privacy">Secrets redacted · the log auto-expires</string>
+    <string name="logs_uploaded_instructions">Compartiu aquest codi amb nosaltres, juntament amb una nota sobre el que feieu quan es va trencar. Publiqueu-ho a Discord, tiquests de GitHub o WhatsApp — els enllaços són a la pantalla Quant a.</string>
+    <string name="logs_uploaded_privacy">S\'han esborrat els secrets · el registre expira automàticament</string>
     <string name="logs_copy_code">Copia el codi</string>
     <string name="logs_done">Fet</string>
     <string name="placeholder_dash">—</string>
@@ -569,7 +569,7 @@
     <string name="dialog_delete_recording_message">Voleu suprimir %1$s?\nAixò no es pot desfer.</string>
     <string name="toast_recording_deleted">S\'ha suprimit l\'enregistrament</string>
     <string name="toast_recording_delete_failed">No s\'ha pogut suprimir l\'enregistrament</string>
-    <string name="toast_batch_delete_partial">%1$d deleted, %2$d failed</string>
+    <string name="toast_batch_delete_partial">%1$d suprimits, %2$d han fallat</string>
     <string name="play_with_chooser">Reprodueix amb</string>
     <!-- Setup guide -->
     <string name="setup_version_banner">S\'ha actualitzat a %1$s — torna a confirmar l\'inici automàtic, BYD l\'esborra en cada instal·lació</string>
@@ -579,7 +579,7 @@
     <string name="setup_traffic_title">Desactiva el monitor de trànsit BYD</string>
     <string name="setup_traffic_body">El Monitor de Trànsit BYD bloqueja que les aplicacions de tercers arribin a Internet. Desactivar-lo permet que OverDrive i qualsevol altra aplicació que instal·leu realment utilitzin la xarxa. Després es requereix un reinici dur.</string>
     <string name="setup_traffic_button">Obre el monitor de trànsit</string>
-    <string name="setup_camera_fix_title">Camera feeds black or incorrect?</string>
+    <string name="setup_camera_fix_title">El canal de la càmera és en nengre o incorrecte?</string>
     <string name="setup_camera_fix_body">Open Diagnostics → Camera probe, set Camera ID to 0, tap Save, then restart the camera daemon. If the feeds are still wrong, repeat with Camera ID 1. Leave the mapping section untouched.</string>
     <!-- Recording storage path -->
     <!-- MainActivity status -->
@@ -602,13 +602,13 @@
     <string name="nav_page_byd_cloud">BYD Cloud</string>
     <!-- StatusOverlayService persistent notification (foreground service) -->
     <string name="status_overlay_notif_title">Estat d\'OverDrive</string>
-    <string name="status_overlay_notif_text">Status overlay active</string>
+    <string name="status_overlay_notif_text">Estat superposat actiu</string>
     <!-- DaemonKeepaliveService persistent notification (foreground service)
          and the group-summary row that collapses Overdrive's three FGS
          notifications into one shade entry. The summary text is intentionally
          generic so it stays accurate whether all three services are running
          or only the keepalive survived an OOM respawn. -->
-    <string name="daemon_keepalive_notif_title">Overdrive Active</string>
+    <string name="daemon_keepalive_notif_title">OverDrive actiu</string>
     <string name="daemon_keepalive_notif_text">Monitoring vehicle systems</string>
     <string name="overdrive_status_summary_title">Overdrive</string>
     <string name="overdrive_status_summary_text">Serveis en segon pla en execució</string>
@@ -636,7 +636,7 @@
     <string name="settings_overlay_camera_title">Indicador de la càmera</string>
     <string name="settings_overlay_camera_subtitle">Mostra la insígnia REC/PROX mentre l\'enregistrament està actiu.</string>
     <string name="settings_overlay_trip_title">Indicador de viatge</string>
-    <string name="settings_overlay_trip_subtitle">Show the TRIP badge while trip detection is running.</string>
+    <string name="settings_overlay_trip_subtitle">Mostra la insígnia TRIP mentre s\'està executant la detecció del viatge.</string>
     <!-- Was "About & updates" — Check for Updates row was removed from
          the About page, so the menu / rail label is now just "About". -->
     <string name="settings_section_about">Quant a</string>
@@ -656,22 +656,22 @@
          star → spread → coffee, in that visual order. Copy aims for
          personality without being corny — short, warm, specific. -->
     <string name="settings_about_support_section">Powered by people like you</string>
-    <string name="settings_about_support_share_title">Tell a fellow owner</string>
+    <string name="settings_about_support_share_title">Digueu-ho a un altre propietari</string>
     <string name="settings_about_support_share_value">Cada enllaç compartit ajuda a un altre propietari de BYD a descobrir Overdrive.</string>
     <string name="settings_about_support_share_message">Check out Overdrive — open-source surveillance &amp; dashcam for BYD: https://overdrive-5lc.pages.dev/</string>
     <string name="settings_about_support_share_chooser">Comparteix Overdrive</string>
     <string name="settings_about_open_link_failed">No s\'ha pogut obrir l\'enllaç.</string>
     <string name="settings_about_open_link_copied">No browser found. URL copied: %1$s</string>
-    <string name="settings_about_support_kofi_title">Fuel the next release</string>
-    <string name="settings_about_support_kofi_value">A coffee on Ko-fi keeps the late-night commits coming.</string>
+    <string name="settings_about_support_kofi_title">Ajudeu per a l següent llançament</string>
+    <string name="settings_about_support_kofi_value">Un cafè a Ko-fi manté l\'arribada de comissions nocturnes.</string>
     <string name="settings_about_license_title">Llicència</string>
     <string name="settings_about_license_value">MIT — codi obert. Toqueu per a veure el text complet.</string>
     <string name="settings_about_source_title">Codi font</string>
     <string name="settings_about_source_value">github.com/yash-srivastava/Overdrive-release</string>
-    <string name="settings_about_star_title">Star us on GitHub</string>
-    <string name="settings_about_star_value">Takes a second. Means a lot.</string>
+    <string name="settings_about_star_title">Marqueu-nos a GitHub</string>
+    <string name="settings_about_star_value">Només és un segon. Significa molt.</string>
     <string name="settings_about_thanks_title">Gràcies</string>
-    <string name="settings_about_thanks_subtitle">Built with the help of contributors and supporters.</string>
+    <string name="settings_about_thanks_subtitle">Construït amb l\'ajuda de col·laboradors i simpatitzants.</string>
     <string name="settings_about_contributors_title">Col·laboradors</string>
     <string name="settings_about_supporters_title">Patrocinadors</string>
     <string name="settings_about_thanks_empty">List populates as people pitch in.</string>
@@ -705,7 +705,7 @@
     <!-- SOTA Diagnostics dashboard -->
     <string name="diagnostics_hero_title">Diagnòstics del sistema</string>
     <string name="diagnostics_hero_subtitle">Live health, logs, and probes for the device.</string>
-    <string name="diagnostics_health_clear">All clear</string>
+    <string name="diagnostics_health_clear">Tot al dia</string>
     <string name="diagnostics_health_section">Salut</string>
     <string name="diagnostics_health_network">Xarxa</string>
     <string name="diagnostics_health_storage">Emmagatzematge</string>
@@ -728,12 +728,12 @@
     <!-- Storage tile bottom line. %1$s human-readable free size. -->
     <string name="diagnostics_storage_free_line">%1$s lliures</string>
     <string name="diagnostics_logs_card_title">Registre d\'esdeveniments en directe</string>
-    <string name="diagnostics_logs_card_subtitle">Streaming output from running services.</string>
+    <string name="diagnostics_logs_card_subtitle">S\'està emetent la sortida des dels serveis en execució.</string>
     <string name="diagnostics_tools_section">Eines</string>
-    <string name="diagnostics_traffic_subtitle">Watch live network throughput.</string>
+    <string name="diagnostics_traffic_subtitle">Vigileu el rendiment de la xarxa en directe.</string>
     <string name="diagnostics_camera_probe_subtitle">Inspecciona els fluxos de càmera connectats.</string>
     <string name="diagnostics_adb_subtitle">Obre el terminal del dispositiu.</string>
-    <string name="diagnostics_battery_subtitle">Inspect cell SOH and pack stats.</string>
+    <string name="diagnostics_battery_subtitle">Inspeccioneu les dades de salut de les cel·les i les estadístiques dels paquets.</string>
     <string name="diagnostics_settings_subtitle">Preferències de l\'aplicació, tema i llengua.</string>
     <!-- SOTA Integrations page -->
     <string name="integrations_hero_title">Integracions</string>
@@ -741,10 +741,10 @@
     <string name="integrations_status_unknown">Toqueu per a configurar</string>
     <string name="integrations_status_configured">Configurat</string>
     <string name="integrations_status_not_set_up">No s\'ha configurat</string>
-    <string name="integrations_telegram_desc">Send drive summaries, motion alerts, and SOS notifications to your private Telegram bot.</string>
+    <string name="integrations_telegram_desc">Envieu resums de la conducció, alertes de moviment i notificacions SOS al vostre bot privat de Telegram.</string>
     <string name="integrations_abrp_desc">Push live battery and route data to A Better Routeplanner for charging predictions.</string>
     <string name="integrations_mqtt_desc">Publica telemetria de vehicles a Home Assistant o a qualsevol corredor de MQTT.</string>
-    <string name="integrations_byd_cloud_desc">Connect your BYD app account to enable remote commands like door lock, flash lights, and horn.</string>
+    <string name="integrations_byd_cloud_desc">Connecteu el vostre compte d\'aplicació BYD per a habilitar ordres remotes com el bloqueig de portes, llums flaix i clàxon.</string>
     <string name="integrations_configure_button">Configura</string>
     <!-- Settings → About / Privacy actions (rows) -->
     <string name="settings_action_check_update">Cerca actualitzacions</string>
@@ -787,7 +787,7 @@
     <string name="vehicle_dialog_summary_soh">SOH: %1$s</string>
     <string name="vehicle_dialog_summary_effective">Efectiu: %1$.1f kWh</string>
     <string name="vehicle_dialog_summary_model">Model: %1$s</string>
-    <string name="vehicle_dialog_summary_calibration">Last calibrated: %1$.1f%% on %2$s</string>
+    <string name="vehicle_dialog_summary_calibration">Darrer calibratge: %1$.1f%% el %2$s</string>
     <string name="vehicle_dialog_soh_unavailable">no disponible</string>
     <!-- Combined Recordings+Storage chip: e.g. "8.4 GB used · 12 GB free" -->
     <string name="dashboard_metric_storage_chip">%1$s usat · %2$s lliure</string>
@@ -848,7 +848,7 @@
     <string name="settings_privacy_storage_unavailable">No disponible</string>
     <string name="settings_privacy_storage_count_format">%1$d clip</string>
     <string name="settings_privacy_storage_count_format_plural">%1$d clips</string>
-    <string name="settings_privacy_reset_subtitle">Choose categories: recordings, events, daemon configs, cached telemetry…</string>
+    <string name="settings_privacy_reset_subtitle">Trieu categories: enregistraments, esdeveniments, configuracions del dimoni, telemetria a la memòria cau...</string>
     <!-- Settings → Security pane copy + PIN unlock screen.
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
          surveillance, recording, Telegram alerts, status overlay, and the
@@ -875,25 +875,25 @@
     <!-- Verbatim ADB command. translatable=false so the i18n pipeline
          doesn't localize the literal path/command — translators following
          Crowdin would otherwise risk breaking the only recovery path. -->
-    <string name="settings_security_dialog_set_title">Set PIN</string>
-    <string name="settings_security_dialog_set_body">Pick a 4–8 digit PIN. You\'ll need this every time you open the app.</string>
+    <string name="settings_security_dialog_set_title">Estableix el PIN</string>
+    <string name="settings_security_dialog_set_body">Trieu un PIN de 4-8 dígits. El necessitareu cada vegada que obriu l\'aplicació.</string>
     <string name="settings_security_dialog_disable_title">Voleu desactivar el bloqueig PIN?</string>
-    <string name="settings_security_dialog_disable_body">Confirm your current PIN to turn off the app lock.</string>
-    <string name="settings_security_dialog_change_step1_title">Confirm current PIN</string>
-    <string name="settings_security_dialog_change_step1_body">Enter your current PIN, then you\'ll set a new one.</string>
-    <string name="settings_security_action_set">Set PIN</string>
-    <string name="settings_security_action_disable">Turn off lock</string>
+    <string name="settings_security_dialog_disable_body">Confirmeu el PIN actual per a desactivar el bloqueig de l\'aplicació.</string>
+    <string name="settings_security_dialog_change_step1_title">Confirmeu el PIN actual</string>
+    <string name="settings_security_dialog_change_step1_body">Introduïu el PIN actual, després n\'establireu un de nou.</string>
+    <string name="settings_security_action_set">Estableix el PIN</string>
+    <string name="settings_security_action_disable">Desactiva el bloqueig</string>
     <string name="settings_security_action_continue">Continua</string>
     <string name="settings_security_pin_hint">PIN</string>
-    <string name="settings_security_pin_confirm_hint">Confirm PIN</string>
-    <string name="settings_security_error_length">PIN must be 4 to 8 digits</string>
+    <string name="settings_security_pin_confirm_hint">Confirmeu el PIN</string>
+    <string name="settings_security_error_length">El PIN ha de ser de 4 a 8 dígits</string>
     <string name="settings_security_error_numeric">Només dígits</string>
     <string name="settings_security_error_mismatch">Els PIN no coincideixen</string>
     <string name="settings_security_error_wrong">PIN incorrecte</string>
-    <string name="settings_security_error_locked_out">Too many attempts. Try again in a moment.</string>
-    <string name="settings_security_error_persist">Couldn\'t save the PIN. Try again.</string>
-    <string name="settings_security_toast_set_ok">PIN set. App lock is on.</string>
-    <string name="settings_security_toast_disable_ok">App lock turned off.</string>
+    <string name="settings_security_error_locked_out">Massa intents. Torneu-ho a provar d\'aquí un moment.</string>
+    <string name="settings_security_error_persist">No s\'ha pogut desar el PIN. Torneu-ho a provar.</string>
+    <string name="settings_security_toast_set_ok">S\'ha establert el PIN. El bloqueig de l\'aplicació està activat.</string>
+    <string name="settings_security_toast_disable_ok">S\'ha desactivat el bloqueig de l\'aplicació.</string>
     <!-- PIN unlock screen (PinLockActivity). Shown over MainActivity when
          the app lock is enabled and the session isn\'t fresh. -->
     <string name="pin_lock_title">Introduïu el PIN</string>
@@ -951,7 +951,7 @@
     <string name="dashboard_insight_last_alert">Last surveillance alert: %1$s</string>
     <!-- Most recent completed charging session in the last 24h.
          %1$s = energy added (e.g. "12.4 kWh"); %2$s = duration (e.g. "1 hr 45 min"). -->
-    <string name="dashboard_insight_last_charge">Last charge: +%1$s in %2$s</string>
+    <string name="dashboard_insight_last_charge">Darrera càrrega: +%1$s en %2$s</string>
     <!-- Storage milestone. %1$d = clip count; %2$s = total size (e.g. "42 GB"). -->
     <string name="dashboard_insight_storage_milestone">%1$d clips · %2$s registrats</string>
     <!-- Number formatters used inside other insights. Translators may localize
@@ -989,7 +989,7 @@
     <string name="rail_roadsense">RoadSense</string>
     <string name="rail_hazard_map">Mapa</string>
     <string name="roadsense_title">RoadSense</string>
-    <string name="roadsense_pill_scanning">Scanning</string>
+    <string name="roadsense_pill_scanning">Escaneig</string>
     <string name="roadsense_pill_idle">RoadSense</string>
     <string name="roadsense_status_idle">Inactiu</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
@@ -1061,8 +1061,8 @@
     <!-- Snackbar / toast confirmations -->
     <string name="roadsense_map_confirmed_toast">Perill confirmat</string>
     <string name="roadsense_map_deleted_toast">S\'ha eliminat el perill</string>
-    <string name="roadsense_map_action_failed">Could not reach RoadSense. Try again.</string>
-    <string name="roadsense_map_no_location">Waiting for GPS fix…</string>
+    <string name="roadsense_map_action_failed">No s\'ha pogut arribar a RoadSense. Torneu-ho a provar.</string>
+    <string name="roadsense_map_no_location">S\'està esperant la correcció del GPS...</string>
     <!-- Navigation: search + routing + turn-by-turn -->
     <string name="roadsense_map_search_hint">Cerca destinació</string>
     <string name="roadsense_map_search_action">Cerca</string>
@@ -1072,11 +1072,11 @@
     <string name="roadsense_map_routing">S\'està cercant la ruta...</string>
     <string name="roadsense_map_route_failed">No s\'ha pogut trobar cap ruta. Torneu-ho a provar.</string>
     <string name="roadsense_map_need_key">Add a routing key in RoadSense settings to navigate.</string>
-    <string name="roadsense_map_rerouting">Off route — recalculating…</string>
+    <string name="roadsense_map_rerouting">Fora de la ruta — s\'està recalculant...</string>
     <string name="roadsense_map_arrived">Heu arribat.</string>
-    <string name="roadsense_map_nav_started">Navigating to %1$s</string>
-    <string name="roadsense_map_nav_ended">Navigation ended</string>
-    <string name="roadsense_map_end_nav">End navigation</string>
+    <string name="roadsense_map_nav_started">S\'està navegant a %1$s</string>
+    <string name="roadsense_map_nav_ended">S\'ha finalitzat la navegació</string>
+    <string name="roadsense_map_end_nav">Finalitza la navegació</string>
     <string name="roadsense_map_zoom_in">Apropa\'t</string>
     <string name="roadsense_map_zoom_out">Allunya\'t</string>
     <!-- Hazard visibility filter -->
@@ -1102,15 +1102,15 @@
     <string name="roadsense_map_poi_kind_fuel">Estació de combustible</string>
     <string name="roadsense_map_poi_charging_generic">Estació de recàrrega</string>
     <string name="roadsense_map_poi_fuel_generic">Estació de combustible</string>
-    <string name="roadsense_map_route_switched">Switched route</string>
+    <string name="roadsense_map_route_switched">S\'ha canviat la ruta</string>
     <!-- "then <next maneuver>" preview shown in the maneuver banner -->
     <string name="roadsense_map_then">llavors</string>
     <!-- Roundabout exit ordinal in the maneuver banner (%1$d = exit number) -->
     <string name="roadsense_map_exit_n">sortida %1$d</string>
     <!-- Hazards-along-route pills (%1$d = count) -->
-    <string name="roadsense_map_pill_severe">%1$d severe</string>
-    <string name="roadsense_map_pill_moderate">%1$d moderate</string>
-    <string name="roadsense_map_pill_minor">%1$d minor</string>
+    <string name="roadsense_map_pill_severe">%1$d greu</string>
+    <string name="roadsense_map_pill_moderate">%1$d moderat</string>
+    <string name="roadsense_map_pill_minor">%1$d menor</string>
     <!-- Shown briefly if the basemap can\'t be reached. -->
     <string name="roadsense_map_offline">Dades del mapa no disponibles fora de línia</string>
     <!-- Navigation: autocomplete + route options -->
@@ -1285,7 +1285,7 @@
     <string name="settings_backup_settings_only">Només els paràmetres</string>
     <string name="settings_backup_with_trips">Inclou els viatges</string>
     <string name="settings_about_tier_diamond">Diamant</string>
-    <string name="settings_about_tier_platinum">Platinum</string>
+    <string name="settings_about_tier_platinum">Platí</string>
     <string name="settings_about_tier_gold">Or</string>
     <string name="settings_about_tier_silver">Plata</string>
     <string name="settings_about_tier_bronze">Bronze</string>
@@ -1356,4 +1356,97 @@
     <string name="projection_autostart_desc">Emet automàticament l\'última aplicació usada en la pantalla del conductor cada vegada que el cotxe s\'engegui. (El clonat s\'obre quan visiteu aquesta pantalla.)</string>
     <string name="projection_autostart_conflict_title">RoadSense usa la pantalla del conductor</string>
     <string name="projection_autostart_conflict_body">RoadSense està configurat per a autoprojectar el mapa a la pantalla del conductor quan el cotxe estigui activat. La pantalla del conductor només pot mostrar una cosa alhora. Voleu desactivar-ho i iniciar automàticament aquesta aplicació?</string>
+    <string name="tailscale_adb_endpoint_copied">S\'ha copiat l\'endpoint</string>
+    <string name="toast_tailscale_adb_enabled">ADB remot habilitat a tailnet</string>
+    <string name="toast_tailscale_adb_disabled">ADB remot desactivat</string>
+    <string name="toast_tailscale_adb_save_failed">Ha fallat en canviar la configuració remota de l\'ADB</string>
+    <string name="camera_section_slice_calibration">Rols i calibratge de 360 — avançat</string>
+    <string name="camera_role_explainer_slice">Calibració del tall: tria quin tall del mosaic 360 mostra aquesta direcció. No canvia quina càmera s\'obre.</string>
+    <string name="camera_role_explainer_windshield">Rol parabrisa: el canal usat com a vista superior de la disposició d\'enregistrament de càmera de davantal i per a la transmissió de parabrises. Independentment de l\'ID de la gravadora de la càmera anterior.</string>
+    <string name="camera_role_explainer_cabin">Rol de cabina: canal interior opcional per a disposicions i estríming.</string>
+    <string name="onboarding_authorize_title">Desperta OverDrive</string>
+    <string name="onboarding_authorize_body">Overdrive executa les seves càmeres a través d\'un petit ajudant en el dispositiu. Android demanarà una vegada que es permeti la depuració USB — toqueu <b>Permet</b> i comproveu <b>Permet sempre des d\'aquest dispositiu</b>, de manera que es manté encesa després de cada reinici.</string>
+    <string name="onboarding_authorize_waiting_body">Accepta la finestra emergent d\'Android. Si no ho veieu, pot ser que ja ho tingui concedit — això continuarà pel seu compte.</string>
+    <string name="onboarding_authorize_retry_body">L\'ajudant encara no s\'està executant. És possible que s\'hagi descartat el permís d\'Android. Torneu-ho a provar i recordeu de marcar <b>Permet permet</b>.</string>
+    <string name="onboarding_mode_body">Trieu com es comporta Overdrive després d\'apagar el cotxe.\n\n<b>Activat i desactivat</b> segueix observant mentre està aparcat — vigilància i seguiment de fons romanen actius, de manera que el cotxe gasta una mica d\'energia durant la nit.\n\n<b>Només activat</b> tanca completament Overdrive una vegada apagueu el cotxe. La càmera de davantal, viatges i recàrrega encara funcionen mentre conduïu, i tot comença a funcionar automàticament quan s\'engega el cotxe. Podeu canviar-ho en qualsevol moment a la configuració.</string>
+    <string name="onboarding_mode_on_off_button">Activa i desactiva</string>
+    <string name="onboarding_mode_on_only_button">Només actiu</string>
+    <string name="onboarding_camera_step_label">Càmera · pas %1$d de %2$d</string>
+    <string name="onboarding_camera_intro_title">Configureu les càmeres</string>
+    <string name="onboarding_camera_intro_body">Indiqueu a OverDrive quina càmera és la vista 360 i quina és la càmera de davantal. Es triga aproximadament un minut, i es pot canviar més tard.</string>
+    <string name="onboarding_camera_intro_primary">Inicia</string>
+    <string name="onboarding_camera_opening_title">S\'està obrint la configuració de la càmera...</string>
+    <string name="onboarding_camera_opening_body">S\'està carregant una vista prèvia en directe des de les càmeres. Això pot trigar uns segons.</string>
+    <string name="onboarding_camera_dashcam_title">Ara trobeu la càmera de carretera</string>
+    <string name="onboarding_camera_dashcam_body">Passeu per les càmeres amb les fletxes i atureu-vos en la que mostra el parabrisa / vista cap endavant. Fixeu-vos en el seu número — el triareu a continuació.</string>
+    <string name="onboarding_camera_pick_title">Trieu la càmera 360</string>
+    <string name="onboarding_camera_pick_body">A la targeta superior, tria el número de la teva càmera 360 / normal. No n\'esteu segur? Deixeu-lo en Auto i Overdrive ho dedueix.</string>
+    <string name="onboarding_camera_pick_dash_body">En aquesta targeta, trieu el número de càmera de davantal que heu trobat abans - o deixeu-lo en AUTO.</string>
+    <string name="onboarding_camera_applying_title">S\'està aplicant — reinici de les càmeres</string>
+    <string name="onboarding_camera_applying_body">El canal es farà fosc i parpellejarà durant uns 10 segons. Això és normal — espereu una estona.</string>
+    <string name="onboarding_camera_verify_repick">Torna a seleccionar</string>
+    <string name="onboarding_dash_tiles_title">La vostra cabina d\'un cop d\'ull</string>
+    <string name="onboarding_dash_tiles_body">Aquestes targetes són botons: toqueu per a obrir càmeres en viu, enregistraments, serveis o el vostre vehicle.</string>
+    <string name="onboarding_dash_chips_title">Només mostren l\'estat</string>
+    <string name="onboarding_reset_toast">Reinici de la incorporació — es torna a mostrar la guia</string>
+    <string name="onboarding_expert_recordings_body">Canvieu entre càmera de davantal (clips continus + de proximitat) i Vigilància (esdeveniments de sentinella aparcats) amb aquest commutador — cadascun manté la seva pròpia biblioteca. Toqueu un clip per a reproduir-lo.</string>
+    <string name="onboarding_expert_camprobe_body">Això reassigna quina càmera física alimenta cada rol i reinicia les càmeres. Canvieu-ho només si un canal sembla incorrecte — ja ho heu configurat abans en la guia.</string>
+    <string name="onboarding_expert_daemons_title">Serveis — gestioneu amb cura</string>
+    <string name="onboarding_expert_security_title">Bloqueja amb un PIN</string>
+    <string name="onboarding_expert_reset_title">Restableix les dades — permanent</string>
+    <string name="onboarding_expert_reset_body">Això esborra els enregistraments, els esdeveniments i la configuració i no es pot desfer. És aquí si mai vens el cotxe — no és part de l\'ús normal.</string>
+    <string name="onboarding_expert_done_title">Això és la visita guiada</string>
+    <string name="onboarding_expert_done_body">Heu vist la configuració més profunda. Obriu aquesta guia de nou en qualsevol moment des del botó d\'ajuda.</string>
+    <string name="daemons_wifi_auto_enable_subtitle">OverDrive restaura Wi-Fi mentre està aparcat i quan comencen els serveis de fons. Desactiveu-ho per a deixar l\'estat actual de Wi-Fi sota control del vehicle.</string>
+    <string name="rail_charging">Recàrrega</string>
+    <string name="settings_overlay_replay_subtitle">Mostra la insígnia del CLIP: verd mentre es reprodueix un registre, blau per a 5s un cop desat, vermell quan falla. Només apareix quan existeix una unió de reproducció o una automatització.</string>
+    <string name="settings_overlay_roadsense_subtitle">Mostra la píndola flotant de RoadSense i la targeta de perill mentre RoadSense està activada.</string>
+    <string name="remote_voice_unmute">No silenciïs la veu remota</string>
+    <string name="remote_voice_notification_title">Veu remota activa</string>
+    <string name="settings_remote_output_override_title">Usa un nivell de veu personalitzat</string>
+    <string name="settings_remote_output_override_subtitle">Desactivat segueix el volum de mitjans actual del cotxe.</string>
+    <string name="settings_remote_speaker_started">Prova d\'altaveu iniciada</string>
+    <string name="settings_remote_emergency_title">Inhabilitació d\'emergència</string>
+    <string name="settings_remote_emergency_subtitle">Atura i bloqueja immediatament totes les veus i missatges remots.</string>
+    <string name="settings_remote_save_failed">No s\'ha pogut desar la configuració de la comunicació remota</string>
+    <string name="settings_backup_pick_file">Trieu una còpia de seguretat a restaurar</string>
+    <string name="settings_backup_restore_confirm_title">Voleu restaurar la configuració?</string>
+    <string name="settings_backup_restore_confirm_msg">Això substitueix la configuració actual de Overdrive amb la còpia de seguretat i recàrrega els serveis. Només funciona en la mateixa unitat principal on s\'ha fet la còpia de seguretat.</string>
+    <string name="settings_backup_restart_hint">"S\'ha restaurat la configuració. Reinicieu el dimoni de la càmera (Dimonis →  Càmera → Reinicia) per a assegurar-vos que s\'apliquen tots els paràmetres restaurats."</string>
+    <string name="recordings_summary_index_down">Nombres no disponibles - l\'índex d\'enregistraments és baix</string>
+    <string name="roadsense_map_search_network">No s\'ha pogut arribar al servei de cerca. Comproveu la connexió o servidor intermediari i torneu-ho a provar.</string>
+    <string name="roadsense_map_route_key_rejected">S\'ha rebutjat la clau d\'encaminament. Comproveu la vostra clau a la configuració de RoadSense.</string>
+    <string name="roadsense_map_route_network">Xarxa massa lenta per a trobar una ruta. Comproveu la connexió i torneu-ho a provar.</string>
+    <string name="roadsense_map_route_http">Error de servei d\'encaminament (%1$d). Torneu-ho a provar d\'aquí poc.</string>
+    <string name="projection_status_idle">No projectant.</string>
+    <string name="projection_status_live">Clonatge en directe — toqueu i llisqueu per a controlar.</string>
+    <string name="projection_app_uninstalled">Aquesta aplicació ja no està instal·lada.</string>
+    <string name="network_subtitle">Compartiu les dades mòbils del cotxe amb el vostre telèfon, tauleta o ordinador portàtil.</string>
+    <string name="network_state_on">Activat — es comparteixen dades mòbils</string>
+    <string name="network_state_off">Desactivat</string>
+    <string name="network_credentials_note">El vehicle estableix el nom i la contrasenya del punt d\'accés, de manera que no es poden canviar aquí. Toqueu-ne qualsevol per a copiar-lo.</string>
+    <string name="network_saved_next_start">Desat — s\'aplica al següent inici del punt d\'accés</string>
+    <string name="network_password_invalid">La contrasenya ha de tenir entre 8 i 63 caràcters.</string>
+    <string name="network_limit_invalid">Introduïu un nombre sencer de megabytes.</string>
+    <string name="network_uptime_label">Temps d\'actualització</string>
+    <string name="network_rx_label">Rebut</string>
+    <string name="network_tx_label">Enviat</string>
+    <string name="network_reset_usage">Restableix el comptador</string>
+    <string name="network_usage_reset">Reinicialització del comptador de dades</string>
+    <string name="network_usage_fmt">S\'han usat %1$s de %2$s</string>
+    <string name="network_usage_nolimit_fmt">S\'ha utilitzat %1$s — no s\'ha establert cap límit</string>
+    <string name="network_keepalive_title">Mantén el punt d\'accés</string>
+    <string name="network_keepalive_desc">Si el punt d\'accés cau pel seu compte, torna a començar-lo.</string>
+    <string name="network_autostart_title">Inicia en engegar el cotxe</string>
+    <string name="network_autostart_desc">Inicia el punt d\'accés una vegada en cada engegada</string>
+    <string name="network_proxy_section">Servidor intermediari</string>
+    <string name="network_proxy_system_title">Encamina el trànsit d\'aquest cotxe a través del servidor intermediari</string>
+    <string name="network_proxy_system_desc">Estableix el servidor intermediari HTTP a tot el sistema, de manera que les aplicacions a la unitat principal utilitzen el túnel encriptat. Necessita que el servei proxy s\'executi.</string>
+    <string name="network_proxy_clients_title">Dona Internet als dispositius connectats (proxy)</string>
+    <string name="network_proxy_clients_desc">Fa que el servidor intermediari sigui accessible des del punt d\'accés. Cada dispositiu ha d\'establir el servidor intermediari en si, connectant-se per si sol no encaminar el seu trànsit.</string>
+    <string name="network_proxy_clients_desc_fmt">Connectar-se al punt d\'accés no és suficient — aquest vehicle no pot encaminar dispositius a Internet pel seu compte, de manera que cada dispositiu ha d\'estar apuntat al servidor intermediari del cotxe.\n\nAl dispositiu, després d\'unir-se a aquest punt d\'accés:\n1. Obriu-ne la configuració de Wi-Fi i editeu aquesta xarxa\n2. Establiu el servidor intermediari a manual\n3. Nom d\'amfitrió %1$s, port %2$d\n4. Deseu, després navegueu\n\nEl dispositiu segueix mostrant «sense internet» i la seva pròpia icona de dades mòbils fins i tot quan això està funcionant — ignora els servidors intermediaris. Les aplicacions que ignoren el servidor intermediari de Wi-Fi (algunes de transmissió i jocs) no l\'usaran.</string>
+    <string name="network_client_tunnel_title">Xifra també el trànsit dels dispositius connectats</string>
+    <string name="network_client_tunnel_desc_fmt">Envia el trànsit dels dispositius connectats a través del túnel xifrat abans de sortir de la SIM del cotxe. Apunteu els dispositius al port %1$d en lloc de %2$d. Més lent, ja que afegeix una salt. Desactivar això impedeix que el port escolti immediatament.</string>
+    <string name="network_warn_title">El cotxe oferirà WiFi</string>
+    <string name="network_warn_body">Aquesta unitat principal té una ràdio WiFi, de manera que no pot allotjar un punt d\'accés i romandre en una xarxa WiFi al mateix temps. Mentre el punt d\'accés està activat, el cotxe es desconnecta de la WiFi i usa les dades mòbils de la SIM incorporades per a si mateix i per a cada dispositiu connectat. La xarxa WiFi torna quan apagueu el punt d\'accés.</string>
 </resources>
