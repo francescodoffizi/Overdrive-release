@@ -42,6 +42,7 @@
     <string name="cd_recording_status">Tình trạng ghi âm</string>
     <string name="cd_trip_tracking_status">Tình trạng theo dõi chuyến đi</string>
     <string name="cd_mic_status">Tình trạng chụp micrô</string>
+    <string name="cd_replay_status">Trạng thái phát lại tức thì</string>
     <string name="cd_video_thumbnail">Hình ảnh nhỏ video</string>
     <string name="cd_play">Phát</string>
     <string name="cd_back">Quay lại</string>
@@ -103,6 +104,13 @@
     <string name="tailscale_qr_waiting">Chờ đợi đăng nhập URL...</string>
     <string name="tailscale_enable_proxy">Khả năng Tailscale Proxy</string>
     <string name="tailscale_proxy_explainer">Các tuyến đường MQTT đến Tailscale để bạn có thể liên lạc với một nhà môi giới riêng trên mạng đuôi của bạn mà không cần chuyển tiếp cổng.</string>
+    <string name="tailscale_enable_adb">Cho phép ADB từ xa qua Tailscale</string>
+    <string name="tailscale_adb_explainer">Mở rộng phạm vi tailnet cho ADB (không phải internet công cộng). Bất kỳ thiết bị tailnet nào có khóa ADB được ủy quyền đều có toàn quyền truy cập shell vào màn hình này. Lưu ý ADB vốn đã chấp nhận kết nối từ mạng nội bộ — tắt tùy chọn này không đóng quyền đó.</string>
+    <string name="tailscale_adb_endpoint">adb connect %1$s</string>
+    <string name="tailscale_adb_endpoint_copied">Đã sao chép điểm cuối</string>
+    <string name="toast_tailscale_adb_enabled">Đã bật ADB từ xa trên tailnet</string>
+    <string name="toast_tailscale_adb_disabled">Đã tắt ADB từ xa</string>
+    <string name="toast_tailscale_adb_save_failed">Không thể thay đổi cài đặt ADB từ xa</string>
     <string name="tailscale_proxy_warning">Trong khi được bật, MQTT đến các nhà môi giới công cộng (HiveMQ, AWS IoT, vv) sẽ thất bại  Tailscale chỉ đường đến lưới đuôi của bạn.</string>
     <!-- Camera ingestion mode selector (Default vs DiLink 4) -->
     <string name="camera_mode_title">Phương thức tiêu thụ</string>
@@ -148,6 +156,27 @@
          dashcam, which is the pano camera, not the dashcam. -->
     <string name="camera_oem_option_0">Camera 0 — Seal / Han (mặc định)</string>
     <string name="camera_oem_option_1">Camera 1 — Atto / Tang</string>
+    <string name="camera_pair_title">Camera nào là camera nào?</string>
+    <string name="camera_pair_pano_label">360 Toàn cảnh</string>
+    <string name="camera_pair_dashcam_label">Camera hành trình trước</string>
+    <string name="camera_pair_swap">Hoán đổi</string>
+    <string name="camera_pair_value_manual">Camera %1$d · Thủ công</string>
+    <string name="camera_pair_value_auto">Tự động · Camera %1$d</string>
+    <string name="camera_pair_hint">Bản xem trước theo lựa chọn ID. Nếu hai luồng hình có vẻ bị đảo, hãy nhấn Hoán đổi — thao tác này tráo cả hai ID và lưu ngay. Cần một ID cụ thể? Mở Thủ công ID camera bên dưới.</string>
+    <string name="cd_camera_pair_swap">Hoán đổi ID camera 360 và camera hành trình</string>
+    <string name="camera_advanced_ids_toggle">Thủ công ID camera — nâng cao</string>
+    <string name="onboarding_camera_pair_title">Kiểm tra ghép nối camera</string>
+    <string name="onboarding_camera_pair_body">Các ô này cho biết camera nào cấp hình cho chế độ xem 360 và camera hành trình trước. Nếu hai bản xem trước có vẻ bị tráo, hãy nhấn Hoán đổi — thao tác này tráo và lưu cả hai ID. Rồi tiếp tục.</string>
+    <string name="onboarding_camera_pair_primary">Trông ổn rồi — lưu &amp; khởi động lại</string>
+    <string name="onboarding_camera_pair_secondary">Chọn ID thủ công</string>
+    <string name="camera_section_slice_calibration">Vai trò &amp; hiệu chỉnh lát cắt 360 — nâng cao</string>
+    <string name="camera_ids_pano_title">Nguồn 360 Toàn cảnh</string>
+    <string name="camera_ids_pano_caption">Camera mà quy trình 360 mở — điều khiển ảnh ghép 2×2 dùng cho ghi hình (cam_*.mp4), giám sát và xem trực tiếp. Được phản chiếu bởi thẻ ghép nối phía trên.</string>
+    <string name="camera_ids_oem_title">Nguồn camera hành trình trước</string>
+    <string name="camera_ids_oem_caption">Camera mà bộ ghi Dashcam OEM mở cho các clip dvr_*.mp4. Tách biệt với vai trò Kính chắn gió bên dưới, vốn chỉ ảnh hưởng đến khung hình trên cùng của bố cục ghi Dashcam.</string>
+    <string name="camera_role_explainer_slice">Hiệu chỉnh lát cắt: chọn lát nào của ảnh ghép 360 hiển thị hướng này. Không thay đổi camera nào được mở.</string>
+    <string name="camera_role_explainer_windshield">Vai trò Kính chắn gió: luồng hình dùng làm khung trên cùng của bố cục ghi Dashcam và để phát trực tiếp kính chắn gió. Độc lập với ID camera hành trình trước ở trên.</string>
+    <string name="camera_role_explainer_cabin">Vai trò Khoang lái: luồng hình nội thất tùy chọn cho bố cục và phát trực tiếp.</string>
     <!-- Camera mapping dialog (multi-vehicle role-to-slice routing) -->
     <string name="camera_mapping_title">Chụp bản đồ bằng máy ảnh</string>
     <string name="camera_role_label">Phân tích vai trò</string>
@@ -295,6 +324,8 @@
     <string name="recording_lib_building_index_title">Đang xây dựng chỉ mục thư viện</string>
     <string name="recording_lib_building_index_body">Đợi một lát trong khi daemon quét các bản ghi của bạn.</string>
     <string name="recording_lib_building_index_progress">Đã lập chỉ mục %1$d trong %2$d clip…</string>
+    <string name="recording_lib_index_down_title">Không có chỉ mục bản ghi</string>
+    <string name="recording_lib_index_down_body">Các bản ghi của bạn vẫn an toàn trên đĩa, nhưng chỉ mục thư viện đang gặp sự cố. Đang tự động thử lại…</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
          filename prefix (cam_/event_/dvr_/proximity_) so power users can
          map a tile back to its file group at a glance. -->
@@ -302,6 +333,7 @@
     <string name="recording_lib_type_event">SỰ KIỆN</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
+    <string name="recording_lib_type_replay">PHÁT LẠI</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
     <string name="toast_share_recordings">Đang chia sẻ %1$d bản ghi</string>
     <!-- fragment_sentry_config -->
@@ -315,6 +347,9 @@
     <string name="daemons_count_pending">Dịch vụ tải...</string>
     <!-- Subtitle on the Daemons hero header. %1$d running, %2$d total. -->
     <string name="daemons_count_fmt">%1$d của %2$d chạy</string>
+    <string name="daemons_wifi_auto_enable_title">Tự động bật Wi&#8209;Fi</string>
+    <string name="daemons_wifi_auto_enable_subtitle">OverDrive khôi phục Wi&#8209;Fi khi đỗ xe và khi các dịch vụ nền khởi động. Tắt tùy chọn này để trạng thái Wi&#8209;Fi hiện tại do xe kiểm soát.</string>
+    <string name="daemons_wifi_auto_enable_save_failed">Không thể lưu cài đặt tự động bật Wi&#8209;Fi.</string>
     <!-- dialog_time_window -->
     <!-- dialog_update_progress -->
     <string name="update_preparing">Chuẩn bị cập nhật...</string>
@@ -484,6 +519,8 @@
     <string name="dashboard_starting_cloudflared">Bắt đầu đường hầm Cloudflared...</string>
     <string name="dashboard_starting_tailscale">Bắt đầu đường hầm Tailscale...</string>
     <string name="dashboard_waiting_url">Chờ đường hầm URL...</string>
+    <string name="dashboard_tunnel_failed">Lỗi đường hầm</string>
+    <string name="dashboard_tunnel_stopping">Đang dừng đường hầm…</string>
     <string name="dashboard_daemons_running">%1$d/%2$d chạy</string>
     <string name="tunnel_label_cloudflared">Cloudflared</string>
     <string name="tunnel_label_zrok">Zrok</string>
@@ -509,6 +546,8 @@
     <string name="dialog_tailscale_settings_message">Thiết lập quy mô đuôi</string>
     <string name="tailscale_failed_login_url">Không tạo URL đăng nhập</string>
     <string name="tailscale_logged_in_relogin">Nhập vào. Nhấp vào để đăng nhập vào tài khoản khác</string>
+    <string name="dialog_tailscale_adb_enable_title">Cho phép ADB từ xa?</string>
+    <string name="dialog_tailscale_adb_enable_message">Thao tác này mở rộng phạm vi tailnet cho ADB (cổng 5555) để bạn có thể gỡ lỗi màn hình này từ xa.\n\nTrước khi bật:\n• ADB cấp TOÀN QUYỀN truy cập shell — một thiết bị tailnet có khóa được ủy quyền có thể đọc dữ liệu, cài ứng dụng và thay đổi cài đặt hệ thống\n• Thao tác này thêm tailnet của bạn làm một tuyến; nó không phơi ADB ra internet công cộng\n• ADB vốn đã chấp nhận kết nối từ mạng nội bộ, nên tắt tùy chọn này không đóng hoàn toàn ADB\n• Máy tính kết nối vẫn cần một khóa ADB được ủy quyền\n• Bật điểm phát Wi-Fi sẽ ngắt kết nối Wi-Fi, nên khi đó truy cập từ xa phụ thuộc vào dữ liệu di động\n\nChỉ bật trên tailnet mà bạn kiểm soát. Bạn có thể tắt bất cứ lúc nào.</string>
     <string name="dialog_tailscale_proxy_enable_title">Khả năng Tailscale Proxy?</string>
     <string name="dialog_tailscale_proxy_enable_message">Điều này tuyến đường MQTT qua Tailscale để bạn có thể tiếp cận một nhà môi giới tư nhân trên mạng đuôi của bạn mà không cần chuyển tiếp cổng.\n\nTrong khi bật:\n• MQTT đến một nhà môi giới đuôi hoạt động (ví dụ: Mosquitto trên một thiết bị trên mạng đuôi của bạn)\n• MQTT đến các nhà môi giới công cộng (HiveMQ, AWS IoT, vv) sẽ thất bại  Tailscale chỉ đường đến mạng đuôi của bạn\n• Daemon Tailscale sẽ khởi động lại để áp dụng thay đổi\n• Traffic ứng dụng khác và phần còn lại của thiết bị không bị ảnh hưởng\n\n Bạn có thể tắt điều này bất cứ lúc nào.</string>
     <string name="dialog_zrok_reset_title">Tái thiết Zrok Môi trường</string>
@@ -622,6 +661,8 @@
     <string name="rail_integrations">Kết hợp</string>
     <string name="rail_diagnostics">Chẩn đoán</string>
     <string name="rail_settings">Cài đặt</string>
+    <string name="rail_expand">Hiện nhãn điều hướng</string>
+    <string name="rail_collapse">Ẩn nhãn điều hướng</string>
     <!-- Settings sub-rail -->
     <string name="settings_section_appearance">Nhìn hình</string>
     <string name="settings_section_recording">Đăng ký</string>
@@ -635,6 +676,36 @@
     <string name="settings_overlay_camera_subtitle">Hình bày thẻ REC / PROX trong khi ghi âm đang hoạt động.</string>
     <string name="settings_overlay_trip_title">Chỉ thị Trip</string>
     <string name="settings_overlay_trip_subtitle">Cho thấy thẻ TRIP khi phát hiện chuyến đi đang chạy.</string>
+    <string name="settings_overlay_replay_title">Chỉ báo phát lại tức thì</string>
+    <string name="settings_overlay_replay_subtitle">Hiển thị huy hiệu CLIP: xanh lá khi đang ghi bản phát lại, xanh dương trong 5 giây sau khi lưu, đỏ khi lỗi. Chỉ xuất hiện khi có liên kết hoặc tự động hóa phát lại.</string>
+    <string name="settings_overlay_roadsense_title">Lớp phủ RoadSense</string>
+    <string name="settings_overlay_roadsense_subtitle">Hiển thị thẻ RoadSense nổi và thẻ cảnh báo nguy hiểm khi RoadSense được bật.</string>
+    <string name="remote_voice_overlay_title">Giọng nói từ xa</string>
+    <string name="remote_voice_mute">Tắt tiếng giọng nói từ xa</string>
+    <string name="remote_voice_unmute">Bật tiếng giọng nói từ xa</string>
+    <string name="remote_voice_notification_title">Giọng nói từ xa đang hoạt động</string>
+    <string name="remote_voice_notification_text">Đang nhận âm thanh trực tiếp từ một phiên OverDrive đã xác thực</string>
+    <string name="settings_remote_communication_title">Liên lạc từ xa</string>
+    <string name="settings_remote_communication_subtitle">Bật giọng nói và tin nhắn từ bảng điều khiển web. Nếu Quyền lớp phủ báo Cần cấp quyền, hãy nhấn vào đó và cho phép Hiển thị trên ứng dụng khác.</string>
+    <string name="settings_remote_voice_title">Bật giọng nói từ xa</string>
+    <string name="settings_remote_output_override_title">Dùng mức âm lượng giọng nói tùy chỉnh</string>
+    <string name="settings_remote_output_override_subtitle">Tắt sẽ theo âm lượng phương tiện hiện tại của xe.</string>
+    <string name="settings_remote_output_level">Mức giọng nói tùy chỉnh</string>
+    <string name="settings_remote_output_car_volume">Âm lượng xe</string>
+    <string name="settings_remote_output_default">70%</string>
+    <string name="settings_remote_output_value">%1$d%%</string>
+    <string name="settings_remote_messages_title">Bật tin nhắn từ xa</string>
+    <string name="settings_remote_overlay_permission">Quyền lớp phủ</string>
+    <string name="settings_remote_overlay_checking">Đang kiểm tra</string>
+    <string name="settings_remote_overlay_allowed">Đã cho phép</string>
+    <string name="settings_remote_overlay_required">Cần cấp quyền</string>
+    <string name="settings_remote_test_speaker">Kiểm tra loa</string>
+    <string name="settings_remote_test_message">Tin nhắn thử</string>
+    <string name="settings_remote_test_message_body">Tin nhắn từ xa đã sẵn sàng.</string>
+    <string name="settings_remote_speaker_started">Đã bắt đầu kiểm tra loa</string>
+    <string name="settings_remote_emergency_title">Tắt khẩn cấp</string>
+    <string name="settings_remote_emergency_subtitle">Ngay lập tức dừng và chặn mọi giọng nói và tin nhắn từ xa.</string>
+    <string name="settings_remote_save_failed">Không thể lưu cài đặt liên lạc từ xa</string>
     <!-- Was "About & updates" — Check for Updates row was removed from
          the About page, so the menu / rail label is now just "About". -->
     <string name="settings_section_about">Giới thiệu</string>
@@ -673,6 +744,13 @@
     <string name="settings_about_contributors_title">Người đóng góp</string>
     <string name="settings_about_supporters_title">Người ủng hộ</string>
     <string name="settings_about_thanks_empty">Danh sách sẽ được điền khi có người tham gia.</string>
+    <string name="settings_about_tier_diamond">Kim cương</string>
+    <string name="settings_about_tier_platinum">Bạch kim</string>
+    <string name="settings_about_tier_gold">Vàng</string>
+    <string name="settings_about_tier_silver">Bạc</string>
+    <string name="settings_about_tier_bronze">Đồng</string>
+    <string name="settings_about_support_count">Đã ủng hộ %1$d lần</string>
+    <string name="settings_about_tiers_explainer">Kim cương, bạch kim, vàng, bạc và đồng thể hiện tổng mức đóng góp của một người; \u00d7N cho biết họ đã đóng góp bao nhiêu lần riêng lẻ.</string>
     <!-- Settings → General -->
     <string name="settings_theme_label">Chủ đề</string>
     <string name="settings_theme_auto">tự động (chế hệ theo dõi)</string>
@@ -682,12 +760,15 @@
     <!-- Recordings page (header + segmented control + page actions) -->
     <string name="recordings_title">Bản ghi</string>
     <string name="recordings_segment_dashcam">Dashcam</string>
+    <string name="recordings_segment_replays">Bản phát lại</string>
     <string name="recordings_segment_surveillance">Giám sát</string>
     <string name="recordings_action_settings">Cài đặt</string>
     <!-- Hero subtitle: "%1$d today · %2$d total · %3$s" where %3$s is a pre-formatted size like "42 GB". -->
     <string name="recordings_summary_format">%1$d ngày hôm nay · %2$d tổng số · %3$s</string>
+    <string name="recordings_summary_index_down">Không có số liệu — chỉ mục bản ghi đang gặp sự cố</string>
     <!-- Per-segment label with running count, e.g. "Dashcam · 118". -->
     <string name="recordings_segment_dashcam_count">Dashcam · %d</string>
+    <string name="recordings_segment_replays_count">Bản phát lại · %d</string>
     <string name="recordings_segment_surveillance_count">Giám sát · %d</string>
     <!-- Layout-time placeholder for the counts subtitle before the scan completes. -->
     <string name="recordings_summary_pending">—</string>
@@ -778,6 +859,7 @@
     <string name="vehicle_dialog_capacity_suffix">kWh</string>
     <string name="vehicle_dialog_capacity_helper">15 đến 120 kWh. Thoát để sử dụng mô hình mặc định.</string>
     <string name="vehicle_dialog_model_label">Mô hình</string>
+    <string name="vehicle_model_seagull">BYD Seagull</string>
     <string name="vehicle_dialog_save">Lưu</string>
     <string name="vehicle_dialog_reset">Đặt lại để tự phát hiện</string>
     <string name="vehicle_dialog_invalid_capacity">Công suất phải là 15 - 120 kWh</string>
@@ -793,12 +875,16 @@
     <string name="dashboard_tunnel_offline">Không liên kết</string>
     <string name="dashboard_tunnel_online">Trên mạng</string>
     <string name="dashboard_tunnel_connecting">Kết nối...</string>
+    <string name="dashboard_tunnel_tile_failed">Lỗi</string>
+    <string name="dashboard_tunnel_tile_stopping">Đang dừng…</string>
     <!-- Quick actions (now rendered as same-size tiles, not chips) -->
     <string name="dashboard_action_live">Hình ảnh trực tiếp</string>
     <string name="dashboard_action_live_subtitle">Khám ảnh mở</string>
     <string name="dashboard_action_recordings">Bản ghi</string>
     <string name="dashboard_action_settings">Cài đặt</string>
     <string name="dashboard_action_settings_subtitle">Ưu tiên và về</string>
+    <string name="dashboard_action_trips">Chuyến đi</string>
+    <string name="dashboard_action_vehicle_control">Điều khiển</string>
     <!-- ============================================================ -->
     <!-- Settings — SOTA portrait hub + section pages                  -->
     <!-- ============================================================ -->
@@ -847,6 +933,18 @@
     <string name="settings_privacy_storage_count_format">Clip %1$d</string>
     <string name="settings_privacy_storage_count_format_plural">Các clip %1$d</string>
     <string name="settings_privacy_reset_subtitle">Chọn các loại: ghi âm, sự kiện, cấu hình con quỷ, bộ nhớ điện thoại trong cache...</string>
+    <string name="settings_privacy_overline_diagnostics">CHẨN ĐOÁN</string>
+    <string name="settings_privacy_log_level_label">Mức chi tiết nhật ký</string>
+    <string name="settings_privacy_log_level_debug">Gỡ lỗi</string>
+    <string name="settings_privacy_log_level_info">Thông tin</string>
+    <string name="settings_privacy_log_level_warn">Cảnh báo</string>
+    <string name="settings_privacy_log_level_error">Lỗi</string>
+    <string name="settings_privacy_log_level_debug_desc">Ghi lại mọi lệnh ADB và mỗi lần kiểm tra dịch vụ. Dùng khi chẩn đoán sự cố — nó lấp đầy tệp nhật ký nhanh chóng, nên các mục cũ bị loại bỏ sớm hơn.</string>
+    <string name="settings_privacy_log_level_info_desc">Hoạt động bình thường. Ghi lại những gì ứng dụng và các dịch vụ của nó đang làm, không có chi tiết từng lệnh.</string>
+    <string name="settings_privacy_log_level_warn_desc">Chỉ ghi lại sự cố và lỗi.</string>
+    <string name="settings_privacy_log_level_error_desc">Chỉ ghi lại lỗi. Mọi thứ dẫn đến lỗi đều bị loại bỏ.</string>
+    <string name="settings_privacy_log_level_note_verbose">Đang bật ghi nhật ký chi tiết — lịch sử nhật ký cũ bị loại bỏ sớm hơn.</string>
+    <string name="settings_privacy_log_level_note_quiet">Hầu hết nhật ký bị chặn — sự cố sau này sẽ khó chẩn đoán hơn.</string>
     <!-- Settings → Security pane copy + PIN unlock screen.
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
          surveillance, recording, Telegram alerts, status overlay, and the
@@ -1277,6 +1375,8 @@
     <string name="onboarding_expert_chapter_label">Chương %1$d trên %2$d</string>
     <string name="rail_charging">Sạc</string>
     <string name="rail_automations">Tự động hóa</string>
+    <string name="rail_key_mapping">Gán phím</string>
+    <string name="rail_seat_positions">Vị trí ghế</string>
     <string name="onboarding_skip">Bỏ qua</string>
     <string name="onboarding_expert_traffic_body">Trình giám sát giao thông tích hợp sẵn của BYD chặn các ứng dụng khác sử dụng SIM tích hợp sẵn của xe. Nếu bạn muốn truy cập xe từ xa qua SIM BYD, bạn phải tắt nó tại đây. Head-unit sẽ khởi động lại để áp dụng thay đổi.</string>
     <string name="onboarding_expert_surveillance_body">Tinh chỉnh phát hiện, chất lượng và bộ nhớ tại đây. Những mục này mở dưới dạng trang cấu hình trong ứng dụng được phục vụ từ xe của bạn — màn hình trống chỉ có nghĩa là trợ lý vẫn đang khởi động.</string>
@@ -1317,6 +1417,13 @@
     <string name="projection_done_adjusting">Xong</string>
     <string name="projection_bounds_hint_idle">Vùng phản chiếu</string>
     <string name="projection_status_adjust">Kéo để di chuyển · kéo một góc để đổi kích thước.</string>
+    <string name="projection_window_title">Cửa sổ cụm đồng hồ</string>
+    <string name="projection_window_desc">Đặt vị trí ứng dụng chiếu lên cụm đồng hồ người lái. Cài đặt sẵn gắn nó vào các bố cục thông dụng; Đổi kích thước cửa sổ cho phép kéo tự do.</string>
+    <string name="projection_preset_full">Toàn bộ</string>
+    <string name="projection_preset_left">Nửa trái</string>
+    <string name="projection_preset_right">Nửa phải</string>
+    <string name="projection_preset_center">Giữa</string>
+    <string name="projection_lock_aspect">Giữ tỷ lệ cụm đồng hồ</string>
     <string name="projection_scale_title">Tỷ lệ</string>
     <string name="projection_scale_desc">Cách cụm đồng hồ lấp đầy vùng phản chiếu.</string>
     <string name="projection_scale_fit">Vừa khít</string>
@@ -1329,5 +1436,59 @@
     <string name="projection_autostart_conflict_body">RoadSense được đặt để tự động chiếu bản đồ lên cụm đồng hồ của người lái khi xe bật nguồn. Cụm đồng hồ chỉ hiển thị được một thứ tại một thời điểm. Tắt tùy chọn đó và tự động khởi động ứng dụng này thay thế?</string>
     <string name="projection_autostart_conflict_confirm">Dùng ứng dụng này</string>
     <string name="projection_app_uninstalled">Ứng dụng đó không còn được cài đặt.</string>
+    <string name="rail_network">Mạng</string>
+    <string name="network_title">Mạng &amp; Điểm phát</string>
+    <string name="network_subtitle">Chia sẻ dữ liệu di động tích hợp của xe với điện thoại, máy tính bảng hoặc laptop của bạn.</string>
+    <string name="network_hotspot_title">Điểm phát WiFi</string>
+    <string name="network_state_on">Bật — đang chia sẻ dữ liệu di động</string>
+    <string name="network_state_off">Tắt</string>
+    <string name="network_state_starting">Đang khởi động…</string>
+    <string name="network_state_stopping">Đang dừng…</string>
+    <string name="network_ssid_hint">Tên mạng</string>
+    <string name="network_password_hint">Mật khẩu (8–63 ký tự)</string>
+    <string name="network_ssid_label">Tên mạng</string>
+    <string name="network_password_label">Mật khẩu</string>
+    <string name="network_reveal">Hiện</string>
+    <string name="network_hide">Ẩn</string>
+    <string name="network_copied">Đã sao chép</string>
+    <string name="network_credentials_note">Xe đặt tên và mật khẩu điểm phát, nên không thể thay đổi ở đây. Nhấn vào một trong hai để sao chép.</string>
+    <string name="network_save">Lưu</string>
+    <string name="network_saved">Đã lưu</string>
+    <string name="network_saved_next_start">Đã lưu — áp dụng ở lần khởi động điểm phát tiếp theo</string>
+    <string name="network_password_invalid">Mật khẩu phải từ 8–63 ký tự.</string>
+    <string name="network_ssid_invalid">Tên mạng giới hạn ở 32 ký tự.</string>
+    <string name="network_limit_invalid">Nhập số nguyên megabyte.</string>
+    <string name="network_value_placeholder">--</string>
+    <string name="network_session_section">Phiên này</string>
+    <string name="network_uptime_label">Thời gian hoạt động</string>
+    <string name="network_rx_label">Đã nhận</string>
+    <string name="network_tx_label">Đã gửi</string>
+    <string name="network_clients_section">Thiết bị đã kết nối</string>
+    <string name="network_clients_empty">Chưa có thiết bị nào kết nối.</string>
+    <string name="network_client_meta_fmt">%1$s · %2$s</string>
+    <string name="network_limit_section">Giới hạn dữ liệu</string>
+    <string name="network_limit_hint">Giới hạn dữ liệu (MB)</string>
+    <string name="network_limit_desc">Khi điểm phát vượt qua lượng dữ liệu này, nó tự tắt và bạn sẽ nhận được thông báo. Để trống nếu không giới hạn. Đây là giới hạn tổng, không phải giới hạn tốc độ.</string>
+    <string name="network_reset_usage">Đặt lại bộ đếm</string>
+    <string name="network_usage_reset">Đã đặt lại bộ đếm dữ liệu</string>
+    <string name="network_usage_fmt">Đã dùng %1$s trong %2$s</string>
+    <string name="network_usage_nolimit_fmt">Đã dùng %1$s — chưa đặt giới hạn</string>
+    <string name="network_behaviour_section">Hành vi</string>
+    <string name="network_keepalive_title">Duy trì điểm phát</string>
+    <string name="network_keepalive_desc">Nếu điểm truy cập tự ngắt, khởi động lại nó.</string>
+    <string name="network_autostart_title">Bật khi xe khởi động</string>
+    <string name="network_autostart_desc">Bật điểm phát một lần ở mỗi lần khởi động.</string>
+    <string name="network_proxy_section">Proxy</string>
+    <string name="network_proxy_system_title">Định tuyến lưu lượng của xe này qua proxy</string>
+    <string name="network_proxy_system_desc">Đặt proxy HTTP toàn hệ thống để các ứng dụng trên màn hình dùng đường hầm mã hóa. Cần dịch vụ proxy đang chạy.</string>
+    <string name="network_proxy_clients_title">Cấp internet cho thiết bị đã kết nối (proxy)</string>
+    <string name="network_proxy_clients_desc">Giúp proxy có thể truy cập từ điểm phát. Mỗi thiết bị phải tự đặt proxy — chỉ kết nối thôi thì không định tuyến lưu lượng của nó.</string>
+    <string name="network_proxy_clients_desc_fmt">Kết nối vào điểm phát là chưa đủ — xe này không thể tự định tuyến thiết bị ra internet, nên mỗi thiết bị phải được trỏ tới proxy của xe.\n\nTrên thiết bị, sau khi tham gia điểm phát này:\n1. Mở cài đặt Wi‑Fi và chỉnh sửa mạng này\n2. Đặt Proxy thành Thủ công\n3. Tên máy chủ %1$s, Cổng %2$d\n4. Lưu, rồi duyệt web\n\nThiết bị vẫn hiển thị \"không có internet\" và biểu tượng dữ liệu di động của nó ngay cả khi cách này đang hoạt động — kiểm tra đó bỏ qua proxy. Các ứng dụng bỏ qua proxy Wi‑Fi (một số dịch vụ phát trực tuyến và trò chơi) sẽ không dùng nó.</string>
+    <string name="network_client_tunnel_title">Mã hóa cả lưu lượng của thiết bị đã kết nối</string>
+    <string name="network_client_tunnel_desc_fmt">Gửi lưu lượng của thiết bị đã kết nối qua đường hầm mã hóa trước khi rời khỏi SIM của xe. Trỏ thiết bị tới cổng %1$d thay vì %2$d. Chậm hơn vì thêm một chặng. Tắt tùy chọn này sẽ dừng cổng đó lắng nghe ngay lập tức.</string>
+    <string name="network_warn_title">Xe sẽ rời khỏi WiFi</string>
+    <string name="network_warn_body">Màn hình này chỉ có một ăng-ten WiFi, nên không thể vừa phát điểm truy cập vừa ở trên một mạng WiFi cùng lúc. Khi điểm phát bật, xe ngắt kết nối WiFi và dùng dữ liệu di động của SIM tích hợp cho chính nó và cho mọi thiết bị đã kết nối. WiFi sẽ trở lại khi bạn tắt điểm phát.</string>
+    <string name="network_warn_continue">Bật điểm phát</string>
+    <string name="network_warn_cancel">Hủy</string>
     <string name="projection_status_service_down">Dịch vụ phản chiếu chưa sẵn sàng — hãy khởi động lại ứng dụng (hoặc daemon máy ảnh) rồi thử lại.</string>
 </resources>
