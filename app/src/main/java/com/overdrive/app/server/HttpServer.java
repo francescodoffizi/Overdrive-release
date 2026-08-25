@@ -767,7 +767,7 @@ public class HttpServer {
 
         // Authenticated, read-only metadata for the web About page. VIN deliberately never enters
         // this HTTP response; the native About screen is the only surface that can request it.
-        if (path.startsWith("/api/about/")) {
+        if (path.equals("/api/about/vehicle-info")) {
             return AboutApiHandler.handle(method, path, body, out);
         }
 

@@ -16,7 +16,7 @@ class AboutApiHandlerTest {
                 android = "10 (API 29)",
                 securityPatch = "2023-02-05",
                 headUnit = "BYD AUTO / DiLink3.0",
-                vin = "1M8GDM9AXKP042788"
+                vin = "TESTV1N1234567890"
             )
         )
 
@@ -25,6 +25,6 @@ class AboutApiHandlerTest {
             response.keySet()
         )
         assertFalse(response.keys().asSequence().any { it.contains("vin", ignoreCase = true) })
-        assertFalse(response.toString().contains("1M8GDM9AXKP042788"))
+        assertFalse(response.toString().contains("TESTV1N1234567890"))
     }
 }

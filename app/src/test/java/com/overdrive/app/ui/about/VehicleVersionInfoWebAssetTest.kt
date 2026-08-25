@@ -20,7 +20,7 @@ class VehicleVersionInfoWebAssetTest {
         }
         assertFalse(html.contains("data-vehicle-info=\"vin\""))
         assertTrue(html.contains("data-i18n=\"about.vehicle_vin_private\""))
-        assertTrue(server.contains("path.startsWith(\"/api/about/\")"))
+        assertTrue(server.contains("path.equals(\"/api/about/vehicle-info\")"))
     }
 
     @Test

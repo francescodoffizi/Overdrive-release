@@ -26,7 +26,7 @@ class VehicleVersionInfoProviderTest {
                 device = "DiLink3.0"
             ),
             propertyReader = properties::get,
-            vin = "1m8gdm9axkp042788"
+            vin = "testv1n1234567890"
         )
 
         assertEquals("2602 (eng.build.20260204.033434)", info.firmware)
@@ -35,7 +35,7 @@ class VehicleVersionInfoProviderTest {
         assertEquals("10 (API 29)", info.android)
         assertEquals("2023-02-05", info.securityPatch)
         assertEquals("BYD AUTO / DiLink3.0", info.headUnit)
-        assertEquals("1M8GDM9AXKP042788", info.vin)
+        assertEquals("TESTV1N1234567890", info.vin)
     }
 
     @Test
@@ -65,10 +65,10 @@ class VehicleVersionInfoProviderTest {
         assertNull(VehicleVersionInfoProvider.normalizeVin("hashed-vin-wrapper"))
         assertNull(VehicleVersionInfoProvider.normalizeVin("LGXCH6CD0I2085367"))
 
-        val vin = "1M8GDM9AXKP042788"
+        val vin = "TESTV1N1234567890"
         val masked = VehicleVersionInfoProvider.maskVin(vin)
         assertEquals(vin.length, masked.length)
-        assertTrue(masked.endsWith("2788"))
+        assertTrue(masked.endsWith("7890"))
         assertFalse(masked.contains(vin.dropLast(4)))
     }
 
@@ -81,7 +81,7 @@ class VehicleVersionInfoProviderTest {
             android = "10 (API 29)",
             securityPatch = "2023-02-05",
             headUnit = "BYD AUTO / DiLink3.0",
-            vin = "1M8GDM9AXKP042788"
+            vin = "TESTV1N1234567890"
         )
 
         val values = VehicleVersionInfoProvider.webValues(info)
