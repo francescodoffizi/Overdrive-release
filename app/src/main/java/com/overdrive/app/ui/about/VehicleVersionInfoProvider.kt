@@ -112,6 +112,21 @@ internal object VehicleVersionInfoProvider {
         return "\u2022".repeat(normalized.length - 4) + normalized.takeLast(4)
     }
 
+    /**
+     * Browser-safe subset used by the authenticated web About endpoint.
+     *
+     * VIN is intentionally absent rather than merely masked. A web session can be reached through
+     * a LAN or remote tunnel, so the identifier never crosses the HTTP boundary at all.
+     */
+    internal fun webValues(info: VehicleVersionInfo): Map<String, String?> = linkedMapOf(
+        "firmware" to info.firmware,
+        "dsp" to info.dsp,
+        "mcu" to info.mcu,
+        "android" to info.android,
+        "securityPatch" to info.securityPatch,
+        "headUnit" to info.headUnit
+    )
+
     private fun firstUseful(vararg candidates: String?): String? =
         candidates.firstNotNullOfOrNull(::useful)
 

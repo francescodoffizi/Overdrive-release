@@ -36,6 +36,51 @@
             line-height: 1.5; margin: 0 0 14px;
         }
 
+        .vehicle-info-card {
+            overflow: hidden;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+        }
+        .vehicle-info-row {
+            display: grid;
+            grid-template-columns: minmax(120px, 0.75fr) minmax(0, 1.25fr);
+            align-items: baseline;
+            gap: 18px;
+            padding: 13px 16px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+        .vehicle-info-row:last-child { border-bottom: 0; }
+        .vehicle-info-label {
+            color: var(--text-secondary);
+            font-size: 13px;
+            font-weight: 500;
+        }
+        .vehicle-info-value {
+            min-width: 0;
+            color: var(--text-primary);
+            font-family: var(--family-mono);
+            font-size: 13px;
+            text-align: right;
+            overflow-wrap: anywhere;
+        }
+        .vehicle-info-status,
+        .vehicle-info-privacy {
+            margin: 10px 2px 0;
+            color: var(--text-muted);
+            font-size: 12px;
+            line-height: 1.5;
+        }
+        .vehicle-info-status:empty { display: none; }
+
+        @media (max-width: 520px) {
+            .vehicle-info-row {
+                grid-template-columns: 1fr;
+                gap: 4px;
+            }
+            .vehicle-info-value { text-align: left; }
+        }
+
         .credits-card {
             background: var(--bg-elevated);
             border: 1px solid var(--border-subtle);
@@ -339,6 +384,39 @@
                         <p class="about-section-sub" data-i18n="about.thanks_subtitle">Built with the help of contributors and supporters.</p>
                     </section>
 
+                    <section class="about-section" id="vehicleInfoSection">
+                        <h3 class="about-subhead" data-i18n="about.vehicle_title">Vehicle &amp; head unit</h3>
+                        <p class="about-section-sub" data-i18n="about.vehicle_sub">Version information reported by this car.</p>
+                        <div class="vehicle-info-card" aria-live="polite">
+                            <div class="vehicle-info-row">
+                                <span class="vehicle-info-label" data-i18n="about.vehicle_firmware">Firmware</span>
+                                <span class="vehicle-info-value" data-vehicle-info="firmware">—</span>
+                            </div>
+                            <div class="vehicle-info-row">
+                                <span class="vehicle-info-label" data-i18n="about.vehicle_dsp">DSP</span>
+                                <span class="vehicle-info-value" data-vehicle-info="dsp">—</span>
+                            </div>
+                            <div class="vehicle-info-row">
+                                <span class="vehicle-info-label" data-i18n="about.vehicle_mcu">MCU</span>
+                                <span class="vehicle-info-value" data-vehicle-info="mcu">—</span>
+                            </div>
+                            <div class="vehicle-info-row">
+                                <span class="vehicle-info-label" data-i18n="about.vehicle_android">Android</span>
+                                <span class="vehicle-info-value" data-vehicle-info="android">—</span>
+                            </div>
+                            <div class="vehicle-info-row">
+                                <span class="vehicle-info-label" data-i18n="about.vehicle_security_patch">Security patch</span>
+                                <span class="vehicle-info-value" data-vehicle-info="securityPatch">—</span>
+                            </div>
+                            <div class="vehicle-info-row">
+                                <span class="vehicle-info-label" data-i18n="about.vehicle_head_unit">Head unit</span>
+                                <span class="vehicle-info-value" data-vehicle-info="headUnit">—</span>
+                            </div>
+                        </div>
+                        <p class="vehicle-info-status" id="vehicleInfoStatus" role="status" data-i18n="about.vehicle_loading">Loading vehicle information…</p>
+                        <p class="vehicle-info-privacy" data-i18n="about.vehicle_vin_private">For privacy, VIN is available only in the in-car About screen and is never sent to the browser.</p>
+                    </section>
+
                     <section class="about-section">
                         <h3 class="about-subhead" data-i18n="about.contributors_title">Contributors</h3>
                         <p class="about-section-sub" data-i18n="about.contributors_sub">People who've shipped code to OverDrive.</p>
@@ -435,6 +513,47 @@
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');
             document.getElementById('sidebarOverlay').classList.toggle('show');
+        }
+
+        const VEHICLE_INFO_KEYS = [
+            'firmware', 'dsp', 'mcu', 'android', 'securityPatch', 'headUnit'
+        ];
+        let vehicleInfoData = null;
+        let vehicleInfoFailed = false;
+
+        function renderVehicleInfo() {
+            const unavailable = tSafe('about.vehicle_unavailable', 'Unavailable');
+            for (const key of VEHICLE_INFO_KEYS) {
+                const node = document.querySelector('[data-vehicle-info="' + key + '"]');
+                if (!node) continue;
+                const value = vehicleInfoData && vehicleInfoData[key];
+                node.textContent = value == null || String(value).trim() === ''
+                    ? unavailable : String(value);
+            }
+            const status = document.getElementById('vehicleInfoStatus');
+            if (status) {
+                status.textContent = vehicleInfoFailed
+                    ? tSafe('about.vehicle_load_failed', 'Vehicle information is unavailable right now.')
+                    : (vehicleInfoData ? '' : tSafe('about.vehicle_loading', 'Loading vehicle information…'));
+            }
+        }
+
+        async function loadVehicleInfo() {
+            try {
+                const resp = await fetch('/api/about/vehicle-info', {
+                    credentials: 'same-origin', cache: 'no-store'
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                if (!data || data.success !== true) throw new Error('Invalid response');
+                vehicleInfoData = data;
+                vehicleInfoFailed = false;
+            } catch (e) {
+                console.warn('[About] vehicle information load failed:', e);
+                vehicleInfoData = null;
+                vehicleInfoFailed = true;
+            }
+            renderVehicleInfo();
         }
 
         // Avatar palette mirrors the native fragment so the same name gets the
@@ -726,6 +845,7 @@
             }
 
             loadCredits();
+            loadVehicleInfo();
             // Re-bind on every i18n change so tier URLs/copy follow locale.
             bindSupportTiers();
             if (window.BYD?.i18n?.onChange) {
@@ -735,6 +855,7 @@
                     // data-i18n attribute, so hydrate() can't repair them —
                     // re-render from the cached data instead.
                     if (creditsData) renderCredits();
+                    renderVehicleInfo();
                 });
             }
         });

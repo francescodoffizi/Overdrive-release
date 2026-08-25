@@ -71,4 +71,26 @@ class VehicleVersionInfoProviderTest {
         assertTrue(masked.endsWith("2788"))
         assertFalse(masked.contains(vin.dropLast(4)))
     }
+
+    @Test
+    fun webValuesNeverExposeVin() {
+        val info = VehicleVersionInfo(
+            firmware = "2602",
+            dsp = "2507223",
+            mcu = "13.5.5",
+            android = "10 (API 29)",
+            securityPatch = "2023-02-05",
+            headUnit = "BYD AUTO / DiLink3.0",
+            vin = "1M8GDM9AXKP042788"
+        )
+
+        val values = VehicleVersionInfoProvider.webValues(info)
+
+        assertEquals(
+            setOf("firmware", "dsp", "mcu", "android", "securityPatch", "headUnit"),
+            values.keys
+        )
+        assertFalse(values.keys.any { it.contains("vin", ignoreCase = true) })
+        assertFalse(values.values.contains(info.vin))
+    }
 }
