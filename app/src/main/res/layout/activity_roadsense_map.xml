@@ -501,6 +501,18 @@
                     tools:text="Routes to Changi Airport" />
 
                 <ImageButton
+                    android:id="@+id/btnRouteCarNav"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:layout_marginEnd="4dp"
+                    android:background="@drawable/bg_nav_leading_icon"
+                    android:contentDescription="@string/carnav_section_header"
+                    android:padding="8dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_directions_car"
+                    app:tint="?attr/colorOnSurfaceVariant" />
+
+                <ImageButton
                     android:id="@+id/btnRouteSheetSave"
                     android:layout_width="40dp"
                     android:layout_height="40dp"
@@ -524,39 +536,61 @@
                     app:tint="?attr/colorOnSurfaceVariant" />
             </LinearLayout>
 
-            <!-- TRIP STOPS — the ordered itinerary (origin → intermediate stops →
-                 destination) plus an "Add stop" affordance. Rebuilt in code by
-                 RoadSenseMapActivity.rebuildStopsUi() into this LinearLayout: an
-                 origin row ("Your location"), one row per entry in routeStops
-                 (each with a remove X + up/down reorder controls), and an
-                 "Add stop" row at the end. Kept as a code-populated container
-                 (not a RecyclerView) since the list is tiny (≤ MAX_STOPS). -->
-            <LinearLayout
-                android:id="@+id/routeStopsContainer"
+            <!-- Scrollable middle: itinerary + route candidates. Header (above) and
+                 the Start button (below) stay pinned; only this region scrolls when
+                 there are many routes, so the header car icon never scrolls off-screen.
+                 Its height is capped in code (RoadSenseMapActivity.showRouteOptionsSheet)
+                 so the whole sheet fits the short landscape screen; short content keeps
+                 the sheet compact (wrap_content). -->
+            <androidx.core.widget.NestedScrollView
+                android:id="@+id/routeSheetScroll"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:orientation="vertical" />
+                android:fillViewport="true"
+                android:overScrollMode="ifContentScrolls">
 
-            <!-- Thin divider between the itinerary and the route candidates. -->
-            <View
-                android:id="@+id/routeStopsDivider"
-                android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:layout_marginHorizontal="20dp"
-                android:layout_marginVertical="8dp"
-                android:background="?attr/colorOutlineVariant" />
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
 
-            <androidx.recyclerview.widget.RecyclerView
-                android:id="@+id/routeOptionsList"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:clipToPadding="false"
-                android:overScrollMode="ifContentScrolls"
-                android:paddingVertical="2dp"
-                tools:itemCount="2"
-                tools:listitem="@layout/item_nav_route_option" />
+                    <!-- TRIP STOPS — the ordered itinerary (origin → intermediate stops →
+                         destination) plus an "Add stop" affordance. Rebuilt in code by
+                         RoadSenseMapActivity.rebuildStopsUi() into this LinearLayout: an
+                         origin row ("Your location"), one row per entry in routeStops
+                         (each with a remove X + up/down reorder controls), and an
+                         "Add stop" row at the end. Kept as a code-populated container
+                         (not a RecyclerView) since the list is tiny (≤ MAX_STOPS). -->
+                    <LinearLayout
+                        android:id="@+id/routeStopsContainer"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:orientation="vertical" />
+
+                    <!-- Thin divider between the itinerary and the route candidates. -->
+                    <View
+                        android:id="@+id/routeStopsDivider"
+                        android:layout_width="match_parent"
+                        android:layout_height="1dp"
+                        android:layout_marginHorizontal="20dp"
+                        android:layout_marginVertical="8dp"
+                        android:background="?attr/colorOutlineVariant" />
+
+                    <androidx.recyclerview.widget.RecyclerView
+                        android:id="@+id/routeOptionsList"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:clipToPadding="false"
+                        android:nestedScrollingEnabled="false"
+                        android:overScrollMode="never"
+                        android:paddingVertical="2dp"
+                        tools:itemCount="2"
+                        tools:listitem="@layout/item_nav_route_option" />
+
+                </LinearLayout>
+            </androidx.core.widget.NestedScrollView>
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnRouteStart"
@@ -572,6 +606,9 @@
                 app:icon="@drawable/ic_directions_car"
                 app:iconGravity="textStart"
                 app:iconPadding="10dp" />
+
+            <!-- "Send to car navigation" lives as a header icon (btnRouteCarNav) so it
+                 stays visible; the old bottom buttons scrolled off the short screen. -->
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 

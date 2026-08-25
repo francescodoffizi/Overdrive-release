@@ -2036,7 +2036,40 @@ object UnifiedConfigManager {
     fun getSurveillance(): JSONObject {
         return loadConfig().optJSONObject("surveillance") ?: JSONObject()
     }
-    
+
+    // ---- Deferred "navigate here" (section: deferred_nav) --------------------
+    // A phone/OverDrive "Navigate here" that arrives while the car is off is stored
+    // here and offered as a floating prompt on the next ACC-on. Latest overwrites.
+    fun getDeferredNav(): JSONObject = loadConfig().optJSONObject("deferred_nav") ?: JSONObject()
+
+    fun setPendingNav(name: String, lat: Double, lng: Double, receivedAt: Long): Boolean =
+        updateValues(
+            "deferred_nav",
+            mapOf(
+                "pending" to true,
+                "name" to name,
+                "lat" to lat,
+                "lng" to lng,
+                "receivedAt" to receivedAt,
+            ),
+        )
+
+    fun clearPendingNav(): Boolean = updateValues("deferred_nav", mapOf("pending" to false))
+
+    /** Max age (hours) a queued target is still offered on ACC-on. Default 4. */
+    fun getDeferredNavExpiryHours(): Int = getDeferredNav().optInt("expiryHours", 4).coerceIn(1, 72)
+
+    /** Saved floating-prompt position, or null when never dragged. */
+    fun getNavPromptPos(): Pair<Int, Int>? {
+        val d = getDeferredNav()
+        val x = d.optInt("posX", Int.MIN_VALUE)
+        val y = d.optInt("posY", Int.MIN_VALUE)
+        return if (x == Int.MIN_VALUE || y == Int.MIN_VALUE) null else x to y
+    }
+
+    fun setNavPromptPos(x: Int, y: Int): Boolean =
+        updateValues("deferred_nav", mapOf("posX" to x, "posY" to y))
+
     /**
      * Get the surveillance schedule from config.
      * Returns a SurveillanceSchedule loaded from the surveillance section.

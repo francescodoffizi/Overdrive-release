@@ -1632,6 +1632,19 @@
     <!-- Place-action sheet (long-press the map or a search result to save/navigate) -->
     <string name="roadsense_map_dropped_pin">Dropped pin</string>
     <string name="roadsense_map_navigate_here">Navigate here</string>
+    <string name="carnav_section_header">Send to car navigation</string>
+    <string name="carnav_navigate">Navigate</string>
+    <string name="carnav_menu_navigate_here">Navigate here (replace route)</string>
+    <string name="carnav_menu_add_stop">Add as stop</string>
+    <string name="carnav_deferred_prompt_title">Navigation offered</string>
+    <string name="carnav_deferred_yes">Accept</string>
+    <string name="carnav_deferred_cancel">Decline</string>
+    <string name="carnav_save_favourite">Save to Favourites</string>
+    <string name="carnav_sending">Sending to car navigation…</string>
+    <string name="carnav_navigate_ok">Navigation started</string>
+    <string name="carnav_navigate_fail">Car navigation declined the request</string>
+    <string name="carnav_saved_ok">Saved to favourites</string>
+    <string name="carnav_failed">Couldn\'t reach car navigation: %1$s</string>
     <!-- Shown after tapping an unset Home/Work chip: search picks the place to save. -->
     <string name="roadsense_map_search_to_save">Search a place to set as %1$s</string>
     <!-- Shown when re-entering the map with a previously-set trip restored. -->

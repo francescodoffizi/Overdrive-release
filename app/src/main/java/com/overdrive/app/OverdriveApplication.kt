@@ -57,6 +57,10 @@ class OverdriveApplication : Application() {
         // - SCREEN_OFF receiver registration
         // - Daemon startup
         DaemonKeepaliveService.start(this)
+
+        // App-process listener that binds Telenav's OEM AIDL for the daemon's
+        // HTTP endpoint (the daemon can't bindService itself). Idempotent.
+        com.overdrive.app.telenav.TelenavIpcServer.start(this)
     }
 
     /**

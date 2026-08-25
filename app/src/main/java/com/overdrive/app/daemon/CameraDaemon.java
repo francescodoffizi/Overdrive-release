@@ -572,6 +572,15 @@ public class CameraDaemon {
         // Grant all manifest permissions via shell (supplements PermissionBypassContext)
         PermissionGranter.grantAllPermissions(APP_PACKAGE_NAME());
 
+        // Deferred "navigate here": watch for ACC-on to offer a target that a phone/on-car
+        // Navigate queued while the car was off. Self-contained (own ACC watcher); guarded
+        // so it can never take the daemon down.
+        try {
+            com.overdrive.app.telenav.DeferredNavManager.start();
+        } catch (Throwable t) {
+            log("DeferredNavManager start failed: " + t.getMessage());
+        }
+
         // Global exception handler - NEVER let the daemon die from uncaught exceptions
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
             if (!(throwable instanceof ThreadDeath)) {
