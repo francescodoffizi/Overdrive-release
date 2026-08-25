@@ -33,6 +33,8 @@ import java.util.concurrent.Executors
 import com.overdrive.app.BuildConfig
 import com.overdrive.app.R
 import com.overdrive.app.ui.MainActivity
+import com.overdrive.app.ui.about.VehicleVersionInfo
+import com.overdrive.app.ui.about.VehicleVersionInfoProvider
 import com.overdrive.app.updater.AppUpdater
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -58,7 +60,11 @@ class SettingsAboutFragment : Fragment() {
      *  enough — at most ~10 contributors at a time, and a queue
      *  serializes their HTTPS calls without flooding the head unit. */
     private var avatarExecutor: ExecutorService? = null
+    /** Kept separate so slow contributor-avatar downloads never delay local vehicle identity. */
+    private var vehicleInfoExecutor: ExecutorService? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var vehicleVersionInfo: VehicleVersionInfo? = null
+    private var vinRevealed = false
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -87,6 +93,7 @@ class SettingsAboutFragment : Fragment() {
             mainHandler.post { if (isAdded && view.parent != null) versionView.text = resolved }
         }
         view.findViewById<TextView>(R.id.tvAboutBuild).text = BuildConfig.APPLICATION_ID
+        setupVehicleInformation(view)
 
         setupChannelToggle(view)
 
@@ -151,6 +158,85 @@ class SettingsAboutFragment : Fragment() {
                 val resolved = AppUpdater.getDisplayVersion(requireContext().applicationContext)
                 mainHandler.post { if (isAdded && view?.parent != null) versionView.text = resolved }
             }
+        refreshVehicleInformation(v)
+    }
+
+    /**
+     * Bind the VIN reveal action once. The identifier is never persisted in UI state: every new
+     * view starts masked, including rotation/recreation, and teardown clears the fragment copy.
+     */
+    private fun setupVehicleInformation(root: View) {
+        root.findViewById<View>(R.id.btnAboutVehicleVinVisibility).setOnClickListener {
+            val info = vehicleVersionInfo ?: return@setOnClickListener
+            if (info.vin == null) return@setOnClickListener
+            vinRevealed = !vinRevealed
+            bindVehicleInformation(root, info)
+        }
+    }
+
+    /**
+     * Resolve Android/BYD version properties and ask the daemon for its existing VIN snapshot.
+     * Both operations run off the looper. The VIN request uses the private loopback IPC command,
+     * not an HTTP endpoint, so the identifier is not added to the tunnel/web API surface.
+     */
+    private fun refreshVehicleInformation(root: View) {
+        val executor = vehicleInfoExecutor
+            ?: Executors.newSingleThreadExecutor().also { vehicleInfoExecutor = it }
+        executor.execute {
+            val response = com.overdrive.app.server.DaemonIpcClient.send(
+                JSONObject().put("command", "GET_VEHICLE_IDENTITY"),
+                2_500
+            )
+            val rawVin = response
+                ?.takeIf { it.optBoolean("success", false) }
+                ?.optString("vin", "")
+                ?.takeIf { it.isNotBlank() }
+            val info = VehicleVersionInfoProvider.read(rawVin)
+            mainHandler.post {
+                if (!isAdded || view !== root || root.parent == null) return@post
+                vehicleVersionInfo = info
+                vinRevealed = false
+                bindVehicleInformation(root, info)
+            }
+        }
+    }
+
+    private fun bindVehicleInformation(root: View, info: VehicleVersionInfo) {
+        val unavailable = getString(R.string.settings_about_vehicle_unavailable)
+        fun setValue(id: Int, value: String?) {
+            root.findViewById<TextView>(id).text = value ?: unavailable
+        }
+
+        setValue(R.id.tvAboutVehicleFirmware, info.firmware)
+        setValue(R.id.tvAboutVehicleDsp, info.dsp)
+        setValue(R.id.tvAboutVehicleMcu, info.mcu)
+        setValue(R.id.tvAboutVehicleAndroid, info.android)
+        setValue(R.id.tvAboutVehicleSecurityPatch, info.securityPatch)
+        setValue(R.id.tvAboutVehicleHeadUnit, info.headUnit)
+
+        val vinView = root.findViewById<TextView>(R.id.tvAboutVehicleVin)
+        val reveal = root.findViewById<TextView>(R.id.btnAboutVehicleVinVisibility)
+        val vin = info.vin
+        if (vin == null) {
+            vinView.text = unavailable
+            vinView.contentDescription = unavailable
+            reveal.visibility = View.GONE
+            return
+        }
+
+        reveal.visibility = View.VISIBLE
+        if (vinRevealed) {
+            vinView.text = vin
+            vinView.contentDescription = vin
+            reveal.setText(R.string.settings_about_vehicle_vin_hide)
+            reveal.contentDescription = getString(R.string.settings_about_vehicle_vin_hide_a11y)
+        } else {
+            vinView.text = VehicleVersionInfoProvider.maskVin(vin)
+            vinView.contentDescription =
+                getString(R.string.settings_about_vehicle_vin_hidden_a11y)
+            reveal.setText(R.string.settings_about_vehicle_vin_show)
+            reveal.contentDescription = getString(R.string.settings_about_vehicle_vin_show_a11y)
+        }
     }
 
     /**
@@ -238,12 +324,16 @@ class SettingsAboutFragment : Fragment() {
         super.onDestroyView()
         avatarExecutor?.shutdownNow()
         avatarExecutor = null
+        vehicleInfoExecutor?.shutdownNow()
+        vehicleInfoExecutor = null
         // Don't retain the export bundle (device-id + encrypted credentials) in
         // memory after teardown if the user navigated away before the SAF
         // save-location picker returned. appContext is just the app context
         // (not sensitive) but clear it too so a torn-down fragment holds nothing.
         pendingExportText = null
         appContext = null
+        vehicleVersionInfo = null
+        vinRevealed = false
     }
 
     // ==================== Backup & Restore ====================

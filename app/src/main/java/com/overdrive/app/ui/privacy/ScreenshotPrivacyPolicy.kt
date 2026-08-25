@@ -31,6 +31,7 @@ object ScreenshotPrivacyPolicy {
         "camerapreview",
         "cameraimage",
         "snapshot",
+        "vehiclevin",
         "platenumber",
         "licenseplate"
     )
