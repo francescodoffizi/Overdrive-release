@@ -34,6 +34,7 @@ import com.overdrive.app.ui.model.DaemonType
 import com.overdrive.app.ui.model.NavigationRailSwipePolicy
 import com.overdrive.app.ui.model.TunnelDisplayPolicy
 import com.overdrive.app.ui.navigation.NavigationRailCatalog
+import com.overdrive.app.ui.privacy.ScreenshotPrivacyController
 import com.overdrive.app.ui.util.PreferencesManager
 import com.overdrive.app.ui.widget.SwipeExpandableRailScrollView
 import com.overdrive.app.ui.viewmodel.DaemonsViewModel
@@ -119,6 +120,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusIndicator: View
     private lateinit var urlStatusDot: View
     private lateinit var btnCopyUrl: ImageButton
+    private var screenshotPrivacyController: ScreenshotPrivacyController? = null
     
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -211,6 +213,7 @@ class MainActivity : AppCompatActivity() {
         maybeShowPinLock()
 
         initViews()
+        screenshotPrivacyController = ScreenshotPrivacyController(this).also { it.start() }
         setupNavigation(savedInstanceState)
         handleNavigateExtra(intent)
         setupCopyButton()
@@ -1375,6 +1378,11 @@ class MainActivity : AppCompatActivity() {
         
         // Brand version + device id used to live in the drawer header; in the
         // rail-based shell they're surfaced on the Dashboard card instead.
+    }
+
+    /** Apply a persisted screenshot-privacy change without recreating the activity. */
+    fun applyScreenshotPrivacyMode(enabled: Boolean) {
+        screenshotPrivacyController?.setEnabled(enabled)
     }
     
     private fun setupNavigation(savedInstanceState: Bundle?) {
@@ -4165,6 +4173,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        screenshotPrivacyController?.stop()
+        screenshotPrivacyController = null
         navigationRailAnimator?.cancel()
         navigationRailAnimator = null
         if (::navigationRailScroll.isInitialized) {

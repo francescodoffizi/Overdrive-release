@@ -3358,7 +3358,10 @@ object UnifiedConfigManager {
      * is the WebView-only locale) so a tunnel-side picker doesn't change
      * the in-car native shell's language and vice versa.
      *
-     * Schema: { "locale": "<bcp47>" | "auto" }
+     * Schema: {
+     *   "locale": "<bcp47>" | "auto",
+     *   "screenshotPrivacyMode": boolean
+     * }
      *
      * The legacy file at /data/local/tmp/.overdrive/locale was unreliable
      * because the app UID can't `mkdir` under /data/local/tmp/, so writes
@@ -3373,6 +3376,21 @@ object UnifiedConfigManager {
     @JvmStatic
     fun setNativeShell(nativeShell: JSONObject): Boolean {
         return updateSection("nativeShell", nativeShell)
+    }
+
+    /**
+     * Whether screenshot privacy masking is active in both the native shell
+     * and daemon-served web UI. This lives in the unified native-shell section
+     * so the app and shell daemon see one persisted value across processes.
+     */
+    @JvmStatic
+    fun isScreenshotPrivacyModeEnabled(): Boolean {
+        return getNativeShell().optBoolean("screenshotPrivacyMode", false)
+    }
+
+    @JvmStatic
+    fun setScreenshotPrivacyModeEnabled(enabled: Boolean): Boolean {
+        return setNativeShell(JSONObject().put("screenshotPrivacyMode", enabled))
     }
 
 

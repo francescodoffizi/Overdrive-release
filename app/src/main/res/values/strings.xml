@@ -1288,6 +1288,10 @@
          ability to diagnose anything later. -->
     <string name="settings_privacy_log_level_note_verbose">Verbose logging is on — older log history is discarded sooner.</string>
     <string name="settings_privacy_log_level_note_quiet">Most logging is suppressed — a later fault will be harder to diagnose.</string>
+    <string name="settings_privacy_overline_developer_tools">DEVELOPER TOOLS</string>
+    <string name="settings_screenshot_privacy_title">Screenshot privacy mode</string>
+    <string name="settings_screenshot_privacy_body">Adds a fuzzy cover over IP addresses, URLs, coordinates, locations, QR codes, recording thumbnails, and camera previews in the native and web interfaces. This is a visual aid; always review screenshots before sharing.</string>
+    <string name="settings_screenshot_privacy_save_failed">Could not save screenshot privacy mode.</string>
 
     <!-- Settings → Security pane copy + PIN unlock screen.
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
