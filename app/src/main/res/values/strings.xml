@@ -994,6 +994,23 @@
     <string name="settings_about_title">About OverDrive</string>
     <string name="settings_about_version_label">Version</string>
     <string name="settings_about_package_label">Build</string>
+    <string name="settings_about_vehicle_title">Vehicle &amp; head unit</string>
+    <string name="settings_about_vehicle_subtitle">Version details reported by this BYD head unit.</string>
+    <string name="settings_about_vehicle_firmware_label">Firmware</string>
+    <string name="settings_about_vehicle_dsp_label">DSP</string>
+    <string name="settings_about_vehicle_mcu_label">MCU</string>
+    <string name="settings_about_vehicle_android_label">Android</string>
+    <string name="settings_about_vehicle_security_patch_label">Android security patch</string>
+    <string name="settings_about_vehicle_head_unit_label">Head unit</string>
+    <string name="settings_about_vehicle_vin_label">VIN</string>
+    <string name="settings_about_vehicle_vin_hint">Sensitive identifier; hidden by default.</string>
+    <string name="settings_about_vehicle_vin_show">Show</string>
+    <string name="settings_about_vehicle_vin_hide">Hide</string>
+    <string name="settings_about_vehicle_vin_show_a11y">Show VIN</string>
+    <string name="settings_about_vehicle_vin_hide_a11y">Hide VIN</string>
+    <string name="settings_about_vehicle_vin_hidden_a11y">VIN hidden</string>
+    <string name="settings_about_vehicle_loading">Loading&#8230;</string>
+    <string name="settings_about_vehicle_unavailable">Unavailable</string>
     <string name="settings_about_check_update_value">Check the latest GitHub release and install if newer.</string>
     <!-- Backup & Restore (same-device). The backup file contains credentials +
          the device key, so the copy warns the user to keep it private. -->

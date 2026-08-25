@@ -28,6 +28,8 @@ class ScreenshotPrivacyPolicyTest {
         assertTrue(ScreenshotPrivacyPolicy.isSensitiveResourceName("ivThumbnail"))
         assertTrue(ScreenshotPrivacyPolicy.isSensitiveResourceName("tvLocation"))
         assertTrue(ScreenshotPrivacyPolicy.isSensitiveResourceName("cameraPreview"))
+        assertTrue(ScreenshotPrivacyPolicy.isSensitiveResourceName("tvAboutVehicleVin"))
         assertFalse(ScreenshotPrivacyPolicy.isSensitiveResourceName("tvBatteryPercent"))
+        assertFalse(ScreenshotPrivacyPolicy.isSensitiveResourceName("tvSavingProgress"))
     }
 }

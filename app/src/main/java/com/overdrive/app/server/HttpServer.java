@@ -765,6 +765,12 @@ public class HttpServer {
             return LauncherApiHandler.handle(method, path, body, out);
         }
 
+        // Authenticated, read-only metadata for the web About page. VIN deliberately never enters
+        // this HTTP response; the native About screen is the only surface that can request it.
+        if (path.equals("/api/about/vehicle-info")) {
+            return AboutApiHandler.handle(method, path, body, out);
+        }
+
         // Recordings API (with Range header support for video seeking) + thumbnails + event timelines
         if (path.startsWith("/api/recordings") || path.startsWith("/video/") ||
             path.startsWith("/thumb/") || path.startsWith("/api/events/")) {

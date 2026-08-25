@@ -371,6 +371,20 @@ public class SurveillanceIpcServer implements Runnable {
                     response.put("success", true);
                     response.put("config", getDefaultConfig());
                     break;
+
+                // Native About screen only: return the VIN already held by the daemon's
+                // bodywork snapshot. This deliberately has no HTTP route, so adding the
+                // optional identifier to About does not expose it through a tunnel/web UI.
+                // The response is never logged; the app masks it until an explicit reveal.
+                case "GET_VEHICLE_IDENTITY": {
+                    com.overdrive.app.byd.BydVehicleData data =
+                            com.overdrive.app.byd.BydDataCollector.getInstance().getData();
+                    response.put("success", data != null);
+                    if (data != null && data.vin != null && !data.vin.trim().isEmpty()) {
+                        response.put("vin", data.vin.trim());
+                    }
+                    break;
+                }
                     
                 case "SET_CONFIG": {
                     JSONObject config = request.optJSONObject("config");
