@@ -1212,10 +1212,7 @@ var CHARGING = {
         if (detail) { detail.classList.remove('hidden'); detail.classList.add('active'); }
 
         // Find the row we already have for the header; fetch full + samples.
-        var row = null;
-        for (var i = 0; i < this.sessions.length; i++) {
-            if (this.sessions[i].id === id) { row = this.sessions[i]; break; }
-        }
+        var row = this._getSession(id);
         if (row) this._fillDetailHeader(row, id);
 
         this._fetchJson('/api/charging/' + id)
@@ -1352,7 +1349,8 @@ var CHARGING = {
         this._setText('detailPeakPower', displayedPeak > 0 ? displayedPeak.toFixed(1) + ' kW' : '--');
         this._setText('detailRangeGained', (s.rangeGained != null && s.rangeGained > 0) ? this._dist(s.rangeGained) : '--');
         this._setText('detailOdometer', (s.startOdometerKm != null && s.startOdometerKm > 0) ? this._dist(s.startOdometerKm) : '--');
-        this._setText('detailCost', (s.cost != null && s.cost > 0) ? this._money(s.cost) : '--');
+        this._setText('detailCost', (s.cost != null && s.cost >= 0) ? this._money(s.cost) : '--');
+        this._setText('detailCostRate', (s.cost != null && s.cost >= 0 && s.electricityRate != null && s.electricityRate >= 0 && !s.tariffLabel) ? '(' + this._money(s.electricityRate) + this._t('charge.per_kwh', '/kWh') + ')' : '');
         this._setText('detailType', this._typeLabel(s));
         this._setText('detailTimeToFull', (chargingNow
                 && s.timeToFullMin != null && s.timeToFullMin > 0)
@@ -1489,6 +1487,72 @@ var CHARGING = {
               // remain dirty and the user can correct/retry in place.
               self._refreshConfigDirty();
           });
+    },
+
+    editCost: async function () {
+        var self = this;
+        if (this.currentSessionId == null) return;
+        
+        var s = this._getSession(this.currentSessionId);
+        if (!s) return;
+        
+        if (s.endTime == null || s.endTime <= 0) {
+            this._toast(this._t('charge.cannot_edit_in_progress_cost', 'Cannot edit cost of an in-progress session'), 'error');
+            return;
+        }
+
+        var oldCostVal = (s.cost != null && s.cost >= 0) ? s.cost.toFixed(2) : '';
+        var msg = this._t('charge.edit_cost_prompt', 'Enter total cost of this charge (leave empty to reset):');
+        
+        var input;
+        if (window.BYD && BYD.utils && typeof BYD.utils.promptDialog === 'function') {
+            input = await BYD.utils.promptDialog({
+                title: this._t('charge.detail_cost', 'Cost'),
+                body: msg,
+                value: oldCostVal,
+                placeholder: '0.00'
+            });
+        } else {
+            input = window.prompt(msg, oldCostVal);
+        }
+        if (input === null) return;
+        
+        var newCost = parseFloat(input.trim());
+        if (input.trim() === '') {
+            newCost = -1;
+        } else if (isNaN(newCost) || newCost < 0) {
+            this._toast(this._t('charge.invalid_cost', 'Please enter a valid non-negative number'), 'error');
+            return;
+        }
+
+        var currentCost = (s.cost != null && s.cost >= 0) ? s.cost : -1;
+        if (newCost === currentCost) return;
+
+        var showError = function () {
+            self._toast(self._t('charge.cost_update_failed', 'Could not update cost'), 'error');
+        };
+        
+        fetch('/api/charging/' + this.currentSessionId + '/cost', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cost: newCost })
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+            if (d && d.success) {
+                self._toast(self._t('charge.cost_updated', 'Cost updated'));
+                s.cost = newCost >= 0 ? newCost : null;
+                s.electricityRate = (newCost >= 0 && s.energyAdded != null && s.energyAdded > 0) ? (newCost / s.energyAdded) : null;
+                s.tariffId = null;
+                s.tariffLabel = null;
+                self._renderSessionCards();
+                self._fillDetailHeader(s);
+                self.loadSummary();
+            } else {
+                showError();
+            }
+        })
+        .catch(showError);
     },
 
     deleteCurrent: function () {
@@ -2999,6 +3063,13 @@ var CHARGING = {
         }
         this.loadTariffs();
         this._loadCurrentLivePair();
+    },
+
+    _getSession: function (id) {
+        for (var i = 0; i < this.sessions.length; i++) {
+            if (this.sessions[i] && this.sessions[i].id === id) return this.sessions[i];
+        }
+        return null;
     },
 
     // ==================== FORMAT / DOM HELPERS ====================

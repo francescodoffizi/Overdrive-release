@@ -431,7 +431,7 @@ public class SocHistoryDatabase {
         this(new java.io.File(CHARGING_LIFECYCLE_JOURNAL_PATH));
     }
 
-    SocHistoryDatabase(java.io.File chargingLifecycleJournalFile) {
+    protected SocHistoryDatabase(java.io.File chargingLifecycleJournalFile) {
         this.chargingLifecycleJournalFile = chargingLifecycleJournalFile;
         // Load the H2 JDBC driver (pure Java - always works)
         try {
@@ -10384,6 +10384,81 @@ public class SocHistoryDatabase {
             }
             logger.error("deleteChargingSession failed for " + id, e);
             return false;
+        }
+    }
+
+    /**
+     * Update the total cost of a single charging session, recalculate its
+     * rate (cost per kWh), clear any location-based tariff fields (as it's now a manual cost),
+     * and adjust the daily rollup so lifetime / monthly-cost totals stay consistent.
+     */
+    public synchronized boolean updateChargingSessionCost(long id, double newCost) {
+        if (!isInitialized || connection == null) return false;
+        boolean priorAutoCommit = false;
+        boolean committed = false;
+        try {
+            priorAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+
+            long startTime = -1, endTime = 0;
+            double energyAdded = 0;
+            double oldCost = 0;
+            try (PreparedStatement sel = connection.prepareStatement(
+                    "SELECT start_time, end_time, energy_added_kwh, session_cost FROM " + TABLE_CHARGING + " WHERE id = ?;")) {
+                sel.setLong(1, id);
+                try (ResultSet rs = sel.executeQuery()) {
+                    if (rs.next()) {
+                        startTime = rs.getLong("start_time");
+                        endTime = rs.getLong("end_time");
+                        if (endTime == 0 || endTime <= startTime) {
+                            logger.warn("updateChargingSessionCost: cannot edit cost of an in-progress session " + id);
+                            return false;
+                        }
+                        double energyRead = rs.getDouble("energy_added_kwh");
+                        energyAdded = (rs.wasNull() || energyRead < 0) ? 0 : energyRead;
+                        double costRead = rs.getDouble("session_cost");
+                        oldCost = (rs.wasNull() || costRead < 0) ? 0 : costRead;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+
+            double newRate = (newCost < 0) ? -1 : ((energyAdded > 0) ? (newCost / energyAdded) : 0);
+
+            try (PreparedStatement updSession = connection.prepareStatement(
+                    "UPDATE " + TABLE_CHARGING + " SET electricity_rate = ?, session_cost = ?, tariff_id = '', tariff_label = '' WHERE id = ?;")) {
+                updSession.setDouble(1, newRate);
+                updSession.setDouble(2, newCost);
+                updSession.setLong(3, id);
+                updSession.executeUpdate();
+            }
+
+            double delta = (newCost >= 0 ? newCost : 0) - (oldCost >= 0 ? oldCost : 0);
+            if (delta != 0 && endTime > 0) {
+                long day = (endTime / 86_400_000L) * 86_400_000L;
+                try (PreparedStatement updDaily = connection.prepareStatement(
+                        "UPDATE " + TABLE_CHARGING_DAILY + " SET cost = GREATEST(cost + ?, 0) WHERE day_epoch = ?;")) {
+                    updDaily.setDouble(1, delta);
+                    updDaily.setLong(2, day);
+                    updDaily.executeUpdate();
+                }
+            }
+
+            connection.commit();
+            committed = true;
+            logger.info("Updated charging session " + id + " to cost " + newCost + ", calculated rate " + newRate);
+            return true;
+        } catch (Exception e) {
+            logger.error("updateChargingSessionCost failed for " + id, e);
+            return false;
+        } finally {
+            if (!committed && connection != null) {
+                try { connection.rollback(); } catch (Exception ignored) {}
+            }
+            if (connection != null) {
+                try { connection.setAutoCommit(priorAutoCommit); } catch (Exception ignored) {}
+            }
         }
     }
 

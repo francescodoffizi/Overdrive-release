@@ -39,6 +39,7 @@ public class ChargingApiHandler {
     private static final Pattern SESSION_SAMPLES_PATTERN = Pattern.compile("^/api/charging/(\\d+)/samples$");
     // POST fallback for per-session delete (the in-app WebView can drop DELETE).
     private static final Pattern SESSION_DELETE_PATTERN = Pattern.compile("^/api/charging/(\\d+)/delete$");
+    private static final Pattern SESSION_COST_PATTERN = Pattern.compile("^/api/charging/(\\d+)/cost$");
 
     private final ChargingSessionManager manager;
     private final Supplier<TripAnalyticsManager>
@@ -129,6 +130,13 @@ public class ChargingApiHandler {
             if (delMatcher.matches() && "POST".equals(method)) {
                 long id = Long.parseLong(delMatcher.group(1));
                 return handleDeleteSession(id);
+            }
+
+            // POST /api/charging/{id}/cost — update cost
+            Matcher costMatcher = SESSION_COST_PATTERN.matcher(path);
+            if (costMatcher.matches() && "POST".equals(method)) {
+                long id = Long.parseLong(costMatcher.group(1));
+                return handleUpdateSessionCost(id, body);
             }
 
             // GET/DELETE /api/charging/{id}
@@ -442,6 +450,31 @@ public class ChargingApiHandler {
         } catch (Exception e) {
             logger.error("Error deleting charging session " + id, e);
             return errorResponse("Failed to delete session", 500);
+        }
+    }
+
+    /** POST /api/charging/{id}/cost — update cost of a completed session. */
+    private JSONObject handleUpdateSessionCost(long id, String body) {
+        try {
+            JSONObject bodyJson;
+            try {
+                bodyJson = new JSONObject(body != null ? body : "{}");
+            } catch (org.json.JSONException je) {
+                return errorResponse("Invalid JSON payload", 400);
+            }
+            if (!bodyJson.has("cost")) {
+                return errorResponse("Missing 'cost' parameter", 400);
+            }
+            double cost = bodyJson.getDouble("cost");
+            boolean ok = db().updateChargingSessionCost(id, cost);
+            if (!ok) return errorResponse("Failed to update session cost (session may be in progress or not found)", 500);
+            
+            JSONObject response = new JSONObject();
+            response.put("success", true);
+            return response;
+        } catch (Exception e) {
+            logger.error("Error updating cost for session " + id, e);
+            return errorResponse("Failed to update cost: " + e.getMessage(), 500);
         }
     }
 

@@ -632,7 +632,12 @@
     "tariff_fallback_global": "Charges outside every tariff use {rate}/kWh.",
     "tariff_auto_hint": "Saved. Charges within {radius} m of here will use this tariff automatically.",
     "tariff_label_placeholder": "Home",
-    "per_kwh_unit": "/kWh"
+    "per_kwh_unit": "/kWh",
+    "edit_cost_prompt": "Enter total cost of this charge (leave empty to reset):",
+    "cannot_edit_in_progress_cost": "Cannot edit cost of an in-progress session",
+    "invalid_cost": "Please enter a valid non-negative number",
+    "cost_updated": "Cost updated",
+    "cost_update_failed": "Could not update cost"
   },
   "trip": {
     "tab_trips": "Trips",

@@ -212,20 +212,22 @@ public class DaemonLogger {
         
         // Console log if enabled (standard Android Log for app context)
         if (globalConfig.enableConsoleLog) {
-            switch (level) {
-                case DEBUG:
-                    Log.d(tag, message);
-                    break;
-                case INFO:
-                    Log.i(tag, message);
-                    break;
-                case WARN:
-                    Log.w(tag, message);
-                    break;
-                case ERROR:
-                    Log.e(tag, message);
-                    break;
-            }
+            try {
+                switch (level) {
+                    case DEBUG:
+                        Log.d(tag, message);
+                        break;
+                    case INFO:
+                        Log.i(tag, message);
+                        break;
+                    case WARN:
+                        Log.w(tag, message);
+                        break;
+                    case ERROR:
+                        Log.e(tag, message);
+                        break;
+                }
+            } catch (Throwable ignored) {}
         }
         
         // Print to stdout for daemon processes running via app_process.

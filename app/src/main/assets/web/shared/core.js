@@ -1784,13 +1784,45 @@ BYD.utils._showModal = function (opts) {
         }
         if (opts.body) {
             var p = document.createElement('p');
-            p.style.margin = '0 0 4px 0';
+            p.style.margin = opts.prompt ? '0 0 12px 0' : '0 0 4px 0';
             p.style.fontSize = '14px';
             p.style.lineHeight = '1.5';
             p.style.color = 'var(--text-secondary, var(--text-primary))';
             p.style.whiteSpace = 'pre-wrap';
             p.textContent = opts.body;
             card.appendChild(p);
+        }
+
+        var input = null;
+        if (opts.prompt) {
+            input = document.createElement('input');
+            input.type = 'text';
+            input.value = opts.promptValue || '';
+            input.placeholder = opts.promptPlaceholder || '';
+            input.style.width = '100%';
+            input.style.boxSizing = 'border-box';
+            input.style.padding = '10px 12px';
+            input.style.marginBottom = '18px';
+            input.style.border = '1px solid var(--border-subtle, #ccc)';
+            input.style.borderRadius = 'var(--radius-md, 8px)';
+            input.style.background = 'var(--bg-surface, #fff)';
+            input.style.color = 'var(--text-primary, #000)';
+            input.style.fontSize = '15px';
+            input.style.outline = 'none';
+            input.addEventListener('focus', function () {
+                input.style.borderColor = 'var(--brand-primary, #007AFF)';
+            });
+            input.addEventListener('blur', function () {
+                input.style.borderColor = 'var(--border-subtle, #ccc)';
+            });
+            card.appendChild(input);
+
+            input.addEventListener('keydown', function (ev) {
+                if (ev.key === 'Enter') {
+                    ev.preventDefault();
+                    dismiss(true);
+                }
+            });
         }
 
         var actions = document.createElement('div');
@@ -1826,10 +1858,18 @@ BYD.utils._showModal = function (opts) {
         var prevFocus = document.activeElement;
         document.body.appendChild(backdrop);
 
-        // Focus the primary action so Enter confirms without an extra tap.
-        try { confirmBtn.focus(); } catch (e) {}
+        try {
+            if (input) {
+                input.focus();
+                if (opts.promptValue) {
+                    input.setSelectionRange(opts.promptValue.length, opts.promptValue.length);
+                }
+            } else {
+                confirmBtn.focus();
+            }
+        } catch (e) {}
 
-        var entry = { dismiss: dismiss };
+        var entry = { dismiss: function () { dismiss(false); } };
         BYD.utils._modalStack.push(entry);
 
         function dismiss(result) {
@@ -1841,7 +1881,12 @@ BYD.utils._showModal = function (opts) {
             // Pop from stack if still there (e.g. button click path).
             var idx = BYD.utils._modalStack.indexOf(entry);
             if (idx !== -1) BYD.utils._modalStack.splice(idx, 1);
-            resolve(result);
+            
+            if (opts.prompt) {
+                resolve(result ? input.value : null);
+            } else {
+                resolve(result);
+            }
         }
     });
 };
@@ -1880,6 +1925,24 @@ BYD.utils.confirmDialog = function (opts) {
         confirmLabel: opts.confirmLabel || (t && t('common.ok')) || 'OK',
         cancelLabel: opts.cancelLabel || (t && t('common.cancel')) || 'Cancel',
         danger: opts.danger === true
+    });
+};
+
+/**
+ * Themed text input prompt. Returns a Promise<string|null> resolving with the input value,
+ * or null when canceled.
+ */
+BYD.utils.promptDialog = function (opts) {
+    opts = opts || {};
+    var t = BYD.i18n && BYD.i18n.t ? BYD.i18n.t.bind(BYD.i18n) : null;
+    return BYD.utils._showModal({
+        title: opts.title || (t && t('common.notice')) || 'Notice',
+        body: opts.body || '',
+        confirmLabel: opts.confirmLabel || (t && t('common.ok')) || 'OK',
+        cancelLabel: opts.cancelLabel || (t && t('common.cancel')) || 'Cancel',
+        prompt: true,
+        promptValue: opts.value || '',
+        promptPlaceholder: opts.placeholder || ''
     });
 };
 
