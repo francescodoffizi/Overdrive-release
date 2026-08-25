@@ -729,6 +729,67 @@ public class ChargingApiHandlerTest {
         return database;
     }
 
+    @Test
+    public void updateSessionCostReturns400ForInvalidJson() throws Exception {
+        TrackingManager manager = new TrackingManager(true);
+        ChargingApiHandler handler = new ChargingApiHandler(manager);
+        JSONObject response = handler.handleRequest(
+                "/api/charging/42/cost", "POST", null, "invalid json");
+        assertEquals(400, response.optInt("_status"));
+        assertEquals("Invalid JSON payload", response.optString("error"));
+    }
+
+    @Test
+    public void updateSessionCostReturns400WhenCostMissing() throws Exception {
+        TrackingManager manager = new TrackingManager(true);
+        ChargingApiHandler handler = new ChargingApiHandler(manager);
+        JSONObject response = handler.handleRequest(
+                "/api/charging/42/cost", "POST", null, "{}");
+        assertEquals(400, response.optInt("_status"));
+        assertEquals("Missing 'cost' parameter", response.optString("error"));
+    }
+
+    @Test
+    public void updateSessionCostSuccess() throws Exception {
+        TrackingManager manager = new TrackingManager(true);
+        final long[] capturedId = new long[1];
+        final double[] capturedCost = new double[1];
+        manager.socDbOverride = new SocHistoryDatabase(null) {
+            @Override
+            public synchronized boolean updateChargingSessionCost(long id, double newCost) {
+                capturedId[0] = id;
+                capturedCost[0] = newCost;
+                return true;
+            }
+        };
+        ChargingApiHandler handler = new ChargingApiHandler(manager);
+        JSONObject response = handler.handleRequest(
+                "/api/charging/42/cost", "POST", null,
+                new JSONObject().put("cost", 15.50).toString());
+
+        assertTrue(response.optBoolean("success"));
+        assertEquals(42L, capturedId[0]);
+        assertEquals(15.50, capturedCost[0], 0.001);
+    }
+
+    @Test
+    public void updateSessionCostDatabaseFailure() throws Exception {
+        TrackingManager manager = new TrackingManager(true);
+        manager.socDbOverride = new SocHistoryDatabase(null) {
+            @Override
+            public synchronized boolean updateChargingSessionCost(long id, double newCost) {
+                return false;
+            }
+        };
+        ChargingApiHandler handler = new ChargingApiHandler(manager);
+        JSONObject response = handler.handleRequest(
+                "/api/charging/42/cost", "POST", null,
+                new JSONObject().put("cost", 15.50).toString());
+
+        assertEquals(500, response.optInt("_status"));
+        assertTrue(response.optString("error").contains("Failed to update session cost"));
+    }
+
     /**
      * Captures the tariff the handler mirrors into the trips config, which is
      * how a saved charging rate reaches trip costing.

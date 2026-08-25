@@ -431,7 +431,7 @@ public class SocHistoryDatabase {
         this(new java.io.File(CHARGING_LIFECYCLE_JOURNAL_PATH));
     }
 
-    SocHistoryDatabase(java.io.File chargingLifecycleJournalFile) {
+    protected SocHistoryDatabase(java.io.File chargingLifecycleJournalFile) {
         this.chargingLifecycleJournalFile = chargingLifecycleJournalFile;
         // Load the H2 JDBC driver (pure Java - always works)
         try {
