@@ -23,6 +23,21 @@ class VehicleVersionInfoWebAssetTest {
         assertTrue(server.contains("path.startsWith(\"/api/about/\")"))
     }
 
+    @Test
+    fun vehicleInformationDoesNotInterruptContributorIntroduction() {
+        val html = readRepositoryFile("app/src/main/assets/web/local/about.html")
+
+        val vehicleInfo = html.indexOf("id=\"vehicleInfoSection\"")
+        val poweredByPeople = html.indexOf("data-i18n=\"about.support.section\"")
+        val contributors = html.indexOf("id=\"contributorsList\"")
+
+        assertTrue("Vehicle information should remain prominent above the people section", vehicleInfo >= 0)
+        assertTrue("Missing Powered by people like you section", poweredByPeople >= 0)
+        assertTrue("Missing contributors list", contributors >= 0)
+        assertTrue("Vehicle information should appear before the people introduction", vehicleInfo < poweredByPeople)
+        assertTrue("The people introduction should lead directly into contributors", poweredByPeople < contributors)
+    }
+
     private fun readRepositoryFile(relative: String): String {
         var current: Path? = Paths.get("").toAbsolutePath()
         while (current != null) {
