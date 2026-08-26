@@ -1,14 +1,20 @@
-// qcarcam_bridge.cpp — Qualcomm AIS / QCarCam native JNI bridge for DiLink 5.0 (Snapdragon SA8155P).
-// Directly interfaces with /vendor/lib64/libais_client.so to stream raw camera frames
-// (1920x1300 / 1920x1020 YUV) for OverDrive's hardware MediaCodec encoder pipeline.
+// qcarcam_bridge.cpp — DiLink 5 Sidecar Client Bridge.
+// Connects to dilink5_cam_sidecar via abstract UNIX domain socket (@dilink5_cam),
+// receives 30 FPS raw camera frames (1920x1300), and posts them into Android's
+// ANativeWindow / SurfaceTexture for zero-copy OpenGL and MediaCodec pipelines.
 
 #include <jni.h>
 #include <android/log.h>
-#include <dlfcn.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <atomic>
 #include <mutex>
 
 #define TAG "QCarCamBridge"
@@ -16,62 +22,133 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-namespace {
+#define SOCKET_NAME "dilink5_cam"
+#define FRAME_WIDTH 1920
+#define FRAME_HEIGHT 1300
+#define RAW_FRAME_SIZE (FRAME_WIDTH * FRAME_HEIGHT * 2)
+#define MAGIC_HEADER 0x44494C35
 
-typedef int (*qcarcam_init_fn)(void*);
-typedef int (*qcarcam_uninit_fn)();
-typedef void* (*qcarcam_open_fn)(int);
-typedef int (*qcarcam_start_fn)(void*);
-typedef int (*qcarcam_stop_fn)(void*);
-typedef int (*qcarcam_close_fn)(void*);
-typedef int (*qcarcam_get_frame_fn)(void*, void*, unsigned long long, unsigned int);
-typedef int (*qcarcam_release_frame_fn)(void*, void*);
-
-struct QCarCamFns {
-    void* handle_lib = nullptr;
-    qcarcam_init_fn init = nullptr;
-    qcarcam_uninit_fn uninit = nullptr;
-    qcarcam_open_fn open = nullptr;
-    qcarcam_close_fn close = nullptr;
-    qcarcam_start_fn start = nullptr;
-    qcarcam_stop_fn stop = nullptr;
-    qcarcam_get_frame_fn get_frame = nullptr;
-    qcarcam_release_frame_fn release_frame = nullptr;
-    bool loaded = false;
+struct FrameHeader {
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t data_size;
+    uint64_t timestamp;
 };
 
-QCarCamFns g_qcarcam;
-std::mutex g_lock;
+namespace {
 
-bool loadQCarCamLibraries() {
-    std::lock_guard<std::mutex> lock(g_lock);
-    if (g_qcarcam.loaded) return true;
+std::atomic<bool> g_streaming{false};
+pthread_t g_streamThread = 0;
+ANativeWindow* g_nativeWindow = nullptr;
+std::mutex g_winMutex;
 
-    g_qcarcam.handle_lib = dlopen("/vendor/lib64/libais_client.so", RTLD_NOW);
-    if (!g_qcarcam.handle_lib) {
-        LOGW("Failed to load /vendor/lib64/libais_client.so: %s", dlerror());
-        return false;
+// Convert UYVY (4:2:2) to RGBA8888 for Surface posting
+void convert_uyvy_to_rgba(const uint8_t* uyvy, int width, int height, uint32_t* dst_rgba, int dst_stride) {
+    const uint8_t* src = uyvy;
+    for (int y = 0; y < height; y++) {
+        uint32_t* row = dst_rgba + y * dst_stride;
+        for (int x = 0; x < width; x += 2) {
+            float u = (float)src[0] - 128.0f;
+            float y0 = (float)src[1];
+            float v = (float)src[2] - 128.0f;
+            float y1 = (float)src[3];
+            src += 4;
+
+            int r0 = (int)(y0 + 1.402f * v);
+            int g0 = (int)(y0 - 0.344136f * u - 0.714136f * v);
+            int b0 = (int)(y0 + 1.772f * u);
+
+            r0 = r0 < 0 ? 0 : (r0 > 255 ? 255 : r0);
+            g0 = g0 < 0 ? 0 : (g0 > 255 ? 255 : g0);
+            b0 = b0 < 0 ? 0 : (b0 > 255 ? 255 : b0);
+
+            int r1 = (int)(y1 + 1.402f * v);
+            int g1 = (int)(y1 - 0.344136f * u - 0.714136f * v);
+            int b1 = (int)(y1 + 1.772f * u);
+
+            r1 = r1 < 0 ? 0 : (r1 > 255 ? 255 : r1);
+            g1 = g1 < 0 ? 0 : (g1 > 255 ? 255 : g1);
+            b1 = b1 < 0 ? 0 : (b1 > 255 ? 255 : b1);
+
+            row[x + 0] = (uint32_t)(0xFF000000 | (b0 << 16) | (g0 << 8) | r0);
+            row[x + 1] = (uint32_t)(0xFF000000 | (b1 << 16) | (g1 << 8) | r1);
+        }
+    }
+}
+
+ssize_t read_all(int fd, void* buf, size_t count) {
+    size_t total = 0;
+    uint8_t* ptr = (uint8_t*)buf;
+    while (total < count) {
+        ssize_t r = recv(fd, ptr + total, count - total, 0);
+        if (r <= 0) return -1;
+        total += r;
+    }
+    return total;
+}
+
+void* streamClientLoop(void* arg) {
+    LOGI("DiLink 5 UNIX Socket Client thread started.");
+
+    uint8_t* frameBuffer = (uint8_t*)malloc(RAW_FRAME_SIZE);
+
+    while (g_streaming.load()) {
+        int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock < 0) {
+            usleep(500000);
+            continue;
+        }
+
+        struct sockaddr_un serv_addr;
+        memset(&serv_addr, 0, sizeof(serv_addr));
+        serv_addr.sun_family = AF_UNIX;
+        serv_addr.sun_path[0] = '\0';
+        strncpy(serv_addr.sun_path + 1, SOCKET_NAME, sizeof(serv_addr.sun_path) - 2);
+        socklen_t addr_len = sizeof(serv_addr.sun_family) + 1 + strlen(SOCKET_NAME);
+
+        if (connect(sock, (struct sockaddr*)&serv_addr, addr_len) < 0) {
+            close(sock);
+            usleep(300000); // retry connect
+            continue;
+        }
+
+        LOGI("Connected to DiLink 5 Camera Sidecar at abstract socket @%s", SOCKET_NAME);
+
+        while (g_streaming.load()) {
+            FrameHeader header;
+            if (read_all(sock, &header, sizeof(header)) != sizeof(header)) {
+                LOGW("Sidecar disconnected (header read failed)");
+                break;
+            }
+
+            if (header.magic != MAGIC_HEADER || header.data_size > RAW_FRAME_SIZE) {
+                LOGE("Invalid frame magic: 0x%08X", header.magic);
+                break;
+            }
+
+            if (read_all(sock, frameBuffer, header.data_size) != (ssize_t)header.data_size) {
+                LOGW("Sidecar disconnected (payload read failed)");
+                break;
+            }
+
+            std::lock_guard<std::mutex> lock(g_winMutex);
+            if (g_nativeWindow) {
+                ANativeWindow_Buffer winBuffer;
+                if (ANativeWindow_lock(g_nativeWindow, &winBuffer, nullptr) == 0) {
+                    convert_uyvy_to_rgba(frameBuffer, header.width, header.height, (uint32_t*)winBuffer.bits, winBuffer.stride);
+                    ANativeWindow_unlockAndPost(g_nativeWindow);
+                }
+            }
+        }
+
+        close(sock);
     }
 
-    g_qcarcam.init = (qcarcam_init_fn)dlsym(g_qcarcam.handle_lib, "qcarcam_initialize");
-    g_qcarcam.uninit = (qcarcam_uninit_fn)dlsym(g_qcarcam.handle_lib, "qcarcam_uninitialize");
-    g_qcarcam.open = (qcarcam_open_fn)dlsym(g_qcarcam.handle_lib, "qcarcam_open");
-    g_qcarcam.close = (qcarcam_close_fn)dlsym(g_qcarcam.handle_lib, "qcarcam_close");
-    g_qcarcam.start = (qcarcam_start_fn)dlsym(g_qcarcam.handle_lib, "qcarcam_start");
-    g_qcarcam.stop = (qcarcam_stop_fn)dlsym(g_qcarcam.handle_lib, "qcarcam_stop");
-    g_qcarcam.get_frame = (qcarcam_get_frame_fn)dlsym(g_qcarcam.handle_lib, "qcarcam_get_frame");
-    g_qcarcam.release_frame = (qcarcam_release_frame_fn)dlsym(g_qcarcam.handle_lib, "qcarcam_release_frame");
-
-    if (!g_qcarcam.init || !g_qcarcam.open || !g_qcarcam.start) {
-        LOGE("Required QCarCam symbols missing from libais_client.so");
-        dlclose(g_qcarcam.handle_lib);
-        g_qcarcam.handle_lib = nullptr;
-        return false;
-    }
-
-    g_qcarcam.loaded = true;
-    LOGI("Qualcomm QCarCam / AIS Client library loaded successfully.");
-    return true;
+    free(frameBuffer);
+    LOGI("DiLink 5 UNIX Socket Client thread terminated.");
+    return nullptr;
 }
 
 } // namespace
@@ -81,58 +158,77 @@ extern "C" {
 JNIEXPORT jboolean JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeIsSupported(
     JNIEnv* env, jclass clazz) {
-    return loadQCarCamLibraries() ? JNI_TRUE : JNI_FALSE;
+    // DiLink 5 platform is present if /vendor/lib64/libais_client.so exists on disk
+    return (access("/vendor/lib64/libais_client.so", F_OK) == 0) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeInit(
     JNIEnv* env, jobject thiz, jint inputId) {
-    if (!loadQCarCamLibraries()) return 0;
-
-    int res = g_qcarcam.init(nullptr);
-    LOGI("qcarcam_initialize() returned %d", res);
-
-    void* cam_hndl = g_qcarcam.open(inputId);
-    if (!cam_hndl) {
-        LOGE("qcarcam_open(%d) failed!", inputId);
-        return 0;
-    }
-
-    LOGI("qcarcam_open(%d) succeeded, handle=%p", inputId, cam_hndl);
-    return reinterpret_cast<jlong>(cam_hndl);
+    return 1;
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStart(
     JNIEnv* env, jobject thiz, jlong handle) {
-    if (!handle || !g_qcarcam.loaded) return JNI_FALSE;
+    g_streaming.store(true);
+    if (g_streamThread == 0) {
+        pthread_create(&g_streamThread, nullptr, streamClientLoop, nullptr);
+    }
+    return JNI_TRUE;
+}
 
-    void* cam_hndl = reinterpret_cast<void*>(handle);
-    int res = g_qcarcam.start(cam_hndl);
-    LOGI("qcarcam_start() returned %d", res);
-    return (res == 0) ? JNI_TRUE : JNI_FALSE;
+JNIEXPORT jboolean JNICALL
+Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStartSurface(
+    JNIEnv* env, jobject thiz, jobject surface) {
+    std::lock_guard<std::mutex> lock(g_winMutex);
+    if (g_nativeWindow) {
+        ANativeWindow_release(g_nativeWindow);
+        g_nativeWindow = nullptr;
+    }
+    if (surface) {
+        g_nativeWindow = ANativeWindow_fromSurface(env, surface);
+        if (g_nativeWindow) {
+            ANativeWindow_setBuffersGeometry(g_nativeWindow, FRAME_WIDTH, FRAME_HEIGHT, WINDOW_FORMAT_RGBA_8888);
+            LOGI("ANativeWindow configured: %dx%d RGBA8888", FRAME_WIDTH, FRAME_HEIGHT);
+        }
+    }
+    g_streaming.store(true);
+    if (g_streamThread == 0) {
+        pthread_create(&g_streamThread, nullptr, streamClientLoop, nullptr);
+    }
+    return JNI_TRUE;
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStop(
     JNIEnv* env, jobject thiz, jlong handle) {
-    if (!handle || !g_qcarcam.loaded) return JNI_FALSE;
-
-    void* cam_hndl = reinterpret_cast<void*>(handle);
-    int res = g_qcarcam.stop(cam_hndl);
-    LOGI("qcarcam_stop() returned %d", res);
-    return (res == 0) ? JNI_TRUE : JNI_FALSE;
+    g_streaming.store(false);
+    if (g_streamThread != 0) {
+        pthread_join(g_streamThread, nullptr);
+        g_streamThread = 0;
+    }
+    std::lock_guard<std::mutex> lock(g_winMutex);
+    if (g_nativeWindow) {
+        ANativeWindow_release(g_nativeWindow);
+        g_nativeWindow = nullptr;
+    }
+    return JNI_TRUE;
 }
 
 JNIEXPORT void JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeRelease(
     JNIEnv* env, jobject thiz, jlong handle) {
-    if (!handle || !g_qcarcam.loaded) return;
-
-    void* cam_hndl = reinterpret_cast<void*>(handle);
-    g_qcarcam.close(cam_hndl);
-    g_qcarcam.uninit();
-    LOGI("qcarcam handle released.");
+    g_streaming.store(false);
+    if (g_streamThread != 0) {
+        pthread_join(g_streamThread, nullptr);
+        g_streamThread = 0;
+    }
+    std::lock_guard<std::mutex> lock(g_winMutex);
+    if (g_nativeWindow) {
+        ANativeWindow_release(g_nativeWindow);
+        g_nativeWindow = nullptr;
+    }
 }
 
 } // extern "C"

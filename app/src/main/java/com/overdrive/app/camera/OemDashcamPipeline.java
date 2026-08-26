@@ -1485,7 +1485,27 @@ public class OemDashcamPipeline {
     private static final int GLES11_OES_TEXTURE_EXTERNAL = 0x8D65;
 
     private void openCameraAndAttach() throws Exception {
-        Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            logger.info("DiLink 5 OEM dashcam using native QCarCam backend on Surface");
+            if (cameraSurface == null && cameraSurfaceTexture != null) {
+                cameraSurface = new Surface(cameraSurfaceTexture);
+            }
+            com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend backend =
+                    new com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend(oemDashcamCameraId);
+            if (backend.startSurface(cameraSurface)) {
+                cameraObj = backend;
+                logger.info("DiLink 5 OEM dashcam active on Surface.");
+                return;
+            }
+        }
+
+        Class<?> avmClass;
+        try {
+            avmClass = Class.forName("android.hardware.AVMCamera");
+        } catch (ClassNotFoundException e) {
+            logger.warn("android.hardware.AVMCamera not present on this device");
+            return;
+        }
 
         try {
             Constructor<?> c = avmClass.getDeclaredConstructor(int.class);

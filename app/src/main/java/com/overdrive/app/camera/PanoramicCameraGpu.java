@@ -2143,6 +2143,10 @@ public class PanoramicCameraGpu {
             // (compareAndSet fails) and the kick would be permanently unavailable
             // after the first camera close.
             previewKickArming.set(false);
+            if (cam instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
+                ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cam).close();
+                return;
+            }
             clearAvmCameraCallbacks(cam);
         }
         // Steps 5+6 (and disablePreviewCallback in legacy compat).
@@ -2535,10 +2539,14 @@ public class PanoramicCameraGpu {
         // DiLink 5.0 (Snapdragon SA8155P): uses native QCarCam / AIS backend directly
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             logger.info("DiLink 5 platform detected — initializing native QCarCam backend (cameraId=" + cameraId + ")");
+            if (cameraSurface == null && cameraSurfaceTexture != null) {
+                cameraSurface = new Surface(cameraSurfaceTexture);
+            }
             com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend dilink5Backend =
                     new com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend(cameraId);
-            if (dilink5Backend.start()) {
-                logger.info("DiLink 5 native QCarCam stream initialized and active.");
+            if (dilink5Backend.startSurface(cameraSurface)) {
+                cameraObj = dilink5Backend;
+                logger.info("DiLink 5 native QCarCam stream initialized and active on Surface (cameraObj assigned).");
                 return;
             }
             logger.warn("DiLink 5 native QCarCam start returned false — attempting legacy reflection fallback");

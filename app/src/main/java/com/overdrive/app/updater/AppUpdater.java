@@ -664,6 +664,15 @@ public class AppUpdater {
                         return;
                     }
 
+                    // Downgrade protection: if running build is strictly newer than remote, suppress offer
+                    if (!remoteNumeric.isEmpty() && !installedNumeric.isEmpty()
+                            && isNewerVersion(remoteNumeric, installedNumeric)) {
+                        Log.i(TAG, "Installed version " + installedNumeric
+                                + " is newer than remote " + remoteNumeric + " — suppressing downgrade offer");
+                        runCallback(() -> callback.onNoUpdate(currentVersion));
+                        return;
+                    }
+
                     // Update detection: compare asset updated_at timestamp only.
                     // Version comparison is unreliable since versionName may not be bumped
                     // when the APK is replaced on the same release tag.

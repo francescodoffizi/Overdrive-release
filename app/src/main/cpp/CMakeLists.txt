@@ -150,6 +150,15 @@ else()
     message(STATUS "od/od.cpp not present — skipping 'od' target; prebuilt libod.so in jniLibs/ is used at runtime.")
 endif()
 
+# ==================== DiLink 5 Camera Sidecar Executable ====================
+add_executable(dilink5_cam_sidecar
+    camera/dilink5_cam_sidecar.cpp
+)
+target_link_libraries(dilink5_cam_sidecar
+    dl
+    log
+)
+
 # ==================== NEON SIMD Optimization ====================
 # Enable NEON for ARM architectures
 if(ANDROID_ABI STREQUAL "arm64-v8a")

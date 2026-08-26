@@ -83,6 +83,25 @@ public class DiLink5QCarCamBackend {
         }
     }
 
+    public synchronized boolean startSurface(android.view.Surface surface) {
+        if (nativeHandle == 0 && !open()) return false;
+        if (isStreaming.get()) return true;
+
+        try {
+            boolean ok = nativeStartSurface(surface);
+            if (ok) {
+                isStreaming.set(true);
+                logger.info("DiLink 5 QCarCam stream started on Surface for camera " + cameraId);
+            } else {
+                logger.warn("nativeStartSurface failed on camera " + cameraId);
+            }
+            return ok;
+        } catch (Throwable t) {
+            logger.error("Error starting DiLink 5 QCarCam stream on Surface", t);
+            return false;
+        }
+    }
+
     public synchronized void stop() {
         if (nativeHandle != 0 && isStreaming.getAndSet(false)) {
             try {
@@ -115,6 +134,7 @@ public class DiLink5QCarCamBackend {
     private static native boolean nativeIsSupported();
     private native long nativeInit(int inputId);
     private native boolean nativeStart(long handle);
+    private native boolean nativeStartSurface(android.view.Surface surface);
     private native boolean nativeStop(long handle);
     private native void nativeRelease(long handle);
 }
