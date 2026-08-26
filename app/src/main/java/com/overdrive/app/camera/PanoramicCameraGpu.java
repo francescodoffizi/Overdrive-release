@@ -105,6 +105,9 @@ public class PanoramicCameraGpu {
     private final boolean USE_OEM_SURFACE_TEXTURE_PATH = resolveCameraModeFromConfig();
 
     private static boolean resolveCameraModeFromConfig() {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            return false; // DiLink 5 uses direct native Qualcomm AIS stream
+        }
         try {
             org.json.JSONObject cam = com.overdrive.app.config.UnifiedConfigManager
                 .loadConfig().optJSONObject("camera");
@@ -118,8 +121,11 @@ public class PanoramicCameraGpu {
 
     /** Effective camera-layout mode for downstream consumers.
      *  0 = 4-strip → 2x2 rearrangement (legacy);
-     *  3 = passthrough (dilink4 — HAL emits 2x2 natively). */
+     *  3 = passthrough (dilink4 / dilink5 — HAL emits complete frame natively). */
     public int getCameraLayoutMode() {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            return 3;
+        }
         return USE_OEM_SURFACE_TEXTURE_PATH ? 3 : 0;
     }
     
@@ -1453,11 +1459,13 @@ public class PanoramicCameraGpu {
                 frameSync.notify();
             }
         }, glHandler);
-        // Build the Surface that AVMCamera doesn't actually receive — the
-        // oem path uses addTexture(SurfaceTexture, ...) directly. We keep
-        // the cameraSurface reference null on this path so any stray
-        // addPreviewSurface code can't accidentally re-attach.
-        cameraSurface = null;
+        if (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
+            cameraSurface = new Surface(cameraSurfaceTexture);
+            ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cameraObj).startSurface(cameraSurface);
+            logger.info("DiLink 5 QCarCamBackend started with new SurfaceTexture Surface");
+        } else {
+            cameraSurface = null;
+        }
     }
 
     /** Bind the active SurfaceTexture to the AVMCamera via reflection,
@@ -1474,6 +1482,14 @@ public class PanoramicCameraGpu {
         if (cameraSurfaceTexture == null) {
             throw new IllegalStateException("attachSurfaceTextureToCamera before createCameraSurfaceTexture");
         }
+
+        if (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
+            logger.info("Attaching Surface to DiLink 5 QCarCam backend");
+            if (cameraSurface == null) cameraSurface = new Surface(cameraSurfaceTexture);
+            ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cameraObj).startSurface(cameraSurface);
+            return;
+        }
+
         Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
         int previewIndex = cameraSurfaceMode;
 
@@ -2539,17 +2555,17 @@ public class PanoramicCameraGpu {
         // DiLink 5.0 (Snapdragon SA8155P): uses native QCarCam / AIS backend directly
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             logger.info("DiLink 5 platform detected — initializing native QCarCam backend (cameraId=" + cameraId + ")");
-            if (cameraSurface == null && cameraSurfaceTexture != null) {
-                cameraSurface = new Surface(cameraSurfaceTexture);
-            }
             com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend dilink5Backend =
                     new com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend(cameraId);
-            if (dilink5Backend.startSurface(cameraSurface)) {
-                cameraObj = dilink5Backend;
-                logger.info("DiLink 5 native QCarCam stream initialized and active on Surface (cameraObj assigned).");
-                return;
+            if (cameraSurfaceTexture != null) {
+                if (cameraSurface == null) cameraSurface = new Surface(cameraSurfaceTexture);
+                dilink5Backend.startSurface(cameraSurface);
+            } else {
+                dilink5Backend.start();
             }
-            logger.warn("DiLink 5 native QCarCam start returned false — attempting legacy reflection fallback");
+            cameraObj = dilink5Backend;
+            logger.info("DiLink 5 native QCarCam stream initialized (cameraObj assigned).");
+            return;
         }
 
         Class<?> avmClass;

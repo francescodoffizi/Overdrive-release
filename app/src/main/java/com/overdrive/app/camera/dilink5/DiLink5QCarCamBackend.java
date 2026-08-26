@@ -39,6 +39,10 @@ public class DiLink5QCarCamBackend {
         return sSupported;
     }
 
+    public static void main(String[] args) {
+        System.out.println("[+] DiLink5QCarCamBackend.isSupported() = " + isSupported());
+    }
+
     public DiLink5QCarCamBackend(int cameraId) {
         this.cameraId = cameraId;
     }

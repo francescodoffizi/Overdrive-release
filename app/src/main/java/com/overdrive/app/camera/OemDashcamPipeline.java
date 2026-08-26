@@ -1486,17 +1486,8 @@ public class OemDashcamPipeline {
 
     private void openCameraAndAttach() throws Exception {
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
-            logger.info("DiLink 5 OEM dashcam using native QCarCam backend on Surface");
-            if (cameraSurface == null && cameraSurfaceTexture != null) {
-                cameraSurface = new Surface(cameraSurfaceTexture);
-            }
-            com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend backend =
-                    new com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend(oemDashcamCameraId);
-            if (backend.startSurface(cameraSurface)) {
-                cameraObj = backend;
-                logger.info("DiLink 5 OEM dashcam active on Surface.");
-                return;
-            }
+            logger.info("DiLink 5 platform: dashcam integrated into primary QCarCam pipeline");
+            return;
         }
 
         Class<?> avmClass;
