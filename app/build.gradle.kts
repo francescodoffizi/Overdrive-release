@@ -221,8 +221,8 @@ android {
         // value (e.g. `-PoverdriveVersionName=27.4 -PoverdriveVersionCode=12`)
         // without a source edit per release; the defaults track the current
         // rolling head so a plain local build is still accurate.
-        versionCode = (project.findProperty("overdriveVersionCode") as? String)?.toIntOrNull() ?: 58
-        versionName = (project.findProperty("overdriveVersionName") as? String) ?: "36.5"
+        versionCode = (project.findProperty("overdriveVersionCode") as? String)?.toIntOrNull() ?: 65
+        versionName = (project.findProperty("overdriveVersionName") as? String) ?: "44.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
         // Note: abiFilters removed - using splits.abi instead for size optimization
@@ -304,8 +304,8 @@ android {
         debug {
             isMinifyEnabled = false
 
-            // Debug builds also check alpha channel for updates
-            buildConfigField("String", "UPDATE_CHANNEL", "\"alpha\"")
+            // Debug builds match the active braveheart channel
+            buildConfigField("String", "UPDATE_CHANNEL", "\"braveheart\"")
         }
         // Braveheart: the rolling/bleeding-edge channel, shipped as a RELEASE build but
         // with diagnostics ON so braveheart customers can upload complete per-daemon
