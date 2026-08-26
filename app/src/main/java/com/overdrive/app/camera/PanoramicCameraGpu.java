@@ -2532,7 +2532,25 @@ public class PanoramicCameraGpu {
             releaseSentryBridgeViewpoint();
         }
 
-        Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
+        // DiLink 5.0 (Snapdragon SA8155P): uses native QCarCam / AIS backend directly
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            logger.info("DiLink 5 platform detected — initializing native QCarCam backend (cameraId=" + cameraId + ")");
+            com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend dilink5Backend =
+                    new com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend(cameraId);
+            if (dilink5Backend.start()) {
+                logger.info("DiLink 5 native QCarCam stream initialized and active.");
+                return;
+            }
+            logger.warn("DiLink 5 native QCarCam start returned false — attempting legacy reflection fallback");
+        }
+
+        Class<?> avmClass;
+        try {
+            avmClass = Class.forName("android.hardware.AVMCamera");
+        } catch (ClassNotFoundException e) {
+            logger.warn("android.hardware.AVMCamera not present on this device (DiLink 5+ architecture)");
+            return;
+        }
 
         // === ATTEMPT 1: Constructor new AVMCamera(int) + .open() ===
         // Required on this firmware. The static factory would return null.
