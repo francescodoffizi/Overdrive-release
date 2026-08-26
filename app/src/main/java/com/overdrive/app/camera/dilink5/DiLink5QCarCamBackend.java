@@ -20,7 +20,11 @@ public class DiLink5QCarCamBackend {
         try {
             System.loadLibrary("surveillance");
         } catch (Throwable t) {
-            logger.warn("Failed to load libsurveillance.so: " + t.getMessage());
+            try {
+                System.load("/data/local/tmp/libsurveillance.so");
+            } catch (Throwable t2) {
+                logger.warn("Failed to load libsurveillance.so: " + t2.getMessage());
+            }
         }
     }
 

@@ -23,7 +23,7 @@
 
 #define SOCKET_NAME "dilink5_cam"
 #define FRAME_WIDTH 1920
-#define FRAME_HEIGHT 1080
+#define FRAME_HEIGHT 1300
 #define MAX_RAW_FRAME_SIZE (FRAME_WIDTH * FRAME_HEIGHT * 2)
 #define MAGIC_HEADER 0x44494C35
 
@@ -44,6 +44,44 @@ ANativeWindow* g_nativeWindow = nullptr;
 std::mutex g_winMutex;
 
 // Convert NV12 to RGBA8888 for Surface posting
+void convert_uyvy_to_rgba(const uint8_t* uyvy, int width, int height, uint32_t* dst_rgba, int dst_stride) {
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* src_row = uyvy + y * width * 2;
+        uint32_t* dst_row = dst_rgba + y * (dst_stride > 0 ? dst_stride : width);
+        for (int x = 0; x < width; x += 2) {
+            uint8_t u  = src_row[0];
+            uint8_t y0 = src_row[1];
+            uint8_t v  = src_row[2];
+            uint8_t y1 = src_row[3];
+            src_row += 4;
+
+            int c0 = (int)y0 - 16;
+            int c1 = (int)y1 - 16;
+            int d = (int)u - 128;
+            int e = (int)v - 128;
+
+            int r0 = (298 * c0 + 409 * e + 128) >> 8;
+            int g0 = (298 * c0 - 100 * d - 208 * e + 128) >> 8;
+            int b0 = (298 * c0 + 516 * d + 128) >> 8;
+
+            int r1 = (298 * c1 + 409 * e + 128) >> 8;
+            int g1 = (298 * c1 - 100 * d - 208 * e + 128) >> 8;
+            int b1 = (298 * c1 + 516 * d + 128) >> 8;
+
+            r0 = r0 < 0 ? 0 : (r0 > 255 ? 255 : r0);
+            g0 = g0 < 0 ? 0 : (g0 > 255 ? 255 : g0);
+            b0 = b0 < 0 ? 0 : (b0 > 255 ? 255 : b0);
+
+            r1 = r1 < 0 ? 0 : (r1 > 255 ? 255 : r1);
+            g1 = g1 < 0 ? 0 : (g1 > 255 ? 255 : g1);
+            b1 = b1 < 0 ? 0 : (b1 > 255 ? 255 : b1);
+
+            dst_row[x]     = (uint32_t)(0xFF000000 | (b0 << 16) | (g0 << 8) | r0);
+            dst_row[x + 1] = (uint32_t)(0xFF000000 | (b1 << 16) | (g1 << 8) | r1);
+        }
+    }
+}
+
 void convert_nv12_to_rgba(const uint8_t* nv12, int width, int height, uint32_t* dst_rgba, int dst_stride) {
     const uint8_t* y_plane = nv12;
     const uint8_t* uv_plane = nv12 + (width * height);
@@ -128,7 +166,11 @@ void* streamClientLoop(void* arg) {
             if (g_nativeWindow) {
                 ANativeWindow_Buffer winBuffer;
                 if (ANativeWindow_lock(g_nativeWindow, &winBuffer, nullptr) == 0) {
-                    convert_nv12_to_rgba(frameBuffer, header.width, header.height, (uint32_t*)winBuffer.bits, winBuffer.stride);
+                    if (header.format == 1) {
+                        convert_uyvy_to_rgba(frameBuffer, header.width, header.height, (uint32_t*)winBuffer.bits, winBuffer.stride);
+                    } else {
+                        convert_nv12_to_rgba(frameBuffer, header.width, header.height, (uint32_t*)winBuffer.bits, winBuffer.stride);
+                    }
                     ANativeWindow_unlockAndPost(g_nativeWindow);
                 }
             }

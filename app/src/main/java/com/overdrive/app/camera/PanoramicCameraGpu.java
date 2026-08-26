@@ -124,7 +124,7 @@ public class PanoramicCameraGpu {
      *  3 = passthrough (dilink4 / dilink5 — HAL emits complete frame natively). */
     public int getCameraLayoutMode() {
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
-            return 3;
+            return 1; // DiLink 5: direct 1:1 single camera passthrough (no 4-way mosaic)
         }
         return USE_OEM_SURFACE_TEXTURE_PATH ? 3 : 0;
     }
@@ -1436,12 +1436,9 @@ public class PanoramicCameraGpu {
             return;
         }
         cameraSurfaceTexture = new SurfaceTexture(cameraTextureId);
-        // oem-parity: do NOT call setDefaultBufferSize. oem's GL pipeline
-        // wraps SurfaceTexture without setting a default size; the BYD HAL
-        // drives the BufferQueue dims for the active previewIndex (mosaic
-        // strip = 5120x960 on Seal/Tang, etc.) and the consumer adapts via
-        // updateTexImage's transform matrix. Forcing dims here can make the
-        // HAL silently scale/crop or stall on byd_apa boards.
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            cameraSurfaceTexture.setDefaultBufferSize(width > 0 ? width : 1920, height > 0 ? height : 1024);
+        }
         cameraSurfaceTexture.setOnFrameAvailableListener(st -> {
             // Cheap signalling — the actual updateTexImage happens on the GL
             // thread inside renderLoop. Ride frameSync so the wait/notify
@@ -3512,16 +3509,18 @@ public class PanoramicCameraGpu {
                         }
                     }
                     int currentId = cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID;
-                    boolean isPanoramic = width >= 5000;
+                    boolean isDilink5 = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
+                    boolean isPanoramic = isDilink5 || (width >= 5000);
                     logger.info("Camera ID " + currentId + " probe: " + 
                         (hasData ? "HAS DATA" : "BLACK") +
                         " | resolution=" + width + "x" + height +
                         " | type=" + (isPanoramic ? "PANORAMIC" : "SINGLE") +
                         " | surfaceMode=" + cameraSurfaceMode);
                     
-                    if (hasData && isPanoramic) {
+                    if (isDilink5 || (hasData && isPanoramic)) {
                         // Track this camera as having real data (for fallback if strip check fails)
                         lastDataCameraId = currentId;
+                        probeComplete = true;
                         
                         // During auto-probe: accept the first camera with non-black panoramic data.
                         // The 5120x960 resolution IS the panoramic strip identifier on BYD — no other

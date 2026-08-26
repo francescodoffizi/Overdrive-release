@@ -4181,12 +4181,10 @@ public class GpuSurveillancePipeline {
             logger.warn("od init failed: " + t.getMessage());
         }
 
-        // Match the recorder's layout choice. oem-parity passthrough (3)
-        // when SurfaceTexture path is active; legacy 4-cam mosaic (0)
-        // otherwise.
+        boolean isDilink5 = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
         boolean streamUsingOemPath =
             (camera != null && camera.isUsingOemSurfaceTexturePath());
-        streamScaler.setCameraLayout(streamUsingOemPath ? 3 : 0);
+        streamScaler.setCameraLayout(isDilink5 ? 1 : (streamUsingOemPath ? 3 : 0));
 
         // Hardcoded Variant A corner+flip constants on DiLink 4. Mirrors
         // GpuMosaicRecorder so live stream and recording stay aligned. On
