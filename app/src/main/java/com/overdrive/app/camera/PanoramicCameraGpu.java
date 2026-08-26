@@ -106,7 +106,7 @@ public class PanoramicCameraGpu {
 
     private static boolean resolveCameraModeFromConfig() {
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
-            return false; // DiLink 5 uses direct native Qualcomm AIS stream
+            return true; // DiLink 5 uses SurfaceTexture / ANativeWindow pipeline
         }
         try {
             org.json.JSONObject cam = com.overdrive.app.config.UnifiedConfigManager

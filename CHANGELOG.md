@@ -21,5 +21,5 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
   - **Backend Driver Java (`DiLink5QCarCamBackend.java`)**: Driver integrato nel ciclo di vita delle telecamere di OverDrive per Dashcam, Sentry e pipeline EGL/MediaCodec.
   - **Coordinatore AIDL TS AVM (`TsAvmCoordinator.java`)**: Gestione e risveglio del sottosistema Surround View 360° senza conflitti tramite `com.ts.avm.AvmAndroidService`.
     - **Profilo Hardware (`CameraProfiles.java`)**: Aggiunto profilo dedicato `dilink5_sealion7` con risoluzione nativa 1920x1300 e auto-rilevamento intelligente.
-    - **Pipeline EGL & Dashcam Sicura (`EGLCore.java`, `OemDashcamPipeline.java`, `PanoramicCameraGpu.java`)**: Aggiunto fallback automatico GLES2 per contesti headless EGL, bypass pipeline mirror su DiLink 5 e aggancio sicuro SurfaceTexture a QCarCam.
-    - **Fix Protezione Downgrade & Versioning (`AppUpdater.java`)**: Soppressione automatica dei falsi popup di aggiornamento quando la versione locale installata è superiore alla release remota.
+    - **Pipeline EGL & Dashcam Sicura (`EGLCore.java`, `OemDashcamPipeline.java`, `PanoramicCameraGpu.java`)**: Aggiunto fallback automatico GLES2 per contesti headless EGL, bypass pipeline mirror su DiLink 5 e aggancio sicuro SurfaceTexture a QCarCam con flusso H.264 verificato su WebSocket porta 8887.
+    - **Verifica Flusso Live (SPS/PPS/IDR)**: Ricezione e decodifica verificata di frame NAL completi `[1, 5, 7, 8]` a 30 FPS dal sidecar nativo Qualcomm SA8155P.
