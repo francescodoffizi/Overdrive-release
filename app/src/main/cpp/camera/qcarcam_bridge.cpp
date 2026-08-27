@@ -39,6 +39,7 @@ struct FrameHeader {
 namespace {
 
 std::atomic<bool> g_streaming{false};
+std::atomic<int> g_active_camera{0};
 pthread_t g_streamThread = 0;
 ANativeWindow* g_nativeWindow = nullptr;
 std::mutex g_winMutex;

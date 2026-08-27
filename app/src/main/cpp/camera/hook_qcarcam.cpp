@@ -30,8 +30,10 @@ static int g_num_windows = 0;
 
 static int g_server_fd = -1;
 static int g_clients[MAX_CLIENTS];
-static int g_client_cam[MAX_CLIENTS]; // active camera index per client (0..3)
+static int g_client_cam[MAX_CLIENTS]; // 0=Front, 1=Right, 2=Rear, 3=Left, 4=Mosaic (2x2)
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint8_t g_mosaic_buf[UYVY_SIZE];
 
 static bool write_all(int fd, const void* buf, size_t count) {
     size_t total = 0;
@@ -44,10 +46,95 @@ static bool write_all(int fd, const void* buf, size_t count) {
     return true;
 }
 
+static void* get_cam_vaddr(int cam_idx, int buf_idx) {
+    if (cam_idx < 0 || cam_idx >= g_num_windows) return NULL;
+    void* win = g_windows[cam_idx];
+    if (!win) return NULL;
+    uint8_t* p_win = (uint8_t*)win;
+    uint8_t* p_desc_base = (uint8_t*)(*(uint64_t*)(p_win + 0x78));
+    if (!p_desc_base) return NULL;
+    uint8_t* desc = p_desc_base + (buf_idx * 56);
+    return *(void**)(desc + 0x10);
+}
+
+// 2x2 grid compositor in UYVY (4 cameras combined into 1920x1300 at 30 FPS)
+static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const uint8_t* cam2, const uint8_t* cam3) {
+    const int W = FRAME_WIDTH;  // 1920
+    const int H = FRAME_HEIGHT; // 1300
+    const int HALF_W = W / 2;   // 960
+    const int HALF_H = H / 2;   // 650
+
+    // Top half: Cam 0 (Front) on Left, Cam 1 (Right) on Right
+    for (int y = 0; y < HALF_H; y++) {
+        const uint8_t* src0 = cam0 ? (cam0 + (y * 2) * W * 2) : NULL;
+        const uint8_t* src1 = cam1 ? (cam1 + (y * 2) * W * 2) : NULL;
+        uint8_t* dst_row = g_mosaic_buf + y * W * 2;
+
+        // Top-Left: Cam 0
+        for (int x = 0; x < HALF_W; x += 2) {
+            if (src0) {
+                int s = (x * 2) * 2;
+                dst_row[x * 2]     = src0[s];
+                dst_row[x * 2 + 1] = src0[s + 1];
+                dst_row[x * 2 + 2] = src0[s + 2];
+                dst_row[x * 2 + 3] = src0[s + 5];
+            } else {
+                memset(dst_row + x * 2, 0, 4);
+            }
+        }
+        // Top-Right: Cam 1
+        uint8_t* dst_right = dst_row + HALF_W * 2;
+        for (int x = 0; x < HALF_W; x += 2) {
+            if (src1) {
+                int s = (x * 2) * 2;
+                dst_right[x * 2]     = src1[s];
+                dst_right[x * 2 + 1] = src1[s + 1];
+                dst_right[x * 2 + 2] = src1[s + 2];
+                dst_right[x * 2 + 3] = src1[s + 5];
+            } else {
+                memset(dst_right + x * 2, 0, 4);
+            }
+        }
+    }
+
+    // Bottom half: Cam 3 (Left) on Left, Cam 2 (Rear) on Right
+    for (int y = 0; y < HALF_H; y++) {
+        const uint8_t* src3 = cam3 ? (cam3 + (y * 2) * W * 2) : NULL;
+        const uint8_t* src2 = cam2 ? (cam2 + (y * 2) * W * 2) : NULL;
+        uint8_t* dst_row = g_mosaic_buf + (y + HALF_H) * W * 2;
+
+        // Bottom-Left: Cam 3
+        for (int x = 0; x < HALF_W; x += 2) {
+            if (src3) {
+                int s = (x * 2) * 2;
+                dst_row[x * 2]     = src3[s];
+                dst_row[x * 2 + 1] = src3[s + 1];
+                dst_row[x * 2 + 2] = src3[s + 2];
+                dst_row[x * 2 + 3] = src3[s + 5];
+            } else {
+                memset(dst_row + x * 2, 0, 4);
+            }
+        }
+        // Bottom-Right: Cam 2
+        uint8_t* dst_right = dst_row + HALF_W * 2;
+        for (int x = 0; x < HALF_W; x += 2) {
+            if (src2) {
+                int s = (x * 2) * 2;
+                dst_right[x * 2]     = src2[s];
+                dst_right[x * 2 + 1] = src2[s + 1];
+                dst_right[x * 2 + 2] = src2[s + 2];
+                dst_right[x * 2 + 3] = src2[s + 5];
+            } else {
+                memset(dst_right + x * 2, 0, 4);
+            }
+        }
+    }
+}
+
 static void* socket_server_thread(void* arg) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         g_clients[i] = -1;
-        g_client_cam[i] = 0; // Default: Front camera
+        g_client_cam[i] = 4; // Default: 2x2 Mosaic
     }
 
     g_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -79,7 +166,7 @@ static void* socket_server_thread(void* arg) {
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (g_clients[i] < 0) {
                     g_clients[i] = client;
-                    g_client_cam[i] = 0; // Default to Camera 0 (Front)
+                    g_client_cam[i] = 4; // Default: 2x2 Mosaic
                     printf("[Hook] Client connected in slot [%d] (fd=%d)\n", i, client);
                     added = true;
                     break;
@@ -136,6 +223,8 @@ extern "C" int clock_gettime(clockid_t clk_id, struct timespec *tp) {
     int buf_idx = s_idx % 5;
 
     pthread_mutex_lock(&g_mutex);
+    bool mosaic_built = false;
+
     for (int i = 0; i < MAX_CLIENTS; i++) {
         int cfd = g_clients[i];
         if (cfd < 0) continue;
@@ -143,36 +232,43 @@ extern "C" int clock_gettime(clockid_t clk_id, struct timespec *tp) {
         // Check if client requested a camera switch (non-blocking command byte)
         uint8_t cmd = 0xFF;
         ssize_t cr = recv(cfd, &cmd, 1, MSG_DONTWAIT);
-        if (cr == 1 && cmd < MAX_CAMERAS) {
+        if (cr == 1 && cmd <= 4) {
             g_client_cam[i] = cmd;
-            printf("[Hook] Client slot [%d] switched to Camera [%u]\n", i, cmd);
+            printf("[Hook] Client slot [%d] switched to Mode [%u] (0=Front, 1=Right, 2=Rear, 3=Left, 4=Mosaic)\n", i, cmd);
         }
 
-        int target_cam = g_client_cam[i];
-        if (target_cam >= g_num_windows) target_cam = 0;
-        void* win = g_windows[target_cam];
+        int target_mode = g_client_cam[i];
+        void* send_payload = NULL;
 
-        if (win) {
-            uint8_t* p_win = (uint8_t*)win;
-            uint8_t* p_desc_base = (uint8_t*)(*(uint64_t*)(p_win + 0x78));
-            if (p_desc_base) {
-                uint8_t* desc = p_desc_base + (buf_idx * 56);
-                void* vaddr = *(void**)(desc + 0x10);
-                if (vaddr) {
-                    FrameHeader header;
-                    header.magic = MAGIC_HEADER;
-                    header.width = FRAME_WIDTH;
-                    header.height = FRAME_HEIGHT;
-                    header.format = 1; // UYVY
-                    header.data_size = UYVY_SIZE;
-                    header.timestamp = 0;
+        if (target_mode == 4) {
+            // 2x2 Mosaic (all 4 cameras)
+            if (!mosaic_built) {
+                const uint8_t* c0 = (const uint8_t*)get_cam_vaddr(0, buf_idx);
+                const uint8_t* c1 = (const uint8_t*)get_cam_vaddr(1, buf_idx);
+                const uint8_t* c2 = (const uint8_t*)get_cam_vaddr(2, buf_idx);
+                const uint8_t* c3 = (const uint8_t*)get_cam_vaddr(3, buf_idx);
+                compose_2x2_mosaic(c0, c1, c2, c3);
+                mosaic_built = true;
+            }
+            send_payload = g_mosaic_buf;
+        } else {
+            // Single camera
+            send_payload = get_cam_vaddr(target_mode, buf_idx);
+        }
 
-                    if (!write_all(cfd, &header, sizeof(header)) ||
-                        !write_all(cfd, vaddr, header.data_size)) {
-                        close(cfd);
-                        g_clients[i] = -1;
-                    }
-                }
+        if (send_payload) {
+            FrameHeader header;
+            header.magic = MAGIC_HEADER;
+            header.width = FRAME_WIDTH;
+            header.height = FRAME_HEIGHT;
+            header.format = 1; // UYVY
+            header.data_size = UYVY_SIZE;
+            header.timestamp = 0;
+
+            if (!write_all(cfd, &header, sizeof(header)) ||
+                !write_all(cfd, send_payload, header.data_size)) {
+                close(cfd);
+                g_clients[i] = -1;
             }
         }
     }

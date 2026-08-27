@@ -7769,6 +7769,15 @@ public class GpuSurveillancePipeline {
      * @param mode 0=Mosaic (2x2 grid), 1=Front, 2=Right, 3=Rear, 4=Left
      */
     public void setStreamViewMode(int mode) {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            int hookMode = 4; // 4 = 2x2 Mosaic
+            if (mode == 0) hookMode = 4;      // Tutte le telecamere
+            else if (mode == 1) hookMode = 0; // Anteriore (Front)
+            else if (mode == 2) hookMode = 1; // Destra (Right)
+            else if (mode == 3) hookMode = 2; // Posteriore (Rear)
+            else if (mode == 4) hookMode = 3; // Sinistra (Left)
+            com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.setActiveCamera(hookMode);
+        }
         if (streamScaler != null) {
             streamScaler.setViewMode(mode);
             logger.info("Stream view mode changed to " + mode);
