@@ -112,6 +112,13 @@ public class TsAvmCoordinator {
         return isBound.get() && avmService != null;
     }
 
+    public static boolean isAvmServiceAlive() {
+        if (sInstance != null) {
+            return sInstance.isConnected();
+        }
+        return false;
+    }
+
     public synchronized void unbind() {
         if (isBound.getAndSet(false)) {
             try {

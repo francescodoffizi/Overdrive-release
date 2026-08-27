@@ -1367,6 +1367,14 @@ public class CameraDaemon {
             log("ClusterViewMirrorService register failed: " + t.getMessage());
         }
 
+        try {
+            if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+                com.overdrive.app.daemon.sentry.DiLink5PowerDiagnostics.start(getAppContext());
+            }
+        } catch (Throwable t) {
+            log("DiLink5PowerDiagnostics start failed: " + t.getMessage());
+        }
+
         log("Daemon ready on TCP:" + TCP_PORT + " HTTP:" + HTTP_PORT);
 
         // Periodic memory monitor — mirrors AccSentryDaemon.logMemoryStatus().
