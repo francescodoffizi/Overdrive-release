@@ -32,10 +32,10 @@
   - Inversione verticale Y in `convert_uyvy_to_rgba` (`qcarcam_bridge.cpp`) per orientamento dritto naturale.
   - Filtro DiLink 4 RedMask disabilitato su DiLink 5 (colori reali, rosso e blu fedeli).
 
-### C. Comportamento a Veicolo Spento (ACC OFF)
-- **Connessione Remota**: Il modem 4G/LTE e il demone OverDrive rimangono svegli e raggiungibili via Cloudflare Tunnel.
-- **Telecamera Anteriore Operativa**: La Camera 0 (Frontale) rimane alimentata sulla linea ADAS anche ad auto spenta.
-- **Telecamere Laterali/Posteriore**: I serializzatori degli specchietti e del paraurti vanno in standby energetico con l'AVM ECU.
+### D. Integrazione Modello Sealion 7 & Rilevamento ACC DiLink 5.0
+- **Modello Sealion 7 Ufficiale**: Aggiunto nel catalogo `manifest.json` dei modelli con Blade Battery LFP da 82.5 kWh nominali.
+- **Rilevamento ACC DiLink 5.0**: Implementato in `AccMonitor.java` tramite polling `sys.accanim.status` e `PowerManager.isInteractive()`.
+- **Installazione su Veicolo**: Build e installazione completate con successo via ADB (`10.0.1.45:5555`).
 
 ---
 
@@ -46,10 +46,12 @@
 4. `app/src/main/java/com/overdrive/app/camera/dilink5/TsAvmCoordinator.java`: Coordinatore AIDL per `com.ts.avm.AvmAndroidService`.
 5. `app/src/main/java/com/overdrive/app/surveillance/GpuSurveillancePipeline.java`: Mappatura layout 1:1, stream scaler e gestione visuali 0..4.
 6. `app/src/main/assets/dilink5/4cam.xml`: File di configurazione 4 canali per Qualcomm QCarCam.
-7. `app/build.gradle.kts` & `CHANGELOG.md`: Versione `50.0` e storico rilasci.
+7. `app/src/main/java/com/overdrive/app/monitor/AccMonitor.java`: Rilevamento stato accensione / standby display su DiLink 5.0.
+8. `app/src/main/assets/web/shared/models/manifest.json`: Catalogo modelli veicoli con Sealion 7.
+9. `app/build.gradle.kts` & `CHANGELOG.md`: Versione `50.0` e storico rilasci.
 
 ---
 
 ## 🚀 4. Prossimi Passi di Sviluppo
-1. **Rilevamento ACC OFF su DiLink 5**: Adattare la lettura dello stato di accensione in `BydDataCollector` / `CarPropertyManager` (per passare da *"ACC: ON / Sorveglianza OFF"* a *"ACC: OFF / Sorveglianza ON (Armata)"* ad auto spenta).
+1. **Telemetria CarPropertyManager / VHAL DiLink 5**: Mappare i registri Android Automotive VHAL per la lettura di porte, finestrini, ricarica e pressione pneumatici.
 2. **Risveglio Centralina 360° (AVM)**: Testare `TsAvmCoordinator.startAvm()` per verificare se è possibile alimentare anche le telecamere laterali/posteriore ad auto spenta.
