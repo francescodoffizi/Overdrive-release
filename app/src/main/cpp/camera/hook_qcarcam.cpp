@@ -13,6 +13,7 @@
 #define FRAME_HEIGHT 1300
 #define UYVY_SIZE (FRAME_WIDTH * FRAME_HEIGHT * 2)
 #define MAGIC_HEADER 0x44494C35
+#define MAX_CLIENTS 8
 
 struct FrameHeader {
     uint32_t magic;
@@ -25,7 +26,7 @@ struct FrameHeader {
 
 static void* g_window = NULL;
 static int g_server_fd = -1;
-static int g_client_fd = -1;
+static int g_clients[MAX_CLIENTS];
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static bool write_all(int fd, const void* buf, size_t count) {
@@ -40,6 +41,8 @@ static bool write_all(int fd, const void* buf, size_t count) {
 }
 
 static void* socket_server_thread(void* arg) {
+    for (int i = 0; i < MAX_CLIENTS; i++) g_clients[i] = -1;
+
     g_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_server_fd < 0) return NULL;
 
@@ -55,19 +58,29 @@ static void* socket_server_thread(void* arg) {
         return NULL;
     }
 
-    if (listen(g_server_fd, 4) < 0) {
+    if (listen(g_server_fd, 8) < 0) {
         close(g_server_fd);
         return NULL;
     }
-    printf("[Hook] Listening for OverDrive connection on @dilink5_cam\n");
+    printf("[Hook] Multi-client server listening on @dilink5_cam (max %d clients)\n", MAX_CLIENTS);
 
     while (1) {
         int client = accept(g_server_fd, NULL, NULL);
         if (client >= 0) {
             pthread_mutex_lock(&g_mutex);
-            if (g_client_fd >= 0) close(g_client_fd);
-            g_client_fd = client;
-            printf("[Hook] OverDrive client connected! Streaming genuine hardware camera frames...\n");
+            bool added = false;
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (g_clients[i] < 0) {
+                    g_clients[i] = client;
+                    printf("[Hook] Client connected in slot [%d] (fd=%d)\n", i, client);
+                    added = true;
+                    break;
+                }
+            }
+            if (!added) {
+                printf("[Hook] Max clients reached, dropping fd=%d\n", client);
+                close(client);
+            }
             pthread_mutex_unlock(&g_mutex);
         }
     }
@@ -76,7 +89,7 @@ static void* socket_server_thread(void* arg) {
 
 __attribute__((constructor))
 void hook_init() {
-    printf("[Hook] libhook_qcarcam.so initialized with direct DMA memory descriptor offsets!\n");
+    printf("[Hook] libhook_qcarcam.so multi-client initialized!\n");
     pthread_t th;
     pthread_create(&th, NULL, socket_server_thread, NULL);
     pthread_detach(th);
@@ -106,11 +119,7 @@ extern "C" int clock_gettime(clockid_t clk_id, struct timespec *tp) {
     }
     int res = real_clock_gettime ? real_clock_gettime(clk_id, tp) : -1;
 
-    pthread_mutex_lock(&g_mutex);
-    int client = g_client_fd;
-    pthread_mutex_unlock(&g_mutex);
-
-    if (g_window && client >= 0) {
+    if (g_window) {
         uint8_t* p_win = (uint8_t*)g_window;
         uint8_t* p_desc_base = (uint8_t*)(*(uint64_t*)(p_win + 0x78));
         if (p_desc_base) {
@@ -128,15 +137,18 @@ extern "C" int clock_gettime(clockid_t clk_id, struct timespec *tp) {
                 header.data_size = UYVY_SIZE;
                 header.timestamp = 0;
 
-                if (!write_all(client, &header, sizeof(header)) ||
-                    !write_all(client, vaddr, header.data_size)) {
-                    pthread_mutex_lock(&g_mutex);
-                    if (g_client_fd == client) {
-                        close(g_client_fd);
-                        g_client_fd = -1;
+                pthread_mutex_lock(&g_mutex);
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    int cfd = g_clients[i];
+                    if (cfd >= 0) {
+                        if (!write_all(cfd, &header, sizeof(header)) ||
+                            !write_all(cfd, vaddr, header.data_size)) {
+                            close(cfd);
+                            g_clients[i] = -1;
+                        }
                     }
-                    pthread_mutex_unlock(&g_mutex);
                 }
+                pthread_mutex_unlock(&g_mutex);
             }
         }
     }

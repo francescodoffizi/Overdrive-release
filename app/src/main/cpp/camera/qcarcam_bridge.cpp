@@ -43,11 +43,13 @@ pthread_t g_streamThread = 0;
 ANativeWindow* g_nativeWindow = nullptr;
 std::mutex g_winMutex;
 
-// Convert NV12 to RGBA8888 for Surface posting
+// Convert UYVY to RGBA8888 for Surface posting (vertical flip for upright orientation)
 void convert_uyvy_to_rgba(const uint8_t* uyvy, int width, int height, uint32_t* dst_rgba, int dst_stride) {
+    int stride = (dst_stride > 0 ? dst_stride : width);
     for (int y = 0; y < height; ++y) {
-        const uint8_t* src_row = uyvy + y * width * 2;
-        uint32_t* dst_row = dst_rgba + y * (dst_stride > 0 ? dst_stride : width);
+        // Flip vertically: map y to (height - 1 - y)
+        const uint8_t* src_row = uyvy + (height - 1 - y) * width * 2;
+        uint32_t* dst_row = dst_rgba + y * stride;
         for (int x = 0; x < width; x += 2) {
             uint8_t u  = src_row[0];
             uint8_t y0 = src_row[1];
@@ -83,14 +85,16 @@ void convert_uyvy_to_rgba(const uint8_t* uyvy, int width, int height, uint32_t* 
 }
 
 void convert_nv12_to_rgba(const uint8_t* nv12, int width, int height, uint32_t* dst_rgba, int dst_stride) {
+    int stride = (dst_stride > 0 ? dst_stride : width);
     const uint8_t* y_plane = nv12;
     const uint8_t* uv_plane = nv12 + (width * height);
 
     for (int y = 0; y < height; y++) {
-        uint32_t* row = dst_rgba + y * dst_stride;
+        int src_y = height - 1 - y;
+        uint32_t* row = dst_rgba + y * stride;
         for (int x = 0; x < width; x++) {
-            int y_val = y_plane[y * width + x];
-            int uv_idx = (y / 2) * width + (x & ~1);
+            int y_val = y_plane[src_y * width + x];
+            int uv_idx = (src_y / 2) * width + (x & ~1);
             float u = (float)uv_plane[uv_idx] - 128.0f;
             float v = (float)uv_plane[uv_idx + 1] - 128.0f;
 
@@ -152,8 +156,31 @@ void* streamClientLoop(void* arg) {
                 break;
             }
 
-            if (header.magic != MAGIC_HEADER || header.data_size > MAX_RAW_FRAME_SIZE) {
-                LOGE("Invalid frame magic: 0x%08X", header.magic);
+            if (header.magic != MAGIC_HEADER) {
+                // Resynchronization: byte-scan until MAGIC_HEADER is found
+                uint32_t magic_window = header.magic;
+                bool synced = false;
+                while (g_streaming.load()) {
+                    uint8_t next_b = 0;
+                    if (recv(sock, &next_b, 1, 0) <= 0) break;
+                    magic_window = (magic_window >> 8) | ((uint32_t)next_b << 24);
+                    if (magic_window == MAGIC_HEADER) {
+                        // Read rest of header
+                        if (read_all(sock, ((uint8_t*)&header) + 4, sizeof(header) - 4) == (ssize_t)(sizeof(header) - 4)) {
+                            header.magic = MAGIC_HEADER;
+                            synced = true;
+                        }
+                        break;
+                    }
+                }
+                if (!synced) {
+                    LOGW("Sidecar resync failed / socket closed");
+                    break;
+                }
+            }
+
+            if (header.data_size > MAX_RAW_FRAME_SIZE) {
+                LOGE("Invalid frame data size: %u", header.data_size);
                 break;
             }
 

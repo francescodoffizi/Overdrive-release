@@ -4169,17 +4169,17 @@ public class GpuSurveillancePipeline {
         streamScaler = new com.overdrive.app.streaming.GpuStreamScaler(
             streamWidth, streamHeight, streamQuadrantStripOffsetX);
 
-        try {
-            android.content.Context odCtx = savedContext;
-            if (odCtx == null) odCtx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
-            if (odCtx != null) {
-                com.overdrive.app.od.Od.authorize(odCtx);
-            } else {
-                logger.error("od authorize skipped: no context available");
+            try {
+                android.content.Context odCtx = savedContext;
+                if (odCtx == null) odCtx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+                if (odCtx != null) {
+                    com.overdrive.app.od.Od.authorize(odCtx);
+                } else {
+                    logger.error("od authorize skipped: no context available");
+                }
+            } catch (Throwable t) {
+                logger.warn("od init failed: " + t.getMessage());
             }
-        } catch (Throwable t) {
-            logger.warn("od init failed: " + t.getMessage());
-        }
 
         boolean isDilink5 = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
         boolean streamUsingOemPath =
@@ -4189,7 +4189,7 @@ public class GpuSurveillancePipeline {
         // Hardcoded Variant A corner+flip constants on DiLink 4. Mirrors
         // GpuMosaicRecorder so live stream and recording stay aligned. On
         // legacy cars the uniforms are unused (uApaMode != 3 path).
-        if (streamUsingOemPath) {
+        if (streamUsingOemPath && !isDilink5) {
             // Single combined call referencing the shared Dilink4Constants
             // so the stream scaler can never silently diverge from the
             // recorder's mosaic arrangement.
@@ -4216,6 +4216,8 @@ public class GpuSurveillancePipeline {
             } catch (Throwable t) {
                 logger.warn("Stream scaler red-mask flag read failed: " + t.getMessage());
             }
+        } else if (isDilink5) {
+            streamScaler.setRedMaskEnabled(false);
         }
         
         // Initialize on GL thread and WAIT for completion.
