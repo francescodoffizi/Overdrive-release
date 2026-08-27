@@ -2876,12 +2876,17 @@ object UnifiedConfigManager {
     @JvmStatic
     fun resolveOemDashcamId(): Int {
         val camera = loadConfig().optJSONObject("camera") ?: return -1
-        if (camera.optBoolean("oemDashcamManualOverride", false)) {
-            return camera.optInt("oemDashcamCameraId", -1)
+        val mode = camera.optString("cameraMode", "")
+        if (mode.contains("dilink5", ignoreCase = true) || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            val oemEnabled = getOemDashcam().optBoolean("enabled", false)
+            if (!oemEnabled) {
+                return -1
+            }
         }
-        val configuredOemId = camera.optInt("oemDashcamCameraId", -1)
-        if (configuredOemId >= 0) {
-            return configuredOemId
+        if (camera.optBoolean("oemDashcamManualOverride", false)) {
+            val id = camera.optInt("oemDashcamCameraId", -1)
+            val oemEnabled = getOemDashcam().optBoolean("enabled", false)
+            return if (oemEnabled && id >= 0) id else -1
         }
         return -1
     }
