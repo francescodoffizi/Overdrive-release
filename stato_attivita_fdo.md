@@ -33,8 +33,10 @@
   - Filtro DiLink 4 RedMask disabilitato su DiLink 5 (colori reali, rosso e blu fedeli).
 
 ### D. Integrazione Modello Sealion 7, ACC & Telemetria DiLink 5.0
-- **Modello Sealion 7 Ufficiale**: Aggiunto nel catalogo `manifest.json` dei modelli con Blade Battery LFP da 82.5 kWh nominali.
-- **Rilevamento ACC DiLink 5.0**: Implementato in `AccMonitor.java` tramite polling `sys.accanim.status` e `PowerManager.isInteractive()`.
+- **Modello Sealion 7 Ufficiale**: Aggiunto nel catalogo `manifest.json` dei modelli con Blade Battery LFP da 82.5 kWh nominali e agganciato al modello 3D fastback.
+- **Rilevamento ACC DiLink 5.0**: Implementato in `AccMonitor.java` tramite polling `sys.accanim.status`, stato blocco portiere e `PowerManager.isInteractive()`.
+- **Risoluzione Stato di Ricarica**: `BydDataCollector` promuove `chargingState` a `CHARGING (1)` quando il cloud conferma la ricarica con cavo inserito anche se l'hardware DiLink 5 restituisce `0 (READY)`.
+- **Gating Hotspot DVR Telecamere**: Disabilitato automaticamente su DiLink 5.0 per non mostrare hotspot DVR su veicoli europei privi di dashcam OEM.
 - **Telemetria & VHAL DiLink 5.0 Live**:
   - `CarPropertyBridge`: Supporto fallback binder diretto via `ServiceManager` (`car_service`).
   - `BydDataCollector`: Gestito `0.0` unpopulated su `StatisticDevice` permettendo il merge di SOC reale, autonomia e stato di ricarica.
