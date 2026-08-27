@@ -4110,7 +4110,15 @@ BYD.surveillance = {
         fetch('/api/surveillance/screen-deterrent/test', { method: 'POST' })
             .then(function(res) {
                 if (!res.ok) throw new Error('HTTP ' + res.status);
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Deterrent triggered', 'success');
+                return res.json();
+            })
+            .then(function(data) {
+                if (!BYD.utils || !BYD.utils.toast) return;
+                if (data && data.success) {
+                    BYD.utils.toast('Deterrent triggered', 'success');
+                } else {
+                    BYD.utils.toast((data && data.error) || 'Failed to trigger deterrent', 'error');
+                }
             })
             .catch(function(err) {
                 console.error('[deterrent] test failed:', err);

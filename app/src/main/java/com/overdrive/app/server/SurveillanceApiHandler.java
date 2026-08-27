@@ -110,6 +110,13 @@ public class SurveillanceApiHandler {
                         "Deterrent test blocked while ACC is on / vehicle in use");
                     return true;
                 }
+                boolean enabled = com.overdrive.app.config.UnifiedConfigManager.getSurveillance()
+                        .optBoolean("screenDeterrentEnabled", false);
+                if (!enabled) {
+                    HttpResponse.sendJsonError(out,
+                        "Screen deterrent is off — enable \"Display warning on motion\" first");
+                    return true;
+                }
                 com.overdrive.app.surveillance.ScreenDeterrent.getInstance().onMotionDetected();
                 HttpResponse.sendJsonSuccess(out);
             } catch (Exception e) {
