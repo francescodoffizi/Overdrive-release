@@ -2804,11 +2804,14 @@ public class BydDataCollector {
                 ? built.gearMode
                 : com.overdrive.app.monitor.GearMonitor.GEAR_P;
         }
+        int effectiveBmsState = (built.chargingState == 1) ? 1 : observed.observedBmsState;
+        boolean effectiveBmsObserved = bmsObserved || (built.chargingState == 1);
+        boolean effectiveConnectionObserved = connectionObserved || (built.chargingGunState >= 2);
         com.overdrive.app.monitor.ChargingDetector.getInstance()
             .updatePollObservation(
                 built, gearNow, com.overdrive.app.monitor.GearMonitor.GEAR_P,
-                connectionObserved, typeObserved,
-                bmsObserved, observed.observedBmsState,
+                effectiveConnectionObserved, typeObserved,
+                effectiveBmsObserved, effectiveBmsState,
                 powerObserved, observed.powerIsCharging);
 
         // Feed the ring-buffer power estimator (FALLBACK power source for models
@@ -8990,16 +8993,26 @@ public class BydDataCollector {
             if (b.fuelRangeKm == BydVehicleData.UNAVAILABLE && cs.hasFuelRange()) b.fuelRangeKm(cs.fuelRangeKm);
             if (Double.isNaN(b.fuelPercent) && cs.hasFuelPercent()) b.fuelPercent(cs.fuelPercent);
 
-            // Charging state — only if SDK returned UNAVAILABLE
-            if (b.chargingState == BydVehicleData.UNAVAILABLE && cs.hasChargingState()) {
+            // Charging state — if SDK returned UNAVAILABLE, or if hardware returned READY(0)
+            // but cloud confirms active CHARGING(1) while plugged in
+            if (cs.hasChargingState()) {
                 int sdkState = cs.getChargingStateAsSdk();
-                if (sdkState >= 0) b.chargingState(sdkState);
+                if (sdkState >= 0) {
+                    if (b.chargingState == BydVehicleData.UNAVAILABLE) {
+                        b.chargingState(sdkState);
+                    } else if (b.chargingState == 0 && sdkState == 1 && (b.chargingGunState >= 2 || cs.chargingState == 1)) {
+                        b.chargingState(1);
+                        if (b.chargingGunState < 2) {
+                            b.chargingGunState(2);
+                        }
+                    }
+                }
             }
 
             // Charge ETA — only if SDK has nothing
-            if (b.chargingRestTimeHours == BydVehicleData.UNAVAILABLE && cs.hasRemainingHours())
+            if ((b.chargingRestTimeHours == BydVehicleData.UNAVAILABLE || b.chargingRestTimeHours == 0) && cs.hasRemainingHours())
                 b.chargingRestTimeHours(cs.remainingHours);
-            if (b.chargingRestTimeMinutes == BydVehicleData.UNAVAILABLE && cs.hasRemainingMinutes())
+            if ((b.chargingRestTimeMinutes == BydVehicleData.UNAVAILABLE || b.chargingRestTimeMinutes == 0) && cs.hasRemainingMinutes())
                 b.chargingRestTimeMinutes(cs.remainingMinutes);
 
             // Temperatures — cabin cloud data may replace a carried-forward HAL value when this

@@ -4,12 +4,17 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
-### Aggiunte (Added)
+### Aggiunte e Correzioni (Added & Fixed)
+- **Rilevamento Stato di Ricarica (Charging Status)**:
+  - `BydDataCollector`: Se il cloud conferma lo stato di ricarica attiva (`cs.getChargingStateAsSdk() == 1`) con cavo collegato (`gunState >= 2`), promuove `b.chargingState` a `CHARGING (1)` e notifica `ChargingDetector` anche se l'hardware DiLink 5 locale restituisce `READY(0)` o `UNAVAILABLE`.
+  - Popolato il tempo stimato residuo (`chargingRestTimeHours` / `chargingRestTimeMinutes`) dal cloud snapshot quando non fornito dall'hardware.
+  - Corretta la localizzazione italiana in `it.json`: `"state_plugged": "Collegato"` (anziché la traduzione letterale `"Collegato in"`).
+- **Gating Hotspot DVR Telecamere**:
+  - `UnifiedConfigManager.resolveOemDashcamId()`: Eliminata l'assegnazione automatica di un canale DVR (`0/1`) quando il veicolo non ha una dashcam OEM installata/configurata (tipico dei veicoli per il mercato europeo), evitando la comparsa ingannevole dell'hotspot DVR sul selettore telecamere.
+- **Rilevamento ACC OFF & Armamento Sentinella su DiLink 5.0**:
+  - `AccMonitor`: Integrato il controllo dello stato di blocco porte (veicolo chiuso/bloccato) e display spento su DiLink 5.0 per determinare in modo affidabile lo stato di veicolo parcheggiato e consentire l'armamento della Sentinella.
 - **Modello Veicolo `sealion7` (BYD Sealion 7)**:
   - Aggiunto `sealion7` nel catalogo `manifest.json` dei modelli 3D con batteria LFP Blade da 82.5 kWh nominali.
-- **Rilevamento ACC OFF su DiLink 5.0 (Android 11 Automotive / SA8155P)**:
-  - Adattato `AccMonitor.java` per interrogare `sys.accanim.status` e `PowerManager.isInteractive()` su DiLink 5.0 quando le classi legacy `BYDAutoBodyworkDevice` non sono disponibili.
-  - Armamento automatico della Sentinella (Sentry Mode) ad auto spenta / schermo spento, mantenendo la totale retrocompatibilità con DiLink 3.0 e 4.0.
 - **Integrazione Telemetria & VHAL DiLink 5.0**:
   - `CarPropertyBridge`: Aggiunta risoluzione diretta binder tramite `ServiceManager` per interrogare i servizi VHAL Android Automotive nativi (`car_service`).
   - `BydDataCollector`: Gestito il valore grezzo `0.0` di `StatisticDevice` come non popolato per permettere il fallback tempestivo su cloud/VHAL.

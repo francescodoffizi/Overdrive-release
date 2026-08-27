@@ -318,20 +318,42 @@ public class AccMonitor {
                     return !isAccOn;
                 }
 
+                // Check vehicle data and lock state for DiLink 5.0
+                com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+                if (collector != null) {
+                    com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                    if (vd != null) {
+                        boolean isLocked = false;
+                        if (vd.doorLockStatus != null && vd.doorLockStatus.length > 0) {
+                            // In BYD doorLockStatus: 1 = LOCKED
+                            isLocked = (vd.doorLockStatus[0] == 1);
+                        }
+                        if (isLocked) {
+                            accOn = false;
+                            inSentryMode = true;
+                            lastProbeTrustworthy = true;
+                            accOnAuthoritative = true;
+                            notifyAccEdge(false);
+                            CameraDaemon.log("AccMonitor [DiLink5]: Vehicle locked -> accOn=false, sentryMode=true");
+                            return true;
+                        }
+                    }
+                }
+
                 // Fallback: check Display/Interactive power state on DiLink 5
                 if (context != null) {
                     android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(android.content.Context.POWER_SERVICE);
                     if (pm != null) {
                         boolean isScreenOn = pm.isInteractive();
-                        // If the head unit screen/display is completely off and vehicle in Park, assume ACC OFF (Sentry Arm)
-                        boolean isAccOn = isScreenOn;
-                        accOn = isAccOn;
-                        inSentryMode = !isAccOn;
-                        lastProbeTrustworthy = true;
-                        accOnAuthoritative = true;
-                        notifyAccEdge(isAccOn);
-                        CameraDaemon.log("AccMonitor [DiLink5]: PowerManager isInteractive=" + isScreenOn + " -> accOn=" + isAccOn + ", sentryMode=" + inSentryMode);
-                        return !isAccOn;
+                        if (!isScreenOn) {
+                            accOn = false;
+                            inSentryMode = true;
+                            lastProbeTrustworthy = true;
+                            accOnAuthoritative = true;
+                            notifyAccEdge(false);
+                            CameraDaemon.log("AccMonitor [DiLink5]: Display off -> accOn=false, sentryMode=true");
+                            return true;
+                        }
                     }
                 }
             } catch (Throwable t) {

@@ -2875,20 +2875,15 @@ object UnifiedConfigManager {
      */
     @JvmStatic
     fun resolveOemDashcamId(): Int {
-        val camera = loadConfig().optJSONObject("camera") ?: return 0
+        val camera = loadConfig().optJSONObject("camera") ?: return -1
         if (camera.optBoolean("oemDashcamManualOverride", false)) {
             return camera.optInt("oemDashcamCameraId", -1)
         }
-        val panoId = if (camera.optBoolean("manualOverride", false)) {
-            camera.optInt("manualCameraId", -1)
-        } else {
-            camera.optInt("probedCameraId", -1)
+        val configuredOemId = camera.optInt("oemDashcamCameraId", -1)
+        if (configuredOemId >= 0) {
+            return configuredOemId
         }
-        return when (panoId) {
-            0 -> 1                  // Tang-style: pano=0 → OEM=1
-            1 -> 0                  // Seal/Han: pano=1 → OEM=0
-            else -> 0               // Default symmetric to pano's id=1 default
-        }
+        return -1
     }
     
     /**
