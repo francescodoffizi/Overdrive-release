@@ -369,11 +369,26 @@ public final class ScreenDeterrent {
         final int dispW = size.x;
         final int dispH = size.y;
 
+        String imagePath = getImagePath();
+
+        // Video owns its own SurfaceControl layer, so none of the Bitmap/lockCanvas
+        // plumbing below applies. On failure we fall through to the default screen
+        // rather than a poster frame: MediaMetadataRetriever can hang indefinitely
+        // on a malformed mp4, and this thread owns the full-screen layer.
+        if (imagePath != null && !imagePath.isEmpty()
+                && ScreenDeterrentVideo.isMp4File(imagePath)) {
+            if (ScreenDeterrentVideo.play(imagePath, dispW, dispH,
+                    this::shouldStop, this::maybeReassertWake)) {
+                return;
+            }
+            logger.warn("Deterrent video playback failed — falling back to default screen");
+            imagePath = "";
+        }
+
         Object surface = null;
         Bitmap staticFrame = null;
         Movie movie = null;
         try {
-            String imagePath = getImagePath();
             boolean isGif = imagePath != null && !imagePath.isEmpty()
                     && isGifFile(imagePath);
 
