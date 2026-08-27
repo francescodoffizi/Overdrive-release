@@ -2,9 +2,14 @@
 
 Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e versionati in corrispondenza delle release ufficiali o dei Version Bump.
 
-## [Unreleased]
+## [50.0] - 2026-08-27
 
 ### Aggiunte (Added)
+- **Supporto Completo BYD DiLink 5.0 (Snapdragon SA8155P / Sealion 7)**:
+  - **Driver 4-Telecamere Hardware AIS/QCarCam**: Inizializzazione contemporanea dei 4 canali fisici (Anteriore, Destra, Posteriore, Sinistra) a risoluzione 1920x1300 @ 30 FPS.
+  - **Compositore Griglia 2x2 Nativo C++**: Vista "Tutte le telecamere" con griglia 2x2 fluida e senza artefatti di slicing.
+  - **Commutazione Istantanea Telecamere Hardware**: Selezione diretta dal diagramma dell'auto tra Anteriore, Destra, Posteriore e Sinistra con orientamento verticale naturale corretto.
+  - **Architettura Multi-Client Socket (`hook_qcarcam.cpp`)**: Supporto fino a 8 client concorrenti con sincronizzazione a byte stream senza collisioni.
 - **Nuovo modulo autonomo `dilink-probe` (DiLink 5 Camera Dumper & Diagnostic Probe)**:
   - App APK standalone per raccogliere informazioni hardware, kernel, HAL e APK su infotainment BYD DiLink 5.0 (Sealion 7 / Snapdragon 8155).
   - Dump automatico di proprietà di sistema (`getprop`), `dumpsys` (`media.camera`, `evs`, `ServiceManager`), e HAL (`lshal`, EVS 1.0/1.1, QCarCam).
