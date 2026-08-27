@@ -342,11 +342,13 @@ public class SurveillanceApiHandler {
 
     /**
      * Null if the staged MP4 is playable here, else a user-facing rejection message.
+     * Uses {@link com.overdrive.app.surveillance.ScreenDeterrentVideo#probe} — the
+     * same MediaExtractor path {@code play()} uses — instead of MediaMetadataRetriever,
+     * which can misreport "no video track" on a moov-at-end MP4 that plays fine.
      *
-     * <p>Runs on a throwaway daemon thread with a hard budget: MediaMetadataRetriever
-     * is JNI and can hang forever on a truncated moov, and Thread.interrupt() cannot
-     * abort a native call. Timing out leaks one thread rather than wedging the HTTP
-     * worker — same trade as SurveillanceEngineGpu.writeFallbackHeroWithTimeout.
+     * <p>Runs on a throwaway daemon thread with a hard budget: MediaExtractor is JNI
+     * and can hang on a truncated file, and Thread.interrupt() cannot abort a native
+     * call. Timing out leaks one thread rather than wedging the HTTP worker.
      */
     private static String validateDeterrentVideo(java.io.File file) {
         final String[] result = { "Could not read the video" };
@@ -354,51 +356,43 @@ public class SurveillanceApiHandler {
         final Object done = new Object();
 
         Thread worker = new Thread(() -> {
-            android.media.MediaMetadataRetriever mmr = null;
             try {
-                mmr = new android.media.MediaMetadataRetriever();
-                mmr.setDataSource(file.getAbsolutePath());
-
-                String hasVideo = mmr.extractMetadata(
-                        android.media.MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO);
-                if (!"yes".equalsIgnoreCase(hasVideo)) {
+                com.overdrive.app.surveillance.ScreenDeterrentVideo.Probe probe =
+                        com.overdrive.app.surveillance.ScreenDeterrentVideo.probe(
+                                file.getAbsolutePath());
+                if (probe == null) {
                     result[0] = "That MP4 has no video track";
                     return;
                 }
 
-                long durationMs = parseLongOr(mmr.extractMetadata(
-                        android.media.MediaMetadataRetriever.METADATA_KEY_DURATION), -1);
-                if (durationMs <= 0) {
+                if (probe.durationUs <= 0) {
                     result[0] = "Could not read the video duration";
                     return;
                 }
+                long durationMs = probe.durationUs / 1000;
                 if (durationMs > SCREEN_DETERRENT_MAX_VIDEO_MS) {
                     result[0] = "Video too long (" + (durationMs / 1000)
                             + "s, max 10s) — it loops, so keep it short";
                     return;
                 }
 
-                int w = (int) parseLongOr(mmr.extractMetadata(
-                        android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH), 0);
-                int h = (int) parseLongOr(mmr.extractMetadata(
-                        android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT), 0);
-                if (w <= 0 || h <= 0) {
+                if (probe.width <= 0 || probe.height <= 0) {
                     result[0] = "Could not read the video resolution";
                     return;
                 }
                 // Orientation-agnostic — the panel rotates on some models.
-                int major = Math.max(w, h);
-                int minor = Math.min(w, h);
+                int major = Math.max(probe.width, probe.height);
+                int minor = Math.min(probe.width, probe.height);
                 if (major > SCREEN_DETERRENT_MAX_VIDEO_DIM
                         || minor > SCREEN_DETERRENT_MAX_VIDEO_MINOR_DIM) {
-                    result[0] = "Video too large (" + w + "x" + h + ", max 1920x1080)";
+                    result[0] = "Video too large (" + probe.width + "x" + probe.height
+                            + ", max 1920x1080)";
                     return;
                 }
 
-                String mime = deterrentVideoMime(file);
-                if (mime != null
-                        && !com.overdrive.app.surveillance.ScreenDeterrentVideo.hasDecoderFor(mime)) {
-                    result[0] = "This head unit has no decoder for " + mime
+                if (!com.overdrive.app.surveillance.ScreenDeterrentVideo
+                        .hasDecoderFor(probe.mime)) {
+                    result[0] = "This head unit has no decoder for " + probe.mime
                             + " — re-encode as H.264 / AVC";
                     return;
                 }
@@ -407,9 +401,6 @@ public class SurveillanceApiHandler {
             } catch (Throwable t) {
                 result[0] = "Not a readable MP4 (" + t.getMessage() + ")";
             } finally {
-                if (mmr != null) {
-                    try { mmr.release(); } catch (Throwable ignored) {}
-                }
                 synchronized (done) {
                     finished[0] = true;
                     done.notifyAll();
@@ -440,35 +431,6 @@ public class SurveillanceApiHandler {
         return result[0];
     }
 
-    /** Video-track MIME of an MP4, or null if it can't be determined. */
-    private static String deterrentVideoMime(java.io.File file) {
-        android.media.MediaExtractor extractor = null;
-        try {
-            extractor = new android.media.MediaExtractor();
-            extractor.setDataSource(file.getAbsolutePath());
-            for (int i = 0; i < extractor.getTrackCount(); i++) {
-                String mime = extractor.getTrackFormat(i)
-                        .getString(android.media.MediaFormat.KEY_MIME);
-                if (mime != null && mime.startsWith("video/")) return mime;
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            if (extractor != null) {
-                try { extractor.release(); } catch (Throwable ignored) {}
-            }
-        }
-        return null;
-    }
-
-    private static long parseLongOr(String value, long fallback) {
-        if (value == null) return fallback;
-        try {
-            return Long.parseLong(value.trim());
-        } catch (NumberFormatException e) {
-            return fallback;
-        }
-    }
-    
     private static void sendConfig(OutputStream out) throws Exception {
         GpuSurveillancePipeline gpuPipeline = CameraDaemon.getGpuPipeline();
         

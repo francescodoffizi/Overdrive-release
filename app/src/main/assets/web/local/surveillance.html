@@ -794,14 +794,15 @@
                                 <div style="flex:1; height:1px; background:var(--card-border);"></div>
                             </div>
 
-                            <!-- Image option -->
+                            <!-- Image option. Upload/Remove share the theme cards' flex-wrap
+                                 row so a wide panel keeps everything on one line. -->
                             <div class="setting-row" style="border-bottom:none; padding:6px 0;">
                                 <div class="setting-info">
                                     <div class="setting-name" data-i18n="surveillance.screen_deterrent_image">Custom image, GIF or video</div>
                                     <div class="setting-desc" data-i18n="surveillance.screen_deterrent_image_desc">PNG / JPG / WebP / GIF up to 8 MB, or an MP4 clip up to 10 s, 1080p and 10 MB. Video loops for as long as the warning is up. Replaces the entire screen; audio is not played.</div>
                                     <div class="setting-desc" style="margin-top: 12px; color: var(--text-primary);">
                                         <div style="font-weight:600; margin-bottom:8px;" data-i18n="surveillance.themes_title">Themes by Giovanni Mirulla</div>
-                                        <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                                        <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start;">
                                             <!-- Theme 1 -->
                                             <div style="border:1px solid var(--card-border); border-radius:8px; padding:8px; background:var(--bg-base); width: 140px; text-align: center;">
                                                 <div style="font-size:12px; font-weight:600; margin-bottom:8px;">Sentry 1</div>
@@ -816,19 +817,17 @@
                                                     <span data-i18n="surveillance.download_set">Download &amp; Set</span>
                                                 </button>
                                             </div>
+                                            <input type="file" id="screenDeterrentFile" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4" style="display:none;" onchange="SurvSettings.uploadScreenDeterrentImage(this.files[0])">
+                                            <button type="button" class="btn btn-secondary" onclick="document.getElementById('screenDeterrentFile').click()" id="screenDeterrentUploadBtn">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                                                <span id="screenDeterrentUploadLabel" data-i18n="surveillance.screen_deterrent_upload">Upload</span>
+                                            </button>
+                                            <button type="button" class="btn btn-secondary" id="screenDeterrentClearBtn" onclick="SurvSettings.clearScreenDeterrentImage()" style="display:none; color:var(--danger); border-color:var(--danger);">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                                                <span data-i18n="surveillance.screen_deterrent_remove">Remove asset</span>
+                                            </button>
                                         </div>
                                     </div>
-                                </div>
-                                <div class="setting-control">
-                                    <input type="file" id="screenDeterrentFile" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4" style="display:none;" onchange="SurvSettings.uploadScreenDeterrentImage(this.files[0])">
-                                    <button type="button" class="btn btn-secondary" onclick="document.getElementById('screenDeterrentFile').click()" id="screenDeterrentUploadBtn">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                                        <span id="screenDeterrentUploadLabel" data-i18n="surveillance.screen_deterrent_upload">Upload</span>
-                                    </button>
-                                    <button type="button" class="btn btn-secondary" id="screenDeterrentClearBtn" onclick="SurvSettings.clearScreenDeterrentImage()" style="display:none; margin-left:8px; color:var(--danger); border-color:var(--danger);">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
-                                        <span data-i18n="surveillance.screen_deterrent_remove">Remove asset</span>
-                                    </button>
                                 </div>
                             </div>
 

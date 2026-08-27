@@ -59,6 +59,49 @@ public final class ScreenDeterrentVideo {
         }
     }
 
+    /** Video track's mime/dimensions/duration, as MediaExtractor sees it. */
+    public static final class Probe {
+        public final String mime;
+        public final int width;
+        public final int height;
+        public final long durationUs;
+
+        Probe(String mime, int width, int height, long durationUs) {
+            this.mime = mime;
+            this.width = width;
+            this.height = height;
+            this.durationUs = durationUs;
+        }
+    }
+
+    /**
+     * Reads the video track's format without decoding — same demux path {@link #play}
+     * uses, so the upload validator accepts a clip exactly when it will later play.
+     *
+     * @return null if the file has no readable video track.
+     */
+    public static Probe probe(String path) {
+        MediaExtractor extractor = null;
+        try {
+            extractor = new MediaExtractor();
+            extractor.setDataSource(path);
+            int track = selectVideoTrack(extractor);
+            if (track < 0) return null;
+            MediaFormat format = extractor.getTrackFormat(track);
+            String mime = format.getString(MediaFormat.KEY_MIME);
+            if (mime == null) return null;
+            return new Probe(mime, displayWidth(format), displayHeight(format),
+                             trackDurationUs(format));
+        } catch (Throwable t) {
+            logger.debug("Deterrent video probe failed: " + t.getMessage());
+            return null;
+        } finally {
+            if (extractor != null) {
+                try { extractor.release(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
     /**
      * Play {@code path} full-screen on loop until {@code stop} fires.
      *
@@ -292,6 +335,17 @@ public final class ScreenDeterrentVideo {
             // Some extractors store KEY_FRAME_RATE as a float.
         }
         return DEFAULT_FRAME_GAP_US;
+    }
+
+    /** -1 if the container has no usable duration on this track. */
+    private static long trackDurationUs(MediaFormat f) {
+        try {
+            if (f.containsKey(MediaFormat.KEY_DURATION)) {
+                long d = f.getLong(MediaFormat.KEY_DURATION);
+                if (d > 0) return d;
+            }
+        } catch (Throwable ignored) {}
+        return -1;
     }
 
     /**
