@@ -150,11 +150,19 @@ else()
     message(STATUS "od/od.cpp not present — skipping 'od' target; prebuilt libod.so in jniLibs/ is used at runtime.")
 endif()
 
-# ==================== DiLink 5 Camera Sidecar Executable ====================
+# ==================== DiLink 5 Camera Sidecar Executable & Hook ====================
 add_executable(dilink5_cam_sidecar
     camera/dilink5_cam_sidecar.cpp
 )
 target_link_libraries(dilink5_cam_sidecar
+    dl
+    log
+)
+
+add_library(hook_qcarcam SHARED
+    camera/hook_qcarcam.cpp
+)
+target_link_libraries(hook_qcarcam
     dl
     log
 )

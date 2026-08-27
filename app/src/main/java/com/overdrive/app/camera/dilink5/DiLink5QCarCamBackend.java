@@ -31,6 +31,7 @@ public class DiLink5QCarCamBackend {
     private long nativeHandle = 0;
     private final int cameraId;
     private final AtomicBoolean isStreaming = new AtomicBoolean(false);
+    private static volatile Process sHardwareProcess = null;
 
     public static boolean isSupported() {
         if (sSupported != null) return sSupported;
@@ -51,12 +52,100 @@ public class DiLink5QCarCamBackend {
         this.cameraId = cameraId;
     }
 
+    private static synchronized void ensureHardwareProcess() {
+        try {
+            // Check if qcarcam_test is already running
+            Process checkPgrep = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", "qcarcam_test"});
+            java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(checkPgrep.getInputStream()));
+            String line = reader.readLine();
+            checkPgrep.waitFor();
+            if (line != null && !line.trim().isEmpty()) {
+                logger.info("Qualcomm QCarCam hardware pipeline already running (PID: " + line.trim() + ")");
+                return;
+            }
+
+            logger.info("Starting Qualcomm QCarCam hardware capture supervisor...");
+
+            // Ensure 1cam.xml exists in /data/local/tmp
+            java.io.File cfgFile = new java.io.File("/data/local/tmp/1cam.xml");
+            if (!cfgFile.exists()) {
+                java.io.File vendorCfg = new java.io.File("/vendor/bin/1cam.xml");
+                if (vendorCfg.exists()) {
+                    copyFile(vendorCfg, cfgFile);
+                } else {
+                    String defaultXml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+                            "<qcarcam_inputs>\n" +
+                            "    <input_device>\n" +
+                            "        <properties input_id=\"0\"/>\n" +
+                            "        <display_setting display_id=\"0\"/>\n" +
+                            "        <output_setting nbufs=\"5\"/>\n" +
+                            "    </input_device>\n" +
+                            "</qcarcam_inputs>\n";
+                    java.io.FileWriter writer = new java.io.FileWriter(cfgFile);
+                    writer.write(defaultXml);
+                    writer.close();
+                }
+            }
+
+            // Path to libhook_qcarcam.so
+            String hookPath = "/data/local/tmp/libhook_qcarcam.so";
+            java.io.File hookFile = new java.io.File(hookPath);
+            if (!hookFile.exists()) {
+                java.io.File appHook = new java.io.File("/data/app", "libhook_qcarcam.so");
+                if (appHook.exists()) {
+                    copyFile(appHook, hookFile);
+                }
+            }
+
+            String qcarcamBin = "/data/local/tmp/qcarcam_test";
+            if (!new java.io.File(qcarcamBin).exists()) {
+                qcarcamBin = "/vendor/bin/qcarcam_test";
+            }
+
+            ProcessBuilder pb = new ProcessBuilder(
+                    "/system/bin/sh", "-c",
+                    "LD_PRELOAD=" + hookPath + " " + qcarcamBin + " -config=/data/local/tmp/1cam.xml"
+            );
+            pb.redirectErrorStream(true);
+            sHardwareProcess = pb.start();
+            logger.info("Qualcomm QCarCam hardware pipeline started successfully via supervisor.");
+        } catch (Throwable t) {
+            logger.error("Failed to start Qualcomm QCarCam hardware supervisor: " + t.getMessage(), t);
+        }
+    }
+
+    private static void copyFile(java.io.File src, java.io.File dst) {
+        try (java.io.InputStream in = new java.io.FileInputStream(src);
+             java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = in.read(buf)) > 0) {
+                out.write(buf, 0, len);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    public static synchronized void stopHardwareProcess() {
+        try {
+            if (sHardwareProcess != null) {
+                sHardwareProcess.destroy();
+                sHardwareProcess = null;
+            }
+            Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "qcarcam_test"});
+            logger.info("Qualcomm QCarCam hardware supervisor stopped.");
+        } catch (Throwable t) {
+            logger.warn("Error stopping hardware supervisor: " + t.getMessage());
+        }
+    }
+
     public synchronized boolean open() {
         if (nativeHandle != 0) return true;
         if (!isSupported()) {
             logger.warn("DiLink 5 QCarCam backend is not supported on this platform.");
             return false;
         }
+
+        ensureHardwareProcess();
 
         try {
             nativeHandle = nativeInit(cameraId);
