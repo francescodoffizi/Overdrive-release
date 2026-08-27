@@ -3768,7 +3768,9 @@ public class BydDataCollector {
             Object elecPct = BydDeviceHelper.callGetter(statisticDevice, "getElecPercentageValue");
             if (elecPct instanceof Number) {
                 double soc = ((Number) elecPct).doubleValue();
-                if (soc >= 0 && soc <= 100) {
+                // Note: On DiLink 5.0 (Sealion 7 etc.), getElecPercentageValue() returns 0.0 when unpopulated.
+                // An unpopulated 0.0 must not block cloud / VHAL fallback.
+                if (soc > 0 && soc <= 100) {
                     // The on-demand getter returns a COARSE (integer on this trim) SoC,
                     // while the typed onElecPercentageChanged event carries the true
                     // decimal. Don't let an integer poll clobber a fresher decimal that
@@ -3787,7 +3789,7 @@ public class BydDataCollector {
                     if (val != null) {
                         int raw = BydDeviceHelper.getIntValue(val);
                         if (raw != BydFeatureIds.BMS_UNAVAILABLE && raw != BydFeatureIds.INVALID_VALUE
-                            && raw != BydFeatureIds.INVALID_VALUE_2 && raw >= 0 && raw <= 100) {
+                            && raw != BydFeatureIds.INVALID_VALUE_2 && raw > 0 && raw <= 100) {
                             b.socPercent((double) raw);
                         }
                     }
@@ -9035,6 +9037,36 @@ public class BydDataCollector {
                 b.pm25Inside((int) cs.pm25Inside);
             if (b.pm25Outside == BydVehicleData.UNAVAILABLE && cs.hasPm25Outside())
                 b.pm25Outside((int) cs.pm25Outside);
+
+            // Doors / Locks — merge if SDK doorLockStatus is unavailable or all sentinels
+            if (cs.hasValidLockState()) {
+                boolean sdkLocksEmpty = (b.doorLockStatus == null);
+                if (!sdkLocksEmpty) {
+                    boolean allInvalid = true;
+                    for (int s : b.doorLockStatus) {
+                        if (s == 1 || s == 2) { allInvalid = false; break; }
+                    }
+                    sdkLocksEmpty = allInvalid;
+                }
+                if (sdkLocksEmpty) {
+                    b.doorLockStatus(cs.getDoorLockStatusAsArray());
+                }
+            }
+
+            // Windows — merge if SDK windowOpenPercent is unavailable or all sentinels
+            if (cs.hasWindows()) {
+                boolean sdkWindowsEmpty = (b.windowOpenPercent == null);
+                if (!sdkWindowsEmpty) {
+                    boolean allInvalid = true;
+                    for (int p : b.windowOpenPercent) {
+                        if (p >= 0 && p <= 100) { allInvalid = false; break; }
+                    }
+                    sdkWindowsEmpty = allInvalid;
+                }
+                if (sdkWindowsEmpty) {
+                    b.windowOpenPercent(cs.getWindowOpenPercentAsArray());
+                }
+            }
 
         } catch (Exception e) {
             logger.debug("Cloud data merge error: " + e.getMessage());

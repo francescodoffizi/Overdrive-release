@@ -32,9 +32,13 @@
   - Inversione verticale Y in `convert_uyvy_to_rgba` (`qcarcam_bridge.cpp`) per orientamento dritto naturale.
   - Filtro DiLink 4 RedMask disabilitato su DiLink 5 (colori reali, rosso e blu fedeli).
 
-### D. Integrazione Modello Sealion 7 & Rilevamento ACC DiLink 5.0
+### D. Integrazione Modello Sealion 7, ACC & Telemetria DiLink 5.0
 - **Modello Sealion 7 Ufficiale**: Aggiunto nel catalogo `manifest.json` dei modelli con Blade Battery LFP da 82.5 kWh nominali.
 - **Rilevamento ACC DiLink 5.0**: Implementato in `AccMonitor.java` tramite polling `sys.accanim.status` e `PowerManager.isInteractive()`.
+- **Telemetria & VHAL DiLink 5.0 Live**:
+  - `CarPropertyBridge`: Supporto fallback binder diretto via `ServiceManager` (`car_service`).
+  - `BydDataCollector`: Gestito `0.0` unpopulated su `StatisticDevice` permettendo il merge di SOC reale, autonomia e stato di ricarica.
+  - `VehicleControlApiHandler`: Overlay a strati (SDK -> VHAL -> Cloud Snapshot) per finestrini, porte, serrature, clima e batteria.
 - **Installazione su Veicolo**: Build e installazione completate con successo via ADB (`10.0.1.45:5555`).
 
 ---
@@ -48,10 +52,12 @@
 6. `app/src/main/assets/dilink5/4cam.xml`: File di configurazione 4 canali per Qualcomm QCarCam.
 7. `app/src/main/java/com/overdrive/app/monitor/AccMonitor.java`: Rilevamento stato accensione / standby display su DiLink 5.0.
 8. `app/src/main/assets/web/shared/models/manifest.json`: Catalogo modelli veicoli con Sealion 7.
-9. `app/build.gradle.kts` & `CHANGELOG.md`: Versione `50.0` e storico rilasci.
+9. `app/src/main/java/com/overdrive/app/byd/CarPropertyBridge.java`: Bridge VHAL Android Automotive.
+10. `app/src/main/java/com/overdrive/app/byd/BydDataCollector.java`: Raccolta telemetria e merge cloud.
+11. `app/build.gradle.kts` & `CHANGELOG.md`: Versione `50.0` e storico rilasci.
 
 ---
 
 ## 🚀 4. Prossimi Passi di Sviluppo
-1. **Telemetria CarPropertyManager / VHAL DiLink 5**: Mappare i registri Android Automotive VHAL per la lettura di porte, finestrini, ricarica e pressione pneumatici.
-2. **Risveglio Centralina 360° (AVM)**: Testare `TsAvmCoordinator.startAvm()` per verificare se è possibile alimentare anche le telecamere laterali/posteriore ad auto spenta.
+1. **Risveglio Centralina 360° (AVM)**: Testare `TsAvmCoordinator.startAvm()` per verificare se è possibile alimentare anche le telecamere laterali/posteriore ad auto spenta.
+2. **Modello 3D Sealion 7**: Quando disponibile il file `.glb` dedicato, inserirlo negli asset/manifest.

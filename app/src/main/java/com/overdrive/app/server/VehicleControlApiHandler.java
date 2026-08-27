@@ -747,16 +747,42 @@ public class VehicleControlApiHandler {
             windows.put("rr", data.windowOpenPercent[3]);
             if (data.windowOpenPercent.length >= 5) windows.put("sunroof", data.windowOpenPercent[4]);
             if (data.windowOpenPercent.length >= 6) windows.put("sunshade", data.windowOpenPercent[5]);
+        } else {
+            // Check cloud fallback
+            try {
+                com.overdrive.app.byd.cloud.BydCloudDataProvider provider =
+                        com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance();
+                com.overdrive.app.byd.cloud.VehicleCloudSnapshot cs = provider.getSnapshot();
+                if (cs != null && cs.hasWindows()) {
+                    int[] w = cs.getWindowOpenPercentAsArray();
+                    windows.put("lf", w[0]);
+                    windows.put("rf", w[1]);
+                    windows.put("lr", w[2]);
+                    windows.put("rr", w[3]);
+                    windows.put("sunroof", w[4]);
+                    windows.put("sunshade", w[5]);
+                }
+            } catch (Exception ignored) {}
         }
         response.put("windows", windows);
 
-        // Trunk/tailgate status from extended bodywork
+        // Trunk/tailgate status from extended bodywork or cloud
         JSONObject trunk = new JSONObject();
-        // Back door status from feature ID (if available in toJson)
-        // We use doorLockStatus[4] for trunk lock, and check body door status flags
+        int trunkLock = -1;
         if (data.doorLockStatus != null && data.doorLockStatus.length >= 5) {
-            trunk.put("lockStatus", data.doorLockStatus[4]);
+            trunkLock = data.doorLockStatus[4];
         }
+        if (trunkLock == -1) {
+            try {
+                com.overdrive.app.byd.cloud.BydCloudDataProvider provider =
+                        com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance();
+                com.overdrive.app.byd.cloud.VehicleCloudSnapshot cs = provider.getSnapshot();
+                if (cs != null && cs.trunkLid != -1) {
+                    trunk.put("doorStatus", cs.trunkLid == 1 ? "OPEN" : "CLOSED");
+                }
+            } catch (Exception ignored) {}
+        }
+        trunk.put("lockStatus", trunkLock);
         response.put("trunk", trunk);
 
         // Sunroof
@@ -766,6 +792,16 @@ public class VehicleControlApiHandler {
         }
         if (data.sunroofPosition != BydVehicleData.UNAVAILABLE) {
             sunroof.put("position", data.sunroofPosition);
+        }
+        if (!sunroof.has("state")) {
+            try {
+                com.overdrive.app.byd.cloud.BydCloudDataProvider provider =
+                        com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance();
+                com.overdrive.app.byd.cloud.VehicleCloudSnapshot cs = provider.getSnapshot();
+                if (cs != null && cs.skylight != -1) {
+                    sunroof.put("state", cs.skylight == 2 ? 1 : 0);
+                }
+            } catch (Exception ignored) {}
         }
         response.put("sunroof", sunroof);
 

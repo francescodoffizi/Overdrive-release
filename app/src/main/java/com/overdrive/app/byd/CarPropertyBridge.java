@@ -239,9 +239,40 @@ public final class CarPropertyBridge {
                 if (b != null && b.isBinderAlive()) return svc;
             }
             svc = resolveServiceViaProvider();
+            if (svc == null) {
+                svc = resolveServiceViaServiceManager();
+            }
             cached = svc;
             return svc;
         }
+    }
+
+    private ICarPropertyService resolveServiceViaServiceManager() {
+        try {
+            Class<?> smClass = Class.forName("android.os.ServiceManager");
+            java.lang.reflect.Method getService = smClass.getMethod("getService", String.class);
+            
+            // Try car_service first, then direct byd property service names
+            String[] serviceNames = new String[] { "car_service", "byd_car_property", "car_property_service", "byd_car_service" };
+            for (String name : serviceNames) {
+                IBinder binder = (IBinder) getService.invoke(null, name);
+                if (binder != null && binder.isBinderAlive()) {
+                    log("Found service binder for: " + name);
+                    try {
+                        ICarPropertyService service = ICarPropertyService.Stub.asInterface(binder);
+                        if (service != null) {
+                            log("Resolved ICarPropertyService via ServiceManager(" + name + ")");
+                            return service;
+                        }
+                    } catch (Throwable t) {
+                        log("Stub.asInterface failed for " + name + ": " + t);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            log("resolveServiceViaServiceManager threw: " + t);
+        }
+        return null;
     }
 
     private void invalidateBinder() {

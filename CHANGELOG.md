@@ -10,6 +10,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 - **Rilevamento ACC OFF su DiLink 5.0 (Android 11 Automotive / SA8155P)**:
   - Adattato `AccMonitor.java` per interrogare `sys.accanim.status` e `PowerManager.isInteractive()` su DiLink 5.0 quando le classi legacy `BYDAutoBodyworkDevice` non sono disponibili.
   - Armamento automatico della Sentinella (Sentry Mode) ad auto spenta / schermo spento, mantenendo la totale retrocompatibilità con DiLink 3.0 e 4.0.
+- **Integrazione Telemetria & VHAL DiLink 5.0**:
+  - `CarPropertyBridge`: Aggiunta risoluzione diretta binder tramite `ServiceManager` per interrogare i servizi VHAL Android Automotive nativi (`car_service`).
+  - `BydDataCollector`: Gestito il valore grezzo `0.0` di `StatisticDevice` come non popolato per permettere il fallback tempestivo su cloud/VHAL.
+  - Esteso `mergeCloudData`: Merge automatico in assenza di segnale hardware per finestrini (LF, RF, LR, RR, tettuccio), portellone/bagagliaio e serrature.
+  - `VehicleControlApiHandler`: Overlay a strati (SDK -> VHAL -> Cloud Snapshot) per restituire lo stato veritiero di batteria (SOC), autonomia, finestrini, serrature e climatizzazione nell'interfaccia utente.
 
 ## [50.0] - 2026-08-27
 
