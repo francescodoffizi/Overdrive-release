@@ -1516,4 +1516,21 @@
     <string name="projection_scale_fill">Estira</string>
     <string name="projection_autostart_need_app">Primer emeteu una aplicació i, a continuació, activeu això.</string>
     <string name="network_limit_desc">Quan el punt d\'accés ha passat moltes dades, es desactiva i obteniu una notificació. Deixeu-ho buit per a no tenir límit. Aquest és un límit total, no un límit de velocitat.</string>
+    <string name="settings_about_vehicle_title">Vehicle i unitat principal</string>
+    <string name="settings_about_vehicle_subtitle">Detalls de la versió informats per aquesta unitat principal de BYD.</string>
+    <string name="settings_about_vehicle_firmware_label">Microprogramari</string>
+    <string name="settings_about_vehicle_dsp_label">DSP</string>
+    <string name="settings_about_vehicle_mcu_label">MCU</string>
+    <string name="settings_about_vehicle_android_label">Android</string>
+    <string name="settings_about_vehicle_security_patch_label">Pegat de seguretat d\'Android</string>
+    <string name="settings_about_vehicle_head_unit_label">Unitat principal</string>
+    <string name="settings_about_vehicle_vin_label">VIN</string>
+    <string name="settings_about_vehicle_vin_hint">Identificador sensible; amagat per defecte.</string>
+    <string name="settings_about_vehicle_vin_show">Mostra</string>
+    <string name="settings_about_vehicle_vin_hide">Amaga</string>
+    <string name="settings_about_vehicle_vin_show_a11y">Mostra el VIN</string>
+    <string name="settings_about_vehicle_vin_hide_a11y">Amaga el VIN</string>
+    <string name="settings_about_vehicle_vin_hidden_a11y">VIN ocult</string>
+    <string name="settings_about_vehicle_loading">S\'està carregant…</string>
+    <string name="settings_about_vehicle_unavailable">No disponible</string>
 </resources>
