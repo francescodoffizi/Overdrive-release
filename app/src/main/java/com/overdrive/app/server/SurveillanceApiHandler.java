@@ -98,26 +98,12 @@ public class SurveillanceApiHandler {
         }
         if (cleanPath.equals("/api/surveillance/screen-deterrent/test") && method.equals("POST")) {
             try {
-                // SAFETY (deterrent-while-driving): never fire the full-screen
-                // z=MAX deterrent layer while ACC is on / the car is in use —
-                // it would occlude nav, the reversing camera, and controls.
-                // ScreenDeterrent.onMotionDetected() now self-guards on this too
-                // (the load-bearing fix), but reject here as well so the web
-                // "Test on Screen" button reports WHY it didn't run instead of
-                // silently no-op'ing.
-                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-                    HttpResponse.sendJsonError(out,
-                        "Deterrent test blocked while ACC is on / vehicle in use");
-                    return true;
-                }
-                boolean enabled = com.overdrive.app.config.UnifiedConfigManager.getSurveillance()
-                        .optBoolean("screenDeterrentEnabled", false);
-                if (!enabled) {
-                    HttpResponse.sendJsonError(out,
-                        "Screen deterrent is off — enable \"Display warning on motion\" first");
-                    return true;
-                }
-                com.overdrive.app.surveillance.ScreenDeterrent.getInstance().onMotionDetected();
+                // Manual preview: user-initiated from the settings page, not a
+                // simulated motion event. Deliberately does not gate on ACC or
+                // screenDeterrentEnabled — see ScreenDeterrent.previewNow().
+                // The real motion-triggered path (onMotionDetected/fire) keeps
+                // its own ACC gating untouched.
+                com.overdrive.app.surveillance.ScreenDeterrent.getInstance().previewNow();
                 HttpResponse.sendJsonSuccess(out);
             } catch (Exception e) {
                 HttpResponse.sendJsonError(out, "Failed to trigger screen deterrent: " + e.getMessage());

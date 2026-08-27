@@ -36,6 +36,7 @@ import org.json.JSONObject;
  *   - screenDeterrentActiveUntilMs has elapsed, OR
  *   - screenDeterrentForceStop is true (ACC turned on), OR
  *   - screenDeterrentEnabled was toggled off mid-session, OR
+ *   - the user tapped the panel (screenDeterrentUserDismissed), OR
  *   - the absolute safety bound (60s) was hit.
  *
  * Single-instance: re-launching while already running is a no-op (or routes
@@ -68,6 +69,7 @@ public class DeterrentActivity extends Activity {
      *  other reason (orientation change, system kill, swipe-from-recents).
      *  Drives whether onDestroy signals the daemon to tear down. */
     private boolean orderlyFinish = false;
+    private boolean dismissRequested = false;
 
     private final Runnable deadlinePoll = new Runnable() {
         @Override public void run() {
@@ -161,11 +163,26 @@ public class DeterrentActivity extends Activity {
     @Override public boolean onKeyDown(int keyCode, KeyEvent event) { return true; }
     @Override public boolean onKeyUp(int keyCode, KeyEvent event) { return true; }
     @Override public boolean dispatchKeyEvent(KeyEvent event) { return true; }
-    @Override public boolean dispatchTouchEvent(MotionEvent ev) { return true; }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (ev.getAction() == MotionEvent.ACTION_DOWN && !dismissRequested) {
+            dismissRequested = true;
+            new Thread(() -> {
+                try {
+                    UnifiedConfigManager.updateValues("surveillance",
+                        java.util.Collections.singletonMap("screenDeterrentUserDismissed", true));
+                } catch (Throwable ignored) {}
+            }, "DeterrentUserDismiss").start();
+            finishCleanly();
+        }
+        return true;
+    }
 
     private boolean shouldFinishNow() {
         long now = System.currentTimeMillis();
         if (now - deterrentStartedAtMs > ABSOLUTE_MAX_MS) return true;
+        if (dismissRequested) return true;
         try {
             JSONObject s = UnifiedConfigManager.forceReload().optJSONObject("surveillance");
             consecutiveReadFailures = 0;
