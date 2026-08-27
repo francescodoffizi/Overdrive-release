@@ -300,6 +300,46 @@ public class AccMonitor {
      * @return true if ACC is OFF (sentry mode should be active), false if ACC is ON or unknown
      */
     public static boolean probeAccState(android.content.Context context) {
+        // 1. DI-LINK 5.0 (Android 11 Automotive / SA8155P) ACC PROBE
+        // On DiLink 5.0, BYDAutoBodyworkDevice is virtualized/missing or returns sentinel 4/255.
+        // We probe sys.accanim.status and Android PowerManager/Display power state.
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            try {
+                String accAnim = getSystemProperty("sys.accanim.status", "");
+                // sys.accanim.status: "1" = ACC OFF (power-down animation/standby), "0" = ACC ON / Driving
+                if (!accAnim.isEmpty()) {
+                    boolean isAccOn = "0".equals(accAnim);
+                    accOn = isAccOn;
+                    inSentryMode = !isAccOn;
+                    lastProbeTrustworthy = true;
+                    accOnAuthoritative = true;
+                    notifyAccEdge(isAccOn);
+                    CameraDaemon.log("AccMonitor [DiLink5]: sys.accanim.status=" + accAnim + " -> accOn=" + isAccOn + ", sentryMode=" + inSentryMode);
+                    return !isAccOn;
+                }
+
+                // Fallback: check Display/Interactive power state on DiLink 5
+                if (context != null) {
+                    android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(android.content.Context.POWER_SERVICE);
+                    if (pm != null) {
+                        boolean isScreenOn = pm.isInteractive();
+                        // If the head unit screen/display is completely off and vehicle in Park, assume ACC OFF (Sentry Arm)
+                        boolean isAccOn = isScreenOn;
+                        accOn = isAccOn;
+                        inSentryMode = !isAccOn;
+                        lastProbeTrustworthy = true;
+                        accOnAuthoritative = true;
+                        notifyAccEdge(isAccOn);
+                        CameraDaemon.log("AccMonitor [DiLink5]: PowerManager isInteractive=" + isScreenOn + " -> accOn=" + isAccOn + ", sentryMode=" + inSentryMode);
+                        return !isAccOn;
+                    }
+                }
+            } catch (Throwable t) {
+                CameraDaemon.log("AccMonitor [DiLink5]: power probe error: " + t.getMessage());
+            }
+        }
+
+        // 2. LEGACY DILINK 3.0 / 4.0 BYDAutoBodyworkDevice PROBE (Preserved 100% untouched)
         resolveBodyworkReflection();
         if (!bodyworkReflectionResolved) {
             // Class genuinely missing on this firmware — safe default.
@@ -450,5 +490,18 @@ public class AccMonitor {
      */
     public void stop() {
         // Nothing to stop
+    }
+
+    /**
+     * Helper to read Android system properties safely via reflection.
+     */
+    private static String getSystemProperty(String key, String def) {
+        try {
+            Class<?> systemProperties = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method get = systemProperties.getMethod("get", String.class, String.class);
+            return (String) get.invoke(null, key, def);
+        } catch (Throwable t) {
+            return def;
+        }
     }
 }

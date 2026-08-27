@@ -56,6 +56,24 @@
       "nominalKwh": 82.5
     },
     {
+      "id": "sealion7",
+      "name": "BYD Sealion 7",
+      "file": "seal-u.glb",
+      "sizeBytes": 1808308,
+      "sha256": "e41eebdbc2ceaa0d196e7f09348bb11f1bd8c9430fd04abc830cfb40321de9fd",
+      "bundled": false,
+      "batteryChemistry": "lfp",
+      "batteryChemistryEvidence": {
+        "authority": "BYD",
+        "technology": "blade",
+        "nominalKwh": 82.5,
+        "configuration": "European Comfort / Design / Excellence AWD 82.5 kWh Blade",
+        "sourceUrl": "https://media.byd.com/all-new-byd-sealion-7-arrives-in-europe/?lang=eng",
+        "verifiedOn": "2026-08-27"
+      },
+      "nominalKwh": 82.5
+    },
+    {
       "id": "seal-u",
       "name": "BYD Seal U",
       "file": "seal-u.glb",

@@ -2,6 +2,15 @@
 
 Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e versionati in corrispondenza delle release ufficiali o dei Version Bump.
 
+## [In corso / Unreleased]
+
+### Aggiunte (Added)
+- **Modello Veicolo `sealion7` (BYD Sealion 7)**:
+  - Aggiunto `sealion7` nel catalogo `manifest.json` dei modelli 3D con batteria LFP Blade da 82.5 kWh nominali.
+- **Rilevamento ACC OFF su DiLink 5.0 (Android 11 Automotive / SA8155P)**:
+  - Adattato `AccMonitor.java` per interrogare `sys.accanim.status` e `PowerManager.isInteractive()` su DiLink 5.0 quando le classi legacy `BYDAutoBodyworkDevice` non sono disponibili.
+  - Armamento automatico della Sentinella (Sentry Mode) ad auto spenta / schermo spento, mantenendo la totale retrocompatibilità con DiLink 3.0 e 4.0.
+
 ## [50.0] - 2026-08-27
 
 ### Aggiunte (Added)
