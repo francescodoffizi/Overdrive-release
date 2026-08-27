@@ -147,9 +147,15 @@ void* streamClientLoop(void* arg) {
             continue;
         }
 
-        LOGI("Connected to DiLink 5 Camera Sidecar at abstract socket @%s", SOCKET_NAME);
-
+        int curCam = -1;
         while (g_streaming.load()) {
+            int reqCam = g_active_camera.load();
+            if (reqCam != curCam && reqCam >= 0) {
+                uint8_t cmd = (uint8_t)reqCam;
+                send(sock, &cmd, 1, MSG_NOSIGNAL);
+                curCam = reqCam;
+            }
+
             FrameHeader header;
             if (read_all(sock, &header, sizeof(header)) != sizeof(header)) {
                 LOGW("Sidecar disconnected (header read failed)");
@@ -273,6 +279,12 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStop(
         g_nativeWindow = nullptr;
     }
     return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeSetActiveCamera(
+    JNIEnv* env, jclass clazz, jint camIdx) {
+    g_active_camera.store(camIdx);
 }
 
 JNIEXPORT void JNICALL

@@ -227,8 +227,18 @@ public class DiLink5QCarCamBackend {
         return isStreaming.get();
     }
 
+    public static void setActiveCamera(int camIdx) {
+        try {
+            nativeSetActiveCamera(camIdx);
+            logger.info("Switched active QCarCam camera to: " + camIdx);
+        } catch (Throwable t) {
+            logger.warn("Failed to set active camera: " + t.getMessage());
+        }
+    }
+
     // --- Native JNI Interface ---
     private static native boolean nativeIsSupported();
+    private static native void nativeSetActiveCamera(int camIdx);
     private native long nativeInit(int inputId);
     private native boolean nativeStart(long handle);
     private native boolean nativeStartSurface(android.view.Surface surface);

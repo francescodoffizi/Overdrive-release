@@ -14,6 +14,7 @@
 #define UYVY_SIZE (FRAME_WIDTH * FRAME_HEIGHT * 2)
 #define MAGIC_HEADER 0x44494C35
 #define MAX_CLIENTS 8
+#define MAX_CAMERAS 4
 
 struct FrameHeader {
     uint32_t magic;
@@ -24,9 +25,12 @@ struct FrameHeader {
     uint64_t timestamp;
 };
 
-static void* g_window = NULL;
+static void* g_windows[MAX_CAMERAS] = { NULL, NULL, NULL, NULL };
+static int g_num_windows = 0;
+
 static int g_server_fd = -1;
 static int g_clients[MAX_CLIENTS];
+static int g_client_cam[MAX_CLIENTS]; // active camera index per client (0..3)
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static bool write_all(int fd, const void* buf, size_t count) {
@@ -41,7 +45,10 @@ static bool write_all(int fd, const void* buf, size_t count) {
 }
 
 static void* socket_server_thread(void* arg) {
-    for (int i = 0; i < MAX_CLIENTS; i++) g_clients[i] = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        g_clients[i] = -1;
+        g_client_cam[i] = 0; // Default: Front camera
+    }
 
     g_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_server_fd < 0) return NULL;
@@ -62,7 +69,7 @@ static void* socket_server_thread(void* arg) {
         close(g_server_fd);
         return NULL;
     }
-    printf("[Hook] Multi-client server listening on @dilink5_cam (max %d clients)\n", MAX_CLIENTS);
+    printf("[Hook] 4-Camera Multi-client server listening on @dilink5_cam\n");
 
     while (1) {
         int client = accept(g_server_fd, NULL, NULL);
@@ -72,13 +79,13 @@ static void* socket_server_thread(void* arg) {
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (g_clients[i] < 0) {
                     g_clients[i] = client;
+                    g_client_cam[i] = 0; // Default to Camera 0 (Front)
                     printf("[Hook] Client connected in slot [%d] (fd=%d)\n", i, client);
                     added = true;
                     break;
                 }
             }
             if (!added) {
-                printf("[Hook] Max clients reached, dropping fd=%d\n", client);
                 close(client);
             }
             pthread_mutex_unlock(&g_mutex);
@@ -89,7 +96,7 @@ static void* socket_server_thread(void* arg) {
 
 __attribute__((constructor))
 void hook_init() {
-    printf("[Hook] libhook_qcarcam.so multi-client initialized!\n");
+    printf("[Hook] libhook_qcarcam.so 4-Camera driver initialized!\n");
     pthread_t th;
     pthread_create(&th, NULL, socket_server_thread, NULL);
     pthread_detach(th);
@@ -104,8 +111,13 @@ extern "C" int _Z21test_util_init_windowP16test_util_ctxt_tPP18test_util_window_
     }
     int res = real_init_window ? real_init_window(ctxt, pp_window) : 0;
     if (pp_window && *pp_window) {
-        g_window = *pp_window;
-        printf("[Hook] Captured test_util window pointer: %p\n", g_window);
+        pthread_mutex_lock(&g_mutex);
+        if (g_num_windows < MAX_CAMERAS) {
+            g_windows[g_num_windows] = *pp_window;
+            printf("[Hook] Captured Camera [%d] test_util window pointer: %p\n", g_num_windows, *pp_window);
+            g_num_windows++;
+        }
+        pthread_mutex_unlock(&g_mutex);
     }
     return res;
 }
@@ -119,38 +131,52 @@ extern "C" int clock_gettime(clockid_t clk_id, struct timespec *tp) {
     }
     int res = real_clock_gettime ? real_clock_gettime(clk_id, tp) : -1;
 
-    if (g_window) {
-        uint8_t* p_win = (uint8_t*)g_window;
-        uint8_t* p_desc_base = (uint8_t*)(*(uint64_t*)(p_win + 0x78));
-        if (p_desc_base) {
-            static uint32_t s_idx = 0;
-            int buf_idx = s_idx % 5;
-            uint8_t* desc = p_desc_base + (buf_idx * 56);
-            void* vaddr = *(void**)(desc + 0x10);
-            if (vaddr) {
-                s_idx++;
-                FrameHeader header;
-                header.magic = MAGIC_HEADER;
-                header.width = FRAME_WIDTH;
-                header.height = FRAME_HEIGHT;
-                header.format = 1; // UYVY
-                header.data_size = UYVY_SIZE;
-                header.timestamp = 0;
+    static uint32_t s_idx = 0;
+    s_idx++;
+    int buf_idx = s_idx % 5;
 
-                pthread_mutex_lock(&g_mutex);
-                for (int i = 0; i < MAX_CLIENTS; i++) {
-                    int cfd = g_clients[i];
-                    if (cfd >= 0) {
-                        if (!write_all(cfd, &header, sizeof(header)) ||
-                            !write_all(cfd, vaddr, header.data_size)) {
-                            close(cfd);
-                            g_clients[i] = -1;
-                        }
+    pthread_mutex_lock(&g_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        int cfd = g_clients[i];
+        if (cfd < 0) continue;
+
+        // Check if client requested a camera switch (non-blocking command byte)
+        uint8_t cmd = 0xFF;
+        ssize_t cr = recv(cfd, &cmd, 1, MSG_DONTWAIT);
+        if (cr == 1 && cmd < MAX_CAMERAS) {
+            g_client_cam[i] = cmd;
+            printf("[Hook] Client slot [%d] switched to Camera [%u]\n", i, cmd);
+        }
+
+        int target_cam = g_client_cam[i];
+        if (target_cam >= g_num_windows) target_cam = 0;
+        void* win = g_windows[target_cam];
+
+        if (win) {
+            uint8_t* p_win = (uint8_t*)win;
+            uint8_t* p_desc_base = (uint8_t*)(*(uint64_t*)(p_win + 0x78));
+            if (p_desc_base) {
+                uint8_t* desc = p_desc_base + (buf_idx * 56);
+                void* vaddr = *(void**)(desc + 0x10);
+                if (vaddr) {
+                    FrameHeader header;
+                    header.magic = MAGIC_HEADER;
+                    header.width = FRAME_WIDTH;
+                    header.height = FRAME_HEIGHT;
+                    header.format = 1; // UYVY
+                    header.data_size = UYVY_SIZE;
+                    header.timestamp = 0;
+
+                    if (!write_all(cfd, &header, sizeof(header)) ||
+                        !write_all(cfd, vaddr, header.data_size)) {
+                        close(cfd);
+                        g_clients[i] = -1;
                     }
                 }
-                pthread_mutex_unlock(&g_mutex);
             }
         }
     }
+    pthread_mutex_unlock(&g_mutex);
+
     return res;
 }
