@@ -766,13 +766,13 @@
                              the mutex is unmissable. -->
                         <div style="margin-top:8px; padding:12px; border:1px solid var(--card-border); border-radius:12px; background:var(--bg-secondary);">
                             <div style="font-size:13px; font-weight:600; color:var(--text-primary); margin-bottom:8px;" data-i18n="surveillance.screen_deterrent_content_heading">Custom content</div>
-                            <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;" data-i18n="surveillance.screen_deterrent_content_help">Pick ONE: a custom message overlaid on the default red screen, OR your own image / GIF. The image always wins if both are set.</div>
+                            <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;" data-i18n="surveillance.screen_deterrent_content_help">Pick ONE: a custom message overlaid on the default red screen, OR your own image, GIF or MP4 clip. The uploaded asset always wins if both are set.</div>
 
                             <!-- Override banner: shown when image is set -->
                             <div id="screenDeterrentOverrideBanner" style="display:none; padding:10px 12px; border:1px solid var(--warning); background:rgba(245,158,11,0.12); border-radius:8px; margin-bottom:12px;">
                                 <div style="display:flex; align-items:center; gap:8px; color:var(--warning); font-size:13px;">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px; height:16px; flex-shrink:0;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                                    <span data-i18n="surveillance.screen_deterrent_override_banner">Image is set — the custom message is being ignored. Clear the image to use a message instead.</span>
+                                    <span data-i18n="surveillance.screen_deterrent_override_banner">An asset is set — the custom message is being ignored. Remove the asset to use a message instead.</span>
                                 </div>
                             </div>
 
@@ -794,47 +794,48 @@
                                 <div style="flex:1; height:1px; background:var(--card-border);"></div>
                             </div>
 
-                            <!-- Image option -->
+                            <!-- Image option. Upload/Remove share the theme cards' flex-wrap
+                                 row so a wide panel keeps everything on one line. -->
                             <div class="setting-row" style="border-bottom:none; padding:6px 0;">
                                 <div class="setting-info">
-                                    <div class="setting-name" data-i18n="surveillance.screen_deterrent_image">Custom image or GIF</div>
-                                    <div class="setting-desc" data-i18n="surveillance.screen_deterrent_image_desc">PNG / JPG / WebP / GIF, up to 8 MB. Replaces the entire screen.</div>
+                                    <div class="setting-name" data-i18n="surveillance.screen_deterrent_image">Custom image, GIF or video</div>
+                                    <div class="setting-desc" data-i18n="surveillance.screen_deterrent_image_desc">PNG / JPG / WebP / GIF up to 8 MB, or an MP4 clip up to 10 s, 1080p and 10 MB. Video loops for as long as the warning is up. Replaces the entire screen; audio is not played.</div>
                                     <div class="setting-desc" style="margin-top: 12px; color: var(--text-primary);">
                                         <div style="font-weight:600; margin-bottom:8px;" data-i18n="surveillance.themes_title">Themes by Giovanni Mirulla</div>
-                                        <div style="display: flex; gap: 12px; flex-wrap: wrap;">
-                                            <!-- Theme 1 -->
-                                            <div style="border:1px solid var(--card-border); border-radius:8px; padding:8px; background:var(--bg-base); width: 140px; text-align: center;">
+                                        <div style="display: flex; flex-wrap: wrap; margin:-12px 0 0 -12px;">
+                                            <div style="margin:12px 0 0 12px; border:1px solid var(--card-border); border-radius:8px; padding:8px; background:var(--bg-base); width: 140px; text-align: center;">
                                                 <div style="font-size:12px; font-weight:600; margin-bottom:8px;">Sentry 1</div>
                                                 <button type="button" class="btn btn-primary" style="width:100%; font-size:12px; padding:6px 0;" onclick="SurvSettings.downloadAndSetTheme('https://raw.githubusercontent.com/yash-srivastava/Overdrive-release/refs/heads/main/themes/sentry1.gif', 'sentry1.gif', this)">
                                                     <span data-i18n="surveillance.download_set">Download &amp; Set</span>
                                                 </button>
                                             </div>
-                                            <!-- Theme 2 -->
-                                            <div style="border:1px solid var(--card-border); border-radius:8px; padding:8px; background:var(--bg-base); width: 140px; text-align: center;">
+                                            <div style="margin:12px 0 0 12px; border:1px solid var(--card-border); border-radius:8px; padding:8px; background:var(--bg-base); width: 140px; text-align: center;">
                                                 <div style="font-size:12px; font-weight:600; margin-bottom:8px;">Sentry 2</div>
                                                 <button type="button" class="btn btn-primary" style="width:100%; font-size:12px; padding:6px 0;" onclick="SurvSettings.downloadAndSetTheme('https://raw.githubusercontent.com/yash-srivastava/Overdrive-release/refs/heads/main/themes/sentry2.gif', 'sentry2.gif', this)">
                                                     <span data-i18n="surveillance.download_set">Download &amp; Set</span>
                                                 </button>
                                             </div>
+                                            <input type="file" id="screenDeterrentFile" accept="image/png,image/jpeg,image/webp,image/gif,video/mp4" style="display:none;" onchange="SurvSettings.uploadScreenDeterrentImage(this.files[0])">
+                                            <div style="margin:12px 0 0 12px; border:1px solid var(--card-border); border-radius:8px; padding:8px; background:var(--bg-base); width: 140px; min-height:90px; display:flex; flex-direction:column; justify-content:center;">
+                                                <button type="button" class="btn btn-secondary" onclick="document.getElementById('screenDeterrentFile').click()" id="screenDeterrentUploadBtn" style="width:100%; font-size:12px; padding:6px 0; min-height:auto;">
+                                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                                                    <span id="screenDeterrentUploadLabel" data-i18n="surveillance.screen_deterrent_upload">Upload</span>
+                                                </button>
+                                                <button type="button" class="btn btn-secondary" id="screenDeterrentClearBtn" onclick="SurvSettings.clearScreenDeterrentImage()" style="display:none; width:100%; font-size:12px; padding:6px 0; min-height:auto; margin-top:8px; color:var(--danger); border-color:var(--danger);">
+                                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;vertical-align:-2px;margin-right:4px;"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                                                    <span data-i18n="surveillance.screen_deterrent_remove">Remove asset</span>
+                                                </button>
+                                            </div>
                                         </div>
                                     </div>
-                                </div>
-                                <div class="setting-control">
-                                    <input type="file" id="screenDeterrentFile" accept="image/png,image/jpeg,image/webp,image/gif" style="display:none;" onchange="SurvSettings.uploadScreenDeterrentImage(this.files[0])">
-                                    <button type="button" class="btn btn-secondary" onclick="document.getElementById('screenDeterrentFile').click()" id="screenDeterrentUploadBtn">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                                        <span id="screenDeterrentUploadLabel" data-i18n="surveillance.screen_deterrent_upload">Upload</span>
-                                    </button>
-                                    <button type="button" class="btn btn-secondary" id="screenDeterrentClearBtn" onclick="SurvSettings.clearScreenDeterrentImage()" style="display:none; margin-left:8px; color:var(--danger); border-color:var(--danger);">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
-                                        <span data-i18n="surveillance.screen_deterrent_remove">Remove image</span>
-                                    </button>
                                 </div>
                             </div>
 
                             <div id="screenDeterrentPreview" style="display:none; margin-top:12px; text-align:center;">
                                 <img id="screenDeterrentPreviewImg" alt="" style="max-width:100%; max-height:180px; border-radius:8px; border:1px solid var(--card-border); background:var(--bg-secondary);" />
-                                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;" data-i18n="surveillance.screen_deterrent_preview_label">Current asset</div>
+                                <!-- muted: unmuted autoplay is refused by the WebView. -->
+                                <video id="screenDeterrentPreviewVideo" muted loop playsinline controls preload="auto" style="display:none; max-width:100%; max-height:180px; border-radius:8px; border:1px solid var(--card-border); background:var(--bg-secondary);"></video>
+                                <div id="screenDeterrentPreviewLabel" style="font-size:12px; color:var(--text-muted); margin-top:4px;" data-i18n="surveillance.screen_deterrent_preview_label">Current asset</div>
                                 <button type="button" class="btn btn-secondary" style="margin-top:8px; font-size:12px;" onclick="SurvSettings.testScreenDeterrent()">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px;"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                                     <span data-i18n="surveillance.test_on_screen">Test on Screen</span>

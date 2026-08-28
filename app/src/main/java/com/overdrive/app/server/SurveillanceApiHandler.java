@@ -98,19 +98,12 @@ public class SurveillanceApiHandler {
         }
         if (cleanPath.equals("/api/surveillance/screen-deterrent/test") && method.equals("POST")) {
             try {
-                // SAFETY (deterrent-while-driving): never fire the full-screen
-                // z=MAX deterrent layer while ACC is on / the car is in use —
-                // it would occlude nav, the reversing camera, and controls.
-                // ScreenDeterrent.onMotionDetected() now self-guards on this too
-                // (the load-bearing fix), but reject here as well so the web
-                // "Test on Screen" button reports WHY it didn't run instead of
-                // silently no-op'ing.
-                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-                    HttpResponse.sendJsonError(out,
-                        "Deterrent test blocked while ACC is on / vehicle in use");
-                    return true;
-                }
-                com.overdrive.app.surveillance.ScreenDeterrent.getInstance().onMotionDetected();
+                // Manual preview: user-initiated from the settings page, not a
+                // simulated motion event. Deliberately does not gate on ACC or
+                // screenDeterrentEnabled — see ScreenDeterrent.previewNow().
+                // The real motion-triggered path (onMotionDetected/fire) keeps
+                // its own ACC gating untouched.
+                com.overdrive.app.surveillance.ScreenDeterrent.getInstance().previewNow();
                 HttpResponse.sendJsonSuccess(out);
             } catch (Exception e) {
                 HttpResponse.sendJsonError(out, "Failed to trigger screen deterrent: " + e.getMessage());
@@ -129,6 +122,19 @@ public class SurveillanceApiHandler {
      */
     private static final String SCREEN_DETERRENT_DIR = "/data/local/tmp/.overdrive";
     private static final String SCREEN_DETERRENT_PREFIX = "screen_deterrent_asset.";
+
+    /** Drives the upload whitelist and the "one asset on disk" cleanup sweeps. */
+    private static final String[] SCREEN_DETERRENT_EXTS =
+            { "png", "jpg", "jpeg", "webp", "gif", "mp4" };
+
+    private static final int SCREEN_DETERRENT_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+    /** 10 MB base64-encodes to ~13.4 MB, under HttpServer's 16 MB generic body cap.
+     *  Raising this past ~11 MB means raising that cap too. */
+    private static final int SCREEN_DETERRENT_MAX_VIDEO_BYTES = 10 * 1024 * 1024;
+    /** Slack so a clip authored at exactly 10 s isn't rejected. */
+    private static final long SCREEN_DETERRENT_MAX_VIDEO_MS = 10_500L;
+    private static final int SCREEN_DETERRENT_MAX_VIDEO_DIM = 1920;
+    private static final int SCREEN_DETERRENT_MAX_VIDEO_MINOR_DIM = 1080;
 
     private static boolean isAllowedDeterrentPath(String path) {
         if (path == null || path.isEmpty()) return false;
@@ -164,6 +170,7 @@ public class SurveillanceApiHandler {
         String contentType;
         String lower = path.toLowerCase();
         if (lower.endsWith(".gif")) contentType = "image/gif";
+        else if (lower.endsWith(".mp4")) contentType = "video/mp4";
         else if (lower.endsWith(".webp")) contentType = "image/webp";
         else if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) contentType = "image/jpeg";
         else contentType = "image/png";
@@ -177,12 +184,16 @@ public class SurveillanceApiHandler {
     }
 
     /**
-     * Accept a base64-encoded image/GIF for the screen deterrent. JSON body:
+     * Accept a base64-encoded image / GIF / MP4 for the screen deterrent. JSON body:
      *   { "filename": "warning.gif", "dataBase64": "<base64>" }
      *
      * Persists to /data/local/tmp/.overdrive/screen_deterrent_asset.<ext>
      * world-readable so the daemon UID 2000 can decode it. Updates
      * surveillance.screenDeterrentImagePath in unified config on success.
+     *
+     * MP4 uploads are validated here (see {@link #validateDeterrentVideo}) rather
+     * than at render time — the render happens while the car is parked, so an
+     * unplayable clip would silently degrade to the red screen with nobody watching.
      */
     private static void handleScreenDeterrentImageUpload(OutputStream out, String body) throws Exception {
         if (body == null || body.isEmpty()) {
@@ -225,22 +236,24 @@ public class SurveillanceApiHandler {
             HttpResponse.sendJsonError(out, "Empty file");
             return;
         }
-        // Cap at 8 MB — anything bigger is unlikely to be a deterrent asset
-        // and the GIF Movie API can't handle huge files anyway.
-        if (data.length > 8 * 1024 * 1024) {
-            HttpResponse.sendJsonError(out, "File too large (max 8MB)");
-            return;
-        }
-
         // Determine extension from filename (default .png).
         String ext = "png";
         int dot = filename.lastIndexOf('.');
         if (dot > 0 && dot < filename.length() - 1) {
             String e = filename.substring(dot + 1).toLowerCase();
-            if (e.equals("png") || e.equals("jpg") || e.equals("jpeg")
-                    || e.equals("webp") || e.equals("gif")) {
-                ext = e;
+            for (String allowed : SCREEN_DETERRENT_EXTS) {
+                if (allowed.equals(e)) { ext = e; break; }
             }
+        }
+        boolean isVideo = ext.equals("mp4");
+
+        // Checked here rather than next to the base64 decode: the cap depends on ext.
+        int maxBytes = isVideo
+                ? SCREEN_DETERRENT_MAX_VIDEO_BYTES : SCREEN_DETERRENT_MAX_IMAGE_BYTES;
+        if (data.length > maxBytes) {
+            HttpResponse.sendJsonError(out, "File too large (max "
+                    + (maxBytes / (1024 * 1024)) + "MB)");
+            return;
         }
 
         java.io.File dir = new java.io.File("/data/local/tmp/.overdrive");
@@ -265,6 +278,16 @@ public class SurveillanceApiHandler {
         }
         try { tmpFile.setReadable(true, false); } catch (Exception ignored) {}
 
+        // Before the swap, so a rejected clip never displaces a working asset.
+        if (isVideo) {
+            String reject = validateDeterrentVideo(tmpFile);
+            if (reject != null) {
+                try { tmpFile.delete(); } catch (Exception ignored) {}
+                HttpResponse.sendJsonError(out, reject);
+                return;
+            }
+        }
+
         // Stage successful — now clean up any previous assets and atomically
         // swap in the new one. The "latest only" invariant: one and only
         // one screen_deterrent_asset.<ext> file ever exists on disk after
@@ -274,7 +297,7 @@ public class SurveillanceApiHandler {
         //      uploads — never cleaned up otherwise)
         // The same-extension live file is overwritten by tmpFile.renameTo()
         // below; our own .tmp is the source of the rename.
-        for (String oldExt : new String[]{"png", "jpg", "jpeg", "webp", "gif"}) {
+        for (String oldExt : SCREEN_DETERRENT_EXTS) {
             if (oldExt.equals(ext)) continue;
             java.io.File oldFile = new java.io.File(dir, "screen_deterrent_asset." + oldExt);
             if (oldFile.exists()) {
@@ -306,9 +329,101 @@ public class SurveillanceApiHandler {
         resp.put("success", true);
         resp.put("path", outFile.getAbsolutePath());
         resp.put("size", data.length);
+        resp.put("assetType", isVideo ? "video" : "image");
         HttpResponse.sendJson(out, resp.toString());
     }
-    
+
+    /**
+     * Null if the staged MP4 is playable here, else a user-facing rejection message.
+     * Uses {@link com.overdrive.app.surveillance.ScreenDeterrentVideo#probe} — the
+     * same MediaExtractor path {@code play()} uses — instead of MediaMetadataRetriever,
+     * which can misreport "no video track" on a moov-at-end MP4 that plays fine.
+     *
+     * <p>Runs on a throwaway daemon thread with a hard budget: MediaExtractor is JNI
+     * and can hang on a truncated file, and Thread.interrupt() cannot abort a native
+     * call. Timing out leaks one thread rather than wedging the HTTP worker.
+     */
+    private static String validateDeterrentVideo(java.io.File file) {
+        final String[] result = { "Could not read the video" };
+        final boolean[] finished = { false };
+        final Object done = new Object();
+
+        Thread worker = new Thread(() -> {
+            try {
+                com.overdrive.app.surveillance.ScreenDeterrentVideo.Probe probe =
+                        com.overdrive.app.surveillance.ScreenDeterrentVideo.probe(
+                                file.getAbsolutePath());
+                if (probe == null) {
+                    result[0] = "That MP4 has no video track";
+                    return;
+                }
+
+                if (probe.durationUs <= 0) {
+                    result[0] = "Could not read the video duration";
+                    return;
+                }
+                long durationMs = probe.durationUs / 1000;
+                if (durationMs > SCREEN_DETERRENT_MAX_VIDEO_MS) {
+                    result[0] = "Video too long (" + (durationMs / 1000)
+                            + "s, max 10s) — it loops, so keep it short";
+                    return;
+                }
+
+                if (probe.width <= 0 || probe.height <= 0) {
+                    result[0] = "Could not read the video resolution";
+                    return;
+                }
+                // Orientation-agnostic — the panel rotates on some models.
+                int major = Math.max(probe.width, probe.height);
+                int minor = Math.min(probe.width, probe.height);
+                if (major > SCREEN_DETERRENT_MAX_VIDEO_DIM
+                        || minor > SCREEN_DETERRENT_MAX_VIDEO_MINOR_DIM) {
+                    result[0] = "Video too large (" + probe.width + "x" + probe.height
+                            + ", max 1920x1080)";
+                    return;
+                }
+
+                if (!com.overdrive.app.surveillance.ScreenDeterrentVideo
+                        .hasDecoderFor(probe.mime)) {
+                    result[0] = "This head unit has no decoder for " + probe.mime
+                            + " — re-encode as H.264 / AVC";
+                    return;
+                }
+
+                result[0] = null;
+            } catch (Throwable t) {
+                result[0] = "Not a readable MP4 (" + t.getMessage() + ")";
+            } finally {
+                synchronized (done) {
+                    finished[0] = true;
+                    done.notifyAll();
+                }
+            }
+        }, "DeterrentVideoValidate");
+        worker.setDaemon(true);
+        worker.start();
+
+        synchronized (done) {
+            long deadline = System.currentTimeMillis() + 8_000L;
+            while (!finished[0]) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) break;
+                try { done.wait(remaining); }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return "Validation interrupted";
+                }
+            }
+        }
+        if (!finished[0]) {
+            worker.interrupt();
+            CameraDaemon.log("Deterrent video validation timed out — rejecting "
+                    + file.getName());
+            return "Could not read that MP4 (validation timed out)";
+        }
+        return result[0];
+    }
+
     private static void sendConfig(OutputStream out) throws Exception {
         GpuSurveillancePipeline gpuPipeline = CameraDaemon.getGpuPipeline();
         
@@ -498,6 +613,9 @@ public class SurveillanceApiHandler {
         }
         config.put("screenDeterrentImagePath", imgPath);
         config.put("screenDeterrentHasImage", hasImage);
+        // "video" | "image" | "" — picks the preview element on the settings page.
+        config.put("screenDeterrentAssetType",
+                hasImage ? (imgPath.toLowerCase().endsWith(".mp4") ? "video" : "image") : "");
         
         // SOTA: BYD Cloud connection status
         JSONObject bydCloud = com.overdrive.app.config.UnifiedConfigManager.getBydCloud();
@@ -1253,7 +1371,7 @@ public class SurveillanceApiHandler {
                 // any escape from the .overdrive directory.
                 java.io.File dir = new java.io.File(SCREEN_DETERRENT_DIR);
                 if (dir.isDirectory()) {
-                    for (String oldExt : new String[]{"png", "jpg", "jpeg", "webp", "gif"}) {
+                    for (String oldExt : SCREEN_DETERRENT_EXTS) {
                         java.io.File f = new java.io.File(dir, SCREEN_DETERRENT_PREFIX + oldExt);
                         if (f.exists() && isAllowedDeterrentPath(f.getAbsolutePath())) {
                             try { f.delete(); } catch (Exception ignored) {}

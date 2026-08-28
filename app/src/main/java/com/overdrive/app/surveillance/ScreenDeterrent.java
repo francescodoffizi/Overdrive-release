@@ -71,6 +71,13 @@ import java.util.concurrent.atomic.AtomicLong;
  *     keep-alive (in a third process) to skip its setBacklightState(false).
  *   - screenDeterrentForceStop: set by AccSentryDaemon.exitSentryMode() to
  *     ask the daemon-side render and the activity to bail before duration.
+ *   - screenDeterrentUserDismissed: set by DeterrentActivity on tap; cleared
+ *     by cleanup() so it never blocks a later, unrelated firing.
+ *
+ * previewNow() is a separate, manually-triggered entry point (the settings
+ * page's "Test on Screen" button) with no ACC or enabled-toggle gating —
+ * see its own doc comment. It shares the renderer with fire() but not the
+ * eligibility checks.
  */
 public final class ScreenDeterrent {
 
@@ -122,6 +129,9 @@ public final class ScreenDeterrent {
     private final AtomicBoolean inFlight = new AtomicBoolean(false);
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
     private volatile Thread renderThread;
+
+    private final AtomicBoolean previewInFlight = new AtomicBoolean(false);
+    private volatile long previewDeadlineMs = 0;
 
     /**
      * Hot-path cache: read on the GL frame thread (volatile-only, no I/O).
@@ -257,8 +267,10 @@ public final class ScreenDeterrent {
 
     private void cleanup() {
         try {
-            UnifiedConfigManager.updateValues("surveillance",
-                java.util.Collections.singletonMap("screenDeterrentActiveUntilMs", 0L));
+            java.util.Map<String, Object> reset = new java.util.HashMap<>();
+            reset.put("screenDeterrentActiveUntilMs", 0L);
+            reset.put("screenDeterrentUserDismissed", false);
+            UnifiedConfigManager.updateValues("surveillance", reset);
         } catch (Throwable ignored) {}
         lastPublishedGateMs = 0;
         lastGateWriteMs = 0;
@@ -305,6 +317,68 @@ public final class ScreenDeterrent {
         } else {
             extendDeadlineMs.set(0);
         }
+    }
+
+    // ── previewNow() — manual, user-initiated preview ──────────────────────
+    //
+    // Entered only from the settings page's "Test on Screen" button, never
+    // from the motion pipeline. Deliberately has NO AccMonitor.isAccOn()
+    // check and no screenDeterrentEnabled requirement: the button is meant
+    // to work while sitting in the car with ACC on, inspecting the selected
+    // asset on the real display. onMotionDetected()/fire()/shouldStop() —
+    // the real motion-triggered path — are untouched by this method.
+
+    /** Renders the configured asset full-screen until the duration elapses
+     *  or the user taps the panel. Reuses {@link #renderAsset}, the same
+     *  renderer the real motion path uses. */
+    public void previewNow() {
+        if (!previewInFlight.compareAndSet(false, true)) return;
+        executor.execute(() -> {
+            renderThread = Thread.currentThread();
+            try {
+                firePreview();
+            } catch (Throwable t) {
+                logger.warn("Screen deterrent preview failed: " + t.getMessage());
+            } finally {
+                cleanupPreview();
+            }
+        });
+    }
+
+    private void firePreview() {
+        Context ctx = resolveContext();
+        if (ctx == null) {
+            logger.warn("No daemon context — cannot preview");
+            return;
+        }
+        wakePanel(ctx);
+        launchActivity();
+
+        Point size = resolveDisplaySize(ctx);
+        previewDeadlineMs = System.currentTimeMillis() + hotCacheDurationSec * 1000L;
+
+        renderAsset(size.x, size.y, this::shouldStopPreview, this::maybeReassertWake);
+    }
+
+    private boolean shouldStopPreview() {
+        if (cancelled.get()) return true;
+        if (System.currentTimeMillis() >= previewDeadlineMs) return true;
+        try {
+            JSONObject s = UnifiedConfigManager.forceReload().optJSONObject("surveillance");
+            if (s == null) return false;
+            if (s.optBoolean("screenDeterrentForceStop", false)) return true;
+            if (s.optBoolean("screenDeterrentUserDismissed", false)) return true;
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private void cleanupPreview() {
+        try {
+            UnifiedConfigManager.updateValues("surveillance",
+                java.util.Collections.singletonMap("screenDeterrentUserDismissed", false));
+        } catch (Throwable ignored) {}
+        renderThread = null;
+        previewInFlight.set(false);
     }
 
     public void cancel() {
@@ -369,11 +443,36 @@ public final class ScreenDeterrent {
         final int dispW = size.x;
         final int dispH = size.y;
 
+        renderAsset(dispW, dispH, this::shouldStop, this::maybeReassertWake);
+    }
+
+    /**
+     * Shared asset dispatch (video/GIF/static image) used by both the real
+     * motion path ({@link #fire}) and the manual preview ({@link #firePreview}).
+     * Eligibility gating lives entirely in the caller — this method just renders
+     * whatever is configured until {@code stop} says otherwise.
+     */
+    private void renderAsset(int dispW, int dispH, ScreenDeterrentVideo.StopSignal stop,
+                             Runnable onFrame) {
+        String imagePath = getImagePath();
+
+        // Video owns its own SurfaceControl layer, so none of the Bitmap/lockCanvas
+        // plumbing below applies. On failure we fall through to the default screen
+        // rather than a poster frame: MediaMetadataRetriever can hang indefinitely
+        // on a malformed mp4, and this thread owns the full-screen layer.
+        if (imagePath != null && !imagePath.isEmpty()
+                && ScreenDeterrentVideo.isMp4File(imagePath)) {
+            if (ScreenDeterrentVideo.play(imagePath, dispW, dispH, stop, onFrame)) {
+                return;
+            }
+            logger.warn("Deterrent video playback failed — falling back to default screen");
+            imagePath = "";
+        }
+
         Object surface = null;
         Bitmap staticFrame = null;
         Movie movie = null;
         try {
-            String imagePath = getImagePath();
             boolean isGif = imagePath != null && !imagePath.isEmpty()
                     && isGifFile(imagePath);
 
@@ -387,10 +486,10 @@ public final class ScreenDeterrent {
             if (isGif) movie = decodeGifSafe(imagePath);
 
             if (movie != null && movie.duration() > 0) {
-                renderGifLoop(surface, movie, dispW, dispH);
+                renderGifLoop(surface, movie, dispW, dispH, stop);
             } else {
                 staticFrame = buildStaticFrame(imagePath, dispW, dispH);
-                renderStaticLoop(surface, staticFrame);
+                renderStaticLoop(surface, staticFrame, stop);
             }
         } catch (Throwable t) {
             logger.warn("Deterrent render failed: " + t.getMessage());
@@ -402,9 +501,9 @@ public final class ScreenDeterrent {
         }
     }
 
-    private void renderStaticLoop(Object surface, Bitmap frame) {
+    private void renderStaticLoop(Object surface, Bitmap frame, ScreenDeterrentVideo.StopSignal stop) {
         drawBitmapToSurface(surface, frame);
-        while (!shouldStop()) {
+        while (!stop.shouldStop()) {
             maybeReassertWake();
             try {
                 Thread.sleep(STATIC_FRAME_TICK_MS);
@@ -416,7 +515,8 @@ public final class ScreenDeterrent {
         }
     }
 
-    private void renderGifLoop(Object surface, Movie movie, int dispW, int dispH) {
+    private void renderGifLoop(Object surface, Movie movie, int dispW, int dispH,
+                               ScreenDeterrentVideo.StopSignal stop) {
         Bitmap frame = null;
         try {
             frame = Bitmap.createBitmap(dispW, dispH, Bitmap.Config.ARGB_8888);
@@ -430,7 +530,7 @@ public final class ScreenDeterrent {
             int dy = (dispH - dh) / 2;
 
             long start = SystemClock.uptimeMillis();
-            while (!shouldStop()) {
+            while (!stop.shouldStop()) {
                 long elapsed = SystemClock.uptimeMillis() - start;
                 int progress = (int) (elapsed % movie.duration());
                 movie.setTime(progress);
@@ -508,6 +608,12 @@ public final class ScreenDeterrent {
             if (s == null) return false;
             if (s.optBoolean("screenDeterrentForceStop", false)) return true;
             if (!s.optBoolean("screenDeterrentEnabled", false)) return true;
+            if (s.optBoolean("screenDeterrentUserDismissed", false)) {
+                // Skip any pending sustained-motion re-fire — the user just
+                // dismissed this exact session, not future motion.
+                extendDeadlineMs.set(0);
+                return true;
+            }
         } catch (Throwable ignored) {}
         return false;
     }

@@ -3673,6 +3673,82 @@ BYD.surveillance = {
         BYD.utils.toast(detail ? headline + ' — ' + detail : headline, 'error', 4500);
     },
 
+    /** Mirrors SurveillanceApiHandler's SCREEN_DETERRENT_MAX_* constants. */
+    DETERRENT_MAX_IMAGE_BYTES: 8 * 1024 * 1024,
+    DETERRENT_MAX_VIDEO_BYTES: 10 * 1024 * 1024,
+    DETERRENT_MAX_VIDEO_SECONDS: 10.5,
+    DETERRENT_MAX_VIDEO_DIM: 1920,
+    DETERRENT_MAX_VIDEO_MINOR_DIM: 1080,
+
+    _isDeterrentVideo: function(file) {
+        if (!file) return false;
+        if ((file.type || '').indexOf('video/') === 0) return true;
+        return /\.mp4$/i.test(file.name || '');
+    },
+
+    /**
+     * Advisory pre-flight so an over-long clip is caught before a ~13 MB base64
+     * round trip; the daemon re-checks everything. Fails open — the head unit's
+     * MediaCodec supports formats Chrome 58 cannot read.
+     */
+    _checkDeterrentVideo: function(file, done) {
+        var self = this;
+        var url = null;
+        var video = document.createElement('video');
+        var settled = false;
+
+        function finish(err) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try { video.removeAttribute('src'); video.load(); } catch (_) {}
+            if (url) { try { URL.revokeObjectURL(url); } catch (_) {} }
+            done(err);
+        }
+
+        var timer = setTimeout(function () {
+            console.warn('[deterrent] video metadata probe timed out - deferring to server');
+            finish(null);
+        }, 5000);
+
+        video.preload = 'metadata';
+        video.muted = true;
+        video.onloadedmetadata = function () {
+            var dur = video.duration;
+            var w = video.videoWidth;
+            var h = video.videoHeight;
+            console.log('[deterrent] probe:', w + 'x' + h, dur + 's');
+            if (isFinite(dur) && dur > self.DETERRENT_MAX_VIDEO_SECONDS) {
+                finish({ key: 'surveillance.screen_deterrent_video_too_long',
+                         msg: 'Video too long (' + Math.round(dur) + 's, max 10s)' });
+                return;
+            }
+            if (w > 0 && h > 0) {
+                var major = Math.max(w, h);
+                var minor = Math.min(w, h);
+                if (major > self.DETERRENT_MAX_VIDEO_DIM
+                        || minor > self.DETERRENT_MAX_VIDEO_MINOR_DIM) {
+                    finish({ key: 'surveillance.screen_deterrent_video_too_big',
+                             msg: 'Video too large (' + w + 'x' + h + ', max 1920x1080)' });
+                    return;
+                }
+            }
+            finish(null);
+        };
+        video.onerror = function () {
+            console.warn('[deterrent] video probe failed - deferring to server');
+            finish(null);
+        };
+
+        try {
+            url = URL.createObjectURL(file);
+            video.src = url;
+        } catch (err) {
+            console.warn('[deterrent] createObjectURL failed:', err);
+            finish(null);
+        }
+    },
+
     uploadScreenDeterrentImage: function(file) {
         // Always reset the <input> value so the same file can be re-selected
         // later. Without this, picking the same image twice silently no-ops
@@ -3688,9 +3764,17 @@ BYD.surveillance = {
         }
         console.log('[deterrent] upload start:', file.name, file.size, file.type);
 
-        if (file.size > 8 * 1024 * 1024) {
-            this._uploadToastError('surveillance.screen_deterrent_too_large',
-                                   'Image too large (max 8 MB)');
+        var isVideo = this._isDeterrentVideo(file);
+        var maxBytes = isVideo
+            ? this.DETERRENT_MAX_VIDEO_BYTES : this.DETERRENT_MAX_IMAGE_BYTES;
+        if (file.size > maxBytes) {
+            if (isVideo) {
+                this._uploadToastError('surveillance.screen_deterrent_video_too_large',
+                                       'Video too large (max 10 MB)');
+            } else {
+                this._uploadToastError('surveillance.screen_deterrent_too_large',
+                                       'Image too large (max 8 MB)');
+            }
             return;
         }
         if (file.size === 0) {
@@ -3699,6 +3783,22 @@ BYD.surveillance = {
             return;
         }
 
+        var self = this;
+        if (isVideo) {
+            this._checkDeterrentVideo(file, function (err) {
+                if (err) {
+                    self._uploadToastError(err.key, err.msg);
+                    return;
+                }
+                self._postDeterrentAsset(file);
+            });
+            return;
+        }
+        this._postDeterrentAsset(file);
+    },
+
+    /** Base64 the file and POST it to the deterrent asset endpoint. */
+    _postDeterrentAsset: function(file) {
         var self = this;
         var reader = new FileReader();
 
@@ -3749,10 +3849,15 @@ BYD.surveillance = {
                     console.log('[deterrent] upload success:', data.path);
                     self.config.screenDeterrentImagePath = data.path;
                     self.config.screenDeterrentHasImage = true;
+                    self.config.screenDeterrentAssetType = data.assetType
+                        || (/\.mp4$/i.test(data.path || '') ? 'video' : 'image');
                     self.updateScreenDeterrentUI();
                     if (BYD.utils && BYD.utils.toast) {
-                        var tt = BYD.i18n && BYD.i18n.t ? BYD.i18n.t('surveillance.screen_deterrent_upload_ok') : null;
-                        BYD.utils.toast(tt || 'Image uploaded', 'success');
+                        var okKey = self.config.screenDeterrentAssetType === 'video'
+                            ? 'surveillance.screen_deterrent_video_upload_ok'
+                            : 'surveillance.screen_deterrent_upload_ok';
+                        var tt = BYD.i18n && BYD.i18n.t ? BYD.i18n.t(okKey) : null;
+                        BYD.utils.toast(tt || 'Asset uploaded', 'success');
                     }
                 } else {
                     self._uploadToastError(null, (data && data.error) || '');
@@ -3807,6 +3912,7 @@ BYD.surveillance = {
         }).then(function() {
             self.config.screenDeterrentImagePath = '';
             self.config.screenDeterrentHasImage = false;
+            self.config.screenDeterrentAssetType = '';
             self.updateScreenDeterrentUI();
         }).catch(function(e) {
             console.warn('Failed to clear screen deterrent image:', e);
@@ -3820,6 +3926,10 @@ BYD.surveillance = {
         var msg = this.config.screenDeterrentMessage || '';
         var hasImage = !!this.config.screenDeterrentHasImage;
         var imagePath = this.config.screenDeterrentImagePath || '';
+        // Path sniffing is the fallback for a config response from an older daemon.
+        var assetType = this.config.screenDeterrentAssetType
+            || (/\.mp4$/i.test(imagePath) ? 'video' : (hasImage ? 'image' : ''));
+        var isVideo = assetType === 'video';
 
         var cb = document.getElementById('screenDeterrentEnabled');
         if (cb) cb.checked = enabled;
@@ -3865,8 +3975,16 @@ BYD.surveillance = {
                 : BYD.i18n.t('surveillance.screen_deterrent_upload');
         }
 
+        var previewLabel = document.getElementById('screenDeterrentPreviewLabel');
+        if (previewLabel && BYD.i18n && BYD.i18n.t) {
+            previewLabel.textContent = isVideo
+                ? BYD.i18n.t('surveillance.screen_deterrent_preview_label_video')
+                : BYD.i18n.t('surveillance.screen_deterrent_preview_label');
+        }
+
         var preview = document.getElementById('screenDeterrentPreview');
         var previewImg = document.getElementById('screenDeterrentPreviewImg');
+        var previewVideo = document.getElementById('screenDeterrentPreviewVideo');
         if (preview && previewImg) {
             if (hasImage && imagePath) {
                 // Load preview via fetch → Blob → URL.createObjectURL.
@@ -3888,6 +4006,9 @@ BYD.surveillance = {
                 // same WebView and is known good. revoke the previous URL
                 // before assigning a new one to avoid leaking blob handles
                 // across reloads.
+                //
+                // Video takes the same blob hop: sendImage has no Range support, and
+                // Chrome 58 abandons a media element whose source refuses one.
                 var self = this;
                 if (this._lastDeterrentBlobUrl) {
                     try { URL.revokeObjectURL(this._lastDeterrentBlobUrl); } catch (_) {}
@@ -3903,6 +4024,30 @@ BYD.surveillance = {
                     if (!blob || blob.size === 0) throw new Error('empty blob');
                     var url = URL.createObjectURL(blob);
                     self._lastDeterrentBlobUrl = url;
+                    if (isVideo && previewVideo) {
+                        previewImg.style.display = 'none';
+                        previewImg.removeAttribute('src');
+                        previewVideo.style.display = '';
+                        previewVideo.onloadedmetadata = function () {
+                            preview.style.display = '';
+                            // Autoplay can be refused; the controls are the fallback.
+                            var play = previewVideo.play();
+                            if (play && play.catch) play.catch(function () {});
+                        };
+                        previewVideo.onerror = function () {
+                            console.warn('[deterrent] preview <video> failed to decode blob');
+                            preview.style.display = 'none';
+                        };
+                        previewVideo.src = url;
+                        previewVideo.load();
+                        return;
+                    }
+                    if (previewVideo) {
+                        previewVideo.style.display = 'none';
+                        try { previewVideo.pause(); } catch (_) {}
+                        previewVideo.removeAttribute('src');
+                    }
+                    previewImg.style.display = '';
                     previewImg.onload = function () {
                         preview.style.display = '';
                     };
@@ -3922,6 +4067,10 @@ BYD.surveillance = {
                 }
                 preview.style.display = 'none';
                 previewImg.removeAttribute('src');
+                if (previewVideo) {
+                    try { previewVideo.pause(); } catch (_) {}
+                    previewVideo.removeAttribute('src');
+                }
             }
         }
     },
@@ -3961,7 +4110,15 @@ BYD.surveillance = {
         fetch('/api/surveillance/screen-deterrent/test', { method: 'POST' })
             .then(function(res) {
                 if (!res.ok) throw new Error('HTTP ' + res.status);
-                if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Deterrent triggered', 'success');
+                return res.json();
+            })
+            .then(function(data) {
+                if (!BYD.utils || !BYD.utils.toast) return;
+                if (data && data.success) {
+                    BYD.utils.toast('Deterrent triggered', 'success');
+                } else {
+                    BYD.utils.toast((data && data.error) || 'Failed to trigger deterrent', 'error');
+                }
             })
             .catch(function(err) {
                 console.error('[deterrent] test failed:', err);
