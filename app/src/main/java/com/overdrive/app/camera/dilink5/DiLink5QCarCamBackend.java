@@ -66,25 +66,35 @@ public class DiLink5QCarCamBackend {
 
             logger.info("Starting Qualcomm QCarCam hardware capture supervisor...");
 
-            // Ensure 1cam.xml exists in /data/local/tmp
-            java.io.File cfgFile = new java.io.File("/data/local/tmp/1cam.xml");
+            // Ensure 4cam.xml exists in /data/local/tmp
+            java.io.File cfgFile = new java.io.File("/data/local/tmp/4cam.xml");
             if (!cfgFile.exists()) {
-                java.io.File vendorCfg = new java.io.File("/vendor/bin/1cam.xml");
-                if (vendorCfg.exists()) {
-                    copyFile(vendorCfg, cfgFile);
-                } else {
-                    String defaultXml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
-                            "<qcarcam_inputs>\n" +
-                            "    <input_device>\n" +
-                            "        <properties input_id=\"0\"/>\n" +
-                            "        <display_setting display_id=\"0\"/>\n" +
-                            "        <output_setting nbufs=\"5\"/>\n" +
-                            "    </input_device>\n" +
-                            "</qcarcam_inputs>\n";
-                    java.io.FileWriter writer = new java.io.FileWriter(cfgFile);
-                    writer.write(defaultXml);
-                    writer.close();
-                }
+                String defaultXml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+                        "<qcarcam_inputs>\n" +
+                        "    <input_device>\n" +
+                        "        <properties input_id=\"0\"/>\n" +
+                        "        <display_setting display_id=\"0\"/>\n" +
+                        "        <output_setting nbufs=\"5\"/>\n" +
+                        "    </input_device>\n" +
+                        "    <input_device>\n" +
+                        "        <properties input_id=\"1\"/>\n" +
+                        "        <display_setting display_id=\"0\"/>\n" +
+                        "        <output_setting nbufs=\"5\"/>\n" +
+                        "    </input_device>\n" +
+                        "    <input_device>\n" +
+                        "        <properties input_id=\"2\"/>\n" +
+                        "        <display_setting display_id=\"0\"/>\n" +
+                        "        <output_setting nbufs=\"5\"/>\n" +
+                        "    </input_device>\n" +
+                        "    <input_device>\n" +
+                        "        <properties input_id=\"3\"/>\n" +
+                        "        <display_setting display_id=\"0\"/>\n" +
+                        "        <output_setting nbufs=\"5\"/>\n" +
+                        "    </input_device>\n" +
+                        "</qcarcam_inputs>\n";
+                java.io.FileWriter writer = new java.io.FileWriter(cfgFile);
+                writer.write(defaultXml);
+                writer.close();
             }
 
             // Path to libhook_qcarcam.so
@@ -104,7 +114,7 @@ public class DiLink5QCarCamBackend {
 
             ProcessBuilder pb = new ProcessBuilder(
                     "/system/bin/sh", "-c",
-                    "LD_PRELOAD=" + hookPath + " " + qcarcamBin + " -config=/data/local/tmp/1cam.xml"
+                    "LD_PRELOAD=" + hookPath + " " + qcarcamBin + " -config=/data/local/tmp/4cam.xml"
             );
             pb.redirectErrorStream(true);
             sHardwareProcess = pb.start();

@@ -546,12 +546,29 @@ public class VehicleControlApiHandler {
         JSONObject response = new JSONObject();
         BydDataCollector collector = BydDataCollector.getInstance();
         BydVehicleData data = collector.getData();
+        if (data == null) {
+            // Trigger a full data collection in the background
+            try {
+                new Thread(() -> collector.collectAllFull(), "EarlyCollectState").start();
+            } catch (Throwable ignored) {}
+
+            // Check if cloud data is available to populate initial state
+            try {
+                com.overdrive.app.byd.cloud.BydCloudDataProvider provider =
+                        com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance();
+                com.overdrive.app.byd.cloud.VehicleCloudSnapshot cs = provider.getSnapshot();
+                BydVehicleData.Builder b = new BydVehicleData.Builder();
+                if (cs != null) {
+                    if (cs.hasSoc()) b.socPercent(cs.socPercent);
+                    if (cs.hasElecRange()) b.elecRangeKm(cs.elecRangeKm);
+                    if (cs.hasChargingState()) b.chargingState(cs.getChargingStateAsSdk());
+                }
+                data = b.build();
+            } catch (Throwable ignored) {}
+        }
 
         if (data == null) {
-            response.put("success", false);
-            response.put("error", Messages.get("errors.vehicle_data_unavailable"));
-            HttpResponse.sendJson(out, response.toString());
-            return;
+            data = new BydVehicleData.Builder().build();
         }
 
         response.put("success", true);

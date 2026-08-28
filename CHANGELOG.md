@@ -5,6 +5,12 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 ## [In corso / Unreleased]
 
 ### Aggiunte e Correzioni (Added & Fixed)
+- **Cattura Hardware 4 Telecamere (Qualcomm QCarCam / 4cam.xml)**:
+  - `DiLink5QCarCamBackend`: Corretto il supervisore hardware di cattura per caricare ed eseguire `4cam.xml` (tutti e 4 i sensori: Anteriore, Destra, Posteriore, Sinistra) anziché il preset singolo canale `1cam.xml` che causava i quadranti verdi/vuoti nella griglia 2x2.
+- **Supporto Audio & AVAS su DiLink 5.0 / Android Automotive**:
+  - `AvasController`: Aggiunto fallback con risoluzione binder VHAL (`CarPropertyBridge`) quando `getSystemService("auto")` non è registrato a livello di sistema operativo, abilitando la corretta esecuzione dei pattern sonori e prevenendo l'errore ingannevole di servizio non disponibile.
+- **Stato Veicolo & Telemetria Istantanea (/api/vehicle/state)**:
+  - `VehicleControlApiHandler`: Implementata la sintesi iniziale e il fallback dinamico da Cloud/VHAL in `handleGetState()` quando il collector locale non ha ancora completato il primo polling hardware, evitando risposte di errore "Dati veicolo non disponibili" al caricamento della dashboard.
 - **Rilevamento Stato di Ricarica (Charging Status)**:
   - `BydDataCollector`: Se il cloud conferma lo stato di ricarica attiva (`cs.getChargingStateAsSdk() == 1`) con cavo collegato (`gunState >= 2`), promuove `b.chargingState` a `CHARGING (1)` e notifica `ChargingDetector` anche se l'hardware DiLink 5 locale restituisce `READY(0)` o `UNAVAILABLE`.
   - Popolato il tempo stimato residuo (`chargingRestTimeHours` / `chargingRestTimeMinutes`) dal cloud snapshot quando non fornito dall'hardware.
