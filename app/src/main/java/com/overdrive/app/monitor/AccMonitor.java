@@ -305,56 +305,55 @@ public class AccMonitor {
         // We probe sys.accanim.status and Android PowerManager/Display power state.
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             try {
-                String accAnim = getSystemProperty("sys.accanim.status", "");
-                // sys.accanim.status: "1" = ACC OFF (power-down animation/standby), "0" = ACC ON / Driving
-                if (!accAnim.isEmpty()) {
-                    boolean isAccOn = "0".equals(accAnim);
-                    accOn = isAccOn;
-                    inSentryMode = !isAccOn;
-                    lastProbeTrustworthy = true;
-                    accOnAuthoritative = true;
-                    notifyAccEdge(isAccOn);
-                    CameraDaemon.log("AccMonitor [DiLink5]: sys.accanim.status=" + accAnim + " -> accOn=" + isAccOn + ", sentryMode=" + inSentryMode);
-                    return !isAccOn;
+                // 1. Check Display Interactive State on DiLink 5 (Primary Indicator of Sleep/Parked)
+                if (context != null) {
+                    android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(android.content.Context.POWER_SERVICE);
+                    if (pm != null && !pm.isInteractive()) {
+                        accOn = false;
+                        inSentryMode = true;
+                        lastProbeTrustworthy = true;
+                        accOnAuthoritative = true;
+                        notifyAccEdge(false);
+                        CameraDaemon.log("AccMonitor [DiLink5]: Display is OFF (isInteractive=false) -> accOn=false, sentryMode=true");
+                        return true;
+                    }
                 }
 
-                // Check vehicle data and lock state for DiLink 5.0
+                // 2. Check Lock State (Vehicle Locked = ACC OFF)
                 com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
                 if (collector != null) {
                     com.overdrive.app.byd.BydVehicleData vd = collector.getData();
-                    if (vd != null) {
-                        boolean isLocked = false;
-                        if (vd.doorLockStatus != null && vd.doorLockStatus.length > 0) {
-                            // In BYD doorLockStatus: 1 = LOCKED
-                            isLocked = (vd.doorLockStatus[0] == 1);
-                        }
-                        if (isLocked) {
+                    if (vd != null && vd.doorLockStatus != null && vd.doorLockStatus.length > 0) {
+                        // In BYD doorLockStatus: 1 = LOCKED
+                        if (vd.doorLockStatus[0] == 1) {
                             accOn = false;
                             inSentryMode = true;
                             lastProbeTrustworthy = true;
                             accOnAuthoritative = true;
                             notifyAccEdge(false);
-                            CameraDaemon.log("AccMonitor [DiLink5]: Vehicle locked -> accOn=false, sentryMode=true");
+                            CameraDaemon.log("AccMonitor [DiLink5]: Vehicle is LOCKED -> accOn=false, sentryMode=true");
                             return true;
                         }
                     }
                 }
 
-                // Fallback: check Display/Interactive power state on DiLink 5
-                if (context != null) {
-                    android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(android.content.Context.POWER_SERVICE);
-                    if (pm != null) {
-                        boolean isScreenOn = pm.isInteractive();
-                        if (!isScreenOn) {
-                            accOn = false;
-                            inSentryMode = true;
-                            lastProbeTrustworthy = true;
-                            accOnAuthoritative = true;
-                            notifyAccEdge(false);
-                            CameraDaemon.log("AccMonitor [DiLink5]: Display off -> accOn=false, sentryMode=true");
-                            return true;
-                        }
-                    }
+                // 3. Fallback: check sys.accanim.status if explicitly set to "1" (OFF)
+                String accAnim = getSystemProperty("sys.accanim.status", "");
+                if ("1".equals(accAnim)) {
+                    accOn = false;
+                    inSentryMode = true;
+                    lastProbeTrustworthy = true;
+                    accOnAuthoritative = true;
+                    notifyAccEdge(false);
+                    CameraDaemon.log("AccMonitor [DiLink5]: sys.accanim.status=1 -> accOn=false, sentryMode=true");
+                    return true;
+                } else if ("0".equals(accAnim)) {
+                    accOn = true;
+                    inSentryMode = false;
+                    lastProbeTrustworthy = true;
+                    accOnAuthoritative = true;
+                    notifyAccEdge(true);
+                    return false;
                 }
             } catch (Throwable t) {
                 CameraDaemon.log("AccMonitor [DiLink5]: power probe error: " + t.getMessage());
