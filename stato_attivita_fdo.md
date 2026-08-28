@@ -41,7 +41,15 @@
   - `CarPropertyBridge`: Supporto fallback binder diretto via `ServiceManager` (`car_service`).
   - `BydDataCollector`: Gestito `0.0` unpopulated su `StatisticDevice` permettendo il merge di SOC reale, autonomia e stato di ricarica.
   - `VehicleControlApiHandler`: Overlay a strati (SDK -> VHAL -> Cloud Snapshot) per finestrini, porte, serrature, clima e batteria.
-- **Installazione su Veicolo**: Build e installazione completate con successo via ADB (`10.0.1.45:5555`).
+### E. Risoluzione Schermo Verde Telecamere, AVAS & Telemetria Istantanea
+- **Cattura Hardware 4 Telecamere a 30 FPS**:
+  - Risolto il problema della schermata verde modificando il supervisore in `DiLink5QCarCamBackend` per caricare ed eseguire `4cam.xml` (tutti e 4 i sensori contemporaneamente).
+  - Verificata la corretta iniezione dei fotogrammi nella pipeline GPU zero-copy con campionamento pixel OES non-zero e streaming H.264 / WebSocket attivo su porta `8887`.
+- **Supporto Audio & Toni AVAS DiLink 5.0**:
+  - `AvasController`: Integrato fallback su `CarPropertyBridge` quando il binder legacy `auto` non è registrato in Android Automotive, abilitando i pattern sonori senza generare errori.
+- **Telemetria e Stato Veicolo (/api/vehicle/state)**:
+  - `VehicleControlApiHandler`: Implementata sintesi immediata da Cloud/VHAL in caso di collector avviato di recente, eliminando gli errori "Dati non disponibili".
+- **Deploy**: Installato con successo su veicolo via ADB (`192.168.189.60:5555`).
 
 ---
 
