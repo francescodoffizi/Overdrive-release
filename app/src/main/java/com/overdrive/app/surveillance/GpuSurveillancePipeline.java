@@ -375,13 +375,23 @@ public class GpuSurveillancePipeline {
     public GpuSurveillancePipeline(int cameraWidth, int cameraHeight, File eventOutputDir) {
         this.cameraWidth = cameraWidth;
         this.cameraHeight = cameraHeight;
-        // Encoder/mosaic dims are derived from the strip aspect: each tile is
-        // (cameraWidth/4) wide x cameraHeight tall, mosaic is 2x2 of tiles, so
-        // encoder = (cameraWidth/2) x (cameraHeight*2). Seal 5120x960 → 2560x1920
-        // (4:3 quadrants). Tang 5120x720 → 2560x1440 (16:9 quadrants). Without
-        // this, Tang content gets stretched 33% vertically into 4:3 mosaic tiles.
-        this.encoderWidth = Math.max(1, cameraWidth / 2);
-        this.encoderHeight = Math.max(1, cameraHeight * 2);
+        boolean isDilink5 = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
+        com.overdrive.app.camera.ResolvedCameraConfig resolved =
+            com.overdrive.app.camera.CameraConfigResolver.resolve();
+        if (isDilink5) {
+            this.encoderWidth = 1920;
+            this.encoderHeight = 1080;
+        } else if (resolved != null && resolved.getProfile() != null) {
+            this.encoderWidth = resolved.getProfile().getEncoderWidth();
+            this.encoderHeight = resolved.getProfile().getEncoderHeight();
+        } else {
+            // Encoder/mosaic dims are derived from the strip aspect: each tile is
+            // (cameraWidth/4) wide x cameraHeight tall, mosaic is 2x2 of tiles, so
+            // encoder = (cameraWidth/2) x (cameraHeight*2). Seal 5120x960 → 2560x1920
+            // (4:3 quadrants). Tang 5120x720 → 2560x1440 (16:9 quadrants).
+            this.encoderWidth = Math.max(1, cameraWidth / 2);
+            this.encoderHeight = Math.max(1, cameraHeight * 2);
+        }
         this.eventOutputDir = eventOutputDir;
         this.config = new GpuPipelineConfig();
     }

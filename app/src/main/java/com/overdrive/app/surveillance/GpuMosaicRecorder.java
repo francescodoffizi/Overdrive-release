@@ -2154,7 +2154,9 @@ public class GpuMosaicRecorder {
             "            samplePos = vec2(0.25 + lx * 0.5, vTexCoord.y);\n" +
             "        }\n" +
             "    } else if (uApaMode > 0.5) {\n" +
-            "        samplePos = vTexCoord;\n" +
+            "        // DiLink 5 1:1 direct camera stream: center-crop 1920x1300 source to 1920x1080 canvas (16:9)\n" +
+            "        float cropY = 0.0846;\n" +
+            "        samplePos = vec2(vTexCoord.x, cropY + vTexCoord.y * (1.0 - 2.0 * cropY));\n" +
             "    } else if (uRecordLayout > 0.5) {\n" +
             // Dashcam composition (4-camera 360 source only). The 360 front
             // slice fills the top `split` band at full width; the 360

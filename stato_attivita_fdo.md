@@ -51,6 +51,17 @@
   - `VehicleControlApiHandler`: Implementata sintesi immediata da Cloud/VHAL in caso di collector avviato di recente, eliminando gli errori "Dati non disponibili".
 - **Deploy**: Installato con successo su veicolo via ADB (`192.168.189.60:5555`).
 
+### F. Risoluzione FPS Bassi (30.0 FPS Stabili), Risoluzione 1080p & Sentinella AVM
+- **Correzione Risoluzione & Aspect Ratio (Full HD 1080p / 16:9 Standard)**:
+  - Eliminata la risoluzione anomala 960x2600 (derivante dalla formula legacy per strip 4-cam `panoWidth / 2` e `panoHeight * 2`).
+  - `CameraProfile.java` & `CameraProfiles.java`: Introdotto il supporto per risoluzione encoder esplicita (1920x1080 @ 30 FPS).
+  - `GpuMosaicRecorder.java`: Implementato il center-crop 16:9 del sensore raw 1920x1300 verso canvas 1920x1080 nello shader OpenGL, preservando le proporzioni fisheye senza deformazioni.
+- **Motore di Streaming Hardware DMA a 30.0 FPS (`hook_qcarcam.cpp`)**:
+  - Sostituito l'aggancio a `clock_gettime` con un thread di streaming dedicato a 30.00 FPS con temporizzazione nanometrica su `CLOCK_MONOTONIC`.
+  - Azzerati i frame drop, il tearing e i duplicati orizzontali.
+- **Wakeup & Sincronizzazione Sentinella ad Auto Spenta (`TsAvmCoordinator.java`)**:
+  - Integrata l'attivazione preventivo `startAvm()` di `com.ts.avm.AvmAndroidService` all'apertura del driver di cattura per mantenere accese le telecamere anche ad auto bloccata/spenta.
+
 ---
 
 ## 🛠️ 3. File Chiave del Modulo DiLink 5.0

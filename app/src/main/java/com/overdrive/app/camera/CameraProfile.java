@@ -37,6 +37,8 @@ public final class CameraProfile {
     // These are estimates derived from typical AVM hardware datasheets;
     // an on-device calibration could tighten them but the per-quadrant
     // split alone is a substantial improvement over the global constant.
+    private final int customEncoderWidth;
+    private final int customEncoderHeight;
     private final float[] verticalFovDegPerQuadrant;
 
     public CameraProfile(
@@ -49,7 +51,9 @@ public final class CameraProfile {
             int directPreviewWidth,
             int directPreviewHeight,
             Map<CameraRole, CameraSourceRef> defaultRoleMappings,
-            float[] verticalFovDegPerQuadrant) {
+            float[] verticalFovDegPerQuadrant,
+            int encoderWidth,
+            int encoderHeight) {
         this.id = id;
         this.displayName = displayName;
         this.panoCameraId = panoCameraId;
@@ -58,6 +62,8 @@ public final class CameraProfile {
         this.panoSurfaceMode = panoSurfaceMode;
         this.directPreviewWidth = directPreviewWidth;
         this.directPreviewHeight = directPreviewHeight;
+        this.customEncoderWidth = encoderWidth;
+        this.customEncoderHeight = encoderHeight;
         this.defaultRoleMappings = new EnumMap<>(CameraRole.class);
         if (defaultRoleMappings != null) {
             this.defaultRoleMappings.putAll(defaultRoleMappings);
@@ -70,6 +76,22 @@ public final class CameraProfile {
         } else {
             this.verticalFovDegPerQuadrant = new float[]{110f, 110f, 110f, 110f};
         }
+    }
+
+    public CameraProfile(
+            String id,
+            String displayName,
+            int panoCameraId,
+            int panoWidth,
+            int panoHeight,
+            int panoSurfaceMode,
+            int directPreviewWidth,
+            int directPreviewHeight,
+            Map<CameraRole, CameraSourceRef> defaultRoleMappings,
+            float[] verticalFovDegPerQuadrant) {
+        this(id, displayName, panoCameraId, panoWidth, panoHeight,
+                panoSurfaceMode, directPreviewWidth, directPreviewHeight,
+                defaultRoleMappings, verticalFovDegPerQuadrant, -1, -1);
     }
 
     /** Convenience constructor — defaults to uniform 110° vertical FOV. */
@@ -85,7 +107,7 @@ public final class CameraProfile {
             Map<CameraRole, CameraSourceRef> defaultRoleMappings) {
         this(id, displayName, panoCameraId, panoWidth, panoHeight,
                 panoSurfaceMode, directPreviewWidth, directPreviewHeight,
-                defaultRoleMappings, null);
+                defaultRoleMappings, null, -1, -1);
     }
 
     /**
@@ -132,19 +154,27 @@ public final class CameraProfile {
     }
 
     /**
-     * Encoder/mosaic output width. The mosaic is a 2x2 grid of camera tiles,
+     * Encoder/mosaic output width. When explicit customEncoderWidth is set (>0),
+     * returns that value. Otherwise, the mosaic is a 2x2 grid of camera tiles,
      * each tile = (panoWidth/4) wide. Two tiles side-by-side = panoWidth/2.
      * For 5120 strip → 2560.
      */
     public int getEncoderWidth() {
+        if (customEncoderWidth > 0) {
+            return customEncoderWidth;
+        }
         return Math.max(1, panoWidth / 2);
     }
 
     /**
-     * Encoder/mosaic output height. Each tile is panoHeight tall, two tiles
+     * Encoder/mosaic output height. When explicit customEncoderHeight is set (>0),
+     * returns that value. Otherwise, each tile is panoHeight tall, two tiles
      * stacked = panoHeight*2. For 960 strip → 1920 (Seal). For 720 strip → 1440 (Tang).
      */
     public int getEncoderHeight() {
+        if (customEncoderHeight > 0) {
+            return customEncoderHeight;
+        }
         return Math.max(1, panoHeight * 2);
     }
 

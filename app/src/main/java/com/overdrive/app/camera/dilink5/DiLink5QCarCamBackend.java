@@ -158,6 +158,16 @@ public class DiLink5QCarCamBackend {
         ensureHardwareProcess();
 
         try {
+            android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            if (ctx != null) {
+                TsAvmCoordinator.getInstance(ctx).bind();
+                TsAvmCoordinator.getInstance(ctx).startAvm();
+            }
+        } catch (Throwable t) {
+            logger.warn("TsAvmCoordinator start error: " + t.getMessage());
+        }
+
+        try {
             nativeHandle = nativeInit(cameraId);
             if (nativeHandle == 0) {
                 logger.error("nativeInit(" + cameraId + ") failed to open camera handle.");

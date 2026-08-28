@@ -211,7 +211,7 @@ body.dashboard-page .sidebar .brand-link:hover {
 .app-bar-title {
     font-size: 22px;
     font-weight: 600;
-    letter-spacing: var(--tracking-headline, -0.015em);
+    letter-spacing: var(--tracking-headline, 0em);
     color: var(--on-surface);
     margin: 0;
 }

@@ -8,6 +8,7 @@
 #include <sys/un.h>
 #include <time.h>
 #include <stdint.h>
+#include <atomic>
 
 #define FRAME_WIDTH 1920
 #define FRAME_HEIGHT 1300
@@ -32,8 +33,15 @@ static int g_server_fd = -1;
 static int g_clients[MAX_CLIENTS];
 static int g_client_cam[MAX_CLIENTS]; // 0=Front, 1=Right, 2=Rear, 3=Left, 4=Mosaic (2x2)
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::atomic<bool> g_running{true};
 
 static uint8_t g_mosaic_buf[UYVY_SIZE];
+
+static inline uint64_t get_monotonic_time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static bool write_all(int fd, const void* buf, size_t count) {
     size_t total = 0;
@@ -131,6 +139,91 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
     }
 }
 
+static void* dma_streamer_thread(void* arg) {
+    printf("[Hook] Dedicated 30.0 FPS DMA Streaming engine started.\n");
+
+    const uint64_t target_frame_period_ns = 33333333ULL; // 30.00 FPS (~33.33 ms)
+    uint32_t s_idx = 0;
+
+    while (g_running.load()) {
+        uint64_t frame_start_ns = get_monotonic_time_ns();
+
+        pthread_mutex_lock(&g_mutex);
+
+        // Check if any client is active
+        int active_clients = 0;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (g_clients[i] >= 0) active_clients++;
+        }
+
+        if (active_clients > 0 && g_num_windows > 0) {
+            s_idx++;
+            int buf_idx = s_idx % 5;
+            bool mosaic_built = false;
+
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                int cfd = g_clients[i];
+                if (cfd < 0) continue;
+
+                // Check for client commands (non-blocking)
+                uint8_t cmd = 0xFF;
+                ssize_t cr = recv(cfd, &cmd, 1, MSG_DONTWAIT);
+                if (cr == 1 && cmd <= 4) {
+                    g_client_cam[i] = cmd;
+                    printf("[Hook] Client slot [%d] switched to Mode [%u]\n", i, cmd);
+                }
+
+                int target_mode = g_client_cam[i];
+                void* send_payload = NULL;
+
+                if (target_mode == 4) {
+                    // 2x2 Mosaic
+                    if (!mosaic_built) {
+                        const uint8_t* c0 = (const uint8_t*)get_cam_vaddr(0, buf_idx);
+                        const uint8_t* c1 = (const uint8_t*)get_cam_vaddr(1, buf_idx);
+                        const uint8_t* c2 = (const uint8_t*)get_cam_vaddr(2, buf_idx);
+                        const uint8_t* c3 = (const uint8_t*)get_cam_vaddr(3, buf_idx);
+                        compose_2x2_mosaic(c0, c1, c2, c3);
+                        mosaic_built = true;
+                    }
+                    send_payload = g_mosaic_buf;
+                } else {
+                    // Single camera
+                    send_payload = get_cam_vaddr(target_mode, buf_idx);
+                }
+
+                if (send_payload) {
+                    FrameHeader header;
+                    header.magic = MAGIC_HEADER;
+                    header.width = FRAME_WIDTH;
+                    header.height = FRAME_HEIGHT;
+                    header.format = 1; // UYVY
+                    header.data_size = UYVY_SIZE;
+                    header.timestamp = frame_start_ns;
+
+                    if (!write_all(cfd, &header, sizeof(header)) ||
+                        !write_all(cfd, send_payload, header.data_size)) {
+                        close(cfd);
+                        g_clients[i] = -1;
+                    }
+                }
+            }
+        }
+
+        pthread_mutex_unlock(&g_mutex);
+
+        // Precise sleep to maintain stable 30.0 FPS
+        uint64_t elapsed_ns = get_monotonic_time_ns() - frame_start_ns;
+        if (elapsed_ns < target_frame_period_ns) {
+            uint64_t sleep_ns = target_frame_period_ns - elapsed_ns;
+            struct timespec req = { 0, (long)sleep_ns };
+            nanosleep(&req, NULL);
+        }
+    }
+
+    return NULL;
+}
+
 static void* socket_server_thread(void* arg) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         g_clients[i] = -1;
@@ -158,7 +251,7 @@ static void* socket_server_thread(void* arg) {
     }
     printf("[Hook] 4-Camera Multi-client server listening on @dilink5_cam\n");
 
-    while (1) {
+    while (g_running.load()) {
         int client = accept(g_server_fd, NULL, NULL);
         if (client >= 0) {
             pthread_mutex_lock(&g_mutex);
@@ -184,9 +277,11 @@ static void* socket_server_thread(void* arg) {
 __attribute__((constructor))
 void hook_init() {
     printf("[Hook] libhook_qcarcam.so 4-Camera driver initialized!\n");
-    pthread_t th;
-    pthread_create(&th, NULL, socket_server_thread, NULL);
-    pthread_detach(th);
+    pthread_t th_server, th_stream;
+    pthread_create(&th_server, NULL, socket_server_thread, NULL);
+    pthread_detach(th_server);
+    pthread_create(&th_stream, NULL, dma_streamer_thread, NULL);
+    pthread_detach(th_stream);
 }
 
 typedef int (*init_window_fn)(void* ctxt, void** pp_window);
@@ -206,73 +301,5 @@ extern "C" int _Z21test_util_init_windowP16test_util_ctxt_tPP18test_util_window_
         }
         pthread_mutex_unlock(&g_mutex);
     }
-    return res;
-}
-
-typedef int (*clock_gettime_fn)(clockid_t, struct timespec*);
-static clock_gettime_fn real_clock_gettime = NULL;
-
-extern "C" int clock_gettime(clockid_t clk_id, struct timespec *tp) {
-    if (!real_clock_gettime) {
-        real_clock_gettime = (clock_gettime_fn)dlsym(RTLD_NEXT, "clock_gettime");
-    }
-    int res = real_clock_gettime ? real_clock_gettime(clk_id, tp) : -1;
-
-    static uint32_t s_idx = 0;
-    s_idx++;
-    int buf_idx = s_idx % 5;
-
-    pthread_mutex_lock(&g_mutex);
-    bool mosaic_built = false;
-
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        int cfd = g_clients[i];
-        if (cfd < 0) continue;
-
-        // Check if client requested a camera switch (non-blocking command byte)
-        uint8_t cmd = 0xFF;
-        ssize_t cr = recv(cfd, &cmd, 1, MSG_DONTWAIT);
-        if (cr == 1 && cmd <= 4) {
-            g_client_cam[i] = cmd;
-            printf("[Hook] Client slot [%d] switched to Mode [%u] (0=Front, 1=Right, 2=Rear, 3=Left, 4=Mosaic)\n", i, cmd);
-        }
-
-        int target_mode = g_client_cam[i];
-        void* send_payload = NULL;
-
-        if (target_mode == 4) {
-            // 2x2 Mosaic (all 4 cameras)
-            if (!mosaic_built) {
-                const uint8_t* c0 = (const uint8_t*)get_cam_vaddr(0, buf_idx);
-                const uint8_t* c1 = (const uint8_t*)get_cam_vaddr(1, buf_idx);
-                const uint8_t* c2 = (const uint8_t*)get_cam_vaddr(2, buf_idx);
-                const uint8_t* c3 = (const uint8_t*)get_cam_vaddr(3, buf_idx);
-                compose_2x2_mosaic(c0, c1, c2, c3);
-                mosaic_built = true;
-            }
-            send_payload = g_mosaic_buf;
-        } else {
-            // Single camera
-            send_payload = get_cam_vaddr(target_mode, buf_idx);
-        }
-
-        if (send_payload) {
-            FrameHeader header;
-            header.magic = MAGIC_HEADER;
-            header.width = FRAME_WIDTH;
-            header.height = FRAME_HEIGHT;
-            header.format = 1; // UYVY
-            header.data_size = UYVY_SIZE;
-            header.timestamp = 0;
-
-            if (!write_all(cfd, &header, sizeof(header)) ||
-                !write_all(cfd, send_payload, header.data_size)) {
-                close(cfd);
-                g_clients[i] = -1;
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_mutex);
-
     return res;
 }

@@ -5,6 +5,15 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 ## [In corso / Unreleased]
 
 ### Aggiunte e Correzioni (Added & Fixed)
+- **Risoluzione Risoluzione Video & Aspect Ratio su DiLink 5.0 (Full HD 1080p / 16:9 Standard)**:
+  - `CameraProfile.java` & `CameraProfiles.java`: Introdotto il supporto per dimensioni encoder personalizzate. Impostata la risoluzione encoder di `dilink5_sealion7` a **1920×1080 @ 30 FPS** nativa (eliminando il calcolo legacy 4-strip che causava l'anomalo 960×2600 e lo stiramento verticale 2.7:1).
+  - `GpuSurveillancePipeline.java`: Il costruttore e il supervisore della pipeline acquisiscono direttamente la risoluzione encoder risolta dal profilo (1920×1080 su DiLink 5).
+  - `GpuMosaicRecorder.java`: Configurato il vertex/fragment shader OpenGL per eseguire il crop centrato 16:9 del sensore raw 1920×1300 verso canvas 1920×1080, preservando le proporzioni naturali dei sensori fisheye senza deformazioni.
+- **Motore di Streaming DMA a 30.0 FPS Hardware & Eliminazione Tearing DMA (`hook_qcarcam.cpp`)**:
+  - Sostituita l'intercettazione instabile di `clock_gettime` con un thread di streaming dedicato a 30.00 FPS con temporizzazione nanometrica su `CLOCK_MONOTONIC`.
+  - Risolti i cali di framerate (~3.7 FPS) e il tearing orizzontale, garantendo un flusso video fluido a 30.0 FPS stabili verso MediaCodec e client di streaming.
+- **Keep-Alive & Risveglio Sottosistema AVM per Modalità Sentinella su DiLink 5.0**:
+  - `DiLink5QCarCamBackend.java` & `TsAvmCoordinator.java`: Integrato il binding e l'avvio preventivo del servizio di sistema `com.ts.avm.AvmAndroidService` (`startAvm()`) all'apertura del backend di cattura e all'armamento della Sentinella ad auto spenta, mantenendo alimentati i sensori fisici QCarCam.
 - **Persistenza ADB (Wireless 5555 & USB) & Sblocco Alimentazione Periferiche su DiLink 5.0**:
   - `DiLink5PowerDiagnostics`: Aggiunta l'impostazione automatica persistente delle property di sistema (`persist.adb.tcp.port 5555`, `service.adb.tcp.port 5555`, `persist.sys.usb.config mtp,adb` e `adb_enabled 1`) per evitare la disattivazione del debug ADB al riavvio/sleep.
   - `AccSentryDaemon`: Rimosso il vincolo esclusivo DiLink 4 su `BYDAutoSpecialDevice`, abilitando il mantenimento dell'alimentazione dei rail USB / modem anche su DiLink 5.0 (Snapdragon SA8155P).

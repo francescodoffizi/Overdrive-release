@@ -77,7 +77,7 @@
     text-transform: uppercase;
     color: var(--outline);
 }
-.sp-match { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+.sp-match { font-size: 17px; font-weight: 650; letter-spacing: 0em; }
 .sp-match em { font-style: normal; color: var(--primary); }
 
 /* ── Axis readout ────────────────────────────────────────────────────────────── */
@@ -145,7 +145,7 @@
 
 .sp-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .sp-name-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.sp-name { font-weight: 650; font-size: 14.5px; letter-spacing: -0.005em; }
+.sp-name { font-weight: 650; font-size: 14.5px; letter-spacing: 0em; }
 /* The car's own name for a renamed slot. Subdued and truncating: it is a reference
    point, not the row's identity, and the account-prefixed form is long. */
 .sp-carname {
