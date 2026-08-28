@@ -73,26 +73,28 @@ class AccMonitorController(
                     }
                     
                     // Check Display Power & Interactive State (DiLink 5 & standard Android Automotive)
-                    val isInteractiveCmd = execShell("dumpsys power 2>/dev/null | grep -i 'mIsInteractive' | head -1").trim()
-                    val isScreenOff = isInteractiveCmd.contains("false", ignoreCase = true)
-
-                    // Check sys.accanim.status
+                    val screenPower = execShell("dumpsys power 2>/dev/null | grep -i 'Display Power: state=' | head -1").trim()
+                    val isInteractive = execShell("dumpsys power 2>/dev/null | grep -i 'mIsInteractive' | head -1").trim()
+                    val isScreenOff = !screenPower.contains("state=ON") || isInteractive.contains("false")
                     var accAnimStatus = execShell("getprop sys.accanim.status").trim()
+                    val carPowerMode = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 2 | grep 'current' | head -1").trim()
+                    val isStandby = carPowerMode.contains("Standby") || carPowerMode.contains("Sleep") || carPowerMode.contains("Str") || carPowerMode.contains("4=") || carPowerMode.contains("8=") || carPowerMode.contains("5=")
+
                     if (accAnimStatus.isEmpty()) {
-                        accAnimStatus = if (isScreenOff) "1" else "0"
+                        accAnimStatus = if (isScreenOff || isStandby) "1" else "0"
                     }
 
-                    // Combined ACC OFF logic: if screen is OFF or accanim.status is 1
-                    val isAccOffNow = (accAnimStatus != "0") || isScreenOff
+                    // Combined ACC OFF logic: if screen is OFF, car in Standby, or accanim.status is 1
+                    val isAccOffNow = (accAnimStatus != "0") || isScreenOff || isStandby
                     val wasAccOff = (lastAccAnimStatus != "0")
 
                     if (isAccOffNow != wasAccOff) {
-                        logger.info(">>> ACC STATE CHANGED: isAccOffNow=$isAccOffNow (wasAccOff=$wasAccOff, screenOff=$isScreenOff, accAnim=$accAnimStatus)")
+                        logger.info(">>> ACC STATE CHANGED: isAccOffNow=$isAccOffNow (wasAccOff=$wasAccOff, isStandby=$isStandby, screenOff=$isScreenOff, accAnim=$accAnimStatus, powerMode=$carPowerMode)")
                         if (isAccOffNow) {
-                            logger.info("!!! ACC OFF DETECTED (Screen Off or accanim.status!=0) -> ENTER SENTRY !!!")
+                            logger.info("!!! ACC OFF DETECTED (Standby/ScreenOff) -> ENTER SENTRY !!!")
                             onAccOff()
                         } else {
-                            logger.info("!!! ACC ON DETECTED (Screen On and accanim.status=0) -> EXIT SENTRY !!!")
+                            logger.info("!!! ACC ON DETECTED -> EXIT SENTRY !!!")
                             onAccOn()
                         }
                         lastAccAnimStatus = if (isAccOffNow) "1" else "0"

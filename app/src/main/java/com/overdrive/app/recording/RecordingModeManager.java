@@ -3121,6 +3121,10 @@ public class RecordingModeManager {
      * reconnected device on the next tick automatically.
      */
     private boolean queryAccStateFromHardware() {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            boolean isAccOff = com.overdrive.app.monitor.AccMonitor.probeAccState(context);
+            return !isAccOff;
+        }
         resolveBodyworkReflection();
         if (bodyworkReflectionResolved) {
             try {

@@ -302,10 +302,27 @@ public class AccMonitor {
     public static boolean probeAccState(android.content.Context context) {
         // 1. DI-LINK 5.0 (Android 11 Automotive / SA8155P) ACC PROBE
         // On DiLink 5.0, BYDAutoBodyworkDevice is virtualized/missing or returns sentinel 4/255.
-        // We probe sys.accanim.status and Android PowerManager/Display power state.
+        // We probe dumpsys car_service PowerMode, Android PowerManager/Display power state and doorLockStatus.
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             try {
-                // 1. Check Display Interactive State on DiLink 5 (Primary Indicator of Sleep/Parked)
+                // 1. Check Automotive PowerMode (Standby=4, Sleep=8, Str=5, Off=0)
+                String carServicePower = getSystemProperty("sys.byd.power_mode", "");
+                if (carServicePower.isEmpty()) {
+                    carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 4");
+                }
+                if (carServicePower.contains("Standby") || carServicePower.contains("Sleep") ||
+                    carServicePower.contains("Str") || carServicePower.contains("PowerMode Off") ||
+                    carServicePower.contains("4=") || carServicePower.contains("8=") || carServicePower.contains("5=")) {
+                    accOn = false;
+                    inSentryMode = true;
+                    lastProbeTrustworthy = true;
+                    accOnAuthoritative = true;
+                    notifyAccEdge(false);
+                    CameraDaemon.log("AccMonitor [DiLink5]: car_service PowerMode is STANDBY/SLEEP (" + carServicePower.trim() + ") -> accOn=false, sentryMode=true");
+                    return true;
+                }
+
+                // 2. Check Display Interactive State on DiLink 5 (Primary Indicator of Sleep/Parked)
                 if (context != null) {
                     android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(android.content.Context.POWER_SERVICE);
                     if (pm != null && !pm.isInteractive()) {
@@ -524,5 +541,20 @@ public class AccMonitor {
         } catch (Throwable t) {
             return def;
         }
+    }
+
+    private static String execShell(String command) {
+        StringBuilder output = new StringBuilder();
+        try {
+            Process process = Runtime.getRuntime().exec(new String[]{"sh", "-c", command});
+            java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+            reader.close();
+            process.waitFor();
+        } catch (Throwable ignored) {}
+        return output.toString();
     }
 }

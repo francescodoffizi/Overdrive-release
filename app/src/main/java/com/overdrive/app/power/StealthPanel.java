@@ -100,6 +100,9 @@ public final class StealthPanel {
      */
     public static boolean isDilink4() {
         try {
+            if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+                return true;
+            }
             JSONObject c = UnifiedConfigManager.loadConfig().optJSONObject("camera");
             if (c == null) return false;
             return "dilink4".equalsIgnoreCase(c.optString("cameraMode", "default"));

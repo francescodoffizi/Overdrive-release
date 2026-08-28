@@ -1882,6 +1882,17 @@ public class CameraDaemon {
     }
 
     private static Integer readRawAccPowerLevel() throws Exception {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            // DiLink 5.0 (Snapdragon SA8155P / Android Automotive 11)
+            // Uses dumpsys car_service Power Mute State or PowerManager/interactive
+            try {
+                if (com.overdrive.app.monitor.AccMonitor.probeAccState(sharedAppContext)) {
+                    return 0; // POWER_LEVEL_OFF (Standby/Sleep/Parked)
+                } else {
+                    return 2; // POWER_LEVEL_ON (Active)
+                }
+            } catch (Throwable ignored) {}
+        }
         if (!rawAccReflectionResolved && !rawAccReflectionFailed) {
             synchronized (CameraDaemon.class) {
                 if (!rawAccReflectionResolved && !rawAccReflectionFailed) {

@@ -110,28 +110,45 @@ public class DiLink5PowerDiagnostics {
                 String screenPower = execShell("dumpsys power 2>/dev/null | grep -i 'Display Power' | head -1").trim();
                 String isInteractive = execShell("dumpsys power 2>/dev/null | grep -i 'mIsInteractive' | head -1").trim();
 
-                // 2. Wi-Fi Status
+                // 2. Wi-Fi Status & Proactive Reconnect
                 String wifiIp = "N/A";
                 String wifiSsid = "N/A";
                 int wifiRssi = 0;
+                boolean wifiConnected = false;
                 if (context != null) {
                     try {
                         WifiManager wm = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
                         if (wm != null) {
+                            if (!wm.isWifiEnabled()) {
+                                wm.setWifiEnabled(true);
+                            }
                             WifiInfo info = wm.getConnectionInfo();
-                            if (info != null) {
+                            if (info != null && info.getNetworkId() != -1) {
                                 wifiSsid = info.getSSID();
                                 wifiRssi = info.getRssi();
                                 int ip = info.getIpAddress();
-                                wifiIp = String.format(Locale.US, "%d.%d.%d.%d",
-                                        (ip & 0xff), (ip >> 8 & 0xff), (ip >> 16 & 0xff), (ip >> 24 & 0xff));
+                                if (ip != 0) {
+                                    wifiConnected = true;
+                                    wifiIp = String.format(Locale.US, "%d.%d.%d.%d",
+                                            (ip & 0xff), (ip >> 8 & 0xff), (ip >> 16 & 0xff), (ip >> 24 & 0xff));
+                                }
+                            }
+                            // Proactively reconnect if disconnected
+                            if (!wifiConnected) {
+                                wm.reconnect();
                             }
                         }
                     } catch (Throwable ignored) {}
                 }
                 if ("N/A".equals(wifiIp) || "0.0.0.0".equals(wifiIp)) {
                     String ipCmd = execShell("ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}'").trim();
-                    if (!ipCmd.isEmpty()) wifiIp = ipCmd;
+                    if (!ipCmd.isEmpty()) {
+                        wifiIp = ipCmd;
+                        wifiConnected = true;
+                    } else {
+                        // Shell fallback to ensure Wi-Fi stays awake and reconnects
+                        execShell("svc wifi enable 2>/dev/null; cmd wifi reconnect 2>/dev/null");
+                    }
                 }
 
                 // 3. Hardware Camera Status
@@ -144,11 +161,12 @@ public class DiLink5PowerDiagnostics {
 
                 // Format entry
                 String entry = String.format(Locale.US,
-                        "[%s] ACC: '%s' | Screen: [%s, %s] | Wi-Fi: [IP=%s, SSID=%s, RSSI=%d] | QCarCam: [Running=%b, PID=%s, Supported=%b] | AVM Alive: %b\n",
+                        "[%s] ACC: '%s' | Screen: [%s, %s] | Wi-Fi: [Connected=%b, IP=%s, SSID=%s, RSSI=%d] | QCarCam: [Running=%b, PID=%s, Supported=%b] | AVM Alive: %b\n",
                         timestamp,
                         accAnimStatus.isEmpty() ? "0 (ON)" : accAnimStatus,
                         screenPower.isEmpty() ? "UNKNOWN" : screenPower,
                         isInteractive.isEmpty() ? "UNKNOWN" : isInteractive,
+                        wifiConnected,
                         wifiIp,
                         wifiSsid,
                         wifiRssi,

@@ -716,6 +716,16 @@ public class ChargingApiHandler {
                 }
             }
 
+            com.overdrive.app.byd.cloud.VehicleCloudSnapshot cloudSnap = null;
+            try {
+                com.overdrive.app.byd.cloud.BydCloudDataProvider cp = com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance();
+                if (cp != null) cloudSnap = cp.getSnapshot();
+            } catch (Exception ignored) {}
+
+            if (timeToFullMin <= 0 && cloudSnap != null && (cloudSnap.remainingHours >= 0 || cloudSnap.remainingMinutes >= 0)) {
+                timeToFullMin = Math.max(0, cloudSnap.remainingHours * 60 + Math.max(0, cloudSnap.remainingMinutes));
+            }
+
             ChargingDetector.StateSnapshot after = null;
             try {
                 after = ChargingDetector.getInstance().getStateSnapshot();
@@ -725,21 +735,34 @@ public class ChargingApiHandler {
                 continue;
             }
 
+            boolean isCloudCharging = cloudSnap != null && cloudSnap.chargingState > 0;
+            boolean isCloudPlugged = isCloudCharging || (cloudSnap != null && (cloudSnap.remainingHours > 0 || cloudSnap.remainingMinutes > 0));
+
             ChargingStateData.ChargingStatus status = state != null
-                    ? state.status : ChargingStateData.ChargingStatus.UNKNOWN;
+                    ? state.status : (isCloudCharging ? ChargingStateData.ChargingStatus.CHARGING : ChargingStateData.ChargingStatus.UNKNOWN);
             LiveStateFlags flags = normalizeLiveState(
-                    after.charging,
+                    (after != null && after.charging) || isCloudCharging,
                     status,
                     state != null && state.isTaperCharging,
                     gunState,
                     vtolCharging);
+            if (isCloudCharging || isCloudPlugged) {
+                flags = new LiveStateFlags(
+                    flags.charging || isCloudCharging,
+                    flags.plugged || isCloudPlugged,
+                    flags.full
+                );
+            }
             PowerPublication power =
                     normalizePowerPublication(flags.charging, state);
-            if (!flags.charging) {
+            if (!flags.charging && !isCloudCharging) {
                 // An open row may remain during the bounded final-counter drain. It is persistence
                 // state, not proof that power is still flowing.
                 sessionKwh = -1.0;
                 timeToFullMin = -1;
+            }
+            if (state == null && (isCloudCharging || isCloudPlugged)) {
+                state = new ChargingStateData(isCloudCharging ? 1 : 0);
             }
             return new LivePublication(
                     state,
