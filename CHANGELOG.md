@@ -5,8 +5,10 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 ## [In corso / Unreleased]
 
 ### Aggiunte e Correzioni (Added & Fixed)
-- **Cattura Hardware 4 Telecamere (Qualcomm QCarCam / 4cam.xml)**:
-  - `DiLink5QCarCamBackend`: Corretto il supervisore hardware di cattura per caricare ed eseguire `4cam.xml` (tutti e 4 i sensori: Anteriore, Destra, Posteriore, Sinistra) anziché il preset singolo canale `1cam.xml` che causava i quadranti verdi/vuoti nella griglia 2x2.
+- **Persistenza ADB (Wireless 5555 & USB) & Sblocco Alimentazione Periferiche su DiLink 5.0**:
+  - `DiLink5PowerDiagnostics`: Aggiunta l'impostazione automatica persistente delle property di sistema (`persist.adb.tcp.port 5555`, `service.adb.tcp.port 5555`, `persist.sys.usb.config mtp,adb` e `adb_enabled 1`) per evitare la disattivazione del debug ADB al riavvio/sleep.
+  - `AccSentryDaemon`: Rimosso il vincolo esclusivo DiLink 4 su `BYDAutoSpecialDevice`, abilitando il mantenimento dell'alimentazione dei rail USB / modem anche su DiLink 5.0 (Snapdragon SA8155P).
+  - `RecordingModeManager`: Esteso il keep-alive delle telecamere e del backend nativo a basso livello ad auto spenta (ACC OFF) per DiLink 5.0.
 - **Supporto Audio & AVAS su DiLink 5.0 / Android Automotive**:
   - `AvasController`: Aggiunto fallback con risoluzione binder VHAL (`CarPropertyBridge`) quando `getSystemService("auto")` non è registrato a livello di sistema operativo, abilitando la corretta esecuzione dei pattern sonori e prevenendo l'errore ingannevole di servizio non disponibile.
 - **Stato Veicolo & Telemetria Istantanea (/api/vehicle/state)**:

