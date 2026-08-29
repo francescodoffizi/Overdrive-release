@@ -70,7 +70,7 @@ public class FoveatedCropper {
     // map and flip flags. 0 = no crop (default / legacy). On dilink4 the
     // pipeline pushes the producer-UV inset (e.g. 240/2560 = 0.09375).
     private volatile float apaCenterInset = 0.0f;
-    // 0 = legacy 4-strip (default); 3 = oem-parity 2x2 passthrough.
+    // 0 = legacy 4-strip; 1 = full-frame; 3 = oem-parity 2x2 remap.
     // Volatile because the GL thread reads it inside crop() and the camera
     // thread (or pipeline init) writes it via setCameraLayout.
     private volatile int cameraLayout = 0;
@@ -415,8 +415,8 @@ public class FoveatedCropper {
      * Layout-aware foveated AI crop. Branches between:
      *   cameraLayout == 0 → legacy 4-strip: each role is a 0.25-wide
      *       vertical strip indexed by stripOffsetX[quadrant].
-     *   cameraLayout == 3 → DiLink 4 2x2: each role is a 0.5×0.5 corner
-     *       indexed by quadrantCornerOffsetsXY[quadrant*2..+1].
+     *   cameraLayout == 1 or 3 → SurfaceTexture frame: each motion-grid
+     *       quadrant maps to a 0.5×0.5 producer corner.
      * Centroid (centroidX, centroidY) is in V2 motion's single-quadrant
      * local coordinates; we map it into the producer-frame UV based on
      * the active layout.
@@ -431,10 +431,10 @@ public class FoveatedCropper {
         float camNormY = quadPixelY / 240.0f;
 
         // Cropper's CROP_SIZE is in producer-frame pixels. The producer
-        // frame has different aspect on legacy (4-strip 5120×960) vs DiLink
-        // 4 (2x2 mosaic, e.g. 2560×1920) — derive crop dims from current
-        // layout rather than always assuming `stripWidth × stripHeight`.
-        boolean useCornerLayout = (cameraLayout == 3);
+        // frame has different geometry on legacy (4-strip 5120×960) and
+        // SurfaceTexture layouts — derive crop dims from current layout
+        // rather than always assuming `stripWidth × stripHeight`.
+        boolean useCornerLayout = (cameraLayout == 1 || cameraLayout == 3);
         float cropWidthNorm;
         float cropHeightNorm;
         float quadLeft, quadTop;
@@ -751,6 +751,7 @@ public class FoveatedCropper {
     /**
      * Selects between layouts:
      *   0 = legacy 4-strip (default — Seal/Atto/Dolphin).
+     *   1 = full-frame APA passthrough divided into the motion grid.
      *   3 = oem-parity 2x2 mosaic (DiLink 4 / byd_apa cars).
      * Other values fall through to layout 0 in the math.
      * Volatile read/write — set once at pipeline init, no per-frame churn.

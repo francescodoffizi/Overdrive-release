@@ -44,6 +44,10 @@ public final class DynamicsEvent {
         poller.refresh();
     }
 
+    static boolean isScheduledForTest() {
+        return poller.isScheduledForTest();
+    }
+
     /**
      * Read all four dynamic inputs NOW and publish them, ignoring the per-signal reference gate.
      * For the editor's live-value hints only: these keys are {@code FAST_POLL_OWNED}, so the

@@ -1451,8 +1451,8 @@
     "heatmap_threat_high": "उच्च",
     "heatmap_threat_critical": "महत्वपूर्ण",
     "state_active": "सक्रिय",
-    "state_safe_zone": " सुरक्षित क्षेत्र",
-    "state_safe_zone_named": " सुरक्षित क्षेत्र ({name})",
+    "state_safe_zone": "सुरक्षित क्षेत्र",
+    "state_safe_zone_named": "सुरक्षित क्षेत्र ({name})",
     "size_used_dash": "-- इस्तेमाल किया गया",
     "size_limit_dash": "-- सीमा",
     "limit_min_default": "100 एमबी",
@@ -2161,13 +2161,13 @@
     "add_zone_failed": "क्षेत्र जोड़ने में विफल",
     "confirm_delete_zone": "इस सुरक्षित क्षेत्र को हटा दें?",
     "zone_deleted": "हटाया गया क्षेत्र",
-    "in_safe_zone": " सुरक्षित क्षेत्र में ({zone}, {meters}m)",
-    "outside_zone": "🔴 बाहर ({meters}m से निकटतम तक)",
+    "in_safe_zone": "सुरक्षित क्षेत्र में ({zone}, {meters}m)",
+    "outside_zone": "बाहर ({meters}m से निकटतम तक)",
     "no_zones_yet": "अभी तक कोई क्षेत्र नहीं",
     "waiting_gps": "GPS के लिए इंतजार...",
-    "badge_on": "● चालू",
-    "badge_off": "○ बंद",
-    "you_are_here": " तुम यहाँ हो",
+    "badge_on": "चालू",
+    "badge_off": "बंद",
+    "you_are_here": "तुम यहाँ हो",
     "popup_radius": "<b>{name}</b><br>{meters}m त्रिज्या"
   },
   "liveview": {
@@ -2268,7 +2268,6 @@
     "auto": "ऑटो"
   },
   "about": {
-    "ack_chimes": "RoadSense चेतावनी ध्वनियाँ — Google Sound Library से ध्वनियाँ, इसके तहत लाइसेंस प्राप्त",
     "page_title": "के बारे में — OverDrive",
     "page_title_short": "के बारे में",
     "contributors_title": "योगदानकर्ता",
@@ -2290,7 +2289,8 @@
       "kofi_value": "Ko-fi पर एक कॉफी देर रात के commits जारी रखती है।",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "योगदानकर्ताओं और समर्थकों की मदद से निर्मित।"
+    "thanks_subtitle": "योगदानकर्ताओं और समर्थकों की मदद से निर्मित।",
+      "ack_chimes": "RoadSense चेतावनी ध्वनियाँ — Google Sound Library से ध्वनियाँ, इसके तहत लाइसेंस प्राप्त"
   },
   "byd_cloud": {
     "page_title": "BYD बादल",

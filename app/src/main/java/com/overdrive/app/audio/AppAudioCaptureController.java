@@ -1,5 +1,6 @@
 package com.overdrive.app.audio;
 
+import android.annotation.SuppressLint;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaCodec;
@@ -20,27 +21,30 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * App-process owner of cabin-mic capture. Runs ONLY when the user has
- * audioEnabled=on in recording config AND the daemon is in an ACC-on
- * recording mode (CONTINUOUS / DRIVE_MODE / PROXIMITY_GUARD).
+ * App-process owner of cabin-mic capture. A single process-wide instance
+ * serves recording and remote-listener demand so two AudioRecord clients can
+ * never contend for the cabin microphone.
  *
  * <h3>Why app process</h3>
  * The daemon runs as UID 2000 (shell). BYD AOSP's AudioPolicy denies
  * AudioRecord for that UID — verified via {@code /api/audio/probe-mic}
  * and {@code /api/audio/probe-mic-spoof}. The app process runs under
- * its own UID (10067) with RECORD_AUDIO granted, so capture lives here
+ * its own app UID with RECORD_AUDIO granted, so capture lives here
  * and the encoded AAC bitstream is shipped to the daemon over a TCP
  * socket on 127.0.0.1:19878. Same physical mic, different speaker.
  *
  * <h3>Pipeline</h3>
  * <pre>
- *   AudioRecord (48kHz mono PCM_16)
- *      → MediaCodec AAC-LC encoder (64 kbps, byte-buffer mode)
+ *   AudioRecord (48kHz, or Di+ compatible 8kHz while listening)
+ *      ├→ MediaCodec AAC-LC encoder (recording demand only)
+ *      └→ PCM listener frames (listener demand only)
  *      → DataOutputStream length-prefixed frames to AacIngestServer
  * </pre>
- * Two threads (run on a fixed pool):
+ * Recording mode uses two threads:
  *   - capture thread: reads PCM, queues to encoder input
  *   - drain thread: pulls AAC frames, ships over TCP
+ * Listener-only mode uses just the capture thread and does not create an AAC
+ * encoder.
  *
  * <h3>PTS</h3>
  * Each emitted AAC frame is stamped from a SAMPLE-COUNT clock: AAC-LC is a
@@ -63,18 +67,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class AppAudioCaptureController {
 
     private static final String TAG = "AudioCapture";
+    private static final Object OWNER_LOCK = new Object();
+    private static AppAudioCaptureController owner;
+    private static boolean recordingDemand;
+    private static boolean listenerDemand;
+    private static boolean listenerDiPlusCompatibility;
 
     // Capture parameters. Matched to the daemon's expected MediaFormat
     // in HardwareEventRecorderGpu.maybeAddAudioTrack — change here
     // means the daemon CSD-0 lookup needs the new value.
     private static final int SAMPLE_RATE = 48000;
+    private static final int LISTENER_CAPTURE_RATE = 8000;
     private static final int CHANNEL_COUNT = 1;
     private static final int CHANNEL_CONFIG_IN = AudioFormat.CHANNEL_IN_MONO;
     private static final int PCM_FORMAT = AudioFormat.ENCODING_PCM_16BIT;
     private static final int AAC_BITRATE = 64000;
     private static final int BYTES_PER_SAMPLE = 2; // PCM_16BIT mono
 
-    // PCM read chunk: 20 ms at 48 kHz mono PCM_16 = 1920 samples = 3840 B.
+    // PCM read chunk: 40 ms at 48 kHz mono PCM_16 = 1920 samples = 3840 B.
     // Matches a typical AAC frame's 1024-sample budget closely so the
     // encoder isn't starved or flooded.
     private static final int PCM_CHUNK_SAMPLES = 1920;
@@ -87,6 +97,8 @@ public class AppAudioCaptureController {
     // Wire format constants — keep in sync with AacIngestServer.
     private static final int MSG_CONFIG = 1;
     private static final int MSG_DATA = 2;
+    private static final int MSG_PCM = 3;
+    private static final int MSG_LISTENER_ONLY = 4;
 
     // Drain-loop bail-out: after running=false, allow this many
     // consecutive INFO_TRY_AGAIN_LATER timeouts before exiting so we
@@ -96,19 +108,23 @@ public class AppAudioCaptureController {
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean started = new AtomicBoolean(false);
+    private final AtomicBoolean listenerEnabled = new AtomicBoolean(false);
     private final Object lifecycleLock = new Object();
+    private final boolean recordForMuxing;
+    private final int captureSampleRate;
 
     private ExecutorService executor;
     private AudioRecord audioRecord;
     private MediaCodec aacEncoder;
     private Socket socket;
     private DataOutputStream out;
+    private byte[] normalizedPcmBuffer;
     // FIX H3: per-frame scratch buffer for AAC packet copies. AAC frames are
     // typically <1500 bytes (4-8 ms × 64 kbps mono ≈ 32-64 bytes for data,
     // plus ADTS header). Allocating a fresh byte[info.size] per packet at
     // ~50 Hz (20 ms AAC frames) churned ~3 KB/s through GC. Grows on the
     // rare oversized frame, never shrinks.
-    private byte[] drainScratch = new byte[8192];
+    private byte[] drainScratch;
 
     // ---- Sample-accurate audio PTS (drain thread only) ----------------------
     // AAC-LC emits a FIXED 1024 samples per frame; at SAMPLE_RATE that is a
@@ -141,8 +157,8 @@ public class AppAudioCaptureController {
     // mid-trip; AudioRecord then throws ERROR_INVALID_OPERATION on read.
     // We close + retry every 5 s instead of busy-looping or giving up.
     //
-    // STATIC because StatusOverlayService.reconcileAudioCapture creates a
-    // fresh controller on every poll cycle when capture isn't running —
+    // STATIC because the process-wide demand owner creates a fresh controller
+    // on every retry when capture isn't running —
     // an instance-scoped back-off timer would reset to 0 every retry,
     // collapsing the 5 s gate into a 1 s fast-poll loop (~30 attempts in
     // 30 s while the mic is claimed). Process-scoped is correct: there's
@@ -156,7 +172,85 @@ public class AppAudioCaptureController {
     // start() returned false without spamming logcat at 1 Hz.
     private boolean loggedBackoffSkip = false;
 
-    public boolean start() {
+    private AppAudioCaptureController(
+            boolean recordForMuxing,
+            boolean listenerEnabled,
+            int captureSampleRate) {
+        this.recordForMuxing = recordForMuxing;
+        this.listenerEnabled.set(listenerEnabled);
+        this.captureSampleRate = captureSampleRate;
+    }
+
+    /**
+     * Recording and listener callers share this owner. Changing listener
+     * demand never restarts a healthy recording capture; changing recording
+     * demand preserves the existing start/stop boundary so stale AAC config
+     * cannot leak into video-only recordings.
+     */
+    public static boolean setRecordingDemand(boolean wanted) {
+        synchronized (OWNER_LOCK) {
+            recordingDemand = wanted;
+            return reconcileOwnerLocked();
+        }
+    }
+
+    public static boolean setListenerDemand(boolean wanted) {
+        return setListenerDemand(wanted, false);
+    }
+
+    public static boolean setListenerDemand(
+            boolean wanted, boolean diPlusCompatibility) {
+        synchronized (OWNER_LOCK) {
+            listenerDemand = wanted;
+            listenerDiPlusCompatibility =
+                    wanted && diPlusCompatibility;
+            return reconcileOwnerLocked();
+        }
+    }
+
+    public static boolean isRecordingCaptureRunning() {
+        synchronized (OWNER_LOCK) {
+            return recordingDemand
+                    && owner != null
+                    && owner.recordForMuxing
+                    && owner.isRunning();
+        }
+    }
+
+    private static boolean reconcileOwnerLocked() {
+        if (!recordingDemand && !listenerDemand) {
+            stopOwnerLocked();
+            return true;
+        }
+
+        AppAudioCaptureController current = owner;
+        int desiredCaptureRate =
+                listenerDemand && listenerDiPlusCompatibility
+                        ? LISTENER_CAPTURE_RATE : SAMPLE_RATE;
+        if (current != null
+                && current.isRunning()
+                && current.recordForMuxing == recordingDemand
+                && current.captureSampleRate == desiredCaptureRate) {
+            current.listenerEnabled.set(listenerDemand);
+            return true;
+        }
+
+        stopOwnerLocked();
+        AppAudioCaptureController replacement =
+                new AppAudioCaptureController(
+                        recordingDemand, listenerDemand, desiredCaptureRate);
+        if (!replacement.start()) return false;
+        owner = replacement;
+        return true;
+    }
+
+    private static void stopOwnerLocked() {
+        AppAudioCaptureController current = owner;
+        owner = null;
+        if (current != null) current.stop();
+    }
+
+    private boolean start() {
         // Fast-path: only one start() succeeds; concurrent starts noop.
         if (!started.compareAndSet(false, true)) {
             return running.get();
@@ -185,11 +279,13 @@ public class AppAudioCaptureController {
             // encoder configure) happens OUTSIDE the lifecycleLock so
             // a concurrent stop() isn't blocked by the 2 s connect.
             currentStep = "ingest-socket";
-            initIngestSocket();      // opens TCP, sends CONFIG
+            initIngestSocket();      // opens TCP, declares recording/listener mode
             currentStep = "audio-record";
             initAudioRecord();       // opens AudioRecord (may throw on perm denial)
-            currentStep = "encoder";
-            initEncoder();           // sets up MediaCodec AAC-LC encoder
+            if (recordForMuxing) {
+                currentStep = "encoder";
+                initEncoder();       // sets up MediaCodec AAC-LC encoder
+            }
 
             synchronized (lifecycleLock) {
                 running.set(true);
@@ -200,7 +296,8 @@ public class AppAudioCaptureController {
                 // the single drain thread after this point.
                 audioPtsBaseUs = -1L;
                 emittedSamples = 0L;
-                executor = Executors.newFixedThreadPool(2, r -> {
+                executor = Executors.newFixedThreadPool(
+                        recordForMuxing ? 2 : 1, r -> {
                     Thread t = new Thread(r);
                     t.setPriority(Thread.NORM_PRIORITY + 1);
                     return t;
@@ -209,13 +306,17 @@ public class AppAudioCaptureController {
                     Thread.currentThread().setName("AudioCapture");
                     captureLoop();
                 });
-                executor.submit(() -> {
-                    Thread.currentThread().setName("AudioDrain");
-                    drainLoop();
-                });
+                if (recordForMuxing) {
+                    executor.submit(() -> {
+                        Thread.currentThread().setName("AudioDrain");
+                        drainLoop();
+                    });
+                }
             }
 
-            Log.i(TAG, "Audio capture started");
+            Log.i(TAG, "Audio capture started (recording=" + recordForMuxing
+                    + ", listener=" + listenerEnabled.get()
+                    + ", captureRate=" + captureSampleRate + ")");
             return true;
         } catch (Throwable t) {
             // Log the FULL stack — getMessage() is null for many of the
@@ -233,7 +334,7 @@ public class AppAudioCaptureController {
         }
     }
 
-    public void stop() {
+    private void stop() {
         if (!started.compareAndSet(true, false)) return;
         running.set(false);
         Log.i(TAG, "Audio capture stopping");
@@ -241,7 +342,7 @@ public class AppAudioCaptureController {
         Log.i(TAG, "Audio capture stopped");
     }
 
-    public boolean isRunning() {
+    private boolean isRunning() {
         // `running` flips false the instant a worker self-exits OR stop()
         // is called. We deliberately surface "started but not running" as
         // !isRunning so the StatusOverlayService poll naturally calls
@@ -261,6 +362,15 @@ public class AppAudioCaptureController {
         socket.connect(new InetSocketAddress(INGEST_HOST, INGEST_PORT), 2000);
         socket.setTcpNoDelay(true);
         out = new DataOutputStream(socket.getOutputStream());
+
+        if (!recordForMuxing) {
+            // Explicitly clear any cached AAC config left by a recording
+            // client that this listener-only connection replaced.
+            out.writeInt(4);
+            out.writeInt(MSG_LISTENER_ONLY);
+            out.flush();
+            return;
+        }
 
         // Send CONFIG immediately. The CSD-0 for 48 kHz mono AAC-LC is
         // {0x11, 0x88} per ISO/IEC 14496-3 §1.6.2.1:
@@ -285,21 +395,12 @@ public class AppAudioCaptureController {
         out.flush();
     }
 
+    @SuppressLint("MissingPermission")
     private void initAudioRecord() {
-        // TODO: Verify RECORD_AUDIO is granted before constructing AudioRecord.
-        // The explicit ContextCompat.checkSelfPermission() up-front would give
-        // a cleaner error path than relying on the AudioRecord ctor to throw
-        // SecurityException (which is then caught by start() and routed to the
-        // 5 s static back-off). Currently this controller does not hold a
-        // Context — callers (StatusOverlayService) construct it via the no-arg
-        // ctor, and OverdriveApplication has no public getInstance() singleton.
-        // Adding the up-front check requires either threading a Context through
-        // the ctor (touches StatusOverlayService) or exposing an Application
-        // singleton (touches OverdriveApplication.kt) — out of scope for this
-        // file-local fix. The current path still works: SecurityException is
-        // caught in start() and the back-off engages. This TODO documents the
-        // cleaner error message we'd get with a Context.
-        int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG_IN, PCM_FORMAT);
+        // AudioRecord remains the authoritative permission/policy check because
+        // BYD's audio policy can deny an otherwise granted app UID at runtime.
+        int minBuf = AudioRecord.getMinBufferSize(
+                captureSampleRate, CHANNEL_CONFIG_IN, PCM_FORMAT);
         if (minBuf == AudioRecord.ERROR_BAD_VALUE || minBuf == AudioRecord.ERROR) {
             throw new IllegalStateException("AudioRecord.getMinBufferSize=" + minBuf);
         }
@@ -307,9 +408,9 @@ public class AppAudioCaptureController {
         // capture-thread stall without dropping samples, but not so
         // much that a transient pause shows up as audible latency on
         // subsequent recordings.
-        int bufSize = Math.max(minBuf * 4, SAMPLE_RATE / 5);
+        int bufSize = Math.max(minBuf * 4, captureSampleRate / 5);
         audioRecord = new AudioRecord(MediaRecorder.AudioSource.MIC,
-            SAMPLE_RATE, CHANNEL_CONFIG_IN, PCM_FORMAT, bufSize);
+            captureSampleRate, CHANNEL_CONFIG_IN, PCM_FORMAT, bufSize);
         if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
             int state = audioRecord.getState();
             audioRecord.release();
@@ -356,11 +457,13 @@ public class AppAudioCaptureController {
     // ==================== CAPTURE LOOP ====================
 
     private void captureLoop() {
-        byte[] pcmBuf = new byte[PCM_CHUNK_BYTES];
+        int captureChunkBytes =
+                PCM_CHUNK_BYTES * captureSampleRate / SAMPLE_RATE;
+        byte[] pcmBuf = new byte[captureChunkBytes];
         while (running.get()) {
             int n;
             try {
-                n = audioRecord.read(pcmBuf, 0, PCM_CHUNK_BYTES);
+                n = audioRecord.read(pcmBuf, 0, captureChunkBytes);
             } catch (Throwable t) {
                 Log.w(TAG, "AudioRecord.read threw: " + t.getMessage());
                 lastFailureNanos = System.nanoTime();
@@ -381,6 +484,29 @@ public class AppAudioCaptureController {
                 continue;
             }
 
+            byte[] consumerPcm = pcmBuf;
+            int consumerLength = n;
+            if (captureSampleRate != SAMPLE_RATE) {
+                consumerLength = normalizePcmRate(pcmBuf, n);
+                consumerPcm = normalizedPcmBuffer;
+            }
+
+            if (listenerEnabled.get()) {
+                try {
+                    sendListenerPcm(consumerPcm, consumerLength);
+                } catch (java.net.SocketException se) {
+                    Log.i(TAG, "Listener socket closed: " + se.getMessage());
+                    running.set(false);
+                    break;
+                } catch (Throwable t) {
+                    Log.w(TAG, "Listener PCM send failed: " + t.getMessage());
+                    running.set(false);
+                    break;
+                }
+            }
+
+            if (!recordForMuxing) continue;
+
             // PTS handling: the input PTS is irrelevant here — the drain loop
             // assigns each output frame a PTS from a sample-count clock (see
             // the field doc on audioPtsBaseUs / the drainLoop stamp). We pass 0
@@ -394,8 +520,9 @@ public class AppAudioCaptureController {
                     ByteBuffer inBuf = aacEncoder.getInputBuffer(inputIndex);
                     if (inBuf != null) {
                         inBuf.clear();
-                        inBuf.put(pcmBuf, 0, n);
-                        aacEncoder.queueInputBuffer(inputIndex, 0, n, 0L, 0);
+                        inBuf.put(consumerPcm, 0, consumerLength);
+                        aacEncoder.queueInputBuffer(
+                                inputIndex, 0, consumerLength, 0L, 0);
                     }
                 }
                 // dequeueInputBuffer returning negative just means the
@@ -412,6 +539,41 @@ public class AppAudioCaptureController {
         // not here — queueing EOS while the encoder may already be
         // in mid-shutdown races with stop()/release() and throws
         // IllegalStateException intermittently.
+    }
+
+    private int normalizePcmRate(byte[] pcm, int length) {
+        int inputLength = length & ~1;
+        int repeat = SAMPLE_RATE / captureSampleRate;
+        int required = inputLength * repeat;
+        if (normalizedPcmBuffer == null
+                || normalizedPcmBuffer.length < required) {
+            normalizedPcmBuffer = new byte[required];
+        }
+        // ponytail: zero-order hold is enough for intelligible 8 kHz speech;
+        // use a band-limited resampler only if cabin-listener fidelity matters.
+        int output = 0;
+        for (int input = 0; input < inputLength; input += 2) {
+            byte low = pcm[input];
+            byte high = pcm[input + 1];
+            for (int copy = 0; copy < repeat; copy++) {
+                normalizedPcmBuffer[output++] = low;
+                normalizedPcmBuffer[output++] = high;
+            }
+        }
+        return output;
+    }
+
+    private void sendListenerPcm(byte[] pcm, int length) throws IOException {
+        // Frame format: [4 totalLength][4 msgType][N PCM bytes].
+        // The daemon fan-out is bounded and lossy, so this loopback write
+        // never waits on a slow browser.
+        synchronized (this) {
+            DataOutputStream o = out;
+            if (o == null) throw new IOException("ingest socket unavailable");
+            o.writeInt(4 + length);
+            o.writeInt(MSG_PCM);
+            o.write(pcm, 0, length);
+        }
     }
 
     // ==================== DRAIN LOOP ====================
@@ -520,7 +682,7 @@ public class AppAudioCaptureController {
                     // FIX H3: reuse drainScratch instead of `new byte[info.size]`.
                     // AAC frames are <1500 bytes; the scratch starts at 8 KB
                     // and only grows on the rare oversize frame.
-                    if (info.size > drainScratch.length) {
+                    if (drainScratch == null || info.size > drainScratch.length) {
                         drainScratch = new byte[info.size];
                     }
                     outBuf.get(drainScratch, 0, info.size);
@@ -664,6 +826,7 @@ public class AppAudioCaptureController {
         if (o != null) {
             try { o.close(); } catch (Throwable ignored) {}
         }
+        normalizedPcmBuffer = null;
         Socket s = socket;
         socket = null;
         if (s != null) {

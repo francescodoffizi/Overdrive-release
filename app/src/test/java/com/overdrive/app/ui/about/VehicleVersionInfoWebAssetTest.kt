@@ -21,6 +21,14 @@ class VehicleVersionInfoWebAssetTest {
         assertFalse(html.contains("data-vehicle-info=\"vin\""))
         assertTrue(html.contains("data-i18n=\"about.vehicle_vin_private\""))
         assertTrue(server.contains("path.equals(\"/api/about/vehicle-info\")"))
+
+        val authCheck = server.indexOf("AuthMiddleware.checkAuth(path")
+        val requestRouting = server.indexOf("routeToHandlers(method", authCheck)
+        assertTrue("Web About must remain behind HTTP authentication", authCheck >= 0)
+        assertTrue(
+            "Web About routing must happen only after authentication",
+            requestRouting > authCheck
+        )
     }
 
     @Test

@@ -1763,8 +1763,8 @@
     "heatmap_threat_high": "HIGH",
     "heatmap_threat_critical": "Kritisch",
     "state_active": "Aktiv",
-    "state_safe_zone": " Sicherheitszone",
-    "state_safe_zone_named": " Sicherheitszone ({name})",
+    "state_safe_zone": "Sicherheitszone",
+    "state_safe_zone_named": "Sicherheitszone ({name})",
     "size_used_dash": "-- verwendet",
     "size_limit_dash": "-- Grenzwerte",
     "limit_min_default": "100 MB",
@@ -2442,12 +2442,12 @@
     "add_zone_failed": "Zone nicht hinzugefügt",
     "confirm_delete_zone": "Diese sichere Zone zu löschen?",
     "zone_deleted": "Strecke gelöscht",
-    "in_safe_zone": " In der sicheren Zone ({zone}, {meters}m)",
-    "outside_zone": "🔴 Außen ({meters}m bis nächstgelegen)",
+    "in_safe_zone": "In der sicheren Zone ({zone}, {meters}m)",
+    "outside_zone": "Außen ({meters}m bis nächstgelegen)",
     "no_zones_yet": "Noch keine Zonen",
     "waiting_gps": "Ich warte auf GPS...",
-    "badge_on": "● ON",
-    "badge_off": "○ OFF",
+    "badge_on": "ON",
+    "badge_off": "OFF",
     "you_are_here": "Sie sind hier.",
     "popup_radius": "<b>{name}</b><br>{meters}m Radius"
   },
@@ -2577,7 +2577,6 @@
     "restore_failed": "Wiederherstellung fehlgeschlagen."
   },
   "about": {
-    "ack_chimes": "RoadSense Warnschimen — Sounds aus der Google Sound Library, lizenziert unter",
     "page_title": "Über — OverDrive",
     "page_title_short": "Über",
     "contributors_title": "Mitwirkende",
@@ -2599,7 +2598,8 @@
       "kofi_value": "Ein Kaffee auf Ko-fi hält die Nacht-Commits am Laufen.",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "Mit Hilfe von Mitwirkenden und Unterstützern entstanden."
+    "thanks_subtitle": "Mit Hilfe von Mitwirkenden und Unterstützern entstanden.",
+      "ack_chimes": "RoadSense Warnschimen — Sounds aus der Google Sound Library, lizenziert unter"
   },
   "byd_cloud": {
     "page_title": "BYD Wolke",

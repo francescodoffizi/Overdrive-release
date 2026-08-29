@@ -1451,8 +1451,8 @@
     "heatmap_threat_high": "สูง",
     "heatmap_threat_critical": "วิกฤต",
     "state_active": "กำลังทำงาน",
-    "state_safe_zone": "🏠 พื้นที่ปลอดภัย",
-    "state_safe_zone_named": "🏠 พื้นที่ปลอดภัย ({name})",
+    "state_safe_zone": "พื้นที่ปลอดภัย",
+    "state_safe_zone_named": "พื้นที่ปลอดภัย ({name})",
     "size_used_dash": "-- ใช้ไป",
     "size_limit_dash": "-- ขีดจำกัด",
     "limit_min_default": "100 MB",
@@ -2161,13 +2161,13 @@
     "add_zone_failed": "เพิ่มพิกัดปลอดภัยล้มเหลว",
     "confirm_delete_zone": "ต้องการลบพิกัดปลอดภัยนี้ออกจากระบบรถ?",
     "zone_deleted": "ลบพิกัดปลอดภัยเรียบร้อยแล้ว",
-    "in_safe_zone": "🟢 จอดในพิกัดปลอดภัย ({zone}, ห่างจุดศูนย์กลาง {meters} เมตร)",
-    "outside_zone": "🔴 อยู่นอกพื้นที่ปลอดภัย (ห่างจากจุดปลอดภัยที่ใกล้ที่สุด {meters} เมตร)",
+    "in_safe_zone": "จอดในพิกัดปลอดภัย ({zone}, ห่างจุดศูนย์กลาง {meters} เมตร)",
+    "outside_zone": "อยู่นอกพื้นที่ปลอดภัย (ห่างจากจุดปลอดภัยที่ใกล้ที่สุด {meters} เมตร)",
     "no_zones_yet": "ยังไม่มีการลงทะเบียนพิกัดปลอดภัยไว้ในเครื่อง",
     "waiting_gps": "กำลังรอสัญญาณ GPS...",
-    "badge_on": "● เปิดอยู่",
-    "badge_off": "○ ปิดอยู่",
-    "you_are_here": "📍 คุณอยู่ตรงนี้",
+    "badge_on": "เปิดอยู่",
+    "badge_off": "ปิดอยู่",
+    "you_are_here": "คุณอยู่ตรงนี้",
     "popup_radius": "<b>{name}</b><br>ขอบเขตรัศมีกว้าง {meters} เมตร"
   },
   "liveview": {
@@ -2268,7 +2268,6 @@
     "auto": "ปรับอัตโนมัติ"
   },
   "about": {
-    "ack_chimes": "เสียงเตือน RoadSense — เสียงจาก Google Sound Library ภายใต้ลิขสิทธิ์",
     "page_title": "เกี่ยวกับ — OverDrive",
     "page_title_short": "เกี่ยวกับ",
     "contributors_title": "ผู้ร่วมพัฒนา",
@@ -2290,7 +2289,8 @@
       "kofi_value": "ค่ากาแฟผ่าน Ko-fi ช่วยหล่อเลี้ยงให้พวกเรามีแรงทำงานเพิ่มยามดึกได้ต่อเนื่อง",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "แอปพลิเคชันนี้พัฒนาขึ้นได้ด้วยความช่วยเหลือจากผู้ร่วมพัฒนาและผู้สนับสนุนทุกท่าน"
+    "thanks_subtitle": "แอปพลิเคชันนี้พัฒนาขึ้นได้ด้วยความช่วยเหลือจากผู้ร่วมพัฒนาและผู้สนับสนุนทุกท่าน",
+      "ack_chimes": "เสียงเตือน RoadSense — เสียงจาก Google Sound Library ภายใต้ลิขสิทธิ์"
   },
   "byd_cloud": {
     "page_title": "BYD Cloud",

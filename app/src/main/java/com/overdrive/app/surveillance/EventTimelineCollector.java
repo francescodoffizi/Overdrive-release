@@ -434,6 +434,16 @@ public class EventTimelineCollector {
                 logger.warn("Place resolve dispatch failed for "
                         + mp4File.getName() + ": " + t.getMessage());
             }
+
+            // Idle cleanup gate: this batch (JSON + SRT) runs async and can
+            // land AFTER onSurveillanceFileSaved's bump and after an idle
+            // pass completed — without a bump of its own the bytes stay
+            // invisible to the parked-tick skip until the hourly backstop.
+            // One bump per batch. Best-effort. (Async place merges bump via
+            // SidecarGeoUpdater.writeSidecar.)
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance().markStorageDirty();
+            } catch (Throwable ignored) {}
         });
     }
 

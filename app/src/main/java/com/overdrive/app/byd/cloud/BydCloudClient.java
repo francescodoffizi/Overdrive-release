@@ -3,6 +3,7 @@ package com.overdrive.app.byd.cloud;
 import com.overdrive.app.byd.cloud.crypto.BydCryptoUtils;
 import com.overdrive.app.byd.cloud.crypto.EnvelopeCodec;
 import com.overdrive.app.byd.cloud.crypto.EnvelopeCodecFactory;
+import com.overdrive.app.byd.routing.DrivingSafetyGuard;
 import com.overdrive.app.logging.DaemonLogger;
 
 import org.json.JSONArray;
@@ -37,6 +38,8 @@ public final class BydCloudClient {
     private volatile CloudCapabilities cloudCapabilities;
     static final String SMART_CHARGE_REQUEST_ORDER_KEY =
             "__overdriveSmartChargeRequestOrder";
+    public static final String DRIVING_SAFETY_BLOCKED_CODE =
+            "OVERDRIVE_BLOCKED_DRIVING";
     private static final AtomicLong smartChargeRequestOrder = new AtomicLong();
 
     public BydCloudClient(BydCloudConfig config) {
@@ -1177,6 +1180,24 @@ public final class BydCloudClient {
         }
 
         TokenEnvelope env = buildTokenOuterEnvelope(nowMs, s, inner);
+        String guardKey = drivingSafetyGuardForRemoteCommand(commandType);
+        if (guardKey != null) {
+            boolean blocked;
+            try {
+                blocked = DrivingSafetyGuard.isActionBlocked(guardKey);
+            } catch (Throwable unavailable) {
+                blocked = true;
+            }
+            if (blocked) {
+                logger.warn("Blocked cloud command " + commandType
+                        + " at transport boundary");
+                return new CloudCommandResult(
+                        false, DRIVING_SAFETY_BLOCKED_CODE, "blocked while driving");
+            }
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            throw new IOException("remote command cancelled");
+        }
         JSONObject response = transport.postSecure("/control/remoteControl", env.outer);
         if (Thread.currentThread().isInterrupted()) {
             throw new IOException("remote command cancelled");
@@ -1221,6 +1242,16 @@ public final class BydCloudClient {
 
         logger.info("Remote command " + commandType + " dispatched (fire-and-forget)");
         return new CloudCommandResult(true, "0", "");
+    }
+
+    private static String drivingSafetyGuardForRemoteCommand(String commandType) {
+        if ("LOCKDOOR".equals(commandType) || "OPENDOOR".equals(commandType)) {
+            return DrivingSafetyGuard.GUARD_DOOR_LOCKS;
+        }
+        if ("OPENTRUNK".equals(commandType) || "CLOSETRUNK".equals(commandType)) {
+            return DrivingSafetyGuard.GUARD_TRUNK;
+        }
+        return null;
     }
 
     /** 0=pending/unknown, 1=success, 2=failure. Supports both BYD result shapes. */

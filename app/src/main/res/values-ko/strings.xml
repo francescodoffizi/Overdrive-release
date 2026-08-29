@@ -506,7 +506,7 @@
     <string name="dialog_zrok_token_message">Zrok 활성화 토큰을 입력합니다.</string>
     <string name="toast_token_cannot_be_empty">지표는 빈이 될 수 없습니다</string>
     <string name="dialog_tailscale_settings_title">Tailscale 터널 설정</string>
-    <string name="dialog_tailscale_settings_message">꼬리 스케일을 구성</string>
+    <string name="dialog_tailscale_settings_message">Tailscale 구성</string>
     <string name="tailscale_failed_login_url">로그인 URL를 생성하지 못했습니다</string>
     <string name="tailscale_logged_in_relogin">로그인. 다른 계정에 로그인하려면 클릭하세요</string>
     <string name="dialog_tailscale_proxy_enable_title">Tailscale 프록시를 활성화하세요?</string>
@@ -519,8 +519,8 @@
     <string name="toast_zrok_reset_warnings">환경 리셋 (주의사항: %1$s)</string>
     <string name="zrok_no_token_configured">토큰이 설정되지 않았습니다. 설정하기 위해 탭하세요.</string>
     <string name="dialog_tailscale_reset_title">Tailscale 환경을 다시 설정</string>
-    <string name="dialog_tailscale_reset_message">이것은:\n• 실행되는 경우 꼬리 스케일 터널을 중지합니다\n• 이 장치에서 꼬리 스케일 환경을 제거합니다\n• 당신은 여전히 꼬리 스케일 콘솔에서 장치를 제거해야합니다\n\n당신은 다시 로그인해야합니다.\n\n당신은 확신합니까?</string>
-    <string name="toast_resetting_tailscale">꼬리 스케일 환경을 재설정...</string>
+    <string name="dialog_tailscale_reset_message">이 작업은:\n• 실행 중이면 Tailscale 터널을 중지합니다\n• 이 장치에서 Tailscale 환경을 제거합니다\n• Tailscale 콘솔에서 장치를 제거하는 것은 별도로 필요합니다\n\n다시 로그인해야 합니다.\n\n계속하시겠습니까?</string>
+    <string name="toast_resetting_tailscale">Tailscale 환경을 재설정하는 중…</string>
     <string name="toast_tailscale_reset_success">Tailscale 환경 리셋. 로그인해서 다시 설정합니다.</string>
     <string name="toast_tailscale_reset_warnings">Tailscale 환경 리셋 (주의사항: %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Tailscale 프록시 활성화</string>

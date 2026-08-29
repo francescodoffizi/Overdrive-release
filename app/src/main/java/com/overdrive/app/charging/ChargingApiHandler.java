@@ -2,10 +2,12 @@ package com.overdrive.app.charging;
 
 import com.overdrive.app.byd.BydDataCollector;
 import com.overdrive.app.byd.BydVehicleData;
+import com.overdrive.app.abrp.SohEstimator;
 import com.overdrive.app.logging.DaemonLogger;
 import com.overdrive.app.monitor.BatterySocData;
 import com.overdrive.app.monitor.ChargingDetector;
 import com.overdrive.app.monitor.ChargingStateData;
+import com.overdrive.app.monitor.DrivingRangeData;
 import com.overdrive.app.monitor.SocHistoryDatabase;
 import com.overdrive.app.monitor.VehicleDataMonitor;
 import com.overdrive.app.trips.TripAnalyticsManager;
@@ -132,7 +134,7 @@ public class ChargingApiHandler {
                 return handleDeleteSession(id);
             }
 
-            // POST /api/charging/{id}/cost — update cost
+            // POST /api/charging/{id}/cost — update a completed session's cost.
             Matcher costMatcher = SESSION_COST_PATTERN.matcher(path);
             if (costMatcher.matches() && "POST".equals(method)) {
                 long id = Long.parseLong(costMatcher.group(1));
@@ -453,28 +455,43 @@ public class ChargingApiHandler {
         }
     }
 
-    /** POST /api/charging/{id}/cost — update cost of a completed session. */
+    /** POST /api/charging/{id}/cost — update or reset a completed session's cost. */
     private JSONObject handleUpdateSessionCost(long id, String body) {
         try {
             JSONObject bodyJson;
             try {
                 bodyJson = new JSONObject(body != null ? body : "{}");
-            } catch (org.json.JSONException je) {
+            } catch (org.json.JSONException e) {
                 return errorResponse("Invalid JSON payload", 400);
             }
             if (!bodyJson.has("cost")) {
                 return errorResponse("Missing 'cost' parameter", 400);
             }
-            double cost = bodyJson.getDouble("cost");
-            boolean ok = db().updateChargingSessionCost(id, cost);
-            if (!ok) return errorResponse("Failed to update session cost (session may be in progress or not found)", 500);
-            
+
+            Object rawCost = bodyJson.get("cost");
+            if (!(rawCost instanceof Number)) {
+                return errorResponse("'cost' must be a number", 400);
+            }
+            double cost = ((Number) rawCost).doubleValue();
+            if (!Double.isFinite(cost)
+                    || !Float.isFinite((float) cost)
+                    || (cost < 0 && cost != -1)) {
+                return errorResponse(
+                        "'cost' must be finite and non-negative, or -1 to reset",
+                        400);
+            }
+
+            if (!db().updateChargingSessionCost(id, cost)) {
+                return errorResponse(
+                        "Failed to update session cost (session may be in progress or not found)",
+                        500);
+            }
             JSONObject response = new JSONObject();
             response.put("success", true);
             return response;
         } catch (Exception e) {
             logger.error("Error updating cost for session " + id, e);
-            return errorResponse("Failed to update cost: " + e.getMessage(), 500);
+            return errorResponse("Failed to update cost", 500);
         }
     }
 
@@ -568,15 +585,43 @@ public class ChargingApiHandler {
         public final boolean fault;
         public final double socPercent;
         public final double sessionKwh;
+        public final boolean sessionEnergyIncomplete;
+        public final boolean sessionEnergyEstimated;
+        public final String sessionEnergySource;
         public final int timeToFullMin;
         public final PowerPublication power;
+        public final double rangeKm;
+        public final double sohPercent;
         private final ChargingDetector.StateSnapshot verifiedAt;
 
         private LivePublication(
                 ChargingStateData state,
                 boolean charging, boolean plugged, boolean full, boolean fault,
-                double socPercent, double sessionKwh, int timeToFullMin,
+                double socPercent, double sessionKwh,
+                boolean sessionEnergyIncomplete,
+                boolean sessionEnergyEstimated,
+                String sessionEnergySource,
+                int timeToFullMin,
                 PowerPublication power,
+                ChargingDetector.StateSnapshot verifiedAt) {
+            this(state, charging, plugged, full, fault,
+                    socPercent, sessionKwh,
+                    sessionEnergyIncomplete, sessionEnergyEstimated,
+                    sessionEnergySource, timeToFullMin, power,
+                    -1.0, -1.0, verifiedAt);
+        }
+
+        private LivePublication(
+                ChargingStateData state,
+                boolean charging, boolean plugged, boolean full, boolean fault,
+                double socPercent, double sessionKwh,
+                boolean sessionEnergyIncomplete,
+                boolean sessionEnergyEstimated,
+                String sessionEnergySource,
+                int timeToFullMin,
+                PowerPublication power,
+                double rangeKm,
+                double sohPercent,
                 ChargingDetector.StateSnapshot verifiedAt) {
             this.state = state;
             this.charging = charging;
@@ -585,8 +630,22 @@ public class ChargingApiHandler {
             this.fault = fault;
             this.socPercent = socPercent;
             this.sessionKwh = charging ? sessionKwh : -1.0;
+            boolean hasSessionEnergy = charging && sessionKwh > 0;
+            this.sessionEnergyIncomplete =
+                    hasSessionEnergy && sessionEnergyIncomplete;
+            this.sessionEnergyEstimated =
+                    hasSessionEnergy
+                            && (sessionEnergyEstimated
+                            || sessionEnergyIncomplete);
+            this.sessionEnergySource = hasSessionEnergy
+                    && sessionEnergySource != null
+                    && !sessionEnergySource.isEmpty()
+                    ? sessionEnergySource
+                    : SessionEnergyResolver.SRC_NONE;
             this.timeToFullMin = charging ? timeToFullMin : -1;
             this.power = power;
+            this.rangeKm = rangeKm;
+            this.sohPercent = sohPercent;
             this.verifiedAt = verifiedAt;
         }
 
@@ -594,7 +653,9 @@ public class ChargingApiHandler {
                 ChargingDetector.StateSnapshot verifiedAt) {
             return new LivePublication(
                     null, false, false, false, false,
-                    -1.0, -1.0, -1,
+                    -1.0, -1.0,
+                    false, false, SessionEnergyResolver.SRC_NONE,
+                    -1,
                     normalizePowerPublication(false, null), verifiedAt);
         }
 
@@ -626,8 +687,20 @@ public class ChargingApiHandler {
                         socPercent >= 0 ? socPercent : JSONObject.NULL);
                 live.put("sessionKwh",
                         sessionKwh > 0 ? sessionKwh : JSONObject.NULL);
+                live.put("sessionEnergyIncomplete",
+                        sessionEnergyIncomplete);
+                live.put("sessionEnergyEstimated",
+                        sessionEnergyEstimated);
+                live.put("sessionEnergySource",
+                        sessionKwh > 0
+                                ? sessionEnergySource
+                                : JSONObject.NULL);
                 live.put("timeToFullMin",
                         timeToFullMin > 0 ? timeToFullMin : JSONObject.NULL);
+                live.put("rangeKm",
+                        rangeKm >= 0 ? rangeKm : JSONObject.NULL);
+                live.put("sohPercent",
+                        sohPercent > 0 ? sohPercent : JSONObject.NULL);
             } catch (Exception e) {
                 logger.debug("Could not serialize live charging state: "
                         + e.getMessage());
@@ -636,20 +709,34 @@ public class ChargingApiHandler {
         }
 
         public JSONObject toStatusJson() {
-            if (state == null) return buildClearedStatusJson();
             JSONObject status = new JSONObject();
             try {
-                status.put("stateName", state.stateName);
-                status.put("status", state.status.name());
-                status.put("isDischarging", state.isDischarging);
-                status.put("isError", state.isError);
+                status.put("stateName",
+                        state != null ? state.stateName : "Unavailable");
+                status.put("status",
+                        state != null
+                                ? state.status.name()
+                                : ChargingStateData.ChargingStatus.UNKNOWN.name());
+                status.put("isDischarging",
+                        state != null && state.isDischarging);
+                status.put("isError",
+                        state != null && state.isError);
                 putPower(status, power, true);
                 status.put("charging", charging);
                 status.put("plugged", plugged);
                 status.put("full", full);
                 status.put("fault", fault);
                 if (socPercent >= 0) status.put("socPercent", socPercent);
-                if (sessionKwh > 0) status.put("sessionKwh", sessionKwh);
+                status.put("sessionKwh",
+                        sessionKwh > 0 ? sessionKwh : JSONObject.NULL);
+                status.put("sessionEnergyIncomplete",
+                        sessionEnergyIncomplete);
+                status.put("sessionEnergyEstimated",
+                        sessionEnergyEstimated);
+                status.put("sessionEnergySource",
+                        sessionKwh > 0
+                                ? sessionEnergySource
+                                : JSONObject.NULL);
                 if (timeToFullMin > 0) {
                     status.put("timeToFullMin", timeToFullMin);
                 }
@@ -671,6 +758,7 @@ public class ChargingApiHandler {
 
             ChargingStateData state = null;
             double socPercent = -1.0;
+            double rangeKm = -1.0;
             VehicleDataMonitor monitor = VehicleDataMonitor.getInstance();
             if (monitor != null) {
                 try {
@@ -679,6 +767,12 @@ public class ChargingApiHandler {
                 try {
                     BatterySocData soc = monitor.getBatterySoc();
                     if (soc != null) socPercent = soc.socPercent;
+                } catch (Exception ignored) {}
+                try {
+                    DrivingRangeData range = monitor.getDrivingRange();
+                    if (range != null && range.isValidRange()) {
+                        rangeKm = range.elecRangeKm;
+                    }
                 } catch (Exception ignored) {}
             }
 
@@ -694,16 +788,41 @@ public class ChargingApiHandler {
             } catch (Exception ignored) {}
 
             double sessionKwh = -1.0;
+            boolean sessionEnergyIncomplete = false;
+            boolean sessionEnergyEstimated = false;
+            String sessionEnergySource = SessionEnergyResolver.SRC_NONE;
             int timeToFullMin = -1;
+            double sohPercent = -1.0;
             if (database != null) {
                 try {
                     if (database.getOpenChargingSessionStart() > 0) {
-                        sessionKwh =
-                                database.getOpenChargingSessionEnergyKwh();
+                        SocHistoryDatabase.OpenChargingSessionEnergy energy =
+                                database.getOpenChargingSessionEnergy();
+                        sessionKwh = energy.energyKwh;
+                        sessionEnergyIncomplete = energy.incomplete;
+                        sessionEnergyEstimated = energy.estimated;
+                        sessionEnergySource = energy.source;
                         timeToFullMin =
                                 database.getOpenChargingSessionTimeToFullMin();
                     }
                 } catch (Exception ignored) {}
+                try {
+                    SohEstimator soh = database.getSohEstimator();
+                    if (soh != null && soh.hasDisplaySoh()) {
+                        double value = soh.getDisplaySoh();
+                        if (value > 0 && value <= 100) {
+                            sohPercent =
+                                    Math.round(value * 10.0) / 10.0;
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+            if (sohPercent <= 0 && vehicleData != null
+                    && Double.isFinite(vehicleData.sohPercent)
+                    && vehicleData.sohPercent > 0
+                    && vehicleData.sohPercent <= 100) {
+                sohPercent =
+                        Math.round(vehicleData.sohPercent * 10.0) / 10.0;
             }
             if (timeToFullMin <= 0 && vehicleData != null) {
                 int unavailable = BydVehicleData.UNAVAILABLE;
@@ -739,6 +858,9 @@ public class ChargingApiHandler {
                 // An open row may remain during the bounded final-counter drain. It is persistence
                 // state, not proof that power is still flowing.
                 sessionKwh = -1.0;
+                sessionEnergyIncomplete = false;
+                sessionEnergyEstimated = false;
+                sessionEnergySource = SessionEnergyResolver.SRC_NONE;
                 timeToFullMin = -1;
             }
             return new LivePublication(
@@ -749,8 +871,13 @@ public class ChargingApiHandler {
                     state != null && state.isError,
                     socPercent,
                     sessionKwh,
+                    sessionEnergyIncomplete,
+                    sessionEnergyEstimated,
+                    sessionEnergySource,
                     timeToFullMin,
                     power,
+                    rangeKm,
+                    sohPercent,
                     after);
         }
         return LivePublication.cleared(lastSnapshot);
@@ -789,6 +916,10 @@ public class ChargingApiHandler {
             status.put("full", false);
             status.put("fault", false);
             status.put("powerKw", 0);
+            status.put("sessionKwh", JSONObject.NULL);
+            status.put("sessionEnergyIncomplete", false);
+            status.put("sessionEnergyEstimated", false);
+            status.put("sessionEnergySource", JSONObject.NULL);
         } catch (Exception ignored) {}
         return status;
     }
@@ -818,7 +949,9 @@ public class ChargingApiHandler {
             boolean charging, ChargingStateData state) {
         if (!charging || state == null
                 || !Double.isFinite(state.chargingPowerKW)
-                || state.chargingPowerKW <= 0.0) {
+                || state.chargingPowerKW <= 0.0
+                || state.chargingPowerKW
+                        > ChargingStateData.MAX_ABSOLUTE_POWER_KW) {
             return new PowerPublication(
                     0.0, false, "none", 0L,
                     ChargingStateData.PowerQuality.UNKNOWN.name(), 0.0);

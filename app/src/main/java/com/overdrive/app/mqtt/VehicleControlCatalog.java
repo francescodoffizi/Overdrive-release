@@ -1,5 +1,6 @@
 package com.overdrive.app.mqtt;
 
+import com.overdrive.app.byd.BydDataCollector;
 import com.overdrive.app.byd.BydVehicleData;
 import com.overdrive.app.byd.routing.VehicleCommandRouter;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.VehicleCommand;
@@ -828,6 +829,18 @@ public final class VehicleControlCatalog {
     }
     private static final List<String> INFOTAINMENT_ROTATIONS =
             java.util.Arrays.asList("horizontal", "vertical");
+    private static final List<String> HEADLIGHT_MODES =
+            java.util.Arrays.asList("off", "auto", "parking", "low_beam");
+    static int headlightModeValue(String payload) {
+        if (payload == null) return BydVehicleData.UNAVAILABLE;
+        switch (payload.trim().toLowerCase()) {
+            case "off": return com.overdrive.app.byd.BydDataCollector.HEADLIGHT_MODE_OFF;
+            case "auto": return com.overdrive.app.byd.BydDataCollector.HEADLIGHT_MODE_AUTO;
+            case "parking": return com.overdrive.app.byd.BydDataCollector.HEADLIGHT_MODE_PARKING;
+            case "low_beam": return com.overdrive.app.byd.BydDataCollector.HEADLIGHT_MODE_LOW_BEAM;
+            default: return BydVehicleData.UNAVAILABLE;
+        }
+    }
     private static int infotainmentRotationValue(String payload) {
         if ("horizontal".equalsIgnoreCase(payload)) {
             return com.overdrive.app.byd.BydDataCollector.PAD_ROTATION_HORIZONTAL;
@@ -855,10 +868,8 @@ public final class VehicleControlCatalog {
             default: return -1;
         }
     }
-    // User-facing config-axis values. BydDataCollector maps these onto this head unit's
-    // operation-mode setter enum (normal=3, economy=1, sport=2) and keeps snow on its
-    // road-surface path.
-    private static final List<String> DRIVE_MODES = java.util.Arrays.asList("normal", "eco", "sport");
+    // User-facing config-axis values map to Energy operation NORMAL/ECO/SPORT/SNOW = 3/1/2/4.
+    private static final List<String> DRIVE_MODES = java.util.Arrays.asList("normal", "eco", "sport", "snow");
     // Stable OverDrive config axis (see BydDataCollector.setDriveConfigMode):
     // NORMAL=1, ECO=2, SPORT=3, SNOW=4. This is not the energy setter's public numbering.
     private static int driveModeValue(String payload) {
@@ -1030,6 +1041,28 @@ public final class VehicleControlCatalog {
         register(sw("drl", "Daytime Running Lights", "mdi:car-light-dimmed", null, "light_drl", "1", "0",
                 (sub, payload, snap) -> ControlAction.of(new VehicleCommandRouter.LightsCommand(truthy(payload))),
                 snap -> snap == null ? null : snap.dayTimeLight));
+
+        // ── OEM exterior-light selector — four-state Instrument HAL control ──
+        // This is not the DRL switch or beam-height adjustment. It mirrors CarSetting's
+        // selector exactly: 1=off, 2=auto, 3=parking lights, 4=low beam. OFF is Park-gated
+        // by HeadlightModeCommand; all modes are local-only and cannot wake the vehicle.
+        register(select("headlight_mode", "Headlight Mode", "mdi:car-light-high", null,
+                "headlight_mode", HEADLIGHT_MODES,
+                (sub, payload, snap) -> {
+                    int mode = headlightModeValue(payload);
+                    if (mode == BydVehicleData.UNAVAILABLE) return null;
+                    return ControlAction.echo(
+                            new VehicleCommandRouter.HeadlightModeCommand(mode),
+                            "headlight_mode", payload);
+                },
+                () -> {
+                    int mode = com.overdrive.app.byd.BydDataCollector.getInstance()
+                            .readHeadlightModeNow();
+                    return mode >= com.overdrive.app.byd.BydDataCollector.HEADLIGHT_MODE_OFF
+                            && mode <= com.overdrive.app.byd.BydDataCollector.HEADLIGHT_MODE_LOW_BEAM
+                            ? mode - com.overdrive.app.byd.BydDataCollector.HEADLIGHT_MODE_OFF
+                            : -1;
+                }));
 
         // ── Hazard (double-flash) lights — switch ────────────────────────────
         // State published to light_hazard (getLightStatus(8) → snap.hazard). The READBACK is
@@ -1339,11 +1372,12 @@ public final class VehicleControlCatalog {
         // the pair — the hold switch first, then the target level (see applySocHold for why that
         // order, which deliberately differs from the OEM's):
         //   at_current → switch 2 + min(SOC,50) — "keep the charge I have" (the Highway preset)
+        //   at_target  → switch 2, preserving the configured target_soc
         //   at_floor   → switch 1 + this trim's floor — "let it deplete" (the City preset)
         //   off        → switch 0, target untouched
         // No telemetry field reports the hold state (getSocSaveSwitch does not exist in the SDK
         // or on any trim), so this is set-only and reports no state.
-        // OPTION ORDER IS DELIBERATE: off → at_current → at_floor, in increasing order of
+        // OPTION ORDER IS DELIBERATE: off → at_current → at_target → at_floor.
         // intervention. No UI offers "toggle" for this entity (it is declared per-entry in the
         // keymap catalog and the automation picker, and HA is sent only these three options), but
         // a hand-published MQTT "toggle" still reaches toAction's no-readback cycle, which
@@ -1351,16 +1385,24 @@ public final class VehicleControlCatalog {
         // change. With this order that is at_current ("keep what I have"); the previous order put
         // at_floor there, silently permitting the pack to run down to the reserve.
         register(select("battery_hold", "Battery Hold", "mdi:battery-lock", null, null,
-                java.util.Arrays.asList("off", "at_current", "at_floor"),
+                java.util.Arrays.asList("off", "at_current", "at_target", "at_floor"),
                 (sub, payload, snap) -> {
                     String p = payload == null ? "" : payload.trim().toLowerCase();
                     if ("off".equals(p)) {
                         return ControlAction.of(new VehicleCommandRouter.SocHoldToggleCommand(false));
                     }
+                    if ("at_target".equals(p)) {
+                        return ControlAction.of(new VehicleCommandRouter.SocHoldToggleCommand(true));
+                    }
                     // "toggle" never arrives here — toAction rewrites it to a concrete option
                     // first. Anything unrecognised → at_current, the intent behind the name.
                     return ControlAction.of(new VehicleCommandRouter.SocHoldPresetCommand(!"at_floor".equals(p)));
                 }));
+        register(number("target_soc", "Target SOC", "mdi:battery-sync", "config",
+                "target_soc", BydDataCollector.SOC_TARGET_MIN, BydDataCollector.SOC_TARGET_MAX,
+                1, "%", (sub, payload, snap) ->
+                        ControlAction.of(new VehicleCommandRouter.SocTargetPercentCommand(
+                                pInt(payload, BydDataCollector.SOC_TARGET_MIN)))));
         // regen_level: normalized user level fed to BydDataCollector.setEnergyFeedback,
         // which maps 0..2 -> MCU 2..4. standard = 0 (SETTING_ENERGY_FEEDBACK_STANDARD),
         // high = 1 (SETTING_ENERGY_FEEDBACK_LARGE) — per the OEM firmware convention.

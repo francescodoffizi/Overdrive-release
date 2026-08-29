@@ -145,7 +145,6 @@ public final class SeatDebugApiHandler {
      * Forms:
      *   /api/debug/seat/write?axis=horizontal&value=52&confirm=YES        (single axis)
      *   /api/debug/seat/write?apply=HORIZONTAL:52,BACKREST:56,...&confirm=YES  (batch)
-     *   ...&force=YES  to bypass the movement gate (only if certain the car is parked)
      */
     private static boolean handleWrite(OutputStream out, Map<String, String> q) throws Exception {
         if (!"YES".equals(q.get("confirm"))) {
@@ -172,9 +171,8 @@ public final class SeatDebugApiHandler {
                 catch (NumberFormatException e) { HttpResponse.sendJsonError(out, "Bad value in full: '" + pair + "'"); return true; }
             }
             for (float v : ov.values()) { if (v < 0 || v > 255) { HttpResponse.sendJsonError(out, "Value out of 0..255"); return true; } }
-            boolean fforce = "YES".equals(q.get("force"));
-            log("apply FULL overrides=" + ov + " force=" + fforce);
-            JSONObject fres = BodyworkSeatProbe.applyFull(ctx, ov, fforce);
+            log("apply FULL overrides=" + ov);
+            JSONObject fres = BodyworkSeatProbe.applyFull(ctx, ov);
             HttpResponse.sendJson(out, fres.toString());
             return true;
         }
@@ -208,9 +206,8 @@ public final class SeatDebugApiHandler {
             if (!batch.containsKey(0x4C116038)) batch.put(0x4C116038, 127.5f);   // ST_V
             int[] mi = new int[batch.size()]; float[] mv = new float[batch.size()];
             int bi = 0; for (java.util.Map.Entry<Integer,Float> e : batch.entrySet()) { mi[bi] = e.getKey(); mv[bi] = e.getValue(); bi++; }
-            boolean mforce = "YES".equals(q.get("force"));
-            log("write MIRROR+steering (bodywork/float) ids=" + batch.keySet() + " vals=" + batch.values() + " force=" + mforce);
-            JSONObject mres = BodyworkSeatProbe.writeAxes(ctx, mi, mv, mforce);
+            log("write MIRROR+steering (bodywork/float) ids=" + batch.keySet() + " vals=" + batch.values());
+            JSONObject mres = BodyworkSeatProbe.writeAxes(ctx, mi, mv);
             HttpResponse.sendJson(out, mres.toString());
             return true;
         }
@@ -251,10 +248,8 @@ public final class SeatDebugApiHandler {
         int[] idArr = new int[ids.size()];
         float[] valArr = new float[vals.size()];
         for (int i = 0; i < ids.size(); i++) { idArr[i] = ids.get(i); valArr[i] = vals.get(i); }
-        boolean force = "YES".equals(q.get("force"));
-
-        log("write ids=" + ids + " vals=" + vals + " force=" + force);
-        JSONObject result = BodyworkSeatProbe.writeAxes(ctx, idArr, valArr, force);
+        log("write ids=" + ids + " vals=" + vals);
+        JSONObject result = BodyworkSeatProbe.writeAxes(ctx, idArr, valArr);
         log("write -> " + result.optString("skipped", "").isEmpty()
                 + " code=" + result.opt("resultCode") + " blocked=" + result.opt("movementBlocked"));
         HttpResponse.sendJson(out, result.toString());

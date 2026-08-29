@@ -115,6 +115,73 @@ object CommunityApiHandler {
     }
 
     /**
+     * Small, read-only catalog surface for the local GenAI assistant.
+     *
+     * The Worker search is a literal substring match, so use one meaningful
+     * term from the natural-language request, then fall back to the top-rated
+     * page when it has no literal hit. Only public list metadata is returned;
+     * rules are still fetched and imported through the existing guarded routes.
+     */
+    @JvmStatic
+    fun searchForAssistant(query: String): JSONObject {
+        val term = assistantSearchTerm(query)
+        fun queryString(q: String): String {
+            val base = "sort=rating&order=desc&page=1&pageSize=20"
+            return if (q.isEmpty()) base else "$base&q=" +
+                    java.net.URLEncoder.encode(q, "UTF-8")
+        }
+
+        var result = provider.list(
+            queryString(term), CommunityConfig.publisherId())
+        if (result.ok && term.isNotEmpty()
+            && (result.body?.optJSONArray("items")?.length() ?: 0) == 0) {
+            result = provider.list(
+                queryString(""), CommunityConfig.publisherId())
+        }
+
+        val out = JSONObject()
+        if (!result.ok || result.body == null) {
+            return out.put("available", false)
+                .put("error", result.error ?: "community catalog unavailable")
+                .put("items", JSONArray())
+        }
+
+        val safe = JSONArray()
+        val items = result.body.optJSONArray("items") ?: JSONArray()
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            safe.put(JSONObject()
+                .put("id", item.optString("id", ""))
+                .put("name", item.optString("name", ""))
+                .put("description", item.optString("description", ""))
+                .put("category", item.optString("category", "other"))
+                .put("authorName", item.optString("authorName", ""))
+                .put("ratingAvg", item.optDouble("ratingAvg", 0.0))
+                .put("ratingCount", item.optInt("ratingCount", 0))
+                .put("downloadCount", item.optInt("downloadCount", 0))
+                .put("createdMs", item.optLong("createdMs", 0L))
+                .put("mine", item.optBoolean("mine", false)))
+        }
+        return out.put("available", true)
+            .put("searchTerm", term)
+            .put("items", safe)
+    }
+
+    private fun assistantSearchTerm(query: String): String {
+        val stop = setOf(
+            "automation", "automations", "community", "find", "search",
+            "browse", "help", "please", "create", "make", "useful",
+            "want", "need", "with", "when", "that", "this", "from",
+            "into", "about", "overdrive", "could", "would", "should")
+        return query.lowercase()
+            .split(Regex("[^\\p{L}\\p{N}]+"))
+            .filter { it.length >= 3 && it !in stop }
+            .maxByOrNull { it.length }
+            ?.take(40)
+            ?: ""
+    }
+
+    /**
      * GET one — fetch the full record (with rules) and ENRICH it with a per-vehicle
      * capability check so the UI can show a "works on your car" badge and list any
      * unsupported actions. Enrichment is advisory; the record is returned regardless.

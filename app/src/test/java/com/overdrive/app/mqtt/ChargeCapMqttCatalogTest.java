@@ -47,6 +47,24 @@ public class ChargeCapMqttCatalogTest {
         assertTrue(verifiedComponents.has("ctl_charge_cap_enabled"));
     }
 
+    @Test
+    public void chargingEnergyPublishesExplicitQualityMetadata() {
+        TelemetryFieldCatalog.Field incomplete =
+                TelemetryFieldCatalog.get(
+                        "charging_capacity_incomplete");
+        TelemetryFieldCatalog.Field estimated =
+                TelemetryFieldCatalog.get(
+                        "charging_capacity_estimated");
+        TelemetryFieldCatalog.Field source =
+                TelemetryFieldCatalog.get(
+                        "charging_capacity_source");
+
+        assertTrue(incomplete.isBinary());
+        assertTrue(estimated.isBinary());
+        assertEquals("enum", source.deviceClass);
+        assertTrue(source.isDiscoverable());
+    }
+
     private static JSONObject bundleComponents(JSONObject snapshot) throws Exception {
         String bundle = HomeAssistantDiscovery.buildBundle(
                 "test-device", null, null, null, "overdrive/test", snapshot,

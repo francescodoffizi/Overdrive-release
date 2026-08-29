@@ -64,7 +64,7 @@ public final class AutomationCategories {
         put(CLIMATE, "setAc", "setAcTemp", "stepAcTemp", "setAcFan", "ac", "temperature", "outsideTemp",
                 "seat", "seatClimate", "seat_heat_driver", "seat_heat_passenger",
                 "seat_vent_driver", "seat_vent_passenger",
-                "acAuto", "acAutoOff", "fanOnly", "steeringHeat", "recirculation",
+                "acAuto", "acSync", "acAutoOff", "fanOnly", "steeringHeat", "recirculation",
                 "frontDefrost", "rearDefrost");
         // ── Windows / body / openings ──
         put(WINDOWS_BODY, "windows", "windowsAll", "windowsPreset", "windowState",
@@ -75,7 +75,7 @@ public final class AutomationCategories {
                 // heating/venting ids above, which are climate.
                 "seatPosition", "seatSave", "applySeatPosition");
         // ── Lighting ──
-        put(LIGHTING, "drl", "hazard", "setAmbient", "ambient_colour", "ambientBrightness",
+        put(LIGHTING, "drl", "headlight_mode", "hazard", "setAmbient", "ambient_colour", "ambientBrightness",
                 // "ambientPower" = the on/off ACTION's id, "ambient" = the on/off CONDITION's id.
                 // Only action/condition ids belong in this map — the MQTT telemetry field name
                 // (ambient_enabled) is never looked up here and would be dead weight.
@@ -86,6 +86,7 @@ public final class AutomationCategories {
         put(ADAS_SAFETY, "adas_slw", "slw", "esp_control", "esp_state", "itac",
                 "lane_assist", "cpd", "adas_cpd", "tyrePressureWarn",
                 "tyreLeakWarn", "seatbelt", "occupant", "radarNearest", "blindSpot",
+                "rearCrossTraffic", "doorOpenWarning",
                 // Expanded ADAS matrix
                 "adas_bsd", "adas_tsr", "adas_rcta", "adas_fcta", "adas_tla", "adas_dow",
                 "adas_rcw", "adas_islc", "adas_elka", "adas_rctb", "adas_fctb",
@@ -96,7 +97,8 @@ public final class AutomationCategories {
                 "gear", "speed", "accelerator", "brake", "steeringAngle", "slope",
                 // The real SOC-hold pair, alongside hold_battery so users comparing the two
                 // find them together (hold_battery is only an energy-mode HEV alias).
-                "charge_cap_enabled", "charge_cap_percent", "battery_hold");
+                "charge_cap_enabled", "charge_cap_percent", "battery_hold", "target_soc",
+                "acChargeCurrentLimit");
         // ── Media / audio ──
         put(MEDIA, "mediaVolume", "channelVolume", "volumeStep", "mediaControl",
                 "playAudio", "playVideo", "stopAudio", "speak");
@@ -110,7 +112,7 @@ public final class AutomationCategories {
                 "boot", "power", "time", "day", "dayOfMonth", "month", "sunPhase",
                 "uiNav", "screenshot", "moveAppToDisplay", "stopClusterCast");
         // ── Surveillance / recording / camera ──
-        put(SURVEILLANCE, "surveillance", "recording", "manualClip",
+        put(SURVEILLANCE, "surveillance", "operatingMode", "recording", "manualClip",
                 "showCameraFeed", "setCameraViewSize", "setBlindSpotOverlaySize", "hideCameraView",
                 "surveillanceArmed", "surveillanceThreat", "surveillanceObject",
                 // Blind-spot CARD actions (OverDrive's own rear+side view). The OEM ADAS
@@ -135,7 +137,7 @@ public final class AutomationCategories {
         // pickers once the collector has positively identified the current car as BEV.
         java.util.Collections.addAll(HYBRID_ONLY,
                 "powertrainMode", "powertrain_mode", "hold_battery", "battery_hold",
-                "charge_cap_enabled", "charge_cap_percent");
+                "charge_cap_enabled", "charge_cap_percent", "target_soc");
     }
 
     private static void put(String category, String... ids) {

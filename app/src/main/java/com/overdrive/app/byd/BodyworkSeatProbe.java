@@ -3,6 +3,8 @@ package com.overdrive.app.byd;
 import android.content.Context;
 import android.content.ContextWrapper;
 
+import com.overdrive.app.byd.routing.DrivingSafetyGuard;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -46,6 +48,24 @@ public final class BodyworkSeatProbe {
 
     public static final String BODYWORK_DEVICE =
             "android.hardware.bydauto.bodywork.BYDAutoBodyworkDevice";
+
+    /**
+     * Stands in for "set() gave us no result code" (void setter, or a non-numeric return).
+     * Deliberately not 0: 0 is the HAL's success code, so defaulting to it turned an
+     * unconfirmable write into a confirmed one.
+     */
+    private static final int UNKNOWN_CODE = Integer.MIN_VALUE;
+
+    /** Not-equipped filler the HAL ignores; also what an unreadable axis is stored as. */
+    private static final float SENTINEL = 127.5f;
+
+    /** Axis values live in 0..127.5; anything else is an error code or a rail, not a position. */
+    private static final float AXIS_MAX = 127.5f;
+
+    /** True for a value that is safe to command an axis to. */
+    private static boolean inRange(float v) {
+        return !Float.isNaN(v) && !Float.isInfinite(v) && v >= 0f && v <= AXIS_MAX;
+    }
 
     private BodyworkSeatProbe() {}
 
@@ -219,7 +239,7 @@ public final class BodyworkSeatProbe {
      * counterpart of {@link #writeAxes}, matching spi.p7 (mirrors use int array, not float).
      * MOVES THE MIRROR(S). Parked-gated like the seat write.
      */
-    public static JSONObject writeMirror(Context ctx, int[] ids, int[] values, boolean force) {
+    public static JSONObject writeMirror(Context ctx, int[] ids, int[] values) {
         JSONObject r = new JSONObject();
         try {
             r.put("uid", android.os.Process.myUid());
@@ -230,14 +250,9 @@ public final class BodyworkSeatProbe {
             r.put("ids", reqIds);
             r.put("values", reqVals);
 
-            boolean blocked = false;
-            try { blocked = com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked(); }
-            catch (Throwable t) { r.put("gateError", String.valueOf(t)); blocked = true; }
-            r.put("movementBlocked", blocked);
-            r.put("forced", force);
-            if (blocked && !force) {
+            if (positioningBlocked(r)) {
                 r.put("skipped", true);
-                r.put("reason", "movement gate blocked — add force=YES only if certain the car is parked");
+                r.put("reason", "movement gate blocked");
                 return r;
             }
 
@@ -253,12 +268,19 @@ public final class BodyworkSeatProbe {
             Method setM = device.getClass().getMethod("set", int[].class, evClass);
             r.put("setMethod", setM.getDeclaringClass().getName() + ".set(int[],BYDAutoEventValue[intArrayValue])");
 
+            // Device/reflection setup can take long enough for the car to leave Park.
+            if (positioningBlocked(r)) {
+                r.put("skipped", true);
+                r.put("reason", "movement gate became active before actuation");
+                return r;
+            }
             Object res = setM.invoke(device, ids, ev);
             int code = (res instanceof Number) ? ((Number) res).intValue()
-                     : (res instanceof Boolean) ? (((Boolean) res) ? 0 : -1) : 0;
+                     : (res instanceof Boolean) ? (((Boolean) res) ? 0 : -1) : UNKNOWN_CODE;
             r.put("resultCode", code);
             r.put("resultCodeHex", "0x" + Integer.toHexString(code));
             r.put("accepted", code == 0);
+            if (code == UNKNOWN_CODE) r.put("unconfirmed", "set() returned no result code");
         } catch (Throwable t) {
             try { r.put("exception", String.valueOf(t)); } catch (Exception ignored) {}
         }
@@ -270,15 +292,14 @@ public final class BodyworkSeatProbe {
      * the bodywork device (the DiLink apply pattern), through the PermissiveContext. This
      * MOVES THE SEAT.
      *
-     * <p>Parked-gated: refuses unless {@link DrivingSafetyGuard#isMovementBlocked()} is
+     * <p>Parked-gated: refuses unless the positioning guard is disabled or
+     * {@link DrivingSafetyGuard#isMovementBlocked()} is
      * false, matching the native app (which won't change a seat position while driving)
-     * and the sub-41 {@code s7.T()} gate. {@code force=true} bypasses the gate for a
-     * bench test where the ACC/gear state can't be resolved — caller must be certain the
-     * car is parked.
+     * and the sub-41 {@code s7.T()} gate.
      *
      * @return JSON: the gate decision, the resolved set() method, and the raw SDK result code.
      */
-    public static JSONObject writeAxes(Context ctx, int[] ids, float[] values, boolean force) {
+    public static JSONObject writeAxes(Context ctx, int[] ids, float[] values) {
         JSONObject r = new JSONObject();
         try {
             r.put("uid", android.os.Process.myUid());
@@ -289,14 +310,9 @@ public final class BodyworkSeatProbe {
             r.put("ids", reqIds);
             r.put("values", reqVals);
 
-            boolean blocked = false;
-            try { blocked = com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked(); }
-            catch (Throwable t) { r.put("gateError", String.valueOf(t)); blocked = true; }
-            r.put("movementBlocked", blocked);
-            r.put("forced", force);
-            if (blocked && !force) {
+            if (positioningBlocked(r)) {
                 r.put("skipped", true);
-                r.put("reason", "movement gate blocked (not parked / unknown state) — add force=YES only if certain the car is parked");
+                r.put("reason", "movement gate blocked (not parked / unknown state)");
                 return r;
             }
 
@@ -318,12 +334,19 @@ public final class BodyworkSeatProbe {
             Method setM = device.getClass().getMethod("set", int[].class, evClass);
             r.put("setMethod", setM.getDeclaringClass().getName() + ".set(int[],BYDAutoEventValue[floatArrayValue])");
 
+            // Device/reflection setup can take long enough for the car to leave Park.
+            if (positioningBlocked(r)) {
+                r.put("skipped", true);
+                r.put("reason", "movement gate became active before actuation");
+                return r;
+            }
             Object res = setM.invoke(device, ids, ev);
             int code = (res instanceof Number) ? ((Number) res).intValue()
-                     : (res instanceof Boolean) ? (((Boolean) res) ? 0 : -1) : 0;
+                     : (res instanceof Boolean) ? (((Boolean) res) ? 0 : -1) : UNKNOWN_CODE;
             r.put("resultCode", code);
             r.put("resultCodeHex", "0x" + Integer.toHexString(code));
             r.put("accepted", code == 0);   // spi.p7: resultCode==0 == success (sa.b)
+            if (code == UNKNOWN_CODE) r.put("unconfirmed", "set() returned no result code");
         } catch (Throwable t) {
             try { r.put("exception", String.valueOf(t)); } catch (Exception ignored) {}
         }
@@ -429,7 +452,9 @@ public final class BodyworkSeatProbe {
             for (Axis a : fullAxes()) {
                 Object rd = BydDeviceHelper.callGet(device, a.readId, Double.TYPE);
                 double d = BydDeviceHelper.getDoubleValue(rd);
-                axes.put(a.label, Double.isNaN(d) ? 127.5 : d);
+                // Store the sentinel for anything that isn't a real position, so a negative
+                // error code can't be captured and later replayed as a setpoint.
+                axes.put(a.label, inRange((float) d) ? d : (double) SENTINEL);
             }
         } catch (Throwable ignored) {}
         return axes;
@@ -473,15 +498,15 @@ public final class BodyworkSeatProbe {
      *
      * @param overrides label -> value (e.g. {"LEFT_H":15}); axes not overridden keep their current read value.
      */
-    public static JSONObject applyFull(Context ctx, Map<String, Float> overrides, boolean force) {
+    public static JSONObject applyFull(Context ctx, Map<String, Float> overrides) {
         JSONObject r = new JSONObject();
         try {
             r.put("uid", android.os.Process.myUid());
-            boolean blocked = false;
-            try { blocked = com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked(); }
-            catch (Throwable t) { r.put("gateError", String.valueOf(t)); blocked = true; }
-            r.put("movementBlocked", blocked); r.put("forced", force);
-            if (blocked && !force) { r.put("skipped", true); r.put("reason", "movement gate blocked; add force=YES only if certain the car is parked"); return r; }
+            if (positioningBlocked(r)) {
+                r.put("skipped", true);
+                r.put("reason", "movement gate blocked");
+                return r;
+            }
 
             Context permissive = new PermissiveContext(ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx);
             Object device = BydDeviceHelper.getDevice(BODYWORK_DEVICE, permissive);
@@ -497,29 +522,93 @@ public final class BodyworkSeatProbe {
             if (overrides != null) for (Map.Entry<String, Float> e : overrides.entrySet()) ov.put(e.getKey().trim().toUpperCase(), e.getValue());
             JSONObject applied = new JSONObject();
             float[] valByIdx = new float[axes.length];
+            JSONArray rejected = new JSONArray();
             for (int k = 0; k < axes.length; k++) {
                 Float o = ov.get(axes[k].label);
                 float v;
-                if (o != null) v = o;
-                else {
+                if (o != null) {
+                    // An override arrives from a stored position, i.e. off disk, so it can be
+                    // NaN or out of range. Sending that to the HAL is a physical command;
+                    // fall back to the ignored sentinel instead.
+                    v = inRange(o) ? o : SENTINEL;
+                    if (!inRange(o)) rejected.put(axes[k].label);
+                } else {
                     Object rd = BydDeviceHelper.callGet(device, axes[k].readId, Double.TYPE);
                     double d = BydDeviceHelper.getDoubleValue(rd);
-                    v = Double.isNaN(d) ? 127.5f : (float) d;   // 127.5 = not-equipped sentinel, matches native
+                    // Out-of-range covers both NaN (read failed) and a negative error code
+                    // returned as a value — neither is a position to drive to.
+                    v = inRange((float) d) ? (float) d : SENTINEL;
                 }
                 valByIdx[k] = v;
                 applied.put(axes[k].label, v);
             }
             r.put("applied", applied);
+            if (rejected.length() > 0) r.put("rejectedAxes", rejected);
 
+            // The thirteen live reads above can take long enough for the car to leave Park.
+            // Recheck before starting the two-batch native sequence; once batch 1 commits,
+            // batch 2 follows 50 ms later as one pose.
+            if (positioningBlocked(r)) {
+                r.put("skipped", true);
+                r.put("reason", "movement gate became active while preparing the position");
+                return r;
+            }
             // Batch 1: group 1 (mirrors + steering).
-            r.put("batch1", writeGroup(setM, evClass, device, axes, valByIdx, 1));
+            JSONObject b1 = writeGroup(setM, evClass, device, axes, valByIdx, 1);
+            r.put("batch1", b1);
+            if (b1.optBoolean("movementBlocked", false)) {
+                r.put("accepted", false);
+                r.put("error", "movement gate became active at the first batch boundary");
+                return r;
+            }
             try { Thread.sleep(50L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            if (positioningBlocked(r)) {
+                r.put("accepted", false);
+                r.put("partialApplied", b1.optBoolean("accepted", false));
+                r.put("error", "movement gate became active before the seat batch");
+                return r;
+            }
             // Batch 2: group 2 (seat).
-            r.put("batch2", writeGroup(setM, evClass, device, axes, valByIdx, 2));
+            JSONObject b2 = writeGroup(setM, evClass, device, axes, valByIdx, 2);
+            r.put("batch2", b2);
+            if (b2.optBoolean("movementBlocked", false)) {
+                r.put("accepted", false);
+                r.put("partialApplied", b1.optBoolean("accepted", false));
+                r.put("error", "movement gate became active at the seat batch boundary");
+                return r;
+            }
+            // One aggregate verdict. Callers were reading only `error`/`skipped`, so a
+            // batch-1-ok / batch-2-failed apply reported success with the seat unmoved.
+            boolean ok = b1.optBoolean("accepted", false) && b2.optBoolean("accepted", false);
+            r.put("accepted", ok);
+            // ACC off is not "blocked" (the car is parked), but the motors are unpowered, so
+            // the HAL returns 0 for a write that cannot actuate. Say so rather than claim it moved.
+            try {
+                if (ok && !com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                    r.put("inert", true);
+                    r.put("reason", "accepted with ACC off: seat motors unpowered, nothing moved");
+                }
+            } catch (Throwable ignored) { }
         } catch (Throwable t) {
-            try { r.put("exception", String.valueOf(t)); } catch (Exception ignored) {}
+            try { r.put("exception", String.valueOf(t)); r.put("accepted", false); } catch (Exception ignored) {}
         }
         return r;
+    }
+
+    private static boolean positioningBlocked(JSONObject result) {
+        try {
+            boolean blocked = DrivingSafetyGuard.isActionBlocked(
+                    DrivingSafetyGuard.GUARD_POSITIONING);
+            result.put("movementBlocked", blocked);
+            return blocked;
+        } catch (Throwable t) {
+            try {
+                result.put("gateError", String.valueOf(t));
+                result.put("movementBlocked", true);
+            } catch (Exception ignored) {
+            }
+            return true;
+        }
     }
 
     private static JSONObject writeGroup(Method setM, Class<?> evClass, Object device, Axis[] axes, float[] valByIdx, int group) throws Exception {
@@ -530,10 +619,21 @@ public final class BodyworkSeatProbe {
         for (int k = 0; k < ids.size(); k++) { idArr[k] = ids.get(k); valArr[k] = vals.get(k); }
         Object ev = evClass.getConstructor().newInstance();
         evClass.getField("floatArrayValue").set(ev, valArr);
-        Object res = setM.invoke(device, idArr, ev);
-        int code = (res instanceof Number) ? ((Number) res).intValue() : (res instanceof Boolean) ? (((Boolean) res) ? 0 : -1) : 0;
         JSONObject o = new JSONObject();
-        o.put("group", group); o.put("count", idArr.length); o.put("resultCode", code); o.put("accepted", code == 0);
+        o.put("group", group);
+        o.put("count", idArr.length);
+        if (positioningBlocked(o)) {
+            o.put("accepted", false);
+            o.put("skipped", true);
+            o.put("reason", "movement gate became active at batch boundary");
+            return o;
+        }
+        Object res = setM.invoke(device, idArr, ev);
+        int code = (res instanceof Number) ? ((Number) res).intValue()
+                 : (res instanceof Boolean) ? (((Boolean) res) ? 0 : -1) : UNKNOWN_CODE;
+        o.put("resultCode", code);
+        o.put("accepted", code == 0);
+        if (code == UNKNOWN_CODE) o.put("unconfirmed", "set() returned no result code");
         return o;
     }
 

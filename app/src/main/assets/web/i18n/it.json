@@ -1762,8 +1762,8 @@
     "heatmap_threat_high": "Alti",
     "heatmap_threat_critical": "CRIZIALE",
     "state_active": "Attivo",
-    "state_safe_zone": " Zona di sicurezza",
-    "state_safe_zone_named": " Zona di sicurezza ({name})",
+    "state_safe_zone": "Zona di sicurezza",
+    "state_safe_zone_named": "Zona di sicurezza ({name})",
     "size_used_dash": "-- utilizzato",
     "size_limit_dash": "-- limite",
     "limit_min_default": "100 MB",
@@ -2441,12 +2441,12 @@
     "add_zone_failed": "Non è stato possibile aggiungere zona",
     "confirm_delete_zone": "Eliminare questa zona di sicurezza?",
     "zone_deleted": "Zona eliminata",
-    "in_safe_zone": " In zona di sicurezza ({zone}, {meters}m)",
-    "outside_zone": "🔴 All'esterno ({meters}m alla più vicina)",
+    "in_safe_zone": "In zona di sicurezza ({zone}, {meters}m)",
+    "outside_zone": "All'esterno ({meters}m alla più vicina)",
     "no_zones_yet": "Non ci sono ancora zone",
     "waiting_gps": "In attesa di GPS...",
-    "badge_on": "● ON",
-    "badge_off": "○ STOP",
+    "badge_on": "ON",
+    "badge_off": "STOP",
     "you_are_here": "Sei qui.",
     "popup_radius": "<b>{name}</b><br>{meters}m raggio"
   },
@@ -2576,7 +2576,6 @@
     "restore_failed": "Ripristino fallito."
   },
   "about": {
-    "ack_chimes": "RoadSense ammonimento carillon — suoni dalla Google Sound Library, sotto licenza",
     "page_title": "Info — OverDrive",
     "page_title_short": "Info",
     "contributors_title": "Contributori",
@@ -2598,7 +2597,8 @@
       "kofi_value": "Un caffe su Ko-fi aiuta a tenere vivo lo sviluppo.",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "Realizzato con l’aiuto di contributori e sostenitori."
+    "thanks_subtitle": "Realizzato con l’aiuto di contributori e sostenitori.",
+      "ack_chimes": "RoadSense ammonimento carillon — suoni dalla Google Sound Library, sotto licenza"
   },
   "byd_cloud": {
     "page_title": "BYD Cloud",

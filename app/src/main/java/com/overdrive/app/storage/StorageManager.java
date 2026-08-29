@@ -537,6 +537,90 @@ public class StorageManager {
     private final java.util.Set<String> deferredCleanupDirs =
         java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    // ---------------- idle dirty-generation gate ----------------
+    //
+    // WHY (field incident): while PARKED at steady state, every 30s tick paid
+    // sweepOrphanTempFiles (a full listing of every reapable dir) plus two
+    // uncached FUSE walks (scopedSizeForCategory for recordings+surveillance),
+    // and — whenever a category sat in the 90–100% band, which a converged
+    // archive does permanently — a third full walk + sort inside ensureSpace
+    // that then deleted nothing. On a ~51 GB archive one pass overran the 30s
+    // period, so scheduleAtFixedRate ran the cleanup thread back-to-back
+    // forever: sustained CPU (this thread + the FUSE daemon it hammers) with
+    // zero bytes freed.
+    //
+    // FIX: cleanup state can only change through this class's own mutation
+    // paths (file finalized, limit changed, storage type changed, mount /
+    // fallback transition). Each of those bumps this generation counter; the
+    // idle tick SKIPS the walks entirely unless the generation moved since the
+    // last COMPLETED idle pass, a deferred drain is pending, disk is low
+    // (StatFs-only probe), or the hourly backstop is due. The backstop bounds
+    // staleness from anything that mutates storage without going through us
+    // (adb push, other apps, MTP) — deliberately NOT FileObserver-based: on
+    // these FUSE volumes inotify delivery is unreliable (listFiles() itself
+    // returns null under daemon UID — see sweepOrphanTempFiles' shell
+    // fallback), so an event-based signal would be false confidence.
+    //
+    // Compare-before-clear: the pass records the generation it STARTED with
+    // and only marks it clean if it is unchanged when the pass COMPLETES — a
+    // save landing mid-pass leaves the flag dirty so the next tick re-runs.
+    // The reaper itself stays the deletion authority and still measures
+    // uncached; this gate only decides WHETHER it runs, so the worst case of
+    // a missed bump is delayed cleanup (bounded by the backstop), never a
+    // wrong deletion. Recording-time behavior is untouched: the encoder-
+    // writing branch keeps its existing bounded-trim path.
+    //
+    // State machine + semantics live in IdleCleanupGate (unit-tested).
+    private final IdleCleanupGate idleCleanupGate =
+        new IdleCleanupGate(IDLE_CLEANUP_BACKSTOP_MS);
+
+    /** Hourly backstop: bounds staleness from mutations that bypass this class. */
+    private static final long IDLE_CLEANUP_BACKSTOP_MS = 60 * 60 * 1000L;
+    /** Same floor as the recording branch's diskCritical signal. */
+    private static final long IDLE_LOW_DISK_FLOOR_BYTES = 200L * 1024 * 1024;
+
+    /**
+     * Mark storage state changed so the next idle cleanup tick runs a real
+     * pass. Called from EVERY mutation path that can affect a category's size
+     * or its effective limit: file-finalized hooks, limit setters, storage-
+     * type setters, mount/unmount/fallback transitions, and post-finalization
+     * sidecar writers (LocationSidecarWriter / SidecarGeoUpdater — sidecars
+     * land AFTER the mp4's save hook fired, so they need their own bump).
+     * Cheap (one atomic increment) and safe to over-call — a spurious bump
+     * costs one extra bounded pass, never a wrong deletion.
+     *
+     * <p>Public because sidecar writers live outside this package; harmless
+     * to call from any process (an app-process bump is never read — only the
+     * daemon runs the cleanup scheduler).
+     */
+    public void markStorageDirty() {
+        idleCleanupGate.markDirty();
+    }
+
+    /**
+     * StatFs-only low-disk probe for the idle gate — O(1), no directory I/O.
+     * Mirrors the recording branch's diskCritical semantics: min free across
+     * every category's ACTIVE volume below the floor, or a 0-read on an
+     * active EXTERNAL volume (unmounted/inaccessible). Internal 0-reads are
+     * transient StatFs hiccups and don't latch, same as the recording branch.
+     */
+    private boolean isAnyActiveVolumeLowOnDisk() {
+        Set<StorageType> activeTypes = new HashSet<>();
+        activeTypes.add(activeTypeForCategory("recordings"));
+        activeTypes.add(activeTypeForCategory("surveillance"));
+        activeTypes.add(activeTypeForCategory("trips"));
+        activeTypes.add(activeTypeForCategory("proximity"));
+        for (StorageType t : activeTypes) {
+            long f = freeBytesForType(t);
+            if (f <= 0) {
+                if (t == StorageType.SD_CARD || t == StorageType.USB) return true;
+                continue;
+            }
+            if (f < IDLE_LOW_DISK_FLOOR_BYTES) return true;
+        }
+        return false;
+    }
+
     private static final String DEFERRED_RECORDINGS = "recordings";
     private static final String DEFERRED_SURVEILLANCE = "surveillance";
     private static final String DEFERRED_PROXIMITY = "proximity";
@@ -697,9 +781,40 @@ public class StorageManager {
     }
 
     private StorageManager() {
+        // PASSIVE by design (audit: cleanup ran in the wrong process). This
+        // singleton is constructed lazily by whichever process touches
+        // getInstance() first — including the APP-UID UI process
+        // (RecordingViewModel.updateStorageInfo). The constructor therefore
+        // does resolution + idempotent directory setup ONLY: no mount
+        // attempts, no reaping, no schedulers. All destructive / background
+        // maintenance lives in startDaemonMaintenance(), which ONLY
+        // CameraDaemon calls. Before this split, first UI touch fired the
+        // startup reap in the app process: its per-category locks are
+        // JVM-local (so it raced the daemon's reaper), and its post-delete
+        // RecordingsIndex.removeByPath() ran against a daemon-UID-only H2
+        // (swallowed failure → ghost rows until the next reconcile; see
+        // RecordingsIndex's FILE_LOCK=SOCKET cross-UID warning).
         discoverVolumes();
         initDirectories();
         loadConfig();
+        updateActiveDirectories();
+    }
+
+    // True once startDaemonMaintenance has run. Guards idempotency.
+    private final java.util.concurrent.atomic.AtomicBoolean daemonMaintenanceStarted =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * Daemon-only startup maintenance: async mount attempts for configured-
+     * but-missing external volumes, plus the one-shot startup reap.
+     * MUST be called exactly once, by CameraDaemon, after getInstance() —
+     * never from app-UID code (see the constructor comment). Idempotent:
+     * a second call is a no-op.
+     */
+    public void startDaemonMaintenance() {
+        if (!daemonMaintenanceStarted.compareAndSet(false, true)) {
+            return;  // already started
+        }
 
         // If config says SD/USB but it's not available, try to mount it on a
         // background thread. Even with the per-call timeouts in
@@ -737,8 +852,6 @@ public class StorageManager {
             }
         };
         new Thread(mountAttempt, "StorageMountInit").start();
-
-        updateActiveDirectories();
 
         // One-shot startup reap. If the user lowered the limit, switched
         // storage type, or upgraded from a legacy build, the inactive +
@@ -1036,7 +1149,368 @@ public class StorageManager {
             if (usbCameOnline) what.append(what.length() > 0 ? ", " : "").append("USB came online");
             if (usbMoved) what.append(what.length() > 0 ? ", " : "").append("USB path changed");
             notifyRecordingsIndexOfStorageChange(reason + ": " + what);
+            // Post-mount recording migration (mount-direction symmetry with
+            // the watchdog FAILURE branch and setRecordingsStorageType, both
+            // of which already force-stop a live session to move it). If the
+            // configured recordings volume just came online while an RMM
+            // CONTINUOUS/DRIVE session is path-latched on the internal
+            // fallback (ACC-ON won the async-mount race), finalize the
+            // current segment and roll the session over. Riding THIS hook —
+            // not the watchdog tick — covers every mount path uniformly:
+            // ACC-ON/OFF remounts, the media-event receiver's refresh,
+            // on-demand ensureStorageReady, and both watchdogs. The "moved"
+            // edges are included for the uuid-swap remount, where a session
+            // previously failed over to internal without an offline→online
+            // flip ever being observed.
+            if (sdCameOnline || sdMoved) {
+                maybeMigrateActiveRecordingToExternal(StorageType.SD_CARD, reason);
+            }
+            if (usbCameOnline || usbMoved) {
+                maybeMigrateActiveRecordingToExternal(StorageType.USB, reason);
+            }
         }
+    }
+
+    // ============ Post-mount internal→external recording migration ============
+
+    /**
+     * Serializes the settle-delayed migration worker: a mount flap that fires
+     * two online edges back-to-back must not run two concurrent
+     * stop+reactivate cycles against the shared recorder. Cleared in the
+     * worker's finally; the handler itself is idempotent (a repeat run sees
+     * the output already external and skips), so the latch is purely an
+     * efficiency/serialization guard, not a correctness one.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean recordingMigrationInFlight =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * Delay before the worker's FIRST evaluation. Two reasons: (1) the
+     * online edge can fire from discoverVolumes() BEFORE the same pass has
+     * run initSd/UsbDirectories + updateActiveDirectories (refreshSdCard
+     * orders discovery first), so the per-class dir fields are often not
+     * committed yet at edge time; (2) pipeline.stopRecording() joins encoder
+     * threads — heavy work that must not run on the mount/broadcast caller's
+     * thread. This delay is a fast-path nicety only, NOT the correctness
+     * mechanism — the retry loop below is what actually rides out a slow
+     * directory init.
+     */
+    private static final long RECORDING_MIGRATION_SETTLE_MS = 1_500L;
+
+    /**
+     * Retry cadence for TRANSIENT skips (see
+     * {@link RecordingStorageMigrationPolicy#isRetryableSkip}). The online
+     * edge is one-shot: nothing re-fires it when directory initialization
+     * for the freshly-mounted card commits a few seconds later (observed up
+     * to ~5s on FUSE-bridged volumes, and the init runs AFTER the
+     * discovery-driven edge). A single-shot check would consume the edge and
+     * strand the session on internal for the whole drive, so the worker
+     * re-evaluates the FULL gate set live on this cadence until it reaches a
+     * terminal decision or the window closes.
+     */
+    private static final long RECORDING_MIGRATION_RETRY_INTERVAL_MS = 2_500L;
+
+    /**
+     * Hard ceiling on how long one edge's worker keeps re-evaluating. Sized
+     * an order of magnitude above the worst observed directory-init latency
+     * so a genuinely-ready card always converges, while a genuinely broken
+     * one (probe failing every attempt) stops burning bounded write probes
+     * after this window. Later starts resolve the live directory themselves,
+     * and the recurring watchdog/media paths emit a fresh edge on the next
+     * real transition.
+     */
+    private static final long RECORDING_MIGRATION_RETRY_WINDOW_MS = 45_000L;
+
+    /**
+     * Spawn the migration worker for {@code onlineType} if the cheap
+     * pre-filters pass. The worker evaluates the full gate set
+     * ({@link RecordingStorageMigrationPolicy}) live on a bounded retry loop:
+     * first attempt after a short settle, then every
+     * {@link #RECORDING_MIGRATION_RETRY_INTERVAL_MS} while the decision is a
+     * TRANSIENT skip (directory init still committing, session mid-start),
+     * exiting on MIGRATE (action performed), any terminal skip, or the
+     * {@link #RECORDING_MIGRATION_RETRY_WINDOW_MS} deadline.
+     *
+     * <p>Coalescing: one worker per edge burst. A new online edge landing
+     * while a worker is in flight is safely subsumed — the worker re-reads
+     * ALL state (config, pipeline, resolve, probe) on every attempt, so it
+     * observes whatever the newer edge changed.
+     */
+    private void maybeMigrateActiveRecordingToExternal(final StorageType onlineType,
+                                                       final String reason) {
+        // Passive (UI-process) instances must never touch the daemon
+        // pipeline — same guard as the index notify above.
+        if (!daemonMaintenanceStarted.get()) {
+            return;
+        }
+        if (onlineType != StorageType.SD_CARD && onlineType != StorageType.USB) {
+            return;
+        }
+        // Cheap config pre-filter before spawning a worker; re-checked live
+        // on every attempt (the user can switch types meanwhile).
+        if (recordingsStorageType != onlineType) {
+            return;
+        }
+        if (!recordingMigrationInFlight.compareAndSet(false, true)) {
+            logDebug("Recording migration (" + reason + "): worker already in flight — coalescing");
+            return;
+        }
+        Thread worker = new Thread(() -> {
+            try {
+                final long deadline = System.currentTimeMillis()
+                        + RECORDING_MIGRATION_RETRY_WINDOW_MS;
+                long sleepMs = RECORDING_MIGRATION_SETTLE_MS;
+                int attempt = 0;
+                while (true) {
+                    Thread.sleep(sleepMs);
+                    attempt++;
+                    RecordingStorageMigrationPolicy.Decision decision =
+                            runExternalRecordingMigration(onlineType, reason, attempt);
+                    if (decision == RecordingStorageMigrationPolicy.Decision.MIGRATE) {
+                        return;  // action performed inside
+                    }
+                    if (!RecordingStorageMigrationPolicy.isRetryableSkip(decision)) {
+                        return;  // terminal for this edge — logged inside
+                    }
+                    if (System.currentTimeMillis() >= deadline) {
+                        logInfo("Recording migration (" + reason + "): retry window ("
+                            + (RECORDING_MIGRATION_RETRY_WINDOW_MS / 1000) + "s) exhausted after "
+                            + attempt + " attempts (last=" + decision
+                            + ") — giving up on this edge; later starts resolve the live dir themselves");
+                        return;
+                    }
+                    sleepMs = RECORDING_MIGRATION_RETRY_INTERVAL_MS;
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                logWarn("Recording migration (" + reason + ") failed: " + t.getMessage());
+            } finally {
+                recordingMigrationInFlight.set(false);
+            }
+        }, "RecStorageMigration");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /**
+     * Evaluate the migration gates against LIVE state and, on MIGRATE, roll
+     * the internal-fallback session over to the configured external volume.
+     *
+     * <p>Action order matters and mirrors setRecordingsStorageType / the
+     * watchdog failure branch:
+     * <ol>
+     *   <li>{@code recorder.setOutputDir(external)} FIRST — whichever start
+     *       consumes the one-shot override next (our forced reactivation or
+     *       any racing start) lands external. reconcileRecordingOverride
+     *       keeps a live external override unchanged at consumption.</li>
+     *   <li>{@code pipeline.stopRecording()}, NOT recorder.stopRecording():
+     *       the wrapper-only stop leaves pipeline.currentMode pinned at
+     *       NORMAL_RECORDING and RMM's activate would short-circuit on
+     *       isNormalRecordingMode() and never consume the override
+     *       (audit R7 rationale at setRecordingsStorageType).</li>
+     *   <li>{@code rmm.forceModeReactivation(...)} — drive the restart NOW.
+     *       An ordinary resyncFromHardware kick is suppressed by the 5s
+     *       segment-rotation grace the stop just stamped and would defer the
+     *       restart to a later 30s tick while burning a wedge-budget slot.</li>
+     * </ol>
+     * Costs ≈ one segment-second of footage, the same accepted tradeoff as
+     * every other forced-migration path.
+     *
+     * <p><b>Two-phase evaluation (TOCTOU across the write probe).</b> The
+     * bounded write probe — the policy's last gate — can take up to ~3.5s on
+     * a sick volume (liveness probe + touch-probe budgets). Mode, ownership
+     * and path state read BEFORE the probe can therefore be stale by the
+     * time it passes: an ACC bounce or mode flip during the probe can hand
+     * the shared recorder to a surveillance event or a manual session, and a
+     * stale MIGRATE would then stop the NEW session. So: phase 1 evaluates
+     * with the real probe (which must run before anything is stopped);
+     * on MIGRATE, phase 2 RE-READS every input fresh and re-evaluates with
+     * the probe result carried over — the action then uses only the fresh
+     * references, shrinking the check-to-stop window from probe-length
+     * seconds to microseconds. If the resolved target itself changed during
+     * the probe, the carried-over probe result proves nothing about the new
+     * target: report the target unavailable (retryable) so the next attempt
+     * probes the right directory.
+     *
+     * @return the policy decision for this attempt, so the caller's retry
+     *         loop can distinguish transient skips (worth re-evaluating
+     *         within the edge's window) from terminal ones. MIGRATE means
+     *         the action sequence was performed.
+     */
+    private RecordingStorageMigrationPolicy.Decision runExternalRecordingMigration(
+            StorageType onlineType, String reason, int attempt) {
+        // Live re-check: configured type may have changed since the edge.
+        if (recordingsStorageType != onlineType) {
+            logDebug("Recording migration (" + reason + "): configured type is now "
+                + recordingsStorageType + " — skipping");
+            return RecordingStorageMigrationPolicy.Decision
+                    .SKIP_ONLINE_VOLUME_NOT_CONFIGURED_TARGET;
+        }
+
+        // ── PHASE 1: evaluate with the real bounded write probe ──────────
+        final MigrationState probed = new MigrationState(onlineType);
+        // Writability is a LAZY supplier the policy invokes only after every
+        // other gate has passed: mount liveness alone (StatFs on the volume
+        // root) cannot prove the recordings DIRECTORY accepts writes (perms
+        // reset, RO remount, dir-level FUSE wedge) — and discovering that
+        // only after stopping a healthy internal recording would trade
+        // working footage for none. Reuse the pipeline's bounded touch-probe
+        // (the exact pre-flight the restarted recording must pass anyway),
+        // behind the cheap liveness check so an obviously dead volume never
+        // burns the probe's timeout.
+        java.util.function.BooleanSupplier externalWritable = () ->
+            probed.externalDir != null && probed.volumePath != null
+                && isPathLikelyMounted(probed.volumePath)
+                && probed.pipeline != null
+                && probed.pipeline.isStorageWriteReady(probed.externalDir);
+
+        RecordingStorageMigrationPolicy.Decision decision =
+            evaluateMigrationState(probed, externalWritable);
+        if (decision != RecordingStorageMigrationPolicy.Decision.MIGRATE) {
+            // First attempt and terminal decisions at info (one line per
+            // edge documents why the session was left alone); intermediate
+            // transient retries at debug so a slow init doesn't spam.
+            String skipMsg = "Recording migration (" + reason + ") attempt " + attempt
+                + ": " + decision + " (rmmMode=" + probed.rmmMode
+                + ", activePath=" + probed.activePath + ")";
+            if (attempt == 1 || !RecordingStorageMigrationPolicy.isRetryableSkip(decision)) {
+                logInfo(skipMsg);
+            } else {
+                logDebug(skipMsg);
+            }
+            return decision;
+        }
+
+        // ── PHASE 2: post-probe confirm — re-read EVERYTHING fresh ───────
+        if (recordingsStorageType != onlineType) {
+            logInfo("Recording migration (" + reason + "): configured type changed to "
+                + recordingsStorageType + " during the write probe — standing down");
+            return RecordingStorageMigrationPolicy.Decision
+                    .SKIP_ONLINE_VOLUME_NOT_CONFIGURED_TARGET;
+        }
+        final MigrationState fresh = new MigrationState(onlineType);
+        // The probe validated ONE directory. If the resolve now yields a
+        // different one (volume path swap mid-probe), that validation is
+        // worthless for the new target — retryable, so the next attempt
+        // probes the right directory.
+        if (fresh.externalDir == null || probed.externalDir == null
+                || !fresh.externalDir.getAbsolutePath()
+                        .equals(probed.externalDir.getAbsolutePath())) {
+            logInfo("Recording migration (" + reason + "): resolved target changed during "
+                + "the write probe (" + (probed.externalDir != null
+                        ? probed.externalDir.getAbsolutePath() : "null")
+                + " -> " + (fresh.externalDir != null
+                        ? fresh.externalDir.getAbsolutePath() : "null")
+                + ") — will re-probe on the next attempt");
+            return RecordingStorageMigrationPolicy.Decision.SKIP_EXTERNAL_TARGET_UNAVAILABLE;
+        }
+        // Same target — carry the just-proven probe result over instead of
+        // re-running it (re-probing would only reopen the window this
+        // confirm pass exists to close).
+        RecordingStorageMigrationPolicy.Decision confirmed =
+            evaluateMigrationState(fresh, () -> true);
+        if (confirmed != RecordingStorageMigrationPolicy.Decision.MIGRATE) {
+            logInfo("Recording migration (" + reason + ") attempt " + attempt
+                + ": state changed during the write probe — standing down (" + confirmed
+                + ", rmmMode=" + fresh.rmmMode + ", activePath=" + fresh.activePath + ")");
+            return confirmed;
+        }
+
+        logInfo("Recording migration (" + reason + ") attempt " + attempt
+            + ": configured " + onlineType
+            + " came online while the active session is path-latched on internal ("
+            + fresh.activePath + ") — finalizing segment and rolling over to "
+            + fresh.externalDir.getAbsolutePath());
+
+        // Act on the FRESH references only (the phase-1 ones are as old as
+        // the probe). MIGRATE from the fresh evaluation guarantees
+        // fresh.pipeline / fresh.recorder are non-null.
+        fresh.recorder.setOutputDir(fresh.externalDir);
+        try {
+            fresh.pipeline.stopRecording();
+        } catch (Throwable t) {
+            logWarn("Recording migration (" + reason + "): pipeline.stopRecording threw: "
+                + t.getMessage() + " — proceeding to reactivation");
+        }
+        if (fresh.rmm != null) {
+            try {
+                fresh.rmm.forceModeReactivation("storage-migration:" + reason);
+            } catch (Throwable t) {
+                logWarn("Recording migration (" + reason + "): forceModeReactivation threw: "
+                    + t.getMessage() + " — RMM resync ticker will recover on a later tick");
+            }
+        }
+        return RecordingStorageMigrationPolicy.Decision.MIGRATE;
+    }
+
+    /**
+     * One coherent read of every input the migration policy consumes, taken
+     * at construction time. Both evaluation phases build one of these so the
+     * gate inputs and the references the action later uses are the SAME
+     * generation — the point of the phase-2 re-read is that nothing here is
+     * older than microseconds when {@code stopRecording} fires.
+     */
+    private final class MigrationState {
+        final com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline;
+        final com.overdrive.app.recording.RecordingModeManager rmm;
+        final com.overdrive.app.surveillance.GpuMosaicRecorder recorder;
+        final com.overdrive.app.recording.RecordingModeManager.Mode rmmMode;
+        final boolean rmmOwnsSession;
+        final boolean normalRecordingMode;
+        final boolean recording;
+        final String activePath;
+        final String internalRootPath;
+        final File externalDir;
+        final String volumePath;
+
+        MigrationState(StorageType onlineType) {
+            pipeline = com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            rmm = com.overdrive.app.daemon.CameraDaemon.getRecordingModeManager();
+            recorder = (pipeline != null) ? pipeline.getRecorder() : null;
+            com.overdrive.app.surveillance.HardwareEventRecorderGpu encoder =
+                (recorder != null) ? recorder.getEncoder() : null;
+            rmmMode = (rmm != null) ? rmm.getCurrentMode()
+                    : com.overdrive.app.recording.RecordingModeManager.Mode.NONE;
+            // Only CONTINUOUS/DRIVE sessions are restartable by RMM. A manual
+            // /api/start session or a proximity event clip would be stopped
+            // but never restarted — the policy refuses those
+            // (SKIP_SESSION_NOT_RMM_OWNED).
+            rmmOwnsSession =
+                rmmMode == com.overdrive.app.recording.RecordingModeManager.Mode.CONTINUOUS
+                    || rmmMode == com.overdrive.app.recording.RecordingModeManager.Mode.DRIVE_MODE;
+            normalRecordingMode = pipeline != null && pipeline.isNormalRecordingMode();
+            recording = recorder != null && recorder.isRecording();
+            // The encoder's ACTUAL open-file path — NOT
+            // getActiveRecordingsStorageType(), which flips to the external
+            // type the moment the volume is available even while the open
+            // file remains internal.
+            activePath = (encoder != null) ? encoder.getCurrentOutputPath() : null;
+            File internalRoot = internalRecordingsDir;
+            internalRootPath = (internalRoot != null) ? internalRoot.getAbsolutePath() : null;
+            // Resolve the external target the same way the recording-start
+            // path will. resolveActive falls back to internal when the
+            // volume/dir is missing — require it to have resolved AS the
+            // configured type.
+            ResolvedDir resolvedTarget = resolveActive(onlineType,
+                internalRecordingsDir, sdCardRecordingsDir, usbRecordingsDir, "recordings");
+            externalDir = (resolvedTarget.resolved == onlineType) ? resolvedTarget.dir : null;
+            volumePath = (onlineType == StorageType.SD_CARD) ? sdCardPath : usbPath;
+        }
+    }
+
+    /** Feed one {@link MigrationState} generation through the policy. */
+    private RecordingStorageMigrationPolicy.Decision evaluateMigrationState(
+            MigrationState state, java.util.function.BooleanSupplier externalWritable) {
+        return RecordingStorageMigrationPolicy.evaluate(
+            true /* configured-target edge — gated by caller + live re-checks */,
+            state.normalRecordingMode,
+            state.rmmOwnsSession,
+            state.recording,
+            state.activePath,
+            state.internalRootPath,
+            (state.externalDir != null) ? state.externalDir.getAbsolutePath() : null,
+            externalWritable);
     }
 
     private boolean ensureVolumeMountedLocked(String targetClass, boolean force) {
@@ -3016,8 +3490,13 @@ public class StorageManager {
                 // reserve flaps the banner / scope every segment rotation. The wider
                 // clear threshold matches the periodic ticker (ENOSPC_FALLBACK_RECOVER_BYTES)
                 // so both writers of the flag use the same hysteresis band.
-                if (trackState && targetFree >= ENOSPC_FALLBACK_RECOVER_BYTES) {
+                if (trackState && recordingsEnospcFallbackActive
+                        && targetFree >= ENOSPC_FALLBACK_RECOVER_BYTES) {
                     recordingsEnospcFallbackActive = false;
+                    // Idle gate: scoping moved back to the external pool. Mostly
+                    // redundant (the session's final save hook bumps too) but
+                    // covers a crash-between-clear-and-finalize losing the bump.
+                    markStorageDirty();
                 }
                 return targetDir;
             }
@@ -3033,7 +3512,10 @@ public class StorageManager {
                 // Both volumes short — we did NOT redirect to internal, so don't
                 // claim a fall-back. (The recording will likely fail; the wedge
                 // detector + diagnostic log surface that separately.)
-                if (trackState) recordingsEnospcFallbackActive = false;
+                if (trackState && recordingsEnospcFallbackActive) {
+                    recordingsEnospcFallbackActive = false;
+                    markStorageDirty();  // idle gate: measurement scope changed
+                }
                 return targetDir;
             }
 
@@ -3062,6 +3544,7 @@ public class StorageManager {
             boolean risingEdge = trackState && !recordingsEnospcFallbackActive;
             if (trackState) recordingsEnospcFallbackActive = true;
             if (risingEdge) {
+                markStorageDirty();  // idle gate: fallback re-scopes measurement to internal
                 try {
                     asyncCleanupExecutor.execute(() -> {
                         try { ensureRecordingsSpace(0, internalDir); }
@@ -3173,6 +3656,34 @@ public class StorageManager {
      * being split across volumes when the user changes storage mid-recording.
      */
     private void updateActiveDirectories() {
+        // Idle gate: a RESOLVED-DIR CHANGE means the pool a category is
+        // measured against changed, so the next idle tick must run a real
+        // pass. Compare before/after and bump ONLY on an actual change
+        // (audit finding, HIGH): the SD/USB watchdog's remount-FAILURE branch
+        // calls this every 15s while a configured card stays missing — an
+        // unconditional bump there kept the gate permanently dirty and
+        // re-created the full-scan-every-tick incident for exactly the
+        // parked-with-unmounted-card fleet the gate exists to protect.
+        // Config-side scope changes that DON'T move a dir (e.g. selecting SD
+        // while the card is absent flips fallback semantics with the active
+        // dir still internal) are bumped by the storage-type setters
+        // directly.
+        //
+        // KNOWN, ACCEPTED EDGE (audit): while a session is active, the
+        // recordingActive/surveillanceActive guards below freeze the dir
+        // swap, so a volume loss during the session produces no dir change
+        // here and no bump. This delays only the IDLE gate, never cleanup
+        // correctness, and is covered by independent signals: mid-session
+        // the encoder-writing branch runs regardless of this gate; a normal
+        // session end bumps via the final save hook; a crashed session's
+        // next 15s watchdog tick re-resolves with the guard released and
+        // the dir change bumps here; the hourly backstop bounds the rest.
+        // Deliberately NOT fixed with an availability-bearing scope
+        // signature: availability flaps on transient StatFs/probe hiccups
+        // every 15s watchdog tick, which would keep the gate permanently
+        // dirty — the repeated-scan incident this gate exists to prevent.
+        File recBefore = recordingsDir, survBefore = surveillanceDir,
+             tripsBefore = tripsDir, proxBefore = proximityDir;
         // Each per-category lock is taken briefly so a concurrent
         // ensureXxxSpace / sweep / wipe sees an atomic dir swap (not a
         // torn read where one volatile read returns the old dir and a
@@ -3237,6 +3748,22 @@ public class StorageManager {
             tripsDir = rTrips.dir;
             logResolvedDir("Trips", tripsStorageType, rTrips);
         }
+
+        // Idle gate: bump ONLY on an actual resolved-dir change (see the
+        // comment at the top of this method). Path-based compare, not
+        // identity: remount paths re-create the external dir Files with the
+        // same path, which must not read as a change.
+        if (!sameDirPath(recBefore, recordingsDir) || !sameDirPath(survBefore, surveillanceDir)
+                || !sameDirPath(tripsBefore, tripsDir) || !sameDirPath(proxBefore, proximityDir)) {
+            markStorageDirty();
+        }
+    }
+
+    /** Null-safe absolute-path equality for resolved active dirs. */
+    private static boolean sameDirPath(File a, File b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        return a.getAbsolutePath().equals(b.getAbsolutePath());
     }
     
     /**
@@ -3611,6 +4138,7 @@ public class StorageManager {
             recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(recordingsStorageType), limitMb));
             saveConfig();
         }
+        markStorageDirty();  // idle gate: a lowered cap may need a reap
     }
 
     public void setSurveillanceLimitMb(long limitMb) {
@@ -3618,6 +4146,7 @@ public class StorageManager {
             surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(surveillanceStorageType), limitMb));
             saveConfig();
         }
+        markStorageDirty();  // idle gate: a lowered cap may need a reap
     }
 
     /**
@@ -3639,6 +4168,7 @@ public class StorageManager {
             tripsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(tripsStorageType), limitMb));
             saveConfig();
         }
+        markStorageDirty();  // idle gate: a lowered cap may need a reap
     }
     
     // ==================== Storage Type Getters/Setters ====================
@@ -3884,6 +4414,11 @@ public class StorageManager {
         } catch (Throwable t) {
             logWarn("setRecordingsStorageType: RecordingsIndex re-arm failed: " + t.getMessage());
         }
+        // Idle gate: a configured-type change alters measurement/limit scope
+        // even when the ACTIVE dir doesn't move (e.g. selecting an absent SD
+        // flips fallback semantics with writes still on internal), which the
+        // dir-compare bump in updateActiveDirectories can't see.
+        markStorageDirty();
         return true;
         } // end synchronized(configChangeLock) — FIX audit R8 LOW
         } finally { mountLock.unlock(); } // lock order mountLock -> configChangeLock
@@ -3953,6 +4488,7 @@ public class StorageManager {
         } catch (Throwable t) {
             logWarn("setSurveillanceStorageType: RecordingsIndex re-arm failed: " + t.getMessage());
         }
+        markStorageDirty();  // idle gate: config-side scope change (see setRecordingsStorageType)
         return true;
         } // end synchronized(configChangeLock) — FIX audit R8 LOW
         } finally { mountLock.unlock(); } // lock order mountLock -> configChangeLock
@@ -4006,6 +4542,7 @@ public class StorageManager {
         } catch (Throwable t) {
             logWarn("setTripsStorageType: RecordingsIndex re-arm failed: " + t.getMessage());
         }
+        markStorageDirty();  // idle gate: config-side scope change (see setRecordingsStorageType)
         return true;
         } // end synchronized(configChangeLock) — FIX audit R8 LOW
         } finally { mountLock.unlock(); } // lock order mountLock -> configChangeLock
@@ -4217,6 +4754,25 @@ public class StorageManager {
 
     public List<File> getAllTripsDirs() {
         return getAllDirsForType(tripsDir, internalTripsDir, sdCardTripsDir, usbTripsDir);
+    }
+
+    /** Active-first rank used only to resolve legacy filename-only requests. */
+    public int getRecordingRootRank(File file) {
+        if (file == null) return 100;
+        String path = file.getAbsolutePath();
+        List<File> roots = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (List<File> category : java.util.Arrays.asList(
+                getAllRecordingsDirs(), getAllSurveillanceDirs(), getAllProximityDirs())) {
+            for (File root : category) {
+                if (root != null && seen.add(root.getAbsolutePath())) roots.add(root);
+            }
+        }
+        for (int rank = 0; rank < roots.size(); rank++) {
+            String root = roots.get(rank).getAbsolutePath();
+            if (path.equals(root) || path.startsWith(root + File.separator)) return rank;
+        }
+        return 100;
     }
 
     /**
@@ -6178,6 +6734,68 @@ public class StorageManager {
         return listFilesWithFallback(dir, ".mp4");
     }
 
+    public static final class Mp4Listing {
+        public final File[] files;
+        public final boolean available;
+        public final boolean complete;
+
+        Mp4Listing(File[] files, boolean available, boolean complete) {
+            this.files = files;
+            this.available = available;
+            this.complete = complete;
+        }
+    }
+
+    /**
+     * MP4 listing with enough status for destructive reconciliation. A partial
+     * shell result may add/update rows, but callers must delete missing rows
+     * only when {@link Mp4Listing#complete} is true.
+     */
+    public Mp4Listing listMp4FilesWithStatus(File dir) {
+        if (dir == null || !dir.exists() || !dir.isDirectory()) {
+            return new Mp4Listing(new File[0], false, false);
+        }
+        java.io.FileFilter mp4Filter = file -> file.getName().endsWith(".mp4");
+        DirListing direct = listFilesDirectWithStatus(dir, mp4Filter, 4_000L);
+        if (direct.complete) {
+            return new Mp4Listing(direct.files, true, true);
+        }
+        DirListing shell = listFilesViaShellChecked(dir);
+        java.util.List<File> mp4 = new java.util.ArrayList<>();
+        for (File file : shell.files) {
+            if (file.getName().endsWith(".mp4")) mp4.add(file);
+        }
+        return new Mp4Listing(mp4.toArray(new File[0]), true, shell.complete);
+    }
+
+    static DirListing listFilesDirectWithStatus(
+            File dir, java.io.FileFilter filter, long timeoutMs) {
+        java.util.concurrent.atomic.AtomicReference<File[]> files =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicBoolean finished =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        Thread worker = new Thread(() -> {
+            try {
+                files.set(dir.listFiles(filter));
+            } catch (Throwable ignored) {
+                files.set(null);
+            } finally {
+                finished.set(true);
+            }
+        }, "StorageDirectList-" + dir.getName());
+        worker.setDaemon(true);
+        worker.start();
+        try {
+            worker.join(Math.max(1L, timeoutMs));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new DirListing(new File[0], false);
+        }
+        File[] result = files.get();
+        return new DirListing(result != null ? result : new File[0],
+                finished.get() && result != null);
+    }
+
     /**
      * Completeness-aware variant of {@link #listMp4Files(File)} for callers
      * that DELETE based on absence (RecordingsIndex reconcile). See
@@ -6339,6 +6957,22 @@ public class StorageManager {
     }
 
     private void notifyRecordingsIndexOfStorageChange(String reason) {
+        // Daemon-only guard (audit: the "passive" constructor could still start
+        // process-local index machinery). discoverVolumes() fires
+        // notifyIfVolumeCameOnline on FIRST discovery — before-state fields are
+        // false at construction, so a mounted SD/USB reads as "came online" —
+        // and without this gate that chain constructs RecordingsIndex and
+        // starts FileObserver walks in whichever process built the singleton,
+        // including the app-UID UI process (the exact cross-UID H2 hazard the
+        // constructor split exists to prevent). Suppressing the daemon's own
+        // constructor-time notify is harmless: CameraDaemon kicks off the
+        // index warmup right after startDaemonMaintenance(), and every later
+        // transition (watchdogs, setters, ACC remounts) fires post-maintenance.
+        if (!daemonMaintenanceStarted.get()) {
+            logDebug(reason + ": index notify suppressed — daemon maintenance not started"
+                + " (passive instance)");
+            return;
+        }
         try {
             com.overdrive.app.daemon.RecordingsIndexFileWatcher.getInstance().refresh();
         } catch (Throwable t) {
@@ -7187,7 +7821,7 @@ public class StorageManager {
                 if (file.getName().endsWith(".mp4")) {
                     try {
                         com.overdrive.app.server.RecordingsIndex
-                                .getInstance().remove(file.getName());
+                                .getInstance().removeByPath(file.getAbsolutePath());
                     } catch (Throwable ignored) {}
                 }
 
@@ -7623,6 +8257,7 @@ public class StorageManager {
      * IMPORTANT: Runs async to avoid blocking the video encoding thread.
      */
     public void onRecordingFileSaved() {
+        markStorageDirty();  // idle gate: a new clip can put the pool over cap
         // Fix directory permissions in case they were reset
         fixDirectoryPermissions(recordingsDir);
 
@@ -7677,6 +8312,7 @@ public class StorageManager {
      * IMPORTANT: Runs async to avoid blocking the video encoding thread.
      */
     public void onSurveillanceFileSaved() {
+        markStorageDirty();  // idle gate: a new clip can put the pool over cap
         // Fix directory permissions in case they were reset
         fixDirectoryPermissions(surveillanceDir);
 
@@ -7727,6 +8363,7 @@ public class StorageManager {
      * IMPORTANT: Runs async to avoid blocking the video encoding thread.
      */
     public void onProximityFileSaved() {
+        markStorageDirty();  // idle gate: a new clip can put the pool over cap
         // Fix directory permissions in case they were reset
         fixDirectoryPermissions(proximityDir);
 
@@ -7775,6 +8412,7 @@ public class StorageManager {
      * IMPORTANT: Runs async to avoid blocking the telemetry recording thread.
      */
     public void onTripFileSaved() {
+        markStorageDirty();  // idle gate: a new trip file can put the pool over cap
         // Fix directory permissions in case they were reset
         fixDirectoryPermissions(tripsDir);
 
@@ -8023,6 +8661,7 @@ public class StorageManager {
                         ? getUsbFreeSpace() : getSdCardFreeSpace();
                     if (extFreeNow >= ENOSPC_FALLBACK_RECOVER_BYTES) {
                         recordingsEnospcFallbackActive = false;
+                        markStorageDirty();  // idle gate: scoping just moved back to the external pool
                         logInfo("ENOSPC-fallback cleared: " + recordingsStorageType
                             + " now has " + formatSize(extFreeNow)
                             + " free — recordings retention re-scoped to the external pool");
@@ -8050,6 +8689,10 @@ public class StorageManager {
                 // hold tick I/O low, but still run during a genuine emergency.
                 boolean encoderWriting = isEncoderWriting();
                 boolean diskCritical = false;
+
+                // Idle dirty-generation gate bookkeeping (set in the idle branch,
+                // consumed after the per-category passes complete).
+                IdleCleanupGate.Decision idleDecision = null;
 
                 // Scoped size/limit snapshot for recordings/surveillance/proximity,
                 // measured ONCE per tick in the recording branch and reused by the
@@ -8135,10 +8778,41 @@ public class StorageManager {
                     // SKIP drainDeferredCleanupIfDue + sweepOrphanTempFiles here to
                     // keep steady-state recording-tick I/O low; both run at idle.
                 } else {
-                    // Encoder idle: drain any deferred work first so storage limits
-                    // re-converge after a long recording, then sweep orphan
-                    // .mp4.tmp / .broken / .jpg.tmp partials (whole-tree walk, safe
-                    // when idle; otherwise partials only get reaped at daemon boot).
+                    // Encoder idle: dirty-generation gate (see the field block by
+                    // deferredCleanupDirs). A parked car at steady state used to pay
+                    // the orphan sweep + two uncached FUSE walks + (when a category
+                    // sat in the permanent 90–100% band) a third walk in ensureSpace
+                    // EVERY tick, freeing nothing — on a large archive the pass
+                    // overran the 30s period and the cleanup thread ran continuously.
+                    // Skip all of it unless something could actually have changed:
+                    //  - dirty:    a mutation path bumped the generation since the
+                    //              last COMPLETED idle pass (save/limit/type/mount/
+                    //              fallback);
+                    //  - deferred: a recording-time defer is waiting to drain;
+                    //  - lowDisk:  StatFs floor breach on an active volume (O(1));
+                    //  - backstop: hourly, bounds staleness from out-of-band
+                    //              mutations (adb/MTP/other apps).
+                    // elapsedRealtime, NOT wall clock (audit): head units get
+                    // GPS/NTP time corrections, and a backward jump would
+                    // stretch the hourly backstop by the jump amount. The gate
+                    // only ever diffs this value, so a monotonic base is safe.
+                    idleDecision = idleCleanupGate.evaluate(
+                            !deferredCleanupDirs.isEmpty(),
+                            android.os.SystemClock.elapsedRealtime(),
+                            this::isAnyActiveVolumeLowOnDisk);  // probed lazily, last
+                    if (!idleDecision.runPass) {
+                        // Steady-state parked tick: O(1). The physical-floor
+                        // emergency reap still runs (StatFs probes; walks only
+                        // when a volume is genuinely below the floor), so disk
+                        // exhaustion protection keeps its 30s cadence.
+                        runPhysicalFreeSpaceEmergencyReap();
+                        return;
+                    }
+                    logDebug("Idle cleanup pass: " + idleDecision.reason);
+                    // Drain any deferred work first so storage limits re-converge
+                    // after a long recording, then sweep orphan .mp4.tmp / .broken /
+                    // .jpg.tmp partials (whole-tree walk, safe when idle; otherwise
+                    // partials only get reaped at daemon boot).
                     drainDeferredCleanupIfDue();
                     sweepOrphanTempFiles();
                 }
@@ -8209,6 +8883,18 @@ public class StorageManager {
                 // A proximity-only pass would measure the narrow dir set against that
                 // same wide cap — never firing — while paying two uncached FUSE walks
                 // per tick for the privilege.
+
+                // Idle gate completion. Compare-before-clear semantics live in
+                // IdleCleanupGate.onPassComplete: the generation is only marked
+                // clean if NOTHING bumped it while this pass ran — a save landing
+                // mid-pass leaves the flag dirty and the next tick re-runs. The
+                // backstop clock always advances. Recording-branch ticks never
+                // set idleDecision, so a drive can't mark the parked state clean.
+                if (idleDecision != null) {
+                    idleCleanupGate.onPassComplete(
+                        idleDecision.generationAtStart,
+                        android.os.SystemClock.elapsedRealtime());
+                }
             } catch (Exception e) {
                 logWarn("Periodic cleanup error: " + e.getMessage());
             }
@@ -8643,7 +9329,8 @@ public class StorageManager {
 
         if (file.getName().endsWith(".mp4")) {
             try {
-                com.overdrive.app.server.RecordingsIndex.getInstance().remove(file.getName());
+                com.overdrive.app.server.RecordingsIndex.getInstance()
+                    .removeByPath(file.getAbsolutePath());
             } catch (Throwable ignored) {}
         }
         if (sidecarExts.length > 0) {
@@ -9742,7 +10429,7 @@ public class StorageManager {
                             if (name.endsWith(".mp4")) {
                                 try {
                                     com.overdrive.app.server.RecordingsIndex
-                                            .getInstance().remove(name);
+                                            .getInstance().removeByPath(f.getAbsolutePath());
                                 } catch (Throwable ignored) {
                                     // Index not initialised in this
                                     // process; reconcile() will catch up.

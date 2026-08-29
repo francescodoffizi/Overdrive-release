@@ -11,8 +11,8 @@ import java.util.Properties;
  * 
  * Uses the same process names and kill approach as the UI daemon controllers.
  * 
- * Writes daemon state to /data/local/tmp/daemon_telegram_state.properties
- * so health checks can honor Telegram-initiated stops.
+ * User stops are persisted through the same cross-UID .disabled sentinels
+ * used by the app UI. The properties file is kept only for legacy readers.
  */
 public class DaemonCommandHandler implements TelegramCommandHandler {
     
@@ -87,42 +87,35 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
         
         switch (action) {
             case "start":
-                if (isRunning) {
-                    ctx.sendMessage(chatId, ctx.tr("daemon.already_running", displayName));
-                } else if (!isStartable) {
+                if (!isStartable) {
                     ctx.sendMessage(chatId, ctx.tr("daemon.must_start_from_app", displayName));
                 } else {
-                    // Clear the durable disable sentinel — user is explicitly
-                    // starting this daemon, so the watchdog + app health-check
-                    // should be free to keep it alive again. The cam/acc start
-                    // flows rm their own sentinel inside the watchdog deploy and
-                    // zrok start rm's it too, but sentry/cloudflared/tailscale/
-                    // singbox don't — clear generically here so all are covered.
+                    // A manual start re-arms auto-management even if the
+                    // process is already alive or this launch attempt fails.
                     String startSentinel = sentinelForProcess(processName);
                     if (startSentinel != null) {
                         ctx.execShell("rm -f " + startSentinel + " 2>/dev/null");
                     }
+                    clearDaemonStoppedState(name);
 
-                    // Cloudflared and Zrok are mutually exclusive. This is an
-                    // automatic, NON-user stop of the OTHER tunnel — mirror the
-                    // app's stopDaemonSilent contract: kill it WITHOUT planting a
-                    // durable disable sentinel, otherwise the dead tunnel's
-                    // crash-recovery (app health-check + watchdog) would be
-                    // permanently disarmed for a daemon the user never stopped.
+                    // Cloudflared and Zrok are mutually exclusive. Starting one
+                    // manually is the Telegram equivalent of enabling it in the
+                    // UI, which durably disables the other tunnel even if its
+                    // process happened to be down when this command arrived.
                     if ("cloudflared".equals(name)) {
-                        if (isDaemonRunning("zrok", ctx)) {
-                            ctx.log("Stopping Zrok (mutually exclusive with Cloudflared)");
-                            stopDaemon("zrok", ctx, false /* writeSentinel */);
-                            saveDaemonState("zrok", false, ctx); // Mark zrok as stopped
-                            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-                        }
+                        ctx.log("Stopping Zrok (mutually exclusive with Cloudflared)");
+                        stopDaemon("zrok", ctx);
+                        saveDaemonState("zrok", false, ctx);
                     } else if ("zrok".equals(name)) {
-                        if (isDaemonRunning("cloudflared", ctx)) {
-                            ctx.log("Stopping Cloudflared (mutually exclusive with Zrok)");
-                            stopDaemon("cloudflared", ctx, false /* writeSentinel */);
-                            saveDaemonState("cloudflared", false, ctx); // Mark cloudflared as stopped
-                            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-                        }
+                        ctx.log("Stopping Cloudflared (mutually exclusive with Zrok)");
+                        stopDaemon("cloudflared", ctx);
+                        saveDaemonState("cloudflared", false, ctx);
+                    }
+
+                    if (isRunning) {
+                        saveDaemonState(name, true, ctx);
+                        ctx.sendMessage(chatId, ctx.tr("daemon.already_running", displayName));
+                        break;
                     }
                     
                     boolean ok;
@@ -131,11 +124,10 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
                         ok = startShellDaemon(name, ctx);
                     } else {
                         // Java daemon - start via app_process
-                        ok = startDaemon(daemon[2], ctx);
+                        ok = startDaemon(daemon[2], processName, ctx);
                     }
                     
                     if (ok) {
-                        // Clear stopped state - daemon was started via Telegram
                         saveDaemonState(name, true, ctx);
                     }
                     ctx.sendMessage(chatId, ctx.tr(ok ? "daemon.started" : "daemon.start_failed", displayName));
@@ -143,18 +135,12 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
                 break;
                 
             case "stop":
-                if (!isRunning) {
-                    ctx.sendMessage(chatId, ctx.tr("daemon.not_running", displayName));
-                } else {
-                    // Real user stop — plant the durable disable sentinel so the
-                    // watchdog + app health-check honor it across restarts.
-                    boolean ok = stopDaemon(processName, ctx, true /* writeSentinel */);
-                    if (ok) {
-                        // Mark as stopped via Telegram - health check should NOT auto-restart
-                        saveDaemonState(name, false, ctx);
-                    }
-                    ctx.sendMessage(chatId, ctx.tr(ok ? "daemon.stopped" : "daemon.stop_failed", displayName));
-                }
+                // Stop is idempotent. Even if the main process is already
+                // down, run the cleanup so an orphan watchdog cannot respawn
+                // it, and persist the same durable intent as a UI stop.
+                boolean ok = stopDaemon(processName, ctx);
+                saveDaemonState(name, false, ctx);
+                ctx.sendMessage(chatId, ctx.tr(ok ? "daemon.stopped" : "daemon.stop_failed", displayName));
                 break;
                 
             case "status":
@@ -249,31 +235,31 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
      */
     private boolean isDaemonRunning(String processName, CommandContext ctx) {
         // Use grep -F for fixed string matching (handles hyphens in process names like sing-box)
-        String output = ctx.execShell("ps -A | grep -F '" + processName + "' | grep -v grep");
+        String output = ctx.execShell("ps -A | " + processMatcher(processName));
         return output != null && !output.trim().isEmpty();
+    }
+
+    static String processMatcher(String processName) {
+        String matcher = "grep -F '" + processName + "' | grep -v grep";
+        return "sentry_daemon".equals(processName)
+                ? matcher + " | grep -v acc_sentry_daemon"
+                : matcher;
     }
     
     /**
      * Stop daemon using killall -9.
      * Same approach as AccSentryDaemonController.
      */
-    private boolean stopDaemon(String processName, CommandContext ctx, boolean writeSentinel) {
-        ctx.log("Stopping daemon: " + processName + (writeSentinel ? "" : " (silent, no sentinel)"));
+    private boolean stopDaemon(String processName, CommandContext ctx) {
+        ctx.log("Stopping daemon: " + processName);
 
         // Plant the durable, cross-UID disable sentinel for EVERY daemon up
-        // front (chmod 666 so the app's health-check probe can read it). The
-        // cam/acc/zrok cases below also write their own sentinel as part of
-        // their watchdog-kill handshake — this is idempotent and additionally
-        // covers sentry / cloudflared / tailscale / singbox, which previously
-        // wrote NO sentinel and so were resurrected by the app health-check
-        // within 30s of a Telegram stop. See sentinelForProcess.
-        //
-        // writeSentinel is FALSE only for the tunnel mutual-exclusion auto-stop
-        // (mirrors the app's stopDaemonSilent contract): an automatic stop must
-        // NOT plant a durable sentinel, or it would permanently disarm the
-        // other tunnel's crash-recovery for a daemon the user never stopped.
+        // front (chmod 666 so the app's health-check probe can read it). This
+        // covers every daemon, including those that previously had no stop
+        // marker and were resurrected by the app health-check. See
+        // sentinelForProcess.
         String sentinel = sentinelForProcess(processName);
-        if (writeSentinel && sentinel != null) {
+        if (sentinel != null) {
             ctx.execShell("echo \"disabled by telegram at $(date)\" > " + sentinel
                 + "; chmod 666 " + sentinel + " 2>/dev/null");
         }
@@ -288,10 +274,6 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
             // update path which aborts. The trip still survives as a
             // recoverable telemetry file either way.
             prepareCameraDaemonForKill(ctx);
-            // Write disable sentinel FIRST — prevents watchdog from restarting
-            if (writeSentinel) {
-                ctx.execShell("echo \"disabled by telegram at $(date)\" > /data/local/tmp/camera_daemon.disabled; chmod 666 /data/local/tmp/camera_daemon.disabled 2>/dev/null");
-            }
             // Kill watchdog FIRST so it doesn't respawn the daemon.
             //
             // pkill -f matches FULL argv (including any variable-assignment
@@ -315,13 +297,9 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
             ctx.execShell("rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null");
         }
 
-        // For acc sentry daemon, also kill the watchdog script and plant
-        // the disable sentinel so the watchdog (if it survives the pkill)
-        // exits cleanly on its next loop iteration.
+        // For acc sentry daemon, also kill the watchdog script; the sentinel
+        // above makes any surviving loop exit cleanly.
         if ("acc_sentry_daemon".equals(processName)) {
-            if (writeSentinel) {
-                ctx.execShell("echo \"disabled by telegram at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled; chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null");
-            }
             // ps+awk+kill — see cam case above for why pkill -f / variable
             // hop is not self-match safe.
             ctx.execShell(
@@ -333,17 +311,41 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
             ctx.execShell("rm -f /data/local/tmp/acc_sentry_daemon.lock 2>/dev/null");
         }
 
-        // For zrok, also plant the disable sentinel + nuke the watchdog
-        // script so start_zrok.sh exits and stays gone. `pkill -f 'zrok'`
+        // Mirror SentryDaemonController: request a clean stop, then remove
+        // the PID file so a later manual start cannot inherit stale state.
+        if ("sentry_daemon".equals(processName)) {
+            ctx.execShell(
+                "echo 'STOP' | nc -w 1 127.0.0.1 19879 2>/dev/null; "
+                + "if [ -f /data/local/tmp/sentry_daemon.pid ]; then "
+                + "kill -9 $(cat /data/local/tmp/sentry_daemon.pid) 2>/dev/null; "
+                + "rm -f /data/local/tmp/sentry_daemon.pid; fi"
+            );
+        }
+
+        // For zrok, also nuke the watchdog script so start_zrok.sh exits and
+        // stays gone. `pkill -f 'zrok'`
         // below catches both start_zrok.sh and the zrok share binary, but
         // without the sentinel the watchdog can re-exec the share between
         // our pkill and the next health-check tick. Mirrors the cam_daemon
         // sentinel handshake.
         if ("zrok".equals(processName)) {
-            if (writeSentinel) {
-                ctx.execShell("echo \"disabled by telegram at $(date)\" > /data/local/tmp/zrok.disabled; chmod 666 /data/local/tmp/zrok.disabled 2>/dev/null");
-            }
             ctx.execShell("rm -f /data/local/tmp/start_zrok.sh 2>/dev/null");
+        }
+
+        // Sing-box is launched by the sentry_proxy parent in the UI flow.
+        // Kill that parent too and clear the same global proxy settings as
+        // SingboxController, otherwise a Telegram stop leaks the wrapper and
+        // its wakelock even though sing-box itself is down.
+        if ("sing-box".equals(processName)) {
+            ctx.execShell(
+                "MY_PID=$$; ps -A -o PID,ARGS | " + processMatcher("sentry_proxy") + " "
+                + "| awk '{print $1}' | while read pid; do "
+                + "if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done; "
+                + "settings delete global http_proxy 2>/dev/null; "
+                + "settings put global global_http_proxy_host '' 2>/dev/null; "
+                + "settings put global global_http_proxy_port '' 2>/dev/null; "
+                + "settings delete global global_http_proxy_exclusion_list 2>/dev/null"
+            );
         }
 
         // For any tunnel stop, clear the daemon-side notify-tunnel throttle
@@ -351,7 +353,7 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
         // spam — but a user-initiated stop+start should always re-notify.
         if ("cloudflared".equals(processName)
                 || "zrok".equals(processName)
-                || "tailscale".equals(processName)) {
+                || "tailscaled".equals(processName)) {
             ctx.execShell("rm -f /data/local/tmp/.tunnel_last_notified 2>/dev/null");
         }
         
@@ -363,7 +365,7 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
         // not 0. ps+awk+kill filters by PID and excludes $$ → no
         // self-match.
         ctx.execShell(
-            "MY_PID=$$; ps -A -o PID,ARGS | grep -F " + processName + " | grep -v grep "
+            "MY_PID=$$; ps -A -o PID,ARGS | " + processMatcher(processName) + " "
             + "| awk '{print $1}' | while read pid; do "
             + "if [ \"$pid\" != \"$MY_PID\" ]; then kill -9 $pid 2>/dev/null; fi; done"
         );
@@ -394,7 +396,8 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
      * For CameraDaemon: deploys watchdog script with bmmcamera.jar, native libs, proxy args.
      * For other daemons: uses the appropriate launch pattern.
      */
-    private boolean startDaemon(String className, CommandContext ctx) {
+    private boolean startDaemon(
+            String className, String processName, CommandContext ctx) {
         ctx.log("Starting daemon: " + className);
         
         // Get APK path
@@ -417,10 +420,10 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
             String fullClass = "com.overdrive.app.daemon." + className;
             String cmd = String.format(
                 "CLASSPATH=%s app_process /system/bin --nice-name=%s %s >> /data/local/tmp/%s.log 2>&1",
-                apkPath, className.toLowerCase(), fullClass, className.toLowerCase());
+                apkPath, processName, fullClass, processName);
             ctx.spawnDetached(cmd);
             try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
-            return true;
+            return isDaemonRunning(processName, ctx);
         }
     }
     
@@ -652,9 +655,7 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
         String cmd;
         String processName;
 
-        // Check if sing-box proxy is running
-        String singboxCheck = ctx.execShell("pgrep -f sing-box");
-        boolean useProxy = singboxCheck != null && !singboxCheck.trim().isEmpty();
+        boolean useProxy = com.overdrive.app.mqtt.ProxyHelper.probePort(8119);
         switch (name) {
             case "cloudflared":
                 // Cloudflared tunnel - match UI version (TunnelLauncher.kt)
@@ -686,14 +687,10 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
                 // Clear the disable sentinel — user is explicitly starting
                 // the tunnel via Telegram. Without this, /daemon zrok stop
                 // followed by /daemon zrok start would silently no-op
-                // because the (still-running watchdog from the prior
-                // start) sees the sentinel and exits, and our spawn below
-                // bypasses the watchdog entirely. Note: this Telegram
-                // path launches zrok bare, not under the start_zrok.sh
-                // watchdog. A subsequent UI start will re-deploy the
-                // watchdog properly; until then the tunnel runs without
-                // a supervisor.
-                ctx.execShell("rm -f /data/local/tmp/zrok.disabled 2>/dev/null");
+                // because the new watchdog would see the stale sentinel and exit.
+                // Clear the old log too so public-mode URL discovery cannot return
+                // a URL from the previous share session.
+                ctx.execShell("rm -f /data/local/tmp/zrok.disabled /data/local/tmp/zrok.log 2>/dev/null");
 
                 // Zrok tunnel — use RESERVED mode with saved token (same as app UI)
                 // Falls back to public mode only if no reserved token exists
@@ -713,16 +710,40 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
                         ctx.log("❌ Zrok enable token could not be decrypted. Re-set it from the app UI.");
                         return false;
                     }
+                    if (!useProxy) {
+                        useProxy = com.overdrive.app.launcher.ZrokRuntimeProbe.waitForProxy(5_000L);
+                    }
                     ctx.log("⚠️ Device not enabled. Registering now (uses 1 of 5 slots)...");
+                    String zrokProxyEnv = useProxy
+                        ? "ALL_PROXY=socks5://127.0.0.1:8119 " +
+                          "HTTP_PROXY=socks5://127.0.0.1:8119 " +
+                          "HTTPS_PROXY=socks5://127.0.0.1:8119 " +
+                          "NO_PROXY=localhost,127.0.0.1 "
+                        : "";
                     String enableCmd = "HOME=/data/local/tmp " +
-                        "ALL_PROXY=socks5://127.0.0.1:8119 " +
-                        "HTTP_PROXY=socks5://127.0.0.1:8119 " +
-                        "HTTPS_PROXY=socks5://127.0.0.1:8119 " +
-                        "NO_PROXY=localhost,127.0.0.1 " +
-                        "/data/local/tmp/zrok enable " + enableToken + " --headless 2>&1";
+                        zrokProxyEnv +
+                        "/data/local/tmp/zrok enable " +
+                        com.overdrive.app.launcher.ZrokRuntimeProbe.shellQuote(enableToken) +
+                        " --headless 2>&1";
                     String enableResult = ctx.execShell(enableCmd);
-                    ctx.log("Enable result: " + enableResult);
+                    if (enableResult == null) {
+                        ctx.log("❌ Zrok enable command failed without output.");
+                        return false;
+                    }
+                    String enableError =
+                        com.overdrive.app.launcher.ZrokRuntimeProbe.extractErrorMessage(enableResult);
+                    if (!enableError.isEmpty()) {
+                        ctx.log("❌ Failed to enable zrok: " + enableError);
+                        return false;
+                    }
                     try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+                    String enabledCheck = ctx.execShell(
+                        "test -f /data/local/tmp/.zrok/environment.json && echo yes || echo no");
+                    if (enabledCheck == null || !"yes".equals(enabledCheck.trim())) {
+                        ctx.log("❌ Zrok enable did not create an environment identity.");
+                        return false;
+                    }
+                    ctx.log("✅ Zrok environment enabled.");
                 } else {
                     ctx.log("✅ Device already enabled.");
                 }
@@ -756,7 +777,7 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
                 boolean reservedMode = (reservedToken != null);
                 String tokenForScript = reservedMode ? reservedToken : "";
                 if (reservedMode) {
-                    ctx.log("Using reserved token: " + reservedToken);
+                    ctx.log("Using saved reserved zrok share.");
                     if (savedName != null) {
                         ctx.log("Permanent URL: https://" + savedName + ".share.zrok.io");
                     }
@@ -906,7 +927,7 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
             for (int i = 0; i < 15; i++) { // Wait up to 15 seconds
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
                 // SOTA FIX: Use grep instead of cat to avoid loading entire log into memory
-                String grepResult = ctx.execShell("grep -o 'https://[a-z0-9]*\\.share\\.zrok\\.io' /data/local/tmp/zrok.log 2>/dev/null | head -1");
+                String grepResult = ctx.execShell("grep -o 'https://[a-z0-9-]*\\.share\\.zrok\\.io' /data/local/tmp/zrok.log 2>/dev/null | tail -1");
                 if (grepResult != null && grepResult.startsWith("https://")) {
                     zrokUrl = grepResult.trim();
                     ctx.log("Zrok URL: " + zrokUrl);
@@ -966,7 +987,7 @@ public class DaemonCommandHandler implements TelegramCommandHandler {
     }
     
     /**
-     * Save daemon state to file so health checks can honor Telegram-initiated stops.
+     * Save the legacy Telegram daemon-state file.
      * 
      * @param daemonName The daemon name (e.g., "cloudflared", "singbox")
      * @param running true if daemon was started, false if stopped

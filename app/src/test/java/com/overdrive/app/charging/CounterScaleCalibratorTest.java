@@ -79,6 +79,31 @@ public class CounterScaleCalibratorTest {
         assertFalse(CounterScaleCalibrator.isScaleSuspect(SRC));
     }
 
+    @Test
+    public void laterSessionCanChallengeAStoredUnityVerdict() {
+        feed(SRC, 10.6, 1.0, 30, 1_000_000L);
+        assertEquals(1.0, CounterScaleCalibrator.factorFor(SRC), 0.0001);
+        CounterScaleCalibrator.onSessionEnded();
+
+        feed(SRC, 5.62, 2.0, 8, 4_000_000L);
+
+        assertEquals("the correction is not final before the long baseline",
+                1.0, CounterScaleCalibrator.factorFor(SRC), 0.0001);
+        assertTrue("clean current-session 1:2 evidence must override stale unity confidence",
+                CounterScaleCalibrator.isScaleSuspect(SRC));
+    }
+
+    @Test
+    public void laterSessionCanRecalibrateUnityToHalfScale() {
+        feed(SRC, 10.6, 1.0, 30, 1_000_000L);
+        CounterScaleCalibrator.onSessionEnded();
+
+        feed(SRC, 5.62, 2.0, 30, 4_000_000L);
+
+        assertEquals(2.0, CounterScaleCalibrator.factorFor(SRC), 0.0001);
+        assertFalse(CounterScaleCalibrator.isScaleSuspect(SRC));
+    }
+
     /**
      * An uncalibrated source must behave exactly as before — factor 1.0 and no suspicion — or every
      * trim with no fault would have its rate withheld.
@@ -131,6 +156,16 @@ public class CounterScaleCalibratorTest {
         assertEquals(1.0, CounterScaleCalibrator.factorFor(SRC), 0.0001);
     }
 
+    @Test
+    public void weakUnityEvidenceIsNotPersistedAsAFullScaleVerdict() {
+        feed(SRC, 5.0, 1.229, 40, 1_000_000L);
+
+        assertFalse(CounterScaleCalibrator.isCalibrated(SRC));
+        assertEquals("uncalibrated behavior remains neutral",
+                1.0, CounterScaleCalibrator.factorFor(SRC), 0.0001);
+        assertFalse(CounterScaleCalibrator.isScaleSuspect(SRC));
+    }
+
     /** A verdict is a firmware property and survives the session; the pairing anchors must not. */
     @Test
     public void sessionEndKeepsTheVerdictAndDropsTheAnchors() {
@@ -144,6 +179,21 @@ public class CounterScaleCalibratorTest {
         // A stale anchor would pair this session's last reading against the next session's first.
         CounterScaleCalibrator.observePaired(SRC, 0.0, 5.0, 9_000_000L);
         assertEquals(2.0, CounterScaleCalibrator.factorFor(SRC), 0.0001);
+    }
+
+    @Test
+    public void sessionEndDropsUndecidedPartialEvidence() {
+        feed(SRC, 5.62, 2.0, 8, 1_000_000L);
+        assertTrue(CounterScaleCalibrator.isScaleSuspect(SRC));
+        assertFalse(CounterScaleCalibrator.isCalibrated(SRC));
+
+        CounterScaleCalibrator.onSessionEnded();
+
+        assertFalse(CounterScaleCalibrator.isScaleSuspect(SRC));
+        feed(SRC, 10.6, 1.0, 12, 3_000_000L);
+        assertFalse("the next short healthy session must not inherit the prior 1:2 baseline",
+                CounterScaleCalibrator.isCalibrated(SRC));
+        assertFalse(CounterScaleCalibrator.isScaleSuspect(SRC));
     }
 
     /**

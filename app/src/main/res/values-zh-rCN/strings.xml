@@ -622,7 +622,7 @@
     <string name="dialog_zrok_token_message">输入Zrok启用代币.</string>
     <string name="toast_token_cannot_be_empty">标签不能空</string>
     <string name="dialog_tailscale_settings_title">Tailscale道设置</string>
-    <string name="dialog_tailscale_settings_message">配置尾声尺度</string>
+    <string name="dialog_tailscale_settings_message">配置 Tailscale</string>
     <string name="tailscale_failed_login_url">无法生成登录URL</string>
     <string name="tailscale_logged_in_relogin">登录. 点击登录另一个帐户</string>
     <string name="dialog_tailscale_proxy_enable_title">启用Tailscale代理?</string>
@@ -635,8 +635,8 @@
     <string name="toast_zrok_reset_warnings">环境重置 (附警告:%1$s)</string>
     <string name="zrok_no_token_configured">没有配置的代币.</string>
     <string name="dialog_tailscale_reset_title">重置Tailscale环境</string>
-    <string name="dialog_tailscale_reset_message">这将:\n• 停止尾标道如果运行\n• 从这个设备中删除尾标环境\n• 你仍然需要从尾标控制台中删除设备\n\n你需要再次登录.\n\n你确定吗?</string>
-    <string name="toast_resetting_tailscale">重新设置后背尺度环境...</string>
+    <string name="dialog_tailscale_reset_message">此操作将:\n• 如果 Tailscale 隧道正在运行，则停止它\n• 从本设备移除 Tailscale 环境\n• 你仍需在 Tailscale 控制台中移除该设备\n\n你需要重新登录。\n\n确定吗?</string>
+    <string name="toast_resetting_tailscale">正在重置 Tailscale 环境…</string>
     <string name="toast_tailscale_reset_success">Tailscale环境重置. 登录重新设置.</string>
     <string name="toast_tailscale_reset_warnings">环境重置Tailscale (附警告:%1$s)</string>
     <string name="toast_tailscale_proxy_enabled">启用Tailscale代理</string>
@@ -1308,7 +1308,7 @@
     <string name="roadsense_map_trip_restored">行程已恢復</string>
     <!-- Cloudflared paid-tunnel settings -->
     <string name="cloudflared_token_storage_note">令牌安全地存储并在应用程序和守护进程之间共享。</string>
-    <string name="cloudflared_token_hint">输入云端令牌</string>
+    <string name="cloudflared_token_hint">输入 cloudflared 令牌</string>
     <string name="cloudflare_paid_version">Cloudflare已付费版本</string>
     <string name="dialog_cloudflared_settings_title">Cloudflared 设置</string>
     <string name="dialog_cloudflared_settings_message">请指定您使用的是付费版 Cloudflare 还是 trycloudflare。如果使用付费版 Cloudflare，请输入您的隧道令牌。</string>

@@ -1796,9 +1796,12 @@ BYD.utils._showModal = function (opts) {
         var input = null;
         if (opts.prompt) {
             input = document.createElement('input');
-            input.type = 'text';
+            input.type = opts.inputType || 'text';
             input.value = opts.promptValue || '';
             input.placeholder = opts.promptPlaceholder || '';
+            input.setAttribute('aria-label',
+                opts.promptLabel || opts.title || opts.body || 'Input');
+            if (opts.inputMode) input.setAttribute('inputmode', opts.inputMode);
             input.style.width = '100%';
             input.style.boxSizing = 'border-box';
             input.style.padding = '10px 12px';
@@ -1815,14 +1818,13 @@ BYD.utils._showModal = function (opts) {
             input.addEventListener('blur', function () {
                 input.style.borderColor = 'var(--border-subtle, #ccc)';
             });
-            card.appendChild(input);
-
             input.addEventListener('keydown', function (ev) {
                 if (ev.key === 'Enter') {
                     ev.preventDefault();
                     dismiss(true);
                 }
             });
+            card.appendChild(input);
         }
 
         var actions = document.createElement('div');
@@ -1859,17 +1861,11 @@ BYD.utils._showModal = function (opts) {
         document.body.appendChild(backdrop);
 
         try {
-            if (input) {
-                input.focus();
-                if (opts.promptValue) {
-                    input.setSelectionRange(opts.promptValue.length, opts.promptValue.length);
-                }
-            } else {
-                confirmBtn.focus();
-            }
+            if (input) input.focus();
+            else confirmBtn.focus();
         } catch (e) {}
 
-        var entry = { dismiss: function () { dismiss(false); } };
+        var entry = { dismiss: dismiss };
         BYD.utils._modalStack.push(entry);
 
         function dismiss(result) {
@@ -1881,12 +1877,7 @@ BYD.utils._showModal = function (opts) {
             // Pop from stack if still there (e.g. button click path).
             var idx = BYD.utils._modalStack.indexOf(entry);
             if (idx !== -1) BYD.utils._modalStack.splice(idx, 1);
-            
-            if (opts.prompt) {
-                resolve(result ? input.value : null);
-            } else {
-                resolve(result);
-            }
+            resolve(opts.prompt ? (result ? input.value : null) : result);
         }
     });
 };
@@ -1928,10 +1919,7 @@ BYD.utils.confirmDialog = function (opts) {
     });
 };
 
-/**
- * Themed text input prompt. Returns a Promise<string|null> resolving with the input value,
- * or null when canceled.
- */
+/** Themed input prompt. Resolves to the entered string, or null when canceled. */
 BYD.utils.promptDialog = function (opts) {
     opts = opts || {};
     var t = BYD.i18n && BYD.i18n.t ? BYD.i18n.t.bind(BYD.i18n) : null;
@@ -1942,7 +1930,10 @@ BYD.utils.promptDialog = function (opts) {
         cancelLabel: opts.cancelLabel || (t && t('common.cancel')) || 'Cancel',
         prompt: true,
         promptValue: opts.value || '',
-        promptPlaceholder: opts.placeholder || ''
+        promptPlaceholder: opts.placeholder || '',
+        promptLabel: opts.label || '',
+        inputType: opts.inputType || 'text',
+        inputMode: opts.inputMode || ''
     });
 };
 

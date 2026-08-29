@@ -141,7 +141,7 @@ public class SystemCommandHandler implements TelegramCommandHandler {
 
             if (zrokUp) {
                 String url = null;
-                String grepResult = ctx.execShell("grep -o 'https://[a-z0-9]*\\.share\\.zrok\\.io' /data/local/tmp/zrok.log 2>/dev/null | head -1");
+                String grepResult = ctx.execShell("grep -o 'https://[a-z0-9-]*\\.share\\.zrok\\.io' /data/local/tmp/zrok.log 2>/dev/null | tail -1");
                 if (grepResult != null && grepResult.startsWith("https://")) {
                     url = grepResult.trim();
                 }
@@ -219,7 +219,8 @@ public class SystemCommandHandler implements TelegramCommandHandler {
     
     private boolean isDaemonRunning(String processName, CommandContext ctx) {
         // Use grep -F for fixed string matching (handles hyphens in process names like sing-box)
-        String output = ctx.execShell("ps -A | grep -F '" + processName + "' | grep -v grep");
+        String output = ctx.execShell(
+                "ps -A | " + DaemonCommandHandler.processMatcher(processName));
         return output != null && !output.trim().isEmpty();
     }
 }

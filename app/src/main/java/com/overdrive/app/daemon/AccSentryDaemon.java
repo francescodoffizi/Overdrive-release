@@ -1531,10 +1531,9 @@ public class AccSentryDaemon {
                 // Start periodic status monitoring
                 startStatusMonitoring();
                 
-                // Disable BYD traffic monitor app (consumes data/battery in background)
-                // NOTE: Removed automatic disable — user can now toggle this from the app drawer menu
-                // disableBydTrafficMonitor();
-                
+                // BYD traffic monitor: user-opt-in only. TrafficMonitorPolicy owns the
+                // toggle, and CameraDaemon re-applies it on boot when the user opted in.
+
                 // Note: VehicleDataMonitor is initialized in CameraDaemon (separate process)
                 // which handles the HTTP API for vehicle data
             } else {
@@ -1698,7 +1697,11 @@ public class AccSentryDaemon {
      * Fallback: direct binder transact with TX code 2 (confirmed working).
      */
     private static void whitelistAppPackageOld() {
-        String pkg = APP_PACKAGE_NAME();
+        whitelistAccPackage(APP_PACKAGE_NAME());
+        whitelistAccPackage("com.byd.warning");
+    }
+
+    private static void whitelistAccPackage(String pkg) {
         log("Whitelisting package " + pkg + " via accmodemanager...");
 
         boolean success = false;
@@ -6724,15 +6727,10 @@ public class AccSentryDaemon {
             return true;
         }
 
-        // Check if the user explicitly stopped it. Two signals:
-        //  (1) the durable disable sentinel — written by BOTH the UI stop and
-        //      the Telegram stop, the single cross-UID source of truth. We're
-        //      UID 2000 here so we can stat it directly.
-        //  (2) the legacy daemon_telegram_state.properties — Telegram-only,
-        //      kept for back-compat.
-        // The sentinel is the important one: without this check, a daemon the
-        // user stopped from the Daemons UI (which never wrote the .properties
-        // file) would get silently resurrected on the next ACC-on.
+        // Check the durable disable sentinel written by BOTH the UI stop and
+        // the Telegram stop — the single cross-UID source of truth. Without
+        // it, a daemon the user stopped from the Daemons UI would get silently
+        // resurrected on the next ACC-on.
         //
         // BUT the sentinel file is overloaded — three kinds of writer use it:
         //   "disabled by ui"/"disabled by telegram"  → a REAL user stop, honor it
@@ -6749,7 +6747,7 @@ public class AccSentryDaemon {
         // a parked-only bot permanently unable to auto-start after any update,
         // since nothing clears the optional-daemon sentinels post-update.
         //
-        // A missing/unreadable file also falls through to auto-start.
+        // A missing file falls through to auto-start; an unreadable one retries.
         java.io.File telegramSentinel =
             new java.io.File("/data/local/tmp/telegram_bot_daemon.disabled");
         if (telegramSentinel.exists()) {
@@ -6767,14 +6765,6 @@ public class AccSentryDaemon {
                 log("Telegram daemon disable sentinel present (user-stopped), not auto-starting");
                 return true;
             }
-        }
-        try {
-            if (com.overdrive.app.daemon.telegram.DaemonCommandHandler.isDaemonStoppedViaTelegram("telegram")) {
-                log("Telegram daemon was stopped via Telegram command, not auto-starting");
-                return true;
-            }
-        } catch (Exception e) {
-            // State file not available, proceed with auto-start
         }
         if (shouldAbortTelegramReconciliation(
                 transitionGeneration, true, "process check")) {
@@ -7139,10 +7129,12 @@ public class AccSentryDaemon {
             transitionGeneration,
             false,
             "S=/data/local/tmp/telegram_bot_daemon.disabled; T=\"$S.tmp.$$\"; "
-            + "printf 'disabled by ACC-on at %s\\n' \"$(date)\" > \"$T\" "
-            + "&& chmod 666 \"$T\" "
-            + "&& mv -f \"$T\" \"$S\" "
-            + "&& rm -f /data/local/tmp/start_telegram.sh"
+            + "R=$(head -1 \"$S\" 2>/dev/null); "
+            + "case \"$R\" in "
+            + "'disabled by ui'*|'disabled by telegram'*|'disabled by user'*) :;; "
+            + "*) printf 'disabled by ACC-on at %s\\n' \"$(date)\" > \"$T\" "
+            + "&& chmod 666 \"$T\" && mv -f \"$T\" \"$S\";; esac; "
+            + "rm -f /data/local/tmp/start_telegram.sh"
         );
         if (!shellResult.success) {
             return shellResult.canceled;
@@ -7454,19 +7446,6 @@ public class AccSentryDaemon {
     }
 
     // ==================== SHELL EXECUTION ====================
-
-    /**
-     * Disable BYD's built-in traffic monitor app.
-     * It runs in the background consuming mobile data and battery.
-     */
-    private static void disableBydTrafficMonitor() {
-        try {
-            String result = execShell("pm disable-user --user 0 com.byd.trafficmonitor 2>&1");
-            log("Disable BYD traffic monitor: " + result);
-        } catch (Exception e) {
-            log("Failed to disable BYD traffic monitor: " + e.getMessage());
-        }
-    }
 
     /**
      * "Vehicle ON only" parked reaper. Writes a detached shell script and launches it with
@@ -8837,8 +8816,8 @@ public class AccSentryDaemon {
      * would never come back. Returns true when the flag was stale and cleared
      * (caller should proceed to re-enable WiFi).
      *
-     * <p>Only touches HOTSPOT-owned suppressions — a deliberate user "WiFi off"
-     * rule sets the same flag without the hotspot marker and must survive.
+     * <p>Only touches the HOTSPOT-owned marker. A deliberate user "WiFi off"
+     * preference is stored independently and must survive.
      */
     /**
      * Consecutive keep-alive ticks spent honouring a published "AP coming up".
@@ -8913,12 +8892,14 @@ public class AccSentryDaemon {
             }
             log("Hotspot WiFi suppression is stale (AP is not up)"
                     + " — clearing so WiFi keep-alive can resume");
-            com.overdrive.app.config.UnifiedConfigManager
-                    .setWifiKeepAliveSuppressed(false);
             java.util.Map<String, Object> clear = new java.util.HashMap<>();
             clear.put("suppressedByHotspot", false);
-            com.overdrive.app.config.UnifiedConfigManager.updateHotspot(clear);
-            return true;
+            boolean cleared =
+                    com.overdrive.app.config.UnifiedConfigManager.updateHotspot(clear);
+            // Fall through to re-enable only when no independent user/automation
+            // suppression remains after clearing the stale hotspot marker.
+            return cleared && !com.overdrive.app.config.UnifiedConfigManager
+                    .isWifiKeepAliveSuppressed();
         } catch (Throwable t) {
             log("Hotspot suppression reconcile failed: " + t.getMessage());
             return false;

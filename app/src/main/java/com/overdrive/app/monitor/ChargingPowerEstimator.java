@@ -229,8 +229,9 @@ public final class ChargingPowerEstimator {
             // passes a valid socScaleKwh; BEV passes NaN → socE stays NaN and the
             // estimator falls through to remain/cap exactly as before.
             double socEnergyKwh = Double.NaN;
-            if (!Double.isNaN(socPercent) && socPercent > 0 && !Double.isNaN(socScaleKwh) && socScaleKwh > 0) {
-                if (Double.isNaN(frozenSocScaleKwh)) frozenSocScaleKwh = socScaleKwh;
+            if (Double.isFinite(socPercent) && socPercent > 0 && socPercent <= 100
+                    && Double.isFinite(socScaleKwh) && socScaleKwh > 0) {
+                if (!Double.isFinite(frozenSocScaleKwh)) frozenSocScaleKwh = socScaleKwh;
                 socEnergyKwh = (socPercent / 100.0) * frozenSocScaleKwh;
             }
             // socE is the COARSE counter (SOC × frozen scale, so it moves in whole-1% steps —
@@ -306,7 +307,7 @@ public final class ChargingPowerEstimator {
                 usedSrc = "awaiting-connected-gun";
                 movedThisCycle = false;
                 invalidateEstimate();
-            } else if (!Double.isNaN(socE)) {
+            } else if (Double.isFinite(socE)) {
                 derived = socE;
                 usedSrc = "socE";
                 movedThisCycle = socMoved;
@@ -370,7 +371,7 @@ public final class ChargingPowerEstimator {
                     movedThisCycle = false;
                     invalidateEstimate();
                 }
-            } else if (!Double.isNaN(rem)) {
+            } else if (Double.isFinite(rem)) {
                 // DC, AC_DC and unavailable/legacy gun states retain the proven Seal behaviour.
                 derived = rem;
                 usedSrc = "remain";
@@ -390,7 +391,7 @@ public final class ChargingPowerEstimator {
             // of the ring that actually produced the published number (so a different, still-ticking
             // counter cannot vouch for a frozen one).
             if (movedThisCycle) lastDeriveMs = nowMs;
-            if (!Double.isNaN(derived)) {
+            if (Double.isFinite(derived)) {
                 // Never blend the rejected AC counter into the source that replaced it. A source
                 // decision is a trust boundary, not a normal EMA update.
                 if (resetSmoothing) estimateKw = Double.NaN;
@@ -428,7 +429,7 @@ public final class ChargingPowerEstimator {
     private double pushAndDerive(ArrayDeque<long[]> ring, double counterKwh, long nowMs, String label,
                                  int minPoints, long maxSpanMs) {
         appendedLastCall = false;   // per-call; see the field's doc
-        if (Double.isNaN(counterKwh) || counterKwh <= 0) return Double.NaN;
+        if (!Double.isFinite(counterKwh) || counterKwh <= 0) return Double.NaN;
         long milli = Math.round(counterKwh * 1000.0);
         long[] last = ring.peekLast();
         // Only record real upward movement. A flat or DECREASING counter (V2L /
@@ -567,7 +568,7 @@ public final class ChargingPowerEstimator {
         // derive it was meant to enable. Fine-grained callers still pass MAX_INTERVAL_MS.
         if (dtMs <= 0 || dtMs > maxSpanMs || dKwhMilli <= 0) return Double.NaN;
         double kw = (dKwhMilli / 1000.0) * 3_600_000.0 / dtMs;
-        if (kw < MIN_KW || kw > MAX_KW) return Double.NaN;
+        if (!Double.isFinite(kw) || kw < MIN_KW || kw > MAX_KW) return Double.NaN;
         return kw;
     }
 
@@ -590,7 +591,7 @@ public final class ChargingPowerEstimator {
      */
     public double estimatePowerKw() {
         synchronized (lock) {
-            if (Double.isNaN(estimateKw)) return Double.NaN;
+            if (!Double.isFinite(estimateKw)) return Double.NaN;
             if (lastDeriveMs <= 0) return Double.NaN;
             if (System.currentTimeMillis() - lastDeriveMs > STALE_ESTIMATE_MS) {
                 // DESTRUCTIVE expiry. Merely withholding the value left it in estimateKw, where
@@ -608,7 +609,7 @@ public final class ChargingPowerEstimator {
     }
 
     private static boolean isPositiveFinite(double value) {
-        return !Double.isNaN(value) && !Double.isInfinite(value) && value > 0;
+        return Double.isFinite(value) && value > 0;
     }
 
     private static boolean isPlausibleAcSlope(double kw) {

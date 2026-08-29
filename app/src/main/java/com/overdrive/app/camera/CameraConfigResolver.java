@@ -92,6 +92,14 @@ public final class CameraConfigResolver {
         return section != null ? section : new JSONObject();
     }
 
+    /** True only for the opt-in DiLink 4 passive APA compatibility path. */
+    public static boolean isPassiveApaModeEnabled() {
+        JSONObject camera = getCameraSection();
+        return Di4AvcViewpointPolicy.isPassiveApaModeEnabled(
+                camera.optString("cameraMode", "default"),
+                camera.optBoolean("dilink4PassiveApaMode", false));
+    }
+
     /**
      * Persist a single role → source mapping. Accepts both {@code DIRECT} and
      * {@code PANORAMIC_SLICE} kinds so the diagnostics dialog can map any
@@ -247,16 +255,24 @@ public final class CameraConfigResolver {
      */
     public static JSONArray buildPreviewCandidates(ResolvedCameraConfig resolved) {
         JSONArray out = new JSONArray();
+        boolean passiveApa = isPassiveApaModeEnabled();
         for (int cameraId = 0; cameraId <= 5; cameraId++) {
             JSONObject item = CameraSourceRef.direct(cameraId).toJson();
-            putSafely(item, "previewWidth", resolved.getProfile().getDirectPreviewWidth());
-            putSafely(item, "previewHeight", resolved.getProfile().getDirectPreviewHeight());
+            boolean passivePano = passiveApa && cameraId == resolved.getPanoCameraId();
+            putSafely(item, "previewWidth", passivePano
+                    ? PassiveApaGeometry.WIDTH
+                    : resolved.getProfile().getDirectPreviewWidth());
+            putSafely(item, "previewHeight", passivePano
+                    ? PassiveApaGeometry.HEIGHT
+                    : resolved.getProfile().getDirectPreviewHeight());
             out.put(item);
         }
         for (PanoramicSlice slice : PanoramicSlice.values()) {
             JSONObject item = CameraSourceRef.panoramicSlice(slice).toJson();
-            putSafely(item, "previewWidth", resolved.getPanoWidth() / 4);
-            putSafely(item, "previewHeight", resolved.getPanoHeight());
+            putSafely(item, "previewWidth", passiveApa
+                    ? PassiveApaGeometry.WIDTH : resolved.getPanoWidth() / 4);
+            putSafely(item, "previewHeight", passiveApa
+                    ? PassiveApaGeometry.HEIGHT : resolved.getPanoHeight());
             out.put(item);
         }
         return out;
@@ -275,8 +291,11 @@ public final class CameraConfigResolver {
         putSafely(out, "panoSurfaceMode", resolved.getPanoSurfaceMode());
         putSafely(out, "panoWidth", resolved.getPanoWidth());
         putSafely(out, "panoHeight", resolved.getPanoHeight());
-        putSafely(out, "encoderWidth", resolved.getProfile().getEncoderWidth());
-        putSafely(out, "encoderHeight", resolved.getProfile().getEncoderHeight());
+        boolean passiveApa = isPassiveApaModeEnabled();
+        putSafely(out, "encoderWidth", passiveApa
+                ? PassiveApaGeometry.WIDTH : resolved.getProfile().getEncoderWidth());
+        putSafely(out, "encoderHeight", passiveApa
+                ? PassiveApaGeometry.HEIGHT : resolved.getProfile().getEncoderHeight());
         putSafely(out, "cameraManualOverride", resolved.isManualPanoOverride());
         putSafely(out, "cameraValidated", resolved.isValidated());
         putSafely(out, "cameraFallbackFromProbe", resolved.isFallbackFromProbe());

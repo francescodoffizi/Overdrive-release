@@ -282,6 +282,12 @@ public final class LocationSidecarWriter {
                 try { tmpFile.delete(); } catch (Throwable ignored) {}
             }
             try { jsonFile.setReadable(true, false); } catch (Throwable ignored) {}
+            // Idle cleanup gate: sidecars land AFTER the mp4's save hook fired,
+            // so without this bump their bytes stay invisible to the parked-tick
+            // skip until the hourly backstop. Best-effort.
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance().markStorageDirty();
+            } catch (Throwable ignored) {}
         } catch (Throwable t) {
             logger.warn("writeJsonAtomic failed for " + mp4File.getName()
                     + ": " + t.getMessage());
@@ -299,6 +305,10 @@ public final class LocationSidecarWriter {
         SrtWriter srt = new SrtWriter();
         srt.addEvent(0L, SrtWriter.K_LOCATION_PREFIX, label);
         srt.write(mp4File);
+        // Same rationale as writeJsonAtomic's bump: post-finalization bytes.
+        try {
+            com.overdrive.app.storage.StorageManager.getInstance().markStorageDirty();
+        } catch (Throwable ignored) {}
     }
 
     /**

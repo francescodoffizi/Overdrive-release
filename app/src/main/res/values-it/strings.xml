@@ -626,7 +626,7 @@
 Puoi ottenerne uno su: zrok.io</string>
     <string name="toast_token_cannot_be_empty">Il token non puo essere vuoto</string>
     <string name="dialog_tailscale_settings_title">Impostazioni tunnel Tailscale</string>
-    <string name="dialog_tailscale_settings_message">Configurazione della scala della coda</string>
+    <string name="dialog_tailscale_settings_message">Configura Tailscale</string>
     <string name="tailscale_failed_login_url">Generazione URL di accesso non riuscita</string>
     <string name="tailscale_logged_in_relogin">Accesso effettuato. Tocca per accedere con un altro account</string>
     <string name="dialog_tailscale_proxy_enable_title">Attivare proxy Tailscale?</string>
@@ -639,7 +639,7 @@ Puoi ottenerne uno su: zrok.io</string>
     <string name="toast_zrok_reset_warnings">Ripristino dell\'ambiente (con avvertenze: %1$s)</string>
     <string name="zrok_no_token_configured">Nessun token configurato. Tocca per configurare.</string>
     <string name="dialog_tailscale_reset_title">Ripristinare ambiente Tailscale</string>
-    <string name="dialog_tailscale_reset_message">Questo:\n• Fermerà il tunnel di scala a coda se eseguito\n• Rimuovere l\'ambiente di scala a coda da questo dispositivo\n• Dovrai comunque rimuovere il dispositivo dalla console di scala a coda\n\nDovrai ancora accedere.\n\nSei sicuro?</string>
+    <string name="dialog_tailscale_reset_message">Questo:\n• Fermerà il tunnel Tailscale se in esecuzione\n• Rimuoverà l\'ambiente Tailscale da questo dispositivo\n• Dovrai comunque rimuovere il dispositivo dalla console Tailscale\n\nDovrai accedere di nuovo.\n\nSei sicuro?</string>
     <string name="toast_resetting_tailscale">Reimpostazione ambiente Tailscale...</string>
     <string name="toast_tailscale_reset_success">Ambiente Tailscale reimpostato. Accedi per configurarlo di nuovo.</string>
     <string name="toast_tailscale_reset_warnings">Ripristino dell\'ambiente Tailscale (con avvertimenti: %1$s)</string>
@@ -1320,7 +1320,7 @@ Questa azione non puo essere annullata.</string>
     <string name="roadsense_map_trip_restored">Viaggio ripristinato</string>
     <!-- Cloudflared paid-tunnel settings -->
     <string name="cloudflared_token_storage_note">Il token è memorizzato in modo sicuro e condiviso tra i processi di app e demoni.</string>
-    <string name="cloudflared_token_hint">Inserisci il token nuvoloso</string>
+    <string name="cloudflared_token_hint">Inserisci il token cloudflared</string>
     <string name="cloudflare_paid_version">Versione A Pagamento Cloudflare</string>
     <string name="dialog_cloudflared_settings_title">🌐 Impostazioni Cloudflared</string>
     <string name="dialog_cloudflared_settings_message">Definire se si utilizza Cloudflare a pagamento o trycloudflare. Se si utilizza Cloudflare a pagamento, inserire il token del tunnel.</string>

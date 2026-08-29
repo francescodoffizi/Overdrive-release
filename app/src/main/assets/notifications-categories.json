@@ -138,6 +138,15 @@
       "note": "Can be sent by creating an automation action to send a notification."
     },
     {
+      "id": "genai.insight",
+      "label": "AI insight ready",
+      "group": "Assistant",
+      "defaultEnabled": true,
+      "severity": "info",
+      "defaultClickUrl": "/assistant",
+      "note": "Sent only when AI insight notification delivery is explicitly enabled."
+    },
+    {
       "id": "network.hotspot.limit",
       "label": "Hotspot data limit reached",
       "group": "Network",

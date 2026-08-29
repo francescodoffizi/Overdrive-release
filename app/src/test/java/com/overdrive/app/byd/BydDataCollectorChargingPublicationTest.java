@@ -76,11 +76,24 @@ public class BydDataCollectorChargingPublicationTest {
     public void negativeDevicePowerCallbackIsAValidClearSignal() {
         assertTrue(BydDataCollector.isChargingPowerCallbackPayload(-1.0));
         assertTrue(BydDataCollector.isChargingPowerCallbackPayload(0.0));
+        assertTrue(BydDataCollector.isChargingPowerCallbackPayload(359.4));
+        assertTrue(BydDataCollector.isChargingPowerCallbackPayload(500.0));
+        assertFalse(BydDataCollector.isChargingPowerCallbackPayload(500.1));
         assertFalse(BydDataCollector.isChargingPowerCallbackPayload(-10011.0));
     }
 
     @Test
-    public void chargingDevicePowerUsesChargePowerAliasBeforeLegacyName() {
+    public void acChargingCurrentLimitLabelsMatchOemFiveStateControl() {
+        assertEquals("6 A", BydDataCollector.acChargingCurrentLimitLabel(1));
+        assertEquals("8 A", BydDataCollector.acChargingCurrentLimitLabel(2));
+        assertEquals("10 A", BydDataCollector.acChargingCurrentLimitLabel(3));
+        assertEquals("16 A", BydDataCollector.acChargingCurrentLimitLabel(4));
+        assertEquals("Max", BydDataCollector.acChargingCurrentLimitLabel(5));
+        assertEquals(null, BydDataCollector.acChargingCurrentLimitLabel(0));
+    }
+
+    @Test
+    public void chargingDevicePowerPrefersDedicatedFrameworkMethod() {
         DualPowerAliasChargingDevice device =
                 new DualPowerAliasChargingDevice(6.4, 7.2);
 
@@ -88,35 +101,78 @@ public class BydDataCollectorChargingPublicationTest {
                 BydDataCollector.readChargingDevicePower(device);
 
         assertTrue(reading.answered());
-        assertEquals("getChargePower", reading.getter);
-        assertEquals(6.4, reading.raw, 0.0);
-        assertEquals(0L, device.chargingPowerCalls.get());
+        assertEquals("getChargingPower", reading.getter);
+        assertEquals(7.2, reading.raw, 0.0);
+        assertEquals(1L, device.chargingPowerCalls.get());
+        assertEquals(0L, device.chargePowerCalls.get());
     }
 
     @Test
-    public void chargingDevicePowerFallsBackToChargingPowerAlias() {
-        LegacyPowerAliasChargingDevice device =
-                new LegacyPowerAliasChargingDevice(7.2);
+    public void chargingDevicePowerFallsBackToCompatibilityAlias() {
+        ChargePowerOnlyChargingDevice device =
+                new ChargePowerOnlyChargingDevice(6.4);
 
         BydDataCollector.ChargingPowerReading reading =
                 BydDataCollector.readChargingDevicePower(device);
 
         assertTrue(reading.answered());
-        assertEquals("getChargingPower", reading.getter);
-        assertEquals(7.2, reading.raw, 0.0);
+        assertEquals("getChargePower", reading.getter);
+        assertEquals(6.4, reading.raw, 0.0);
     }
 
     @Test
     public void chargingDevicePowerTreatsPrimaryZeroAsAnswered() {
         DualPowerAliasChargingDevice device =
-                new DualPowerAliasChargingDevice(0.0, 7.2);
+                new DualPowerAliasChargingDevice(6.4, 0.0);
 
         BydDataCollector.ChargingPowerReading reading =
                 BydDataCollector.readChargingDevicePower(device);
 
-        assertEquals("getChargePower", reading.getter);
+        assertEquals("getChargingPower", reading.getter);
         assertEquals(0.0, reading.raw, 0.0);
-        assertEquals(0L, device.chargingPowerCalls.get());
+        assertEquals(1L, device.chargingPowerCalls.get());
+        assertEquals(0L, device.chargePowerCalls.get());
+    }
+
+    @Test
+    public void unavailableSettingValuesDoNotMeanUnsupported() {
+        assertTrue(BydDataCollector.isSettingFeatureUnavailable(
+                BydVehicleData.UNAVAILABLE));
+        assertTrue(BydDataCollector.isSettingFeatureUnavailable(
+                BydFeatureIds.BMS_UNAVAILABLE));
+        assertTrue(BydDataCollector.isSettingFeatureUnavailable(
+                BydFeatureIds.INVALID_VALUE));
+        assertTrue(BydDataCollector.isSettingFeatureUnavailable(
+                BydFeatureIds.INVALID_VALUE_2));
+        assertTrue(BydDataCollector.isSettingFeatureUnavailable(65_535));
+        assertTrue(BydDataCollector.isSettingFeatureUnavailable(-1));
+        assertFalse(BydDataCollector.isSettingFeatureUnavailable(0));
+        assertFalse(BydDataCollector.isSettingFeatureUnavailable(1));
+        assertFalse(BydDataCollector.isSettingFeatureUnavailable(2));
+    }
+
+    @Test
+    public void validCurrentLimitReadbackProvesSupportDespiteConfigMismatch() {
+        assertEquals(Boolean.TRUE,
+                BydDataCollector.resolveAcChargingCurrentLimitSupport(
+                        0, BydDataCollector.AC_CHARGE_CURRENT_10A, null));
+        assertEquals(Boolean.TRUE,
+                BydDataCollector.resolveAcChargingCurrentLimitSupport(
+                        BydVehicleData.UNAVAILABLE,
+                        BydDataCollector.AC_CHARGE_CURRENT_MAX, null));
+        assertEquals(Boolean.TRUE,
+                BydDataCollector.resolveAcChargingCurrentLimitSupport(
+                        0, BydVehicleData.UNAVAILABLE, Boolean.TRUE));
+        assertEquals(Boolean.TRUE,
+                BydDataCollector.resolveAcChargingCurrentLimitSupport(
+                        BydVehicleData.UNAVAILABLE,
+                        BydVehicleData.UNAVAILABLE, Boolean.TRUE));
+        assertEquals(0x18500843,
+                BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_CONFIG_STATUS);
+        assertEquals(0x18500845,
+                BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS);
+        assertEquals(0x4EF06044,
+                BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS_SET);
     }
 
     @Test
@@ -138,6 +194,97 @@ public class BydDataCollectorChargingPublicationTest {
 
             assertEquals(6.4, builder.build().chargingPowerKw, 0.0);
         }
+    }
+
+    @Test
+    public void freshCallbackPowerSurvivesZeroGetterWithoutRefreshingItsAge()
+            throws Exception {
+        InterleavingChargingDevice device =
+                new InterleavingChargingDevice(2, 0, 1);
+        BydDataCollector collector = newActiveCollector(device,
+                new BydVehicleData.Builder()
+                        .chargingState(1)
+                        .chargingGunState(2)
+                        .chargingType(0)
+                        .build());
+
+        invokeChargingCallback(
+                collector, device, "onChargingPowerChanged", 6.1);
+        long callbackAtMs = collector.getData().chargingPowerAtMs;
+        BydVehicleData.Builder builder = collector.getData().toBuilder();
+
+        invokeCollectChargingOrdered(collector, builder);
+
+        BydVehicleData polled = builder.build();
+        assertEquals(6.1, polled.chargingPowerKw, 0.0);
+        assertEquals(callbackAtMs, polled.chargingPowerAtMs);
+    }
+
+    @Test
+    public void freshCallbackPowerSurvivesUnavailableGetterWithoutRefreshingItsAge()
+            throws Exception {
+        CallbackOnlyChargingDevice device = new CallbackOnlyChargingDevice();
+        BydDataCollector collector = newActiveCollector(device,
+                new BydVehicleData.Builder()
+                        .chargingState(1)
+                        .chargingGunState(2)
+                        .chargingType(0)
+                        .build());
+
+        invokeChargingCallback(
+                collector, device, "onChargingPowerChanged", 7.2);
+        long callbackAtMs = collector.getData().chargingPowerAtMs;
+        BydVehicleData.Builder builder = collector.getData().toBuilder();
+
+        invokeCollectChargingOrdered(collector, builder);
+
+        BydVehicleData polled = builder.build();
+        assertEquals(7.2, polled.chargingPowerKw, 0.0);
+        assertEquals(callbackAtMs, polled.chargingPowerAtMs);
+    }
+
+    @Test
+    public void staleCallbackPowerDoesNotSurviveZeroGetter() throws Exception {
+        long staleAtMs = System.currentTimeMillis()
+                - BydDataCollector.DEVICE_POWER_CALLBACK_MAX_AGE_MS - 1L;
+        InterleavingChargingDevice device =
+                new InterleavingChargingDevice(2, 0, 1);
+        BydVehicleData initial = new BydVehicleData.Builder()
+                .chargingState(1)
+                .chargingGunState(2)
+                .chargingType(0)
+                .chargingPowerKw(6.1)
+                .chargingPowerAtMs(staleAtMs)
+                .build();
+        BydDataCollector collector = newActiveCollector(device, initial);
+        setField(collector, "latestDevicePowerCameFromCallback", true);
+        setField(collector, "lastPositiveDevicePowerCallbackAtMs", staleAtMs);
+        BydVehicleData.Builder builder = initial.toBuilder();
+
+        invokeCollectChargingOrdered(collector, builder);
+
+        assertTrue(Double.isNaN(builder.build().chargingPowerKw));
+    }
+
+    @Test
+    public void explicitZeroCallbackStillClearsCallbackOwnedPower() throws Exception {
+        CallbackOnlyChargingDevice device = new CallbackOnlyChargingDevice();
+        BydDataCollector collector = newActiveCollector(device,
+                new BydVehicleData.Builder()
+                        .chargingState(1)
+                        .chargingGunState(2)
+                        .chargingType(0)
+                        .build());
+
+        invokeChargingCallback(
+                collector, device, "onChargingPowerChanged", 7.2);
+        invokeChargingCallback(
+                collector, device, "onChargingPowerChanged", 0.0);
+
+        assertTrue(Double.isNaN(collector.getData().chargingPowerKw));
+        assertEquals(0L, collector.getData().chargingPowerAtMs);
+        assertFalse((Boolean) field(
+                collector, "latestDevicePowerCameFromCallback"));
     }
 
     @Test
@@ -172,14 +319,17 @@ public class BydDataCollectorChargingPublicationTest {
 
     @Test
     public void terminalCounterReconciliationPreservesLowerWrapAndResetObservations() {
+        double nearCapacityCeiling =
+                BydDataCollector.CHARGING_CAPACITY_MAX_KWH - 0.1;
         assertEquals(0.25, BydDataCollector.reconcileTerminalCounterObservation(
-                ChargeSourceClassifier.SRC_CAPACITY, 65.4, 0.25), 0.0);
+                ChargeSourceClassifier.SRC_CAPACITY, nearCapacityCeiling, 0.25), 0.0);
         assertEquals(0.0, BydDataCollector.reconcileTerminalCounterObservation(
                 ChargeSourceClassifier.SRC_CAPACITY, 4.25, 0.0), 0.0);
         assertEquals(3.0, BydDataCollector.reconcileTerminalCounterObservation(
                 ChargeSourceClassifier.SRC_EXTERNAL, 499.5, 3.0), 0.0);
         assertEquals(4.25, BydDataCollector.reconcileTerminalCounterObservation(
-                ChargeSourceClassifier.SRC_CAPACITY, 4.25, 70.0), 0.0);
+                ChargeSourceClassifier.SRC_CAPACITY, 4.25,
+                BydDataCollector.CHARGING_CAPACITY_MAX_KWH + 0.001), 0.0);
     }
 
     private DaemonLogger.Config previousLogConfig;
@@ -250,9 +400,11 @@ public class BydDataCollectorChargingPublicationTest {
         String capacity = ChargeSourceClassifier.SRC_CAPACITY;
 
         assertTrue(BydDataCollector.allowsFinalCounterDuringLifecycleHold(
-                capacity, 65.534, 1, false, true));
+                capacity, BydDataCollector.CHARGING_CAPACITY_MAX_KWH,
+                1, false, true));
         assertFalse(BydDataCollector.allowsFinalCounterDuringLifecycleHold(
-                capacity, 65.535, 1, false, true));
+                capacity, BydDataCollector.CHARGING_CAPACITY_MAX_KWH + 0.001,
+                1, false, true));
         assertFalse(BydDataCollector.allowsFinalCounterDuringLifecycleHold(
                 capacity, 12.3, 1, false, false));
         assertFalse(BydDataCollector.allowsFinalCounterDuringLifecycleHold(
@@ -1380,6 +1532,18 @@ public class BydDataCollectorChargingPublicationTest {
     }
 
     @Test
+    public void bevRemainEnergyRejectsCapturedOscillatingFrames() {
+        assertFalse(BydDataCollector.isPlausibleBevRemainKwh(
+                4.6, 24.0, 82.5));
+        assertFalse(BydDataCollector.isPlausibleBevRemainKwh(
+                1.2, 24.0, 82.5));
+        assertTrue(BydDataCollector.isPlausibleBevRemainKwh(
+                20.0, 24.0, 82.5));
+        assertTrue(BydDataCollector.isPlausibleBevRemainKwh(
+                22.8, 28.0, 82.5));
+    }
+
+    @Test
     public void startupDrivetrainCacheRejectsJunkBeforePersistedRateCalibration()
             throws Exception {
         String source = ChargeSourceClassifier.SRC_CLUSTER;
@@ -2252,6 +2416,7 @@ public class BydDataCollectorChargingPublicationTest {
     public static final class DualPowerAliasChargingDevice {
         private final double chargePower;
         private final double chargingPower;
+        final AtomicLong chargePowerCalls = new AtomicLong();
         final AtomicLong chargingPowerCalls = new AtomicLong();
 
         DualPowerAliasChargingDevice(double chargePower, double chargingPower) {
@@ -2260,6 +2425,7 @@ public class BydDataCollectorChargingPublicationTest {
         }
 
         public double getChargePower() {
+            chargePowerCalls.incrementAndGet();
             return chargePower;
         }
 
@@ -2302,6 +2468,20 @@ public class BydDataCollectorChargingPublicationTest {
 
         public double getChargePower() {
             return chargePower;
+        }
+    }
+
+    public static final class CallbackOnlyChargingDevice {
+        public int getChargingGunState() {
+            return 2;
+        }
+
+        public int getChargingType() {
+            return 0;
+        }
+
+        public int getBatteryManagementDeviceState() {
+            return 1;
         }
     }
 

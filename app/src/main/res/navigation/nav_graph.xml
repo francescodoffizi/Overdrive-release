@@ -11,6 +11,17 @@
         android:label="@string/rail_dashboard"
         tools:layout="@layout/fragment_dashboard" />
 
+    <fragment
+        android:id="@+id/genAiFragment"
+        android:name="com.overdrive.app.ui.fragment.WebViewFragment"
+        android:label="@string/rail_assistant"
+        tools:layout="@layout/fragment_webview">
+        <argument
+            android:name="page_path"
+            app:argType="string"
+            android:defaultValue="/assistant" />
+    </fragment>
+
     <!-- Live view: canonical multi-cam page (WebView). Falls back from
          WebCodecs to JMuxer on Chrome 58 / Android 7.1 head unit.
          page_path is /live-view (the camera UI moved out of index.html

@@ -6,9 +6,8 @@ import com.overdrive.app.logging.DaemonLogger;
  * Accumulates session energy from the vehicle's charged-energy counter, correctly across counter
  * WRAP, SATURATION and session RESET.
  *
- * <p><b>Why a plain {@code end - start} is not enough.</b> The counter is a 16-bit value at 1 Wh
- * resolution, so its full range is {@code [0, 65.534]} kWh. A single session can exceed that: a
- * 10→100% charge on a large pack (85-109 kWh nominal) delivers 75-98 kWh. At the ceiling the
+ * <p><b>Why a plain {@code end - start} is not enough.</b> The framework declares a
+ * {@code [0, 131.07]} kWh range. At the ceiling the
  * counter either wraps back through zero or pins, and both cases make a naive difference
  * under-report by exactly the amount that overflowed — silently, and in currency.
  *
@@ -37,8 +36,8 @@ public final class ChargeCounterAccumulator {
 
     private static final DaemonLogger logger = DaemonLogger.getInstance("ChargeCounterAccumulator");
 
-    /** Full-scale of the counter, kWh (0xFFFE at 1 Wh resolution). */
-    public static final double COUNTER_FULL_SCALE_KWH = 65.534;
+    /** Full-scale of the dedicated charged-energy counter, kWh. */
+    public static final double COUNTER_FULL_SCALE_KWH = 131.07;
     /**
      * Consecutive unchanged reads at the ceiling before saturation is declared.
      *
@@ -65,7 +64,7 @@ public final class ChargeCounterAccumulator {
      * rate with headroom, so it never truncates a real charge, but finite so a pathological gap
      * cannot invent unbounded energy.
      */
-    private static final double MAX_PLAUSIBLE_RATE_KW = 400.0;
+    private static final double MAX_PLAUSIBLE_RATE_KW = 500.0;
     /**
      * Drops at or below this are noise, not events, kWh.
      *
@@ -105,9 +104,8 @@ public final class ChargeCounterAccumulator {
     /**
      * Full scale of the counter currently bound to this accumulator, kWh.
      *
-     * <p>Defaults to the 16-bit {@link #COUNTER_FULL_SCALE_KWH}, which is what the dedicated capacity
-     * counter uses. Not every counter shares it: a field capture recorded the external accessor reading
-     * 119.0, well past 65.534, so that source is plainly a wider register. Hard-coding one scale meant
+     * <p>Defaults to the framework-declared {@link #COUNTER_FULL_SCALE_KWH}, which is what the dedicated
+     * capacity counter uses. Not every counter shares it. Hard-coding one scale meant
      * every reading from such a source was rejected outright and the trim had no metered energy at all.
      * The wrap, saturation and reach arithmetic all key off this, so it must be set BEFORE the first
      * observation of a session.
@@ -121,8 +119,8 @@ public final class ChargeCounterAccumulator {
      * because changing the modulus mid-series would reinterpret every wrap already credited.
      */
     public void setFullScaleKwh(double kwh) {
-        if (Double.isNaN(kwh) || kwh <= 1.0) return;
-        if (!Double.isNaN(baseline)) return;   // series already started
+        if (!Double.isFinite(kwh) || kwh <= 1.0) return;
+        if (Double.isFinite(baseline)) return;   // series already started
         if (Double.compare(fullScaleKwh, kwh) == 0) return;
         fullScaleKwh = kwh;
         advanceObservationGeneration();
@@ -134,9 +132,9 @@ public final class ChargeCounterAccumulator {
      * <p>Normally the scale is immutable once a series starts, because reinterpreting the modulus would
      * change how every wrap already credited should have been read. Widening is the one safe direction,
      * and it is necessary: a session restored from a legacy row that recorded no source, whose stored
-     * endpoints both happened to sit below the 16-bit ceiling, is indistinguishable from a capacity
-     * session — so it restores at 65.534 and then silently DISCARDS every later reading above that,
-     * losing the rest of the charge. A reading above the current ceiling is proof the register is wider.
+     * endpoints both happened to sit below an older stored ceiling, is indistinguishable from a
+     * capacity session. A later reading above that ceiling proves the register is wider; rejecting it
+     * would silently lose the rest of the charge.
      *
      * <p>Safe because widening cannot retroactively invent a wrap: {@code wraps == 0} is required, so no
      * already-credited wrap can be reinterpreted. With no wrap yet, the accumulated total is a plain sum
@@ -145,7 +143,7 @@ public final class ChargeCounterAccumulator {
      * @return true when the modulus was widened
      */
     public boolean widenFullScaleKwh(double kwh) {
-        if (Double.isNaN(kwh) || kwh <= fullScaleKwh) return false;
+        if (!Double.isFinite(kwh) || kwh <= fullScaleKwh) return false;
         if (wraps > 0) return false;   // a credited wrap was read against the old modulus
         logger.info(String.format(java.util.Locale.US,
                 "Widening counter full scale %.3f -> %.3f kWh: a reading exceeded the assumed ceiling,"
@@ -250,22 +248,23 @@ public final class ChargeCounterAccumulator {
 
     /**
      * @param fullScale the modulus of the counter this session was using. Carried explicitly because
-     *                  {@link #reset()} restores the 16-bit default, and a resumed external-counter
-     *                  session would otherwise have its readings rejected by the domain gate (they can
-     *                  exceed 65.534) and its wrap deltas computed against the wrong ceiling.
+     *                  {@link #reset()} restores the dedicated-capacity default, and a resumed
+     *                  external-counter session would otherwise have its readings rejected by the
+     *                  domain gate and its wrap deltas computed against the wrong ceiling.
      */
     public void restore(double baselineKwh, double lastKwh, double energyKwh, boolean incomplete,
                         double gapEstimate, double fullScale) {
         reset();
-        if (!Double.isNaN(fullScale) && fullScale > 1.0) fullScaleKwh = fullScale;
-        if (!Double.isNaN(baselineKwh)) baseline = baselineKwh;
-        if (!Double.isNaN(lastKwh)) last = lastKwh;
-        if (!Double.isNaN(energyKwh) && energyKwh > 0) accumulated = energyKwh;
+        if (Double.isFinite(fullScale) && fullScale > 1.0) fullScaleKwh = fullScale;
+        if (isValidCounterReading(baselineKwh, fullScaleKwh)) baseline = baselineKwh;
+        if (isValidCounterReading(lastKwh, fullScaleKwh)) last = lastKwh;
+        if (Double.isFinite(energyKwh) && energyKwh > 0) accumulated = energyKwh;
         // Unknown elapsed time across the outage, so the rate bound cannot be applied to the first
         // reading. The gap is attributed by candidate-vs-estimate instead — see observe().
         lastAtMs = 0;
-        gapEstimateKwh = gapEstimate;
-        awaitingGapReconcile = !Double.isNaN(last);
+        gapEstimateKwh = Double.isFinite(gapEstimate) && gapEstimate > 0
+                ? gapEstimate : Double.NaN;
+        awaitingGapReconcile = Double.isFinite(last);
         if (incomplete) resets = Math.max(resets, 1);
     }
 
@@ -288,8 +287,9 @@ public final class ChargeCounterAccumulator {
         // it. Doing so makes candidate arbitration compare a gap delta with a total and can
         // select an extra wrap.
         if (awaitingGapReconcile) return;
-        if (Double.compare(gapEstimateKwh, kwh) == 0) return;
-        gapEstimateKwh = kwh;
+        double normalized = Double.isFinite(kwh) && kwh > 0 ? kwh : Double.NaN;
+        if (Double.compare(gapEstimateKwh, normalized) == 0) return;
+        gapEstimateKwh = normalized;
         advanceObservationGeneration();
     }
 
@@ -344,24 +344,32 @@ public final class ChargeCounterAccumulator {
     public void restoreState(State state) {
         reset();
         if (state == null) return;
-        baseline = state.baseline;
-        last = state.last;
-        lastAtMs = state.lastAtMs;
+        if (Double.isFinite(state.fullScaleKwh) && state.fullScaleKwh > 1.0) {
+            fullScaleKwh = state.fullScaleKwh;
+        }
+        baseline = isValidCounterReading(state.baseline, fullScaleKwh)
+                ? state.baseline : Double.NaN;
+        last = isValidCounterReading(state.last, fullScaleKwh)
+                ? state.last : Double.NaN;
+        lastAtMs = Double.isFinite(last) ? Math.max(0L, state.lastAtMs) : 0L;
         observationGeneration = Math.max(0L, state.observationGeneration);
-        accumulated = Math.max(0, state.accumulated);
+        accumulated = Double.isFinite(state.accumulated)
+                ? Math.max(0, state.accumulated) : 0.0;
         wraps = Math.max(0, state.wraps);
         resets = Math.max(0, state.resets);
         ceilingStreak = Math.max(0, state.ceilingStreak);
         saturated = state.saturated;
-        abandonedKwh = Math.max(0, state.abandonedKwh);
+        abandonedKwh = Double.isFinite(state.abandonedKwh)
+                ? Math.max(0, state.abandonedKwh) : 0.0;
         unattributedGaps = Math.max(0, state.unattributedGaps);
-        awaitingGapReconcile = state.awaitingGapReconcile && !Double.isNaN(last);
+        awaitingGapReconcile = state.awaitingGapReconcile && Double.isFinite(last);
         gapReconstructed = state.gapReconstructed;
-        gapEstimateKwh = state.gapEstimateKwh;
-        recentRateKwhPerH = state.recentRateKwhPerH;
-        if (!Double.isNaN(state.fullScaleKwh) && state.fullScaleKwh > 1.0) {
-            fullScaleKwh = state.fullScaleKwh;
-        }
+        gapEstimateKwh = Double.isFinite(state.gapEstimateKwh)
+                && state.gapEstimateKwh > 0 ? state.gapEstimateKwh : Double.NaN;
+        recentRateKwhPerH = Double.isFinite(state.recentRateKwhPerH)
+                && state.recentRateKwhPerH > 0
+                && state.recentRateKwhPerH <= MAX_PLAUSIBLE_RATE_KW
+                ? state.recentRateKwhPerH : Double.NaN;
     }
 
     /**
@@ -433,12 +441,15 @@ public final class ChargeCounterAccumulator {
 
     /** Mark only the next observation as spanning a process outage. */
     public void beginGapReconciliation(double independentGapEstimateKwh) {
-        if (Double.isNaN(last)) return;
+        if (!Double.isFinite(last)) return;
+        double normalized = Double.isFinite(independentGapEstimateKwh)
+                && independentGapEstimateKwh > 0
+                ? independentGapEstimateKwh : Double.NaN;
         if (awaitingGapReconcile
-                && Double.compare(gapEstimateKwh, independentGapEstimateKwh) == 0) {
+                && Double.compare(gapEstimateKwh, normalized) == 0) {
             return;
         }
-        gapEstimateKwh = independentGapEstimateKwh;
+        gapEstimateKwh = normalized;
         awaitingGapReconcile = true;
         advanceObservationGeneration();
     }
@@ -479,8 +490,8 @@ public final class ChargeCounterAccumulator {
      * outage interval. Any of these means the series is live and must not be restarted.
      */
     public boolean hasSeriesState() {
-        return !Double.isNaN(baseline)
-                || !Double.isNaN(last)
+        return Double.isFinite(baseline)
+                || Double.isFinite(last)
                 || accumulated > 0
                 || awaitingGapReconcile
                 || gapReconstructed
@@ -489,7 +500,7 @@ public final class ChargeCounterAccumulator {
     }
 
     /** True once a baseline has been captured, i.e. the counter is contributing. */
-    public boolean hasBaseline() { return !Double.isNaN(baseline); }
+    public boolean hasBaseline() { return Double.isFinite(baseline); }
 
     /**
      * The counter has stopped being a measurement (pinned at full scale). The caller MUST fall
@@ -541,7 +552,7 @@ public final class ChargeCounterAccumulator {
      * @param nowMs    observation time, used to bound how much energy a wrap may have delivered
      */
     public void observe(double valueKwh, long nowMs) {
-        if (Double.isNaN(valueKwh) || valueKwh < 0 || valueKwh > fullScaleKwh + 1.0) return;
+        if (!isValidCounterReading(valueKwh, fullScaleKwh)) return;
         advanceObservationGeneration();
 
         if (Double.isNaN(baseline)) {
@@ -553,8 +564,8 @@ public final class ChargeCounterAccumulator {
         // FIRST OBSERVATION AFTER A RESTORE. The counter ran unobserved while the daemon was down,
         // and a plain rise-difference silently assumes it did NOT wrap. It may have: down 8 h at
         // 11 kW delivers 88 kWh, so a counter last seen at 25 kWh reappears at 47.5 kWh having
-        // passed full scale once — and differencing gives 22.5 kWh instead of 88, under-reporting
-        // by a whole cycle. Both readings are equally consistent with either story, so the choice
+        // passed full scale once — and differencing under-reports by a whole cycle. Both readings
+        // are equally consistent with either story, so the choice
         // is made against the independent SOC estimate, exactly as for any other gap.
         if (awaitingGapReconcile) {
             awaitingGapReconcile = false;
@@ -563,7 +574,7 @@ public final class ChargeCounterAccumulator {
             // restoring a row whose counter energy is exactly zero and then observing the same
             // counter value must clear the restart fence without manufacturing incompleteness.
             if (Double.compare(valueKwh, last) == 0
-                    && (Double.isNaN(gapEstimateKwh) || gapEstimateKwh <= 0)) {
+                    && (!Double.isFinite(gapEstimateKwh) || gapEstimateKwh <= 0)) {
                 lastAtMs = nowMs;
                 return;
             }
@@ -571,8 +582,9 @@ public final class ChargeCounterAccumulator {
             double[] cands = gapCandidatesKwh(last, valueKwh, fullScaleKwh);
             double chosen = chooseCandidate(cands, gapEstimateKwh,
                     GAP_RATIO_LOW, GAP_RATIO_HIGH);
-            boolean unverifiedChoice = Double.isNaN(gapEstimateKwh) || gapEstimateKwh <= 0;
-            if (!Double.isNaN(chosen) && chosen >= 0) {
+            boolean unverifiedChoice =
+                    !Double.isFinite(gapEstimateKwh) || gapEstimateKwh <= 0;
+            if (Double.isFinite(chosen) && chosen >= 0) {
                 if (chosen > 0) accumulated += chosen;
                 // Whether the gap contained one cycle or several cannot be known from two readings,
                 // so a gap credited at more than a full cycle is flagged rather than presented as
@@ -581,8 +593,8 @@ public final class ChargeCounterAccumulator {
                 // NO ESTIMATE = NO VERIFICATION. chooseCandidate falls back to the SMALLEST candidate
                 // when it has nothing to compare against, which is the right default (it under-reports
                 // rather than inventing energy) but it is still an unresolved coin-flip between
-                // interpretations that differ by a whole 65.534 kWh cycle. A 50 -> 10 gap is either
-                // +10 or +75.534, and picking 10 must not then be stored and PRICED as a complete
+                // interpretations that differ by a whole counter cycle. Picking the smaller
+                // candidate must not then be stored and PRICED as a complete
                 // measurement. Flag it so the row reads as a floor.
                 else if (unverifiedChoice && cands.length > 1) {
                     unattributedGaps++;
@@ -635,7 +647,7 @@ public final class ChargeCounterAccumulator {
                 double h = (nowMs - lastAtMs) / 3_600_000.0;
                 if (h > 0) {
                     double inst = rise / h;
-                    recentRateKwhPerH = Double.isNaN(recentRateKwhPerH) ? inst
+                    recentRateKwhPerH = !Double.isFinite(recentRateKwhPerH) ? inst
                             : (RATE_EWMA_ALPHA * inst + (1 - RATE_EWMA_ALPHA) * recentRateKwhPerH);
                 }
             }
@@ -673,9 +685,9 @@ public final class ChargeCounterAccumulator {
             // RTC rollback removes the rate evidence that distinguishes a wrap from a reset. Only an
             // independent estimate close to the complete wrap-implied total can prove the wrap.
             double candidateTotal = accumulated + wrapEnergy;
-            double estimateRatio = !Double.isNaN(gapEstimateKwh) && gapEstimateKwh > 0
+            double estimateRatio = Double.isFinite(gapEstimateKwh) && gapEstimateKwh > 0
                     ? candidateTotal / gapEstimateKwh : Double.NaN;
-            wrapPlausible = !Double.isNaN(estimateRatio)
+            wrapPlausible = Double.isFinite(estimateRatio)
                     && estimateRatio >= GAP_RATIO_LOW
                     && estimateRatio <= WRAP_ESTIMATE_TOLERANCE;
         } else {
@@ -706,7 +718,7 @@ public final class ChargeCounterAccumulator {
             // lets the window be honest in both directions: a fixed cap either discards real
             // fast-charge wraps (when too small) or credits ordinary mid-range resets (when too
             // large). Falls back to the theoretical bound only before any rise has been seen.
-            double reachRate = Double.isNaN(recentRateKwhPerH)
+            double reachRate = !Double.isFinite(recentRateKwhPerH)
                     ? MAX_PLAUSIBLE_RATE_KW
                     : Math.min(MAX_PLAUSIBLE_RATE_KW, recentRateKwhPerH * REACH_RATE_HEADROOM);
             double reachKwh = reachRate * hours;
@@ -723,7 +735,7 @@ public final class ChargeCounterAccumulator {
             // fast-advancing interval is a reset. Requiring the landing to account for a reasonable
             // share of the interval's energy is what rules that in or out; with no learned rate there
             // is no expectation to test against, so the check is skipped.
-            if (wrapPlausible && !Double.isNaN(recentRateKwhPerH)) {
+            if (wrapPlausible && Double.isFinite(recentRateKwhPerH)) {
                 double expectedLanding = (recentRateKwhPerH * hours) - (fullScaleKwh - last);
                 if (expectedLanding <= 0) {
                     // The interval's energy does not even close the gap to the ceiling at the rate
@@ -739,7 +751,7 @@ public final class ChargeCounterAccumulator {
             // Belt and braces: if an independent estimate exists and the wrap story would claim more
             // energy than the pack plausibly took, veto it. Tighter than the display-side tolerance
             // because this decides whether to CREATE energy from nothing.
-            if (wrapPlausible && !Double.isNaN(gapEstimateKwh) && gapEstimateKwh > 0) {
+            if (wrapPlausible && Double.isFinite(gapEstimateKwh) && gapEstimateKwh > 0) {
                 if ((accumulated + wrapEnergy) / gapEstimateKwh > WRAP_ESTIMATE_TOLERANCE) {
                     wrapPlausible = false;
                 }
@@ -823,8 +835,16 @@ public final class ChargeCounterAccumulator {
      *                  the difference between the two, which on the external counter is hundreds of kWh.
      */
     public static double[] gapCandidatesKwh(double baselineKwh, double currentKwh, double fullScale) {
-        if (Double.isNaN(baselineKwh) || Double.isNaN(currentKwh)) return new double[0];
-        if (Double.isNaN(fullScale) || fullScale <= 1.0) fullScale = COUNTER_FULL_SCALE_KWH;
+        if (!Double.isFinite(baselineKwh) || !Double.isFinite(currentKwh)
+                || baselineKwh < 0 || currentKwh < 0) {
+            return new double[0];
+        }
+        if (!Double.isFinite(fullScale) || fullScale <= 1.0) {
+            fullScale = COUNTER_FULL_SCALE_KWH;
+        }
+        if (baselineKwh > fullScale + 1.0 || currentKwh > fullScale + 1.0) {
+            return new double[0];
+        }
         if (currentKwh >= baselineKwh) {
             double plain = currentKwh - baselineKwh;
             // It may also have wrapped all the way round and come back above the baseline.
@@ -851,19 +871,27 @@ public final class ChargeCounterAccumulator {
     public static double chooseCandidate(double[] candidates, double estimateKwh,
                                          double toleranceLow, double toleranceHigh) {
         if (candidates == null || candidates.length == 0) return Double.NaN;
-        if (Double.isNaN(estimateKwh) || estimateKwh <= 0) {
+        if (!Double.isFinite(estimateKwh) || estimateKwh <= 0) {
             // No way to disambiguate — take the conservative (smallest) candidate.
             return candidates[0];
         }
         double best = Double.NaN;
         double bestErr = Double.MAX_VALUE;
         for (double c : candidates) {
-            if (c <= 0) continue;
+            if (!Double.isFinite(c) || c <= 0) continue;
             double ratio = c / estimateKwh;
             if (ratio < toleranceLow || ratio > toleranceHigh) continue;
             double err = Math.abs(ratio - 1.0);
             if (err < bestErr) { bestErr = err; best = c; }
         }
         return best;
+    }
+
+    private static boolean isValidCounterReading(double valueKwh, double fullScaleKwh) {
+        return Double.isFinite(valueKwh)
+                && Double.isFinite(fullScaleKwh)
+                && fullScaleKwh > 1.0
+                && valueKwh >= 0
+                && valueKwh <= fullScaleKwh + 1.0;
     }
 }

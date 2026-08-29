@@ -912,6 +912,56 @@ public class RecordingModeManager {
     }
 
     /**
+     * Force an immediate re-activation of the current recording mode WITHOUT
+     * the full pipeline teardown of {@link #forceWarmupRestart} (the camera
+     * is healthy here) and WITHOUT {@link #resyncFromHardware}'s wedge
+     * gating.
+     *
+     * <p>Entry point for StorageManager's post-mount migration hook: after it
+     * has pushed the external output-dir override and called
+     * {@code pipeline.stopRecording()} to finalize an internal-fallback
+     * session, the restart must be driven HERE, not left to the resync
+     * ticker. The stop it just performed stamps the pipeline's 5s
+     * segment-rotation grace window, and the ticker's wedge detector
+     * deliberately refuses to fire inside that window
+     * ({@code inRotationGrace}) — so an ordinary {@code resyncFromHardware}
+     * kick would observe modeActive=true + not-recording + in-grace, do
+     * nothing, and leave the restart to a LATER 30s tick (which would then
+     * also burn a wedge-budget slot for what is an intentional stop, not a
+     * fault).
+     *
+     * <p>Routes through {@code activateModeWithWarmup(force=true)}: force
+     * bypasses only the "already active" supplier short-circuit;
+     * {@code activateMode}'s CONTINUOUS/DRIVE_MODE branches then see
+     * {@code !pipeline.isNormalRecordingMode()} (the caller just stopped it)
+     * and re-issue {@code pipeline.startRecording()}, which consumes the
+     * freshly-pushed output-dir override. Warmup itself is skipped while the
+     * pipeline is running, and the warmupInFlight CAS coalesces concurrent
+     * activations, so the healthy path restarts in well under a second.
+     * DRIVE_MODE's driving-gear gate still applies — if the car shifted out
+     * of a driving gear meanwhile, the activation correctly declines and the
+     * latched override is consumed at the next legitimate start instead.
+     *
+     * <p>No-op when ACC is off or no mode is configured (nothing to restart).
+     */
+    public void forceModeReactivation(String reason) {
+        final Mode mode;
+        final boolean acc;
+        synchronized (this) {
+            mode = currentMode;
+            acc = accIsOn;
+        }
+        if (!acc || mode == Mode.NONE) {
+            logger.info("forceModeReactivation(" + reason + ") — no-op (accIsOn=" + acc
+                + ", mode=" + mode + "); nothing to restart");
+            return;
+        }
+        logger.info("forceModeReactivation(" + reason + ") — re-activating " + mode
+            + " (force=true, no pipeline teardown)");
+        activateModeWithWarmup(mode, reason, true);
+    }
+
+    /**
      * Single-flight serializer for {@link #activateMode}/{@link #deactivateMode}.
      * Held INSTEAD of the manager monitor across the heavy I/O inside those
      * methods (camera/encoder init, storage cleanup pre-flight, etc.) so the

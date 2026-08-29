@@ -176,8 +176,8 @@ class SettingsAboutFragment : Fragment() {
 
     /**
      * Resolve Android/BYD version properties and ask the daemon for its existing VIN snapshot.
-     * Both operations run off the looper. The VIN request uses the private loopback IPC command,
-     * not an HTTP endpoint, so the identifier is not added to the tunnel/web API surface.
+     * Both operations run off the looper. The VIN request uses device-local loopback IPC, not an
+     * HTTP endpoint, so the identifier is not added to the authenticated tunnel/web API surface.
      */
     private fun refreshVehicleInformation(root: View) {
         val executor = vehicleInfoExecutor

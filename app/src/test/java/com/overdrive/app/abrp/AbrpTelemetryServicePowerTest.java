@@ -46,8 +46,13 @@ public class AbrpTelemetryServicePowerTest {
 
         assertTrue(AbrpTelemetryService.canPublishEnginePower(
                 active, now, false, true));
+        assertEquals(-2.7, AbrpTelemetryService.selectTelemetryPower(
+                active, chargingState, now, false, true), 0.0);
+
+        chargingState.isEstimated = true;
         assertEquals(-3.0, AbrpTelemetryService.selectTelemetryPower(
                 active, chargingState, now, false, true), 0.0);
+        chargingState.isEstimated = false;
 
         BydVehicleData stale = active.toBuilder()
                 .enginePowerAtMs(now - 15_001L)
@@ -93,6 +98,9 @@ public class AbrpTelemetryServicePowerTest {
                 .chargingGunState(2)
                 .build();
         assertTrue(AbrpTelemetryService.isChargingForTelemetry(idle, connected));
+        idle.isEstimated = true;
+        assertFalse(AbrpTelemetryService.isChargingForTelemetry(idle, connected));
+        idle.isEstimated = false;
 
         BydVehicleData v2l = connected.toBuilder()
                 .chargingGunState(5)

@@ -334,13 +334,26 @@ public class Conditions {
                 "automation.emergency_alarm_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
         // ── Safety / ADAS events ─────────────────────────────────────────
-        // Radar blind-spot / lane-change / cross-traffic alert, per side. The OEM
-        // radar warning (not the side-camera overlay). Alerts are momentary pulses,
-        // so the publisher holds "on" briefly — see BlindSpotEvent. The `side`
-        // sub-variable selects left vs right so one schema serves both.
+        // OEM radar alerts, split by warning family so one feature cannot masquerade as another.
         addCondition(new EventCondition(
                 new Label("blindSpot", "automation.blind_spot"),
                 "automation.blind_spot_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off")),
+                new EnumType(
+                        new Label("side", "automation.side"),
+                        new Label("left", "automation.side_left"),
+                        new Label("right", "automation.side_right"))));
+        addCondition(new EventCondition(
+                new Label("rearCrossTraffic", "automation.rear_cross_traffic"),
+                "automation.rear_cross_traffic_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off")),
+                new EnumType(
+                        new Label("side", "automation.side"),
+                        new Label("left", "automation.side_left"),
+                        new Label("right", "automation.side_right"))));
+        addCondition(new EventCondition(
+                new Label("doorOpenWarning", "automation.door_open_warning"),
+                "automation.door_open_warning_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off")),
                 new EnumType(
                         new Label("side", "automation.side"),

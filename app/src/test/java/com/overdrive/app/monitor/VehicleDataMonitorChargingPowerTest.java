@@ -91,7 +91,7 @@ public class VehicleDataMonitorChargingPowerTest {
     }
 
     @Test
-    public void phevFailureSignaturesCannotCalibrateAgainstRealThreeKwPackFlow() {
+    public void instrumentFailureSignaturesDoNotContaminateDedicatedDevicePower() {
         long now = System.currentTimeMillis();
         long sessionStartedAt = now - 1_000L;
         com.overdrive.app.byd.BydVehicleData junk =
@@ -138,10 +138,28 @@ public class VehicleDataMonitorChargingPowerTest {
         VehicleDataMonitor.observePhevSessionRateProofs(
                 real, sessionStartedAt, now);
 
-        assertEquals(3.0, ChargeRateResolver.resolveSessionRateValue(
+        assertEquals(300.0, ChargeRateResolver.resolveSessionRateValue(
                 ChargeSourceClassifier.SRC_DEVICE, 300.0, Double.NaN), 1e-9);
-        assertTrue(ChargeRateResolver.isSessionRateCorroborated(
-                ChargeSourceClassifier.SRC_DEVICE, 3.0));
+        assertTrue(ChargeRateResolver.isScaleVerified(
+                ChargeSourceClassifier.SRC_DEVICE, 300.0));
+        assertFalse(VehicleDataMonitor.shouldRejectCandidateBeforeSelection(
+                ChargeSourceClassifier.SRC_DEVICE, 300.0, 3.0));
+    }
+
+    @Test
+    public void dedicatedChargingDeviceKeepsItsFrameworkKwContract() {
+        assertEquals(7.2, ChargeRateResolver.rateKw(
+                ChargeSourceClassifier.SRC_DEVICE, 7.2), 0.0);
+        assertEquals(359.4, ChargeRateResolver.rateKw(
+                ChargeSourceClassifier.SRC_DEVICE, 359.4), 0.0);
+        assertTrue(Double.isNaN(ChargeRateResolver.rateKw(
+                ChargeSourceClassifier.SRC_DEVICE, 500.1)));
+        assertTrue(ChargeRateResolver.isScaleVerified(
+                ChargeSourceClassifier.SRC_DEVICE, 359.4));
+        assertFalse(VehicleDataMonitor.shouldRejectCandidateBeforeSelection(
+                ChargeSourceClassifier.SRC_DEVICE, 359.4, Double.NaN));
+        assertEquals(359.4, VehicleDataMonitor.selectTaperRate(
+                7.2, 359.4, 6.8, 6.5), 0.0);
     }
 
     @Test
@@ -163,11 +181,11 @@ public class VehicleDataMonitorChargingPowerTest {
         assertEquals(200.0,
                 VehicleDataMonitor.resolveDirectChargePower(200.0, 100.0), 1e-9);
         assertFalse(VehicleDataMonitor.shouldRejectCandidateBeforeSelection(
-                direct, 200.0, Double.NaN, false));
+                direct, 200.0, Double.NaN));
 
         // A source with no independent unit proof remains fail-closed against the same mismatch.
         assertTrue(VehicleDataMonitor.shouldRejectCandidateBeforeSelection(
-                "unproven-" + System.nanoTime(), 200.0, Double.NaN, false));
+                "unproven-" + System.nanoTime(), 200.0, Double.NaN));
         assertTrue(ChargeRateResolver.isScaleVerified(direct, 200.0, 100.0));
         assertTrue(VehicleDataMonitor.isCandidateContradictedByReference(
                 direct, 200.0, 100.0));
@@ -190,6 +208,32 @@ public class VehicleDataMonitorChargingPowerTest {
                 observedAt, observedAt + ChargeRateResolver.MAX_HELD_RATE_MS));
         assertFalse(ChargeRateResolver.isHeldRateFresh(
                 observedAt, observedAt + ChargeRateResolver.MAX_HELD_RATE_MS + 1L));
+    }
+
+    @Test
+    public void suspectCounterStopsBeingTheScaleReferenceImmediately() {
+        String source = "suspectScaleReference-" + System.nanoTime();
+        long now = System.currentTimeMillis();
+        long start = now - 20_000L;
+        double delta = 6.0 * (20_000.0 / 3_600_000.0);
+        ChargeRateResolver.observeCounterForScale(source, 0.0, start);
+        ChargeRateResolver.observeCounterForScale(source, delta, now);
+        assertEquals(6.0, ChargeRateResolver.referenceRateKw(), 1e-9);
+
+        double counter = 10.0;
+        double reference = 40.0;
+        long calibrationStart = 1_000_000L;
+        for (int minute = 0; minute <= 8; minute++) {
+            com.overdrive.app.charging.CounterScaleCalibrator.observePaired(
+                    source, counter, reference,
+                    calibrationStart + minute * 60_000L);
+            counter += 5.62 / 60.0;
+            reference += 10.63 / 60.0;
+        }
+
+        assertTrue(com.overdrive.app.charging.CounterScaleCalibrator
+                .isScaleSuspect(source));
+        assertTrue(Double.isNaN(ChargeRateResolver.referenceRateKw()));
     }
 
     @Test
@@ -269,6 +313,18 @@ public class VehicleDataMonitorChargingPowerTest {
     }
 
     @Test
+    public void sessionScaleSuspicionKeepsIndependentBevFallbackSelected() {
+        assertTrue(VehicleDataMonitor.shouldWithholdCapacityRate(
+                Double.NaN, 5.59, false, true));
+        assertFalse(VehicleDataMonitor.shouldWithholdCapacityRate(
+                Double.NaN, 5.59, true, true));
+        assertFalse(VehicleDataMonitor.shouldWithholdCapacityRate(
+                3.22, 5.59, false, false));
+        assertFalse(VehicleDataMonitor.isLikelyHalfScaleCapacityRate(
+                Double.NaN, 191.5, false));
+    }
+
+    @Test
     public void verifiesPhevClusterRateOnlyWhenPackFlowCorroboratesIt() {
         // Captured PHEV session: dash 2.7-3.2 kW, pack flow 3.0 kW.
         assertTrue(VehicleDataMonitor.isPhevClusterRateCorroboratedByPackFlow(
@@ -307,13 +363,11 @@ public class VehicleDataMonitorChargingPowerTest {
     @Test
     public void rejectsContradictedCandidateBeforeItCanBlockMeasuredFallback() {
         assertTrue(VehicleDataMonitor.isCandidateContradictedByFreshPackFlow(
-                0.32, 3.2, true));
+                0.32, 3.2));
         assertTrue(VehicleDataMonitor.isCandidateContradictedByFreshPackFlow(
-                32.0, 3.2, true));
+                32.0, 3.2));
         assertFalse(VehicleDataMonitor.isCandidateContradictedByFreshPackFlow(
-                3.0, 3.2, true));
-        assertFalse(VehicleDataMonitor.isCandidateContradictedByFreshPackFlow(
-                0.32, 3.2, false));
+                3.0, 3.2));
     }
 
     @Test
@@ -427,11 +481,15 @@ public class VehicleDataMonitorChargingPowerTest {
                 10_001L, sessionStartedAt));
 
         assertTrue(Double.isNaN(VehicleDataMonitor.packFlowReferenceForSource(
-                650.0, 9_999L, 6.5, 10_002L, true, sessionStartedAt)));
+                650.0, 9_999L, 6.5, 10_002L, sessionStartedAt)));
         assertTrue(Double.isNaN(VehicleDataMonitor.packFlowReferenceForSource(
-                650.0, 10_001L, 6.5, 30_000L, true, sessionStartedAt)));
+                650.0, 10_001L, 6.5, 30_000L, sessionStartedAt)));
         assertEquals(6.5, VehicleDataMonitor.packFlowReferenceForSource(
-                650.0, 10_001L, 6.5, 10_002L, true, sessionStartedAt), 1e-9);
+                650.0, 10_001L, 6.5, 10_002L, sessionStartedAt), 1e-9);
+        assertEquals(6.0, VehicleDataMonitor.packFlowReferenceForSource(
+                6.3, 10_001L, 6.0, 10_002L, sessionStartedAt), 1e-9);
+        assertFalse(VehicleDataMonitor.shouldRejectCandidateBeforeSelection(
+                "__packSideDirect", 6.3, 6.0));
     }
 
     @Test
@@ -475,6 +533,31 @@ public class VehicleDataMonitorChargingPowerTest {
         assertEquals(0L, state.powerObservedAtMs);
         assertEquals(ChargingStateData.PowerQuality.UNKNOWN,
                 state.powerQuality);
+        assertEquals(0.0, state.powerConfidence, 0.0);
+    }
+
+    @Test
+    public void chargingStateRejectsOutOfDomainPowerAndConfidence() {
+        ChargingStateData state = new ChargingStateData(
+                ChargingStateData.CHARGING_BATTERY_STATE_CHARGING);
+        state.updateChargingPower(
+                Double.POSITIVE_INFINITY, "chargingDevice", 12345L,
+                ChargingStateData.PowerQuality.MEASURED, 1.0);
+        assertEquals(0.0, state.chargingPowerKW, 0.0);
+        assertEquals("none", state.powerSource);
+        assertEquals(ChargingStateData.PowerQuality.UNKNOWN,
+                state.powerQuality);
+
+        state.updateChargingPower(
+                500.01, "chargingDevice", 12345L,
+                ChargingStateData.PowerQuality.MEASURED, 1.0);
+        assertEquals(0.0, state.chargingPowerKW, 0.0);
+        assertEquals("none", state.powerSource);
+
+        state.updateChargingPower(
+                6.1, "chargingDevice", 12345L,
+                ChargingStateData.PowerQuality.MEASURED, Double.NaN);
+        assertEquals(6.1, state.chargingPowerKW, 0.0);
         assertEquals(0.0, state.powerConfidence, 0.0);
     }
 
@@ -525,10 +608,11 @@ public class VehicleDataMonitorChargingPowerTest {
     }
 
     @Test
-    public void bevKeepsBatterySideDirectSourcePriority() {
-        assertTrue(VehicleDataMonitor.shouldPreferDirectPackSide(false, 6.2));
-        assertFalse(VehicleDataMonitor.shouldPreferDirectPackSide(true, 6.2));
-        assertFalse(VehicleDataMonitor.shouldPreferDirectPackSide(false, Double.NaN));
+    public void dedicatedChargingDeviceOutranksAmbiguousFallbackFields() {
+        assertEquals(7.2, VehicleDataMonitor.selectTaperRate(
+                6.2, 7.2, 6.8, 6.5), 0.0);
+        assertEquals(6.2, VehicleDataMonitor.selectTaperRate(
+                6.2, Double.NaN, 6.8, 6.5), 0.0);
     }
 
     @Test

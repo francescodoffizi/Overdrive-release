@@ -84,6 +84,26 @@ public class CameraDaemon {
     private static final Object TERMINAL_SHUTDOWN_GUARD_LOCK = new Object();
     private static Thread terminalShutdownGuard;
     private static Runnable terminalShutdownHandlerCallback;
+    /**
+     * Budget for {@link #requestUrgentCameraReleaseRestart}: the process is
+     * halted this long after an urgent camera-release restart is requested,
+     * whether or not the trip checkpoint completed. Deliberately much shorter
+     * than {@link #TERMINAL_SHUTDOWN_BUDGET_MS}: while this deadline runs the
+     * daemon is holding an AVMCamera handle it can no longer close or yield,
+     * so every second is a second the native AVM app shows no video signal.
+     * 5s still covers trip-analytics init or a briefly-blocking flush write;
+     * a write blocked longer than this on a wedged FUSE mount was never going
+     * to complete inside any deadline we could responsibly wait out.
+     */
+    private static final long URGENT_CAMERA_RELEASE_BUDGET_MS = 5_000L;
+    /**
+     * Latched true by {@link #requestUrgentCameraReleaseRestart} when its
+     * non-cancellable halt deadline is armed (arm-once). Never cleared: once
+     * armed, process death is guaranteed, so {@link #isProcessRestartPending()}
+     * must keep refusing new camera/GL bring-up even if the conservative
+     * coordinator's failure paths clear {@link #PROCESS_RESTART_REQUESTED}.
+     */
+    private static final AtomicBoolean URGENT_CAMERA_RELEASE_ARMED = new AtomicBoolean(false);
     private static Handler mainHandler;
     private static String outputDir = null; // Initialized in main()
     private static String nativeLibDir = null; // Initialized in parseArguments()
@@ -282,6 +302,16 @@ public class CameraDaemon {
 
     /** Accessor for the IPC server's IMU_BATCH case. */
     public static com.overdrive.app.roadsense.RoadSenseController getRoadSense() { return roadSense; }
+
+    // ==================== GENAI BYOK ====================
+    // Daemon-owned so explicit requests can run while parked in onAndOff mode.
+    // The runtime is transport-lazy: attaching only installs a cheap config
+    // listener; no HTTP client/thread/socket exists until a user request.
+    private static volatile com.overdrive.app.genai.GenAiRuntime genAiRuntime;
+
+    public static com.overdrive.app.genai.GenAiRuntime getGenAiRuntime() {
+        return genAiRuntime;
+    }
 
     // ==================== SHARED APP CONTEXT ====================
     // Volatile: written at boot AND re-published on ACC ON via
@@ -685,6 +715,15 @@ public class CameraDaemon {
         // command. (init() is fast — file read + optional one-shot migration.)
         com.overdrive.app.config.UnifiedConfigManager.init();
 
+        try {
+            genAiRuntime = new com.overdrive.app.genai.GenAiRuntime();
+            genAiRuntime.attach();
+            log("GenAI runtime attached (transport remains lazy)");
+        } catch (Throwable t) {
+            genAiRuntime = null;
+            log("GenAI runtime attach failed: " + t.getMessage());
+        }
+
         new Thread(tcpServer::start, "TcpServer").start();
         new Thread(httpServer::start, "HttpServer").start();
         new Thread(ipcServer, "SurveillanceIPC").start();
@@ -784,6 +823,10 @@ public class CameraDaemon {
         // never opted in or the package isn't on this trim. We're already
         // running as UID shell so pm calls succeed directly.
         com.overdrive.app.server.OemDashcamApiHandler.enforceStickyDisableIfRequested();
+        // Same OTA-survives contract for BYD's traffic monitor. A firmware OTA
+        // re-scans com.byd.trafficmonitor and resurrects it, so without this the
+        // user had to re-disable it by hand after every single update.
+        com.overdrive.app.byd.TrafficMonitorPolicy.enforceStickyDisableIfRequested();
         // OEM Dashcam pipeline: sticky enable is INTENTIONALLY deferred until
         // after the ACC hardware probe at line ~794. The two-axis resolver
         // gates each axis on AccMonitor.isAccOn(), and AccMonitor defaults to
@@ -816,15 +859,24 @@ public class CameraDaemon {
         HttpServer.loadPersistedSettings();
 
         // Construct StorageManager AFTER the servers are already accepting
-        // connections. The constructor reads the unified config's `storage`
-        // section and may attempt to mount an SD/USB volume that isn't
-        // present — those calls are time-bounded (see ensureVolumeMounted)
-        // but on a pathological ROM they can still take seconds. Doing this
-        // here means the user's web UI is already alive even on slow paths,
-        // and the watchdogs below kick in once the singleton exists.
+        // connections. The constructor is passive (config read + directory
+        // resolution only); mount attempts for a missing SD/USB volume happen
+        // in startDaemonMaintenance() below on a background thread — those
+        // calls are time-bounded (see ensureVolumeMounted) but on a
+        // pathological ROM they can still take seconds. Doing this here means
+        // the user's web UI is already alive even on slow paths, and the
+        // watchdogs below kick in once the singleton exists.
         com.overdrive.app.storage.StorageManager storageManager =
             com.overdrive.app.storage.StorageManager.getInstance();
         storageManager.fixAllPermissions();
+        // Daemon-only maintenance: async mount attempts + the one-shot startup
+        // reap. These used to run from the constructor, which meant whichever
+        // process touched getInstance() first — including the app-UID UI
+        // (RecordingViewModel) — ran destructive cleanup with process-local
+        // locks and no access to the daemon-only RecordingsIndex H2 (ghost
+        // rows, cross-process reap races). The constructor is now passive;
+        // this explicit call is the single place maintenance starts.
+        storageManager.startDaemonMaintenance();
 
         // Start the SD-card mount watchdog at daemon boot (instead of only on
         // ACC OFF). The watchdog no-ops when no storage type is set to SD, so
@@ -2247,6 +2299,12 @@ public class CameraDaemon {
             abortUncommittedAutomationDrain("ACC changed during shutdown drain");
             return false;
         }
+        if (!com.overdrive.app.config.UnifiedConfigManager.isVehicleOnOnlyMode()) {
+            log("parkTerminate canceled — operating mode changed to onAndOff during shutdown drain");
+            abortUncommittedAutomationDrain("operating mode changed during shutdown drain");
+            forceLatestAccStateReconciliation("operating mode changed during shutdown drain");
+            return false;
+        }
 
         java.util.concurrent.atomic.AtomicBoolean markerAttempted =
             new java.util.concurrent.atomic.AtomicBoolean(false);
@@ -2687,6 +2745,7 @@ public class CameraDaemon {
 
         // Stop RoadSense + RecordingModeManager (shared with the JVM shutdown
         // hook). Early so their tickers can't fire against tearing-down state.
+        closeGenAiRuntime();
         detachRoadSenseAndRecordingMode();
 
         // Stop cameras and GPU pipeline
@@ -2853,6 +2912,16 @@ public class CameraDaemon {
         if (recordingModeManager != null) {
             try { recordingModeManager.shutdown(); }
             catch (Throwable t) { log("RecordingModeManager shutdown error: " + t.getMessage()); }
+        }
+    }
+
+    /** Idempotent inverse of the startup attach; cancels provider I/O first. */
+    private static void closeGenAiRuntime() {
+        com.overdrive.app.genai.GenAiRuntime runtime = genAiRuntime;
+        genAiRuntime = null;
+        if (runtime != null) {
+            try { runtime.close(); }
+            catch (Throwable t) { log("GenAI runtime shutdown error: " + t.getMessage()); }
         }
     }
 
@@ -3190,10 +3259,11 @@ public class CameraDaemon {
                 //     watchdog System.exit leaks the sidecar and lets the
                 //     warning-tick fire against tearing-down state.
                 try {
+                    closeGenAiRuntime();
                     detachRoadSenseAndRecordingMode();
-                    log("Shutdown hook: RoadSense detached, recording mode manager stopped");
+                    log("Shutdown hook: GenAI/RoadSense/RMM teardown complete");
                 } catch (Exception e) {
-                    log("Shutdown hook: RoadSense/RMM teardown error: " + e.getMessage());
+                    log("Shutdown hook: GenAI/RoadSense/RMM teardown error: " + e.getMessage());
                 }
 
                 // 1. Stop PermissionGranter — prevent orphaned pm grant processes
@@ -3619,7 +3689,38 @@ public class CameraDaemon {
      * commits, the terminal shutdown guard is armed just before System.exit so a
      * shutdown hook wedged on the failed camera/GL state cannot hold the process
      * open forever — at that point a forced halt loses nothing.
+     *
+     * <p>The ONE deliberate exception to "no halt before the checkpoint is
+     * durable" is {@link #requestUrgentCameraReleaseRestart}: when the process
+     * holds an AVMCamera handle it can no longer safely close or yield, an
+     * unbounded checkpoint wait leaves the native AVM app without video
+     * indefinitely — and the checkpoint write can BLOCK on the very storage
+     * wedge that broke the camera path in the first place (the flush path
+     * swallows write FAILURES, so this coordinator only ever waits on init or
+     * on a blocked write — see prepareTripsForProcessRestart). That variant
+     * arms a short independent halt deadline first and then delegates here,
+     * trading a bounded telemetry-buffer loss for a guaranteed camera release.
      */
+    /**
+     * True once a trip-safe process restart has been requested and its coordinator
+     * is (or is about to be) running. Camera/pipeline lifecycle entry points consult
+     * this to refuse bringing up NEW camera/GL state while the process is on its way
+     * down: the coordinator is ASYNCHRONOUS and can retry the trip checkpoint for a
+     * while before System.exit, and a fresh pipeline started in that window would
+     * open a second camera/EGL stack alongside the wedged one the restart exists to
+     * escape. The flag self-clears on the coordinator's failure paths, so a restart
+     * that could not be carried out lifts the gate rather than bricking the daemon.
+     *
+     * <p>Also true once an URGENT camera-release restart has armed its halt
+     * deadline ({@link #requestUrgentCameraReleaseRestart}). That latch never
+     * self-clears: the halt is non-cancellable, so process death is guaranteed
+     * and bringing up new camera/GL state in the remaining seconds would only
+     * hand the wrapper a dirtier crash.
+     */
+    public static boolean isProcessRestartPending() {
+        return PROCESS_RESTART_REQUESTED.get() || URGENT_CAMERA_RELEASE_ARMED.get();
+    }
+
     public static void requestProcessRestartPreservingTrip(String reason) {
         if (!PROCESS_RESTART_REQUESTED.compareAndSet(false, true)) {
             return;
@@ -3693,6 +3794,185 @@ public class CameraDaemon {
             HARDWARE_QUERY_PROCESS_RECOVERY_REQUESTED.set(false);
             log("Could not start trip-safe process restart coordinator: "
                     + startFailure.getMessage());
+        }
+    }
+
+    /**
+     * URGENT bounded variant of {@link #requestProcessRestartPreservingTrip},
+     * for callers that hold an AVMCamera handle they can no longer safely
+     * close or yield (wedged encoder drainer before a camera close, GL thread
+     * heartbeat-dead while the camera is open). Process death is the only safe
+     * way to release the handle, and it must happen on a short bound: the
+     * native BYD AVM app shows NO VIDEO SIGNAL until the handle is released,
+     * and the conservative coordinator can wait indefinitely (its checkpoint
+     * write can block on the same wedged FUSE/SD mount that broke the camera
+     * path — write FAILURES are swallowed by the flush path, so only init-wait
+     * and blocked writes ever hold it).
+     *
+     * <p>Ordering contract:
+     * <ol>
+     *   <li>Arm a dedicated, NON-CANCELLABLE halt deadline
+     *       ({@link #URGENT_CAMERA_RELEASE_BUDGET_MS}) first. Deliberately not
+     *       {@link #armTerminalShutdownDeadline()}: that shared guard is
+     *       disarmed by parkTerminate's deferral path and by the conservative
+     *       coordinator's System.exit-failure handling — either would silently
+     *       cancel the camera-release guarantee. Park flows and AVM usage
+     *       coincide (parking maneuvers), so that race is realistic.</li>
+     *   <li>Arm-once: the FIRST wedge site's deadline stands; later calls in
+     *       the same incident return immediately.</li>
+     *   <li>Arms even when {@link #PROCESS_RESTART_REQUESTED} is already true
+     *       (escalation of an in-flight conservative restart, e.g. one already
+     *       requested by an encoder-worker wedge from the same stall).</li>
+     *   <li>Then delegate to the conservative coordinator so the trip
+     *       checkpoint gets its bounded shot; if it lands first, the normal
+     *       trip-safe System.exit wins the race and the halt never fires.</li>
+     *   <li>If NO deadline can be armed, halt immediately — never fall back to
+     *       an unbounded path, and never attempt a synchronous checkpoint here
+     *       (a blocking flush is the exact trap this method exists to escape).</li>
+     * </ol>
+     *
+     * <p>The deadline fires {@link #forceTerminateProcess} — SIGKILL via
+     * Process.killProcess (the wrapper normally observes 137), with the
+     * finally-block Runtime.halt(0) running whenever killProcess returns or
+     * throws, so termination is unconditional either way — and NOT
+     * System.exit: shutdown hooks could pile onto the wedged
+     * startStopLock/GL/storage state and hold the process open. The
+     * DaemonLauncher watchdog respawns on ANY exit code unless the user
+     * disable-sentinel or parked marker exists, and clears the stale FileLock
+     * file on 137/134 so the respawn isn't refused by the singleton-lock
+     * check.
+     *
+     * <p>Worst-case data loss: the un-flushed telemetry buffer (≤60s cadence),
+     * or the whole trip if the halt lands before the first 5s flush; the trip
+     * row itself is rebuilt from the on-disk .jsonl.gz by next-boot recovery
+     * whenever any flush has landed. Accepted trade — the alternative is an
+     * indefinite camera blackout in the vehicle's parking/AVM display.
+     */
+    public static void requestUrgentCameraReleaseRestart(String reason) {
+        if (!URGENT_CAMERA_RELEASE_ARMED.compareAndSet(false, true)) {
+            return;
+        }
+
+        // Arm FIRST, log AFTER (audit follow-up): the logger can itself block
+        // on the wedged FUSE/SD storage this path fires under. Logging before
+        // the guards are armed would set the arm-once latch, wedge here, and
+        // leave NO deadline running while every later urgent request no-ops
+        // on the latch — exactly the lost guarantee this method exists to
+        // prevent. Nothing observable happens between the latch CAS and the
+        // guard arms below.
+        //
+        // Monotonic deadline, stamped BEFORE the guard thread starts:
+        // elapsedRealtime is immune to wall-clock changes (NTP/manual set
+        // would stretch or shrink a currentTimeMillis window), and stamping it
+        // here means scheduler delay in starting the guard thread cannot
+        // extend the camera-hold bound — the 5s clock is already running.
+        final long haltDeadlineElapsedMs =
+                android.os.SystemClock.elapsedRealtime() + URGENT_CAMERA_RELEASE_BUDGET_MS;
+
+        boolean armed = false;
+        Throwable guardStartFailure = null;
+        try {
+            Thread guard = new Thread(() -> {
+                // Non-cancellable AND non-accelerable: wait out the full
+                // deadline across interrupts (nothing should hold a reference
+                // to this thread, but an errant interrupt must neither cancel
+                // the halt nor fire it early — the checkpoint deserves its
+                // full bounded shot).
+                long remaining;
+                while ((remaining = haltDeadlineElapsedMs
+                        - android.os.SystemClock.elapsedRealtime()) > 0) {
+                    try {
+                        Thread.sleep(remaining);
+                    } catch (InterruptedException ignored) {
+                        // fall through and re-check the deadline
+                    }
+                }
+                forceTerminateProcess("urgent camera-release deadline exceeded: " + reason);
+            }, "UrgentCameraReleaseGuard");
+            guard.setDaemon(false);
+            guard.start();
+            armed = true;
+        } catch (Throwable t) {
+            // Defer the failure log: NO deadline is armed yet, and the logger
+            // can block on the wedged storage this path fires under — logging
+            // here would leave the latch set with nothing running, exactly the
+            // lost guarantee this method exists to prevent. Reported below,
+            // after a deadline exists (or the immediate halt makes it moot).
+            guardStartFailure = t;
+        }
+
+        // Second, independent arm on the main handler (same dual-arm shape as
+        // armTerminalShutdownDeadline): covers a thread-creation failure as
+        // long as the main looper is still turning. Scheduled with the
+        // REMAINING monotonic budget, not a fresh window — if the thread arm
+        // stalled before failing, a fresh 5s here would extend the
+        // camera-hold bound past the stamped deadline. Never removed — the
+        // halt is idempotent via forceTerminationStarted, and a stray late
+        // halt of a process that is exiting anyway is harmless.
+        Handler handler = mainHandler;
+        if (handler != null) {
+            try {
+                long remainingBudgetMs = haltDeadlineElapsedMs
+                        - android.os.SystemClock.elapsedRealtime();
+                if (remainingBudgetMs <= 0) {
+                    // The deadline already expired while arming (e.g. the
+                    // thread arm stalled before failing). postDelayed(0) would
+                    // only QUEUE the halt behind a possibly-blocked main
+                    // looper — and when the thread arm failed, this queue
+                    // entry would be the ONLY "deadline", making the
+                    // guarantee depend on the very looper health this path
+                    // cannot assume. The contract is already breached: halt
+                    // now. (Idempotent — a concurrent halt just wins.)
+                    forceTerminateProcess(
+                            "urgent camera-release deadline already expired during arming: "
+                                    + reason);
+                    return;
+                }
+                if (handler.postDelayed(
+                        () -> forceTerminateProcess(
+                                "urgent camera-release deadline exceeded (main loop): "
+                                        + reason),
+                        remainingBudgetMs)) {
+                    armed = true;
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        if (!armed) {
+            // No deadline could be armed at all (OOM-grade distress). Halting
+            // immediately is the only way to keep the camera-release
+            // guarantee — silently degrading to the unbounded coordinator
+            // would re-open the indefinite native-app blackout this method
+            // exists to close.
+            forceTerminateProcess("urgent camera-release guard unavailable: " + reason);
+            return;
+        }
+
+        // Only NOW is it safe to touch the (possibly wedged) logger: the halt
+        // deadline is armed, so a blocking log call can no longer strand the
+        // camera — the guard halts the process out from under it.
+        try {
+            log("URGENT camera-release restart armed: halting in "
+                    + URGENT_CAMERA_RELEASE_BUDGET_MS + "ms unless the trip-safe exit "
+                    + "lands first (" + reason + ")");
+        } catch (Throwable ignored) {}
+        if (guardStartFailure != null) {
+            try {
+                log("Urgent camera-release guard thread could not start ("
+                        + guardStartFailure.getMessage()
+                        + ") — halt deadline is riding the main-handler fallback");
+            } catch (Throwable ignored) {}
+        }
+
+        // Give the trip checkpoint its bounded shot. A no-op if a conservative
+        // restart is already pending — the deadline above is armed either way,
+        // which is exactly the escalation semantics we need.
+        try {
+            requestProcessRestartPreservingTrip(reason);
+        } catch (Throwable t) {
+            try {
+                log("Urgent camera-release: trip-safe delegate failed: " + t.getMessage());
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -6051,6 +6331,15 @@ public class CameraDaemon {
         new AccEffectLedger();
     private static final AccEffectLedger notifiedTripAccGenerations =
         new AccEffectLedger();
+    // Once-per-generation guard for the RecordingModeManager ACC-OFF dispatch
+    // (audit: arm/disarm notification storm). RMM's OFF handler activates mode
+    // NONE and STOPS the whole pipeline — re-driving it on a reconciler retry
+    // pass of the SAME generation (e.g. after an SD mount failure) tore down
+    // armed surveillance and re-fired the disarmed/armed automations on every
+    // pass. Commit after success; release (stay retryable) only on throw. A
+    // genuine new OFF edge is a new generation and always dispatches.
+    private static final AccEffectLedger rmmAccOffDispatchGenerations =
+        new AccEffectLedger();
 
     /** Revocable serialized ownership for public and deferred surveillance starts. */
     private static long nextSurveillanceEnableLease;
@@ -6271,6 +6560,20 @@ public class CameraDaemon {
         requestAccTransitionReconciliation(true);
     }
 
+    /** Apply an automation operating-mode change to the current parked cycle. */
+    public static void reconcileOperatingModeForCurrentAccState() {
+        final Boolean accIsOff;
+        synchronized (parkTerminateLock) {
+            if (!running.get() || parkShutdownCommitted) return;
+            accIsOff = latestAccIsOff;
+        }
+        if (accIsOff == null) {
+            requestTrustedAccHardwareRecovery("operating mode automation");
+        } else if (accIsOff.booleanValue()) {
+            forceLatestAccStateReconciliation("operating mode automation");
+        }
+    }
+
     private static void requestTrustedAccHardwareRecovery(String reason) {
         log("ACC trusted hardware recovery requested after " + reason);
         trustedAccHardwareRecoveryRequested = true;
@@ -6413,60 +6716,58 @@ public class CameraDaemon {
         }
     }
 
-    // Ceiling for the ACC-OFF SD force-mount while it runs on the ACC
-    // dispatch path (usually the single AccStateReconciler worker). The
-    // mount's internals are individually bounded (sm drains, StatFs probes,
-    // dir init), so a healthy attempt finishes well inside this; the ceiling
-    // only caps the pathological stacked-worst-case so the reconciler can't
-    // be occupied indefinitely by one wedged volume.
-    private static final long ACC_OFF_SD_MOUNT_TIMEOUT_MS = 30_000L;
+    // Single-flight latch for the ACC-OFF background force-mount. Repeat OFF
+    // chains (probe re-dispatch, reconciler retry, 60s heartbeat) must not
+    // stack workers that would just queue on the mount lock behind each other.
+    private static final java.util.concurrent.atomic.AtomicBoolean accOffSdMountInFlight =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
-     * Timeout-bounded wrapper around {@code ensureSdCardMounted(true)} for
-     * the ACC-OFF prologue. Same daemon-thread + bounded-join idiom as
-     * {@code GpuSurveillancePipeline.ensureStorageReadyBounded}. Returns
-     * false on failure OR timeout — the caller marks the transition for
-     * retry either way, and a late-landing abandoned mount makes the retry
-     * pass a fast no-op.
+     * Fire-and-forget ACC-OFF SD force-mount (audit: arm/disarm notification
+     * storm — the previous bounded 30s join ran on the reconciler thread
+     * inside the 20s ACC effect lease, so the lease revocation interrupted
+     * the wait and the retry re-ran the whole OFF lifecycle). Mirror of
+     * {@link #startAccOnRemountAsync}: the OFF transition proceeds
+     * immediately on internal storage; a late-landing mount is re-pointed by
+     * StorageManager's came-online path and the engine's per-trigger
+     * surveillance-dir refresh. Failures are the VolumeWatchdog's to retry —
+     * the ACC transition is never marked for retry on mount failure.
      */
-    private static boolean ensureSdCardMountedBounded(
+    private static void startAccOffSdMountAsync(
             com.overdrive.app.storage.StorageManager storage) {
-        final boolean[] ok = {false};
-        Thread worker = new Thread(() -> {
-            try {
-                ok[0] = storage.ensureSdCardMounted(true);
-            } catch (Throwable t) {
-                log("ACC-OFF SD force mount threw: " + t.getMessage());
-            }
-        }, "AccOffSdMount");
-        worker.setDaemon(true);
-        worker.start();
-        // The bounded join is itself a storage-bound wait on the ACC dispatch
-        // thread — mark it so the probe-edge lease machinery treats an
-        // overstay here as "slow storage", never "wedged HAL" (see
-        // ACC_STORAGE_PHASE_THREADS).
-        enterAccStoragePhase();
+        if (!accOffSdMountInFlight.compareAndSet(false, true)) {
+            log("ACC OFF: SD force mount already in flight — not stacking another worker");
+            return;
+        }
+        log("FORCE mounting SD card (ACC OFF, SD card configured for storage)...");
         try {
-            worker.join(ACC_OFF_SD_MOUNT_TIMEOUT_MS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            // AUDIT FIX (silent interrupt): this branch used to return with
-            // no log line — 32 of 50 mount attempts in the field log left no
-            // trace because a probe-edge revocation interrupted the waiting
-            // dispatch thread right here.
-            log("WARNING: ACC-OFF SD force mount wait interrupted (probe-edge revocation"
-                + " or shutdown) — mount worker continues in background, reporting failure"
-                + " to caller");
-            return false;
-        } finally {
-            exitAccStoragePhase();
+            Thread worker = new Thread(() -> {
+                try {
+                    // Storage-phase mark: the probe-edge lease machinery must
+                    // treat a slow mount as "slow storage", never "wedged HAL"
+                    // (see ACC_STORAGE_PHASE_THREADS).
+                    enterAccStoragePhase();
+                    if (storage.ensureSdCardMounted(true)) {
+                        log("SD card force mounted (ACC OFF, async)");
+                    } else {
+                        log("WARNING: ACC-OFF SD force mount incomplete - using internal"
+                            + " storage until VolumeWatchdog lands the mount");
+                    }
+                } catch (Throwable t) {
+                    log("ACC-OFF SD force mount threw: " + t.getMessage()
+                        + " — VolumeWatchdog remains the recovery path");
+                } finally {
+                    exitAccStoragePhase();
+                    accOffSdMountInFlight.set(false);
+                }
+            }, "AccOffSdMount");
+            worker.setDaemon(true);
+            worker.start();
+        } catch (Throwable spawnFailure) {
+            accOffSdMountInFlight.set(false);
+            log("ACC OFF: SD force mount worker spawn failed: " + spawnFailure.getMessage()
+                + " — VolumeWatchdog remains the recovery path");
         }
-        if (worker.isAlive()) {
-            log("WARNING: ACC-OFF SD force mount exceeded " + ACC_OFF_SD_MOUNT_TIMEOUT_MS
-                + "ms — abandoning worker (mount continues in background), marking retry");
-            return false;
-        }
-        return ok[0];
     }
 
     private static void finishAccTransitionLease(AccApplyContext context) {
@@ -7310,9 +7611,53 @@ public class CameraDaemon {
                 // to surveillance. Without this, the last recording segment is lost
                 // when surveillance is disabled or suppressed by safe zone (early returns
                 // below skip enableSurveillance which was the only path that stopped recording).
+                //
+                // ONCE PER GENERATION (audit: arm/disarm notification storm): RMM's
+                // OFF handler activates mode NONE and stops the whole pipeline. On a
+                // reconciler retry pass of the same OFF generation (SD mount failure,
+                // lease revocation) that stop tore down already-armed surveillance and
+                // re-fired the disarmed/armed automations on every pass. Ledger-guard
+                // the dispatch: commit after success, release + retry only on throw.
                 if (recordingModeManager != null) {
-                    log("ACC OFF - notifying RecordingModeManager to finalize active recording...");
-                    recordingModeManager.onAccStateChanged(false);
+                    AccEffectClaim rmmAccOffClaim = claimAccEffectOnce(
+                        rmmAccOffDispatchGenerations, transitionGeneration);
+                    if (rmmAccOffClaim != null) {
+                        try {
+                            log("ACC OFF - notifying RecordingModeManager to finalize active recording...");
+                            recordingModeManager.onAccStateChanged(false);
+                            commitAccEffect(rmmAccOffClaim);
+                        } catch (Throwable t) {
+                            log("RecordingModeManager ACC OFF dispatch failed: "
+                                + t.getMessage());
+                            releaseAccEffect(rmmAccOffClaim);
+                            markCurrentAccApplyRetry();
+                            // The pipeline state is indeterminate mid-stop; arming
+                            // on top of it would race the failed teardown. ABORT
+                            // this pass (matching the pre-ledger behavior, where a
+                            // throw here propagated to the outer catch) — the
+                            // retry flag makes finishAccTransitionLease invalidate
+                            // completion and schedule reconciliation, which re-runs
+                            // the chain from the top with the effect released.
+                            return;
+                        }
+                    } else if (!isAccEffectCommitted(
+                            rmmAccOffDispatchGenerations, transitionGeneration)) {
+                        // BUSY, not committed: a revoked (lease-expired) apply
+                        // thread is still executing the RMM stop — interruption
+                        // is cooperative, so it keeps running until it finishes.
+                        // Continuing into arming here would race its in-flight
+                        // pipeline stop (stop-after-arm). claimAccEffectOnce
+                        // already marked this pass for retry; end it and let the
+                        // reconciler re-drive once the owner commits or releases.
+                        log("ACC OFF - RecordingModeManager dispatch still owned by a"
+                            + " prior apply thread for gen=" + transitionGeneration
+                            + " — deferring this pass to the reconciler retry");
+                        return;
+                    } else {
+                        log("ACC OFF - RecordingModeManager dispatch already committed"
+                            + " for gen=" + transitionGeneration + " — skipping"
+                            + " duplicate pipeline stop");
+                    }
                 }
                 if (stopStaleAccTransition(
                         transitionGeneration, true, "recording finalization")) {
@@ -7406,22 +7751,23 @@ public class CameraDaemon {
                     storage.getRecordingsStorageType() == com.overdrive.app.storage.StorageManager.StorageType.SD_CARD ||
                     storage.getTripsStorageType() == com.overdrive.app.storage.StorageManager.StorageType.SD_CARD;
                 if (anyStorageOnSd) {
-                    log("FORCE mounting SD card (ACC OFF, SD card configured for storage)...");
-                    // BOUNDED (audit: a wedged filesystem must not occupy the
-                    // sole AccStateReconciler worker). This dispatch now runs
-                    // on the reconciler thread; an unbounded mount here would
-                    // block every subsequent ACC transition. On timeout the
-                    // worker is abandoned (it holds no daemon locks the ACC
-                    // path needs; its internals are individually bounded so
-                    // it drains on its own) and the transition marks retry —
-                    // if the abandoned mount later lands, the retry pass sees
-                    // the card mounted and completes instantly.
-                    if (ensureSdCardMountedBounded(storage)) {
-                        log("SD card force mounted");
-                    } else {
-                        log("WARNING: SD card mount failed or timed out - using internal storage");
-                        markCurrentAccApplyRetry();
-                    }
+                    // ASYNC + SINGLE-FLIGHT (audit: arm/disarm notification storm).
+                    // This used to be a bounded 30s join on the reconciler thread,
+                    // which sat inside the 20s ACC effect lease — the lease expiry
+                    // interrupted the wait, the transition marked retry, and every
+                    // retry pass re-ran the full ACC-OFF lifecycle (RMM pipeline
+                    // stop → "disarmed" automation → re-arm → "armed" automation)
+                    // while the SD card was slow to enumerate. Mirror of the
+                    // ACC-ON fix (startAccOnRemountAsync): the OFF transition
+                    // proceeds immediately on internal storage; when the mount
+                    // lands, StorageManager's centralized came-online path
+                    // re-points writers and reindexes, and the engine's
+                    // per-trigger getLiveSurveillanceDir() refresh routes each
+                    // event to SD. Mount failure is the VolumeWatchdog's to
+                    // retry — the transition is deliberately NOT marked for
+                    // retry, because re-running the OFF chain wouldn't do
+                    // anything the watchdog isn't already doing.
+                    startAccOffSdMountAsync(storage);
                     // Watchdog already started at daemon boot in main(); calling
                     // startSdCardWatchdog() again is idempotent (it stops any
                     // existing watchdog before starting). Kept here as a

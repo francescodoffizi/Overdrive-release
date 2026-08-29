@@ -41,6 +41,10 @@
     <string name="dashboard_modern_activity_loading">Loading recent activity</string>
     <string name="dashboard_modern_no_activity">No recent activity</string>
     <string name="dashboard_modern_activity_unavailable">Recent activity unavailable</string>
+    <string name="dashboard_ai_insight_kicker">AI insight</string>
+    <string name="dashboard_ai_insight_default_title">Vehicle brief</string>
+    <string name="dashboard_ai_insight_open">Show full AI insight</string>
+    <string name="dashboard_ai_insight_collapse">Collapse AI insight</string>
     <string name="dashboard_modern_quick_actions">Quick actions</string>
     <string name="dashboard_modern_remote_details">Connection details</string>
     <string name="dashboard_modern_expand_remote">Show remote access details</string>

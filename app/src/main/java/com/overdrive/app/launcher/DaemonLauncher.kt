@@ -1929,8 +1929,6 @@ class DaemonLauncher(
             // contain the variable assignment text but the kill
             // operates on a PID list, so $$ filtering correctly
             // excludes the priv-shell's PID.
-            "echo \"disabled by ui at \$(date)\" > /data/local/tmp/camera_daemon.disabled; " +
-            "chmod 666 /data/local/tmp/camera_daemon.disabled 2>/dev/null; " +
             "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid 2>/dev/null; " +
             "MY_PID=\$\$; ps -A -o PID,ARGS | grep -F cam_daemon | grep -v grep " +
             "| awk '{print \$1}' | while read pid; do " +
@@ -2025,6 +2023,7 @@ class DaemonLauncher(
 
         val killScript = when (processName) {
             ACC_SENTRY_DAEMON_PROCESS ->
+                "[ -f /data/local/tmp/acc_sentry_daemon.disabled ] || " +
                 "echo \"disabled by killDaemon at \$(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n" +
                 "rm -f /data/local/tmp/start_acc_sentry.sh 2>/dev/null\n" +
@@ -2043,6 +2042,7 @@ class DaemonLauncher(
                 "rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null\n" +
                 "echo done\n"
             else -> // ZROK_PROCESS
+                "[ -f /data/local/tmp/zrok.disabled ] || " +
                 "echo \"disabled by killDaemon at \$(date)\" > /data/local/tmp/zrok.disabled\n" +
                 "chmod 666 /data/local/tmp/zrok.disabled 2>/dev/null\n" +
                 "rm -f /data/local/tmp/start_zrok.sh 2>/dev/null\n" +
@@ -2076,8 +2076,6 @@ class DaemonLauncher(
         // its own `sh -c`. ps+awk+kill keeps the priv-shell alive (PID
         // exclusion via $$) so the trailing lock-rm runs.
         val privKillCmd = if (processName == CAMERA_DAEMON_PROCESS) {
-            "echo \"disabled by ui at \$(date)\" > /data/local/tmp/camera_daemon.disabled; " +
-            "chmod 666 /data/local/tmp/camera_daemon.disabled 2>/dev/null; " +
             "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid 2>/dev/null; " +
             "MY_PID=\$\$; ps -A -o PID,ARGS | grep -F cam_daemon | grep -v grep " +
             "| awk '{print \$1}' | while read pid; do " +
@@ -2097,6 +2095,7 @@ class DaemonLauncher(
         // safer (avoids an unnecessary 137 exit on the inner sh that
         // runs the script body).
         val adbKillCmd = if (processName == ACC_SENTRY_DAEMON_PROCESS) {
+            "[ -f /data/local/tmp/acc_sentry_daemon.disabled ] || " +
             "echo \"disabled by killDaemon at \$(date)\" > /data/local/tmp/acc_sentry_daemon.disabled; " +
             "chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null; " +
             "rm -f /data/local/tmp/start_acc_sentry.sh 2>/dev/null; " +
@@ -2114,6 +2113,7 @@ class DaemonLauncher(
             "sleep 1; " +
             "rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null"
         } else if (processName == ZROK_PROCESS) {
+            "[ -f /data/local/tmp/zrok.disabled ] || " +
             "echo \"disabled by killDaemon at \$(date)\" > /data/local/tmp/zrok.disabled; " +
             "chmod 666 /data/local/tmp/zrok.disabled 2>/dev/null; " +
             "rm -f /data/local/tmp/start_zrok.sh 2>/dev/null; " +

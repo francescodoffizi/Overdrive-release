@@ -22,6 +22,15 @@ final class Di4AvcViewpointPolicy {
         return "dilink4".equalsIgnoreCase(cameraMode);
     }
 
+    static boolean isPassiveApaModeEnabled(String cameraMode, boolean requested) {
+        return cameraLayoutMode(cameraMode, requested) == 1;
+    }
+
+    static int cameraLayoutMode(String cameraMode, boolean passiveApaRequested) {
+        if (!isEnabledForCameraMode(cameraMode)) return 0;
+        return passiveApaRequested ? 1 : 3;
+    }
+
     void beginSession(boolean enable) {
         enabled = enable;
         nativeAvcForeground = false;

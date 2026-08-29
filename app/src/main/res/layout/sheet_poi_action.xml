@@ -89,6 +89,7 @@
 
     <!-- Hand the POI to the car's built-in navigation -->
     <TextView
+        android:id="@+id/poiCarNavSectionHeader"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="18dp"
@@ -98,6 +99,7 @@
         android:alpha="0.7" />
 
     <LinearLayout
+        android:id="@+id/poiCarNavActionsRow"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"

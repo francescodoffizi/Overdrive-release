@@ -67,12 +67,19 @@ var VC = {
         // an unread state must not render as "off" — see updateSteeringHeatUI.
         steeringHeat: null,
         // Cloud-only readback; null until a fresh snapshot reports it.
-        batteryHeat: null
+        batteryHeat: null,
+        acChargeCurrentLimit: {
+            state: null,
+            supported: null,
+            available: false,
+            checked: false
+        }
     },
 
     pollInterval: null,
     cloudStatusInterval: null,
     cloudLockInterval: null,
+    acChargeCurrentInterval: null,
     _toastTimer: null,
     // Command and fetch generations keep an older asynchronous result from
     // overwriting a newer action or a user edit.
@@ -94,6 +101,9 @@ var VC = {
     _chargeCapRevision: 0,
     _chargeCapFetchRevision: 0,
     _chargeCapPendingRevision: 0,
+    _acChargeCurrentRevision: 0,
+    _acChargeCurrentFetchRevision: 0,
+    _acChargeCurrentPendingRevision: 0,
     _chargingScheduleRevision: 0,
     _chargingScheduleFetchRevision: 0,
     _scheduleDirty: false,
@@ -161,6 +171,7 @@ var VC = {
         }
         this.bindControls();
         this.startStateSync();
+        this.startAcChargeCurrentSync();
         this.startCloudStatusSync();
         this.requestCloudLockRefresh();
         this.startCloudLockSync();
@@ -1542,6 +1553,7 @@ var VC = {
         if (panelId === 'panelCharging') {
             this.fetchChargingSchedule();
             this.fetchChargeCap();
+            this.fetchAcChargeCurrentLimit();
         }
         if (panelId === 'panelClimate') {
             this.fetchClimateSchedule();
@@ -2132,6 +2144,54 @@ var VC = {
             });
         }
         this.fetchChargeCap();
+
+        // === OEM AC CHARGING CURRENT LIMIT (SDK_ONLY) ===
+        // Five discrete states exposed by BYDAutoSettingDevice:
+        // 1=6 A, 2=8 A, 3=10 A, 4=16 A, 5=maximum.
+        var currentSegments = document.querySelectorAll('#acChargeCurrentSegmented .vc-seg');
+        for (var currentIndex = 0; currentIndex < currentSegments.length; currentIndex++) {
+            (function(segment) {
+                segment.addEventListener('click', function() {
+                    var nextState = parseInt(segment.getAttribute('data-state'), 10);
+                    var currentLimit = self.vehicleState.acChargeCurrentLimit || {};
+                    if (nextState < 1 || nextState > 5
+                            || currentLimit.supported !== true
+                            || currentLimit.available !== true
+                            || self._acChargeCurrentPendingRevision) return;
+                    var revision = ++self._acChargeCurrentRevision;
+                    self._acChargeCurrentPendingRevision = revision;
+                    self.updateAcChargeCurrentUI();
+                    self.apiPost('/api/vehicle/ac-charge-current-limit',
+                        { state: nextState }).then(function(result) {
+                        if (revision !== self._acChargeCurrentRevision) return;
+                        self._acChargeCurrentPendingRevision = 0;
+                        if (result && typeof result.state === 'number'
+                                && result.state >= 1 && result.state <= 5) {
+                            self.vehicleState.acChargeCurrentLimit.state = result.state;
+                            self.vehicleState.acChargeCurrentLimit.supported =
+                                result.supported !== false;
+                            self.vehicleState.acChargeCurrentLimit.available =
+                                result.available !== false;
+                        } else if (result && result.supported === false) {
+                            self.vehicleState.acChargeCurrentLimit.supported = false;
+                            self.vehicleState.acChargeCurrentLimit.available = true;
+                        } else if (result && result.available === false) {
+                            self.vehicleState.acChargeCurrentLimit.available = false;
+                        }
+                        self.vehicleState.acChargeCurrentLimit.checked = true;
+                        self.updateAcChargeCurrentUI();
+                        self.toastFromResult(result, null, null);
+                    }).catch(function(e) {
+                        if (revision !== self._acChargeCurrentRevision) return;
+                        self._acChargeCurrentPendingRevision = 0;
+                        self.updateAcChargeCurrentUI();
+                        self.fetchAcChargeCurrentLimit();
+                        self.toastFromResult({ success: false, error: e.message }, null, null);
+                    });
+                });
+            })(currentSegments[currentIndex]);
+        }
+        this.updateAcChargeCurrentUI();
 
         // === CLIMATE CONTROLS ===
         function submitClimateValue(field, next, request) {
@@ -2821,6 +2881,7 @@ var VC = {
                 self.stopSyncPollers();
             } else {
                 self.startStateSync();
+                self.startAcChargeCurrentSync();
                 self.startCloudStatusSync();
                 self.startCloudLockSync();
             }
@@ -2831,6 +2892,10 @@ var VC = {
         if (this.pollInterval) { clearInterval(this.pollInterval); this.pollInterval = null; }
         if (this.cloudStatusInterval) { clearInterval(this.cloudStatusInterval); this.cloudStatusInterval = null; }
         if (this.cloudLockInterval) { clearInterval(this.cloudLockInterval); this.cloudLockInterval = null; }
+        if (this.acChargeCurrentInterval) {
+            clearInterval(this.acChargeCurrentInterval);
+            this.acChargeCurrentInterval = null;
+        }
     },
 
     fetchState: function() {
@@ -3658,6 +3723,67 @@ var VC = {
             s.controlKind = typeof data.controlKind === 'string' ? data.controlKind : null;
             self.updateChargeCapUI();
         }).catch(function(e) { console.debug('[VC] charge-cap GET threw', e); });
+    },
+
+    updateAcChargeCurrentUI: function() {
+        var state = this.vehicleState.acChargeCurrentLimit || {};
+        var section = document.getElementById('acChargeCurrentSection');
+        if (section) section.setAttribute(
+            'aria-disabled',
+            state.supported === true && state.available === true ? 'false' : 'true');
+        var pending = !!this._acChargeCurrentPendingRevision;
+        var segments = document.querySelectorAll('#acChargeCurrentSegmented .vc-seg');
+        for (var i = 0; i < segments.length; i++) {
+            var value = parseInt(segments[i].getAttribute('data-state'), 10);
+            if (value === state.state) segments[i].classList.add('on');
+            else segments[i].classList.remove('on');
+            segments[i].disabled = pending
+                || state.supported !== true
+                || state.available !== true;
+        }
+    },
+
+    startAcChargeCurrentSync: function() {
+        var self = this;
+        if (this.acChargeCurrentInterval) {
+            clearInterval(this.acChargeCurrentInterval);
+        }
+        this.fetchAcChargeCurrentLimit();
+        this.acChargeCurrentInterval = setInterval(function() {
+            self.fetchAcChargeCurrentLimit();
+        }, 15 * 1000);
+    },
+
+    fetchAcChargeCurrentLimit: function() {
+        var self = this;
+        var fetchRevision = ++this._acChargeCurrentFetchRevision;
+        var stateRevision = this._acChargeCurrentRevision;
+        fetch('/api/vehicle/ac-charge-current-limit').then(function(resp) {
+            return resp.json();
+        }).then(function(data) {
+            if (fetchRevision !== self._acChargeCurrentFetchRevision
+                    || stateRevision !== self._acChargeCurrentRevision
+                    || self._acChargeCurrentPendingRevision) return;
+            if (!data || !data.success) {
+                console.debug('[VC] AC charge current GET failed', data);
+                self.vehicleState.acChargeCurrentLimit.available = false;
+                self.updateAcChargeCurrentUI();
+                return;
+            }
+            var state = self.vehicleState.acChargeCurrentLimit;
+            state.checked = true;
+            if (typeof data.supported === 'boolean') {
+                state.supported = data.supported;
+            }
+            state.available = data.available === true;
+            state.state = typeof data.state === 'number'
+                    && data.state >= 1 && data.state <= 5 ? data.state : null;
+            self.updateAcChargeCurrentUI();
+        }).catch(function(e) {
+            console.debug('[VC] AC charge current GET threw', e);
+            self.vehicleState.acChargeCurrentLimit.available = false;
+            self.updateAcChargeCurrentUI();
+        });
     },
 
     fetchChargingSchedule: function() {
@@ -5600,8 +5726,8 @@ var VC = {
         if (corner.signalState === 1) return BYD.i18n.t('vehicle.tyre_no_signal');
         if (corner.airLeakState === 2) return BYD.i18n.t('vehicle.tyre_fast_leak');
         if (corner.airLeakState === 1) return BYD.i18n.t('vehicle.tyre_slow_leak');
-        if (corner.pressureState === 1) return BYD.i18n.t('vehicle.tyre_low');
-        if (corner.pressureState === 2) return BYD.i18n.t('vehicle.tyre_high');
+        if (corner.pressureState === 1) return BYD.i18n.t('vehicle.tyre_high');
+        if (corner.pressureState === 2) return BYD.i18n.t('vehicle.tyre_low');
         // Firmware reports normal but the reading is outside the user's band —
         // name the direction so the LOW/HIGH word matches the warn colour the
         // token function just assigned. Without this the callout said "OK" in

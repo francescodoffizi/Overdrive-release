@@ -101,9 +101,9 @@
     <string name="tailscale_generate_login_url">إنشاء رابط تسجيل الدخول</string>
     <string name="tailscale_scan_to_login">مسح لتسجيل الدخول</string>
     <string name="tailscale_qr_waiting">في انتظار رابط تسجيل الدخول…</string>
-    <string name="tailscale_enable_proxy">تمكين وكيل النطاق</string>
-    <string name="tailscale_proxy_explainer">طرق MQTT عبر Tailscal، حتى تتمكن من الوصول إلى وسيط خاص على شبكة الذيل الخاصة بك بدون شحن المنفذ.</string>
-    <string name="tailscale_proxy_warning">مع تمكين MQTT للسماسرة العموميين (HiveMQ، AWS IoT، إلخ.) سوف تفشل - الطرق الخياطية فقط إلى الخياطة الخاصة بك. التوفير سوف يعيد تشغيل الرديمون.</string>
+    <string name="tailscale_enable_proxy">تمكين وكيل Tailscale</string>
+    <string name="tailscale_proxy_explainer">يوجّه MQTT عبر Tailscale حتى تتمكن من الوصول إلى وسيط خاص على شبكة tailnet الخاصة بك دون إعادة توجيه المنافذ.</string>
+    <string name="tailscale_proxy_warning">أثناء التمكين، سيفشل MQTT مع الوسطاء العامّين (HiveMQ، AWS IoT، إلخ) — إذ يوجّه Tailscale إلى شبكة tailnet الخاصة بك فقط. سيؤدي الحفظ إلى إعادة تشغيل الخدمة.</string>
     <!-- Camera ingestion mode selector (Default vs DiLink 4) -->
     <string name="camera_mode_title">وضع الازدحام</string>
     <string name="camera_mode_subtitle">اختر المسار الذي يطابق وحدة رأسك. يناسب الافتراضي معظم نماذج BYD ؛ DiLink 4 مطلوب على المسارات الأحدث (Han / Tang 2024+) حيث تصدر AVM HL فسيفساء 2x2 مسبقاً.</string>
@@ -217,7 +217,7 @@
     <!-- dialog_zrok_token -->
     <string name="zrok_enable_token_hint">تمكين الرمز المميز</string>
     <string name="zrok_token_storage_note">يتم تخزين الرمز المميز بشكل آمن ويتم تقاسمه بين عمليات التطبيق والعملية الرمزية.</string>
-    <string name="zrok_reset_environment">إعادة تعيين بيئة السكر</string>
+    <string name="zrok_reset_environment">إعادة تعيين بيئة Zrok</string>
     <string name="zrok_reset_environment_desc">إزالة البيئة والرمز المميز. سوف تحتاج إلى إعادة التمكين باستخدام الرمز المميز الخاص بك (يستخدم فتحة الجهاز).</string>
     <!-- dialog_reset_data -->
     <string name="reset_title">إعادة تعيين البيانات</string>
@@ -495,51 +495,51 @@
     <string name="toast_token_regenerated_no_notify">تم تجديد الرمز المميز. لا يمكن إخطار الرمز.</string>
     <string name="toast_token_regenerated">تم تجديد الرمز</string>
     <string name="dashboard_no_tunnel">لا يوجد نفق قيد التشغيل</string>
-    <string name="dashboard_starting_zrok">بدء نفق زروك…</string>
-    <string name="dashboard_starting_cloudflared">بدء تشغيل نفق Cloudfachred…</string>
-    <string name="dashboard_starting_tailscale">بدء نفق النطاق الخطي…</string>
+    <string name="dashboard_starting_zrok">بدء نفق Zrok…</string>
+    <string name="dashboard_starting_cloudflared">بدء نفق Cloudflared…</string>
+    <string name="dashboard_starting_tailscale">بدء نفق Tailscale…</string>
     <string name="dashboard_waiting_url">في انتظار رابط النفق…</string>
     <string name="dashboard_daemons_running">%1$d/%2$d قيد التشغيل</string>
-    <string name="tunnel_label_cloudflared">كلودفري</string>
-    <string name="tunnel_label_zrok">صخرة</string>
-    <string name="tunnel_label_tailscale">مقياس</string>
+    <string name="tunnel_label_cloudflared">Cloudflared</string>
+    <string name="tunnel_label_zrok">Zrok</string>
+    <string name="tunnel_label_tailscale">Tailscale</string>
     <!-- Daemon names — shown on the Daemons list and dashboard. -->
     <string name="daemon_name_camera">كاميرا دايمون</string>
     <string name="daemon_name_surveillance">Surveillance Daemon</string>
     <string name="daemon_name_acc_surveillance">مراقبة لجنة التنسيق الإدارية</string>
     <string name="daemon_name_singbox">وكيل فردي</string>
-    <string name="daemon_name_cloudflared">نفق كلودفري</string>
-    <string name="daemon_name_zrok">نفق زروك</string>
-    <string name="daemon_name_tailscale">نفق مخصص</string>
+    <string name="daemon_name_cloudflared">نفق Cloudflared</string>
+    <string name="daemon_name_zrok">نفق Zrok</string>
+    <string name="daemon_name_tailscale">نفق Tailscale</string>
     <string name="daemon_name_telegram">بوت تيليجرام</string>
     <string name="clip_label_access_code">رمز الوصول</string>
     <string name="clip_label_url">الرابط</string>
     <!-- ABRP -->
     <!-- Daemons fragment -->
     <string name="toast_no_config_needed">لا توجد اعدادات مطلوبة ل %1$s</string>
-    <string name="dialog_zrok_token_title">الرمز المميز للنفق</string>
+    <string name="dialog_zrok_token_title">رمز نفق Zrok</string>
     <string name="dialog_zrok_token_message">Enter your Zrok enable token.\nGet one at: zrok.io</string>
     <string name="toast_token_cannot_be_empty">لا يمكن أن تكون الرمز فارغة</string>
-    <string name="dialog_tailscale_settings_title">إعدادات النفق حسب المقياس</string>
+    <string name="dialog_tailscale_settings_title">إعدادات نفق Tailscale</string>
     <string name="dialog_tailscale_settings_message">Configure tailscale</string>
     <string name="tailscale_failed_login_url">فشل في إنشاء رابط تسجيل الدخول</string>
     <string name="tailscale_logged_in_relogin">تسجيل الدخول. انقر لتسجيل الدخول إلى حساب مختلف</string>
-    <string name="dialog_tailscale_proxy_enable_title">تمكين وكيل النطاق السريع؟</string>
+    <string name="dialog_tailscale_proxy_enable_title">تمكين وكيل Tailscale؟</string>
     <string name="dialog_tailscale_proxy_enable_message">هذا الطريق MQTT من خلال تايلباس حتى تتمكن من الوصول إلى وسيط خاص على شبكة الذيل الخاصة بك بدون شحن المنفذ.\n\nأثناء التفعيل:\n• MQTT لعمل وسيط لشبكة الذيل (على سبيل المثال البعوض على جهاز على شبكة الذيل الخاصة بك)\n• MQTT للسماسرة العموميين (HiveMQ، AWS IoT، إلخ. سوف تفشل - فقط الطرق المجدولة إلى شبكة الذيل\n• سيتم إعادة تشغيل Demon Tailscale لتطبيق التغيير\n• حركة مرور التطبيقات الأخرى وبقية الجهاز غير متأثرة\n\nيمكنك إيقاف تشغيل هذا في أي وقت.</string>
-    <string name="dialog_zrok_reset_title">إعادة تعيين بيئة السكر</string>
+    <string name="dialog_zrok_reset_title">إعادة تعيين بيئة Zrok</string>
     <string name="dialog_zrok_reset_message">سيؤدي هذا إلى:\n• أوقف نفق الزروك إذا تم تشغيله\n• إزالة بيئة الزروك من هذا الجهاز\n• حذف الرمز المميز المحفوظ\n\nستحتاج إلى إعادة إدخال الرمز المميز الخاص بك وإعادة تمكينه. هذا يستخدم واحدة من خانات جهازك الخمسة على zrok.io.\n\nهل أنت متأكد؟</string>
-    <string name="toast_resetting_zrok">إعادة تعيين بيئة زروك…</string>
-    <string name="toast_zrok_reset_success">إعادة تعيين بيئة الصفر. أدخل رمز جديد للإعداد مرة أخرى.</string>
+    <string name="toast_resetting_zrok">جارٍ إعادة تعيين بيئة Zrok…</string>
+    <string name="toast_zrok_reset_success">تمت إعادة تعيين بيئة Zrok. أدخل رمزًا جديدًا للإعداد مرة أخرى.</string>
     <string name="toast_zrok_reset_partial">إعادة تعيين البيئة (قد يحتاج ملف الرمز المميز إلى تنظيف يدوي)</string>
     <string name="toast_zrok_reset_warnings">إعادة تعيين البيئة (مع التحذيرات: %1$s)</string>
     <string name="zrok_no_token_configured">لم يتم تكوين الرمز المميز. انقر للإعداد.</string>
-    <string name="dialog_tailscale_reset_title">إعادة تعيين بيئة النطاق</string>
-    <string name="dialog_tailscale_reset_message">سيؤدي هذا إلى:\n• إيقاف نفق النطاق المؤقت إذا تم تشغيله\n• إزالة بيئة النطاق المكيف من هذا الجهاز\n• ستظل بحاجة إلى إزالة الجهاز من وحدة التحكم المكيفة\n\nستحتاج إلى تسجيل الدخول مرة أخرى.\n\nهل أنت متأكد؟</string>
-    <string name="toast_resetting_tailscale">إعادة تعيين البيئة حسب النطاق…</string>
-    <string name="toast_tailscale_reset_success">إعادة تعيين بيئة النطاق السريع. قم بتسجيل الدخول للإعداد مرة أخرى.</string>
-    <string name="toast_tailscale_reset_warnings">إعادة ضبط البيئة حسب المقياس (مع التحذيرات: %1$s)</string>
-    <string name="toast_tailscale_proxy_enabled">تمكين الوكيل حسب الحجم</string>
-    <string name="toast_tailscale_proxy_disabled">تم تعطيل البروكسي حسب المقياس</string>
+    <string name="dialog_tailscale_reset_title">إعادة تعيين بيئة Tailscale</string>
+    <string name="dialog_tailscale_reset_message">سيؤدي هذا إلى:\n• إيقاف نفق Tailscale إذا كان قيد التشغيل\n• إزالة بيئة Tailscale من هذا الجهاز\n• ستظل بحاجة إلى إزالة الجهاز من وحدة تحكم Tailscale\n\nستحتاج إلى تسجيل الدخول مرة أخرى.\n\nهل أنت متأكد؟</string>
+    <string name="toast_resetting_tailscale">جارٍ إعادة تعيين بيئة Tailscale…</string>
+    <string name="toast_tailscale_reset_success">تمت إعادة تعيين بيئة Tailscale. سجّل الدخول للإعداد مرة أخرى.</string>
+    <string name="toast_tailscale_reset_warnings">تمت إعادة تعيين بيئة Tailscale (مع تحذيرات: %1$s)</string>
+    <string name="toast_tailscale_proxy_enabled">تم تمكين وكيل Tailscale</string>
+    <string name="toast_tailscale_proxy_disabled">تم تعطيل وكيل Tailscale</string>
     <string name="toast_tailscale_proxy_save_failed">فشل في حفظ إعدادات الوكيل</string>
     <string name="toast_zrok_token_saved">تم حفظ الرمز</string>
     <string name="toast_zrok_token_save_failed">فشل حفظ الرمز المميز</string>
@@ -829,7 +829,7 @@
     <!-- Section row subtitles (portrait) -->
     <string name="settings_section_recording_subtitle">المخازن المؤقتة/المنشور، الترميز، حدود التخزين.</string>
     <string name="settings_section_surveillance_subtitle">اكتشاف المناطق، الجدول، حساسية الحركة.</string>
-    <string name="settings_section_daemons_subtitle">كلاودفر، زروك، تيليجرام، MQTT.</string>
+    <string name="settings_section_daemons_subtitle">خدمات Cloudflared و Zrok و Telegram و MQTT.</string>
     <!-- About / data row subtitles -->
     <string name="settings_about_row_title">حول OverDrive</string>
     <string name="settings_about_row_subtitle">الإصدار، الترخيص، دعم التطوير.</string>

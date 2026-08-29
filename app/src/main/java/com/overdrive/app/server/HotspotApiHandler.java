@@ -61,9 +61,23 @@ public class HotspotApiHandler {
      */
     /** Read a system property; empty string when unavailable. */
     private static String readProp(String name) {
+        try {
+            Class<?> properties = Class.forName("android.os.SystemProperties");
+            String value = (String) properties
+                    .getMethod("get", String.class, String.class)
+                    .invoke(null, name, "");
+            if (value != null && !value.trim().isEmpty()) {
+                return value.trim();
+            }
+        } catch (Throwable ignored) {
+            // Hidden API access varies by firmware; use the native binary below.
+        }
+
         java.lang.Process p = null;
         try {
-            p = new ProcessBuilder("getprop", name).redirectErrorStream(true).start();
+            p = new ProcessBuilder("/system/bin/getprop", name)
+                    .redirectErrorStream(true)
+                    .start();
             java.io.BufferedReader r = new java.io.BufferedReader(
                     new java.io.InputStreamReader(p.getInputStream()));
             String line = r.readLine();
@@ -75,6 +89,41 @@ public class HotspotApiHandler {
         } finally {
             if (p != null) p.destroy();
         }
+    }
+
+    /** Read the framework's saved SoftAP config as the shell-UID fallback. */
+    private static String[] readFrameworkCredentials() {
+        String[] out = {"", ""};
+        try {
+            android.content.Context context =
+                    com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            android.net.wifi.WifiManager manager = context == null ? null
+                    : (android.net.wifi.WifiManager) context.getSystemService(
+                            android.content.Context.WIFI_SERVICE);
+            if (manager == null) return out;
+
+            java.lang.reflect.Method getter =
+                    manager.getClass().getMethod("getWifiApConfiguration");
+            android.net.wifi.WifiConfiguration config =
+                    (android.net.wifi.WifiConfiguration) getter.invoke(manager);
+            if (config == null) return out;
+
+            out[0] = cleanCredential(config.SSID);
+            out[1] = cleanCredential(config.preSharedKey);
+        } catch (Throwable ignored) {
+            // Some OEM builds deny even the shell UID; properties remain authoritative.
+        }
+        return out;
+    }
+
+    private static String cleanCredential(String value) {
+        if (value == null) return "";
+        String clean = value.trim();
+        if ("*".equals(clean)) return "";
+        if (clean.length() >= 2 && clean.startsWith("\"") && clean.endsWith("\"")) {
+            return clean.substring(1, clean.length() - 1);
+        }
+        return clean;
     }
 
     private static boolean handleStatus(OutputStream out) throws Exception {
@@ -115,6 +164,11 @@ public class HotspotApiHandler {
             // (the daemon is UID 2000, so getprop is available to it).
             if (activeSsid.isEmpty()) activeSsid = readProp("persist.sys.ap.ssid");
             if (activePassword.isEmpty()) activePassword = readProp("persist.sys.ap.password");
+            if (activeSsid.isEmpty() || activePassword.isEmpty()) {
+                String[] frameworkCredentials = readFrameworkCredentials();
+                if (activeSsid.isEmpty()) activeSsid = frameworkCredentials[0];
+                if (activePassword.isEmpty()) activePassword = frameworkCredentials[1];
+            }
             // Live value wins: the persisted `ssid` is only what was requested and is
             // never applied on this firmware, so preferring it showed a stale name.
             status.put("ssid", !activeSsid.isEmpty() ? activeSsid : cfg.optString("ssid", ""));

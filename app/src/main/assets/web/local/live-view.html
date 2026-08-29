@@ -10,8 +10,16 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
-    <script src="../shared/theme.js?v=5"></script>
+    <script src="../shared/theme.js?v=6"></script>
     <script src="../shared/app-shell.js?v=5"></script>
+    <script>
+        if (typeof window.AndroidBridge !== 'undefined') {
+            document.documentElement.classList.add('is-app-webview');
+        }
+    </script>
+    <style>
+        html.is-app-webview .cabin-listen-btn { display: none !important; }
+    </style>
     <link rel="stylesheet" href="../shared/styles.css?v=23">
     <link rel="stylesheet" href="../shared/leaflet.css" />
     <script src="../shared/leaflet.js"></script>
@@ -65,6 +73,20 @@
                                         <option value="SMOOTH"     data-i18n="stream.quality_smooth">Smooth (3.5M, 25 fps)</option>
                                         <option value="MAX"        data-i18n="stream.quality_max">Max (5M, 30 fps)</option>
                                     </select>
+                                    <button class="top-bar-btn cabin-listen-btn"
+                                            id="cabinListenButton"
+                                            type="button"
+                                            onclick="BYD.cabinListener.toggle()"
+                                            aria-pressed="false"
+                                            data-i18n-attr="title:liveview.listen_cabin;aria-label:liveview.listen_cabin"
+                                            title="Listen to cabin"
+                                            aria-label="Listen to cabin">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                                            <path d="M11 5 6 9H2v6h4l5 4V5Z"/>
+                                            <path d="M15.5 8.5a5 5 0 0 1 0 7"/>
+                                            <path d="M18.5 5.5a9 9 0 0 1 0 13"/>
+                                        </svg>
+                                    </button>
                                     <button class="top-bar-btn" onclick="BYD.stream.toggleFullscreen()">
                                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                             <path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/>
@@ -336,6 +358,8 @@
         }
 
         .top-bar-left, .top-bar-right { display: flex; align-items: center; gap: 10px; }
+        .top-bar-left { min-width: 0; }
+        .top-bar-right { flex: 0 0 auto; }
 
         .connection-status {
             display: inline-flex;
@@ -358,7 +382,12 @@
             background: var(--text-muted);
             transition: all 0.3s;
         }
-        .connection-status .status-text { line-height: 1; }
+        .connection-status .status-text {
+            min-width: 0;
+            overflow: hidden;
+            line-height: 1;
+            text-overflow: ellipsis;
+        }
         
         .connection-status.live .conn-dot {
             background: #22c55e;
@@ -428,6 +457,20 @@
 
         .top-bar-btn:hover { background: var(--lv-pill-bg-hover); color: var(--text-primary); }
         .top-bar-btn svg { width: 18px; height: 18px; }
+        .cabin-listen-btn.is-active {
+            color: var(--brand-primary);
+            border-color: var(--brand-primary);
+            background: rgba(0, 212, 170, 0.14);
+        }
+        .cabin-listen-btn.is-connecting {
+            color: var(--status-warning);
+            border-color: var(--status-warning);
+        }
+        .cabin-listen-btn.is-paused {
+            color: var(--status-warning);
+            border-color: var(--status-warning);
+            background: var(--status-warning-container);
+        }
         
         /* Video Display — the stage and the layered video / canvas /
            software-decoder containers all share --lv-video-bg so the camera
@@ -1064,10 +1107,19 @@
         
         /* Mobile */
         @media (max-width: 768px) {
-            .camera-top-bar { padding: 12px 16px; }
-            .connection-status { padding: 6px 10px; font-size: 11px; }
+            .camera-top-bar { padding: 12px; }
+            .top-bar-left, .top-bar-right { gap: 6px; }
+            .top-bar-left { flex: 1 1 auto; }
+            .connection-status {
+                max-width: 92px;
+                padding: 6px 10px;
+                font-size: 11px;
+            }
             .decoder-chip { padding: 4px 8px; font-size: 9px; }
             .quality-select-sota {
+                width: 108px;
+                min-width: 108px;
+                max-width: 108px;
                 padding: 6px 26px 6px 10px;
                 font-size: 11px;
                 /* Use native appearance on mobile for better dropdown rendering */
@@ -1193,6 +1245,7 @@
     <script src="../shared/pwa-init.js?v=index1"></script>
     <script src="../shared/core.js?v=20"></script>
     <script src="../shared/update-flow.js"></script>
+    <script src="../shared/cabin-audio.js?v=1"></script>
     <script src="../shared/stream.js?v=index3"></script>
     <script src="../shared/map.js?v=1"></script>
     <script src="../shared/surveillance.js?v=survtoggle1"></script>
@@ -1201,6 +1254,62 @@
             document.getElementById('sidebar').classList.toggle('open');
             document.getElementById('sidebarOverlay').classList.toggle('show');
         }
+
+        BYD.cabinListener = {
+            lastState: 'idle',
+            init: function () {
+                var self = this;
+                CabinAudio.subscribe(function (status) {
+                    self.render(status);
+                });
+                document.addEventListener('visibilitychange', function () {
+                    if (document.hidden) CabinAudio.stop();
+                });
+                window.addEventListener('pagehide', function () {
+                    CabinAudio.stop();
+                });
+                window.addEventListener('beforeunload', function () {
+                    CabinAudio.stop();
+                });
+            },
+            toggle: function () {
+                CabinAudio.toggle();
+            },
+            render: function (status) {
+                var button = document.getElementById('cabinListenButton');
+                if (!button) return;
+                var active = status.state === 'live';
+                var paused = status.state === 'paused';
+                var connecting = status.state === 'connecting';
+                button.classList.toggle('is-active', active);
+                button.classList.toggle('is-paused', paused);
+                button.classList.toggle('is-connecting', connecting);
+                button.setAttribute(
+                    'aria-pressed',
+                    active || paused || connecting ? 'true' : 'false');
+                var key = active
+                    ? 'liveview.stop_listening'
+                    : paused
+                        ? 'liveview.listening_paused'
+                        : connecting
+                            ? 'liveview.listener_starting'
+                            : 'liveview.listen_cabin';
+                var label = BYD.i18n.t(key);
+                if (label && label !== key) {
+                    button.title = label;
+                    button.setAttribute('aria-label', label);
+                }
+                if (status.state === 'error'
+                        && this.lastState !== 'error'
+                        && BYD.utils
+                        && BYD.utils.toast) {
+                    BYD.utils.toast(
+                        status.reason || BYD.i18n.t('liveview.listener_unavailable'),
+                        'error');
+                }
+                this.lastState = status.state;
+            }
+        };
         
         BYD.liveLayout = {
             mapExpanded: false,
@@ -1782,6 +1891,7 @@
         // of presenting an empty "select camera" state.
         BYD.i18n.init().then(async function () {
             BYD.core.init();
+            BYD.cabinListener.init();
             BYD.stream.init();
             BYD.map.init();
             SurvSettings.initHeatmapOnly();

@@ -119,30 +119,42 @@ public class WaitUntilAction extends BaseAction {
             return;
         }
 
-        long deadline = System.currentTimeMillis() + timeoutS * 1000L;
+        long queuedDeadline = Automations.queuedWaitDeadlineNanos(
+                automationAction, timeoutS * 1000L);
+        boolean queuedWait = queuedDeadline != 0L;
+        long deadline = queuedWait ? queuedDeadline : System.nanoTime()
+                + java.util.concurrent.TimeUnit.SECONDS.toNanos(timeoutS);
         // Poll the shared state, comparing through the shared condition path so a dynamic
-        // ${var:…}/${signal:…} RHS is resolved fresh each tick (a variable another action
-        // sets during the wait, or a live signal, is honoured).
+        // RHS is resolved fresh each tick (a variable another action sets during the wait,
+        // or a live signal, is honoured).
         while (true) {
             if (AutomationCondition.evaluate(event, comparator, target)) {
+                Automations.clearQueuedWait(automationAction);
                 logger.info("WaitUntilAction: satisfied (" + event.getType() + " " + comparator + " " + target + ")");
                 return;
             }
-            if (System.currentTimeMillis() >= deadline) {
+            if (System.nanoTime() >= deadline) {
                 // The condition never became true, so the precondition this wait guards was
-                // NOT satisfied — stop the chain instead of letting every following action run
-                // as if the wait had succeeded (which made a too-short timeout look like the
-                // wait was ignored entirely).
+                // NOT satisfied - stop the chain instead of running the remaining actions.
+                Automations.clearQueuedWait(automationAction);
                 logger.info("WaitUntilAction: timed out after " + timeoutS + "s waiting for "
                         + event.getType() + " " + comparator + " " + target
-                        + " — stopping the remaining actions");
+                        + " - stopping the remaining actions");
                 Automations.abortChain();
                 return;
             }
+            long remainingNanos = Math.max(1L, deadline - System.nanoTime());
+            long pollMs = Math.max(1L, Math.min(POLL_MS,
+                    java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+            if (queuedWait) {
+                if (Automations.deferQueuedAction(automationAction, pollMs, false)) return;
+                Automations.clearQueuedWait(automationAction);
+                queuedWait = false;
+            }
             try {
-                Thread.sleep(POLL_MS);
+                Thread.sleep(pollMs);
             } catch (InterruptedException ie) {
-                // Worker teardown — re-assert and bail so take() unwinds the thread.
+                // Worker teardown - re-assert and bail so take() unwinds the thread.
                 Thread.currentThread().interrupt();
                 return;
             }

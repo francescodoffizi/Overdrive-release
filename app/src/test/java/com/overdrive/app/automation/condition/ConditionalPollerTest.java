@@ -50,6 +50,27 @@ public class ConditionalPollerTest {
         assertEquals(stableRuns, runs.get());
     }
 
+    @Test
+    public void repeatedRefreshKeepsTheExistingScheduledTask() {
+        AtomicBoolean referenced = new AtomicBoolean(true);
+        ConditionalPoller poller = new ConditionalPoller(
+                "refresh idempotency test", 20L, referenced::get, () -> {});
+
+        poller.refresh();
+        long scheduledGeneration = poller.generationForTest();
+        assertTrue(poller.isScheduledForTest());
+
+        poller.refresh();
+        poller.refresh();
+
+        assertTrue(poller.isScheduledForTest());
+        assertEquals(scheduledGeneration, poller.generationForTest());
+
+        referenced.set(false);
+        poller.refresh();
+        assertFalse(poller.isScheduledForTest());
+    }
+
     private static void awaitAtLeastOneRun(AtomicInteger runs) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 1000L;
         while (runs.get() == 0 && System.currentTimeMillis() < deadline) {

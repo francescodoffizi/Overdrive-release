@@ -5,6 +5,7 @@ import android.util.Base64;
 
 import com.overdrive.app.auth.AuthManager;
 import com.overdrive.app.daemon.CameraDaemon;
+import com.overdrive.app.genai.GenAiConfig;
 import com.overdrive.app.monitor.AccMonitor;
 import com.overdrive.app.monitor.BatteryMonitor;
 import com.overdrive.app.surveillance.GpuPipelineConfig;
@@ -234,10 +235,20 @@ public class HttpServer {
     public void stop() {
         running = false;
         RemoteCommunicationWebSocket.stopActive("Communication server stopped");
+        CabinAudioWebSocket.stopActive("Communication server stopped");
+        GenAiVoiceWebSocket.stopActive("GenAI server stopped");
         try {
             if (serverSocket != null) serverSocket.close();
         } catch (Exception e) {}
         threadPool.shutdownNow();
+    }
+
+    static String redactQueryToken(String requestLine) {
+        if (requestLine == null || requestLine.indexOf("token=") < 0) {
+            return requestLine;
+        }
+        return requestLine.replaceAll(
+                "([?&]token=)[^& ]*", "$1<redacted>");
     }
 
     private void handleClient(Socket client) {
@@ -263,7 +274,7 @@ public class HttpServer {
             if (!(requestLine.contains("/api/stream/turn")
                     || requestLine.contains("/api/bs/status")
                     || requestLine.startsWith("GET /status"))) {
-                CameraDaemon.log("HTTP: " + requestLine);
+                CameraDaemon.log("HTTP: " + redactQueryToken(requestLine));
             }
 
             // Parse headers
@@ -271,6 +282,7 @@ public class HttpServer {
             int contentLength = 0;
             String websocketKey = null;
             String upgradeHeader = null;
+            String websocketProtocolHeader = null;
             String rangeHeader = null;
             // Conditional GET — if the client (Chrome WebView's HTTP cache)
             // sends If-None-Match matching our ETag, we return 304 instead of
@@ -284,6 +296,7 @@ public class HttpServer {
             boolean hasTunnelHeaders = false;
             String forwardedFor = null;
             String hostHeader = null;
+            String originHeader = null;
             // Zrok's HTTP backend rewrites Host: to the backend URL (localhost:8080)
             // before forwarding, and stashes the original public hostname in
             // X-Forwarded-Host. Captured here so isPwaOrigin can match it.
@@ -297,6 +310,8 @@ public class HttpServer {
                     websocketKey = line.substring(18).trim();
                 } else if (lower.startsWith("upgrade:")) {
                     upgradeHeader = line.substring(8).trim();
+                } else if (lower.startsWith("sec-websocket-protocol:")) {
+                    websocketProtocolHeader = line.substring(23).trim();
                 } else if (lower.startsWith("range:")) {
                     rangeHeader = line.substring(6).trim();
                 } else if (lower.startsWith("if-none-match:")) {
@@ -317,6 +332,8 @@ public class HttpServer {
                     }
                 } else if (lower.startsWith("host:")) {
                     hostHeader = line.substring(5).trim();
+                } else if (lower.startsWith("origin:")) {
+                    originHeader = line.substring(7).trim();
                 } else if (lower.startsWith("x-forwarded-for:")) {
                     hasTunnelHeaders = true;
                     forwardedFor = line.substring(16).trim();
@@ -410,9 +427,21 @@ public class HttpServer {
             // tokens are supported because browser WebSocket clients cannot set
             // arbitrary Authorization headers.
             String wsPathOnly = path.contains("?") ? path.substring(0, path.indexOf("?")) : path;
-            if ((wsPathOnly.equals("/ws") || wsPathOnly.equals("/ws/communicate"))
+            if ((wsPathOnly.equals("/ws")
+                    || wsPathOnly.equals("/ws/communicate")
+                    || wsPathOnly.equals("/ws/cabin-audio")
+                    || wsPathOnly.equals(GenAiVoiceWebSocket.PATH)
+                    || wsPathOnly.equals(GenAiChatWebSocket.PATH)
+                    || wsPathOnly.equals(RemoteDevViewWebSocketStream.PATH))
                     && websocketKey != null
                     && "websocket".equalsIgnoreCase(upgradeHeader)) {
+                if (GenAiRequestSecurity.isGenAiPath(wsPathOnly)
+                        && !GenAiRequestSecurity.isAllowedOrigin(
+                                originHeader, hostHeader, forwardedHostHeader)) {
+                    HttpResponse.sendError(out, 403, "Forbidden origin");
+                    client.close();
+                    return;
+                }
                 // Promote ?token= query param into a synthetic Authorization header
                 // so AuthMiddleware's existing Bearer-token path handles it.
                 String wsAuthHeader = authHeader;
@@ -427,13 +456,37 @@ public class HttpServer {
                         }
                     }
                 }
-                if (!AuthMiddleware.checkAuth(wsPathOnly, cookieHeader, wsAuthHeader, out,
-                        client.getRemoteSocketAddress(), hasTunnelHeaders)) {
+                boolean wsAuthenticated = wsPathOnly.equals(RemoteDevViewWebSocketStream.PATH)
+                        || GenAiRequestSecurity.isGenAiPath(wsPathOnly)
+                    ? AuthMiddleware.checkJwtOnly(
+                        wsPathOnly, cookieHeader, wsAuthHeader, out)
+                    : AuthMiddleware.checkAuth(wsPathOnly, cookieHeader, wsAuthHeader, out,
+                        client.getRemoteSocketAddress(), hasTunnelHeaders);
+                if (!wsAuthenticated) {
                     client.close();
                     return;
                 }
-                if (wsPathOnly.equals("/ws/communicate")) {
+                if (wsPathOnly.equals(RemoteDevViewWebSocketStream.PATH)) {
+                    String devViewSession = RemoteDevViewWebSocketStream
+                        .sessionFromProtocols(websocketProtocolHeader);
+                    if (devViewSession == null
+                            || !RemoteDevViewApiHandler.validateStreamSession(devViewSession)) {
+                        HttpResponse.sendError(out, 403,
+                            "Developer-view session is invalid or expired");
+                        client.close();
+                        return;
+                    }
+                    RemoteDevViewWebSocketStream.handle(client, websocketKey, devViewSession);
+                } else if (wsPathOnly.equals("/ws/communicate")) {
                     RemoteCommunicationWebSocket.handle(client, websocketKey);
+                } else if (wsPathOnly.equals("/ws/cabin-audio")) {
+                    CabinAudioWebSocket.handle(client, websocketKey);
+                } else if (wsPathOnly.equals(GenAiVoiceWebSocket.PATH)) {
+                    GenAiVoiceWebSocket.handle(
+                            client, websocketKey,
+                            GenAiApiHandler.queryParam(path, "lang"));
+                } else if (wsPathOnly.equals(GenAiChatWebSocket.PATH)) {
+                    GenAiChatWebSocket.handle(client, websocketKey);
                 } else {
                     handleWebSocketUpgrade(client, websocketKey);
                 }
@@ -466,19 +519,37 @@ public class HttpServer {
                 return;
             }
             
+            boolean genAiRequest = GenAiRequestSecurity.isGenAiPath(pathOnly);
+            if (genAiRequest && !GenAiRequestSecurity.isAllowedOrigin(
+                    originHeader, hostHeader, forwardedHostHeader)) {
+                HttpResponse.sendError(out, 403, "Forbidden origin");
+                client.close();
+                return;
+            }
+
             // Handle CORS preflight (OPTIONS) requests for cross-origin webapp access.
             // Browsers send OPTIONS before POST/PUT/DELETE with Content-Type: application/json.
             // The in-app WebView is same-origin so it skips this, but the external webapp needs it.
             // Must be handled BEFORE auth check — preflight requests don't carry cookies/tokens.
             if (method.equals("OPTIONS")) {
-                HttpResponse.sendCorsPreflightResponse(out);
+                if (genAiRequest) {
+                    HttpResponse.sendCorsPreflightResponse(out, originHeader);
+                } else {
+                    HttpResponse.sendCorsPreflightResponse(out);
+                }
                 client.close();
                 return;
             }
             
             // Check authentication for all other paths
-            if (!AuthMiddleware.checkAuth(path, cookieHeader, authHeader, out,
-                    client.getRemoteSocketAddress(), hasTunnelHeaders)) {
+            boolean remoteDevRequest = pathOnly.equals("/remote-dev-view")
+                    || pathOnly.equals("/remote-dev-view.html")
+                    || pathOnly.startsWith("/api/dev-view/");
+            boolean authenticated = remoteDevRequest || genAiRequest
+                ? AuthMiddleware.checkJwtOnly(path, cookieHeader, authHeader, out)
+                : AuthMiddleware.checkAuth(path, cookieHeader, authHeader, out,
+                    client.getRemoteSocketAddress(), hasTunnelHeaders);
+            if (!authenticated) {
                 client.close();
                 return;
             }
@@ -491,6 +562,10 @@ public class HttpServer {
             else if (path.equals("/") || path.equals("/index.html")) {
                 if (!serveStaticFile(out, "local/index.html")) {
                     HttpResponse.sendError(out, 404, "index.html not found");
+                }
+            } else if (path.equals("/assistant.html") || path.equals("/assistant")) {
+                if (!serveStaticFile(out, "local/assistant.html")) {
+                    HttpResponse.sendError(out, 404, "assistant.html not found");
                 }
             } else if (path.equals("/live-view.html") || path.equals("/live-view")) {
                 if (!serveStaticFile(out, "local/live-view.html")) {
@@ -524,6 +599,10 @@ public class HttpServer {
             } else if (path.equals("/performance.html") || path.equals("/performance")) {
                 if (!serveStaticFile(out, "local/performance.html")) {
                     HttpResponse.sendError(out, 404, "performance.html not found");
+                }
+            } else if (path.equals("/remote-dev-view.html") || path.equals("/remote-dev-view")) {
+                if (!serveStaticFile(out, "local/remote-dev-view.html")) {
+                    HttpResponse.sendError(out, 404, "remote-dev-view.html not found");
                 }
             } else if (path.equals("/abrp.html") || path.equals("/abrp")) {
                 if (!serveStaticFile(out, "local/abrp.html")) {
@@ -612,7 +691,7 @@ public class HttpServer {
                 String base = dot > 0 ? tag.substring(0, dot) : tag;
                 if (!LocaleManager.isSupported(base)) {
                     HttpResponse.sendError(out, 404, "Unknown locale");
-                } else if (!serveStaticFile(out, "i18n/" + tag)) {
+                } else if (!serveStaticFile(out, "i18n/" + tag, ifNoneMatchHeader)) {
                     HttpResponse.sendError(out, 404, "Catalog missing: " + tag);
                 }
             } else if (path.startsWith("/shared/") || path.startsWith("/local/")) {
@@ -657,7 +736,6 @@ public class HttpServer {
      */
     private static final String[] AUTOMATION_ALLOWED_PREFIXES = {
         "/api/vehicle/",       // vehicle controls: setting, window, climate, seat
-        "/api/surveillance/",  // surveillance enable / disable
         "/api/recording/mode", // recording mode
         "/api/apps/launch",    // open-app action: launch a user-selected app (NOT /api/apps/list)
         "/api/camview/",       // camera-view show/hide (native lane, shares blind-spot pipeline)
@@ -676,6 +754,12 @@ public class HttpServer {
         if (path == null) return false;
         int q = path.indexOf('?');
         String clean = q >= 0 ? path.substring(0, q) : path;
+        if (clean.startsWith("/api/surveillance/")) {
+            return clean.equals("/api/surveillance/enable")
+                    || clean.equals("/api/surveillance/disable")
+                    || clean.equals("/api/surveillance/config")
+                    || clean.equals("/api/surveillance/${action}");
+        }
         for (String prefix : AUTOMATION_ALLOWED_PREFIXES) {
             if (clean.startsWith(prefix)) return true;
         }
@@ -828,6 +912,12 @@ public class HttpServer {
         // group editor.
         if (path.startsWith("/api/automations") || path.startsWith("/api/action-groups")) {
             return AutomationApiHandler.handle(method, path, body, out);
+        }
+
+        // GenAI BYOK API. Authentication is enforced by HttpServer before
+        // modular handlers are reached; credentials are never returned.
+        if (path.startsWith("/api/genai/")) {
+            return GenAiApiHandler.handle(method, path, body, out);
         }
 
         // Community Automations API (browse / publish / import shared automations)
@@ -1031,6 +1121,12 @@ public class HttpServer {
             return PerformanceApiHandler.handle(method, path, body, out);
         }
 
+        // Explicitly confirmed app-window capture/control. Its HTTP and
+        // WebSocket entry points require a real JWT (no loopback fallback).
+        if (path.startsWith("/api/dev-view/")) {
+            return RemoteDevViewApiHandler.handle(method, path, body, out);
+        }
+
         // Network & Hotspot API (AP on/off, clients, session stats, data limit, proxy)
         if (path.startsWith("/api/hotspot")) {
             return HotspotApiHandler.handle(method, path, body, out);
@@ -1123,6 +1219,8 @@ public class HttpServer {
             // is temporarily unreadable during a cross-process replacement.
             status.put("screenshotPrivacyMode", false);
         }
+        status.put("genAiDashboardEnabled",
+                GenAiConfig.isDashboardPresentationEnabled());
 
         // Vehicle-data readiness, surfaced explicitly so the web UI can render
         // a "waiting for vehicle…" state instead of silently leaving every
@@ -1322,8 +1420,20 @@ public class HttpServer {
                 // the layer is shared with camview, so gating on visibility alone would
                 // reconcile the BS ✕ over a camera view. Target pairs with it so the
                 // overlay can suppress the ✕ on the cluster (a display it can't overlay).
-                recordingStatus.put("bsCardShowing", pipeline.isBlindSpotCardShowing());
+                // ✕-selection labels as ONE consistent snapshot (single laneProgram
+                // read inside getCloseLabels). Two separate getter calls could
+                // straddle an arbiter program change and emit false/false with the
+                // blind-spot card still visible — labels that CLAIM coherence while
+                // lying, which the overlay would then act on (wrong camera ✕).
+                // laneTransitioning is the daemon's honest incoherence signal for the
+                // ≤250ms transition window; the overlay skips adopting the ✕ flags
+                // from a response carrying it, instead of trusting edge-broadcast
+                // timing to win.
+                com.overdrive.app.surveillance.GpuSurveillancePipeline.CloseLabels closeLabels =
+                        pipeline.getCloseLabels();
+                recordingStatus.put("bsCardShowing", closeLabels.bsCardShowing);
                 recordingStatus.put("bsCardTarget", pipeline.getBsTargetString());
+                recordingStatus.put("laneTransitioning", closeLabels.laneTransitioning);
                 // On-screen rect of whichever program owns the lane, so the overlay can
                 // place its floating ✕ CLEAR of the card. The card's SurfaceControl layer
                 // sits above every app window, so a ✕ that overlaps it is composited
@@ -1333,11 +1443,12 @@ public class HttpServer {
                 // HEAD-UNIT ONLY. A cluster rect is in the 1920×720 cluster panel's space,
                 // and the overlay can't draw on that display (it suppresses the ✕ there), so
                 // publishing one would only leave wrong-space coordinates cached for a later
-                // head-unit show to position against. Keyed to the lane's CURRENT owner:
-                // bsTarget is the shared field camview overwrites, so it names whichever
-                // program the rect belongs to.
-                boolean laneOnCluster = "cluster".equals(pipeline.getBsTargetString());
-                int[] laneRect = laneOnCluster ? null : pipeline.getLaneGeomRect();
+                // head-unit show to position against. The cluster gate lives INSIDE
+                // getLaneGeomRect, keyed to the rect's true owner: a pre-gate on
+                // bsTarget here suppressed the rect during a cluster→head-unit camview
+                // transition (bsTarget lags camViewTarget until the arbiter tick),
+                // feeding the overlay a null that cleared the fresh show-edge rect.
+                int[] laneRect = pipeline.getLaneGeomRect();
                 if (laneRect != null) {
                     org.json.JSONObject lr = new org.json.JSONObject();
                     lr.put("x", laneRect[0]); lr.put("y", laneRect[1]);
@@ -1587,11 +1698,17 @@ public class HttpServer {
             // Other static assets (JS/CSS/fonts/images) ship inside the APK, so they only
             // change on an app update — but they DO change then, and the old policy
             // ("public, max-age=86400", no validator) meant the browser could not find that
-            // out for a day. That is what made freshly-deployed nav items appear only
-            // intermittently: /shared/app-shell.js was served from cache with no way to
-            // revalidate. A short max-age plus an ETag keeps the bandwidth win — repeat
-            // page loads in a session still skip the body — while an update is picked up on
-            // the next revalidation instead of the next day.
+            // out for a day, which is what made a freshly-deployed /shared/app-shell.js
+            // appear only intermittently.
+            //
+            // The ETag below only helps EXTERNAL clients. The in-app WebView proxies every
+            // 127.0.0.1:8080 request through WebViewFragment.shouldInterceptRequest, which
+            // strips If-None-Match (a 304 there returns to WebView as an empty 200 and breaks
+            // <video>) — so in-app there is no 304 to soften a short max-age, and every expiry
+            // re-downloads the full body. 1h is the compromise: it bounds that re-download to
+            // hourly instead of the 5 minutes an aggressive revalidation window cost, while
+            // cutting the stale-after-update window from a day to an hour. Use a ?v= bump when
+            // an asset change has to land immediately in-app.
             String cacheControl;
             String fileName = new File(relativePath).getName();
             if (relativePath.endsWith(".html")
@@ -1599,7 +1716,7 @@ public class HttpServer {
                     || fileName.equals("manifest.json")) {
                 cacheControl = "no-store, no-cache, must-revalidate, max-age=0";
             } else {
-                cacheControl = "public, max-age=300, must-revalidate";
+                cacheControl = "public, max-age=3600, must-revalidate";
             }
 
             // Validator over (mtime, size). Both change when the APK reinstalls an asset,

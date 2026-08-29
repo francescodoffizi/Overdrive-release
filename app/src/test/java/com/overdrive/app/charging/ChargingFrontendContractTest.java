@@ -27,6 +27,14 @@ public class ChargingFrontendContractTest {
                 "c.powerSource !== 'nominalPlaceholder'"));
         assertTrue(dashboard.contains(
                 "(c.isEstimated ? '~' : '') + dashboardPower.toFixed(1) + ' kW'"));
+        assertTrue(dashboard.contains(
+                "c.sessionEnergyIncomplete === true"));
+        assertTrue(dashboard.contains(
+                "c.sessionEnergyEstimated === true"));
+        assertTrue(dashboard.contains(
+                "c.sessionEnergySource !== 'metered_counter'"));
+        assertTrue(dashboard.contains(
+                "(dashboardEnergyApproximate ? '~' : '')"));
         assertTrue(dashboard.contains("setText('dashChargeKwh', '--')"));
         assertTrue(dashboard.contains("setText('dashChargeTtf', '--')"));
     }
@@ -45,6 +53,32 @@ public class ChargingFrontendContractTest {
         assertTrue(charging.contains("!this._detailInProgress"));
         assertTrue(charging.contains("body.success !== true"));
         assertTrue(charging.contains("'charge.clear_failed'"));
+    }
+
+    @Test
+    public void manualCostEditingIsAccessibleValidatedAndRefreshesTheOpenDetail()
+            throws IOException {
+        String charging = readRepositoryFile(
+                "app/src/main/assets/web/shared/charging.js");
+        String html = readRepositoryFile(
+                "app/src/main/assets/web/local/charging.html");
+        String core = readRepositoryFile(
+                "app/src/main/assets/web/shared/core.js");
+
+        assertTrue(html.contains(
+                "<button type=\"button\" class=\"ch-detail-metric-row ch-detail-cost-edit\""));
+        assertTrue(html.contains(
+                "data-i18n-attr=\"title:charge.edit_cost;aria-label:charge.edit_cost\""));
+        assertTrue(charging.contains(
+                "var sessionId = this.currentSessionId"));
+        assertTrue(charging.contains(
+                "var newCost = trimmed === '' ? -1 : Number(trimmed)"));
+        assertTrue(charging.contains(
+                "!isFinite(newCost) || (newCost < 0 && newCost !== -1)"));
+        assertTrue(charging.contains(
+                "self._fillDetailHeader(s, sessionId)"));
+        assertTrue(core.contains(
+                "BYD.utils.promptDialog = function (opts)"));
     }
 
     @Test
@@ -197,6 +231,121 @@ public class ChargingFrontendContractTest {
                 "class=\"filter-tab active\" data-days=\"7\""));
         assertTrue(html.contains(
                 "class=\"filter-tab active\" data-hours=\"168\""));
+    }
+
+    @Test
+    public void sessionCardsKeepTierLabelsAndTemperatureChartsHandlePartialData()
+            throws IOException {
+        String charging = readRepositoryFile(
+                "app/src/main/assets/web/shared/charging.js");
+        String html = readRepositoryFile(
+                "app/src/main/assets/web/local/charging.html");
+
+        assertTrue(charging.contains(
+                "self._typeIcon(kind) + '<span>'"));
+        assertTrue(charging.contains("self._esc(typeLabel)"));
+        assertTrue(charging.contains(
+                "return this._t('charge.type_dc', 'DC fast')"));
+        assertTrue(charging.contains(
+                "return this._t('charge.type_fast', 'AC fast')"));
+        assertTrue(charging.contains(
+                "return this._t('charge.type_slow', 'AC slow')"));
+        assertTrue(html.contains(
+                "flex: 0 0 auto; white-space: nowrap;"));
+
+        assertTrue(charging.contains(
+                "_temperaturePoints: function (samples)"));
+        assertTrue(charging.contains(
+                "if (center == null) center = hi != null ? hi : lo"));
+        assertTrue(charging.contains("if (center > hi) hi = center"));
+        assertTrue(charging.contains("if (center < lo) lo = center"));
+        assertTrue(charging.contains(
+                "var hasTemperatureSamples = this._temperaturePoints(samples).length > 1"));
+        assertTrue(charging.contains(
+                "var hasSamples = this._powerCurveValueCount(powerSamples) > 1"));
+        assertTrue(charging.contains(
+                "power: hasPower ? s.power : null"));
+        assertTrue(charging.contains(
+                "isFinite(s.power) && s.power > 0"));
+        assertTrue(charging.contains(
+                "var segments = [], segment = []"));
+        assertTrue(charging.contains(
+                "_energyIsApproximate: function (energy)"));
+        assertTrue(charging.contains(
+                "energy.sessionEnergyEstimated === true"));
+        assertTrue(charging.contains(
+                "if (source !== '') return source !== 'metered_counter'"));
+        assertTrue(charging.contains(
+                "s.periodEstimatedSessions || s.periodIncompleteSessions"));
+        assertTrue(charging.contains(
+                "s.lifetimeEstimatedSessions || s.lifetimeIncompleteSessions"));
+        assertTrue(charging.contains(
+                "(periodEnergyApproximate ? '~' : '')"));
+        assertTrue(charging.contains(
+                "approximate: this._energyIsApproximate(s)"));
+        assertTrue(charging.contains(
+                "var prefix = p.approximate ? '~' : ''"));
+        assertTrue(charging.contains(
+                "var approximate = (p.estimated || p.incomplete || 0) > 0"));
+        assertTrue(html.contains("id=\"detailTempNoSamples\""));
+        assertTrue(html.contains("id=\"statsEstimateDisclosure\""));
+        assertTrue(html.contains("id=\"summaryEstimateDisclosure\""));
+        assertTrue(html.contains("id=\"detailEstimateDisclosure\""));
+        assertTrue(html.contains("<details class=\"ch-estimate-disclosure\""));
+        assertTrue(charging.contains(
+                "(powerEstimated ? '≈' : '') + livePowerKw.toFixed(1) + ' kW'"));
+        assertTrue(charging.contains(
+                "'Power & energy estimated'"));
+        assertTrue(charging.contains(
+                "'Power estimated'"));
+        assertTrue(charging.contains(
+                "'Energy estimated'"));
+        assertTrue(charging.contains(
+                "this._t('charge.not_measured', 'Not measured')"));
+        assertTrue(html.contains("charging.js?v=43"));
+    }
+
+    @Test
+    public void importedChargingViewKeepsLabelsAndLegacySocReadable()
+            throws IOException {
+        String charging = readRepositoryFile(
+                "app/src/main/assets/web/shared/charging.js");
+        String html = readRepositoryFile(
+                "app/src/main/assets/web/local/charging.html");
+        String english = readRepositoryFile(
+                "app/src/main/assets/web/i18n/en.json");
+        String api = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/charging/ChargingApiHandler.java");
+
+        assertTrue(english.contains(
+                "\"sessions_title\": \"Charging sessions\""));
+        assertTrue(html.contains("data-i18n=\"charge.sessions_title\""));
+        assertTrue(html.contains("id=\"socRangeValue\""));
+        assertTrue(html.contains("id=\"socSohValue\""));
+        assertTrue(html.contains("id=\"completionHeroCard\""));
+        assertTrue(html.contains("id=\"sessionSort\""));
+        assertTrue(charging.contains("_socRangeText: function (session)"));
+        assertTrue(charging.contains(
+                "(hasStart ? Math.round(start) + '%' : '--')"));
+        assertTrue(charging.contains(
+                "(hasEnd ? Math.round(end) + '%' : '--')"));
+        assertTrue(charging.contains(
+                "this._showCard('statsLowerGrid', hasEfficiency || hasSessions)"));
+        assertTrue(charging.contains("_latestBatterySnapshot: function ()"));
+        assertTrue(charging.contains(
+                "this.summaryCache, this._summaryPeriodKey, true"));
+        assertTrue(html.contains(
+                "grid-template-areas:\n"
+                        + "                \"primary start duration actions\"\n"
+                        + "                \"primary range context actions\""));
+        assertTrue(html.contains(
+                "#chargingDetail { width: 100%; max-width: 1900px;"));
+        assertTrue(html.contains(
+                ".ch-detail-chart-stat > div { min-width: 0; flex: 1; }"));
+        assertTrue(html.contains(
+                "white-space: normal; overflow-wrap: break-word;"));
+        assertTrue(api.contains("live.put(\"rangeKm\""));
+        assertTrue(api.contains("live.put(\"sohPercent\""));
     }
 
     private static String readRepositoryFile(String relativePath) throws IOException {

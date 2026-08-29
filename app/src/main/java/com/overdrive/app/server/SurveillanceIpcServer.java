@@ -218,6 +218,11 @@ public class SurveillanceIpcServer implements Runnable {
                 // reply with an error, and keep serving the next command.
                 try {
                     JSONObject request = new JSONObject(line);
+                    if ("DETERRENT_INPUT_CAPTURE".equals(
+                            request.optString("command", ""))) {
+                        handleDeterrentInputCapture(client, in, out, request);
+                        return;
+                    }
                     JSONObject response = handleCommand(request);
                     // handleCommand returns null for fire-and-forget streaming
                     // commands (IMU_BATCH ~10/s, UPDATE_GPS ~1/s) whose sidecar
@@ -240,6 +245,51 @@ public class SurveillanceIpcServer implements Runnable {
             try { client.close(); } catch (Exception ignored) {}
         } catch (Exception e) {
             logger.error("Error handling client", e);
+            try { client.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * Holds one authenticated Activity connection for the visual session.
+     * EOF is the process/focus-death signal; DISMISS is the in-band tap signal.
+     * No config file heartbeat is needed.
+     */
+    private void handleDeterrentInputCapture(
+            Socket client, BufferedReader in, PrintWriter out, JSONObject request) {
+        long captureId = 0;
+        try {
+            captureId = com.overdrive.app.surveillance.ScreenDeterrent
+                    .openInputCapture(request.optString("token", ""));
+            JSONObject response = new JSONObject();
+            response.put("success", captureId != 0);
+            out.println(response.toString());
+            if (captureId == 0 || out.checkError()) return;
+
+            // Poll daemon-side ownership so cleanup closes the peer even when
+            // the persisted UCM gate cannot be cleared. The Activity then
+            // releases input after its short visual-teardown grace instead of
+            // blocking the screen until its 60s absolute ceiling.
+            client.setSoTimeout(1_000);
+            while (com.overdrive.app.surveillance.ScreenDeterrent
+                    .isInputCaptureActive(captureId)) {
+                try {
+                    String message = in.readLine();
+                    if (message == null) break;
+                    if ("DISMISS".equals(message)) {
+                        com.overdrive.app.surveillance.ScreenDeterrent
+                                .dismissInputCapture(captureId);
+                    }
+                } catch (java.net.SocketTimeoutException idle) {
+                    // Expected while the focused Activity holds an idle socket.
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("Deterrent input-capture socket closed: " + e.getMessage());
+        } finally {
+            if (captureId != 0) {
+                com.overdrive.app.surveillance.ScreenDeterrent
+                        .closeInputCapture(captureId);
+            }
             try { client.close(); } catch (Exception ignored) {}
         }
     }
@@ -372,9 +422,9 @@ public class SurveillanceIpcServer implements Runnable {
                     response.put("config", getDefaultConfig());
                     break;
 
-                // Native About screen only: return the VIN already held by the daemon's
-                // bodywork snapshot. This deliberately has no HTTP route, so adding the
-                // optional identifier to About does not expose it through a tunnel/web UI.
+                // Device-local About screen: return the VIN already held by the daemon's
+                // bodywork snapshot over the existing localhost IPC boundary. This deliberately
+                // has no HTTP route, so the identifier is not exposed through a tunnel/web UI.
                 // The response is never logged; the app masks it until an explicit reveal.
                 case "GET_VEHICLE_IDENTITY": {
                     com.overdrive.app.byd.BydVehicleData data =

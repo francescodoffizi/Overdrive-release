@@ -393,6 +393,7 @@ object HotspotManager {
             append(" | awk '{print \$1}' | while read pid; do\n")
             append("  if [ \"\$pid\" != \"\$MY_PID\" ]; then kill -9 \$pid 2>/dev/null; fi\n")
             append("done\n")
+            append("if [ -f /data/local/tmp/singbox.disabled ]; then echo configured-stopped; exit 0; fi\n")
             append("test -x $bin || exit 3\n")
             append("nohup $bin run -c $cfgPath >/dev/null 2>&1 &\n")
             // `nohup ... &` reports success on fork, so verify the process survived —
@@ -402,7 +403,8 @@ object HotspotManager {
             append("ps -A -o ARGS 2>/dev/null | grep -F '$cfgPath' | grep -qv grep && echo applied\n")
         }
         val out = runShellScript(script)
-        val ok = out != null && out.contains("applied")
+        val ok = out != null &&
+            (out.contains("applied") || out.contains("configured-stopped"))
         if (ok) clientTunnelApplied = enable
         log.info(TAG, "client tunnel ${if (enable) "enabled" else "disabled"} -> $ok")
     }
@@ -431,13 +433,15 @@ object HotspotManager {
             append(" | awk '{print \$1}' | while read pid; do\n")
             append("  if [ \"\$pid\" != \"\$MY_PID\" ]; then kill -9 \$pid 2>/dev/null; fi\n")
             append("done\n")
+            append("if [ -f /data/local/tmp/singbox.disabled ]; then echo cleared-stopped; exit 0; fi\n")
             append("test -x $bin || exit 3\n")
             append("nohup $bin run -c $cfgPath >/dev/null 2>&1 &\n")
             append("sleep 2\n")
             append("ps -A -o ARGS 2>/dev/null | grep -F '$cfgPath' | grep -qv grep && echo cleared\n")
         }
         val out = runShellScript(script)
-        val ok = out != null && out.contains("cleared")
+        val ok = out != null &&
+            (out.contains("cleared") || out.contains("cleared-stopped"))
         // Only drop the flag once the rewrite is confirmed, so a failed teardown is
         // retried rather than remembered as done while :8122 still listens.
         if (ok) clientTunnelApplied = false
@@ -503,28 +507,21 @@ object HotspotManager {
             return
         }
 
-        // ORDER IS LOAD-BEARING: suppress the WiFi keep-alive watchdog BEFORE
-        // startTethering, or it re-enables the station link and kills the AP.
-        val priorSuppressed = UnifiedConfigManager.isWifiKeepAliveSuppressed()
-        val weOwnFlag = !priorSuppressed
-        if (weOwnFlag) {
-            // This write is load-bearing, and from the app UID it is an IPC to the
-            // daemon that can fail. Unchecked, a lost write leaves the keep-alive
-            // armed: it runs `svc wifi enable` within seconds and the station link
-            // kills the AP on this single-radio chip, so refuse to touch the radio.
-            val suppressed = try {
-                UnifiedConfigManager.setWifiKeepAliveSuppressed(true)
-            } catch (t: Throwable) {
-                log.warn(TAG, "keep-alive suppression write threw: ${t.message}")
-                false
-            }
-            if (!suppressed) {
-                synchronized(lock) { lastError = "could not suppress the WiFi keep-alive" }
-                publishState()
-                onResult?.invoke(false, "could not prepare the radio — try again")
-                return
-            }
+        // ORDER IS LOAD-BEARING: take the hotspot's independent suppression marker
+        // BEFORE startTethering, or keep-alive can re-enable the station link and kill
+        // the AP. Always take ownership even when the user currently keeps WiFi off:
+        // that preference may be changed while the hotspot is still active.
+        val suppressed = try {
             UnifiedConfigManager.updateHotspot(mapOf("suppressedByHotspot" to true))
+        } catch (t: Throwable) {
+            log.warn(TAG, "keep-alive suppression write threw: ${t.message}")
+            false
+        }
+        if (!suppressed) {
+            synchronized(lock) { lastError = "could not suppress the WiFi keep-alive" }
+            publishState()
+            onResult?.invoke(false, "could not prepare the radio — try again")
+            return
         }
 
         // Publish ENABLING before the blocking work below. The daemon's stale-
@@ -553,11 +550,8 @@ object HotspotManager {
 
         val ok = startTethering(ctx)
         if (!ok) {
-            // Never strand WiFi off: restore exactly the prior value.
-            if (weOwnFlag) {
-                UnifiedConfigManager.setWifiKeepAliveSuppressed(priorSuppressed)
-                UnifiedConfigManager.updateHotspot(mapOf("suppressedByHotspot" to false))
-            }
+            // Never strand the hotspot-owned guard; user intent is a separate key.
+            UnifiedConfigManager.updateHotspot(mapOf("suppressedByHotspot" to false))
             // Re-read the radio: we published ENABLING before blocking, and leaving
             // that behind would pin both UIs on "Starting…" with the toggle stuck on,
             // since a cold failure arms no sampler and no callback to correct it.
@@ -598,10 +592,8 @@ object HotspotManager {
         // the data call up for nothing.
         CellularRelay.stop()
 
-        // Only clear the suppression flag if the HOTSPOT set it — a user's
-        // deliberate "WiFi off" rule must survive a hotspot teardown.
+        // Clear only the hotspot marker; user/automation intent must survive teardown.
         if (UnifiedConfigManager.didHotspotSuppressWifiKeepAlive()) {
-            UnifiedConfigManager.setWifiKeepAliveSuppressed(false)
             UnifiedConfigManager.updateHotspot(mapOf("suppressedByHotspot" to false))
         }
         UnifiedConfigManager.updateHotspot(mapOf("enabled" to false))
@@ -806,7 +798,6 @@ object HotspotManager {
             return
         }
         if (UnifiedConfigManager.didHotspotSuppressWifiKeepAlive()) {
-            UnifiedConfigManager.setWifiKeepAliveSuppressed(false)
             UnifiedConfigManager.updateHotspot(mapOf("suppressedByHotspot" to false))
         }
         publishState()

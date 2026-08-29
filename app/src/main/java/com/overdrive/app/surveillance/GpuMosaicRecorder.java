@@ -169,7 +169,7 @@ public class GpuMosaicRecorder {
     // startRecording. Null = no override (default behaviour).
     private volatile java.io.File pendingOutputDirOverride = null;
     private volatile boolean apaMode = false;  // APA mode: passthrough instead of mosaic split
-    private volatile int cameraLayout = 0;  // 0=4-cam, 1=APA passthrough, 2=3-cam, 3=oem-parity passthrough
+    private volatile int cameraLayout = 0;  // 0=4-cam, 1=full-frame, 2=3-cam, 3=four-corner remap
     // Set when setCameraLayout flips on a non-GL thread; consumed inside
     // drawFrame on the encoder GL thread to push the new uniform exactly
     // once. Per GLES2 spec, uniform values are part of the program object,
@@ -358,9 +358,9 @@ public class GpuMosaicRecorder {
     //   - Legacy (uApaMode <= 0.5): vertex shader inverts V so the recorder
     //     samples top-of-producer at top-of-screen, identical to pre-Phase-2
     //     output.
-    //   - DiLink 4 (uApaMode > 2.5): uTexMatrix from SurfaceTexture already
-    //     contains the Android producer Y-flip, so we DON'T pre-flip — that
-    //     would double-flip and emit upside-down content.
+    //   - SurfaceTexture layouts 1 and 3: uTexMatrix already contains the
+    //     Android producer Y-flip, so we DON'T pre-flip — that would
+    //     double-flip and emit upside-down content.
     // Both branches yield the producer's top-of-image at top-of-screen.
     private static final float[] TEX_COORDS = {
         0.0f, 0.0f,  // Bottom-left vertex → bottom of texture
@@ -855,12 +855,11 @@ public class GpuMosaicRecorder {
         // frames pay zero uniform uploads + zero lock acquisitions.
         if (uniformsDirty.compareAndSet(true, false)) {
             if (uApplyManualYFlipLocation >= 0) {
-                // Legacy (cameraLayout != 3) → ImageReader output is canonical
-                // Y-up; we must manually flip V to put producer-top at screen-top.
-                // DiLink 4 (cameraLayout == 3) → SurfaceTexture matrix already
-                // contains the producer Y-flip; manual flip would double-flip.
+                // Layouts 1 and 3 consume SurfaceTexture output, whose matrix
+                // already contains the producer Y-flip. Layouts 0 and 2 use
+                // the legacy orientation and still need the manual flip.
                 GLES20.glUniform1f(uApplyManualYFlipLocation,
-                    cameraLayout == 3 ? 0.0f : 1.0f);
+                    (cameraLayout == 1 || cameraLayout == 3) ? 0.0f : 1.0f);
             }
             if (uProducerForFrontLocation >= 0) {
                 synchronized (producerCornerMapLock) {
@@ -1616,10 +1615,9 @@ public class GpuMosaicRecorder {
     /**
      * Sets the camera layout mode for the mosaic shader.
      * 0 = 4-camera mosaic (Seal: pano_h/pano_l, surfaceMode=0)
-     * 1 = APA passthrough (single pre-composited image, surfaceMode=1 with apa/byd_apa tag)
+     * 1 = full-frame APA passthrough (firmware-default preview port 0)
      * 2 = 3-camera mosaic (Atto 3 default: Rear, Side, Front)
-     * 3 = oem-parity passthrough — sample camera as-is, no rearrangement;
-     *     pairs with uTexMatrix from SurfaceTexture.getTransformMatrix().
+     * 3 = DiLink 4 four-corner producer remap.
      */
     public void setCameraLayout(int layout) {
         if (layout == this.cameraLayout) return;
@@ -2026,13 +2024,7 @@ public class GpuMosaicRecorder {
         //   1.0  APA passthrough: sample camera surface as-is.
         //   2.0  3-camera mosaic (Atto 3): rear=left half, front=top-right,
         //        left+right=bottom-right.
-        //   3.0  oem-parity passthrough: HAL emits the final 2x2 layout
-        //        natively; we sample with uTexMatrix in the vertex shader.
-        //        Per-quadrant 180° rotation on TR (Right) and BL (Rear)
-        //        mirrors oem's APARotateFilter (C7610c quadrantAngles
-        //        {0, 180, 180, 0}). Toggle via uRotateNonZeroQuads:
-        //          1.0 → rotate TR+BL by 180°
-        //          0.0 → no rotation (debug / variant fallback)
+        //   3.0  DiLink 4 four-corner producer remap.
         return String.format(Locale.US,
             "#extension GL_OES_EGL_image_external : require\n" +
             "precision mediump float;\n" +
@@ -2115,8 +2107,8 @@ public class GpuMosaicRecorder {
             "    float rearOffset  = %.5f;\n" +
             "    float leftOffset  = %.5f;\n" +
             "    if (uApaMode > 2.5) {\n" +
-            "        // DiLink 4 passthrough with per-output-corner producer\n" +
-            "        // remap + per-role X/Y flip. Each of the four output\n" +
+            "        // DiLink 4 per-output-corner producer remap + per-role\n" +
+            "        // X/Y flip. Each of the four output\n" +
             "        // corners (Front=TL, Right=TR, Rear=BL, Left=BR) reads\n" +
             "        // a configurable producer corner; X/Y flips are applied\n" +
             "        // within the role's local 0.5×0.5 region to un-mirror\n" +

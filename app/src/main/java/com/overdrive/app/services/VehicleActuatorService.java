@@ -16,11 +16,13 @@ import com.overdrive.app.R;
 import com.overdrive.app.byd.BydConstants;
 import com.overdrive.app.byd.BydDeviceHelper;
 import com.overdrive.app.byd.BydFeatureIds;
+import com.overdrive.app.byd.routing.DrivingSafetyGuard;
 import com.overdrive.app.logging.DaemonLogger;
 
 import java.lang.reflect.Method;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -48,11 +50,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@code action=mirror_auto_follow_up} + {@code enabled}=true|false;
  * {@code action=hud} + {@code level}=0..100 (brightness);
  * {@code action=hud_power} + {@code on}=true|false (the dedicated HUD switch);
- * {@code action=energy_mode} + {@code mode}=1..5 (powertrain EV/HEV). Mirror/HUD writes complete
- * inline; energy writes are serialized off the main thread and the service stops after bounded
- * readback verification.
+ * {@code action=ac_charge_current_limit} + {@code state}=1..5;
+ * {@code action=energy_mode} + {@code mode}=1..5 (powertrain EV/HEV). Mirror/HUD/current-limit
+ * writes are serialized off the main thread so their daemon-backed safety state can be rechecked
+ * immediately before actuation. Energy writes use their own serialized lane and bounded readback.
  */
-public final class VehicleActuatorService extends Service {
+public class VehicleActuatorService extends Service {
 
     private static final String TAG = "VehicleActuator";
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
@@ -87,6 +90,7 @@ public final class VehicleActuatorService extends Service {
     private final EnergyModeArbiter energyModeArbiter = new EnergyModeArbiter();
     private final EnergyModeQueue energyModeQueue = new EnergyModeQueue();
     private final AtomicInteger activeEnergyHalChains = new AtomicInteger();
+    private ExecutorService guardedActuatorExecutor;
     private ExecutorService energyExecutor;
     private ScheduledThreadPoolExecutor energyReconcileExecutor;
     private final Object energyReconcileLock = new Object();
@@ -99,15 +103,23 @@ public final class VehicleActuatorService extends Service {
     private volatile boolean destroyed;
     private volatile boolean foregroundStarted;
 
+    protected boolean supportsEnergyMode() {
+        return false;
+    }
+
     @Override public void onCreate() {
         super.onCreate();
-        energyExecutor = new ThreadPoolExecutor(
-                1, 1, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1),
-                r -> daemonThread(r, "ActuatorEnergy"), new ThreadPoolExecutor.AbortPolicy());
-        energyReconcileExecutor = new ScheduledThreadPoolExecutor(
-                1, r -> daemonThread(r, "ActuatorEnergyReconcile"),
-                new ThreadPoolExecutor.AbortPolicy());
-        energyReconcileExecutor.setRemoveOnCancelPolicy(true);
+        guardedActuatorExecutor = Executors.newSingleThreadExecutor(
+                r -> daemonThread(r, "ActuatorSafety"));
+        if (supportsEnergyMode()) {
+            energyExecutor = new ThreadPoolExecutor(
+                    1, 1, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1),
+                    r -> daemonThread(r, "ActuatorEnergy"), new ThreadPoolExecutor.AbortPolicy());
+            energyReconcileExecutor = new ScheduledThreadPoolExecutor(
+                    1, r -> daemonThread(r, "ActuatorEnergyReconcile"),
+                    new ThreadPoolExecutor.AbortPolicy());
+            energyReconcileExecutor.setRemoveOnCancelPolicy(true);
+        }
         createChannel();
         foregroundStarted = startForegroundCompat();
         if (!foregroundStarted) {
@@ -116,7 +128,7 @@ public final class VehicleActuatorService extends Service {
             }
             shutdownInstanceExecutors();
             stopSelf();
-        } else {
+        } else if (supportsEnergyMode()) {
             // Process-wide HAL work can outlive a service object. Adopt any active/pending chain so
             // recreation keeps the live foreground instance leased until that work settles.
             ENERGY_HAL_LANE.attachOwner(this);
@@ -151,6 +163,7 @@ public final class VehicleActuatorService extends Service {
         // starts are DUMP-permission-gated, a malformed shell/system bundle must not escape
         // onStartCommand and kill the process.
         String action = null;
+        boolean finishesAsync = false;
         try {
             if (!foregroundStarted) {
                 Log.e(TAG, "refusing actuation because foreground promotion failed");
@@ -158,24 +171,43 @@ public final class VehicleActuatorService extends Service {
             }
             if (intent == null) {
                 Log.w(TAG, "null start intent");
-                reconcilePersistedEnergyState();
+                if (supportsEnergyMode()) reconcilePersistedEnergyState();
                 return START_STICKY;
             }
             action = intent.getStringExtra("action");
             if ("mirror".equals(action)) {
                 boolean fold = intent.getBooleanExtra("fold", false);
-                logger.info("mirror fold=" + fold + " -> ok=" + setMirrorsFolded(fold));
+                finishesAsync = submitGuardedActuation(
+                        fold ? DrivingSafetyGuard.GUARD_MIRROR_FOLD : null,
+                        "mirror fold=" + fold,
+                        () -> logger.info(
+                                "mirror fold=" + fold + " -> ok=" + setMirrorsFolded(fold)));
             } else if ("mirror_auto_follow_up".equals(action)) {
                 boolean enabled = intent.getBooleanExtra("enabled", false);
                 logger.info("mirror auto follow-up enabled=" + enabled + " -> ok="
                         + setAutoExternalRearMirrorFollowUp(enabled));
             } else if ("hud".equals(action)) {
                 int level = intent.getIntExtra("level", -1);
-                Log.i(TAG, "hud level=" + level + " -> ok=" + setHud(level));
+                finishesAsync = submitGuardedActuation(
+                        DrivingSafetyGuard.GUARD_DISPLAY_BRIGHTNESS,
+                        "hud level=" + level,
+                        () -> Log.i(TAG, "hud level=" + level + " -> ok=" + setHud(level)));
             } else if ("hud_power".equals(action)) {
                 boolean on = intent.getBooleanExtra("on", false);
-                Log.i(TAG, "hud_power on=" + on + " -> ok=" + setHudPower(on));
-            } else if ("energy_mode".equals(action)) {
+                finishesAsync = submitGuardedActuation(
+                        on ? null : DrivingSafetyGuard.GUARD_DISPLAY_POWER,
+                        "hud_power on=" + on,
+                        () -> Log.i(TAG,
+                                "hud_power on=" + on + " -> ok=" + setHudPower(on)));
+            } else if ("ac_charge_current_limit".equals(action)) {
+                int state = parseBoundedIntExtra(
+                        intent.getStringExtra("state"),
+                        intent.getIntExtra("state", -1),
+                        com.overdrive.app.byd.BydDataCollector.AC_CHARGE_CURRENT_6A,
+                        com.overdrive.app.byd.BydDataCollector.AC_CHARGE_CURRENT_MAX);
+                Log.i(TAG, "ac_charge_current_limit state=" + state
+                        + " -> ok=" + setAcChargeCurrentLimit(state));
+            } else if (supportsEnergyMode() && "energy_mode".equals(action)) {
                 int mode = parseEnergyModeExtra(
                         intent.getStringExtra("mode"),
                         intent.getIntExtra("mode", -1));
@@ -185,12 +217,12 @@ public final class VehicleActuatorService extends Service {
                 boolean started = setEnergyMode(mode, sourceGeneration);
                 Log.i(TAG, "energy_mode mode=" + mode + " sourceGeneration=" + sourceGeneration
                         + " -> started=" + started);
-            } else if ("energy_mode_cancel".equals(action)) {
+            } else if (supportsEnergyMode() && "energy_mode_cancel".equals(action)) {
                 long sourceGeneration = parseEnergyGenerationExtra(
                         intent.getStringExtra("request_generation"), -1L);
                 Log.i(TAG, "energy_mode_cancel sourceGeneration=" + sourceGeneration
                         + " -> accepted=" + cancelEnergyMode(sourceGeneration));
-            } else if ("energy_mode_fence".equals(action)) {
+            } else if (supportsEnergyMode() && "energy_mode_fence".equals(action)) {
                 long sourceGeneration = parseEnergyGenerationExtra(
                         intent.getStringExtra("request_generation"), -1L);
                 Log.i(TAG, "energy_mode_fence sourceGeneration=" + sourceGeneration
@@ -201,10 +233,45 @@ public final class VehicleActuatorService extends Service {
         } catch (Throwable t) {
             Log.w(TAG, "actuation failed (" + action + "): " + t.getMessage());
         } finally {
-            finishStartCommand();
+            if (!finishesAsync) finishStartCommand();
         }
-        return action != null && action.startsWith("energy_mode")
+        return supportsEnergyMode() && action != null && action.startsWith("energy_mode")
                 ? START_REDELIVER_INTENT : START_NOT_STICKY;
+    }
+
+    private boolean submitGuardedActuation(
+            String guardKey, String description, Runnable actuation) {
+        ExecutorService executor = guardedActuatorExecutor;
+        if (executor == null || executor.isShutdown()) {
+            logger.warn("refusing " + description + ": actuator worker unavailable");
+            return false;
+        }
+        try {
+            executor.execute(() -> {
+                try {
+                    if (guardKey != null
+                            && isAppProcessActionBlocked(guardKey)) {
+                        logger.warn("blocked delayed app-process actuation: " + description);
+                        return;
+                    }
+                    actuation.run();
+                } catch (Throwable t) {
+                    logger.warn("app-process actuation failed (" + description + "): "
+                            + t.getMessage());
+                } finally {
+                    finishStartCommand();
+                }
+            });
+            return true;
+        } catch (Throwable unavailable) {
+            logger.warn("refusing " + description + ": "
+                    + unavailable.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    private static boolean isAppProcessActionBlocked(String guardKey) {
+        return DrivingSafetyGuard.isActionBlockedViaDaemon(guardKey);
     }
 
     /**
@@ -405,6 +472,19 @@ public final class VehicleActuatorService extends Service {
         }
     }
 
+    private static int parseBoundedIntExtra(
+            String stringValue, int legacyValue, int minimum, int maximum) {
+        int value = legacyValue;
+        if (stringValue != null) {
+            try {
+                value = Integer.parseInt(stringValue.trim());
+            } catch (NumberFormatException ignored) {
+                return -1;
+            }
+        }
+        return value >= minimum && value <= maximum ? value : -1;
+    }
+
     /**
      * Fold ({@code true}) / unfold ({@code false}) the exterior mirrors from the app process.
      *
@@ -420,6 +500,8 @@ public final class VehicleActuatorService extends Service {
         int code = Integer.MIN_VALUE;
         if (settingDevice != null) {
             // This is the same public set(int[], EventValue) shape used by DiCar's HalSetter.
+            if (fold && isAppProcessActionBlocked(
+                    DrivingSafetyGuard.GUARD_MIRROR_FOLD)) return false;
             code = BydDeviceHelper.sendSetCommandRaw(
                     settingDevice,
                     BydFeatureIds.SETTING_OUTSIDE_REARVIEW_MIRROR_FOLD_SET,
@@ -435,6 +517,8 @@ public final class VehicleActuatorService extends Service {
 
             // Bypass only the SDK wrapper's local feature-list validation; the manager/HAL still
             // receives the identical Setting device, feature id and value.
+            if (fold && isAppProcessActionBlocked(
+                    DrivingSafetyGuard.GUARD_MIRROR_FOLD)) return false;
             code = BydDeviceHelper.callSetSingle(
                     settingDevice,
                     BydFeatureIds.SETTING_OUTSIDE_REARVIEW_MIRROR_FOLD_SET,
@@ -452,6 +536,8 @@ public final class VehicleActuatorService extends Service {
         // callSetSingle already invokes manager.setInt. Use the manager directly only when the
         // singleton or its inherited protected setter was unavailable.
         if (settingDevice == null || code == -1 || code == Integer.MIN_VALUE) {
+            if (fold && isAppProcessActionBlocked(
+                    DrivingSafetyGuard.GUARD_MIRROR_FOLD)) return false;
             int managerCode = BydDeviceHelper.callManagerSetInt(
                     bydContext,
                     BydConstants.MIRROR_FOLD_SETTING_DEVICE_TYPE,
@@ -488,6 +574,8 @@ public final class VehicleActuatorService extends Service {
     private boolean setMirrorsFoldedViaLegacyBodywork(Context bydContext, boolean fold) {
         Object device = BydDeviceHelper.getDevice(BODYWORK_DEVICE, bydContext);
         if (device == null) {
+            if (fold && isAppProcessActionBlocked(
+                    DrivingSafetyGuard.GUARD_MIRROR_FOLD)) return false;
             int code = BydDeviceHelper.callManagerSetInt(
                     bydContext,
                     BODYWORK_DEVICE_TYPE,
@@ -502,6 +590,8 @@ public final class VehicleActuatorService extends Service {
         int val = fold ? 1 : 0;
         try {
             Method m = device.getClass().getMethod("setMirrorFoldState", int.class);
+            if (fold && isAppProcessActionBlocked(
+                    DrivingSafetyGuard.GUARD_MIRROR_FOLD)) return false;
             Object r = m.invoke(device, val);
             // CHECK the result. This used to `return true` on any non-throwing invoke, so a
             // HAL that refused the write (BODYWORK_COMMAND_FAILED = -2147482648, returned
@@ -524,6 +614,8 @@ public final class VehicleActuatorService extends Service {
         // event-value setter validates against a feature list that omits the mirror command.
         // The protected three-int setter is the compatible route used by newer-device wrappers.
         try {
+            if (fold && isAppProcessActionBlocked(
+                    DrivingSafetyGuard.GUARD_MIRROR_FOLD)) return false;
             int code = BydDeviceHelper.callSetSingle(
                     device, BydFeatureIds.MIRROR_REARVIEW_SET, val);
             logger.info("direct BODYWORK_REARVIEW_MIRROR_SET(" + val + ") -> code=" + code
@@ -535,6 +627,8 @@ public final class VehicleActuatorService extends Service {
 
         // Retain the standard public event-value API for firmware that advertises this command.
         try {
+            if (fold && isAppProcessActionBlocked(
+                    DrivingSafetyGuard.GUARD_MIRROR_FOLD)) return false;
             int code = BydDeviceHelper.sendSetCommandRaw(
                     device, BydFeatureIds.MIRROR_REARVIEW_SET, val);
             logger.info("public BODYWORK_REARVIEW_MIRROR_SET(" + val + ") -> code=" + code
@@ -598,6 +692,8 @@ public final class VehicleActuatorService extends Service {
         if (device == null) { Log.w(TAG, "setting device unavailable"); return false; }
         try {
             Method m = device.getClass().getMethod("setHUDBrightness", int.class);
+            if (isAppProcessActionBlocked(
+                    DrivingSafetyGuard.GUARD_DISPLAY_BRIGHTNESS)) return false;
             m.invoke(device, level);
             return true;
         } catch (NoSuchMethodException nsme) {
@@ -622,6 +718,8 @@ public final class VehicleActuatorService extends Service {
         Object device = com.overdrive.app.byd.BydDeviceHelper.getDevice(SETTING_DEVICE, getApplicationContext());
         if (device == null) { Log.w(TAG, "setting device unavailable"); return false; }
         int val = on ? 1 : 2; // OEM: 1=on, 2=off
+        if (!on && isAppProcessActionBlocked(
+                DrivingSafetyGuard.GUARD_DISPLAY_POWER)) return false;
         boolean ok = com.overdrive.app.byd.BydDeviceHelper.sendSetCommand(
                 device, com.overdrive.app.byd.BydFeatureIds.SETTING_HUD_SWITCH_SET, val);
         Log.i(TAG, "setHudPower SET_HUD_SWITCH_SET(" + val + ") accepted=" + ok);
@@ -629,17 +727,87 @@ public final class VehicleActuatorService extends Service {
     }
 
     /**
+     * Set the AC inlet current limit from the normal application Context.
+     *
+     * <p>The daemon performs the authoritative API readback. This local check is diagnostic and
+     * prevents the service log from claiming success solely because the SDK accepted the command.
+     */
+    private boolean setAcChargeCurrentLimit(int state) {
+        if (state < com.overdrive.app.byd.BydDataCollector.AC_CHARGE_CURRENT_6A
+                || state > com.overdrive.app.byd.BydDataCollector.AC_CHARGE_CURRENT_MAX
+                || !BydFeatureIds.isResolved(
+                        BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS_SET)
+                || !BydFeatureIds.isResolved(
+                        BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS)) {
+            return false;
+        }
+        Context bydContext = BydDeviceHelper.withBydPermissionBypass(getApplicationContext());
+        Object device = BydDeviceHelper.getDevice(SETTING_DEVICE, bydContext);
+        if (device == null) {
+            Log.w(TAG, "setting device unavailable for AC charge current limit");
+            return false;
+        }
+        int configState = readSettingInt(
+                device, BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_CONFIG_STATUS);
+        int currentState = readSettingInt(
+                device, BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS);
+        if (!Boolean.TRUE.equals(
+                com.overdrive.app.byd.BydDataCollector.resolveAcChargingCurrentLimitSupport(
+                        configState, currentState, null))) {
+            Log.w(TAG, "AC charge current limit read side did not prove capability"
+                    + " config=" + configState + " state=" + currentState);
+            return false;
+        }
+        boolean accepted = BydDeviceHelper.sendSetCommand(
+                device,
+                BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS_SET,
+                state);
+        if (!accepted) return false;
+
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                try {
+                    Thread.sleep(150L);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            int readBack = readSettingInt(
+                    device, BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS);
+            if (readBack == state) return true;
+        }
+        return false;
+    }
+
+    private static int readSettingInt(Object device, int featureId) {
+        if (device == null || !BydFeatureIds.isResolved(featureId)) {
+            return com.overdrive.app.byd.BydVehicleData.UNAVAILABLE;
+        }
+        try {
+            Object value = BydDeviceHelper.callGet(device, featureId, Integer.TYPE);
+            return value != null
+                    ? BydDeviceHelper.getIntValue(value)
+                    : com.overdrive.app.byd.BydVehicleData.UNAVAILABLE;
+        } catch (Throwable unavailable) {
+            return com.overdrive.app.byd.BydVehicleData.UNAVAILABLE;
+        }
+    }
+
+    /**
      * Powertrain mode (EV/HEV) via {@code BYDAutoEnergyDevice.setEnergyMode(int)}, run here in the
      * real app process with a handle resolved from {@code getApplicationContext()}.
      *
      * <p>Only in-domain values are written; {@code 0} (STOP) is refused because it is not a user
-     * powertrain preference. The result IS inspected, using the same convention as the daemon-side
-     * judge: compare against the device's own {@code ENERGY_COMMAND_SUCCESS} constant when the
-     * firmware exposes it, else accept any non-negative (documented failures are large negatives
-     * returned WITHOUT throwing). Hardcoding {@code == 0} here would report REFUSED for a success
-     * on any firmware whose SUCCESS constant is non-zero, disagreeing with the daemon's verdict on
-     * the identical write. A post-write read of the axis is the only evidence that distinguishes
-     * an accepted-and-applied write from an accepted-and-ignored one.
+     * powertrain preference. It is still a valid current readback while the car is stationary, so
+     * it must not block a requested EV/HEV transition. STOP is never armed as a rollback command.
+     * The result IS inspected, using the same convention as the daemon-side judge: compare against
+     * the device's own {@code ENERGY_COMMAND_SUCCESS} constant when the firmware exposes it, else
+     * accept any non-negative (documented failures are large negatives returned WITHOUT throwing).
+     * Hardcoding {@code == 0} here would report REFUSED for a success on any firmware whose SUCCESS
+     * constant is non-zero, disagreeing with the daemon's verdict on the identical write. A
+     * post-write read of the axis is the only evidence that distinguishes an
+     * accepted-and-applied write from an accepted-and-ignored one.
      *
      * <p>The write runs on one serialized executor, not {@code onStartCommand}'s main thread. A
      * generation ticket plus a one-slot conflating queue gives latest-request-wins behavior without
@@ -835,14 +1003,16 @@ public final class VehicleActuatorService extends Service {
 
     private static EnergyWriteResult writeEnergyModeDirect(EnergyHalTask task) {
         if (!isEnergyHalTaskCurrent(task)) return null;
+        Context bydContext =
+                BydDeviceHelper.withBydPermissionBypass(task.appContext);
         Object device = com.overdrive.app.byd.BydDeviceHelper.getDevice(
-                ENERGY_DEVICE, task.appContext);
+                ENERGY_DEVICE, bydContext);
         if (device == null) { Log.w(TAG, "energy device unavailable"); return null; }
         task.device = device;
         if (!isEnergyHalTaskCurrent(task)) return null;
         try {
             boolean activated = com.overdrive.app.byd.BydManagerChannel.enableDevice(
-                    task.appContext, device, "Energy");
+                    bydContext, device, "Energy");
             Log.i(TAG, "energy device activation=" + activated);
         } catch (Throwable t) {
             // The same activation step is advisory in collector init; the named setter may still
@@ -852,28 +1022,50 @@ public final class VehicleActuatorService extends Service {
         if (!isEnergyHalTaskCurrent(task)) return null;
 
         final boolean accepted;
+        String setterName = "setEnergyMode";
+        int setterValue = task.mode;
+        boolean preferenceAxis = false;
         if (!isEnergyHalTaskCurrent(task)) {
             Log.i(TAG, "energy_mode mode=" + task.mode + " sourceGeneration="
                     + task.sourceGeneration + " skipped: superseded before setter");
             return null;
         }
         try {
-            Method m = device.getClass().getMethod("setEnergyMode", int.class);
+            Method m = null;
+            int preference =
+                    com.overdrive.app.byd.VehicleActuatorBridge
+                            .mandatoryElectricStateForEnergyMode(task.mode);
+            if (preference > 0) {
+                int selectedMode = readEnergyMode(
+                        device, ENERGY_READ_TIMEOUT_MS, true);
+                if (isUserWritableEnergyMode(selectedMode)) {
+                    setterName = "setMandatoryElectricPreference";
+                    setterValue = preference;
+                    preferenceAxis = true;
+                } else {
+                    m = device.getClass().getMethod("setEnergyMode", int.class);
+                }
+            } else {
+                m = device.getClass().getMethod("setEnergyMode", int.class);
+            }
+            task.preferenceAxis = preferenceAxis;
             if (!task.compensation) {
                 if (!isEnergyHalTaskCurrent(task)) return null;
-                int previousMode = readEnergyMode(device, ENERGY_READ_TIMEOUT_MS);
+                int previousMode = readEnergyMode(
+                        device, ENERGY_READ_TIMEOUT_MS, preferenceAxis);
                 if (!isEnergyHalTaskCurrent(task)) return null;
-                if (previousMode < 1 || previousMode > 5) {
+                if (!isReadableEnergySourceMode(previousMode)) {
                     Log.w(TAG, "energy_mode mode=" + task.mode + " sourceGeneration="
                             + task.sourceGeneration
-                            + " skipped: pre-write axis unavailable for cancellation compensation");
+                            + " skipped: pre-write axis unavailable");
                     return null;
                 }
                 task.setPreviousMode(previousMode);
                 if (previousMode == task.mode) {
                     return new EnergyWriteResult(device, true);
                 }
-                if (!com.overdrive.app.byd.VehicleActuatorBridge.beginEnergyActuation(
+                if (isSafeEnergyRollbackMode(previousMode)
+                        && !com.overdrive.app.byd.VehicleActuatorBridge.beginEnergyActuation(
                         task.appContext,
                         task.sourceGeneration,
                         task.mode,
@@ -884,8 +1076,14 @@ public final class VehicleActuatorService extends Service {
                             + " skipped: rollback metadata was not durably confirmed");
                     return null;
                 }
+                if (!isSafeEnergyRollbackMode(previousMode)) {
+                    Log.i(TAG, "energy_mode mode=" + task.mode + " sourceGeneration="
+                            + task.sourceGeneration
+                            + " starting from STOP; rollback to STOP is intentionally disabled");
+                }
             } else {
-                int currentMode = readEnergyMode(device, ENERGY_READ_TIMEOUT_MS);
+                int currentMode = readEnergyMode(
+                        device, ENERGY_READ_TIMEOUT_MS, preferenceAxis);
                 if (currentMode == task.mode && isEnergyHalTaskCurrent(task)) {
                     task.markCompensationPreconfirmed();
                     return new EnergyWriteResult(device, true);
@@ -908,7 +1106,7 @@ public final class VehicleActuatorService extends Service {
                     return null;
                 }
             }
-            Object result = task.invokeSetter(m, device);
+            Object result = task.invokeSetter(m, device, setterValue);
             if (result == EnergyHalTask.INVOCATION_SKIPPED) {
                 Log.i(TAG, "energy_mode mode=" + task.mode + " sourceGeneration="
                         + task.sourceGeneration
@@ -916,14 +1114,15 @@ public final class VehicleActuatorService extends Service {
                 return null;
             }
             accepted = isWriteAccepted(device, result);
-            Log.i(TAG, "setEnergyMode(" + task.mode + ") sourceGeneration="
-                    + task.sourceGeneration + " returned " + result + " -> "
+            Log.i(TAG, setterName + "(" + setterValue + ") desiredMode=" + task.mode
+                    + " sourceGeneration=" + task.sourceGeneration
+                    + " returned " + result + " -> "
                     + (accepted ? "ACCEPTED" : "REFUSED"));
         } catch (NoSuchMethodException nsme) {
-            Log.w(TAG, "setEnergyMode absent on this trim");
+            Log.w(TAG, "compatible energy preference setter absent on this trim");
             return null;
         } catch (Throwable t) {
-            Log.w(TAG, "setEnergyMode failed: " + t.getMessage());
+            Log.w(TAG, setterName + " failed: " + t.getMessage());
             return null;
         }
         return new EnergyWriteResult(device, accepted);
@@ -1006,7 +1205,10 @@ public final class VehicleActuatorService extends Service {
             if (!isEnergyHalTaskCurrent(task)) return false;
             long remaining = deadline - SystemClock.elapsedRealtime();
             if (remaining <= 0L) break;
-            seen = readEnergyMode(device, Math.min(ENERGY_READ_TIMEOUT_MS, remaining));
+            seen = readEnergyMode(
+                    device,
+                    Math.min(ENERGY_READ_TIMEOUT_MS, remaining),
+                    task.preferenceAxis);
             if (!isEnergyHalTaskCurrent(task)) return false;
             if (seen == task.mode) {
                 Log.i(TAG, "setEnergyMode(" + task.mode + ") sourceGeneration="
@@ -1034,7 +1236,8 @@ public final class VehicleActuatorService extends Service {
         return false;
     }
 
-    private static int readEnergyMode(Object device, long timeoutMs) {
+    private static int readEnergyMode(
+            Object device, long timeoutMs, boolean preferenceAxis) {
         ThreadPoolExecutor executor = ENERGY_READ_EXECUTOR;
         if (executor == null || executor.isShutdown() || timeoutMs <= 0L) {
             return Integer.MIN_VALUE;
@@ -1044,7 +1247,8 @@ public final class VehicleActuatorService extends Service {
         }
         final Future<Integer> read;
         try {
-            read = executor.submit(() -> readEnergyModeDirect(device));
+            read = executor.submit(
+                    () -> readEnergyModeDirect(device, preferenceAxis));
         } catch (Throwable unavailable) {
             return Integer.MIN_VALUE;
         }
@@ -1070,7 +1274,13 @@ public final class VehicleActuatorService extends Service {
         }
     }
 
-    private static int readEnergyModeDirect(Object device) {
+    private static int readEnergyModeDirect(Object device, boolean preferenceAxis) {
+        if (preferenceAxis) {
+            return com.overdrive.app.byd.VehicleActuatorBridge
+                    .energyModeForMandatoryElectricState(
+                            com.overdrive.app.byd.VehicleActuatorBridge
+                                    .readMandatoryElectricState(device));
+        }
         try {
             Object result = device.getClass().getMethod("getEnergyMode").invoke(device);
             if (result instanceof Number) return ((Number) result).intValue();
@@ -1165,6 +1375,7 @@ public final class VehicleActuatorService extends Service {
         private final java.util.concurrent.locks.ReentrantLock invocationGate =
                 new java.util.concurrent.locks.ReentrantLock();
         volatile Object device;
+        volatile boolean preferenceAxis;
         private EnergyWriteResult result;
         private boolean completed;
         private volatile boolean cancelled;
@@ -1223,18 +1434,22 @@ public final class VehicleActuatorService extends Service {
             previousMode = mode;
         }
 
-        Object invokeSetter(Method method, Object target) throws Exception {
+        Object invokeSetter(Method method, Object target, int value) throws Exception {
             invocationGate.lock();
             try {
                 if (cancelled || !isEnergyHalTaskCurrent(this)) {
                     return INVOCATION_SKIPPED;
                 }
                 actuationStarted = true;
-                Object value = method.invoke(target, mode);
+                Object result = method != null
+                        ? method.invoke(target, value)
+                        : Integer.valueOf(
+                                com.overdrive.app.byd.VehicleActuatorBridge
+                                        .writeMandatoryElectricState(target, value));
                 if (cancelled || !isEnergyHalTaskCurrent(this)) {
                     if (!compensation) compensationRequired = true;
                 }
-                return value;
+                return result;
             } finally {
                 invocationGate.unlock();
             }
@@ -2081,6 +2296,14 @@ public final class VehicleActuatorService extends Service {
         return mode == 1 || mode == 3;
     }
 
+    static boolean isReadableEnergySourceMode(int mode) {
+        return mode >= 0 && mode <= 5;
+    }
+
+    static boolean isSafeEnergyRollbackMode(int mode) {
+        return mode >= 1 && mode <= 5;
+    }
+
     /** One pending request plus one drain owner; replacements never allocate executor work. */
     static final class EnergyModeQueue {
         static final class Offer {
@@ -2166,6 +2389,8 @@ public final class VehicleActuatorService extends Service {
     }
 
     private void shutdownInstanceExecutors() {
+        ExecutorService actuatorExecutor = guardedActuatorExecutor;
+        if (actuatorExecutor != null) actuatorExecutor.shutdownNow();
         ExecutorService executor = energyExecutor;
         if (executor != null) executor.shutdownNow();
         synchronized (energyReconcileLock) {

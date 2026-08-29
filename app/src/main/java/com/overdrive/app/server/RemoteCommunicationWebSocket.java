@@ -7,6 +7,7 @@ import com.overdrive.app.communication.RemoteCommunicationPolicy;
 import com.overdrive.app.communication.RemoteCommunicationSettings;
 import com.overdrive.app.communication.RemoteVoiceBridge;
 import com.overdrive.app.communication.RemoteVoiceController;
+import com.overdrive.app.communication.RemoteVoicePcmConverter;
 import com.overdrive.app.communication.VehicleCommunicationSafety;
 import com.overdrive.app.logging.DaemonLogger;
 
@@ -56,9 +57,12 @@ public final class RemoteCommunicationWebSocket {
             logger.warn("PTT WebSocket failed: " + error.getMessage());
             if (!session.stopRequested) session.requestStop("Connection lost");
         } finally {
-            ACTIVE.compareAndSet(session, null);
-            session.logPcmStats();
-            session.close();
+            try {
+                session.logPcmStats();
+                session.close();
+            } finally {
+                ACTIVE.compareAndSet(session, null);
+            }
         }
     }
 
@@ -66,7 +70,8 @@ public final class RemoteCommunicationWebSocket {
         private final Socket socket;
         private final Object outputLock = new Object();
         private volatile boolean stopRequested;
-        private volatile String stopReason = "Released";
+        private volatile boolean drainAudio;
+        private volatile String stopReason = "Connection closed";
         private InputStream input;
         private OutputStream output;
         private RemoteVoiceBridge bridge;
@@ -75,6 +80,8 @@ public final class RemoteCommunicationWebSocket {
         private long previousPcmAt;
         private long maxPcmGapMs;
         private long delayedPcmFrames;
+        private int maxPcmPeak;
+        private boolean cabinListenerPaused;
 
         Session(Socket socket) {
             this.socket = socket;
@@ -119,6 +126,8 @@ public final class RemoteCommunicationWebSocket {
                             RemoteCommunicationPolicy.MAX_SESSION_MS / 1000L));
 
             if (!awaitStartCommand()) return;
+            CabinAudioWebSocket.setTalkActive(true);
+            cabinListenerPaused = true;
 
             try {
                 bridge = RemoteVoiceBridge.connect(
@@ -130,6 +139,7 @@ public final class RemoteCommunicationWebSocket {
                 failAndClose(rejected.getMessage(), 1011);
                 return;
             }
+            if (stopRequested) return;
 
             long startedAt = System.currentTimeMillis();
             long lastAudioAt = startedAt;
@@ -148,6 +158,7 @@ public final class RemoteCommunicationWebSocket {
                 }
                 if (RemoteCommunicationPolicy.shouldStopForLimit(now - startedAt)) {
                     stopReason = "30 second limit reached";
+                    drainAudio = true;
                     break;
                 }
                 if (RemoteCommunicationPolicy.shouldStopForInactivity(now - lastAudioAt)) {
@@ -158,7 +169,7 @@ public final class RemoteCommunicationWebSocket {
                 Frame frame;
                 try {
                     frame = readFrame(input);
-                } catch (SocketTimeoutException timeout) {
+                } catch (IdleReadTimeout timeout) {
                     continue;
                 } catch (IOException disconnected) {
                     if (stopRequested) break;
@@ -177,6 +188,7 @@ public final class RemoteCommunicationWebSocket {
                     JSONObject command = new JSONObject(text);
                     if ("stop".equals(command.optString("type"))) {
                         stopReason = command.optString("reason", "Released");
+                        drainAudio = isGracefulStopReason(stopReason);
                         break;
                     }
                     continue;
@@ -189,6 +201,10 @@ public final class RemoteCommunicationWebSocket {
                     throw new IOException("Invalid PCM WebSocket frame");
                 }
                 bridge.sendPcm(frame.payload);
+                maxPcmPeak = Math.max(
+                        maxPcmPeak,
+                        RemoteVoicePcmConverter.peakAbsoluteSample(
+                                frame.payload, frame.payload.length));
                 long receivedAt = System.currentTimeMillis();
                 if (previousPcmAt > 0L) {
                     long gapMs = receivedAt - previousPcmAt;
@@ -201,10 +217,14 @@ public final class RemoteCommunicationWebSocket {
                 lastAudioAt = receivedAt;
             }
 
-            sendJson(new JSONObject()
-                    .put("type", "stopped")
-                    .put("reason", stopReason));
-            sendClose(1000, stopReason);
+            try {
+                sendJson(new JSONObject()
+                        .put("type", "stopped")
+                        .put("reason", stopReason));
+                sendClose(1000, stopReason);
+            } catch (IOException ignored) {
+                // The browser may close immediately after its stop command.
+            }
         }
 
         void logPcmStats() {
@@ -212,7 +232,8 @@ public final class RemoteCommunicationWebSocket {
             logger.info("PTT network stats: frames=" + pcmFrames
                     + ", bytes=" + pcmBytes
                     + ", maxGapMs=" + maxPcmGapMs
-                    + ", delayedFrames=" + delayedPcmFrames);
+                    + ", delayedFrames=" + delayedPcmFrames
+                    + ", maxPeak=" + maxPcmPeak);
         }
 
         private boolean awaitStartCommand() throws Exception {
@@ -221,7 +242,7 @@ public final class RemoteCommunicationWebSocket {
                 Frame frame;
                 try {
                     frame = readFrame(input);
-                } catch (SocketTimeoutException timeout) {
+                } catch (IdleReadTimeout timeout) {
                     continue;
                 }
                 if (frame == null || frame.opcode == 0x8) return false;
@@ -253,6 +274,8 @@ public final class RemoteCommunicationWebSocket {
                     sendJson(new JSONObject()
                             .put("type", "receiver-muted")
                             .put("muted", control.endsWith("1")));
+                } else if (control.startsWith("DIAG:")) {
+                    logger.info("Receiver " + control.substring(5));
                 } else if ("STOP".equals(control)) {
                     requestStop("Stopped in the car");
                 }
@@ -265,6 +288,7 @@ public final class RemoteCommunicationWebSocket {
 
         void requestStop(String reason) {
             stopRequested = true;
+            drainAudio = false;
             if (reason != null && !reason.trim().isEmpty()) stopReason = reason;
             try { socket.shutdownInput(); } catch (Throwable ignored) {}
         }
@@ -278,8 +302,21 @@ public final class RemoteCommunicationWebSocket {
         }
 
         void close() {
-            if (bridge != null) bridge.close();
+            if (bridge != null) bridge.close(shouldDrainAudio());
+            if (cabinListenerPaused) {
+                CabinAudioWebSocket.setTalkActive(false);
+                cabinListenerPaused = false;
+            }
             try { socket.close(); } catch (Throwable ignored) {}
+        }
+
+        private boolean shouldDrainAudio() {
+            return drainAudio;
+        }
+
+        private static boolean isGracefulStopReason(String reason) {
+            return "Released".equals(reason)
+                    || "30 second limit reached".equals(reason);
         }
 
         private void sendJson(JSONObject object) throws IOException {
@@ -329,8 +366,19 @@ public final class RemoteCommunicationWebSocket {
         }
     }
 
+    private static final class IdleReadTimeout extends SocketTimeoutException {
+        IdleReadTimeout() {
+            super("No WebSocket frame started before the idle timeout");
+        }
+    }
+
     private static Frame readFrame(InputStream input) throws IOException {
-        int first = input.read();
+        int first;
+        try {
+            first = input.read();
+        } catch (SocketTimeoutException timeout) {
+            throw new IdleReadTimeout();
+        }
         if (first < 0) return null;
         int second = input.read();
         if (second < 0) throw new EOFException();

@@ -3,6 +3,8 @@ package com.overdrive.app.services;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
 import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
@@ -35,7 +37,24 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
 
     private static final String TAG = "KeepAliveA11y";
 
-    private static KeepAliveAccessibilityService instance;
+    // volatile: written on the main thread in onServiceConnected/onUnbind/onDestroy,
+    // read from callers on other threads (the setup wizard's autostart button).
+    private static volatile KeepAliveAccessibilityService instance;
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    /** The bound service, or null when the a11y service isn't enabled or connected. */
+    public static KeepAliveAccessibilityService getInstance() {
+        return instance;
+    }
+
+    /**
+     * Result of a deliberate, button-triggered autostart-enable run. Delivered on the
+     * main thread so UI callers can update views directly.
+     */
+    public interface Callback {
+        void onResult(boolean success, AutoStartEnabler.Result result);
+    }
 
     public static boolean isRunning() {
         return instance != null;
@@ -322,6 +341,55 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         }
     }
 
+    /**
+     * Drive {@link AutoStartEnabler} once, off the main thread, reporting the outcome back
+     * on it.
+     *
+     * <p>Triggered deliberately from the setup wizard's button and never automatically. An
+     * earlier version ran it from onServiceConnected, which re-fired on every reconnect and
+     * app-churn and repeatedly popped BYD's dialog in the user's face. Single-flight is
+     * enforced inside the enabler, so a double-tap cannot double-run.
+     */
+    public void runAutoStartEnabler(final Callback callback) {
+        try {
+            final AutoStartEnabler enabler = new AutoStartEnabler(this);
+            Thread worker = new Thread(() -> {
+                AutoStartEnabler.Result result = null;
+                try {
+                    result = enabler.run();
+                } catch (Throwable t) {
+                    Log.w(TAG, "runAutoStartEnabler worker threw: " + t);
+                }
+                final AutoStartEnabler.Result fResult = result;
+                final boolean success = result == AutoStartEnabler.Result.SUCCESS
+                        || result == AutoStartEnabler.Result.ALREADY_OFF;
+                mainHandler.post(() -> {
+                    if (callback == null) return;
+                    try {
+                        callback.onResult(success, fResult);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "AutoStartEnabler callback threw: " + t);
+                    }
+                });
+            }, "autostart-enabler");
+            worker.start();
+        } catch (Throwable t) {
+            Log.w(TAG, "runAutoStartEnabler failed to start worker: " + t);
+            if (callback != null) {
+                mainHandler.post(() -> callback.onResult(false, null));
+            }
+        }
+    }
+
+    @Override
+    public boolean onUnbind(Intent intent) {
+        Log.i(TAG, "AccessibilityService unbound — clearing instance");
+        // Only if it is still OURS: a reconnect can construct the new instance before the old
+        // one unbinds, and an unguarded null would erase the live service's registration.
+        if (instance == this) instance = null;
+        return super.onUnbind(intent);
+    }
+
     @Override
     public void onInterrupt() {
         // No-op
@@ -330,7 +398,16 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
     @Override
     public void onDestroy() {
         Log.w(TAG, "AccessibilityService destroyed — attempting restart");
-        instance = null;
+        if (instance == this) instance = null;
+
+        // Non-daemon single-thread pool with no core timeout: every disable/re-enable cycle
+        // that captured a position would otherwise strand one more idle thread for the life
+        // of the process.
+        try {
+            captureExecutor.shutdown();
+        } catch (Throwable t) {
+            Log.w(TAG, "captureExecutor shutdown failed: " + t.getMessage());
+        }
 
         // Clear transient key-gesture state so a gesture torn down mid-flight
         // (service destroyed between a promoting DOWN and its UP) can't strand a

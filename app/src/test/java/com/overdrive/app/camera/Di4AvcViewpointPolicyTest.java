@@ -23,6 +23,17 @@ public class Di4AvcViewpointPolicyTest {
     }
 
     @Test
+    public void passiveApaModeIsOptInAndDilink4Only() {
+        assertTrue(Di4AvcViewpointPolicy.isPassiveApaModeEnabled("dilink4", true));
+        assertTrue(Di4AvcViewpointPolicy.isPassiveApaModeEnabled("DiLink4", true));
+        assertFalse(Di4AvcViewpointPolicy.isPassiveApaModeEnabled("dilink4", false));
+        assertFalse(Di4AvcViewpointPolicy.isPassiveApaModeEnabled("default", true));
+        assertEquals(1, Di4AvcViewpointPolicy.cameraLayoutMode("dilink4", true));
+        assertEquals(3, Di4AvcViewpointPolicy.cameraLayoutMode("dilink4", false));
+        assertEquals(0, Di4AvcViewpointPolicy.cameraLayoutMode("default", true));
+    }
+
+    @Test
     public void dilink4YieldsToForegroundAvcAndRestoresAfterItLeaves() {
         Di4AvcViewpointPolicy policy = new Di4AvcViewpointPolicy();
         policy.beginSession(true);

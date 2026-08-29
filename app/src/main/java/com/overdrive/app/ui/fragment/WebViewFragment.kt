@@ -1,6 +1,8 @@
 package com.overdrive.app.ui.fragment
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.Uri
 import android.os.Bundle
@@ -8,6 +10,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -17,6 +20,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import com.google.android.material.button.MaterialButton
 import com.overdrive.app.R
@@ -397,6 +401,8 @@ class WebViewFragment : Fragment() {
     // GetContent is single-select. The web <input> doesn't carry `multiple`
     // either, so there's no UX regression.
     private lateinit var fileChooserLauncher: ActivityResultLauncher<String>
+    private lateinit var audioPermissionLauncher: ActivityResultLauncher<String>
+    private var pendingAudioPermissionRequest: PermissionRequest? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -406,6 +412,24 @@ class WebViewFragment : Fragment() {
             val result = if (uri == null) null else arrayOf(uri)
             pendingFileCallback?.onReceiveValue(result)
             pendingFileCallback = null
+        }
+        audioPermissionLauncher = registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            val request = pendingAudioPermissionRequest
+            pendingAudioPermissionRequest = null
+            if (request == null) return@registerForActivityResult
+            try {
+                if (granted && isTrustedAssistantAudioRequest(request)) {
+                    request.grant(arrayOf(
+                        PermissionRequest.RESOURCE_AUDIO_CAPTURE
+                    ))
+                } else {
+                    request.deny()
+                }
+            } catch (_: Throwable) {
+                try { request.deny() } catch (_: Throwable) {}
+            }
         }
     }
 
@@ -467,13 +491,14 @@ class WebViewFragment : Fragment() {
             // the file the user just picked in the system picker.
             settings.allowContentAccess = true
             settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            // Respect server Cache-Control headers. The daemon serves HTML with no-store,
-            // and shared static assets (CSS/JS/fonts/icons, ~360KB total) with
-            // "max-age=300, must-revalidate" plus an ETag — so HTML is always fresh, assets
-            // are not re-downloaded on every page load, and a pushed asset change is picked
-            // up on the next revalidation (a 304 when unchanged) instead of being stuck.
-            // This used to be a 24h max-age with no validator, which is what made a
-            // freshly-deployed /shared/app-shell.js invisible for up to a day.
+            // Respect server Cache-Control headers. The daemon serves HTML with no-store and
+            // shared static assets (CSS/JS/fonts/icons, ~360KB total) with
+            // "max-age=3600, must-revalidate" plus an ETag, so HTML is always fresh and assets
+            // are not re-downloaded on every page load.
+            //
+            // Note the ETag does NOT help here: the proxy path below strips If-None-Match, so
+            // this client can never get a 304 and each expiry costs the full body. max-age is
+            // the only lever in-app, which is why it is an hour rather than minutes.
             settings.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
             settings.loadWithOverviewMode = true
             settings.useWideViewPort = true
@@ -504,8 +529,7 @@ class WebViewFragment : Fragment() {
                         url.contains("localhost:${CameraDaemon.HTTP_PORT}")
                     
                     // Bypass proxy for map tiles and CDN resources (sing-box proxy blocks these)
-                    val isMapTile = url.contains("tile.openstreetmap.org") ||
-                        url.contains("basemaps.cartocdn.com") ||
+                    val isMapTile = url.contains("tile.openstreetmap.de") ||
                         url.contains("unpkg.com") ||
                         url.contains("cdn.jsdelivr.net") ||
                         url.contains("fonts.googleapis.com") ||
@@ -1029,11 +1053,53 @@ class WebViewFragment : Fragment() {
                         false
                     }
                 }
+
+                override fun onPermissionRequest(request: PermissionRequest?) {
+                    if (request == null
+                            || !isTrustedAssistantAudioRequest(request)) {
+                        request?.deny()
+                        return
+                    }
+                    if (ContextCompat.checkSelfPermission(
+                            requireContext(),
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED) {
+                        request.grant(arrayOf(
+                            PermissionRequest.RESOURCE_AUDIO_CAPTURE
+                        ))
+                        return
+                    }
+                    pendingAudioPermissionRequest?.deny()
+                    pendingAudioPermissionRequest = request
+                    audioPermissionLauncher.launch(
+                        Manifest.permission.RECORD_AUDIO
+                    )
+                }
             }
 
             // Native bridge for direct HTTP calls bypassing proxy
             addJavascriptInterface(ProxyBypassBridge(), "AndroidBridge")
         }
+    }
+
+    private fun isTrustedAssistantAudioRequest(
+        request: PermissionRequest
+    ): Boolean {
+        val resources = request.resources ?: return false
+        if (!resources.contains(
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+            return false
+        }
+        val origin = request.origin ?: return false
+        if (origin.host != "127.0.0.1"
+                && origin.host != "localhost") {
+            return false
+        }
+        val page = Uri.parse(webView?.url ?: currentUrl ?: return false)
+        return (page.host == "127.0.0.1"
+                || page.host == "localhost")
+                && (page.path == "/assistant"
+                || page.path == "/assistant.html")
     }
 
     /**
@@ -1292,8 +1358,13 @@ class WebViewFragment : Fragment() {
                 conn = url.openConnection(java.net.Proxy.NO_PROXY) as java.net.HttpURLConnection
                 conn.requestMethod = method
                 val isBydCloudApi = url.path.startsWith("/api/bydcloud")
+                val isGenAiApi = url.path.startsWith("/api/genai/")
                 conn.connectTimeout = if (isBydCloudApi) 10000 else 8000
-                conn.readTimeout = if (isBydCloudApi) 60000 else 10000
+                conn.readTimeout = when {
+                    isGenAiApi -> 130000
+                    isBydCloudApi -> 60000
+                    else -> 10000
+                }
                 conn.instanceFollowRedirects = false
 
                 // Parse and set headers
@@ -1345,6 +1416,59 @@ class WebViewFragment : Fragment() {
                 return "{\"_status\":0,\"error\":\"${e.message?.replace("\"", "'") ?: "unknown"}\"}"
             } finally {
                 conn?.disconnect()
+            }
+        }
+
+        /**
+         * Long GenAI calls must not block Chrome 58's JavaScript thread. The
+         * normal write bridge is synchronous, so the Assistant uses this
+         * narrowly-scoped asynchronous variant and receives one quoted callback.
+         */
+        @android.webkit.JavascriptInterface
+        fun httpRequestAsync(
+            urlStr: String,
+            method: String,
+            body: String,
+            headers: String,
+            callbackId: String
+        ) {
+            if (!callbackId.matches(Regex("[A-Za-z0-9_-]{1,64}"))) return
+            val allowed = try {
+                val url = java.net.URL(urlStr)
+                (url.host == "127.0.0.1" || url.host == "localhost") &&
+                    (url.port == -1 || url.port == CameraDaemon.HTTP_PORT) &&
+                    url.path.startsWith("/api/genai/")
+            } catch (_: Exception) {
+                false
+            }
+            if (!allowed) {
+                deliverAsyncHttpResponse(
+                    callbackId,
+                    "{\"_status\":403,\"error\":\"Request not allowed\"}"
+                )
+                return
+            }
+            Thread({
+                deliverAsyncHttpResponse(
+                    callbackId,
+                    httpRequest(urlStr, method, body, headers)
+                )
+            }, "GenAiWebRequest").apply {
+                isDaemon = true
+                start()
+            }
+        }
+
+        private fun deliverAsyncHttpResponse(callbackId: String, raw: String) {
+            val script = "window.GenAI&&GenAI.onNativeResponse(" +
+                org.json.JSONObject.quote(callbackId) + "," +
+                org.json.JSONObject.quote(raw) + ");"
+            webView?.post {
+                try {
+                    webView?.evaluateJavascript(script, null)
+                } catch (_: Throwable) {
+                    // Page was closed while the provider request was finishing.
+                }
             }
         }
     }
@@ -1625,6 +1749,8 @@ class WebViewFragment : Fragment() {
         // doesn't hang onto a dangling handle.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
+        pendingAudioPermissionRequest?.deny()
+        pendingAudioPermissionRequest = null
 
         webView?.let { wv ->
             // Stop any media playback and clear content before destroying

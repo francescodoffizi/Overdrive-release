@@ -136,15 +136,6 @@ public class StatusOverlayService extends Service {
     private volatile boolean accOn = false;
     // User-controlled audio toggle (recording.audioEnabled in unified config)
     private volatile boolean audioEnabledConfig = false;
-    // The capture controller. Touched from the polling executor (reconcile)
-    // and from the main thread (onDestroy) — must be volatile so the destroy
-    // path observes any in-flight assignment from the executor.
-    //
-    // Note on idempotency: AppAudioCaptureController.stop() is synchronized
-    // and short-circuits when not running, so the onDestroy stop() and any
-    // racing reconcile stop() are safe to call independently. start() and
-    // stop() are both synchronized on the controller so they serialize.
-    private volatile com.overdrive.app.audio.AppAudioCaptureController audioController;
 
     // Single shared Runnable for the poll-loop reschedule. Used so we
     // can call `handler.removeCallbacks(pollRunnable)` to drop the
@@ -315,6 +306,7 @@ public class StatusOverlayService extends Service {
             String target = intent.getStringExtra("target");
             boolean headUnit = target == null || !"cluster".equals(target);
             camViewWantsClose = active && headUnit;
+            closeEdgeAtMs = android.os.SystemClock.elapsedRealtime();
             // Adopt the rect carried on the show edge BEFORE reconciling, so the ✕ is
             // placed clear of the card on its very first frame rather than waiting for
             // the next /status poll to correct it.
@@ -340,6 +332,7 @@ public class StatusOverlayService extends Service {
             String target = intent.getStringExtra("target");
             boolean headUnit = target == null || !"cluster".equals(target);
             bsCardWantsClose = active && headUnit;
+            closeEdgeAtMs = android.os.SystemClock.elapsedRealtime();
             // See camCloseReceiver: adopt the show-edge rect before reconciling.
             adoptLaneRectFromIntent(intent);
             reconcileCloseButtons();
@@ -367,8 +360,44 @@ public class StatusOverlayService extends Service {
     // entirely. The camera view escaped it only because its default corner is "center".
     // These hold the daemon's live lane rect in PANEL PX (null = unknown → fixed corner).
     private volatile int[] laneRectPx = null;
+    // Monotonic (elapsedRealtime) instant of the last SHOW-EDGE rect adoption
+    // (adoptLaneRectFromIntent). The /status poll may only overwrite the rect from a
+    // response FETCHED AFTER this instant PLUS a settle window: a response fetched
+    // before the edge carries the PREVIOUS program's rect, and one fetched shortly
+    // AFTER the edge can still carry stale daemon truth — the daemon's shared rect
+    // and target fields only converge on the arbiter's transition tick (≤250ms), so
+    // an in-window response could jostle the ✕ or NULL the rect (a lagging cluster
+    // target suppresses laneRect entirely). Real rect changes always ride their own
+    // edge broadcast, and the poll is only the catch-up for DROPPED edges (3s/30s
+    // cadence), so deferring poll adoption 1.5s past a RECEIVED edge costs nothing.
+    // 0 = no edge rect yet (poll adopts freely). Same stale-snapshot discipline as
+    // the tap-settle windows above.
+    private volatile long laneRectEdgeAdoptedAtMs = 0L;
+    private static final long LANE_RECT_EDGE_SETTLE_MS = 1500L;
+    // Monotonic instant of the last ✕ show/hide EDGE broadcast (either channel).
+    // The /status poll may only overwrite the per-channel wants-close flags from a
+    // response FETCHED after this instant plus the settle window. The daemon's
+    // bsCardShowing keys on laneProgram, which enableCamView wipes to PROG_NONE
+    // while the BLIND-SPOT card may still be on screen (its own javadoc documents
+    // that the shared layer's visibility flag cannot distinguish the programs) —
+    // a poll built in that ≤250ms window reports bsCardShowing=false +
+    // camViewActive=true, and adopting it swapped the visible blind-spot ✕ for
+    // the camera ✕ until the NEXT poll (3s/30s) corrected it; tapping that ✕
+    // hid the camview request instead of the card the user was looking at. The
+    // edges are authoritative and immediate; the poll is only the catch-up for
+    // DROPPED edges, so deferring its adoption 1.5s past a received edge is free.
+    private volatile long closeEdgeAtMs = 0L;
+    private static final long CLOSE_EDGE_SETTLE_MS = 1500L;
+    // ✕ spec (operator, audit round 22): 32dp button, 4dp outside the card's
+    // top-right edge. OUTSIDE is a hard constraint, not a preference — the card's
+    // SurfaceControl layer composites above every app window, so an inside ✕ is
+    // occluded (tappable but invisible). positionCloseParams' preference cascade
+    // already anchors at the top-right-outside corner and only falls back
+    // (left/below/inner) when the card is flush against screen edges.
     /** Gap between the card edge and the ✕, in dp. */
-    private static final int CLOSE_BTN_GAP_DP = 8;
+    private static final int CLOSE_BTN_GAP_DP = 4;
+    /** ✕ button diameter, in dp. Every sizing site derives from this. */
+    private static final int CLOSE_BTN_SIZE_DP = 32;
 
     /**
      * Place the ✕ params just OUTSIDE the card's rect so the SurfaceControl layer can't
@@ -381,7 +410,7 @@ public class StatusOverlayService extends Service {
     private void positionCloseParams(WindowManager.LayoutParams p) {
         if (p == null) return;
         final int gap = camDp(CLOSE_BTN_GAP_DP);
-        final int size = camDp(40);
+        final int size = camDp(CLOSE_BTN_SIZE_DP);
         final int inset = camDp(16);
         int[] r = laneRectPx;
         if (r == null) { p.x = inset; p.y = inset; return; }
@@ -431,6 +460,9 @@ public class StatusOverlayService extends Service {
         if (w <= 0 || h <= 0) return;   // degenerate: keep whatever we had
         laneRectPx = new int[]{ intent.getIntExtra("rectX", 0),
                                 intent.getIntExtra("rectY", 0), w, h };
+        // Stamp the adoption so an older in-flight /status response (fetched before
+        // this edge, parsed after) cannot overwrite the fresh rect with a stale one.
+        laneRectEdgeAdoptedAtMs = android.os.SystemClock.elapsedRealtime();
     }
 
     /** Re-apply {@link #positionCloseParams} to whichever ✕ is attached (main thread). */
@@ -716,7 +748,7 @@ public class StatusOverlayService extends Service {
         TextView tv = new TextView(this);
         tv.setText("✕"); // ✕
         tv.setTextColor(android.graphics.Color.WHITE);
-        tv.setTextSize(20);
+        tv.setTextSize(16);   // scaled with the 32dp button (was 20 at 40dp)
         tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         tv.setGravity(Gravity.CENTER);
         android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
@@ -724,12 +756,12 @@ public class StatusOverlayService extends Service {
         bg.setColor(android.graphics.Color.parseColor("#CC000000"));
         bg.setStroke(2, android.graphics.Color.parseColor("#80FFFFFF"));
         tv.setBackground(bg);
-        int pad = camDp(6);
+        int pad = camDp(5);   // scaled with the 32dp button (was 6 at 40dp)
         tv.setPadding(pad, pad, pad, pad);
         tv.setOnClickListener(v -> onCamCloseTapped());
         camCloseButton = tv;
 
-        int size = camDp(40);
+        int size = camDp(CLOSE_BTN_SIZE_DP);
         camCloseParams = new WindowManager.LayoutParams(
                 size, size,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -831,7 +863,7 @@ public class StatusOverlayService extends Service {
         TextView tv = new TextView(this);
         tv.setText("✕");
         tv.setTextColor(android.graphics.Color.WHITE);
-        tv.setTextSize(20);
+        tv.setTextSize(16);   // scaled with the 32dp button (was 20 at 40dp)
         tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         tv.setGravity(Gravity.CENTER);
         android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
@@ -839,12 +871,12 @@ public class StatusOverlayService extends Service {
         bg.setColor(android.graphics.Color.parseColor("#CC000000"));
         bg.setStroke(2, android.graphics.Color.parseColor("#80FFFFFF"));
         tv.setBackground(bg);
-        int pad = camDp(6);
+        int pad = camDp(5);   // scaled with the 32dp button (was 6 at 40dp)
         tv.setPadding(pad, pad, pad, pad);
         tv.setOnClickListener(v -> onBsCloseTapped());
         bsCloseButton = tv;
 
-        int size = camDp(40);
+        int size = camDp(CLOSE_BTN_SIZE_DP);
         bsCloseParams = new WindowManager.LayoutParams(
                 size, size,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -936,11 +968,8 @@ public class StatusOverlayService extends Service {
         running.set(false);
         handler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
-        com.overdrive.app.audio.AppAudioCaptureController ctrl = audioController;
-        audioController = null;
-        if (ctrl != null) {
-            try { ctrl.stop(); } catch (Exception ignored) {}
-        }
+        com.overdrive.app.audio.AppAudioCaptureController
+                .setRecordingDemand(false);
         // Tear down the camera-view close button + its receiver.
         if (camCloseReceiverRegistered) {
             try { unregisterReceiver(camCloseReceiver); } catch (Throwable ignored) {}
@@ -1699,67 +1728,34 @@ public class StatusOverlayService extends Service {
                 || configuredMode.equals("DRIVE_MODE")
                 || configuredMode.equals("PROXIMITY_GUARD"));
 
-        // Source of truth for "is capture happening" is the controller
-        // itself. We used to mirror it in an audioActive boolean, which
-        // desynced after fast user toggles (off-poll calls stop, the next
-        // on-poll's start hits back-off and returns false, but our flag
-        // was already cleared) — losing the back-off-retry signal entirely.
-        com.overdrive.app.audio.AppAudioCaptureController ctrl = audioController;
-        boolean isCapturing = ctrl != null && ctrl.isRunning();
+        boolean wasCapturing =
+                com.overdrive.app.audio.AppAudioCaptureController
+                        .isRecordingCaptureRunning();
+        if (shouldCapture && !running.get()) return;
 
-        if (shouldCapture && !isCapturing) {
-            // Bail if the service is shutting down. onDestroy can land
-            // between the isCapturing read above and the new-controller
-            // start below — without this guard a fresh AudioRecord
-            // would be created AFTER onDestroy nulled audioController,
-            // and the new mic capture would have no live owner to stop
-            // it (privacy indicator stuck on until process death).
-            if (!running.get()) return;
-            // Tear down any dead-but-not-stopped controller before
-            // creating a new one. A worker thread that self-exited (drain
-            // socket reset, encoder error, etc.) leaves running=false but
-            // the controller's internal `started` CAS gate is still true,
-            // so subsequent start() calls would silently reject. Calling
-            // stop() resets that gate and releases the half-allocated
-            // resources. stop() is idempotent + cheap when state is
-            // already clean.
-            if (ctrl != null) {
-                ctrl.stop();
-            }
-            ctrl = new com.overdrive.app.audio.AppAudioCaptureController();
-            boolean ok = ctrl.start();
-            // Recheck running AFTER start() — onDestroy can land in
-            // the window between our pre-create guard and start()
-            // completing. If that happened, onDestroy already
-            // snapshotted+stopped the previous audioController and
-            // nulled the field; publishing our new ctrl now would
-            // leak it (mic indicator stays on until process death,
-            // since the destroyed Service can't see it). Stop and
-            // bail without publishing.
-            if (!running.get()) {
-                if (ok) {
-                    try { ctrl.stop(); } catch (Exception ignored) {}
-                }
-                return;
-            }
-            audioController = ctrl;
-            if (ok) {
+        boolean ok = com.overdrive.app.audio.AppAudioCaptureController
+                .setRecordingDemand(shouldCapture);
+        if (!running.get()) {
+            com.overdrive.app.audio.AppAudioCaptureController
+                    .setRecordingDemand(false);
+            return;
+        }
+
+        boolean isCapturing =
+                com.overdrive.app.audio.AppAudioCaptureController
+                        .isRecordingCaptureRunning();
+        if (shouldCapture && isCapturing) {
+            if (!wasCapturing) {
                 Log.i(TAG, "Audio capture enabled (mode=" + configuredMode + ")");
-                // Clear any stale failure hint so the MIC pill recovers
-                // from RED to GREEN as soon as we get back in.
-                lastAudioStartFailureMs = 0;
-            } else {
-                lastAudioStartFailureMs = android.os.SystemClock.elapsedRealtime();
-                Log.w(TAG, "Audio capture start failed — will retry on next poll");
             }
-        } else if (!shouldCapture && isCapturing) {
-            // ctrl is non-null when isCapturing is true.
-            ctrl.stop();
+            lastAudioStartFailureMs = 0;
+        } else if (shouldCapture && !ok) {
+            lastAudioStartFailureMs =
+                    android.os.SystemClock.elapsedRealtime();
+            Log.w(TAG, "Audio capture start failed — will retry on next poll");
+        } else if (!shouldCapture && wasCapturing) {
             Log.i(TAG, "Audio capture disabled");
         }
-        // No third "self-stopped" branch needed: isRunning() is now the
-        // source of truth, so the next poll naturally retries via the
-        // shouldCapture && !isCapturing branch.
     }
 
     private void parseStatus(JSONObject status, long fetchStartElapsedMs) {
@@ -1802,14 +1798,35 @@ public class StatusOverlayService extends Service {
                 // older daemon lacking it keeps the pre-existing edge-driven behaviour.
                 boolean reconcile = false;
                 long nowMs = android.os.SystemClock.elapsedRealtime();
-                if (recStatus.has("camViewActive") && nowMs >= camCloseReconcileAfterMs) {
+                // EDGE SETTLE (see closeEdgeAtMs): a response built inside the daemon's
+                // ≤250ms program-transition window mislabels WHICH program's content is
+                // on screen (bsCardShowing=false + camViewActive=true while the
+                // blind-spot card is still visible) — adopting it swaps in the wrong ✕
+                // whose tap fires the wrong hide. Only a response FETCHED comfortably
+                // after the last edge may overwrite the edge-driven truth.
+                //
+                // laneTransitioning is the daemon's OWN "labels unreliable" signal for
+                // that window, and it is the authoritative half of this guard: the
+                // show-edge broadcast rides a detached `am` exec, so a transitional
+                // poll can BEAT the edge's timestamp — the settle gate alone then
+                // cleared bsCardWantsClose, and the late edge (camview state only)
+                // never restored it, leaving the wrong ✕ until the next poll. A
+                // response that admits incoherent labels is simply not adopted;
+                // truth converges within one daemon tick, well before the next poll.
+                // has()-free read: absent on an older daemon → false → gate inert.
+                boolean pastEdgeSettle =
+                        fetchStartElapsedMs > closeEdgeAtMs + CLOSE_EDGE_SETTLE_MS
+                        && !recStatus.optBoolean("laneTransitioning", false);
+                if (recStatus.has("camViewActive") && nowMs >= camCloseReconcileAfterMs
+                        && pastEdgeSettle) {
                     boolean cvActive = recStatus.optBoolean("camViewActive", false);
                     String cvTarget = recStatus.optString("camViewTarget", "head_unit");
                     // Head-unit only: the cluster is a separate display we can't overlay.
                     camViewWantsClose = cvActive && !"cluster".equals(cvTarget);
                     reconcile = true;
                 }
-                if (recStatus.has("bsCardShowing") && nowMs >= bsCloseReconcileAfterMs) {
+                if (recStatus.has("bsCardShowing") && nowMs >= bsCloseReconcileAfterMs
+                        && pastEdgeSettle) {
                     boolean bsShowing = recStatus.optBoolean("bsCardShowing", false);
                     String bsTarget = recStatus.optString("bsCardTarget", "head_unit");
                     bsCardWantsClose = bsShowing && !"cluster".equals(bsTarget);
@@ -1825,7 +1842,13 @@ public class StatusOverlayService extends Service {
                         ? new int[]{ lrJson.optInt("x"), lrJson.optInt("y"),
                                      lrJson.optInt("w"), lrJson.optInt("h") }
                         : null;
-                if (!java.util.Arrays.equals(newLaneRect, laneRectPx)) {
+                // FRESHNESS GATE: only adopt from a response FETCHED after the last
+                // show-edge rect plus its settle window (see laneRectEdgeAdoptedAtMs).
+                // Covers both an older in-flight response (previous program's rect)
+                // and a post-edge response built before the daemon's transition tick
+                // converged (stale rect, or a null from a lagging cluster target).
+                if (fetchStartElapsedMs > laneRectEdgeAdoptedAtMs + LANE_RECT_EDGE_SETTLE_MS
+                        && !java.util.Arrays.equals(newLaneRect, laneRectPx)) {
                     laneRectPx = newLaneRect;
                     repositionAttachedCloseButtons();
                 }
@@ -2205,11 +2228,9 @@ public class StatusOverlayService extends Service {
         boolean micVisibleByConfig = audioEnabledConfig && recConfigured && cameraOverlayEnabled;
         if (micVisibleByConfig) {
             micContainer.setVisibility(View.VISIBLE);
-            // Read the live controller state directly — the polling thread
-            // and the UI thread both see the volatile reference, and
-            // isRunning() is itself thread-safe (AtomicBoolean.get).
-            com.overdrive.app.audio.AppAudioCaptureController ctrl = audioController;
-            boolean isCapturing = ctrl != null && ctrl.isRunning();
+            boolean isCapturing =
+                    com.overdrive.app.audio.AppAudioCaptureController
+                            .isRecordingCaptureRunning();
             // Mode says we should be capturing right now (see reconcileAudioCapture).
             boolean wantCapture = audioEnabledConfig && daemonReachable && accOn
                 && (configuredMode.equals("CONTINUOUS")

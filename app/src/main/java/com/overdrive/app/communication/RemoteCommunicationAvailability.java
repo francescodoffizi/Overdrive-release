@@ -64,6 +64,27 @@ public final class RemoteCommunicationAvailability {
         return ready();
     }
 
+    public static Result listener(
+            boolean carKnownOff,
+            RemoteCommunicationSettings.Snapshot settings,
+            boolean busy) {
+        if (carKnownOff) return carOff();
+        if (settings.emergencyDisabled) return emergencyDisabled();
+        if (!settings.listenerEnabled) {
+            return unavailable(
+                    "listener_disabled",
+                    "Cabin listening is disabled in the car settings",
+                    inCar("enable Cabin listener."));
+        }
+        if (busy) {
+            return unavailable(
+                    "listener_busy",
+                    "Another cabin listener is already active",
+                    "Stop the other listener before starting a new one.");
+        }
+        return ready();
+    }
+
     public static boolean shouldCheckVoiceOverlay(
             boolean carKnownOff,
             RemoteCommunicationSettings.Snapshot settings,

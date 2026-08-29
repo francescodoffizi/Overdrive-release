@@ -11,6 +11,9 @@
     <string name="recording_library_select">Select recordings</string>
     <string name="recording_library_open_filters">Filter recordings</string>
     <string name="recording_library_clear_search">Clear place search</string>
+    <string name="recording_preview_details">Recording details</string>
+    <string name="cd_expand_recording_details">Show recording details</string>
+    <string name="cd_collapse_recording_details">Hide recording details</string>
     <string name="recording_item_description">%1$s, %2$s, %3$s. Open recording.</string>
     <string name="recording_item_selection_description">%1$s, %2$s, %3$s. %4$s</string>
     <string name="recording_item_selected_action">Selected. Double tap to deselect.</string>

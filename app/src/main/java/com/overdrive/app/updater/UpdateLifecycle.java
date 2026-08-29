@@ -122,7 +122,7 @@ public final class UpdateLifecycle {
         //      (UPDATE_IN_PROGRESS_FILE, POST_UPDATE_FILE) are KEPT; the
         //      new process consumes them via isPostUpdateLaunch.
         // Plant disable sentinels ONLY for CORE daemons (camera + sentry +
-        // acc-sentry). These are wiped again at the end of this same script —
+        // acc-sentry). Machine-written markers are wiped again at the end —
         // the transient sentinel just keeps any watchdog we miss with the pkill
         // from re-exec'ing the daemon between our kill and the new process'
         // launch. OPTIONAL daemons (telegram / zrok / tailscale / singbox) are
@@ -131,12 +131,15 @@ public final class UpdateLifecycle {
         // (and then wiping) the telegram/zrok sentinels here would resurrect a
         // user-stopped tunnel/bot — and would also destroy the only cross-UID
         // record of a UI stop that AccSentryDaemon's ACC-on auto-start gate
-        // relies on. Mirrors DaemonStartupManager.clearStaleSentinels (core-only).
+        // relies on. Write-if-absent also preserves a manual CORE-daemon stop.
         String script =
+                "[ -f /data/local/tmp/camera_daemon.disabled ] || " +
                 "echo \"disabled by post-update reset at $(date)\" > /data/local/tmp/camera_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/camera_daemon.disabled 2>/dev/null\n" +
+                "[ -f /data/local/tmp/sentry_daemon.disabled ] || " +
                 "echo \"disabled by post-update reset at $(date)\" > /data/local/tmp/sentry_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/sentry_daemon.disabled 2>/dev/null\n" +
+                "[ -f /data/local/tmp/acc_sentry_daemon.disabled ] || " +
                 "echo \"disabled by post-update reset at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n" +
                 "rm -f /data/local/tmp/cam_watchdog.pid 2>/dev/null\n" +
@@ -172,17 +175,20 @@ public final class UpdateLifecycle {
                 // doesn't linger in /data/local/tmp (hygiene; it's rewritten via
                 // atomic tmp+rename each install so it never blocks recovery).
                 "rm -f /data/local/tmp/overdrive_install.sh 2>/dev/null\n" +
-                // Clear ONLY the CORE per-daemon sentinels so the new
-                // MainActivity starts clean (core re-arms on app-launch). The
-                // OPTIONAL daemon sentinels (telegram_bot_daemon.disabled,
-                // zrok.disabled, tailscale.disabled, singbox.disabled) are NOT
-                // wiped — they encode a durable user stop that must survive the
-                // update. A broad `*_daemon.disabled` glob would match
-                // telegram_bot_daemon.disabled and resurrect a user-stopped bot.
-                // Mirrors DaemonStartupManager.clearStaleSentinels (core-only).
+                // Clear only known machine-written CORE markers. A pre-existing
+                // "disabled by ui/telegram" sentinel is durable manual intent
+                // and must survive the update.
                 // The post-update markers (UPDATE_IN_PROGRESS_FILE /
                 // POST_UPDATE_FILE) survive — new process owns them.
-                "rm -f /data/local/tmp/camera_daemon.disabled /data/local/tmp/sentry_daemon.disabled /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n" +
+                "for S in /data/local/tmp/camera_daemon.disabled " +
+                "/data/local/tmp/sentry_daemon.disabled " +
+                "/data/local/tmp/acc_sentry_daemon.disabled; do\n" +
+                "  R=$(head -1 \"$S\" 2>/dev/null)\n" +
+                "  case \"$R\" in " +
+                "'disabled by post-update reset'*|'disabled for update'*|" +
+                "'disabled by stopAllDaemons sweep'*|'disabled by killDaemon'*) " +
+                "rm -f \"$S\" 2>/dev/null;; esac\n" +
+                "done\n" +
                 // Stale daemon-log cleanup: only when the NEWLY-INSTALLED build
                 // does NOT capture logs (BuildConfig.LOG_CAPTURE is false — i.e.
                 // a braveheart→alpha/stable downgrade). braveheart keeps file

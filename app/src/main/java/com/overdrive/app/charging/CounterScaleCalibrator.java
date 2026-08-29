@@ -69,6 +69,13 @@ public final class CounterScaleCalibrator {
      * comfortably inside the 2.0 band, while being nowhere near 1.0.
      */
     private static final double SNAP_TOLERANCE = 1.25;
+    /**
+     * A unity verdict is confidence, not a correction, so require closer agreement before persisting
+     * it. Falling outside this band is harmless: factorFor() still defaults to 1.0, but the source
+     * remains challengeable instead of storing a weak full-scale conclusion. The wider tolerance
+     * above remains appropriate for identifying a discrete non-unity register width.
+     */
+    private static final double UNITY_SNAP_TOLERANCE = 1.15;
 
     /**
      * Baseline required before a factor may be decided, ms.
@@ -154,7 +161,12 @@ public final class CounterScaleCalibrator {
         if (!Double.isFinite(counterKwh) || !Double.isFinite(referenceKwh)) return;
         loadIfNeeded();
         Calibration c = cal(source);
-        if (!Double.isNaN(c.factor)) return;   // already decided; a verdict is not re-guessed
+        // A non-unity correction is already a proven register-width fault. A stored 1.0 verdict is
+        // different: it only says an earlier baseline looked full-scale. A later physical session
+        // may provide stronger contradictory evidence, and field captures have shown exactly that
+        // after an early comparison landed near the edge of the 1.0 snap band. Keep collecting
+        // session-local evidence for 1.0 so it can be revised to a discrete non-unity factor.
+        if (!Double.isNaN(c.factor) && c.factor != 1.0) return;
 
         if (Double.isNaN(c.lastCounter) || Double.isNaN(c.lastReference) || c.lastAtMs <= 0) {
             anchor(c, counterKwh, referenceKwh, atMs);
@@ -202,11 +214,19 @@ public final class CounterScaleCalibrator {
                     source, ratio, c.counterKwh, c.referenceKwh, c.spanMs / 60_000L));
             return;
         }
+        double previousFactor = c.factor;
+        if (!Double.isNaN(previousFactor)) {
+            if (Double.compare(previousFactor, snapped) == 0) return;
+            // Only a unity verdict is revisable. Once a discrete correction has been proven, this
+            // method stops accumulating above and cannot oscillate between factors.
+            if (previousFactor != 1.0) return;
+        }
         c.factor = snapped;
         c.decidedRatio = ratio;
         logger.info(String.format(java.util.Locale.US,
-                "Calibrated counter '%s' at unit factor %.0f — it advanced %.3f kWh while an"
+                "%s counter '%s' at unit factor %.0f — it advanced %.3f kWh while an"
                 + " independent register advanced %.3f kWh over %d min (ratio %.3f)",
+                Double.isNaN(previousFactor) ? "Calibrated" : "Recalibrated",
                 source, snapped, c.counterKwh, c.referenceKwh, c.spanMs / 60_000L, ratio));
         persist();
     }
@@ -222,7 +242,9 @@ public final class CounterScaleCalibrator {
                 best = candidate;
             }
         }
-        return bestDeviation <= Math.log(SNAP_TOLERANCE) ? best : Double.NaN;
+        double tolerance = Double.compare(best, 1.0) == 0
+                ? UNITY_SNAP_TOLERANCE : SNAP_TOLERANCE;
+        return bestDeviation <= Math.log(tolerance) ? best : Double.NaN;
     }
 
     /**
@@ -260,10 +282,19 @@ public final class CounterScaleCalibrator {
         if (source == null) return false;
         loadIfNeeded();
         Calibration c = calibrations.get(source);
-        if (c == null || !Double.isNaN(c.factor)) return false;
+        if (c == null) return false;
         synchronized (CounterScaleCalibrator.class) {
+            // A proven non-unity factor is already corrected by factorFor(). A unity verdict remains
+            // challengeable by the current session, because persisted evidence from an earlier
+            // session can be weaker than a later clean 1:2 comparison.
+            if (!Double.isNaN(c.factor) && c.factor != 1.0) return false;
             if (c.counterKwh < MIN_SUSPICION_KWH || c.referenceKwh < MIN_SUSPICION_KWH) return false;
             double ratio = c.referenceKwh / c.counterKwh;
+            if (!Double.isNaN(c.factor)) {
+                // Challenging an existing full-scale verdict needs evidence that identifies a
+                // specific replacement factor, not merely ordinary measurement disagreement.
+                return Double.compare(snap(ratio), 2.0) == 0;
+            }
             // The geometric midpoint between full scale and the first sub-unit candidate. Below it the
             // gap is ordinary disagreement (charging loss, quantisation); above it, no explanation
             // other than a register width remains.
@@ -283,8 +314,10 @@ public final class CounterScaleCalibrator {
             c.lastCounter = Double.NaN;
             c.lastReference = Double.NaN;
             c.lastAtMs = 0;
-            if (Double.isNaN(c.factor)) continue;
-            // A decided source needs no further evidence; clear its sums so they cannot be re-read.
+            // Accumulated deltas describe exactly one physical charge, regardless of whether they
+            // were sufficient to decide a factor. Carrying an undecided partial baseline into the
+            // next session pairs unrelated operating conditions and can eventually create a false
+            // firmware verdict. Keep only the decided factor itself.
             c.counterKwh = 0;
             c.referenceKwh = 0;
             c.spanMs = 0;

@@ -902,6 +902,51 @@ public final class BydDeviceHelper {
     }
 
     /**
+     * Register the concrete energy listener through the SDK's generic listener method.
+     * The generic Proxy path cannot receive methods declared only by the concrete class.
+     */
+    public static boolean registerEnergyListener(Object device, ListenerCallback callback) {
+        if (device == null) return false;
+        try {
+            android.hardware.bydauto.energy.AbsBYDAutoEnergyListener listener =
+                    new android.hardware.bydauto.energy.AbsBYDAutoEnergyListener() {
+                        @Override
+                        public void onDataChanged(android.hardware.IBYDAutoEvent event) {
+                            invokeCallback(callback, "onDataChanged", new Object[]{event});
+                        }
+
+                        @Override
+                        public void onEnergyModeChanged(int mode) {
+                            invokeCallback(callback, "onEnergyModeChanged", new Object[]{mode});
+                        }
+
+                        @Override
+                        public void onOperationModeChanged(int mode) {
+                            invokeCallback(callback, "onOperationModeChanged", new Object[]{mode});
+                        }
+
+                        @Override
+                        public void onRoadSurfaceChanged(int mode) {
+                            invokeCallback(callback, "onRoadSurfaceChanged", new Object[]{mode});
+                        }
+                    };
+            Method register = findRegisterMethod(
+                    device.getClass(), android.hardware.IBYDAutoListener.class);
+            if (register != null) {
+                register.invoke(device, listener);
+                return true;
+            }
+            logger.debug("registerEnergyListener: no generic registerListener method on "
+                    + device.getClass().getName());
+        } catch (LinkageError e) {
+            logger.debug("registerEnergyListener: class not available on this firmware");
+        } catch (Exception e) {
+            logger.debug("registerEnergyListener failed: " + e.getMessage());
+        }
+        return false;
+    }
+
+    /**
      * Register a typed door-lock listener. Captures the canonical
      * onDoorLockStatusChanged(area, state) event the BMS emits when the gun is
      * connected and the lock state transitions.

@@ -266,6 +266,8 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <include layout="@layout/include_dashboard_ai_insight" />
+
         <com.google.android.material.card.MaterialCardView
             android:id="@+id/chargingCard"
             android:layout_width="match_parent"

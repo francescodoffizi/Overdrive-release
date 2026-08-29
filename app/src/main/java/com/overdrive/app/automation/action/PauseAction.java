@@ -1,6 +1,7 @@
 package com.overdrive.app.automation.action;
 
 import com.overdrive.app.automation.AutomationAction;
+import com.overdrive.app.automation.Automations;
 import com.overdrive.app.automation.type.IntType;
 import com.overdrive.app.automation.type.Type;
 import com.overdrive.app.automation.value.Label;
@@ -63,6 +64,10 @@ public class PauseAction extends BaseAction {
         }
         ms = Math.max(0, Math.min(MAX_MS, ms));
         if (ms == 0) return;
+        if (Automations.deferQueuedAction(automationAction, ms, true)) {
+            logger.info("PauseAction: deferred " + ms + "ms");
+            return;
+        }
         try {
             Thread.sleep(ms);
             logger.info("PauseAction: waited " + ms + "ms");

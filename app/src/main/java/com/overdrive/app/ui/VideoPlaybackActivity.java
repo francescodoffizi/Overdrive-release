@@ -14,9 +14,15 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 
+import com.overdrive.app.byd.routing.DrivingSafetyGuard;
 import com.overdrive.app.services.MediaPlaybackService;
 import com.overdrive.app.services.PlaybackDuckCoordinator;
 import com.overdrive.app.ui.view.ZoomableVideoView;
+
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Fullscreen video player for the "Play Video" automation / key-mapping action.
@@ -55,6 +61,10 @@ public final class VideoPlaybackActivity extends Activity {
     private ZoomableVideoView videoView;
     private boolean stopReceiverRegistered;
     private boolean hasAcceptedPlayback;
+    private boolean playbackUiReady;
+    private long safetyRequestGeneration;
+    private ScheduledExecutorService safetyExecutor;
+    private ScheduledFuture<?> safetyMonitor;
     private volatile boolean roadSenseDucked;
     private final PlaybackDuckCoordinator.Target roadSenseDuckTarget = ducked -> {
         roadSenseDucked = ducked;
@@ -71,6 +81,19 @@ public final class VideoPlaybackActivity extends Activity {
         // dropped before onCreate — the real question behind "Play Video does nothing").
         Log.i(TAG, "onCreate reached");
 
+        safetyExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread worker = new Thread(r, "VideoDrivingSafety");
+            worker.setDaemon(true);
+            return worker;
+        });
+        registerReceiver(stopReceiver, new IntentFilter(ACTION_STOP));
+        stopReceiverRegistered = true;
+        requestSafeStart(getIntent());
+    }
+
+    private void ensurePlaybackUi() {
+        if (playbackUiReady) return;
+        playbackUiReady = true;
         getWindow().addFlags(
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                 | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
@@ -100,20 +123,75 @@ public final class VideoPlaybackActivity extends Activity {
         root.setOnClickListener(v -> finish());
 
         hideSystemUi(root);
-        registerReceiver(stopReceiver, new IntentFilter(ACTION_STOP));
-        stopReceiverRegistered = true;
-
-        startFromIntent(getIntent());
     }
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        // Keep the last accepted Intent when a malformed replacement arrives, so a
-        // later Activity recreation cannot resurrect the rejected command.
-        if (startFromIntent(intent)) setIntent(intent);
+        requestSafeStart(intent);
     }
 
-    private boolean startFromIntent(Intent intent) {
+    private void requestSafeStart(Intent intent) {
+        final long generation = ++safetyRequestGeneration;
+        ScheduledExecutorService executor = safetyExecutor;
+        if (executor == null || executor.isShutdown()) {
+            finish();
+            return;
+        }
+        try {
+            executor.execute(() -> {
+                boolean blocked = DrivingSafetyGuard.isActionBlockedViaDaemon(
+                        DrivingSafetyGuard.GUARD_SCREEN_MEDIA);
+                runOnUiThread(() -> {
+                    if (generation != safetyRequestGeneration
+                            || isFinishing() || isDestroyed()) {
+                        return;
+                    }
+                    if (blocked) {
+                        Log.w(TAG, "blocked fullscreen media at final app-process boundary");
+                        finish();
+                        return;
+                    }
+                    ensurePlaybackUi();
+                    // Keep the last accepted Intent when a malformed replacement arrives, so a
+                    // later Activity recreation cannot resurrect the rejected command.
+                    if (startFromIntent(intent, generation)) {
+                        setIntent(intent);
+                        startSafetyMonitor();
+                    }
+                });
+            });
+        } catch (Throwable unavailable) {
+            finish();
+        }
+    }
+
+    /** Stop ongoing fullscreen playback if the guard becomes active while driving. */
+    private void startSafetyMonitor() {
+        if (safetyMonitor != null) safetyMonitor.cancel(false);
+        ScheduledExecutorService executor = safetyExecutor;
+        if (executor == null || executor.isShutdown()) {
+            finish();
+            return;
+        }
+        try {
+            safetyMonitor = executor.scheduleWithFixedDelay(() -> {
+                if (!DrivingSafetyGuard.isActionBlockedViaDaemon(
+                        DrivingSafetyGuard.GUARD_SCREEN_MEDIA)) {
+                    return;
+                }
+                runOnUiThread(() -> {
+                    if (!isFinishing() && !isDestroyed()) {
+                        Log.w(TAG, "stopping fullscreen media after driving state changed");
+                        finish();
+                    }
+                });
+            }, 1, 1, TimeUnit.SECONDS);
+        } catch (RuntimeException unavailable) {
+            finish();
+        }
+    }
+
+    private boolean startFromIntent(Intent intent, long generation) {
         if (intent == null) {
             finish();
             return false;
@@ -145,19 +223,34 @@ public final class VideoPlaybackActivity extends Activity {
 
         try {
             videoView.setOnPreparedListener(mp -> {
-                // Do NOT call setAudioAttributes()/setAudioStreamType() here. Reassigning
-                // the audio stream on the MediaPlayer in its PREPARED state stalls the
-                // codec on this BYD/DiLink stack — "reassignAudioAttributes streamType=3
-                // → streamType=1" — so the audio system registers but NO video frames are
-                // ever delivered (audio plays, screen stays black). ZoomableVideoView.
-                // startPreparing() documents this exact failure, and the working recordings
-                // player (VideoPlayerFragment) never touches audio attributes for the same
-                // reason — it relies on the view's default USAGE_MEDIA + CONTENT_TYPE_MOVIE.
-                // Play Video is intentionally Media-only. Per-channel video-audio routing, if
-                // ever revisited, must be applied BEFORE prepareAsync (in startPreparing), not
-                // in this Prepared-state callback.
-                try { mp.setLooping(loop); } catch (Throwable ignored) {}
-                videoView.start();
+                ScheduledExecutorService executor = safetyExecutor;
+                if (executor == null || executor.isShutdown()) {
+                    finish();
+                    return;
+                }
+                try {
+                    executor.execute(() -> {
+                        boolean blocked = DrivingSafetyGuard.isActionBlockedViaDaemon(
+                                DrivingSafetyGuard.GUARD_SCREEN_MEDIA);
+                        runOnUiThread(() -> {
+                            if (generation != safetyRequestGeneration
+                                    || isFinishing() || isDestroyed()) {
+                                return;
+                            }
+                            if (blocked) {
+                                Log.w(TAG, "blocked fullscreen media before prepared playback");
+                                finish();
+                                return;
+                            }
+                            // Do NOT reassign audio attributes here: doing so in PREPARED
+                            // stalls video frames on this DiLink stack.
+                            try { mp.setLooping(loop); } catch (Throwable ignored) {}
+                            videoView.start();
+                        });
+                    });
+                } catch (RuntimeException unavailable) {
+                    finish();
+                }
             });
             // One-shot finishes when the clip ends; a looping clip never completes.
             videoView.setOnCompletionListener(mp -> { if (!loop) finish(); });
@@ -242,6 +335,9 @@ public final class VideoPlaybackActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        safetyRequestGeneration++;
+        if (safetyMonitor != null) safetyMonitor.cancel(true);
+        if (safetyExecutor != null) safetyExecutor.shutdownNow();
         try {
             MediaPlaybackService.detachRoadSenseDuckTarget(roadSenseDuckTarget);
         } catch (Throwable ignored) {

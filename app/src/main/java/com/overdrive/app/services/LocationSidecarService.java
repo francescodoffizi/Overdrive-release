@@ -540,12 +540,11 @@ public class LocationSidecarService extends Service implements LocationListener 
             if (isFirstFix) {
                 Log.i(TAG, "First location fix: " + latitude + ", " + longitude);
             } else if (Log.isLoggable(TAG, Log.DEBUG)) {
-                // Opt-in per fix. The gate has to be isLoggable, not BuildConfig.DEBUG: that
-                // is a compile-time constant which is true for every debug build, so the line
-                // always ran at the provider's 1 Hz, and Log.d reaches logcat regardless —
-                // there was no mechanism behind "only shown if explicitly requested". Enable
-                // at runtime, no reinstall:
-                //   adb shell setprop log.tag.LocationSidecar DEBUG
+                // Per-fix logging is runtime opt-in: `setprop log.tag.LocationSidecar DEBUG`
+                // (same pattern as KeepAliveAccessibilityService.onKeyEvent). The old
+                // BuildConfig.DEBUG gate was compile-time: always on in debug builds
+                // (~1 Hz spam) and unreachable in release-type builds — including
+                // braveheart, where logcat survives R8 and this line is actually useful.
                 Log.d(TAG, "Location update (moved=" + String.format("%.1f", distanceMoved) + "m): " + latitude + ", " + longitude);
             }
             

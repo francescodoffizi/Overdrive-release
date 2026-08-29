@@ -11,6 +11,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
@@ -18,6 +19,7 @@ import com.overdrive.app.R
 import com.overdrive.app.communication.RemoteCommunicationSettings
 import com.overdrive.app.overlay.MessageOverlayService
 import com.overdrive.app.overlay.OverlayPermissionChecker
+import com.overdrive.app.services.CabinAudioCaptureService
 import com.overdrive.app.services.RemoteVoiceService
 import java.util.concurrent.Executors
 
@@ -35,6 +37,8 @@ class RemoteCommunicationSettingsBinder(private val root: View) {
     }
 
     private val voiceSwitch = root.findViewById<SwitchMaterial>(R.id.swRemoteVoice)
+    private val listenerSwitch =
+        root.findViewById<SwitchMaterial>(R.id.swRemoteListener)
     private val messagesSwitch =
         root.findViewById<SwitchMaterial>(R.id.swRemoteMessages)
     private val emergencySwitch =
@@ -45,6 +49,12 @@ class RemoteCommunicationSettingsBinder(private val root: View) {
         root.findViewById<Slider>(R.id.sliderRemoteOutputLevel)
     private val outputValue =
         root.findViewById<TextView>(R.id.tvRemoteOutputLevel)
+    private val outputChannelGroup =
+        root.findViewById<MaterialButtonToggleGroup>(R.id.toggleRemoteAudioChannel)
+    private val outputMediaButton =
+        root.findViewById<MaterialButton>(R.id.btnRemoteAudioMedia)
+    private val outputNavigationButton =
+        root.findViewById<MaterialButton>(R.id.btnRemoteAudioNavigation)
     private val overlayPermission =
         root.findViewById<TextView>(R.id.tvRemoteOverlayPermission)
     private val testSpeaker =
@@ -90,6 +100,11 @@ class RemoteCommunicationSettingsBinder(private val root: View) {
                 messagesSwitch.isChecked = !messagesSwitch.isChecked
             }
         }
+        root.findViewById<View>(R.id.rowRemoteListener)?.setOnClickListener {
+            if (listenerSwitch.isEnabled) {
+                listenerSwitch.isChecked = !listenerSwitch.isChecked
+            }
+        }
         root.findViewById<View>(R.id.rowRemoteOutputOverride)?.setOnClickListener {
             if (outputOverrideSwitch.isEnabled) {
                 outputOverrideSwitch.isChecked = !outputOverrideSwitch.isChecked
@@ -109,6 +124,22 @@ class RemoteCommunicationSettingsBinder(private val root: View) {
                         RemoteCommunicationSettings.update(
                             checked, null, null, null)
                     },
+                    onSuccess = {
+                        if (!checked) RemoteVoiceService.stopNow(context)
+                    },
+                    onFailure = ::refresh
+                )
+            }
+        }
+        listenerSwitch.setOnCheckedChangeListener { _, checked ->
+            if (!applying) {
+                persist(
+                    write = {
+                        RemoteCommunicationSettings.updateListenerEnabled(checked)
+                    },
+                    onSuccess = {
+                        if (!checked) CabinAudioCaptureService.stopNow(context)
+                    },
                     onFailure = ::refresh
                 )
             }
@@ -119,6 +150,9 @@ class RemoteCommunicationSettingsBinder(private val root: View) {
                     write = {
                         RemoteCommunicationSettings.update(
                             null, null, checked, null)
+                    },
+                    onSuccess = {
+                        if (!checked) dismissRemoteMessagesNow()
                     },
                     onFailure = ::refresh
                 )
@@ -145,6 +179,21 @@ class RemoteCommunicationSettingsBinder(private val root: View) {
                 write = {
                     RemoteCommunicationSettings.update(
                         null, null, checked, null, null)
+                },
+                onFailure = ::refresh
+            )
+        }
+        outputChannelGroup.addOnButtonCheckedListener { _, checkedId, checked ->
+            if (!checked || applying) return@addOnButtonCheckedListener
+            val channel =
+                if (checkedId == R.id.btnRemoteAudioNavigation) {
+                    RemoteCommunicationSettings.AUDIO_CHANNEL_NAVIGATION
+                } else {
+                    RemoteCommunicationSettings.AUDIO_CHANNEL_MEDIA
+                }
+            persist(
+                write = {
+                    RemoteCommunicationSettings.updateAudioChannel(channel)
                 },
                 onFailure = ::refresh
             )
@@ -216,10 +265,20 @@ class RemoteCommunicationSettingsBinder(private val root: View) {
     private fun render(snapshot: RemoteCommunicationSettings.Snapshot) {
         applying = true
         voiceSwitch.isChecked = snapshot.voiceEnabled
+        listenerSwitch.isChecked = snapshot.listenerEnabled
         messagesSwitch.isChecked = snapshot.messagesEnabled
         emergencySwitch.isChecked = snapshot.emergencyDisabled
         outputOverrideSwitch.isChecked =
             snapshot.outputLevelOverrideEnabled
+        outputChannelGroup.check(
+            if (snapshot.audioChannel
+                == RemoteCommunicationSettings.AUDIO_CHANNEL_NAVIGATION
+            ) {
+                R.id.btnRemoteAudioNavigation
+            } else {
+                R.id.btnRemoteAudioMedia
+            }
+        )
         persistedOutputLevel = snapshot.outputLevel
         outputSlider.value = snapshot.outputLevel.toFloat()
         applying = false
@@ -245,13 +304,21 @@ class RemoteCommunicationSettingsBinder(private val root: View) {
 
     private fun applyEmergencyUi(disabled: Boolean) {
         voiceSwitch.isEnabled = !disabled
+        listenerSwitch.isEnabled = !disabled
         messagesSwitch.isEnabled = !disabled
+        outputChannelGroup.isEnabled = !disabled
+        outputMediaButton.isEnabled = !disabled
+        outputNavigationButton.isEnabled = !disabled
         applyOutputOverrideUi(outputOverrideSwitch.isChecked, disabled)
         testSpeaker.isEnabled = !disabled && voiceSwitch.isChecked
         testMessage.isEnabled = !disabled && messagesSwitch.isChecked
         root.findViewById<View>(R.id.rowRemoteVoice)?.alpha =
             if (disabled) 0.5f else 1f
+        root.findViewById<View>(R.id.rowRemoteListener)?.alpha =
+            if (disabled) 0.5f else 1f
         root.findViewById<View>(R.id.rowRemoteMessages)?.alpha =
+            if (disabled) 0.5f else 1f
+        root.findViewById<View>(R.id.rowRemoteAudioChannel)?.alpha =
             if (disabled) 0.5f else 1f
     }
 
@@ -296,6 +363,11 @@ class RemoteCommunicationSettingsBinder(private val root: View) {
 
     private fun stopRemoteCommunicationNow() {
         RemoteVoiceService.stopNow(context)
+        CabinAudioCaptureService.stopNow(context)
+        dismissRemoteMessagesNow()
+    }
+
+    private fun dismissRemoteMessagesNow() {
         context.sendBroadcast(Intent(MessageOverlayService.ACTION_DISMISS))
         context.stopService(Intent(context, MessageOverlayService::class.java))
     }

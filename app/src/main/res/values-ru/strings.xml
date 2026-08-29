@@ -631,21 +631,21 @@
     <string name="dialog_zrok_token_message">Введите свой токен Zrok включить.\nПолучайте один на: zrok.io</string>
     <string name="toast_token_cannot_be_empty">Токен не может быть пустым</string>
     <string name="dialog_tailscale_settings_title">Настройки туннеля Tailscale</string>
-    <string name="dialog_tailscale_settings_message">Конфигурировать масштаб хвоста</string>
+    <string name="dialog_tailscale_settings_message">Настроить Tailscale</string>
     <string name="tailscale_failed_login_url">Не удалось создать URL-адрес входа</string>
     <string name="tailscale_logged_in_relogin">Зарегистрировано. Нажмите, чтобы зайти на другой счет</string>
     <string name="dialog_tailscale_proxy_enable_title">Включить Tailscale Proxy?</string>
     <string name="dialog_tailscale_proxy_enable_message">Это направляет MQTT через Tailscale, чтобы вы могли добраться до частного брокера на вашей хвостовой сети без портового пересылки.\n\nПока включен:\n• MQTT к брокеру хвостовой сети работает (например, Mosquitto на устройстве на вашей хвостовой сети)\n• MQTT к публичным брокерам (HiveMQ, AWS IoT, и т. Д.) не удастся  Tailscale только маршруты к вашей хвостовой сети\n• Daemon Tailscale будет перезагрузиться, чтобы применить изменение\n• Другие приложения и трафик остального устройства не пострадают\n\nВы можете отключить это в любое время.</string>
     <string name="dialog_zrok_reset_title">Перезагрузка окружающей среды Zrok</string>
     <string name="dialog_zrok_reset_message">Это:\n• остановит туннель zrok, если он работает\n• удалите среду zrok с этого устройства\n• удалите сохраненный токен\n\nВы должны снова ввести свой токен и включить его снова. Это использует один из ваших 5 слотов устройств на zrok.io.\n\nВы уверены?</string>
-    <string name="toast_resetting_zrok">Восстановление среды зрок...</string>
+    <string name="toast_resetting_zrok">Сброс среды Zrok…</string>
     <string name="toast_zrok_reset_success">Восстановление среды Zrok. Введите новый токен для восстановления.</string>
     <string name="toast_zrok_reset_partial">Настройка окружающей среды (файл токена может потребовать ручной очистки)</string>
     <string name="toast_zrok_reset_warnings">Резагрузка окружающей среды (с предупреждениями: %1$s)</string>
     <string name="zrok_no_token_configured">Никакой токен не настроен, нажмите, чтобы настроить.</string>
     <string name="dialog_tailscale_reset_title">Перезагрузка окружающей среды Tailscale</string>
-    <string name="dialog_tailscale_reset_message">Это:\n• остановит туннель хвостового масштаба, если он будет работать\n• удалите среду хвостового масштаба с этого устройства\n• Вам все равно придется удалить устройство из консоли хвостового масштаба\n\nВот вам придется снова войти в систему.\n\nУверен ли вы?</string>
-    <string name="toast_resetting_tailscale">Восстановление среды с хвостовым масштабом...</string>
+    <string name="dialog_tailscale_reset_message">Это:\n• остановит туннель Tailscale, если он запущен\n• удалит среду Tailscale с этого устройства\n• устройство всё равно нужно будет удалить из консоли Tailscale\n\nПотребуется войти снова.\n\nВы уверены?</string>
+    <string name="toast_resetting_tailscale">Сброс среды Tailscale…</string>
     <string name="toast_tailscale_reset_success">Возобновить настройку среды Tailscale. Зарегистрируйтесь, чтобы снова настроить.</string>
     <string name="toast_tailscale_reset_warnings">Настройка окружающей среды Tailscale (с предупреждениями: %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Задействованный прокси Tailscale</string>
@@ -1338,7 +1338,7 @@
     <string name="roadsense_map_trip_restored">Поездка восстановлена</string>
     <!-- Cloudflared paid-tunnel settings -->
     <string name="cloudflared_token_storage_note">Токен надежно хранится между приложениями и демонами.</string>
-    <string name="cloudflared_token_hint">Ввести в облачный токен</string>
+    <string name="cloudflared_token_hint">Введите токен cloudflared</string>
     <string name="cloudflare_paid_version">Платная версия Cloudflare</string>
     <string name="dialog_cloudflared_settings_title">Настройки Cloudflared</string>
     <string name="dialog_cloudflared_settings_message">Определите, используете ли вы платный Cloudflare или trycloudflare. Если вы используете платный Cloudflare, введите свой маркер туннеля.</string>

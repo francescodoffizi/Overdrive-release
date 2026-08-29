@@ -536,6 +536,23 @@
                                         </div>
                                     </div>
                                 </section>
+                                <!-- ── Section 3: OEM AC inlet current limit ── -->
+                                <section class="vc-charging-section vc-charging-divider"
+                                         id="acChargeCurrentSection">
+                                    <div class="vc-schedule-grid">
+                                        <div class="vc-schedule-bar">
+                                            <span class="vc-inline-control-label">AC current</span>
+                                            <div class="vc-segmented" id="acChargeCurrentSegmented"
+                                                 aria-label="AC charging current limit">
+                                                <button class="vc-seg" data-state="1" disabled>6 A</button>
+                                                <button class="vc-seg" data-state="2" disabled>8 A</button>
+                                                <button class="vc-seg" data-state="3" disabled>10 A</button>
+                                                <button class="vc-seg" data-state="4" disabled>16 A</button>
+                                                <button class="vc-seg" data-state="5" disabled>Max</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </section>
                             </div>
                         </div>
                     </div>
@@ -637,7 +654,7 @@
                 '../shared/vendor/OrbitControls.js?v=12',
                 '../shared/vendor/gsap.min.js?v=12'
             ];
-            chain.push('../shared/vehicle-control.js?v=vclite4');
+            chain.push('../shared/vehicle-control.js?v=vclite7');
             for (var i = 0; i < chain.length; i++) {
                 var s = document.createElement('script');
                 s.src = chain[i];

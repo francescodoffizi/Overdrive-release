@@ -625,7 +625,7 @@
     <string name="dialog_zrok_token_message">Entrez votre jeton Zrok activé.\n Obtenez un à: zrok.io</string>
     <string name="toast_token_cannot_be_empty">Le jeton ne peut pas être vide</string>
     <string name="dialog_tailscale_settings_title">Paramètres de tunnel Tailscale</string>
-    <string name="dialog_tailscale_settings_message">Configurer l\'échelle de la queue</string>
+    <string name="dialog_tailscale_settings_message">Configurer Tailscale</string>
     <string name="tailscale_failed_login_url">Échec de générer l\' url de connexion</string>
     <string name="tailscale_logged_in_relogin">Connectez-vous. Cliquez pour vous connecter à un autre compte</string>
     <string name="dialog_tailscale_proxy_enable_title">Activer le Tailscale Proxy ?</string>
@@ -639,7 +639,7 @@
     <string name="zrok_no_token_configured">Aucun jeton configuré.</string>
     <string name="dialog_tailscale_reset_title">Réinitialiser l\'environnement Tailscale</string>
     <string name="dialog_tailscale_reset_message">Cela:\n• Arrêtera le tunnel de tailscale si elle fonctionne\n• Retirez l\'environnement de tailscale de cet appareil\n• Vous devrez toujours retirer l\'appareil de la console de tailscale\n\nVous devrez vous connecter à nouveau.\n\nEst-ce que vous êtes sûr?</string>
-    <string name="toast_resetting_tailscale">Réinitialiser l\'environnement à l\'échelle de la queue...</string>
+    <string name="toast_resetting_tailscale">Réinitialisation de l\'environnement Tailscale…</string>
     <string name="toast_tailscale_reset_success">Réinitialisation de l\'environnement Tailscale.</string>
     <string name="toast_tailscale_reset_warnings">Réinitialisation de l\'environnement Tailscale (avec avertissements: %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Tailscale proxy activé</string>

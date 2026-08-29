@@ -680,6 +680,12 @@ public class TariffManager {
 
     private static TariffProfile resolveInCircleSnapshot(
             List<TariffProfile> snapshot, double lat, double lng, int isDc) {
+        return resolveInCircleSnapshot(snapshot, lat, lng, isDc, false);
+    }
+
+    private static TariffProfile resolveInCircleSnapshot(
+            List<TariffProfile> snapshot, double lat, double lng,
+            int isDc, boolean anyRate) {
         if (snapshot.isEmpty()) return null;
         // (0,0) is the "no GPS fix at the charge edge" sentinel, not the Atlantic.
         if (lat == 0 && lng == 0) return null;
@@ -688,7 +694,7 @@ public class TariffManager {
         double bestDist = Double.MAX_VALUE;
         for (TariffProfile p : snapshot) {
             if (!p.isEnabled()) continue;
-            if (p.rateFor(isDc) <= 0) continue;   // doesn't price this gun
+            if (anyRate ? !p.hasAnyRate() : p.rateFor(isDc) <= 0) continue;
             double d = SafeLocationManager.haversine(lat, lng, p.getLatitude(), p.getLongitude());
             // Written as !(d <= r) rather than (d > r) so a NaN distance — from a
             // hand-edited/garbage coordinate in the world-writable config file —
@@ -1096,10 +1102,9 @@ public class TariffManager {
         if (!(lat == 0 && lng == 0)) {
             out.put("lat", lat);
             out.put("lng", lng);
-            // Report the AC match — the gun is unknown until a cable is in,
-            // and AC is the base case the label describes.
+            // Status answers whether a saved tariff exists here; charger type is not known yet.
             TariffProfile match =
-                    resolveInCircleSnapshot(image.profiles, lat, lng, 0);
+                    resolveInCircleSnapshot(image.profiles, lat, lng, 0, true);
             if (match == null) {
                 TariffProfile fallback = null;
                 for (TariffProfile candidate : image.profiles) {
@@ -1109,7 +1114,7 @@ public class TariffManager {
                     }
                 }
                 if (fallback != null && fallback.isEnabled()
-                        && fallback.rateFor(0) > 0) {
+                        && fallback.hasAnyRate()) {
                     match = fallback;
                 }
             }

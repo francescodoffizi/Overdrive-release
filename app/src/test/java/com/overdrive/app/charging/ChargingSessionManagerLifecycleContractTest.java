@@ -619,11 +619,22 @@ public class ChargingSessionManagerLifecycleContractTest {
         String retry = sourceBetween(
                 "private boolean retryPendingBoundary()",
                 "/** Release everything scoped");
+        String clear = sourceBetween(
+                "private void clearPendingBoundaryLocked()",
+                "private boolean retryPendingBoundary()");
 
         assertTrue(retry.contains("openSessionStart != pendingBoundarySessionStart"));
-        assertTrue(retry.contains("pendingBoundarySessionStart = -1L"));
+        assertTrue(retry.contains("clearPendingBoundaryLocked()"));
         assertTrue(retry.indexOf("openSessionStart != pendingBoundarySessionStart")
                 < retry.indexOf("persistBoundaryLocked("));
+        assertTrue(clear.contains("pendingBoundarySessionStart = -1L"));
+        assertTrue(clear.contains("pendingBoundaryAtMs = 0L"));
+        assertTrue(clear.contains(
+                "pendingBoundaryPowerKw = SocHistoryDatabase.STOP_BOUNDARY_POWER_KW"));
+        assertTrue(clear.contains("pendingBoundarySoc = Double.NaN"));
+        assertTrue(clear.contains("pendingBoundaryTemp = -999"));
+        assertTrue(clear.contains("pendingBoundaryTempHigh = -999"));
+        assertTrue(clear.contains("pendingBoundaryTempLow = -999"));
     }
 
     @Test

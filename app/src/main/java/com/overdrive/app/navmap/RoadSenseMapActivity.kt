@@ -28,6 +28,7 @@ import com.google.android.material.chip.ChipGroup
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import com.google.android.material.snackbar.Snackbar
 import com.overdrive.app.R
+import com.overdrive.app.telenav.TelenavActions
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
@@ -2832,15 +2833,24 @@ open class RoadSenseMapActivity : AppCompatActivity() {
             }
 
         // Hand the POI to the car's built-in navigation (factory nav via the Telenav bridge).
-        view.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnPoiCarNavNavigate)
-            ?.setOnClickListener { anchor ->
-                showCarNavMenu(anchor, SearchResult(label, lat, lng), includeSave = false) { sheet.dismiss() }
-            }
-        view.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnPoiCarNavSave)
-            ?.setOnClickListener {
-                sheet.dismiss()
-                sendToCarNav(SearchResult(label, lat, lng), navigate = false)
-            }
+        val carNavAvailable = TelenavActions.isAvailable(applicationContext)
+        view.findViewById<View>(R.id.poiCarNavSectionHeader).visibility =
+            if (carNavAvailable) View.VISIBLE else View.GONE
+        view.findViewById<View>(R.id.poiCarNavActionsRow).visibility =
+            if (carNavAvailable) View.VISIBLE else View.GONE
+        if (carNavAvailable) {
+            view.findViewById<MaterialButton>(R.id.btnPoiCarNavNavigate)
+                ?.setOnClickListener { anchor ->
+                    showCarNavMenu(anchor, SearchResult(label, lat, lng), includeSave = false) {
+                        sheet.dismiss()
+                    }
+                }
+            view.findViewById<MaterialButton>(R.id.btnPoiCarNavSave)
+                ?.setOnClickListener {
+                    sheet.dismiss()
+                    sendToCarNav(SearchResult(label, lat, lng), navigate = false)
+                }
+        }
 
         sheet.setContentView(view)
         sheet.show()
@@ -3033,12 +3043,19 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         }
 
         // Hand the place to the car's built-in navigation (factory nav via Telenav bridge).
-        view.findViewById<MaterialButton>(R.id.btnCarNavNavigate).setOnClickListener { anchor ->
-            showCarNavMenu(anchor, current, includeSave = false) { sheet.dismiss() }
-        }
-        view.findViewById<MaterialButton>(R.id.btnCarNavSave).setOnClickListener {
-            sheet.dismiss()
-            sendToCarNav(current, navigate = false)
+        val carNavAvailable = TelenavActions.isAvailable(applicationContext)
+        view.findViewById<View>(R.id.carNavSectionHeader).visibility =
+            if (carNavAvailable) View.VISIBLE else View.GONE
+        view.findViewById<View>(R.id.carNavActionsRow).visibility =
+            if (carNavAvailable) View.VISIBLE else View.GONE
+        if (carNavAvailable) {
+            view.findViewById<MaterialButton>(R.id.btnCarNavNavigate).setOnClickListener { anchor ->
+                showCarNavMenu(anchor, current, includeSave = false) { sheet.dismiss() }
+            }
+            view.findViewById<MaterialButton>(R.id.btnCarNavSave).setOnClickListener {
+                sheet.dismiss()
+                sendToCarNav(current, navigate = false)
+            }
         }
 
         sheet.setOnDismissListener {
@@ -4091,8 +4108,13 @@ open class RoadSenseMapActivity : AppCompatActivity() {
 
         // Hand the destination to the car's built-in navigation instead of OverDrive's route.
         // In the header (always visible) so it never scrolls off the short landscape screen.
-        findViewById<View>(R.id.btnRouteCarNav)?.setOnClickListener { anchor ->
-            showCarNavMenu(anchor, routeStops.lastOrNull(), includeSave = true)
+        findViewById<View>(R.id.btnRouteCarNav)?.apply {
+            visibility = if (TelenavActions.isAvailable(applicationContext)) View.VISIBLE else View.GONE
+            if (visibility == View.VISIBLE) {
+                setOnClickListener { anchor ->
+                    showCarNavMenu(anchor, routeStops.lastOrNull(), includeSave = true)
+                }
+            }
         }
 
         // Build the ordered trip itinerary (origin → stops → destination + an

@@ -5,6 +5,7 @@ import android.media.MediaCodec;
 import android.media.MediaCodecList;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
+import android.os.SystemClock;
 import android.view.Surface;
 
 import com.overdrive.app.logging.DaemonLogger;
@@ -12,74 +13,69 @@ import com.overdrive.app.logging.DaemonLogger;
 import java.io.FileInputStream;
 import java.nio.ByteBuffer;
 
-/**
- * Looping MP4 playback for the Screen Deterrent, hardware-decoded onto a
- * daemon-owned SurfaceControl layer at z=Integer.MAX_VALUE.
- *
- * Separate layer from {@link ScreenDeterrent}'s static/GIF path because a Surface
- * cannot serve both lockCanvas and a MediaCodec output. The layer is sized to the
- * VIDEO, not the panel — the decoder owns the buffer dimensions, and SurfaceFlinger
- * scales a source-crop of them into the panel rect.
- *
- * All MediaCodec use is synchronous: the daemon render thread has no Looper.
- */
+/** Hardware-decoded, muted MP4 playback on the daemon-owned deterrent layer. */
 public final class ScreenDeterrentVideo {
 
-    private static final String TAG = "ScreenDeterrentVideo";
-    private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
-
-    private ScreenDeterrentVideo() {}
-
-    /** Same z as the static deterrent layer — the two never render concurrently. */
-    private static final int Z_ORDER = Integer.MAX_VALUE;
-
+    private static final DaemonLogger logger =
+            DaemonLogger.getInstance("ScreenDeterrentVideo");
     private static final long DEQUEUE_TIMEOUT_US = 5_000;
     private static final long DEFAULT_FRAME_GAP_US = 33_333;
-    /** Cap on waiting for a frame's presentation time, so a bogus PTS jump can't
-     *  park the render thread with the panel frozen mid-deterrent. */
-    private static final long MAX_FRAME_SLEEP_MS = 500;
-    /** ScreenDeterrent.shouldStop() forceReloads the config file on every call, so
-     *  it cannot be polled per frame. Matches the static loop's cadence. */
     private static final long STOP_POLL_INTERVAL_MS = 200;
+
+    private ScreenDeterrentVideo() {}
 
     public interface StopSignal {
         boolean shouldStop();
     }
 
-    /** ISO-BMFF {@code ftyp} box at offset 4. Magic bytes, not the extension — the
-     *  filename comes from a browser upload. */
+    /** ISO-BMFF {@code ftyp} magic. Upload names and MIME types are untrusted. */
+    public static boolean isMp4(byte[] data) {
+        return data != null
+                && data.length >= 12
+                && data[4] == 'f'
+                && data[5] == 't'
+                && data[6] == 'y'
+                && data[7] == 'p';
+    }
+
     public static boolean isMp4File(String path) {
-        try (FileInputStream fis = new FileInputStream(path)) {
-            byte[] hdr = new byte[12];
-            int n = fis.read(hdr);
-            return n >= 12
-                && hdr[4] == 'f' && hdr[5] == 't' && hdr[6] == 'y' && hdr[7] == 'p';
-        } catch (Throwable t) {
+        try (FileInputStream in = new FileInputStream(path)) {
+            byte[] header = new byte[12];
+            int offset = 0;
+            while (offset < header.length) {
+                int read = in.read(header, offset, header.length - offset);
+                if (read < 0) break;
+                offset += read;
+            }
+            return offset == header.length && isMp4(header);
+        } catch (Throwable ignored) {
             return false;
         }
     }
 
-    /** Video track's mime/dimensions/duration, as MediaExtractor sees it. */
     public static final class Probe {
         public final String mime;
         public final int width;
         public final int height;
+        public final int visibleWidth;
+        public final int visibleHeight;
         public final long durationUs;
+        public final MediaFormat format;
 
-        Probe(String mime, int width, int height, long durationUs) {
+        Probe(String mime, int width, int height,
+              int visibleWidth, int visibleHeight,
+              long durationUs, MediaFormat format) {
             this.mime = mime;
             this.width = width;
             this.height = height;
+            this.visibleWidth = visibleWidth;
+            this.visibleHeight = visibleHeight;
             this.durationUs = durationUs;
+            this.format = format;
         }
     }
 
-    /**
-     * Reads the video track's format without decoding — same demux path {@link #play}
-     * uses, so the upload validator accepts a clip exactly when it will later play.
-     *
-     * @return null if the file has no readable video track.
-     */
+    /** Reads the same video-track metadata used by playback. */
     public static Probe probe(String path) {
         MediaExtractor extractor = null;
         try {
@@ -90,8 +86,14 @@ public final class ScreenDeterrentVideo {
             MediaFormat format = extractor.getTrackFormat(track);
             String mime = format.getString(MediaFormat.KEY_MIME);
             if (mime == null) return null;
-            return new Probe(mime, displayWidth(format), displayHeight(format),
-                             trackDurationUs(format));
+            return new Probe(
+                    mime,
+                    codedWidth(format),
+                    codedHeight(format),
+                    displayWidth(format),
+                    displayHeight(format),
+                    trackDurationUs(format),
+                    format);
         } catch (Throwable t) {
             logger.debug("Deterrent video probe failed: " + t.getMessage());
             return null;
@@ -103,66 +105,71 @@ public final class ScreenDeterrentVideo {
     }
 
     /**
-     * Play {@code path} full-screen on loop until {@code stop} fires.
-     *
-     * @param onFrame invoked after each rendered frame (backlight re-assert).
-     * @return true if playback ran and ended on the stop signal; false if setup or
-     *         decode failed and the caller should fall back to its static path.
+     * Loops the video until the supplied stop predicate fires. Audio tracks are
+     * never selected, so playback is always silent.
      */
-    public static boolean play(String path, int dispW, int dispH,
+    public static boolean play(String path, int displayWidth, int displayHeight,
                                StopSignal stop, Runnable onFrame) {
-        if (path == null || path.isEmpty() || dispW <= 0 || dispH <= 0) return false;
+        if (path == null || path.isEmpty() || displayWidth <= 0 || displayHeight <= 0) {
+            return false;
+        }
+        if (stop == null || stop.shouldStop()) return false;
 
         MediaExtractor extractor = null;
         MediaCodec codec = null;
-        Object layer = null;
-        Surface surface = null;
+        BsNativeLayer layer = null;
         boolean codecStarted = false;
-
         try {
             extractor = new MediaExtractor();
             extractor.setDataSource(path);
-
             int track = selectVideoTrack(extractor);
-            if (track < 0) {
-                logger.warn("Deterrent video has no video track: " + path);
-                return false;
-            }
+            if (track < 0) return false;
             extractor.selectTrack(track);
 
             MediaFormat format = extractor.getTrackFormat(track);
             String mime = format.getString(MediaFormat.KEY_MIME);
-            int vw = displayWidth(format);
-            int vh = displayHeight(format);
-            if (mime == null || vw <= 0 || vh <= 0) {
-                logger.warn("Deterrent video has unusable format: " + format);
-                return false;
-            }
+            int videoWidth = displayWidth(format);
+            int videoHeight = displayHeight(format);
+            int rotation = rotationDegrees(format);
+            if (mime == null || videoWidth <= 0 || videoHeight <= 0) return false;
+            String decoderName = decoderForFormat(format);
+            if (decoderName == null) return false;
+            if (stop.shouldStop()) return false;
 
-            layer = createBufferLayer("ScreenDeterrentVideo", vw, vh);
-            if (layer == null) return false;
-            surface = newSurfaceFor(layer);
+            layer = new BsNativeLayer(
+                    videoWidth, videoHeight, "ScreenDeterrentVideo", Integer.MAX_VALUE);
+            if (!layer.create()) return false;
+            Surface surface = layer.getSurface();
             if (surface == null) return false;
 
-            // Centre-crop to cover: letterbox bars would expose BYD's AccAnimation
-            // layer underneath, which is what the deterrent exists to prevent.
-            applyGeometry(layer, coverCrop(vw, vh, dispW, dispH),
-                          new Rect(0, 0, dispW, dispH));
-
-            codec = MediaCodec.createDecoderByType(mime);
+            codec = MediaCodec.createByCodecName(decoderName);
             codec.configure(format, surface, null, 0);
             codec.start();
             codecStarted = true;
 
-            logger.info("Deterrent video: " + vw + "x" + vh + " " + mime
-                    + " on " + dispW + "x" + dispH + " panel");
+            if (stop.shouldStop()) return false;
+            layer.setBufferRotation(rotation);
+            layer.setGeometry(
+                    coverCrop(videoWidth, videoHeight, displayWidth, displayHeight,
+                            rotation),
+                    0, 0, displayWidth, displayHeight);
+            logger.info("Deterrent video: " + videoWidth + "x" + videoHeight
+                    + " " + mime + " rotation=" + rotation
+                    + " on " + displayWidth + "x" + displayHeight);
 
-            return decodeLoop(codec, extractor, frameGapUs(format), stop, onFrame);
-
+            return decodeLoop(codec, extractor, frameGapUs(format),
+                    trackDurationUs(format), stop, onFrame);
         } catch (Throwable t) {
-            logger.warn("Deterrent video setup failed: " + t.getMessage());
+            logger.warn("Deterrent video playback failed: " + t.getMessage());
             return false;
         } finally {
+            // Visual teardown must not wait on vendor codec shutdown. Some
+            // MediaCodec implementations can block in stop()/release(); hide
+            // the z=MAX layer first so input capture can later be released
+            // without leaving a visible tap-through surface behind.
+            if (layer != null) {
+                try { layer.hide(); } catch (Throwable ignored) {}
+            }
             if (codec != null) {
                 if (codecStarted) {
                     try { codec.stop(); } catch (Throwable ignored) {}
@@ -172,87 +179,92 @@ public final class ScreenDeterrentVideo {
             if (extractor != null) {
                 try { extractor.release(); } catch (Throwable ignored) {}
             }
-            if (surface != null) {
-                try { surface.release(); } catch (Throwable ignored) {}
-            }
-            if (layer != null) releaseLayer(layer);
+            if (layer != null) layer.release();
         }
     }
 
     private static boolean decodeLoop(MediaCodec codec, MediaExtractor extractor,
-                                      long frameGapUs, StopSignal stop, Runnable onFrame)
+                                      long frameGapUs, long trackDurationUs,
+                                      StopSignal stop, Runnable onFrame)
             throws Exception {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         ThrottledStop shouldStop = new ThrottledStop(stop);
-
         long loopOffsetUs = 0;
-        long lastSampleUs = 0;
+        long maxSampleUs = 0;
         long anchorNs = -1;
         boolean rendered = false;
         boolean inputDone = false;
 
         while (!shouldStop.check()) {
             if (!inputDone) {
-                int inIdx = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US);
-                if (inIdx >= 0) {
-                    ByteBuffer in = codec.getInputBuffer(inIdx);
-                    int size = in == null ? -1 : extractor.readSampleData(in, 0);
+                int inputIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US);
+                if (inputIndex >= 0) {
+                    ByteBuffer input = codec.getInputBuffer(inputIndex);
+                    if (input != null) input.clear();
+                    int size = input == null ? -1 : extractor.readSampleData(input, 0);
                     if (size < 0) {
-                        // Loop by rewinding rather than signalling end-of-stream: the
-                        // clip opens on an IDR, so the decoder just sees another
-                        // keyframe. The offset keeps PTS monotonic across the seam.
-                        loopOffsetUs += lastSampleUs + frameGapUs;
+                        loopOffsetUs = nextLoopOffsetUs(
+                                loopOffsetUs, trackDurationUs,
+                                maxSampleUs, frameGapUs);
+                        maxSampleUs = 0;
                         extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
-                        size = in == null ? -1 : extractor.readSampleData(in, 0);
+                        if (input != null) input.clear();
+                        size = input == null ? -1 : extractor.readSampleData(input, 0);
                         if (size < 0) {
-                            codec.queueInputBuffer(inIdx, 0, 0, 0,
+                            codec.queueInputBuffer(inputIndex, 0, 0, 0,
                                     MediaCodec.BUFFER_FLAG_END_OF_STREAM);
                             inputDone = true;
                         }
                     }
                     if (!inputDone && size >= 0) {
-                        lastSampleUs = Math.max(0, extractor.getSampleTime());
-                        codec.queueInputBuffer(inIdx, 0, size,
-                                lastSampleUs + loopOffsetUs, 0);
+                        long sampleUs = Math.max(0, extractor.getSampleTime());
+                        maxSampleUs = Math.max(maxSampleUs, sampleUs);
+                        codec.queueInputBuffer(inputIndex, 0, size,
+                                sampleUs + loopOffsetUs, 0);
                         extractor.advance();
                     }
                 }
             }
 
-            int outIdx = codec.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US);
-            if (outIdx >= 0) {
-                boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+            int outputIndex = codec.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US);
+            if (outputIndex >= 0) {
+                boolean end = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
                 if (info.size > 0) {
                     if (anchorNs < 0) {
-                        anchorNs = System.nanoTime() - info.presentationTimeUs * 1000L;
+                        anchorNs = System.nanoTime() - info.presentationTimeUs * 1_000L;
                     }
-                    if (!sleepUntil(anchorNs + info.presentationTimeUs * 1000L, shouldStop)) {
-                        codec.releaseOutputBuffer(outIdx, false);
+                    if (!waitForFrame(anchorNs + info.presentationTimeUs * 1_000L,
+                            shouldStop, onFrame)) {
+                        codec.releaseOutputBuffer(outputIndex, false);
                         return rendered;
                     }
-                    codec.releaseOutputBuffer(outIdx, true);
+                    codec.releaseOutputBuffer(outputIndex, true);
                     rendered = true;
-                    if (onFrame != null) onFrame.run();
+                    if (onFrame != null) {
+                        try { onFrame.run(); } catch (Throwable ignored) {}
+                    }
                 } else {
-                    codec.releaseOutputBuffer(outIdx, false);
+                    codec.releaseOutputBuffer(outputIndex, false);
                 }
-                if (eos) return rendered && holdLastFrame(shouldStop, onFrame);
-            } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                logger.debug("Deterrent video output format: " + codec.getOutputFormat());
-            } else if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER && inputDone && rendered) {
+                if (end) return rendered && holdLastFrame(shouldStop, onFrame);
+            } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                logger.debug("Deterrent video output: " + codec.getOutputFormat());
+            } else if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER
+                    && inputDone && rendered) {
                 return holdLastFrame(shouldStop, onFrame);
             }
         }
         return rendered;
     }
 
-    /** Hold the last decoded frame on the layer until the deterrent's deadline. */
     private static boolean holdLastFrame(ThrottledStop shouldStop, Runnable onFrame) {
         while (!shouldStop.check()) {
-            if (onFrame != null) onFrame.run();
+            if (onFrame != null) {
+                try { onFrame.run(); } catch (Throwable ignored) {}
+            }
             try {
                 Thread.sleep(STOP_POLL_INTERVAL_MS);
-            } catch (InterruptedException ie) {
+            } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 return true;
             }
@@ -260,44 +272,46 @@ public final class ScreenDeterrentVideo {
         return true;
     }
 
-    /** False if the caller should abandon the frame and unwind. */
-    private static boolean sleepUntil(long targetNs, ThrottledStop shouldStop) {
+    private static boolean waitForFrame(long targetNs, ThrottledStop shouldStop,
+                                        Runnable onFrame) {
         while (true) {
             long remainingNs = targetNs - System.nanoTime();
             if (remainingNs <= 0) return true;
-            long sleepMs = Math.min(remainingNs / 1_000_000L, MAX_FRAME_SLEEP_MS);
-            if (sleepMs <= 0) return true;
             if (shouldStop.check()) return false;
+            if (onFrame != null) {
+                try { onFrame.run(); } catch (Throwable ignored) {}
+            }
+            long sleepMs = Math.min(
+                    STOP_POLL_INTERVAL_MS, Math.max(1, remainingNs / 1_000_000L));
             try {
-                Thread.sleep(Math.min(sleepMs, STOP_POLL_INTERVAL_MS));
-            } catch (InterruptedException ie) {
+                Thread.sleep(sleepMs);
+            } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 return false;
             }
-            if (sleepMs >= MAX_FRAME_SLEEP_MS) return true;
         }
     }
 
-    /** Rate-limits the disk-reading stop predicate; see STOP_POLL_INTERVAL_MS. */
     private static final class ThrottledStop {
         private final StopSignal delegate;
-        private long lastCheckMs = 0;
-        private boolean cached = false;
+        private long lastCheckMs;
+        private boolean stopped;
 
-        ThrottledStop(StopSignal delegate) { this.delegate = delegate; }
+        ThrottledStop(StopSignal delegate) {
+            this.delegate = delegate;
+        }
 
         boolean check() {
-            if (cached) return true;
-            if (Thread.currentThread().isInterrupted()) return true;
-            long now = System.currentTimeMillis();
-            if (now - lastCheckMs < STOP_POLL_INTERVAL_MS) return false;
+            if (stopped || Thread.currentThread().isInterrupted()) return true;
+            long now = SystemClock.elapsedRealtime();
+            if (lastCheckMs != 0 && now - lastCheckMs < STOP_POLL_INTERVAL_MS) return false;
             lastCheckMs = now;
             try {
-                cached = delegate == null || delegate.shouldStop();
-            } catch (Throwable t) {
-                cached = true;
+                stopped = delegate == null || delegate.shouldStop();
+            } catch (Throwable ignored) {
+                stopped = true;
             }
-            return cached;
+            return stopped;
         }
     }
 
@@ -309,172 +323,135 @@ public final class ScreenDeterrentVideo {
         return -1;
     }
 
-    /** Crop rect, not KEY_WIDTH/HEIGHT: H.264 pads coded dimensions to a multiple
-     *  of 16, so a 1080-tall clip reports 1088 and would show 8 rows of garbage. */
-    private static int displayWidth(MediaFormat f) {
-        if (f.containsKey("crop-left") && f.containsKey("crop-right")) {
-            return f.getInteger("crop-right") - f.getInteger("crop-left") + 1;
+    private static int displayWidth(MediaFormat format) {
+        int coded = codedWidth(format);
+        if (coded <= 0) return 0;
+        if (format.containsKey("crop-left") && format.containsKey("crop-right")) {
+            int left = format.getInteger("crop-left");
+            int right = format.getInteger("crop-right");
+            if (left < 0 || right < left || right >= coded) return 0;
+            return right - left + 1;
         }
-        return f.containsKey(MediaFormat.KEY_WIDTH) ? f.getInteger(MediaFormat.KEY_WIDTH) : 0;
+        return coded;
     }
 
-    private static int displayHeight(MediaFormat f) {
-        if (f.containsKey("crop-top") && f.containsKey("crop-bottom")) {
-            return f.getInteger("crop-bottom") - f.getInteger("crop-top") + 1;
-        }
-        return f.containsKey(MediaFormat.KEY_HEIGHT) ? f.getInteger(MediaFormat.KEY_HEIGHT) : 0;
+    private static int codedWidth(MediaFormat format) {
+        return format.containsKey(MediaFormat.KEY_WIDTH)
+                ? format.getInteger(MediaFormat.KEY_WIDTH) : 0;
     }
 
-    private static long frameGapUs(MediaFormat f) {
+    private static int displayHeight(MediaFormat format) {
+        int coded = codedHeight(format);
+        if (coded <= 0) return 0;
+        if (format.containsKey("crop-top") && format.containsKey("crop-bottom")) {
+            int top = format.getInteger("crop-top");
+            int bottom = format.getInteger("crop-bottom");
+            if (top < 0 || bottom < top || bottom >= coded) return 0;
+            return bottom - top + 1;
+        }
+        return coded;
+    }
+
+    private static int codedHeight(MediaFormat format) {
+        return format.containsKey(MediaFormat.KEY_HEIGHT)
+                ? format.getInteger(MediaFormat.KEY_HEIGHT) : 0;
+    }
+
+    private static long frameGapUs(MediaFormat format) {
         try {
-            if (f.containsKey(MediaFormat.KEY_FRAME_RATE)) {
-                int fps = f.getInteger(MediaFormat.KEY_FRAME_RATE);
+            if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                int fps = format.getInteger(MediaFormat.KEY_FRAME_RATE);
                 if (fps > 0) return 1_000_000L / fps;
             }
-        } catch (Throwable ignored) {
-            // Some extractors store KEY_FRAME_RATE as a float.
-        }
+        } catch (Throwable ignored) {}
         return DEFAULT_FRAME_GAP_US;
     }
 
-    /** -1 if the container has no usable duration on this track. */
-    private static long trackDurationUs(MediaFormat f) {
+    private static long trackDurationUs(MediaFormat format) {
         try {
-            if (f.containsKey(MediaFormat.KEY_DURATION)) {
-                long d = f.getLong(MediaFormat.KEY_DURATION);
-                if (d > 0) return d;
+            if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                long duration = format.getLong(MediaFormat.KEY_DURATION);
+                if (duration > 0) return duration;
             }
         } catch (Throwable ignored) {}
         return -1;
     }
 
-    /**
-     * Centred sub-rect of the video with the panel's aspect ratio; scaled to the
-     * full panel this gives cover/centre-crop.
-     *
-     * Returns {left, top, right, bottom} rather than a Rect so the arithmetic is
-     * reachable from a plain JVM unit test.
-     */
-    static int[] coverCropBounds(int vw, int vh, int dispW, int dispH) {
-        float videoAspect = (float) vw / vh;
-        float panelAspect = (float) dispW / dispH;
-        int cw, ch;
-        if (videoAspect > panelAspect) {
-            ch = vh;
-            cw = Math.max(1, Math.round(vh * panelAspect));
-        } else {
-            cw = vw;
-            ch = Math.max(1, Math.round(vw / panelAspect));
-        }
-        cw = Math.min(cw, vw);
-        ch = Math.min(ch, vh);
-        int cx = (vw - cw) / 2;
-        int cy = (vh - ch) / 2;
-        return new int[] { cx, cy, cx + cw, cy + ch };
+    static long nextLoopOffsetUs(long currentOffsetUs, long trackDurationUs,
+                                 long maxSampleUs, long frameGapUs) {
+        long minimumGapUs = Math.max(1L, frameGapUs);
+        long loopSpanUs = Math.max(
+                trackDurationUs, maxSampleUs + minimumGapUs);
+        return currentOffsetUs + Math.max(minimumGapUs, loopSpanUs);
     }
 
-    private static Rect coverCrop(int vw, int vh, int dispW, int dispH) {
-        int[] b = coverCropBounds(vw, vh, dispW, dispH);
-        return new Rect(b[0], b[1], b[2], b[3]);
-    }
-
-    /** Used by the upload endpoint to reject a clip this unit cannot decode. */
-    public static boolean hasDecoderFor(String mime) {
-        if (mime == null || mime.isEmpty()) return false;
+    private static int rotationDegrees(MediaFormat format) {
         try {
-            MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
-            MediaFormat probe = MediaFormat.createVideoFormat(mime, 1920, 1080);
-            return list.findDecoderForFormat(probe) != null;
-        } catch (Throwable t) {
-            // Probe unavailable — don't block the upload on a diagnostic.
-            return true;
-        }
-    }
-
-    // ── SurfaceControl reflection (mirrors BsNativeLayer's proven path) ────
-
-    private static Object createBufferLayer(String name, int w, int h) {
-        try {
-            Class<?> b = Class.forName("android.view.SurfaceControl$Builder");
-            Object builder = b.getDeclaredConstructor().newInstance();
-            b.getMethod("setName", String.class).invoke(builder, name);
-            b.getMethod("setBufferSize", int.class, int.class).invoke(builder, w, h);
-            // Opaque, unlike the blind-spot card: video has no alpha, and this lets
-            // SurfaceFlinger skip blending the whole panel.
-            try {
-                b.getMethod("setOpaque", boolean.class).invoke(builder, true);
-            } catch (NoSuchMethodException ignored) {}
-            return b.getMethod("build").invoke(builder);
-        } catch (Throwable t) {
-            logger.warn("Video buffer layer creation failed: " + t.getMessage());
-            return null;
-        }
-    }
-
-    private static Surface newSurfaceFor(Object layer) {
-        try {
-            Class<?> sc = Class.forName("android.view.SurfaceControl");
-            return Surface.class.getConstructor(sc).newInstance(layer);
-        } catch (Throwable t) {
-            logger.warn("Surface-from-SurfaceControl failed: " + t.getMessage());
-            return null;
-        }
-    }
-
-    private static void applyGeometry(Object layer, Rect src, Rect dst) {
-        try {
-            Class<?> scCls = Class.forName("android.view.SurfaceControl");
-            Class<?> txCls = Class.forName("android.view.SurfaceControl$Transaction");
-            Object tx = txCls.getDeclaredConstructor().newInstance();
-            try {
-                txCls.getMethod("setLayer", scCls, int.class).invoke(tx, layer, Z_ORDER);
-            } catch (Throwable ignored) {}
-            try {
-                txCls.getMethod("setAlpha", scCls, float.class).invoke(tx, layer, 1.0f);
-            } catch (Throwable ignored) {}
-            boolean geom = false;
-            try {
-                txCls.getMethod("setGeometry", scCls, Rect.class, Rect.class, int.class)
-                        .invoke(tx, layer, src, dst, 0);
-                geom = true;
-            } catch (Throwable ignored) {}
-            if (!geom) {
-                // No 4-arg setGeometry: scale the whole buffer from the origin. Loses
-                // the centre-crop (a mismatched aspect stretches) but still covers.
-                try {
-                    txCls.getMethod("setPosition", scCls, float.class, float.class)
-                            .invoke(tx, layer, 0f, 0f);
-                } catch (Throwable ignored) {}
-                try {
-                    txCls.getMethod("setMatrix", scCls, float.class, float.class,
-                                    float.class, float.class)
-                            .invoke(tx, layer,
-                                    (float) dst.width() / Math.max(1, src.width()), 0f,
-                                    0f, (float) dst.height() / Math.max(1, src.height()));
-                } catch (Throwable ignored) {}
+            if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                int degrees = format.getInteger(MediaFormat.KEY_ROTATION);
+                int normalized = ((degrees % 360) + 360) % 360;
+                return (Math.round(normalized / 90f) * 90) % 360;
             }
-            try {
-                txCls.getMethod("show", scCls).invoke(tx, layer);
-            } catch (Throwable ignored) {}
-            txCls.getMethod("apply").invoke(tx);
-        } catch (Throwable t) {
-            logger.warn("Video layer geometry failed: " + t.getMessage());
-        }
+        } catch (Throwable ignored) {}
+        return 0;
     }
 
-    private static void releaseLayer(Object layer) {
+    static int[] coverCropBounds(int videoWidth, int videoHeight,
+                                 int displayWidth, int displayHeight) {
+        float videoAspect = (float) videoWidth / videoHeight;
+        float displayAspect = (float) displayWidth / displayHeight;
+        int cropWidth;
+        int cropHeight;
+        if (videoAspect > displayAspect) {
+            cropHeight = videoHeight;
+            cropWidth = Math.max(1, Math.round(videoHeight * displayAspect));
+        } else {
+            cropWidth = videoWidth;
+            cropHeight = Math.max(1, Math.round(videoWidth / displayAspect));
+        }
+        cropWidth = Math.min(cropWidth, videoWidth);
+        cropHeight = Math.min(cropHeight, videoHeight);
+        int left = (videoWidth - cropWidth) / 2;
+        int top = (videoHeight - cropHeight) / 2;
+        return new int[] { left, top, left + cropWidth, top + cropHeight };
+    }
+
+    static int[] coverCropBounds(int videoWidth, int videoHeight,
+                                 int displayWidth, int displayHeight,
+                                 int rotation) {
+        boolean quarterTurn = rotation == 90 || rotation == 270;
+        int orientedWidth = quarterTurn ? videoHeight : videoWidth;
+        int orientedHeight = quarterTurn ? videoWidth : videoHeight;
+        int[] oriented = coverCropBounds(
+                orientedWidth, orientedHeight, displayWidth, displayHeight);
+        int cropWidth = oriented[2] - oriented[0];
+        int cropHeight = oriented[3] - oriented[1];
+        if (quarterTurn) {
+            int swap = cropWidth;
+            cropWidth = cropHeight;
+            cropHeight = swap;
+        }
+        int left = (videoWidth - cropWidth) / 2;
+        int top = (videoHeight - cropHeight) / 2;
+        return new int[] { left, top, left + cropWidth, top + cropHeight };
+    }
+
+    private static Rect coverCrop(int videoWidth, int videoHeight,
+                                  int displayWidth, int displayHeight,
+                                  int rotation) {
+        int[] bounds = coverCropBounds(
+                videoWidth, videoHeight, displayWidth, displayHeight, rotation);
+        return new Rect(bounds[0], bounds[1], bounds[2], bounds[3]);
+    }
+
+    public static String decoderForFormat(MediaFormat format) {
+        if (format == null) return null;
         try {
-            Class<?> scCls = Class.forName("android.view.SurfaceControl");
-            Class<?> txCls = Class.forName("android.view.SurfaceControl$Transaction");
-            Object tx = txCls.getDeclaredConstructor().newInstance();
-            try { txCls.getMethod("hide", scCls).invoke(tx, layer); } catch (Throwable ignored) {}
-            try {
-                txCls.getMethod("reparent", scCls, scCls).invoke(tx, layer, null);
-            } catch (Throwable ignored) {}
-            txCls.getMethod("apply").invoke(tx);
-            try { scCls.getMethod("release").invoke(layer); } catch (Throwable ignored) {}
+            return new MediaCodecList(MediaCodecList.REGULAR_CODECS)
+                    .findDecoderForFormat(format);
         } catch (Throwable t) {
-            logger.debug("Video layer release failed: " + t.getMessage());
+            logger.debug("Decoder probe failed: " + t.getMessage());
+            return null;
         }
     }
 }

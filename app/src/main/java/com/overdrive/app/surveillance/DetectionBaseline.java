@@ -352,6 +352,165 @@ public class DetectionBaseline {
         return false;
     }
 
+    // ==================== SHADOW DIAGNOSTICS (log-only) ====================
+
+    /**
+     * SHADOW-MODE diagnostic for the containment-suppression candidate
+     * (parked-car split-box FP audit). For a detection that just BYPASSED or
+     * PASSED the baseline, report the CONFIRMED entry that overlaps it most
+     * by CONTAINMENT (intersection area / detection area) — any class,
+     * because the two FP signatures under investigation differ:
+     * <ul>
+     *   <li><b>nonperson-pass</b>: a split/reshaped box of a parked car
+     *       passes when IoU &lt; {@link #MATCH_IOU_THRESHOLD} and the
+     *       foot-point path fails (centroid shift &gt; 4%, w/h ratio &gt;
+     *       1.30, or area ratio &gt; 1.15) — but the fragment lies INSIDE
+     *       the stored full-car box, so containment stays near 1.0.
+     *       Candidate rule under validation: contain &gt;= 0.80 AND same
+     *       canonical class =&gt; suppress.</li>
+     *   <li><b>person-bypass</b>: part of a parked car misread as a person
+     *       bypasses the baseline BY DESIGN (class 0 is never suppressed);
+     *       high containment vs a DIFFERENT-class (vehicle) entry is the
+     *       misclassification signature.</li>
+     * </ul>
+     * Purely observational: mutates nothing (stale entries are skipped, not
+     * evicted), suppresses nothing. ALWAYS returns a line for a valid call
+     * (review fix): a silent no-overlap case would right-censor the
+     * containment distribution — "contain=0" and "no baseline to compare
+     * against" are data, not noise. Two slots are reported:
+     * <ul>
+     *   <li>{@code same{...}} — the best SAME-canonical-class entry (by
+     *       containment; among zero-overlap entries, nearest foot-point).
+     *       This is the entry the candidate suppression rule would score, so
+     *       it must never be masked by a larger cross-class overlap (review
+     *       fix). Absent for person detections (class 0 is never promoted).</li>
+     *   <li>{@code any{...}} / {@code bestOther{...}} — the best entry across
+     *       ALL classes when it overlaps more than the same-class one (or
+     *       when no same-class entry exists — the person-bypass signature is
+     *       precisely a person box sitting on a stored vehicle entry).</li>
+     * </ul>
+     */
+    public synchronized String shadowContainmentDiag(Detection det, int quadrant,
+                                                     int quadW, int quadH) {
+        if (quadrant < 0 || quadrant >= NUM_QUADRANTS) return null;
+        if (quadW <= 0 || quadH <= 0) return null;
+
+        float detCx = (det.getX() + det.getW() / 2.0f) / quadW;
+        float detCy = (det.getY() + det.getH() / 2.0f) / quadH;
+        float detW = (float) det.getW() / quadW;
+        float detH = (float) det.getH() / quadH;
+        float detFootX = detCx;
+        float detFootY = detCy + detH / 2.0f;
+        int detCanonical = canonicalClass(det.getClassId());
+
+        long now = System.currentTimeMillis();
+        int eligible = 0;
+        Entry bestSame = null;
+        float bestSameContain = -1f;           // -1 so a zero-overlap same-class entry still selects
+        float bestSameFoot = Float.MAX_VALUE;
+        Entry bestAny = null;
+        float bestAnyContain = 0f;             // strictly-> so bestAny != null implies real overlap
+        for (Entry entry : baselines[quadrant]) {
+            // Mirror isInBaseline's eligibility (confirmed + not stale) but
+            // WITHOUT the eviction side-effect — diagnostics must not mutate.
+            if (!entry.isConfirmed()) continue;
+            if (now - entry.lastSeenMs > BASELINE_ENTRY_MAX_AGE_MS) continue;
+            eligible++;
+            float contain = containmentFrac(detCx, detCy, detW, detH,
+                    entry.cx, entry.cy, entry.w, entry.h);
+            if (contain > bestAnyContain) {
+                bestAnyContain = contain;
+                bestAny = entry;
+            }
+            if (canonicalClass(entry.classId) == detCanonical) {
+                float dxs = detFootX - entry.footX();
+                float dys = detFootY - entry.footY();
+                float foot = (float) Math.sqrt(dxs * dxs + dys * dys);
+                // Selection: containment first; among equal (typically zero)
+                // containment, nearest foot-point — "how far from the known
+                // object was this box" is the useful datum when nothing
+                // overlaps.
+                if (contain > bestSameContain
+                        || (contain == bestSameContain && foot < bestSameFoot)) {
+                    bestSame = entry;
+                    bestSameContain = contain;
+                    bestSameFoot = foot;
+                }
+            }
+        }
+
+        StringBuilder sb = new StringBuilder(192);
+        sb.append(String.format(java.util.Locale.US,
+                "det{cls=%d conf=%.2f c=%.3f,%.3f wh=%.3fx%.3f}",
+                det.getClassId(), det.getConfidence(), detCx, detCy, detW, detH));
+        if (eligible == 0) {
+            // Still a line — "no confirmed baseline here" must appear in the
+            // distribution, not vanish from it.
+            return sb.append(" entries=0").toString();
+        }
+        if (bestSame != null) {
+            sb.append(" same").append(entryDiag(bestSame,
+                    Math.max(bestSameContain, 0f),
+                    detCx, detCy, detW, detH, detFootX, detFootY));
+            // Masking guard (review fix): the same-class slot is what the
+            // candidate rule scores, but a different-class entry may overlap
+            // MORE — surface it so cross-class containment can't hide the
+            // same-class value.
+            if (bestAny != null && bestAny != bestSame
+                    && bestAnyContain > bestSameContain) {
+                sb.append(String.format(java.util.Locale.US,
+                        " bestOther{cls=%d contain=%.2f}",
+                        bestAny.classId, bestAnyContain));
+            }
+        } else if (bestAny != null) {
+            // No same-class entries (always the case for person-bypass —
+            // class 0 is never promoted): the best cross-class overlap IS the
+            // misclassification signature, so report its full geometry.
+            sb.append(" any").append(entryDiag(bestAny, bestAnyContain,
+                    detCx, detCy, detW, detH, detFootX, detFootY));
+        } else {
+            sb.append(" any{noOverlap entries=").append(eligible).append('}');
+        }
+        return sb.toString();
+    }
+
+    /** One entry's geometry vs the detection, for the shadow log. */
+    private static String entryDiag(Entry entry, float contain,
+                                    float detCx, float detCy, float detW, float detH,
+                                    float detFootX, float detFootY) {
+        float iou = computeIoU(detCx, detCy, detW, detH,
+                entry.cx, entry.cy, entry.w, entry.h);
+        float dx = detFootX - entry.footX();
+        float dy = detFootY - entry.footY();
+        float footDist = (float) Math.sqrt(dx * dx + dy * dy);
+        float wR = entry.w > 0 && detW > 0 ? Math.max(detW / entry.w, entry.w / detW) : 99f;
+        float hR = entry.h > 0 && detH > 0 ? Math.max(detH / entry.h, entry.h / detH) : 99f;
+        float aR = (entry.w * entry.h) > 0 && (detW * detH) > 0
+                ? Math.max((detW * detH) / (entry.w * entry.h),
+                           (entry.w * entry.h) / (detW * detH))
+                : 99f;
+        return String.format(java.util.Locale.US,
+                "{cls=%d hits=%d contain=%.2f iou=%.2f footDist=%.3f wR=%.2f hR=%.2f aR=%.2f}",
+                entry.classId, entry.hitCount, contain, iou, footDist, wR, hR, aR);
+    }
+
+    /** Fraction of the FIRST box's area covered by the second (both in
+     *  center + dims form). 1.0 = the detection lies entirely inside the
+     *  entry — the split-box signature computeIoU misses because the union
+     *  in its denominator is dominated by the full-car entry. */
+    private static float containmentFrac(float cx1, float cy1, float w1, float h1,
+                                         float cx2, float cy2, float w2, float h2) {
+        float l1 = cx1 - w1 / 2f, t1 = cy1 - h1 / 2f;
+        float r1 = cx1 + w1 / 2f, b1 = cy1 + h1 / 2f;
+        float l2 = cx2 - w2 / 2f, t2 = cy2 - h2 / 2f;
+        float r2 = cx2 + w2 / 2f, b2 = cy2 + h2 / 2f;
+        float iw = Math.min(r1, r2) - Math.max(l1, l2);
+        float ih = Math.min(b1, b2) - Math.max(t1, t2);
+        if (iw <= 0f || ih <= 0f) return 0f;
+        float detArea = w1 * h1;
+        return detArea > 0f ? (iw * ih) / detArea : 0f;
+    }
+
     // ==================== EVENT-DRIVEN UPDATE ====================
 
     /**

@@ -779,12 +779,13 @@ public class TelemetryDataCollector {
                 // sanitizeSeatbeltState, so the raw HAL value is never DECODED differently here.
                 //
                 // That is decode parity, NOT end-to-end parity: the automation/MQTT path layers a
-                // passenger boot-latch (passengerBeltEverUnlatched — a never-unlatched belt idles
-                // at "buckled", so its 1 is held as unbuckled until one genuine 0) and an
-                // occupancy gate on top. So at boot this overlay can legitimately show the
-                // passenger green while a "passenger buckled" automation has not fired. Deliberate:
-                // the latch suppresses a possibly-bogus edge, whereas the overlay just draws the
-                // sensor. Do not "reconcile" them by copying the latch here.
+                // passenger-session tracker and an occupancy gate on top. On affected firmware an
+                // empty seat idles at the same raw 1 as a real buckle, so automation withholds that
+                // value until a closed-door 0 establishes the session; opening the passenger door
+                // ends it before the empty-seat rebound. This overlay can therefore show passenger
+                // green while a "passenger buckled" automation has not fired. Deliberate: the
+                // automation path suppresses an ambiguous edge, whereas the overlay draws the raw
+                // sensor. Do not copy the tracker here.
                 //
                 // Two separate hazards, hence neither a bare "!= 0" nor a bare "== 1":
                 //  - "!= 0" read every HAL failure code (-1, the -21474826xx family,

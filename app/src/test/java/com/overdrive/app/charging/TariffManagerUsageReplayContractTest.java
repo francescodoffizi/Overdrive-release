@@ -281,6 +281,28 @@ public class TariffManagerUsageReplayContractTest {
     }
 
     @Test
+    public void statusMatchesDcOnlyTariffAtCurrentLocation()
+            throws Exception {
+        JSONObject tariff = new JSONObject()
+                .put("id", "dc-only")
+                .put("label", "Fast charger")
+                .put("lat", 3.339791)
+                .put("lng", 101.250876)
+                .put("radiusM", 50)
+                .put("acRate", 0.0)
+                .put("dcRate", 1.25)
+                .put("enabled", true);
+        JSONObject root = new JSONObject().put(
+                "chargingAnalytics",
+                new JSONObject().put("tariffs", new JSONArray().put(tariff)));
+
+        JSONObject status = TariffManager.getInstance().toStatusJson(
+                root, 3.339791, 101.250876);
+
+        assertEquals("dc-only", status.getString("matchedTariffId"));
+    }
+
+    @Test
     public void apiKeepsConfigIntentUntilDatabaseAndCleanupComplete()
             throws IOException {
         String api = readRepositoryFile(

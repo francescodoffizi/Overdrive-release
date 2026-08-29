@@ -148,6 +148,9 @@ class VideoPlayerFragment : Fragment() {
             refreshFullscreenButton()
         }
 
+    var onPlaylistItemChanged: ((String) -> Unit)? = null
+    var onDurationResolved: ((String, Long) -> Unit)? = null
+
     private val handler = Handler(Looper.getMainLooper())
     private var isUserSeeking = false
     private var timelineExecutor: ExecutorService? = null
@@ -369,6 +372,7 @@ class VideoPlayerFragment : Fragment() {
         val path = playlistPaths[newIndex]
         val title = playlistTitles.getOrNull(newIndex) ?: File(path).name
         loadVideo(path, title)
+        onPlaylistItemChanged?.invoke(path)
         // Keep the host's index in sync so its onPlay-from-list also tracks.
         // Update arguments so config-change (rotation) restores the right
         // entry rather than the original starting one.
@@ -536,6 +540,7 @@ class VideoPlayerFragment : Fragment() {
             seekBar.max = duration
             tvDuration.text = formatTime(duration)
             eventTimeline.setPlayhead(0)
+            if (duration > 0) onDurationResolved?.invoke(path, duration.toLong())
 
             mp.isLooping = false
             currentMediaPlayer = mp

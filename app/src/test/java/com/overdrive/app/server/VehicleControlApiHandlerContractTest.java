@@ -64,6 +64,40 @@ public class VehicleControlApiHandlerContractTest {
         assertTrue(source.contains("isValidChargeWay(way)"));
         assertTrue(source.contains("Integer requestedPercent = hasPercent ? jsonInteger(req, \"percent\") : null"));
         assertTrue(source.contains("setChargeCapPercentAndEnabledWithResult(percent, enabled)"));
+        assertTrue(source.contains("\"/api/vehicle/ac-charge-current-limit\""));
+        assertTrue(source.contains("state must be an integer from 1 to 5"));
+        assertTrue(source.contains("new VehicleCommandRouter.AcChargeCurrentLimitCommand("));
+        assertTrue(source.contains("collector.getAcChargingCurrentLimitStatus()"));
+        assertTrue(source.contains("response.put(\"available\", status.available)"));
+        assertTrue(source.contains("status.supported != null"));
+        assertTrue(source.contains("Messages.get(\"vehicle_data_unavailable\")"));
+        String collector = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/byd/BydDataCollector.java");
+        String bridge = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/byd/VehicleActuatorBridge.java");
+        String actuator = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/services/VehicleActuatorService.java");
+        assertTrue(collector.contains(
+                "VehicleActuatorBridge.dispatchAcChargeCurrentLimit(state)"));
+        assertTrue(collector.contains("public synchronized boolean setAcChargingCurrentLimitState"));
+        assertTrue(collector.contains("boolean confirmed = readBack == state"));
+        assertTrue(bridge.contains("--es action ac_charge_current_limit"));
+        assertTrue(bridge.contains("--es state \" + state"));
+        assertTrue(actuator.contains("\"ac_charge_current_limit\".equals(action)"));
+        assertTrue(actuator.contains("setAcChargeCurrentLimit(state)"));
+        assertTrue(actuator.contains(
+                "BydDeviceHelper.withBydPermissionBypass(getApplicationContext())"));
+        assertTrue(actuator.contains(
+                "BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS_SET"));
+        assertTrue(actuator.contains(
+                "BydFeatureIds.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS"));
+        assertTrue(actuator.contains(
+                "resolveAcChargingCurrentLimitSupport("));
+        assertTrue(actuator.contains(
+                "AC charge current limit read side did not prove capability"));
+        assertTrue(source.contains("boolean confirmed = readBack == state.intValue()"));
+        assertTrue(source.contains("routed.put(\"success\", confirmed)"));
+        assertTrue(source.contains("routed.put(\"commandSuccess\", confirmed)"));
         assertTrue(source.contains("if (hasEnabled && hasPercent)"));
         assertTrue(source.contains("resp.put(\"partialApplied\", combinedResult.partiallyApplied("));
         assertTrue(source.contains("boolean verified = Boolean.TRUE.equals(supported)"));
@@ -195,6 +229,68 @@ public class VehicleControlApiHandlerContractTest {
         volumeRequest.put("channel", 3);
         assertNull(invokePrivate("optionalVolumeChannel", new Class<?>[] {
                 org.json.JSONObject.class}, volumeRequest));
+    }
+
+    @Test
+    public void drivingGateTargetsOnlySafetyRelevantDisplays() throws Exception {
+        Class<?>[] argument = { String.class };
+        assertEquals("displayBrightness", invokePrivate(
+                "drivingSafetyGuardForDisplayTarget", argument, "brightness"));
+        assertEquals("displayBrightness", invokePrivate(
+                "drivingSafetyGuardForDisplayTarget", argument, "cluster_brightness"));
+        assertEquals("displayBrightness", invokePrivate(
+                "drivingSafetyGuardForDisplayTarget", argument, "hud_brightness"));
+        assertEquals("displayPower", invokePrivate(
+                "drivingSafetyGuardForDisplayTarget", argument, "hud_power"));
+        assertEquals("displayPower", invokePrivate(
+                "drivingSafetyGuardForDisplayTarget", argument, "screen_power"));
+        for (String target : new String[] {
+                "volume", "volume_step", "media_key", "ambient_brightness", "ambient_power", null
+        }) {
+            assertNull(invokePrivate(
+                    "drivingSafetyGuardForDisplayTarget", argument, target));
+        }
+
+        String source = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/server/VehicleControlApiHandler.java");
+        assertTrue(source.contains("displaySafetyGuard != null\n"
+                + "                    && !(isHudPower && value > 0)\n"
+                + "                    && DrivingSafetyGuard.isActionBlocked(displaySafetyGuard)"));
+        assertTrue(source.contains("DrivingSafetyGuard.GUARD_SCREEN_MEDIA"));
+        assertTrue(source.contains("Messages.get(\"vehicle_control.blocked_driving\")"));
+        assertFalse(source.contains("boolean screenTarget = !isVolume"));
+
+        String guard = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/byd/routing/DrivingSafetyGuard.java");
+        String service = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/services/VehicleActuatorService.java");
+        String activity = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/ui/VideoPlaybackActivity.java");
+        String manifest = readRepositoryFile("app/src/main/AndroidManifest.xml");
+        assertTrue(source.contains("\"/api/vehicle/driving-safety/\""));
+        assertTrue(guard.contains("isActionBlockedViaDaemon(String key)"));
+        assertTrue(service.contains("submitGuardedActuation("));
+        assertTrue(service.contains("DrivingSafetyGuard.GUARD_MIRROR_FOLD"));
+        assertTrue(service.contains("DrivingSafetyGuard.GUARD_DISPLAY_BRIGHTNESS"));
+        assertTrue(service.contains("DrivingSafetyGuard.GUARD_DISPLAY_POWER"));
+        assertTrue(service.contains("DrivingSafetyGuard.isActionBlockedViaDaemon(guardKey)"));
+        assertTrue(activity.contains("requestSafeStart(Intent intent)"));
+        assertTrue(activity.contains("startSafetyMonitor()"));
+        assertTrue(activity.contains("blocked fullscreen media before prepared playback"));
+        assertTrue(activity.contains("generation != safetyRequestGeneration"));
+        assertTrue(activity.contains(
+                "DrivingSafetyGuard.isActionBlockedViaDaemon(\n"
+                        + "                                DrivingSafetyGuard.GUARD_SCREEN_MEDIA)"));
+        assertTrue(activity.contains("if (executor == null || executor.isShutdown())"));
+        assertTrue(activity.contains("catch (RuntimeException unavailable)"));
+        assertTrue(activity.contains(
+                "DrivingSafetyGuard.isActionBlockedViaDaemon("));
+        int activityStart = manifest.indexOf(
+                "android:name=\"com.overdrive.app.ui.VideoPlaybackActivity\"");
+        int activityEnd = manifest.indexOf("/>", activityStart);
+        assertTrue(activityStart >= 0 && activityEnd > activityStart);
+        assertTrue(manifest.substring(activityStart, activityEnd).contains(
+                "android:permission=\"android.permission.DUMP\""));
     }
 
     @Test

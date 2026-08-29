@@ -6,6 +6,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import com.overdrive.app.byd.BydVehicleData;
+import com.overdrive.app.monitor.ChargingDetector;
 import com.overdrive.app.monitor.ChargingStateData;
 import com.overdrive.app.monitor.SocHistoryDatabase;
 import com.overdrive.app.trips.TripAnalyticsManager;
@@ -151,6 +152,90 @@ public class ChargingApiHandlerTest {
         assertEquals(0L, stopped.observedAtMs);
         assertEquals("UNKNOWN", stopped.quality);
         assertEquals(0.0, stopped.confidence, 0.0);
+    }
+
+    @Test
+    public void powerPublicationRejectsOutOfDomainStateEvenIfFieldWasMutated() {
+        ChargingStateData state = new ChargingStateData(
+                ChargingStateData.CHARGING_BATTERY_STATE_CHARGING);
+        state.chargingPowerKW = 500.01;
+        state.powerSource = "chargingDevice";
+        state.powerQuality = ChargingStateData.PowerQuality.MEASURED;
+        state.powerConfidence = 1.0;
+
+        ChargingApiHandler.PowerPublication publication =
+                ChargingApiHandler.normalizePowerPublication(true, state);
+        assertEquals(0.0, publication.powerKw, 0.0);
+        assertEquals("none", publication.source);
+        assertEquals("UNKNOWN", publication.quality);
+    }
+
+    @Test
+    public void livePublicationPreservesSessionEnergyQualityOnBothSurfaces()
+            throws Exception {
+        ChargingStateData state = new ChargingStateData(
+                ChargingStateData.CHARGING_BATTERY_STATE_CHARGING);
+        state.updateChargingPower(
+                6.1, "chargingDevice", 1234L,
+                ChargingStateData.PowerQuality.MEASURED, 1.0);
+        ChargingApiHandler.PowerPublication power =
+                ChargingApiHandler.normalizePowerPublication(true, state);
+
+        Constructor<ChargingApiHandler.LivePublication> constructor =
+                ChargingApiHandler.LivePublication.class.getDeclaredConstructor(
+                        ChargingStateData.class,
+                        boolean.class, boolean.class,
+                        boolean.class, boolean.class,
+                        double.class, double.class,
+                        boolean.class, boolean.class, String.class,
+                        int.class,
+                        ChargingApiHandler.PowerPublication.class,
+                        ChargingDetector.StateSnapshot.class);
+        constructor.setAccessible(true);
+        ChargingApiHandler.LivePublication publication =
+                constructor.newInstance(
+                        state,
+                        true, true, false, false,
+                        52.0, 1.4,
+                        true, false,
+                        SessionEnergyResolver.SRC_INTEGRATED,
+                        45,
+                        power,
+                        null);
+
+        JSONObject liveJson = publication.toLiveJson();
+        assertTrue(liveJson.has("rangeKm"));
+        assertTrue(liveJson.has("sohPercent"));
+        for (JSONObject json : new JSONObject[] {
+                liveJson, publication.toStatusJson()
+        }) {
+            assertEquals(1.4, json.getDouble("sessionKwh"), 0.0);
+            assertTrue(json.getBoolean("sessionEnergyIncomplete"));
+            assertTrue(json.getBoolean("sessionEnergyEstimated"));
+            assertEquals(SessionEnergyResolver.SRC_INTEGRATED,
+                    json.getString("sessionEnergySource"));
+        }
+
+        ChargingApiHandler.LivePublication stateLess =
+                constructor.newInstance(
+                        null,
+                        true, true, false, false,
+                        52.0, 2.2,
+                        false, false,
+                        SessionEnergyResolver.SRC_METERED,
+                        30,
+                        ChargingApiHandler.normalizePowerPublication(
+                                true, null),
+                        null);
+        JSONObject stateLessStatus = stateLess.toStatusJson();
+        assertTrue(stateLessStatus.getBoolean("charging"));
+        assertTrue(stateLessStatus.getBoolean("plugged"));
+        assertEquals(2.2,
+                stateLessStatus.getDouble("sessionKwh"), 0.0);
+        assertEquals(0.0,
+                stateLessStatus.getDouble("powerKw"), 0.0);
+        assertEquals("Unavailable",
+                stateLessStatus.getString("stateName"));
     }
 
     @Test
@@ -692,6 +777,46 @@ public class ChargingApiHandlerTest {
         assertEquals(500, response.optInt("_status"));
     }
 
+    @Test
+    public void updateSessionCostRejectsMalformedPayloads()
+            throws Exception {
+        ChargingApiHandler handler =
+                new ChargingApiHandler(new TrackingManager(true));
+
+        assertEquals(400, handler.handleRequest(
+                "/api/charging/42/cost", "POST", null, "not json")
+                .optInt("_status"));
+        assertEquals(400, handler.handleRequest(
+                "/api/charging/42/cost", "POST", null, "{}")
+                .optInt("_status"));
+        assertEquals(400, handler.handleRequest(
+                "/api/charging/42/cost", "POST", null,
+                "{\"cost\":\"not a number\"}")
+                .optInt("_status"));
+        assertEquals(400, handler.handleRequest(
+                "/api/charging/42/cost", "POST", null,
+                "{\"cost\":\"12.50\"}")
+                .optInt("_status"));
+    }
+
+    @Test
+    public void updateSessionCostRejectsNonFiniteAndUnexpectedNegativeValues()
+            throws Exception {
+        ChargingApiHandler handler =
+                new ChargingApiHandler(new TrackingManager(true));
+
+        for (String body : new String[] {
+                "{\"cost\":NaN}",
+                "{\"cost\":1e400}",
+                "{\"cost\":1e100}",
+                "{\"cost\":-2}"
+        }) {
+            JSONObject response = handler.handleRequest(
+                    "/api/charging/42/cost", "POST", null, body);
+            assertEquals(body, 400, response.optInt("_status"));
+        }
+    }
+
     private static ChargingConfig configThatSaves(boolean succeeds) {
         ChargingConfig config = new ChargingConfig(ignored -> succeeds);
         config.setElectricityRate(2.5);
@@ -749,46 +874,10 @@ public class ChargingApiHandlerTest {
         assertEquals("Missing 'cost' parameter", response.optString("error"));
     }
 
-    @Test
-    public void updateSessionCostSuccess() throws Exception {
-        TrackingManager manager = new TrackingManager(true);
-        final long[] capturedId = new long[1];
-        final double[] capturedCost = new double[1];
-        manager.socDbOverride = new SocHistoryDatabase(null) {
-            @Override
-            public synchronized boolean updateChargingSessionCost(long id, double newCost) {
-                capturedId[0] = id;
-                capturedCost[0] = newCost;
-                return true;
-            }
-        };
-        ChargingApiHandler handler = new ChargingApiHandler(manager);
-        JSONObject response = handler.handleRequest(
-                "/api/charging/42/cost", "POST", null,
-                new JSONObject().put("cost", 15.50).toString());
-
-        assertTrue(response.optBoolean("success"));
-        assertEquals(42L, capturedId[0]);
-        assertEquals(15.50, capturedCost[0], 0.001);
-    }
-
-    @Test
-    public void updateSessionCostDatabaseFailure() throws Exception {
-        TrackingManager manager = new TrackingManager(true);
-        manager.socDbOverride = new SocHistoryDatabase(null) {
-            @Override
-            public synchronized boolean updateChargingSessionCost(long id, double newCost) {
-                return false;
-            }
-        };
-        ChargingApiHandler handler = new ChargingApiHandler(manager);
-        JSONObject response = handler.handleRequest(
-                "/api/charging/42/cost", "POST", null,
-                new JSONObject().put("cost", 15.50).toString());
-
-        assertEquals(500, response.optInt("_status"));
-        assertTrue(response.optString("error").contains("Failed to update session cost"));
-    }
+    // The 200/500 wiring of POST /api/charging/{id}/cost is not covered here:
+    // SocHistoryDatabase's constructors are not accessible from this package, so the
+    // return value of updateChargingSessionCost cannot be stubbed. Its semantics are
+    // pinned by SocHistoryDatabaseManualCostTest instead.
 
     /**
      * Captures the tariff the handler mirrors into the trips config, which is

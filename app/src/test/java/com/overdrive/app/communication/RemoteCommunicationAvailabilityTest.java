@@ -22,10 +22,14 @@ public class RemoteCommunicationAvailabilityTest {
         RemoteCommunicationAvailability.Result messages =
                 RemoteCommunicationAvailability.messages(
                         true, allDisabled, false);
+        RemoteCommunicationAvailability.Result listener =
+                RemoteCommunicationAvailability.listener(
+                        true, allDisabled, true);
 
         assertFalse(voice.ready);
         assertEquals("car_off", voice.code);
         assertEquals("car_off", messages.code);
+        assertEquals("car_off", listener.code);
         assertTrue(voice.reason.contains("car is off"));
     }
 
@@ -47,6 +51,17 @@ public class RemoteCommunicationAvailabilityTest {
                 false, ENABLED, false, true).ready);
         assertTrue(RemoteCommunicationAvailability.messages(
                 false, ENABLED, true).ready);
+        RemoteCommunicationSettings.Snapshot listenerEnabled =
+                new RemoteCommunicationSettings.Snapshot(
+                        true, 70, false, true, true, false);
+        assertTrue(RemoteCommunicationAvailability.listener(
+                false, listenerEnabled, false).ready);
+        assertEquals("listener_busy",
+                RemoteCommunicationAvailability.listener(
+                        false, listenerEnabled, true).code);
+        assertEquals("listener_disabled",
+                RemoteCommunicationAvailability.listener(
+                        false, ENABLED, false).code);
     }
 
     @Test

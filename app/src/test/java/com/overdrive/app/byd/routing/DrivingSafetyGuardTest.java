@@ -5,6 +5,7 @@ import static org.junit.Assert.assertTrue;
 
 import com.overdrive.app.byd.routing.DrivingSafetyGuard.GearReading;
 
+import org.json.JSONObject;
 import org.junit.Test;
 
 public class DrivingSafetyGuardTest {
@@ -50,5 +51,44 @@ public class DrivingSafetyGuardTest {
     @Test
     public void unknownGearIsBlocked() {
         assertTrue(DrivingSafetyGuard.isBlocked(GearReading.UNKNOWN, true, true, 0.0));
+    }
+
+    @Test
+    public void configurableGuardsDefaultOnAndOnlyAcceptBooleans() throws Exception {
+        JSONObject settings = new JSONObject();
+        assertTrue(DrivingSafetyGuard.isGuardEnabled(
+                settings, DrivingSafetyGuard.GUARD_DOOR_LOCKS));
+
+        settings.put(DrivingSafetyGuard.GUARD_DOOR_LOCKS, false);
+        assertFalse(DrivingSafetyGuard.isGuardEnabled(
+                settings, DrivingSafetyGuard.GUARD_DOOR_LOCKS));
+
+        settings.put(DrivingSafetyGuard.GUARD_DOOR_LOCKS, "false");
+        assertTrue(DrivingSafetyGuard.isGuardEnabled(
+                settings, DrivingSafetyGuard.GUARD_DOOR_LOCKS));
+        assertTrue(DrivingSafetyGuard.isGuardEnabled(settings, "futureGuard"));
+    }
+
+    @Test
+    public void daemonAdmissionRequiresStrictMatchingBooleanResponse() throws Exception {
+        String key = DrivingSafetyGuard.GUARD_SCREEN_MEDIA;
+        assertTrue(DrivingSafetyGuard.isDaemonResponseUnblocked(
+                new JSONObject()
+                        .put("success", true)
+                        .put("guard", key)
+                        .put("blocked", false),
+                key));
+        assertFalse(DrivingSafetyGuard.isDaemonResponseUnblocked(
+                new JSONObject()
+                        .put("success", "true")
+                        .put("guard", key)
+                        .put("blocked", "false"),
+                key));
+        assertFalse(DrivingSafetyGuard.isDaemonResponseUnblocked(
+                new JSONObject()
+                        .put("success", true)
+                        .put("guard", DrivingSafetyGuard.GUARD_DISPLAY_POWER)
+                        .put("blocked", false),
+                key));
     }
 }

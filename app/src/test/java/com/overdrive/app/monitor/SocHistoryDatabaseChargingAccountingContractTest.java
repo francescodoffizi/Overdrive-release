@@ -19,6 +19,8 @@ import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayDeque;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
 import org.junit.Test;
 import org.junit.BeforeClass;
 
@@ -45,6 +47,653 @@ public class SocHistoryDatabaseChargingAccountingContractTest {
                 "public synchronized boolean finalizeStaleOpenSessions(boolean forceRecent)"));
         assertTrue(source.contains("private boolean persistCounterProgress()"));
         assertTrue(source.contains("if (p.executeUpdate() != 1)"));
+    }
+
+    @Test
+    public void sessionAverageRequiresRecordedPowerPoints()
+            throws IOException {
+        String source = databaseSource();
+        String resolver = between(source,
+                "private double resolveAveragePowerKw",
+                "/** Arithmetic mean of measured positive samples");
+        String sampleQuery = between(source,
+                "private double averageSamplePowerKw",
+                "/** Max measured power");
+
+        assertTrue(resolver.contains("averageSamplePowerKw(sessionStartTime)"));
+        assertTrue(resolver.contains("coarsePowerSum / coarsePowerCount"));
+        assertTrue(resolver.contains("return -1"));
+        assertFalse(source.contains("timeWeightedAvgKw("));
+        assertTrue(sampleQuery.contains("SELECT AVG(power_kw)"));
+        assertTrue(sampleQuery.contains("power_kw > 0"));
+        assertEquals(3, occurrences(source, "double avgPower = resolveAveragePowerKw("));
+    }
+
+    @Test
+    public void maintenanceRejectsNonFiniteEnergyAndCost() throws Exception {
+        String source = databaseSource();
+        String reprice = between(source,
+                "private int repriceSessionsForTariffNow",
+                "private boolean reconcileRepriceCommit");
+        String range = between(source,
+                "private int rangeGainedFromEnergy",
+                "/** Current GPS");
+        String dailyCost = between(source,
+                "private void adjustDailyCost",
+                "// ==================== CHARGING SESSION HELPERS");
+
+        assertTrue(reprice.contains(
+                "if (!Double.isFinite(energy) || energy <= 0) continue;"));
+        assertTrue(range.contains(
+                "if (!Double.isFinite(energyKwh) || energyKwh <= 0) return -1;"));
+        assertTrue(dailyCost.contains("if (!Double.isFinite(delta))"));
+    }
+
+    @Test
+    public void sessionAverageIsArithmeticMeanOfPositiveRecordedPoints()
+            throws Exception {
+        Path journal = Files.createTempFile("charging-average-points", ".json");
+        Files.deleteIfExists(journal);
+        Class.forName("org.h2.Driver");
+        SocHistoryDatabase database = new SocHistoryDatabase(journal.toFile());
+        try (Connection connection = DriverManager.getConnection(
+                "jdbc:h2:mem:charging-average-" + System.nanoTime()
+                        + ";DB_CLOSE_DELAY=-1", "sa", "");
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE charging_power_samples ("
+                    + "session_start_time BIGINT NOT NULL, power_kw REAL)");
+            statement.execute("INSERT INTO charging_power_samples"
+                    + " (session_start_time, power_kw)"
+                    + " VALUES (1000, 2), (1000, 4), (1000, 8), (1000, 0),"
+                    + " (1000, 600),"
+                    + " (2000, 100)");
+            setField(database, "connection", connection);
+            setField(database, "isInitialized", true);
+
+            double average = ((Number) invoke(database,
+                    "resolveAveragePowerKw",
+                    new Class<?>[] {long.class, double.class, int.class},
+                    1000L, 0.0, 0)).doubleValue();
+
+            assertEquals((2.0 + 4.0 + 8.0) / 3.0, average, 0.0001);
+            assertEquals(8.0, ((Number) invoke(database,
+                    "peakSampleKw",
+                    new Class<?>[] {long.class},
+                    1000L)).doubleValue(), 0.0);
+            assertEquals(6.0, ((Number) invoke(database,
+                    "resolveAveragePowerKw",
+                    new Class<?>[] {long.class, double.class, int.class},
+                    3000L, 12.0, 2)).doubleValue(), 0.0001);
+            assertEquals(-1.0, ((Number) invoke(database,
+                    "resolveAveragePowerKw",
+                    new Class<?>[] {long.class, double.class, int.class},
+                    3000L, 0.0, 0)).doubleValue(), 0.0);
+        } finally {
+            Files.deleteIfExists(journal);
+            Files.deleteIfExists(Paths.get(journal.toString() + ".tmp"));
+        }
+    }
+
+    @Test
+    public void recentChargeAndDailyRollupsPreserveEnergyQuality()
+            throws Exception {
+        Path journal = Files.createTempFile(
+                "charging-energy-quality", ".json");
+        Files.deleteIfExists(journal);
+        Class.forName("org.h2.Driver");
+        SocHistoryDatabase database =
+                new SocHistoryDatabase(journal.toFile());
+        long now = System.currentTimeMillis();
+        long start = now - 26 * 60 * 60_000L;
+        long end = now - 30 * 60_000L;
+        try (Connection connection =
+                     DriverManager.getConnection(
+                             "jdbc:h2:mem:charging-energy-quality-"
+                                     + System.nanoTime()
+                                     + ";DB_CLOSE_DELAY=-1",
+                             "sa", "");
+             Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE charging_sessions ("
+                            + "start_time BIGINT,"
+                            + "end_time BIGINT,"
+                            + "start_soc REAL,"
+                            + "end_soc REAL,"
+                            + "energy_added_kwh REAL,"
+                            + "energy_source VARCHAR,"
+                            + "energy_incomplete INTEGER)");
+            statement.execute(
+                    "INSERT INTO charging_sessions VALUES ("
+                            + start + ", " + end
+                            + ", 40, 60, 3.6, 'integrated_rate', 0)");
+            statement.execute(
+                    "INSERT INTO charging_sessions VALUES ("
+                            + (start - 1_000L) + ", "
+                            + (end - 1_000L)
+                            + ", 20, 30, 1.2, 'metered_counter', 0)");
+            setField(database, "connection", connection);
+            setField(database, "isInitialized", true);
+
+            JSONObject recent =
+                    database.getMostRecentCompletedChargingSession(24);
+            assertEquals(3.6,
+                    recent.getDouble("energyAddedKwh"), 0.0);
+            assertEquals("integrated_rate",
+                    recent.getString("energySource"));
+            assertTrue(recent.getBoolean("energyEstimated"));
+            assertFalse(recent.getBoolean("energyIncomplete"));
+
+            @SuppressWarnings("unchecked")
+            java.util.Map<Long, Integer> byDay =
+                    (java.util.Map<Long, Integer>) invoke(
+                            database,
+                            "estimatedEnergySessionsByDay",
+                            new Class<?>[] {
+                                    Connection.class,
+                                    long.class,
+                                    long.class
+                            },
+                            connection,
+                            0L,
+                            Long.MAX_VALUE);
+            long day = (end / 86_400_000L)
+                    * 86_400_000L;
+            assertEquals(Integer.valueOf(1),
+                    byDay.get(Long.valueOf(day)));
+
+            statement.execute(
+                    "INSERT INTO charging_sessions VALUES ("
+                            + (start + 1_000L) + ", "
+                            + (end - 2_000L)
+                            + ", 30, 35, 0.8, 'none', 0)");
+            byDay = (java.util.Map<Long, Integer>) invoke(
+                    database,
+                    "estimatedEnergySessionsByDay",
+                    new Class<?>[] {
+                            Connection.class,
+                            long.class,
+                            long.class
+                    },
+                    connection,
+                    0L,
+                    Long.MAX_VALUE);
+            assertEquals(Integer.valueOf(2),
+                    byDay.get(Long.valueOf(day)));
+        } finally {
+            Files.deleteIfExists(journal);
+            Files.deleteIfExists(
+                    Paths.get(journal.toString() + ".tmp"));
+        }
+    }
+
+    @Test
+    public void legacySessionFeedPreservesUnknownAndNullQuality()
+            throws Exception {
+        Path journal = Files.createTempFile(
+                "charging-legacy-quality", ".json");
+        Files.deleteIfExists(journal);
+        Class.forName("org.h2.Driver");
+        SocHistoryDatabase database =
+                new SocHistoryDatabase(journal.toFile());
+        long now = System.currentTimeMillis();
+        long start = now - 90 * 60_000L;
+        long end = now - 30 * 60_000L;
+        try (Connection connection =
+                     DriverManager.getConnection(
+                             "jdbc:h2:mem:charging-legacy-quality-"
+                                     + System.nanoTime()
+                                     + ";DB_CLOSE_DELAY=-1",
+                             "sa", "");
+             Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE charging_sessions ("
+                            + "start_time BIGINT,"
+                            + "end_time BIGINT,"
+                            + "start_soc REAL,"
+                            + "end_soc REAL,"
+                            + "energy_added_kwh REAL,"
+                            + "peak_power_kw REAL,"
+                            + "avg_power_kw REAL,"
+                            + "gun_state INTEGER,"
+                            + "is_dc INTEGER,"
+                            + "energy_source VARCHAR,"
+                            + "energy_incomplete INTEGER)");
+            statement.execute(
+                    "INSERT INTO charging_sessions VALUES ("
+                            + start + ", " + end
+                            + ", NULL, 120, 3.6, 7.2, 6.1, 4,"
+                            + " NULL, 'none', 0)");
+            setField(database, "connection", connection);
+            setField(database, "isInitialized", true);
+
+            JSONArray sessions = database.getChargingSessions(1);
+            assertEquals(1, sessions.length());
+            JSONObject session = sessions.getJSONObject(0);
+            assertTrue(session.isNull("startSoc"));
+            assertTrue(session.isNull("endSoc"));
+            assertTrue(session.isNull("isDc"));
+            assertEquals("none", session.getString("energySource"));
+            assertTrue(session.getBoolean("energyEstimated"));
+            assertFalse(session.getBoolean("energyIncomplete"));
+            assertEquals(3.6, session.getDouble("energyAdded"), 0.0001);
+            assertEquals(6.1, session.getDouble("avgPower"), 0.0001);
+
+            JSONObject recent =
+                    database.getMostRecentCompletedChargingSession(24);
+            assertTrue(recent.isNull("startSoc"));
+            assertTrue(recent.isNull("endSoc"));
+            assertTrue(recent.getBoolean("energyEstimated"));
+        } finally {
+            Files.deleteIfExists(journal);
+            Files.deleteIfExists(
+                    Paths.get(journal.toString() + ".tmp"));
+        }
+    }
+
+    @Test
+    public void enrichedSessionFeedPreservesSqlNullsAndUnknownChargerType()
+            throws Exception {
+        Path journal = Files.createTempFile(
+                "charging-v2-null-quality", ".json");
+        Files.deleteIfExists(journal);
+        Class.forName("org.h2.Driver");
+        SocHistoryDatabase database =
+                new SocHistoryDatabase(journal.toFile());
+        long start = System.currentTimeMillis() - 60_000L;
+        long end = start + 30_000L;
+        try (Connection connection =
+                     DriverManager.getConnection(
+                             "jdbc:h2:mem:charging-v2-null-quality-"
+                                     + System.nanoTime()
+                                     + ";DB_CLOSE_DELAY=-1",
+                             "sa", "");
+             Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE charging_sessions ("
+                            + "id BIGINT PRIMARY KEY,"
+                            + "start_time BIGINT,"
+                            + "end_time BIGINT,"
+                            + "start_soc REAL,"
+                            + "end_soc REAL,"
+                            + "energy_added_kwh REAL,"
+                            + "peak_power_kw REAL,"
+                            + "avg_power_kw REAL,"
+                            + "range_gained_km INTEGER,"
+                            + "gun_state INTEGER,"
+                            + "is_dc INTEGER,"
+                            + "electricity_rate REAL,"
+                            + "currency VARCHAR,"
+                            + "session_cost REAL,"
+                            + "time_to_full_min INTEGER,"
+                            + "hv_temp_high REAL,"
+                            + "hv_temp_low REAL,"
+                            + "hv_temp_avg REAL,"
+                            + "start_lat DOUBLE,"
+                            + "start_lng DOUBLE,"
+                            + "place_label VARCHAR,"
+                            + "start_odometer_km INTEGER,"
+                            + "tariff_id VARCHAR,"
+                            + "tariff_label VARCHAR,"
+                            + "energy_source VARCHAR,"
+                            + "energy_soc_kwh DOUBLE,"
+                            + "energy_incomplete INTEGER,"
+                            + "counter_energy_kwh DOUBLE)");
+            statement.execute(
+                    "INSERT INTO charging_sessions VALUES ("
+                            + "1, " + start + ", " + end + ","
+                            + "NULL, NULL, 3.6, NULL, NULL, NULL, 4, NULL,"
+                            + "NULL, '$', NULL, NULL, NULL, NULL, NULL,"
+                            + "NULL, NULL, NULL, NULL, NULL, NULL,"
+                            + "'none', NULL, 0, NULL)");
+            setField(database, "connection", connection);
+            setField(database, "isInitialized", true);
+
+            JSONArray sessions = database.getChargingSessionsV2RangeStrict(
+                    0L, Long.MAX_VALUE, 20, 0);
+            assertEquals(1, sessions.length());
+            JSONObject session = sessions.getJSONObject(0);
+            assertTrue(session.isNull("startSoc"));
+            assertTrue(session.isNull("endSoc"));
+            assertTrue(session.isNull("peakPower"));
+            assertTrue(session.isNull("avgPower"));
+            assertTrue(session.isNull("rangeGained"));
+            assertTrue(session.isNull("isDc"));
+            assertTrue(session.isNull("electricityRate"));
+            assertTrue(session.isNull("cost"));
+            assertTrue(session.isNull("timeToFullMin"));
+            assertTrue(session.isNull("tempHigh"));
+            assertTrue(session.isNull("tempLow"));
+            assertTrue(session.isNull("tempAvg"));
+            assertTrue(session.isNull("lat"));
+            assertTrue(session.isNull("lng"));
+            assertTrue(session.isNull("startOdometerKm"));
+            assertTrue(session.isNull("energySocKwh"));
+            assertTrue(session.isNull("energyCounterKwh"));
+            assertTrue(session.isNull("isDc"));
+            assertTrue(session.getBoolean("energyEstimated"));
+        } finally {
+            Files.deleteIfExists(journal);
+            Files.deleteIfExists(
+                    Paths.get(journal.toString() + ".tmp"));
+        }
+    }
+
+    @Test
+    public void lastTariffRatePreservesUnknownChargerType()
+            throws Exception {
+        Path journal = Files.createTempFile(
+                "charging-last-rate-type", ".json");
+        Files.deleteIfExists(journal);
+        Class.forName("org.h2.Driver");
+        SocHistoryDatabase database =
+                new SocHistoryDatabase(journal.toFile());
+        long now = System.currentTimeMillis();
+        try (Connection connection =
+                     DriverManager.getConnection(
+                             "jdbc:h2:mem:charging-last-rate-type-"
+                                     + System.nanoTime()
+                                     + ";DB_CLOSE_DELAY=-1",
+                             "sa", "");
+             Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "CREATE TABLE charging_sessions ("
+                            + "start_time BIGINT,"
+                            + "end_time BIGINT,"
+                            + "electricity_rate REAL,"
+                            + "currency VARCHAR,"
+                            + "tariff_id VARCHAR,"
+                            + "tariff_label VARCHAR,"
+                            + "is_dc INTEGER)");
+            statement.execute(
+                    "INSERT INTO charging_sessions VALUES ("
+                            + (now - 60_000L) + ", " + now
+                            + ", 0.25, '$', 'home', 'Home', NULL)");
+            setField(database, "connection", connection);
+            setField(database, "isInitialized", true);
+
+            JSONObject rate = database.getLastChargeRateStrict(1);
+            assertEquals(0.25, rate.getDouble("rate"), 0.0001);
+            assertTrue(rate.isNull("isDc"));
+        } finally {
+            Files.deleteIfExists(journal);
+            Files.deleteIfExists(
+                    Paths.get(journal.toString() + ".tmp"));
+        }
+    }
+
+    @Test
+    public void chargingSamplePowerAdmissionIsFiniteAndBounded()
+            throws Exception {
+        SocHistoryDatabase database = new SocHistoryDatabase(null);
+        Class<?>[] signature = new Class<?>[] {double.class};
+        assertEquals(Boolean.TRUE, invoke(database,
+                "isValidChargingSamplePower", signature, 0.0));
+        assertEquals(Boolean.TRUE, invoke(database,
+                "isValidChargingSamplePower", signature, 500.0));
+        assertEquals(Boolean.TRUE, invoke(database,
+                "isValidChargingSamplePower", signature,
+                SocHistoryDatabase.STOP_BOUNDARY_POWER_KW));
+        assertEquals(Boolean.TRUE, invoke(database,
+                "isValidChargingSamplePower", signature,
+                SocHistoryDatabase.MISSING_RATE_BOUNDARY_POWER_KW));
+        assertEquals(Boolean.TRUE, invoke(database,
+                "isValidChargingSamplePower", signature,
+                SocHistoryDatabase.AUXILIARY_SAMPLE_POWER_KW));
+        assertEquals(Boolean.FALSE, invoke(database,
+                "isValidChargingSamplePower", signature,
+                Double.POSITIVE_INFINITY));
+        assertEquals(Boolean.FALSE, invoke(database,
+                "isValidChargingSamplePower", signature, 500.01));
+        assertEquals(Boolean.FALSE, invoke(database,
+                "isValidChargingSamplePower", signature, -4.0));
+    }
+
+    @Test
+    public void fullReportUsesAtLeastOneChargingHistoryDay()
+            throws IOException {
+        String report = between(databaseSource(),
+                "public synchronized JSONObject getFullReport",
+                "public synchronized void setSohEstimator");
+        assertTrue(report.contains(
+                "Math.max(\n                    1, (int) Math.ceil(hoursBack / 24.0))"));
+        assertTrue(report.contains(
+                "getChargingSessions(reportDays)"));
+    }
+
+    @Test
+    public void liveSessionClassificationUsesThePeakServedToTheCard()
+            throws IOException {
+        String live = between(databaseSource(),
+                "// ---- Live enrichment for the OPEN (in-progress) session ----",
+                "return o;");
+
+        int resolvedPeak = live.indexOf(
+                "double livePeak = resolvePeakKw(start, chargingPeakPower)");
+        int verdict = live.indexOf(
+                "int liveIsDc = currentChargingTypeVerdict()");
+        int publishedPeak = live.indexOf(
+                "o.put(\"peakPower\", livePeak)");
+
+        assertTrue(resolvedPeak >= 0);
+        assertTrue(verdict > resolvedPeak);
+        assertTrue(publishedPeak > verdict);
+        assertTrue(live.contains(
+                "PricingDecision livePd = priceSession(\n"
+                        + "                            liveIsDc,"));
+        assertFalse(live.contains(
+                "deriveIsDc(chargingGunState, chargingPeakPower)"));
+        assertTrue(live.contains(
+                "double liveAverage = resolveAveragePowerKw("));
+        assertTrue(live.contains(
+                "if (liveAverage > 0) o.put(\"avgPower\", liveAverage)"));
+    }
+
+    @Test
+    public void chargerTypeUsesGunVerdictBeforePowerOnlyFallback() {
+        assertEquals(0, SocHistoryDatabase.deriveIsDc(2, 359.4));
+        assertEquals(1, SocHistoryDatabase.deriveIsDc(3, 15.0));
+        assertEquals(-1, SocHistoryDatabase.deriveIsDc(3, 14.9));
+        assertEquals(1, SocHistoryDatabase.deriveIsDc(-1, 25.0));
+        assertEquals(-1, SocHistoryDatabase.deriveIsDc(-1, 24.9));
+        assertEquals(1, SocHistoryDatabase.deriveIsDc(4, 25.0));
+        assertEquals(-1, SocHistoryDatabase.deriveIsDc(1, 100.0));
+        assertEquals(-1, SocHistoryDatabase.deriveIsDc(5, 100.0));
+    }
+
+    @Test
+    public void openSessionChargerVerdictRetainsProvenPeakDuringTaper()
+            throws Exception {
+        Path journal = Files.createTempFile(
+                "charging-open-type", ".json");
+        Files.deleteIfExists(journal);
+        Class.forName("org.h2.Driver");
+        SocHistoryDatabase database =
+                new SocHistoryDatabase(journal.toFile());
+        try (Connection connection = DriverManager.getConnection(
+                "jdbc:h2:mem:charging-open-type-" + System.nanoTime()
+                        + ";DB_CLOSE_DELAY=-1", "sa", "");
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE charging_power_samples ("
+                    + "id IDENTITY PRIMARY KEY,"
+                    + "session_start_time BIGINT NOT NULL,"
+                    + "t BIGINT NOT NULL,"
+                    + "power_kw REAL,"
+                    + "soc REAL,"
+                    + "temp REAL,"
+                    + "temp_high REAL,"
+                    + "temp_low REAL)");
+            setField(database, "connection", connection);
+            setField(database, "isInitialized", true);
+            setField(database, "chargingAnalyticsEnabled", true);
+            setField(database, "wasCharging", true);
+            setField(database, "chargingStartTime", 1000L);
+            setField(database, "lastAllocatedChargingStartMs", 1000L);
+            setField(database, "chargingGunState", 3);
+            setField(database, "chargingPeakPower", 8.0);
+
+            assertEquals(ChargingTypeClassifier.UNKNOWN,
+                    database.getOpenChargingSessionTypeVerdict());
+            assertTrue(database.observeEstimatedChargingTypeEvidence(82.0));
+            assertEquals(ChargingTypeClassifier.DC,
+                    database.getOpenChargingSessionTypeVerdict());
+            assertEquals(8.0,
+                    ((Number) getField(database, "chargingPeakPower")).doubleValue(),
+                    0.0);
+
+            // Keep the measured-peak path independently covered below.
+            setField(database, "chargingTypeVerdict",
+                    ChargingTypeClassifier.UNKNOWN);
+            assertTrue(database.recordChargingSample(
+                    1000L, 2000L, 40.0, 50.0, 30.0, 32.0, 28.0));
+            statement.execute("INSERT INTO charging_power_samples"
+                    + " (session_start_time, t, power_kw, soc, temp, temp_high, temp_low)"
+                    + " VALUES (1000, 2100, 600, 50, 30, 32, 28)");
+
+            assertEquals(ChargingTypeClassifier.DC,
+                    database.getOpenChargingSessionTypeVerdict());
+            assertEquals(40.0,
+                    ((Number) getField(database, "chargingPeakPower")).doubleValue(),
+                    0.0);
+
+            // A restart can restore an older coarse peak from the lifecycle journal while the
+            // fine sample is already durable. Startup reconciliation must rebuild the cache once.
+            setField(database, "chargingPeakPower", 8.0);
+            invoke(database, "reconcileRecoveredActivePowerStatsWithDatabase",
+                    new Class<?>[0]);
+            assertEquals(40.0,
+                    ((Number) getField(database, "chargingPeakPower")).doubleValue(),
+                    0.0);
+            assertEquals(ChargingTypeClassifier.DC,
+                    database.getOpenChargingSessionTypeVerdict());
+
+            String verdictMethod = between(databaseSource(),
+                    "public synchronized int getOpenChargingSessionTypeVerdict",
+                    "/** Durable H2 truth");
+            assertFalse(verdictMethod.contains("resolvePeakKw("));
+        } finally {
+            Files.deleteIfExists(journal);
+            Files.deleteIfExists(Paths.get(journal.toString() + ".tmp"));
+        }
+    }
+
+    @Test
+    public void chargingSamplesSerializePartialThermalDataWithoutInvalidJson()
+            throws IOException {
+        String samples = between(databaseSource(),
+                "public synchronized JSONArray getChargingSamplesStrict(long id)",
+                "private Connection requireChargingHistoryReadConnection");
+
+        assertTrue(samples.contains("power_kw = ? OR power_kw = ?"));
+        assertTrue(samples.contains("MISSING_RATE_BOUNDARY_POWER_KW"));
+        assertTrue(samples.contains("AUXILIARY_SAMPLE_POWER_KW"));
+        assertTrue(samples.contains("double sampleTemp = rs.getDouble(\"temp\")"));
+        assertTrue(samples.contains("!isFinite(sampleSoc)"));
+        assertTrue(samples.contains("sampleSoc < 0 || sampleSoc > 100"));
+            assertTrue(samples.contains("samplePower > 0"));
+            assertTrue(samples.contains("samplePower <= 500"));
+        assertTrue(samples.contains("isFinite(sampleTemp)"));
+        assertTrue(samples.contains(
+                "double sampleTempHigh = rs.getDouble(\"temp_high\")"));
+        assertTrue(samples.contains("isFinite(sampleTempHigh)"));
+        assertTrue(samples.contains(
+                "double sampleTempLow = rs.getDouble(\"temp_low\")"));
+        assertTrue(samples.contains("isFinite(sampleTempLow)"));
+    }
+
+    @Test
+    public void missingRateRowsExposeThermalDataButNeverExposeSentinelPower()
+            throws Exception {
+        Path journal = Files.createTempFile("charging-missing-rate-thermal", ".json");
+        Files.deleteIfExists(journal);
+        Class.forName("org.h2.Driver");
+        SocHistoryDatabase database = new SocHistoryDatabase(journal.toFile());
+        try (Connection connection = DriverManager.getConnection(
+                "jdbc:h2:mem:charging-missing-rate-" + System.nanoTime()
+                        + ";DB_CLOSE_DELAY=-1", "sa", "");
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE charging_sessions (id BIGINT PRIMARY KEY,"
+                    + " start_time BIGINT NOT NULL)");
+            statement.execute("CREATE TABLE charging_power_samples ("
+                    + "id IDENTITY PRIMARY KEY, session_start_time BIGINT NOT NULL,"
+                    + "t BIGINT NOT NULL, power_kw REAL, soc REAL, temp REAL,"
+                    + "temp_high REAL, temp_low REAL)");
+            statement.execute("INSERT INTO charging_sessions (id, start_time) VALUES (1, 1000)");
+            statement.execute("INSERT INTO charging_power_samples"
+                    + " (session_start_time, t, power_kw, soc, temp, temp_high, temp_low)"
+                    + " VALUES (1000, 1100, 6.2, 40, 33, 35, 32),"
+                    + " (1000, 1200, -2, 41, 33.5, 35.5, 32.5),"
+                    + " (1000, 1300, -3, 42, 34, 36, 33),"
+                    + " (1000, 1400, 0, 140, 34.5, 36.5, 33.5),"
+                    + " (1000, 1450, 600, 43, 34.5, 36.5, 33.5),"
+                    + " (1000, 1500, -1, -999, -999, -999, -999)");
+            setField(database, "connection", connection);
+            setField(database, "isInitialized", true);
+
+            JSONArray samples = database.getChargingSamplesStrict(1L);
+
+            assertEquals(5, samples.length());
+            assertEquals(6.2, samples.getJSONObject(0).getDouble("power"), 0.001);
+            assertTrue(samples.getJSONObject(1).isNull("power"));
+            assertEquals(33.5, samples.getJSONObject(1).getDouble("temp"), 0.001);
+            assertEquals(35.5, samples.getJSONObject(1).getDouble("tempHigh"), 0.001);
+            assertEquals(32.5, samples.getJSONObject(1).getDouble("tempLow"), 0.001);
+            assertTrue(samples.getJSONObject(2).isNull("power"));
+            assertEquals(42.0, samples.getJSONObject(2).getDouble("soc"), 0.001);
+            assertTrue(samples.getJSONObject(3).isNull("power"));
+            assertTrue(samples.getJSONObject(3).isNull("soc"));
+            assertTrue(samples.getJSONObject(4).isNull("power"));
+            assertEquals(43.0, samples.getJSONObject(4).getDouble("soc"), 0.001);
+        } finally {
+            Files.deleteIfExists(journal);
+            Files.deleteIfExists(Paths.get(journal.toString() + ".tmp"));
+        }
+    }
+
+    @Test
+    public void invalidStoredPowerBreaksEnergyIntegrationInsteadOfInflatingIt()
+            throws Exception {
+        Path journal = Files.createTempFile(
+                "charging-invalid-power-gap", ".json");
+        Files.deleteIfExists(journal);
+        Class.forName("org.h2.Driver");
+        SocHistoryDatabase database =
+                new SocHistoryDatabase(journal.toFile());
+        try (Connection connection = DriverManager.getConnection(
+                "jdbc:h2:mem:charging-invalid-power-gap-" + System.nanoTime()
+                        + ";DB_CLOSE_DELAY=-1", "sa", "");
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE charging_sessions ("
+                    + "start_time BIGINT PRIMARY KEY,"
+                    + "integration_truncated INT DEFAULT 0)");
+            statement.execute("CREATE TABLE charging_power_samples ("
+                    + "id IDENTITY PRIMARY KEY,"
+                    + "session_start_time BIGINT NOT NULL,"
+                    + "t BIGINT NOT NULL,"
+                    + "power_kw REAL)");
+            statement.execute("INSERT INTO charging_sessions"
+                    + " (start_time, integration_truncated) VALUES (1000, 0)");
+            statement.execute("INSERT INTO charging_power_samples"
+                    + " (session_start_time, t, power_kw) VALUES"
+                    + " (1000, 1000, 6),"
+                    + " (1000, 61000, 6),"
+                    + " (1000, 121000, 600),"
+                    + " (1000, 181000, 6),"
+                    + " (1000, 241000, 6)");
+            setField(database, "connection", connection);
+            setField(database, "isInitialized", true);
+
+            double energy = ((Number) invoke(database,
+                    "integrateSessionEnergyKwh",
+                    new Class<?>[] {long.class},
+                    1000L)).doubleValue();
+
+            assertEquals(0.2, energy, 0.0001);
+            assertEquals(Boolean.TRUE,
+                    getField(database, "lastIntegrationTruncated"));
+        } finally {
+            Files.deleteIfExists(journal);
+            Files.deleteIfExists(Paths.get(journal.toString() + ".tmp"));
+        }
     }
 
     @Test
@@ -117,6 +766,26 @@ public class SocHistoryDatabaseChargingAccountingContractTest {
                 "accountingBound = Math.min(accountingBound, analyticsDisabledSinceMs)"));
         assertTrue(sweep.contains("if (committed && matchesInMemory)"));
         assertTrue(sweep.contains("resetLiveChargingState(true)"));
+    }
+
+    @Test
+    public void staleCloseConsumesThermalOnlyRowsAndChecksEachNullableColumn()
+            throws IOException {
+        String stale = between(databaseSource(),
+                "private boolean finalizeOneStaleSession",
+                "private static long dayEpoch");
+
+        assertTrue(stale.contains(
+                "SELECT t, power_kw, soc, temp, temp_high, temp_low"));
+        assertTrue(stale.contains("MISSING_RATE_BOUNDARY_POWER_KW"));
+        assertTrue(stale.contains("AUXILIARY_SAMPLE_POWER_KW"));
+        assertTrue(stale.contains("boolean socMissing = rs.wasNull()"));
+        assertTrue(stale.contains("boolean tempMissing = rs.wasNull()"));
+        assertTrue(stale.contains("boolean tempHighMissing = rs.wasNull()"));
+        assertTrue(stale.contains("boolean tempLowMissing = rs.wasNull()"));
+        assertTrue(stale.contains("s >= 0 && s <= 100"));
+        assertTrue(stale.contains(
+                "hv_temp_high = ?, hv_temp_low = ?, hv_temp_avg = ?"));
     }
 
     @Test
@@ -692,7 +1361,8 @@ public class SocHistoryDatabaseChargingAccountingContractTest {
                 "private void observeDeferredPhysicalCounter");
 
         assertTrue(capture.contains("pendingClosePricing = priceSessionForClose("));
-        assertTrue(capture.contains("pendingCloseIsDc = deriveIsDc"));
+        assertTrue(capture.contains(
+                "pendingCloseIsDc = currentChargingTypeVerdict()"));
         assertTrue(close.contains("PricingDecision pd = pendingClosePricing;"));
         assertTrue(deferredEnd.contains(
                 "generation.closePricing = priceSessionForClose("));
@@ -1487,6 +2157,38 @@ public class SocHistoryDatabaseChargingAccountingContractTest {
     }
 
     @Test
+    public void liveEnergyKeepsValueAndQualityInOneSnapshot()
+            throws IOException {
+        String source = databaseSource();
+        String accessor = between(source,
+                "public synchronized OpenChargingSessionEnergy getOpenChargingSessionEnergy()",
+                "/** Compatibility accessor");
+        String json = between(source,
+                "private JSONObject chargingRowToJson",
+                "private double resolvePeakKw");
+
+        assertTrue(accessor.contains("r.energyKwh"));
+        assertTrue(accessor.contains("r.source"));
+        assertTrue(accessor.contains("r.incomplete"));
+        assertTrue(accessor.contains(
+                "isSessionEnergyEstimated(r.source, r.incomplete)"));
+        assertTrue(json.contains(
+                "OpenChargingSessionEnergy liveEnergy ="));
+        assertTrue(json.contains(
+                "o.put(\"energySource\", liveEnergy.source)"));
+        assertTrue(json.contains(
+                "o.put(\"energyIncomplete\", liveEnergy.incomplete)"));
+        assertTrue(json.contains(
+                "o.put(\"energyEstimated\", liveEnergy.estimated)"));
+        assertTrue(source.contains(
+                "out.put(\"periodEstimatedSessions\""));
+        assertTrue(source.contains(
+                "out.put(\"lifetimeEstimatedSessions\""));
+        assertTrue(source.contains(
+                "private int countEstimatedEnergySessions("));
+    }
+
+    @Test
     public void maintenanceBoundaryIsWriteAheadAndRebasesDeferredOnlyState()
             throws IOException {
         String source = databaseSource();
@@ -1612,7 +2314,7 @@ public class SocHistoryDatabaseChargingAccountingContractTest {
         assertTrue(capture.contains(
                 "pendingCloseResumeBlocked = resumeBlocked"));
         assertTrue(stale.contains("resume_blocked = ?"));
-        assertTrue(stale.contains("upd.setInt(18, forceRecent ? 1 : 0)"));
+        assertTrue(stale.contains("upd.setInt(20, forceRecent ? 1 : 0)"));
     }
 
     @Test

@@ -128,6 +128,7 @@
 
     <!-- Hand the place to the car's built-in navigation (factory nav) -->
     <TextView
+        android:id="@+id/carNavSectionHeader"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="18dp"
@@ -137,6 +138,7 @@
         android:alpha="0.7" />
 
     <LinearLayout
+        android:id="@+id/carNavActionsRow"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"

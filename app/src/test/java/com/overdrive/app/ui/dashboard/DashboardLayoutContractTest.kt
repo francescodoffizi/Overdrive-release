@@ -83,6 +83,42 @@ class DashboardLayoutContractTest {
     }
 
     @Test
+    fun optionalAiInsightCardIsHiddenAndSharedByBothLayouts() {
+        val include = readResource("layout/include_dashboard_ai_insight.xml")
+
+        assertTrue(include.contains("android:id=\"@+id/aiInsightCard\""))
+        assertTrue(include.contains("android:visibility=\"gone\""))
+        assertTrue(include.contains("android:id=\"@+id/aiInsightText\""))
+        assertTrue(include.contains("android:id=\"@+id/aiInsightExpand\""))
+        assertTrue(include.contains("android:id=\"@+id/aiInsightIconSurface\""))
+        assertTrue(include.contains(
+            "android:foreground=\"?attr/selectableItemBackground\""
+        ))
+        listOf(
+            readResource("layout/fragment_dashboard.xml"),
+            readResource("layout-land/fragment_dashboard.xml"),
+        ).forEach { layout ->
+            assertTrue(layout.contains(
+                "<include layout=\"@layout/include_dashboard_ai_insight\""
+            ))
+        }
+
+        val source = readSource(
+            "main/java/com/overdrive/app/ui/fragment/DashboardFragment.kt"
+        )
+        assertTrue(source.contains(
+            "aiInsightExpanded = !aiInsightExpanded"
+        ))
+        assertTrue(source.contains(
+            "if (aiInsightExpanded) Int.MAX_VALUE else AI_INSIGHT_PREVIEW_LINES"
+        ))
+        assertTrue(!source.contains(
+            "aiInsightCard.setOnClickListener {\n" +
+                "            findNavController().navigate(R.id.genAiFragment"
+        ))
+    }
+
+    @Test
     fun quickActionTilesHaveEqualWidthAndHeightContracts() {
         listOf(
             readResource("layout/fragment_dashboard.xml"),
@@ -125,6 +161,17 @@ class DashboardLayoutContractTest {
                 assertEquals("1", attributeValue(tag, "layout_weight"))
             }
         }
+    }
+
+    @Test
+    fun chargingSessionEnergyKeepsApproximationMarker() {
+        val source = readSource(
+            "main/java/com/overdrive/app/ui/fragment/DashboardFragment.kt"
+        )
+
+        assertTrue(source.contains("charging.sessionEnergyEstimated"))
+        assertTrue(source.contains("charging.sessionEnergyIncomplete"))
+        assertTrue(source.contains("\"~\$rendered\""))
     }
 
     @Test

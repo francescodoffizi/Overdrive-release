@@ -14,16 +14,33 @@
       getViewIdResourceName() so the match is by resource-id, not localized
       button text. The match reads the event source only — no getWindows(), no
       extra window-retrieval flags.
+   4. Autostart auto-enable — AutoStartEnabler drives BYD's
+      com.byd.appstartmanagement dialog through the a11y APIs.
+      canRetrieveWindowContent + flagRetrieveInteractiveWindows are what let
+      getWindows() reach that dialog's window: it is mShowToOwnerOnly, so
+      getRootInActiveWindow returns the launcher and uiautomator cannot see it
+      at all. canPerformGestures backs the dispatchGesture coordinate-tap
+      fallback, and typeWindowsChanged notices the dialog appear — the enabler
+      polls as its primary mechanism, so that event is belt-and-suspenders.
 
-  Event types are the union of (2) and (3): key filtering needs no window events,
-  capture needs the long-click event, and neither disables the other.
+  Event types and flags are the UNION of (2), (3) and (4). notificationTimeout
+  stays at the key filter's 100 ms: a longer value coalesces event delivery,
+  which is wrong for a service that also filters hardware keys, and neither the
+  capture hook nor the enabler depends on it.
+
+  NOTE: onServiceConnected re-asserts eventTypes with a hard assignment, so the
+  live mask is whatever that code sets — typeWindowsChanged declared here is not
+  in it. The enabler polls getWindows() instead of relying on that event, so this
+  stays declared for intent while the flags (which onServiceConnected only ORs)
+  are what actually carry through.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeViewLongClicked"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeViewLongClicked|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagRequestFilterKeyEvents|flagReportViewIds"
+    android:accessibilityFlags="flagRequestFilterKeyEvents|flagRetrieveInteractiveWindows|flagReportViewIds"
     android:canRequestFilterKeyEvents="true"
     android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
     android:notificationTimeout="100"
     android:settingsActivity="com.overdrive.app.ui.MainActivity" />

@@ -81,6 +81,16 @@ public class TripDatabase {
                 return;
 
             } catch (Exception e) {
+                // Same invariant as reconnect()/forceReconnect(): SET CACHE_SIZE or
+                // createTables() can throw AFTER the handle is live. Left assigned,
+                // a table-less handle passes ensureConnection() (isClosed()==false,
+                // SELECT 1 needs no table) and every DAO fails "table not found"
+                // forever. On the retry path it also still holds the H2 file lock —
+                // the very thing the retry is waiting out. Close and null it first.
+                if (connection != null) {
+                    try { connection.close(); } catch (Exception ignored) { }
+                    connection = null;
+                }
                 String msg = e.getMessage();
                 boolean isLockError = msg != null && (msg.contains("Locked by another process") ||
                         msg.contains("lock.db") || msg.contains("already in use"));
@@ -134,19 +144,74 @@ public class TripDatabase {
         try {
             if (connection == null || connection.isClosed()) {
                 connection = DriverManager.getConnection(JDBC_URL, "sa", "");
+                // Idempotent (IF NOT EXISTS throughout). A reopen against a wiped
+                // or replaced .mv.db would otherwise yield a table-less store that
+                // probe() still calls healthy (SELECT 1 needs no table), turning
+                // every DAO call into "table not found" instead of self-healing.
+                createTables();
                 isInitialized = true;
                 logger.info("H2 trip database connection re-established");
             }
         } catch (Exception e) {
             logger.error("Failed to reconnect to H2 trip database", e);
+            // createTables() can throw AFTER the handle is live (corrupt store,
+            // full disk, read-only mount). Leaving that handle assigned would make
+            // the next ensureConnection() pass — isClosed()==false and probe()'s
+            // SELECT 1 needs no table — so every DAO would fail "table not found"
+            // permanently with no further reopen attempt. Close and null it so
+            // the next call retries from scratch instead of trusting a possibly
+            // table-less store.
+            if (connection != null) {
+                try { connection.close(); } catch (Exception ignored) { }
+                connection = null;
+            }
+        }
+    }
+
+    // Liveness check that actually talks to the engine. Connection.isClosed()
+    // reports only whether close() was called on THIS Connection object — it
+    // knows nothing about the H2 engine behind it. If the engine shut down
+    // underneath the handle (e.g. H2's own shutdown hook fired), isClosed()
+    // keeps returning false while every real statement throws.
+    private synchronized boolean probe() {
+        if (connection == null) return false;
+        try (Statement stmt = connection.createStatement()) {
+            stmt.execute("SELECT 1");
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // Drop a handle that failed probe() and reopen. Only reachable from the
+    // already-synchronized ensureConnection(), AFTER its
+    // `!isInitialized && connection == null` guard has passed — so this cannot
+    // resurrect a deliberately close()d store (see close() above).
+    private synchronized void forceReconnect() {
+        if (connection != null) {
+            try { connection.close(); } catch (Exception ignored) { }
+            connection = null;
+        }
+        try {
+            connection = DriverManager.getConnection(JDBC_URL, "sa", "");
+            createTables();   // idempotent; see reconnect()
+            isInitialized = true;
+            logger.warn("H2 trip database force-reconnected after failed liveness probe");
+        } catch (Exception e) {
+            logger.error("Force reconnect failed", e);
+            if (connection != null) {
+                try { connection.close(); } catch (Exception ignored) { }
+                connection = null;
+            }
         }
     }
 
     /**
      * Ensure the database connection is alive. Returns true if ready.
-     * Attempts reconnection if the connection is closed. synchronized for the
-     * same reason as {@link #reconnect()} — it reads + (via reconnect) writes
-     * the shared connection field.
+     * Attempts reconnection if the connection is closed, and force-reconnects
+     * if the handle claims to be open but fails a liveness {@link #probe()}.
+     * synchronized for the same reason as {@link #reconnect()} — it reads +
+     * (via reconnect/forceReconnect) writes the shared connection field.
      */
     private synchronized boolean ensureConnection() {
         if (!isInitialized && connection == null) return false;
@@ -154,62 +219,18 @@ public class TripDatabase {
             if (connection == null || connection.isClosed()) {
                 logger.info("Database connection closed, reconnecting...");
                 reconnect();
-                return connection != null && !connection.isClosed();
+                return probe();
             }
-            // isClosed() is not enough. It reports only whether THIS Connection object was
-            // closed on our side; when H2 shuts the DATABASE down underneath us it keeps
-            // returning false while every statement throws 90098 "The database has been
-            // closed". Observed on a BYD Seal head unit on 2026-08-14: the store closed
-            // mid-session and stayed dead for hours until the daemon was restarted. The
-            // failure is near-silent, because every DAO logs its SQLException and returns an
-            // empty result — so GET /api/trips answered `success:true, trips:[]`, anything
-            // derived from trip history (recent consumption, range estimates) went null, and
-            // a real drive was recorded to the telemetry file only, to be rebuilt later by
-            // recoverTripsFromDisk. So probe the store instead of trusting the flag.
+            // isClosed()==false is NOT proof of life (see probe()). Verify with
+            // a real statement; on failure drop the dead handle and reopen.
             if (probe()) return true;
-            logger.warn("connection alive but database unusable — forcing a reopen");
+            logger.warn("Connection reports open but failed liveness probe — force-reconnecting");
             forceReconnect();
             return probe();
         } catch (Exception e) {
             logger.error("Connection check failed", e);
             forceReconnect();
-            try {
-                return connection != null && !connection.isClosed();
-            } catch (Exception e2) {
-                return false;
-            }
-        }
-    }
-
-    /**
-     * Cheapest round-trip that actually reaches the store. Embedded H2, so this is
-     * microseconds; the alternative is trusting a client-side flag that lies.
-     */
-    private boolean probe() {
-        Connection c = connection;
-        if (c == null) return false;
-        try (java.sql.Statement st = c.createStatement()) {
-            st.execute("SELECT 1");
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    /**
-     * Reopen unconditionally. {@link #reconnect()} is a no-op when {@code isClosed()} returns
-     * false, which is exactly the case that needs reopening here, so the handle is dropped
-     * first.
-     */
-    private synchronized void forceReconnect() {
-        Connection old = connection;
-        connection = null;
-        if (old != null) {
-            try { old.close(); } catch (Exception ignored) { }
-        }
-        reconnect();
-        if (connection != null) {
-            logger.info("Trip database reopened after the store closed underneath us");
+            return probe();
         }
     }
 

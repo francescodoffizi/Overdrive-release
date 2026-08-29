@@ -20,6 +20,7 @@ const SeatPositions = {
     current: null,
     acc: false,
     movementBlocked: false,
+    positioningBlocked: true,
     modelId: null,
     modelConfirmed: false,
     modelAcknowledged: false,
@@ -112,12 +113,18 @@ const SeatPositions = {
             const j = await r.json();
             this.positions = Array.isArray(j.positions) ? j.positions : [];
             this.acc = !!j.acc;
-            this.movementBlocked = !!j.movementBlocked;
+            this.movementBlocked = typeof j.movementBlocked === 'boolean'
+                ? j.movementBlocked : true;
+            this.positioningBlocked = typeof j.positioningBlocked === 'boolean'
+                ? j.positioningBlocked : this.movementBlocked;
             this.modelId = j.modelId || null;
             this.modelConfirmed = !!j.modelConfirmed;
             this.modelAcknowledged = !!j.modelAcknowledged;
         } catch (e) {
             this.positions = [];
+            this.acc = false;
+            this.movementBlocked = true;
+            this.positioningBlocked = true;
         }
         await this.loadAutomations();
         await this.loadCurrent();
@@ -129,7 +136,7 @@ const SeatPositions = {
     // overwrite or delete it.
     async loadAutomations() {
         try {
-            const r = await fetch('/api/automations', { cache: 'no-store' });
+            const r = await fetch('/api/automations/list', { cache: 'no-store' });
             const j = await r.json();
             this.automations = (j && typeof j === 'object') ? j : {};
         } catch (e) {
@@ -138,11 +145,20 @@ const SeatPositions = {
     },
 
     async loadCurrent() {
+        const previousAcc = this.acc;
         try {
             const r = await fetch('/api/positions/current', { cache: 'no-store' });
             const j = await r.json();
             this.current = (j && j.axes) ? j.axes : null;
             this.currentAmbient = (j && j.ambient) ? j.ambient : null;
+            if (typeof j.acc === 'boolean') this.acc = j.acc;
+            if (typeof j.movementBlocked === 'boolean') {
+                this.movementBlocked = j.movementBlocked;
+            } else {
+                this.movementBlocked = true;
+            }
+            this.positioningBlocked = typeof j.positioningBlocked === 'boolean'
+                ? j.positioningBlocked : true;
             // The swatch list is static but the BOUND is a HAL read and differs by trim, so
             // the picker offers what this car has rather than what the table happens to hold.
             if (Array.isArray(j && j.ambientPalette)) this.palette = j.ambientPalette;
@@ -150,8 +166,17 @@ const SeatPositions = {
         } catch (e) {
             this.current = null;
             this.currentAmbient = null;
+            this.movementBlocked = true;
+            this.positioningBlocked = true;
         }
         this.renderCurrent();
+        this.renderGate();
+        const canApply = this.acc && !this.positioningBlocked;
+        document.querySelectorAll('#spList button[data-act="apply"]')
+            .forEach(button => { button.disabled = !canApply; });
+        document.querySelectorAll('#spList button[data-act="saveHere"]')
+            .forEach(button => { button.disabled = !this.acc; });
+        if (previousAcc !== this.acc) this.syncPolling();
     },
 
     /**
@@ -299,10 +324,9 @@ const SeatPositions = {
         const moving = document.getElementById('spMoving');
         const badge = document.getElementById('spStateBadge');
         gate.style.display = this.acc ? 'none' : '';
-        // Moving is NOT a blocker — the write goes out with the gate overridden, because
-        // whether the car honours a seat move in motion is an open question and the only
-        // way to answer it is to try. ACC off IS a blocker: unpowered motors accept the
-        // write and do nothing, which would otherwise read as success.
+        // Keep raw movement state visible even when the user disables OverDrive's global
+        // positioning guard: the vehicle may still refuse the write outside Park. ACC off
+        // remains a blocker because unpowered motors accept the write and do nothing.
         moving.style.display = (this.acc && this.movementBlocked) ? '' : 'none';
         if (!this.acc) {
             badge.className = 'status-badge inactive';
@@ -342,7 +366,7 @@ const SeatPositions = {
             '<div class="sp-row-actions">' +
                 (isUser ? '<button class="btn btn-secondary" data-act="saveHere"' + (this.acc ? '' : ' disabled') + '>' +
                     this.esc(this.t('seatpos.save_here', 'Save here')) + '</button>' : '') +
-                '<button class="btn btn-primary" data-act="apply"' + ((this.acc && !this.movementBlocked) ? '' : ' disabled') + '>' +
+                '<button class="btn btn-primary" data-act="apply"' + ((this.acc && !this.positioningBlocked) ? '' : ' disabled') + '>' +
                     this.esc(this.t('seatpos.apply', 'Apply')) + '</button>' +
                 '<div class="sp-menu-wrap">' +
                     '<button class="btn btn-secondary icon-btn" data-act="menu" aria-haspopup="true" aria-expanded="false">' +
@@ -471,7 +495,7 @@ const SeatPositions = {
     },
 
     async apply(p) {
-        if (!this.acc || this.movementBlocked) return;
+        if (!this.acc || this.positioningBlocked) return;
 
         // The axis ids are confirmed on a Seal only. On any other model — or a car where the
         // owner never picked one — ask before the first write rather than either writing
@@ -498,10 +522,8 @@ const SeatPositions = {
         host.style.display = '';
         b1.className = 'sp-batch run';
         b2.className = 'sp-batch';
-        // No force. Settled on the car (2026-08-11): the VEHICLE refuses the write unless the
-        // gear is in P — not a motion gate, it refuses with the brake pressed and the car
-        // standing still — and shows its own warning. So the block is below OverDrive, not
-        // applyFull's gate, and overriding only buys a doomed write plus a native popup.
+        // The vehicle can still refuse this write outside Park even when the user disables
+        // OverDrive's positioning guard.
         const url = '/api/positions/apply?id=' + encodeURIComponent(p.id) + ack;
         const res = await this.post(url).catch(() => null);
         b1.className = 'sp-batch done';
@@ -648,13 +670,13 @@ const SeatPositions = {
     },
 
     useInAutomation(p) {
-        // Deep-link into the single editor with the action and position pre-filled. A
-        // shortcut into the Automations page, never a second editor here.
+        // A shortcut to the Automations page, never a second editor here. The page has no
+        // pre-fill entry point, so don't pass params it ignores or promise a filled-in rule.
         this.confirm(this.t('seatpos.use_title', 'Use in an automation'),
-            this.t('seatpos.use_body', 'Opens the Automations page with a new rule, action set to Apply Seat & Mirror Position and position set to {0}.').replace('{0}', p.name),
+            this.t('seatpos.use_body', 'Opens the Automations page, where you can add a rule with the Apply Saved Seat Position action and pick {0}.').replace('{0}', p.name),
             '', false, this.t('seatpos.open_automations', 'Open Automations'))
             .then(ok => {
-                if (ok) window.location.href = 'automations.html?action=applySeatPosition&id=' + encodeURIComponent(p.id);
+                if (ok) window.location.href = 'automations.html';
             });
     },
 

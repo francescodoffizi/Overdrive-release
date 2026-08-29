@@ -70,39 +70,110 @@ public final class PositionStore {
         return instance;
     }
 
-    /** Load the store, tolerating a missing/corrupt file (returns an empty {version, positions:[]}). */
-    private JSONObject load() {
-        try {
-            File f = new File(STORE_FILE);
-            if (f.exists()) {
-                String txt = new String(Files.readAllBytes(f.toPath()), "UTF-8");
-                JSONObject root = new JSONObject(txt);
-                if (!root.has("positions")) root.put("positions", new JSONArray());
-                return root;
-            }
-        } catch (Throwable t) {
-            log("load failed (starting empty): " + t);
-        }
+    private JSONObject emptyRoot() {
         JSONObject root = new JSONObject();
         try { root.put("version", VERSION); root.put("positions", new JSONArray()); } catch (Throwable ignored) {}
         return root;
     }
 
-    /** Atomic write (tmp+rename) + world readable/writable, matching SafeLocationManager. */
-    private void save(JSONObject root) {
+    /**
+     * Read the store. {@code forWrite} decides what an UNREADABLE-but-present file means:
+     * a read path gets an empty store so the UI still renders, while a write path gets
+     * null and MUST abort — saving an empty root over a corrupt file would replace every
+     * stored position with nothing, and this file is the only record of them.
+     */
+    private JSONObject readRoot(boolean forWrite) {
+        File f = new File(STORE_FILE);
+        if (!f.exists()) {
+            // Absent primary but a surviving .bak means the last rename was interrupted;
+            // recovering from it is the difference between "one save lost" and "all of them".
+            JSONObject fromBak = parseFile(new File(STORE_FILE + ".bak"));
+            if (fromBak != null) {
+                log("primary store missing; recovered from .bak");
+                return fromBak;
+            }
+            return emptyRoot();
+        }
+        JSONObject root = parseFile(f);
+        if (root != null) return root;
+        JSONObject bak = parseFile(new File(STORE_FILE + ".bak"));
+        if (bak != null) {
+            log("store unparseable; recovered from .bak");
+            return bak;
+        }
+        log("store unparseable and no usable .bak"
+                + (forWrite ? " — refusing to overwrite it" : " — reporting empty for this read"));
+        return forWrite ? null : emptyRoot();
+    }
+
+    /** Parse a store file, or null if it is missing, empty or not valid JSON. */
+    private JSONObject parseFile(File f) {
+        try {
+            if (f == null || !f.isFile() || f.length() == 0) return null;
+            JSONObject root = new JSONObject(new String(Files.readAllBytes(f.toPath()), "UTF-8"));
+            // optJSONArray, not has(): {"positions":null} and a non-array both have to
+            // read as "no usable list" rather than passing through as one.
+            if (root.optJSONArray("positions") == null) root.put("positions", new JSONArray());
+            return root;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** False when the store exists but neither it nor its .bak can be parsed. */
+    public boolean isReadable() {
+        synchronized (LOCK) {
+            return readRoot(true) != null;
+        }
+    }
+
+    /** Tolerant read for list/lookup paths; never null. */
+    private JSONObject load() {
+        return readRoot(false);
+    }
+
+    /** Read for a mutation; null means the store is unreadable and the caller must not save. */
+    private JSONObject loadForWrite() {
+        return readRoot(true);
+    }
+
+    /**
+     * Atomic write: fsync'd tmp, previous copy kept as .bak, then rename. Returns false when
+     * nothing was persisted. A failed rename leaves the existing store untouched — writing
+     * into the target directly would truncate the only good copy before replacing it.
+     */
+    private boolean save(JSONObject root) {
+        File tmp = new File(STORE_FILE + ".tmp");
         try {
             root.put("version", VERSION);
-            File tmp = new File(STORE_FILE + ".tmp");
-            try (FileWriter w = new FileWriter(tmp)) { w.write(root.toString(2)); }
+            byte[] bytes = root.toString(2).getBytes("UTF-8");
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp)) {
+                fos.write(bytes);
+                fos.flush();
+                fos.getFD().sync();
+            }
             File target = new File(STORE_FILE);
+            if (target.exists()) {
+                File bak = new File(STORE_FILE + ".bak");
+                try {
+                    bak.delete();
+                    Files.copy(target.toPath(), bak.toPath());
+                    bak.setReadable(true, false);
+                    bak.setWritable(true, false);
+                } catch (Throwable ignored) { /* best effort */ }
+            }
             if (!tmp.renameTo(target)) {
-                try (FileWriter w = new FileWriter(target)) { w.write(root.toString(2)); }
+                log("save FAILED: could not rename over " + STORE_FILE + "; store left intact");
                 tmp.delete();
+                return false;
             }
             target.setReadable(true, false);
             target.setWritable(true, false);
+            return true;
         } catch (Throwable t) {
             log("save failed: " + t);
+            try { tmp.delete(); } catch (Throwable ignored) {}
+            return false;
         }
     }
 
@@ -141,7 +212,8 @@ public final class PositionStore {
     public JSONObject upsertCaptured(String profile, int slot, String name, JSONObject axes,
                                      JSONObject ambient, long nowMs) {
         synchronized (LOCK) {
-            JSONObject root = load();
+            JSONObject root = loadForWrite();
+            if (root == null) return null;
             JSONArray arr = root.optJSONArray("positions");
             String prof = (profile == null || profile.trim().isEmpty()) ? "default" : profile.trim();
             String id = sanitize(prof) + "-slot-" + slot;
@@ -152,12 +224,31 @@ public final class PositionStore {
             // nudging the seat silently renames the position back to
             // "<account> - Posisjon 2". Carried across the replace below.
             String priorAlias = null;
+            JSONObject priorAmbient = null;
+            long priorCreatedAt = 0L;
+            // Match on id, then fall back to (profile, slot). The id is derived from the
+            // profile via sanitize(), so an entry captured under an older slug spelling would
+            // otherwise be missed and re-capture would append a SECOND row for the same
+            // physical slot instead of replacing it.
             int priorIdx = indexOf(arr, id);
+            String legacyId = null;
+            if (priorIdx < 0) {
+                priorIdx = indexOfCapturedSlot(arr, prof, slot);
+                if (priorIdx >= 0) {
+                    JSONObject legacy = arr.optJSONObject(priorIdx);
+                    legacyId = (legacy != null) ? legacy.optString("id", null) : null;
+                }
+            }
             if (priorIdx >= 0) {
                 JSONObject prior = arr.optJSONObject(priorIdx);
                 if (prior != null) {
                     String a = prior.optString("alias", "").trim();
                     if (!a.isEmpty()) priorAlias = a;
+                    // A capture that could not read the lights must not DELETE an ambient block
+                    // the user set here; and re-saving the seat natively is not a new entry, so
+                    // createdAt survives too.
+                    priorAmbient = prior.optJSONObject("ambient");
+                    priorCreatedAt = prior.optLong("createdAt", 0L);
                 }
             }
             JSONObject entry = new JSONObject();
@@ -168,20 +259,27 @@ public final class PositionStore {
                 entry.put("profile", prof);
                 entry.put("slot", slot);
                 entry.put("source", "captured");
-                entry.put("createdAt", nowMs);
+                entry.put("createdAt", priorCreatedAt > 0 ? priorCreatedAt : nowMs);
+                if (priorCreatedAt > 0) entry.put("updatedAt", nowMs);
                 entry.put("axes", axes != null ? axes : new JSONObject());
                 if (ambient != null && ambient.length() > 0) entry.put("ambient", ambient);
-                // Replace any existing captured entry for this slot.
+                else if (priorAmbient != null && priorAmbient.length() > 0) entry.put("ambient", priorAmbient);
+                // Replace any existing captured entry for this slot — by the new id AND by the
+                // legacy id it was stored under, so a slug change replaces rather than duplicates.
                 JSONArray next = new JSONArray();
                 for (int i = 0; i < arr.length(); i++) {
                     JSONObject p = arr.optJSONObject(i);
-                    if (p != null && !id.equals(p.optString("id"))) next.put(p);
+                    if (p == null) continue;
+                    String pid = p.optString("id");
+                    if (id.equals(pid) || (legacyId != null && legacyId.equals(pid))) continue;
+                    next.put(p);
                 }
                 next.put(entry);
                 root.put("positions", next);
-                save(root);
+                if (!save(root)) return null;   // nothing on disk: the caller must not report success
             } catch (Throwable t) {
                 log("upsertCaptured failed: " + t);
+                return null;
             }
             return entry;
         }
@@ -206,7 +304,8 @@ public final class PositionStore {
         if (clean.isEmpty() || clean.length() > 60) return null;
         if (isEmpty(axes) && isEmpty(ambient)) return null;
         synchronized (LOCK) {
-            JSONObject root = load();
+            JSONObject root = loadForWrite();
+            if (root == null) return null;
             JSONArray arr = root.optJSONArray("positions");
             String base = "user-" + sanitize(clean);
             String id = base;
@@ -220,7 +319,7 @@ public final class PositionStore {
                 if (!isEmpty(axes)) entry.put("axes", axes);
                 if (!isEmpty(ambient)) entry.put("ambient", ambient);
                 arr.put(entry);
-                save(root);
+                if (!save(root)) return null;
             } catch (Throwable t) {
                 log("createUser failed: " + t);
                 return null;
@@ -242,17 +341,21 @@ public final class PositionStore {
     public JSONObject updateParts(String id, JSONObject axes, JSONObject ambient, long nowMs) {
         if (id == null) return null;
         synchronized (LOCK) {
-            JSONObject root = load();
+            JSONObject root = loadForWrite();
+            if (root == null) return null;
             JSONArray arr = root.optJSONArray("positions");
             int i = indexOf(arr, id);
             if (i < 0) return null;
             JSONObject entry = arr.optJSONObject(i);
             if (entry == null || !"user".equals(entry.optString("source"))) return null;
+            // Nothing asked for is a no-op, not a rewrite: rewriting the whole file to change
+            // nothing burns a .bak cycle and can only lose data if it is interrupted.
+            if (isEmpty(axes) && isEmpty(ambient)) return entry;
             try {
                 if (!isEmpty(axes)) { entry.put("axes", axes); entry.put("updatedAt", nowMs); }
                 if (!isEmpty(ambient)) { entry.put("ambient", ambient); entry.put("updatedAt", nowMs); }
                 arr.put(i, entry);
-                save(root);
+                if (!save(root)) return null;
             } catch (Throwable t) {
                 log("updateParts failed: " + t);
                 return null;
@@ -274,7 +377,8 @@ public final class PositionStore {
     public JSONObject setAmbient(String id, JSONObject ambient) {
         if (id == null || isEmpty(ambient)) return null;
         synchronized (LOCK) {
-            JSONObject root = load();
+            JSONObject root = loadForWrite();
+            if (root == null) return null;
             JSONArray arr = root.optJSONArray("positions");
             int i = indexOf(arr, id);
             if (i < 0) return null;
@@ -283,7 +387,7 @@ public final class PositionStore {
             try {
                 entry.put("ambient", ambient);
                 arr.put(i, entry);
-                save(root);
+                if (!save(root)) return null;
             } catch (Throwable t) {
                 log("setAmbient failed: " + t);
                 return null;
@@ -334,7 +438,8 @@ public final class PositionStore {
         String clean = (alias == null) ? "" : alias.trim();
         if (clean.length() > 60) return null;
         synchronized (LOCK) {
-            JSONObject root = load();
+            JSONObject root = loadForWrite();
+            if (root == null) return null;
             JSONArray arr = root.optJSONArray("positions");
             int i = indexOf(arr, id);
             if (i < 0) return null;
@@ -344,7 +449,7 @@ public final class PositionStore {
                 if (clean.isEmpty()) entry.remove("alias");
                 else entry.put("alias", clean);
                 arr.put(i, entry);
-                save(root);
+                if (!save(root)) return null;
             } catch (Throwable t) {
                 log("setAlias failed: " + t);
                 return null;
@@ -368,7 +473,8 @@ public final class PositionStore {
     private JSONObject mutate(String id, JSONObject axes, String name, long nowMs) {
         if (id == null) return null;
         synchronized (LOCK) {
-            JSONObject root = load();
+            JSONObject root = loadForWrite();
+            if (root == null) return null;
             JSONArray arr = root.optJSONArray("positions");
             int i = indexOf(arr, id);
             if (i < 0) return null;
@@ -378,7 +484,7 @@ public final class PositionStore {
                 if (axes != null) { entry.put("axes", axes); entry.put("updatedAt", nowMs); }
                 if (name != null) entry.put("name", name);
                 arr.put(i, entry);
-                save(root);
+                if (!save(root)) return null;
             } catch (Throwable t) {
                 log("mutate failed: " + t);
                 return null;
@@ -430,17 +536,35 @@ public final class PositionStore {
         }
     }
 
-    /** Record that the user accepted applying on this model. Idempotent. */
-    public void acknowledgeModel(String modelId) {
-        if (isModelAcknowledged(modelId)) return;
+    /**
+     * Record that the user accepted applying on this model. Idempotent. Returns false when the
+     * acknowledgement did not persist, so the caller can say it will be asked again rather than
+     * quietly re-prompting on the next apply.
+     */
+    public boolean acknowledgeModel(String modelId) {
+        if (isModelAcknowledged(modelId)) return true;
         synchronized (LOCK) {
-            JSONObject root = load();
+            JSONObject root = loadForWrite();
+            if (root == null) return false;
             JSONArray acked = root.optJSONArray("acknowledgedModels");
             if (acked == null) acked = new JSONArray();
             acked.put(ackKey(modelId));
-            try { root.put("acknowledgedModels", acked); save(root); }
-            catch (Throwable t) { log("acknowledgeModel failed: " + t); }
+            try { root.put("acknowledgedModels", acked); return save(root); }
+            catch (Throwable t) { log("acknowledgeModel failed: " + t); return false; }
         }
+    }
+
+    /** Index of the captured entry for this (profile, slot), whatever its id spelling, or -1. */
+    private static int indexOfCapturedSlot(JSONArray arr, String profile, int slot) {
+        if (arr == null || profile == null) return -1;
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject p = arr.optJSONObject(i);
+            if (p == null) continue;
+            if (!"captured".equals(p.optString("source"))) continue;
+            if (p.optInt("slot", -1) != slot) continue;
+            if (profile.equals(p.optString("profile"))) return i;
+        }
+        return -1;
     }
 
     /** Index of the entry with this id, or -1. */
@@ -457,7 +581,8 @@ public final class PositionStore {
     public boolean remove(String id) {
         if (id == null) return false;
         synchronized (LOCK) {
-            JSONObject root = load();
+            JSONObject root = loadForWrite();
+            if (root == null) return false;
             JSONArray arr = root.optJSONArray("positions");
             JSONArray next = new JSONArray();
             boolean removed = false;
@@ -466,17 +591,27 @@ public final class PositionStore {
                 if (p != null && id.equals(p.optString("id"))) { removed = true; continue; }
                 next.put(p);
             }
-            if (removed) { try { root.put("positions", next); } catch (Throwable ignored) {} save(root); }
+            if (removed) {
+                try { root.put("positions", next); } catch (Throwable ignored) {}
+                if (!save(root)) return false;   // still on disk, so it was not removed
+            }
             return removed;
         }
     }
 
-    /** Sanitize a profile string into an id-safe token (keep alphanumerics, collapse the rest to '_'). */
+    /** Sanitize a profile string into an id-safe token (keep ASCII alphanumerics, rest to '_'). */
+    /**
+     * ASCII-only [a-z0-9_] slug. Deliberately NOT Character.isLetterOrDigit, which is
+     * Unicode-aware and would keep letters like "å" — the automation-side value validator
+     * (SavedSeatPositionType.isValidValue) accepts ASCII only, so a non-ASCII id renders in
+     * the picker and then makes the whole automation unsaveable.
+     */
     private static String sanitize(String s) {
         StringBuilder b = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
-            b.append((Character.isLetterOrDigit(c)) ? Character.toLowerCase(c) : '_');
+            boolean ascii = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+            b.append(ascii ? Character.toLowerCase(c) : '_');
         }
         return b.toString();
     }

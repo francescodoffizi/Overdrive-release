@@ -26,9 +26,8 @@ import java.util.Map;
  *   <li>{@code POST /api/positions/capture?slot=N&name=..} — read the live full bundle and
  *       upsert it as the captured entry for native slot N (1..3). Fired by the long-press hook.</li>
  *   <li>{@code POST /api/positions/apply?id=..}         — apply a stored position (moves seat+mirrors,
- *       full spi.p7.m() two-batch sequence via {@link BodyworkSeatProbe#applyFull}). Movement-gated,
- *       {@code force=YES} overrides. Also accepts the id in a JSON body, which is how the
- *       automation action reaches it.</li>
+ *       full spi.p7.m() two-batch sequence via {@link BodyworkSeatProbe#applyFull}). Movement-gated.
+ *       Also accepts the id in a JSON body, which is how the automation action reaches it.</li>
  *   <li>{@code POST /api/positions/delete?id=..}        — remove a stored position</li>
  *   <li>{@code POST /api/positions/create?name=..&parts=..} — save the live state as a new user
  *       entry. {@code parts} is {@code all} (default), {@code geometry} or {@code ambient}.</li>
@@ -64,6 +63,40 @@ public final class PositionsApiHandler {
         }
     }
 
+    /**
+     * True when every axis in a read-back bundle is the 127.5 not-equipped sentinel, i.e. the
+     * reads failed rather than the car reporting a real pose. 127.5 for SOME axes is normal
+     * (a trim without an electric steering column reads it).
+     */
+    private static boolean allSentinel(JSONObject axes) {
+        if (axes == null || axes.length() == 0) return false;
+        for (java.util.Iterator<String> it = axes.keys(); it.hasNext(); ) {
+            double v = axes.optDouble(it.next(), Double.NaN);
+            if (!Double.isNaN(v) && Math.abs(v - 127.5) > 0.01) return false;
+        }
+        return true;
+    }
+
+    /**
+     * The honest reason a store operation returned nothing, or null when the store is fine and
+     * the caller's own message applies. Without this an unreadable store surfaces as "no
+     * position with id=X" or "the name is too long" — user error the user cannot act on.
+     */
+    private static String storeFault() {
+        try {
+            if (!PositionStore.getInstance().isReadable()) {
+                return "the saved-positions file could not be read; nothing was changed. "
+                        + "Its last good copy is kept alongside it as seat_positions.json.bak";
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    private static void sendStoreOrOwnError(java.io.OutputStream out, String ownMessage) throws Exception {
+        String fault = storeFault();
+        HttpResponse.sendJsonError(out, fault != null ? fault : ownMessage);
+    }
+
     private static Context resolveContext() {
         Context ctx = null;
         try { ctx = CameraDaemon.getAppContext(); } catch (Throwable ignore) {}
@@ -92,10 +125,7 @@ public final class PositionsApiHandler {
             // authority is still applyFull's own gate, which the UI cannot talk its way past.
             // ACC off matters most: the seat motors are unpowered, so a write is accepted
             // (code 0) and does nothing, which would otherwise look like success.
-            try { r.put("acc", com.overdrive.app.monitor.AccMonitor.isAccOn()); }
-            catch (Throwable ignore) { }
-            try { r.put("movementBlocked", com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked()); }
-            catch (Throwable ignore) { }
+            putGateState(r);
             String model = resolvedModel();
             r.put("modelId", model != null ? model : JSONObject.NULL);
             r.put("modelConfirmed", PositionStore.isModelConfirmed(model));
@@ -127,6 +157,7 @@ public final class PositionsApiHandler {
             JSONObject axes = readLive(out);
             if (axes == null) return true;
             JSONObject cur = new JSONObject().put("axes", axes);
+            putGateState(cur);
             // Live ambient rides along so the page can show what the car is set to now and
             // offer "save this". Absent rather than empty when unreadable, so the UI can tell
             // "the car did not say" from "the lights are off".
@@ -147,7 +178,7 @@ public final class PositionsApiHandler {
         }
         if (pathOnly.equals("/api/positions/capture")) return handleCapture(out, q);
         if (pathOnly.equals("/api/positions/apply"))   return handleApply(out, q, body);
-        if (pathOnly.equals("/api/positions/delete"))  return handleDelete(out, q);
+        if (pathOnly.equals("/api/positions/delete"))  return handleDelete(out, q, body);
         if (pathOnly.equals("/api/positions/create"))  return handleCreate(out, q, body);
         if (pathOnly.equals("/api/positions/save"))    return handleSave(out, q, body);
         if (pathOnly.equals("/api/positions/rename"))  return handleRename(out, q, body);
@@ -156,6 +187,20 @@ public final class PositionsApiHandler {
 
         HttpResponse.sendError(out, 404, "Unknown positions endpoint");
         return true;
+    }
+
+    private static void putGateState(JSONObject target) {
+        try { target.put("acc", com.overdrive.app.monitor.AccMonitor.isAccOn()); }
+        catch (Throwable ignore) { }
+        try {
+            boolean movementBlocked =
+                    com.overdrive.app.byd.routing.DrivingSafetyGuard.isMovementBlocked();
+            target.put("movementBlocked", movementBlocked);
+            target.put("positioningBlocked",
+                    com.overdrive.app.byd.routing.DrivingSafetyGuard.isGuardEnabled(
+                            com.overdrive.app.byd.routing.DrivingSafetyGuard.GUARD_POSITIONING)
+                            && movementBlocked);
+        } catch (Throwable ignore) { }
     }
 
     /**
@@ -204,6 +249,14 @@ public final class PositionsApiHandler {
             HttpResponse.sendJsonError(out, "read of live geometry returned nothing (bodywork device unavailable?)");
             return true;
         }
+        // A failed read is stored as the 127.5 not-equipped sentinel, so a bundle that is ALL
+        // sentinel means the reads failed, not that the car has no seat. Capture upserts by
+        // slot, so accepting it would replace a good stored position with an unusable one.
+        if (allSentinel(axes)) {
+            HttpResponse.sendJsonError(out, "live geometry read back as all-unavailable; "
+                    + "not overwriting the stored position for slot " + slot);
+            return true;
+        }
         // BYD's Pos 1/2/3 are per-logged-in-profile, so key captures by profile. A captured
         // entry MIRRORS the car: its name is "<nickName> - <car slot name>", both read live
         // from the DiLink account content provider, and it is NOT user-renameable in our UI
@@ -219,6 +272,11 @@ public final class PositionsApiHandler {
         // position it shadows. Null when the car will not report it; never a default.
         JSONObject ambient = com.overdrive.app.byd.AmbientProbe.read(ctx);
         JSONObject entry = PositionStore.getInstance().upsertCaptured(profile, slot, name, axes, ambient, now);
+        if (entry == null) {
+            // Store unreadable or the write did not land — never confirm a capture that is not on disk.
+            HttpResponse.sendJsonError(out, "capture could not be saved; the stored position is unchanged");
+            return true;
+        }
         log("captured profile=" + profile + " slot=" + slot + " name=" + name
                 + " model=" + resolvedModel() + " axes=" + axes);
         // Confirm the capture on screen. Without this the long-press is completely silent from
@@ -312,7 +370,7 @@ public final class PositionsApiHandler {
             return true;
         }
         JSONObject entry = PositionStore.getInstance().createUser(name, axes, ambient, System.currentTimeMillis());
-        if (entry == null) { HttpResponse.sendJsonError(out, "name must be 1..60 characters, and at least one part must be saved"); return true; }
+        if (entry == null) { sendStoreOrOwnError(out, "name must be 1..60 characters, and at least one part must be saved"); return true; }
         log("created " + entry.optString("id") + " name=" + name);
         HttpResponse.sendJson(out, entry.toString());
         return true;
@@ -336,7 +394,7 @@ public final class PositionsApiHandler {
         }
         JSONObject entry = PositionStore.getInstance().updateParts(id, axes, ambient, System.currentTimeMillis());
         if (entry == null) {
-            HttpResponse.sendJsonError(out, "no user position with id=" + id + " (captured positions cannot be overwritten)");
+            sendStoreOrOwnError(out, "no user position with id=" + id + " (captured positions cannot be overwritten)");
             return true;
         }
         log("saved over " + id);
@@ -351,7 +409,7 @@ public final class PositionsApiHandler {
         if (id == null || name == null) { HttpResponse.sendJsonError(out, "rename needs an id and a name"); return true; }
         JSONObject entry = PositionStore.getInstance().rename(id, name);
         if (entry == null) {
-            HttpResponse.sendJsonError(out, "no user position with id=" + id + ", or the name is not 1..60 characters");
+            sendStoreOrOwnError(out, "no user position with id=" + id + ", or the name is not 1..60 characters");
             return true;
         }
         log("renamed " + id + " to " + name);
@@ -415,7 +473,7 @@ public final class PositionsApiHandler {
             return true;
         }
         JSONObject pos = PositionStore.getInstance().getById(id);
-        if (pos == null) { HttpResponse.sendJsonError(out, "no position with id=" + id); return true; }
+        if (pos == null) { sendStoreOrOwnError(out, "no position with id=" + id); return true; }
         JSONObject ambient = pos.optJSONObject("ambient");
         if (ambient == null || ambient.length() == 0) {
             HttpResponse.sendJsonError(out, "this position stores no ambient light to change");
@@ -431,10 +489,20 @@ public final class PositionsApiHandler {
         boolean front = zone == null || "both".equalsIgnoreCase(zone) || "front".equalsIgnoreCase(zone);
         boolean rear = zone == null || "both".equalsIgnoreCase(zone) || "rear".equalsIgnoreCase(zone);
         JSONObject next = new JSONObject(ambient.toString());
-        if (front) setZoneColour(next, "front", colour);
-        if (rear) setZoneColour(next, "rear", colour);
+        boolean changed = false;
+        if (front) changed |= setZoneColour(next, "front", colour);
+        if (rear) changed |= setZoneColour(next, "rear", colour);
+        // setZoneColour refuses to invent a zone the car never reported, so asking for a zone
+        // this position has no block for changes nothing. Saying so beats a 200 that re-renders
+        // the old colour and looks like the write was ignored at random.
+        if (!changed) {
+            HttpResponse.sendJsonError(out, "this position stores no "
+                    + (zone == null ? "front or rear" : zone.toLowerCase())
+                    + " ambient zone to change");
+            return true;
+        }
         JSONObject entry = PositionStore.getInstance().setAmbient(id, next);
-        if (entry == null) { HttpResponse.sendJsonError(out, "could not update id=" + id); return true; }
+        if (entry == null) { sendStoreOrOwnError(out, "could not update id=" + id); return true; }
         log("ambient colour " + id + " zone=" + (zone == null ? "both" : zone) + " -> " + colour);
         HttpResponse.sendJson(out, entry.toString());
         return true;
@@ -445,11 +513,12 @@ public final class PositionsApiHandler {
      * assert the car has it — and on a car whose rear zone never reported, an invented rear
      * block would start applying a colour to lights that do not exist.
      */
-    private static void setZoneColour(JSONObject ambient, String zone, int colour) throws Exception {
+    private static boolean setZoneColour(JSONObject ambient, String zone, int colour) throws Exception {
         JSONObject z = ambient.optJSONObject(zone);
-        if (z == null) return;
+        if (z == null) return false;
         z.put("colour", colour);
         ambient.put(zone, z);
+        return true;
     }
 
     /**
@@ -467,7 +536,7 @@ public final class PositionsApiHandler {
         String alias = param(q, body, "alias");
         JSONObject entry = PositionStore.getInstance().setAlias(id, alias);
         if (entry == null) {
-            HttpResponse.sendJsonError(out,
+            sendStoreOrOwnError(out,
                 "no captured position with id=" + id + ", or the alias is over 60 characters");
             return true;
         }
@@ -522,6 +591,14 @@ public final class PositionsApiHandler {
             HttpResponse.sendJsonError(out, "read of live geometry returned nothing (bodywork device unavailable?)");
             return null;
         }
+        // readFullBundle fills unreadable axes with the sentinel, so it is never empty once the
+        // device handle resolves — the length check above cannot catch a wholly failed read.
+        // Storing that would produce a position that applies cleanly and moves nothing.
+        if (allSentinel(axes)) {
+            HttpResponse.sendJsonError(out, "the car reported no seat geometry (every axis read back "
+                    + "as unavailable); nothing was saved");
+            return null;
+        }
         return axes;
     }
 
@@ -529,7 +606,7 @@ public final class PositionsApiHandler {
     private static boolean handleApply(OutputStream out, Map<String, String> q, String body) throws Exception {
         String id = param(q, body, "id");
         JSONObject pos = PositionStore.getInstance().getById(id);
-        if (pos == null) { HttpResponse.sendJsonError(out, "no position with id=" + id); return true; }
+        if (pos == null) { sendStoreOrOwnError(out, "no position with id=" + id); return true; }
         Context ctx = resolveContext();
         if (ctx == null) {
             HttpResponse.sendJson(out, 503, new JSONObject().put("error", "Daemon Context unavailable").toString());
@@ -552,7 +629,9 @@ public final class PositionsApiHandler {
         // ask, rather than as an error the user has to decode.
         String model = resolvedModel();
         PositionStore store = PositionStore.getInstance();
-        boolean acked = "YES".equals(q.get("ack")) || "1".equals(q.get("ack"));
+        String ackRaw = param(q, body, "ack");
+        boolean acked = "YES".equals(ackRaw) || "1".equals(ackRaw);
+        boolean ackPersisted = true;
         // The acknowledgement exists because the AXIS ID MAP is what might differ on an
         // unconfirmed model. Ambient rides on named SDK calls with the zone as an argument,
         // not on a per-car id table, so an ambient-only position has nothing to mis-address
@@ -561,26 +640,34 @@ public final class PositionsApiHandler {
             if (!acked) {
                 JSONObject r = new JSONObject();
                 r.put("needsModelAck", true);
+                // A headless caller must not read this pre-flight stop as an
+                // applied position: ApiAction treats a 2xx JSON body without an
+                // explicit success:false as success, so the applySeatPosition
+                // automation reported "applied" while nothing moved. The web UI
+                // is unaffected — it acknowledges up front and already treats
+                // needsModelAck as a failure condition (seat-positions.js).
+                r.put("success", false);
+                r.put("error", "vehicle model not acknowledged for seat writes; "
+                        + "open the Seat Positions page once and confirm to enable applies");
                 r.put("modelId", model != null ? model : JSONObject.NULL);
                 r.put("appliedId", id);
                 HttpResponse.sendJson(out, r.toString());
                 return true;
             }
-            store.acknowledgeModel(model);
+            ackPersisted = store.acknowledgeModel(model);
         }
-        boolean force = "YES".equals(q.get("force"));
         JSONObject res = new JSONObject();
 
-        // Geometry, when the position carries it. The two-batch sequence is all-or-nothing by
-        // construction: a mirror-only batch is accepted and inert, so applyFull always writes
-        // both batches and there is no half-geometry state to end up in.
+        // Geometry, when the position carries it. applyFull writes both batches and returns one
+        // aggregate `accepted`; a batch-1-ok / batch-2-failed run leaves the mirrors moved and
+        // the seat where it was, so it must NOT read as applied.
         if (hasGeometry) {
             Map<String, Float> overrides = new LinkedHashMap<>();
             for (java.util.Iterator<String> it = axes.keys(); it.hasNext(); ) {
                 String k = it.next();
                 overrides.put(k, (float) axes.optDouble(k, Double.NaN));
             }
-            res = BodyworkSeatProbe.applyFull(ctx, overrides, force);
+            res = BodyworkSeatProbe.applyFull(ctx, overrides);
         }
 
         // Ambient, when the position carries it. Independent of the geometry write: a
@@ -597,10 +684,22 @@ public final class PositionsApiHandler {
         }
 
         res.put("appliedId", id);
+        // The apply itself still went ahead — the user just acknowledged — but say so, or they
+        // are silently re-prompted on every future apply.
+        if (!ackPersisted) res.put("ackNotPersisted", true);
         JSONArray applied = new JSONArray();
-        if (hasGeometry) applied.put("geometry");
+        boolean geometryOk = !hasGeometry || res.optBoolean("accepted", false);
+        if (hasGeometry && geometryOk) applied.put("geometry");
         if (hasAmbient) applied.put("ambient");
         res.put("appliedParts", applied);
+        // Report the honest outcome: the HAL refusing the write, and the HAL accepting a write
+        // the unpowered motors cannot act on, are both "the seat did not move".
+        if (hasGeometry && !geometryOk && !res.has("error") && !res.has("skipped")) {
+            res.put("error", "the car did not confirm the seat write"
+                    + (res.has("exception") ? " (" + res.optString("exception") + ")" : ""));
+        } else if (res.optBoolean("inert", false)) {
+            res.put("warning", res.optString("reason", "vehicle off: nothing moved"));
+        }
         log("apply " + id + " model=" + model + " geometry=" + hasGeometry + " ambient=" + hasAmbient
                 + " -> batch1=" + res.optJSONObject("batch1") + " batch2=" + res.optJSONObject("batch2")
                 + " ambientRes=" + res.optJSONObject("ambient"));
@@ -608,9 +707,18 @@ public final class PositionsApiHandler {
         return true;
     }
 
-    private static boolean handleDelete(OutputStream out, Map<String, String> q) throws Exception {
-        String id = q.get("id");
-        boolean removed = PositionStore.getInstance().remove(id);
+    private static boolean handleDelete(OutputStream out, Map<String, String> q, String body) throws Exception {
+        String id = param(q, body, "id");
+        PositionStore store = PositionStore.getInstance();
+        // remove() returns false for "not there" AND for "could not persist". The UI only checks
+        // `error`, so a failed delete otherwise looked like a success and the row came back on
+        // the next load with nothing said.
+        boolean existed = store.getById(id) != null;
+        boolean removed = store.remove(id);
+        if (!removed && existed) {
+            sendStoreOrOwnError(out, "could not delete id=" + id + "; it is still stored");
+            return true;
+        }
         HttpResponse.sendJson(out, new JSONObject().put("removed", removed).put("id", id).toString());
         return true;
     }

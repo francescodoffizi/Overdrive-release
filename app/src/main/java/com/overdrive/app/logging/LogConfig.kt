@@ -16,8 +16,6 @@ import java.io.File
  * @param rotationCount Number of rotated log files to keep
  * @param enableConsoleLog Whether to log to Android Log (logcat)
  * @param enableFileLog Whether to write logs to file
- * @param minLevel Lowest severity that is emitted at all; anything below is dropped
- *   before both the console and the file sink
  */
 data class LogConfig(
     val logDir: String = "",
@@ -95,6 +93,13 @@ data class LogConfig(
     }
     
     /**
+     * Whether a line of [level] survives the severity gate — the same comparison
+     * LogManager.log() applies, kept here as a pure function so the policy is
+     * testable without a Context or Android's Log.
+     */
+    fun emits(level: LogLevel): Boolean = level.ordinal >= minLevel.ordinal
+
+    /**
      * Validate configuration values.
      *
      * Upper bounds matter: `maxFileSizeMB` is consumed as
@@ -103,15 +108,6 @@ data class LogConfig(
      * we clamp it to a sane 1 GB ceiling here — the gate every persist path
      * (updateLoggingConfig / importConfig) already runs through.
      */
-    /**
-     * Whether a line of [level] survives the severity gate.
-     *
-     * Kept here, as a pure function, so the policy is unit-testable without a Context,
-     * a log directory, or Android's Log — LogManager itself is a file-writing singleton
-     * and is not.
-     */
-    fun emits(level: LogLevel): Boolean = level.ordinal >= minLevel.ordinal
-
     fun isValid(): Boolean {
         if (enableFileLog && logDir.isEmpty()) return false
         return retentionHours in 1..(24 * 30) &&     // ≤ 30 days

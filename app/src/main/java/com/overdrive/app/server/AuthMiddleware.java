@@ -121,13 +121,7 @@ public class AuthMiddleware {
         // Tier 1 — JWT validation. This is the primary path: WebView (cookie),
         // frontend pages (Authorization header via auth.js), native callers
         // (cookie via DaemonHttpClient).
-        String jwt = null;
-        if (authHeader != null && authHeader.startsWith("Bearer ")) {
-            jwt = authHeader.substring(7);
-        }
-        if (jwt == null && cookieHeader != null) {
-            jwt = extractJwtFromCookie(cookieHeader);
-        }
+        String jwt = jwtFromHeaders(cookieHeader, authHeader);
         if (jwt != null && !jwt.isEmpty()) {
             AuthManager.JwtValidation validation = AuthManager.validateJwt(jwt);
             if (validation.valid) {
@@ -153,6 +147,32 @@ public class AuthMiddleware {
 
         return handleUnauthorized(path, out,
             jwt == null || jwt.isEmpty() ? "No session token" : "Invalid session token");
+    }
+
+    /**
+     * Require a valid JWT with no public-path or loopback fallback.
+     * Use this for sensitive surfaces where same-device shell access must not
+     * silently become browser control.
+     */
+    public static boolean checkJwtOnly(String path, String cookieHeader, String authHeader,
+                                       OutputStream out) throws Exception {
+        String jwt = jwtFromHeaders(cookieHeader, authHeader);
+        if (jwt != null && !jwt.isEmpty()) {
+            AuthManager.JwtValidation validation = AuthManager.validateJwt(jwt);
+            if (validation.valid) {
+                return true;
+            }
+            log("JWT invalid for " + path + ": " + validation.error);
+        }
+        return handleUnauthorized(path, out,
+            jwt == null || jwt.isEmpty() ? "No session token" : "Invalid session token");
+    }
+
+    private static String jwtFromHeaders(String cookieHeader, String authHeader) {
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            return authHeader.substring(7);
+        }
+        return extractJwtFromCookie(cookieHeader);
     }
     
     /**

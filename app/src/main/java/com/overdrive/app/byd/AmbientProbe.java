@@ -50,11 +50,18 @@ public final class AmbientProbe {
     /** "All rows" — a write-only convenience. Never read with this. */
     public static final int AREA_ALL = 3;
 
-    /** BYD's boolean encoding on these switches: 1 = on, 2 = off (not 0). */
+    /**
+     * On is always 1. Off is NOT uniform across these features — execute-style ones use 2,
+     * the Light-device main switch uses 0 — so OFF here is only for the mode switches, and the
+     * main switch goes through {@link #setMainSwitch} instead.
+     */
     private static final int ON = 1;
     private static final int OFF = 2;
 
     private static final int BRIGHTNESS_MAX = 5;
+
+    /** Highest colour BydDataCollector.setAmbientLightZoned will write. */
+    private static final int WRITABLE_COLOUR_MAX = 31;
 
     // Switch/mode feature ids, cross-checked against BYD's own Lights/Setting constants.
     private static final int MAIN_SWITCH_STATUS = 0x3F300046;
@@ -93,15 +100,22 @@ public final class AmbientProbe {
         try {
             JSONObject r = new JSONObject();
             putIf(r, "area", intOrNull(BydDeviceHelper.callGetter(setting, "getIALArea")));
-            r.put("front", readZone(setting, AREA_FRONT));
-            r.put("rear", readZone(setting, AREA_REAR));
+            // Only store a zone the car actually reported. An unconditional put left {} behind
+            // on trims with no zone getters, and every "did we capture ambient?" guard
+            // downstream tests length()>0 — so an empty zone read as a real captured one.
+            JSONObject front = readZone(setting, AREA_FRONT);
+            JSONObject rear = readZone(setting, AREA_REAR);
+            if (front.length() > 0) r.put("front", front);
+            if (rear.length() > 0) r.put("rear", rear);
 
             // Modes. Stored as booleans because 1/2 is BYD's wire encoding, not a concept
             // the position store or the UI should have to carry.
-            putBool(r, "mainSwitch", readSwitch(light, MAIN_SWITCH_STATUS));
-            putBool(r, "musicMode", readSwitch(setting, MUSIC_MODE_STATE));
-            putBool(r, "dynamicColours", readSwitch(light, DYNAMIC_COLOURS_STATE));
-            putBool(r, "nightAutoDim", readSwitch(light, NIGHT_DIM_FEEDBACK));
+            // MAIN_SWITCH is the Light-device 0/1 feature (see BydDataCollector's tier ladder);
+            // the mode switches are the execute-style 1/2 ones.
+            putBool(r, "mainSwitch", readSwitch(light, MAIN_SWITCH_STATUS, 0));
+            putBool(r, "musicMode", readSwitch(setting, MUSIC_MODE_STATE, OFF));
+            putBool(r, "dynamicColours", readSwitch(light, DYNAMIC_COLOURS_STATE, OFF));
+            putBool(r, "nightAutoDim", readSwitch(light, NIGHT_DIM_FEEDBACK, OFF));
             putIf(r, "customMode", validOrNull(BydDeviceHelper.callGetSingle(light, CUSTOM_MODE)));
             return r;
         } catch (JSONException e) {
@@ -141,7 +155,10 @@ public final class AmbientProbe {
             case 6:  seekbarMax = 126; break;
             default: seekbarMax = DEFAULT_SEEKBAR_MAX; break;
         }
-        return seekbarMax + 1;
+        // Never advertise more colours than the write path accepts: setAmbientLightZoned
+        // rejects anything above 31, so a 63/126 trim would offer swatches that validate
+        // on save and then silently fail to apply.
+        return Math.min(seekbarMax + 1, WRITABLE_COLOUR_MAX);
     }
 
     // ── apply ───────────────────────────────────────────────────────────────────
@@ -176,7 +193,7 @@ public final class AmbientProbe {
         // 1. Main switch on first when the capture had it on: the zone writes below are
         //    pointless against lights that are off.
         if (ambient.has("mainSwitch") && ambient.getBoolean("mainSwitch")) {
-            steps.put("mainSwitch", writeSwitch(light, MAIN_SWITCH_SET, true));
+            steps.put("mainSwitch", setMainSwitch(true));
         }
 
         // 2. Silence the dynamic drivers before writing a static colour.
@@ -216,7 +233,7 @@ public final class AmbientProbe {
         // 7. Main switch OFF last when the capture had it off — doing it first would make
         //    every write above a no-op against dark lights.
         if (ambient.has("mainSwitch") && !ambient.getBoolean("mainSwitch")) {
-            steps.put("mainSwitch", writeSwitch(light, MAIN_SWITCH_SET, false));
+            steps.put("mainSwitch", setMainSwitch(false));
         }
 
         result.put("applied", true);
@@ -319,16 +336,39 @@ public final class AmbientProbe {
     }
 
     /** null unless the HAL gave a real 0/1-style answer; negatives are error codes. */
-    private static Boolean readSwitch(Object device, int featureId) {
+    /**
+     * Tri-state switch read. The off value is per-feature, not global: the Light-device main
+     * switch is on=1/off=0, the execute-style mode features are on=1/off=2. Reading with the
+     * wrong one turns a switch that is genuinely OFF into "unreadable", which apply then skips
+     * — restoring a lights-off position with the lights still on.
+     *
+     * @param offValue what off looks like on THIS feature; anything else that is not ON stays
+     *                 null, because inventing a state is worse than admitting we do not know.
+     */
+    private static Boolean readSwitch(Object device, int featureId, int offValue) {
         if (device == null) return null;
         int v = BydDeviceHelper.callGetSingle(device, featureId);
         if (v == ON) return Boolean.TRUE;
-        if (v == OFF) return Boolean.FALSE;
-        return null;
+        if (v == offValue) return Boolean.FALSE;
+        return null;   // negatives and the 65534/65535 rails are errors, not states
     }
 
     private static boolean writeSwitch(Object device, int featureId, boolean on) {
         return BydDeviceHelper.sendSetCommand(device, featureId, on ? ON : OFF);
+    }
+
+    /**
+     * The global ambient on/off, via the collector's three-tier ladder. NOT a plain
+     * writeSwitch: each tier has its own off value (light main switch 0, bodywork execute 2,
+     * carsettings flag 0), so sending this file's OFF=2 to the light switch was out of domain
+     * and left the lights on — and a single-tier write has no fallback on signature-gated trims.
+     */
+    private static boolean setMainSwitch(boolean on) {
+        try {
+            return BydDataCollector.getInstance().setAmbientLightEnabled(on);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private static boolean ok(Object result) {
@@ -337,12 +377,17 @@ public final class AmbientProbe {
 
     private static Integer intOrNull(Object v) {
         if (!(v instanceof Number)) return null;
-        int i = ((Number) v).intValue();
-        return i < 0 ? null : i;   // negatives are HAL error codes, not values
+        return validOrNull(((Number) v).intValue());
     }
 
+    /**
+     * Null unless the HAL returned a real value. Negatives are error codes, and 65534/65535 are
+     * the "unavailable" rails the other readers in this codebase reject — captured as a value,
+     * 65535 clamps to full brightness and then applies as full brightness.
+     */
     private static Integer validOrNull(int v) {
-        return v < 0 ? null : v;
+        if (v < 0 || v >= 65534) return null;
+        return v;
     }
 
     /**

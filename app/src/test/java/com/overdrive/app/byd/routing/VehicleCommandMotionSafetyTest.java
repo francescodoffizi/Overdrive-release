@@ -14,6 +14,7 @@ import com.overdrive.app.byd.routing.VehicleCommandRouter.FindCarCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.FlashLightsCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.FrontDefrostCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.HazardCommand;
+import com.overdrive.app.byd.routing.VehicleCommandRouter.HeadlightModeCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.LightsCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.LockCommand;
 import com.overdrive.app.byd.routing.VehicleCommandRouter.MirrorAutoFollowUpCommand;
@@ -34,10 +35,9 @@ import com.overdrive.app.byd.routing.VehicleCommandRouter.WindowMoveCommand;
 import org.junit.Test;
 
 /**
- * Locks in the motion-safety policy: the gate blocks ONLY a small, explicit
- * blocklist of physical body actuators — door lock/unlock and the trunk/tailgate.
- * Everything else (climate, defrost, hazards, ADAS toggles, drive-feel, lighting,
- * seats, charging, screen/media) is UNRESTRICTED and works while the car moves.
+ * Locks in the motion-safety policy: the gate blocks a small, explicit set of
+ * commands or unsafe command directions. Most controls remain UNRESTRICTED and
+ * work while the car moves.
  *
  * <p>The default is UNRESTRICTED, so these tests guard two regressions:
  * (1) a gated command silently losing its BLOCK_WHILE_MOVING override (the gate
@@ -45,9 +45,9 @@ import org.junit.Test;
  * over-broad gating we deliberately reverted). The base-default assertion pins
  * that a brand-new command ships UNRESTRICTED.
  *
- * <p>Two commands are gated DIRECTIONALLY — mirror fold and seat-memory recall move a physical
- * part, while unfold and save are respectively the recovery and the no-op — so each is asserted in
- * both polarities. Gating the recovery half would strand a moving driver.
+ * <p>Three controls are gated DIRECTIONALLY: mirror fold and seat-memory recall move a physical
+ * part, while headlight OFF removes exterior illumination. Their recovery/no-op directions remain
+ * unrestricted, so each polarity is asserted explicitly.
  */
 public class VehicleCommandMotionSafetyTest {
 
@@ -83,6 +83,24 @@ public class VehicleCommandMotionSafetyTest {
     // Exterior DRL — unrestricted.
     @Test public void drlLightsIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new LightsCommand(false).motionSafety()); }
 
+    // The OEM selector blocks only OFF. Auto/parking/low-beam restore or increase visibility.
+    @Test public void headlightOffIsBlockedWhileMoving() {
+        assertEquals(MotionSafety.BLOCK_WHILE_MOVING,
+                new HeadlightModeCommand(1).motionSafety());
+    }
+    @Test public void headlightAutoIsUnrestricted() {
+        assertEquals(MotionSafety.UNRESTRICTED,
+                new HeadlightModeCommand(2).motionSafety());
+    }
+    @Test public void headlightParkingIsUnrestricted() {
+        assertEquals(MotionSafety.UNRESTRICTED,
+                new HeadlightModeCommand(3).motionSafety());
+    }
+    @Test public void headlightLowBeamIsUnrestricted() {
+        assertEquals(MotionSafety.UNRESTRICTED,
+                new HeadlightModeCommand(4).motionSafety());
+    }
+
     // Drive-dynamics / drive-feel — unrestricted.
     @Test public void operationModeIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new OperationModeCommand(1).motionSafety()); }
     @Test public void energyFeedbackIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new EnergyFeedbackCommand(1).motionSafety()); }
@@ -105,6 +123,19 @@ public class VehicleCommandMotionSafetyTest {
     @Test public void carSettingEspAssistIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new CarSettingCommand("esp_assist", 0).motionSafety()); }
     @Test public void carSettingAebIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new CarSettingCommand("aeb", 0).motionSafety()); }
     @Test public void carSettingArbitraryKeyIsUnrestricted() { assertEquals(MotionSafety.UNRESTRICTED, new CarSettingCommand("some_future_key", 0).motionSafety()); }
+
+    @Test public void guardedCommandsExposeTheirUiSetting() {
+        assertEquals(DrivingSafetyGuard.GUARD_DOOR_LOCKS,
+                new LockCommand().motionSafetyGuardKey());
+        assertEquals(DrivingSafetyGuard.GUARD_TRUNK,
+                new TrunkOpenCommand().motionSafetyGuardKey());
+        assertEquals(DrivingSafetyGuard.GUARD_MIRROR_FOLD,
+                new MirrorFoldCommand(true).motionSafetyGuardKey());
+        assertEquals(DrivingSafetyGuard.GUARD_POSITIONING,
+                new SeatMemoryCommand(1, false).motionSafetyGuardKey());
+        assertEquals(DrivingSafetyGuard.GUARD_HEADLIGHT_OFF,
+                new HeadlightModeCommand(1).motionSafetyGuardKey());
+    }
 
     // ── Base default: a brand-new command ships UNRESTRICTED ───────────────
 

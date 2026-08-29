@@ -156,8 +156,53 @@ public class EGLCore {
         eglContext = EGL14.eglCreateContext(eglDisplay, eglConfig, shareWith, contextAttribs, 0);
 
         if (eglContext == EGL14.EGL_NO_CONTEXT) {
-            throw new RuntimeException("Failed to create EGL context (gles=" + actualGles + ")");
+            // FIX (EGL-leak audit): capture eglGetError() IMMEDIATELY — the
+            // fleet crash loop ("eglCreateContext failed" x77 until reboot)
+            // never recorded the symbolic error, so context-table exhaustion
+            // (EGL_BAD_ALLOC) could not be proven from logs.
+            int eglError = EGL14.eglGetError();
+            logger.error("eglCreateContext FAILED: error=" + eglErrorString(eglError)
+                + ", requestedGles=" + glesVersion + ", actualGles=" + actualGles
+                + ", recordable=" + recordable + ", shared=" + (parent != null));
+
+            // EGL_BAD_MATCH/BAD_CONFIG: some Adreno builds accept a GLES3
+            // config at chooseConfig time but refuse the GLES3 context
+            // against it. Retry ONCE with a GLES2 config+context. Root
+            // (non-shared) contexts only — a child must match its parent's
+            // actual version or the share group is invalid.
+            if (actualGles == 3 && parent == null
+                    && (eglError == EGL14.EGL_BAD_MATCH || eglError == EGL14.EGL_BAD_CONFIG)) {
+                logger.warn("Retrying EGL context creation with GLES2 "
+                    + "(BAD_MATCH/BAD_CONFIG fallback)");
+                EGLConfig gles2Config = chooseConfigOrFallback(eglDisplay, 2, recordable);
+                if (gles2Config != null) {
+                    int[] gles2Attribs = {
+                        EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
+                        EGL14.EGL_NONE
+                    };
+                    eglContext = EGL14.eglCreateContext(eglDisplay, gles2Config,
+                        shareWith, gles2Attribs, 0);
+                    if (eglContext != EGL14.EGL_NO_CONTEXT) {
+                        eglConfig = gles2Config;
+                        actualGles = 2;
+                        logger.warn("GLES2 fallback context created");
+                    } else {
+                        eglError = EGL14.eglGetError();
+                        logger.error("GLES2 fallback context creation also failed: "
+                            + eglErrorString(eglError));
+                    }
+                }
+            }
+
+            if (eglContext == EGL14.EGL_NO_CONTEXT) {
+                recordContextCreateFailure(eglError);
+                throw new RuntimeException("Failed to create EGL context (gles=" + actualGles
+                    + ", recordable=" + recordable + ", shared=" + (parent != null)
+                    + ", error=" + eglErrorString(eglError) + ")");
+            }
         }
+        // Context creation succeeded — reset the consecutive-failure breaker.
+        CONSECUTIVE_CONTEXT_CREATE_FAILURES.set(0);
         // Mutate field so getGlesVersion() reports what we actually got.
         actualGlesVersionRef.set(actualGles);
         logger.debug("EGL context created (gles=" + actualGles + ", shared=" + (parent != null) + ")");
@@ -169,6 +214,93 @@ public class EGLCore {
     // the KHR_create_context extension and accepted by every Adreno driver
     // since Adreno 3xx. The numeric value is part of the EGL spec.
     private static final int EGL_OPENGL_ES3_BIT_KHR = 0x0040;
+
+    // EGL 1.4 core error not exposed by the EGL14 Java constants.
+    private static final int EGL_CONTEXT_LOST = 0x300E;
+
+    // ==================== EGL FAILURE CIRCUIT BREAKER ====================
+    // FIX (EGL-leak audit): leaked EGL/KGSL contexts are PER-PROCESS kernel
+    // resources. When context creation starts failing, no amount of in-process
+    // retrying can recover — the daemon's global uncaught-exception handler
+    // ("NEVER let the daemon die") swallows the GL-thread crash, so without an
+    // explicit escalation the daemon retried eglCreateContext forever (77
+    // recorded failures on one vehicle) until a full reboot. A process restart
+    // frees every context the kernel attributes to us and is a supported
+    // recovery path here (the shell watchdog wrapper relaunches the daemon;
+    // the GL stall watchdog already exits the same way).
+    //
+    // ONLY the exhaustion/state-loss class (EGL_BAD_ALLOC, EGL_CONTEXT_LOST)
+    // escalates to a process restart: those are exactly the errors a fresh
+    // process fixes (leaked per-process KGSL contexts / lost GPU state).
+    // Deterministic configuration errors (EGL_BAD_CONFIG, EGL_BAD_MATCH that
+    // survived the GLES2 fallback, EGL_BAD_ATTRIBUTE, ...) reproduce
+    // identically in a fresh process — and since this counter is per-process
+    // and resets on relaunch, restarting on them would loop forever
+    // (restart → same failure x N → restart ...). For those we only fail
+    // upward: the pipeline rollback releases partial state and the daemon's
+    // bounded-backoff retry ladder (5s/30s/120s/300s) owns recovery, leaving
+    // the process — and the rest of the daemon's functions — alive.
+    private static final java.util.concurrent.atomic.AtomicInteger
+            CONSECUTIVE_CONTEXT_CREATE_FAILURES =
+                new java.util.concurrent.atomic.AtomicInteger(0);
+    private static final int EXHAUSTION_FAILURE_RESTART_THRESHOLD = 2;
+
+    private static void recordContextCreateFailure(int eglError) {
+        boolean exhaustionClass =
+            (eglError == EGL14.EGL_BAD_ALLOC || eglError == EGL_CONTEXT_LOST);
+        if (!exhaustionClass) {
+            logger.error("EGL context-create failure: " + eglErrorString(eglError)
+                + " (deterministic/config class — NOT counted toward process-restart"
+                + " threshold; a fresh process would fail identically)");
+            return;
+        }
+        int failures = CONSECUTIVE_CONTEXT_CREATE_FAILURES.incrementAndGet();
+        logger.error("Consecutive exhaustion-class EGL context-create failures: "
+            + failures + "/" + EXHAUSTION_FAILURE_RESTART_THRESHOLD
+            + " (last=" + eglErrorString(eglError) + ")");
+        if (failures >= EXHAUSTION_FAILURE_RESTART_THRESHOLD) {
+            logger.error("EGL context creation failed " + failures
+                + " consecutive times — requesting trip-safe daemon process restart "
+                + "(leaked KGSL contexts are per-process; only a process exit "
+                + "reclaims them without a vehicle reboot)");
+            try {
+                com.overdrive.app.daemon.CameraDaemon.requestProcessRestartPreservingTrip(
+                    "EGL context exhaustion: " + failures
+                        + " consecutive eglCreateContext failures, last error "
+                        + eglErrorString(eglError));
+            } catch (Throwable t) {
+                // Never let breaker plumbing mask the original failure
+                // (also keeps EGLCore usable in isolation/tests).
+                logger.error("Failed to request daemon restart: " + t.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Human-readable name for an EGL error code. Public so peer EGL owners
+     * (GpuDownscaler's private context, AiLaneGl, etc.) log the same symbols.
+     */
+    public static String eglErrorString(int error) {
+        switch (error) {
+            case EGL14.EGL_SUCCESS:             return "EGL_SUCCESS";
+            case EGL14.EGL_NOT_INITIALIZED:     return "EGL_NOT_INITIALIZED";
+            case EGL14.EGL_BAD_ACCESS:          return "EGL_BAD_ACCESS";
+            case EGL14.EGL_BAD_ALLOC:           return "EGL_BAD_ALLOC";
+            case EGL14.EGL_BAD_ATTRIBUTE:       return "EGL_BAD_ATTRIBUTE";
+            case EGL14.EGL_BAD_CONFIG:          return "EGL_BAD_CONFIG";
+            case EGL14.EGL_BAD_CONTEXT:         return "EGL_BAD_CONTEXT";
+            case EGL14.EGL_BAD_CURRENT_SURFACE: return "EGL_BAD_CURRENT_SURFACE";
+            case EGL14.EGL_BAD_DISPLAY:         return "EGL_BAD_DISPLAY";
+            case EGL14.EGL_BAD_MATCH:           return "EGL_BAD_MATCH";
+            case EGL14.EGL_BAD_NATIVE_PIXMAP:   return "EGL_BAD_NATIVE_PIXMAP";
+            case EGL14.EGL_BAD_NATIVE_WINDOW:   return "EGL_BAD_NATIVE_WINDOW";
+            case EGL14.EGL_BAD_PARAMETER:       return "EGL_BAD_PARAMETER";
+            case EGL14.EGL_BAD_SURFACE:         return "EGL_BAD_SURFACE";
+            case EGL_CONTEXT_LOST:              return "EGL_CONTEXT_LOST";
+            default:
+                return String.format("EGL error 0x%x", error);
+        }
+    }
 
     /** @return the actual GLES version this context was created with (2 or 3). */
     public int getActualGlesVersion() {

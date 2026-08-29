@@ -1758,8 +1758,8 @@
     "heatmap_threat_high": "HIGH",
     "heatmap_threat_critical": "CRITICAL",
     "state_active": "Activé",
-    "state_safe_zone": "🏠 Zone sûre",
-    "state_safe_zone_named": "🏠 Zone sûre ({name})",
+    "state_safe_zone": "Zone sûre",
+    "state_safe_zone_named": "Zone sûre ({name})",
     "size_used_dash": "-- utilisé",
     "size_limit_dash": "-- limité",
     "limit_min_default": "100 Mo",
@@ -2437,13 +2437,13 @@
     "add_zone_failed": "Échec lors de l'ajout de l'endroit sûr",
     "confirm_delete_zone": "Supprimer cet endroit sûr ?",
     "zone_deleted": "Endroit sûr supprimé",
-    "in_safe_zone": "🟢 Dans l'endroit sûr ({zone}, {meters}m)",
-    "outside_zone": "🔴 À l'extérieur ({meters}m au plus proche)",
+    "in_safe_zone": "Dans l'endroit sûr ({zone}, {meters}m)",
+    "outside_zone": "À l'extérieur ({meters}m au plus proche)",
     "no_zones_yet": "Pas encore d'endroit sûr",
     "waiting_gps": "En attente du GPS...",
-    "badge_on": "● ON",
-    "badge_off": "○ OFF",
-    "you_are_here": "📍Vous êtes ici.",
+    "badge_on": "ON",
+    "badge_off": "OFF",
+    "you_are_here": "Vous êtes ici.",
     "popup_radius": "<b>{name}</b><br>{meters}m de rayon"
   },
   "liveview": {
@@ -2572,7 +2572,6 @@
     "restore_failed": "Échec de la restauration."
   },
   "about": {
-    "ack_chimes": "Carillons d'avertissement RoadSense — sons de la bibliothèque Google Sound sous licence",
     "page_title": "À propos — OverDrive",
     "page_title_short": "À propos",
     "contributors_title": "Contributeurs",
@@ -2594,7 +2593,8 @@
       "kofi_value": "Un café sur Ko-fi maintient les commits nocturnes.",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "Conçu avec l'aide de contributeurs et de soutiens."
+    "thanks_subtitle": "Conçu avec l'aide de contributeurs et de soutiens.",
+      "ack_chimes": "Carillons d'avertissement RoadSense — sons de la bibliothèque Google Sound sous licence"
   },
   "byd_cloud": {
     "page_title": "BYD Nuage",

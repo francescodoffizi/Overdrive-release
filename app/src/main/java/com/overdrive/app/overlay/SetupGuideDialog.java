@@ -7,13 +7,16 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.net.Uri;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.overdrive.app.R;
+import com.overdrive.app.services.KeepAliveAccessibilityService;
 
 /**
  * First-launch and post-update setup guide.
@@ -32,6 +35,8 @@ public class SetupGuideDialog {
     private static final String TAG = "SetupGuideDialog";
     private static final String PREFS_NAME = "overdrive_setup";
     private static final String KEY_LAST_SEEN_INSTALL_TIME = "last_seen_install_time";
+    private static final long AUTOSTART_SERVICE_WAIT_MS = 5000L;
+    private static final long AUTOSTART_SERVICE_POLL_MS = 200L;
 
     /**
      * Show the setup guide if the app's last install/update time has advanced
@@ -96,9 +101,21 @@ public class SetupGuideDialog {
                 }));
         }
 
-        // Step 2: Auto-start restriction
-        TextView btnAutoStart = view.findViewById(R.id.btnOpenAutoStart);
-        btnAutoStart.setOnClickListener(v -> openAutoStartSettings(context));
+        // Step 2: Auto-start restriction.
+        // Wait briefly for the asynchronously bound KeepAlive AccessibilityService,
+        // then drive BYD's "Deaktiver Autostart" switch. A fast tap during app
+        // startup previously raced the bind and went straight to the manual screen.
+        final TextView btnAutoStart = view.findViewById(R.id.btnOpenAutoStart);
+        final View ivAutoStartCheck = view.findViewById(R.id.ivAutoStartCheck);
+        btnAutoStart.setOnClickListener(v -> {
+            btnAutoStart.setEnabled(false);
+            btnAutoStart.setText(context.getString(R.string.setup_autostart_enabling));
+            runAutoStartWhenServiceReady(
+                    context,
+                    btnAutoStart,
+                    ivAutoStartCheck,
+                    SystemClock.elapsedRealtime() + AUTOSTART_SERVICE_WAIT_MS);
+        });
 
         // Step 3: Overlay permission
         TextView btnOverlay = view.findViewById(R.id.btnOpenOverlay);
@@ -172,6 +189,48 @@ public class SetupGuideDialog {
         dialog.show();
     }
 
+    private static void runAutoStartWhenServiceReady(
+            Context context, TextView button, View check, long deadline) {
+        KeepAliveAccessibilityService service = KeepAliveAccessibilityService.getInstance();
+        if (service != null) {
+            service.runAutoStartEnabler((success, result) ->
+                    finishAutoStartAttempt(context, button, check, success, result));
+            return;
+        }
+        if (SystemClock.elapsedRealtime() < deadline) {
+            button.postDelayed(
+                    () -> runAutoStartWhenServiceReady(context, button, check, deadline),
+                    AUTOSTART_SERVICE_POLL_MS);
+            return;
+        }
+        Log.w(TAG, "a11y service did not bind within " + AUTOSTART_SERVICE_WAIT_MS
+                + "ms — falling back to manual settings");
+        finishAutoStartAttempt(context, button, check, false, null);
+    }
+
+    private static void finishAutoStartAttempt(
+            Context context,
+            TextView button,
+            View check,
+            boolean success,
+            com.overdrive.app.services.AutoStartEnabler.Result result) {
+        if (success) {
+            Log.i(TAG, "autostart auto-enable done (result=" + result + ")");
+            button.setText(context.getString(R.string.setup_autostart_enabled));
+            button.setEnabled(false);
+            if (check != null) check.setVisibility(View.VISIBLE);
+            return;
+        }
+        Log.w(TAG, "autostart auto-enable failed (result=" + result
+                + ") — falling back to manual settings");
+        button.setEnabled(true);
+        button.setText(context.getString(R.string.setup_autostart_button));
+        Toast.makeText(context,
+                context.getString(R.string.setup_autostart_failed),
+                Toast.LENGTH_LONG).show();
+        openAutoStartSettings(context);
+    }
+
     private static void renderOverlayPermission(
             Context context, TextView button, View check) {
         boolean granted = OverlayPermissionChecker.isGranted(context);
@@ -190,14 +249,33 @@ public class SetupGuideDialog {
      *   3. ACTION_APPLICATION_DETAILS_SETTINGS for OverDrive (legacy fallback)
      *   4. ACTION_APPLICATION_SETTINGS / ACTION_SETTINGS
      */
+    /** BYD AppStartManagement package — the privileged "Deaktiver Autostart" app. */
+    public static final String BYD_APPSTART_PKG = "com.byd.appstartmanagement";
+
+    /**
+     * The canonical explicit intent for BYD's autostart-management dialog
+     * (the "Deaktiver Autostart" screen with the per-app switches).
+     *
+     * Shared with {@code AutoStartEnabler}, which drives this same screen via the
+     * AccessibilityService to auto-flip OverDrive's switch after each reinstall.
+     * Kept in sync with the canonical deep link in {@link #openAutoStartSettings}.
+     * Includes FLAG_ACTIVITY_NEW_TASK so it can be launched from a non-Activity
+     * context (the a11y service). Throws ActivityNotFoundException at startActivity
+     * time on firmware without this component — callers must catch it.
+     */
+    public static Intent buildAppStartManagementIntent() {
+        Intent i = new Intent();
+        i.setComponent(new ComponentName(
+                BYD_APPSTART_PKG,
+                "com.byd.appstartmanagement.frame.AppStartManagement"));
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        return i;
+    }
+
     private static void openAutoStartSettings(Context context) {
         // 1) Canonical BYD deep link.
         try {
-            Intent direct = new Intent();
-            direct.setComponent(new ComponentName(
-                    "com.byd.appstartmanagement",
-                    "com.byd.appstartmanagement.frame.AppStartManagement"));
-            direct.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            Intent direct = buildAppStartManagementIntent();
             context.startActivity(direct);
             return;
         } catch (Exception e) {

@@ -102,29 +102,44 @@ class AdbShellExecutor(private val context: Context) {
      * chained from inside onSuccess/onError on a worker thread, where an uncaught
      * RejectedExecutionException kills the process.
      */
-    private fun submit(seq: Int, command: String, task: Runnable): Boolean {
+    private fun submit(seq: Int, commandForLog: String, task: Runnable): Boolean {
         return when (ExecutorFallback.submit(task, executor, fallbackExecutor)) {
             ExecutorFallback.Outcome.OWNER -> true
             ExecutorFallback.Outcome.REROUTED -> {
                 logger.warn(TAG, "adb#$seq REROUTED to the shared executor " +
-                    "(owner's executor was shut down mid-chain): $command")
+                    "(owner's executor was shut down mid-chain): $commandForLog")
                 true
             }
             ExecutorFallback.Outcome.REFUSED -> {
-                logger.warn(TAG, "adb#$seq REJECTED (shared executor is down too): $command")
+                logger.warn(TAG, "adb#$seq REJECTED (shared executor is down too): $commandForLog")
                 false
             }
         }
     }
 
     fun execute(command: String, callback: ShellCallback) {
+        executeInternal(command, command, callback)
+    }
+
+    /**
+     * Execute [command] unchanged while keeping its credentials out of diagnostic logs.
+     */
+    fun executeSensitive(command: String, description: String, callback: ShellCallback) {
+        executeInternal(command, "<sensitive:$description>", callback)
+    }
+
+    private fun executeInternal(
+        command: String,
+        commandForLog: String,
+        callback: ShellCallback
+    ) {
         val seq = cmdSeq.incrementAndGet()
-        logger.debug(TAG, "adb#$seq SUBMIT [${Thread.currentThread().name}]: $command")
+        logger.debug(TAG, "adb#$seq SUBMIT [${Thread.currentThread().name}]: $commandForLog")
         // Return value ignored deliberately: on a double rejection we log and stop rather
         // than call callback.onError, because ServiceLauncher chains the next command from
         // inside onError — an error raised on the caller's thread would re-enter execute(),
         // be rejected again, and recurse. Unreachable anyway: fallbackExecutor never dies.
-        submit(seq, command) {
+        submit(seq, commandForLog) {
             val t0 = System.currentTimeMillis()
             try {
                 logger.debug(TAG, "adb#$seq RUN [${Thread.currentThread().name}]")
@@ -139,7 +154,7 @@ class AdbShellExecutor(private val context: Context) {
                     callback.onError("Exit code ${result.exitCode}: ${result.allOutput}")
                 }
             } catch (e: Exception) {
-                logger.error(TAG, "adb#$seq FAILED after ${System.currentTimeMillis() - t0}ms: $command", e)
+                logger.error(TAG, "adb#$seq FAILED after ${System.currentTimeMillis() - t0}ms: $commandForLog", e)
                 callback.onError("Execution failed: ${e.message}")
             }
         }

@@ -509,7 +509,7 @@
     <string name="dialog_zrok_token_message">Zrok etkinleştirme simgelerinizi girin.</string>
     <string name="toast_token_cannot_be_empty">İşaret boş olamaz .</string>
     <string name="dialog_tailscale_settings_title">Tailscale Tunel Ayarları</string>
-    <string name="dialog_tailscale_settings_message">Kuyruk ölçeğini yapılandır</string>
+    <string name="dialog_tailscale_settings_message">Tailscale\'i yapılandır</string>
     <string name="tailscale_failed_login_url">Giriş URL\'si oluşturulamadı</string>
     <string name="tailscale_logged_in_relogin">Giriş. Farklı bir hesabına giriş için tıklayın</string>
     <string name="dialog_tailscale_proxy_enable_title">Tailscale Proxy\'yi etkinleştirmek mi?</string>
@@ -522,8 +522,8 @@
     <string name="toast_zrok_reset_warnings">Çevre sıfırlaması (açıklamalarla: %1$s)</string>
     <string name="zrok_no_token_configured">İşaret yapılandırılmamış.</string>
     <string name="dialog_tailscale_reset_title">Tailscale Çevresini Yeniden Oturt</string>
-    <string name="dialog_tailscale_reset_message">Bu:\n• Çıkıyorsa kuyruk ölçeği tünelini durdurur\n• Bu cihazdan kuyruk ölçeği ortamını çıkarın\n• Yine de cihazı kuyruk ölçeği konsolosundan çıkarmanız gerekir\n\nYeni giriş yapmanız gerekir.\n\nEmin misiniz?</string>
-    <string name="toast_resetting_tailscale">Kuyruk ölçeği ortamını yeniden ayarlayın...</string>
+    <string name="dialog_tailscale_reset_message">Bu işlem:\n• Çalışıyorsa Tailscale tünelini durdurur\n• Tailscale ortamını bu cihazdan kaldırır\n• Cihazı Tailscale konsolundan da kaldırmanız gerekir\n\nTekrar giriş yapmanız gerekecek.\n\nEmin misiniz?</string>
+    <string name="toast_resetting_tailscale">Tailscale ortamı sıfırlanıyor…</string>
     <string name="toast_tailscale_reset_success">Tailscale ortamı yeniden ayarlayın.</string>
     <string name="toast_tailscale_reset_warnings">Tailscale ortamı yeniden ayarlandı (açıklamalarla: %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Tailscale vekili etkinleştirildi</string>

@@ -113,4 +113,8 @@ final class ConditionalPoller {
     synchronized boolean isScheduledForTest() {
         return future != null && !future.isDone() && !future.isCancelled();
     }
+
+    synchronized long generationForTest() {
+        return generation;
+    }
 }

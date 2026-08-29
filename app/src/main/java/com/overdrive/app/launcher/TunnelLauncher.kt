@@ -16,33 +16,31 @@ class TunnelLauncher(
 ) {
     companion object {
         private const val TAG = "TunnelLauncher"
-
+        private const val LAUNCH_GUARD_TIMEOUT_SECONDS = 90L
+        
         // Cloudflared paths
         private const val CLOUDFLARED_TMP_PATH = "/data/local/tmp/cloudflared"
         private const val CLOUDFLARED_LOG = "/data/local/tmp/cloudflared.log"
-
+        
         // Process name for identification
         private const val CLOUDFLARED_PROCESS = "cloudflared"
 
-        // Process-wide single-flight guard for cloudflared launches.
-        //
-        // The running-check (`ps | grep cloudflared`) and the spawn are two
-        // separate async ADB round-trips, and cloudflared takes ~1-2s to
-        // appear in `ps`. Multiple launch triggers fire during that window
-        // (boot brings up several AdbDaemonLauncher instances, each with its
-        // own TunnelLauncher), so every check returns "not running" and each
-        // spawns its own cloudflared — observed 3x to the same token on the
-        // 2026-07-06 reboot. A companion (static) flag is shared across all
-        // TunnelLauncher instances in the process, so concurrent requests
-        // collapse to one. It lives in memory only, so an app restart clears
-        // it — it can never wedge launches the way an on-disk lock could.
-        private val launchInProgress = java.util.concurrent.atomic.AtomicBoolean(false)
+        private val launchLock = Any()
+        private var activeLaunch: LaunchFlight? = null
+        private val launchGuardScheduler =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor { runnable ->
+                Thread(runnable, "cloudflared-launch-guard").apply { isDaemon = true }
+            }
     }
     
     interface TunnelCallback {
         fun onLog(message: String)
         fun onTunnelUrl(url: String)
         fun onError(error: String)
+    }
+
+    private class LaunchFlight(callback: TunnelCallback) {
+        val callbacks = mutableListOf(callback)
     }
 
     /**
@@ -70,26 +68,85 @@ class TunnelLauncher(
      * NOTE: Cloudflared and Zrok are mutually exclusive - this will kill zrok first.
      */
     fun launchCloudflared(callback: TunnelCallback) {
-        // Single-flight: if a launch is already in flight, drop this duplicate
-        // request instead of racing it into a second cloudflared process.
-        if (!launchInProgress.compareAndSet(false, true)) {
-            logManager.info(TAG, "Cloudflared launch already in progress — skipping duplicate request")
-            callback.onLog("Tunnel launch already in progress")
+        val (flight, ownsLaunch) = registerLaunch(callback)
+        if (!ownsLaunch) {
+            logManager.info(TAG, "Cloudflared launch already in progress; joining existing launch")
+            notifyCallbacks(listOf(callback)) { it.onLog("Tunnel launch already in progress") }
             return
         }
-        // Safety net: never leave the flag stuck if a terminal callback is
-        // missed (e.g. an exception inside a nested ADB callback). 90s is well
-        // beyond the 30-attempt (~30s) URL-wait plus kill/settle delays.
-        pollScheduler.schedule({ launchInProgress.set(false) }, 90, java.util.concurrent.TimeUnit.SECONDS)
 
-        // Clear the flag on every terminal outcome (URL obtained or error),
-        // while passing through non-terminal onLog calls untouched.
-        val guarded = object : TunnelCallback {
-            override fun onLog(message: String) { callback.onLog(message) }
-            override fun onTunnelUrl(url: String) { launchInProgress.set(false); callback.onTunnelUrl(url) }
-            override fun onError(error: String) { launchInProgress.set(false); callback.onError(error) }
+        // A shared scheduler keeps the process-wide guard safe even if the
+        // TunnelLauncher instance that started the work is shut down.
+        launchGuardScheduler.schedule({
+            notifyCallbacks(finishLaunch(flight)) {
+                it.onError("Cloudflared launch timed out")
+            }
+        }, LAUNCH_GUARD_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
+
+        val guardedCallback = object : TunnelCallback {
+            override fun onLog(message: String) {
+                notifyCallbacks(callbacksFor(flight)) { it.onLog(message) }
+            }
+
+            override fun onTunnelUrl(url: String) {
+                notifyCallbacks(finishLaunch(flight)) { it.onTunnelUrl(url) }
+            }
+
+            override fun onError(error: String) {
+                notifyCallbacks(finishLaunch(flight)) { it.onError(error) }
+            }
         }
-        launchCloudflaredGuarded(guarded)
+
+        try {
+            launchCloudflaredGuarded(guardedCallback)
+        } catch (e: Exception) {
+            notifyCallbacks(finishLaunch(flight)) {
+                it.onError("Cloudflared launch failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun registerLaunch(callback: TunnelCallback): Pair<LaunchFlight, Boolean> =
+        synchronized(launchLock) {
+            val current = activeLaunch
+            if (current != null) {
+                current.callbacks.add(callback)
+                current to false
+            } else {
+                val created = LaunchFlight(callback)
+                activeLaunch = created
+                created to true
+            }
+        }
+
+    private fun callbacksFor(flight: LaunchFlight): List<TunnelCallback> =
+        synchronized(launchLock) {
+            if (activeLaunch === flight) flight.callbacks.toList() else emptyList()
+        }
+
+    private fun finishLaunch(flight: LaunchFlight): List<TunnelCallback> =
+        synchronized(launchLock) {
+            if (activeLaunch !== flight) {
+                emptyList()
+            } else {
+                val callbacks = flight.callbacks.toList()
+                flight.callbacks.clear()
+                activeLaunch = null
+                callbacks
+            }
+        }
+
+    private fun notifyCallbacks(
+        callbacks: List<TunnelCallback>,
+        action: (TunnelCallback) -> Unit
+    ) {
+        callbacks.forEach {
+            try {
+                action(it)
+            } catch (e: Exception) {
+                logManager.warn(TAG, "Tunnel callback failed: ${e.message}")
+            }
+        }
     }
 
     private fun launchCloudflaredGuarded(callback: TunnelCallback) {
@@ -172,6 +229,7 @@ class TunnelLauncher(
                         // important is dropped (defense-in-depth even though
                         // the script form already prevents the suicide).
                         val killScript =
+                            "[ -f /data/local/tmp/zrok.disabled ] || " +
                             "echo \"disabled — cloudflared starting at \$(date)\" > /data/local/tmp/zrok.disabled\n" +
                             "chmod 666 /data/local/tmp/zrok.disabled 2>/dev/null\n" +
                             "rm -f /data/local/tmp/start_zrok.sh 2>/dev/null\n" +

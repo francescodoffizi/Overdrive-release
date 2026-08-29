@@ -509,7 +509,7 @@
     <string name="dialog_zrok_token_message">अपने Zrok सक्षम टोकन दर्ज करें.</string>
     <string name="toast_token_cannot_be_empty">टोकन खाली नहीं हो सकता</string>
     <string name="dialog_tailscale_settings_title">Tailscale सुरंग सेटिंग्स</string>
-    <string name="dialog_tailscale_settings_message">पूंछ पैमाने को कॉन्फ़िगर करें</string>
+    <string name="dialog_tailscale_settings_message">Tailscale कॉन्फ़िगर करें</string>
     <string name="tailscale_failed_login_url">लॉगिन यूआरएल उत्पन्न करने में विफल</string>
     <string name="tailscale_logged_in_relogin">लॉग इन किया गया है. एक अलग खाते में लॉग इन करने के लिए क्लिक करें</string>
     <string name="dialog_tailscale_proxy_enable_title">Tailscale प्रॉक्सी सक्षम करें?</string>
@@ -522,8 +522,8 @@
     <string name="toast_zrok_reset_warnings">पर्यावरण रीसेट (चेतावनी के साथः %1$s)</string>
     <string name="zrok_no_token_configured">कोई टोकन कॉन्फ़िगर नहीं किया गया है. सेटअप करने के लिए टैप करें.</string>
     <string name="dialog_tailscale_reset_title">Tailscale पर्यावरण को रीसेट करें</string>
-    <string name="dialog_tailscale_reset_message">यह होगाः\n• स्टॉप पूंछ पैमाने सुरंग यदि चल रहा है\n• इस डिवाइस से पूंछ पैमाने वातावरण निकालें\n• आप अभी भी पूंछ पैमाने कंसोल से डिवाइस निकालने की जरूरत होगी\n\nआप फिर से लॉग इन करने की जरूरत होगी.\n\nक्या आप सुनिश्चित हैं?</string>
-    <string name="toast_resetting_tailscale">पूंछ पैमाने वातावरण को रीसेट करना ...</string>
+    <string name="dialog_tailscale_reset_message">यह होगा:\n• चल रहा हो तो Tailscale सुरंग रोकें\n• इस डिवाइस से Tailscale वातावरण हटाएँ\n• आपको Tailscale कंसोल से डिवाइस भी हटाना होगा\n\nआपको फिर से लॉग इन करना होगा।\n\nक्या आप सुनिश्चित हैं?</string>
+    <string name="toast_resetting_tailscale">Tailscale वातावरण रीसेट किया जा रहा है…</string>
     <string name="toast_tailscale_reset_success">Tailscale वातावरण रीसेट. फिर से सेट करने के लिए लॉगिन करें.</string>
     <string name="toast_tailscale_reset_warnings">Tailscale वातावरण रीसेट (चेतावनी के साथः %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Tailscale प्रॉक्सी सक्षम</string>

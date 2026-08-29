@@ -8,9 +8,12 @@
     <script src="../shared/theme.js?v=5"></script>
     <script src="../shared/app-shell.js"></script>
     <!--
-      Bottom-tab manifest for Automations — three task-based tabs:
+      Bottom-tab manifest for Automations — five task-based tabs:
         Automations — automation list (or empty-state with a CTA that switches to Add)
         Add         — automation form, always visible; "Save" returns to Automations
+        Groups      — reusable action sequences
+        Safety      — driving-safety guard switches
+        Community   — shared automation browser
       No tab-bar action button: the form lives on its own tab so the Apply
       pill stays clean. List item Edit switches to Add tab with the form
       prefilled (handled in shared/automations.js).
@@ -20,6 +23,7 @@
             { id: 'automations', label: 'Automations', i18n: 'automation.tab_automations', svg: '<rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/>', readOnly: true },
             { id: 'add',         label: 'Add',         i18n: 'automation.tab_add',         svg: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>', readOnly: true },
             { id: 'groups',      label: 'Groups',      i18n: 'automation.tab_groups',      svg: '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>', readOnly: true },
+            { id: 'safety',      label: 'Safety',      i18n: 'automation.tab_safety',      svg: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>', readOnly: true },
             { id: 'community',   label: 'Community',   i18n: 'community.tab_community',    svg: '<path d="M18 21a8 8 0 0 0-16 0"/><circle cx="10" cy="8" r="5"/><path d="M22 20c0-3.37-2-6.5-4-8a5 5 0 0 0-.45-8.3"/>', readOnly: true }
         ];
 
@@ -33,7 +37,7 @@
         };
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=23">
+    <link rel="stylesheet" href="../shared/styles.css?v=26">
     <link rel="stylesheet" href="../shared/automations.css?v=av53">
     <link rel="stylesheet" href="../shared/community-automations.css?v=4">
 </head>
@@ -198,6 +202,133 @@
                     </div>
                 </div>
 
+                <!-- Global driving-safety policy. These switches affect every command source
+                     (automation, key mapping, MQTT and the vehicle-control UI), not just this page. -->
+                <div class="card" data-tab="safety">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+                            <span data-i18n="automation.safety_title">Driving safety guards</span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="info-box-warning" role="alert" style="margin:0 0 8px;">
+                            <svg class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                            <div class="info-note" data-i18n="automation.safety_warning">These guards apply to matching vehicle actions started through OverDrive's Automations, Action Groups, Key Mapping, Quick Controls, MQTT, Vehicle Controls, and saved seat positions. Turning one off lets OverDrive attempt that action while the car is moving or its state is unknown. Advanced raw shell, CAN, and diagnostic actions are outside these guards.</div>
+                        </div>
+
+                        <div id="safetySettingsStatus" class="info-box-note" role="status" style="margin:0;">
+                            <svg id="safetySettingsStatusIcon" class="info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                            <div id="safetySettingsStatusText" class="info-note" data-i18n="automation.safety_loading">Loading safety settings…</div>
+                        </div>
+                        <div id="safetySettingsControls" hidden>
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" id="safetyDoorLocksName" data-i18n="automation.safety_door_locks">Door lock and unlock</div>
+                                <div class="setting-desc" id="safetyDoorLocksDesc" data-i18n="automation.safety_door_locks_desc">Block locking or unlocking the doors unless the car is safely parked.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" role="switch" id="safetyDoorLocks" data-safety-key="doorLocks" checked aria-labelledby="safetyDoorLocksName" aria-describedby="safetyDoorLocksDesc" onchange="AutomationSettings.saveSafetySetting(this)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" id="safetyTrunkName" data-i18n="automation.safety_trunk">Trunk movement</div>
+                                <div class="setting-desc" id="safetyTrunkDesc" data-i18n="automation.safety_trunk_desc">Block opening or closing the tailgate. Stop remains available.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" role="switch" id="safetyTrunk" data-safety-key="trunk" checked aria-labelledby="safetyTrunkName" aria-describedby="safetyTrunkDesc" onchange="AutomationSettings.saveSafetySetting(this)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" id="safetyMirrorFoldName" data-i18n="automation.safety_mirror_fold">Fold mirrors</div>
+                                <div class="setting-desc" id="safetyMirrorFoldDesc" data-i18n="automation.safety_mirror_fold_desc">Block folding the exterior mirrors. Unfolding remains available.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" role="switch" id="safetyMirrorFold" data-safety-key="mirrorFold" checked aria-labelledby="safetyMirrorFoldName" aria-describedby="safetyMirrorFoldDesc" onchange="AutomationSettings.saveSafetySetting(this)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" id="safetyPositioningName" data-i18n="automation.safety_positioning">Seat, steering and mirror positioning</div>
+                                <div class="setting-desc" id="safetyPositioningDesc" data-i18n="automation.safety_positioning_desc">Block seat-memory recall and saved-position movement. The vehicle may still require Park itself.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" role="switch" id="safetyPositioning" data-safety-key="positioning" checked aria-labelledby="safetyPositioningName" aria-describedby="safetyPositioningDesc" onchange="AutomationSettings.saveSafetySetting(this)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" id="safetyHeadlightOffName" data-i18n="automation.safety_headlight_off">Turn headlights off</div>
+                                <div class="setting-desc" id="safetyHeadlightOffDesc" data-i18n="automation.safety_headlight_off_desc">Block selecting headlight Off. Auto, parking lights and low beam remain available.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" role="switch" id="safetyHeadlightOff" data-safety-key="headlightOff" checked aria-labelledby="safetyHeadlightOffName" aria-describedby="safetyHeadlightOffDesc" onchange="AutomationSettings.saveSafetySetting(this)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" id="safetyDisplayBrightnessName" data-i18n="automation.safety_display_brightness">Display brightness</div>
+                                <div class="setting-desc" id="safetyDisplayBrightnessDesc" data-i18n="automation.safety_display_brightness_desc">Block changes to infotainment, driver-cluster and HUD brightness.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" role="switch" id="safetyDisplayBrightness" data-safety-key="displayBrightness" checked aria-labelledby="safetyDisplayBrightnessName" aria-describedby="safetyDisplayBrightnessDesc" onchange="AutomationSettings.saveSafetySetting(this)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" id="safetyDisplayPowerName" data-i18n="automation.safety_display_power">Display power</div>
+                                <div class="setting-desc" id="safetyDisplayPowerDesc" data-i18n="automation.safety_display_power_desc">Block screen power changes and turning the HUD off. Turning the HUD on remains available.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" role="switch" id="safetyDisplayPower" data-safety-key="displayPower" checked aria-labelledby="safetyDisplayPowerName" aria-describedby="safetyDisplayPowerDesc" onchange="AutomationSettings.saveSafetySetting(this)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="setting-row" style="border-bottom:none;">
+                            <div class="setting-info">
+                                <div class="setting-name" id="safetyScreenMediaName" data-i18n="automation.safety_screen_media">Full-screen media</div>
+                                <div class="setting-desc" id="safetyScreenMediaDesc" data-i18n="automation.safety_screen_media_desc">Block full-screen playback. Speaker-only audio remains available.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" role="switch" id="safetyScreenMedia" data-safety-key="screenMedia" checked aria-labelledby="safetyScreenMediaName" aria-describedby="safetyScreenMediaDesc" onchange="AutomationSettings.saveSafetySetting(this)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Community tab: browse + import shared automations. All
                      elements tagged data-tab="community" so app-tabs shows them
                      only on the Community tab. Populated by community-automations.js. -->
@@ -299,7 +430,7 @@
     <script src="../shared/auth.js"></script>
     <script src="../shared/core.js?v=20"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/automations.js?v=av62"></script>
+    <script src="../shared/automations.js?v=av70"></script>
     <script src="../shared/audio-library.js?v=2"></script>
     <script src="../shared/community-automations.js?v=7"></script>
     <script src="../shared/cluster-projection.js?v=1"></script>

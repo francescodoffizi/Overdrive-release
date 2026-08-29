@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
     <string name="app_name">OverDrive</string>
 
     <!-- Accessibility Service -->
@@ -144,7 +144,7 @@
 
     <!-- Camera ingestion mode selector (Default vs DiLink 4) -->
     <string name="camera_mode_title">Ingestion Mode</string>
-    <string name="camera_mode_subtitle">Pick the path that matches your head unit. Default fits most BYD models; DiLink 4 is required on newer trims (Han / Tang 2024+) where the AVM HAL emits a pre-stitched 2x2 mosaic.</string>
+    <string name="camera_mode_subtitle">Pick the path that matches your head unit. Default fits legacy panoramic cameras; DiLink 4 consumes the AVM HAL\'s native SurfaceTexture output.</string>
     <string name="camera_mode_option_default">Default — works on Seal, Atto, Dolphin (most cars)</string>
     <string name="camera_mode_option_dilink4">DiLink 4 — newer Han / Tang variants</string>
     <string name="camera_mode_current_default">Current: Default</string>
@@ -152,11 +152,13 @@
     <string name="camera_mode_save">Apply &amp; restart</string>
     <string name="camera_mode_hint">Changing the mode restarts the camera daemon. If video looks wrong (squished, missing quadrants, red overlay), try the other mode.</string>
 
-    <!-- DiLink 4 quadrant tweaks (only effective when cameraMode = DiLink 4) -->
-    <string name="camera_dilink4_tweaks_title">DiLink 4 Quadrant Tweaks</string>
+    <!-- DiLink 4 compatibility options (only effective in DiLink 4 mode) -->
+    <string name="camera_dilink4_tweaks_title">DiLink 4 Compatibility</string>
     <string name="camera_dilink4_tweaks_subtitle">Per-vehicle adjustments for the DiLink 4 path. Only effective when DiLink 4 mode is selected above.</string>
     <string name="camera_dilink4_save">Apply</string>
-    <string name="camera_dilink4_hint">Toggle these only if the HAL paints a red "calibration failed" chrome over the feed. Daemon restart applies the change.</string>
+    <string name="camera_dilink4_hint">Enable only the compatibility options needed by this vehicle. Daemon restart applies the change.</string>
+    <string name="camera_dilink4_passive_apa_label">Use passive APA port 0</string>
+    <string name="camera_dilink4_passive_apa_subtitle">Leaves the OEM panorama output untouched and records preview port 0 as supplied. Use when forced panorama control opens the red calibration screen. Some models expose two views instead of four.</string>
     <string name="camera_dilink4_red_mask_label">Suppress red calibration overlay (GL)</string>
     <string name="camera_dilink4_red_mask_subtitle">Adds a fragment-shader pass that detects bright-red HAL "calibration failed" pixels and replaces them with a neighbour sample (or luminance gray when the banner is too large to inpaint). Cosmetic only — does not affect the underlying calibration state.</string>
 
@@ -272,6 +274,9 @@
     <string name="setup_autostart_title">Disable Auto-Start Restriction</string>
     <string name="setup_autostart_body">Tap below to open BYD Auto-Start. Find OverDrive in the list and uncheck the box. BYD wipes this on every install — you\'ll redo it after updates.</string>
     <string name="setup_autostart_button">Open BYD Auto-Start</string>
+    <string name="setup_autostart_enabling">Enabling autostart…</string>
+    <string name="setup_autostart_enabled">Autostart enabled ✓</string>
+    <string name="setup_autostart_failed">Couldn\'t enable autostart automatically — opening BYD Auto-Start so you can do it by hand.</string>
     <string name="setup_overlay_title">Allow Display Over Other Apps</string>
     <string name="setup_overlay_body">Enable this to show a floating status indicator for recording and trip tracking on top of other apps.</string>
     <string name="setup_overlay_button">Open Overlay Settings</string>
@@ -703,6 +708,7 @@
     <string name="toast_select_at_least_one_category">Select at least one category</string>
     <string name="toast_reset_failed_with_error">Reset failed: %1$s</string>
     <string name="toast_traffic_monitor_changing">%1$s traffic monitor…</string>
+    <string name="toast_traffic_monitor_persist_failed">Applied, but the preference could not be saved — it will not survive a firmware update.</string>
 
     <string name="dialog_close">Close</string>
     <string name="dialog_reset">Reset</string>
@@ -897,6 +903,7 @@
     <string name="nav_page_abrp">ABRP</string>
     <string name="nav_page_mqtt">MQTT</string>
     <string name="nav_page_byd_cloud">BYD Cloud</string>
+    <string name="nav_page_assistant">Assistant</string>
 
     <!-- StatusOverlayService persistent notification (foreground service) -->
     <string name="status_overlay_notif_title">OverDrive Status</string>
@@ -918,6 +925,7 @@
 
     <!-- Top-level destinations (navigation rail labels) -->
     <string name="rail_dashboard">Dashboard</string>
+    <string name="rail_assistant">Assistant</string>
     <string name="rail_live">Live</string>
     <string name="rail_recordings">Recordings</string>
     <string name="rail_vehicle">Vehicle</string>
@@ -956,10 +964,16 @@
     <string name="remote_voice_notification_title">Remote voice active</string>
     <string name="remote_voice_notification_text">Receiving live audio from an authenticated OverDrive session</string>
     <string name="settings_remote_communication_title">Remote communication</string>
-    <string name="settings_remote_communication_subtitle">Enable voice and messages from the web console. If Overlay permission says Permission required, tap it and allow Display over other apps.</string>
+    <string name="settings_remote_communication_subtitle">Enable voice, cabin listening, and messages from the web console. If Overlay permission says Permission required, tap it and allow Display over other apps.</string>
     <string name="settings_remote_voice_title">Enable remote voice</string>
+    <string name="settings_remote_listener_title" tools:ignore="MissingTranslation">Enable cabin listener</string>
+    <string name="settings_remote_listener_subtitle" tools:ignore="MissingTranslation">Allow authenticated Live View and Communicate sessions to hear the cabin microphone while the car is on.</string>
+    <string name="settings_remote_audio_channel_title" tools:ignore="MissingTranslation">Voice compatibility</string>
+    <string name="settings_remote_audio_channel_subtitle" tools:ignore="MissingTranslation">Media keeps the existing speaker and microphone paths. Navigation matches Di+ routing and 8 kHz microphone capture.</string>
+    <string name="settings_remote_audio_channel_media" tools:ignore="MissingTranslation">Media</string>
+    <string name="settings_remote_audio_channel_navigation" tools:ignore="MissingTranslation">Navigation</string>
     <string name="settings_remote_output_override_title">Use custom voice level</string>
-    <string name="settings_remote_output_override_subtitle">Off follows the car\'s current media volume.</string>
+    <string name="settings_remote_output_override_subtitle">Off follows the selected audio channel\'s car volume.</string>
     <string name="settings_remote_output_level">Custom voice level</string>
     <string name="settings_remote_output_car_volume">Car volume</string>
     <string name="settings_remote_output_default">70%</string>
@@ -974,8 +988,11 @@
     <string name="settings_remote_test_message_body">Remote messages are ready.</string>
     <string name="settings_remote_speaker_started">Speaker test started</string>
     <string name="settings_remote_emergency_title">Emergency disable</string>
-    <string name="settings_remote_emergency_subtitle">Immediately stop and block all remote voice and messages.</string>
+    <string name="settings_remote_emergency_subtitle">Immediately stop and block remote voice, cabin listening, and messages.</string>
     <string name="settings_remote_save_failed">Could not save remote communication settings</string>
+    <string name="cabin_audio_notification_channel" tools:ignore="MissingTranslation">Cabin listener</string>
+    <string name="cabin_audio_notification_title" tools:ignore="MissingTranslation">Cabin listener active</string>
+    <string name="cabin_audio_notification_text" tools:ignore="MissingTranslation">The web console is receiving cabin microphone audio.</string>
     <!-- Was "About & updates" — Check for Updates row was removed from
          the About page, so the menu / rail label is now just "About". -->
     <string name="settings_section_about">About</string>
@@ -1087,6 +1104,7 @@
 
     <!-- Recordings page (header + segmented control + page actions) -->
     <string name="recordings_title">Recordings</string>
+    <string name="recordings_segment_all">All</string>
     <string name="recordings_segment_dashcam">Dashcam</string>
     <string name="recordings_segment_replays">Replays</string>
     <string name="recordings_segment_surveillance">Surveillance</string>
@@ -1101,11 +1119,66 @@
     <string name="recordings_segment_dashcam_count">Dashcam · %d</string>
     <string name="recordings_segment_replays_count">Replays · %d</string>
     <string name="recordings_segment_surveillance_count">Surveillance · %d</string>
+    <string name="recordings_segment_all_count">All · %d</string>
     <!-- Layout-time placeholder for the counts subtitle before the scan completes. -->
     <string name="recordings_summary_pending">—</string>
     <!-- Landscape recordings preview placeholder (right pane). -->
     <string name="recordings_preview_placeholder_title">Select a recording</string>
     <string name="recordings_preview_placeholder_body">Tap any item on the left to play it.</string>
+    <string name="recording_preview_detected">Detected</string>
+    <string name="recording_preview_no_detection">No detection</string>
+    <string name="recording_preview_not_available">—</string>
+    <string name="recording_preview_distance">Distance</string>
+    <string name="recording_preview_recorded">Recorded</string>
+    <string name="recording_preview_duration">Duration</string>
+    <string name="recording_preview_storage">Storage</string>
+    <string name="recording_preview_file_size">File size</string>
+    <string name="recording_preview_storage_internal">Internal</string>
+    <string name="recording_preview_storage_sd">SD card</string>
+    <string name="recording_preview_storage_usb">USB</string>
+    <string name="recording_preview_storage_unknown">Unknown</string>
+    <string name="recording_headline_activity">Activity detected</string>
+    <string name="recording_headline_motion">Motion detected</string>
+    <string name="recording_headline_dashcam">Dashcam recording</string>
+    <string name="recording_headline_forward_camera">Forward-camera recording</string>
+    <string name="recording_headline_replay">Instant replay</string>
+    <plurals name="recording_headline_person">
+        <item quantity="one">Person detected</item>
+        <item quantity="other">%1$d people detected</item>
+    </plurals>
+    <plurals name="recording_headline_vehicle">
+        <item quantity="one">Vehicle detected</item>
+        <item quantity="other">%1$d vehicles detected</item>
+    </plurals>
+    <plurals name="recording_headline_bike">
+        <item quantity="one">Bike detected</item>
+        <item quantity="other">%1$d bikes detected</item>
+    </plurals>
+    <plurals name="recording_headline_animal">
+        <item quantity="one">Animal detected</item>
+        <item quantity="other">%1$d animals detected</item>
+    </plurals>
+    <plurals name="recording_actor_person">
+        <item quantity="one">%1$d person</item>
+        <item quantity="other">%1$d people</item>
+    </plurals>
+    <plurals name="recording_actor_vehicle">
+        <item quantity="one">%1$d vehicle</item>
+        <item quantity="other">%1$d vehicles</item>
+    </plurals>
+    <plurals name="recording_actor_bike">
+        <item quantity="one">%1$d bike</item>
+        <item quantity="other">%1$d bikes</item>
+    </plurals>
+    <plurals name="recording_actor_animal">
+        <item quantity="one">%1$d animal</item>
+        <item quantity="other">%1$d animals</item>
+    </plurals>
+    <string name="recording_distance_very_close">Very close</string>
+    <string name="recording_distance_close">Close</string>
+    <string name="recording_distance_mid">Mid-range</string>
+    <string name="recording_distance_far">Far</string>
+    <string name="cd_recording_more_actions">More recording actions</string>
 
     <!-- Diagnostics page -->
     <string name="diagnostics_section_adb_console">ADB Console</string>

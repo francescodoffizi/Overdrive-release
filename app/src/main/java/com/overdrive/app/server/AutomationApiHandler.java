@@ -1,11 +1,14 @@
 package com.overdrive.app.server;
 
 import com.overdrive.app.automation.Automations;
+import com.overdrive.app.byd.routing.DrivingSafetyGuard;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.OutputStream;
+import java.util.Iterator;
 
 /**
  * HTTP routes for automations.
@@ -35,8 +38,10 @@ public final class AutomationApiHandler {
         if (path.equals("/api/automations/list") && method.equals("GET")) {
             return getAutomations(out);
         }
-        if (path.equals("/api/automations/schema") && method.equals("GET")) {
-            return getSchema(out);
+        if ((path.equals("/api/automations/schema")
+                || path.startsWith("/api/automations/schema?"))
+                && method.equals("GET")) {
+            return getSchema(queryParam(path, "lang"), out);
         }
         // Lightweight [{id,name}] list for the "Control Automation" target picker.
         // Optional ?self=<id> excludes that automation (so a rule can't pick itself).
@@ -85,10 +90,8 @@ public final class AutomationApiHandler {
             if (isBlankId(id)) return rejectBlankId(out);
             return disableAutomation(id, body, out);
         }
-        // Automation-wide settings (not per-automation): currently just the
-        // shell-action gate. Kept on the automations surface — it governs
-        // automations firing autonomously, so it lives with them, not on the
-        // key-mapping page (the flag is a distinct opt-in from keymap advanced).
+        // Automation-wide settings (not per-automation): shell-action permission
+        // plus the global driving-safety guard switches shown on this page.
         // Live signal values for the editor's "reads X right now" hints. Read-only.
         if (path.equals("/api/automations/state") && method.equals("GET")) {
             return getState(out);
@@ -365,27 +368,80 @@ public final class AutomationApiHandler {
         return true;
     }
 
-    /** GET automation-wide settings: { allowShell }. Fresh read for cross-UID. */
+    /** GET automation-wide settings. Fresh read for cross-UID. */
     private static boolean getSettings(OutputStream out) throws Exception {
         com.overdrive.app.config.UnifiedConfigManager.forceReload();
         JSONObject resp = new JSONObject();
         resp.put("success", true);
         resp.put("allowShell", com.overdrive.app.config.UnifiedConfigManager.isAutomationShellAllowed());
+        resp.put("drivingSafety", DrivingSafetyGuard.getGuardSettings());
         HttpResponse.sendJson(out, resp.toString());
         return true;
     }
 
-    /** POST { allowShell:bool } — persist the autonomous-shell gate. */
+    /** POST a partial automation-wide settings update. */
     private static boolean saveSettings(String body, OutputStream out) throws Exception {
-        JSONObject resp = new JSONObject();
         if (body == null || body.isBlank()) { HttpResponse.sendJsonError(out, "Empty request body"); return true; }
-        boolean allow;
+        JSONObject request;
         try {
-            allow = new JSONObject(body).optBoolean("allowShell", false);
+            request = new JSONObject(body);
         } catch (Exception e) { HttpResponse.sendJsonError(out, "Invalid JSON"); return true; }
-        boolean ok = com.overdrive.app.config.UnifiedConfigManager.setAutomationShellAllowed(allow);
+
+        Boolean allowShell = null;
+        if (request.has("allowShell")) {
+            Object allow = request.opt("allowShell");
+            if (!(allow instanceof Boolean)) {
+                HttpResponse.sendJsonError(out, "allowShell must be a boolean");
+                return true;
+            }
+            allowShell = (Boolean) allow;
+        }
+
+        JSONObject safetyUpdate = null;
+        if (request.has("drivingSafety")) {
+            JSONObject requested = request.optJSONObject("drivingSafety");
+            if (requested == null || requested.length() == 0) {
+                HttpResponse.sendJsonError(out, "drivingSafety must be a non-empty object");
+                return true;
+            }
+            safetyUpdate = new JSONObject();
+            Iterator<String> keys = requested.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                Object enabled = requested.opt(key);
+                if (!DrivingSafetyGuard.isKnownGuard(key)) {
+                    HttpResponse.sendJsonError(out, "Unknown drivingSafety setting: " + key);
+                    return true;
+                }
+                if (!(enabled instanceof Boolean)) {
+                    HttpResponse.sendJsonError(out, "drivingSafety." + key + " must be a boolean");
+                    return true;
+                }
+                safetyUpdate.put(key, enabled);
+            }
+        }
+
+        if (allowShell == null && safetyUpdate == null) {
+            HttpResponse.sendJsonError(out, "No supported automation settings supplied");
+            return true;
+        }
+        if (allowShell != null && safetyUpdate != null) {
+            HttpResponse.sendJsonError(out, "Update allowShell or drivingSafety, not both");
+            return true;
+        }
+
+        boolean ok = allowShell == null
+                || com.overdrive.app.config.UnifiedConfigManager
+                        .setAutomationShellAllowed(allowShell.booleanValue());
+        if (ok && safetyUpdate != null) {
+            ok = com.overdrive.app.config.UnifiedConfigManager.updateSection(
+                    "drivingSafety", safetyUpdate);
+        }
+        JSONObject resp = new JSONObject();
         resp.put("success", ok);
-        resp.put("allowShell", allow);
+        resp.put("allowShell",
+                com.overdrive.app.config.UnifiedConfigManager.isAutomationShellAllowed());
+        resp.put("drivingSafety", DrivingSafetyGuard.getGuardSettings());
         if (!ok) resp.put("error", "Failed to persist automation settings");
         HttpResponse.sendJson(out, resp.toString());
         return true;
@@ -422,6 +478,28 @@ public final class AutomationApiHandler {
         }
     }
 
+    /** Read one percent-decoded query parameter without letting malformed input escape routing. */
+    private static String queryParam(String path, String name) {
+        if (path == null || name == null) return null;
+        int q = path.indexOf('?');
+        if (q < 0 || q + 1 >= path.length()) return null;
+        String[] pairs = path.substring(q + 1).split("&");
+        for (String pair : pairs) {
+            int eq = pair.indexOf('=');
+            String rawKey = eq >= 0 ? pair.substring(0, eq) : pair;
+            String rawValue = eq >= 0 ? pair.substring(eq + 1) : "";
+            try {
+                String key = java.net.URLDecoder.decode(rawKey, "UTF-8");
+                if (name.equals(key)) {
+                    return java.net.URLDecoder.decode(rawValue, "UTF-8");
+                }
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
     /**
      * Send a 400 for a request that carried a missing/blank automation id.
      *
@@ -438,8 +516,11 @@ public final class AutomationApiHandler {
         return true;
     }
 
-    private static boolean getSchema(OutputStream out) throws Exception {
-        HttpResponse.sendJson(out, Automations.schemaJson().toString());
+    private static boolean getSchema(String locale, OutputStream out) throws Exception {
+        JSONArray schema = LocaleManager.isSupported(locale)
+                ? Messages.withLocale(locale, Automations::schemaJson)
+                : Automations.schemaJson();
+        HttpResponse.sendJson(out, schema.toString());
         return true;
     }
 

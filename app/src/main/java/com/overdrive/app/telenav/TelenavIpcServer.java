@@ -19,6 +19,8 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.List;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Localhost IPC listener that runs in the APP process and binds Telenav's OEM
@@ -26,7 +28,7 @@ import java.util.List;
  * {@code bindService} itself — its synthetic {@code ActivityThread} isn't an
  * AMS-registered app process ("Unable to find app for caller … when binding
  * service") — so {@link TelenavDebugApiHandler} forwards Telenav requests here
- * over {@code 127.0.0.1:19878}, mirroring the app→daemon {@code DaemonIpcClient}
+ * over {@code 127.0.0.1:19882}, mirroring the app→daemon {@code DaemonIpcClient}
  * socket in reverse.
  *
  * <p>Protocol: one line of JSON request in, one line of JSON response out.
@@ -35,7 +37,7 @@ import java.util.List;
 public final class TelenavIpcServer {
 
     private static final String TAG = "TelenavIpc";
-    public static final int PORT = 19878;
+    public static final int PORT = 19882;
 
     // Query every bucket: null / "" (unfiltered) plus each named FavoriteType.
     private static final String[] TYPES = {
@@ -50,6 +52,10 @@ public final class TelenavIpcServer {
     public static synchronized void start(Context ctx) {
         if (started) return;
         appCtx = ctx.getApplicationContext();
+        if (!TelenavActions.isAvailable(appCtx)) {
+            Log.i(TAG, "Telenav navigation service unavailable; IPC disabled");
+            return;
+        }
         Thread t = new Thread(TelenavIpcServer::serve, "telenav-ipc");
         t.setDaemon(true);
         t.start();
@@ -132,9 +138,17 @@ public final class TelenavIpcServer {
             final String name = req.optString("name", "Shared location");
             final double lat = req.getDouble("lat");
             final double lng = req.getDouble("lng");
-            new android.os.Handler(android.os.Looper.getMainLooper()).post(
+            TelenavActions.validateCoordinates(lat, lng);
+            FutureTask<Boolean> show = new FutureTask<>(
                     () -> NavPromptOverlay.show(appCtx, name, lat, lng));
-            o.put("success", true);
+            if (!new android.os.Handler(android.os.Looper.getMainLooper()).post(show)) {
+                o.put("success", false);
+                o.put("error", "main thread unavailable");
+                return o;
+            }
+            boolean shown = show.get(5, TimeUnit.SECONDS);
+            o.put("success", shown);
+            if (!shown) o.put("error", "navigation prompt unavailable");
             return o;
         }
         JSONObject o = new JSONObject();
@@ -149,7 +163,7 @@ public final class TelenavIpcServer {
                 req.optString("name", ""),
                 req.getDouble("lat"),
                 req.getDouble("lng"),
-                req.optString("favoriteType", FavoriteType.Normal),
+                FavoriteType.Normal,
                 req.optString("placeId", null),
                 req.optString("formattedAddress", null));
     }
@@ -165,7 +179,12 @@ public final class TelenavIpcServer {
         if (req.optBoolean("replace", false)) {
             // Force a fresh route (REPLACE): stop any active nav first, then start.
             try { TelenavClient.stopNav(appCtx, 20_000); } catch (Exception ignore) {}
-            try { Thread.sleep(1200); } catch (InterruptedException ignore) {}
+            try {
+                Thread.sleep(1200);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            }
         }
         boolean started = TelenavClient.startNavigation(appCtx, 20_000, place);
         o.put("success", started);
@@ -184,7 +203,7 @@ public final class TelenavIpcServer {
             o.put("error", "no app context");
             return o;
         }
-        final String type = req.optString("favoriteType", FavoriteType.Normal);
+        final String type = FavoriteType.Normal;
         final String name = req.optString("name", "");
         final double lat = req.getDouble("lat");
         final double lng = req.getDouble("lng");

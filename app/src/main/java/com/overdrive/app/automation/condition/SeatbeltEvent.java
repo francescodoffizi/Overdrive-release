@@ -41,11 +41,21 @@ public final class SeatbeltEvent {
     }
 
     private static void poll() {
-        if (Automations.isEventReferenced(BydEvent.SEATBELT_DRIVER)
-                || Automations.isEventReferenced(BydEvent.SEATBELT_PASSENGER)) {
+        boolean passengerBelt =
+                Automations.isEventReferenced(BydEvent.SEATBELT_PASSENGER);
+        boolean passengerOccupant =
+                Automations.isEventReferenced(BydEvent.OCCUPANT_PASSENGER);
+        if (passengerBelt || passengerOccupant) {
+            // The passenger getter uses the same raw value for a real buckle and an empty seat.
+            // Sample its door first so an exit edge ends the current belt session before the
+            // getter can rebound to the empty-seat value.
+            com.overdrive.app.byd.BydDataCollector.getInstance()
+                    .pollPassengerDoorStateForSeatbeltNow();
+        }
+        if (Automations.isEventReferenced(BydEvent.SEATBELT_DRIVER) || passengerBelt) {
             BydEvent.pollSeatbelts();
         }
-        if (Automations.isEventReferenced(BydEvent.OCCUPANT_PASSENGER)) {
+        if (passengerOccupant) {
             BydEvent.pollOccupants();
         }
         if (Automations.isEventReferenced(BydEvent.OCCUPANT_DRIVER)) {

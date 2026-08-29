@@ -14,7 +14,6 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -24,6 +23,8 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+
+import com.overdrive.app.logging.DaemonLogger;
 
 import java.io.DataOutputStream;
 import java.net.InetSocketAddress;
@@ -54,6 +55,7 @@ import java.net.Socket;
 public final class MessageOverlayService extends Service {
 
     private static final String TAG = "MessageOverlay";
+    private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
     private static final String CHANNEL_ID = "message_overlay";
     private static final int NOTIFICATION_ID = 9101;
 
@@ -86,7 +88,7 @@ public final class MessageOverlayService extends Service {
             registerReceiver(dismissReceiver, new android.content.IntentFilter(ACTION_DISMISS));
             dismissReceiverRegistered = true;
         } catch (Throwable t) {
-            Log.w(TAG, "dismiss receiver register failed: " + t.getMessage());
+            logger.warn("Dismiss receiver register failed: " + t.getMessage());
         }
     }
 
@@ -95,7 +97,7 @@ public final class MessageOverlayService extends Service {
         // A running-app can't render an overlay without the permission; a shell `am`
         // launch bypasses the in-app grant flow, so guard here and cleanly no-op.
         if (!OverlayPermissionChecker.isGranted(this)) {
-            Log.w(TAG, "SYSTEM_ALERT_WINDOW not granted — cannot show message");
+            logger.warn("SYSTEM_ALERT_WINDOW not granted; cannot show message");
             sendAcknowledgement(intent, false,
                     "Display-over-other-apps permission is not granted in the car");
             stopSelf();
@@ -112,7 +114,7 @@ public final class MessageOverlayService extends Service {
             sendAcknowledgement(intent, displayed,
                     displayed ? "" : "The car could not add the message overlay");
         } catch (Throwable t) {
-            Log.w(TAG, "show failed: " + t.getMessage());
+            logger.warn("Show failed: " + t.getMessage());
             sendAcknowledgement(intent, false,
                     t.getMessage() == null ? "Message display failed" : t.getMessage());
             stopSelf();
@@ -238,7 +240,7 @@ public final class MessageOverlayService extends Service {
             windowManager.addView(overlayView, lp);
             return true;
         } catch (Throwable t) {
-            Log.e(TAG, "addView failed: " + t.getMessage());
+            logger.error("addView failed: " + t.getMessage());
             overlayView = null;
             stopSelf();
             return false;
@@ -272,7 +274,9 @@ public final class MessageOverlayService extends Service {
                 output.writeUTF(reason == null ? "" : reason);
                 output.flush();
             } catch (Throwable error) {
-                Log.w(TAG, "acknowledgement callback failed: " + error.getMessage());
+                logger.warn(
+                        "Acknowledgement callback failed: "
+                                + error.getMessage());
             }
         }, "MessageOverlayAck");
         callback.setDaemon(true);
@@ -416,7 +420,9 @@ public final class MessageOverlayService extends Service {
                 startForeground(NOTIFICATION_ID, n);
             }
         } catch (Throwable e) {
-            Log.w(TAG, "startForeground failed, falling back: " + e.getMessage());
+            logger.warn(
+                    "startForeground failed, falling back: "
+                            + e.getMessage());
             try { startForeground(NOTIFICATION_ID, n); } catch (Throwable ignored) {}
         }
     }

@@ -7,6 +7,7 @@ import com.overdrive.app.monitor.BatterySocData;
 import com.overdrive.app.monitor.ChargingStateData;
 import com.overdrive.app.monitor.GearMonitor;
 import com.overdrive.app.monitor.GpsMonitor;
+import com.overdrive.app.monitor.SocHistoryDatabase;
 import com.overdrive.app.monitor.VehicleDataMonitor;
 
 import org.json.JSONArray;
@@ -617,7 +618,18 @@ public class MqttConnectionManager {
 
             // Read BYD data from cached snapshot (refreshed by BydDataCollector's 5s polling timer)
             BydDataCollector collector = BydDataCollector.getInstance();
-            BydVehicleData vd = collector.isInitialized() ? collector.getData() : null;
+            // Charging-derived state and its raw fields must come from one detector-stable
+            // publication. A terminal edge between independent reads could otherwise pair a stopped
+            // state with an older positive power/gun sample. When stability cannot be proved, retain
+            // the raw fallback for unrelated telemetry but leave chargingState unavailable.
+            VehicleDataMonitor.ChargingSnapshot chargingSnapshot =
+                    vehicleDataMonitor.getChargingSnapshot();
+            BydVehicleData vd = chargingSnapshot != null
+                    ? chargingSnapshot.getVehicleData()
+                    : collector.isInitialized() ? collector.getData() : null;
+            ChargingStateData chargingState = chargingSnapshot != null
+                    ? chargingSnapshot.getChargingState() : null;
+            SocHistoryDatabase chargingDb = SocHistoryDatabase.getInstance();
 
             // utc
             payload.put("utc", now / 1000);
@@ -636,6 +648,10 @@ public class MqttConnectionManager {
                 if (socData != null) soc = socData.socPercent;
             }
             if (soc >= 0) payload.put("soc", Math.round(soc * 10.0) / 10.0);
+            if (vd != null && vd.socTargetPercent >= BydDataCollector.SOC_TARGET_MIN
+                    && vd.socTargetPercent <= BydDataCollector.SOC_TARGET_MAX) {
+                payload.put("target_soc", vd.socTargetPercent);
+            }
 
             // power — motor/propulsion power (kW). Positive = consuming, negative = regen.
             // Only meaningful while the car is on: the motor signal idles at ~-2 kW noise when
@@ -677,7 +693,6 @@ public class MqttConnectionManager {
 
             // is_charging — BMS state primary, with gun-connected + power-flowing
             // as a fallback for PHEVs that leave BMS state at IDLE while charging.
-            ChargingStateData chargingState = vehicleDataMonitor.getChargingState();
             // A CV taper IS charging: the BMS reports FINISHED while current still flows, so a bare
             // status test published is_charging=0 (and charge_power=0) for the whole tail.
             boolean isCharging = chargingState != null
@@ -695,16 +710,18 @@ public class MqttConnectionManager {
                 // the charge ends — so a bare "> 0.15" test kept reporting is_charging=1 on a
                 // finished-but-plugged car for the rest of the session.
                 boolean powerFlowing = chargingState != null
-                        && !Double.isNaN(chargingState.chargingPowerKW)
-                        && chargingState.chargingPowerKW > 0.15;
+                        && !chargingState.isEstimated
+                        && Double.isFinite(chargingState.chargingPowerKW)
+                        && chargingState.chargingPowerKW > 0.15
+                        && chargingState.chargingPowerKW <= 500.0;
                 if (gunConnected && powerFlowing) isCharging = true;
             }
             payload.put("is_charging", isCharging ? 1 : 0);
 
-            // is_dcfc
+            // is_dcfc — use the same guarded verdict as session pricing/cards. A raw gun==3
+            // alone is not sufficient because some trims have reported it during ordinary AC.
             boolean v2l = false;
             if (vd != null && vd.chargingGunState != BydVehicleData.UNAVAILABLE) {
-                payload.put("is_dcfc", vd.chargingGunState == 3 ? 1 : 0);
                 // V2L is gun state 5 (VTOL), NOT 4. Per BYDAutoChargingDevice:
                 // 2=AC, 3=DC, 4=AC_DC (a real combined charging gun), 5=VTOL. The
                 // old `== 4` mislabelled genuine AC_DC charging as V2L — forcing
@@ -713,13 +730,36 @@ public class MqttConnectionManager {
                 // gunPlausible) correctly treats 5 as V2L and 4 as charging.
                 if (vd.chargingGunState == 5) { payload.put("is_charging", 0); v2l = true; } // V2L (VTOL)
             }
+            int dcGunState = vd != null
+                    ? vd.chargingGunState : BydVehicleData.UNAVAILABLE;
+            double dcEvidenceKw = isCharging && chargingState != null
+                    && !chargingState.isEstimated
+                    && Double.isFinite(chargingState.chargingPowerKW)
+                    ? chargingState.chargingPowerKW : 0;
+            int openSessionVerdict =
+                    com.overdrive.app.monitor.ChargingTypeClassifier.UNKNOWN;
+            if (isCharging) {
+                try {
+                    openSessionVerdict =
+                            chargingDb.getOpenChargingSessionTypeVerdict();
+                } catch (Throwable ignored) {}
+            }
+            int dcVerdict = com.overdrive.app.monitor.ChargingTypeClassifier.classifyLive(
+                    dcGunState, dcEvidenceKw, openSessionVerdict);
+            Integer dcFastFlag =
+                    com.overdrive.app.monitor.ChargingTypeClassifier.toBinaryFlag(dcVerdict);
+            if (dcFastFlag != null) {
+                payload.put("is_dcfc", dcFastFlag.intValue());
+            } else {
+                // Home Assistant publishes this field on a retained per-key topic. Omitting an
+                // unknown verdict would leave the previous session's AC/DC value retained
+                // indefinitely. An explicit null clears that topic and keeps aggregate JSON honest.
+                payload.put("is_dcfc", JSONObject.NULL);
+            }
 
-            // charge_power — DC charge power into the pack (kW). Prefer the direct
-            // getChargePower() reading; when it's absent (dead on PHEV) fall back to
-            // the resolved getChargingState().chargingPowerKW — the SAME value the app
-            // UI and ABRP use (SOC-derived ring estimator on PHEV) — so all surfaces
-            // agree. getChargePower() returns ~359 garbage when idle, so gate on the
-            // charging state and a sane upper bound; 0 otherwise.
+            // charge_power — resolved charging power into the pack (kW), from the same
+            // ChargingStateData publication used by the UI, ABRP, history, and notifications.
+            // Raw getter fields never enter MQTT directly.
             double chargeKw = 0;
             if (isCharging && !v2l) {
                 // Prefer the RESOLVED figure over any raw getter. Raw accessors are stored
@@ -735,13 +775,68 @@ public class MqttConnectionManager {
                 // the old cap silently published 0 for it.
                 if (chargingState != null
                         && !chargingState.isEstimated
-                        && !Double.isNaN(chargingState.chargingPowerKW)
+                        && Double.isFinite(chargingState.chargingPowerKW)
                         && chargingState.chargingPowerKW > 0.1
                         && chargingState.chargingPowerKW <= 500) {
                     chargeKw = chargingState.chargingPowerKW;
                 }
             }
             payload.put("charge_power", chargeKw);
+
+            // Per-session energy is database-owned and must not disappear merely because the raw
+            // vehicle snapshot is momentarily unavailable. Publish the resolved value and its
+            // quality as one unit. The framework counter is only an explicitly incomplete fallback
+            // while physical charging is confirmed and no database-owned baseline exists.
+            SocHistoryDatabase.OpenChargingSessionEnergy sessionEnergy = null;
+            long openSessionStart = -1L;
+            try {
+                openSessionStart =
+                        chargingDb.getOpenChargingSessionStart();
+                if (openSessionStart > 0) {
+                    sessionEnergy =
+                            chargingDb.getOpenChargingSessionEnergy();
+                }
+            } catch (Throwable ignored) {}
+            if (sessionEnergy != null && sessionEnergy.isUsable()) {
+                payload.put("charging_capacity_kwh",
+                        Math.round(sessionEnergy.energyKwh * 1000.0) / 1000.0);
+                payload.put("charging_capacity_incomplete",
+                        sessionEnergy.incomplete ? 1 : 0);
+                payload.put("charging_capacity_estimated",
+                        sessionEnergy.estimated ? 1 : 0);
+                payload.put("charging_capacity_source",
+                        sessionEnergy.source);
+            } else if (openSessionStart <= 0
+                    && isCharging
+                    && !v2l
+                    && vd != null
+                    && Double.isFinite(vd.chargingCapacityKwh)
+                    && vd.chargingCapacityKwh >= 0
+                    && vd.chargingCapacityKwh
+                    <= com.overdrive.app.charging.ChargeCounterAccumulator
+                            .COUNTER_FULL_SCALE_KWH) {
+                payload.put("charging_capacity_kwh",
+                        vd.chargingCapacityKwh);
+                // No database-owned baseline exists, so this raw framework value cannot prove how
+                // much belongs to the current physical session.
+                payload.put("charging_capacity_incomplete", 1);
+                payload.put("charging_capacity_estimated", 1);
+                payload.put("charging_capacity_source",
+                        "raw_counter_unowned");
+            } else {
+                payload.put("charging_capacity_incomplete",
+                        sessionEnergy != null
+                                && sessionEnergy.incomplete ? 1 : 0);
+                payload.put("charging_capacity_estimated",
+                        sessionEnergy != null
+                                && sessionEnergy.estimated ? 1 : 0);
+                payload.put("charging_capacity_source",
+                        sessionEnergy != null
+                                ? sessionEnergy.source
+                                : openSessionStart > 0
+                                        ? "unavailable"
+                                        : "none");
+            }
 
             // is_parked — gear==P, OR the car is powered off. When ACC is off the gear signal
             // isn't actively polled and carries forward its last value (e.g. R after backing into
@@ -976,23 +1071,6 @@ public class MqttConnectionManager {
                 if (vd.chargingPercent != BydVehicleData.UNAVAILABLE
                         && vd.chargingPercent >= 0 && vd.chargingPercent <= 100)
                     payload.put("charging_pct", vd.chargingPercent);
-                // Per-session charged energy, kWh — the WRAP-CORRECTED running total, not the raw
-                // counter. The vehicle's counter is 16-bit at 1 Wh (full scale 65.534 kWh) and wraps
-                // on any session larger than that, so an 82 kWh pack taking ~66 kWh published ~0.5
-                // here: a subscriber charting cumulative energy saw it collapse to near zero
-                // mid-charge. The accumulator already tracks wraps, so publish its total and fall
-                // back to the raw reading only when no session is open to attribute it to.
-                double sessionKwh = -1;
-                try {
-                    sessionKwh = com.overdrive.app.monitor.SocHistoryDatabase.getInstance()
-                            .getOpenChargingSessionEnergyKwh();
-                } catch (Throwable ignored) {}
-                if (sessionKwh >= 0) {
-                    payload.put("charging_capacity_kwh", Math.round(sessionKwh * 1000.0) / 1000.0);
-                } else if (!Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0
-                        && vd.chargingCapacityKwh <= 65.534) {
-                    payload.put("charging_capacity_kwh", vd.chargingCapacityKwh);
-                }
                 payload.put("charging_v2l", vd.vtolCharging ? 1 : 0);
                 if (vd.wirelessChargingLeftState != BydVehicleData.UNAVAILABLE) payload.put("wireless_charging_left", vd.wirelessChargingLeftState);
                 if (vd.wirelessChargingRightState != BydVehicleData.UNAVAILABLE) payload.put("wireless_charging_right", vd.wirelessChargingRightState);

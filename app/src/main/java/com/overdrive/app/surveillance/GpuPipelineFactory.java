@@ -31,13 +31,23 @@ public class GpuPipelineFactory {
     public static GpuSurveillancePipeline createDefault(File eventOutputDir) {
         com.overdrive.app.camera.ResolvedCameraConfig resolved =
             com.overdrive.app.camera.CameraConfigResolver.resolve();
+        boolean passiveApa =
+            com.overdrive.app.camera.CameraConfigResolver.isPassiveApaModeEnabled();
+        int encoderWidth = passiveApa
+            ? com.overdrive.app.camera.PassiveApaGeometry.WIDTH
+            : resolved.getProfile().getEncoderWidth();
+        int encoderHeight = passiveApa
+            ? com.overdrive.app.camera.PassiveApaGeometry.HEIGHT
+            : resolved.getProfile().getEncoderHeight();
         logger.info("createDefault: profile=" + resolved.getProfile().getDisplayName()
             + " (panoSize=" + resolved.getPanoWidth() + "x" + resolved.getPanoHeight()
-            + ", encoderSize=" + resolved.getProfile().getEncoderWidth()
-            + "x" + resolved.getProfile().getEncoderHeight() + ")");
+            + ", encoderSize=" + encoderWidth + "x" + encoderHeight
+            + (passiveApa ? ", passiveApa=true" : "") + ")");
         return new GpuSurveillancePipeline(
             resolved.getPanoWidth(),
             resolved.getPanoHeight(),
+            encoderWidth,
+            encoderHeight,
             eventOutputDir);
     }
     

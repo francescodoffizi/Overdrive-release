@@ -867,15 +867,16 @@ class RecordingLibraryFragment : Fragment() {
     // -----------------------------------------------------------------
 
     private fun setupRecordingsList() {
+        val landscape =
+            resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
         recordingAdapter = RecordingAdapter(
             onPlay = { recording -> playRecording(recording) },
             onDelete = { recording -> confirmDelete(recording) },
             onSelectionChanged = { count -> onSelectionChanged(count) },
-            onShare = { recording -> shareSingleRecording(recording) }
+            onShare = { recording -> shareSingleRecording(recording) },
+            landscapeRows = landscape
         )
 
-        val landscape =
-            resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
         val gridLayoutManager = GridLayoutManager(context, if (landscape) 1 else 2)
         recyclerRecordings.apply {
             layoutManager = gridLayoutManager
@@ -1071,6 +1072,18 @@ class RecordingLibraryFragment : Fragment() {
         recordingAdapter.enterSelectMode()
         selectToolbar?.visibility = View.VISIBLE
         onSelectionChanged(0)
+    }
+
+    fun setActiveRecording(path: String?) {
+        if (::recordingAdapter.isInitialized) recordingAdapter.setActiveRecording(path)
+    }
+
+    fun shareRecording(recording: RecordingFile) {
+        shareSingleRecording(recording)
+    }
+
+    fun requestDeleteRecording(recording: RecordingFile) {
+        confirmDelete(recording)
     }
 
     /**

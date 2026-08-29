@@ -12,10 +12,8 @@
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=5"></script>
     <script src="../shared/app-shell.js?v=2"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=20">
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
     <link rel="stylesheet" href="../shared/seat-positions.css">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 </head>
 <body>
     <div class="app-layout">
@@ -52,13 +50,13 @@
                     </div>
                 </div>
 
-                <!-- Gear-not-in-P blocks Apply. The gate is the GEAR, not motion: Pål confirmed
+                <!-- Gear-not-in-P is still shown when the OverDrive positioning guard is
+                     disabled. The gate is the GEAR, not motion: Pål confirmed
                      the car refuses with the brake fully pressed and the car standing still, as
                      long as the gear is out of P. DrivingSafetyGuard already keys on gear
                      (NOT_PARK blocks; P only counts as parked below 2 km/h, to catch rolling in
-                     Park), so the signal was right and only this wording was wrong. The refusal
-                     is the VEHICLE's, not applyFull's gate, so force=YES buys nothing and only
-                     adds a native popup. Saving and renaming stay available; those only read. -->
+                     Park), so the signal was right and only this wording was wrong. Saving and
+                     renaming stay available; those only read. -->
                 <div class="card" id="spMoving" style="display:none;">
                     <div class="card-body">
                         <div class="info-box-note">
@@ -116,7 +114,7 @@
             <p id="spDialogBody" style="margin:0 0 14px;font-size:13.5px;color:var(--text-secondary);"></p>
             <div id="spDialogHtml" style="margin-bottom:14px;"></div>
             <input type="text" id="spDialogInput" class="input" maxlength="60" style="display:none;width:100%;margin-bottom:14px;">
-            <div style="display:flex;justify-content:flex-end;gap:8px;">
+            <div class="sp-dialog-actions">
                 <button class="btn btn-secondary" id="spDialogCancel" data-i18n="common.cancel">Cancel</button>
                 <button class="btn btn-primary" id="spDialogConfirm"></button>
             </div>

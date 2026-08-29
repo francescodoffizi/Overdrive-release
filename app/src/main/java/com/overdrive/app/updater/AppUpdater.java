@@ -1738,9 +1738,16 @@ public class AppUpdater {
             }
             cleanup(UPDATE_IN_PROGRESS_FILE + " " + POST_UPDATE_FILE + " "
                     + APK_PATH + " /data/local/tmp/overdrive_install.sh "
-                    + "/data/local/tmp/overdrive_install.sh.tmp "
-                    + "/data/local/tmp/camera_daemon.disabled "
-                    + "/data/local/tmp/acc_sentry_daemon.disabled");
+                    + "/data/local/tmp/overdrive_install.sh.tmp");
+            runShell(
+                    "for S in /data/local/tmp/camera_daemon.disabled "
+                            + "/data/local/tmp/acc_sentry_daemon.disabled; do "
+                            + "R=$(head -1 \"$S\" 2>/dev/null); "
+                            + "case \"$R\" in 'disabled for update'*|"
+                            + "'disabled by stopAllDaemons sweep'*|"
+                            + "'disabled by killDaemon'*) "
+                            + "rm -f \"$S\" 2>/dev/null;; esac; done",
+                    NOOP_SHELL);
         } catch (Exception e) {
             Log.w(TAG, "Could not roll back aborted update metadata: "
                     + e.getMessage());
@@ -1789,7 +1796,8 @@ public class AppUpdater {
         // out watchdog + daemon together — no kill-order race, no sleep
         // window for one to respawn the other. Each `2>/dev/null` so a
         // "no such process" exit doesn't abort the script.
-        script.append("echo \"disabled for update at $(date)\" > /data/local/tmp/camera_daemon.disabled\n");
+        script.append("[ -f /data/local/tmp/camera_daemon.disabled ] || "
+                + "echo \"disabled for update at $(date)\" > /data/local/tmp/camera_daemon.disabled\n");
         script.append("chmod 666 /data/local/tmp/camera_daemon.disabled 2>/dev/null\n");
         // Plant the acc-sentry sentinel so its shell watchdog
         // (start_acc_sentry.sh) bails out on its next iteration if our pkill
@@ -1804,7 +1812,8 @@ public class AppUpdater {
         // destroy that record and resurrect a user-stopped tunnel/bot. The
         // pkill cascade below takes those daemons out regardless. Mirrors
         // UpdateLifecycle's core-only sentinel handling.
-        script.append("echo \"disabled for update at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n");
+        script.append("[ -f /data/local/tmp/acc_sentry_daemon.disabled ] || "
+                + "echo \"disabled for update at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n");
         script.append("chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n");
         script.append(psAwkKillLine("cam_daemon"));
         script.append(psAwkKillLine("acc_sentry"));
@@ -1841,18 +1850,17 @@ public class AppUpdater {
         // never a broad overdrive_config* / *.json glob.
         script.append("rm -f /data/local/tmp/overdrive_config.json.tmp.* "
                 + "/data/local/tmp/overdrive_config.json.bak.tmp 2>/dev/null\n");
-        // Clear ONLY the CORE disable sentinels (camera + acc-sentry) — we
-        // needed them set above so any surviving watchdog exits, but the new
-        // MainActivity must not see them on startup or it'll leave those CORE
-        // daemons disabled (core re-arms on app-launch). The OPTIONAL-daemon
-        // sentinels (zrok.disabled, telegram_bot_daemon.disabled,
-        // tailscale.disabled, singbox.disabled) are NOT touched here — they
-        // encode a durable user stop that must survive the update, and a
-        // broad `*.disabled` glob would resurrect a user-stopped tunnel/bot.
+        // Clear only machine-written CORE markers. Pre-existing UI/Telegram
+        // markers are durable manual stop intent and survive the update.
         // POST_UPDATE_FILE / UPDATE_IN_PROGRESS_FILE stay in place; the new
         // process consumes them via UpdateLifecycle.
-        script.append("rm -f /data/local/tmp/camera_daemon.disabled 2>/dev/null\n");
-        script.append("rm -f /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n");
+        script.append("for S in /data/local/tmp/camera_daemon.disabled "
+                + "/data/local/tmp/acc_sentry_daemon.disabled; do\n");
+        script.append("  R=$(head -1 \"$S\" 2>/dev/null)\n");
+        script.append("  case \"$R\" in 'disabled for update'*|"
+                + "'disabled by stopAllDaemons sweep'*|'disabled by killDaemon'*) "
+                + "rm -f \"$S\" 2>/dev/null;; esac\n");
+        script.append("done\n");
         script.append("sleep 2\n");
         // Step 4: install. `pm install -r -d` allows downgrades (-d) so a
         // bad release doesn't strand the user, and replaces the existing app
@@ -2141,6 +2149,7 @@ public class AppUpdater {
         // bugs.
         Log.i(TAG, "Killing daemons and watchdogs...");
         String killWatchdogsCmd =
+                "[ -f /data/local/tmp/camera_daemon.disabled ] || " +
                 "echo 'disabled for update at $(date)' > /data/local/tmp/camera_daemon.disabled\n" +
                 psAwkKillLine("cam_daemon") +
                 psAwkKillLine("acc_sentry") +
@@ -2222,19 +2231,20 @@ public class AppUpdater {
         // right before `am start`. The OPTIONAL ones (telegram, zrok, …) are
         // deliberately left in place so a durable user stop survives the update.
         //
-        // The telegram sentinel is written ONLY IF ABSENT (`[ -f ] || echo`)
+        // The zrok + telegram sentinels are written ONLY IF ABSENT (`[ -f ] || echo`)
         // rather than with a plain `>`. A clobbering write destroyed the
-        // distinction the ACC-off auto-start gate depends on: it reads the
+        // distinction the post-update/ACC-off auto-start gates depend on: they read the
         // sentinel's TEXT to tell a machine stop ("stopAllDaemons sweep" — safe
         // to disregard) from a durable user stop ("disabled by ui"). Overwriting
         // a pre-existing "disabled by ui" made a real user stop indistinguishable
-        // from our own, and honouring the text then left a parked-only bot unable
-        // to auto-start ever again after any update. Preserving the original text
-        // keeps both readings correct with no ambiguity to resolve downstream.
+        // from our own. Preserving the original text keeps both readings correct
+        // with no ambiguity to resolve downstream.
         String sweepScript =
-                "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/zrok.disabled\n" +
+                "[ -f /data/local/tmp/zrok.disabled ] || "
+                + "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/zrok.disabled\n" +
                 "chmod 666 /data/local/tmp/zrok.disabled 2>/dev/null\n" +
-                "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n" +
+                "[ -f /data/local/tmp/acc_sentry_daemon.disabled ] || "
+                + "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n" +
                 "[ -f /data/local/tmp/telegram_bot_daemon.disabled ] || "
                 + "echo \"disabled by stopAllDaemons sweep at $(date)\" > /data/local/tmp/telegram_bot_daemon.disabled\n" +

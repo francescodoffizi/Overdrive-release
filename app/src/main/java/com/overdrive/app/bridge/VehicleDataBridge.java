@@ -170,7 +170,7 @@ public class VehicleDataBridge {
             json.put("isEstimated", data.isEstimated);
             json.put("isDischarging", data.isDischarging);
             json.put("timestamp", data.timestamp);
-            json.put("description", getPowerFlowDescription(data.chargingPowerKW, data.isDischarging));
+            json.put("description", getPowerFlowDescription(data));
             
             return json.toString();
             
@@ -228,9 +228,13 @@ public class VehicleDataBridge {
         if (data.isError) {
             return "Charging Error: " + data.stateName;
         } else if (data.isDischarging) {
-            return "Discharging (" + String.format("%.1f", Math.abs(data.chargingPowerKW)) + " KW)";
+            return "Discharging ("
+                    + powerDescription(data) + ")";
         } else if (data.status == ChargingStateData.ChargingStatus.CHARGING || data.isTaperCharging) {
-            return "Charging (" + String.format("%.1f", data.chargingPowerKW) + " KW)";
+            if (isNominalPlaceholder(data)) {
+                return "Charging (power unavailable)";
+            }
+            return "Charging (" + powerDescription(data) + ")";
         } else {
             return data.stateName;
         }
@@ -239,13 +243,34 @@ public class VehicleDataBridge {
     /**
      * Get human-readable description for power flow.
      */
-    private String getPowerFlowDescription(double powerKW, boolean isDischarging) {
-        if (isDischarging) {
-            return "Discharging at " + String.format("%.1f", Math.abs(powerKW)) + " KW";
-        } else if (powerKW > 0) {
-            return "Charging at " + String.format("%.1f", powerKW) + " KW";
+    private String getPowerFlowDescription(ChargingStateData data) {
+        if (isNominalPlaceholder(data)) {
+            return data.isDischarging
+                    ? "Discharging power unavailable"
+                    : "Charging power unavailable";
+        }
+        if (data.isDischarging) {
+            return "Discharging at " + powerDescription(data);
+        } else if (data.chargingPowerKW > 0) {
+            return "Charging at " + powerDescription(data);
         } else {
             return "No power flow";
         }
+    }
+
+    private static boolean isNominalPlaceholder(
+            ChargingStateData data) {
+        return data != null
+                && data.isEstimated
+                && "nominalPlaceholder".equals(data.powerSource);
+    }
+
+    private static String powerDescription(
+            ChargingStateData data) {
+        String prefix = data.isEstimated ? "~" : "";
+        return prefix
+                + String.format("%.1f",
+                        Math.abs(data.chargingPowerKW))
+                + " kW";
     }
 }
