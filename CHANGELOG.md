@@ -4,6 +4,9 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Ottimizzazione CPU & Prevenzione Latenza Pad (YOLO AI Threading)**:
+  - `YoloDetector.kt`: Ridotti i thread CPU del motore TFLite da 4 a 2 (`cpuOptions.setNumThreads(2)`), lasciando sempre liberi e prioritari i core dedicati al sottosistema grafico/touch di Android Automotive (`SurfaceFlinger` e UI del pad).
+
 - **Correzione Falso Rilevamento Ricarica ("Charging in progress") da Cloud BYD**:
   - `ChargingApiHandler.java`: Risolto il bug in cui `cloudSnap.chargingState > 0` interpretava il valore sentinella/inattivo `15` (`CONNECTED`) di BYD Cloud come ricarica attiva (`charging = true`), mostrando erroneamente *"Charging in progress"* sulla dashboard a cavo scollegato e potenza 0 kW.
   - La condizione verifica ora esclusivamente lo stato effettivo di ricarica (`cloudSnap.getChargingStateAsSdk() == 1`) e assegna sempre priorità autoritativa alle letture del `ChargingDetector` locale del veicolo.
