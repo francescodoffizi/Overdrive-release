@@ -1773,6 +1773,9 @@ public class GpuMosaicRecorder {
     }
 
     public void setRedMaskEnabled(boolean enabled) {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            enabled = false;
+        }
         if (enabled == this.redMaskEnabled) return;
         this.redMaskEnabled = enabled;
         this.uniformsDirty.set(true);
