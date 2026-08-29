@@ -612,9 +612,9 @@ object UnifiedConfigManager {
         //   "power" — arm immediately on ACC-off, disarm on ACC-on. No lock gate.
         //             Deterministic; works on every trim.
         // Branched in CameraDaemon's ACC-off dispatch + door-lock gate. Both modes
-        // still honor the safe-zone and schedule suppression gates. Default "lock"
-        // to preserve the owner-privacy behaviour of the prior single-mode build.
-        if (!surveillance.has("armMode")) surveillance.put("armMode", "lock")
+        // still honor the safe-zone and schedule suppression gates. Default "power"
+        // for autonomous zero-cloud sentry activation.
+        if (!surveillance.has("armMode")) surveillance.put("armMode", "power")
         // Keep ONLY the USB/data rail powered after ACC OFF (e.g. to charge a phone
         // while parked). DEFAULT TRUE so out-of-box behaviour is unchanged; user
         // opt-out (Surveillance → General) lets just that rail sleep on the next
@@ -2944,20 +2944,20 @@ object UnifiedConfigManager {
      */
     @JvmStatic
     fun resolveOemDashcamId(): Int {
-        val camera = loadConfig().optJSONObject("camera") ?: return 0
+        val camera = loadConfig().optJSONObject("camera") ?: return -1
+        val mode = camera.optString("cameraMode", "")
+        if (mode.contains("dilink5", ignoreCase = true) || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            val oemEnabled = getOemDashcam().optBoolean("enabled", false)
+            if (!oemEnabled) {
+                return -1
+            }
+        }
         if (camera.optBoolean("oemDashcamManualOverride", false)) {
-            return camera.optInt("oemDashcamCameraId", -1)
+            val id = camera.optInt("oemDashcamCameraId", -1)
+            val oemEnabled = getOemDashcam().optBoolean("enabled", false)
+            return if (oemEnabled && id >= 0) id else -1
         }
-        val panoId = if (camera.optBoolean("manualOverride", false)) {
-            camera.optInt("manualCameraId", -1)
-        } else {
-            camera.optInt("probedCameraId", -1)
-        }
-        return when (panoId) {
-            0 -> 1                  // Tang-style: pano=0 → OEM=1
-            1 -> 0                  // Seal/Han: pano=1 → OEM=0
-            else -> 0               // Default symmetric to pano's id=1 default
-        }
+        return -1
     }
     
     /**
@@ -4033,8 +4033,8 @@ object UnifiedConfigManager {
      */
     @JvmStatic
     fun getSurveillanceArmMode(): String {
-        val mode = getSurveillance().optString("armMode", "lock")
-        return if (mode == "power") "power" else "lock"
+        val mode = getSurveillance().optString("armMode", "power")
+        return if (mode == "lock") "lock" else "power"
     }
 
     /**

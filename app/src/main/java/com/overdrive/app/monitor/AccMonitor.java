@@ -300,6 +300,118 @@ public class AccMonitor {
      * @return true if ACC is OFF (sentry mode should be active), false if ACC is ON or unknown
      */
     public static boolean probeAccState(android.content.Context context) {
+        // 1. DI-LINK 5.0 (Android 11 Automotive / SA8155P) ACC PROBE
+        // On DiLink 5.0, BYDAutoBodyworkDevice is virtualized/missing or returns sentinel 4/255.
+        // We probe dumpsys car_service PowerMode, Android PowerManager/Display power state and doorLockStatus.
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            try {
+                // 0. Check Vehicle Active Telemetry (Speed > 0 or in Gear = definitely ACC ON / Driving)
+                com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+                if (collector != null) {
+                    com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                    if (vd != null) {
+                        if (vd.speedKmh > 0 && vd.speedKmh != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) {
+                            accOn = true;
+                            inSentryMode = false;
+                            lastProbeTrustworthy = true;
+                            accOnAuthoritative = true;
+                            notifyAccEdge(true);
+                            CameraDaemon.log("AccMonitor [DiLink5]: Vehicle is MOVING (speed=" + vd.speedKmh + " km/h) -> accOn=true, sentryMode=false");
+                            return false;
+                        }
+                        if (vd.gearMode > com.overdrive.app.monitor.GearMonitor.GEAR_P && vd.gearMode <= com.overdrive.app.monitor.GearMonitor.GEAR_S) {
+                            accOn = true;
+                            inSentryMode = false;
+                            lastProbeTrustworthy = true;
+                            accOnAuthoritative = true;
+                            notifyAccEdge(true);
+                            CameraDaemon.log("AccMonitor [DiLink5]: Vehicle is IN GEAR (" + vd.gearMode + ") -> accOn=true, sentryMode=false");
+                            return false;
+                        }
+                    }
+                }
+
+                // 1. Check Automotive BYD PowerMode enum (Standby=4, Sleep=8, Str=5, Off=0 vs StartUp=2, Pre StartUp=1)
+                String carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 3 | grep 'current' | head -1");
+                if (!carServicePower.isEmpty()) {
+                    if (carServicePower.contains("4=PowerMode Standby") || carServicePower.contains("8=PowerMode Sleep") ||
+                        carServicePower.contains("5=PowerMode Str") || carServicePower.contains("0=PowerMode Off") ||
+                        carServicePower.contains("9=PowerMode Str Suspending")) {
+                        accOn = false;
+                        inSentryMode = true;
+                        lastProbeTrustworthy = true;
+                        accOnAuthoritative = true;
+                        notifyAccEdge(false);
+                        CameraDaemon.log("AccMonitor [DiLink5]: Vehicle PowerMode is STANDBY/OFF (" + carServicePower.trim() + ") -> accOn=false, sentryMode=true");
+                        return true;
+                    } else if (carServicePower.contains("2=PowerMode StartUp") || carServicePower.contains("1=PowerMode Pre StartUp") ||
+                               carServicePower.contains("10=PowerMode DisPlay on") || carServicePower.contains("3=PowerMode Degraded")) {
+                        accOn = true;
+                        inSentryMode = false;
+                        lastProbeTrustworthy = true;
+                        accOnAuthoritative = true;
+                        notifyAccEdge(true);
+                        CameraDaemon.log("AccMonitor [DiLink5]: Vehicle PowerMode is ACTIVE/READY (" + carServicePower.trim() + ") -> accOn=true, sentryMode=false");
+                        return false;
+                    }
+                }
+
+                // 2. Check Display Interactive State on DiLink 5 (Display OFF = Definitely Sleep/Parked)
+                if (context != null) {
+                    android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(android.content.Context.POWER_SERVICE);
+                    if (pm != null && !pm.isInteractive()) {
+                        accOn = false;
+                        inSentryMode = true;
+                        lastProbeTrustworthy = true;
+                        accOnAuthoritative = true;
+                        notifyAccEdge(false);
+                        CameraDaemon.log("AccMonitor [DiLink5]: Display is OFF (isInteractive=false) -> accOn=false, sentryMode=true");
+                        return true;
+                    }
+                }
+
+                // 3. Check Lock State (Vehicle Locked = ACC OFF)
+                if (collector != null) {
+                    com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                    if (vd != null && vd.doorLockStatus != null && vd.doorLockStatus.length > 0) {
+                        // In BYD doorLockStatus: 1 = LOCKED
+                        if (vd.doorLockStatus[0] == 1) {
+                            accOn = false;
+                            inSentryMode = true;
+                            lastProbeTrustworthy = true;
+                            accOnAuthoritative = true;
+                            notifyAccEdge(false);
+                            CameraDaemon.log("AccMonitor [DiLink5]: Vehicle is LOCKED -> accOn=false, sentryMode=true");
+                            return true;
+                        }
+                    }
+                }
+
+                // 4. Fallback: check sys.accanim.status if explicitly set to "1" (OFF)
+                String accAnim = getSystemProperty("sys.accanim.status", "");
+                if ("1".equals(accAnim)) {
+                    accOn = false;
+                    inSentryMode = true;
+                    lastProbeTrustworthy = true;
+                    accOnAuthoritative = true;
+                    notifyAccEdge(false);
+                    CameraDaemon.log("AccMonitor [DiLink5]: sys.accanim.status=1 -> accOn=false, sentryMode=true");
+                    return true;
+                } else if ("0".equals(accAnim)) {
+                    accOn = true;
+                    inSentryMode = false;
+                    lastProbeTrustworthy = true;
+                    accOnAuthoritative = true;
+                    notifyAccEdge(true);
+                    CameraDaemon.log("AccMonitor [DiLink5]: sys.accanim.status=0 -> accOn=true, sentryMode=false");
+                    return false;
+                }
+            } catch (Throwable t) {
+                CameraDaemon.log("AccMonitor [DiLink5]: power probe error: " + t.getMessage());
+            }
+        }
+
+        // 2. LEGACY DILINK 3.0 / 4.0 BYDAutoBodyworkDevice PROBE (Preserved 100% untouched)
         resolveBodyworkReflection();
         if (!bodyworkReflectionResolved) {
             // Class genuinely missing on this firmware — safe default.
@@ -450,5 +562,33 @@ public class AccMonitor {
      */
     public void stop() {
         // Nothing to stop
+    }
+
+    /**
+     * Helper to read Android system properties safely via reflection.
+     */
+    private static String getSystemProperty(String key, String def) {
+        try {
+            Class<?> systemProperties = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method get = systemProperties.getMethod("get", String.class, String.class);
+            return (String) get.invoke(null, key, def);
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    public static String execShell(String command) {
+        StringBuilder output = new StringBuilder();
+        try {
+            Process process = Runtime.getRuntime().exec(new String[]{"sh", "-c", command});
+            java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+            reader.close();
+            process.waitFor();
+        } catch (Throwable ignored) {}
+        return output.toString();
     }
 }

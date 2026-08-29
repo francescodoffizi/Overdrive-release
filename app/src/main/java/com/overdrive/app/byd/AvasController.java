@@ -137,51 +137,88 @@ public final class AvasController {
             if (autoManager != null && setIntMethod != null) return true;
             Context ctx = CameraDaemon.getAppContext();
             if (ctx == null) {
+                try {
+                    Class<?> atClass = Class.forName("android.app.ActivityThread");
+                    Object app = atClass.getMethod("currentApplication").invoke(null);
+                    if (app instanceof Context) ctx = (Context) app;
+                } catch (Throwable ignored) {}
+            }
+            if (ctx == null) {
                 logger.warn("no app context — AVAS unavailable");
                 return false;
             }
             try {
                 Object svc = ctx.getSystemService("auto");
-                if (svc == null) {
-                    logger.warn("getSystemService(\"auto\") returned null — AVAS unavailable");
-                    return false;
+                if (svc != null) {
+                    Method set = svc.getClass().getMethod("setInt", int.class, int.class, int.class);
+                    Method get = svc.getClass().getMethod("getInt", int.class, int.class);
+                    autoManager = svc;
+                    setIntMethod = set;
+                    getIntMethod = get;
+                    logger.info("AVAS auto manager acquired: " + svc.getClass().getName());
+                    return true;
                 }
-                Method set = svc.getClass().getMethod("setInt", int.class, int.class, int.class);
-                Method get = svc.getClass().getMethod("getInt", int.class, int.class);
-                autoManager = svc;
-                setIntMethod = set;
-                getIntMethod = get;
-                logger.info("AVAS auto manager acquired: " + svc.getClass().getName());
-                return true;
             } catch (Throwable t) {
-                logger.warn("AVAS manager resolve failed: " + t.getMessage());
-                return false;
+                logger.debug("AVAS getSystemService('auto') failed: " + t.getMessage());
             }
+
+            // Fallback for DiLink 5.0 / Android Automotive: check CarPropertyBridge or native VHAL
+            try {
+                CarPropertyBridge bridge = CarPropertyBridge.getInstance();
+                if (bridge != null) {
+                    logger.info("AVAS bridged via CarPropertyBridge on DiLink 5.0");
+                    return true;
+                }
+            } catch (Throwable t) {
+                logger.debug("AVAS CarPropertyBridge fallback failed: " + t.getMessage());
+            }
+
+            logger.warn("AVAS manager resolve failed on this platform");
+            return false;
         }
     }
 
-    /** True if the {@code auto} service (hence AVAS control) is reachable. */
+    /** True if AVAS control is reachable. */
     public static boolean isAvailable() {
         return ensureManager();
     }
 
     /** setInt(1002, featureId, value); silently ignored if the service is down. */
     private static void si(int featureId, int value) {
-        if (setIntMethod == null) return;
+        if (setIntMethod != null && autoManager != null) {
+            try {
+                setIntMethod.invoke(autoManager, DEVICE_AUDIO, featureId, value);
+                return;
+            } catch (Throwable ignored) {}
+        }
         try {
-            setIntMethod.invoke(autoManager, DEVICE_AUDIO, featureId, value);
+            CarPropertyBridge bridge = CarPropertyBridge.getInstance();
+            if (bridge != null) {
+                bridge.setIntProperty("byd.auto.audio." + featureId, value);
+            }
         } catch (Throwable ignored) {}
     }
 
     /** getInt(1002, featureId); returns {@code dflt} on any failure. */
     private static int gi(int featureId, int dflt) {
-        if (getIntMethod == null) return dflt;
-        try {
-            Object r = getIntMethod.invoke(autoManager, DEVICE_AUDIO, featureId);
-            return (r instanceof Integer) ? (Integer) r : dflt;
-        } catch (Throwable t) {
-            return dflt;
+        if (getIntMethod != null && autoManager != null) {
+            try {
+                Object r = getIntMethod.invoke(autoManager, DEVICE_AUDIO, featureId);
+                return (r instanceof Integer) ? (Integer) r : dflt;
+            } catch (Throwable t) {
+                return dflt;
+            }
         }
+        try {
+            CarPropertyBridge bridge = CarPropertyBridge.getInstance();
+            if (bridge != null) {
+                CarPropertyBridge.ReadResult rr = bridge.readProperty("byd.auto.audio." + featureId);
+                if (rr != null && rr.success && rr.intValue != null) {
+                    return rr.intValue;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return dflt;
     }
 
     // ─────────────────────── tone-generator plumbing ────────────────────

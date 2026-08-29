@@ -221,8 +221,8 @@ android {
         // value (e.g. `-PoverdriveVersionName=27.4 -PoverdriveVersionCode=12`)
         // without a source edit per release; the defaults track the current
         // rolling head so a plain local build is still accurate.
-        versionCode = (project.findProperty("overdriveVersionCode") as? String)?.toIntOrNull() ?: 58
-        versionName = (project.findProperty("overdriveVersionName") as? String) ?: "36.5"
+        versionCode = (project.findProperty("overdriveVersionCode") as? String)?.toIntOrNull() ?: 66
+        versionName = (project.findProperty("overdriveVersionName") as? String) ?: "50.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
         // Note: abiFilters removed - using splits.abi instead for size optimization
@@ -239,6 +239,7 @@ android {
 
     buildFeatures {
         buildConfig = true
+        aidl = true
     }
 
     lint {
@@ -303,8 +304,8 @@ android {
         debug {
             isMinifyEnabled = false
 
-            // Debug builds also check alpha channel for updates
-            buildConfigField("String", "UPDATE_CHANNEL", "\"alpha\"")
+            // Debug builds match the active braveheart channel
+            buildConfigField("String", "UPDATE_CHANNEL", "\"braveheart\"")
         }
         // Braveheart: the rolling/bleeding-edge channel, shipped as a RELEASE build but
         // with diagnostics ON so braveheart customers can upload complete per-daemon
@@ -410,6 +411,21 @@ android {
  * 3. getInstance() is called via reflection on the real class
  */
 
+// ── DiLink BYD Auto compile stubs (built from SOURCE, not bundled into APK) ──────────
+val bydautoStubsClasses = layout.buildDirectory.dir("bydauto-stubs/classes")
+val compileBydautoStubs = tasks.register<JavaCompile>("compileBydautoStubs") {
+    source(fileTree(rootProject.file("stubs-bydauto")) { include("android/**/*.java") })
+    classpath = files(android.bootClasspath)
+    options.release.set(17)
+    destinationDirectory.set(bydautoStubsClasses)
+}
+val bydautoStubsJar = tasks.register<Jar>("bydautoStubsJar") {
+    dependsOn(compileBydautoStubs)
+    from(bydautoStubsClasses)
+    archiveFileName.set("bydauto-stubs.jar")
+    destinationDirectory.set(layout.buildDirectory.dir("bydauto-stubs"))
+}
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
@@ -497,4 +513,9 @@ dependencies {
     testImplementation("org.json:json:20231013")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+
+    // Compile against BYD Auto stubs without bundling dummy mocks into APK classes.dex
+    compileOnly(files(bydautoStubsJar.flatMap { it.archiveFile }))
+    testImplementation(files(bydautoStubsJar.flatMap { it.archiveFile }))
 }
+

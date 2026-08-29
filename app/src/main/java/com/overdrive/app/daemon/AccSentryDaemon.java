@@ -322,9 +322,8 @@ public class AccSentryDaemon {
             return null;
         }
 
-        // Non-dilink4 probes ONLY the historically-resolved FQN so its write set is
-        // byte-identical to before this change (see SPECIAL_DEVICE_CLASS_CANDIDATES).
-        int limit = isDilink4CameraMode()
+        // Probe all candidate packages on DiLink 4 and DiLink 5
+        int limit = (isDilink4CameraMode() || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported())
                 ? SPECIAL_DEVICE_CLASS_CANDIDATES.length
                 : SPECIAL_DEVICE_LEGACY_CANDIDATE_COUNT;
         for (int i = 0; i < limit; i++) {
@@ -6248,6 +6247,11 @@ public class AccSentryDaemon {
      */
     private static int readPowerLevel() {
         if (appContext == null) return -1;
+        try {
+            if (!com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                return POWER_LEVEL_OFF;
+            }
+        } catch (Throwable ignored) {}
         try {
             Class<?> deviceClass = Class.forName(
                 "android.hardware.bydauto.bodywork.BYDAutoBodyworkDevice");

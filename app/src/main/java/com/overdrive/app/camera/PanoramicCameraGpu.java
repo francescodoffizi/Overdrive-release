@@ -111,6 +111,9 @@ public class PanoramicCameraGpu {
     private final boolean USE_PASSIVE_APA_MODE = CAMERA_LAYOUT_MODE == 1;
 
     private static int resolveCameraLayoutModeFromConfig() {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            return 1; // DiLink 5: direct 1:1 single camera passthrough (no 4-way mosaic)
+        }
         try {
             org.json.JSONObject cam = com.overdrive.app.config.UnifiedConfigManager
                 .loadConfig().optJSONObject("camera");
@@ -125,9 +128,12 @@ public class PanoramicCameraGpu {
 
     /** Effective camera-layout mode for downstream consumers.
      *  0 = 4-strip → 2x2 rearrangement (legacy);
-     *  1 = full-frame passthrough (DiLink 4 passive APA);
+     *  1 = full-frame passthrough (DiLink 4 passive APA / DiLink 5);
      *  3 = DiLink 4 four-corner remap. */
     public int getCameraLayoutMode() {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            return 1; // DiLink 5: direct 1:1 single camera passthrough (no 4-way mosaic)
+        }
         return CAMERA_LAYOUT_MODE;
     }
     
@@ -1630,12 +1636,9 @@ public class PanoramicCameraGpu {
             return;
         }
         cameraSurfaceTexture = new SurfaceTexture(cameraTextureId);
-        // oem-parity: do NOT call setDefaultBufferSize. oem's GL pipeline
-        // wraps SurfaceTexture without setting a default size; the BYD HAL
-        // drives the BufferQueue dims for the active previewIndex (mosaic
-        // strip = 5120x960 on Seal/Tang, etc.) and the consumer adapts via
-        // updateTexImage's transform matrix. Forcing dims here can make the
-        // HAL silently scale/crop or stall on byd_apa boards.
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            cameraSurfaceTexture.setDefaultBufferSize(width > 0 ? width : 1920, height > 0 ? height : 1024);
+        }
         cameraSurfaceTexture.setOnFrameAvailableListener(st -> {
             // Cheap signalling — the actual updateTexImage happens on the GL
             // thread inside renderLoop. Ride frameSync so the wait/notify
@@ -1653,11 +1656,13 @@ public class PanoramicCameraGpu {
                 frameSync.notify();
             }
         }, glHandler);
-        // Build the Surface that AVMCamera doesn't actually receive — the
-        // oem path uses addTexture(SurfaceTexture, ...) directly. We keep
-        // the cameraSurface reference null on this path so any stray
-        // addPreviewSurface code can't accidentally re-attach.
-        cameraSurface = null;
+        if (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
+            cameraSurface = new Surface(cameraSurfaceTexture);
+            ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cameraObj).startSurface(cameraSurface);
+            logger.info("DiLink 5 QCarCamBackend started with new SurfaceTexture Surface");
+        } else {
+            cameraSurface = null;
+        }
     }
 
     /** Bind the active SurfaceTexture to the AVMCamera via reflection,
@@ -1675,6 +1680,14 @@ public class PanoramicCameraGpu {
         if (cameraSurfaceTexture == null) {
             throw new IllegalStateException("attachSurfaceTextureToCamera before createCameraSurfaceTexture");
         }
+
+        if (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
+            logger.info("Attaching Surface to DiLink 5 QCarCam backend");
+            if (cameraSurface == null) cameraSurface = new Surface(cameraSurfaceTexture);
+            ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cameraObj).startSurface(cameraSurface);
+            return;
+        }
+
         Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
         int previewIndex = cameraSurfaceMode;
 
@@ -2344,6 +2357,10 @@ public class PanoramicCameraGpu {
             // (compareAndSet fails) and the kick would be permanently unavailable
             // after the first camera close.
             previewKickArming.set(false);
+            if (cam instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
+                ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cam).close();
+                return;
+            }
             clearAvmCameraCallbacks(cam);
         }
         // Steps 5+6 (and disablePreviewCallback in legacy compat).
@@ -2733,7 +2750,29 @@ public class PanoramicCameraGpu {
             releaseSentryBridgeViewpoint();
         }
 
-        Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
+        // DiLink 5.0 (Snapdragon SA8155P): uses native QCarCam / AIS backend directly
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            logger.info("DiLink 5 platform detected — initializing native QCarCam backend (cameraId=" + cameraId + ")");
+            com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend dilink5Backend =
+                    new com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend(cameraId);
+            if (cameraSurfaceTexture != null) {
+                if (cameraSurface == null) cameraSurface = new Surface(cameraSurfaceTexture);
+                dilink5Backend.startSurface(cameraSurface);
+            } else {
+                dilink5Backend.start();
+            }
+            cameraObj = dilink5Backend;
+            logger.info("DiLink 5 native QCarCam stream initialized (cameraObj assigned).");
+            return;
+        }
+
+        Class<?> avmClass;
+        try {
+            avmClass = Class.forName("android.hardware.AVMCamera");
+        } catch (ClassNotFoundException e) {
+            logger.warn("android.hardware.AVMCamera not present on this device (DiLink 5+ architecture)");
+            return;
+        }
 
         // === ATTEMPT 1: Constructor new AVMCamera(int) + .open() ===
         // Required on this firmware. The static factory would return null.
@@ -3679,16 +3718,18 @@ public class PanoramicCameraGpu {
                         }
                     }
                     int currentId = cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID;
-                    boolean isPanoramic = width >= 5000;
+                    boolean isDilink5 = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
+                    boolean isPanoramic = isDilink5 || (width >= 5000);
                     logger.info("Camera ID " + currentId + " probe: " + 
                         (hasData ? "HAS DATA" : "BLACK") +
                         " | resolution=" + width + "x" + height +
                         " | type=" + (isPanoramic ? "PANORAMIC" : "SINGLE") +
                         " | surfaceMode=" + cameraSurfaceMode);
                     
-                    if (hasData && isPanoramic) {
+                    if (isDilink5 || (hasData && isPanoramic)) {
                         // Track this camera as having real data (for fallback if strip check fails)
                         lastDataCameraId = currentId;
+                        probeComplete = true;
                         
                         // During auto-probe: accept the first camera with non-black panoramic data.
                         // The 5120x960 resolution IS the panoramic strip identifier on BYD — no other

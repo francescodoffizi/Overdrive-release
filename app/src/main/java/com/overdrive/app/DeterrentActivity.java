@@ -101,6 +101,10 @@ public class DeterrentActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+            finish();
+            return;
+        }
         createdAtElapsedMs = SystemClock.elapsedRealtime();
         deterrentStartedAtElapsedMs = createdAtElapsedMs;
         inputCaptureToken = inputToken(getIntent());
@@ -217,6 +221,17 @@ public class DeterrentActivity extends Activity {
     }
 
     private boolean shouldFinishNow() {
+        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) return true;
+        try {
+            com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (collector != null) {
+                com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                if (vd != null) {
+                    if (vd.speedKmh > 0 && vd.speedKmh != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) return true;
+                    if (vd.gearMode > com.overdrive.app.monitor.GearMonitor.GEAR_P && vd.gearMode <= com.overdrive.app.monitor.GearMonitor.GEAR_S) return true;
+                }
+            }
+        } catch (Throwable ignored) {}
         // Once the daemon authenticated this session, its socket closure is
         // the only trustworthy visual-teardown acknowledgement. Other
         // processes clear the persisted deadline during ACC transitions, so

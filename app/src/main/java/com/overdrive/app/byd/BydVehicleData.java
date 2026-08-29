@@ -817,6 +817,78 @@ public class BydVehicleData {
         if (!Double.isNaN(val)) j.put(key, Math.round(val * 100) / 100.0);
     }
 
+    public static BydVehicleData fromJson(JSONObject j) {
+        if (j == null) return null;
+        Builder b = new Builder();
+        try {
+            b.vin = j.optString("vin", null);
+            if (j.has("battery")) {
+                JSONObject batt = j.getJSONObject("battery");
+                b.socPercent = batt.optDouble("socPercent", NaN);
+                b.socHevPercent = batt.optDouble("socHevPercent", NaN);
+                b.socTargetPercent = batt.optInt("socTargetPercent", UNAVAILABLE);
+                b.capacityAh = batt.optDouble("capacityAh", NaN);
+                b.remainKwh = batt.optDouble("remainKwh", NaN);
+                b.voltage12v = batt.optDouble("voltage12v", NaN);
+                b.voltage12vAtMs = batt.optLong("voltage12vAtMs", 0L);
+                b.voltageLevelRaw = batt.optInt("voltageLevelRaw", UNAVAILABLE);
+            }
+            if (j.has("speed")) {
+                JSONObject spd = j.getJSONObject("speed");
+                b.speedKmh = spd.optDouble("kmh", NaN);
+                b.accelPercent = spd.optInt("accelPercent", UNAVAILABLE);
+                b.brakePercent = spd.optInt("brakePercent", UNAVAILABLE);
+            }
+            if (j.has("gearMode")) b.gearMode = j.optInt("gearMode", UNAVAILABLE);
+            if (j.has("tyrePressure")) {
+                JSONArray tp = j.getJSONArray("tyrePressure");
+                int[] p = new int[tp.length()];
+                for (int i = 0; i < tp.length(); i++) p[i] = tp.getInt(i);
+                b.tyrePressure = p;
+            }
+            if (j.has("tyrePressureState")) {
+                JSONArray a = j.getJSONArray("tyrePressureState");
+                int[] v = new int[a.length()];
+                for (int i = 0; i < a.length(); i++) v[i] = a.getInt(i);
+                b.tyrePressureState = v;
+            }
+            if (j.has("tyreTemperature")) {
+                JSONArray a = j.getJSONArray("tyreTemperature");
+                int[] v = new int[a.length()];
+                for (int i = 0; i < a.length(); i++) v[i] = a.isNull(i) ? UNAVAILABLE : a.getInt(i);
+                b.tyreTemperature = v;
+            }
+            if (j.has("tyreSystemState")) b.tyreSystemState = j.optInt("tyreSystemState", UNAVAILABLE);
+            if (j.has("tyreTemperatureState")) b.tyreTemperatureState = j.optInt("tyreTemperatureState", UNAVAILABLE);
+            if (j.has("doorLockStatus")) {
+                JSONArray dl = j.getJSONArray("doorLockStatus");
+                int[] s = new int[dl.length()];
+                for (int i = 0; i < dl.length(); i++) s[i] = dl.getInt(i);
+                b.doorLockStatus = s;
+            }
+            if (j.has("windowOpenPercent")) {
+                JSONArray wp = j.getJSONArray("windowOpenPercent");
+                int[] p = new int[wp.length()];
+                for (int i = 0; i < wp.length(); i++) p[i] = wp.getInt(i);
+                b.windowOpenPercent = p;
+            }
+            if (j.has("range")) {
+                JSONObject rng = j.getJSONObject("range");
+                b.elecRangeKm = rng.optInt("elecKm", UNAVAILABLE);
+                b.fuelRangeKm = rng.optInt("fuelKm", UNAVAILABLE);
+                b.bodyworkRangeKm = rng.optInt("bodyworkKm", UNAVAILABLE);
+                b.fuelPercent = rng.optDouble("fuelPercent", -1.0);
+            }
+            if (j.has("mileage")) {
+                JSONObject mil = j.getJSONObject("mileage");
+                b.totalMileageKm = mil.optInt("totalKm", UNAVAILABLE);
+                b.evMileageKm = mil.optInt("evKm", UNAVAILABLE);
+                b.hevMileageKm = mil.optInt("hevKm", UNAVAILABLE);
+            }
+        } catch (Exception ignored) {}
+        return b.build();
+    }
+
     /** Create a new builder pre-filled with this snapshot's values */
     public Builder toBuilder() {
         Builder b = new Builder();

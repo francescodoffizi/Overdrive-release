@@ -173,6 +173,8 @@ open class MainActivity : AppCompatActivity() {
             // Physical MainActivity keeps the existing best-effort behavior.
         }
 
+        com.overdrive.app.byd.dilink5.Dilink5SdkInjector.ensure(this)
+
         setContentView(R.layout.activity_main_new)
 
         // Storage setup is posted off the onCreate critical path so a failure

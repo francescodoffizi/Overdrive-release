@@ -19,12 +19,13 @@ import java.util.Set;
 
 public class BatteryChemistryMetadataTest {
     private static final Set<String> EXPECTED_MODELS = new HashSet<>(Arrays.asList(
-            "seal", "seal-u", "seal-u-dmi", "dolphin", "atto3",
+            "seal", "sealion7", "seal-u", "seal-u-dmi", "dolphin", "atto3",
             "han", "tang", "m6", "seagull", "destroyer"));
     private static final Map<String, String> EXPECTED_MODEL_SOURCES = new HashMap<>();
 
     static {
         EXPECTED_MODEL_SOURCES.put("seal", "https://media.byd.com/byd-seal-arrives-in-europe-setting-the-standard-in-breakthrough-technology-and-stunning-design/?lang=eng");
+        EXPECTED_MODEL_SOURCES.put("sealion7", "https://media.byd.com/all-new-byd-sealion-7-arrives-in-europe/?lang=eng");
         EXPECTED_MODEL_SOURCES.put("seal-u", "https://www.byd.com/content/dam/byd-site/hu/pdfs/seal-u/BYD_SEAL_U_arlista_20250101.pdf");
         EXPECTED_MODEL_SOURCES.put("seal-u-dmi", "https://www.byd.com/material/byd-site/si/pdfs/2026-04/Seal_U_Dmi-0226-BPS-SLO.pdf");
         EXPECTED_MODEL_SOURCES.put("dolphin", "https://www.byd.com/content/dam/byd-site/pl/pdfs/dolphin/Dolphin-0524-BPS-PL-V1-web.pdf");

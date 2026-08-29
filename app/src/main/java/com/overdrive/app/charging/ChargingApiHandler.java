@@ -835,6 +835,16 @@ public class ChargingApiHandler {
                 }
             }
 
+            com.overdrive.app.byd.cloud.VehicleCloudSnapshot cloudSnap = null;
+            try {
+                com.overdrive.app.byd.cloud.BydCloudDataProvider cp = com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance();
+                if (cp != null) cloudSnap = cp.getSnapshot();
+            } catch (Exception ignored) {}
+
+            if (timeToFullMin <= 0 && cloudSnap != null && (cloudSnap.remainingHours >= 0 || cloudSnap.remainingMinutes >= 0)) {
+                timeToFullMin = Math.max(0, cloudSnap.remainingHours * 60 + Math.max(0, cloudSnap.remainingMinutes));
+            }
+
             ChargingDetector.StateSnapshot after = null;
             try {
                 after = ChargingDetector.getInstance().getStateSnapshot();
@@ -844,14 +854,27 @@ public class ChargingApiHandler {
                 continue;
             }
 
+            boolean isCloudCharging = cloudSnap != null && cloudSnap.getChargingStateAsSdk() == 1;
+            boolean isCloudPlugged = isCloudCharging || (cloudSnap != null && cloudSnap.chargingState == 15);
+
+            boolean hasLocalDetector = after != null;
+            boolean effectiveCharging = hasLocalDetector ? after.charging : isCloudCharging;
+
             ChargingStateData.ChargingStatus status = state != null
-                    ? state.status : ChargingStateData.ChargingStatus.UNKNOWN;
+                    ? state.status : (effectiveCharging ? ChargingStateData.ChargingStatus.CHARGING : ChargingStateData.ChargingStatus.UNKNOWN);
             LiveStateFlags flags = normalizeLiveState(
-                    after.charging,
+                    effectiveCharging,
                     status,
                     state != null && state.isTaperCharging,
                     gunState,
                     vtolCharging);
+            if (!hasLocalDetector && (isCloudCharging || isCloudPlugged)) {
+                flags = new LiveStateFlags(
+                    flags.charging || isCloudCharging,
+                    flags.plugged || isCloudPlugged,
+                    flags.full
+                );
+            }
             PowerPublication power =
                     normalizePowerPublication(flags.charging, state);
             if (!flags.charging) {
@@ -862,6 +885,9 @@ public class ChargingApiHandler {
                 sessionEnergyEstimated = false;
                 sessionEnergySource = SessionEnergyResolver.SRC_NONE;
                 timeToFullMin = -1;
+            }
+            if (state == null && (isCloudCharging || isCloudPlugged)) {
+                state = new ChargingStateData(isCloudCharging ? 1 : 0);
             }
             return new LivePublication(
                     state,

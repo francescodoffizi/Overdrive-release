@@ -110,6 +110,16 @@ class DaemonKeepaliveService : Service() {
         } catch (e: Exception) {
             Log.w(TAG, "ProcessRevivalReceiver.schedule failed: ${e.message}")
         }
+
+        // Initialize BYD Data Collector in the app process (where OEM services like CarAdapterService bind cleanly)
+        Thread({
+            try {
+                com.overdrive.app.byd.BydDataCollector.getInstance().init(applicationContext)
+                Log.i(TAG, "BydDataCollector initialized in app process")
+            } catch (e: Throwable) {
+                Log.w(TAG, "BydDataCollector init in app process failed: ${e.message}")
+            }
+        }, "AppBydCollectorInit").start()
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

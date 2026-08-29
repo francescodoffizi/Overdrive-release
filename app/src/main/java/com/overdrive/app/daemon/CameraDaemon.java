@@ -632,8 +632,14 @@ public class CameraDaemon {
             }
         });
 
-        if (Looper.myLooper() == null) Looper.prepare();
-        mainHandler = new Handler(Looper.myLooper());
+        if (Looper.getMainLooper() == null) {
+            try {
+                Looper.prepareMainLooper();
+            } catch (Throwable ignored) {
+                if (Looper.myLooper() == null) Looper.prepare();
+            }
+        }
+        mainHandler = new Handler(Looper.getMainLooper() != null ? Looper.getMainLooper() : Looper.myLooper());
 
         // Parse arguments (sets outputDir if provided)
         parseArguments(args);
@@ -1419,6 +1425,14 @@ public class CameraDaemon {
             log("ClusterViewMirrorService register failed: " + t.getMessage());
         }
 
+        try {
+            if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+                com.overdrive.app.daemon.sentry.DiLink5PowerDiagnostics.start(getAppContext());
+            }
+        } catch (Throwable t) {
+            log("DiLink5PowerDiagnostics start failed: " + t.getMessage());
+        }
+
         log("Daemon ready on TCP:" + TCP_PORT + " HTTP:" + HTTP_PORT);
 
         // Periodic memory monitor — mirrors AccSentryDaemon.logMemoryStatus().
@@ -1926,6 +1940,17 @@ public class CameraDaemon {
     }
 
     private static Integer readRawAccPowerLevel() throws Exception {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            // DiLink 5.0 (Snapdragon SA8155P / Android Automotive 11)
+            // Uses dumpsys car_service Power Mute State or PowerManager/interactive
+            try {
+                if (com.overdrive.app.monitor.AccMonitor.probeAccState(sharedAppContext)) {
+                    return 0; // POWER_LEVEL_OFF (Standby/Sleep/Parked)
+                } else {
+                    return 2; // POWER_LEVEL_ON (Active)
+                }
+            } catch (Throwable ignored) {}
+        }
         if (!rawAccReflectionResolved && !rawAccReflectionFailed) {
             synchronized (CameraDaemon.class) {
                 if (!rawAccReflectionResolved && !rawAccReflectionFailed) {
@@ -7913,22 +7938,35 @@ public class CameraDaemon {
                                 transitionGeneration, true, "power-mode arm")) {
                             return;
                         }
-                        log("Pipeline started in sentry mode — arm mode=power, arming immediately");
-                        // Publish the armed flag only after the enable lease actually succeeds.
-                        doorLockListenerArmed =
-                            enableSurveillanceForAccGeneration(
-                                transitionGeneration, "ACC OFF power arm");
-                        // Consistency guard: enableSurveillance() can decline to
-                        // start (ACC flipped ON, or safe-zone suppression). If the
-                        // pipeline isn't actually running, revert the flag so it
-                        // doesn't lie about being armed.
-                        if (com.overdrive.app.monitor.AccMonitor.isAccOn()
-                                || safeZoneSuppressed
-                                || gpuPipeline == null || !gpuPipeline.isRunning()) {
-                            log("Arm mode=power: pipeline not running after enable "
-                                + "(safeZone=" + safeZoneSuppressed + ") — reverting armed flag");
-                            doorLockListenerArmed = false;
-                        }
+                        log("Pipeline started in sentry mode — arm mode=power (grace period 15s before arming)");
+                        // Grace period of 15s to allow passenger/driver exit before motion detection starts
+                        Thread powerArmThread = new Thread(() -> {
+                            try {
+                                Thread.sleep(15000);
+                                if (stopStaleAccTransition(
+                                        transitionGeneration, true, "power-mode grace-period arm")) {
+                                    return;
+                                }
+                                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                                    log("Power arm cancelled: ACC is ON");
+                                    return;
+                                }
+                                log("Arming surveillance now (power mode grace period elapsed)");
+                                doorLockListenerArmed =
+                                    enableSurveillanceForAccGeneration(
+                                        transitionGeneration, "ACC OFF power arm");
+                                if (com.overdrive.app.monitor.AccMonitor.isAccOn()
+                                        || safeZoneSuppressed
+                                        || gpuPipeline == null || !gpuPipeline.isRunning()) {
+                                    log("Arm mode=power: pipeline not running after enable "
+                                        + "(safeZone=" + safeZoneSuppressed + ") — reverting armed flag");
+                                    doorLockListenerArmed = false;
+                                }
+                            } catch (InterruptedException ignored) {
+                                log("Power arm grace period interrupted");
+                            }
+                        }, "PowerArmGraceThread");
+                        powerArmThread.start();
                         // Still need the ACC-ON disarm watchdog as the reverse
                         // fallback (ACC turns ON without an IPC reaching us).
                         startAccOnDisarmWatchdog(transitionGeneration);
@@ -9564,6 +9602,8 @@ public class CameraDaemon {
                 return;
             }
 
+            com.overdrive.app.byd.dilink5.Dilink5SdkInjector.ensure(sharedAppContext);
+
             com.overdrive.app.monitor.VehicleDataMonitor vehicleMonitor =
                 com.overdrive.app.monitor.VehicleDataMonitor.getInstance();
 
@@ -9789,7 +9829,7 @@ public class CameraDaemon {
                 return createFallbackContext();
             }
 
-            String packageName = APP_PACKAGE_NAME();
+            String packageName = (android.os.Process.myUid() == 2000) ? "com.android.shell" : APP_PACKAGE_NAME();
             log("createAppContext: Creating package context for " + packageName);
             android.content.Context appContext = systemContext.createPackageContext(packageName,
                     android.content.Context.CONTEXT_INCLUDE_CODE | android.content.Context.CONTEXT_IGNORE_SECURITY);
@@ -9799,6 +9839,9 @@ public class CameraDaemon {
                 log("createAppContext: appContext is null, trying fallback...");
                 return createFallbackContext();
             }
+
+            com.overdrive.app.byd.BydDeviceHelper.fixContextImplForUid2000(appContext);
+            com.overdrive.app.byd.BydDeviceHelper.fixContextImplForUid2000(systemContext);
 
             PermissionBypassContext wrapped = new PermissionBypassContext(appContext);
             log("createAppContext: Success, returning PermissionBypassContext");
@@ -9908,7 +9951,12 @@ public class CameraDaemon {
             return this;
         }
         @Override public String getPackageName() {
+            if (android.os.Process.myUid() == 2000) return "com.android.shell";
             try { return super.getPackageName(); } catch (NullPointerException e) { return APP_PACKAGE_NAME(); }
+        }
+        @Override public String getOpPackageName() {
+            if (android.os.Process.myUid() == 2000) return "com.android.shell";
+            try { return super.getOpPackageName(); } catch (Throwable e) { return "com.android.shell"; }
         }
         @Override public Object getSystemService(String name) {
             try { return super.getSystemService(name); } catch (NullPointerException e) { return null; }

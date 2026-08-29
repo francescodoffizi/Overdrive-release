@@ -55,6 +55,8 @@ set(SURVEILLANCE_SOURCES
     # Camera/EGL: AHardwareBuffer → EGLImage → GL_TEXTURE_EXTERNAL_OES
     # binding for the ImageReader-based zero-copy camera path.
     camera/HardwareBufferTextureBinder.cpp
+    # DiLink 5 Qualcomm QCarCam / AIS Client hardware stream backend
+    camera/qcarcam_bridge.cpp
 )
 
 add_library(surveillance SHARED ${SURVEILLANCE_SOURCES})
@@ -147,6 +149,23 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/od/od.cpp)
 else()
     message(STATUS "od/od.cpp not present — skipping 'od' target; prebuilt libod.so in jniLibs/ is used at runtime.")
 endif()
+
+# ==================== DiLink 5 Camera Sidecar Executable & Hook ====================
+add_executable(dilink5_cam_sidecar
+    camera/dilink5_cam_sidecar.cpp
+)
+target_link_libraries(dilink5_cam_sidecar
+    dl
+    log
+)
+
+add_library(hook_qcarcam SHARED
+    camera/hook_qcarcam.cpp
+)
+target_link_libraries(hook_qcarcam
+    dl
+    log
+)
 
 # ==================== NEON SIMD Optimization ====================
 # Enable NEON for ARM architectures

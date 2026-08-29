@@ -305,8 +305,21 @@ public final class ScreenDeterrent {
     }
 
     private static boolean isAccUnsafe() {
-        return !com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative()
-                || com.overdrive.app.monitor.AccMonitor.isAccOn();
+        if (!com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative()
+                || com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+            return true;
+        }
+        try {
+            com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (collector != null) {
+                com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                if (vd != null) {
+                    if (vd.speedKmh > 0 && vd.speedKmh != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) return true;
+                    if (vd.gearMode > com.overdrive.app.monitor.GearMonitor.GEAR_P && vd.gearMode <= com.overdrive.app.monitor.GearMonitor.GEAR_S) return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
     }
 
     /**
@@ -1504,5 +1517,20 @@ public final class ScreenDeterrent {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    private static boolean isVehicleActive() {
+        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) return true;
+        try {
+            com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (collector != null) {
+                com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                if (vd != null) {
+                    if (vd.speedKmh > 0 && vd.speedKmh != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) return true;
+                    if (vd.gearMode > com.overdrive.app.monitor.GearMonitor.GEAR_P && vd.gearMode <= com.overdrive.app.monitor.GearMonitor.GEAR_S) return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
     }
 }

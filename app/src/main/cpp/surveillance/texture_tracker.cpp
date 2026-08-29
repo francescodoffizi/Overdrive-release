@@ -6,7 +6,7 @@
 // OpenCV for template matching (available in opencv-mobile imgproc)
 // The build system defines HAVE_OPENCV=1 via CMake, and opencv_modules.hpp
 // defines HAVE_OPENCV_IMGPROC (without a value). Use #ifdef, not #if.
-#ifdef HAVE_OPENCV
+#if HAVE_OPENCV
 #include <opencv2/imgproc.hpp>
 #include <opencv2/core.hpp>
 #define USE_OPENCV_IMGPROC

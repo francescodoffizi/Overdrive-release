@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/bg_dark"
+    android:padding="14dp">
+
+    <!-- Header -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginBottom="10dp">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="DiLink 5 Camera &amp; AVM Probe"
+                android:textColor="@color/text_main"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="BYD Sealion 7 / DiLink 5 (EVS, QCarCam, Camera1/2 &amp; TS AVM AIDL)"
+                android:textColor="@color/text_muted"
+                android:textSize="11sp"
+                android:layout_marginTop="2dp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvFpsMonitor"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@color/console_text"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:typeface="monospace"
+            android:text="IDLE" />
+    </LinearLayout>
+
+    <!-- Controls Card -->
+    <com.google.android.material.card.MaterialCardView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        app:cardBackgroundColor="@color/card_bg"
+        app:strokeColor="@color/card_border"
+        app:strokeWidth="1dp"
+        app:cardCornerRadius="10dp"
+        app:cardElevation="0dp"
+        android:layout_marginBottom="10dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <TextView
+                android:id="@+id/tvStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/status_ready"
+                android:textColor="@color/text_main"
+                android:textSize="13sp"
+                android:layout_marginBottom="6dp" />
+
+            <ProgressBar
+                android:id="@+id/progressBar"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="4dp"
+                android:indeterminate="true"
+                android:visibility="gone"
+                android:layout_marginBottom="8dp" />
+
+            <!-- Row 1: Primary Actions -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginBottom="6dp">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnRun"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Esegui Dump ZIP"
+                    android:textColor="#000000"
+                    android:textStyle="bold"
+                    app:backgroundTint="@color/primary_accent"
+                    app:cornerRadius="6dp"
+                    android:textAllCaps="false"
+                    android:textSize="12sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnTsAvmProbe"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:layout_marginStart="8dp"
+                    android:text="1. Bind TS AVM"
+                    android:textColor="@color/text_main"
+                    app:strokeColor="@color/primary_accent"
+                    app:strokeWidth="1dp"
+                    app:backgroundTint="@color/card_bg"
+                    app:cornerRadius="6dp"
+                    android:textAllCaps="false"
+                    android:textSize="12sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnStartAvm"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:layout_marginStart="8dp"
+                    android:text="2. startAvm()"
+                    android:textColor="@color/text_main"
+                    app:strokeColor="@color/card_border"
+                    app:strokeWidth="1dp"
+                    app:backgroundTint="@color/card_bg"
+                    app:cornerRadius="6dp"
+                    android:textAllCaps="false"
+                    android:textSize="12sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnStopAvm"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:layout_marginStart="8dp"
+                    android:text="stopAvm()"
+                    android:textColor="@color/text_main"
+                    app:strokeColor="@color/card_border"
+                    app:strokeWidth="1dp"
+                    app:backgroundTint="@color/card_bg"
+                    app:cornerRadius="6dp"
+                    android:textAllCaps="false"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <!-- Row 2: Stream & Framework Probes -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnCamera1Probe"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Test Camera1 Legacy"
+                    android:textColor="@color/text_main"
+                    app:strokeColor="@color/card_border"
+                    app:strokeWidth="1dp"
+                    app:backgroundTint="@color/card_bg"
+                    app:cornerRadius="6dp"
+                    android:textAllCaps="false"
+                    android:textSize="12sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnCamera2Probe"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:layout_marginStart="8dp"
+                    android:text="Test Camera2 API"
+                    android:textColor="@color/text_main"
+                    app:strokeColor="@color/card_border"
+                    app:strokeWidth="1dp"
+                    app:backgroundTint="@color/card_bg"
+                    app:cornerRadius="6dp"
+                    android:textAllCaps="false"
+                    android:textSize="12sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnTsFrameworkProbe"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:layout_marginStart="8dp"
+                    android:text="Scan ts-framework.jar"
+                    android:textColor="@color/text_main"
+                    app:strokeColor="@color/card_border"
+                    app:strokeWidth="1dp"
+                    app:backgroundTint="@color/card_bg"
+                    app:cornerRadius="6dp"
+                    android:textAllCaps="false"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tvOutputPath"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/primary_accent"
+                android:textSize="11sp"
+                android:layout_marginTop="4dp"
+                android:visibility="gone"
+                android:textIsSelectable="true" />
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- Console Log Card -->
+    <com.google.android.material.card.MaterialCardView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        app:cardBackgroundColor="@color/console_bg"
+        app:strokeColor="@color/card_border"
+        app:strokeWidth="1dp"
+        app:cardCornerRadius="10dp"
+        app:cardElevation="0dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="#14181F"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="5dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Console Output"
+                    android:textColor="@color/text_muted"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
+
+                <View
+                    android:layout_width="0dp"
+                    android:layout_height="1dp"
+                    android:layout_weight="1" />
+
+                <TextView
+                    android:id="@+id/tvLineCount"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="0 righe"
+                    android:textColor="@color/text_muted"
+                    android:textSize="10sp" />
+            </LinearLayout>
+
+            <ScrollView
+                android:id="@+id/scrollConsole"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:padding="10dp"
+                android:fillViewport="true">
+
+                <TextView
+                    android:id="@+id/tvConsole"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:typeface="monospace"
+                    android:textColor="@color/console_text"
+                    android:textSize="11sp"
+                    android:lineSpacingExtra="2dp"
+                    android:textIsSelectable="true"
+                    android:text="[INFO] Pronto per test Camera1/2 &amp; TS AVM.\n" />
+            </ScrollView>
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+</LinearLayout>

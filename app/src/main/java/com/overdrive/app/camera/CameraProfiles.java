@@ -22,6 +22,7 @@ public final class CameraProfiles {
     public static final String PROFILE_LEGACY_SEAL_ATTO = "legacy_seal_atto";
     public static final String PROFILE_ATTO_3 = "atto3";
     public static final String PROFILE_TANG_2022 = "tang_2022";
+    public static final String PROFILE_DILINK5_SEALION7 = "dilink5_sealion7";
 
     private static final LinkedHashMap<String, CameraProfile> PROFILES = new LinkedHashMap<>();
 
@@ -77,6 +78,30 @@ public final class CameraProfiles {
                 legacyMappings,
                 FOV_DEG_DEFAULT));
 
+        EnumMap<CameraRole, CameraSourceRef> dilink5Mappings = new EnumMap<>(CameraRole.class);
+        dilink5Mappings.put(CameraRole.WINDSHIELD, CameraSourceRef.direct(0));
+        dilink5Mappings.put(CameraRole.PANO_FRONT, CameraSourceRef.direct(0));
+        dilink5Mappings.put(CameraRole.PANO_REAR, CameraSourceRef.direct(1));
+        dilink5Mappings.put(CameraRole.PANO_LEFT, CameraSourceRef.direct(2));
+        dilink5Mappings.put(CameraRole.PANO_RIGHT, CameraSourceRef.direct(3));
+
+        // Field-verified on BYD Sealion 7 (DiLink 5.0 / Snapdragon SA8155P):
+        // Raw hardware QCarCam / AIS stream at 1920x1300 @ 30 FPS.
+        // Direct Full HD 1920x1080 encoder canvas (16:9 aspect ratio).
+        register(new CameraProfile(
+                PROFILE_DILINK5_SEALION7,
+                "BYD DiLink 5.0 (Sealion 7 / Snapdragon 8155)",
+                0,
+                1920,
+                1300,
+                0,
+                1920,
+                1080,
+                dilink5Mappings,
+                FOV_DEG_DEFAULT,
+                1920,
+                1080));
+
         EnumMap<CameraRole, CameraSourceRef> tangMappings = new EnumMap<>(legacyMappings);
         tangMappings.put(CameraRole.WINDSHIELD, CameraSourceRef.direct(0));
         register(new CameraProfile(
@@ -114,20 +139,18 @@ public final class CameraProfiles {
                     .replace("-", "")
                     .replace("_", "")
                     .replace(" ", "");
+            if (normalized.contains("sealion") || normalized.contains("sealion7") || normalized.contains("dilink5")) {
+                return get(PROFILE_DILINK5_SEALION7);
+            }
             if (normalized.contains("atto3") || normalized.contains("yuanplus")) {
                 return get(PROFILE_ATTO_3);
             }
         }
 
-        // Tang profile split remains disabled. Its separate profile caused
-        // daemon hangs on the tested firmware, so unknown/Tang models retain
-        // the camera-1 legacy fallback until a field-verified mapping exists.
-        // if (vehicleModel != null) {
-        //     String normalized = vehicleModel.toLowerCase(Locale.US);
-        //     if (normalized.contains("tang")) {
-        //         return get(PROFILE_TANG_2022);
-        //     }
-        // }
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            return get(PROFILE_DILINK5_SEALION7);
+        }
+
         return getLegacyDefault();
     }
 

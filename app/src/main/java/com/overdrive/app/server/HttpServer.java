@@ -1245,7 +1245,11 @@ public class HttpServer {
         status.put("streaming", TcpCommandServer.getStreamingCameras());
         status.put("available", TcpCommandServer.getAvailableCameras());
         status.put("battery", BatteryMonitor.getBatteryInfo());
-        status.put("acc", AccMonitor.isAccOn());
+        boolean currentAcc = AccMonitor.isAccOn();
+        if (CameraDaemon.getRecordingModeManager() != null) {
+            currentAcc = CameraDaemon.getRecordingModeManager().isAccOn();
+        }
+        status.put("acc", currentAcc);
         
         // Safe zone status (so UI can show suppressed state)
         com.overdrive.app.surveillance.SafeLocationManager safeMgr =
@@ -1363,10 +1367,13 @@ public class HttpServer {
             // SOH not available
         }
         
-        // GPU surveillance status — only true when actually in sentry/surveillance mode,
-        // not when pipeline is running for normal recording (CONTINUOUS, PROXIMITY_GUARD)
+        // GPU surveillance status — true when in sentry/surveillance mode or enabled on DiLink 5
         com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
-        status.put("gpuSurveillance", pipeline != null && pipeline.isSurveillanceMode());
+        boolean survEnabled = false;
+        try {
+            survEnabled = com.overdrive.app.config.UnifiedConfigManager.isSurveillanceEnabled();
+        } catch (Throwable ignored) {}
+        status.put("gpuSurveillance", (pipeline != null && pipeline.isSurveillanceMode()) || survEnabled);
         
         // Recording mode details (for status overlay)
         try {

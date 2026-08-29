@@ -419,8 +419,23 @@ public class GpuSurveillancePipeline {
                                    File eventOutputDir) {
         this.cameraWidth = cameraWidth;
         this.cameraHeight = cameraHeight;
-        this.encoderWidth = Math.max(1, encoderWidth);
-        this.encoderHeight = Math.max(1, encoderHeight);
+        boolean isDilink5 = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
+        com.overdrive.app.camera.ResolvedCameraConfig resolved =
+            com.overdrive.app.camera.CameraConfigResolver.resolve();
+        if (isDilink5) {
+            this.encoderWidth = 1920;
+            this.encoderHeight = 1080;
+        } else if (resolved != null && resolved.getProfile() != null) {
+            this.encoderWidth = resolved.getProfile().getEncoderWidth();
+            this.encoderHeight = resolved.getProfile().getEncoderHeight();
+        } else {
+            // Encoder/mosaic dims are derived from the strip aspect: each tile is
+            // (cameraWidth/4) wide x cameraHeight tall, mosaic is 2x2 of tiles, so
+            // encoder = (cameraWidth/2) x (cameraHeight*2). Seal 5120x960 → 2560x1920
+            // (4:3 quadrants). Tang 5120x720 → 2560x1440 (16:9 quadrants).
+            this.encoderWidth = Math.max(1, encoderWidth);
+            this.encoderHeight = Math.max(1, encoderHeight);
+        }
         this.sharedLaneHeight =
             com.overdrive.app.camera.CameraConfigResolver.isPassiveApaModeEnabled()
                 ? com.overdrive.app.camera.PassiveApaGeometry.HEIGHT
@@ -4685,20 +4700,20 @@ public class GpuSurveillancePipeline {
         streamScaler = new com.overdrive.app.streaming.GpuStreamScaler(
             streamWidth, streamHeight, streamQuadrantStripOffsetX);
 
-        try {
-            android.content.Context odCtx = savedContext;
-            if (odCtx == null) odCtx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
-            if (odCtx != null) {
-                com.overdrive.app.od.Od.authorize(odCtx);
-            } else {
-                logger.error("od authorize skipped: no context available");
+            try {
+                android.content.Context odCtx = savedContext;
+                if (odCtx == null) odCtx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+                if (odCtx != null) {
+                    com.overdrive.app.od.Od.authorize(odCtx);
+                } else {
+                    logger.error("od authorize skipped: no context available");
+                }
+            } catch (Throwable t) {
+                logger.warn("od init failed: " + t.getMessage());
             }
-        } catch (Throwable t) {
-            logger.warn("od init failed: " + t.getMessage());
-        }
 
         // Match the recorder exactly: 0=legacy strip, 1=full-frame passive
-        // APA, 3=four-corner DiLink 4 remap.
+        // APA (and DiLink 5), 3=four-corner DiLink 4 remap.
         streamScaler.setCameraLayout(streamLayout);
 
         // Hardcoded Variant A corner+flip constants on DiLink 4. Mirrors
@@ -4735,6 +4750,8 @@ public class GpuSurveillancePipeline {
             } catch (Throwable t) {
                 logger.warn("Stream scaler red-mask flag read failed: " + t.getMessage());
             }
+        } else if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            streamScaler.setRedMaskEnabled(false);
         }
         
         // Initialize on GL thread and WAIT for completion.
@@ -8805,6 +8822,15 @@ public class GpuSurveillancePipeline {
      * @param mode 0=Mosaic (2x2 grid), 1=Front, 2=Right, 3=Rear, 4=Left
      */
     public void setStreamViewMode(int mode) {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            int hookMode = 4; // 4 = 2x2 Mosaic
+            if (mode == 0) hookMode = 4;      // Tutte le telecamere
+            else if (mode == 1) hookMode = 0; // Anteriore (Front)
+            else if (mode == 2) hookMode = 1; // Destra (Right)
+            else if (mode == 3) hookMode = 2; // Posteriore (Rear)
+            else if (mode == 4) hookMode = 3; // Sinistra (Left)
+            com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.setActiveCamera(hookMode);
+        }
         if (streamScaler != null) {
             streamScaler.setViewMode(mode);
             logger.info("Stream view mode changed to " + mode);

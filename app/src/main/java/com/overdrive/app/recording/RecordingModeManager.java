@@ -1890,14 +1890,15 @@ public class RecordingModeManager {
             // Legacy mode (non-dilink4) keeps the original teardown
             // behaviour — the close+reopen race is dilink4-firmware-
             // specific.
-            boolean dilink4 = false;
+            boolean dilinkKeepAlive = false;
             try {
-                dilink4 = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+                dilinkKeepAlive = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic()
+                        || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
             } catch (Throwable t) {
-                logger.warn("dilink4 mode probe failed: " + t.getMessage());
+                logger.warn("dilink mode probe failed: " + t.getMessage());
             }
 
-            if (dilink4) {
+            if (dilinkKeepAlive) {
                 if (pipeline.isRunning()) {
                     logger.info("ACC OFF (dilink4) — finalize recording, keep camera alive (oem-parity, unconditional)");
                     try {
@@ -3170,6 +3171,10 @@ public class RecordingModeManager {
      * reconnected device on the next tick automatically.
      */
     private boolean queryAccStateFromHardware() {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            boolean isAccOff = com.overdrive.app.monitor.AccMonitor.probeAccState(context);
+            return !isAccOff;
+        }
         resolveBodyworkReflection();
         if (bodyworkReflectionResolved) {
             try {
