@@ -148,6 +148,17 @@ public final class LogUploader {
         return sb.toString();
     }
 
+    /**
+     * Read a bounded local tail and apply the same secret redaction used by
+     * support uploads. This performs no upload and opens no network client.
+     */
+    public static String readRedactedTail(
+            String path, long requestedMaxBytes) throws Exception {
+        long maxBytes = Math.max(
+                1L, Math.min(requestedMaxBytes, MAX_TAIL_BYTES));
+        return redact(readTail(path, maxBytes));
+    }
+
     private static Result doUpload(String content, String daemonLabel, String appVersion)
             throws Exception {
         String url = BuildConfig.LOG_UPLOAD_URL;

@@ -195,7 +195,7 @@ public class GpuStreamScaler {
     
     // View mode: 0=Mosaic, 1=Front, 2=Right, 3=Rear, 4=Left, 5=Raw
     private volatile int currentViewMode = 0;
-    private volatile int cameraLayout = 0;  // 0=4-cam, 1=APA, 2=3-cam
+    private volatile int cameraLayout = 0;  // 0=4-cam, 1=full-frame APA, 2=3-cam, 3=2x2 remap
     
     // Vertex data
     private FloatBuffer vertexBuffer;
@@ -541,9 +541,9 @@ public class GpuStreamScaler {
                 if (uBsRectifyAspectLocation >= 0) GLES20.glUniform1f(uBsRectifyAspectLocation, bsRectifyAspect);
             }
             if (uApplyManualYFlipLocation >= 0) {
-                // Legacy → manual Y-flip; DiLink 4 → matrix handles it.
+                // SurfaceTexture layouts 1/3 use the matrix's Y-flip.
                 GLES20.glUniform1f(uApplyManualYFlipLocation,
-                    cameraLayout == 3 ? 0.0f : 1.0f);
+                    (cameraLayout == 1 || cameraLayout == 3) ? 0.0f : 1.0f);
             }
             if (uRedMaskStrengthLocation >= 0) {
                 GLES20.glUniform1f(uRedMaskStrengthLocation, redMaskEnabled ? 1.0f : 0.0f);

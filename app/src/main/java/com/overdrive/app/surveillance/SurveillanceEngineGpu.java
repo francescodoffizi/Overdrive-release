@@ -258,7 +258,13 @@ public class SurveillanceEngineGpu {
     // same single sequence-start point. The correlated-lighting guard's
     // onset-vs-sequence-start comparison runs entirely in the monotonic
     // domain (audit R2 #4). Only meaningful while firstMotionTime > 0.
-    private long firstMotionElapsedMs = 0;
+    // volatile: written on the engine thread only; the multi-batch
+    // confirmation SHADOW block (aiExecutor thread) reads it for its
+    // sequence-scoped batch count. A plain long read across threads could
+    // tear/staleness — volatile keeps the diagnostic honest without any
+    // lock-protocol coupling. Trigger logic is unaffected (its readers stay
+    // on the engine thread).
+    private volatile long firstMotionElapsedMs = 0;
     // CORRELATED-LIGHTING GUARD (audit finding on the I3 scoping change): one
     // physical lighting event can suppress camera A while its light POOL
     // shows up as ordinary coherent MEDIUM+ motion in camera B — per-quadrant
@@ -667,13 +673,10 @@ public class SurveillanceEngineGpu {
     // sustained loitering, and the trigger fires immediately past the gap if motion
     // continues). Only active when aiAvailable=false; YOLO installs are unaffected.
     
-    // YOLO CONFIRMATION GATE: Track when YOLO last confirmed a real threat object.
-    // For THREAT_MEDIUM: recording requires YOLO confirmation within the motion sequence
-    // (with 2-second timeout fallback if YOLO is unavailable/broken).
-    // For THREAT_HIGH: only gated during deterrent window (loitering evidence is strong enough otherwise).
-    // This makes AI-based background subtraction effective against ALL lighting artifacts,
-    // not just the deterrent flash.
-    private volatile long lastAiConfirmationTimeMs = 0;  // When YOLO last found a real object
+    // YOLO CONFIRMATION GATE: while AI is available, recording requires a
+    // current-sequence person or a new/moved non-baseline object. Motion-only
+    // timeout and proximity paths cannot authorize a static/unclassified scene.
+    private volatile long lastAiConfirmationElapsedMs = 0;
     // When YOLO last confirmed a PERSON specifically. The track-anchored
     // confirmation + standing-person-immunity recency gates key on THIS (not the
     // class-agnostic timestamp): a held in-zone track is classId==0 (person), so
@@ -681,8 +684,7 @@ public class SurveillanceEngineGpu {
     // class-agnostic timestamp let a passing CAR/BIKE certify a stale zombie
     // person track as fresh, firing a false recording on an unrelated burst.
     private volatile long lastPersonConfirmationTimeMs = 0;
-    // Monotonic twin used by the recording-continuation policy. The wall-clock
-    // timestamp above remains for sequence comparisons that already use wall time.
+    // Monotonic twin used by recording continuation and event evidence carry.
     private volatile long lastPersonConfirmationElapsedMs = 0;
     
     // Detection mode
@@ -1214,6 +1216,18 @@ public class SurveillanceEngineGpu {
     // the timeline + thumbnail + notification + UI layers. Does not affect motion
     // detection or recording trigger logic.
     private final ActorTracker actorTracker = new ActorTracker();
+
+    // SHADOW-MODE multi-batch confirmation counter (parked-car single-frame
+    // FP audit). LOG-ONLY — nothing in the trigger chain reads it. Counts
+    // DISTINCT AI batches per CrossQuadrantTracker trackId and, at each
+    // single-frame confirmation (the lastAiConfirmationElapsedMs stamp site),
+    // logs what an N(class)-batches-within-this-sequence gate WOULD have
+    // decided. Field-cycle goal: measure the FN cost (real short-window
+    // subjects that would have been deferred) and the FP win (one-frame blips
+    // that never reach N) before any enforcement. Candidate design +
+    // thresholds documented on MultiBatchConfirmationShadow.
+    private final MultiBatchConfirmationShadow aiConfirmShadow =
+            new MultiBatchConfirmationShadow();
     // Snapshot of the most recent Actor list, for callers that read state.
     // CopyOnWrite to keep reads lock-free for UI / API threads.
     private volatile java.util.List<Actor> lastActors = java.util.Collections.emptyList();
@@ -1265,7 +1279,7 @@ public class SurveillanceEngineGpu {
     // That latch is `!sequenceConfirmed`, and its comment assumes a shadow FP
     // "opens its AI gate via the PARKED CAR's own YOLO boxes, so sequenceConfirmed
     // == true and it stays discardable". Field log (2026-07-26 10:26:36 event)
-    // falsifies that: lastAiConfirmationTimeMs — the only setter of
+    // falsifies that: lastAiConfirmationElapsedMs — the only setter of
     // sequenceConfirmed — is written only when relevantCount > 0, i.e. AFTER the
     // baseline filter, and the baseline filter's whole job is to suppress those
     // parked-car boxes. So on a scene with an established baseline the latch can
@@ -1532,6 +1546,7 @@ public class SurveillanceEngineGpu {
      *  Published as a unit so cross-thread readers can't see a torn state. */
     private static final class YoloPublication {
         final java.util.List<com.overdrive.app.ai.Detection> detections;
+        final java.util.List<com.overdrive.app.ai.Detection> triggerDetections;
         final int frameHeightPx;
         // True when the SOURCE pixels were a foveated crop (audit R5 / R4
         // coords #1): the M2 fix publishes affine-mapped quadrant-space
@@ -1541,9 +1556,11 @@ public class SurveillanceEngineGpu {
         // for. Consumers needing "were these pixels foveated" read this
         // bit; consumers needing the coordinate SPACE keep frameHeightPx.
         final boolean wasFoveated;
-        YoloPublication(java.util.List<com.overdrive.app.ai.Detection> detections, int frameHeightPx,
-                boolean wasFoveated) {
+        YoloPublication(java.util.List<com.overdrive.app.ai.Detection> detections,
+                java.util.List<com.overdrive.app.ai.Detection> triggerDetections,
+                int frameHeightPx, boolean wasFoveated) {
             this.detections = detections;
+            this.triggerDetections = triggerDetections;
             this.frameHeightPx = frameHeightPx;
             this.wasFoveated = wasFoveated;
         }
@@ -2938,7 +2955,7 @@ public class SurveillanceEngineGpu {
         // 0, can never satisfy it. Defense-in-depth: stopRecording() and the hard
         // ceiling also drop all tracks so the zombie can't persist at all.
         //
-        // YOLO-RECENCY GATE (now - lastAiConfirmationTimeMs <= TRACK_ANCHOR_RECENCY_MS):
+        // YOLO-RECENCY GATE (now - lastPersonConfirmationTimeMs <= TRACK_ANCHOR_RECENCY_MS):
         // the revive-only guard alone is not enough for the PRE-recording case. If a
         // person stood in-zone long enough to start a sequence (firstMotionTime set)
         // then LEFT before the sequence triggered, the native track is NOT torn down
@@ -2949,7 +2966,7 @@ public class SurveillanceEngineGpu {
         // track-anchored-confirmation sibling already uses: only a track backed by a
         // genuine YOLO hit within the last TRACK_ANCHOR_RECENCY_MS keeps immunity. A
         // truly-present standing person is continuously re-confirmed (heartbeat /
-        // early-AI), refreshing lastAiConfirmationTimeMs, so the legitimate fix
+        // early-AI), refreshing lastAiConfirmationElapsedMs, so the legitimate fix
         // survives; a departed-person zombie's last confirmation goes stale and
         // immunity lapses, letting the sequence end normally.
         boolean recentYoloForImmunity = lastPersonConfirmationTimeMs > 0
@@ -3596,7 +3613,7 @@ public class SurveillanceEngineGpu {
             // (the only tracker seed is trackerStartTrack from a YOLO 'best' —
             // see ~:3150). So an in-zone person track held right now is itself
             // standing confirmation that a real person is at the car, even if
-            // lastAiConfirmationTimeMs predates this sequence's firstMotionTime.
+            // the last AI confirmation predates this sequence's firstMotionElapsedMs.
             // This matters across a ZONE-BOUNDARY JITTER: a person pacing in and
             // out of the configured zone trips the gap-branch firstMotionTime
             // reset, so on re-entry the YOLO timestamp looks "stale" and the
@@ -3642,7 +3659,8 @@ public class SurveillanceEngineGpu {
             // confirmation; the second bridges a zone-boundary firstMotionTime
             // reset for an already-identified, still-tracked person.
             boolean sequenceConfirmed =
-                    (lastAiConfirmationTimeMs >= firstMotionTime) || inZonePersonTrackerHeld;
+                    (lastAiConfirmationElapsedMs >= firstMotionElapsedMs)
+                    || inZonePersonTrackerHeld;
 
             // Brightness-event flags (hoisted): the lighting-artifact signature
             // that closes the close-zone / salience / vigilance paths and
@@ -3734,7 +3752,7 @@ public class SurveillanceEngineGpu {
                 // Approach fast-path: enabled (approachTriggerMs>0), AI confirmed a
                 // real object during THIS sequence, and the fast bar is shorter than
                 // the loiter bar. firstMotionTime>0 guards against a stale prior-
-                // sequence confirmation leaking in (lastAiConfirmationTimeMs is reset
+                // sequence confirmation leaking in (lastAiConfirmationElapsedMs is reset
                 // on enable()/sequence handling).
                 if (approachTriggerMs > 0
                         && firstMotionTime > 0
@@ -4281,6 +4299,14 @@ public class SurveillanceEngineGpu {
                             peakThreatDuringSequence = 0;
                         }
                     }
+
+                    // With AI available, only a current-sequence person or
+                    // new/moved non-baseline object may authorize recording.
+                    // This is final: motion-only timeout/proximity/salience
+                    // overrides cannot revive a static or unclassified scene.
+                    if (aiAvailable && !aiRecentlyConfirmed) {
+                        shouldSuppress = true;
+                    }
                     
                     if (shouldSuppress) {
                         if (frameCount % 50 == 0) {
@@ -4294,7 +4320,7 @@ public class SurveillanceEngineGpu {
                                 brightnessEventCloseZoneScope ? "yes" : "no"));
                         }
                         // Don't reset firstMotionTime — let the timer keep running.
-                        // When YOLO confirms (or timeout expires), the trigger fires immediately.
+                        // When YOLO confirms a valid object, the trigger fires immediately.
                     }
                     // SOTA: Event stitching — if new motion appears shortly after the last
                     // recording stopped, start a new recording immediately. The previous
@@ -4649,7 +4675,7 @@ public class SurveillanceEngineGpu {
                 // or between quadrants, causing motion to drop below MEDIUM. But YOLO
                 // already verified they're real — don't kill the sequence prematurely.
                 boolean aiConfirmedDuringSequence = (firstMotionTime > 0) 
-                        && (lastAiConfirmationTimeMs >= firstMotionTime);
+                        && (lastAiConfirmationElapsedMs >= firstMotionElapsedMs);
                 for (int q = 0; q < MotionPipelineV2.NUM_QUADRANTS; q++) {
                     try {
                         if (NativeMotion.trackerHasActiveTrack(q)) {
@@ -5868,6 +5894,7 @@ public class SurveillanceEngineGpu {
                     
                     int relevantCount = motionFiltered.size();
                     motionFilteredCount = relevantCount;
+                    boolean triggerEvidenceFound = false;
                     
                     if (relevantCount > 0) {
                         // COORDINATE SPACE for DetectionBaseline (audit R3b
@@ -5929,12 +5956,35 @@ public class SurveillanceEngineGpu {
                         // downstream keeps the NATIVE-space det (bbox↔pixels
                         // coherence for ActorTracker/ThumbnailBuffer).
                         java.util.List<com.overdrive.app.ai.Detection> baselineFiltered = new java.util.ArrayList<>();
+                        java.util.List<com.overdrive.app.ai.Detection> triggerSpaceDets =
+                                new java.util.ArrayList<>();
                         int baselineSuppressed = 0;
                         for (int di = 0; di < motionFiltered.size(); di++) {
                             com.overdrive.app.ai.Detection det = motionFiltered.get(di);
                             if (det.getClassId() == 0) {
                                 // Person — always pass through, never check baseline
                                 baselineFiltered.add(det);
+                                triggerSpaceDets.add(baselineSpaceDets != null
+                                        ? baselineSpaceDets.get(di) : det);
+                                triggerEvidenceFound = true;
+                                // SHADOW (containment validation, log-only): a person
+                                // box heavily overlapped by a confirmed baseline entry
+                                // is the "parked-car part misread as person" FP
+                                // signature the multi-batch audit is chasing — class 0
+                                // bypasses the baseline by design, so this is the only
+                                // place the geometry can be captured. Suppresses
+                                // nothing; fail-silent (instrumentation must never
+                                // break the trigger path).
+                                if (baselineSpaceDets != null) {
+                                    try {
+                                        String diag = detectionBaseline.shadowContainmentDiag(
+                                                baselineSpaceDets.get(di), qIdx, qWNorm, qHNorm);
+                                        if (diag != null) {
+                                            logger.info("Baseline shadow Q" + qIdx
+                                                    + " (person-bypass): " + diag);
+                                        }
+                                    } catch (Throwable ignored) {}
+                                }
                             } else if (baselineSpaceDets != null
                                     && detectionBaseline.isInBaseline(
                                             baselineSpaceDets.get(di), qIdx, qWNorm, qHNorm)) {
@@ -5943,6 +5993,31 @@ public class SurveillanceEngineGpu {
                             } else {
                                 // New or moved non-person object — pass through
                                 baselineFiltered.add(det);
+                                // A non-person may authorize recording only
+                                // when baseline comparison was actually possible.
+                                if (baselineSpaceDets != null) {
+                                    triggerSpaceDets.add(baselineSpaceDets.get(di));
+                                    triggerEvidenceFound = true;
+                                    // SHADOW (containment validation, log-only): this
+                                    // det just PASSED the baseline and can authorize a
+                                    // recording. If it is largely CONTAINED in a
+                                    // confirmed entry (split box of a parked car: IoU
+                                    // < 0.7 and the foot-point/size checks fail, but
+                                    // the fragment lies INSIDE the stored full-car
+                                    // box), the candidate rule "contain >= 0.80 +
+                                    // same canonical class => suppress" would have
+                                    // caught it. Log the geometry so field data can
+                                    // prove or kill that hypothesis before it gates
+                                    // anything. Fail-silent by design.
+                                    try {
+                                        String diag = detectionBaseline.shadowContainmentDiag(
+                                                baselineSpaceDets.get(di), qIdx, qWNorm, qHNorm);
+                                        if (diag != null) {
+                                            logger.info("Baseline shadow Q" + qIdx
+                                                    + " (nonperson-pass): " + diag);
+                                        }
+                                    } catch (Throwable ignored) {}
+                                }
                             }
                         }
                         
@@ -5964,6 +6039,7 @@ public class SurveillanceEngineGpu {
                         lastYoloPublication.set(qIdx, new YoloPublication(
                                 new java.util.ArrayList<>(
                                         baselineSpaceDets != null ? baselineSpaceDets : motionFiltered),
+                                triggerSpaceDets,
                                 baselineSpaceDets != null ? qHNorm : qH,
                                 usedFoveated));
                         lastEventQuadrant = qIdx;
@@ -6017,7 +6093,9 @@ public class SurveillanceEngineGpu {
                         // YOLO confirmed a real object — update AI confirmation timestamp.
                         // This is used by the deterrent flash guard to allow recording
                         // even during the suppression window if YOLO sees a real threat.
-                        lastAiConfirmationTimeMs = System.currentTimeMillis();
+                        if (triggerEvidenceFound) {
+                            lastAiConfirmationElapsedMs = detectionObservationElapsedMs;
+                        }
                         // PERSON-specific timestamp for the track-anchored / immunity
                         // recency gates (a held in-zone track is a person; only a
                         // recent PERSON hit may certify it fresh). GENERATION-GATED:
@@ -6131,6 +6209,72 @@ public class SurveillanceEngineGpu {
 
                         java.util.List<CrossQuadrantTracker.TrackResult> tracked =
                                 crossQuadrantTracker.processDetections(cqtDetections, qIdx, obsWallMs);
+
+                        // ------ MULTI-BATCH CONFIRMATION SHADOW (log-only) ------
+                        // The stamp above (lastAiConfirmationElapsedMs) confirmed
+                        // this sequence from a SINGLE qualifying frame. Candidate
+                        // replacement under field validation: require the same
+                        // CQT-tracked object across N(class) DISTINCT AI batches
+                        // within the current motion sequence (person 2,
+                        // vehicle/bike 3, other 2). This block only counts and
+                        // logs the would-be verdict next to today's behavior — it
+                        // gates nothing and writes no trigger state. Sequence
+                        // scoping = stamps >= firstMotionElapsedMs, the same
+                        // comparison idiom sequenceConfirmed uses, so stale
+                        // stamps stop counting on their own when a new sequence
+                        // starts (no cross-sequence carry, no handoff reset —
+                        // CQT ids survive camera handoffs). The N batches must
+                        // additionally cluster inside MAX_CONFIRM_WINDOW_MS of
+                        // the newest one (review fix): a sequence can live for
+                        // minutes, and without a recency bound a sporadic false
+                        // box would accumulate to N across a long shadow storm.
+                        try {
+                            final long shadowSeqStart = firstMotionElapsedMs;
+                            StringBuilder shadowSb = null;
+                            boolean shadowWouldConfirm = false;
+                            for (int si = 0; si < motionFiltered.size(); si++) {
+                                com.overdrive.app.ai.Detection sd = motionFiltered.get(si);
+                                // Trigger-evidence mirror of the baseline filter loop
+                                // above: persons always qualify; non-persons only when
+                                // the baseline comparison was possible (mappable
+                                // coords — same usedFoveated/fovMapValid condition
+                                // that decided baselineSpaceDets there). Checked
+                                // BEFORE counting (review fix): a detection the gate
+                                // could never stamp from must not advance the counter
+                                // either — otherwise unmappable-foveated batches
+                                // contribute hidden counts and the shadow verdict
+                                // reads optimistic vs the gate it models.
+                                boolean sEvidence = sd.getClassId() == 0
+                                        || !(usedFoveated && !fovMapValid);
+                                if (!sEvidence) continue;
+                                int sTid = si < tracked.size() ? tracked.get(si).trackId : 0;
+                                int inSeq = aiConfirmShadow.observe(
+                                        sTid, sd.getClassId(),
+                                        detectionObservationElapsedMs, shadowSeqStart);
+                                int sNeed = MultiBatchConfirmationShadow
+                                        .requiredBatches(sd.getClassId());
+                                boolean sMet = inSeq >= sNeed;
+                                shadowWouldConfirm |= sMet;
+                                if (shadowSb == null) shadowSb = new StringBuilder(96);
+                                else shadowSb.append("; ");
+                                shadowSb.append("trk#").append(sTid)
+                                        .append(" cls=").append(sd.getClassId())
+                                        .append(String.format(java.util.Locale.US,
+                                                " conf=%.2f", sd.getConfidence()))
+                                        .append(" seqBatches=").append(inSeq)
+                                        .append('/').append(sNeed)
+                                        .append(sMet ? " (met)" : "");
+                            }
+                            if (triggerEvidenceFound && shadowSb != null) {
+                                logger.info("AI-confirm shadow Q" + qIdx
+                                        + ": today=stamped, wouldBe="
+                                        + (shadowWouldConfirm ? "CONFIRM" : "DEFER")
+                                        + " | " + shadowSb);
+                            }
+                        } catch (Throwable shadowT) {
+                            // Instrumentation must never break the AI pipeline.
+                            logger.debug("Confirm-shadow logging failed: " + shadowT);
+                        }
 
                         // ActorTracker + ThumbnailBuffer want bboxes in cropData's
                         // NATIVE coord space so the bbox-vs-rgb pair stays coherent
@@ -7508,7 +7652,8 @@ public class SurveillanceEngineGpu {
         // the new tick's; never new detections paired with old frame H.
         if (quadrant >= 0 && quadrant < lastYoloPublication.length()) {
             YoloPublication pub = lastYoloPublication.get(quadrant);
-            if (pub != null && pub.detections != null && !pub.detections.isEmpty()) {
+            if (pub != null && pub.triggerDetections != null
+                    && !pub.triggerDetections.isEmpty()) {
                 int frameH = pub.frameHeightPx > 0 ? pub.frameHeightPx : (THUMBNAIL_HEIGHT / 2);
                 // Per-quadrant base FOV from the active CameraProfile.
                 // Side-camera FOV is materially narrower than front/rear,
@@ -7549,12 +7694,12 @@ public class SurveillanceEngineGpu {
                 // mappable foveated runs, silently disabling this guard —
                 // the bit restores it regardless of publication space.
                 if ((isFoveated || pub.wasFoveated)
-                        && isInTileEdgeBand(pub.detections, frameH)) {
+                        && isInTileEdgeBand(pub.triggerDetections, frameH)) {
                     // Fall through to Technique B below.
                 } else {
                     DistanceEstimator.ProximityEstimate est =
                             DistanceEstimator.fromYoloDetections(
-                                    pub.detections, frameH, fovDeg, trend);
+                                    pub.triggerDetections, frameH, fovDeg, trend);
                     if (est != null) return est;
                 }
             }
@@ -8000,7 +8145,7 @@ public class SurveillanceEngineGpu {
         // currentEventFile are cleared before the publish tail runs).
         java.util.List<Actor> liveSnap = finalNotificationActors();
         sendFinalTelegramNotification(videoFilename, heroPhotoPath,
-                liveSnap, lastActors, snapshotSceneryIds(liveSnap), currentEventFile);
+                liveSnap, lastActors, snapshotSceneryIds(liveSnap), currentEventFile, null);
     }
 
     /** Snapshot variant (audit R8-2 / ExtC-3): consumes the caller's actor
@@ -8010,7 +8155,9 @@ public class SurveillanceEngineGpu {
                                                java.util.List<Actor> snapIn,
                                                java.util.List<Actor> liveActors,
                                                java.util.Set<Long> sceneryIdsIn,
-                                               File eventFile) {
+                                               File eventFile,
+                                               com.overdrive.app.camera.OemDashcamPipeline.FinalizedClip
+                                                       oemFinalizedClip) {
         // Event-peak union (not the TTL-pruned lastActors) so the caption names
         // the same actor the hero shows — see finalNotificationActors().
         java.util.List<Actor> snap = snapIn != null
@@ -8164,6 +8311,21 @@ public class SurveillanceEngineGpu {
             }
         } catch (Throwable t) {
             logger.debug("Telegram surveillance video send failed: " + t.getMessage());
+        }
+
+        // This OEM mirror was opened SURVEILLANCE_GATED, so deliver it only
+        // after the same parent-event tier gate above has passed.
+        try {
+            if (oemFinalizedClip != null
+                    && oemFinalizedClip.getPath() != null
+                    && new java.io.File(oemFinalizedClip.getPath()).exists()) {
+                String label = threat != null ? Actor.groupLabel(threat.classGroup) : null;
+                TelegramNotifier.notifyVideoRecorded(
+                        oemFinalizedClip.getPath(), label,
+                        oemFinalizedClip.getDurationSeconds());
+            }
+        } catch (Throwable t) {
+            logger.debug("Telegram OEM surveillance video send failed: " + t.getMessage());
         }
     }
 
@@ -8557,6 +8719,13 @@ public class SurveillanceEngineGpu {
                 }
             }
             logger.info("Fallback hero (from mp4 keyframe): " + outFile.getName());
+            // Idle cleanup gate: shared successful-write point for BOTH
+            // fallback-hero callers (rotation path is also covered by its
+            // task's finally-bump — double bump is harmless; the
+            // final-segment path at stop has no other bump).
+            try {
+                com.overdrive.app.storage.StorageManager.getInstance().markStorageDirty();
+            } catch (Throwable ignored) {}
         } catch (Throwable t) {
             logger.debug("Fallback hero extraction failed for " + mp4File.getName()
                     + ": " + t.getMessage());
@@ -10539,7 +10708,8 @@ public class SurveillanceEngineGpu {
         // joins the encoder drainer thread, after which no further frames or
         // segment-rotation listener calls can fire.
         recorder.stopEventRecording(true, 0);
-        // Symmetric OEM stop — fire-and-forget; never block pano teardown.
+        // Capture the finalized event-owned OEM mirror for gated delivery.
+        com.overdrive.app.camera.OemDashcamPipeline.FinalizedClip oemFinalizedClip = null;
         try {
             com.overdrive.app.camera.OemDashcamPipeline oemPipe =
                 com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
@@ -10554,7 +10724,10 @@ public class SurveillanceEngineGpu {
             // Engine has already absorbed the post-record window via its
             // own loop (lastMotionTime + postRecordMs gate). Pass 0 so the
             // OEM recorder finalizes promptly, matching pano's behaviour.
-            if (oemPipe != null) oemPipe.stopRecordingIfOwned(canStop, 0L);
+            if (oemPipe != null) {
+                oemFinalizedClip = oemPipe.stopRecordingIfOwnedAndGetFinalizedClip(
+                        canStop, 0L);
+            }
             oemEventOwned = false;
             oemEventOwnedGeneration = -1;
         } catch (Throwable t) {
@@ -10757,7 +10930,8 @@ public class SurveillanceEngineGpu {
                         stoppingNotifActors, stoppingSceneryIds); }
                 catch (Throwable t) { logger.debug("publishMotionFinal threw: " + t.getMessage()); }
                 try { sendFinalTelegramNotification(videoName, heroPath,
-                        stoppingNotifActors, stoppingActors, stoppingSceneryIds, stoppingFile); }
+                        stoppingNotifActors, stoppingActors, stoppingSceneryIds, stoppingFile,
+                        oemFinalizedClip); }
                 catch (Throwable t) { logger.debug("sendFinalTelegramNotification threw: " + t.getMessage()); }
             } else {
                 logger.debug("Final notification already sent for " + videoName + "; skipping duplicate");
@@ -11066,6 +11240,11 @@ public class SurveillanceEngineGpu {
                     // alone cannot distinguish a hero written just now from an
                     // orphan .jpg left at the same path by an earlier run.
                     lastSyncHeroMp4Name.set(segmentMp4.getName());
+                    // Idle cleanup gate: hero JPEG bytes land after the mp4's
+                    // save hook — bump so a parked idle tick sees them.
+                    try {
+                        com.overdrive.app.storage.StorageManager.getInstance().markStorageDirty();
+                    } catch (Throwable ignored) {}
                 }
             } else {
                 // Async hero path (rotation listener — no publish blocking
@@ -11121,6 +11300,11 @@ public class SurveillanceEngineGpu {
                         logger.warn("Hero thumbnail async write failed for "
                                 + segmentMp4.getName() + ": " + t.getMessage());
                     } finally {
+                        // Idle cleanup gate: async hero/fallback JPEG bytes
+                        // land after the save hook — one bump per batch.
+                        try {
+                            com.overdrive.app.storage.StorageManager.getInstance().markStorageDirty();
+                        } catch (Throwable ignored) {}
                         inFlightSegmentMetadata.decrementAndGet();
                         synchronized (segmentMetadataDrainLock) {
                             segmentMetadataDrainLock.notifyAll();
@@ -11164,6 +11348,11 @@ public class SurveillanceEngineGpu {
                             }
                         }
                     } finally {
+                        // Idle cleanup gate: per-actor JPEG bytes land after
+                        // the save hook — one bump per batch.
+                        try {
+                            com.overdrive.app.storage.StorageManager.getInstance().markStorageDirty();
+                        } catch (Throwable ignored) {}
                         inFlightSegmentMetadata.decrementAndGet();
                         synchronized (segmentMetadataDrainLock) {
                             segmentMetadataDrainLock.notifyAll();
@@ -11464,9 +11653,12 @@ public class SurveillanceEngineGpu {
         motionDetections = 0;
         firstMotionTime = 0;  // Reset sustained motion timer
         deterrentFiredTime = 0;  // Reset deterrent suppression
-        lastAiConfirmationTimeMs = 0;  // Reset AI confirmation gate
+        lastAiConfirmationElapsedMs = 0;  // Reset AI confirmation gate
         lastPersonConfirmationTimeMs = 0;  // Reset person-specific confirmation gate
         lastPersonConfirmationElapsedMs = 0;
+        // Shadow-only multi-batch confirmation counters (I2: every latch
+        // resets in enable()). Log-only state — hygiene, not correctness.
+        aiConfirmShadow.reset();
         for (int q = 0; q < MotionPipelineV2.NUM_QUADRANTS; q++) {
             lastRawDetectionElapsedMs.set(q, 0L);
         }

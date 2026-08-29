@@ -1,5 +1,5 @@
-/* Dedicated remote voice/message page. Communication resources exist only
- * while this visible page is actively being pressed. */
+/* Dedicated remote voice/message page. Talk resources are press-scoped;
+ * cabin-listener resources are explicit-toggle scoped. */
 var CommunicatePage = {
     STATUS_POLL_MS: 5000,
     SETUP_STATUS_POLL_MS: 15000,
@@ -7,16 +7,23 @@ var CommunicatePage = {
     TARGET_SAMPLE_RATE: 16000,
     MAX_SESSION_MS: 30000,
     AUDIO_INACTIVITY_MS: 3000,
+    MAX_CAPTURE_AGE_MS: 250,
+    WORKLET_MODULE_URL: '/shared/communicate-worklet.js?v=1',
 
     status: null,
     statusTimer: null,
+    statusGeneration: 0,
     tickTimer: null,
     stream: null,
     audioContext: null,
     sourceNode: null,
     processorNode: null,
     silentGain: null,
+    captureMode: '',
+    audioClockOffsetMs: 0,
+    staleCaptureFrames: 0,
     socket: null,
+    activePointerId: null,
     pressing: false,
     live: false,
     stopping: false,
@@ -34,8 +41,10 @@ var CommunicatePage = {
     messageKind: 'toast',
     messagePending: false,
     activeMobilePanel: 'talk',
+    listenerLastState: 'idle',
 
     init: function () {
+        this.bindCabinListener();
         this.bindTalk();
         this.bindOutputLevel();
         this.bindMessage();
@@ -44,6 +53,63 @@ var CommunicatePage = {
         this.setTalkState('disabled', 'Checking car...', '', '');
         this.loadOutputSettings();
         this.startStatusPolling(true);
+    },
+
+    bindCabinListener: function () {
+        var self = this;
+        var button = document.getElementById('cabinListenerToggle');
+        if (button) {
+            button.addEventListener('click', function () {
+                var current = CabinAudio.getState();
+                if (!current.active
+                        && (!self.status || !self.status.listenerReady)) {
+                    return;
+                }
+                CabinAudio.toggle();
+            });
+        }
+        CabinAudio.subscribe(function (status) {
+            self.renderCabinListener(status);
+        });
+    },
+
+    renderCabinListener: function (listener) {
+        var button = document.getElementById('cabinListenerToggle');
+        if (!button) return;
+        var active = listener.state === 'live';
+        var paused = listener.state === 'paused';
+        var connecting = listener.state === 'connecting';
+        var owned = active || paused || connecting;
+        var ready = !!(this.status && this.status.listenerReady);
+        button.disabled = !owned && (!ready || this.pressing || this.live);
+        button.classList.toggle('is-active', active);
+        button.classList.toggle('is-paused', paused);
+        button.classList.toggle('is-connecting', connecting);
+        button.setAttribute('aria-pressed', owned ? 'true' : 'false');
+        var label = button.querySelector('span');
+        var key = active
+            ? 'communicate.stop_listening'
+            : paused
+                ? 'communicate.listening_paused'
+                : connecting
+                    ? 'communicate.listener_starting'
+                    : 'communicate.listen';
+        var translated = BYD.i18n.t(key);
+        if (label && translated && translated !== key) {
+            label.textContent = translated;
+        }
+        button.title = owned
+            ? (translated || '')
+            : (this.status && this.status.listenerReason) || translated || '';
+        if (listener.state === 'error'
+                && this.listenerLastState !== 'error'
+                && BYD.utils
+                && BYD.utils.toast) {
+            BYD.utils.toast(
+                listener.reason || BYD.i18n.t('communicate.listener_unavailable'),
+                'error');
+        }
+        this.listenerLastState = listener.state;
     },
 
     bindTalk: function () {
@@ -63,6 +129,12 @@ var CommunicatePage = {
             });
             window.addEventListener('pointercancel', function (event) {
                 self.onPressEnd(event, 'Touch cancelled');
+            });
+            button.addEventListener('lostpointercapture', function (event) {
+                if (self.activePointerId === event.pointerId
+                        && (self.pressing || self.live)) {
+                    self.stopTalk('Touch cancelled');
+                }
             });
         } else {
             button.addEventListener('touchstart', function (event) {
@@ -257,7 +329,7 @@ var CommunicatePage = {
 
     renderOutputStatus: function (saved) {
         if (!this.outputOverrideEnabled) {
-            this.setOutputStatus(null, 'Using car media volume');
+            this.setOutputStatus(null, 'Using selected car volume');
         } else if (saved) {
             this.setOutputStatus(true, 'Saved');
         } else {
@@ -306,6 +378,7 @@ var CommunicatePage = {
         document.addEventListener('visibilitychange', function () {
             if (document.hidden) {
                 self.stopTalk('Page hidden', true);
+                CabinAudio.stop();
                 self.stopStatusPolling();
             } else {
                 self.loadOutputSettings();
@@ -314,10 +387,18 @@ var CommunicatePage = {
         });
         window.addEventListener('pagehide', function () {
             self.stopTalk('Page hidden', true);
+            CabinAudio.stop();
             self.stopStatusPolling();
+        });
+        window.addEventListener('pageshow', function () {
+            if (!document.hidden) {
+                self.loadOutputSettings();
+                self.startStatusPolling(true);
+            }
         });
         window.addEventListener('beforeunload', function () {
             self.stopTalk('Navigation', true);
+            CabinAudio.stop();
             self.stopStatusPolling();
         });
         document.addEventListener('click', function (event) {
@@ -327,6 +408,7 @@ var CommunicatePage = {
             }
             if (node && node.tagName === 'A' && node.getAttribute('href')) {
                 self.stopTalk('Navigation', true);
+                CabinAudio.stop();
             }
         }, true);
     },
@@ -355,10 +437,13 @@ var CommunicatePage = {
     startStatusPolling: function (immediate) {
         var self = this;
         this.stopStatusPolling();
-        if (document.hidden || this.live || this.stopping) return;
+        if (document.hidden || this.pressing || this.live || this.stopping) return;
+        var generation = this.statusGeneration;
         var run = function () {
-            self.refreshStatus().then(function () {
-                if (!document.hidden && !self.live && !self.stopping) {
+            self.statusTimer = null;
+            if (!self.isStatusPollingCurrent(generation)) return;
+            self.refreshStatus(generation).then(function () {
+                if (self.isStatusPollingCurrent(generation)) {
                     self.statusTimer = window.setTimeout(
                         run, self.statusPollDelay());
                 }
@@ -369,10 +454,19 @@ var CommunicatePage = {
     },
 
     stopStatusPolling: function () {
+        this.statusGeneration += 1;
         if (this.statusTimer !== null) {
             window.clearTimeout(this.statusTimer);
             this.statusTimer = null;
         }
+    },
+
+    isStatusPollingCurrent: function (generation) {
+        return generation === this.statusGeneration
+            && !document.hidden
+            && !this.pressing
+            && !this.live
+            && !this.stopping;
     },
 
     statusPollDelay: function () {
@@ -381,30 +475,46 @@ var CommunicatePage = {
 
         var audioInactive = status.audioState === 'voice_disabled'
             || status.audioState === 'emergency_disabled';
+        var listenerInactive = status.listenerState === 'listener_disabled'
+            || status.listenerState === 'emergency_disabled';
         var messagesInactive = status.messageState === 'messages_disabled'
             || status.messageState === 'emergency_disabled';
-        if (audioInactive && messagesInactive) {
+        if (audioInactive && listenerInactive && messagesInactive) {
             return this.INACTIVE_STATUS_POLL_MS;
         }
         if (status.reachable === false
-                || (!status.audioReady && !status.messagesReady)) {
+                || (!status.audioReady
+                    && !status.listenerReady
+                    && !status.messagesReady)) {
             return this.SETUP_STATUS_POLL_MS;
         }
         return this.STATUS_POLL_MS;
     },
 
-    refreshStatus: function () {
+    refreshStatus: function (generation) {
         var self = this;
-        return fetch('/api/communicate/status', { cache: 'no-store' })
+        var options = { cache: 'no-store' };
+        var request = typeof BYDAuth !== 'undefined'
+            ? BYDAuth.fetch('/api/communicate/status', options)
+            : fetch('/api/communicate/status', options);
+        return request
             .then(function (response) {
                 if (!response.ok) throw new Error('Car returned ' + response.status);
                 return response.json();
             })
             .then(function (data) {
+                if (typeof generation === 'number'
+                        && generation !== self.statusGeneration) {
+                    return;
+                }
                 self.status = data;
                 self.renderStatus();
             })
             .catch(function () {
+                if (typeof generation === 'number'
+                        && generation !== self.statusGeneration) {
+                    return;
+                }
                 self.status = {
                     reachable: false,
                     online: false,
@@ -413,6 +523,11 @@ var CommunicatePage = {
                     audioState: 'unreachable',
                     audioReason: 'Car is offline or unreachable',
                     audioGuidance:
+                        'Check that the car is powered on and its OverDrive connection is reachable.',
+                    listenerReady: false,
+                    listenerState: 'unreachable',
+                    listenerReason: 'Car is offline or unreachable',
+                    listenerGuidance:
                         'Check that the car is powered on and its OverDrive connection is reachable.',
                     messagesReady: false,
                     messageState: 'unreachable',
@@ -485,6 +600,7 @@ var CommunicatePage = {
             }
         }
         this.renderMessageAvailability(carState);
+        this.renderCabinListener(CabinAudio.getState());
         this.updateMessageControls();
         this.updateOutputControlState();
     },
@@ -525,13 +641,27 @@ var CommunicatePage = {
         if (document.hidden || this.pressing || this.live || this.stopping) return;
         if (this.outputSaving) return;
         if (!this.status || !this.status.audioReady) return;
+        CabinAudio.setLocalPaused(true);
+        if (event && typeof event.pointerId === 'number') {
+            this.activePointerId = event.pointerId;
+            if (event.currentTarget
+                    && typeof event.currentTarget.setPointerCapture
+                        === 'function') {
+                try {
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                } catch (error) {}
+            }
+        }
         this.pressing = true;
         this.generation += 1;
+        this.captureMode = '';
+        this.audioClockOffsetMs = 0;
+        this.staleCaptureFrames = 0;
         var generation = this.generation;
         this.stopStatusPolling();
         this.setTalkState('connecting', 'Connecting...', '', '');
 
-        if (!this.prepareAudioContext()) return;
+        if (!this.prepareAudioContext(generation)) return;
 
         var media = navigator.mediaDevices;
         if (!media || !media.getUserMedia) {
@@ -556,6 +686,7 @@ var CommunicatePage = {
             self.stream = stream;
             self.openTalkSocket(generation);
         }).catch(function (error) {
+            if (!self.isPressCurrent(generation)) return;
             var reason = error && error.name === 'NotAllowedError'
                 ? 'Microphone permission was denied'
                 : 'Microphone is unavailable';
@@ -563,20 +694,22 @@ var CommunicatePage = {
         });
     },
 
-    prepareAudioContext: function () {
+    prepareAudioContext: function (generation) {
         var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
         if (!AudioContextCtor) {
             this.failTalk('This browser cannot process microphone audio');
             return false;
         }
         try {
-            this.audioContext = new AudioContextCtor();
-            if (this.audioContext.state === 'suspended') {
+            var context = new AudioContextCtor();
+            this.audioContext = context;
+            if (context.state === 'suspended') {
                 var self = this;
-                var resume = this.audioContext.resume();
+                var resume = context.resume();
                 if (resume && typeof resume.catch === 'function') {
                     resume.catch(function () {
-                        if (self.pressing) {
+                        if (self.isPressCurrent(generation)
+                                && self.audioContext === context) {
                             self.failTalk('Could not activate microphone processing');
                         }
                     });
@@ -591,6 +724,12 @@ var CommunicatePage = {
 
     onPressEnd: function (event, reason) {
         if (event && event.cancelable) event.preventDefault();
+        if (event
+                && this.activePointerId !== null
+                && typeof event.pointerId === 'number'
+                && event.pointerId !== this.activePointerId) {
+            return;
+        }
         if (!this.pressing && !this.live) return;
         this.stopTalk(reason || 'Released');
     },
@@ -621,8 +760,9 @@ var CommunicatePage = {
         this.socket = socket;
         socket.binaryType = 'arraybuffer';
         socket.onopen = function () {
-            if (!self.isPressCurrent(generation)) {
-                self.stopTalk('Released', true);
+            if (self.socket !== socket
+                    || !self.isPressCurrent(generation)) {
+                try { socket.close(1000, 'stale'); } catch (error) {}
                 return;
             }
             socket.send(JSON.stringify({
@@ -632,6 +772,10 @@ var CommunicatePage = {
             }));
         };
         socket.onmessage = function (event) {
+            if (self.socket !== socket
+                    || generation !== self.generation) {
+                return;
+            }
             if (typeof event.data !== 'string') return;
             var message;
             try { message = JSON.parse(event.data); }
@@ -649,10 +793,17 @@ var CommunicatePage = {
             }
         };
         socket.onerror = function () {
-            if (!self.stopping) self.failTalk('Car audio connection failed');
+            if (self.socket === socket
+                    && generation === self.generation
+                    && !self.stopping) {
+                self.failTalk('Car audio connection failed');
+            }
         };
         socket.onclose = function () {
-            if (!self.stopping && (self.pressing || self.live)) {
+            if (self.socket === socket
+                    && generation === self.generation
+                    && !self.stopping
+                    && (self.pressing || self.live)) {
                 self.failTalk('Car audio connection was lost');
             }
         };
@@ -660,46 +811,142 @@ var CommunicatePage = {
 
     startAudioPipeline: function (generation) {
         if (!this.isPressCurrent(generation) || !this.stream || this.live) return;
-        var self = this;
         if (!this.audioContext || this.audioContext.state === 'closed') {
             this.failTalk('Microphone processing was not activated by the press');
             return;
         }
+        var self = this;
+        var context = this.audioContext;
+        var supportsWorklet = !!(
+            context.audioWorklet
+            && window.AudioWorkletNode
+            && typeof context.audioWorklet.addModule === 'function');
+        if (!supportsWorklet) {
+            this.startScriptProcessorPipeline(generation);
+            return;
+        }
+
+        context.audioWorklet.addModule(this.WORKLET_MODULE_URL)
+            .then(function () {
+                if (!self.isPressCurrent(generation)
+                        || self.audioContext !== context
+                        || context.state === 'closed') {
+                    return;
+                }
+                self.startWorkletPipeline(generation);
+            })
+            .catch(function () {
+                if (self.isPressCurrent(generation)
+                        && self.audioContext === context
+                        && context.state !== 'closed') {
+                    self.startScriptProcessorPipeline(generation);
+                }
+            });
+    },
+
+    startWorkletPipeline: function (generation) {
+        var self = this;
+        try {
+            this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
+            this.processorNode = new window.AudioWorkletNode(
+                this.audioContext,
+                'remote-voice-capture',
+                {
+                    numberOfInputs: 1,
+                    numberOfOutputs: 1,
+                    outputChannelCount: [1],
+                    processorOptions: {
+                        targetSampleRate: this.TARGET_SAMPLE_RATE,
+                        blockSize: 2048
+                    }
+                });
+            this.silentGain = this.audioContext.createGain();
+            this.silentGain.gain.value = 0;
+            this.processorNode.port.onmessage = function (event) {
+                var data = event.data || {};
+                if (data.type !== 'pcm' || !data.pcm) return;
+                self.handleCapturedPcm(
+                    data.pcm,
+                    typeof data.rms === 'number' ? data.rms : 0,
+                    typeof data.contextTime === 'number'
+                        ? data.contextTime : null,
+                    generation);
+            };
+            this.processorNode.onprocessorerror = function () {
+                if (!self.isPressCurrent(generation)
+                        || self.captureMode !== 'worklet') {
+                    return;
+                }
+                self.disconnectCaptureGraph();
+                self.captureMode = '';
+                self.startScriptProcessorPipeline(generation);
+            };
+            this.connectCaptureGraph();
+            this.captureMode = 'worklet';
+            this.activateAudioPipeline(generation);
+        } catch (error) {
+            this.disconnectCaptureGraph();
+            if (this.isPressCurrent(generation)) {
+                this.startScriptProcessorPipeline(generation);
+            }
+        }
+    },
+
+    startScriptProcessorPipeline: function (generation) {
+        var self = this;
         try {
             this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
             this.processorNode = this.audioContext.createScriptProcessor(2048, 1, 1);
             this.silentGain = this.audioContext.createGain();
             this.silentGain.gain.value = 0;
-            this.sourceNode.connect(this.processorNode);
-            this.processorNode.connect(this.silentGain);
-            this.silentGain.connect(this.audioContext.destination);
+            this.connectCaptureGraph();
         } catch (error) {
+            this.disconnectCaptureGraph();
             this.failTalk('Could not start microphone processing');
             return;
         }
 
         this.processorNode.onaudioprocess = function (event) {
-            if (!self.live || generation !== self.generation) return;
             var input = event.inputBuffer.getChannelData(0);
             var pcm = self.downsampleToPcm16(
                 input, self.audioContext.sampleRate, self.TARGET_SAMPLE_RATE);
-            var now = Date.now();
-            self.lastAudioAt = now;
-            if (now - self.lastMeterAt >= 100) {
-                self.lastMeterAt = now;
-                self.updateMeter(input);
-            }
-            if (!self.socket || self.socket.readyState !== WebSocket.OPEN) {
-                self.failTalk('Car audio connection was lost');
-                return;
-            }
-            if (self.socket.bufferedAmount > 131072) {
-                self.failTalk('Network is too slow for live audio');
-                return;
-            }
-            self.socket.send(pcm.buffer);
+            self.handleCapturedPcm(
+                pcm.buffer, self.sampleRms(input), null, generation);
         };
+        this.captureMode = 'script';
+        this.activateAudioPipeline(generation);
+    },
 
+    connectCaptureGraph: function () {
+        this.sourceNode.connect(this.processorNode);
+        this.processorNode.connect(this.silentGain);
+        this.silentGain.connect(this.audioContext.destination);
+    },
+
+    disconnectCaptureGraph: function () {
+        if (this.processorNode) {
+            try {
+                if (this.processorNode.port) {
+                    this.processorNode.port.onmessage = null;
+                }
+            } catch (error) {}
+            try { this.processorNode.onprocessorerror = null; } catch (error) {}
+            try { this.processorNode.onaudioprocess = null; } catch (error) {}
+            try { this.processorNode.disconnect(); } catch (error) {}
+        }
+        if (this.sourceNode) {
+            try { this.sourceNode.disconnect(); } catch (error) {}
+        }
+        if (this.silentGain) {
+            try { this.silentGain.disconnect(); } catch (error) {}
+        }
+        this.processorNode = null;
+        this.sourceNode = null;
+        this.silentGain = null;
+    },
+
+    activateAudioPipeline: function (generation) {
+        var self = this;
         var activate = function () {
             if (!self.isPressCurrent(generation)
                     || !self.audioContext
@@ -708,6 +955,13 @@ var CommunicatePage = {
                     self.failTalk('Could not activate microphone processing');
                 }
                 return;
+            }
+            if (self.captureMode === 'worklet'
+                    && window.performance
+                    && typeof window.performance.now === 'function') {
+                self.audioClockOffsetMs =
+                    window.performance.now()
+                    - self.audioContext.currentTime * 1000;
             }
             self.markTalkLive();
         };
@@ -730,6 +984,38 @@ var CommunicatePage = {
             return;
         }
         activate();
+    },
+
+    handleCapturedPcm: function (
+            pcmBuffer, rms, contextTime, generation) {
+        if (!this.live || generation !== this.generation) return;
+        if (contextTime !== null
+                && window.performance
+                && typeof window.performance.now === 'function') {
+            var capturedAt =
+                this.audioClockOffsetMs + contextTime * 1000;
+            if (window.performance.now() - capturedAt
+                    > this.MAX_CAPTURE_AGE_MS) {
+                this.staleCaptureFrames++;
+                return;
+            }
+        }
+
+        var now = Date.now();
+        this.lastAudioAt = now;
+        if (now - this.lastMeterAt >= 100) {
+            this.lastMeterAt = now;
+            this.setMeter(Math.min(1, Math.max(0, rms) * 4.5));
+        }
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            this.failTalk('Car audio connection was lost');
+            return;
+        }
+        if (this.socket.bufferedAmount > 131072) {
+            this.failTalk('Network is too slow for live audio');
+            return;
+        }
+        this.socket.send(pcmBuffer);
     },
 
     markTalkLive: function () {
@@ -771,6 +1057,7 @@ var CommunicatePage = {
         this.stopping = true;
         this.pressing = false;
         this.live = false;
+        this.activePointerId = null;
         this.generation += 1;
         this.stopTalkTicker();
         if (hadResources && !silent) {
@@ -791,26 +1078,22 @@ var CommunicatePage = {
             try { socket.close(1000, 'stop'); } catch (error) {}
         }
 
-        if (this.processorNode) {
-            try { this.processorNode.onaudioprocess = null; } catch (error) {}
-            try { this.processorNode.disconnect(); } catch (error) {}
-        }
-        if (this.sourceNode) {
-            try { this.sourceNode.disconnect(); } catch (error) {}
-        }
-        if (this.silentGain) {
-            try { this.silentGain.disconnect(); } catch (error) {}
-        }
-        this.processorNode = null;
-        this.sourceNode = null;
-        this.silentGain = null;
+        this.disconnectCaptureGraph();
+        this.captureMode = '';
+        this.audioClockOffsetMs = 0;
 
         if (this.audioContext) {
-            try { this.audioContext.close(); } catch (error) {}
+            try {
+                var closeResult = this.audioContext.close();
+                if (closeResult && typeof closeResult.catch === 'function') {
+                    closeResult.catch(function () {});
+                }
+            } catch (error) {}
             this.audioContext = null;
         }
         this.stopTracks(this.stream);
         this.stream = null;
+        CabinAudio.setLocalPaused(false);
         this.renderElapsed(0);
         this.setMeter(0);
 
@@ -877,10 +1160,13 @@ var CommunicatePage = {
     },
 
     updateMeter: function (samples) {
+        this.setMeter(Math.min(1, this.sampleRms(samples) * 4.5));
+    },
+
+    sampleRms: function (samples) {
         var sum = 0;
         for (var i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
-        var rms = Math.sqrt(sum / Math.max(1, samples.length));
-        this.setMeter(Math.min(1, rms * 4.5));
+        return Math.sqrt(sum / Math.max(1, samples.length));
     },
 
     setMeter: function (level) {

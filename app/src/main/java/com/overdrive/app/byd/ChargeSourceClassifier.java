@@ -1,5 +1,7 @@
 package com.overdrive.app.byd;
 
+import android.content.Context;
+
 import com.overdrive.app.logging.DaemonLogger;
 
 import org.json.JSONObject;
@@ -11,16 +13,22 @@ import java.io.ByteArrayOutputStream;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Decides, per vehicle, what each charging-power getter actually MEANS.
+ * Decides, per vehicle, what each ambiguous charging-power getter actually MEANS.
  *
- * <p>The BYD charging getters are not consistent across firmware families. The same accessor
+ * <p>Some BYD charging getters are not consistent across firmware families. The same accessor
  * answers an instantaneous rate in kW on some trims and a cumulative charged-energy counter in
  * kWh on others, with no unit flag anywhere in the API. Guessing from the magnitude cannot work:
  * a counter sitting at 119.0 and a DC session at 119 kW are the same number, and every
  * magnitude rule that resolves one breaks the other. That guess is what made charging history
  * wrong on some models and right on others.
  *
- * <p>The two kinds are trivially separable by BEHAVIOUR instead:
+ * <p>The dedicated {@code BYDAutoChargingDevice.getChargingPower()} signal is not ambiguous: the
+ * framework defines it as a signed charging rate in kW over [-500, 500], and its listener is driven
+ * by the charging battery-voltage/current inputs. {@link #SRC_DEVICE} is therefore always
+ * {@link Kind#RATE}. The documented charged-capacity field is likewise always
+ * {@link Kind#COUNTER}. Only the remaining firmware-dependent accessors need behavioral learning.
+ *
+ * <p>The two ambiguous kinds are separable by BEHAVIOUR:
  * <ul>
  *   <li>a COUNTER only ever rises while energy is flowing, and never falls (except a reset to
  *       ~zero when a new session begins);</li>
@@ -150,12 +158,24 @@ public final class ChargeSourceClassifier {
      */
     private static final long STEADY_RATE_CORROBORATION_MAX_AGE_MS = 2 * 60_000L;
 
-    private static final String STATE_FILE = "/data/local/tmp/od_charge_source_kinds.json";
+    private static volatile File stateFile;
 
     private static final ConcurrentHashMap<String, Observation> observations = new ConcurrentHashMap<>();
     private static volatile boolean loaded = false;
 
     private ChargeSourceClassifier() {}
+
+    /** Configure firmware-scoped persistence in storage writable by the current process UID. */
+    public static synchronized void initializePersistence(Context context) {
+        if (context == null) return;
+        File next = android.os.Process.myUid() == 2000
+                ? new File("/data/local/tmp/od_charge_source_kinds.json")
+                : new File(context.getFilesDir(), "od_charge_source_kinds.json");
+        if (next.equals(stateFile)) return;
+        stateFile = next;
+        loaded = false;
+        loadIfNeeded();
+    }
 
     private static final class Observation {
         volatile Kind kind = Kind.UNKNOWN;
@@ -234,6 +254,13 @@ public final class ChargeSourceClassifier {
         if (source == null || Double.isNaN(value) || Double.isInfinite(value)) return;
         loadIfNeeded();
         Observation o = obs(source);
+        if (SRC_DEVICE.equals(source)) {
+            // Framework contract: signed instantaneous kW, not a firmware-dependent counter.
+            o.kind = Kind.RATE;
+            o.lastValue = value;
+            o.observations++;
+            return;
+        }
         if (SRC_CAPACITY.equals(source)) {
             // This SDK field is documented as a bounded per-session kWh total. It is not an
             // ambiguous firmware-dependent power accessor, so behavioral classification is both
@@ -358,7 +385,7 @@ public final class ChargeSourceClassifier {
 
     private static boolean isSteadyRateCandidateLocked(
             String source, Observation o, double value, long nowMs) {
-        if (SRC_CAPACITY.equals(source)) return false;
+        if (SRC_CAPACITY.equals(source) || SRC_DEVICE.equals(source)) return false;
         if (o.kind != Kind.UNKNOWN
                 || Double.doubleToLongBits(o.lastValue) != Double.doubleToLongBits(value)) {
             return false;
@@ -422,6 +449,7 @@ public final class ChargeSourceClassifier {
 
     /** @return the verdict for a source; {@link Kind#UNKNOWN} until enough evidence exists. */
     public static Kind kindOf(String source) {
+        if (SRC_DEVICE.equals(source)) return Kind.RATE;
         if (SRC_CAPACITY.equals(source)) return Kind.COUNTER;
         loadIfNeeded();
         Observation o = observations.get(source);
@@ -525,7 +553,8 @@ public final class ChargeSourceClassifier {
         if (loaded) return;
         loaded = true;
         try {
-            File f = new File(STATE_FILE);
+            File f = stateFile;
+            if (f == null) return;
             if (!f.exists()) return;
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             try (FileInputStream in = new FileInputStream(f)) {
@@ -554,6 +583,8 @@ public final class ChargeSourceClassifier {
                 } catch (IllegalArgumentException e) {
                     o.kind = Kind.UNKNOWN;
                 }
+                if (SRC_DEVICE.equals(key)) o.kind = Kind.RATE;
+                if (SRC_CAPACITY.equals(key)) o.kind = Kind.COUNTER;
                 o.rises = j.optInt("rises", 0);
                 o.falls = j.optInt("falls", 0);
                 o.resets = j.optInt("resets", 0);
@@ -570,11 +601,18 @@ public final class ChargeSourceClassifier {
 
     private static void persist() {
         try {
+            File f = stateFile;
+            if (f == null) return;
             JSONObject root = describe();
             // Stamp the firmware identity these verdicts describe, so a later OTA or a different head
             // unit discards them instead of reinterpreting this vehicle's accessors as its own.
             try { root.put(IDENTITY_KEY, currentIdentity()); } catch (Exception ignored) {}
-            try (FileOutputStream out = new FileOutputStream(STATE_FILE)) {
+            File parent = f.getParentFile();
+            if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                logger.debug("Could not create charge-source state directory: " + parent);
+                return;
+            }
+            try (FileOutputStream out = new FileOutputStream(f)) {
                 out.write(root.toString().getBytes("UTF-8"));
             }
         } catch (Exception e) {

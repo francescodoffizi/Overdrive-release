@@ -160,7 +160,8 @@ public class SurveillanceCommandHandler implements TelegramCommandHandler {
     
     private boolean isDaemonRunning(String processName, CommandContext ctx) {
         // Use grep -F for fixed string matching (handles hyphens in process names like sing-box)
-        String output = ctx.execShell("ps -A | grep -F '" + processName + "' | grep -v grep");
+        String output = ctx.execShell(
+                "ps -A | " + DaemonCommandHandler.processMatcher(processName));
         return output != null && !output.trim().isEmpty();
     }
 }

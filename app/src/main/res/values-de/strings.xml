@@ -625,7 +625,7 @@
     <string name="dialog_zrok_token_message">Geben Sie Ihren Zrok aktivieren Token ein.\nKriegen Sie einen unter: zrok.io</string>
     <string name="toast_token_cannot_be_empty">Das Token kann nicht leer sein</string>
     <string name="dialog_tailscale_settings_title">Tailscale Tunnel-Einstellungen</string>
-    <string name="dialog_tailscale_settings_message">Konfiguration der Schwanzgröße</string>
+    <string name="dialog_tailscale_settings_message">Tailscale konfigurieren</string>
     <string name="tailscale_failed_login_url">Login-Url nicht erstellt</string>
     <string name="tailscale_logged_in_relogin">Klicken Sie, um sich auf ein anderes Konto anzumelden</string>
     <string name="dialog_tailscale_proxy_enable_title">Tailscale Proxy aktivieren?</string>
@@ -639,7 +639,7 @@
     <string name="zrok_no_token_configured">Kein Token konfiguriert.</string>
     <string name="dialog_tailscale_reset_title">Wiederherstellen Tailscale Umgebung</string>
     <string name="dialog_tailscale_reset_message">Dies wird:\n• den Tailscale-Tunnel stoppen, wenn er läuft\n• die Tailscale-Umgebung aus diesem Gerät entfernen\n• Sie müssen das Gerät immer noch aus der Tailscale-Konsole entfernen\n\nWir müssen sich erneut anmelden.\n\nSind Sie sicher?</string>
-    <string name="toast_resetting_tailscale">Umgebung in der Schwanzskala neu einstellen...</string>
+    <string name="toast_resetting_tailscale">Tailscale-Umgebung wird zurückgesetzt…</string>
     <string name="toast_tailscale_reset_success">Tailscale Umgebung zurücksetzen.</string>
     <string name="toast_tailscale_reset_warnings">Wiederherstellung der Umgebung Tailscale (mit Warnungen: %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Tailscale Proxy aktiviert</string>

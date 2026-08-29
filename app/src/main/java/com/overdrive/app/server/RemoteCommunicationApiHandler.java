@@ -1,6 +1,7 @@
 package com.overdrive.app.server;
 
 import com.overdrive.app.byd.MessageOverlayController;
+import com.overdrive.app.communication.CabinAudioController;
 import com.overdrive.app.communication.RemoteCommunicationAvailability;
 import com.overdrive.app.communication.RemoteCommunicationPolicy;
 import com.overdrive.app.communication.RemoteCommunicationSettings;
@@ -68,6 +69,10 @@ public final class RemoteCommunicationApiHandler {
                     null, null, null, true);
             RemoteCommunicationWebSocket.stopActive(
                     "Remote communication was emergency-disabled in the car");
+            CabinAudioWebSocket.stopActive(
+                    "Remote communication was emergency-disabled in the car");
+            RemoteVoiceController.stop();
+            CabinAudioController.stop();
             MessageOverlayController.dismiss();
             JSONObject response = new JSONObject()
                     .put("success", saved)
@@ -85,6 +90,7 @@ public final class RemoteCommunicationApiHandler {
                 VehicleCommunicationSafety.isCarPowerStateKnown();
         boolean carOff = VehicleCommunicationSafety.isCarKnownOff();
         boolean busy = RemoteCommunicationWebSocket.isBusy();
+        boolean listenerBusy = CabinAudioWebSocket.isBusy();
         Boolean overlay = RemoteCommunicationAvailability.shouldCheckAnyOverlay(
                 carOff, settings, busy)
                 ? RemoteVoiceController.hasOverlayPermission() : null;
@@ -94,6 +100,9 @@ public final class RemoteCommunicationApiHandler {
         RemoteCommunicationAvailability.Result messages =
                 RemoteCommunicationAvailability.messages(
                         carOff, settings, overlay);
+        RemoteCommunicationAvailability.Result listener =
+                RemoteCommunicationAvailability.listener(
+                        carOff, settings, listenerBusy);
 
         JSONObject response = new JSONObject();
         response.put("success", true);
@@ -102,7 +111,9 @@ public final class RemoteCommunicationApiHandler {
         response.put("carState",
                 carOff ? "off" : (carStateKnown ? "on" : "unknown"));
         response.put("busy", busy);
+        response.put("listenerBusy", listenerBusy);
         putAvailability(response, "audio", "audioReady", audio);
+        putAvailability(response, "listener", "listenerReady", listener);
         putAvailability(response, "message", "messagesReady", messages);
         response.put("overlayPermission",
                 overlay == null ? JSONObject.NULL : overlay);
@@ -118,16 +129,18 @@ public final class RemoteCommunicationApiHandler {
     private static void sendSettings(OutputStream out) throws Exception {
         RemoteCommunicationSettings.Snapshot settings =
                 RemoteCommunicationSettings.load();
+        boolean carOff = VehicleCommunicationSafety.isCarKnownOff();
         JSONObject response = new JSONObject()
                 .put("success", true)
                 .put("voiceEnabled", settings.voiceEnabled)
                 .put("outputLevel", settings.outputLevel)
                 .put("outputLevelOverrideEnabled",
                         settings.outputLevelOverrideEnabled)
+                .put("listenerEnabled", settings.listenerEnabled)
                 .put("messagesEnabled", settings.messagesEnabled)
                 .put("emergencyDisabled", settings.emergencyDisabled);
         Boolean overlay = RemoteCommunicationAvailability.shouldCheckAnyOverlay(
-                false, settings, false)
+                carOff, settings, false)
                 ? RemoteVoiceController.hasOverlayPermission() : null;
         response.put("overlayPermission",
                 overlay == null ? JSONObject.NULL : overlay);
@@ -153,16 +166,35 @@ public final class RemoteCommunicationApiHandler {
                 ? request.optBoolean("messagesEnabled") : null;
         Boolean emergency = request.has("emergencyDisabled")
                 ? request.optBoolean("emergencyDisabled") : null;
+        Boolean listener = request.has("listenerEnabled")
+                ? request.optBoolean("listenerEnabled") : null;
         boolean saved = RemoteCommunicationSettings.update(
-                voice, level, levelOverride, messages, emergency);
+                voice, level, levelOverride, messages, emergency, listener);
         if (Boolean.TRUE.equals(emergency)) {
             RemoteCommunicationWebSocket.stopActive(
                     "Remote communication was emergency-disabled in the car");
+            CabinAudioWebSocket.stopActive(
+                    "Remote communication was emergency-disabled in the car");
+            RemoteVoiceController.stop();
+            CabinAudioController.stop();
             MessageOverlayController.dismiss();
         }
         if (!saved) {
             sendFailure(out, 500, "Could not save remote communication settings");
             return;
+        }
+        if (Boolean.FALSE.equals(voice)) {
+            RemoteCommunicationWebSocket.stopActive(
+                    "Remote voice was disabled in the car settings");
+            RemoteVoiceController.stop();
+        }
+        if (Boolean.FALSE.equals(messages)) {
+            MessageOverlayController.dismiss();
+        }
+        if (Boolean.FALSE.equals(listener)) {
+            CabinAudioWebSocket.stopActive(
+                    "Cabin listening was disabled in the car settings");
+            CabinAudioController.stop();
         }
         sendSettings(out);
     }

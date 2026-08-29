@@ -168,6 +168,7 @@ public class GpuSurveillancePipeline {
         new java.util.concurrent.locks.ReentrantLock();
     private static final int BS_WIDTH = 1280;
     private static final int BS_HEIGHT = 960;
+    private final int sharedLaneHeight;
 
     // ── Camera-view (on-demand) — SHARES the single BS lane (scaler+SC layer+EGL) ──
     // Option A coexistence: there is exactly ONE on-screen native lane. Blind-spot
@@ -177,6 +178,40 @@ public class GpuSurveillancePipeline {
     // geometry(+layerStack) reconfig — never a lane rebuild (compute-optimal).
     // camViewActive = a camera view is requested; the lane may be shared with BS.
     private volatile boolean camViewActive = false;
+    // ── Camera-view ownership (audit: automation ownership) ────────────────────
+    // Single current-owner model, no restore of older automation views:
+    //   * every accepted show bumps camViewSessionId (identifies THIS request, so
+    //     a stale auto-hide dispatch can never hide a newer view) and records the
+    //     requesting automation execution's token as camViewOwnerToken — or null
+    //     for an ownerless show (manual API call, key mapping, overlay, web UI);
+    //   * a TOKENED hide closes the view only when its token matches the owner
+    //     (an automation can hide only the view it showed; A show → B show →
+    //     A hide leaves B's view up);
+    //   * an OWNERLESS hide (user ✕, key mapping, web UI) keeps the legacy
+    //     global-close behaviour and clears any owner;
+    //   * internal teardowns (pipeline stop, BS takeover) always close.
+    private final java.util.concurrent.atomic.AtomicLong camViewSessionSeq =
+        new java.util.concurrent.atomic.AtomicLong(0);
+    private volatile long camViewSessionId = 0L;
+    private volatile Long camViewOwnerToken = null;
+    // The session the CURRENT auto-hide deadline belongs to, bound to
+    // camViewHideAtMs when enableCamView arms it (under bsLifecycleLock). The
+    // timeout claim returns THIS, not the live camViewSessionId — a claim
+    // landing between a newer show's noteCamViewShowRequest and its
+    // enableCamView re-arm would otherwise capture the NEW session and hide
+    // the view that show is about to put up.
+    private volatile long camViewHideSessionId = 0L;
+    /** Verdicts for {@link #hideCamViewIfAllowed}. */
+    public static final int CAMVIEW_HIDE_NOT_OWNER = 0;
+    public static final int CAMVIEW_HIDE_CLOSED = 1;
+    public static final int CAMVIEW_HIDE_ALREADY_HIDDEN = 2;
+    // In-memory geometry override for the CURRENT camview session. Set ONLY when
+    // the show request's atomic config write failed (fail-open: render the
+    // REQUESTED geometry rather than stale persisted geometry); cleared on the
+    // next successful persist and on disable. Same JSON shape as the persisted
+    // per-target geometry object (sizePct/corner or x/y/w/h).
+    private volatile org.json.JSONObject camViewGeomOverride = null;
+    private volatile String camViewGeomOverrideTarget = null;
     // True while an enableCamView() is in flight (set under bsLifecycleLock before
     // buildSharedLaneLocked, cleared when it returns). Mirrors bsEnabling: the lane
     // build releases bsLifecycleLock around its GL-init wait, so this lets a
@@ -373,6 +408,15 @@ public class GpuSurveillancePipeline {
      * @param eventOutputDir Directory for event recordings
      */
     public GpuSurveillancePipeline(int cameraWidth, int cameraHeight, File eventOutputDir) {
+        this(cameraWidth, cameraHeight,
+            Math.max(1, cameraWidth / 2),
+            Math.max(1, cameraHeight * 2),
+            eventOutputDir);
+    }
+
+    public GpuSurveillancePipeline(int cameraWidth, int cameraHeight,
+                                   int encoderWidth, int encoderHeight,
+                                   File eventOutputDir) {
         this.cameraWidth = cameraWidth;
         this.cameraHeight = cameraHeight;
         boolean isDilink5 = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
@@ -389,9 +433,13 @@ public class GpuSurveillancePipeline {
             // (cameraWidth/4) wide x cameraHeight tall, mosaic is 2x2 of tiles, so
             // encoder = (cameraWidth/2) x (cameraHeight*2). Seal 5120x960 → 2560x1920
             // (4:3 quadrants). Tang 5120x720 → 2560x1440 (16:9 quadrants).
-            this.encoderWidth = Math.max(1, cameraWidth / 2);
-            this.encoderHeight = Math.max(1, cameraHeight * 2);
+            this.encoderWidth = Math.max(1, encoderWidth);
+            this.encoderHeight = Math.max(1, encoderHeight);
         }
+        this.sharedLaneHeight =
+            com.overdrive.app.camera.CameraConfigResolver.isPassiveApaModeEnabled()
+                ? com.overdrive.app.camera.PassiveApaGeometry.HEIGHT
+                : BS_HEIGHT;
         this.eventOutputDir = eventOutputDir;
         this.config = new GpuPipelineConfig();
     }
@@ -1498,13 +1546,10 @@ public class GpuSurveillancePipeline {
      * silently reverted the recorder to legacy 4-strip geometry with every
      * output quadrant sampling the producer's top-left corner.
      *
-     * <p>Layout 3 = DiLink 4 (HAL emits a non-canonical 2x2; we rearrange via
-     * the per-role corner remap). Layout 0 = legacy 4-strip. Corner/flip values
-     * come from {@link com.overdrive.app.camera.Dilink4Constants} — the shared
-     * constant the recorder, stream scaler, blind-spot scaler, AI downscaler and
-     * motion cropper all read, so they can never silently disagree.
+     * <p>Layout 1 = full-frame passive APA. Layout 3 = DiLink 4 four-corner
+     * remap. Layout 0 = legacy 4-strip.
      *
-     * <p>DiLink 4 layout is the only known-good arrangement for that HAL:
+     * <p>Layout 3 is the known-good four-corner arrangement for that HAL:
      * Front=TL X-mirrored, Right=BR, Rear=TR, Left=BL, NO Y flip on any role.
      * A previous comment here claimed rear/left were Y-flipped; that was wrong
      * on device (front and right were the inverted tiles). Do not reintroduce Y
@@ -1515,19 +1560,21 @@ public class GpuSurveillancePipeline {
         if (rec == null) return;
         int layoutMode = camera != null ? camera.getCameraLayoutMode() : 0;
         rec.setCameraLayout(layoutMode);
-        rec.setProducerLayout(
-            com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
-            com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
-            com.overdrive.app.camera.Dilink4Constants.CORNER_REAR,
-            com.overdrive.app.camera.Dilink4Constants.CORNER_LEFT,
-            com.overdrive.app.camera.Dilink4Constants.FLIP_FRONT,
-            com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
-            com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
-            com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
+        if (layoutMode == 3) {
+            rec.setProducerLayout(
+                com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
+                com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
+                com.overdrive.app.camera.Dilink4Constants.CORNER_REAR,
+                com.overdrive.app.camera.Dilink4Constants.CORNER_LEFT,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_FRONT,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
+        }
         try {
             org.json.JSONObject camCfg = com.overdrive.app.config
                 .UnifiedConfigManager.loadConfig().optJSONObject("camera");
-            if (camCfg != null && layoutMode == 3) {
+            if (camCfg != null && layoutMode != 0) {
                 // LAYOUT-GATED. The red-mask GLSL block sits OUTSIDE the
                 // `uApaMode > 2.5` branch chain in every shader, so unlike the
                 // corner/flip uniforms it is NOT structurally inert on legacy
@@ -1536,10 +1583,10 @@ public class GpuSurveillancePipeline {
                 // The flag is a dilink4-only remedy — its API handler, its UI
                 // label and its own comments all say so — so gate to match.
                 rec.setRedMaskEnabled(camCfg.optBoolean("dilink4RedMask", false));
-                // APA center inset — oem APACropFilter parity. Default
-                // 240/2560 = 0.09375 trims the chrome-painted seams on byd_apa.
-                rec.setApaCenterInset(
-                    (float) camCfg.optDouble("dilink4ApaCenterInset", 0.09375));
+                rec.setApaCenterInset(layoutMode == 3
+                    ? (float) camCfg.optDouble(
+                        "dilink4ApaCenterInset", 0.09375)
+                    : 0.0f);
             }
         } catch (Throwable t) {
             logger.warn("Failed to apply dilink4 red-mask/inset to recorder: " + t.getMessage());
@@ -1592,7 +1639,16 @@ public class GpuSurveillancePipeline {
                 encoder.flushAndClose();
                 Thread.sleep(200);
             }
-            encoder.release();
+            // Consume the release verdict (audit follow-up): a wedge discovered
+            // here means a worker is still alive on the old codec — release()
+            // already requested the trip-safe restart, and constructing the
+            // replacement below would hide the wedged original from every close
+            // guard. Abort the recreate; the caller's failure handling applies.
+            if (!encoder.release()) {
+                encoder = null;
+                throw new IllegalStateException("encoder teardown wedged — refusing to "
+                    + "create a replacement codec (trip-safe restart pending)");
+            }
             encoder = null;
         }
         
@@ -1867,15 +1923,28 @@ public class GpuSurveillancePipeline {
         }
         
         // SOTA: Release any stuck encoder resources before creating new one
-        // This helps recover from previous crashes that left encoder in bad state
+        // This helps recover from previous crashes that left encoder in bad state.
+        // The verdict is consumed (audit follow-up): release() returning false
+        // means a worker on the OLD encoder is still alive — creating the
+        // replacement below would hide it from every close guard, so abort and
+        // latch this pipeline terminal. A THROW from release() is treated the
+        // same way: release() contains its own failure handling internally, so
+        // an escaping throw means teardown state is unknown — not safe to build
+        // over.
         if (encoder != null) {
             logger.info("Releasing previous encoder before reinit...");
+            boolean prevReleaseClean = false;
             try {
-                encoder.release();
+                prevReleaseClean = encoder.release();
             } catch (Exception e) {
                 logger.warn("Error releasing previous encoder: " + e.getMessage());
             }
             encoder = null;
+            if (!prevReleaseClean) {
+                pipelineTeardownWedged = true;
+                throw new IllegalStateException("previous encoder teardown wedged — "
+                    + "refusing to build a replacement (trip-safe restart pending)");
+            }
         }
         
         // 1. Create hardware encoder (shared by normal recording and surveillance)
@@ -1995,7 +2064,21 @@ public class GpuSurveillancePipeline {
         // the dashcam profile; surveillance uses its own.
         applyActiveLayoutProfile();
 
-        // 3. Create GPU downscaler with profile-driven offsets
+        // 3. Create GPU downscaler with profile-driven offsets.
+        // FIX (EGL-leak audit): defensively release any prior instance before
+        // overwriting the reference. stop() now releases it too, but if a
+        // prior teardown aborted partway (or a future code path reaches init()
+        // with a live downscaler), overwriting the reference here would leak
+        // its HandlerThread + EGL context + ImageReader with no way to ever
+        // reclaim them. release() is synchronous and idempotent.
+        if (downscaler != null) {
+            logger.warn("init: previous downscaler was never released — releasing now "
+                + "(EGL context/thread would otherwise leak)");
+            try { downscaler.release(); } catch (Throwable t) {
+                logger.warn("init: stale downscaler release failed: " + t.getMessage());
+            }
+            downscaler = null;
+        }
         downscaler = new GpuDownscaler(quadrantStripOffsetX);
         // Note: downscaler.init() will be called after EGL context is created by camera
 
@@ -2028,7 +2111,9 @@ public class GpuSurveillancePipeline {
         // in DistanceEstimator. Seal=960, Tang=720. Without this the
         // foveated path uses a Seal-specific 0.66 ratio and reads ~30%
         // long on Tang.
-        sentry.setCameraStripHeight(cameraHeight);
+        sentry.setCameraStripHeight(
+            com.overdrive.app.camera.CameraConfigResolver.isPassiveApaModeEnabled()
+                ? encoderHeight : cameraHeight);
         // Per-quadrant vertical FOV from the active camera profile.
         // Without this, the engine uses uniform 110° for all four
         // quadrants — which inflates side-camera distances by ~70%
@@ -2239,6 +2324,114 @@ public class GpuSurveillancePipeline {
     public void start() throws Exception {
         start(false);
     }
+
+    // TERMINAL latch (audit follow-up): set when a camera stop — normal stop()
+    // or a start()-rollback — reports a wedged teardown. Unlike the global
+    // restart-pending flag (which self-clears if the coordinator fails), this
+    // never clears: the wedged camera/GL stack cannot be reclaimed in-process,
+    // so this pipeline instance must never start again.
+    private volatile boolean pipelineTeardownWedged = false;
+
+    // Retiring stream-encoder release verdict (audit follow-up). The stream
+    // disable path nulls the encoder fields and queues release() on the
+    // single-threaded release executor — so the camera-close guard can never
+    // see the retiring encoder, whose drainer keeps dequeuing against the
+    // camera until the release completes. stop() verifies this before the
+    // camera closes; enableStreaming checks it before installing a replacement.
+    //
+    // PUBLICATION CONTRACT (audit follow-up 2 — the first revision published
+    // the executor future from INSIDE the GL-posted cleanup runnable, so a
+    // slow runnable left this null past the caller's 1s latch wait and the
+    // guard was silently bypassed; and racing publications could let an OLDER
+    // future overwrite a newer one): a placeholder CompletableFuture is
+    // published SYNCHRONOUSLY at detach time (before any GL post), completed
+    // by the eventual release with its verdict. Pending placeholder ⇒ verify
+    // times out ⇒ treated as wedged — exactly right for a GL runnable that
+    // never ran. Publications compose (existing AND fresh) so stacked retiring
+    // encoders can't shadow an earlier dirty verdict, and verification clears
+    // only the exact future it verified (CAS), never a newer one.
+    private final java.util.concurrent.atomic.AtomicReference<
+            java.util.concurrent.CompletableFuture<Boolean>>
+        retiringStreamEncoderRelease = new java.util.concurrent.atomic.AtomicReference<>();
+
+    /**
+     * Publish a retirement placeholder synchronously at detach time. Returns the
+     * FRESH future the caller must hand to {@link #submitEncoderRelease} for
+     * completion; the published (possibly combined) future is what verification
+     * observes. Callers hold streamLifecycleLock, so publications are ordered;
+     * the CAS loop is belt-and-braces.
+     */
+    private java.util.concurrent.CompletableFuture<Boolean>
+            publishRetiringStreamEncoderRelease() {
+        java.util.concurrent.CompletableFuture<Boolean> fresh =
+            new java.util.concurrent.CompletableFuture<>();
+        java.util.concurrent.CompletableFuture<Boolean> safeFresh =
+            fresh.exceptionally(t -> Boolean.FALSE);
+        while (true) {
+            java.util.concurrent.CompletableFuture<Boolean> cur =
+                retiringStreamEncoderRelease.get();
+            java.util.concurrent.CompletableFuture<Boolean> pub = (cur == null)
+                ? safeFresh
+                : cur.thenCombine(safeFresh, (a, b) -> Boolean.TRUE.equals(a)
+                    && Boolean.TRUE.equals(b));
+            if (retiringStreamEncoderRelease.compareAndSet(cur, pub)) {
+                return fresh;
+            }
+        }
+    }
+
+    /**
+     * Verify the retiring stream-encoder release (if any) completed CLEANLY
+     * within {@code budgetMs}. CAS-clears only the exact future verified clean,
+     * so a newer retirement published concurrently is never wiped; a pending or
+     * failed release stays, and every subsequent verification re-answers
+     * honestly (sticky, same discipline as the worker stops).
+     */
+    private boolean verifyRetiringStreamEncoderRelease(long budgetMs, String where) {
+        // LOOP on CAS failure (audit follow-up 3): a failed clear means a NEWER
+        // retirement was published between our get() and the CAS — returning
+        // true there verified only the OLD future and let the camera close over
+        // the unverified new encoder's drainer. Re-read and verify the current
+        // future with whatever remains of the deadline; only a run where the
+        // verified future is still current (CAS succeeds) may answer clean.
+        final long deadlineNanos = System.nanoTime() + budgetMs * 1_000_000L;
+        while (true) {
+            java.util.concurrent.CompletableFuture<Boolean> f =
+                retiringStreamEncoderRelease.get();
+            if (f == null) return true;
+            long remainingMs =
+                Math.max(0L, (deadlineNanos - System.nanoTime()) / 1_000_000L);
+            try {
+                boolean clean = Boolean.TRUE.equals(
+                    f.get(remainingMs, java.util.concurrent.TimeUnit.MILLISECONDS));
+                if (!clean) {
+                    logger.error(where + ": retiring stream-encoder release reported a "
+                        + "wedged worker");
+                    return false;
+                }
+                if (retiringStreamEncoderRelease.compareAndSet(f, null)) {
+                    return true;
+                }
+                // Newer retirement published concurrently — loop and verify it.
+                logger.info(where + ": newer stream-encoder retirement published "
+                    + "during verification — re-verifying");
+            } catch (java.util.concurrent.TimeoutException te) {
+                logger.error(where + ": retiring stream-encoder release still pending "
+                    + "after the " + budgetMs + "ms budget (release never ran, or is "
+                    + "wedged)");
+                return false;
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                logger.error(where + ": interrupted verifying retiring stream-encoder "
+                    + "release");
+                return false;
+            } catch (Throwable t) {
+                logger.error(where + ": retiring stream-encoder release failed: "
+                    + t.getMessage());
+                return false;
+            }
+        }
+    }
     
     /**
      * Starts the GPU pipeline.
@@ -2265,6 +2458,28 @@ public class GpuSurveillancePipeline {
                 // down). Refuse — caller (cold-start executor) can retry on
                 // its next 2-second tick when the lane has settled.
                 logger.warn("Refusing start() — pipeline is mid-stop");
+                return;
+            }
+            // A trip-safe process restart is in flight (audit finding: a wedged
+            // teardown escalates asynchronously, and its coordinator can retry
+            // the trip checkpoint for a while before System.exit). Starting a
+            // NEW pipeline in that window would open a second camera/EGL stack
+            // alongside the wedged one the restart exists to escape — refuse.
+            // The flag self-clears if the coordinator fails, so this cannot
+            // permanently brick the daemon; callers retry on their next tick.
+            if (com.overdrive.app.daemon.CameraDaemon.isProcessRestartPending()) {
+                logger.warn("Refusing start() — trip-safe process restart pending");
+                return;
+            }
+            // LOCAL sticky latch (audit follow-up): the global flag above
+            // self-clears if the restart coordinator FAILS (System.exit threw),
+            // but the wedged camera/GL stack this pipeline abandoned is still
+            // out there — a start after that would build a second stack over
+            // it. This instance-level latch never clears; only a real process
+            // restart (which replaces the instance) lifts it.
+            if (pipelineTeardownWedged) {
+                logger.error("Refusing start() — a previous teardown of this pipeline "
+                    + "wedged (terminal); process restart required");
                 return;
             }
             starting = true;  // Block concurrent starts; running stays false
@@ -2473,7 +2688,14 @@ public class GpuSurveillancePipeline {
             if (camera == null || !camera.isRunning()) {
                 logger.warn("start(): camera.isRunning() false after warmup window — "
                     + "treating start as failed");
-                try { if (camera != null) camera.stop(); } catch (Throwable ignored) {}
+                // Deliberately NO camera.stop() here (audit follow-up): the catch
+                // below performs the one and only rollback stop and CONSUMES its
+                // verdict. An eager stop here discarded that verdict, and the
+                // catch's second call could then report clean (e.g. a rejected
+                // releaseGl post nulls an exited GL thread on call one; call two
+                // skips the whole GL block and returns true) — erasing the wedge
+                // the first call detected. Panoramic's verdict is also sticky now,
+                // but one stop with one consumed verdict is the primary fix.
                 // running stays false; starting cleared in catch below.
                 throw new IllegalStateException(
                     "Camera failed to reach running state within warmup window");
@@ -2613,14 +2835,29 @@ public class GpuSurveillancePipeline {
             // overwritten without releasing on the retry path.
             logger.warn("start() failed — releasing partial init state for clean retry: "
                 + e.getMessage());
+            // Rollback consumes camera.stop()'s verdict (audit follow-up): a
+            // wedged teardown discovered HERE must gate the recorder/encoder
+            // releases below (touching the wedged native state is the hazard
+            // the verdict exists to prevent) and latch this pipeline terminal.
+            // The earlier warmup-verify branch's own camera.stop() deliberately
+            // discards its result — it rethrows into THIS catch, which re-calls
+            // stop() (idempotent; sticky verdicts re-answer honestly) and
+            // handles the verdict once, here.
+            boolean rollbackCameraClean = true;
             try {
                 if (camera != null) {
-                    try { camera.stop(); } catch (Throwable t) {
+                    try { rollbackCameraClean = camera.stop(); } catch (Throwable t) {
                         logger.warn("start() rollback: camera.stop failed: " + t.getMessage());
                     }
                     camera = null;
                 }
             } catch (Throwable ignored) {}
+            if (!rollbackCameraClean) {
+                pipelineTeardownWedged = true;
+                logger.error("start() rollback: camera stop wedged — skipping "
+                    + "recorder/encoder release (trip-safe restart pending); this "
+                    + "pipeline instance is now terminal");
+            }
             try {
                 if (sentry != null) {
                     try { sentry.disable(); } catch (Throwable ignored) {}
@@ -2638,22 +2875,40 @@ public class GpuSurveillancePipeline {
                     downscaler = null;
                 }
             } catch (Throwable ignored) {}
-            try {
-                if (recorder != null) {
-                    try { recorder.release(); } catch (Throwable t) {
-                        logger.warn("start() rollback: recorder.release failed: " + t.getMessage());
+            if (rollbackCameraClean) {
+                try {
+                    if (recorder != null) {
+                        try { recorder.release(); } catch (Throwable t) {
+                            logger.warn("start() rollback: recorder.release failed: " + t.getMessage());
+                        }
+                        recorder = null;
                     }
-                    recorder = null;
-                }
-            } catch (Throwable ignored) {}
-            try {
-                if (encoder != null) {
-                    try { encoder.release(); } catch (Throwable t) {
-                        logger.warn("start() rollback: encoder.release failed: " + t.getMessage());
+                } catch (Throwable ignored) {}
+                try {
+                    if (encoder != null) {
+                        // Verdict consumed (audit follow-up): a wedge first
+                        // discovered here must latch the pipeline terminal.
+                        try {
+                            if (!encoder.release()) {
+                                pipelineTeardownWedged = true;
+                                logger.error("start() rollback: encoder release wedged "
+                                    + "— pipeline terminal");
+                            }
+                        } catch (Throwable t) {
+                            // Throw = wedge (see stop(): teardown state unknown).
+                            pipelineTeardownWedged = true;
+                            logger.error("start() rollback: encoder.release threw ("
+                                + t.getMessage() + ") — pipeline terminal");
+                        }
+                        encoder = null;
                     }
-                    encoder = null;
-                }
-            } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {}
+            } else {
+                // Wedged: drop the references without touching the native state —
+                // the pending process restart reclaims them.
+                recorder = null;
+                encoder = null;
+            }
             // FIX (audit R7): release the AdaptiveBitrateController that init()
             // allocated at line 1489. Without this, every start()-failure cycle
             // leaks the prior controller's handler thread, and the next init()
@@ -2766,10 +3021,16 @@ public class GpuSurveillancePipeline {
 
             // Disable streaming — stream encoder/scaler hold EGL surfaces that will be
             // destroyed when the camera stops. They must be released before camera.stop().
+            // UNCONDITIONAL (audit follow-up 2): an in-progress enableStreaming holds
+            // streamLifecycleLock across its bounded GL-init wait with a LIVE encoder
+            // while streamingEnabled is still false — a streamingEnabled-gated call
+            // here skipped the teardown in exactly that window and closed the camera
+            // over the new drainer. Calling unconditionally serializes on the lock:
+            // we block until the enable finishes (≤2s), then tear down whatever it
+            // installed; disableStreamingLocked's own early-out makes the truly-idle
+            // case a cheap no-op.
             try {
-                if (streamingEnabled) {
-                    disableStreaming();
-                }
+                disableStreaming();
             } catch (Throwable t) {
                 logger.warn("stop: disableStreaming failed: " + t.getMessage());
             }
@@ -2830,31 +3091,128 @@ public class GpuSurveillancePipeline {
                 logger.warn("OEM pre-pano-stop teardown failed: " + t.getMessage());
             }
 
-            // Stop camera (this releases EGL context and surfaces)
+            // FIX (EGL-leak audit): release the AI downscaler on every normal
+            // stop, BEFORE camera.stop() eglTerminates the shared display.
+            // The downscaler owns a private HandlerThread whose EGL context
+            // (shared with the camera's) is made current forever; without
+            // this release the context survives eglTerminate (EGL defers
+            // deletion of anything current on a live thread), the next
+            // init() overwrites the reference, and one context + surface +
+            // ImageReader leaks per stop/start cycle until the Adreno driver
+            // refuses new contexts (fleet failure: eglCreateContext loops
+            // until reboot). release() is synchronous and idempotent; the
+            // sentry was disabled above, so no consumer is still feeding it.
             try {
-                if (camera != null) {
-                    camera.stop();
+                if (downscaler != null) {
+                    downscaler.release();
                 }
             } catch (Throwable t) {
-                logger.warn("stop: camera.stop failed: " + t.getMessage());
+                logger.warn("stop: downscaler.release failed: " + t.getMessage());
+            } finally {
+                downscaler = null;
             }
 
-            // CRITICAL: Release recorder and encoder since EGL context is gone
-            // They must be recreated on next start()
-            try {
-                if (recorder != null) {
-                    recorder.release();
+            // Stop camera (this releases EGL context and surfaces). The verdict
+            // matters (audit follow-up): camera.stop() ABORTS on a wedged
+            // drainer/GL thread and requests a trip-safe restart — but the
+            // restart coordinator is asynchronous and can retry its checkpoint
+            // for a while, so this is NOT necessarily an imminent process exit.
+            // Releasing the recorder's GL resources and the encoder's codec/input
+            // surface over that still-live wedged state is exactly what must not
+            // happen. A THROW keeps the legacy behaviour (release anyway) — a
+            // throw is an ordinary teardown error with no restart pending, and
+            // skipping the releases there would leak with no recovery scheduled.
+            // Verify the RETIRING stream-encoder release BEFORE the camera closes
+            // (audit follow-up): disableStreaming above nulled the encoder fields
+            // and queued release() fire-and-forget, so the camera-close guard can
+            // never see that encoder — but its drainer keeps dequeuing against
+            // the camera until the release completes. 8s budget covers the worst
+            // BOUNDED release (2s drainer + 2s writer joins + codec release +
+            // executor queue); exceeding it means a wedge, and closing the camera
+            // over it is the FORTIFY abort. Escalation is idempotent (release()
+            // already requested it if the wedge was its own).
+            boolean cameraStopClean = true;
+            if (!verifyRetiringStreamEncoderRelease(8000, "stop")) {
+                cameraStopClean = false;
+                // URGENT when the camera is held (audit follow-up): skipping
+                // the close leaves the native AVM app without video until this
+                // process dies, and the conservative coordinator can wait
+                // indefinitely (checkpoint write can block on the same wedged
+                // mount). The urgent variant arms a short non-cancellable halt
+                // deadline first — and it arms even though release() may have
+                // already requested a conservative restart for the same wedge
+                // (escalation, not a duplicate request).
+                final boolean cameraHeld = camera != null && camera.isCameraHandleHeld();
+                // Request BEFORE logging: the logger can block on the same
+                // wedged storage that wedged the release, and a blocked log
+                // call ahead of the request would strand the held camera with
+                // no deadline armed.
+                try {
+                    if (cameraHeld) {
+                        com.overdrive.app.daemon.CameraDaemon.requestUrgentCameraReleaseRestart(
+                            "retiring stream encoder release incomplete before camera close");
+                    } else {
+                        com.overdrive.app.daemon.CameraDaemon.requestProcessRestartPreservingTrip(
+                            "retiring stream encoder release incomplete before camera close");
+                    }
+                } catch (Throwable t) {
+                    try {
+                        logger.error("stop: process-restart request failed: " + t.getMessage());
+                    } catch (Throwable ignored) {}
                 }
-            } catch (Throwable t) {
-                logger.warn("stop: recorder.release failed: " + t.getMessage());
+                logger.error("stop: retiring stream-encoder release incomplete/wedged — "
+                    + "skipping camera close (FORTIFY risk); requested "
+                    + (cameraHeld ? "URGENT bounded" : "trip-safe") + " restart");
+            } else {
+                try {
+                    if (camera != null) {
+                        cameraStopClean = camera.stop();
+                    }
+                } catch (Throwable t) {
+                    logger.warn("stop: camera.stop failed: " + t.getMessage());
+                }
             }
 
-            try {
-                if (encoder != null) {
-                    encoder.release();
+            if (cameraStopClean) {
+                // CRITICAL: Release recorder and encoder since EGL context is gone
+                // They must be recreated on next start()
+                try {
+                    if (recorder != null) {
+                        recorder.release();
+                    }
+                } catch (Throwable t) {
+                    logger.warn("stop: recorder.release failed: " + t.getMessage());
                 }
-            } catch (Throwable t) {
-                logger.warn("stop: encoder.release failed: " + t.getMessage());
+
+                // Consume the release verdict (audit follow-up): a disk-writer
+                // wedge can be FIRST discovered here, and without latching it the
+                // instance stays locally reusable if the global restart request
+                // self-clears. release() escalates internally; the latch is ours.
+                try {
+                    if (encoder != null && !encoder.release()) {
+                        pipelineTeardownWedged = true;
+                        logger.error("stop: encoder release wedged — pipeline terminal");
+                    }
+                } catch (Throwable t) {
+                    // A THROW is treated like a wedge (audit follow-up 3):
+                    // release() handles its failures internally, so an escaping
+                    // throw means teardown state is unknown — not safe to reuse.
+                    pipelineTeardownWedged = true;
+                    logger.error("stop: encoder.release threw (" + t.getMessage()
+                        + ") — pipeline terminal");
+                }
+            } else {
+                // LOCAL sticky latch too (audit follow-up): the finally below
+                // still clears initialized/refs/stopping — necessary so the
+                // shutdown path can proceed — but if the restart coordinator
+                // FAILS and clears the global pending flag, only this latch
+                // stops a later start() from building a second camera/GL stack
+                // over the wedged one we just abandoned.
+                pipelineTeardownWedged = true;
+                logger.error("stop: camera stop aborted/degraded (wedged native state, "
+                    + "trip-safe restart pending) — skipping recorder/encoder release; "
+                    + "references are dropped and the process exit reclaims the "
+                    + "resources. This pipeline instance is now terminal.");
             }
 
             logger.info( "GPU pipeline stopped");
@@ -2911,7 +3269,21 @@ public class GpuSurveillancePipeline {
         }
         
         if (encoder != null) {
-            encoder.release();
+            // Verdict consumed (audit follow-up 3): this path is reachable with a
+            // live encoder when stop() early-returned (pipeline never running), so
+            // a wedge can be FIRST discovered here. release() escalates
+            // internally; the terminal latch is ours to set — on a false verdict
+            // AND on a throw (teardown state unknown either way).
+            try {
+                if (!encoder.release()) {
+                    pipelineTeardownWedged = true;
+                    logger.error("release(): encoder release wedged — pipeline terminal");
+                }
+            } catch (Throwable t) {
+                pipelineTeardownWedged = true;
+                logger.error("release(): encoder.release threw (" + t.getMessage()
+                    + ") — pipeline terminal");
+            }
             encoder = null;
         }
         
@@ -3613,41 +3985,121 @@ public class GpuSurveillancePipeline {
         return probeDir;
     }
 
-    private boolean isStorageWriteReady(java.io.File dir) {
+    /**
+     * Public (rather than private) for exactly one external caller:
+     * StorageManager's post-mount recording-migration worker probes the
+     * freshly-resolved external recordings dir with THIS bounded touch-probe
+     * before it stops a healthy internal-fallback session — mount liveness
+     * alone (StatFs on the volume root) cannot prove the recordings
+     * directory itself accepts writes (perms reset, RO remount, dir-level
+     * FUSE wedge), and discovering that only after the stop would trade a
+     * working internal recording for none at all. Same probe, same timeout,
+     * same semantics as the recording-start pre-flight — a target the start
+     * path would accept is exactly what the migration must require.
+     *
+     * <p><b>Same-path single-flight.</b> A probe that misses its join budget
+     * leaves its daemon thread wedged inside the FUSE write until the volume
+     * recovers — and every RETRY loop above this method (the pipeline's own
+     * 2s storage-ready retry, StorageManager's post-mount migration worker)
+     * would otherwise stack a fresh wedged thread per attempt (~11 per
+     * migration edge alone). One outstanding probe per absolute path is both
+     * the leak fix and the honest answer: an unanswered probe already IS the
+     * "not write-ready" verdict, so callers get {@code false} immediately
+     * instead of paying another timeout against the same dead directory.
+     * The wedged thread removes itself from the registry whenever the volume
+     * finally lets it finish, after which probing resumes normally.
+     */
+    public boolean isStorageWriteReady(java.io.File dir) {
         if (dir == null) return false;
         final java.io.File target = dir;
+        final String probeKey = dir.getAbsolutePath();
         final boolean[] ok = {false};
-        Thread probe = new Thread(() -> {
-            try {
-                if (!target.exists()) {
-                    target.mkdirs();
-                }
-                if (!target.isDirectory()) return;
-                java.io.File t = new java.io.File(target,
-                    ".wrprobe_" + android.os.Process.myPid());
-                java.io.FileOutputStream fos = new java.io.FileOutputStream(t);
-                try {
-                    fos.write(0);
-                    fos.flush();
-                } finally {
-                    try { fos.close(); } catch (Exception ignored) {}
-                }
-                t.delete();
-                ok[0] = true;
-            } catch (Throwable ignored) {
-                // ok stays false — volume not write-ready
+        final Thread[] spawned = {null};
+        writeProbesInFlight.compute(probeKey, (key, existing) -> {
+            if (existing != null) {
+                // ANY existing entry is an in-flight probe — deliberately no
+                // isAlive() check. The entry is published HERE, before the
+                // spawning caller reaches start(), and a NEW (un-started)
+                // thread reads isAlive()==false: an aliveness test would let
+                // a concurrent same-path caller mistake the about-to-start
+                // probe for a dead leftover, replace it, and run TWO probes
+                // against the same path — the exact stacking this map
+                // prevents. Presence IS the liveness signal: every started
+                // probe removes itself in its finally, and the one way an
+                // entry can go stale — start() itself throwing — is cleaned
+                // up at the spawn site below.
+                return existing;
             }
-        }, "RecWriteProbe");
-        probe.setDaemon(true);
-        probe.start();
+            // No probe outstanding — this call owns the slot.
+            Thread t = new Thread(() -> {
+                try {
+                    if (!target.exists()) {
+                        target.mkdirs();
+                    }
+                    if (!target.isDirectory()) return;
+                    java.io.File probeFile = new java.io.File(target,
+                        ".wrprobe_" + android.os.Process.myPid());
+                    java.io.FileOutputStream fos = new java.io.FileOutputStream(probeFile);
+                    try {
+                        fos.write(0);
+                        fos.flush();
+                    } finally {
+                        try { fos.close(); } catch (Exception ignored) {}
+                    }
+                    probeFile.delete();
+                    ok[0] = true;
+                } catch (Throwable ignored) {
+                    // ok stays false — volume not write-ready
+                } finally {
+                    // Two-arg remove: only clears the slot if THIS thread
+                    // still owns it (a dead predecessor's late finally must
+                    // not evict a live successor probe).
+                    writeProbesInFlight.remove(key, Thread.currentThread());
+                }
+            }, "RecWriteProbe");
+            t.setDaemon(true);
+            spawned[0] = t;
+            return t;
+        });
+        if (spawned[0] == null) {
+            logger.info("isStorageWriteReady: probe for " + probeKey
+                + " already in flight (concurrent caller or earlier timed-out attempt) — "
+                + "reporting not-ready without stacking another probe thread");
+            return false;
+        }
         try {
-            probe.join(STORAGE_PROBE_TIMEOUT_MS);
+            spawned[0].start();
+        } catch (Throwable t) {
+            // start() failing (thread limit, OOM) means the probe body's
+            // self-removing finally will never run — without this cleanup the
+            // never-started thread would occupy the path's slot forever and
+            // every future probe of this path would report not-ready. Two-arg
+            // remove so we only clear the slot if we still own it.
+            writeProbesInFlight.remove(probeKey, spawned[0]);
+            logger.warn("isStorageWriteReady: probe thread start failed for " + probeKey
+                + " (" + t.getMessage() + ") — slot released, reporting not-ready");
+            return false;
+        }
+        try {
+            spawned[0].join(STORAGE_PROBE_TIMEOUT_MS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
         }
         return ok[0];  // false if the probe timed out (still running) or failed
     }
+
+    /**
+     * In-flight {@link #isStorageWriteReady} probe threads keyed by absolute
+     * directory path — see the single-flight note on that method. An entry's
+     * PRESENCE is the in-flight signal (no isAlive() checks — a published
+     * thread may legitimately still be NEW for a beat before its owner calls
+     * start()). Entries self-remove in the probe's finally, or at the spawn
+     * site when start() itself throws; a wedged probe therefore occupies its
+     * path's slot exactly as long as the volume holds its write hostage.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, Thread> writeProbesInFlight =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * Timeout-bounded wrapper around {@link StorageManager#ensureStorageReady}
@@ -3780,10 +4232,19 @@ public class GpuSurveillancePipeline {
             }
         }
         
-        // SOTA: Ensure storage is ready (mount SD card if needed)
+        // SOTA: Ensure storage is ready (mount SD card if needed).
+        // BOUNDED (audit: arm/disarm notification storm): this was the raw
+        // ensureStorageReady(true), which can block for minutes on a
+        // FUSE-bridged SD mid-enumeration — blowing the 15s surveillance-
+        // enable lease (CameraDaemon revoked it "after enable deadline" in
+        // the field log), marking the ACC transition stale and re-running
+        // the whole OFF lifecycle. Same bounded-probe idiom as the
+        // recording-start path above; on timeout we continue on the internal
+        // fallback and the engine's per-trigger dir refresh routes a
+        // late-landing mount to SD.
         try {
             StorageManager storage = StorageManager.getInstance();
-            if (!storage.ensureStorageReady(true)) {
+            if (!ensureStorageReadyBounded(true)) {
                 logger.warn("Storage not ready for surveillance, but continuing with fallback");
             }
 
@@ -4035,10 +4496,52 @@ public class GpuSurveillancePipeline {
                 return;
             }
 
+            // Reject while a stop is in flight (audit follow-up 3): stop()'s
+            // unconditional disableStreaming barrier has possibly ALREADY run,
+            // so an enable admitted now would build a live encoder+drainer that
+            // stop's subsequent camera close never re-checks. `stopping` is
+            // volatile; the definitive re-check happens again after the
+            // auto-start below.
+            if (stopping) {
+                throw new IllegalStateException(
+                    "stream enable refused — pipeline stop in progress");
+            }
+
+            // Refuse a replacement while the RETIRING encoder's release is still
+            // in flight or failed (audit follow-up): a rapid disable→enable used
+            // to install a fresh encoder while the old one's drainer was still
+            // dequeuing against the camera — the new lane's healthy workers then
+            // masked the retiring one from every guard. Not-done → transient
+            // refusal (caller retries in a moment); done-but-wedged → terminal
+            // (release() already requested the trip-safe restart).
+            java.util.concurrent.CompletableFuture<Boolean> retiring =
+                retiringStreamEncoderRelease.get();
+            if (retiring != null && !retiring.isDone()) {
+                throw new IllegalStateException("stream re-enable refused — previous "
+                    + "stream encoder release still in flight; retry shortly");
+            }
+            if (retiring != null
+                    && !verifyRetiringStreamEncoderRelease(0, "enableStreaming")) {
+                throw new IllegalStateException("stream re-enable refused — previous "
+                    + "stream encoder release wedged (trip-safe restart pending)");
+            }
+
             // Auto-start pipeline if not running (e.g., DRIVE_MODE in gear P, user opens stream)
             if (!running) {
                 logger.info("Pipeline not running — auto-starting for streaming (view-only)");
                 start(false);  // Start without auto-recording
+            }
+
+            // start(false) REFUSES BY RETURNING NORMALLY when a stop is mid-flight,
+            // a trip-safe restart is pending, or the pipeline is terminal — so its
+            // outcome must be re-checked, not assumed (audit follow-up 3).
+            // Proceeding here used to build a live encoder+drainer against the
+            // RETAINED camera object (whose stale GL handler is non-null even
+            // after its looper quit), after stop()'s disable barrier had already
+            // run — a drainer nothing would guard at the camera close.
+            if (!running || stopping) {
+                throw new IllegalStateException("Cannot enable streaming — pipeline "
+                    + "not running (stop in progress, or start refused)");
             }
 
             // Verify camera GL thread is ready after start
@@ -4073,6 +4576,13 @@ public class GpuSurveillancePipeline {
             streamEncoder = null;
             streamScaler = null;
             wsStreamServer = null;
+            // Publish the retirement placeholder SYNCHRONOUSLY at detach (audit
+            // follow-up 2): publication from inside the GL runnable left the
+            // guard bypassable whenever the runnable outran the caller's wait.
+            // The runnable now only COMPLETES this placeholder; if it never
+            // runs, the pending placeholder correctly reads as wedged.
+            final java.util.concurrent.CompletableFuture<Boolean> encRetireVerdict =
+                (encLocal != null) ? publishRetiringStreamEncoderRelease() : null;
             try { if (wsLocal != null) wsLocal.shutdown(); } catch (Throwable ignored) {}
             android.os.Handler glH = (camera != null) ? camera.getGlHandler() : null;
             boolean glPostAccepted = false;
@@ -4083,7 +4593,7 @@ public class GpuSurveillancePipeline {
                     // Encoder release dispatched AFTER scaler.release runs
                     // (still on GL thread), so the BufferQueue tear-down
                     // can't race the EGLWindowSurface destroy.
-                    if (encLocal != null) submitEncoderRelease(encLocal);
+                    if (encLocal != null) submitEncoderRelease(encLocal, encRetireVerdict);
                 });
             }
             if (!glPostAccepted) {
@@ -4096,7 +4606,7 @@ public class GpuSurveillancePipeline {
                 // race with — fall back to direct release for both.
                 try { if (scLocal != null) { scLocal.unbindOemSource(); scLocal.release(); } }
                 catch (Throwable ignored) {}
-                if (encLocal != null) submitEncoderRelease(encLocal);
+                if (encLocal != null) submitEncoderRelease(encLocal, encRetireVerdict);
             }
             if (t instanceof Exception) throw (Exception) t;
             throw new RuntimeException(t);
@@ -4114,6 +4624,17 @@ public class GpuSurveillancePipeline {
         // at true, causing the next reattachOwnStreamCallback to try
         // unbinding an OEM source that this fresh enable never bound.
         externalStreamSourceActive = false;
+
+        int streamLayout = camera != null ? camera.getCameraLayoutMode() : 0;
+        if (streamLayout == 1) {
+            int nativeAspectHeight =
+                com.overdrive.app.camera.PassiveApaGeometry.heightForWidth(streamWidth);
+            if (streamHeight != nativeAspectHeight) {
+                logger.info("Passive APA stream size " + streamWidth + "x" + streamHeight
+                    + " -> " + streamWidth + "x" + nativeAspectHeight);
+                streamHeight = nativeAspectHeight;
+            }
+        }
 
         // On dilink4, cap the ENCODER's declared frame rate to what this HAL can
         // actually deliver.
@@ -4191,15 +4712,14 @@ public class GpuSurveillancePipeline {
                 logger.warn("od init failed: " + t.getMessage());
             }
 
-        boolean isDilink5 = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
-        boolean streamUsingOemPath =
-            (camera != null && camera.isUsingOemSurfaceTexturePath());
-        streamScaler.setCameraLayout(isDilink5 ? 1 : (streamUsingOemPath ? 3 : 0));
+        // Match the recorder exactly: 0=legacy strip, 1=full-frame passive
+        // APA (and DiLink 5), 3=four-corner DiLink 4 remap.
+        streamScaler.setCameraLayout(streamLayout);
 
         // Hardcoded Variant A corner+flip constants on DiLink 4. Mirrors
         // GpuMosaicRecorder so live stream and recording stay aligned. On
         // legacy cars the uniforms are unused (uApaMode != 3 path).
-        if (streamUsingOemPath && !isDilink5) {
+        if (streamLayout == 3) {
             // Single combined call referencing the shared Dilink4Constants
             // so the stream scaler can never silently diverge from the
             // recorder's mosaic arrangement.
@@ -4212,6 +4732,8 @@ public class GpuSurveillancePipeline {
                 com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
                 com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
                 com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
+        }
+        if (streamLayout != 0) {
             // Red-overlay suppression follows the recorder. Read the same
             // unified-config flag so the live preview matches the MP4.
             try {
@@ -4220,13 +4742,15 @@ public class GpuSurveillancePipeline {
                 if (camCfgStream != null) {
                     streamScaler.setRedMaskEnabled(
                         camCfgStream.optBoolean("dilink4RedMask", false));
-                    streamScaler.setApaCenterInset(
-                        (float) camCfgStream.optDouble("dilink4ApaCenterInset", 0.09375));
+                    streamScaler.setApaCenterInset(streamLayout == 3
+                        ? (float) camCfgStream.optDouble(
+                            "dilink4ApaCenterInset", 0.09375)
+                        : 0.0f);
                 }
             } catch (Throwable t) {
                 logger.warn("Stream scaler red-mask flag read failed: " + t.getMessage());
             }
-        } else if (isDilink5) {
+        } else if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             streamScaler.setRedMaskEnabled(false);
         }
         
@@ -4261,25 +4785,22 @@ public class GpuSurveillancePipeline {
             }
         });
 
-        // Wait for GL thread initialization (max 2 seconds). Release the
-        // streamLifecycleLock around the wait so concurrent disable /
-        // attach / stop callers don't pin for the full 2 seconds — the
-        // pre-fix synchronized(this) held the monitor across this wait
-        // and starved every peer. The components aren't published to the
-        // camera yet (camera.setStreamingComponents happens AFTER this
-        // wait), so a concurrent disableStreaming will see streamingEnabled
-        // == false and bail; a concurrent attachExternalStreamCallback
-        // will see streamScaler == null and refuse. Both safe.
-        boolean lockHeld = streamLifecycleLock.isHeldByCurrentThread();
-        if (lockHeld) streamLifecycleLock.unlock();
-        try {
-            synchronized (initLock) {
-                if (!initDone[0]) {
-                    initLock.wait(2000);
-                }
+        // Wait for GL thread initialization (max 2 seconds) — HOLDING
+        // streamLifecycleLock (audit follow-up 2). An earlier fix released the
+        // lock here so peers didn't pin for the full 2s, reasoning that a
+        // concurrent disableStreaming "sees streamingEnabled == false and
+        // bails — safe". That reasoning missed the camera CLOSE path: the
+        // stream encoder and its drainer are ALREADY LIVE (streamEncoder.init()
+        // above), while streamingEnabled is still false and the camera-side
+        // reference is still null — so a concurrent stop() skipped streaming
+        // teardown entirely and closed the camera with NOTHING guarding the
+        // brand-new drainer (FORTIFY destroyed-mutex risk). stop() now calls
+        // disableStreaming() unconditionally, and blocking it here for up to
+        // 2s is exactly the serialization that makes its camera close safe.
+        synchronized (initLock) {
+            if (!initDone[0]) {
+                initLock.wait(2000);
             }
-        } finally {
-            if (lockHeld) streamLifecycleLock.lock();
         }
 
         if (!initDone[0]) {
@@ -4531,6 +5052,15 @@ public class GpuSurveillancePipeline {
         final HardwareEventRecorderGpu encoderRef = streamEncoder;
         streamScaler = null;        // field-null visible to render loop + attach NOW
         streamEncoder = null;
+        // Publish the retirement placeholder SYNCHRONOUSLY at detach (audit
+        // follow-up 2): the release itself is dispatched from inside the
+        // GL-posted runnable below, which can outrun the 1000ms latch wait —
+        // publication from in there left stop()'s pre-camera-close guard
+        // reading null and bypassing the verification entirely. The runnable
+        // now only COMPLETES this placeholder; a runnable that never runs
+        // leaves it pending, which verification correctly reads as wedged.
+        final java.util.concurrent.CompletableFuture<Boolean> streamRetireVerdict =
+            (encoderRef != null) ? publishRetiringStreamEncoderRelease() : null;
 
         // OEM publish ref clear runs AFTER the field-null so any concurrent
         // attach that captured a non-null scaler reference observes the
@@ -4589,7 +5119,7 @@ public class GpuSurveillancePipeline {
                     // so order is preserved without pinning the GL thread
                     // for the 3s waitForFinalizers.
                     if (encoderRef != null) {
-                        submitEncoderRelease(encoderRef);
+                        submitEncoderRelease(encoderRef, streamRetireVerdict);
                     }
                 } finally {
                     latch.countDown();
@@ -4599,7 +5129,7 @@ public class GpuSurveillancePipeline {
                 logger.warn("scaler release: GL handler post() rejected; falling back");
                 try { scalerRef.unbindOemSource(); } catch (Throwable ignored) {}
                 try { scalerRef.release(); } catch (Throwable ignored) {}
-                if (encoderRef != null) submitEncoderRelease(encoderRef);
+                if (encoderRef != null) submitEncoderRelease(encoderRef, streamRetireVerdict);
             } else {
                 try {
                     // 1000ms ceiling: scaler.release does eglCore.makeCurrent +
@@ -4621,10 +5151,10 @@ public class GpuSurveillancePipeline {
         } else if (scalerRef != null) {
             try { scalerRef.unbindOemSource(); } catch (Throwable ignored) {}
             try { scalerRef.release(); } catch (Throwable ignored) {}
-            if (encoderRef != null) submitEncoderRelease(encoderRef);
+            if (encoderRef != null) submitEncoderRelease(encoderRef, streamRetireVerdict);
         } else if (encoderRef != null) {
             // Scaler-less path (initialization aborted before scaler).
-            submitEncoderRelease(encoderRef);
+            submitEncoderRelease(encoderRef, streamRetireVerdict);
         }
 
         logger.info("H.264 streaming disabled");
@@ -4706,6 +5236,108 @@ public class GpuSurveillancePipeline {
     }
 
     /**
+     * True while the shared lane's program labels are INCOHERENT: the layer is
+     * visible but {@code laneProgram} is {@link #PROG_NONE} — an inherited live
+     * lane between {@code enableCamView} and the arbiter's transition tick
+     * (≤250ms), where the on-screen content may be the previous program's (a
+     * blind-spot card, or an earlier camera view) and this class cannot attribute
+     * it ({@link #isBlindSpotCardShowing}'s javadoc explains why bare visibility
+     * cannot distinguish the programs).
+     *
+     * <p>Surfaced through /status so the overlay's poll can SKIP adopting the
+     * ✕-selection flags from a response built in this window. The overlay's
+     * edge-settle gate alone cannot cover it: the show-edge broadcast rides a
+     * DETACHED {@code am} exec, so a transitional poll can beat the edge's
+     * timestamp stamp, clear the blind-spot flag, and the late edge (which only
+     * carries camview state) never restores it — the wrong ✕ then stood until
+     * the next poll (3s, 30s idle-throttled). An honest "labels unreliable"
+     * signal closes that race independent of broadcast timing.
+     *
+     * <p>Single-label read. When PAIRING this with {@link #isBlindSpotCardShowing}
+     * (the /status emission), use {@link #getCloseLabels()} — two separate calls
+     * can straddle an arbiter program change and report false/false with the card
+     * still visible, defeating the very gate the pair exists to feed.
+     */
+    public boolean isLaneProgramTransitioning() {
+        return bsLayerVisible && laneProgram == PROG_NONE;
+    }
+
+    /** The ✕-selection labels as one CONSISTENT pair — see {@link #getCloseLabels()}. */
+    public static final class CloseLabels {
+        public final boolean bsCardShowing;
+        public final boolean laneTransitioning;
+        CloseLabels(boolean bsCardShowing, boolean laneTransitioning) {
+            this.bsCardShowing = bsCardShowing;
+            this.laneTransitioning = laneTransitioning;
+        }
+    }
+
+    /**
+     * Snapshot BOTH ✕-selection labels from ONE {@code laneProgram} read.
+     *
+     * <p>Volatile reads are individually visible but not jointly atomic: computing
+     * {@code bsCardShowing} and {@code laneTransitioning} through two separate
+     * getter calls lets the arbiter change {@code laneProgram} in between —
+     * bsCardShowing evaluated during PROG_NONE (false), laneTransitioning after
+     * the PROG_BS restore (false) — and the false/false pair told the overlay the
+     * labels were COHERENT while the blind-spot card was still visible, so it
+     * adopted the wrong camera ✕. Deriving both from the same program value makes
+     * that pair impossible by construction: with the layer visible, PROG_NONE ⇒
+     * transitioning=true (skip), PROG_BS ⇒ bsCardShowing=true (blind-spot ✕),
+     * PROG_CAMVIEW ⇒ false/false is genuinely correct (camview content, camera ✕).
+     *
+     * <p>The WHOLE TUPLE is read twice (seqlock-style double read): a single
+     * pre-read of the program alone could pair an OLD program with a NEW
+     * visibility — during the idle-BS → camview yield the tick writes
+     * laneProgram=PROG_CAMVIEW then bsLayerVisible=true, so a snapshot straddling
+     * it combined stale PROG_BS with fresh visible=true and reported the
+     * blind-spot ✕ over camview content (a false POSITIVE the transitioning flag
+     * did not cover). And a program-only bracket is NOT preemption-safe: the HTTP
+     * thread can be descheduled across multiple 250ms ticks, so BS → CAMVIEW → BS
+     * passes an equal program check while the companion reads came from the
+     * camview era. Requiring the FULL tuple to match across both passes catches
+     * any single-field change mid-snapshot; a full-tuple ABA (returning to the
+     * identical tuple) computes a label correct for the end-of-snapshot state.
+     *
+     * <p>ACCEPTED RESIDUAL (audit 2026-08, rated Low): an unversioned double read
+     * is still not a true snapshot — IDENTICALLY torn passes can pass equality.
+     * Concretely: repeated BS-idle → camview → BS-idle → camview flips could
+     * yield (BS, true, true) on both passes, with each read landing in a
+     * different era. Reaching it needs THREE program transitions (arbiter ticks
+     * are 250ms apart, so ≥500ms of flapping) interleaved into one six-read
+     * snapshot, with the reader descheduled at exactly the right field
+     * boundaries each time, coinciding with a /status poll; the consequence is
+     * one wrong ✕ for ≤1 poll cycle, self-correcting, and the mis-tap is
+     * recoverable (a BS dismiss re-shows on the next signal; a camview hide is
+     * re-showable). The airtight fix is a real seqlock — paired odd/even version
+     * bumps around EVERY mutation of these three fields (~15 scattered writer
+     * sites across the arbiter/enable/disable/takeover/teardown paths, several
+     * of which run WITHOUT bsLifecycleLock, e.g. bsTurnTick's PROG_BS restore) —
+     * where one missed or misordered bump silently voids the guarantee. A
+     * single-bump version counter is NOT airtight (bump-after-write misses a
+     * reader finishing before the bump; bump-before-write has the mirror hole),
+     * so the only honest upgrades are the full seqlock or funneling all writes
+     * through locked mutators. Both were judged regression-riskier than this
+     * residual; escalate only if a wrong ✕ is actually observed in the field.
+     */
+    public CloseLabels getCloseLabels() {
+        final int p1 = laneProgram;
+        final boolean v1 = bsLayerVisible;
+        final boolean e1 = blindSpotEnabled;
+        final int p2 = laneProgram;
+        final boolean v2 = bsLayerVisible;
+        final boolean e2 = blindSpotEnabled;
+        if (p1 != p2 || v1 != v2 || e1 != e2) {
+            // The lane state moved mid-snapshot: the reads cannot be attributed
+            // to a single instant. Honest incoherence.
+            return new CloseLabels(false, true);
+        }
+        return new CloseLabels(
+                e1 && v1 && p1 == PROG_BS,
+                v1 && p1 == PROG_NONE);
+    }
+
+    /**
      * The lane's current on-screen dest rect {x,y,w,h} — whichever program owns it.
      *
      * <p>The floating ✕ needs this because the card renders on a SurfaceControl layer at
@@ -4719,7 +5351,37 @@ public class GpuSurveillancePipeline {
      * not alias it). Null when no lane geometry is resolved yet.
      */
     public int[] getLaneGeomRect() {
-        int[] g = bsGeomRect;
+        // When a camera view holds an UNMASKED claim on the lane, report the CAMVIEW
+        // rect: between enableCamView and the arbiter's transition tick (≤250ms)
+        // bsGeomRect still holds the PREVIOUS program's geometry, and a /status
+        // response built in that window fed the overlay a stale rect that passed
+        // its fetched-after-the-edge freshness gate — the daemon itself was the
+        // stale source, so the gate could not help. camViewGeomRect is resolved
+        // BEFORE camViewActive publishes, and the transition tick copies this same
+        // rect into bsGeomRect, so the two sources converge once configured.
+        //
+        // The claim during PROG_NONE requires blind-spot DISABLED. PROG_NONE alone
+        // does NOT mean camview owns the visible lane: enableCamView sets PROG_NONE
+        // while a blind-spot card may still be SHOWING (the PROG_BS restore in
+        // bsTurnTick documents that state), and on that tick BS usually re-asserts
+        // priority — reporting the camview rect there would move the VISIBLE
+        // blind-spot ✕ to the camera position. With BS enabled we therefore keep
+        // reporting bsGeomRect until the tick actually hands camview the program
+        // (PROG_CAMVIEW). The camview-under-idle-BS pre-transition window (≤250ms)
+        // is covered by the show-edge broadcast + the overlay's post-edge settle.
+        boolean camViewClaim = camViewActive
+                && (laneProgram == PROG_CAMVIEW
+                    || (laneProgram == PROG_NONE && !blindSpotEnabled));
+        // CLUSTER rects are in the cluster panel's space — meaningless to the
+        // head-unit ✕. Gate on the CLAIM-appropriate target: camViewTarget for a
+        // camview claim (bsTarget can lag it in the transition window — a
+        // cluster→head-unit camview show would otherwise be suppressed by the
+        // stale bsTarget, feeding the overlay a null that clears the fresh edge
+        // rect), bsTarget otherwise. Callers need no cluster gate of their own.
+        if (camViewClaim ? isCamViewClusterTarget() : "cluster".equals(bsTarget)) {
+            return null;
+        }
+        int[] g = camViewClaim ? camViewGeomRect : bsGeomRect;
         if (g == null || g.length != 4) return null;
         // bsGeomRect starts life as the {-1,-1,-1,-1} SENTINEL (never-resolved), and a
         // degenerate w/h can also appear mid-resolve. Publishing that as a real rect made
@@ -4982,9 +5644,9 @@ public class GpuSurveillancePipeline {
                 // Fisheye/lens dewarp for the single-camera views (side/rear). Separate
                 // knob from recording.rectifyStrength; the shader applies it ONLY in the
                 // merge 1/2 passthrough (identity at 0, and never touches 'both'). The
-                // BS card buffer is 4:3 (1280×960) → aspect 0.75, same as a camera tile.
+                // Match the active shared-lane buffer aspect.
                 s.setBlindSpotRectifyStrength((float) bs.optInt("rectifyStrength", 0));
-                s.setBlindSpotRectifyAspect((float) BS_HEIGHT / (float) BS_WIDTH);
+                s.setBlindSpotRectifyAspect((float) sharedLaneHeight / (float) BS_WIDTH);
                 // On-screen card rotation is done in the GL vertex shader (output
                 // geometry), NOT via the SurfaceControl layer transform — this
                 // firmware's compositor drops a 90/270 layer transform → blank card
@@ -5144,7 +5806,7 @@ public class GpuSurveillancePipeline {
 
     private void enableBlindSpotInternal() throws Exception {
         logger.info(String.format("BS: enabling NATIVE blind-spot lane %dx%d, view=%d",
-            BS_WIDTH, BS_HEIGHT, bsViewMode));
+            BS_WIDTH, sharedLaneHeight, bsViewMode));
 
         // Build (or reuse) the single shared native lane. buildSharedLaneLocked returns
         // false when the lane already exists — which now has TWO causes:
@@ -5210,8 +5872,14 @@ public class GpuSurveillancePipeline {
         // re-issues /api/camview/show if they still want it after BS turns off.
         if (camViewActive) {
             try { com.overdrive.app.surveillance.ClusterProjectionController.getInstance().releaseSustained("camview"); } catch (Throwable ignored) {}
-            camViewActive = false;
-            camViewHideAtMs = 0L;
+            // Route through the SHARED session-ending contract (audit finding: this
+            // path used to clear camViewActive directly, leaving the owner token,
+            // session id, fail-open override and any pending deferred arm alive —
+            // a stale enable or surviving arm-retry could re-arm the stolen view,
+            // and the orphaned owner made the next automation hide a false
+            // not-owner no-op). endCamViewSessionLocked invalidates all of it;
+            // the lane itself is deliberately NOT torn down — BS owns it now.
+            endCamViewSessionLocked();
             logger.info("BS: took lane ownership from camera-view (priority)");
             // The camera view is gone (BS stole the lane) but this path does NOT go
             // through disableCamView(), so tell the app-side ✕ overlay it's closed —
@@ -5219,13 +5887,7 @@ public class GpuSurveillancePipeline {
             // view. emitCamViewState only spawns a detached `am broadcast` (no lock, no
             // block), so it's safe to call inline here under bsLifecycleLock.
             emitCamViewState(false, null);
-            // Clear the persisted request too: this path tears the session down without
-            // going through disableCamView, so camview.enabled would stay true in config
-            // while the runtime says gone. Nothing currently restores from that flag, so
-            // this is about the config not lying rather than a live defect. Dispatched
-            // OFF-THREAD: setCamViewValues is a full-JSON write under the cross-process
-            // config file lock, and we hold bsLifecycleLock here — doing it inline would
-            // block the lane lifecycle behind a peer daemon's config write.
+            // Clear the persisted request too. Keep the config write off the lane lock.
             Thread cvOff = new Thread(() -> {
                 try {
                     java.util.Map<String, Object> off = new java.util.HashMap<>();
@@ -5271,7 +5933,8 @@ public class GpuSurveillancePipeline {
         }
 
         // Own SurfaceControl layer (GPU → screen, no encoder/WS/decoder).
-        bsLayer = new com.overdrive.app.surveillance.BsNativeLayer(BS_WIDTH, BS_HEIGHT);
+        bsLayer = new com.overdrive.app.surveillance.BsNativeLayer(
+            BS_WIDTH, sharedLaneHeight);
         if (!bsLayer.create()) {
             bsLayer = null;
             throw new RuntimeException("BS: SurfaceControl layer create failed");
@@ -5282,7 +5945,7 @@ public class GpuSurveillancePipeline {
         com.overdrive.app.camera.ResolvedCameraConfig cfg =
             com.overdrive.app.camera.CameraConfigResolver.resolve(getVehicleModel());
         bsScaler = new com.overdrive.app.streaming.GpuStreamScaler(
-            BS_WIDTH, BS_HEIGHT, cfg.getQuadrantStripOffsetX());
+            BS_WIDTH, sharedLaneHeight, cfg.getQuadrantStripOffsetX());
 
         // BS-LIFECYCLE-1: from here on, bsScaler+bsLayer are assigned to the
         // instance fields and a GL EGLWindowSurface gets created wrapping the SC
@@ -5301,9 +5964,9 @@ public class GpuSurveillancePipeline {
             logger.warn("BS: od init failed: " + t.getMessage());
         }
 
-        boolean oemPath = (camera != null && camera.isUsingOemSurfaceTexturePath());
-        bsScaler.setCameraLayout(oemPath ? 3 : 0);
-        if (oemPath) {
+        int bsLayout = camera != null ? camera.getCameraLayoutMode() : 0;
+        bsScaler.setCameraLayout(bsLayout);
+        if (bsLayout == 3) {
             bsScaler.setProducerLayout(
                 com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
                 com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
@@ -5313,6 +5976,8 @@ public class GpuSurveillancePipeline {
                 com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
                 com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
                 com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
+        }
+        if (bsLayout != 0) {
             // Parity with the recorder + stream lanes: the blind-spot scaler is
             // another GpuStreamScaler sampling the SAME producer, so it needs the
             // same two dilink4 corrections or its card diverges visually from
@@ -5326,8 +5991,10 @@ public class GpuSurveillancePipeline {
                 if (bsCamCfg != null) {
                     bsScaler.setRedMaskEnabled(
                         bsCamCfg.optBoolean("dilink4RedMask", false));
-                    bsScaler.setApaCenterInset(
-                        (float) bsCamCfg.optDouble("dilink4ApaCenterInset", 0.09375));
+                    bsScaler.setApaCenterInset(bsLayout == 3
+                        ? (float) bsCamCfg.optDouble(
+                            "dilink4ApaCenterInset", 0.09375)
+                        : 0.0f);
                 }
             } catch (Throwable t) {
                 logger.warn("BS: failed to apply dilink4 red-mask/inset: " + t.getMessage());
@@ -5479,20 +6146,20 @@ public class GpuSurveillancePipeline {
                 bsCorner = resolveBsCorner(g);
                 r = clampBsRect(g.optInt("x"), g.optInt("y"), g.optInt("w"), g.optInt("h"));
             } else {
-                // Nothing persisted → target-aware default card, 4:3, top-right.
+                // Nothing persisted → target-aware default card at the buffer aspect.
                 // Cluster default = 0.80 (matches web bsSizePctCluster=80; the short
                 // 1920×720 cluster is why the head-unit 0.40 is widened). clampBsRect
-                // keeps 4:3 + fits the panel height, so an 80% cluster card is safely
+                // keeps the buffer aspect + fits panel height, so a large cluster card is
                 // height-limited rather than overflowing.
                 double defFrac = isClusterTarget() ? 0.80 : 0.40;
                 int defW = Math.max(320, (int) (panel.x * defFrac));
-                int defH = (int) (defW * (double) BS_HEIGHT / BS_WIDTH);
+                int defH = (int) (defW * (double) sharedLaneHeight / BS_WIDTH);
                 r = clampBsRect(panel.x - defW - 24, 24, defW, defH);
             }
             if (r == null) {   // presetRect defensive null
                 double defFrac = isClusterTarget() ? 0.80 : 0.40;
                 int defW = Math.max(320, (int) (panel.x * defFrac));
-                int defH = (int) (defW * (double) BS_HEIGHT / BS_WIDTH);
+                int defH = (int) (defW * (double) sharedLaneHeight / BS_WIDTH);
                 r = clampBsRect(panel.x - defW - 24, 24, defW, defH);
             } else {
                 r = clampBsRect(r[0], r[1], r[2], r[3]);
@@ -5515,7 +6182,11 @@ public class GpuSurveillancePipeline {
             if (bss != null) bss.setContentRotation(bsRotationDeg, bsRotationAlignX());
         } catch (Throwable t) {
             logger.warn("resolveBsGeometry failed: " + t.getMessage());
-            if (bsGeomRect[2] <= 0) bsGeomRect = new int[]{24, 24, 640, 480};
+            if (bsGeomRect[2] <= 0) {
+                bsGeomRect = new int[]{
+                    24, 24, 640, (int) (640.0 * sharedLaneHeight / BS_WIDTH)
+                };
+            }
         }
     }
 
@@ -5896,7 +6567,7 @@ public class GpuSurveillancePipeline {
 
     /** Set on-screen geometry from a size%+corner preset (the daemon does the
      *  panel math — the web UI doesn't know the real panel size). Width = pct% of
-     *  panel width, height keeps the BS 4:3 aspect, inset 24px from the chosen
+     *  panel width, height keeps the active buffer aspect, inset 24px from the chosen
      *  corner (tl/tr/bl/br). Persists to the TARGET's geometry key (geometry vs
      *  geometryCluster) + applies live only when that target is active. */
     public void setBsGeometryPreset(int pct, String corner, String target) {
@@ -5910,7 +6581,7 @@ public class GpuSurveillancePipeline {
                 : new android.graphics.Point(1920, cluster ? 720 : 1080);
             int p = Math.max(15, Math.min(pct, 90));
             int w = (int) (panel.x * (p / 100.0));
-            int h = (int) (w * (double) BS_HEIGHT / BS_WIDTH);
+            int h = (int) (w * (double) sharedLaneHeight / BS_WIDTH);
             int inset = 24;
             // One canonical decode for every path (see canonicalCorner): this used to derive
             // right/bottom inline, which read an unknown token as top-left.
@@ -6003,15 +6674,15 @@ public class GpuSurveillancePipeline {
         if (bsSizePct <= 0) return null;
         int p = Math.max(15, Math.min(bsSizePct, 90));
         int w = (int) (panel.x * (p / 100.0));
-        // The dest rect handed to setGeometry must keep the SOURCE buffer's 4:3 aspect
+        // The dest rect handed to setGeometry must keep the source buffer aspect
         // for EVERY rotation. Android's Transaction.setGeometry computes the scale from
-        // the UN-swapped source dims (xScale=dstW/1280, yScale=dstH/960) and rotates the
+        // the un-swapped source dimensions and rotates the
         // result AFTER scaling, so square (undistorted) pixels require dstW/dstH ==
-        // 1280/960. A 3:4 dst at a quarter turn makes xScale != yScale (~1.78x) => the
+        // source aspect. Swapping the destination aspect at a quarter turn makes
         // anamorphic stretch that was the "distorted when rotated" half of issue #164.
-        // (Native then rotates the 4:3-scaled buffer; the card's VISIBLE footprint is
+        // (Native then rotates the uniformly-scaled buffer; the card's visible footprint is
         // portrait — that is the post-scale rotation, not the scale reference.)
-        int h = (int) (w * (double) BS_HEIGHT / BS_WIDTH);
+        int h = (int) (w * (double) sharedLaneHeight / BS_WIDTH);
         int inset = 24;
         return cornerRect(canonicalCorner(bsCorner, "tr"), panel, w, h, inset);
     }
@@ -6066,15 +6737,15 @@ public class GpuSurveillancePipeline {
                 : new android.graphics.Point(1920, isClusterTarget() ? 720 : 1080);
             w = Math.max(160, Math.min(w, panel.x));
             h = Math.max(120, Math.min(h, panel.y));
-            // BS-GEO-4: keep the dest rect at the BS buffer's baked 4:3 aspect for ALL
+            // BS-GEO-4: keep the dest rect at the source buffer's aspect for all
             // rotations so the SurfaceControl scale stays UNIFORM — the rounded corners
-            // are baked into the fixed 1280×960 buffer at 4:3, so a mismatched dest
+            // are baked into the source buffer, so a mismatched destination
             // scales the circular corners into ellipses. Android's setGeometry computes
             // the scale from the UN-swapped source dims and rotates AFTER scaling, so a
-            // uniform (undistorted) rotation needs dstW/dstH == 1280/960 REGARDLESS of
+            // uniform rotation needs dstW/dstH to match the source regardless of
             // the angle — a 3:4 dest at 90/270 gives xScale != yScale (~1.78x squish),
             // the distortion half of issue #164. So NO per-angle aspect swap here.
-            double want = (double) BS_WIDTH / BS_HEIGHT;   // 4:3, all rotations
+            double want = (double) BS_WIDTH / sharedLaneHeight;
             if ((double) w / h > want) w = (int) (h * want);
             else                       h = (int) (w / want);
             x = Math.max(0, Math.min(x, panel.x - w));
@@ -6093,10 +6764,10 @@ public class GpuSurveillancePipeline {
      * projThread (never on the 250ms turn loop). Callers on that loop pass the panel size
      * cached by the last full resolve, the same idiom presetRect uses.
      */
-    private static int[] clampBsRectTo(int x, int y, int w, int h, int panelW, int panelH) {
+    private int[] clampBsRectTo(int x, int y, int w, int h, int panelW, int panelH) {
         w = Math.max(160, Math.min(w, panelW));
         h = Math.max(120, Math.min(h, panelH));
-        double want = (double) BS_WIDTH / BS_HEIGHT;   // 4:3, all rotations (see clampBsRect)
+        double want = (double) BS_WIDTH / sharedLaneHeight;
         if ((double) w / h > want) w = (int) (h * want);
         else                       h = (int) (w / want);
         x = Math.max(0, Math.min(x, panelW - w));
@@ -6497,25 +7168,72 @@ public class GpuSurveillancePipeline {
      * with camview's own program config. Called under NO lock (like bsTurnTick); the
      * scaler/layer snapshots are null-checked.
      */
+    /**
+     * Passive-APA camera selection: ask the OEM firmware to switch its composed
+     * view to the requested camera. In {@code dilink4PassiveApaMode} the HAL feed
+     * on preview port 0 is the firmware's own composed output and the GL shader
+     * passes it through FULL-FRAME ({@code uApaMode > 0.5} — there are no
+     * per-camera quadrants to slice), so front/rear/left/right selection can only
+     * happen at the firmware, via the OEM {@code AUTO_VIDEO_BUTTON} view command.
+     *
+     * <p>Safe by the selector's own documented contract
+     * ({@link com.overdrive.app.byd.BydDataCollector#setNativeCameraView}): the
+     * broadcast "only sends the OEM view command; it never opens the panorama
+     * application" — so no second camera pane appears; only the composed feed
+     * OverDrive is already displaying changes camera.
+     *
+     * <p>Best-effort + fully detached (same discipline as
+     * {@link #emitOverlayCloseState}): a short-lived {@code am broadcast} exec —
+     * the daemon runs as shell/UID-2000 — drained on a daemon thread. Never throws.
+     * No-op outside passive APA mode and for the all-4 mosaic (mode 0), which has
+     * no OEM view code.
+     */
+    private void requestPassiveNativeView(int mode) {
+        try {
+            if (!com.overdrive.app.camera.CameraConfigResolver.isPassiveApaModeEnabled()) return;
+            final int code;
+            switch (mode) {
+                case 1: code = com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_FRONT; break;
+                case 2: case 8:
+                        code = com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_RIGHT; break;
+                case 3: code = com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_REAR;  break;
+                case 4: case 7:
+                        code = com.overdrive.app.byd.BydDataCollector.NATIVE_CAMERA_VIEW_LEFT;  break;
+                default: return;   // 0 = all-4 mosaic — no OEM view code; leave the firmware view
+            }
+            Process p = new ProcessBuilder(
+                    "am", "broadcast",
+                    "-a", "android.intent.action.AUTO_VIDEO_BUTTON",
+                    "--ei", "android.intent.extra.KEY_EVENT", Integer.toString(code))
+                .redirectErrorStream(true).start();
+            final java.io.InputStream is = p.getInputStream();
+            Thread drain = new Thread(() -> {
+                byte[] buf = new byte[256];
+                try { while (is.read(buf) != -1) { /* discard */ } } catch (Throwable ignored) {}
+            }, "passive-apa-view-broadcast");
+            drain.setDaemon(true);
+            drain.start();
+            logger.info("CamView: passive-APA OEM view select mode=" + mode + " code=" + code);
+        } catch (Throwable t) {
+            logger.debug("requestPassiveNativeView(" + mode + ") failed: " + t.getMessage());
+        }
+    }
+
     private void camViewTick() {
+        // ≥0 → the program transition below configured this camview mode; fire the
+        // passive-APA OEM view select AFTER the lock is released (detached exec).
+        int passiveSelectMode = -1;
         try {
             if (!camViewActive) return;
-            // Auto-hide: if a deadline was set and passed, disable the camera view.
-            // CRITICAL: disableCamView() may call stopBsTurnLoop() → bsTurnExec
-            // .shutdownNow(), which would interrupt THIS very thread (camViewTick runs
-            // on bsTurnExec) and make teardownSharedLaneLocked's GL-quiesce/scaler-
-            // release latch.await() calls throw immediately — bypassing the EGL
-            // ordering barrier (EGL_BAD_NATIVE_WINDOW / use-after-release risk). So
-            // run the disable on a SEPARATE short-lived thread, never inline.
-            long hideAt = camViewHideAtMs;
-            if (hideAt > 0 && android.os.SystemClock.elapsedRealtime() >= hideAt
-                    && camViewAutoHideFired.compareAndSet(false, true)) {
-                camViewHideAtMs = 0L;   // one-shot: don't re-dispatch every tick
-                Thread t = new Thread(this::disableCamView, "CamViewAutoHide");
-                t.setDaemon(true);
-                t.start();
-                return;
-            }
+            // Auto-hide moved INSIDE the locked section below (the timeout claim
+            // must be atomic with enableCamView's re-arm — see
+            // tryClaimCamViewAutoHideLocked). Dispatch stays on a separate
+            // short-lived thread: disableCamView() may call stopBsTurnLoop() →
+            // bsTurnExec.shutdownNow(), which would interrupt THIS very thread
+            // (camViewTick runs on bsTurnExec) and make teardownSharedLaneLocked's
+            // GL-quiesce/scaler-release latch.await() calls throw immediately —
+            // bypassing the EGL ordering barrier (EGL_BAD_NATIVE_WINDOW /
+            // use-after-release risk).
             // LOCK-FOR-ACQUIRE (round-3 TOCTOU fix): the "camview" sustained-token
             // ACQUIRE below MUST be mutually exclusive with the locked RELEASE paths
             // (enableCamView retarget, disableCamView, arbiter BS-takeover). Without
@@ -6531,6 +7249,18 @@ public class GpuSurveillancePipeline {
                 // Re-check under the lock: a concurrent disableCamView may have flipped
                 // camViewActive false (and released the token) since the top-of-tick read.
                 if (!camViewActive) return;
+                // Atomic auto-hide claim (deadline check + one-shot CAS + session
+                // capture in one locked step). tryLock miss above just retries in
+                // 250ms — the deadline is wall-clock, not tick-aligned.
+                long expiredSession = tryClaimCamViewAutoHideLocked(
+                    android.os.SystemClock.elapsedRealtime());
+                if (expiredSession >= 0) {
+                    Thread t = new Thread(() -> disableCamViewForSession(expiredSession),
+                        "CamViewAutoHide");
+                    t.setDaemon(true);
+                    t.start();
+                    return;
+                }
                 boolean cluster = isCamViewClusterTarget();
 
                 // Configure the shared scaler for the camview program on first entry /
@@ -6567,6 +7297,12 @@ public class GpuSurveillancePipeline {
                         }
                     }
                     laneProgram = PROG_CAMVIEW;
+                    // Passive APA: the shader shows the firmware's full-frame feed, so
+                    // camera selection must be forwarded to the OEM firmware. Dispatch
+                    // deferred past the unlock below. Transition-only (not per tick):
+                    // every show forces a transition via laneProgram=PROG_NONE, so a
+                    // camera change always lands here exactly once.
+                    passiveSelectMode = camViewMode;
                 }
 
                 if (cluster) {
@@ -6599,6 +7335,9 @@ public class GpuSurveillancePipeline {
                 }
             } finally {
                 bsLifecycleLock.unlock();
+                // Deferred past the unlock (detached exec must never hold the lane
+                // lock). No-op outside passive APA mode / for the all-4 mosaic.
+                if (passiveSelectMode >= 0) requestPassiveNativeView(passiveSelectMode);
             }
         } catch (Throwable t) {
             logger.debug("camViewTick: " + t.getMessage());
@@ -6668,14 +7407,27 @@ public class GpuSurveillancePipeline {
                 // "active" indefinitely, pinning the camera at the camview fps and leaving
                 // an orphaned ✕ on screen with nothing behind it. Checking on every tick
                 // makes the timeout mean wall-clock time, independent of lane ownership.
-                long cvHideAt = camViewHideAtMs;
-                if (cvHideAt > 0 && now >= cvHideAt
-                        && camViewAutoHideFired.compareAndSet(false, true)) {
-                    camViewHideAtMs = 0L;
-                    Thread t = new Thread(this::disableCamView, "CamViewAutoHide");
-                    t.setDaemon(true);
-                    t.start();
-                    return;   // next tick sees camViewActive=false and proceeds normally
+                // Atomic auto-hide claim, same discipline as camViewTick's: the
+                // deadline check, the one-shot CAS and the session capture happen in
+                // ONE step under bsLifecycleLock, so the claim can never consume a
+                // deadline a concurrent show just re-armed, nor capture the new
+                // show's session. tryLock (reentrant-safe): a miss retries in 250ms.
+                if (camViewHideAtMs > 0 && now >= camViewHideAtMs
+                        && bsLifecycleLock.tryLock()) {
+                    long cvExpiredSession;
+                    try {
+                        cvExpiredSession = tryClaimCamViewAutoHideLocked(now);
+                    } finally {
+                        bsLifecycleLock.unlock();
+                    }
+                    if (cvExpiredSession >= 0) {
+                        Thread t = new Thread(
+                            () -> disableCamViewForSession(cvExpiredSession),
+                            "CamViewAutoHide");
+                        t.setDaemon(true);
+                        t.start();
+                        return;   // next tick sees camViewActive=false and proceeds
+                    }
                 }
                 // bsUserDismissed must be folded in HERE too, not only at the show
                 // decision below: after the ✕ tap the card will not be shown for the rest
@@ -6840,7 +7592,7 @@ public class GpuSurveillancePipeline {
                         // card resolveBsGeometry would compute, so the rect is BS's own
                         // rather than the camera view's.
                         int defW = Math.max(320, (int) (panW * 0.80));
-                        int defH = (int) (defW * (double) BS_HEIGHT / BS_WIDTH);
+                        int defH = (int) (defW * (double) sharedLaneHeight / BS_WIDTH);
                         int[] dr = clampBsRectTo(panW - defW - 24, 24, defW, defH,
                                                  panW, panH);
                         bsGeomRect = new int[]{dr[0], dr[1], dr[2], dr[3]};
@@ -7263,15 +8015,117 @@ public class GpuSurveillancePipeline {
     }
 
     /**
+     * Record an accepted show REQUEST (called by the API handler before arming, so
+     * ownership is correct even while the arm is deferred behind a pano cold start).
+     * Latest show wins: bumps the session id and replaces the owner. {@code ownerToken}
+     * null = ownerless (manual) show. Runs under bsLifecycleLock so the owner/session
+     * mutation is atomic with respect to the hide verdict and the auto-hide claim
+     * (TOCTOU fix — HTTP handlers run on a 32-thread pool, automations on their own
+     * threads).
+     *
+     * @return the new session id, which the deferred-arm retry uses to undo an arm
+     *         that raced its own cancellation (see startCamViewArmRetry).
+     */
+    public long noteCamViewShowRequest(Long ownerToken) {
+        bsLifecycleLock.lock();
+        try {
+            camViewSessionId = camViewSessionSeq.incrementAndGet();
+            camViewOwnerToken = ownerToken;
+            return camViewSessionId;
+        } finally {
+            bsLifecycleLock.unlock();
+        }
+    }
+
+    /**
+     * Atomically claim the camview auto-hide timeout. MUST be called with
+     * bsLifecycleLock held: enableCamView re-arms the deadline, its session
+     * binding and the fired flag under the same lock, so a locked claim can
+     * never consume a deadline a concurrent show just re-armed (the old
+     * unlocked claim could CAS the fresh fired=false and zero the NEW
+     * deadline), and the session returned is atomically the one the expired
+     * deadline was armed for.
+     *
+     * @return the session id the expired deadline belongs to, or -1 when
+     *         there is nothing to claim.
+     */
+    private long tryClaimCamViewAutoHideLocked(long nowElapsedMs) {
+        long hideAt = camViewHideAtMs;
+        if (hideAt <= 0 || nowElapsedMs < hideAt) return -1L;
+        if (!camViewAutoHideFired.compareAndSet(false, true)) return -1L;
+        camViewHideAtMs = 0L;   // one-shot: don't re-dispatch every tick
+        return camViewHideSessionId;
+    }
+
+    /** May a hide carrying {@code token} close the current camera view? An ownerless
+     *  hide (null) always may — legacy global close. A tokened hide only when it
+     *  matches the current owner, so an automation can never close a view a later
+     *  automation (or the user) put up. */
+    public boolean camViewHideAllowedFor(Long token) {
+        if (token == null) return true;
+        Long owner = camViewOwnerToken;
+        return owner != null && owner.equals(token);
+    }
+
+    /** Fail-open geometry for the current session — see {@link #camViewGeomOverride}. */
+    public void setCamViewGeometryOverride(String target, org.json.JSONObject geo) {
+        camViewGeomOverrideTarget = "cluster".equals(target) ? "cluster" : "head_unit";
+        camViewGeomOverride = geo;
+    }
+
+    public void clearCamViewGeometryOverride() {
+        camViewGeomOverride = null;
+        camViewGeomOverrideTarget = null;
+    }
+
+    // NOTE: there is deliberately NO self-minting enableCamView(mode, target,
+    // autoHideSec) convenience wrapper. A wrapper that calls
+    // noteCamViewShowRequest() itself mints a session NEWER than any hide that
+    // just landed, so the session check below passes and the dismissed view
+    // re-arms — the hide race the session mechanism exists to prevent. Callers
+    // (the API show route) must mint ONE session per USER request and pass it
+    // to every arm attempt, including every deferred-arm retry pass.
+
+    /**
      * Show a camera view. Builds the shared lane if neither program has it up, then
      * marks camview active; the arbiter (bsTurnTick) applies the camview program
      * whenever blind-spot isn't actively showing. mode 0=all-4,1=front,2=right,
      * 3=rear,4=left. target "head_unit"/"cluster". autoHideSec 0 = until hidden.
+     *
+     * <p>{@code showSession} is the id {@link #noteCamViewShowRequest} returned for
+     * THIS request. Validated under bsLifecycleLock before any state mutation: the
+     * show handler's mutation transaction and this arm are deliberately not one
+     * atomic unit (the arm can block seconds on a lane build), so a hide or a newer
+     * show can land in between — and a stale arm proceeding anyway would resurrect a
+     * dismissed view or overwrite the newer show's camera/target/timeout with the
+     * OLD request's values (the session id would say B while the lane showed A).
+     *
+     * @return true when armed; false when this request was superseded (a newer show
+     *         bumped the session, or an allowed hide invalidated it) — the caller
+     *         must treat the request as cancelled, not retry it.
      */
-    public void enableCamView(int mode, String target, int autoHideSec) throws Exception {
+    public boolean enableCamView(int mode, String target, int autoHideSec,
+            long showSession) throws Exception {
+        String preTarget = "cluster".equals(target) ? "cluster" : "head_unit";
+        // Calculate the on-screen rect BEFORE taking the lane lock (audit: persist +
+        // calculate outside bsLifecycleLock). Geometry resolution reads UCM (which can
+        // block on the cross-process config file lock) and, for a cluster target, the
+        // panel size via a `dumpsys display` shell-out — neither belongs under the
+        // lock the 250ms arbiter tick contends on. Wasted work when the session turns
+        // out stale below — acceptable, staleness is the rare path.
+        int[] preRect = resolveCamViewGeometryRect(preTarget);
+        boolean staleReject = false;
         bsLifecycleLock.lock();
         try {
-            String newTarget = "cluster".equals(target) ? "cluster" : "head_unit";
+            if (showSession != camViewSessionId) {
+                // Suppress the finally's show-edge broadcast: nothing changed here,
+                // and the current (newer) session already emitted its own edge.
+                staleReject = true;
+                logger.info("CamView: stale show request rejected (session " + showSession
+                    + " superseded by " + camViewSessionId + ") — not arming");
+                return false;
+            }
+            String newTarget = preTarget;
             // RETARGET LEAK GUARD: if a camview was ALREADY holding the cluster
             // projection ("camview" sustained token) and this re-show moves it to the
             // head-unit, release the cluster hold NOW. camViewTick only acquires while
@@ -7285,9 +8139,15 @@ public class GpuSurveillancePipeline {
             camViewTarget = newTarget;
             camViewHideAtMs = (autoHideSec > 0)
                 ? android.os.SystemClock.elapsedRealtime() + autoHideSec * 1000L : 0L;
+            // Bind the deadline to the session it belongs to (both under this
+            // lock, so the timeout claim can never associate an old expired
+            // deadline with a newer session — see camViewHideSessionId).
+            camViewHideSessionId = camViewSessionId;
             // Re-arm the one-shot dispatch guard for this new session/deadline.
             camViewAutoHideFired.set(false);
-            resolveCamViewGeometry();
+            // Adopt the rect computed outside the lock (see above). The tick paths
+            // still re-resolve via resolveCamViewGeometry() on reconfig.
+            camViewGeomRect = preRect;
 
             if (!running || camera == null || camera.getGlHandler() == null) {
                 logger.warn("CamView: pano not running yet — enable deferred (caller must re-poll)");
@@ -7347,6 +8207,22 @@ public class GpuSurveillancePipeline {
                     throw new RuntimeException(t);
                 }
                 camViewEnabling = false;
+                // RE-VALIDATE the session before publishing (audit finding: the
+                // entry check is not enough). buildSharedLaneLocked RELEASES
+                // bsLifecycleLock around its GL-init wait, and a hide (or newer
+                // show) acquiring the lock in that window invalidates this
+                // session — publishing camViewActive=true here anyway would
+                // resurrect the dismissed view. The lane build itself is fine;
+                // only THIS request's claim on it is stale. If nobody else wants
+                // the lane, release it (same guard as the failure path).
+                if (showSession != camViewSessionId) {
+                    staleReject = true;
+                    camViewHideAtMs = 0L;
+                    if (!blindSpotEnabled && !camViewActive) releasePartialBsLane();
+                    logger.info("CamView: session invalidated during lane build "
+                        + "(hide or newer show) — not publishing");
+                    return false;
+                }
                 camViewActive = true;       // armed only on successful build
                 laneProgram = PROG_NONE;   // force camview program config next tick
                 startBsTurnLoop();
@@ -7354,13 +8230,21 @@ public class GpuSurveillancePipeline {
             }
             logger.info(String.format("CamView: enabled mode=%d target=%s autoHide=%ds",
                 camViewMode, camViewTarget, autoHideSec));
+            return true;
         } finally {
-            boolean nowActive = camViewActive;
+            boolean nowActive = camViewActive && !staleReject;
             String tgt = camViewTarget;
+            // Snapshot THIS show's rect under the lock. bsGeomRect still holds the
+            // previous program's geometry until camViewTick's transition tick copies
+            // camViewGeomRect over — so the show edge must carry the camview rect
+            // explicitly or the ✕ is placed against stale blind-spot geometry.
+            int[] showRect = camViewGeomRect;
             bsLifecycleLock.unlock();
             // Tell the app-side close-button overlay a view is up (edge-driven, no poll).
             // Fired outside the lock so the short `am broadcast` exec never holds it.
-            if (nowActive) emitCamViewState(true, tgt);
+            if (nowActive) {
+                emitCamViewState(true, tgt, showRect);
+            }
             // NOTE: the camera-profile ramp for the new camera-view rung is driven by the
             // existing camViewTick → setBlindSpotVisible/clusterShowWhenReady →
             // fireBsVisibilityChanged edge (RMM.desiredCameraState reads camViewKeepWarmActive
@@ -7368,29 +8252,122 @@ public class GpuSurveillancePipeline {
         }
     }
 
-    /** Hide the camera view. Tears the lane down only if blind-spot isn't also using it. */
+    /** Hide the camera view. Tears the lane down only if blind-spot isn't also using it.
+     *  LENIENT variant for internal lifecycle callers (pipeline.stop()): does NOT
+     *  invalidate a not-yet-armed show session — see {@link #hideCamView()}. */
     public void disableCamView() {
+        disableCamViewInternal(null, null, false, false);
+    }
+
+    /** Session-guarded variant for the auto-hide dispatch: hides only while
+     *  {@code sessionId} is still the current session. Checked UNDER
+     *  bsLifecycleLock, so a show landing concurrently can't have its brand-new
+     *  view torn down by a stale timeout. */
+    private void disableCamViewForSession(long sessionId) {
+        disableCamViewInternal(sessionId, null, false, false);
+    }
+
+    /**
+     * End the current camview SESSION — flags, owner, session invalidation,
+     * fail-open override, pending deferred arm — WITHOUT touching the lane.
+     * The single implementation of the session-ending contract, shared by
+     * {@link #disableCamViewInternal} (which additionally tears the lane down or
+     * hands it to BS) and the blind-spot takeover (which keeps the lane for BS).
+     * The session bump is load-bearing: it is what makes an in-flight stale
+     * enableCamView reject itself instead of re-arming the ended session's view.
+     * MUST be called holding {@link #bsLifecycleLock}.
+     */
+    private void endCamViewSessionLocked() {
+        camViewActive = false;
+        camViewHideAtMs = 0L;
+        camViewOwnerToken = null;
+        camViewSessionId = camViewSessionSeq.incrementAndGet();
+        clearCamViewGeometryOverride();
+        // The session bump above IS the deferred-arm-retry cancel: retry validity is
+        // session-scoped (StreamingApiHandler.startCamViewArmRetry), so no separate
+        // cancellation token exists to race with.
+    }
+
+    /** Current camview session id — read by the mutation-lock-serialized
+     *  session-conditional config writes in the API handler. */
+    public long getCamViewSessionId() {
+        return camViewSessionId;
+    }
+
+    /**
+     * Ownership-checked hide for the API path. The verdict and the hide are ONE
+     * atomic step under bsLifecycleLock (TOCTOU fix): with an unlocked pre-check,
+     * a show landing between the check and the disable let a stale hide close the
+     * new view. When allowed, this also cancels a pending deferred arm and spends
+     * ownership even if the view never armed (deferred behind a pano cold start) —
+     * a hide of one's own not-yet-visible request is still a valid cancel.
+     *
+     * @return {@link #CAMVIEW_HIDE_NOT_OWNER}, {@link #CAMVIEW_HIDE_CLOSED} or
+     *         {@link #CAMVIEW_HIDE_ALREADY_HIDDEN}.
+     */
+    public int hideCamViewIfAllowed(Long token) {
+        return disableCamViewInternal(null, token, true, false);
+    }
+
+    /**
+     * User-intent hide for the API path (no ownership gate — the global
+     * {@code /api/camview/hide} contract closes whatever is up). Unlike
+     * {@link #disableCamView()}, this INVALIDATES the current show session even
+     * when the view never armed: a hide of a request still deferred behind a
+     * pano cold start — or of a straight-through show whose enableCamView is
+     * still in flight outside the mutation lock — is an explicit cancel, and
+     * only the session bump stops that in-flight enable from arming AFTER this
+     * hide and silently reopening the camera the caller was just told is closed.
+     * {@link #disableCamView()} stays lenient on purpose: pipeline.stop() calls
+     * it unconditionally on routine warmup restarts, where killing a pending
+     * deferred arm would drop the key press the retry exists to rescue.
+     */
+    public int hideCamView() {
+        return disableCamViewInternal(null, null, false, true);
+    }
+
+    private int disableCamViewInternal(Long requiredSessionId, Long token,
+            boolean checkOwner, boolean invalidateSession) {
         boolean wasActive = false;
         bsLifecycleLock.lock();
         try {
+            if (requiredSessionId != null && camViewSessionId != requiredSessionId) {
+                logger.info("CamView: stale session-guarded hide ignored — a newer show "
+                    + "owns the view (session moved on)");
+                return CAMVIEW_HIDE_ALREADY_HIDDEN;
+            }
+            if (checkOwner) {
+                if (!camViewHideAllowedFor(token)) {
+                    return CAMVIEW_HIDE_NOT_OWNER;
+                }
+            }
+            if (checkOwner || invalidateSession) {
+                // Allowed / user-intent hide: spend ownership and INVALIDATE THE
+                // SESSION here — even when the view never armed (deferred behind a
+                // cold start). The session bump is what makes a straight-through
+                // show's enableCamView, still in flight outside the mutation lock,
+                // reject itself instead of arming AFTER this hide, AND what stops
+                // any deferred-arm retry loop (retry validity is session-scoped).
+                // The shared session-ending helper further down is skipped by the
+                // !camViewActive early-out, so the bump must happen here.
+                camViewOwnerToken = null;
+                camViewSessionId = camViewSessionSeq.incrementAndGet();
+            }
             wasActive = camViewActive;
-            if (!camViewActive) return;
-            // Invalidate any pending deferred-arm retry. Placed AFTER the no-op early-out
-            // above, deliberately: pipeline.stop() calls this method unconditionally (a
-            // routine warmup restart does stop()→setMode), so cancelling before that
-            // return would kill a legitimate retry whose view has not armed yet
-            // (camViewActive==false for the whole deferral) — silently dropping the key
-            // press the retry exists to rescue. Here it only fires on a REAL teardown of a
-            // REAL session, which is exactly when a pending arm must not resurrect it.
-            // Direct static call (this class already calls StreamingApiHandler elsewhere)
-            // so R8 renaming can't break it, and it is a bare atomic increment — no lock,
-            // no I/O — so holding bsLifecycleLock across it is safe.
-            try {
-                com.overdrive.app.server.StreamingApiHandler.cancelCamViewArmRetry();
-            } catch (Throwable ignored) {}
+            if (!camViewActive) return CAMVIEW_HIDE_ALREADY_HIDDEN;
             logger.info("CamView: disabling camera view...");
-            camViewActive = false;
-            camViewHideAtMs = 0L;
+            // Shared session-ending contract (also used by the BS takeover): flags,
+            // owner, session invalidation, fail-open override, pending deferred-arm
+            // cancel — one implementation, endCamViewSessionLocked. NOTE its cancel
+            // runs AFTER the no-op early-out above, deliberately: pipeline.stop()
+            // calls this method unconditionally (a routine warmup restart does
+            // stop()→setMode), so cancelling before that return would kill a
+            // legitimate retry whose view has not armed yet (camViewActive==false
+            // for the whole deferral) — silently dropping the key press the retry
+            // exists to rescue. Here it only fires on a REAL teardown of a REAL
+            // session. The checkOwner branch above already bumped/cancelled for the
+            // not-yet-armed hide case; doing it twice is harmless.
+            endCamViewSessionLocked();
 
             // SAFETY (gauge-blank prevention): release the "camview" sustained hold
             // UNCONDITIONALLY — removing a token that isn't in the set is a harmless
@@ -7411,7 +8388,7 @@ public class GpuSurveillancePipeline {
                 setBlindSpotVisible(false);
                 laneProgram = PROG_NONE;   // force BS reconfig on next tick
                 logger.info("CamView: disabled, lane retained for blind-spot");
-                return;
+                return CAMVIEW_HIDE_CLOSED;
             }
 
             // Neither program needs the lane — full teardown. (The cluster projection,
@@ -7420,6 +8397,7 @@ public class GpuSurveillancePipeline {
             teardownSharedLaneLocked();
             laneProgram = PROG_NONE;
             logger.info("CamView: camera view disabled");
+            return CAMVIEW_HIDE_CLOSED;
         } finally {
             bsLifecycleLock.unlock();
             // Tell the app-side close-button overlay the view is gone (edge-driven).
@@ -7443,8 +8421,23 @@ public class GpuSurveillancePipeline {
      * we never read, so it can never block the lifecycle path. Never throws.
      */
     private void emitCamViewState(boolean active, String target) {
+        emitCamViewState(active, target, null);
+    }
+
+    /**
+     * Variant carrying an EXPLICIT on-screen rect for the show edge. enableCamView
+     * must use this with the camview rect it just resolved: at that moment
+     * {@code bsGeomRect} (what {@link #getLaneGeomRect} reads) still holds the
+     * PREVIOUS program's geometry — camViewTick only copies
+     * {@code camViewGeomRect} into it on its program-transition tick, up to 250ms
+     * later. Broadcasting the lane rect on that edge positioned the ✕ against the
+     * stale blind-spot card rect, then the next poll moved it — the "✕ appears and
+     * jumps around" defect. {@code rect} null falls back to the live lane rect
+     * (correct for the paths that publish the shared rect before emitting).
+     */
+    private void emitCamViewState(boolean active, String target, int[] rect) {
         emitOverlayCloseState(com.overdrive.app.overlay.StatusOverlayService.ACTION_CAMVIEW_STATE,
-                active, target, "camview-state-broadcast");
+                active, target, "camview-state-broadcast", rect);
     }
 
     /**
@@ -7456,7 +8449,7 @@ public class GpuSurveillancePipeline {
      */
     private void emitBsCardState(boolean active, String target) {
         emitOverlayCloseState(com.overdrive.app.overlay.StatusOverlayService.ACTION_BS_STATE,
-                active, target, "bs-state-broadcast");
+                active, target, "bs-state-broadcast", null);
     }
 
     /**
@@ -7466,7 +8459,7 @@ public class GpuSurveillancePipeline {
      * lifecycle path or wedge on a full pipe. Never throws.
      */
     private void emitOverlayCloseState(String action, boolean active, String target,
-                                       String threadName) {
+                                       String threadName, int[] explicitRect) {
         try {
             java.util.List<String> cmd = new java.util.ArrayList<>(java.util.Arrays.asList(
                     "am", "broadcast",
@@ -7487,7 +8480,12 @@ public class GpuSurveillancePipeline {
             // degenerate "card fills the panel" branch → ✕ back under the layer). Only the
             // head-unit rect is meaningful to the ✕.
             if (active && !"cluster".equals(target)) {
-                int[] lr = getLaneGeomRect();
+                // Prefer the caller's explicit rect (the geometry THIS edge is about);
+                // fall back to the live lane rect. Same sentinel/degenerate screen as
+                // getLaneGeomRect — never publish {-1,-1,-1,-1} as a real rect.
+                int[] lr = (explicitRect != null && explicitRect.length == 4
+                        && explicitRect[2] > 0 && explicitRect[3] > 0)
+                    ? explicitRect : getLaneGeomRect();
                 if (lr != null) {
                     cmd.add("--ei"); cmd.add("rectX"); cmd.add(Integer.toString(lr[0]));
                     cmd.add("--ei"); cmd.add("rectY"); cmd.add(Integer.toString(lr[1]));
@@ -7513,17 +8511,38 @@ public class GpuSurveillancePipeline {
     /** Resolve the camview on-screen rect from UCM geometry (preset or absolute),
      *  per target, mirroring resolveBsGeometry. Writes camViewGeomRect. */
     private void resolveCamViewGeometry() {
+        camViewGeomRect = resolveCamViewGeometryRect(camViewTarget);
+    }
+
+    /** Rect-computing core of {@link #resolveCamViewGeometry}, parameterised by target
+     *  so {@link #enableCamView} can run it BEFORE taking bsLifecycleLock (UCM read +
+     *  possible `dumpsys display` shell-out don't belong under the lane lock). Still
+     *  refreshes camViewSizePct/camViewCorner as before. Never throws; on failure
+     *  returns the current rect when valid, else the fixed default. */
+    private int[] resolveCamViewGeometryRect(String target) {
+        final boolean clusterTarget = "cluster".equals(target);
         try {
             android.content.Context ctx = savedContext;
             if (ctx == null) ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
-            org.json.JSONObject cv = com.overdrive.app.config.UnifiedConfigManager.getCamView();
             android.graphics.Point panel = (ctx != null)
-                ? (isCamViewClusterTarget()
+                ? (clusterTarget
                     ? com.overdrive.app.surveillance.BsNativeLayer.clusterDisplaySize(ctx)
                     : com.overdrive.app.surveillance.BsNativeLayer.displaySize(ctx))
-                : new android.graphics.Point(1920, isCamViewClusterTarget() ? 720 : 1080);
-            String geomKey = isCamViewClusterTarget() ? "geometryCluster" : "geometry";
-            org.json.JSONObject g = (cv != null) ? cv.optJSONObject(geomKey) : null;
+                : new android.graphics.Point(1920, clusterTarget ? 720 : 1080);
+            String geomKey = clusterTarget ? "geometryCluster" : "geometry";
+            // Fail-open override first: set only when the show's atomic config write
+            // failed, so the session renders the REQUESTED geometry instead of stale
+            // persisted geometry (same JSON shape as the persisted object).
+            org.json.JSONObject g = null;
+            org.json.JSONObject ov = camViewGeomOverride;
+            if (ov != null && clusterTarget == "cluster".equals(camViewGeomOverrideTarget)) {
+                g = ov;
+            }
+            if (g == null) {
+                org.json.JSONObject cv =
+                    com.overdrive.app.config.UnifiedConfigManager.getCamView();
+                g = (cv != null) ? cv.optJSONObject(geomKey) : null;
+            }
             int[] r;
             if (g != null && g.has("sizePct")) {
                 camViewSizePct = g.optInt("sizePct", camViewSizePct);
@@ -7538,33 +8557,37 @@ public class GpuSurveillancePipeline {
             } else if (g != null && g.has("x") && g.has("w")) {
                 r = clampRectToPanel(g.optInt("x"), g.optInt("y"), g.optInt("w"), g.optInt("h"), panel);
             } else {
-                double defFrac = isCamViewClusterTarget() ? 0.80 : 0.60;
+                double defFrac = clusterTarget ? 0.80 : 0.60;
                 int w = (int) (panel.x * defFrac);
-                int h = (int) (w * (double) BS_HEIGHT / BS_WIDTH);
+                int h = (int) (w * (double) sharedLaneHeight / BS_WIDTH);
                 r = clampRectToPanel((panel.x - w) / 2, (panel.y - h) / 2, w, h, panel);
             }
-            camViewGeomRect = new int[]{r[0], r[1], r[2], r[3]};
+            return new int[]{r[0], r[1], r[2], r[3]};
         } catch (Throwable t) {
             logger.warn("resolveCamViewGeometry failed: " + t.getMessage());
-            if (camViewGeomRect[2] <= 0) camViewGeomRect = new int[]{24, 24, 768, 576};
+            int[] cur = camViewGeomRect;
+            if (cur != null && cur.length == 4 && cur[2] > 0) return cur;
+            return new int[]{
+                24, 24, 768, (int) (768.0 * sharedLaneHeight / BS_WIDTH)
+            };
         }
     }
 
     private int[] camViewPresetRect(android.graphics.Point panel) {
         int p = Math.max(15, Math.min(camViewSizePct, 95));
         int w = (int) (panel.x * (p / 100.0));
-        int h = (int) (w * (double) BS_HEIGHT / BS_WIDTH);
+        int h = (int) (w * (double) sharedLaneHeight / BS_WIDTH);
         int inset = 24;
         // Camera-view defaults to CENTER (not the card's tr) when nothing is stored.
         int[] r = cornerRect(canonicalCorner(camViewCorner, "center"), panel, w, h, inset);
         return clampRectToPanel(r[0], r[1], r[2], r[3], panel);
     }
 
-    /** Clamp a rect into the given panel, keeping the 4:3 buffer ratio (uniform scale). */
+    /** Clamp a rect into the given panel, keeping the buffer ratio (uniform scale). */
     private int[] clampRectToPanel(int x, int y, int w, int h, android.graphics.Point panel) {
         w = Math.max(160, Math.min(w, panel.x));
         h = Math.max(120, Math.min(h, panel.y));
-        double want = (double) BS_WIDTH / BS_HEIGHT;   // 4:3
+        double want = (double) BS_WIDTH / sharedLaneHeight;
         if ((double) w / h > want) w = (int) (h * want);
         else                       h = (int) (w / want);
         x = Math.max(0, Math.min(x, panel.x - w));
@@ -7585,13 +8608,30 @@ public class GpuSurveillancePipeline {
      * drains the queue inline at process exit so encoders are released
      * before the JVM goes away.
      */
-    static void submitEncoderRelease(HardwareEventRecorderGpu encoderRef) {
-        if (encoderRef == null) return;
+    static void submitEncoderRelease(HardwareEventRecorderGpu encoderRef,
+            java.util.concurrent.CompletableFuture<Boolean> verdict) {
+        if (encoderRef == null) {
+            // Nothing to release — complete the placeholder clean so a stale
+            // pending future can't wedge-flag an empty retirement.
+            if (verdict != null) verdict.complete(Boolean.TRUE);
+            return;
+        }
         try {
+            // Completes the caller's retirement PLACEHOLDER with the release
+            // verdict (audit follow-up 2: the placeholder is published
+            // synchronously at detach; completing it here — however late the GL
+            // path submitted us — is what lets stop() verify the release before
+            // the camera closes, and a placeholder we never complete correctly
+            // reads as wedged).
             STREAM_ENCODER_RELEASE_EXEC.submit(() -> {
-                try { encoderRef.release(); } catch (Throwable t) {
+                boolean clean = false;
+                try {
+                    clean = encoderRef.release();
+                } catch (Throwable t) {
                     DaemonLogger.getInstance(TAG).warn(
                         "streamEncoder release on offload thread: " + t.getMessage());
+                } finally {
+                    if (verdict != null) verdict.complete(clean);
                 }
             });
         } catch (java.util.concurrent.RejectedExecutionException re) {
@@ -7599,7 +8639,10 @@ public class GpuSurveillancePipeline {
             // path). Best-effort: spawn a one-shot daemon thread so the
             // encoder still releases without pinning the caller.
             Thread t = new Thread(() -> {
-                try { encoderRef.release(); } catch (Throwable ignored) {}
+                boolean clean = false;
+                try { clean = encoderRef.release(); }
+                catch (Throwable ignored) {}
+                finally { if (verdict != null) verdict.complete(clean); }
             }, "StreamEncoderReleaseFallback");
             t.setDaemon(true);
             t.start();

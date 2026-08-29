@@ -98,20 +98,10 @@ public class SurveillanceApiHandler {
         }
         if (cleanPath.equals("/api/surveillance/screen-deterrent/test") && method.equals("POST")) {
             try {
-                // SAFETY (deterrent-while-driving): never fire the full-screen
-                // z=MAX deterrent layer while ACC is on / the car is in use —
-                // it would occlude nav, the reversing camera, and controls.
-                // ScreenDeterrent.onMotionDetected() now self-guards on this too
-                // (the load-bearing fix), but reject here as well so the web
-                // "Test on Screen" button reports WHY it didn't run instead of
-                // silently no-op'ing.
-                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-                    HttpResponse.sendJsonError(out,
-                        "Deterrent test blocked while ACC is on / vehicle in use");
-                    return true;
-                }
-                com.overdrive.app.surveillance.ScreenDeterrent.getInstance().onMotionDetected();
-                HttpResponse.sendJsonSuccess(out);
+                String error = com.overdrive.app.surveillance.ScreenDeterrent
+                        .getInstance().previewNow();
+                if (error == null) HttpResponse.sendJsonSuccess(out);
+                else HttpResponse.sendJsonError(out, error);
             } catch (Exception e) {
                 HttpResponse.sendJsonError(out, "Failed to trigger screen deterrent: " + e.getMessage());
             }
@@ -127,60 +117,135 @@ public class SurveillanceApiHandler {
      * screenDeterrentImagePath at /etc/* and have the web server stream or
      * delete arbitrary readable files.
      */
-    private static final String SCREEN_DETERRENT_DIR = "/data/local/tmp/.overdrive";
-    private static final String SCREEN_DETERRENT_PREFIX = "screen_deterrent_asset.";
+    private static final String SCREEN_DETERRENT_DIR =
+            com.overdrive.app.surveillance.ScreenDeterrentAsset.DIRECTORY;
+    private static final String SCREEN_DETERRENT_PREFIX =
+            com.overdrive.app.surveillance.ScreenDeterrentAsset.PREFIX;
+    private static final int SCREEN_DETERRENT_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+    // 10 MB base64-encodes below HttpServer's 16 MB generic request cap.
+    private static final int SCREEN_DETERRENT_MAX_VIDEO_BYTES = 10 * 1024 * 1024;
+    private static final long SCREEN_DETERRENT_MAX_VIDEO_MS = 10_500L;
+    private static final int SCREEN_DETERRENT_MAX_VIDEO_DIM = 1920;
+    private static final int SCREEN_DETERRENT_MAX_VIDEO_MINOR_DIM = 1080;
+    // 1080-line H.264/HEVC commonly stores 1088 coded rows plus a crop.
+    private static final int SCREEN_DETERRENT_MAX_VIDEO_CODED_MINOR_DIM = 1088;
+    private static final int SCREEN_DETERRENT_MAX_GIF_DIM = 4096;
+    private static final long SCREEN_DETERRENT_MAX_GIF_PIXELS = 1920L * 1920L;
+    private static final Object SCREEN_DETERRENT_ASSET_LOCK = new Object();
+
+    // ponytail: one worker bounds a wedged MediaExtractor JNI call; restart the
+    // daemon if that worker hangs rather than leaking one thread per upload.
+    private static final java.util.concurrent.ThreadPoolExecutor
+            SCREEN_DETERRENT_VIDEO_VALIDATOR =
+            new java.util.concurrent.ThreadPoolExecutor(
+                    1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+                    new java.util.concurrent.ArrayBlockingQueue<>(1),
+                    r -> {
+                        Thread t = new Thread(r, "DeterrentVideoValidate");
+                        t.setDaemon(true);
+                        return t;
+                    },
+                    new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+
+    /** Returns the normalized on-disk extension from magic bytes only. */
+    static String deterrentAssetExtension(byte[] data) {
+        if (com.overdrive.app.surveillance.ScreenDeterrentVideo.isMp4(data)) {
+            return "mp4";
+        }
+        if (data == null) return null;
+        if (data.length >= 8
+                && (data[0] & 0xff) == 0x89
+                && data[1] == 'P' && data[2] == 'N' && data[3] == 'G'
+                && data[4] == 13 && data[5] == 10
+                && data[6] == 26 && data[7] == 10) {
+            return "png";
+        }
+        if (data.length >= 3
+                && (data[0] & 0xff) == 0xff
+                && (data[1] & 0xff) == 0xd8
+                && (data[2] & 0xff) == 0xff) {
+            return "jpg";
+        }
+        if (data.length >= 6
+                && data[0] == 'G' && data[1] == 'I' && data[2] == 'F'
+                && data[3] == '8'
+                && (data[4] == '7' || data[4] == '9')
+                && data[5] == 'a') {
+            return "gif";
+        }
+        if (data.length >= 12
+                && data[0] == 'R' && data[1] == 'I'
+                && data[2] == 'F' && data[3] == 'F'
+                && data[8] == 'W' && data[9] == 'E'
+                && data[10] == 'B' && data[11] == 'P') {
+            return "webp";
+        }
+        return null;
+    }
 
     private static boolean isAllowedDeterrentPath(String path) {
-        if (path == null || path.isEmpty()) return false;
-        try {
-            java.io.File f = new java.io.File(path).getCanonicalFile();
-            java.io.File parent = f.getParentFile();
-            java.io.File expected = new java.io.File(SCREEN_DETERRENT_DIR).getCanonicalFile();
-            return parent != null
-                && parent.equals(expected)
-                && f.getName().startsWith(SCREEN_DETERRENT_PREFIX);
-        } catch (Exception e) {
-            return false;
-        }
+        return com.overdrive.app.surveillance.ScreenDeterrentAsset
+                .isAllowedPath(path);
     }
 
     private static void handleScreenDeterrentImageGet(OutputStream out) throws Exception {
-        String path = com.overdrive.app.config.UnifiedConfigManager.getSurveillance()
-                .optString("screenDeterrentImagePath", "");
-        if (path.isEmpty()) {
-            HttpResponse.sendError(out, 404, "No deterrent image set");
-            return;
-        }
-        if (!isAllowedDeterrentPath(path)) {
-            HttpResponse.sendError(out, 403, "Forbidden");
-            return;
-        }
-        java.io.File f = new java.io.File(path);
-        if (!f.exists() || f.length() == 0) {
-            HttpResponse.sendError(out, 404, "Deterrent image missing");
-            return;
-        }
-
+        java.io.FileInputStream input;
+        long length;
         String contentType;
-        String lower = path.toLowerCase();
-        if (lower.endsWith(".gif")) contentType = "image/gif";
-        else if (lower.endsWith(".webp")) contentType = "image/webp";
-        else if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) contentType = "image/jpeg";
-        else contentType = "image/png";
+        synchronized (SCREEN_DETERRENT_ASSET_LOCK) {
+            String path = com.overdrive.app.config.UnifiedConfigManager.getSurveillance()
+                    .optString("screenDeterrentImagePath", "");
+            if (path.isEmpty()) {
+                HttpResponse.sendError(out, 404, "No deterrent asset set");
+                return;
+            }
+            if (!isAllowedDeterrentPath(path)) {
+                HttpResponse.sendError(out, 403, "Forbidden");
+                return;
+            }
+            java.io.File file = new java.io.File(path).getCanonicalFile();
+            if (!file.isFile() || file.length() == 0) {
+                HttpResponse.sendError(out, 404, "Deterrent asset missing");
+                return;
+            }
 
-        // no-cache: the deterrent asset changes in place when the user
-        // re-uploads. Without this, second-viewer clients (Telegram preview,
-        // a shared-link tunnel viewer, etc.) keep the previous image cached
-        // for 24h and the cache-bust query param only helps the uploader's
-        // own browser session.
-        HttpResponse.sendImage(out, f, contentType, "no-cache");
+            String lower = file.getName().toLowerCase(java.util.Locale.ROOT);
+            if (lower.endsWith(".gif")) contentType = "image/gif";
+            else if (lower.endsWith(".mp4")) contentType = "video/mp4";
+            else if (lower.endsWith(".webp")) contentType = "image/webp";
+            else if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) contentType = "image/jpeg";
+            else contentType = "image/png";
+            try {
+                input = new java.io.FileInputStream(file);
+                length = file.length();
+            } catch (java.io.IOException missing) {
+                HttpResponse.sendError(out, 404, "Deterrent asset missing");
+                return;
+            }
+        }
+
+        String headers = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: " + contentType + "\r\n"
+                + "Content-Length: " + length + "\r\n"
+                + "Cache-Control: no-cache\r\n"
+                + "X-Content-Type-Options: nosniff\r\n"
+                + "Connection: close\r\n\r\n";
+        try (java.io.FileInputStream stream = input) {
+            out.write(headers.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = stream.read(buffer)) != -1) {
+                out.write(buffer, 0, count);
+            }
+        }
+        out.flush();
     }
 
     /**
-     * Accept a base64-encoded image/GIF for the screen deterrent. JSON body:
+     * Accept a base64-encoded image / GIF / MP4 for the screen deterrent. JSON body:
      *   { "filename": "warning.gif", "dataBase64": "<base64>" }
      *
-     * Persists to /data/local/tmp/.overdrive/screen_deterrent_asset.<ext>
+     * Persists below /data/local/tmp/.overdrive/screen_deterrent_asset.*
      * world-readable so the daemon UID 2000 can decode it. Updates
      * surveillance.screenDeterrentImagePath in unified config on success.
      */
@@ -198,7 +263,6 @@ public class SurveillanceApiHandler {
             return;
         }
 
-        String filename = req.optString("filename", "image.png");
         String dataB64 = req.optString("dataBase64", "");
         if (dataB64.isEmpty()) {
             HttpResponse.sendJsonError(out, "Missing dataBase64");
@@ -225,88 +289,230 @@ public class SurveillanceApiHandler {
             HttpResponse.sendJsonError(out, "Empty file");
             return;
         }
-        // Cap at 8 MB — anything bigger is unlikely to be a deterrent asset
-        // and the GIF Movie API can't handle huge files anyway.
-        if (data.length > 8 * 1024 * 1024) {
-            HttpResponse.sendJsonError(out, "File too large (max 8MB)");
+        String ext = deterrentAssetExtension(data);
+        if (ext == null) {
+            HttpResponse.sendJsonError(out,
+                    "Unsupported or unreadable file (use PNG, JPG, WebP, GIF or MP4)");
+            return;
+        }
+        boolean isVideo = "mp4".equals(ext);
+        int maxBytes = isVideo
+                ? SCREEN_DETERRENT_MAX_VIDEO_BYTES
+                : SCREEN_DETERRENT_MAX_IMAGE_BYTES;
+        if (data.length > maxBytes) {
+            HttpResponse.sendJsonError(out, "File too large (max "
+                    + (maxBytes / (1024 * 1024)) + "MB)");
             return;
         }
 
-        // Determine extension from filename (default .png).
-        String ext = "png";
-        int dot = filename.lastIndexOf('.');
-        if (dot > 0 && dot < filename.length() - 1) {
-            String e = filename.substring(dot + 1).toLowerCase();
-            if (e.equals("png") || e.equals("jpg") || e.equals("jpeg")
-                    || e.equals("webp") || e.equals("gif")) {
-                ext = e;
+        persistScreenDeterrentAsset(out, data, ext, isVideo);
+    }
+
+    private static void persistScreenDeterrentAsset(
+            OutputStream out, byte[] data, String ext, boolean isVideo) throws Exception {
+        synchronized (SCREEN_DETERRENT_ASSET_LOCK) {
+            java.io.File dir = new java.io.File(SCREEN_DETERRENT_DIR);
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                HttpResponse.sendJsonError(out, "Could not create deterrent asset directory");
+                return;
+            }
+            try {
+                dir.setReadable(true, false);
+                dir.setExecutable(true, false);
+            } catch (Exception ignored) {}
+
+            java.io.File tmpFile = null;
+            java.io.File outFile = null;
+            boolean configCommitted = false;
+            try {
+                // Unique staging and final names prevent concurrent requests,
+                // crashed uploads, and same-extension replacement from sharing
+                // an inode. The configured old asset remains untouched until
+                // the new file is durable and UCM accepts the new path.
+                tmpFile = java.io.File.createTempFile(
+                        SCREEN_DETERRENT_PREFIX + "upload.", ".tmp", dir);
+                try (java.io.FileOutputStream fos =
+                             new java.io.FileOutputStream(tmpFile, false)) {
+                    fos.write(data);
+                    fos.getFD().sync();
+                }
+                try { tmpFile.setReadable(true, false); } catch (Exception ignored) {}
+
+                String reject = isVideo
+                        ? validateDeterrentVideo(tmpFile)
+                        : validateDeterrentImage(tmpFile, "gif".equals(ext));
+                if (reject != null) {
+                    HttpResponse.sendJsonError(out, reject);
+                    return;
+                }
+
+                outFile = new java.io.File(
+                        dir,
+                        SCREEN_DETERRENT_PREFIX
+                                + java.util.UUID.randomUUID() + "." + ext);
+                try {
+                    java.nio.file.Files.move(
+                            tmpFile.toPath(), outFile.toPath(),
+                            java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                } catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
+                    java.nio.file.Files.move(
+                            tmpFile.toPath(), outFile.toPath());
+                }
+                tmpFile = null;
+                try { outFile.setReadable(true, false); } catch (Exception ignored) {}
+
+                boolean persisted =
+                        com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                                "surveillance",
+                                java.util.Collections.singletonMap(
+                                        "screenDeterrentImagePath",
+                                        outFile.getAbsolutePath()));
+                if (!persisted) {
+                    try { outFile.delete(); } catch (Exception ignored) {}
+                    HttpResponse.sendJsonError(out, "Could not save deterrent asset");
+                    return;
+                }
+                configCommitted = true;
+
+                deleteDeterrentAssetsExcept(dir, outFile);
+                CameraDaemon.log("Screen deterrent asset uploaded: "
+                        + outFile.getAbsolutePath() + " (" + data.length + " bytes)");
+
+                JSONObject resp = new JSONObject();
+                resp.put("success", true);
+                resp.put("path", outFile.getAbsolutePath());
+                resp.put("size", data.length);
+                resp.put("assetType", isVideo ? "video" : "image");
+                HttpResponse.sendJson(out, resp.toString());
+            } catch (Throwable t) {
+                if (!configCommitted && outFile != null) {
+                    try { outFile.delete(); } catch (Exception ignored) {}
+                }
+                if (configCommitted) {
+                    CameraDaemon.log("Screen deterrent asset committed but response failed: "
+                            + t.getMessage());
+                } else {
+                    HttpResponse.sendJsonError(out, "Write failed: " + t.getMessage());
+                }
+            } finally {
+                if (tmpFile != null) {
+                    try { tmpFile.delete(); } catch (Exception ignored) {}
+                }
             }
         }
+    }
 
-        java.io.File dir = new java.io.File("/data/local/tmp/.overdrive");
-        if (!dir.exists()) {
-            dir.mkdirs();
-            try { dir.setReadable(true, false); dir.setExecutable(true, false); } catch (Exception ignored) {}
-        }
-
-        // Atomic write: stream into a .tmp sibling, fsync, then rename. If
-        // anything fails (disk full, permission denied, IOException) we
-        // bail before touching the previous asset, so the user doesn't lose
-        // their working image to a botched upload.
-        java.io.File outFile = new java.io.File(dir, "screen_deterrent_asset." + ext);
-        java.io.File tmpFile = new java.io.File(dir, "screen_deterrent_asset." + ext + ".tmp");
-        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpFile)) {
-            fos.write(data);
-            fos.getFD().sync();
-        } catch (Throwable t) {
-            try { tmpFile.delete(); } catch (Exception ignored) {}
-            HttpResponse.sendJsonError(out, "Write failed: " + t.getMessage());
-            return;
-        }
-        try { tmpFile.setReadable(true, false); } catch (Exception ignored) {}
-
-        // Stage successful — now clean up any previous assets and atomically
-        // swap in the new one. The "latest only" invariant: one and only
-        // one screen_deterrent_asset.<ext> file ever exists on disk after
-        // an upload completes. We delete:
-        //   1. Live asset files for OTHER extensions (only one can exist)
-        //   2. Stale .tmp files for OTHER extensions (from previous crashed
-        //      uploads — never cleaned up otherwise)
-        // The same-extension live file is overwritten by tmpFile.renameTo()
-        // below; our own .tmp is the source of the rename.
-        for (String oldExt : new String[]{"png", "jpg", "jpeg", "webp", "gif"}) {
-            if (oldExt.equals(ext)) continue;
-            java.io.File oldFile = new java.io.File(dir, "screen_deterrent_asset." + oldExt);
-            if (oldFile.exists()) {
-                try { oldFile.delete(); } catch (Exception ignored) {}
+    private static void deleteDeterrentAssetsExcept(
+            java.io.File dir, java.io.File keep) {
+        java.io.File[] files = dir.listFiles();
+        if (files == null) return;
+        String keepPath = keep == null ? "" : keep.getAbsolutePath();
+        for (java.io.File file : files) {
+            String name = file.getName();
+            if (!name.startsWith(SCREEN_DETERRENT_PREFIX)
+                    || file.getAbsolutePath().equals(keepPath)) {
+                continue;
             }
-            java.io.File staleTmp = new java.io.File(dir, "screen_deterrent_asset." + oldExt + ".tmp");
-            if (staleTmp.exists()) {
-                try { staleTmp.delete(); } catch (Exception ignored) {}
+            boolean staging = name.endsWith(".tmp");
+            if (!staging && !isAllowedDeterrentPath(file.getAbsolutePath())) continue;
+            try { file.delete(); } catch (Exception ignored) {}
+        }
+    }
+
+    private static String validateDeterrentVideo(java.io.File file) {
+        if (SCREEN_DETERRENT_VIDEO_VALIDATOR.getActiveCount() > 0
+                || !SCREEN_DETERRENT_VIDEO_VALIDATOR.getQueue().isEmpty()) {
+            return "Video validation is busy; try again";
+        }
+
+        java.util.concurrent.FutureTask<String> task =
+                new java.util.concurrent.FutureTask<>(
+                        () -> validateDeterrentVideoNow(file));
+        try {
+            SCREEN_DETERRENT_VIDEO_VALIDATOR.execute(task);
+        } catch (java.util.concurrent.RejectedExecutionException busy) {
+            return "Video validation is busy; try again";
+        }
+
+        try {
+            return task.get(8, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (java.util.concurrent.TimeoutException timeout) {
+            task.cancel(true);
+            SCREEN_DETERRENT_VIDEO_VALIDATOR.remove(task);
+            CameraDaemon.log("Deterrent video validation timed out — rejecting "
+                    + file.getName());
+            return "Could not read that MP4 (validation timed out)";
+        } catch (InterruptedException interrupted) {
+            task.cancel(true);
+            SCREEN_DETERRENT_VIDEO_VALIDATOR.remove(task);
+            Thread.currentThread().interrupt();
+            return "Video validation interrupted";
+        } catch (java.util.concurrent.ExecutionException failed) {
+            return "Could not validate that MP4";
+        }
+    }
+
+    private static String validateDeterrentImage(
+            java.io.File file, boolean animatedGif) {
+        try {
+            android.graphics.BitmapFactory.Options bounds =
+                    new android.graphics.BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeFile(
+                    file.getAbsolutePath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                return "Could not decode that image";
             }
+            if (animatedGif
+                    && (bounds.outWidth > SCREEN_DETERRENT_MAX_GIF_DIM
+                        || bounds.outHeight > SCREEN_DETERRENT_MAX_GIF_DIM
+                        || (long) bounds.outWidth * bounds.outHeight
+                            > SCREEN_DETERRENT_MAX_GIF_PIXELS)) {
+                return "GIF dimensions too large for this head unit";
+            }
+            return null;
+        } catch (Throwable invalid) {
+            return "Could not decode that image";
         }
-        if (!tmpFile.renameTo(outFile)) {
-            // Rename failed — try a copy fallback (e.g. cross-fs which can't
-            // happen here but doesn't hurt to be defensive).
-            try { tmpFile.delete(); } catch (Exception ignored) {}
-            HttpResponse.sendJsonError(out, "Rename failed");
-            return;
+    }
+
+    private static String validateDeterrentVideoNow(java.io.File file) {
+        if (!com.overdrive.app.surveillance.ScreenDeterrentVideo
+                .isMp4File(file.getAbsolutePath())) {
+            return "That file is not a readable MP4";
         }
-        // World-readable so byd_cam_daemon (UID 2000) can read it.
-        try { outFile.setReadable(true, false); } catch (Exception ignored) {}
+        com.overdrive.app.surveillance.ScreenDeterrentVideo.Probe probe =
+                com.overdrive.app.surveillance.ScreenDeterrentVideo.probe(
+                        file.getAbsolutePath());
+        if (probe == null) return "That MP4 has no readable video track";
+        if (probe.durationUs <= 0) return "Could not read the video duration";
 
-        com.overdrive.app.config.UnifiedConfigManager.updateValues(
-                "surveillance",
-                java.util.Collections.singletonMap("screenDeterrentImagePath", outFile.getAbsolutePath()));
-
-        CameraDaemon.log("Screen deterrent asset uploaded: " + outFile.getAbsolutePath()
-                + " (" + data.length + " bytes)");
-
-        JSONObject resp = new JSONObject();
-        resp.put("success", true);
-        resp.put("path", outFile.getAbsolutePath());
-        resp.put("size", data.length);
-        HttpResponse.sendJson(out, resp.toString());
+        long durationMs = probe.durationUs / 1000L;
+        if (durationMs > SCREEN_DETERRENT_MAX_VIDEO_MS) {
+            return "Video too long (" + (durationMs / 1000L)
+                    + "s, max 10s) — it loops, so keep it short";
+        }
+        if (probe.width <= 0 || probe.height <= 0
+                || probe.visibleWidth <= 0 || probe.visibleHeight <= 0) {
+            return "Could not read the video resolution";
+        }
+        int codedMajor = Math.max(probe.width, probe.height);
+        int codedMinor = Math.min(probe.width, probe.height);
+        int visibleMajor = Math.max(probe.visibleWidth, probe.visibleHeight);
+        int visibleMinor = Math.min(probe.visibleWidth, probe.visibleHeight);
+        if (codedMajor > SCREEN_DETERRENT_MAX_VIDEO_DIM
+                || codedMinor > SCREEN_DETERRENT_MAX_VIDEO_CODED_MINOR_DIM
+                || visibleMajor > SCREEN_DETERRENT_MAX_VIDEO_DIM
+                || visibleMinor > SCREEN_DETERRENT_MAX_VIDEO_MINOR_DIM) {
+            return "Video too large (" + probe.width + "x" + probe.height
+                    + ", max 1920x1080)";
+        }
+        if (com.overdrive.app.surveillance.ScreenDeterrentVideo
+                .decoderForFormat(probe.format) == null) {
+            return "This head unit cannot decode " + probe.mime
+                    + " — re-encode as H.264 / AVC";
+        }
+        return null;
     }
     
     private static void sendConfig(OutputStream out) throws Exception {
@@ -490,14 +696,19 @@ public class SurveillanceApiHandler {
         // makes the UI show a broken preview spinner forever.
         String imgPath = survConfig.optString("screenDeterrentImagePath", "");
         boolean hasImage = false;
-        if (!imgPath.isEmpty()) {
+        if (isAllowedDeterrentPath(imgPath)) {
             try {
-                java.io.File f = new java.io.File(imgPath);
-                hasImage = f.exists() && f.length() > 0;
+                java.io.File f = new java.io.File(imgPath).getCanonicalFile();
+                hasImage = f.isFile() && f.length() > 0;
+                if (hasImage) imgPath = f.getAbsolutePath();
             } catch (Exception ignored) {}
         }
+        if (!hasImage) imgPath = "";
         config.put("screenDeterrentImagePath", imgPath);
         config.put("screenDeterrentHasImage", hasImage);
+        config.put("screenDeterrentAssetType",
+                hasImage && imgPath.toLowerCase(java.util.Locale.ROOT).endsWith(".mp4")
+                        ? "video" : (hasImage ? "image" : ""));
         
         // SOTA: BYD Cloud connection status
         JSONObject bydCloud = com.overdrive.app.config.UnifiedConfigManager.getBydCloud();
@@ -609,6 +820,7 @@ public class SurveillanceApiHandler {
             try {
                 org.json.JSONObject camCfg = com.overdrive.app.config.UnifiedConfigManager
                     .loadConfig().optJSONObject("camera");
+                boolean passiveApaMode = false;
                 if (camCfg != null) {
                     config.put("cameraId", camCfg.optInt("probedCameraId", -1));
                     config.put("cameraManualOverride", camCfg.optBoolean("manualOverride", false));
@@ -617,11 +829,12 @@ public class SurveillanceApiHandler {
                     // the radio group; absence falls back to default.
                     config.put("cameraMode",
                         camCfg.optString("cameraMode", "default"));
-                    // Red-calibration-overlay GL mask flag — the only
-                    // user-controllable mitigation. The dialog reads this
-                    // to pre-check the switch.
+                    // Red-calibration-overlay GL mask fallback. The dialog
+                    // reads this to pre-check the switch.
                     config.put("dilink4RedMask",
                         camCfg.optBoolean("dilink4RedMask", false));
+                    passiveApaMode = camCfg.optBoolean("dilink4PassiveApaMode", false);
+                    config.put("dilink4PassiveApaMode", passiveApaMode);
                 }
                 // DiLink 4 mosaic-viewpoint handshake result. This is the write
                 // that flips the byd_apa HAL out of single-camera dashcam mode;
@@ -634,7 +847,8 @@ public class SurveillanceApiHandler {
                 // byte-identical to before (the values would be meaningless there
                 // anyway — the viewpoint write is never attempted).
                 if (camCfg != null
-                        && "dilink4".equalsIgnoreCase(camCfg.optString("cameraMode", "default"))) {
+                        && "dilink4".equalsIgnoreCase(camCfg.optString("cameraMode", "default"))
+                        && !passiveApaMode) {
                     config.put("dilink4MosaicViewpointConfirmed",
                         com.overdrive.app.camera.BydApaViewpointHelper.isMosaicViewpointConfirmed());
                     config.put("dilink4ViewpointRc",
@@ -796,6 +1010,7 @@ public class SurveillanceApiHandler {
             }
             
             boolean configChanged = false;
+            boolean reconcileOperatingMode = false;
             
             if (sentry != null && configJson.has("sadThreshold")) {
                 sentry.setSadThreshold((float) configJson.optDouble("sadThreshold", 0.05));
@@ -962,9 +1177,9 @@ public class SurveillanceApiHandler {
             }
 
             // Operating mode: onAndOff (default full behaviour) | onOnly (disable all
-            // post-vehicle-OFF work so the head unit can sleep). Pure persist — takes
-            // effect on the next ACC cycle when each daemon re-reads the mtime-gated
-            // config, matching armMode/keepUsbPowerOnAccOff (no mid-session restart).
+            // post-vehicle-OFF work so the head unit can sleep). Settings writes remain
+            // next-cycle changes. Automation may set applyCurrentAccState=true so an action
+            // triggered on the ACC-off edge safely completes or cancels parked shutdown now.
             // Invalid values are rejected; isVehicleOnOnlyMode() fails open to onAndOff.
             if (configJson.has("operatingMode")) {
                 String opMode = configJson.optString("operatingMode", "onAndOff");
@@ -987,6 +1202,8 @@ public class SurveillanceApiHandler {
                         return;
                     }
                     CameraDaemon.log("Operating mode set to: " + opMode);
+                    reconcileOperatingMode =
+                            configJson.optBoolean("applyCurrentAccState", false);
                     configChanged = true;
                 } else {
                     CameraDaemon.log("Rejected operatingMode: " + opMode);
@@ -1033,30 +1250,55 @@ public class SurveillanceApiHandler {
                 }
             }
 
-            // SOTA: Screen deterrent (independent of cloud deterrent — both can be on)
+            // Screen deterrent (independent of cloud deterrent — both can be on).
+            // Commit every supplied field in one UCM transaction so the browser
+            // never receives success for a partial or failed immediate save.
+            java.util.Map<String, Object> screenDeterrentUpdates =
+                    new java.util.HashMap<>();
+            boolean resetScreenDeterrent = false;
+            Boolean screenDeterrentEnabledValue = null;
             if (configJson.has("screenDeterrentEnabled")) {
                 boolean enabled = configJson.optBoolean("screenDeterrentEnabled", false);
-                com.overdrive.app.config.UnifiedConfigManager.updateValues(
-                        "surveillance", java.util.Collections.singletonMap("screenDeterrentEnabled", enabled));
-                CameraDaemon.log("Screen deterrent enabled: " + enabled);
-                try {
-                    com.overdrive.app.surveillance.ScreenDeterrent.getInstance().reset();
-                } catch (Exception ignored) {}
+                screenDeterrentUpdates.put("screenDeterrentEnabled", enabled);
+                resetScreenDeterrent = true;
+                screenDeterrentEnabledValue = enabled;
             }
 
             if (configJson.has("screenDeterrentDurationSeconds")) {
                 int dur = configJson.optInt("screenDeterrentDurationSeconds", 8);
-                if (dur >= 3 && dur <= 30) {
-                    com.overdrive.app.config.UnifiedConfigManager.updateValues(
-                            "surveillance", java.util.Collections.singletonMap("screenDeterrentDurationSeconds", dur));
+                if (dur < 3 || dur > 30) {
+                    HttpResponse.sendJsonError(out,
+                            "Screen deterrent duration must be between 3 and 30 seconds");
+                    return;
                 }
+                screenDeterrentUpdates.put("screenDeterrentDurationSeconds", dur);
             }
 
             if (configJson.has("screenDeterrentMessage")) {
                 String msg = configJson.optString("screenDeterrentMessage", "");
                 if (msg.length() > 120) msg = msg.substring(0, 120);
-                com.overdrive.app.config.UnifiedConfigManager.updateValues(
-                        "surveillance", java.util.Collections.singletonMap("screenDeterrentMessage", msg));
+                screenDeterrentUpdates.put("screenDeterrentMessage", msg);
+            }
+
+            if (!screenDeterrentUpdates.isEmpty()) {
+                boolean persisted =
+                        com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                                "surveillance", screenDeterrentUpdates);
+                if (!persisted) {
+                    HttpResponse.sendJsonError(out,
+                            "Could not save screen deterrent settings");
+                    return;
+                }
+                if (screenDeterrentEnabledValue != null) {
+                    CameraDaemon.log("Screen deterrent enabled: "
+                            + screenDeterrentEnabledValue);
+                }
+                if (resetScreenDeterrent) {
+                    try {
+                        com.overdrive.app.surveillance.ScreenDeterrent
+                                .getInstance().reset();
+                    } catch (Exception ignored) {}
+                }
             }
 
             // ACC-OFF mode: only "smart" or "continuous" are valid; anything
@@ -1243,34 +1485,25 @@ public class SurveillanceApiHandler {
             }
 
             if (configJson.has("clearScreenDeterrentImage") && configJson.optBoolean("clearScreenDeterrentImage", false)) {
-                String existing = com.overdrive.app.config.UnifiedConfigManager.getSurveillance()
-                        .optString("screenDeterrentImagePath", "");
-                // Defense in depth: delete EVERY known-shape file in the
-                // deterrent dir, not just the path UCM points at. This way,
-                // if a previous upload's .tmp leaked or UCM was out of sync
-                // with disk (e.g. the user upgraded mid-upload), Clear
-                // genuinely leaves no asset behind. Path-restriction prevents
-                // any escape from the .overdrive directory.
-                java.io.File dir = new java.io.File(SCREEN_DETERRENT_DIR);
-                if (dir.isDirectory()) {
-                    for (String oldExt : new String[]{"png", "jpg", "jpeg", "webp", "gif"}) {
-                        java.io.File f = new java.io.File(dir, SCREEN_DETERRENT_PREFIX + oldExt);
-                        if (f.exists() && isAllowedDeterrentPath(f.getAbsolutePath())) {
-                            try { f.delete(); } catch (Exception ignored) {}
-                        }
-                        java.io.File t = new java.io.File(dir, SCREEN_DETERRENT_PREFIX + oldExt + ".tmp");
-                        if (t.exists() && isAllowedDeterrentPath(t.getAbsolutePath())) {
-                            try { t.delete(); } catch (Exception ignored) {}
-                        }
+                synchronized (SCREEN_DETERRENT_ASSET_LOCK) {
+                    // Clear the configured pointer first. If persistence fails,
+                    // leave every file untouched so the current deterrent keeps
+                    // working instead of pointing UCM at a deleted asset.
+                    boolean persisted =
+                            com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                                    "surveillance",
+                                    java.util.Collections.singletonMap(
+                                            "screenDeterrentImagePath", ""));
+                    if (!persisted) {
+                        HttpResponse.sendJsonError(out,
+                                "Could not clear deterrent asset");
+                        return;
+                    }
+                    java.io.File dir = new java.io.File(SCREEN_DETERRENT_DIR);
+                    if (dir.isDirectory()) {
+                        deleteDeterrentAssetsExcept(dir, null);
                     }
                 }
-                // Also delete the path UCM points at, in case it's a different
-                // shape than the prefix loop above caught (legacy / migration).
-                if (!existing.isEmpty() && isAllowedDeterrentPath(existing)) {
-                    try { new java.io.File(existing).delete(); } catch (Exception ignored) {}
-                }
-                com.overdrive.app.config.UnifiedConfigManager.updateValues(
-                        "surveillance", java.util.Collections.singletonMap("screenDeterrentImagePath", ""));
                 CameraDaemon.log("Screen deterrent image cleared");
             }
             
@@ -1747,18 +1980,21 @@ public class SurveillanceApiHandler {
                 configChanged = true;
             }
 
-            // DiLink 4 red-overlay GL mask. Only effective when
-            // cameraMode=dilink4. Cosmetic suppression of the HAL's
-            // 'calibration failed' chrome — replaces saturated red pixels
-            // with a neighbour sample (or luminance gray as a last resort).
-            // The 2x2 quadrant arrangement itself is hardcoded in
-            // GpuSurveillancePipeline — every DiLink 4 trim observed emits
-            // the same mosaic so there's nothing to tune there.
-            if (configJson.has("dilink4RedMask")) {
+            // DiLink 4 compatibility options. Passive APA mode leaves preview
+            // port 0 untouched and suppresses all panorama viewpoint writes;
+            // the red mask remains a cosmetic fallback for baked-in chrome.
+            if (configJson.has("dilink4PassiveApaMode")
+                    || configJson.has("dilink4RedMask")) {
                 org.json.JSONObject camCfg = new org.json.JSONObject();
                 try {
-                    camCfg.put("dilink4RedMask",
-                        configJson.optBoolean("dilink4RedMask", false));
+                    if (configJson.has("dilink4PassiveApaMode")) {
+                        camCfg.put("dilink4PassiveApaMode",
+                            configJson.optBoolean("dilink4PassiveApaMode", false));
+                    }
+                    if (configJson.has("dilink4RedMask")) {
+                        camCfg.put("dilink4RedMask",
+                            configJson.optBoolean("dilink4RedMask", false));
+                    }
                 } catch (org.json.JSONException je) {
                     HttpResponse.sendJsonError(out, "Failed to build camera config: " + je.getMessage());
                     return;
@@ -1767,10 +2003,10 @@ public class SurveillanceApiHandler {
                     .updateSection("camera", camCfg);
                 if (!saved) {
                     HttpResponse.sendJsonError(out,
-                        "Could not persist red-overlay flag");
+                        "Could not persist DiLink 4 compatibility options");
                     return;
                 }
-                CameraDaemon.log("DiLink 4 red-overlay flag updated: " + camCfg);
+                CameraDaemon.log("DiLink 4 compatibility options updated: " + camCfg);
                 configChanged = true;
             }
 
@@ -1881,6 +2117,10 @@ public class SurveillanceApiHandler {
                 } catch (Exception e) {
                     CameraDaemon.log("Failed to save recording settings: " + e.getMessage());
                 }
+            }
+
+            if (reconcileOperatingMode) {
+                CameraDaemon.reconcileOperatingModeForCurrentAccState();
             }
             
             HttpResponse.sendJsonSuccess(out);

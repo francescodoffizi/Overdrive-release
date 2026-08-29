@@ -90,43 +90,51 @@ public class PanoramicCameraGpu {
     // AVMCamera surface mode — 0 works on Seal, Atto 1 may need different value
     // Set via setCameraSurfaceMode() before start() for per-model override.
     // On the oem SurfaceTexture path this same value is the previewIndex
-    // passed to addTexture/setTexture/rmTexture — 0=mosaic, 1-4=quadrants.
+    // passed to addTexture/setTexture/rmTexture — 0=firmware-default panorama
+    // output, 1-4=individual viewpoints.
     private int cameraSurfaceMode = 0;
 
     // Frame-ingestion path selector. Two modes, persisted in unified
     // config under camera.cameraMode:
     //   "default" → legacy ImageReader + 4-strip → 2x2 rearrangement.
     //   "dilink4" → oem SurfaceTexture (addTexture + setTexture +
-    //               previewIndex) + cameraLayout=3 (passthrough). The
-    //               HAL emits its final 2x2 mosaic into the producer
-    //               surface natively on byd_apa firmware variants.
+    //               previewIndex). Normal mode uses layout 3 for the known
+    //               four-corner remap; passive APA uses layout 1 to record
+    //               preview port 0 unchanged.
     //
-    // Resolved at construction. Default when key is missing → legacy.
-    private final boolean USE_OEM_SURFACE_TEXTURE_PATH = resolveCameraModeFromConfig();
+    // Resolved at construction. 0=legacy strip, 1=passive full-frame APA,
+    // 3=DiLink 4 four-corner remap.
+    private final int CAMERA_LAYOUT_MODE = resolveCameraLayoutModeFromConfig();
+    private final boolean USE_OEM_SURFACE_TEXTURE_PATH = CAMERA_LAYOUT_MODE != 0;
+    // DiLink 4-only compatibility path: leave the OEM panorama output untouched
+    // and consume preview port 0 exactly as supplied by the HAL.
+    private final boolean USE_PASSIVE_APA_MODE = CAMERA_LAYOUT_MODE == 1;
 
-    private static boolean resolveCameraModeFromConfig() {
+    private static int resolveCameraLayoutModeFromConfig() {
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
-            return true; // DiLink 5 uses SurfaceTexture / ANativeWindow pipeline
+            return 1; // DiLink 5: direct 1:1 single camera passthrough (no 4-way mosaic)
         }
         try {
             org.json.JSONObject cam = com.overdrive.app.config.UnifiedConfigManager
                 .loadConfig().optJSONObject("camera");
-            if (cam == null) return false;
-            String mode = cam.optString("cameraMode", "default");
-            return "dilink4".equalsIgnoreCase(mode);
+            if (cam == null) return 0;
+            return Di4AvcViewpointPolicy.cameraLayoutMode(
+                cam.optString("cameraMode", "default"),
+                cam.optBoolean("dilink4PassiveApaMode", false));
         } catch (Throwable t) {
-            return false;
+            return 0;
         }
     }
 
     /** Effective camera-layout mode for downstream consumers.
      *  0 = 4-strip → 2x2 rearrangement (legacy);
-     *  3 = passthrough (dilink4 / dilink5 — HAL emits complete frame natively). */
+     *  1 = full-frame passthrough (DiLink 4 passive APA / DiLink 5);
+     *  3 = DiLink 4 four-corner remap. */
     public int getCameraLayoutMode() {
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             return 1; // DiLink 5: direct 1:1 single camera passthrough (no 4-way mosaic)
         }
-        return USE_OEM_SURFACE_TEXTURE_PATH ? 3 : 0;
+        return CAMERA_LAYOUT_MODE;
     }
     
     // Camera ID override — set via setCameraId() before start()
@@ -1030,10 +1038,57 @@ public class PanoramicCameraGpu {
             sentry.setCameraTargetFps(targetFps);
         }
 
-        // Initialize on GL thread
+        // Initialize on GL thread.
+        //
+        // FIX (EGL-leak audit): this used to be a fire-and-forget post whose
+        // catch block RETHREW inside the Handler callback. An init failure
+        // (e.g. eglCreateContext refusing under context exhaustion) therefore
+        // killed the GL-RenderLoop looper thread — the daemon's global
+        // uncaught-exception handler swallowed it, start() returned "success",
+        // and queued cleanup work landed on a dead looper. Now init runs on
+        // the GL thread behind a latch: on failure it cleans up ON THAT SAME
+        // THREAD (releaseGl, while its EGL state is still coherent), the
+        // thread is quit+joined, and the actual exception propagates
+        // synchronously out of start() so the pipeline's rollback path can do
+        // its job.
+        final java.util.concurrent.CountDownLatch initDone =
+            new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicReference<Exception> initError =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        // Timeout-cancellation token. If start() gives up waiting and throws,
+        // a still-in-flight init runnable must NOT publish success afterwards
+        // (set running=true, schedule renderLoop, start the watchdog) — and a
+        // camera handle opened AFTER the rollback's stop() checked cameraObj
+        // would otherwise leak with nothing left to close it. The runnable
+        // re-checks this token before opening the HAL and again before
+        // publishing; if cancelled, it tears down whatever it built ON THIS
+        // THREAD (late cameraObj included) and exits without publishing.
+        final java.util.concurrent.atomic.AtomicBoolean startCancelled =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+        // Makes cancel-set and gate-check+publication mutually exclusive.
+        // Without it there is a check-then-act race: the runnable could pass
+        // the gate, the timeout could fire and the rollback's stop() run to
+        // completion, and THEN the runnable publishes running=true + starts
+        // the watchdog against a torn-down looper — the watchdog would see a
+        // permanently stalled heartbeat and System.exit the daemon. With the
+        // lock, either the cancel lands first (runnable self-cleans, never
+        // publishes) or publication completes first (the rollback's stop()
+        // then tears down a FULLY published camera, which it handles).
+        final Object publishLock = new Object();
         glHandler.post(() -> {
             try {
                 initializeGl();
+
+                // Cancelled while initializeGl ran? Don't open the HAL at all.
+                if (startCancelled.get()) {
+                    logger.warn("start: cancelled during GL init — releasing GL state, "
+                        + "skipping camera open");
+                    try { releaseGl(); } catch (Throwable t) {
+                        logger.warn("start: cancel cleanup errored: " + t.getMessage());
+                    }
+                    return;
+                }
+
                 startCamera();
 
                 // SOTA: Setup event callback for HAL error detection (-10086, 8)
@@ -1041,6 +1096,16 @@ public class PanoramicCameraGpu {
                     cameraCoordinator.setupEventCallback(cameraObj);
                 }
 
+                // Publish gate — ATOMIC with the cancel-set via publishLock.
+                // Inside the lock we either publish fully (running=true,
+                // renderLoop scheduled, watchdog started) or observe the
+                // cancel and publish nothing; the timeout path takes the same
+                // lock to set the cancel, so a cancel can never land between
+                // the check and the publication. Cleanup for the cancelled
+                // case runs AFTER the lock is dropped — it's heavyweight
+                // (HAL close + releaseGl) and needs no atomicity, only the
+                // decision does.
+                //
                 // Tier 1: the AI-lane GL thread + its second EGL context +
                 // FoveatedCropper FBO/PBO ring (~6.5MB GPU + ~2.8MB CPU) are
                 // brought up LAZILY on the first surveillance-active frame
@@ -1051,22 +1116,111 @@ public class PanoramicCameraGpu {
                 // idle thread/context never exist. It is created when sentry
                 // arms and torn back down when sentry disarms. The CameraState
                 // (aiCameraState) is captured into a field for the lazy path.
-                this.aiCameraStateRef = aiCameraState;
+                boolean published = false;
+                synchronized (publishLock) {
+                    if (!startCancelled.get()) {
+                        this.aiCameraStateRef = aiCameraState;
+                        running = true;
+                        // Start render loop
+                        glHandler.post(this::renderLoop);
+                        // Start watchdog
+                        startWatchdog();
+                        published = true;
+                    }
+                }
 
-                running = true;
-
-                // Start render loop
-                glHandler.post(this::renderLoop);
-
-                // Start watchdog
-                startWatchdog();
+                if (!published) {
+                    logger.warn("start: cancelled after camera open — closing late "
+                        + "camera handle and GL state on GL thread");
+                    try {
+                        if (cameraObj != null) {
+                            Object toClose = cameraObj;
+                            cameraObj = null;
+                            closeCameraForPath(toClose);
+                            if (cameraCoordinator != null) {
+                                cameraCoordinator.notifyPosCloseCamera();
+                            }
+                        }
+                    } catch (Throwable t) {
+                        logger.warn("start: late camera close errored: " + t.getMessage());
+                    }
+                    try { releaseGl(); } catch (Throwable t) {
+                        logger.warn("start: cancel cleanup errored: " + t.getMessage());
+                    }
+                    return;
+                }
 
                 logger.info("GPU camera pipeline started (AI lane on dedicated GL thread)");
             } catch (Exception e) {
                 logger.error("Failed to start GPU pipeline", e);
-                throw new RuntimeException(e);
+                initError.set(e);
+                // Clean up partial GL state on THIS thread while its EGL
+                // bindings are still coherent. releaseGl is fortified and
+                // null-safe against whatever initializeGl did or didn't
+                // allocate before throwing.
+                try {
+                    releaseGl();
+                } catch (Throwable cleanup) {
+                    logger.warn("start: GL-thread failure cleanup errored: "
+                        + cleanup.getMessage());
+                }
+            } finally {
+                initDone.countDown();
             }
         });
+
+        // Wait for GL-thread init to complete. Camera HAL open can be slow on
+        // a cold boot; 20s comfortably covers the worst observed open latency
+        // while still bounding a genuinely wedged driver.
+        boolean completed;
+        try {
+            completed = initDone.await(20, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            // Same race as the timeout path: the runnable may still be in
+            // flight — take the publish lock so the cancel is atomic with
+            // the runnable's gate-check+publication.
+            synchronized (publishLock) {
+                startCancelled.set(true);
+            }
+            throw new Exception("Interrupted waiting for GL pipeline init", ie);
+        }
+        if (!completed) {
+            // Cancel under the publish lock: after this block, EITHER the
+            // runnable has already fully published (running=true + renderLoop
+            // + watchdog — the rollback's stop() tears that down orderly) OR
+            // it has not and its gate will now see the cancel and self-clean
+            // (including a camera handle the HAL hands back after this
+            // point) without publishing anything. No third interleaving is
+            // possible. Do NOT tear the GL thread down here — the handler
+            // serializes the runnable's own cleanup and any later releaseGl
+            // post behind it. The pipeline's rollback calls stop(), which
+            // owns the orderly teardown of whatever else exists.
+            synchronized (publishLock) {
+                startCancelled.set(true);
+            }
+            throw new Exception("GL pipeline init did not complete within 20s "
+                + "(camera HAL or EGL wedged) — in-flight init cancelled");
+        }
+        Exception failure = initError.get();
+        if (failure != null) {
+            // GL-side cleanup already ran on the GL thread; renderLoop was
+            // never scheduled. Quit + join the thread so no dead looper is
+            // left holding queued work, then surface the real exception to
+            // the caller (pipeline rollback releases camera/downscaler/etc).
+            HandlerThread deadThread = glThread;
+            glHandler = null;
+            glThread = null;
+            if (deadThread != null) {
+                deadThread.quitSafely();
+                try {
+                    deadThread.join(1000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            throw failure;
+        }
     }
     
     /**
@@ -1200,8 +1354,55 @@ public class PanoramicCameraGpu {
             // context — not here. AiLaneGl.shutdown() calls
             // GpuDownscaler.releaseDirectResources() to free them on the
             // matching context (see T1-H1 fix).
-            downscaler.init();
-            // Layout 3 = DiLink 4 / 2x2-native HAL. The fragment shader
+            boolean downscalerUp = downscaler.init();
+            if (!downscalerUp) {
+                // Explicit degraded mode: the PRIVATE probe/thumbnail thread
+                // is dead (downscaler self-released — thread joined, reader
+                // closed, no EGL state leaked). Core recording and the
+                // AI-lane direct path are unaffected. Two consequences:
+                //
+                // 1. readPixels() now returns null — and the frame-15/50
+                //    validation treats a null readback as a BLACK frame,
+                //    which would misdiagnose a WORKING camera as a wrong
+                //    camera-id and trigger a destructive re-probe (or, in
+                //    auto-probe mode, sweep every id×mode combo seeing
+                //    "black" everywhere). Pixel-based validation is
+                //    meaningless without readback: disable it and the
+                //    auto-probe for this run.
+                //
+                // 2. Layout config below still applies — see the comment
+                //    there; the AI direct path consumes those fields.
+                logger.error("GpuDownscaler init FAILED — degraded mode: camera-profile "
+                    + "probe + mapping-snapshot thumbnails disabled, frame-15/50 pixel "
+                    + "validation + auto-probe disabled (no readback to judge frames by; "
+                    + "recording and AI direct path unaffected)");
+                if (autoProbeCameras) {
+                    logger.warn("Auto-probe was requested but cannot run without readback "
+                        + "— keeping current camera id "
+                        + (cameraIdOverride >= 0 ? cameraIdOverride : PHYSICAL_CAMERA_ID));
+                    autoProbeCameras = false;
+                    // setAutoProbeCameras(true) gated ALL consumer passes on
+                    // probeComplete, and the only code that can set it true
+                    // again is the frame-15/50 readback validation we just
+                    // disabled — leaving it false would gate the render loop
+                    // (recording/streaming/AI) forever. Ungate now: recording
+                    // whatever the current camera id delivers beats recording
+                    // nothing, same trade the probe-timeout fallback makes.
+                    probeComplete = true;
+                }
+                skipFrameValidation = true;
+            }
+
+            // Layout configuration applies UNCONDITIONALLY: these setters are
+            // plain field writes (volatiles + a lock-guarded array copy) that
+            // are consumed by BOTH the private-thread probe path AND the
+            // AI-lane direct path (readPixelsDirect renders on the AiLaneGl
+            // context and reads cameraLayout / producer corners / flips /
+            // red-mask), which remains fully functional when the private
+            // thread failed. Gating them on downscalerUp would hand V2 motion
+            // a wrongly-arranged mosaic in degraded mode.
+            // Layout 1 = full-frame passthrough. Layout 3 = DiLink 4 /
+            // 2x2-native HAL. The fragment shader
             // rearranges the producer's 2x2 into canonical Front=TL,
             // Right=TR, Rear=BL, Left=BR upright via the per-role corner+
             // flip uniforms set just below. Layout 0 = legacy 4-strip on
@@ -1215,7 +1416,7 @@ public class PanoramicCameraGpu {
             // mapping (Q0=Front..Q3=Left) only holds when the downscaler
             // emits canonical layout — without this the cropper's centroid
             // and the engine's quadrant grid disagree.
-            if (USE_OEM_SURFACE_TEXTURE_PATH) {
+            if (CAMERA_LAYOUT_MODE == 3) {
                 // Read from Dilink4Constants rather than re-typing the arrays.
                 // These were duplicated literals and had drifted: this site
                 // carried the Y bit on Front+Right (the pair that rendered
@@ -1233,75 +1434,74 @@ public class PanoramicCameraGpu {
                     Dilink4Constants.FLIP_RIGHT,
                     Dilink4Constants.FLIP_REAR,
                     Dilink4Constants.FLIP_LEFT);
-                // Red-overlay suppression on the AI lane. Same dilink4RedMask
-                // unified-config flag the recorder reads — keeps motion
-                // thumbnails clean of the HAL "calibration failed" chrome.
+            }
+            if (USE_OEM_SURFACE_TEXTURE_PATH) {
+                // Red-mask remains available on both DiLink 4 layouts. The
+                // center inset is specific to the four-corner layout.
                 try {
                     org.json.JSONObject camCfgDs = com.overdrive.app.config
                         .UnifiedConfigManager.loadConfig().optJSONObject("camera");
                     if (camCfgDs != null) {
                         downscaler.setRedMaskEnabled(
                             camCfgDs.optBoolean("dilink4RedMask", false));
-                        downscaler.setApaCenterInset(
-                            (float) camCfgDs.optDouble("dilink4ApaCenterInset", 0.09375));
+                        downscaler.setApaCenterInset(CAMERA_LAYOUT_MODE == 3
+                            ? (float) camCfgDs.optDouble(
+                                "dilink4ApaCenterInset", 0.09375)
+                            : 0.0f);
                     }
                 } catch (Throwable t) {
                     logger.warn("Downscaler red-mask flag read failed: " + t.getMessage());
                 }
             }
-            logger.debug("Downscaler initialized (probe path on its own thread)");
+            if (downscalerUp) {
+                logger.debug("Downscaler initialized (probe path on its own thread)");
+            }
         }
 
-        // Construct the foveated cropper, but defer its init to the AI-lane
-        // GL thread (see brings up AiLaneGl below). Allocating its FBOs +
-        // shader on the encoder thread would put them in the encoder
-        // context's command stream, which defeats the whole point of
-        // Tier 1 — the readback in crop() would still serialize against
-        // the encoder thread's eglSwapBuffers.
-        foveatedCropper = new FoveatedCropper(width, height,
-            quadrantStripOffsetX, quadrantCornerOffsetsXY);
-        // Cropper picks 4-strip vs 2x2 corner geometry from the active
-        // layout mode. Layout 0 = legacy 4-strip; layout 3 = DiLink 4 /
-        // 2x2-native HAL with Variant A producer-corner remap pushed below.
-        foveatedCropper.setCameraLayout(getCameraLayoutMode());
+        if (USE_PASSIVE_APA_MODE) {
+            // Port 0 is an opaque full-frame layout on these variants. Do not
+            // invent four producer quadrants for high-resolution AI crops;
+            // the normal full-frame readback remains active for motion/AI.
+            foveatedCropper = null;
+            logger.info("Passive APA: foveated quadrant crops disabled; "
+                + "using full-frame surveillance readback");
+        } else {
+            // Construct the foveated cropper, but defer its init to the AI-lane
+            // GL thread. Allocating its FBOs + shader on the encoder thread
+            // would serialize readback against encoder eglSwapBuffers.
+            foveatedCropper = new FoveatedCropper(width, height,
+                quadrantStripOffsetX, quadrantCornerOffsetsXY);
+            foveatedCropper.setCameraLayout(getCameraLayoutMode());
 
-        // DiLink 4: override the canonical corner map with the only
-        // known-good Variant A layout (Front=TL X-mirrored, Right=BR, Rear=TR,
-        // Left=BL, no Y flip on any role). Mirrors GpuMosaicRecorder so V2
-        // motion crops align with the recorder's mosaic.
-        //
-        // This site used to carry its own literals — FRONT{1,0} RIGHT{0,0}
-        // REAR{0,1} LEFT{0,1} — which agreed with the render paths on front and
-        // right but put Y bits on rear/left that the device frame contradicts.
-        // Because the cropper only maps a motion centroid into producer space
-        // and never renders the visible mosaic, that rear/left error was
-        // invisible in the picture and merely mis-placed motion crops for those
-        // two roles. Now reads the shared constants so recorder / stream /
-        // blind-spot / AI-downscaler / cropper can only ever move together.
-        if (USE_OEM_SURFACE_TEXTURE_PATH) {
-            foveatedCropper.setProducerCornerMap(
-                Dilink4Constants.CORNER_FRONT,
-                Dilink4Constants.CORNER_RIGHT,
-                Dilink4Constants.CORNER_REAR,
-                Dilink4Constants.CORNER_LEFT);
-            foveatedCropper.setFlipFlags(
-                Dilink4Constants.FLIP_FRONT,
-                Dilink4Constants.FLIP_RIGHT,
-                Dilink4Constants.FLIP_REAR,
-                Dilink4Constants.FLIP_LEFT);
-            // Red-overlay suppression on AI thumbnails too — same flag the
-            // recorder/stream/downscaler read.
-            try {
-                org.json.JSONObject camCfgFc = com.overdrive.app.config
-                    .UnifiedConfigManager.loadConfig().optJSONObject("camera");
-                if (camCfgFc != null) {
-                    foveatedCropper.setRedMaskEnabled(
-                        camCfgFc.optBoolean("dilink4RedMask", false));
-                    foveatedCropper.setApaCenterInset(
-                        (float) camCfgFc.optDouble("dilink4ApaCenterInset", 0.09375));
+            // DiLink 4: override the canonical corner map with the known
+            // four-corner layout so AI crops match recorder/stream geometry.
+            if (CAMERA_LAYOUT_MODE == 3) {
+                foveatedCropper.setProducerCornerMap(
+                    Dilink4Constants.CORNER_FRONT,
+                    Dilink4Constants.CORNER_RIGHT,
+                    Dilink4Constants.CORNER_REAR,
+                    Dilink4Constants.CORNER_LEFT);
+                foveatedCropper.setFlipFlags(
+                    Dilink4Constants.FLIP_FRONT,
+                    Dilink4Constants.FLIP_RIGHT,
+                    Dilink4Constants.FLIP_REAR,
+                    Dilink4Constants.FLIP_LEFT);
+            }
+            if (USE_OEM_SURFACE_TEXTURE_PATH) {
+                try {
+                    org.json.JSONObject camCfgFc = com.overdrive.app.config
+                        .UnifiedConfigManager.loadConfig().optJSONObject("camera");
+                    if (camCfgFc != null) {
+                        foveatedCropper.setRedMaskEnabled(
+                            camCfgFc.optBoolean("dilink4RedMask", false));
+                        foveatedCropper.setApaCenterInset(CAMERA_LAYOUT_MODE == 3
+                            ? (float) camCfgFc.optDouble(
+                                "dilink4ApaCenterInset", 0.09375)
+                            : 0.0f);
+                    }
+                } catch (Throwable t) {
+                    logger.warn("Cropper red-mask flag read failed: " + t.getMessage());
                 }
-            } catch (Throwable t) {
-                logger.warn("Cropper red-mask flag read failed: " + t.getMessage());
             }
         }
 
@@ -1470,7 +1670,8 @@ public class PanoramicCameraGpu {
      *      addTexture(st, previewIndex)
      *      setTexture(st, previewIndex)
      *      startPreview()
-     *  previewIndex comes from cameraSurfaceMode (0=mosaic, 1-4=quadrant).
+     *  previewIndex comes from cameraSurfaceMode (0=firmware-default panorama
+     *  output, 1-4=individual viewpoints).
      *  Caller must have just opened the camera (cameraObj != null). */
     private void attachSurfaceTextureToCamera(int cameraId) throws Exception {
         if (cameraObj == null) {
@@ -3499,7 +3700,15 @@ public class PanoramicCameraGpu {
             // Sweeps camera IDs 0-5 × surface modes 0-5 to find the first
             // combination that produces panoramic image data. Each combo gets
             // 15 frames to warm up before pixel readback.
-            if (frameCounter == 15 && downscaler != null && !skipFrameValidation) {
+            // downscaler.isInitialized(): structural guard against a dead
+            // probe path — readPixels() returns null when the downscaler's
+            // private thread failed init or was released, and this block
+            // reads null as BLACK, which would misdiagnose a working camera.
+            // Belt (skipFrameValidation=true set at init-failure) AND
+            // suspenders (this check), because the dead-slot walk resets
+            // skipFrameValidation=false in advanceToNextCandidateCameraId.
+            if (frameCounter == 15 && downscaler != null && downscaler.isInitialized()
+                    && !skipFrameValidation) {
                 try {
                     byte[] probe = downscaler.readPixels(cameraTextureId, 8, 8);
                     boolean hasData = false;
@@ -3569,7 +3778,11 @@ public class PanoramicCameraGpu {
             // By frame 50 the HAL has definitely warmed up. If still black, the saved
             // config is genuinely wrong (BmmCameraInfo returned incorrect ID).
             // Only then trigger a re-probe — this is rare and justified.
-            if (frameCounter == 50 && !autoProbeCameras && !skipFrameValidation && downscaler != null) {
+            // Same dead-probe-path guard as frame 15: null readback is NOT a
+            // black frame; without isInitialized() this recheck would re-probe
+            // a working camera whenever the downscaler thread failed init.
+            if (frameCounter == 50 && !autoProbeCameras && !skipFrameValidation
+                    && downscaler != null && downscaler.isInitialized()) {
                 try {
                     byte[] probe = downscaler.readPixels(cameraTextureId, 8, 8);
                     boolean hasData = false;
@@ -3775,7 +3988,19 @@ public class PanoramicCameraGpu {
                         // reinit, since recorder.init() only frees the encoder
                         // surface, not the programs/textures it then re-creates.
                         localRecorder.release();
-                        localEncoder.release();
+                        // Consume the release verdict (audit follow-up): a wedge
+                        // discovered here means a worker is still alive on the old
+                        // codec. release() already requested the trip-safe restart;
+                        // building a replacement codec now would hide the wedged
+                        // original from every close guard (fresh healthy workers on
+                        // the new instance). init() also self-rejects on a terminal
+                        // instance, but abort explicitly for a clear log trail.
+                        if (!localEncoder.release()) {
+                            logger.error("Encoder reinit ABORTED — worker wedged during "
+                                + "release (trip-safe restart pending); refusing to "
+                                + "build a replacement codec over the wedged one");
+                            return;
+                        }
                         localEncoder.init();
                         localRecorder.init(eglCore, localEncoder);
                         // Re-wire the contention probe — release() restored
@@ -4284,19 +4509,49 @@ public class PanoramicCameraGpu {
                             : GL_THREAD_WARMUP_TIMEOUT_MS;
                     
                     if (timeSinceHeartbeat > effectiveTimeout) {
+                        // Request the restart BEFORE logging (audit follow-up):
+                        // the logger can block on the same wedged storage that
+                        // froze the GL thread, and this watchdog is the LAST
+                        // escape for the camera-held wedge — a log call ahead
+                        // of the request could strand the camera forever. The
+                        // urgent variant arms its halt deadline before it
+                        // touches the logger for the same reason.
+                        if (cameraObj != null) {
+                            // URGENT (audit follow-up): the GL thread is the
+                            // only thread that can close or yield the camera,
+                            // and it is heartbeat-dead while we HOLD the
+                            // AVMCamera handle — the native AVM app has no
+                            // video until this process dies. This is also the
+                            // only escape from the timed-out pre-yield worker
+                            // wedged inside closeEventRecording() while
+                            // holding startStopLock: the GL thread then blocks
+                            // on that monitor inside stopDrainerForCameraClose
+                            // BEFORE its join or its urgent failure branch, so
+                            // the drainer-close helper can never fire. The
+                            // conservative coordinator is no escape either —
+                            // its checkpoint write can block on the same
+                            // wedged mount. Bounded halt; process death
+                            // releases the handle, wrapper respawns us.
+                            CameraDaemon.requestUrgentCameraReleaseRestart(
+                                    "GL watchdog heartbeat timeout (camera held)");
+                        } else {
+                            // No camera held — nothing external is waiting on
+                            // a release. The coordinator exits (and the
+                            // DaemonLauncher wrapper respawns us) only after
+                            // the active trip journal is durable.
+                            CameraDaemon.requestProcessRestartPreservingTrip(
+                                    "GL watchdog heartbeat timeout");
+                        }
+
                         logger.error( "CRITICAL: GL thread blocked for " + timeSinceHeartbeat + 
                                 "ms - forcing process restart" +
                                 (firstFrameReceived ? "" : " (during camera warmup)"));
                         
-                        // Try to flush logs before exit
+                        // Give the log a moment to flush before the requested
+                        // exit/halt lands.
                         try {
                             Thread.sleep(100);
                         } catch (InterruptedException ignored) {}
-                        
-                        // Exit code 0 triggers the DaemonLauncher wrapper only
-                        // after the active trip journal is durable.
-                        CameraDaemon.requestProcessRestartPreservingTrip(
-                                "GL watchdog heartbeat timeout");
                     }
 
                     // DEAD-SLOT ESCAPE (issue #170) — must be checked BEFORE the
@@ -4808,21 +5063,22 @@ public class PanoramicCameraGpu {
             }
         }
         
-        // Detach streaming components to stop drainer threads
+        // Snapshot the stream encoder BEFORE detaching: clearStreamingComponents()
+        // only nulls the reference — its drainer keeps running and must still be
+        // stopped and VERIFIED below, or the camera close races it (audit finding:
+        // the guard used to read the already-nulled field and skip it).
+        final HardwareEventRecorderGpu yieldStreamEnc = streamEncoder;
+        // Detach streaming components from the render loop
         if (streamScaler != null || streamEncoder != null) {
             clearStreamingComponents();
         }
         
-        // FORTIFY FIX: Stop encoder drainer threads BEFORE closing camera.
-        // The drainer thread calls MediaCodec.dequeueOutputBuffer() which internally
-        // accesses the camera's SurfaceTexture buffer queue via EGL. If we destroy
-        // the camera (and its native mutex) while the drainer is mid-dequeue,
-        // we get: FORTIFY: pthread_mutex_lock called on a destroyed mutex
-        if (encoder != null) {
-            encoder.stopDrainerForCameraClose();
-        }
-        if (streamEncoder != null) {
-            streamEncoder.stopDrainerForCameraClose();
+        // FORTIFY FIX: Stop encoder drainer threads BEFORE closing camera —
+        // and abort the yield if one is wedged (trip-safe restart already
+        // requested; process exit releases the camera handle, and the daemon
+        // re-registers with the coordinator on its way back up).
+        if (!stopEncoderDrainersBeforeCameraClose("yield", encoder, yieldStreamEnc)) {
+            return;
         }
         
         if (cameraObj != null) {
@@ -5334,22 +5590,22 @@ public class PanoramicCameraGpu {
                 }
             }
             
-            // Detach streaming components
+            // Snapshot the stream encoder BEFORE detaching — clearStreamingComponents()
+            // only nulls the reference; its drainer must still be stopped and
+            // verified below (see stopEncoderDrainersBeforeCameraClose).
+            final HardwareEventRecorderGpu restartStreamEnc = streamEncoder;
+            // Detach streaming components from the render loop
             if (streamScaler != null || streamEncoder != null) {
                 clearStreamingComponents();
                 logger.info("Pre-restart: streaming components detached");
             }
 
-            // Update heartbeat before drainer join (which can block 2s each)
-            lastGlThreadHeartbeat = System.currentTimeMillis();
-
-            // FORTIFY FIX: Stop encoder drainer threads BEFORE closing camera.
-            if (encoder != null) {
-                encoder.stopDrainerForCameraClose();
-            }
-            lastGlThreadHeartbeat = System.currentTimeMillis();
-            if (streamEncoder != null) {
-                streamEncoder.stopDrainerForCameraClose();
+            // FORTIFY FIX: Stop encoder drainer threads BEFORE closing camera —
+            // and abort the restart if one is wedged (trip-safe process restart
+            // already requested by the helper; the finally below clears the
+            // in-flight flag either way).
+            if (!stopEncoderDrainersBeforeCameraClose("restart", encoder, restartStreamEnc)) {
+                return;
             }
 
             // Close with proper cleanup + notify service
@@ -5494,9 +5750,105 @@ public class PanoramicCameraGpu {
     }
 
     /**
-     * Stops the GPU camera pipeline.
+     * FORTIFY FIX (audit follow-up): stop both encoder drainer threads and VERIFY
+     * they exited before the caller closes the camera. The drainer calls
+     * MediaCodec.dequeueOutputBuffer(), which internally touches the camera's
+     * SurfaceTexture buffer queue — destroying the camera (and its native mutex)
+     * while a drainer is mid-dequeue aborts the whole process with
+     * "FORTIFY: pthread_mutex_lock called on a destroyed mutex". That abort is
+     * WORSE than any recovery we can choose: it kills the process before the
+     * trip-safe restart coordinator (which is asynchronous) can checkpoint the
+     * trip. So on a wedged drainer this requests a process restart and tells
+     * the caller to SKIP the camera close — process exit releases the camera
+     * handle without ever racing the stuck dequeue.
+     *
+     * <p>Which restart depends on whether we HOLD the camera (audit follow-up,
+     * "no video signal" regression vs v36.6's unconditional close): with
+     * {@code cameraObj != null} the native AVM app is stuck with NO VIDEO until
+     * this process dies, and the conservative coordinator can wait indefinitely
+     * (its checkpoint write can BLOCK on the same wedged mount that wedged the
+     * drainer), so the URGENT bounded variant is used — a short halt deadline
+     * guarantees the handle is released within seconds and the wrapper
+     * respawns us. Without a held handle (e.g. stop() while yielded) nothing
+     * external is waiting on a release and the conservative trip-safe
+     * coordinator remains the right recovery.
+     *
+     * <p>Takes explicit encoder SNAPSHOTS rather than reading the fields: the
+     * yield/restart paths call {@link #clearStreamingComponents()} (which only
+     * nulls the references — it does not stop the drainer) before closing the
+     * camera, so a field read here would see null and silently skip verifying
+     * the stream encoder's drainer. Callers must snapshot BEFORE detaching.
+     *
+     * @return true when the camera is safe to close; false when a drainer is
+     *         wedged and a process restart (urgent when the camera is held,
+     *         trip-safe otherwise) has been requested — the caller must abort
+     *         its close path.
      */
-    public void stop() {
+    private boolean stopEncoderDrainersBeforeCameraClose(String where,
+            HardwareEventRecorderGpu mainEnc, HardwareEventRecorderGpu streamEnc) {
+        boolean safe = true;
+        // Heartbeat before/between the joins: each can legitimately block 2s
+        // (stopDrainerForCameraClose's full-deadline join).
+        lastGlThreadHeartbeat = System.currentTimeMillis();
+        if (mainEnc != null) {
+            safe &= mainEnc.stopDrainerForCameraClose();
+        }
+        lastGlThreadHeartbeat = System.currentTimeMillis();
+        if (streamEnc != null) {
+            safe &= streamEnc.stopDrainerForCameraClose();
+        }
+        if (!safe) {
+            final boolean cameraHeld = cameraObj != null;
+            // Request BEFORE logging: the logger can block on the same wedged
+            // FUSE/SD storage that wedged the drainer, and a blocked log call
+            // ahead of the request would strand the held camera with no
+            // deadline armed. The urgent variant arms its halt deadline before
+            // it touches the logger for the same reason.
+            try {
+                if (cameraHeld) {
+                    CameraDaemon.requestUrgentCameraReleaseRestart(
+                        "encoder drainer wedged before camera close (" + where + ")");
+                } else {
+                    CameraDaemon.requestProcessRestartPreservingTrip(
+                        "encoder drainer wedged before camera close (" + where + ")");
+                }
+            } catch (Throwable t) {
+                try {
+                    logger.error(where + ": process-restart request failed: "
+                        + t.getMessage());
+                } catch (Throwable ignored) {}
+            }
+            logger.error(where + ": encoder drainer wedged — closing the camera now "
+                + "would abort the process (FORTIFY destroyed mutex) before the trip "
+                + "checkpoint lands; skipping camera close and requested "
+                + (cameraHeld ? "URGENT bounded" : "trip-safe")
+                + " daemon process restart");
+        }
+        return safe;
+    }
+
+    /**
+     * True while this pipeline holds an open AVMCamera handle. Volatile read —
+     * safe from any thread. Used to decide between the URGENT bounded restart
+     * (handle held: the native AVM app has no video until this process dies)
+     * and the conservative trip-safe restart (no handle: nothing external is
+     * waiting on a release).
+     */
+    public boolean isCameraHandleHeld() {
+        return cameraObj != null;
+    }
+
+    /**
+     * Stops the GPU camera pipeline.
+     *
+     * @return true when the teardown completed cleanly; false when it was aborted
+     *         or degraded by a wedged worker/GL thread (a trip-safe process restart
+     *         has been requested in that case). Callers MUST NOT release
+     *         recorder/encoder GL or codec state on false — the wedged native
+     *         state is exactly what must not be touched, and the process exit
+     *         reclaims it.
+     */
+    public boolean stop() {
         logger.info( "Stopping GPU camera pipeline...");
         running = false;
         // Also stop the attach-time helper threads. They deliberately do NOT test
@@ -5515,12 +5867,15 @@ public class PanoramicCameraGpu {
         // Stop yield poller (if a yield is in-flight when stop() races in)
         stopYieldPoller();
         
-        // FORTIFY FIX: Stop encoder drainer threads BEFORE closing camera
-        if (encoder != null) {
-            encoder.stopDrainerForCameraClose();
-        }
-        if (streamEncoder != null) {
-            streamEncoder.stopDrainerForCameraClose();
+        // FORTIFY FIX: Stop encoder drainer threads BEFORE closing camera —
+        // and abort the close entirely if one is wedged (trip-safe restart
+        // already requested; process exit releases the camera handle). stop()
+        // has not detached the streaming components, so the field reads here
+        // are the live snapshots. Returns false so the pipeline knows this
+        // stop was ABORTED and skips its own recorder/encoder release.
+        if (!stopEncoderDrainersBeforeCameraClose("stop", encoder, streamEncoder)) {
+            stopVerdictWedged = true;
+            return false;
         }
         
         // Close camera with proper cleanup + notify service
@@ -5540,24 +5895,95 @@ public class PanoramicCameraGpu {
             cameraCoordinator.unregister();
         }
         
-        // Cleanup on GL thread
+        // Cleanup on GL thread. quitSafely() below still drains messages that
+        // were already posted, so a successful join implies releaseGl actually
+        // ran — no separate completion latch is needed. But the post() result
+        // MUST be checked: a looper that is already quitting rejects the post
+        // silently, and treating "cleanup never scheduled" as a clean teardown
+        // leaves the EGL context/display unreleased.
+        boolean glCleanupPosted = false;
         if (glHandler != null) {
-            glHandler.post(this::releaseGl);
-        }
-        
-        // Stop GL thread
-        if (glThread != null) {
-            glThread.quitSafely();
-            try {
-                glThread.join(1000);
-            } catch (InterruptedException e) {
-                logger.warn( "GL thread join interrupted");
+            glCleanupPosted = glHandler.post(this::releaseGl);
+            if (!glCleanupPosted) {
+                logger.warn("stop: releaseGl post rejected (GL looper already quitting)");
             }
-            glThread = null;
+        }
+
+        boolean stopClean = true;
+        // Stop GL thread. FIX (EGL-leak audit follow-up): the old join(1000)
+        // (a) returned instantly if the caller arrived interrupted (swallowed
+        // InterruptedException), (b) never checked isAlive() afterwards, and
+        // (c) nulled glThread unconditionally — so a wedged GL thread was
+        // silently abandoned with its EGL context still CURRENT. EGL defers
+        // destruction of anything current on a live thread, so the context
+        // (and the display releaseGl would have terminated) stays pinned in
+        // the driver's context table — the same per-cycle leak the
+        // GpuDownscaler teardown fix closes. Now: full-deadline join across
+        // interrupts, verify the thread exited, and on failure escalate to
+        // the EXISTING trip-safe process restart (same recovery path the GL
+        // stall watchdog and GpuDownscaler.release use) — a process exit is
+        // the only thing that frees a context pinned on a wedged thread.
+        if (glThread != null) {
+            final HandlerThread deadGlThread = glThread;
+            deadGlThread.quitSafely();
+            boolean glThreadExited = true;
+            if (Thread.currentThread() != deadGlThread) {
+                final boolean[] interrupted = { Thread.interrupted() };
+                try {
+                    glThreadExited = com.overdrive.app.util.ThreadJoins
+                        .joinFullDeadline(deadGlThread, 1000, interrupted);
+                } finally {
+                    if (interrupted[0]) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+            if (!glThreadExited || !glCleanupPosted) {
+                stopClean = false;
+                String reason = !glThreadExited
+                    ? "GL thread did not exit within its full 1s deadline after quitSafely"
+                    : "releaseGl was never scheduled (post rejected before looper quit)";
+                logger.error("stop: " + reason + " — the camera's EGL context/display "
+                    + "stays pinned; requesting trip-safe daemon process restart");
+                try {
+                    com.overdrive.app.daemon.CameraDaemon.requestProcessRestartPreservingTrip(
+                        "PanoramicCameraGpu stop wedged: " + reason);
+                } catch (Throwable t) {
+                    logger.error("stop: process-restart request failed: " + t.getMessage());
+                }
+            }
+            // Drop the reference ONLY on a verified exit (audit follow-up):
+            // nulling it up front advertised "GL thread gone" to any concurrent
+            // start() while a wedged thread still pinned the old context — and
+            // the trip-safe restart above is ASYNCHRONOUS (its coordinator can
+            // retry the trip checkpoint for a while before System.exit), so
+            // that window is real. On the failure path the field keeps pointing
+            // at the wedged thread: nothing may treat it as reusable, and the
+            // dangling reference is the honest diagnostic state until the
+            // process exit lands.
+            if (glThreadExited) {
+                glThread = null;
+            }
         }
         
-        logger.info( "GPU camera pipeline stopped");
+        // STICKY verdict (audit follow-up): a wedge detected by ANY stop() call
+        // latches, so a second stop of the same instance can never report clean
+        // over it. Example: call one fails because releaseGl's post was rejected
+        // and nulls the (exited) GL thread; call two would skip the whole GL
+        // block and return true — erasing the wedge. Nothing un-wedges
+        // in-process, so the latch never clears.
+        if (!stopClean) {
+            stopVerdictWedged = true;
+        }
+        boolean verdict = stopClean && !stopVerdictWedged;
+        logger.info( "GPU camera pipeline stopped"
+            + (verdict ? "" : " (DEGRADED — wedged teardown, restart pending)"));
+        return verdict;
     }
+
+    // Sticky stop verdict — see stop(). Never cleared; only a process restart
+    // (which replaces the instance) lifts it.
+    private volatile boolean stopVerdictWedged = false;
     /**
      * Releases and reopens the AVMCamera without tearing down the GL pipeline.
      *
@@ -5980,11 +6406,13 @@ public class PanoramicCameraGpu {
      * Atto 1 may need mode 1 for processed panoramic output.
      *
      * On the oem SurfaceTexture path this same value is the previewIndex
-     * argument to addTexture/setTexture/rmTexture: 0=mosaic, 1-4=quadrant.
+     * argument to addTexture/setTexture/rmTexture: 0=firmware-default panorama
+     * output, 1-4=individual viewpoints.
      */
     public void setCameraSurfaceMode(int mode) {
-        this.cameraSurfaceMode = mode;
-        logger.info("Camera surface mode set to: " + mode);
+        this.cameraSurfaceMode = USE_PASSIVE_APA_MODE ? 0 : mode;
+        logger.info("Camera surface mode set to: " + cameraSurfaceMode
+            + (USE_PASSIVE_APA_MODE ? " (DiLink 4 passive APA)" : ""));
     }
 
     public boolean isUsingOemSurfaceTexturePath() {
@@ -6313,7 +6741,9 @@ public class PanoramicCameraGpu {
      * null as "no frame available" and retry, NOT trigger any side-effect
      * that would touch the camera HAL.
      *
-     * @param cameraId 0=full mosaic, 1=Front, 2=Right, 3=Rear, 4=Left
+     * @param cameraId 0=full frame, 1=Front, 2=Right, 3=Rear, 4=Left.
+     *     Passive APA returns the full native frame for every ID because its
+     *     internal panel-to-direction mapping is not known.
      * @return JPEG bytes, or null when no published mosaic is available
      */
     public byte[] getLatestJpegFrame(int cameraId) {
@@ -6321,13 +6751,13 @@ public class PanoramicCameraGpu {
         if (engine == null) return null;
         byte[] mosaicJpeg = engine.getLatestMosaicJpeg();
         if (mosaicJpeg == null || mosaicJpeg.length == 0) return null;
-        if (cameraId == 0) return mosaicJpeg;
+        if (cameraId == 0 || USE_PASSIVE_APA_MODE) return mosaicJpeg;
         return cropMosaicJpegQuadrant(mosaicJpeg, cameraId);
     }
 
     /**
-     * Sample the live camera texture at FULL encoder resolution and return
-     * a JPEG of the 2x2 mosaic. Seal: 2560×1920. Tang: 2560×1440.
+     * Sample the live camera texture at full encoder resolution. Passive APA
+     * returns its native 1280×720 frame; other layouts return their mosaic.
      *
      * <p><b>Recording-safe.</b> Runs on a dedicated GL thread with a shared
      * EGL context — does NOT block the camera GL thread, the encoder draw,
@@ -6397,6 +6827,13 @@ public class PanoramicCameraGpu {
                     + (sampler != null) + " textureId=" + cameraTextureId);
             return null;
         }
+        if (USE_PASSIVE_APA_MODE) {
+            float[] offsets = quadrantStripOffsetX != null
+                    ? quadrantStripOffsetX.clone()
+                    : new float[]{0.75f, 0.50f, 0.00f, 0.25f};
+            return sampler.sampleFullMosaicJpeg(
+                    cameraTextureId, width, height, offsets);
+        }
         // Force 2x2 math when DiLink 4 is active AND caller supplied corner
         // values; otherwise legacy 4-strip math.
         boolean useCorner = USE_OEM_SURFACE_TEXTURE_PATH
@@ -6438,8 +6875,10 @@ public class PanoramicCameraGpu {
                     if (camCfgHr != null) {
                         highResSampler.setRedMaskEnabled(
                             camCfgHr.optBoolean("dilink4RedMask", false));
-                        highResSampler.setApaCenterInset(
-                            (float) camCfgHr.optDouble("dilink4ApaCenterInset", 0.09375));
+                        highResSampler.setApaCenterInset(CAMERA_LAYOUT_MODE == 3
+                            ? (float) camCfgHr.optDouble(
+                                "dilink4ApaCenterInset", 0.09375)
+                            : 0.0f);
                     }
                 } catch (Throwable t) {
                     logger.warn("Sampler red-mask flag read failed: " + t.getMessage());

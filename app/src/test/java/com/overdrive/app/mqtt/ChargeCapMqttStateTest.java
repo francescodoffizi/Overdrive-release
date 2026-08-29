@@ -35,6 +35,17 @@ public class ChargeCapMqttStateTest {
     }
 
     @Test
+    public void explicitNullRegistersAsAChangedRetainedState() throws Exception {
+        TelemetryDiffer differ = new TelemetryDiffer();
+        JSONObject dc = new JSONObject().put("is_dcfc", 1);
+        assertTrue(differ.changedKeys(dc).contains("is_dcfc"));
+        differ.markAllSent(dc, 1L);
+
+        JSONObject unknown = new JSONObject().put("is_dcfc", JSONObject.NULL);
+        assertTrue(differ.changedKeys(unknown).contains("is_dcfc"));
+    }
+
+    @Test
     public void unavailableTransitionClearsOnlyPreviouslyPublishedChargeCapTopics() {
         assertArrayEquals(new String[]{"charge_cap_percent", "charge_cap_enabled"},
                 MqttPublisherService.chargeCapTombstoneKeys(true, true, false));

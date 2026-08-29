@@ -8,8 +8,10 @@ import com.overdrive.app.logging.DaemonLogger;
 import com.overdrive.app.monitor.BatterySocData;
 import com.overdrive.app.monitor.BatteryThermalData;
 import com.overdrive.app.monitor.ChargingStateData;
+import com.overdrive.app.monitor.ChargingTypeClassifier;
 import com.overdrive.app.monitor.GearMonitor;
 import com.overdrive.app.monitor.GpsMonitor;
+import com.overdrive.app.monitor.SocHistoryDatabase;
 import com.overdrive.app.monitor.VehicleDataMonitor;
 import com.overdrive.app.mqtt.TelemetryDiffer;
 
@@ -185,6 +187,7 @@ public class AbrpTelemetryService {
         if (!charging && state != null
                 && (state.status == ChargingStateData.ChargingStatus.IDLE
                     || state.status == ChargingStateData.ChargingStatus.UNKNOWN)
+                && !state.isEstimated
                 && Double.isFinite(state.chargingPowerKW)
                 && state.chargingPowerKW > 0.15
                 && state.chargingPowerKW <= 500.0) {
@@ -222,15 +225,15 @@ public class AbrpTelemetryService {
 
     static double selectTelemetryPower(BydVehicleData vd, ChargingStateData chargingState,
                                        long nowMs, boolean accOn, boolean charging) {
-        if (canPublishEnginePower(vd, nowMs, accOn, charging)) {
-            return vd.enginePowerKw;
-        }
         if (charging && chargingState != null
                 && !chargingState.isEstimated
                 && Double.isFinite(chargingState.chargingPowerKW)
                 && chargingState.chargingPowerKW > 0.15
                 && chargingState.chargingPowerKW <= 500.0) {
             return -chargingState.chargingPowerKW;
+        }
+        if (canPublishEnginePower(vd, nowMs, accOn, charging)) {
+            return vd.enginePowerKw;
         }
         return 0.0;
     }
@@ -295,9 +298,25 @@ public class AbrpTelemetryService {
 
             payload.put("is_charging", isCharging ? 1 : 0);
 
-            // is_dcfc — gun state from collector
-            if (vd != null && vd.chargingGunState != BydVehicleData.UNAVAILABLE) {
-                payload.put("is_dcfc", vd.chargingGunState == 3 ? 1 : 0);
+            // is_dcfc — same guarded verdict used by session pricing and MQTT.
+            int dcGunState = vd != null
+                    ? vd.chargingGunState : BydVehicleData.UNAVAILABLE;
+            double dcEvidenceKw = isCharging && chargingState != null
+                    && !chargingState.isEstimated
+                    && Double.isFinite(chargingState.chargingPowerKW)
+                    ? chargingState.chargingPowerKW : 0;
+            int openSessionVerdict = ChargingTypeClassifier.UNKNOWN;
+            if (isCharging) {
+                try {
+                    openSessionVerdict = SocHistoryDatabase.getInstance()
+                            .getOpenChargingSessionTypeVerdict();
+                } catch (Throwable ignored) {}
+            }
+            int dcVerdict = ChargingTypeClassifier.classifyLive(
+                    dcGunState, dcEvidenceKw, openSessionVerdict);
+            Integer dcFastFlag = ChargingTypeClassifier.toBinaryFlag(dcVerdict);
+            if (dcFastFlag != null) {
+                payload.put("is_dcfc", dcFastFlag.intValue());
             }
 
             // is_parked — gear from collector

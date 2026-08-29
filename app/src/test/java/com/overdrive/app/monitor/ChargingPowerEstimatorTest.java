@@ -5,6 +5,8 @@ import static org.junit.Assert.assertTrue;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.util.ArrayDeque;
+
 import org.junit.Test;
 
 /** Regression coverage for counter-source selection in {@link ChargingPowerEstimator}. */
@@ -108,6 +110,44 @@ public class ChargingPowerEstimatorTest {
                 true, true, GUN_AC);
 
         assertTrue(Double.isNaN(estimator.estimatePowerKw()));
+    }
+
+    @Test
+    public void nonFiniteCounterCannotEnterOrRefreshEstimatorRing()
+            throws Exception {
+        ChargingPowerEstimator estimator = newEstimator();
+        long start = System.currentTimeMillis();
+        estimator.sample(start, Double.NaN, Double.NaN,
+                Double.NaN, Double.NaN, false, false, GUN_DISCONNECTED);
+        estimator.sample(start + 1_000L, Double.NaN, 1.0,
+                Double.NaN, Double.NaN, true, true, GUN_DC);
+        estimator.sample(start + 61_000L, Double.NaN, 1.2,
+                Double.NaN, Double.NaN, true, true, GUN_DC);
+
+        assertTrue(Double.isFinite(estimator.estimatePowerKw()));
+        assertEquals(2, remainRing(estimator).size());
+
+        estimator.sample(start + 121_000L,
+                Double.POSITIVE_INFINITY,
+                Double.POSITIVE_INFINITY,
+                Double.POSITIVE_INFINITY,
+                Double.POSITIVE_INFINITY,
+                true, true, GUN_DC);
+
+        assertEquals(2, remainRing(estimator).size());
+        assertTrue(Double.isFinite(estimator.estimatePowerKw()));
+
+        estimator.sample(start + 122_000L, Double.NaN, Double.NaN,
+                Double.NaN, Double.NaN, false, false, GUN_DISCONNECTED);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ArrayDeque<long[]> remainRing(
+            ChargingPowerEstimator estimator) throws Exception {
+        Field field =
+                ChargingPowerEstimator.class.getDeclaredField("remainRing");
+        field.setAccessible(true);
+        return (ArrayDeque<long[]>) field.get(estimator);
     }
 
     private static ChargingPowerEstimator newEstimator() throws Exception {

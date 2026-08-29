@@ -639,7 +639,7 @@
     <string name="zrok_no_token_configured">Geen token geconfigureerd.</string>
     <string name="dialog_tailscale_reset_title">Tailscale omgeving opnieuw instellen</string>
     <string name="dialog_tailscale_reset_message">Dit zal:\n• de tailscale tunnel stoppen als het loopt\n• de tailscale omgeving van dit apparaat verwijderen\n• U zult het apparaat nog steeds moeten verwijderen van de tailscale console\n\nU zult opnieuw moeten inloggen.\n\nZijn u zeker?</string>
-    <string name="toast_resetting_tailscale">Het instellen van de achtergrond omgeving...</string>
+    <string name="toast_resetting_tailscale">Tailscale-omgeving wordt opnieuw ingesteld…</string>
     <string name="toast_tailscale_reset_success">Tailscale omgeving opnieuw instellen.</string>
     <string name="toast_tailscale_reset_warnings">Tailscale omgeving opnieuw instellen (met waarschuwingen: %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Tailscale proxy geactiveerd</string>

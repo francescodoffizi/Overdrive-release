@@ -125,7 +125,7 @@ public class ProxyHelper {
     }
 
     /** Loopback TCP probe of a single port on a FRESH socket (see caller for why per-port). */
-    private static boolean probePort(int port) {
+    public static boolean probePort(int port) {
         try (Socket probe = new Socket()) {
             probe.connect(new InetSocketAddress(PROXY_HOST, port), PROBE_TIMEOUT_MS);
             return true;
@@ -201,6 +201,21 @@ public class ProxyHelper {
             return new Proxy(type, new InetSocketAddress(PROXY_HOST, proxyPort));
         }
         return Proxy.NO_PROXY;
+    }
+
+    /**
+     * HTTP proxy selection for privacy-sensitive traffic. When the user has
+     * enabled proxy-only routing but the listener is still unavailable, return
+     * the expected local SOCKS endpoint so clients fail closed instead of
+     * silently dialing the destination directly.
+     */
+    public static Proxy getFailClosedHttpProxy() {
+        Proxy selected = getHttpProxy();
+        if (!Proxy.NO_PROXY.equals(selected) || !isProxyExpected()) {
+            return selected;
+        }
+        return new Proxy(Proxy.Type.SOCKS,
+                new InetSocketAddress(PROXY_HOST, TAILSCALE_PROXY_PORT));
     }
 
     /**

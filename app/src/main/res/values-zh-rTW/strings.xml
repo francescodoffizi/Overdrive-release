@@ -506,7 +506,7 @@
     <string name="dialog_zrok_token_message">請輸入Zrok啟用代號.</string>
     <string name="toast_token_cannot_be_empty">符號不能空</string>
     <string name="dialog_tailscale_settings_title">Tailscale 道設定</string>
-    <string name="dialog_tailscale_settings_message">設定尾聲尺度</string>
+    <string name="dialog_tailscale_settings_message">設定 Tailscale</string>
     <string name="tailscale_failed_login_url">沒有生成登入URL</string>
     <string name="tailscale_logged_in_relogin">登入. 點擊登入另一個帳戶</string>
     <string name="dialog_tailscale_proxy_enable_title">請啟動Tailscale代理?</string>
@@ -519,8 +519,8 @@
     <string name="toast_zrok_reset_warnings">環境重置 (附警告:%1$s)</string>
     <string name="zrok_no_token_configured">沒有設定的代碼.</string>
     <string name="dialog_tailscale_reset_title">重置Tailscale環境</string>
-    <string name="dialog_tailscale_reset_message">這會:\n• 停止尾聲道如果運行\n• 將尾聲環境從這個裝置中移除\n• 你仍然需要從尾聲台中移除裝置\n\n你需要再次登入.\n\n你確定嗎?</string>
-    <string name="toast_resetting_tailscale">這樣的環境,</string>
+    <string name="dialog_tailscale_reset_message">此操作將:\n• 如果 Tailscale 通道正在執行，則停止它\n• 從本裝置移除 Tailscale 環境\n• 你仍需在 Tailscale 控制台中移除該裝置\n\n你需要重新登入。\n\n確定嗎?</string>
+    <string name="toast_resetting_tailscale">正在重設 Tailscale 環境…</string>
     <string name="toast_tailscale_reset_success">Tailscale環境重置. 登入重新設定.</string>
     <string name="toast_tailscale_reset_warnings">Tailscale環境重置 (附警告: %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Tailscale代理啟用</string>

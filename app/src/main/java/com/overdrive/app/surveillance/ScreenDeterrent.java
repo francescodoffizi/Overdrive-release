@@ -16,6 +16,7 @@ import android.view.Display;
 import android.view.Surface;
 import android.view.WindowManager;
 
+import com.overdrive.app.byd.routing.DrivingSafetyGuard;
 import com.overdrive.app.config.UnifiedConfigManager;
 import com.overdrive.app.daemon.DaemonBootstrap;
 import com.overdrive.app.logging.DaemonLogger;
@@ -57,20 +58,28 @@ import java.util.concurrent.atomic.AtomicLong;
  *   │    PowerManager.TurnBacklightOn   ← BYD vendor API, UID 2000     │
  *   │    SurfaceControl@z=MAX render    ← visual                       │
  *   │    am start DeterrentActivity     ← input capture                │
+ *   │    tokened IPC socket             ← input-capture liveness       │
  *   │    refresh UCM gate ≤1 Hz                                        │
  *   │    release surface + TurnBacklightOff                            │
  *   └──────────────────────────────────────────────────────────────────┘
  *   ┌─ com.overdrive.app (UID 10067) ──────────────────────────────────┐
  *   │  DeterrentActivity                                               │
  *   │    setOnTouchListener → consume                                  │
- *   │    polls UCM, finishes when deadline elapses                     │
+ *   │    holds tokened IPC socket while its Window has focus           │
+ *   │    polls UCM, finishes after daemon visual teardown              │
  *   └──────────────────────────────────────────────────────────────────┘
  *
- * Cross-process coordination is via UnifiedConfigManager:
+ * Cross-process session state is in UnifiedConfigManager; live input
+ * readiness uses the authenticated socket so process death cannot leave a
+ * persisted "ready" bit behind:
  *   - screenDeterrentActiveUntilMs: deadline; signals AccSentryDaemon's
  *     keep-alive (in a third process) to skip its setBacklightState(false).
  *   - screenDeterrentForceStop: set by AccSentryDaemon.exitSentryMode() to
  *     ask the daemon-side render and the activity to bail before duration.
+ *   - screenDeterrentPreviewActive: lets the activity stay alive for a manual
+ *     preview even when the motion-triggered feature toggle is off.
+ *   - screenDeterrentUserDismissed: set by the activity on tap and cleared at
+ *     session boundaries.
  */
 public final class ScreenDeterrent {
 
@@ -94,6 +103,8 @@ public final class ScreenDeterrent {
 
     private static final long HOT_CACHE_TTL_MS = 1_000;
     private static final long GATE_REFRESH_INTERVAL_MS = 1_000;
+    private static final long INPUT_READY_TIMEOUT_MS = 4_000;
+    private static final long INPUT_READY_POLL_MS = 50;
 
     private static volatile ScreenDeterrent instance;
 
@@ -118,10 +129,18 @@ public final class ScreenDeterrent {
             return t;
         });
 
-    private final AtomicLong extendDeadlineMs = new AtomicLong(0);
+    /** Local lifetime uses a monotonic clock; the wall-clock UCM gate is derived from it. */
+    private final AtomicLong extendDeadlineElapsedMs = new AtomicLong(0);
     private final AtomicBoolean inFlight = new AtomicBoolean(false);
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
+    /** A terminal stop drops motion extensions that race visual teardown. */
+    private final AtomicBoolean terminalStopRequested = new AtomicBoolean(false);
+    private volatile long previewDeadlineElapsedMs = 0;
     private volatile Thread renderThread;
+    private final Object inputCaptureLock = new Object();
+    private long inputCaptureSequence = 0;
+    private volatile long activeInputCaptureId = 0;
+    private String expectedInputCaptureToken = "";
 
     /**
      * Hot-path cache: read on the GL frame thread (volatile-only, no I/O).
@@ -130,13 +149,11 @@ public final class ScreenDeterrent {
     private volatile boolean hotCacheEnabled = false;
     private volatile int hotCacheDurationSec = DEFAULT_DURATION_SEC;
 
-    private long lastPublishedGateMs = 0;
-
     // Throttle for the "no daemon context" warning. Without this, sustained
     // motion produced one log line per millisecond because cleanup()
     // re-enqueues onMotionDetected() while the deadline is still in the
     // future, fire() early-returns on null ctx, and the cycle repeats.
-    private long lastNoCtxWarnMs = 0;
+    private long lastNoCtxWarnElapsedMs = 0;
     private static final long NO_CTX_WARN_INTERVAL_MS = 5_000;
 
     /**
@@ -168,9 +185,9 @@ public final class ScreenDeterrent {
         }
         return DaemonBootstrap.getContext();
     }
-    private long lastGateWriteMs = 0;
-    private long lastWakeReassertMs = 0;
-    private boolean activityLaunched = false;
+    private long lastGateWriteElapsedMs = 0;
+    private long lastWakeReassertElapsedMs = 0;
+    private boolean restorePanelAfterSession = false;
 
     private ScreenDeterrent() {
         // Refresh hot cache from disk every second on a dedicated background
@@ -203,6 +220,108 @@ public final class ScreenDeterrent {
         return instance;
     }
 
+    /** Called by SurveillanceIpcServer when the focused Activity opens its tokened socket. */
+    public static long openInputCapture(String token) {
+        ScreenDeterrent current = instance;
+        return current == null ? 0L : current.acceptInputCapture(token);
+    }
+
+    /** Called when that socket closes; stale connections cannot clear a newer one. */
+    public static void closeInputCapture(long captureId) {
+        ScreenDeterrent current = instance;
+        if (current != null) current.releaseInputCapture(captureId);
+    }
+
+    /** Lets the IPC holder close its socket when daemon-side teardown clears the session. */
+    public static boolean isInputCaptureActive(long captureId) {
+        ScreenDeterrent current = instance;
+        return current != null
+                && captureId != 0
+                && current.activeInputCaptureId == captureId;
+    }
+
+    /** Authenticated in-band tap dismissal; the socket stays alive through visual teardown. */
+    public static void dismissInputCapture(long captureId) {
+        ScreenDeterrent current = instance;
+        if (current != null) current.requestInputDismiss(captureId);
+    }
+
+    private String prepareInputCapture() {
+        synchronized (inputCaptureLock) {
+            expectedInputCaptureToken = java.util.UUID.randomUUID().toString();
+            activeInputCaptureId = 0;
+            return expectedInputCaptureToken;
+        }
+    }
+
+    private long acceptInputCapture(String token) {
+        synchronized (inputCaptureLock) {
+            if (!inFlight.get() || cancelled.get()
+                    || terminalStopRequested.get()
+                    || token == null || !token.equals(expectedInputCaptureToken)) {
+                return 0L;
+            }
+            long now = SystemClock.elapsedRealtime();
+            if (extendDeadlineElapsedMs.get() <= now
+                    && previewDeadlineElapsedMs <= now) {
+                return 0L;
+            }
+            activeInputCaptureId = ++inputCaptureSequence;
+            return activeInputCaptureId;
+        }
+    }
+
+    private void releaseInputCapture(long captureId) {
+        boolean released = false;
+        synchronized (inputCaptureLock) {
+            if (activeInputCaptureId == captureId) {
+                activeInputCaptureId = 0;
+                released = true;
+            }
+        }
+        if (released) terminateCurrentSession();
+    }
+
+    private void requestInputDismiss(long captureId) {
+        synchronized (inputCaptureLock) {
+            if (captureId != 0 && activeInputCaptureId == captureId) {
+                terminateCurrentSession();
+            }
+        }
+    }
+
+    private void clearInputCapture() {
+        synchronized (inputCaptureLock) {
+            expectedInputCaptureToken = "";
+            activeInputCaptureId = 0;
+        }
+    }
+
+    private boolean terminateCurrentSession() {
+        terminalStopRequested.set(true);
+        extendDeadlineElapsedMs.set(0);
+        previewDeadlineElapsedMs = 0;
+        return true;
+    }
+
+    private static boolean isAccUnsafe() {
+        if (!com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative()
+                || com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+            return true;
+        }
+        try {
+            com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (collector != null) {
+                com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                if (vd != null) {
+                    if (vd.speedKmh > 0 && vd.speedKmh != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) return true;
+                    if (vd.gearMode > com.overdrive.app.monitor.GearMonitor.GEAR_P && vd.gearMode <= com.overdrive.app.monitor.GearMonitor.GEAR_S) return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
     /**
      * GL frame thread enters here on every confirmed motion. Must be cheap:
      * volatile reads + atomic CAS only. NO I/O, NO locks, NO allocations.
@@ -215,34 +334,36 @@ public final class ScreenDeterrent {
         // SurfaceControl layer at z=Integer.MAX_VALUE that occludes the ENTIRE
         // head-unit (nav, reversing camera, controls). It must NEVER appear
         // while ACC is on / the vehicle is in use. This is the load-bearing
-        // gate: it covers EVERY caller — the motion pipeline
-        // (SurveillanceEngineGpu), the /api/surveillance/screen-deterrent/test
-        // endpoint, and any future caller — instead of relying on the
-        // edge-driven screenDeterrentForceStop flag, which is only asserted on
-        // the ACC OFF→ON transition and is false during steady-state driving
-        // (so a deterrent triggered WHILE already driving had nothing stopping
-        // it). isAccOn() is a free volatile read. It can be stale-false in
-        // narrow windows (dead AccSentry, stalled IPC), but those self-heal via
-        // the ACC-on disarm watchdog's HAL probe which also refreshes this
-        // flag; this guard closes the common + steady-state cases that had NO
-        // guard at all. Fail-safe: if ACC is on, do not arm or render.
-        if (isVehicleActive()) {
-            logger.warn("Screen deterrent suppressed — ACC is ON / Vehicle is active (must never cover the screen while driving)");
+        // gate for every motion-pipeline caller; manual preview has its own
+        // movement guard. Do not rely on the edge-driven
+        // screenDeterrentForceStop flag, which is only asserted on the ACC
+        // OFF→ON transition and is false during steady-state driving.
+        // isAccUnsafe() requires an authoritative ACC reading and ACC OFF, so
+        // an unknown or stale state fails closed.
+        if (isAccUnsafe()) {
+            logger.warn("Screen deterrent suppressed — ACC is ON or unknown");
             return;
         }
 
         long durationMs = hotCacheDurationSec * 1000L;
-        long newDeadline = System.currentTimeMillis() + durationMs;
+        long newDeadline = SystemClock.elapsedRealtime() + durationMs;
 
         while (true) {
-            long current = extendDeadlineMs.get();
+            long current = extendDeadlineElapsedMs.get();
             if (newDeadline <= current) break;
-            if (extendDeadlineMs.compareAndSet(current, newDeadline)) break;
+            if (extendDeadlineElapsedMs.compareAndSet(current, newDeadline)) break;
         }
 
         if (!inFlight.compareAndSet(false, true)) return;
 
+        restorePanelAfterSession = false;
         cancelled.set(false);
+        if (terminalStopRequested.get()) {
+            extendDeadlineElapsedMs.set(0);
+            inFlight.set(false);
+            terminalStopRequested.compareAndSet(true, false);
+            return;
+        }
         executor.execute(() -> {
             renderThread = Thread.currentThread();
             try {
@@ -256,36 +377,28 @@ public final class ScreenDeterrent {
     }
 
     private void cleanup() {
-        try {
-            UnifiedConfigManager.updateValues("surveillance",
-                java.util.Collections.singletonMap("screenDeterrentActiveUntilMs", 0L));
-        } catch (Throwable ignored) {}
-        lastPublishedGateMs = 0;
-        lastGateWriteMs = 0;
-        activityLaunched = false;
+        clearSessionGate();
 
         // Restore stealth backlight unless somebody else owns the wake (ACC-on).
         //
-        // The isAccOn() read is deliberate and mirrors shouldStop()'s guard: the
-        // other two conditions are not sufficient on the ACC-ON edge. `cancelled`
-        // is never set on ACC-ON (only by the CameraDaemon shutdown hook and
-        // SurveillanceEngineGpu), and `isForceStop()` reads a flag that
-        // AccSentryDaemon CLEARS ~3.3 s into its wake sequence — and never sets at
-        // all if that daemon is dead or wedged at the transition. Without this,
-        // "owner walks up → deterrent fires → owner starts the car" can darken the
-        // panel after the last wake and leave the driver with a black screen.
+        // The authoritative ACC read mirrors shouldStop()'s guard because
+        // isForceStop() is only an edge signal that AccSentryDaemon later clears.
+        // Without the direct state check, "owner walks up → deterrent fires →
+        // owner starts the car" can darken the panel after the last wake and
+        // leave the driver with a black screen.
         // Note: turnBacklightOff → StealthPanel.turnOff also refuses while a fresh
         // ACC-ON edge is in its trust window, so this is belt-and-braces; keeping it
         // here avoids even starting the teardown chain (locked config writes +
         // binder calls) on the ACC-ON edge.
+        boolean restorePanel = restorePanelAfterSession;
+        restorePanelAfterSession = false;
         Context ctx = resolveContext();
-        if (ctx != null && !cancelled.get() && !isForceStop()
-                && !com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+        if (restorePanel && ctx != null && !isForceStop() && !isAccUnsafe()) {
             turnBacklightOff(ctx);
         }
 
         // Race fix (audit #8): a GL-thread motion bump can land between any
-        // two of the next three lines. Clearing extendDeadlineMs first then
+        // two of the next three lines. Clearing extendDeadlineElapsedMs first then
         // inFlight is wrong (bump lost). Clearing inFlight first then
         // re-reading the deadline AFTER catches the bump correctly. We also
         // re-trigger by enqueueing a fresh executor task instead of recursing
@@ -293,23 +406,135 @@ public final class ScreenDeterrent {
         // keep the executor queue at depth 1 (single-thread) but generates
         // unbounded stack frames inside cleanup→onMotionDetected→cleanup.
         renderThread = null;
+        boolean suppressRearm = terminalStopRequested.getAndSet(false);
+        if (suppressRearm || cancelled.get()
+                || isAccUnsafe()) {
+            // Clear before publishing inFlight=false. A new session that wins
+            // the CAS after that point must own its own deadline; cleanup must
+            // never zero it from the previous session.
+            extendDeadlineElapsedMs.set(0);
+            inFlight.set(false);
+            return;
+        }
+
         inFlight.set(false);
-        long pendingDeadline = extendDeadlineMs.get();
-        long now = System.currentTimeMillis();
-        if (pendingDeadline > now && !cancelled.get()) {
+        long pendingDeadline = extendDeadlineElapsedMs.get();
+        long now = SystemClock.elapsedRealtime();
+        if (pendingDeadline > now) {
             // Re-enter via the public API so we hit inFlight CAS again
             // cleanly. The executor will queue our next fire() task.
             // Note: at this point another GL-thread motion call could ALSO
             // re-enter — that's fine, only one wins the CAS.
             executor.execute(this::onMotionDetected);
         } else {
-            extendDeadlineMs.set(0);
+            // Do not clobber a fresh session that started after inFlight=false.
+            extendDeadlineElapsedMs.compareAndSet(pendingDeadline, 0);
         }
+    }
+
+    private void clearSessionGate() {
+        clearInputCapture();
+        java.util.Map<String, Object> reset = new java.util.HashMap<>();
+        reset.put("screenDeterrentActiveUntilMs", 0L);
+        reset.put("screenDeterrentPreviewActive", false);
+        reset.put("screenDeterrentUserDismissed", false);
+        reset.put("screenDeterrentInputReady", false);
+        reset.put("screenDeterrentInputReadyUntilElapsedMs", 0L);
+        boolean cleared = false;
+        for (int attempt = 0; attempt < 3 && !cleared; attempt++) {
+            try {
+                cleared = UnifiedConfigManager.updateValues("surveillance", reset);
+            } catch (Throwable ignored) {}
+            if (!cleared && attempt < 2) SystemClock.sleep(50);
+        }
+        if (!cleared) {
+            logger.warn("Could not clear deterrent session gate after surface teardown");
+        }
+        lastGateWriteElapsedMs = 0;
+        previewDeadlineElapsedMs = 0;
+    }
+
+    /**
+     * Manual preview for the settings page. Returns null when accepted, or a
+     * user-facing error when the preview cannot start safely.
+     */
+    public String previewNow() {
+        if (previewBlocked()) {
+            return "Preview blocked until the vehicle is safely parked";
+        }
+        refreshHotCacheFromDisk();
+        Context ctx = resolveContext();
+        if (ctx == null) {
+            return "Screen preview unavailable until the camera daemon is ready";
+        }
+        if (!inFlight.compareAndSet(false, true)) {
+            return "Screen deterrent is already active";
+        }
+
+        restorePanelAfterSession = false;
+        cancelled.set(false);
+        if (terminalStopRequested.get()) {
+            inFlight.set(false);
+            terminalStopRequested.compareAndSet(true, false);
+            return "Screen deterrent is stopping";
+        }
+        final String inputToken = prepareInputCapture();
+        previewDeadlineElapsedMs =
+                SystemClock.elapsedRealtime() + hotCacheDurationSec * 1000L;
+        if (!publishGate(previewDeadlineElapsedMs, true, true)) {
+            terminateCurrentSession();
+            clearSessionGate();
+            inFlight.set(false);
+            terminalStopRequested.set(false);
+            return "Could not publish the preview safety gate";
+        }
+
+        try {
+            executor.execute(() -> {
+                renderThread = Thread.currentThread();
+                try {
+                    firePreview(ctx, inputToken);
+                } catch (Throwable t) {
+                    logger.warn("Screen deterrent preview failed: " + t.getMessage());
+                } finally {
+                    cleanup();
+                }
+            });
+            return null;
+        } catch (RuntimeException unavailable) {
+            clearSessionGate();
+            inFlight.set(false);
+            terminalStopRequested.set(false);
+            return "Screen preview worker unavailable";
+        }
+    }
+
+    private void firePreview(Context ctx, String inputToken) {
+        if (cancelled.get()
+                || terminalStopRequested.get()
+                || previewBlocked()
+                || SystemClock.elapsedRealtime() >= previewDeadlineElapsedMs) return;
+        restorePanelAfterSession = panelIsAlreadyDark(ctx);
+        wakePanel(ctx);
+        launchActivity(inputToken);
+        if (!waitForInputCapture(true)) {
+            terminateCurrentSession();
+            return;
+        }
+        Point size = resolveDisplaySize(ctx);
+        renderAsset(size.x, size.y, this::shouldStopPreview, this::maybeReassertWake);
     }
 
     public void cancel() {
         cancelled.set(true);
-        extendDeadlineMs.set(0);
+        if (inFlight.get()) {
+            terminateCurrentSession();
+        } else {
+            terminalStopRequested.set(false);
+            extendDeadlineElapsedMs.set(0);
+            previewDeadlineElapsedMs = 0;
+            clearInputCapture();
+        }
         Thread t = renderThread;
         if (t != null) {
             try { t.interrupt(); } catch (Throwable ignored) {}
@@ -317,7 +542,14 @@ public final class ScreenDeterrent {
     }
 
     public void reset() {
-        extendDeadlineMs.set(0);
+        if (inFlight.get()) {
+            terminateCurrentSession();
+        } else {
+            terminalStopRequested.set(false);
+            extendDeadlineElapsedMs.set(0);
+            previewDeadlineElapsedMs = 0;
+            clearInputCapture();
+        }
         cancelled.set(false);
         // Force the cache scheduler to refresh on its next tick by writing
         // through the same code path (idempotent).
@@ -333,9 +565,12 @@ public final class ScreenDeterrent {
         // moment — this is the last line before the z=MAX SurfaceControl layer
         // is created. Zero the deadline so cleanup()'s sustained-motion
         // re-enqueue loop can't keep re-firing into a driving window.
-        if (isVehicleActive()) {
-            logger.warn("Screen deterrent fire() aborted — ACC is ON / Vehicle is active before render");
-            extendDeadlineMs.set(0);
+        if (cancelled.get()
+                || terminalStopRequested.get()
+                || extendDeadlineElapsedMs.get() <= SystemClock.elapsedRealtime()
+                || isAccUnsafe()) {
+            logger.warn("Screen deterrent fire() aborted — session is no longer safe/live");
+            terminateCurrentSession();
             return;
         }
         Context ctx = resolveContext();
@@ -347,19 +582,36 @@ public final class ScreenDeterrent {
             // process can do without a Context, and ACC monitoring will
             // re-trigger us on the next genuine motion event after context
             // becomes available.
-            long now = System.currentTimeMillis();
-            if (now - lastNoCtxWarnMs > NO_CTX_WARN_INTERVAL_MS) {
+            long now = SystemClock.elapsedRealtime();
+            if (now - lastNoCtxWarnElapsedMs > NO_CTX_WARN_INTERVAL_MS) {
                 logger.warn("No daemon context — cannot wake panel (throttled)");
-                lastNoCtxWarnMs = now;
+                lastNoCtxWarnElapsedMs = now;
             }
-            extendDeadlineMs.set(0);
+            terminateCurrentSession();
             return;
         }
 
-        publishGate(extendDeadlineMs.get());
+        String inputToken = prepareInputCapture();
+        if (!publishGate(extendDeadlineElapsedMs.get(), false, true)) {
+            logger.warn("Could not publish deterrent safety gate");
+            terminateCurrentSession();
+            return;
+        }
+        if (cancelled.get()
+                || terminalStopRequested.get()
+                || extendDeadlineElapsedMs.get() <= SystemClock.elapsedRealtime()
+                || isAccUnsafe()) {
+            terminateCurrentSession();
+            return;
+        }
+        restorePanelAfterSession = panelIsAlreadyDark(ctx);
         wakePanel(ctx);
-        launchActivity();  // touch-capture in app process
-        activityLaunched = true;
+        launchActivity(inputToken);  // touch-capture in app process
+        if (!waitForInputCapture(false)) {
+            logger.warn("Screen deterrent aborted — touch capture did not become ready");
+            terminateCurrentSession();
+            return;
+        }
 
         // Resolve the real panel size once per fire() so portrait-rotated
         // Seal (1080×1920) and other models (Tang, Atto3, etc.) get a buffer
@@ -369,31 +621,54 @@ public final class ScreenDeterrent {
         final int dispW = size.x;
         final int dispH = size.y;
 
+        renderAsset(dispW, dispH, this::shouldStop, this::maybeReassertWake);
+    }
+
+    private void renderAsset(int dispW, int dispH, ScreenDeterrentVideo.StopSignal stop,
+                             Runnable onFrame) {
+        if (stop == null || stop.shouldStop()) return;
+        String imagePath = getImagePath();
+        if (!imagePath.isEmpty() && ScreenDeterrentVideo.isMp4File(imagePath)) {
+            boolean played = ScreenDeterrentVideo.play(
+                    imagePath, dispW, dispH, stop, onFrame);
+            if (played || stop.shouldStop()) return;
+            logger.warn("Deterrent video failed — falling back to the default screen");
+            imagePath = "";
+        }
+
         Object surface = null;
         Bitmap staticFrame = null;
         Movie movie = null;
         try {
-            String imagePath = getImagePath();
             boolean isGif = imagePath != null && !imagePath.isEmpty()
                     && isGifFile(imagePath);
+
+            if (stop.shouldStop()) return;
+            if (isGif) movie = decodeGifSafe(imagePath);
+            if (movie == null || movie.duration() <= 0) {
+                staticFrame = buildStaticFrame(imagePath, dispW, dispH);
+            }
+            if (stop.shouldStop()) return;
 
             surface = createBufferLayer("ScreenDeterrent", dispW, dispH);
             if (surface == null) {
                 logger.warn("Failed to create SurfaceControl buffer layer");
+                terminateCurrentSession();
                 return;
             }
-            applyTransaction(surface, Integer.MAX_VALUE, true);
-
-            if (isGif) movie = decodeGifSafe(imagePath);
+            if (!applyTransaction(surface, Integer.MAX_VALUE, true)) {
+                terminateCurrentSession();
+                return;
+            }
 
             if (movie != null && movie.duration() > 0) {
-                renderGifLoop(surface, movie, dispW, dispH);
+                renderGifLoop(surface, movie, dispW, dispH, stop);
             } else {
-                staticFrame = buildStaticFrame(imagePath, dispW, dispH);
-                renderStaticLoop(surface, staticFrame);
+                renderStaticLoop(surface, staticFrame, stop);
             }
         } catch (Throwable t) {
             logger.warn("Deterrent render failed: " + t.getMessage());
+            terminateCurrentSession();
         } finally {
             if (staticFrame != null) {
                 try { staticFrame.recycle(); } catch (Throwable ignored) {}
@@ -402,9 +677,14 @@ public final class ScreenDeterrent {
         }
     }
 
-    private void renderStaticLoop(Object surface, Bitmap frame) {
-        drawBitmapToSurface(surface, frame);
-        while (!shouldStop()) {
+    private void renderStaticLoop(Object surface, Bitmap frame,
+                                  ScreenDeterrentVideo.StopSignal stop) {
+        if (stop.shouldStop()) return;
+        if (!drawBitmapToSurface(surface, frame)) {
+            terminateCurrentSession();
+            return;
+        }
+        while (!stop.shouldStop()) {
             maybeReassertWake();
             try {
                 Thread.sleep(STATIC_FRAME_TICK_MS);
@@ -416,7 +696,8 @@ public final class ScreenDeterrent {
         }
     }
 
-    private void renderGifLoop(Object surface, Movie movie, int dispW, int dispH) {
+    private void renderGifLoop(Object surface, Movie movie, int dispW, int dispH,
+                               ScreenDeterrentVideo.StopSignal stop) {
         Bitmap frame = null;
         try {
             frame = Bitmap.createBitmap(dispW, dispH, Bitmap.Config.ARGB_8888);
@@ -430,7 +711,7 @@ public final class ScreenDeterrent {
             int dy = (dispH - dh) / 2;
 
             long start = SystemClock.uptimeMillis();
-            while (!shouldStop()) {
+            while (!stop.shouldStop()) {
                 long elapsed = SystemClock.uptimeMillis() - start;
                 int progress = (int) (elapsed % movie.duration());
                 movie.setTime(progress);
@@ -442,7 +723,10 @@ public final class ScreenDeterrent {
                 movie.draw(frameCanvas, 0, 0);
                 frameCanvas.restore();
 
-                drawBitmapToSurface(surface, frame);
+                if (!drawBitmapToSurface(surface, frame)) {
+                    terminateCurrentSession();
+                    return;
+                }
                 maybeReassertWake();
 
                 try {
@@ -455,23 +739,33 @@ public final class ScreenDeterrent {
             }
         } catch (Throwable t) {
             logger.debug("GIF loop failed: " + t.getMessage());
+            terminateCurrentSession();
         } finally {
             if (frame != null) frame.recycle();
         }
     }
 
     private void maybeReassertWake() {
-        long now = System.currentTimeMillis();
-        if (now - lastWakeReassertMs > 5_000) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastWakeReassertElapsedMs > 5_000) {
             Context ctx = resolveContext();
             if (ctx != null) wakePanel(ctx);
-            lastWakeReassertMs = now;
+            lastWakeReassertElapsedMs = now;
+        }
+    }
+
+    private static boolean panelIsAlreadyDark(Context ctx) {
+        try {
+            return com.overdrive.app.power.StealthPanel.isAlreadyDark(ctx);
+        } catch (Throwable ignored) {
+            // If ownership cannot be established, leave the panel alone at
+            // teardown. The parked keep-alive can safely darken it later.
+            return false;
         }
     }
 
     /**
-     * Stop predicate. Side-effect: throttled UCM gate refresh (≤1 Hz, only
-     * when local deadline moved).
+     * Stop predicate. Side-effect: throttled UCM gate refresh (≤1 Hz).
      */
     private boolean shouldStop() {
         if (cancelled.get()) return true;
@@ -480,16 +774,19 @@ public final class ScreenDeterrent {
         // screenDeterrentForceStop flag. forceStop is only written on the ACC
         // OFF→ON edge by AccSentryDaemon; if that daemon is dead/stalled at the
         // transition, forceStop never flips and the loop would otherwise run to
-        // its deadline (up to 30s) over the live driving screen. A direct
-        // isVehicleActive() read here bounds that to one render tick (≤200ms).
-        if (isVehicleActive()) return true;
-        long now = System.currentTimeMillis();
-        long localDeadline = extendDeadlineMs.get();
+        // its deadline (up to 30s) over the live driving screen. Requiring an
+        // authoritative ACC-OFF state bounds that to one render tick (≤200ms).
+        if (isAccUnsafe()) {
+            return terminateCurrentSession();
+        }
+        long now = SystemClock.elapsedRealtime();
+        long localDeadline = extendDeadlineElapsedMs.get();
         if (now >= localDeadline) return true;
 
-        if (localDeadline != lastPublishedGateMs
-                && (now - lastGateWriteMs) >= GATE_REFRESH_INTERVAL_MS) {
-            publishGate(localDeadline);
+        if ((now - lastGateWriteElapsedMs) >= GATE_REFRESH_INTERVAL_MS) {
+            if (!publishGate(localDeadline, false, false)) {
+                return terminateCurrentSession();
+            }
         }
 
         try {
@@ -500,26 +797,125 @@ public final class ScreenDeterrent {
             // in the same wallclock-second, loadConfig()'s
             // (fileModified ≤ lastModified) check returns the stale cached
             // config and shouldStop misses the force-stop signal for up to
-            // ~1s — perceived as user-tap-to-dismiss latency on the
-            // deterrent. forceReload re-parses every call (~10 KB JSON on
-            // a tiny structure) which is cheap enough on this hot path
-            // compared to the deterrent's render cost.
+            // ~1s. forceReload re-parses every call (~10 KB JSON on a tiny
+            // structure), which is cheap enough here and keeps force-stop,
+            // enable, and the compatibility dismissal flag current.
             JSONObject s = UnifiedConfigManager.forceReload().optJSONObject("surveillance");
-            if (s == null) return false;
-            if (s.optBoolean("screenDeterrentForceStop", false)) return true;
-            if (!s.optBoolean("screenDeterrentEnabled", false)) return true;
-        } catch (Throwable ignored) {}
+            if (s == null) return terminateCurrentSession();
+            if (s.optBoolean("screenDeterrentForceStop", false)) {
+                return terminateCurrentSession();
+            }
+            if (!s.optBoolean("screenDeterrentEnabled", false)) {
+                return terminateCurrentSession();
+            }
+            if (!isInputCaptureReady()) return terminateCurrentSession();
+            if (s.optBoolean("screenDeterrentUserDismissed", false)) {
+                return terminateCurrentSession();
+            }
+        } catch (Throwable ignored) {
+            return terminateCurrentSession();
+        }
         return false;
     }
 
-    private void publishGate(long deadlineMs) {
+    private boolean shouldStopPreview() {
+        long now = SystemClock.elapsedRealtime();
+        if (cancelled.get() || now >= previewDeadlineElapsedMs) return true;
+        if (previewBlocked()) return terminateCurrentSession();
+        if ((now - lastGateWriteElapsedMs) >= GATE_REFRESH_INTERVAL_MS
+                && !publishGate(previewDeadlineElapsedMs, true, false)) {
+            return terminateCurrentSession();
+        }
         try {
-            UnifiedConfigManager.updateValues("surveillance",
-                java.util.Collections.singletonMap("screenDeterrentActiveUntilMs", deadlineMs));
-            lastPublishedGateMs = deadlineMs;
-            lastGateWriteMs = System.currentTimeMillis();
+            JSONObject s = UnifiedConfigManager.forceReload().optJSONObject("surveillance");
+            if (s == null || !s.optBoolean("screenDeterrentPreviewActive", false)) {
+                return terminateCurrentSession();
+            }
+            if (!isInputCaptureReady()) return terminateCurrentSession();
+            if (s.optBoolean("screenDeterrentUserDismissed", false)) {
+                return terminateCurrentSession();
+            }
+            return false;
+        } catch (Throwable ignored) {
+            return terminateCurrentSession();
+        }
+    }
+
+    private static boolean previewBlocked() {
+        if (isAccUnsafe()) return true;
+        try {
+            // The deterrent's z=MAX layer must never be user-bypassable while
+            // moving. ACC-OFF is checked above; this independent movement gate
+            // is defense-in-depth against a bad vehicle-state transition.
+            return DrivingSafetyGuard.isMovementBlocked();
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    private boolean waitForInputCapture(boolean preview) {
+        long waitUntil = SystemClock.elapsedRealtime() + INPUT_READY_TIMEOUT_MS;
+        while (SystemClock.elapsedRealtime() < waitUntil) {
+            long now = SystemClock.elapsedRealtime();
+            long deadline = preview
+                    ? previewDeadlineElapsedMs : extendDeadlineElapsedMs.get();
+            if (cancelled.get() || deadline <= now) return false;
+            if (preview ? previewBlocked()
+                    : isAccUnsafe()) {
+                return false;
+            }
+            try {
+                JSONObject s = UnifiedConfigManager.forceReload()
+                        .optJSONObject("surveillance");
+                if (s == null) return false;
+                if (preview) {
+                    if (!s.optBoolean("screenDeterrentPreviewActive", false)) return false;
+                } else {
+                    if (s.optBoolean("screenDeterrentForceStop", false)
+                            || !s.optBoolean("screenDeterrentEnabled", false)) {
+                        return false;
+                    }
+                }
+                if (s.optBoolean("screenDeterrentUserDismissed", false)) return false;
+                if (isInputCaptureReady()) return true;
+            } catch (Throwable ignored) {
+                return false;
+            }
+            try {
+                Thread.sleep(INPUT_READY_POLL_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        logger.warn("Screen deterrent touch-capture readiness timed out");
+        return false;
+    }
+
+    private boolean isInputCaptureReady() {
+        return activeInputCaptureId != 0;
+    }
+
+    private boolean publishGate(long deadlineElapsedMs, boolean preview,
+                                boolean resetSession) {
+        try {
+            long remainingMs = Math.max(
+                    0L, deadlineElapsedMs - SystemClock.elapsedRealtime());
+            java.util.Map<String, Object> gate = new java.util.HashMap<>();
+            gate.put("screenDeterrentActiveUntilMs",
+                    System.currentTimeMillis() + remainingMs);
+            gate.put("screenDeterrentPreviewActive", preview);
+            if (resetSession) {
+                gate.put("screenDeterrentUserDismissed", false);
+                gate.put("screenDeterrentInputReady", false);
+                gate.put("screenDeterrentInputReadyUntilElapsedMs", 0L);
+            }
+            if (!UnifiedConfigManager.updateValues("surveillance", gate)) return false;
+            lastGateWriteElapsedMs = SystemClock.elapsedRealtime();
+            return true;
         } catch (Throwable t) {
             logger.debug("Failed to publish gate: " + t.getMessage());
+            return false;
         }
     }
 
@@ -915,7 +1311,7 @@ public final class ScreenDeterrent {
 
     // ── Activity launch (touch capture only, no visual) ────────────────────
 
-    private static void launchActivity() {
+    private static void launchActivity(String inputToken) {
         try {
             // TWO fixes here, both the same class of bug:
             //
@@ -935,21 +1331,22 @@ public final class ScreenDeterrent {
             //      soon as it stops being foreground. During an ACC-off deterrent anything that
             //      briefly takes foreground (a vendor overlay, a display off/on cycle) would
             //      therefore kill it MID-FIRE — and because that is not an orderly finish,
-            //      onDestroy writes screenDeterrentForceStop=true, which the daemon's
-            //      shouldStop() reads on its next ~200ms tick and tears the whole render down.
-            //      The deterrent would silently truncate, and the latched force-stop can also
-            //      cut the next one short. `excludeFromRecents=true` in the manifest already
-            //      covers the only thing no-history was wanted for (staying out of recents).
+            //      onDestroy closes the authenticated input socket, which the daemon's
+            //      shouldStop() observes on its next ~200ms tick and uses to tear the render
+            //      down. `excludeFromRecents=true` in the manifest already covers the only
+            //      thing no-history was wanted for (staying out of recents).
             //    * `--activity-clear-task` would defeat the coalescing this class documents:
             //      re-launching during sustained motion is meant to land on onNewIntent (a
             //      deliberate no-op — "the deadline poll keeps us up"), not destroy and
             //      re-create the instance. (For a singleInstance activity alone in its task
             //      CLEAR_TASK is largely a no-op, but it is still the wrong intent to express.)
-            ProcessBuilder pb = new ProcessBuilder("sh", "-c",
-                "am start -n com.overdrive.app/.DeterrentActivity "
-                    + "-a android.intent.action.MAIN "
-                    + ">/dev/null 2>&1 &");
+            ProcessBuilder pb = new ProcessBuilder(
+                    "am", "start",
+                    "-n", "com.overdrive.app/.DeterrentActivity",
+                    "-a", "android.intent.action.MAIN",
+                    "--es", "deterrentInputToken", inputToken);
             pb.redirectErrorStream(true);
+            pb.redirectOutput(new File("/dev/null"));
             pb.start();
             // Detach — am start can take 2-3s on cold app spawn; we don't wait.
         } catch (Throwable t) {
@@ -1010,7 +1407,7 @@ public final class ScreenDeterrent {
         }
     }
 
-    private static void applyTransaction(Object surface, int z, boolean show) {
+    private static boolean applyTransaction(Object surface, int z, boolean show) {
         try {
             resolveSurfaceControlReflection();
             Class<?> sc = surfaceControlReflectionResolved
@@ -1018,12 +1415,14 @@ public final class ScreenDeterrent {
                     : Class.forName("android.view.SurfaceControl");
             Class<?> txCls = Class.forName("android.view.SurfaceControl$Transaction");
             Object tx = txCls.getDeclaredConstructor().newInstance();
-            try { txCls.getMethod("setLayer", sc, int.class).invoke(tx, surface, z); } catch (Throwable ignored) {}
+            txCls.getMethod("setLayer", sc, int.class).invoke(tx, surface, z);
             try { txCls.getMethod("setAlpha", sc, float.class).invoke(tx, surface, 1.0f); } catch (Throwable ignored) {}
-            if (show) try { txCls.getMethod("show", sc).invoke(tx, surface); } catch (Throwable ignored) {}
+            if (show) txCls.getMethod("show", sc).invoke(tx, surface);
             txCls.getMethod("apply").invoke(tx);
+            return true;
         } catch (Throwable t) {
             logger.warn("SurfaceControl.Transaction failed: " + t.getMessage());
+            return false;
         }
     }
 
@@ -1044,15 +1443,11 @@ public final class ScreenDeterrent {
         }
     }
 
-    private static void drawBitmapToSurface(Object surfaceControl, Bitmap bitmap) {
+    private static boolean drawBitmapToSurface(Object surfaceControl, Bitmap bitmap) {
         resolveSurfaceControlReflection();
         if (surfaceControlReflectionFailed) {
-            // Permanent resolution failure — nothing to fall back to here; the
-            // original code would have thrown on Class.forName too. Log once
-            // per call (matches prior behavior) and bail. The renderGifLoop
-            // continues; the deterrent visual will be black for this fire.
             logger.warn("drawBitmapToSurface skipped: SurfaceControl reflection unavailable");
-            return;
+            return false;
         }
         Surface surface = null;
         try {
@@ -1063,11 +1458,13 @@ public final class ScreenDeterrent {
             } finally {
                 surface.unlockCanvasAndPost(canvas);
             }
+            return true;
         } catch (Throwable t) {
             // Per-call invocation failure (e.g. ctor.newInstance throws for a
             // particular SurfaceControl instance, lockCanvas races a release).
             // Don't mark reflection failed — the lookup itself succeeded.
             logger.warn("drawBitmapToSurface failed: " + t.getMessage());
+            return false;
         } finally {
             if (surface != null) {
                 try { surface.release(); } catch (Throwable ignored) {}
@@ -1081,9 +1478,9 @@ public final class ScreenDeterrent {
         try {
             JSONObject s = UnifiedConfigManager.getSurveillance();
             String p = s.optString("screenDeterrentImagePath", "");
-            if (p.isEmpty()) return "";
-            File f = new File(p);
-            return (f.exists() && f.length() > 0) ? p : "";
+            if (!ScreenDeterrentAsset.isAllowedPath(p)) return "";
+            File f = new File(p).getCanonicalFile();
+            return (f.isFile() && f.length() > 0) ? f.getAbsolutePath() : "";
         } catch (Throwable t) {
             return "";
         }

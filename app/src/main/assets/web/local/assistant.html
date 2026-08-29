@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title data-i18n="app.assistant_title">Assistant - OverDrive</title>
+    <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
+    <script src="../shared/theme.js?v=5"></script>
+    <script src="../shared/app-shell.js?v=6"></script>
+    <script>
+        window.OT_TABS = [
+            { id: 'assistant', label: 'Assistant', i18n: 'genai.tab_assistant', svg: '<path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/>' },
+            { id: 'provider', label: 'Provider', i18n: 'genai.tab_provider', svg: '<path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>' },
+            { id: 'privacy', label: 'Privacy', i18n: 'genai.tab_privacy', svg: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>' }
+        ];
+        window.OT_setActiveTab = function (id) {
+            var button = document.querySelector('.bottom-tab[data-tab-target="' + id + '"]');
+            if (button) button.click();
+        };
+    </script>
+    <script src="../shared/app-tabs.js"></script>
+    <link rel="stylesheet" href="../shared/styles.css?v=23">
+    <style>
+        .ai-state {
+            display: grid; grid-template-columns: 34px minmax(0, 1fr) auto;
+            align-items: center; column-gap: 12px;
+            padding: 12px 14px; margin-bottom: 12px;
+            border: 1px solid var(--border-subtle); border-radius: 12px;
+            background: var(--bg-elevated);
+        }
+        .ai-state-icon {
+            width: 34px; height: 34px; flex: 0 0 34px; border-radius: 10px;
+            display: flex; align-items: center; justify-content: center;
+            color: var(--brand-primary); background: var(--brand-primary-container);
+        }
+        .ai-state-icon svg { width: 19px; height: 19px; }
+        .ai-state-copy { flex: 1; min-width: 0; }
+        .ai-state-title { font-size: 14px; font-weight: 650; color: var(--text-primary); }
+        .ai-state-desc { margin-top: 3px; font-size: 12px; line-height: 1.45; color: var(--text-secondary); }
+        .ai-state-action { flex: 0 0 auto; }
+
+        .ai-quick-actions {
+            display: flex; overflow-x: auto; padding: 2px 1px 10px;
+            scrollbar-width: none; overscroll-behavior-x: contain;
+            -webkit-overflow-scrolling: touch;
+        }
+        .ai-quick-actions > * { margin-right: 8px; }
+        .ai-quick-actions::-webkit-scrollbar { display: none; }
+        .ai-chip {
+            flex: 0 0 auto; border: 1px solid var(--border-color);
+            border-radius: 999px; background: var(--bg-elevated);
+            color: var(--text-secondary); font: inherit; font-size: 12px;
+            padding: 8px 12px; cursor: pointer; white-space: nowrap;
+        }
+        .ai-chip:active { transform: scale(.98); }
+        .ai-chip:disabled { opacity: .45; cursor: not-allowed; }
+
+        .ai-conversation {
+            min-height: 300px; height: 48vh; height: calc(var(--vh, 1vh) * 48);
+            max-height: 720px; overflow-y: auto; overscroll-behavior: contain;
+            padding: 14px; background: var(--bg-base);
+            border: 1px solid var(--border-subtle); border-radius: 12px;
+        }
+        .ai-empty {
+            min-height: 100%; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; text-align: center;
+            color: var(--text-muted); padding: 24px;
+        }
+        .ai-empty svg { width: 42px; height: 42px; opacity: .45; margin-bottom: 12px; }
+        .ai-empty strong { color: var(--text-primary); font-size: 15px; }
+        .ai-empty span { max-width: 420px; margin-top: 6px; font-size: 12px; line-height: 1.5; }
+        .ai-message { display: flex; min-width: 0; margin: 10px 0; }
+        .ai-message.user { justify-content: flex-end; }
+        .ai-bubble {
+            min-width: 0; max-width: 680px; padding: 10px 12px; border-radius: 14px;
+            box-sizing: border-box;
+            font-size: 14px; line-height: 1.48; white-space: normal;
+            overflow-wrap: anywhere; color: var(--text-primary);
+            background: var(--bg-elevated); border: 1px solid var(--border-subtle);
+        }
+        .ai-message.user .ai-bubble {
+            color: var(--on-primary, #fff); background: var(--brand-primary);
+            border-color: transparent; border-bottom-right-radius: 4px;
+            white-space: pre-wrap;
+        }
+        .ai-message.assistant .ai-bubble { border-bottom-left-radius: 4px; }
+        .ai-message.pending .ai-bubble { color: var(--text-muted); }
+        .ai-rich-text p { margin: 0; }
+        .ai-rich-text p + p,
+        .ai-rich-text p + ul,
+        .ai-rich-text p + ol,
+        .ai-rich-text ul + p,
+        .ai-rich-text ol + p { margin-top: 10px; }
+        .ai-rich-text ul,
+        .ai-rich-text ol {
+            margin: 8px 0 0; padding-left: 21px;
+        }
+        .ai-rich-text li { padding-left: 2px; }
+        .ai-rich-text li + li { margin-top: 9px; }
+        .ai-rich-text strong { font-weight: 700; color: var(--text-primary); }
+        .ai-rich-text code {
+            padding: 2px 5px; border-radius: 5px;
+            color: var(--primary); background: var(--bg-base);
+            font-family: 'JetBrains Mono', 'SF Mono', monospace;
+            font-size: .9em; word-break: break-all;
+        }
+        .ai-rich-heading {
+            margin: 12px 0 0; color: var(--text-primary);
+            font-size: 14px; font-weight: 700;
+        }
+        .ai-rich-heading:first-child { margin-top: 0; }
+        .ai-rich-quote {
+            margin: 10px 0 0; padding-left: 10px;
+            border-left: 3px solid var(--brand-primary);
+            color: var(--text-secondary);
+        }
+        .ai-grounding-label {
+            margin: -2px 0 8px; color: var(--brand-primary);
+            font-size: 10px; font-weight: 700; letter-spacing: .05em;
+            text-transform: uppercase;
+        }
+        .ai-result-card {
+            min-width: 0; max-width: 100%; box-sizing: border-box;
+            margin-top: 10px; padding: 10px; overflow: hidden;
+            overflow-wrap: anywhere; white-space: normal;
+            border: 1px solid var(--border-color); border-radius: 10px;
+            background: var(--bg-base);
+        }
+        .ai-result-card strong { display: block; font-size: 13px; }
+        .ai-result-detail {
+            margin-top: 5px; color: var(--text-secondary);
+            font-size: 12px; line-height: 1.4;
+        }
+        .ai-result-meta {
+            margin-top: 6px; color: var(--text-muted); font-size: 11px;
+        }
+        .ai-result-actions {
+            display: flex; flex-wrap: wrap; margin-top: 9px;
+        }
+        .ai-result-actions > * { margin: 0 7px 7px 0; }
+        .ai-result-actions .btn { padding: 7px 10px; font-size: 11px; }
+        .ai-draft-safety {
+            margin-top: 8px; padding: 7px 8px; border-radius: 7px;
+            color: var(--status-warning); background: var(--bg-elevated);
+            font-size: 11px; line-height: 1.35;
+        }
+        .ai-community-results { margin-top: 8px; }
+
+        .ai-insight-grid {
+            display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+            align-items: start; gap: 12px; margin-top: 12px;
+        }
+        .ai-insight-grid > .card + .card { margin-top: 0; }
+        .ai-insight-controls {
+            display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            gap: 12px;
+        }
+        .ai-insight-grid > *,
+        .ai-insight-controls > *,
+        .ai-form-grid > * { min-width: 0; }
+        .ai-insight-controls .wide { grid-column: 1 / -1; }
+        .ai-inline-note {
+            margin-top: 10px; padding: 9px 10px; border-radius: 9px;
+            color: var(--text-secondary); background: var(--bg-elevated);
+            font-size: 11px; line-height: 1.45;
+        }
+
+        .ai-composer {
+            display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+            gap: 8px; align-items: end; margin-top: 10px;
+        }
+        .ai-composer-dock { position: relative; }
+        .ai-composer textarea {
+            width: 100%; min-height: 46px; max-height: 132px; resize: none;
+            box-sizing: border-box; padding: 12px 13px;
+            border: 1px solid var(--border-color); border-radius: 13px;
+            color: var(--text-primary); background: var(--bg-elevated);
+            font: inherit; font-size: 14px; line-height: 1.4;
+        }
+        .ai-composer textarea:focus { outline: 2px solid var(--primary); outline-offset: 1px; }
+        .ai-icon-button {
+            width: 46px; height: 46px; padding: 0; border-radius: 13px;
+            display: inline-flex; align-items: center; justify-content: center;
+        }
+        .ai-icon-button svg { width: 20px; height: 20px; }
+        .ai-icon-button[hidden] { display: none; }
+        .ai-icon-button.is-cancel svg { display: none; }
+        .ai-icon-button.is-cancel::before {
+            content: "";
+            width: 11px;
+            height: 11px;
+            border-radius: 2px;
+            background: currentColor;
+        }
+        .ai-icon-button.is-live {
+            color: #fff; border-color: transparent; background: var(--danger);
+            box-shadow: 0 0 0 4px rgba(239, 68, 68, .18);
+        }
+        .ai-voice-note { margin: 8px 2px 0; font-size: 11px; color: var(--text-muted); }
+        .ai-voice-note.is-live { color: var(--danger); font-weight: 650; }
+
+        .ai-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        .ai-form-grid .wide { grid-column: 1 / -1; }
+        .ai-custom-model-field { margin-top: 8px; }
+        .ai-custom-model-field[hidden] { display: none; }
+        .assistant-page select.md-input {
+            min-height: 56px;
+            touch-action: manipulation;
+        }
+        .ai-actions { display: flex; flex-wrap: wrap; margin-top: 16px; }
+        .ai-actions > * { margin: 0 8px 8px 0; }
+        .ai-runtime-grid {
+            display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px; margin-top: 12px;
+        }
+        .ai-runtime-item {
+            padding: 10px 12px; border-radius: 10px;
+            background: var(--bg-elevated); min-width: 0;
+        }
+        .ai-runtime-item span { display: block; font-size: 11px; color: var(--text-muted); }
+        .ai-runtime-item strong {
+            display: block; margin-top: 3px; font-size: 13px;
+            color: var(--text-primary); overflow-wrap: anywhere;
+        }
+        .ai-privacy-list { margin: 0; padding-left: 20px; color: var(--text-secondary); }
+        .ai-privacy-list li { margin: 9px 0; line-height: 1.5; font-size: 13px; }
+        @media (max-width: 1100px) {
+            .ai-insight-grid { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 900px) {
+            .ai-form-grid { grid-template-columns: 1fr; }
+            .ai-form-grid .wide { grid-column: auto; }
+            .ai-insight-controls { grid-template-columns: 1fr; }
+            .ai-insight-controls .wide { grid-column: auto; }
+            .ai-state {
+                grid-template-columns: 34px minmax(0, 1fr);
+                align-items: start; padding: 14px;
+            }
+            .ai-state-copy { margin-left: 0; }
+            .ai-state-action {
+                grid-column: 2; justify-self: start; margin-top: 9px;
+            }
+            .ai-state-action .btn {
+                min-height: 36px; padding: 7px 12px;
+                font-size: 12px;
+            }
+            .ai-quick-actions {
+                display: flex; margin: 0 -4px 2px;
+                padding: 2px 16px 8px 4px;
+                scroll-snap-type: x proximity;
+            }
+            .ai-quick-actions > * { margin: 0 8px 8px 0; }
+            .ai-chip {
+                min-height: 38px; padding: 8px 12px;
+                scroll-snap-align: start;
+            }
+            .ai-chat-card {
+                overflow: visible; border: 0; background: transparent;
+            }
+            .ai-chat-card .card-body { padding: 0; }
+            .ai-conversation {
+                height: calc((var(--vh, 1vh) * 100) - 480px);
+                min-height: 180px; max-height: 720px;
+                padding: 14px 12px 18px;
+                border-radius: 16px;
+            }
+            .ai-message { width: 100%; margin: 12px 0; }
+            .ai-message.assistant .ai-bubble {
+                width: 100%; max-width: 100%; box-sizing: border-box;
+                padding: 0; border: 0; border-radius: 0;
+                background: transparent;
+            }
+            .ai-message.user .ai-bubble { max-width: 84%; }
+            .ai-composer-dock {
+                position: relative;
+                z-index: 30; margin: 10px 0 0;
+                padding: 10px 10px 11px;
+                border: 1px solid var(--border-subtle);
+                border-radius: 16px;
+                background: var(--bg-surface);
+                box-shadow: 0 -10px 28px rgba(0, 0, 0, .22);
+            }
+            .ai-composer { margin-top: 0; gap: 7px; }
+            .ai-voice-note { margin: 7px 2px 0; line-height: 1.35; }
+
+            /* The web-only theme FAB uses the empty right side of the mobile
+               header instead of covering the composer/send control. */
+            .assistant-page #bydThemePicker {
+                top: calc(12px + env(safe-area-inset-top, 0px)) !important;
+                right: 16px !important; bottom: auto !important;
+                left: auto !important; transform: none !important;
+            }
+            .assistant-page #bydThemePicker .byd-theme-fab {
+                width: 40px; height: 40px;
+            }
+            .assistant-page #bydThemePicker .byd-theme-popup {
+                top: 48px !important; right: 0 !important;
+                bottom: auto !important; left: auto !important;
+            }
+        }
+        @media (max-width: 480px) {
+            .ai-runtime-grid { grid-template-columns: 1fr; }
+            .ai-actions .btn { width: 100%; justify-content: center; }
+            .ai-composer {
+                grid-template-columns: 44px minmax(0, 1fr) 44px;
+            }
+            .ai-icon-button { width: 44px; height: 44px; }
+        }
+    </style>
+</head>
+<body class="assistant-page">
+    <div class="app-layout">
+        <div id="app-shell-mount"></div>
+        <main class="main-content">
+            <div class="mobile-header">
+                <button class="menu-toggle" onclick="toggleSidebar()" aria-label="Open menu">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></svg>
+                </button>
+                <span style="font-weight:600;" data-i18n="nav.assistant">Assistant</span>
+                <div style="width:40px;"></div>
+            </div>
+
+            <header class="page-header">
+                <h1 class="page-title" data-i18n="genai.page_title">OverDrive Assistant</h1>
+                <div class="header-actions">
+                    <span class="status-badge inactive" id="genAiBadge">OFF</span>
+                </div>
+            </header>
+
+            <div class="page-body">
+                <section data-tab="assistant">
+                    <div class="ai-state" id="genAiState">
+                        <div class="ai-state-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="6" width="16" height="13" rx="3"/><path d="M9 3v3M8 12h.01M16 12h.01M9 16h6"/></svg>
+                        </div>
+                        <div class="ai-state-copy">
+                            <div class="ai-state-title" id="genAiStateTitle">Loading assistant…</div>
+                            <div class="ai-state-desc" id="genAiStateDesc">Checking the on-vehicle BYOK runtime.</div>
+                        </div>
+                        <div class="ai-state-action">
+                            <button class="btn btn-secondary" id="genAiConfigureBtn" type="button" onclick="GenAI.openProvider()" data-i18n="genai.configure">Configure</button>
+                        </div>
+                    </div>
+
+                    <div class="ai-quick-actions" aria-label="Grounded assistant actions">
+                        <button class="ai-chip" type="button" data-mode="current_vehicle" data-prompt="Explain the current vehicle state and call out anything unusual.">Current vehicle</button>
+                        <button class="ai-chip" type="button" data-mode="latest_trip" data-prompt="Explain my latest trip, including efficiency and notable moments.">Explain latest trip</button>
+                        <button class="ai-chip" type="button" data-mode="trip_comparison" data-prompt="Why did my latest trip use more battery than comparable trips?">Why more battery?</button>
+                        <button class="ai-chip" type="button" data-mode="recent_events" data-prompt="Summarize my recent recording and surveillance events.">Summarize events</button>
+                        <button class="ai-chip" type="button" data-mode="roadsense" data-prompt="Summarize recent RoadSense hazards and what they mean.">RoadSense hazards</button>
+                        <button class="ai-chip" type="button" data-mode="charging" data-prompt="Review recent charging and highlight useful trends.">Charging review</button>
+                        <button class="ai-chip" type="button" data-mode="diagnostics" data-prompt="Review current diagnostics and explain any likely issues.">Diagnostics</button>
+                        <button class="ai-chip" type="button" data-mode="diagnostic_logs" data-prompt="Analyze the recent redacted daemon warnings and errors, identify the strongest evidence, and say what is still uncertain.">Analyze logs</button>
+                        <button class="ai-chip" type="button" data-mode="automation_diagnostics" data-prompt="Why did my automation not run? Diagnose its conditions, recent logs, action timing, and safe fixes.">Diagnose automation</button>
+                        <button class="ai-chip" type="button" data-mode="vehicle_action" data-prompt="Set the cabin temperature to ">Control vehicle</button>
+                        <button class="ai-chip" type="button" data-mode="automation_draft" data-prompt="Create an automation that ">Create automation</button>
+                        <button class="ai-chip" type="button" data-mode="community_search" data-prompt="Find a community automation for ">Find automation</button>
+                    </div>
+
+                    <div class="card ai-chat-card" data-tab="assistant">
+                        <div class="card-body">
+                            <div class="ai-conversation" id="genAiConversation" aria-live="polite">
+                                <div class="ai-empty" id="genAiEmpty">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>
+                                    <strong data-i18n="genai.empty_title">Ask about your vehicle</strong>
+                                    <span data-i18n="genai.empty_desc">Text is the default. Vehicle data is attached only when you choose a grounded action or explicitly ask for it.</span>
+                                </div>
+                            </div>
+                            <div class="ai-composer-dock">
+                                <form class="ai-composer" id="genAiComposer">
+                                    <button class="btn btn-secondary ai-icon-button" id="genAiVoiceBtn" type="button" disabled aria-label="Voice unavailable" aria-pressed="false" title="Native realtime voice is unavailable for this provider">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3M8 22h8"/></svg>
+                                    </button>
+                                    <textarea id="genAiInput" rows="1" maxlength="12000" placeholder="Ask OverDrive…" data-i18n-attr="placeholder:genai.input_placeholder"></textarea>
+                                    <button class="btn btn-primary ai-icon-button" id="genAiSendBtn" type="submit" aria-label="Send">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+                                    </button>
+                                </form>
+                                <div class="ai-voice-note" id="genAiVoiceNote">Voice appears only for providers with native realtime audio; OverDrive does not add speech-to-text fallback.</div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section data-tab="assistant">
+                    <div class="ai-insight-grid">
+                        <div class="card">
+                            <div class="card-header">
+                                <div class="card-title">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/><path d="m5 5 14 14"/></svg>
+                                    <span>Generate an insight</span>
+                                </div>
+                            </div>
+                            <div class="card-body">
+                                <div class="ai-insight-controls">
+                                    <div class="md-field">
+                                        <div class="md-field-box">
+                                            <select class="md-input" id="genAiInsightMode">
+                                                <option value="overview">Vehicle overview</option>
+                                                <option value="current_vehicle">Current vehicle</option>
+                                                <option value="latest_trip">Latest trip</option>
+                                                <option value="trip_comparison">Trip consumption comparison</option>
+                                                <option value="recent_events">Recent events</option>
+                                                <option value="roadsense">RoadSense hazards</option>
+                                                <option value="charging">Charging</option>
+                                                <option value="diagnostics">Diagnostics</option>
+                                            </select>
+                                            <label class="md-label" for="genAiInsightMode">Insight type</label>
+                                        </div>
+                                    </div>
+                                    <div class="md-field">
+                                        <div class="md-field-box">
+                                            <input class="md-input" id="genAiInsightPrompt" type="text" maxlength="600" placeholder=" ">
+                                            <label class="md-label" for="genAiInsightPrompt">Optional focus</label>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="setting-row" style="margin-top:12px;">
+                                    <div class="setting-info">
+                                        <div class="setting-name">Also send a notification</div>
+                                        <div class="setting-desc">One-time delivery for this generation only.</div>
+                                    </div>
+                                    <div class="setting-control">
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="genAiInsightNotifyNow">
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="ai-actions">
+                                    <button class="btn btn-primary" id="genAiInsightGenerateBtn" type="button" onclick="GenAI.generateInsight()">Generate now</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-header">
+                                <div class="card-title">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+                                    <span>Dashboard insights</span>
+                                </div>
+                            </div>
+                            <div class="card-body">
+                                <div class="setting-row">
+                                    <div class="setting-info">
+                                        <div class="setting-name">Show latest insight on dashboards</div>
+                                        <div class="setting-desc">Displays the latest saved insight in the native dashboard and web dashboard only while GenAI is enabled.</div>
+                                    </div>
+                                    <div class="setting-control">
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="genAiInsightDashboard">
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="ai-insight-controls">
+                                    <div class="md-field">
+                                        <div class="md-field-box">
+                                            <select class="md-input" id="genAiInsightSchedule">
+                                                <option value="off">Off</option>
+                                                <option value="daily">Daily</option>
+                                                <option value="weekly">Weekly</option>
+                                            </select>
+                                            <label class="md-label" for="genAiInsightSchedule">Frequency</label>
+                                        </div>
+                                    </div>
+                                    <div class="md-field">
+                                        <div class="md-field-box">
+                                            <input class="md-input" id="genAiInsightTime" type="time" value="20:00">
+                                            <label class="md-label" for="genAiInsightTime">Local time</label>
+                                        </div>
+                                    </div>
+                                    <div class="md-field wide" id="genAiInsightDayField">
+                                        <div class="md-field-box">
+                                            <select class="md-input" id="genAiInsightDay">
+                                                <option value="1">Monday</option>
+                                                <option value="2">Tuesday</option>
+                                                <option value="3">Wednesday</option>
+                                                <option value="4">Thursday</option>
+                                                <option value="5">Friday</option>
+                                                <option value="6">Saturday</option>
+                                                <option value="7">Sunday</option>
+                                            </select>
+                                            <label class="md-label" for="genAiInsightDay">Day</label>
+                                        </div>
+                                    </div>
+                                    <div class="md-field wide">
+                                        <div class="md-field-box">
+                                            <select class="md-input" id="genAiInsightScheduleMode">
+                                                <option value="overview">Vehicle overview</option>
+                                                <option value="current_vehicle">Current vehicle</option>
+                                                <option value="latest_trip">Latest trip</option>
+                                                <option value="trip_comparison">Trip consumption comparison</option>
+                                                <option value="recent_events">Recent events</option>
+                                                <option value="roadsense">RoadSense hazards</option>
+                                                <option value="charging">Charging</option>
+                                                <option value="diagnostics">Diagnostics</option>
+                                            </select>
+                                            <label class="md-label" for="genAiInsightScheduleMode">Scheduled summary type</label>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="setting-row" style="margin-top:12px;">
+                                    <div class="setting-info">
+                                        <div class="setting-name">Notify when ready</div>
+                                        <div class="setting-desc">Off keeps scheduled summaries stored on this vehicle without sending a notification.</div>
+                                    </div>
+                                    <div class="setting-control">
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="genAiInsightNotifications">
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="ai-inline-note">The dashboard only reads already-generated text; displaying it never calls the provider. Daily and weekly presets use the existing automation clock. For after-trip, charging, RoadSense, or another trigger, add the “Generate AI insight” action in Automations.</div>
+                                <div class="ai-actions">
+                                    <button class="btn btn-primary" id="genAiInsightScheduleSaveBtn" type="button" onclick="GenAI.saveInsightSettings()">Save settings</button>
+                                    <button class="btn btn-secondary" type="button" onclick="window.location.href='/automations'">Open Automations</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section data-tab="provider">
+                    <div class="card" data-tab="provider">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>
+                                <span data-i18n="genai.provider_title">Bring your own provider</span>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div class="setting-row">
+                                <div class="setting-info">
+                                    <div class="setting-name" data-i18n="genai.enable_title">Enable GenAI</div>
+                                    <div class="setting-desc" data-i18n="genai.enable_desc">Master kill switch. Off cancels active requests and releases the provider transport.</div>
+                                </div>
+                                <div class="setting-control">
+                                    <label class="toggle-switch">
+                                        <input type="checkbox" id="genAiEnabled">
+                                        <span class="toggle-slider"></span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="ai-form-grid" style="margin-top:16px;">
+                                <div class="md-field">
+                                    <div class="md-field-box">
+                                        <select class="md-input" id="genAiProvider">
+                                            <option value="openai">OpenAI</option>
+                                            <option value="anthropic">Anthropic</option>
+                                            <option value="gemini">Google Gemini</option>
+                                            <option value="openai_compatible">OpenAI-compatible</option>
+                                        </select>
+                                        <label class="md-label" for="genAiProvider" data-i18n="genai.provider">Provider</label>
+                                    </div>
+                                </div>
+                                <div class="md-field">
+                                    <div class="md-field-box">
+                                        <select class="md-input" id="genAiModelPreset"></select>
+                                        <label class="md-label" for="genAiModelPreset" data-i18n="genai.text_model">Text model</label>
+                                    </div>
+                                    <div class="md-field-box ai-custom-model-field" id="genAiModelCustomField" hidden>
+                                        <input class="md-input" id="genAiModel" type="text" maxlength="200" autocomplete="off" placeholder=" ">
+                                        <label class="md-label" for="genAiModel">Custom model ID</label>
+                                    </div>
+                                    <span class="md-supporting" id="genAiModelHint">Choose a suggested model or enter any compatible model ID.</span>
+                                </div>
+                                <div class="md-field wide">
+                                    <div class="md-field-box">
+                                        <input class="md-input" id="genAiBaseUrl" type="url" maxlength="2048" placeholder=" ">
+                                        <label class="md-label" for="genAiBaseUrl" data-i18n="genai.base_url">Provider base URL</label>
+                                    </div>
+                                    <span class="md-supporting" data-i18n="genai.base_url_hint">HTTPS is recommended. HTTP is accepted for a trusted local compatible endpoint.</span>
+                                </div>
+                                <div class="md-field">
+                                    <div class="md-field-box">
+                                        <input class="md-input" id="genAiApiKey" type="password" maxlength="8192" autocomplete="off" placeholder=" ">
+                                        <label class="md-label" for="genAiApiKey" data-i18n="genai.api_key">API key</label>
+                                    </div>
+                                    <span class="md-supporting" id="genAiKeyHint">Leave blank to keep the saved key.</span>
+                                </div>
+                                <div class="md-field">
+                                    <div class="md-field-box">
+                                        <input class="md-input" id="genAiMaxTokens" type="number" min="64" max="8192" step="64" value="1200" placeholder=" ">
+                                        <label class="md-label" for="genAiMaxTokens" data-i18n="genai.max_tokens">Maximum output tokens</label>
+                                    </div>
+                                </div>
+                                <div class="md-field wide" id="genAiRealtimeField">
+                                    <div class="md-field-box">
+                                        <select class="md-input" id="genAiRealtimeModelPreset"></select>
+                                        <label class="md-label" for="genAiRealtimeModelPreset" data-i18n="genai.realtime_model">Realtime voice model (optional)</label>
+                                    </div>
+                                    <div class="md-field-box ai-custom-model-field" id="genAiRealtimeModelCustomField" hidden>
+                                        <input class="md-input" id="genAiRealtimeModel" type="text" maxlength="200" autocomplete="off" placeholder=" ">
+                                        <label class="md-label" for="genAiRealtimeModel">Custom realtime model ID</label>
+                                    </div>
+                                    <span class="md-supporting" data-i18n="genai.realtime_hint">Used only for provider-native realtime audio. It is never routed through a speech-to-text fallback.</span>
+                                </div>
+                            </div>
+
+                            <div class="ai-actions">
+                                <button class="btn btn-primary" id="genAiSaveBtn" type="button" onclick="GenAI.saveConfig()" data-i18n="common.save">Save</button>
+                                <button class="btn btn-secondary" id="genAiTestBtn" type="button" onclick="GenAI.testConnection()" data-i18n="genai.test">Test provider</button>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section data-tab="privacy">
+                    <div class="card" data-tab="privacy">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                                <span data-i18n="genai.privacy_title">Privacy and runtime</span>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <ul class="ai-privacy-list">
+                                <li>The API key uses the same device-bound encrypted storage path as BYD Cloud credentials and is never returned to this page.</li>
+                                <li>Chat history stays only in this WebView's memory and is cleared when the page closes or reloads.</li>
+                                <li>Vehicle context is sent only for an explicit grounded action. Context is treated as data, never as provider instructions.</li>
+                                <li>Starting voice opens a provider-native realtime session through the daemon. It closes when stopped, when this page leaves the foreground, or after inactivity.</li>
+                                <li>When the master switch is off, active calls are cancelled and the provider connection pool and dispatcher are destroyed.</li>
+                                <li>Requests re-evaluate the OverDrive proxy route each time. If a Tailscale proxy is expected but unavailable, the request fails closed instead of dialing directly.</li>
+                            </ul>
+                            <div class="ai-runtime-grid">
+                                <div class="ai-runtime-item"><span>Parked availability</span><strong id="genAiParked">—</strong></div>
+                                <div class="ai-runtime-item"><span>Current transport</span><strong id="genAiTransport">—</strong></div>
+                                <div class="ai-runtime-item"><span>Proxy policy</span><strong id="genAiProxy">—</strong></div>
+                                <div class="ai-runtime-item"><span>Active requests</span><strong id="genAiActiveRequests">0</strong></div>
+                            </div>
+                            <div class="ai-actions">
+                                <button class="btn btn-danger" type="button" onclick="GenAI.clearCredentials()" data-i18n="genai.clear">Disable and clear API key</button>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script src="../shared/auth.js"></script>
+    <script src="../shared/core.js?v=20"></script>
+    <script src="../shared/update-flow.js"></script>
+    <script src="../shared/genai.js?v=9"></script>
+    <script>
+        function toggleSidebar() {
+            var sidebar = document.getElementById('sidebar');
+            var overlay = document.getElementById('sidebarOverlay');
+            if (sidebar) sidebar.classList.toggle('open');
+            if (overlay) overlay.classList.toggle('show');
+        }
+        document.addEventListener('DOMContentLoaded', function () {
+            BYD.i18n.init().then(function () {
+                BYD.core.init();
+                GenAI.init();
+            });
+        });
+    </script>
+</body>
+</html>

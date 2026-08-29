@@ -15,7 +15,6 @@ import com.telenav.app.external.IUserDataService;
 import com.telenav.app.external.model.search.Place;
 
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -27,9 +26,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * PermissiveContext).
  *
  * <p>Must run in the APP process — the uid-2000 daemon can't {@code bindService}
- * (no AMS-registered app record). We use the {@code bindService(Intent, int,
- * Executor, ServiceConnection)} overload (API 29+) so the connection callback
- * lands on our executor, not a main Looper the daemon isn't running.
+ * (no AMS-registered app record). The app process has a main Looper, so the
+ * API-compatible three-argument bind works on the app's minSdk 28.
  */
 public final class TelenavClient {
 
@@ -49,6 +47,13 @@ public final class TelenavClient {
     private static final int TRANSACTION_startNavigation = 8;
 
     private TelenavClient() {}
+
+    public static boolean isAvailable(Context ctx) {
+        if (ctx == null) return false;
+        Intent intent = new Intent(NAVI_ACTION);
+        intent.setComponent(new ComponentName(TELENAV_PKG, NAVI_SERVICE));
+        return ctx.getPackageManager().resolveService(intent, 0) != null;
+    }
 
     /** Calls the specific "register …ServiceCallback" method on the manager. */
     public interface Registrar {
@@ -149,11 +154,15 @@ public final class TelenavClient {
     private static <T> T withService(Context ctx, long timeoutMs, Registrar registrar, BinderOp<T> op)
             throws Exception {
         if (ctx == null) throw new IllegalStateException("no context");
+        if (!isAvailable(ctx)) {
+            throw new IllegalStateException("Telenav navigation service unavailable");
+        }
 
         final CountDownLatch connected = new CountDownLatch(1);
         final CountDownLatch serviceReady = new CountDownLatch(1);
         final AtomicReference<IBinder> serviceBinder = new AtomicReference<>();
         final AtomicReference<String> failure = new AtomicReference<>();
+        final long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
 
         final IServiceInitCallback initCallback = new IServiceInitCallback.Stub() {
             @Override public void onServiceInitSuccess(IBinder binder) {
@@ -173,6 +182,11 @@ public final class TelenavClient {
                 try {
                     boolean valid = sm.isValid(CLIENT_VERSION);
                     Log.i(TAG, "isValid(" + CLIENT_VERSION + ")=" + valid);
+                    if (!valid) {
+                        failure.set("Telenav rejected client version " + CLIENT_VERSION);
+                        serviceReady.countDown();
+                        return;
+                    }
                     registrar.register(sm, initCallback);
                 } catch (RemoteException e) {
                     failure.set("register callback: " + e.getMessage());
@@ -187,8 +201,7 @@ public final class TelenavClient {
         Intent intent = new Intent(NAVI_ACTION);
         intent.setComponent(new ComponentName(TELENAV_PKG, NAVI_SERVICE));
 
-        boolean bindRequested = ctx.bindService(
-                intent, Context.BIND_AUTO_CREATE, Executors.newSingleThreadExecutor(), conn);
+        boolean bindRequested = ctx.bindService(intent, conn, Context.BIND_AUTO_CREATE);
         if (!bindRequested) {
             try { ctx.unbindService(conn); } catch (Throwable ignore) {}
             throw new IllegalStateException("bindService returned false for " + NAVI_SERVICE);
@@ -198,7 +211,9 @@ public final class TelenavClient {
             if (!connected.await(timeoutMs, TimeUnit.MILLISECONDS)) {
                 throw new IllegalStateException("timed out binding TnNaviService");
             }
-            if (!serviceReady.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0
+                    || !serviceReady.await(remainingNanos, TimeUnit.NANOSECONDS)) {
                 throw new IllegalStateException("timed out waiting for service");
             }
             IBinder b = serviceBinder.get();

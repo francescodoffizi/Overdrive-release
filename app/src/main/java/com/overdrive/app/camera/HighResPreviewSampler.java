@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <p>Two operations:
  * <ul>
- *   <li>{@link #sampleFullMosaicJpeg} — 2x2 mosaic at full encoder resolution.
+ *   <li>{@link #sampleFullMosaicJpeg} — full recorder frame at encoder resolution.
  *       Seal: 2560×1920. Tang: 2560×1440.</li>
  *   <li>{@link #samplePerQuadrantJpeg} — one camera tile from the raw strip
  *       at full per-camera resolution. Seal: 1280×960. Tang: 1280×720.</li>
@@ -54,7 +54,7 @@ public final class HighResPreviewSampler {
     // TEX_COORDS below are pre-flipped V (legacy convention). On DiLink 4
     // uTexMatrix already includes Android's producer Y-flip — combined,
     // we'd double-flip and the dialog preview would be upside-down.
-    // Counter-flip via uApplyInverseFlip when on dilink4 (uApaMode > 2.5).
+    // Counter-flip via uApplyInverseFlip for SurfaceTexture layouts 1 and 3.
     private static final String VERTEX_SHADER =
             "attribute vec4 aPosition;\n" +
             "attribute vec2 aTexCoord;\n" +
@@ -69,8 +69,8 @@ public final class HighResPreviewSampler {
             "}\n";
 
     private static String buildMosaicShader(float[] offsets) {
-        // uApaMode > 2.5 = oem-parity passthrough (HAL emits final 2x2
-        // mosaic natively). Default 0 = legacy 4-strip → 2x2 rearrangement.
+        // Layout 1 = full-frame passthrough. Layout 3 = four-corner DiLink 4
+        // output with the configured inset. Layout 0 = legacy 4-strip.
         return String.format(Locale.US,
                 "#extension GL_OES_EGL_image_external : require\n" +
                 "precision mediump float;\n" +
@@ -84,6 +84,8 @@ public final class HighResPreviewSampler {
                 "    if (uApaMode > 2.5) {\n" +
                 "        samplePos = vTexCoord;\n" +
                 com.overdrive.app.camera.GlUtil.APA_CENTER_INSET_GLSL +
+                "    } else if (uApaMode > 0.5) {\n" +
+                "        samplePos = vTexCoord;\n" +
                 "    } else {\n" +
                 "        vec2 gridPos = step(0.5, vTexCoord);\n" +
                 "        float frontOffset = %.5f;\n" +
@@ -196,7 +198,7 @@ public final class HighResPreviewSampler {
         0f, 0f, 0f, 1f,
     };
     private final Object texMatrixLock = new Object();
-    private volatile int cameraLayout = 0;  // 0=4-strip rearrange, 3=passthrough
+    private volatile int cameraLayout = 0;  // 0=4-strip, 1=full-frame, 3=corner remap
 
     private int fbo = -1;
     private int fboTexture = -1;
@@ -375,8 +377,10 @@ public final class HighResPreviewSampler {
     public byte[] sampleFullMosaicJpeg(int textureId, int stripWidth, int stripHeight,
                                        float[] offsets) {
         if (textureId == 0 || offsets == null || offsets.length != 4) return null;
-        int outW = Math.max(1, stripWidth / 2);
-        int outH = Math.max(1, stripHeight * 2);
+        int outW = cameraLayout == 1
+                ? PassiveApaGeometry.WIDTH : Math.max(1, stripWidth / 2);
+        int outH = cameraLayout == 1
+                ? PassiveApaGeometry.HEIGHT : Math.max(1, stripHeight * 2);
         return runOnSamplerThread(() -> {
             ensureFbo(outW, outH);
             if (fbo < 0 || !ensureMosaicProgram(offsets)) return null;
@@ -548,7 +552,7 @@ public final class HighResPreviewSampler {
                 : (program == quadProgram ? quadUApplyInverseYFlip : -1);
             if (inverseFlipLoc >= 0) {
                 GLES20.glUniform1f(inverseFlipLoc,
-                    apaModeOverride > 2.5f ? 1.0f : 0.0f);
+                    (apaModeOverride == 1 || apaModeOverride > 2.5f) ? 1.0f : 0.0f);
             }
             int redMaskLoc = (program == mosaicProgram)
                 ? mosaicURedMaskStrength
@@ -660,7 +664,7 @@ public final class HighResPreviewSampler {
         }
     }
 
-    /** 0 = legacy 4-strip → 2x2 rearrangement; 3 = oem-parity passthrough. */
+    /** 0 = legacy 4-strip; 1 = full-frame APA; 3 = four-corner DiLink 4. */
     public void setCameraLayout(int layout) { this.cameraLayout = layout; }
 
     /** Enables the GL red-overlay suppression on dialog preview JPEGs. */

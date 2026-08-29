@@ -39,6 +39,15 @@ public class CameraAutomationActionTest {
     }
 
     @Test
+    public void operatingModeActionOffersWholeLifecycleChoices() throws Exception {
+        JSONObject mode = actionSchema(new Actions(), "operatingMode");
+
+        assertOptionIds(variable(mode, "mode"), "onOnly", "onAndOff");
+        assertEquals(AutomationCategories.SURVEILLANCE,
+                AutomationCategories.forId("operatingMode"));
+    }
+
+    @Test
     public void legacyCameraActionStillAcceptsSavedBlindSpotComposite() throws Exception {
         Action legacy = new Actions().getAction("showCameraView");
         assertNotNull("the legacy action id must remain available", legacy);

@@ -159,28 +159,33 @@ public class CloudFallbackContractTest {
 
         String source = readRouterSource();
         assertTrue(source.contains("prepareSeatCloudSteeringWheelWireState"));
+        assertTrue(source.contains("getSteeringWheelHeatingState()"));
         assertTrue(source.contains("seatSteeringWheelWireState < 0"));
         assertTrue(source.contains("cloudChairType() { return \"5\"; }"));
     }
 
     @Test
-    public void absentWheelCapabilityUsesPyBydOffDefaultButUnknownSupportedWheelBlocks()
+    public void localWheelReadbackPreservesSupportedWheelWhenCloudOmitsIt()
             throws Exception {
         JSONObject frontSeatsOnly = new JSONObject().put("cfFixedList", new JSONArray()
                 .put(new JSONObject().put("functionNo", "10300003")));
         CloudCapabilities noWheel = CloudCapabilities.fromResponses(
                 "VIN", frontSeatsOnly, null, 1L);
         assertEquals(3, VehicleCommandRouter.resolveSeatCloudSteeringWheelWireState(
-                -1, -1, noWheel));
+                -1, -1, 0, noWheel));
 
         JSONObject wheelConfig = new JSONObject().put("cfFixedList", new JSONArray()
                 .put(new JSONObject().put("functionNo", "10300004")));
         CloudCapabilities wheelSupported = CloudCapabilities.fromResponses(
                 "VIN", wheelConfig, null, 1L);
         assertEquals(-1, VehicleCommandRouter.resolveSeatCloudSteeringWheelWireState(
-                -1, -1, wheelSupported));
+                -1, -1, 0, wheelSupported));
         assertEquals(1, VehicleCommandRouter.resolveSeatCloudSteeringWheelWireState(
-                1, -1, wheelSupported));
+                -1, -1, 2, wheelSupported));
+        assertEquals(3, VehicleCommandRouter.resolveSeatCloudSteeringWheelWireState(
+                -1, -1, 1, wheelSupported));
+        assertEquals(1, VehicleCommandRouter.resolveSeatCloudSteeringWheelWireState(
+                1, -1, 1, wheelSupported));
     }
 
     @Test
@@ -489,6 +494,22 @@ public class CloudFallbackContractTest {
         assertTrue(!source.contains("capabilities == null && cmd.requiresKnownCloudFeature()"));
         assertTrue(source.contains("catch (InterruptedException ie)"));
         assertTrue(source.contains("cancelCloudRequest(future, client, workerThread.get(), trackTailgateOpen)"));
+    }
+
+    @Test
+    public void localSdkRejectionIsNotReportedAsUnsupported() throws Exception {
+        String source = readRouterSource();
+        String failed = "return CommandResult.failed(Path.SDK, msg(\"local_failed\"), "
+                + "elapsed, leg.error);";
+
+        int awakeStart = source.indexOf(
+                "private CommandResult runLocalOnlyWhileAwake(VehicleCommand cmd)");
+        int awakeEnd = source.indexOf("\n    /**", awakeStart + 1);
+        assertTrue(source.substring(awakeStart, awakeEnd).contains(failed));
+
+        int sdkStart = source.indexOf("private CommandResult runSdkOnly(VehicleCommand cmd)");
+        int sdkEnd = source.indexOf("\n    /**", sdkStart + 1);
+        assertTrue(source.substring(sdkStart, sdkEnd).contains(failed));
     }
 
     private static String readRouterSource() throws Exception {

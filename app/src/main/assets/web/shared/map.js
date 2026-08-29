@@ -49,9 +49,7 @@ BYD.map = {
             attributionControl: false
         }).setView([0, 0], 2);
         
-        // CartoDB tiles — Voyager (light) / dark_all (dark). The shared
-        // helper picks the right style for the current data-theme and
-        // re-swaps the layer when the user toggles the theme picker.
+        // Shared keyless OSM.de tiles follow the current day/night theme.
         BYD.theme.attachMapTiles(this.map);
         
         // Add zoom control to bottom right

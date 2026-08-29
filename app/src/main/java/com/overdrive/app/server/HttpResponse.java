@@ -2,6 +2,8 @@ package com.overdrive.app.server;
 
 import org.json.JSONObject;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 /**
  * HTTP Response utilities - shared by all handlers.
@@ -29,22 +31,75 @@ public class HttpResponse {
     }
 
     public static void sendJson(OutputStream out, String json) throws Exception {
+        sendJsonInternal(out, 200, json, true);
+    }
+
+    /** Same-origin-only JSON for credential-bearing local APIs. */
+    public static void sendJsonNoCors(OutputStream out, String json) throws Exception {
+        sendJsonInternal(out, 200, json, false);
+    }
+
+    /** Same-origin-only error JSON for credential-bearing local APIs. */
+    public static void sendJsonNoCors(
+            OutputStream out, int status, String json) throws Exception {
+        sendJsonInternal(out, status, json, false);
+    }
+
+    private static void sendJsonInternal(
+            OutputStream out, int status, String json, boolean cors)
+            throws Exception {
         byte[] body = json.getBytes("UTF-8");
-        String headers = "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: application/json\r\n" +
-                        "Access-Control-Allow-Origin: *\r\n" +
-                        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n" +
-                        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
-                        "Cache-Control: no-cache, no-store\r\n" +
-                        "Content-Length: " + body.length + "\r\n" +
-                        "Connection: close\r\n\r\n";
-        out.write(headers.getBytes());
+        String reason = reason(status);
+        StringBuilder headers = new StringBuilder()
+                .append("HTTP/1.1 ").append(status).append(' ')
+                .append(reason).append("\r\n")
+                .append("Content-Type: application/json\r\n");
+        if (cors) {
+            headers.append("Access-Control-Allow-Origin: *\r\n")
+                    .append("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n")
+                    .append("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
+        }
+        headers.append("Cache-Control: no-cache, no-store\r\n")
+                .append("X-Content-Type-Options: nosniff\r\n")
+                .append("Content-Length: ").append(body.length).append("\r\n")
+                .append("Connection: close\r\n\r\n");
+        out.write(headers.toString().getBytes(StandardCharsets.UTF_8));
         out.write(body);
         out.flush();
     }
     
     public static void sendJsonSuccess(OutputStream out) throws Exception {
         sendJson(out, "{\"success\":true}");
+    }
+
+    /** Send sensitive transient bytes with mandatory no-store semantics. */
+    public static void sendBinaryNoStore(OutputStream out, String contentType, byte[] body,
+                                         Map<String, String> extraHeaders) throws Exception {
+        StringBuilder headers = new StringBuilder();
+        headers.append("HTTP/1.1 200 OK\r\n")
+               .append("Content-Type: ").append(safeHeader(contentType)).append("\r\n")
+               .append("Content-Length: ").append(body.length).append("\r\n")
+               .append("Cache-Control: no-store, no-cache, must-revalidate, private\r\n")
+               .append("Pragma: no-cache\r\n")
+               .append("X-Content-Type-Options: nosniff\r\n");
+        if (extraHeaders != null) {
+            for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
+                headers.append(safeHeader(entry.getKey())).append(": ")
+                       .append(safeHeader(entry.getValue())).append("\r\n");
+            }
+            headers.append("Access-Control-Expose-Headers: X-Overdrive-Width, X-Overdrive-Height, ")
+                   .append("X-Overdrive-PixelCopy-Code, X-Overdrive-PixelCopy-Result, ")
+                   .append("X-Overdrive-Capture-Backend, X-Overdrive-Frame-Sequence, ")
+                   .append("X-Overdrive-Activity\r\n");
+        }
+        headers.append("Connection: close\r\n\r\n");
+        out.write(headers.toString().getBytes(StandardCharsets.UTF_8));
+        out.write(body);
+        out.flush();
+    }
+
+    private static String safeHeader(String value) {
+        return value == null ? "" : value.replace("\r", "").replace("\n", "");
     }
 
     /**
@@ -54,31 +109,25 @@ public class HttpResponse {
      * subscription id is tombstoned.
      */
     public static void sendJson(OutputStream out, int status, String json) throws Exception {
-        byte[] body = json.getBytes("UTF-8");
-        String reason;
+        sendJsonInternal(out, status, json, true);
+    }
+
+    private static String reason(int status) {
         switch (status) {
-            case 400: reason = "Bad Request"; break;
-            case 401: reason = "Unauthorized"; break;
-            case 403: reason = "Forbidden"; break;
-            case 404: reason = "Not Found"; break;
-            case 409: reason = "Conflict"; break;
-            case 410: reason = "Gone"; break;
-            case 429: reason = "Too Many Requests"; break;
-            case 500: reason = "Internal Server Error"; break;
-            case 503: reason = "Service Unavailable"; break;
-            default:  reason = "OK";
+            case 200: return "OK";
+            case 400: return "Bad Request";
+            case 401: return "Unauthorized";
+            case 403: return "Forbidden";
+            case 404: return "Not Found";
+            case 409: return "Conflict";
+            case 410: return "Gone";
+            case 413: return "Payload Too Large";
+            case 422: return "Unprocessable Entity";
+            case 429: return "Too Many Requests";
+            case 500: return "Internal Server Error";
+            case 503: return "Service Unavailable";
+            default: return "HTTP " + status;
         }
-        String headers = "HTTP/1.1 " + status + " " + reason + "\r\n" +
-                        "Content-Type: application/json\r\n" +
-                        "Access-Control-Allow-Origin: *\r\n" +
-                        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n" +
-                        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
-                        "Cache-Control: no-cache, no-store\r\n" +
-                        "Content-Length: " + body.length + "\r\n" +
-                        "Connection: close\r\n\r\n";
-        out.write(headers.getBytes());
-        out.write(body);
-        out.flush();
     }
     
     /**
@@ -95,6 +144,21 @@ public class HttpResponse {
                         "Content-Length: 0\r\n" +
                         "Connection: close\r\n\r\n";
         out.write(headers.getBytes());
+        out.flush();
+    }
+
+    public static void sendCorsPreflightResponse(
+            OutputStream out, String allowedOrigin) throws Exception {
+        String origin = safeHeader(allowedOrigin);
+        String headers = "HTTP/1.1 204 No Content\r\n" +
+                        "Access-Control-Allow-Origin: " + origin + "\r\n" +
+                        "Vary: Origin\r\n" +
+                        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n" +
+                        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
+                        "Access-Control-Max-Age: 600\r\n" +
+                        "Content-Length: 0\r\n" +
+                        "Connection: close\r\n\r\n";
+        out.write(headers.getBytes(StandardCharsets.UTF_8));
         out.flush();
     }
     

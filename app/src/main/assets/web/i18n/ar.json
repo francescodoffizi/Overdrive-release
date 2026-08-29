@@ -1324,8 +1324,8 @@
     "heatmap_threat_high": "عالي",
     "heatmap_threat_critical": "وضع",
     "state_active": "نشط",
-    "state_safe_zone": "🏠 منطقة آمنة",
-    "state_safe_zone_named": "🏠 منطقة آمنة ({name})",
+    "state_safe_zone": "منطقة آمنة",
+    "state_safe_zone_named": "منطقة آمنة ({name})",
     "size_used_dash": "-- مستخدمة",
     "size_limit_dash": "-- حد",
     "limit_min_default": "100 ميغابايت",
@@ -2053,13 +2053,13 @@
     "add_zone_failed": "فشل في إضافة منطقة",
     "confirm_delete_zone": "حذف هذه المنطقة الآمنة؟",
     "zone_deleted": "تم حذف المنطقة",
-    "in_safe_zone": "🟢 في المنطقة الآمنة ({zone}، {meters}m)",
-    "outside_zone": "🔴 خارجي ({meters}m للمتصاعد)",
+    "in_safe_zone": "في المنطقة الآمنة ({zone}، {meters}m)",
+    "outside_zone": "خارجي ({meters}m للمتصاعد)",
     "no_zones_yet": "لا توجد مناطق بعد",
     "waiting_gps": "في انتظار GPS...",
-    "badge_on": "● مفعل",
-    "badge_off": "• إيقاف",
-    "you_are_here": "📍 أنت هنا",
+    "badge_on": "مفعل",
+    "badge_off": "إيقاف",
+    "you_are_here": "أنت هنا",
     "popup_radius": "<b>{name}</b><br>{meters}m radius"
   },
   "liveview": {
@@ -2164,7 +2164,6 @@
     "auto": "تلقائي"
   },
   "about": {
-    "ack_chimes": "سماعات تحذير على الطرق - أصوات من مكتبة صوت جوجل، مرخصة تحت",
     "page_title": "حول - تجاوز القرص",
     "page_title_short": "حول",
     "contributors_title": "المساهمون",
@@ -2186,7 +2185,8 @@
       "kofi_value": "القهوة على \"كو - في\" تبقى في وقت متأخر من الليل.",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "بنيت بمساعدة من المساهمين والمؤيدين."
+    "thanks_subtitle": "بنيت بمساعدة من المساهمين والمؤيدين.",
+      "ack_chimes": "سماعات تحذير على الطرق - أصوات من مكتبة صوت جوجل، مرخصة تحت"
   },
   "byd_cloud": {
     "page_title": "BYD Cloud",

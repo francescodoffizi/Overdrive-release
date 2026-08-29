@@ -12,7 +12,9 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.fragment.app.Fragment
@@ -30,6 +32,7 @@ import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.overdrive.app.R
 import com.overdrive.app.ui.model.RecordingFile
 import com.overdrive.app.ui.util.RecordingScanner
+import com.overdrive.app.ui.util.RecordingUiText
 import com.overdrive.app.ui.util.RecordingsApiClient
 import java.lang.ref.WeakReference
 import java.text.SimpleDateFormat
@@ -61,7 +64,7 @@ import java.util.concurrent.Executors
 class RecordingsFragment : Fragment() {
 
     private var libraryFragment: RecordingLibraryFragment? = null
-    private var currentSource: Source = Source.DASHCAM
+    private var currentSource: Source = Source.ALL
 
     // -------- Filter state owned at this level --------
     private val actorClassFilter = mutableSetOf<String>()  // lowercase
@@ -144,6 +147,8 @@ class RecordingsFragment : Fragment() {
     // -------- Playlist for inline player prev/next --------
     private var currentPlaylist: List<RecordingFile> = emptyList()
     private var currentInlineIndex: Int = -1
+    private var activeInlinePath: String? = null
+    private var selectedInlineRecording: RecordingFile? = null
 
     /**
      * Whether the inline player is currently maximized (chrome hidden +
@@ -178,7 +183,7 @@ class RecordingsFragment : Fragment() {
      */
     private val pendingPosts = mutableListOf<Runnable>()
 
-    enum class Source { DASHCAM, REPLAYS, SURVEILLANCE }
+    enum class Source { ALL, DASHCAM, REPLAYS, SURVEILLANCE }
 
     private val isLandscape: Boolean
         get() = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -196,7 +201,7 @@ class RecordingsFragment : Fragment() {
         savedInstanceState?.let { state ->
             currentSource = state.getString(KEY_SOURCE)
                 ?.let { runCatching { Source.valueOf(it) }.getOrNull() }
-                ?: Source.DASHCAM
+                ?: Source.ALL
             state.getStringArray(KEY_ACTORS)?.let { actorClassFilter.addAll(it) }
             state.getStringArray(KEY_SEVERITY)?.let { severityFilter.addAll(it) }
             state.getStringArray(KEY_DASHCAM_TYPES)?.let { dashcamTypes.addAll(it) }
@@ -247,6 +252,7 @@ class RecordingsFragment : Fragment() {
         setupPlaceSearch(view)
         setupResetButton(view)
         setupLibraryActions(view)
+        setupPreviewActions(view)
 
         updateDateHeader(view)
         renderActiveFilterAffordances(view)
@@ -328,6 +334,18 @@ class RecordingsFragment : Fragment() {
         placeSearchRunnable = null
         warmingRetryRunnable?.let { mainHandler.removeCallbacks(it) }
         warmingRetryRunnable = null
+        libraryFragment?.apply {
+            onPlayRecording = null
+            onListChanged = null
+            onContentChanged = null
+            onClearAllFiltersRequested = null
+        }
+        (childFragmentManager.findFragmentByTag(TAG_INLINE_PLAYER) as? VideoPlayerFragment)?.apply {
+            onFullscreenToggle = null
+            onPlaylistItemChanged = null
+            onDurationResolved = null
+        }
+        libraryFragment = null
         metricsExecutor?.shutdownNow()
         metricsExecutor = null
         super.onDestroyView()
@@ -359,10 +377,23 @@ class RecordingsFragment : Fragment() {
         }
         lib.onListChanged = { list ->
             currentPlaylist = list
-            val currentPath = currentInlineIndex
-                .takeIf { it in list.indices }
-                ?.let { list[it].path }
-            if (currentPath == null && currentInlineIndex >= 0) {
+            val activePath = activeInlinePath
+            if (activePath != null) {
+                currentInlineIndex = list.indexOfFirst {
+                    it.path == activePath || it.playbackSource == activePath
+                }
+                if (currentInlineIndex >= 0) {
+                    val active = list[currentInlineIndex]
+                    selectedInlineRecording = active
+                    bindPreviewDetails(active)
+                    lib.setActiveRecording(active.path)
+                } else {
+                    activeInlinePath = null
+                    selectedInlineRecording = null
+                    lib.setActiveRecording(null)
+                    showPreviewPlaceholder()
+                }
+            } else if (currentInlineIndex >= 0) {
                 currentInlineIndex = -1
             }
         }
@@ -416,6 +447,12 @@ class RecordingsFragment : Fragment() {
         val actors: Set<String>
         val severities: Set<String>
         when (currentSource) {
+            Source.ALL -> {
+                source = RecordingLibraryFragment.RecordingFilter.ALL
+                extra = null
+                actors = emptySet()
+                severities = emptySet()
+            }
             Source.DASHCAM -> {
                 // Derive type narrowing from the user's chip toggles. Empty
                 // OR both = show NORMAL + PROXIMITY (the default Dashcam
@@ -493,7 +530,13 @@ class RecordingsFragment : Fragment() {
      */
     private fun showInlinePreview(recording: RecordingFile) {
         val view = view ?: return
+        val hostContext = context ?: return
         if (view.findViewById<View>(R.id.previewContainer) == null) return
+
+        activeInlinePath = recording.playbackSource
+        selectedInlineRecording = recording
+        bindPreviewDetails(recording)
+        libraryFragment?.setActiveRecording(recording.path)
 
         // Keep currentInlineIndex as an index into the descending currentPlaylist
         // (the on-screen list order) — onListChanged relies on that to track the
@@ -504,13 +547,16 @@ class RecordingsFragment : Fragment() {
         // the NEWER clip while the library RecyclerView stays newest-first.
         val ordered = currentPlaylist.asReversed()
         val paths = ordered.map { it.playbackSource }.toTypedArray()
-        val titles = ordered.map { it.name }.toTypedArray()
+        val titles = ordered.map { RecordingUiText.headline(hostContext, it) }.toTypedArray()
         val playerIndex = ordered.indexOfFirst { it.path == recording.path }
 
         val player = VideoPlayerFragment().apply {
             arguments = Bundle().apply {
                 putString(VideoPlayerFragment.ARG_VIDEO_PATH, recording.playbackSource)
-                putString(VideoPlayerFragment.ARG_VIDEO_TITLE, recording.name)
+                putString(
+                    VideoPlayerFragment.ARG_VIDEO_TITLE,
+                    RecordingUiText.headline(hostContext, recording)
+                )
                 putBoolean(VideoPlayerFragment.ARG_INLINE, true)
                 putStringArray(VideoPlayerFragment.ARG_PLAYLIST_PATHS, paths)
                 putStringArray(VideoPlayerFragment.ARG_PLAYLIST_TITLES, titles)
@@ -523,6 +569,8 @@ class RecordingsFragment : Fragment() {
             onFullscreenToggle = { wantFullscreen ->
                 setPlayerFullscreen(wantFullscreen)
             }
+            onPlaylistItemChanged = ::onInlinePlayerClipChanged
+            onDurationResolved = ::onInlinePlayerDurationResolved
         }
         childFragmentManager.commit {
             setCustomAnimations(R.anim.fade_in, R.anim.fade_out)
@@ -540,13 +588,150 @@ class RecordingsFragment : Fragment() {
         val player = childFragmentManager
             .findFragmentByTag(TAG_INLINE_PLAYER) as? VideoPlayerFragment
             ?: return
+        activeInlinePath = player.arguments?.getString(VideoPlayerFragment.ARG_VIDEO_PATH)
+        activeInlinePath
+            ?.let { source ->
+                currentPlaylist.firstOrNull {
+                    it.path == source || it.playbackSource == source
+                }
+            }
+            ?.let {
+                selectedInlineRecording = it
+                bindPreviewDetails(it)
+                libraryFragment?.setActiveRecording(it.path)
+            }
         player.isFullscreen = playerFullscreen
         player.onFullscreenToggle = { wantFullscreen ->
             setPlayerFullscreen(wantFullscreen)
         }
+        player.onPlaylistItemChanged = ::onInlinePlayerClipChanged
+        player.onDurationResolved = ::onInlinePlayerDurationResolved
         // Re-apply the host-side layout to whatever state we restored into.
         view?.let { applyFullscreenLayout(it, playerFullscreen, animate = false) }
         fullscreenBackCallback.isEnabled = playerFullscreen
+    }
+
+    private fun onInlinePlayerClipChanged(source: String) {
+        activeInlinePath = source
+        val index = currentPlaylist.indexOfFirst {
+            it.path == source || it.playbackSource == source
+        }
+        if (index < 0) return
+        currentInlineIndex = index
+        val recording = currentPlaylist[index]
+        selectedInlineRecording = recording
+        bindPreviewDetails(recording)
+        libraryFragment?.setActiveRecording(recording.path)
+    }
+
+    private fun onInlinePlayerDurationResolved(source: String, durationMs: Long) {
+        if (durationMs <= 0 || activeInlinePath != source) return
+        val recording = selectedInlineRecording ?: return
+        view?.findViewById<TextView>(R.id.tvPreviewDurationValue)?.text =
+            recording.copy(durationMs = durationMs).formattedDuration
+    }
+
+    private fun bindPreviewDetails(recording: RecordingFile) {
+        val root = view ?: return
+        val hostContext = context ?: return
+        root.findViewById<View>(R.id.previewPlaceholder)?.visibility = View.GONE
+        root.findViewById<View>(R.id.previewContent)?.visibility = View.VISIBLE
+
+        root.findViewById<TextView>(R.id.tvPreviewTitle)?.text =
+            RecordingUiText.headline(hostContext, recording)
+        root.findViewById<TextView>(R.id.tvPreviewFilename)?.text = recording.name
+        root.findViewById<TextView>(R.id.tvPreviewTypeBadge)?.text = when (recording.type) {
+            RecordingFile.RecordingType.NORMAL -> getString(R.string.recording_lib_type_normal)
+            RecordingFile.RecordingType.SENTRY -> getString(R.string.recording_lib_type_event)
+            RecordingFile.RecordingType.PROXIMITY ->
+                getString(R.string.recording_lib_type_proximity)
+            RecordingFile.RecordingType.OEM_DASHCAM ->
+                getString(R.string.recording_lib_type_oem)
+            RecordingFile.RecordingType.REPLAY -> getString(R.string.recording_lib_type_replay)
+        }
+
+        val severity = recording.peakSeverity?.uppercase(Locale.ROOT)
+        root.findViewById<TextView>(R.id.tvPreviewSeverityBadge)?.apply {
+            visibility = if (severity == null) View.GONE else View.VISIBLE
+            text = severity.orEmpty()
+            setBackgroundColor(
+                when (severity) {
+                    "CRITICAL" -> 0xCCEF4444.toInt()
+                    "ALERT" -> 0xCCF59E0B.toInt()
+                    else -> 0xCC475569.toInt()
+                }
+            )
+        }
+        root.findViewById<TextView>(R.id.tvPreviewDetectedValue)?.text =
+            RecordingUiText.actorSummary(hostContext, recording)
+                ?: getString(R.string.recording_preview_no_detection)
+        root.findViewById<TextView>(R.id.tvPreviewDistanceValue)?.text =
+            RecordingUiText.distanceLabel(hostContext, recording)
+                ?: getString(R.string.recording_preview_not_available)
+        root.findViewById<TextView>(R.id.tvPreviewRecordedValue)?.text =
+            SimpleDateFormat("MMM d, yyyy  h:mm a", Locale.getDefault())
+                .format(Date(recording.timestamp))
+        root.findViewById<TextView>(R.id.tvPreviewDurationValue)?.text =
+            recording.formattedDuration.takeIf { recording.durationMs > 0 }
+                ?: getString(R.string.player_time_zero)
+        root.findViewById<TextView>(R.id.tvPreviewStorageValue)?.text =
+            when (recording.storageType?.uppercase(Locale.ROOT)) {
+                "INTERNAL" -> getString(R.string.recording_preview_storage_internal)
+                "SD_CARD" -> getString(R.string.recording_preview_storage_sd)
+                "USB" -> getString(R.string.recording_preview_storage_usb)
+                else -> getString(R.string.recording_preview_storage_unknown)
+            }
+        root.findViewById<TextView>(R.id.tvPreviewSizeValue)?.text = recording.formattedSize
+    }
+
+    private fun showPreviewPlaceholder() {
+        view?.findViewById<View>(R.id.previewContent)?.visibility = View.GONE
+        view?.findViewById<View>(R.id.previewPlaceholder)?.visibility = View.VISIBLE
+    }
+
+    private fun setPreviewDetailsExpanded(root: View, expanded: Boolean) {
+        root.findViewById<View>(R.id.previewInsights)?.visibility =
+            if (expanded) View.VISIBLE else View.GONE
+        root.findViewById<ImageView>(R.id.ivPreviewInsightsChevron)?.setImageResource(
+            if (expanded) R.drawable.ic_collapse else R.drawable.ic_expand
+        )
+        root.findViewById<View>(R.id.previewInsightsToggle)?.contentDescription = getString(
+            if (expanded) R.string.cd_collapse_recording_details
+            else R.string.cd_expand_recording_details
+        )
+    }
+
+    private fun setupPreviewActions(root: View) {
+        setPreviewDetailsExpanded(root, false)
+        root.findViewById<View>(R.id.previewInsightsToggle)?.setOnClickListener {
+            val expanded =
+                root.findViewById<View>(R.id.previewInsights)?.visibility == View.VISIBLE
+            setPreviewDetailsExpanded(root, !expanded)
+        }
+
+        root.findViewById<View>(R.id.btnPreviewMore)?.setOnClickListener { anchor ->
+            val recording = selectedInlineRecording ?: return@setOnClickListener
+            val shareTitle = getString(R.string.action_share)
+            val deleteTitle = getString(R.string.action_delete)
+            PopupMenu(requireContext(), anchor).apply {
+                menu.add(shareTitle)
+                menu.add(deleteTitle)
+                setOnMenuItemClickListener { item ->
+                    when (item.title?.toString()) {
+                        shareTitle -> {
+                            libraryFragment?.shareRecording(recording)
+                            true
+                        }
+                        deleteTitle -> {
+                            libraryFragment?.requestDeleteRecording(recording)
+                            true
+                        }
+                        else -> false
+                    }
+                }
+                show()
+            }
+        }
     }
 
     /**
@@ -632,6 +817,9 @@ class RecordingsFragment : Fragment() {
         val previewCard = rootView.findViewById<com.google.android.material.card.MaterialCardView>(
             R.id.previewCard
         )
+        val previewHeader = rootView.findViewById<View>(R.id.previewContentHeader)
+        val previewInsightsToggle = rootView.findViewById<View>(R.id.previewInsightsToggle)
+        val previewContent = rootView.findViewById<View>(R.id.previewContent)
         // The chrome views only exist on the landscape layout; portrait
         // would have already short-circuited in [setPlayerFullscreen].
         if (header == null || filterStrip == null || library == null) return
@@ -687,8 +875,15 @@ class RecordingsFragment : Fragment() {
                 resources.getDimensionPixelSize(R.dimen.page_padding_bottom)
             twoPane.setPadding(pad, twoPane.paddingTop, pad, padBottom)
         }
+        previewContent?.let {
+            val pad = if (fullscreen) 0 else (8 * resources.displayMetrics.density).toInt()
+            it.setPadding(pad, pad, pad, pad)
+        }
         previewCard?.radius = if (fullscreen) 0f else
             resources.getDimension(R.dimen.card_radius_hero)
+        previewHeader?.visibility = if (fullscreen) View.GONE else View.VISIBLE
+        previewInsightsToggle?.visibility = if (fullscreen) View.GONE else View.VISIBLE
+        if (fullscreen) setPreviewDetailsExpanded(rootView, false)
     }
 
     // -----------------------------------------------------------------
@@ -698,6 +893,7 @@ class RecordingsFragment : Fragment() {
     private fun setupSegmentedControl(view: View) {
         val group = view.findViewById<MaterialButtonToggleGroup>(R.id.segmentedSource)
         when (currentSource) {
+            Source.ALL -> group.check(R.id.segmentAll)
             Source.DASHCAM -> group.check(R.id.segmentDashcam)
             Source.REPLAYS -> group.check(R.id.segmentReplays)
             Source.SURVEILLANCE -> group.check(R.id.segmentSurveillance)
@@ -706,6 +902,7 @@ class RecordingsFragment : Fragment() {
         group.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked) return@addOnButtonCheckedListener
             currentSource = when (checkedId) {
+                R.id.segmentAll -> Source.ALL
                 R.id.segmentSurveillance -> Source.SURVEILLANCE
                 R.id.segmentReplays -> Source.REPLAYS
                 else -> Source.DASHCAM
@@ -906,7 +1103,8 @@ class RecordingsFragment : Fragment() {
             val target = when (currentSource) {
                 // Replays are produced by the dashcam encoder's pre-record
                 // ring; their knobs live on the same recording settings page.
-                Source.DASHCAM, Source.REPLAYS -> R.id.recordingSettingsWebFragment
+                Source.ALL, Source.DASHCAM, Source.REPLAYS ->
+                    R.id.recordingSettingsWebFragment
                 Source.SURVEILLANCE -> R.id.surveillanceSettingsWebFragment
             }
             findNavController().navigate(target)
@@ -1171,6 +1369,7 @@ class RecordingsFragment : Fragment() {
         // active-filter affordance regardless of the current source.
         val storageActive = storageFilter.isNotEmpty()
         val chipsActive = storageActive || when (currentSource) {
+            Source.ALL -> placeFilter.isNotEmpty() || searchActive
             Source.DASHCAM -> dashcamTypes.isNotEmpty() || placeFilter.isNotEmpty() || searchActive
             Source.REPLAYS -> placeFilter.isNotEmpty() || searchActive
             Source.SURVEILLANCE -> actorClassFilter.isNotEmpty()
@@ -1376,6 +1575,7 @@ class RecordingsFragment : Fragment() {
                 val totalToday = dashcamStats.today + replayStats.today + surveillanceStats.today
                 val totalBytes = dashcamStats.bytes + replayStats.bytes + surveillanceStats.bytes
                 val segmentClips = when (sourceAtDispatch) {
+                    Source.ALL -> all
                     Source.DASHCAM -> dashcam
                     Source.REPLAYS -> replays
                     Source.SURVEILLANCE -> surveillance
@@ -1441,7 +1641,8 @@ class RecordingsFragment : Fragment() {
      * Dashcam segment passes "normal" plus we sum normalCount + proximityCount
      * for the badge. Sentry is its own bucket.
      */
-    private fun Source.toApiType(): String = when (this) {
+    private fun Source.toApiType(): String? = when (this) {
+        Source.ALL -> null
         Source.DASHCAM -> "normal"
         Source.REPLAYS -> "replay"
         Source.SURVEILLANCE -> "sentry"
@@ -1518,6 +1719,12 @@ class RecordingsFragment : Fragment() {
                     else activeCtx.getString(
                         R.string.recordings_segment_surveillance_count,
                         surveillanceCount.toInt()
+                    )
+                v.findViewById<MaterialButton>(R.id.segmentAll)?.text =
+                    if (indexDown) activeCtx.getString(R.string.recordings_segment_all)
+                    else activeCtx.getString(
+                        R.string.recordings_segment_all_count,
+                        totalCount.toInt()
                     )
 
                 availablePlaces = sortedPlaces

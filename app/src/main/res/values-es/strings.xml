@@ -625,7 +625,7 @@
     <string name="dialog_zrok_token_message">Ingrese su Zrok activar el token.\nObtenga uno en: zrok.io</string>
     <string name="toast_token_cannot_be_empty">El token no puede estar vacío</string>
     <string name="dialog_tailscale_settings_title">Configuración del túnel Tailscale</string>
-    <string name="dialog_tailscale_settings_message">Configurar la escala de cola</string>
+    <string name="dialog_tailscale_settings_message">Configurar Tailscale</string>
     <string name="tailscale_failed_login_url">No se ha generado la URL de inicio de sesión</string>
     <string name="tailscale_logged_in_relogin">Ingresado. Haga clic para iniciar sesión en una cuenta diferente</string>
     <string name="dialog_tailscale_proxy_enable_title">¿Habilitar el Tailscale Proxy?</string>
@@ -638,8 +638,8 @@
     <string name="toast_zrok_reset_warnings">Resete de entorno (con advertencias: %1$s)</string>
     <string name="zrok_no_token_configured">No se ha configurado ningún token.</string>
     <string name="dialog_tailscale_reset_title">Resete el entorno Tailscale</string>
-    <string name="dialog_tailscale_reset_message">Esto:\n• detendrá el túnel de escala de cola si se ejecuta\n• Eliminará el entorno de escala de cola de este dispositivo\n• Usted todavía tendrá que eliminar el dispositivo de la consola de escala de cola\n\nTendrá que iniciar sesión de nuevo.\n\n¿Está seguro?</string>
-    <string name="toast_resetting_tailscale">Reestablecer el entorno de escala de cola...</string>
+    <string name="dialog_tailscale_reset_message">Esto:\n• Detendrá el túnel de Tailscale si se está ejecutando\n• Eliminará el entorno de Tailscale de este dispositivo\n• Todavía tendrá que eliminar el dispositivo de la consola de Tailscale\n\nTendrá que iniciar sesión de nuevo.\n\n¿Está seguro?</string>
+    <string name="toast_resetting_tailscale">Restableciendo el entorno de Tailscale…</string>
     <string name="toast_tailscale_reset_success">Resete el entorno Tailscale. Ingrese para volver a configurar.</string>
     <string name="toast_tailscale_reset_warnings">Reinicio del entorno Tailscale (con advertencias: %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Tailscale proxy habilitado</string>

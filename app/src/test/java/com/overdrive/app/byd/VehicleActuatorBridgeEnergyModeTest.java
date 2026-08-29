@@ -11,6 +11,9 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 
 /** Pins ordered, conflating delivery from the daemon process to the actuator service. */
@@ -80,9 +83,115 @@ public class VehicleActuatorBridgeEnergyModeTest {
         String command = VehicleActuatorBridge.buildEnergyCommand(
                 new VehicleActuatorBridge.EnergyDispatch(3, 9876543210L));
 
+        assertTrue(command.contains(
+                "-n com.overdrive.app/.services.EnergyModeActuatorService"));
         assertTrue(command.contains("--es action energy_mode"));
         assertTrue(command.contains("--es mode 3"));
         assertTrue(command.contains("--es request_generation 9876543210"));
+    }
+
+    @Test
+    public void standaloneCommandUsesTheSystemPackageContextPath() {
+        String command = VehicleActuatorBridge.buildStandaloneEnergyCommand(
+                3, 9876543210L);
+
+        assertEquals(
+                "/system/bin/app_process /system/bin --nice-name=overdrive_byd_mode "
+                        + "com.overdrive.app.byd.BydModeCommand energy 3 9876543210",
+                command);
+        assertTrue(BydModeCommand.validArguments(new String[] {"energy", "1", "10"}));
+        assertTrue(BydModeCommand.validArguments(new String[] {"energy", "3", "11"}));
+        assertTrue(BydModeCommand.validArguments(new String[] {"drive", "4"}));
+        assertFalse(BydModeCommand.validArguments(new String[] {"energy", "3"}));
+        assertFalse(BydModeCommand.validArguments(new String[] {"energy", "2", "12"}));
+        assertFalse(BydModeCommand.validArguments(new String[] {"energy", "3", "0"}));
+        assertFalse(BydModeCommand.validArguments(new String[] {"drive", "5"}));
+        assertEquals(null, VehicleActuatorBridge.buildStandaloneEnergyCommand(2, 12L));
+        assertEquals(null, VehicleActuatorBridge.buildStandaloneEnergyCommand(3, 0L));
+        assertEquals(
+                "/system/bin/app_process /system/bin --nice-name=overdrive_byd_mode "
+                        + "com.overdrive.app.byd.BydModeCommand drive 4",
+                VehicleActuatorBridge.buildStandaloneDriveCommand(4));
+    }
+
+    @Test
+    public void standaloneHelperIsThePrimaryPowerTerrainPath() throws Exception {
+        String collector = new String(
+                Files.readAllBytes(Paths.get(
+                        "src/main/java/com/overdrive/app/byd/BydDataCollector.java")),
+                StandardCharsets.UTF_8);
+        int methodStart = collector.indexOf("public boolean setEnergyMode(int mode)");
+        int methodEnd = collector.indexOf("private static final class EnergyRequest", methodStart);
+        String method = collector.substring(methodStart, methodEnd);
+
+        int standalone = method.indexOf(
+                "dispatchStandaloneEnergyMode(\n                                context, mode, generation)");
+        int service = method.indexOf("dispatchEnergyMode(context, mode, generation)");
+        assertTrue(standalone >= 0);
+        assertTrue(service > standalone);
+        int ownershipCheck = method.indexOf("isEnergyActuatorOwnershipAvailable(");
+        int daemonSetter = method.indexOf("invokeOptionalModeSetterBounded(");
+        assertTrue(ownershipCheck > service);
+        assertTrue(daemonSetter > ownershipCheck);
+    }
+
+    @Test
+    public void genericEnergyListenerFallbackFeedsRawModeDiagnostics() throws Exception {
+        String collector = new String(
+                Files.readAllBytes(Paths.get(
+                        "src/main/java/com/overdrive/app/byd/BydDataCollector.java")),
+                StandardCharsets.UTF_8);
+        int typed = collector.indexOf("BydDeviceHelper.registerEnergyListener(");
+        int fallback = collector.indexOf("BydDeviceHelper.registerListener(", typed);
+        int fallbackEnd = collector.indexOf(
+                "Energy listener registered (generic diagnostic fallback)", fallback);
+        String fallbackRegistration = collector.substring(fallback, fallbackEnd);
+
+        assertTrue(fallbackRegistration.contains("onEnergyCallback("));
+        assertTrue(fallbackRegistration.contains("energyListenerDevice, method, args"));
+        assertFalse(fallbackRegistration.contains("this::onDisplayCallback"));
+
+        int handlerStart = collector.indexOf("private void onEnergyCallback(");
+        int handlerEnd = collector.indexOf("private void onGenericCallback(", handlerStart);
+        String handler = collector.substring(handlerStart, handlerEnd);
+        assertTrue(handler.contains("\"onDataChanged\".equals(method)"));
+        assertTrue(handler.contains("\"onDataEventChanged\".equals(method)"));
+        assertTrue(handler.contains("[mode-diag] energy feature event id="));
+    }
+
+    @Test
+    public void standaloneGenerationGuardRejectsStaleOrCancelledMarkers() {
+        VehicleActuatorBridge.PublishedEnergyRequest desired =
+                VehicleActuatorBridge.PublishedEnergyRequest.desired(100L, 3);
+
+        assertTrue(VehicleActuatorBridge.matchesPublishedEnergyRequest(
+                desired, 3, 100L));
+        assertFalse(VehicleActuatorBridge.matchesPublishedEnergyRequest(
+                desired, 1, 100L));
+        assertFalse(VehicleActuatorBridge.matchesPublishedEnergyRequest(
+                desired, 3, 101L));
+        assertFalse(VehicleActuatorBridge.matchesPublishedEnergyRequest(
+                desired.asCancelled(), 3, 100L));
+    }
+
+    @Test
+    public void appOwnedGenerationCannotTransferToTheDaemonActuator() {
+        VehicleActuatorBridge.PublishedEnergyRequest desired =
+                VehicleActuatorBridge.PublishedEnergyRequest.desired(100L, 3);
+        VehicleActuatorBridge.PublishedEnergyRequest appOwned = desired.withActuation(
+                1,
+                true,
+                false,
+                false,
+                VehicleActuatorBridge.ENERGY_ACTUATOR_APP,
+                0);
+
+        assertTrue(VehicleActuatorBridge.isEnergyActuatorOwnershipAvailable(
+                desired, VehicleActuatorBridge.ENERGY_ACTUATOR_DAEMON));
+        assertTrue(VehicleActuatorBridge.isEnergyActuatorOwnershipAvailable(
+                appOwned, VehicleActuatorBridge.ENERGY_ACTUATOR_APP));
+        assertFalse(VehicleActuatorBridge.isEnergyActuatorOwnershipAvailable(
+                appOwned, VehicleActuatorBridge.ENERGY_ACTUATOR_DAEMON));
     }
 
     @Test
@@ -145,6 +254,25 @@ public class VehicleActuatorBridgeEnergyModeTest {
                     }));
         }
         assertEquals(0, launches[0]);
+    }
+
+    @Test
+    public void evAndHevMapToTheOemMandatoryElectricSelector() {
+        assertEquals(2, VehicleActuatorBridge.mandatoryElectricStateForEnergyMode(1));
+        assertEquals(1, VehicleActuatorBridge.mandatoryElectricStateForEnergyMode(3));
+        assertEquals(1, VehicleActuatorBridge.energyModeForMandatoryElectricState(2));
+        assertEquals(3, VehicleActuatorBridge.energyModeForMandatoryElectricState(1));
+        assertEquals(-1, VehicleActuatorBridge.mandatoryElectricStateForEnergyMode(2));
+        assertEquals(-1, VehicleActuatorBridge.energyModeForMandatoryElectricState(0));
+    }
+
+    @Test
+    public void genericEnergyFeaturesProvideTheMissingRuntimeSelectorMethods() {
+        GenericEnergyDevice energy = new GenericEnergyDevice();
+
+        assertEquals(1, VehicleActuatorBridge.readMandatoryElectricState(energy));
+        assertEquals(0, VehicleActuatorBridge.writeMandatoryElectricState(energy, 2));
+        assertEquals(2, VehicleActuatorBridge.readMandatoryElectricState(energy));
     }
 
     @Test
@@ -250,6 +378,27 @@ public class VehicleActuatorBridgeEnergyModeTest {
         @Override
         public void release(String authority, Object holder) {
             released = this.holder == holder && "settings".equals(authority);
+        }
+    }
+
+    public static final class GenericEnergyDevice {
+        private int state = 1;
+
+        public android.hardware.bydauto.BYDAutoEventValue get(
+                int[] featureIds, Class<?> type) {
+            android.hardware.bydauto.BYDAutoEventValue value =
+                    new android.hardware.bydauto.BYDAutoEventValue();
+            value.intValue = featureIds.length == 1 && featureIds[0] == 2665
+                    ? state : Integer.MIN_VALUE;
+            return value;
+        }
+
+        public int set(
+                int[] featureIds,
+                android.hardware.bydauto.BYDAutoEventValue value) {
+            if (featureIds.length != 1 || featureIds[0] != 2667) return -1;
+            state = value.intValue;
+            return 0;
         }
     }
 }

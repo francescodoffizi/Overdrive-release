@@ -1361,7 +1361,9 @@ BYD.events = {
                     this.stopInflightPolling();
                     await this.loadRecordings();
                     // If the file landed on this page, briefly highlight it.
-                    const node = document.getElementById(this._thumbDomId(finishedFile));
+                    const finishedRecording = this.findRecording(finishedFile);
+                    const node = document.getElementById(this._thumbDomId(
+                        finishedRecording ? this.recordingKey(finishedRecording) : finishedFile));
                     const card = node ? node.closest('.recording-card') : null;
                     if (card) {
                         card.classList.add('recording-card-just-finalized');

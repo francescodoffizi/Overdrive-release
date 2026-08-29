@@ -60,9 +60,11 @@ final class RecordingsIndexSchema {
             statement.execute("DROP TABLE recordings_v3_backup");
             connection.commit();
         } catch (Exception migrationFailure) {
-            try { connection.rollback(); } catch (Exception ignored) {}
-            // The index is derived. Prefer a clean, warmup-rebuildable v4 table
-            // over a daemon lifetime with an unusable half-migrated store.
+            try {
+                connection.rollback();
+            } catch (Exception ignored) {
+            }
+            // This is a derived index; a clean table is safer than a half-migration.
             try (Statement statement = connection.createStatement()) {
                 statement.execute("DROP TABLE IF EXISTS recordings");
                 statement.execute("DROP TABLE IF EXISTS recordings_v3_backup");

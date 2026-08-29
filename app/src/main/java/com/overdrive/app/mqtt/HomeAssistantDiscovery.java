@@ -145,9 +145,16 @@ public final class HomeAssistantDiscovery {
                 // advertise a controllable HA entity until telemetry contains the complete
                 // readback pair from a write/read-back verified backend.
                 boolean verifiedChargeCap = MqttPublisherService.hasVerifiedChargeCapState(snapshot);
+                int targetSoc = snapshot.optInt("target_soc", BydVehicleData.UNAVAILABLE);
+                boolean hasTargetSoc = targetSoc >= BydDataCollector.SOC_TARGET_MIN
+                        && targetSoc <= BydDataCollector.SOC_TARGET_MAX;
                 for (VehicleControlCatalog.ControlEntity ent : VehicleControlCatalog.all()) {
                     if (VehicleControlCatalog.isGenericChargeCapControl(ent.key)
                             && !verifiedChargeCap) {
+                        continue;
+                    }
+                    if (("target_soc".equals(ent.key) || "battery_hold".equals(ent.key))
+                            && !hasTargetSoc) {
                         continue;
                     }
                     if (!ent.isAvailable(snap)) continue;

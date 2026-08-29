@@ -72,8 +72,7 @@ final class RecordingIdentity {
     }
 
     static String rootIdFor(File directory) {
-        RecordingIdentity marker = fromPath(new File(directory, ".root").getAbsolutePath());
-        return marker.rootId;
+        return fromPath(new File(directory, ".root").getAbsolutePath()).rootId;
     }
 
     private static String normalize(String path) {

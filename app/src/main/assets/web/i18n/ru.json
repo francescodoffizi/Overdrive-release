@@ -1757,8 +1757,8 @@
     "heatmap_threat_high": "Высокий",
     "heatmap_threat_critical": "КРИТИЧЕСКИЙ",
     "state_active": "Активный",
-    "state_safe_zone": " Безопасная зона",
-    "state_safe_zone_named": " Безопасная зона ({name})",
+    "state_safe_zone": "Безопасная зона",
+    "state_safe_zone_named": "Безопасная зона ({name})",
     "size_used_dash": "-- используется",
     "size_limit_dash": "-- ограничение",
     "limit_min_default": "100 МБ",
@@ -2436,13 +2436,13 @@
     "add_zone_failed": "Не удалось добавить зону",
     "confirm_delete_zone": "Удалить эту безопасную зону?",
     "zone_deleted": "Зона удалена",
-    "in_safe_zone": " В безопасной зоне ({zone}, {meters}m)",
-    "outside_zone": "🔴 За пределами ({meters}m до ближайшего)",
+    "in_safe_zone": "В безопасной зоне ({zone}, {meters}m)",
+    "outside_zone": "За пределами ({meters}m до ближайшего)",
     "no_zones_yet": "До сих пор нет зон",
     "waiting_gps": "Ждём GPS...",
-    "badge_on": "● ВСЕ",
-    "badge_off": "○ ОFF",
-    "you_are_here": " Ты здесь",
+    "badge_on": "ВСЕ",
+    "badge_off": "ОFF",
+    "you_are_here": "Ты здесь",
     "popup_radius": "ЗЗ0XX{name}</b><br>{meters}m радиус"
   },
   "liveview": {
@@ -2571,7 +2571,6 @@
     "restore_failed": "Восстановление не удалось."
   },
   "about": {
-    "ack_chimes": "Предупреждение о RoadSense — звуки из библиотеки Google Sound",
     "page_title": "О приложении — OverDrive",
     "page_title_short": "О приложении",
     "contributors_title": "Контрибьюторы",
@@ -2593,7 +2592,8 @@
       "kofi_value": "Кофе на Ko-fi поддерживает ночные коммиты.",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "Создано с помощью контрибьюторов и сторонников."
+    "thanks_subtitle": "Создано с помощью контрибьюторов и сторонников.",
+      "ack_chimes": "Предупреждение о RoadSense — звуки из библиотеки Google Sound"
   },
   "byd_cloud": {
     "page_title": "BYD Cloud",

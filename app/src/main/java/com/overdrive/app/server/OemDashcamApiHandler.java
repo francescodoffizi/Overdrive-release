@@ -22,9 +22,9 @@ import java.io.OutputStream;
  * therefore runs as UID 2000 (shell). UID shell is allowed to call
  * {@code pm disable-user --user 0 <pkg>} and {@code pm enable <pkg>}
  * directly, so this handler shells out via {@link Runtime#exec} without
- * needing an IPC roundtrip to AccSentryDaemon. (AccSentryDaemon's
- * {@code disableBydTrafficMonitor} helper is the same idea — both daemons
- * are UID shell.)
+ * needing an IPC roundtrip to AccSentryDaemon.
+ * ({@code com.overdrive.app.byd.TrafficMonitorPolicy} applies the same contract
+ * to com.byd.trafficmonitor — both run in a UID shell daemon.)
  *
  * <p>Endpoints:
  * <pre>

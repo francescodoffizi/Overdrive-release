@@ -26,6 +26,7 @@ import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
 import com.overdrive.app.ui.model.DaemonStatus
 import com.overdrive.app.ui.util.QrCodeGenerator
+import java.util.concurrent.Executors
 
 /**
  * Fragment for managing background daemons.
@@ -33,6 +34,9 @@ import com.overdrive.app.ui.util.QrCodeGenerator
 class DaemonsFragment : Fragment() {
 
     private val handler = Handler(Looper.getMainLooper())
+    private val wifiSettingsWorker = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "WifiAutoEnableSettings").apply { isDaemon = true }
+    }
 
     private val daemonsViewModel: DaemonsViewModel by activityViewModels()
     private lateinit var recyclerDaemons: RecyclerView
@@ -64,41 +68,71 @@ class DaemonsFragment : Fragment() {
         recyclerDaemons = view.findViewById(R.id.recyclerDaemons)
         tvDaemonsCount = view.findViewById(R.id.tvDaemonsCount)
         swWifiAutoEnable = view.findViewById(R.id.swWifiAutoEnable)
+        swWifiAutoEnable.isEnabled = false
 
-        refreshWifiAutoEnable()
         view.findViewById<View>(R.id.rowWifiAutoEnable).setOnClickListener {
-            swWifiAutoEnable.isChecked = !swWifiAutoEnable.isChecked
-        }
-        swWifiAutoEnable.setOnCheckedChangeListener { _, checked ->
-            if (applyingWifiAutoEnable) return@setOnCheckedChangeListener
-
-            // The stored value is deliberately phrased as suppression because every
-            // keep-alive site can fail open to the historical/default behaviour when
-            // the config is unreadable. The UI presents the friendlier positive form.
-            if (!UnifiedConfigManager.setWifiKeepAliveSuppressed(!checked)) {
-                applyingWifiAutoEnable = true
-                swWifiAutoEnable.isChecked = !checked
-                applyingWifiAutoEnable = false
-                Toast.makeText(
-                    context,
-                    R.string.daemons_wifi_auto_enable_save_failed,
-                    Toast.LENGTH_LONG
-                ).show()
+            if (swWifiAutoEnable.isEnabled) {
+                swWifiAutoEnable.isChecked = !swWifiAutoEnable.isChecked
             }
+        }
+        swWifiAutoEnable.setOnCheckedChangeListener { _, enabled ->
+            if (applyingWifiAutoEnable || !swWifiAutoEnable.isEnabled) {
+                return@setOnCheckedChangeListener
+            }
+            persistWifiAutoEnable(enabled)
         }
     }
 
     override fun onResume() {
         super.onResume()
-        // Automation and key-mapping radio actions share this preference. Reflect any
-        // change made through those entry points when the user returns to this page.
         if (::swWifiAutoEnable.isInitialized) refreshWifiAutoEnable()
     }
 
+    override fun onDestroy() {
+        wifiSettingsWorker.shutdown()
+        super.onDestroy()
+    }
+
     private fun refreshWifiAutoEnable() {
-        applyingWifiAutoEnable = true
-        swWifiAutoEnable.isChecked = !UnifiedConfigManager.isWifiKeepAliveSuppressed()
-        applyingWifiAutoEnable = false
+        swWifiAutoEnable.isEnabled = false
+        wifiSettingsWorker.execute {
+            val enabled = runCatching {
+                UnifiedConfigManager.forceReload()
+                UnifiedConfigManager.isWifiAutoEnableEnabled()
+            }.getOrDefault(true)
+            handler.post {
+                if (view == null || !::swWifiAutoEnable.isInitialized) return@post
+                applyingWifiAutoEnable = true
+                swWifiAutoEnable.isChecked = enabled
+                swWifiAutoEnable.isEnabled = true
+                applyingWifiAutoEnable = false
+            }
+        }
+    }
+
+    private fun persistWifiAutoEnable(enabled: Boolean) {
+        swWifiAutoEnable.isEnabled = false
+        wifiSettingsWorker.execute {
+            val saved = runCatching {
+                UnifiedConfigManager.setWifiAutoEnableEnabled(enabled)
+            }.getOrDefault(false)
+            handler.post {
+                if (view == null || !::swWifiAutoEnable.isInitialized) return@post
+                applyingWifiAutoEnable = true
+                if (!saved) swWifiAutoEnable.isChecked = !enabled
+                swWifiAutoEnable.isEnabled = true
+                applyingWifiAutoEnable = false
+                if (!saved) {
+                    context?.let {
+                        Toast.makeText(
+                            it,
+                            R.string.daemons_wifi_auto_enable_save_failed,
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+        }
     }
     
     private fun setupRecyclerView() {

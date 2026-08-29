@@ -50,10 +50,13 @@ import java.util.concurrent.CopyOnWriteArraySet;
  * no path does, and the lock-ordering invariant exists to keep it that way.
  *
  * <p>Background threads (drainer at {@link #drainerThread}, disk writer at
- * {@link #diskWriterThread}, segment-rotator running on the drainer) only
- * touch {@code muxerLock}. They observe state changes to the volatile
- * {@code isWritingToFile} / {@code muxerStarted} flags written by the
- * start/stop paths, and never try to acquire the higher-level locks.
+ * {@link #diskWriterThread}) only touch {@code muxerLock}. They observe
+ * state changes to the volatile {@code isWritingToFile} /
+ * {@code muxerStarted} flags written by the start/stop paths, and never try
+ * to acquire the higher-level locks. Segment rotation executes on the DISK
+ * WRITER (writer-owned rotation: the drainer only arms it and packages the
+ * splice frame as a ROTATE queue ticket; the drainer never takes
+ * {@code muxerLock} on the rotation path).
  */
 public class HardwareEventRecorderGpu {
     private static final String TAG = "HWEncoderGpu";
@@ -211,6 +214,84 @@ public class HardwareEventRecorderGpu {
         void onWriterAborted(String reason);
     }
     private volatile WriterAbortListener writerAbortListener = null;
+
+    /**
+     * Dispatches the writer-abort callback on a detached daemon thread —
+     * NEVER synchronously. Both abort-discovery sites run on worker threads
+     * that the listener's typical response must JOIN: the disk writer's
+     * failure-threshold abort runs on the disk writer itself, and the
+     * drainer's abort-stop branch runs on the drainer, while listeners (OEM
+     * pipeline, sentry engine) respond by calling stopEventRecording — whose
+     * close path joins those same threads. A synchronous callback therefore
+     * SELF-JOINS: the join burns its full deadline against a thread that is
+     * alive by definition (it is executing the join), the stop helper
+     * declares a false wedge, the terminal latch trips, and a trip-safe
+     * process restart is requested for a perfectly stoppable worker.
+     *
+     * <p>ONCE-ONLY + LIFECYCLE FENCE. Both discovery sites can fire for the
+     * SAME abort (the writer latches writerAbortedCorrupt and notifies; the
+     * drainer's abort-stop branch notifies again on its next tick), and an
+     * asynchronous delivery can be delayed past RMM's wedge recovery — the
+     * listeners read LIVE state (the OEM pipeline reads its current encoder
+     * field, GpuMosaicRecorder its current recording flag), so a duplicate
+     * or stale delivery would stop the healthy SUCCESSOR recording. The
+     * abort is stamped with its recording generation, delivered at most
+     * once per generation ({@link #lastAbortNotifiedGen}), and the
+     * generation is re-checked immediately before the listener runs.
+     */
+    private void notifyWriterAbortedAsync(final String reason,
+                                          final long abortGeneration) {
+        final WriterAbortListener cb = writerAbortListener;
+        if (cb == null) {
+            return;
+        }
+        long prev = lastAbortNotifiedGen.getAndSet(abortGeneration);
+        if (prev == abortGeneration) {
+            logger.debug("Writer-abort notification suppressed — already "
+                + "delivered for recording generation " + abortGeneration);
+            return;
+        }
+        Thread t = new Thread(
+                () -> deliverWriterAbort(cb, abortGeneration, reason),
+                "WriterAbortNotify");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** One abort notification per recording generation (see
+     *  {@link #notifyWriterAbortedAsync}). */
+    private final java.util.concurrent.atomic.AtomicLong lastAbortNotifiedGen =
+        new java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE);
+    /** The recording generation captured AT the writer's failure latch
+     *  (writerAbortedCorrupt = true). Both notify sites for that abort use
+     *  this ONE immutable stamp — reading the live generation at each
+     *  notification let an interleaved close bump make the drainer's site
+     *  look like a brand-new abort, defeating once-only delivery. */
+    private volatile long abortGenerationAtLatch = Long.MIN_VALUE;
+
+    /**
+     * Fenced delivery half of {@link #notifyWriterAbortedAsync}: drops the
+     * callback if the recording generation moved on between the abort and
+     * this (arbitrarily delayed) dispatch — a trigger or close has taken
+     * over, and the listener's stop response would hit the WRONG recording.
+     * Package-private so the unit harness can exercise the fence
+     * deterministically.
+     */
+    void deliverWriterAbort(WriterAbortListener cb, long abortGeneration,
+                            String reason) {
+        if (recordingGeneration != abortGeneration) {
+            logger.warn("Writer-abort notification dropped — recording "
+                + "generation moved on (" + abortGeneration + " -> "
+                + recordingGeneration + "); a successor recording or close "
+                + "owns the lifecycle now");
+            return;
+        }
+        try {
+            cb.onWriterAborted(reason);
+        } catch (Throwable cbErr) {
+            logger.warn("WriterAbortListener threw: " + cbErr.getMessage());
+        }
+    }
     public void setWriterAbortListener(WriterAbortListener listener) {
         this.writerAbortListener = listener;
     }
@@ -356,19 +437,17 @@ public class HardwareEventRecorderGpu {
     private volatile boolean isWritingToFile = false;
     private final Object startStopLock = new Object();
     
-    // SOTA: Pre-record flush is now a streaming Cursor over the byte ring.
-    // The previous design deep-copied every pre-record packet onto the
-    // trigger thread (~50-180KB × N packets of fresh allocateDirect calls,
-    // 5-50ms native heap stalls during the burst) and queued them on
-    // {@code pendingFlushQueue}. The byte ring eliminates that copy: the
-    // drainer thread iterates the cursor and writes packets directly into
-    // {@code muxerWriteQueue} via the existing pooled MuxerPacket path.
-    // Cursor is set at trigger time, drained by drainEncoderInternal, and
-    // closed (releases the pin) when exhausted or aborted.
-    private volatile H264ByteRingBuffer.Cursor pendingFlushCursor = null;
-    /** Historical AAC staged by the trigger thread and queued only after the
-     * matching video cursor, preserving per-file origin and FIFO ordering. */
-    private volatile java.util.List<AacCircularBuffer.Packet> pendingAudioPreRecord = null;
+    // SOTA: Pre-record flush is a streaming Cursor over the byte ring,
+    // carried inside a single FLUSH_HISTORY control entry on
+    // {@code muxerWriteQueue}. The trigger thread pins the cursor and
+    // enqueues the job (no copies); the DISK WRITER thread streams the
+    // history from the ring straight into the muxer via a reusable buffer
+    // (processFlushHistoryJob) and closes the cursor (releasing the pin)
+    // when exhausted or aborted. The drainer thread never touches history
+    // packets, so a slow SD card cannot park the codec-drain loop behind
+    // the multi-second history write.
+    // True from trigger (job enqueued) until the writer completes the job;
+    // also the manual-replay mutual-exclusion signal.
     private volatile boolean flushInProgress = false;
     /** Manual replay reservation, held from the physical-key trigger through
      * post-roll collection and remux. It deliberately does not hold
@@ -380,9 +459,12 @@ public class HardwareEventRecorderGpu {
      * dashcam remain live while this gate is armed. */
     private volatile boolean awaitLiveMuxerKeyframe = false;
     private volatile long actualPreRecordDurationMs = 0;  // Actual duration of flushed pre-record buffer
-    /** Reusable BufferInfo for cursor reads. drainEncoderInternal is the
-     * sole consumer thread, so this can be reused without locking. */
-    private final MediaCodec.BufferInfo flushCursorInfo = new MediaCodec.BufferInfo();
+    /** Reusable read buffer + BufferInfo for FLUSH_HISTORY processing. The
+     * disk-writer thread is the sole consumer, so both can be reused without
+     * locking. The buffer grows to the largest history packet seen and is
+     * retained across jobs — one allocation per size step, not per packet. */
+    private ByteBuffer historyReadBuffer = null;
+    private final MediaCodec.BufferInfo historyReadInfo = new MediaCodec.BufferInfo();
 
     // SOTA: Muxer write queue — decouples encoder dequeue from SD card I/O.
     // The encoder dequeue loop copies frame data and releases the encoder buffer
@@ -429,6 +511,37 @@ public class HardwareEventRecorderGpu {
         // until the muxer starts.
         int trackKind = TRACK_KIND_VIDEO;
 
+        // FLUSH_HISTORY writer job (pre-record/slow-SD fix): a control
+        // entry carrying the pinned pre-record ring cursor and the staged
+        // historical AAC. Enqueued once per triggerEventRecording — at the
+        // queue head, after muxer.start(), before the live-recording gates
+        // open — and consumed by the DISK WRITER thread, which streams the
+        // history from the ring into the muxer via a reusable buffer. This
+        // moves the multi-MB history copy off the drainer thread so a slow
+        // SD card can never park the codec-drain loop (the GL-watchdog
+        // crash). A history job is never evicted by the drop policy and is
+        // never pooled; queue drains must close its cursor (releasing the
+        // ring pin) via discardQueuedPacket. `data` stays null.
+        H264ByteRingBuffer.Cursor historyCursor;
+        java.util.List<AacCircularBuffer.Packet> historyAudio;
+
+        // Writer-owned rotation: recording generation stamped at splice
+        // capture. The disk writer refuses a ticket whose generation is
+        // stale (recording closed / retriggered while the ticket was in
+        // flight). Only meaningful when trackKind == TRACK_KIND_ROTATE.
+        long rotateGeneration;
+
+        boolean isFlushHistory() {
+            return historyCursor != null || historyAudio != null;
+        }
+
+        /** Control entries are queue-order barriers/commands (FLUSH_HISTORY,
+         *  ROTATE) — never evicted by the drop policy and never written as
+         *  ordinary samples. */
+        boolean isControl() {
+            return isFlushHistory() || trackKind == TRACK_KIND_ROTATE;
+        }
+
         boolean isKeyFrame() {
             return (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
         }
@@ -444,6 +557,12 @@ public class HardwareEventRecorderGpu {
     // resolves them to the live trackIndex/audioTrackIndex at write time.
     private static final int TRACK_KIND_VIDEO = 0;
     private static final int TRACK_KIND_AUDIO = 1;
+    // Writer-owned rotation control ticket. Carries the splice frame's bytes;
+    // the disk writer swaps muxers when the ticket reaches the queue head and
+    // writes the carried frame as the new file's first sample (swap command +
+    // keyframe as ONE atomic queue entry — a rotated segment can never lose
+    // its splice frame to a drop policy or write it to the wrong muxer).
+    private static final int TRACK_KIND_ROTATE = 2;
 
     /**
      * Rebase a packet's PTS to be relative to the muxer's origin (first
@@ -999,10 +1118,15 @@ public class HardwareEventRecorderGpu {
      * for video, {@link #audioDropCount} for audio) so chronic SD stall
      * vs audio-producer-outpaces-consumer can be distinguished in logs.
      * Logged every 30 drops per kind.
+     *
+     * @return true if the packet entered the queue; false if it was dropped
+     *         (released back to the pool). Most callers may ignore this; the
+     *         initial-live-keyframe gate MUST NOT be cleared on a refused
+     *         IDR, so that call site checks it.
      */
-    private void offerMuxerPacket(MuxerPacket packet) {
+    private boolean offerMuxerPacket(MuxerPacket packet) {
         if (muxerWriteQueue.offer(packet)) {
-            return;
+            return true;
         }
         // Queue full. Walk once from the head, tracking:
         //   - oldestNonKeyframe (any track) — fallback eviction target
@@ -1015,6 +1139,14 @@ public class HardwareEventRecorderGpu {
         MuxerPacket oldestVideoNonKf = null;
         while (it.hasNext()) {
             MuxerPacket head = it.next();
+            if (head.isControl()) {
+                // Non-evictable control entry. A FLUSH_HISTORY job owns the
+                // pinned ring cursor (dropping it silently loses the whole
+                // pre-record window and leaks the pin); a ROTATE ticket owns
+                // the armed rotation (dropping it wedges the segment swap
+                // while rotationInFlight stays latched).
+                continue;
+            }
             if (!head.isKeyFrame()) {
                 if (oldestNonKf == null) oldestNonKf = head;
                 if (head.trackKind == TRACK_KIND_VIDEO && oldestVideoNonKf == null) {
@@ -1029,13 +1161,35 @@ public class HardwareEventRecorderGpu {
             }
         }
         MuxerPacket evicted = (oldestVideoNonKf != null) ? oldestVideoNonKf : oldestNonKf;
-        if (evicted != null) {
-            muxerWriteQueue.remove(evicted);
-        } else {
-            // All entries are keyframes — drop the oldest. This only happens
-            // under multi-second SD stalls; the recording will have a gap
-            // but the daemon stays alive.
-            evicted = muxerWriteQueue.pollFirst();
+        if (evicted != null && !muxerWriteQueue.remove(evicted)) {
+            // OWNERSHIP GATE: the disk writer dequeued this exact packet
+            // between our iterator scan and the remove — the writer owns it
+            // now (possibly mid-writeSampleData on its bytes). Recycling it
+            // here would hand the pool a buffer another producer could
+            // overwrite UNDER the writer's in-flight write. Not ours — and
+            // the writer's dequeue just freed a slot, so try admission
+            // BEFORE falling into the eviction below (otherwise a lost race
+            // needlessly drops a second frame).
+            evicted = null;
+            if (muxerWriteQueue.offer(packet)) {
+                return true;
+            }
+        }
+        if (evicted == null) {
+            // All entries are keyframes (or our candidate vanished) — drop
+            // the oldest NON-CONTROL entry (FLUSH_HISTORY jobs and ROTATE
+            // tickets must survive). remove(head) is the same ownership
+            // gate as above. This only happens under multi-second SD
+            // stalls; the recording will have a gap but the daemon stays
+            // alive.
+            java.util.Iterator<MuxerPacket> it2 = muxerWriteQueue.iterator();
+            while (it2.hasNext()) {
+                MuxerPacket head = it2.next();
+                if (!head.isControl() && muxerWriteQueue.remove(head)) {
+                    evicted = head;
+                    break;
+                }
+            }
         }
         if (evicted != null) {
             // Increment the per-kind counter for the evicted packet. Log
@@ -1055,8 +1209,56 @@ public class HardwareEventRecorderGpu {
             }
             releaseMuxerPacket(evicted);
         }
-        // Now there's space.
-        muxerWriteQueue.offer(packet);
+        // Now there's space (unless the queue is somehow all control jobs —
+        // at most one of each exists in practice; drop the incoming packet
+        // rather than leak its pooled buffer).
+        if (!muxerWriteQueue.offer(packet)) {
+            releaseMuxerPacket(packet);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Admission for control tickets (ROTATE). Unlike a data packet, a control
+     * ticket must never be silently released on a full queue — the caller
+     * retains ticket + arm and retries on the next video packet. Evicting ONE
+     * ordinary packet is the queue's normal drop-oldest policy applied at
+     * rotation time (preferring the oldest video non-keyframe, mirroring
+     * {@link #offerMuxerPacket}), so a full queue almost never refuses
+     * admission; refusal is only possible if the queue is somehow entirely
+     * control entries or an eviction race refills it.
+     *
+     * @return true if the ticket entered the queue (ticket ownership
+     *         transferred to the queue); false if admission failed (caller
+     *         keeps the ticket and the arm).
+     */
+    private boolean offerControlToQueue(MuxerPacket ctrl) {
+        if (muxerWriteQueue.offer(ctrl)) {
+            return true;
+        }
+        java.util.Iterator<MuxerPacket> it = muxerWriteQueue.iterator();
+        MuxerPacket victim = null;
+        MuxerPacket videoVictim = null;
+        while (it.hasNext()) {
+            MuxerPacket head = it.next();
+            if (head.isControl()) continue;
+            if (victim == null) victim = head;
+            if (head.trackKind == TRACK_KIND_VIDEO && !head.isKeyFrame()) {
+                videoVictim = head;
+                break;
+            }
+        }
+        MuxerPacket evicted = (videoVictim != null) ? videoVictim : victim;
+        if (evicted != null && muxerWriteQueue.remove(evicted)) {
+            if (evicted.trackKind == TRACK_KIND_AUDIO) {
+                audioDropCount.incrementAndGet();
+            } else {
+                muxerDropCount.incrementAndGet();
+            }
+            releaseMuxerPacket(evicted);
+        }
+        return muxerWriteQueue.offer(ctrl);
     }
     private volatile boolean diskWriterRunning = false;
     private Thread diskWriterThread;
@@ -1098,6 +1300,14 @@ public class HardwareEventRecorderGpu {
     // abort the stop-before-close ordering exists to prevent. Same shape as
     // drainerRestartSuppressed (release()'s permanent-stop latch).
     private volatile boolean drainerSuppressedForCameraClose = false;
+
+    // TERMINAL latch (audit follow-up): set when EITHER worker (codec drainer,
+    // disk writer) fails its verified stop. A wedged worker cannot be recovered
+    // in-process, so this instance must never accept another recording trigger:
+    // a new muxer built over the un-stopped old one would "record" with no
+    // healthy workers and report success while frames pile into a dead pipeline.
+    // Never cleared — the instance rides out the pending trip-safe restart.
+    private volatile boolean teardownWedged = false;
     
     // SOTA: Flag to disable pre-record buffer for stream-only encoders
     private boolean usePreRecordBuffer = true;
@@ -1145,6 +1355,24 @@ public class HardwareEventRecorderGpu {
     private volatile boolean recording = false;
     private String outputPath;
     private File tempFile;
+    /** Controls who may initiate Telegram upload when this clip finalizes. */
+    public enum VideoUploadPolicy {
+        AUTOMATIC,
+        SURVEILLANCE_GATED;
+
+        /** Pure policy check kept Android-runtime independent for local tests. */
+        boolean shouldAutoUpload(String fileName) {
+            if (this != AUTOMATIC) return false;
+            if (fileName == null) return true;
+            String name = fileName;
+            int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+            if (slash >= 0 && slash + 1 < name.length()) {
+                name = name.substring(slash + 1);
+            }
+            return !name.startsWith("event_");
+        }
+    }
+    private VideoUploadPolicy videoUploadPolicy = VideoUploadPolicy.AUTOMATIC;
     private int recordedFrames = 0;
     private long firstFramePtsUs = -1;   // PTS of first frame written to muxer
     private long lastFramePtsUs = -1;    // PTS of last frame written to muxer
@@ -1198,8 +1426,9 @@ public class HardwareEventRecorderGpu {
     // also starts at 0 in its own muxer.
     private long ptsOriginUs = -1;
     
-    // Segment rotation
-    private long segmentStartTime = 0;
+    // Segment rotation. volatile: the disk writer resets it at the swap
+    // (writer-owned rotation) while the drainer reads it on every tick.
+    private volatile long segmentStartTime = 0;
     // Live, per-instance clip segment length. Seeded from the shared default
     // (2 min) and overridden via setSegmentDurationMs() — both recording axes
     // read recording.segmentDurationMinutes and push it here at encoder init,
@@ -1213,27 +1442,103 @@ public class HardwareEventRecorderGpu {
     // holds startStopLock) and producing a near-empty middle segment with
     // bad PTS bookkeeping (firstFramePtsUs == -1 fallback).
     private static final long ROTATE_DEBOUNCE_MS = 1000L;
-    // Max wall-clock the segment rotation will spend writing the queued backlog
-    // into the OLD (about-to-be-finalized) muxer before giving up and dropping
-    // the remainder. This drain (in rotateSegmentLocked) runs on the DRAINER
-    // thread under muxerLock and does blocking writeSampleData calls; if a
-    // stalled USB/SD write makes them block, the drainer stops dequeuing the
-    // encoder, the encoder input Surface fills, the GL thread blocks in
-    // eglSwapBuffers, and the 3s GL watchdog (PanoramicCameraGpu
-    // GL_THREAD_TIMEOUT_MS) force-restarts the process — truncating the clip
-    // and leaving a .broken stub (the field-observed "records then stops after
-    // a few seconds while driving"). Capping the drain far below the 3s
-    // watchdog turns a storage stall into a sub-second gap at the 2-minute
-    // segment seam instead of a process kill. Healthy rotations drain a handful
-    // of frames in well under 1 ms, so this budget is never reached in normal
-    // operation.
-    private static final long ROTATE_DRAIN_BUDGET_MS = 200L;
+    // ==================== Writer-owned rotation ====================
+    // Rotation no longer executes on the DRAINER thread. rotateSegment()
+    // (drainer 2-min tick or forceSegmentRotation HTTP path) is a pure,
+    // non-blocking ARM: it CASes rotationInFlight, stamps the arm clock and
+    // requests a sync frame — no I/O, no muxerLock. The drainer then packages
+    // the next keyframe (or, past ROTATION_SPLICE_DEADLINE_MS, any video
+    // frame) as a TRACK_KIND_ROTATE control packet carrying the splice
+    // frame's bytes, and the DISK WRITER executes the swap when that ticket
+    // reaches the queue head. FIFO guarantees every old-segment packet has
+    // already been written to the old muxer, so nothing is drained and
+    // nothing is dropped at the seam. The old ROTATE_DRAIN_BUDGET_MS backlog
+    // drain (bounded writeSampleData on the drainer under muxerLock — the
+    // residual GL-watchdog trigger under storage stall: the budget only
+    // bounded BETWEEN-write checks, never lock acquisition behind the
+    // writer's in-flight writeSampleData, nor the MediaMuxer fd-open on a
+    // wedged card) is gone entirely. A storage stall now degrades to delayed
+    // rotation / dropped frames while the drainer keeps consuming codec
+    // output and eglSwapBuffers keeps flowing.
+    //
+    // Ownership protocol for rotationInFlight: whoever CASes false→true owns
+    // the arm. Ownership transfers to the queued ROTATE ticket at splice
+    // capture (rotationAwaitingSplice→false), and the DISK WRITER clears the
+    // flag after the swap (success, rollback, or stale-ticket discard).
+    // Teardown paths (closeEventRecording, writer abort, trigger boundary
+    // reset) clear it for arms whose ticket never reached the writer. There
+    // is deliberately NO finally-reset in rotateSegment(): an armed rotation
+    // must survive the method's return.
+
+    // Re-request the sync frame if the splice keyframe hasn't arrived within
+    // this window (encoder hiccup / dropped setParameters). Paced by
+    // rotationLastSyncReqMs, which resets on every re-request.
+    private static final long ROTATION_SYNC_REREQUEST_MS = 5_000L;
+    // Hard deadline, measured from rotationArmedAtMs (which never moves
+    // during an arm): past this, the drainer splices on the NEXT video
+    // packet even if it is not a keyframe. The new segment then starts with
+    // P-frames referencing the previous file (degraded but bounded — an
+    // immediate re-request shortens the window to ~1 GOP) instead of the
+    // segment growing without bound behind an encoder that never honors the
+    // sync-frame request.
+    private static final long ROTATION_SPLICE_DEADLINE_MS = 10_000L;
+    // After a failed writer-side rotation (muxer construct/start/first
+    // write), push segmentStartTime forward so the drainer tick re-arms in
+    // ~5 s instead of on every ~16 ms loop pass (field logs showed
+    // back-to-back "Rotating segment 0" retries during an SD stall).
+    private static final long ROTATION_RETRY_BACKOFF_MS = 5_000L;
+    // Arm state. rotationAwaitingSplice is the drainer's cue to capture a
+    // splice frame; rotationArmedAtMs anchors the ABSOLUTE deadline;
+    // rotationLastSyncReqMs paces sync-frame re-requests. Both timestamps
+    // are SystemClock.elapsedRealtime() (monotonic) — wall-clock corrections
+    // must not stretch the deadline.
+    private volatile boolean rotationAwaitingSplice = false;
+    private volatile long rotationArmedAtMs = 0;
+    private volatile long rotationLastSyncReqMs = 0;
+    // Set by forceSegmentRotation, consumed by the disk writer after a
+    // successful swap: the "did the new segment actually get the audio
+    // track" verification must read POST-swap state (the old synchronous
+    // check right after rotateSegment() returned read the OLD segment's
+    // audioTrackIndex once rotation became asynchronous).
+    private volatile boolean pendingForceAudioVerify = false;
+    // TWO-EPOCH SPLIT. Rotation-ticket invalidation and listener-callback
+    // ownership have DIFFERENT lifetimes and need separate counters:
+    //
+    // recordingGeneration — ROTATE ticket validity. Bumped at trigger commit
+    // and at close ENTRY: a pending swap must die the moment close begins
+    // (a blocked writer holding an already-dequeued ticket must not commit
+    // a rotation into a closing/successor recording).
+    private volatile long recordingGeneration = 0;
+    // Single-owner guard for listenerGeneration during a close: true from
+    // close entry until close performs its own post-wait bump (or aborts on
+    // a wedged worker, bumping inline). The drainer's writer-abort branch
+    // defers its bump while this is set — an independent abort bump landing
+    // during close's waits would drop the very callbacks those waits exist
+    // to deliver.
+    private volatile boolean closeInProgress = false;
+    // LEAF monitor making listener-epoch lifecycle transitions atomic. The
+    // abort branch's {read closeInProgress, bump} and close's {set flag} /
+    // {bump, clear flag} are check-then-act pairs — as bare volatile ops the
+    // drainer could read the flag as false, close could set it, and the
+    // abort bump would still land inside close's wait window (the exact
+    // dropped-valid-callback race the flag exists to prevent). Every
+    // listenerGeneration transition and every closeInProgress write happens
+    // under this lock; NOTHING blocking ever runs inside it, and no other
+    // lock is ever taken while holding it.
+    private final Object listenerEpochLock = new Object();
+    // listenerGeneration — segment-closed callback ownership. Bumped at
+    // trigger commit and in close only AFTER the finalizer waits: a
+    // finalizer that completes DURING those waits belongs to the closing
+    // recording and its callback MUST be delivered (that is what the waits
+    // are for — the engine registers the last rotated segment's metadata
+    // through it). Only a finalizer that OVERRUNS both bounded waits, or
+    // survives into a successor recording, gets its callback dropped.
+    // Bumping this at close entry (the single-counter design) silently
+    // discarded the final segment's surveillance metadata on every
+    // rotation-adjacent close.
+    private volatile long listenerGeneration = 0;
     // CAS gate shared by every rotateSegment() caller (natural drainer tick +
-    // forceSegmentRotation HTTP path). Whoever flips false→true does the
-    // rotation; concurrent callers observe true and bail. Reset in finally
-    // inside rotateSegment so a thrown exception doesn't permanently lock
-    // future rotations. Closes the window where a force fires within ~50ms
-    // of a natural tick and produces an empty middle segment.
+    // forceSegmentRotation HTTP path). See ownership protocol above.
     private final java.util.concurrent.atomic.AtomicBoolean rotationInFlight =
         new java.util.concurrent.atomic.AtomicBoolean(false);
     private int segmentNumber = 0;
@@ -1264,8 +1569,8 @@ public class HardwareEventRecorderGpu {
     private volatile long   startGeoAgeMs = -1L;
     private volatile long   startGeoCapturedAtMs = 0L;
 
-    // Snapshot of the JUST-CLOSED segment's start-geo, captured inside
-    // rotateSegmentLocked() before the active fields above are overwritten
+    // Snapshot of the JUST-CLOSED segment's start-geo, captured inside the
+    // writer-side rotation handler before the active fields are overwritten
     // for the new segment. The engine's segment listener reads these via
     // getClosedStartGeo*() so the closed segment's sidecar carries the GPS
     // fix from the time IT began, not the time the next segment begins.
@@ -1381,6 +1686,27 @@ public class HardwareEventRecorderGpu {
      * @throws Exception if initialization fails
      */
     public void init() throws Exception {
+        // TERMINAL latch (audit follow-up): a worker on this instance failed its
+        // verified stop. Re-initialising would build a fresh codec whose new
+        // workers hide the wedged original from every close guard — the instance
+        // must ride out the pending trip-safe restart instead.
+        if (teardownWedged) {
+            throw new IllegalStateException("encoder instance is terminal (worker "
+                + "wedged during teardown) — refusing re-init; trip-safe restart pending");
+        }
+        // Reinit latch reset. release() leaves drainerRestartSuppressed
+        // latched (its job: make release's FINAL drainer stop stick across
+        // closeEventRecording's restart). This instance is now being
+        // LEGITIMATELY re-initialized — PanoramicCameraGpu's surface-loss
+        // recovery deliberately runs release() + init() on the SAME object —
+        // and a sticky latch would make startDrainerThread refuse forever:
+        // encoder output never drains, the input surface fills, and the GL
+        // thread re-enters the exact eglSwapBuffers stall this whole effort
+        // exists to prevent. Camera-close suppression is equally stale after
+        // a full release; the terminal latch above is the ONLY suppression
+        // meant to survive re-init.
+        drainerRestartSuppressed = false;
+        drainerSuppressedForCameraClose = false;
         logger.info( String.format("Initializing: %dx%d @ %dfps, %d Mbps, codec=%s",
                 width, height, fps, bitrate / 1_000_000,
                 codecMimeType.equals(MediaFormat.MIMETYPE_VIDEO_HEVC) ? "H.265" : "H.264"));
@@ -2232,9 +2558,11 @@ public class HardwareEventRecorderGpu {
      * up the audio track).
      *
      * <p>No-op if no recording is in flight. Holds {@link #startStopLock}
-     * to serialize against start/stop entry points; the inner
-     * {@link #rotateSegment()} acquires {@link #muxerLock} per the
-     * documented lock ordering.
+     * to serialize against start/stop entry points. The inner
+     * {@link #rotateSegment()} is a non-blocking ARM (writer-owned
+     * rotation): the actual swap executes on the disk writer when the
+     * splice frame's ROTATE ticket reaches the queue head, so this method
+     * returns before the new segment exists.
      */
     public void forceSegmentRotation() {
         synchronized (startStopLock) {
@@ -2249,31 +2577,19 @@ public class HardwareEventRecorderGpu {
                 logger.warn("forceSegmentRotation skipped — no segmentBasePath (recording mid-init)");
                 return;
             }
-            // Debounce against the natural-rotation path. The drainer's
-            // 2-minute tick calls rotateSegment() WITHOUT startStopLock,
-            // so a force here can interleave: both paths pre-construct a
-            // new MediaMuxer off-lock and then swap in sequence, producing
-            // an empty/near-empty middle segment with PTS bookkeeping in
-            // its initial state (firstFramePtsUs == -1).
+            // Debounce against the natural-rotation path (a force landing
+            // right after a natural rotation would produce an empty/near-
+            // empty middle segment).
             //
-            // Briefly take muxerLock just to read segmentStartTime
-            // atomically against rotateSegment's swap (which writes
-            // segmentStartTime under muxerLock). Release before calling
-            // rotateSegment(), which acquires muxerLock itself per the
-            // documented lock ordering — we don't want to hold muxerLock
-            // across the rotateSegment call (rotateSegment's body assumes
-            // it can pre-construct the new muxer OFF the lock and then
-            // briefly enter the lock; nesting would defeat that).
-            //
-            // Lock ordering: recordingLock → startStopLock → muxerLock.
-            // We're already holding startStopLock; taking muxerLock here
-            // is consistent.
-            final long sinceLastRotate;
-            synchronized (muxerLock) {
-                sinceLastRotate = (segmentStartTime > 0)
-                        ? (System.currentTimeMillis() - segmentStartTime)
-                        : Long.MAX_VALUE;
-            }
+            // Plain volatile read — deliberately NO muxerLock here. This
+            // thread holds startStopLock; the disk writer can hold muxerLock
+            // across a blocking writeSampleData on wedged storage, so taking
+            // muxerLock just to read a volatile would park the HTTP thread
+            // (and everything queued behind startStopLock — including stop
+            // paths) for the duration of the stall.
+            final long sinceLastRotate = (segmentStartTime > 0)
+                    ? (System.currentTimeMillis() - segmentStartTime)
+                    : Long.MAX_VALUE;
             if (sinceLastRotate < ROTATE_DEBOUNCE_MS) {
                 logger.info("forceSegmentRotation debounced — last rotation "
                         + sinceLastRotate + "ms ago (< " + ROTATE_DEBOUNCE_MS
@@ -2281,45 +2597,17 @@ public class HardwareEventRecorderGpu {
                 return;
             }
             logger.info("forceSegmentRotation: wrapping current segment so the next one carries audio");
+            // Rotation is asynchronous (writer-owned): raise the verification
+            // flag BEFORE arming, so the DISK WRITER runs the "did the new
+            // segment actually get its audio track" check against POST-swap
+            // state and schedules the 1.5s follow-up rotation if not (see
+            // scheduleForceAudioFollowUp). If the CAS inside rotateSegment
+            // loses to an in-flight natural arm, that rotation's swap runs
+            // the verification instead — same outcome. The old synchronous
+            // check here read the OUTGOING segment's audioTrackIndex and
+            // missed a failed addTrack on the new muxer entirely.
+            pendingForceAudioVerify = true;
             rotateSegment();
-
-            // After rotation, verify the new segment actually got the audio
-            // track. If not (CAS lost to a concurrent natural rotation that
-            // pre-constructed its muxer while audioConfig was briefly null,
-            // or the audio config is in a stale window mid-reconfigure),
-            // schedule one follow-up rotation 1.5s later. By then either
-            // (a) the next AAC DATA packet has triggered the
-            // identity-changed replay path in AacIngestServer and audio is
-            // wired up, or (b) audio is genuinely gone again (config null)
-            // and the follow-up is a no-op.
-            //
-            // Daemon thread so JVM shutdown isn't blocked on the sleep.
-            // Single-shot — no spin if the second attempt also misses.
-            if (audioTrackIndex < 0 && hasAudioConfig()) {
-                logger.info("forceSegmentRotation: new segment has no audio track — scheduling 1.5s follow-up");
-                Thread followup = new Thread(new Runnable() {
-                    @Override public void run() {
-                        try {
-                            Thread.sleep(1500);
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                            return;
-                        }
-                        synchronized (startStopLock) {
-                            if (!isWritingToFile) return;
-                            // Already wired up by the next natural rotation
-                            // tick or by another forceSegmentRotation call.
-                            if (audioTrackIndex >= 0) return;
-                            // Audio gone again — nothing to gain by rotating.
-                            if (!hasAudioConfig()) return;
-                            rotateSegment();
-                            logger.info("forceSegmentRotation follow-up fired");
-                        }
-                    }
-                }, "ForceRotateFollowup");
-                followup.setDaemon(true);
-                followup.start();
-            }
         }
     }
 
@@ -2433,6 +2721,16 @@ public class HardwareEventRecorderGpu {
      * @return true if started successfully, false otherwise
      */
     public boolean triggerEventRecording(String outputPath, long postRecordDurationMs) {
+        return triggerEventRecording(outputPath, postRecordDurationMs,
+                VideoUploadPolicy.AUTOMATIC);
+    }
+
+    /**
+     * Trigger event recording with an explicit Telegram upload owner.
+     * SURVEILLANCE_GATED clips are emitted later by SurveillanceEngineGpu.
+     */
+    public boolean triggerEventRecording(String outputPath, long postRecordDurationMs,
+            VideoUploadPolicy uploadPolicy) {
         // Format barrier (LOCK-FREE): refuse to build a muxer until the encoder
         // has published its OUTPUT_FORMAT_CHANGED. Run BEFORE startStopLock
         // entry so a 2-s busy poll doesn't block concurrent stopEventRecording
@@ -2449,6 +2747,17 @@ public class HardwareEventRecorderGpu {
         // the muxer closes with trackIndex=-1 and zero samples — a ~168 KB
         // file with no mvhd duration that players extrapolate as multi-minute
         // garbage.
+        // TERMINAL latch (audit follow-up): a worker (codec drainer / disk
+        // writer) failed its verified stop and this instance is unrecoverable —
+        // a trip-safe restart is in flight. Building a new muxer here would
+        // overwrite the un-stopped old one and report "recording" with no
+        // healthy workers behind it (frames pile up, GL backpressures, and the
+        // caller believes the event was captured).
+        if (teardownWedged) {
+            logger.error("triggerEventRecording REFUSED — encoder teardown wedged "
+                + "(terminal); awaiting trip-safe process restart");
+            return false;
+        }
         if (savedFormat == null) {
             if (!waitForFormat(2000) || savedFormat == null) {
                 logger.error("triggerEventRecording: encoder hasn't published format "
@@ -2465,6 +2774,99 @@ public class HardwareEventRecorderGpu {
         // start request for that long is acceptable — the alternative is the
         // duplicate-files-on-disk bug.
         synchronized (startStopLock) {
+            // RE-CHECK the terminal latch under the lock (audit follow-up): the
+            // unlocked check above is a fast-path only. A camera-close teardown
+            // can wedge and set the latch between that check and this lock
+            // acquisition — and stopDrainerForCameraClose now serializes on this
+            // same lock, so once we hold it the latch is stable for the whole
+            // muxer build.
+            if (teardownWedged) {
+                logger.error("triggerEventRecording REFUSED (locked re-check) — "
+                    + "encoder teardown wedged (terminal)");
+                return false;
+            }
+            // WRITER-ABORT RECLAIM + RECOVERY (pre-existing gap). A disk-
+            // writer abort leaves the failed recording's muxer/fd DANGLING:
+            // the drainer's abort branch only flips flags, the owner's stop
+            // then short-circuits on those cleared flags, and the async
+            // abort listener's quarantine no-ops the same way when the
+            // drainer got there first. Nothing else creates a disk writer
+            // outside startDrainerThread, so without this block every later
+            // trigger would either record with NO disk consumer (zero bytes
+            // reach the muxer, and Proximity Guard has no wedge watchdog to
+            // notice) or silently overwrite the dangling muxer reference —
+            // leaking the native handle and leaving the half-written
+            // .mp4.tmp until the orphan sweep.
+            //
+            // ORDER MATTERS — reclaim BEFORE the already-recording check
+            // below: if the abort latched while isWritingToFile is still
+            // true (the drainer hasn't ticked), that recording is doomed —
+            // close it properly NOW (closeEventRecording quarantines via
+            // writerAbortedCorrupt and its tail restarts the workers).
+            // Restarting the writer first and then bouncing off "already in
+            // progress" would resume a fresh writer against the dead fd,
+            // with the reset abort latch disarming the drainer branch that
+            // would have stopped it.
+            if (writerAbortedCorrupt) {
+                if (isWritingToFile) {
+                    logger.warn("Trigger found a writer-aborted recording still "
+                        + "open — closing/quarantining it before starting the "
+                        + "new one");
+                    closeEventRecording();
+                    if (teardownWedged) {
+                        logger.error("triggerEventRecording REFUSED — reclaim "
+                            + "close wedged (terminal)");
+                        return false;
+                    }
+                } else {
+                    // Flags already cleared by the drainer branch; only the
+                    // dangling muxer/tmp remain. JOIN the dying writer FIRST:
+                    // after latching the abort it still drains/recycles the
+                    // queue before its loop exits, so it can be alive here
+                    // for a beat — the restart below would race that
+                    // isAlive() window and spuriously refuse (sticky guard),
+                    // failing the trigger for a writer that is milliseconds
+                    // from a clean exit. stopDiskWriterThread's verified
+                    // join is instant on a dead thread and also guarantees
+                    // writer quiescence before the quarantine touches the
+                    // muxer. A genuine join failure latches teardownWedged —
+                    // caught right after, refusing the trigger correctly.
+                    synchronized (drainerLock) {
+                        stopDiskWriterThread();
+                    }
+                    if (teardownWedged) {
+                        logger.error("triggerEventRecording REFUSED — dying "
+                            + "disk writer failed its join (terminal)");
+                        return false;
+                    }
+                    quarantineAbortedMuxer();
+                }
+            }
+            // Verified running disk writer, restarting if the abort killed
+            // it (the reclaim-close above usually already restarted the
+            // workers via its tail). startDiskWriterThread resets the abort
+            // latch for the fresh writer — which matters because this
+            // trigger may target a NEW volume (the SD-watchdog's internal-
+            // storage failover). If the PREVIOUS writer is wedged-alive, the
+            // sticky guard refuses the replacement — refuse the trigger
+            // rather than record into a void. drainerLock matches
+            // startDiskWriterThread's existing callers (startStopLock →
+            // drainerLock is the established order via closeEventRecording).
+            if (!diskWriterRunning) {
+                synchronized (drainerLock) {
+                    if (!diskWriterRunning) {
+                        logger.warn("Trigger found disk writer not running "
+                            + "(prior abort) — restarting it");
+                        startDiskWriterThread();
+                    }
+                }
+                if (!diskWriterRunning) {
+                    logger.error("triggerEventRecording REFUSED — disk writer "
+                        + "could not be restarted (previous writer wedged); "
+                        + "recording would have no disk consumer");
+                    return false;
+                }
+            }
             if (isWritingToFile) {
                 // Already recording — caller (proximity controller / sentry
                 // engine) owns the actual stop schedule. We just no-op here;
@@ -2483,8 +2885,17 @@ public class HardwareEventRecorderGpu {
                         + "will start live and may omit its pre-trigger window");
             }
 
+        // FLUSH_HISTORY locals (pre-record/slow-SD fix). Declared OUTSIDE the
+        // try so the catch can close a cursor that was pinned but never handed
+        // to the disk writer's queue. Both are nulled at handoff — after that,
+        // the queued job owns the cursor and every queue drain closes it.
+        H264ByteRingBuffer.Cursor historyCursor = null;
+        java.util.List<AacCircularBuffer.Packet> stagedHistoryAudio = null;
+
         try {
             this.outputPath = outputPath;
+            this.videoUploadPolicy = uploadPolicy != null
+                    ? uploadPolicy : VideoUploadPolicy.AUTOMATIC;
             
             // Write to temp file during recording
             tempFile = new File(outputPath + ".tmp");
@@ -2522,7 +2933,6 @@ public class HardwareEventRecorderGpu {
             lastSourcePtsUs = -1;
             lastAudioPtsUs = -1L;
             awaitLiveMuxerKeyframe = false;
-            pendingAudioPreRecord = null;
             // Seed the disk-write clock at segment open so the wedge ticker's
             // grace window is measured from "muxer just opened," not a stale
             // prior-session value — a fresh segment must never be judged a
@@ -2633,22 +3043,20 @@ public class HardwareEventRecorderGpu {
                     double preRecordDuration = Math.max(0L,
                             cursor.getEndPtsUs() - cursor.getStartPtsUs()) / 1_000_000.0;
                     actualPreRecordDurationMs = (long) (preRecordDuration * 1000);
-                    pendingFlushCursor = cursor;
+                    historyCursor = cursor;
                     logger.info(String.format(
                         "Pre-record flush armed: %d packets (%.1f sec, %.1f MB) — streaming via cursor",
                         cursor.remaining(), preRecordDuration, flushBytes / 1024.0 / 1024.0));
                 } else {
                     logger.warn("Pre-record flush skipped — no keyframe in buffer");
-                    pendingFlushCursor = null;
                 }
             }
 
-            // Stage historical AAC, but do not queue it here. The drainer must
-            // enqueue every selected video packet first so writeRebased seeds
+            // Stage historical AAC, but do not queue it here. The disk writer
+            // writes every selected video packet first so writeRebased seeds
             // the shared PTS origin before writeRebasedAudio sees old AAC. The
             // youngest AAC PTS anchors filtering without assuming clock parity
             // between the app and daemon processes.
-            pendingAudioPreRecord = null;
             if (audioConfig != null && manualClipExportInProgress
                     && !videoPreRecordCursorAcquired) {
                 // The accepted replay still needs the historical AAC packets.
@@ -2690,7 +3098,7 @@ public class HardwareEventRecorderGpu {
                         }
                         filteredPackets.add(ap);
                     }
-                    pendingAudioPreRecord = filteredPackets;
+                    stagedHistoryAudio = filteredPackets;
                     logger.info("Audio pre-record staged: " + filteredPackets.size()
                         + " packets, " + filtered + " filtered as out-of-window"
                         + " (window=" + preRecordDurationSeconds + "s, anchor="
@@ -2704,13 +3112,56 @@ public class HardwareEventRecorderGpu {
                 }
             }
 
-            // Publish the video cursor before the writer gate. The drainer
-            // always queues it, then pendingAudioPreRecord, then live output.
-            flushInProgress = pendingFlushCursor != null;
+            // FLUSH_HISTORY (pre-record/slow-SD fix): hand the pinned video
+            // cursor + staged AAC to the disk writer as ONE non-evictable
+            // control job, enqueued at the queue HEAD while the recording
+            // gates are still closed — so it is ordered ahead of every live
+            // packet of this event. The WRITER thread streams the history
+            // from the ring straight into the muxer via a reusable buffer;
+            // the drainer never copies history packets, so a slow SD card
+            // can no longer park the codec-drain loop behind the multi-
+            // second history write (the GL-watchdog crash this fixes).
+            // flushInProgress stays true until the writer completes the job;
+            // it remains the manual-replay mutual-exclusion signal.
+            if (historyCursor != null) {
+                MuxerPacket historyJob = new MuxerPacket();
+                historyJob.historyCursor = historyCursor;
+                historyJob.historyAudio = stagedHistoryAudio;
+                flushInProgress = true;
+                if (muxerWriteQueue.offerFirst(historyJob)) {
+                    // Queue owns the cursor from here (drains close it).
+                    historyCursor = null;
+                    stagedHistoryAudio = null;
+                } else {
+                    // Queue full at trigger time (cannot happen in practice:
+                    // the previous close drained it). Degrade to live-only.
+                    logger.warn("History job enqueue failed — queue full; "
+                        + "recording starts live-only");
+                    historyCursor.close();
+                    historyCursor = null;
+                    stagedHistoryAudio = null;
+                    flushInProgress = false;
+                }
+            } else {
+                flushInProgress = false;
+            }
             startTimeNs = System.nanoTime();
             segmentStartTime = System.currentTimeMillis();
             segmentNumber = 0;
             segmentBasePath = outputPath.replaceAll("\\.mp4$", "");
+            // Writer-owned rotation boundary reset: reclaim any leftover arm
+            // from a previous recording and step BOTH epochs — a stale
+            // ROTATE ticket (e.g. one a blocked writer dequeued during the
+            // previous close) can never rotate this fresh recording, and a
+            // straggler finalizer callback from the previous recording can
+            // never mutate this one's engine state.
+            rotationAwaitingSplice = false;
+            pendingForceAudioVerify = false;
+            rotationInFlight.set(false);
+            recordingGeneration++;
+            synchronized (listenerEpochLock) {
+                listenerGeneration++;
+            }
             awaitLiveMuxerKeyframe = true;
             isWritingToFile = true;
             recording = true;
@@ -2747,11 +3198,14 @@ public class HardwareEventRecorderGpu {
         } catch (Exception e) {
             logger.error("Failed to trigger event recording", e);
             awaitLiveMuxerKeyframe = false;
-            H264ByteRingBuffer.Cursor failedCursor = pendingFlushCursor;
-            pendingFlushCursor = null;
-            pendingAudioPreRecord = null;
-            flushInProgress = false;
-            if (failedCursor != null) failedCursor.close();
+            // Close a cursor that was pinned but never handed to the queue.
+            // If the job WAS enqueued (historyCursor already null), the
+            // writer processes it against the now-released muxer: every
+            // write no-ops and the job's finally closes the cursor.
+            if (historyCursor != null) {
+                historyCursor.close();
+                flushInProgress = false;
+            }
             // Best-effort cleanup so a partial init doesn't leave a muxer alive
             // referencing a now-orphaned tmp file.
             synchronized (muxerLock) {
@@ -2896,9 +3350,9 @@ public class HardwareEventRecorderGpu {
         return !Double.isNaN(startGeoLat) && !Double.isNaN(startGeoLng);
     }
 
-    // Closed-segment geo (set by rotateSegmentLocked just before the active
-    // fields are refreshed). The engine's segment listener reads these to
-    // populate the OUTGOING segment's sidecar.
+    // Closed-segment geo (set by the writer-side rotation handler just
+    // before the active fields are refreshed). The engine's segment listener
+    // reads these to populate the OUTGOING segment's sidecar.
     public double getClosedStartGeoLat() { return closedStartGeoLat; }
     public double getClosedStartGeoLng() { return closedStartGeoLng; }
     public float  getClosedStartGeoAccuracy() { return closedStartGeoAccuracy; }
@@ -2949,8 +3403,14 @@ public class HardwareEventRecorderGpu {
         // last segment's frames on shutdown.
         //
         // Correct order:
+        //   0. Invalidate rotation (arm + generation) so no NEW writer-side
+        //      swap can commit while this close is in progress.
         //   1. Wait for any in-flight rotation finalizers (audit Finding R1).
-        //   2. Stop drainer thread (waits for current drain cycle to finish)
+        //   2. Stop drainer + disk writer (waits for current cycles to finish)
+        //   2b. Wait AGAIN for finalizers — a rotation that committed between
+        //       step 1 and the writer's stop spawned a NEW finalizer that the
+        //       first wait never saw. Once the writer is stopped no further
+        //       rotation can commit, so this second wait is exhaustive.
         //   3. Do one final synchronous drain WITH isWritingToFile still true
         //   4. THEN set isWritingToFile=false and close the muxer
         //
@@ -2959,6 +3419,37 @@ public class HardwareEventRecorderGpu {
         // for the previous segment AFTER the close path had already torn
         // down the active recording, leaving cleanup in the wrong state.
         // 2-second budget is generous; finalizer should complete in <500 ms.
+
+        // Step 0: rotation-TICKET invalidation at ENTRY (not just inside the
+        // muxer lock section far below). Bumping recordingGeneration here
+        // makes every ticket armed before this point stale — a blocked
+        // writer holding an already-dequeued ticket fails its generation
+        // re-check instead of committing a swap mid-close. The lock-section
+        // disarm further below stays (it reclaims flags from any arm that
+        // lands in the entry→lock window; such an arm's ticket can only
+        // execute before the writer stops, and the second finalizer wait
+        // below covers that commit).
+        //
+        // Deliberately NOT bumped here: listenerGeneration. In-flight
+        // finalizer CALLBACKS remain valid through the waits below — the
+        // step-1/2b waits exist precisely so the closing recording's last
+        // rotation callback can land (it registers the final segment's
+        // surveillance metadata). listenerGeneration bumps after step 2b.
+        //
+        // closeInProgress makes CLOSE the single owner of that epoch for the
+        // duration of this window: the drainer's writer-abort branch defers
+        // to it (a concurrent abort bump during our waits would re-create
+        // exactly the dropped-valid-callback bug the two-epoch split fixed).
+        // Set under the epoch lock so the flag flip is atomic against the
+        // abort branch's check+bump.
+        synchronized (listenerEpochLock) {
+            closeInProgress = true;
+        }
+        rotationAwaitingSplice = false;
+        pendingForceAudioVerify = false;
+        rotationInFlight.set(false);
+        recordingGeneration++;
+
         if (!waitForFinalizers(2_000)) {
             logger.warn("closeEventRecording proceeding with finalizers still in flight");
         }
@@ -2968,8 +3459,71 @@ public class HardwareEventRecorderGpu {
         // Step 1: Stop drainer thread BEFORE touching the muxer.
         // The drainer may be in the middle of muxer.writeSampleData() — 
         // calling muxer.stop() concurrently corrupts the MP4 (broken moov atom).
-        stopDrainerThread();
-        
+        if (!stopDrainerThread()) {
+            // WEDGED worker (audit follow-up): the codec drainer or the disk
+            // writer is still alive — possibly inside dequeueOutputBuffer or
+            // writeSampleData — which makes every next step of this close unsafe:
+            //   - the final synchronous drain would be a SECOND concurrent
+            //     dequeuer on the same codec;
+            //   - muxer.stop() under a mid-write worker corrupts the moov atom;
+            //   - startDrainerThread() would re-raise the shared drainerRunning
+            //     flag and reactivate the wedged loop when its native call
+            //     returns (two drainers on one codec) — and the later
+            //     camera-close guard would see only the healthy replacement.
+            // ESCALATE FIRST, touching no locks: a writer wedged inside
+            // writeSampleData HOLDS muxerLock, so the flag-gating this branch
+            // used to do under that lock could block this thread forever
+            // BEFORE the restart request ever fired. The teardownWedged latch
+            // (set by the stop helpers, checked by triggerEventRecording) is
+            // what prevents re-arming — no muxerLock needed. The segment stays
+            // .tmp; the startup orphan sweep recovers it (same contract as the
+            // FUSE-wedge yield path).
+            logger.error("closeEventRecording ABORTED — worker wedged; segment left "
+                + "as .tmp for startup recovery, trip-safe process restart requested");
+            try {
+                com.overdrive.app.daemon.CameraDaemon.requestProcessRestartPreservingTrip(
+                    "encoder worker wedged during recording close");
+            } catch (Throwable t) {
+                logger.error("closeEventRecording: process-restart request failed: "
+                    + t.getMessage());
+            }
+            // Aborted close: no more waits are coming, the instance is
+            // terminal — fence callbacks now and release epoch ownership.
+            synchronized (listenerEpochLock) {
+                listenerGeneration++;
+                closeInProgress = false;
+            }
+            return;
+        }
+
+        // Step 2b: second finalizer wait, now that BOTH workers are stopped.
+        // A writer-side rotation that committed after the step-1 wait (but
+        // before the writer observed its stop) spawned a finalizer the first
+        // wait never saw; with the writer verifiably exited, no further
+        // rotation can commit, so draining to zero here is exhaustive. 3 s
+        // budget matches release() (worst-case stop+release+rename on slow
+        // storage).
+        if (!waitForFinalizers(3_000)) {
+            logger.warn("closeEventRecording proceeding — post-worker-stop finalizer "
+                + "still in flight");
+        }
+
+        // Callback-ownership epoch: bumped only NOW, after both waits. Every
+        // finalizer that completed during the waits delivered its callback
+        // (the closing recording still owned it); anything still in flight
+        // past this point dispatches into teardown or a successor and is
+        // dropped by the fence. Residual: a callback that passed the fence
+        // check but is still EXECUTING when a wait times out can overlap
+        // teardown — the bounded waits are a deliberate trade against an
+        // unbounded close, and the window is the wait-overrun case only.
+        synchronized (listenerEpochLock) {
+            listenerGeneration++;
+            // Epoch ownership returns to the abort path (close's own bump is
+            // done; from here an abort bump can only affect successors,
+            // which is its legitimate job).
+            closeInProgress = false;
+        }
+
         // Step 2: Final synchronous drain — flush any frames still queued in
         // the encoder's output buffer. isWritingToFile is still true so these
         // frames WILL be written to the muxer.
@@ -3004,6 +3558,18 @@ public class HardwareEventRecorderGpu {
             MuxerPacket packet;
             int flushed = 0;
             while ((packet = muxerWriteQueue.poll()) != null) {
+                // Control entries: a still-queued FLUSH_HISTORY job (instant
+                // stop right after trigger) has its cursor closed safely —
+                // writing multi-seconds of history inline on this close path
+                // is exactly the stall the job design avoids. An unexecuted
+                // ROTATE ticket is moot (we're closing): recycle it; the arm
+                // flags are cleared below alongside isWritingToFile. Without
+                // this check a ROTATE ticket would fall into the video write
+                // branch below and be muxed as a sample.
+                if (packet.isControl()) {
+                    discardQueuedPacket(packet);
+                    continue;
+                }
                 if (muxerStarted && muxer != null) {
                     try {
                         packet.rewindForWrite();
@@ -3037,8 +3603,18 @@ public class HardwareEventRecorderGpu {
             // touching muxer.stop(). isWritingToFile is also cleared under the
             // lock so the upcoming format-change handler can't reopen the muxer.
             awaitLiveMuxerKeyframe = false;
-            pendingAudioPreRecord = null;
             isWritingToFile = false;
+
+            // Writer-owned rotation teardown: kill any outstanding arm and
+            // invalidate ROTATE tickets. A ticket still queued was recycled
+            // by the flush above; a ticket the writer already dequeued (and
+            // is blocked holding) fails its generation re-check under this
+            // same lock and abandons. pendingForceAudioVerify dies with the
+            // recording.
+            rotationAwaitingSplice = false;
+            pendingForceAudioVerify = false;
+            rotationInFlight.set(false);
+            recordingGeneration++;
 
             // Stop muxer (may throw if no frames were written, or if the
             // underlying file descriptor was severed by an SD-card unmount).
@@ -3078,13 +3654,25 @@ public class HardwareEventRecorderGpu {
         // false under muxerLock, and writeSampleData paths gate on those, so
         // the freshly-started drainer can only feed the pre-record circular
         // buffer + streaming until the next event triggers a new muxer.
+        //
+        // SNAPSHOT the abort verdict BEFORE the restart: startDrainerThread
+        // starts a FRESH disk writer, and startDiskWriterThread resets
+        // writerAbortedCorrupt for that new writer's clean slate. The
+        // recordingBroken decision below must describe THIS recording's
+        // fate — reading the live flag after the restart promoted an
+        // aborted recording's half-written tmp to a final .mp4 (the exact
+        // unplayable-file symptom the flag exists to prevent). Rare when
+        // only the owner-stop raced the drainer tick; MAINLINE now that the
+        // trigger's reclaim path deliberately enters this close with the
+        // abort latched.
+        final boolean abortedAtClose = writerAbortedCorrupt;
         startDrainerThread();
 
         // Rename temp to final, quarantine if broken, or delete if empty.
         // SOTA: never promote a tempFile to a final .mp4 unless the muxer
         // actually finalized — that's the single rule that prevents the
         // "60 MB file that won't play" symptom.
-        boolean recordingBroken = !stopOk || writerAbortedCorrupt;
+        boolean recordingBroken = !stopOk || abortedAtClose;
         if (tempFile != null && tempFile.exists()) {
             if (!recordingBroken && recordedFrames > 0 && tempFile.length() > 1024) {
                 File finalFile = new File(outputPath);
@@ -3119,17 +3707,17 @@ public class HardwareEventRecorderGpu {
                         logger.warn("Index upsert failed for " + finalFile.getName() + ": " + e.getMessage());
                     }
 
-                    // Telegram auto video-upload. Surveillance (event_*.mp4) is
-                    // DELIBERATELY excluded here: those clips are sent from
+                    // Telegram auto video-upload. Surveillance (event_*.mp4)
+                    // and explicitly SURVEILLANCE_GATED OEM mirrors are
+                    // deliberately excluded here: those clips are sent from
                     // SurveillanceEngineGpu.sendFinalTelegramNotification, which
                     // is the only place that knows the event's peak severity and
                     // therefore the only place that can honour the per-tier
                     // Telegram toggles (NOTICE/ALERT/CRITICAL). Sending from here
                     // too would bypass that gate — the "NOTICE muted but video
-                    // still arrives" bug — and double-send. Dashcam (cam_*) and
-                    // proximity (proximity_*) clips have no severity concept, so
-                    // they keep the simple videoUploads-only auto-send.
-                    if (!"surveillance".equals(inferGeocodingFlow(finalFile.getName()))) {
+                    // still arrives" bug — and double-send. Ordinary dashcam
+                    // and proximity clips retain automatic delivery.
+                    if (videoUploadPolicy.shouldAutoUpload(finalFile.getName())) {
                         try {
                             TelegramNotifier.notifyVideoRecorded(
                                     finalFile.getAbsolutePath(), null, (int) durationSec);
@@ -3181,7 +3769,7 @@ public class HardwareEventRecorderGpu {
                     tempFile.delete();
                 } else {
                     logger.warn("Quarantined broken recording (stopOk=" + stopOk
-                            + ", writerAborted=" + writerAbortedCorrupt
+                            + ", writerAborted=" + abortedAtClose
                             + ", " + (broken.length() / 1024) + " KB): " + broken.getName());
                 }
             } else {
@@ -3723,8 +4311,37 @@ public class HardwareEventRecorderGpu {
     
     /**
      * Releases all resources.
+     *
+     * @return true when teardown completed cleanly; false when a worker is (or
+     *         was previously) wedged — a trip-safe restart has been requested and
+     *         the instance is TERMINAL. Recovery callers MUST NOT construct a
+     *         replacement codec on false: release() can be the FIRST place a
+     *         wedge is discovered (nothing was recording, so the recording-close
+     *         escalation never ran), and a replacement's fresh workers would hide
+     *         the wedged original from every close guard.
      */
-    public void release() {
+    public boolean release() {
+        // Serialized with EVERY start/stop entry point. release() used to
+        // rely on its inner stopRecording() call for ordering against an
+        // active close — but close sets `recording = false` early in its
+        // body, so a CONCURRENT release's fast-path skipped that blocking
+        // call entirely and proceeded to encoder.stop()/release() while the
+        // close thread was still draining that same codec and stopping the
+        // muxer. The listener-epoch guard added earlier protects CALLBACKS
+        // from that interleaving; only this lock protects the codec
+        // teardown itself. Also serializes trigger-vs-release and
+        // double-release. Lock-order safe: everything inside runs at or
+        // below startStopLock in the documented order (muxerLock below;
+        // drainerLock / epoch / dispatch locks are leaves), and
+        // closeEventRecording already runs its bounded finalizer waits
+        // under this same lock, so the finalizer-callback convoy shape is
+        // unchanged.
+        synchronized (startStopLock) {
+            return releaseInternal();
+        }
+    }
+
+    private boolean releaseInternal() {
         // CRITICAL ORDERING: do NOT stop the drainer up-front. The previous
         // ordering (stopDrainer → stopRecording → encoder.release) was buggy:
         // closeEventRecording calls stopDrainerThread() AGAIN at line ~1157,
@@ -3748,7 +4365,30 @@ public class HardwareEventRecorderGpu {
         // Suppress further drainer restarts — closeEventRecording already
         // restarted it; we want the FINAL stop to stick.
         drainerRestartSuppressed = true;
-        stopDrainerThread();
+        boolean drainerExited = stopDrainerThread();
+        // Combined verdict: this stop's result AND the terminal latch. release()
+        // can be the FIRST discovery of a wedge (nothing was recording, so the
+        // recording-close escalation never ran) — escalate HERE rather than
+        // relying on a later close guard that a recovery caller might bypass by
+        // building a replacement codec. requestProcessRestartPreservingTrip is
+        // CAS-latched, so a duplicate request from an earlier discovery is a
+        // no-op.
+        boolean releaseClean = drainerExited && !teardownWedged;
+        if (!releaseClean) {
+            // Wedged worker (sticky — see stopDrainerThread): stop()/release()
+            // on a codec whose dequeue is stuck is its own native hazard. Leak
+            // the codec deliberately — the process exit reclaims it; a second
+            // concurrent teardown attempt cannot.
+            logger.error("release(): worker wedged — skipping encoder stop/release "
+                + "(process restart reclaims the codec); requesting trip-safe restart");
+            encoder = null;
+            try {
+                com.overdrive.app.daemon.CameraDaemon.requestProcessRestartPreservingTrip(
+                    "encoder worker wedged during release()");
+            } catch (Throwable t) {
+                logger.error("release(): process-restart request failed: " + t.getMessage());
+            }
+        }
 
         // Wait for any in-flight rotation finalizers AFTER stopRecording so
         // the close path's rename has already finished but rotation finalizers
@@ -3759,7 +4399,27 @@ public class HardwareEventRecorderGpu {
         if (!waitForFinalizers(3_000)) {
             logger.warn("release() proceeding with finalizers still in flight");
         }
-        
+
+        // Callback-ownership bump: release() is a teardown boundary that can
+        // be reached WITHOUT closeEventRecording's post-wait bump (e.g. after
+        // a writer abort already flipped isWritingToFile, making the stop
+        // path short-circuit). Any finalizer still in flight past this wait
+        // must not deliver its callback into the torn-down pipeline.
+        //
+        // SINGLE-OWNER RULE (same as the abort branch): defer to an
+        // in-progress close. release() can reach this point CONCURRENTLY
+        // with an active close — close sets `recording=false` early, so a
+        // parallel release's stopRecording() fast-path returns without ever
+        // taking startStopLock — and an unconditional bump here would land
+        // inside close's wait window, dropping the callbacks those waits
+        // exist to deliver. When close owns the epoch, close's own bump
+        // (post-wait or wedge-abort) provides the fencing.
+        synchronized (listenerEpochLock) {
+            if (!closeInProgress) {
+                listenerGeneration++;
+            }
+        }
+
         if (encoder != null) {
             // Note: by the time we reach release(), stopRecording() above
             // has already finalized any active recording (drained and stopped
@@ -3816,7 +4476,8 @@ public class HardwareEventRecorderGpu {
         drainPool(muxerPacketPoolSmall, muxerPacketPoolSmallSize);
         drainPool(muxerPacketPoolLarge, muxerPacketPoolLargeSize);
 
-        logger.info( "Released");
+        logger.info(releaseClean ? "Released" : "Released DEGRADED (worker wedged)");
+        return releaseClean;
     }
 
     private static void drainPool(java.util.concurrent.ConcurrentLinkedDeque<MuxerPacket> pool,
@@ -3838,6 +4499,18 @@ public class HardwareEventRecorderGpu {
         synchronized (drainerLock) {
         if (drainerRunning) {
             logger.warn("Drainer thread already running");
+            return;
+        }
+        // A previous drainer that FAILED its verified stop is still referenced
+        // (sticky — see stopDrainerThread). Refuse: the loop condition is the
+        // SHARED drainerRunning flag, so spawning a replacement would re-raise
+        // it and REACTIVATE the wedged original the moment its native call
+        // returns — two threads dequeuing one codec — while the camera-close
+        // guard would see only the healthy replacement and wrongly declare the
+        // close safe.
+        if (drainerThread != null && drainerThread.isAlive()) {
+            logger.error("startDrainerThread refused — previous drainer is still "
+                + "alive (wedged); a replacement would duplicate the dequeue loop");
             return;
         }
         if (drainerRestartSuppressed) {
@@ -3949,27 +4622,64 @@ public class HardwareEventRecorderGpu {
 
     /**
      * Stops the background drainer thread.
+     *
+     * <p>STICKY on failure (audit follow-up: the recording-close path used to null
+     * the reference after an unverified 2s timeout and then START A REPLACEMENT —
+     * the replacement re-raised the shared {@code drainerRunning} flag, so the
+     * wedged original resumed looping when its native call returned (two drainers
+     * dequeuing one codec), and the later camera-close guard saw only the healthy
+     * replacement and declared the close safe — straight back into the FORTIFY
+     * destroyed-mutex abort). The reference is dropped only on a VERIFIED exit;
+     * on failure it is retained so {@link #startDrainerThread()} refuses to spawn
+     * a duplicate and {@link #stopDrainerForCameraClose()} keeps answering false.
+     *
+     * @return true when the drainer exited (or none was running); false when it is
+     *         still alive after the full deadline — the caller MUST NOT drain
+     *         synchronously, stop the muxer, or restart the drainer.
      */
-    private void stopDrainerThread() {
+    private boolean stopDrainerThread() {
         synchronized (drainerLock) {
             drainerRunning = false;
+            boolean exited = true;
             if (drainerThread != null) {
+                // SOTA: 2 s join matches the disk writer's join. The drainer can
+                // be inside a single drainEncoderInternal() pass that takes
+                // 100+ ms under SD-card pressure; the old 500 ms ceiling let
+                // the close path move on while the drainer was still pushing
+                // packets to the queue, racing the muxer.stop() call.
+                // FIX (audit follow-up): full-deadline join across interrupts —
+                // the old join(2000) returned instantly when THIS thread was
+                // interrupted, so the wait never happened and the muxer race
+                // this join exists to prevent was back.
+                final Thread deadDrainer = drainerThread;
+                deadDrainer.interrupt();
+                final boolean[] interrupted = { Thread.interrupted() };
                 try {
-                    drainerThread.interrupt();
-                    // SOTA: 2 s join matches the disk writer's join. The drainer can
-                    // be inside a single drainEncoderInternal() pass that takes
-                    // 100+ ms under SD-card pressure; the old 500 ms ceiling let
-                    // the close path move on while the drainer was still pushing
-                    // packets to the queue, racing the muxer.stop() call.
-                    drainerThread.join(2000);
-                } catch (InterruptedException e) {
-                    // Ignore
+                    exited = com.overdrive.app.util.ThreadJoins
+                        .joinFullDeadline(deadDrainer, 2000, interrupted);
+                } finally {
+                    if (interrupted[0]) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
-                drainerThread = null;
+                if (exited) {
+                    drainerThread = null;
+                } else {
+                    teardownWedged = true;
+                    logger.error("stopDrainerThread: drainer still alive after its full "
+                        + "2s deadline — reference retained (sticky); draining, muxer "
+                        + "stop and drainer restart are NOT safe");
+                }
             }
 
-            // Stop disk writer after drainer (drainer may still be pushing to the queue)
-            stopDiskWriterThread();
+            // Stop disk writer after drainer (drainer may still be pushing to the
+            // queue). Runs on the drainer-failure path too: it bounds further muxer
+            // writes from the queue side while the close path bails out. The verdict
+            // is COMBINED — a wedged disk writer (possibly inside writeSampleData,
+            // holding muxerLock) makes the subsequent muxer stop exactly as unsafe
+            // as a wedged drainer does.
+            boolean writerExited = stopDiskWriterThread();
+            return exited && writerExited;
         }
     }
     
@@ -3985,26 +4695,82 @@ public class HardwareEventRecorderGpu {
      * making it safe to close the camera afterwards.
      * 
      * Call restartDrainerAfterCameraClose() after the camera is reopened.
+     *
+     * @return true when the drainer exited (or none was running) and the camera is
+     *         safe to close; false when it is STILL ALIVE after the full deadline.
+     *         Callers MUST NOT close the camera on false — doing so races the
+     *         mid-dequeue drainer into the FORTIFY destroyed-mutex abort this
+     *         method exists to prevent, which kills the process before the
+     *         trip-safe restart coordinator can checkpoint the trip.
      */
-    public void stopDrainerForCameraClose() {
+    public boolean stopDrainerForCameraClose() {
+        // startStopLock FIRST (audit follow-up): serializes this teardown with
+        // triggerEventRecording, whose locked re-check of the terminal latch is
+        // only sound if the latch cannot flip while a trigger holds the lock.
+        // Lock order startStopLock → drainerLock matches the existing
+        // closeEventRecording (under startStopLock) → stopDrainerThread
+        // (drainerLock) nesting; nothing acquires them in the reverse order.
+        // Worst-case wait is a bounded in-flight close (~seconds), during which
+        // closing the camera would have been unsafe anyway.
+        synchronized (startStopLock) {
         synchronized (drainerLock) {
             logger.info("Stopping drainer for camera close...");
             drainerSuppressedForCameraClose = true;
             drainerRunning = false;
             if (drainerThread != null) {
+                // FIX (audit follow-up): the old join(1000) returned instantly
+                // when THIS thread was interrupted (swallowed exception) — so
+                // the wait this method exists for never happened, and the
+                // camera close raced a mid-dequeue drainer into the FORTIFY
+                // destroyed-mutex abort. Wait out the full deadline across
+                // interrupts (restoring the caller's interrupt status after),
+                // and report a wedged drainer HONESTLY via the return value —
+                // the "log a warning and proceed anyway" it replaced walked
+                // straight into the documented abort.
+                //
+                // STICKY failure: the reference is dropped only on a VERIFIED
+                // exit. An earlier revision nulled it before the join, so a
+                // SECOND stop saw no drainer, returned "safe", and the caller
+                // closed the camera over the still-running thread — the exact
+                // abort this method exists to prevent. A retained reference
+                // makes every subsequent call re-attempt the join and keep
+                // answering false until the thread really exits.
+                final Thread deadDrainer = drainerThread;
+                deadDrainer.interrupt();
+                final boolean[] interrupted = { Thread.interrupted() };
+                boolean exited;
                 try {
-                    drainerThread.interrupt();
-                    drainerThread.join(1000);  // Wait up to 1 second for clean exit
-                    if (drainerThread.isAlive()) {
-                        logger.warn("Drainer thread still alive after 1s — proceeding anyway");
+                    // 2s deadline (audit follow-up): aligned with the teardown
+                    // standard everywhere else (stopDrainerThread's join, the
+                    // disk-writer join, GpuSurveillancePipeline's bounded
+                    // release). The old 1s was the outlier: a single
+                    // drainEncoderInternal() pass can overrun under SD/FUSE
+                    // pressure (the 500ms→2s history on stopDrainerThread
+                    // records real overruns) and the native dequeue is not
+                    // interruptible, so this join rides the pass-latency
+                    // tail. A false "wedged" verdict now costs a bounded
+                    // URGENT process restart (camera-release halt), so the
+                    // wider grace is the false-positive control that makes
+                    // that escalation safe to ship.
+                    exited = com.overdrive.app.util.ThreadJoins
+                        .joinFullDeadline(deadDrainer, 2000, interrupted);
+                } finally {
+                    if (interrupted[0]) {
+                        Thread.currentThread().interrupt();
                     }
-                } catch (InterruptedException e) {
-                    // Ignore
+                }
+                if (!exited) {
+                    teardownWedged = true;
+                    logger.error("Drainer thread still alive after its full 2s deadline — "
+                        + "camera close is NOT safe (FORTIFY destroyed-mutex risk)");
+                    return false;
                 }
                 drainerThread = null;
             }
             logger.info("Drainer stopped for camera close");
+            return true;
         }
+        } // end synchronized (startStopLock)
     }
     
     /**
@@ -4033,6 +4799,16 @@ public class HardwareEventRecorderGpu {
      */
     private void startDiskWriterThread() {
         if (diskWriterRunning) return;
+        // A previous writer that FAILED its verified stop is still referenced
+        // (sticky — see stopDiskWriterThread). Refuse: the loop condition is the
+        // SHARED diskWriterRunning flag, so a replacement would re-raise it and
+        // reactivate the wedged original when its blocked call returns — two
+        // writers on one muxer.
+        if (diskWriterThread != null && diskWriterThread.isAlive()) {
+            logger.error("startDiskWriterThread refused — previous disk writer is "
+                + "still alive (wedged); a replacement would duplicate the writer");
+            return;
+        }
 
         diskWriterRunning = true;
         // Each disk writer instance starts with a clean abort flag. The flag is
@@ -4082,6 +4858,32 @@ public class HardwareEventRecorderGpu {
                     packet = muxerWriteQueue.pollFirst(50,
                             java.util.concurrent.TimeUnit.MILLISECONDS);
                     if (packet == null) continue;
+                    // FLUSH_HISTORY control job (pre-record/slow-SD fix):
+                    // stream the pre-record history from the pinned ring
+                    // cursor straight into the muxer on THIS thread. All
+                    // internal failures are contained (partial history,
+                    // recording continues live); the cursor is always
+                    // closed. See processFlushHistoryJob.
+                    if (packet.isFlushHistory()) {
+                        MuxerPacket job = packet;
+                        packet = null;
+                        processFlushHistoryJob(job);
+                        continue;
+                    }
+                    // WRITER-OWNED ROTATION: execute the segment swap when
+                    // the ROTATE ticket reaches the queue head. FIFO
+                    // guarantees every old-segment packet has already been
+                    // written into the old muxer — no drain, no seam drops.
+                    // The handler is self-contained: it never throws, always
+                    // consumes the ticket, and settles the rotation gate on
+                    // every path (so it can't feed the consecutive-failure
+                    // abort accounting below).
+                    if (packet.trackKind == TRACK_KIND_ROTATE) {
+                        MuxerPacket rotateTicket = packet;
+                        packet = null;
+                        handleWriterRotatePacket(rotateTicket);
+                        continue;
+                    }
                     // SOTA: serialize against rotateSegment / closeEventRecording.
                     // Without this lock, a concurrent muxer.stop() corrupts the
                     // moov atom and produces a sized-but-unplayable .mp4.
@@ -4129,10 +4931,10 @@ public class HardwareEventRecorderGpu {
                     // muxer.stop(), so any further writeSampleData would corrupt
                     // the moov. The close path drains the queue itself under the
                     // lock before stopping the muxer.
-                    if (packet != null) releaseMuxerPacket(packet);
+                    if (packet != null) discardQueuedPacket(packet);
                     break;
                 } catch (Exception e) {
-                    if (packet != null) releaseMuxerPacket(packet);
+                    if (packet != null) discardQueuedPacket(packet);
                     consecutiveWriteFailures[0]++;
                     logger.error("Disk writer error (#" + consecutiveWriteFailures[0]
                         + "): " + e.getMessage());
@@ -4148,22 +4950,31 @@ public class HardwareEventRecorderGpu {
                         // filename for a file whose moov was never written.
                         writerAbortedCorrupt = true;
                         writerAbortedErrorMessage = reason;
+                        // ONE immutable generation for this abort, captured AT
+                        // THE LATCH. Both notify sites (here and the drainer's
+                        // abort-stop branch) use this value — capturing at
+                        // notification time let a close's generation bump land
+                        // between the two sites, making the once-only gate
+                        // treat the second site as a brand-new abort.
+                        abortGenerationAtLatch = recordingGeneration;
                         // Notify any registered listener — OEM uses this to flip
                         // its `recording` flag and surface lastWriteError into
                         // UCM so the UI status badge transitions from "recording"
                         // to "errored" immediately, instead of lying until the
-                        // next user action.
-                        try {
-                            WriterAbortListener cb = writerAbortListener;
-                            if (cb != null) cb.onWriterAborted(reason);
-                        } catch (Throwable cbErr) {
-                            logger.warn("WriterAbortListener threw: " + cbErr.getMessage());
-                        }
+                        // next user action. ASYNC dispatch: this code runs ON
+                        // the disk writer, and the OEM listener responds with
+                        // stopEventRecording — whose close path joins THIS
+                        // thread. A synchronous callback self-joins, fails the
+                        // 2s stop deadline, and falsely latches the terminal
+                        // wedge.
+                        notifyWriterAbortedAsync(reason, abortGenerationAtLatch);
                         // Drain queue and recycle so the writer loop exits
-                        // promptly without leaking pooled buffers.
+                        // promptly without leaking pooled buffers. A queued
+                        // FLUSH_HISTORY job's cursor is closed (ring pin
+                        // released) by the discard helper.
                         MuxerPacket drained;
                         while ((drained = muxerWriteQueue.poll()) != null) {
-                            releaseMuxerPacket(drained);
+                            discardQueuedPacket(drained);
                         }
                         diskWriterRunning = false;
                         // Don't call stopRecording() from here — that's a heavyweight
@@ -4189,17 +5000,39 @@ public class HardwareEventRecorderGpu {
     /**
      * Stops the disk writer thread, flushing any remaining packets.
      */
-    private void stopDiskWriterThread() {
+    private boolean stopDiskWriterThread() {
         diskWriterRunning = false;
         if (diskWriterThread != null) {
+            // STICKY, same contract as stopDrainerThread (audit follow-up: this
+            // used an interrupt-fragile join, never checked isAlive, and always
+            // nulled the reference — so a writer wedged inside writeSampleData
+            // could be silently replaced, and the replacement's shared
+            // diskWriterRunning=true reactivated the original when its blocked
+            // native call returned). Reference dropped only on a VERIFIED exit;
+            // on failure the terminal latch trips and startDiskWriterThread
+            // refuses a replacement.
+            final Thread deadWriter = diskWriterThread;
+            deadWriter.interrupt();
+            final boolean[] interrupted = { Thread.interrupted() };
+            boolean exited;
             try {
-                diskWriterThread.interrupt();
-                diskWriterThread.join(2000);  // Allow up to 2s for final flush
-            } catch (InterruptedException e) {
-                // Ignore
+                exited = com.overdrive.app.util.ThreadJoins
+                    .joinFullDeadline(deadWriter, 2000, interrupted);
+            } finally {
+                if (interrupted[0]) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            if (!exited) {
+                teardownWedged = true;
+                logger.error("stopDiskWriterThread: disk writer still alive after its "
+                    + "full 2s deadline — reference retained (sticky); muxer stop is "
+                    + "NOT safe and this encoder instance is terminal");
+                return false;
             }
             diskWriterThread = null;
         }
+        return true;
     }
     
     /**
@@ -4211,35 +5044,179 @@ public class HardwareEventRecorderGpu {
         // This method is kept for API compatibility but does nothing
     }
 
-    /** Queue staged AAC only after every matching historical video packet. */
-    private int enqueueStagedPreRecordAudio(
-            java.util.List<AacCircularBuffer.Packet> packets) {
-        int enqueued = 0;
-        for (AacCircularBuffer.Packet packet : packets) {
-            MuxerPacket mp = acquireMuxerPacket(packet.data.length);
-            if (mp == null) continue;
-            mp.data.clear();
-            mp.data.put(packet.data);
-            mp.data.flip();
-            mp.payloadSize = packet.data.length;
-            mp.info.set(0, packet.data.length, packet.ptsUs, 0);
-            mp.trackKind = TRACK_KIND_AUDIO;
-            synchronized (muxerLock) {
-                // The drainer can finish the video flush after the muxer is
-                // ready but just before triggerEvent publishes isWritingToFile.
-                // Muxer readiness is the authoritative gate for this staged
-                // history; startStopLock keeps closeEventRecording out until
-                // trigger publication completes.
-                if (!muxerStarted || muxer == null
-                        || audioTrackIndex < 0 || audioConfig == null) {
-                    releaseMuxerPacket(mp);
-                    break;
+    /**
+     * Processes a FLUSH_HISTORY control job on the DISK WRITER thread
+     * (pre-record/slow-SD fix). Streams the pinned pre-record video cursor
+     * from the byte ring straight into the muxer through the reusable
+     * {@link #historyReadBuffer}, then writes the staged historical AAC —
+     * video first, so writeRebased seeds the shared PTS origin before
+     * writeRebasedAudio sees old AAC (same ordering contract as before).
+     *
+     * <p>muxerLock is taken per packet, never across the whole job, so
+     * rotation/close can interleave. All failures are contained: the
+     * recording continues live with a truncated pre-record window, and the
+     * cursor is ALWAYS closed (releasing the ring pin — a leaked pin would
+     * collapse the NEXT event's pre-record window to keyframes-only).
+     */
+    private void processFlushHistoryJob(MuxerPacket job) {
+        H264ByteRingBuffer.Cursor cursor = job.historyCursor;
+        java.util.List<AacCircularBuffer.Packet> stagedAudio = job.historyAudio;
+        job.historyCursor = null;
+        job.historyAudio = null;
+        int flushedCount = 0;
+        boolean videoFlushComplete = false;
+        try {
+            if (cursor != null) {
+                try {
+                    while (true) {
+                        // Writer shutdown check: stopDiskWriterThread flips
+                        // diskWriterRunning and interrupts this thread, then
+                        // joins for only 2s — under slow SD this loop could
+                        // otherwise outlive the join and race close/release
+                        // against the muxer. Bail out; the finally below
+                        // closes the cursor and clears flushInProgress.
+                        if (!diskWriterRunning
+                                || Thread.currentThread().isInterrupted()) {
+                            logger.warn("History write interrupted by writer "
+                                + "shutdown after " + flushedCount + " packets");
+                            break;
+                        }
+                        int sz = cursor.peekSize();
+                        if (sz <= 0) break;
+                        if (historyReadBuffer == null
+                                || historyReadBuffer.capacity() < sz) {
+                            historyReadBuffer = ByteBuffer.allocateDirect(
+                                    Math.max(sz, historyReadBuffer == null
+                                        ? 256 * 1024
+                                        : historyReadBuffer.capacity() * 2));
+                        }
+                        historyReadBuffer.position(0);
+                        historyReadBuffer.limit(historyReadBuffer.capacity());
+                        if (!cursor.next(historyReadBuffer, historyReadInfo)) {
+                            // Aborted (pin broken) or exhausted.
+                            break;
+                        }
+                        synchronized (muxerLock) {
+                            if (!muxerStarted || muxer == null) {
+                                // Muxer already closed (instant stop / trigger
+                                // rollback) — the rest of the history is moot.
+                                break;
+                            }
+                            historyReadBuffer.position(0);
+                            historyReadBuffer.limit(historyReadInfo.size);
+                            writeRebased(muxer, trackIndex,
+                                    historyReadBuffer, historyReadInfo);
+                            recordedFrames++;
+                            lastDiskWrittenMs = System.currentTimeMillis();
+                        }
+                        flushedCount++;
+                    }
+                    if (cursor.aborted()) {
+                        logger.warn("Pre-record history write aborted by concurrent keyframe (pin broken) — partial write of "
+                            + flushedCount + " packets");
+                    }
+                    videoFlushComplete = !cursor.aborted()
+                            && cursor.remaining() == 0 && flushedCount > 0;
+                } catch (Throwable t) {
+                    // Catch Throwable, not Exception: an OOMError inside
+                    // cursor.next()/put() must not leave the pin stuck on an
+                    // orphaned cursor (the producer would refuse to evict
+                    // P-frames until the next encoder reinit, silently
+                    // collapsing the pre-record window to keyframes-only).
+                    // The cursor is closed in the finally below; recording
+                    // continues with a truncated pre-record window — exactly
+                    // the right degraded behaviour.
+                    logger.error("Pre-record history write failed at packet "
+                        + flushedCount + " — partial history, continuing recording: "
+                        + t.getMessage());
+                } finally {
+                    cursor.close();
                 }
-                offerMuxerPacket(mp);
-                enqueued++;
             }
+            if (stagedAudio != null && !stagedAudio.isEmpty()) {
+                if (videoFlushComplete) {
+                    int audioCount = 0;
+                    try {
+                        for (AacCircularBuffer.Packet ap : stagedAudio) {
+                            // Same writer-shutdown bail-out as the video loop.
+                            if (!diskWriterRunning
+                                    || Thread.currentThread().isInterrupted()) {
+                                logger.warn("History audio write interrupted by "
+                                    + "writer shutdown after " + audioCount
+                                    + " packets");
+                                break;
+                            }
+                            int len = ap.data.length;
+                            if (historyReadBuffer == null
+                                    || historyReadBuffer.capacity() < len) {
+                                historyReadBuffer =
+                                    ByteBuffer.allocateDirect(Math.max(len, 256 * 1024));
+                            }
+                            historyReadBuffer.clear();
+                            historyReadBuffer.put(ap.data);
+                            historyReadBuffer.flip();
+                            historyReadInfo.set(0, len, ap.ptsUs, 0);
+                            synchronized (muxerLock) {
+                                if (!muxerStarted || muxer == null
+                                        || audioTrackIndex < 0 || audioConfig == null) {
+                                    break;
+                                }
+                                writeRebasedAudio(muxer, audioTrackIndex,
+                                        historyReadBuffer, historyReadInfo);
+                                audioCount++;
+                            }
+                        }
+                    } catch (Throwable t) {
+                        logger.warn("History audio write failed after "
+                            + audioCount + " packets: " + t.getMessage());
+                    }
+                    logger.info("History audio write complete: "
+                            + audioCount + " packets queued after video");
+                } else {
+                    logger.warn("Audio pre-record discarded: matching video history incomplete");
+                }
+            }
+            if (flushedCount > 0) {
+                logger.info("History write complete: " + flushedCount
+                    + " pre-record frames written to disk");
+            }
+        } finally {
+            flushInProgress = false;
         }
-        return enqueued;
+    }
+
+    /**
+     * Returns a drained queue entry to its owner: a FLUSH_HISTORY job's
+     * cursor is closed (releasing the ring pin) and flushInProgress is
+     * cleared; an unexecuted ROTATE ticket's payload is recycled (arm-flag
+     * cleanup stays with the drain context); regular data packets go back to
+     * the pool. Every path that empties {@link #muxerWriteQueue} without
+     * writing (writer abort, close flush, writer teardown) must use this
+     * instead of calling releaseMuxerPacket directly.
+     */
+    private void discardQueuedPacket(MuxerPacket packet) {
+        if (packet.isFlushHistory()) {
+            H264ByteRingBuffer.Cursor c = packet.historyCursor;
+            packet.historyCursor = null;
+            packet.historyAudio = null;
+            if (c != null) {
+                try { c.close(); } catch (Throwable ignored) {}
+            }
+            flushInProgress = false;
+            logger.warn("FLUSH_HISTORY job discarded unprocessed — cursor closed "
+                + "(pre-record window lost for this event)");
+            return;
+        }
+        if (packet.trackKind == TRACK_KIND_ROTATE) {
+            // Unexecuted rotation ticket drained during teardown. Release the
+            // payload only — arm-flag cleanup belongs to the drain CONTEXT
+            // (close / writer abort / trigger boundary reset), which knows
+            // whether the live arm is its own or a successor recording's.
+            logger.warn("ROTATE ticket discarded unprocessed (teardown drain)");
+            releaseMuxerPacket(packet);
+            return;
+        }
+        releaseMuxerPacket(packet);
     }
     
     /**
@@ -4259,123 +5236,13 @@ public class HardwareEventRecorderGpu {
             return 0;
         }
         
-        // SOTA: Process queued pre-record packets first (flush all at once).
-        // These packets are written to the SD card via the muxer, which does NOT
-        // block the encoder's input surface. The original chunking was added to prevent
-        // MediaCodec backpressure, but that was only an issue when flushing on the GL
-        // thread. Now that draining happens on a background thread, writing all packets
-        // in one pass is safe and ensures no PTS gap between pre-record and live frames.
-        //
-        // CRITICAL: Live frames must NOT be written until this flush completes.
-        // The pre-record packets have older PTS values. If live frames (with current PTS)
-        // are interleaved, the muxer sees non-monotonic timestamps and the MP4 is corrupt.
-        // Pre-record packets are drained in one pass into muxerWriteQueue.
-        // The earlier "staggered flush" experiment (FLUSH_PACKETS_PER_TICK)
-        // had a real bug: while flushInProgress=true for ~150ms, live frames
-        // produced by the encoder hit the `!flushInProgress` gate below
-        // (line ~1853) and were silently dropped — manifesting as recordings
-        // freezing 5-6s in. Reverted. The single-pass drain is safe because
-        // muxerWriteQueue.offerMuxerPacket() handles backpressure via its
-        // drop-non-keyframe policy, AND the disk writer is now FOREGROUND
-        // priority so it drains the burst quickly.
-        if (flushInProgress && muxerStarted) {
-            H264ByteRingBuffer.Cursor cursor = pendingFlushCursor;
-            int flushedCount = 0;
-            boolean videoFlushComplete = false;
-            // Outer try/finally guarantees flushInProgress is cleared even if
-            // the inner loop throws. Without this, a thrown exception escapes
-            // up through the drainer's catch — pendingFlushCursor is nulled
-            // by the inner finally but flushInProgress stays true, so the
-            // `!flushInProgress` gate at line ~2018 keeps live frames from
-            // entering the muxer queue until something else flips it false.
-            // Recoverable in practice (next tick takes the cursor==null path
-            // and clears the flag), but the symptom is a silently-truncated
-            // pre-record window. Make the invariant explicit.
-            try {
-                if (cursor != null) {
-                    try {
-                        while (true) {
-                            int sz = cursor.peekSize();
-                            if (sz <= 0) break;
-                            // Acquire-and-fill must be exception-safe: if next()
-                            // throws (e.g., outDst.put surfaces a transient
-                            // BufferOverflowException because the encoder produced
-                            // a frame larger than the muxer pool's slot ceiling),
-                            // we must NOT leak the packet back to GC. The pool is
-                            // bounded; a leaked direct buffer waits for the
-                            // Cleaner and starves later acquires.
-                            MuxerPacket mp = acquireMuxerPacket(sz);
-                            boolean handed = false;
-                            try {
-                                mp.data.position(0);
-                                mp.data.limit(mp.data.capacity());
-                                if (!cursor.next(mp.data, flushCursorInfo)) {
-                                    // Aborted (pin broken) or exhausted.
-                                    break;
-                                }
-                                mp.payloadSize = flushCursorInfo.size;
-                                mp.info.set(0, flushCursorInfo.size,
-                                    flushCursorInfo.presentationTimeUs, flushCursorInfo.flags);
-                                offerMuxerPacket(mp);
-                                handed = true;
-                                flushedCount++;
-                            } finally {
-                                if (!handed) {
-                                    releaseMuxerPacket(mp);
-                                }
-                            }
-                        }
-                        if (cursor.aborted()) {
-                            logger.warn("Pre-record flush aborted by concurrent keyframe (pin broken) — partial flush of "
-                                + flushedCount + " packets");
-                        }
-                        videoFlushComplete = !cursor.aborted()
-                                && cursor.remaining() == 0 && flushedCount > 0;
-                    } catch (Throwable t) {
-                        // Catch Throwable, not Exception. An OOMError (or any
-                        // VirtualMachineError) inside cursor.next()/put() would
-                        // otherwise escape with pendingFlushCursor still set
-                        // and the pin stuck on the orphaned cursor's
-                        // pinReadFloor. The producer would then refuse to
-                        // evict P-frames until the next encoder reinit calls
-                        // clear() — silently collapsing the pre-record window
-                        // to keyframes-only (≈1 frame per 2s GOP, ≈3 frames
-                        // for a 5s window).
-                        //
-                        // We deliberately do NOT re-throw Errors: the cursor
-                        // is closed in the inner finally, flushInProgress is
-                        // cleared in the outer finally, and the drainer's
-                        // outer Throwable catch would just log a duplicate.
-                        // Recording continues with a truncated pre-record
-                        // window — exactly the right degraded behaviour.
-                        logger.error("Pre-record flush failed at packet "
-                            + flushedCount + " — partial flush, continuing recording: "
-                            + t.getMessage());
-                    } finally {
-                        cursor.close();
-                        pendingFlushCursor = null;
-                    }
-                }
-                java.util.List<AacCircularBuffer.Packet> stagedAudio = pendingAudioPreRecord;
-                pendingAudioPreRecord = null;
-                if (stagedAudio != null && !stagedAudio.isEmpty()) {
-                    if (videoFlushComplete) {
-                        int audioCount = enqueueStagedPreRecordAudio(stagedAudio);
-                        logger.info("Async audio pre-record flush complete: "
-                                + audioCount + " packets queued after video");
-                    } else {
-                        logger.warn("Audio pre-record discarded: matching video flush incomplete");
-                    }
-                }
-                if (flushedCount > 0) {
-                    logger.info("Async flush complete: " + flushedCount + " pre-record frames queued for disk write");
-                }
-            } finally {
-                pendingAudioPreRecord = null;
-                flushInProgress = false;
-            }
-        }
-        
+        // Pre-record history is no longer flushed here (pre-record/slow-SD
+        // fix): the trigger thread hands the pinned ring cursor + staged AAC
+        // to the disk writer as a single FLUSH_HISTORY control job, and the
+        // WRITER streams the history into the muxer (processFlushHistoryJob).
+        // This loop only ever handles live encoder output, so a slow SD card
+        // can no longer park the codec drain behind the history write.
+
         // Check if segment rotation needed (only when actively writing to file).
         // SOTA: rotation requires a live disk writer + drainer; if either is
         // shutting down (e.g., we're inside the synchronous final drain in
@@ -4389,7 +5256,33 @@ public class HardwareEventRecorderGpu {
         if (writerAbortedCorrupt && isWritingToFile) {
             logger.warn("Writer aborted — stopping recording, no rotation");
             awaitLiveMuxerKeyframe = false;
-            pendingAudioPreRecord = null;
+            // Kill any outstanding rotation arm: the writer that would have
+            // executed the ROTATE ticket is dead (a queued ticket is recycled
+            // by the writer's own abort drain via discardQueuedPacket).
+            rotationAwaitingSplice = false;
+            rotationInFlight.set(false);
+            // Callback-ownership bump HERE, because this abort path bypasses
+            // closeEventRecording entirely: isWritingToFile flips false below,
+            // so the owner's subsequent stop call short-circuits and close's
+            // post-wait listenerGeneration bump never runs. Without this, a
+            // rotation finalizer completing after the abort would deliver its
+            // callback into the abort-recovery flow (racing RMM's wedge-cycle
+            // cleanup of the same engine state).
+            //
+            // SINGLE-OWNER RULE: defer to an in-progress close. This branch
+            // can fire on the drainer while close sits in its finalizer
+            // waits — bumping then would drop the legitimate callbacks those
+            // waits exist to deliver. Close performs its own bump (normal
+            // post-wait path AND wedge-abort path), so nothing is left
+            // unfenced by deferring. Check+bump are ATOMIC under the epoch
+            // lock: a bare volatile check could read false, lose the race to
+            // close's flag set, and still land the bump inside close's wait
+            // window.
+            synchronized (listenerEpochLock) {
+                if (!closeInProgress) {
+                    listenerGeneration++;
+                }
+            }
             isWritingToFile = false;
             recording = false;
             // FIX (audit R2): also propagate the abort up to the wrapper so
@@ -4400,29 +5293,48 @@ public class HardwareEventRecorderGpu {
             // and the SD-watchdog's pendingOutputDirOverride never gets
             // consumed because activateMode short-circuits on
             // !shouldRetryActivation.
-            try {
-                WriterAbortListener cb = writerAbortListener;
-                if (cb != null) {
-                    String reason = writerAbortedErrorMessage != null
-                        ? writerAbortedErrorMessage
-                        : "rotation aborted (writerAbortedCorrupt latched)";
-                    cb.onWriterAborted(reason);
-                }
-            } catch (Throwable cbErr) {
-                logger.warn("WriterAbortListener (rotation path) threw: " + cbErr.getMessage());
-            }
+            // ASYNC dispatch: this branch runs ON the drainer, and listeners
+            // respond with stopEventRecording — whose close path joins THIS
+            // thread. A synchronous callback would self-join (same false-
+            // wedge mechanics as the disk writer's abort site). Uses the
+            // generation captured AT THE LATCH — this branch and the writer's
+            // site describe the SAME abort, and the once-only gate must see
+            // the same stamp even if a close bumped the live generation in
+            // between.
+            notifyWriterAbortedAsync(writerAbortedErrorMessage != null
+                ? writerAbortedErrorMessage
+                : "rotation aborted (writerAbortedCorrupt latched)",
+                abortGenerationAtLatch);
             return 0;
         }
+        // Two-phase rotation liveness: an arm is outstanding but the splice
+        // keyframe hasn't arrived (encoder hiccup / dropped setParameters).
+        // Re-request on a ROTATION_SYNC_REREQUEST_MS cadence. The ABSOLUTE
+        // deadline that downgrades the splice to any-video-packet is checked
+        // at capture time against rotationArmedAtMs, which never moves
+        // during an arm.
+        if (rotationAwaitingSplice && isWritingToFile
+                && rotationClockMs() - rotationLastSyncReqMs
+                    > ROTATION_SYNC_REREQUEST_MS) {
+            rotationLastSyncReqMs = rotationClockMs();
+            logger.warn("Rotation splice keyframe not seen in "
+                + ROTATION_SYNC_REREQUEST_MS + "ms — re-requesting sync frame");
+            requestSyncFrame();
+        }
+        // Natural rotation tick. Gated on !rotationInFlight so an armed /
+        // queued / executing rotation isn't re-logged and re-armed on every
+        // ~16 ms drain pass (segmentStartTime only resets at the writer's
+        // swap).
         if (isWritingToFile && segmentStartTime > 0 && drainerRunning && diskWriterRunning
-                && !writerAbortedCorrupt) {
+                && !writerAbortedCorrupt && !rotationInFlight.get()) {
             long elapsed = System.currentTimeMillis() - segmentStartTime;
             long cachedDuration = segmentDurationMs;
             if (elapsed >= cachedDuration) {
                 if (savedFormat == null) {
                     // Encoder hasn't published its format yet — no frames have
-                    // been encoded since segment start. Rotation would bail
-                    // inside rotateSegmentLocked, but it doesn't update
-                    // segmentStartTime on the bail-out path, so the drainer
+                    // been encoded since segment start. rotateSegment() would
+                    // bail on savedFormat==null without updating
+                    // segmentStartTime, so the drainer
                     // would re-enter this branch on every loop iteration
                     // (~16 ms cadence) and spam the log. Push the timer
                     // forward by a small slice so we re-check in 5 s instead
@@ -4517,7 +5429,16 @@ public class HardwareEventRecorderGpu {
                 }
                 
             } else if (outputBufferIndex >= 0) {
-                // Got encoded data
+                // Got encoded data. The WHOLE branch is wrapped in a single
+                // try/finally so the output buffer is ALWAYS returned to
+                // MediaCodec exactly once — an exception (or the
+                // CODEC_CONFIG continue) anywhere in the body must never
+                // strand a codec buffer: with only 4-10 output slots, a few
+                // stranded buffers starve the encoder's input surface and
+                // freeze the GL thread.
+                try {
+                // Body indentation deliberately unchanged (single-purpose
+                // wrapper; keeps the diff reviewable).
                 ByteBuffer outputBuffer = encoder.getOutputBuffer(outputBufferIndex);
 
                 // CODEC_CONFIG filter. HEVC encoders (notably Adreno 610) can
@@ -4538,8 +5459,7 @@ public class HardwareEventRecorderGpu {
                 // PTS chain on flush.
                 if (outputBuffer != null
                         && (bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                    encoder.releaseOutputBuffer(outputBufferIndex, false);
-                    continue;
+                    continue;  // finally releases the buffer
                 }
 
                 if (outputBuffer != null && bufferInfo.size > 0) {
@@ -4586,18 +5506,67 @@ public class HardwareEventRecorderGpu {
                     if (isWritingToFile && muxerStarted) {
                         boolean isKeyFrame = (bufferInfo.flags
                                 & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
-                        if (!awaitLiveMuxerKeyframe || isKeyFrame) {
+                        // WRITER-OWNED ROTATION splice capture: an armed
+                        // rotation consumes this frame as the ROTATE ticket's
+                        // payload (swap command + the new segment's first
+                        // sample in ONE queue entry) instead of enqueueing it
+                        // as an ordinary packet. Keyframe preferred; past the
+                        // hard deadline ANY video frame is accepted so an
+                        // encoder that ignores sync-frame requests cannot
+                        // grow the segment without bound. Gated on
+                        // diskWriterRunning: closeEventRecording runs this
+                        // drain loop on the CLOSE thread after the writer
+                        // stopped — a ticket queued then would never execute
+                        // and would just be discarded by close's final flush.
+                        boolean spliceCaptured = false;
+                        if (rotationAwaitingSplice && !awaitLiveMuxerKeyframe
+                                && diskWriterRunning) {
+                            boolean deadlineHit = rotationClockMs()
+                                - rotationArmedAtMs > ROTATION_SPLICE_DEADLINE_MS;
+                            if (isKeyFrame || deadlineHit) {
+                                MuxerPacket rot = acquireMuxerPacket(bufferInfo.size);
+                                fillMuxerPacket(rot, outputBuffer, bufferInfo);
+                                rot.trackKind = TRACK_KIND_ROTATE;
+                                rot.rotateGeneration = recordingGeneration;
+                                if (offerControlToQueue(rot)) {
+                                    // Ownership of the arm transfers to the
+                                    // queued ticket; the disk writer (or a
+                                    // teardown drain) settles the gate.
+                                    rotationAwaitingSplice = false;
+                                    spliceCaptured = true;
+                                    if (!isKeyFrame) {
+                                        logger.warn("Rotation splice deadline ("
+                                            + ROTATION_SPLICE_DEADLINE_MS + "ms) hit"
+                                            + " without a keyframe — splicing on a"
+                                            + " P-frame (degraded start); re-requesting"
+                                            + " sync frame to bound the window");
+                                        requestSyncFrame();
+                                    }
+                                } else {
+                                    // Admission failed even with eviction
+                                    // (all-control queue — practically
+                                    // unreachable). Keep the arm; the next
+                                    // video packet retries.
+                                    releaseMuxerPacket(rot);
+                                }
+                            }
+                        }
+                        if (!spliceCaptured && (!awaitLiveMuxerKeyframe || isKeyFrame)) {
                             MuxerPacket mp = acquireMuxerPacket(bufferInfo.size);
                             fillMuxerPacket(mp, outputBuffer, bufferInfo);
-                            if (awaitLiveMuxerKeyframe) {
-                                // Serialize the first IDR with audio's final gate
-                                // check so AAC cannot enter this event queue first.
-                                synchronized (muxerLock) {
-                                    offerMuxerPacket(mp);
-                                    awaitLiveMuxerKeyframe = false;
-                                }
-                            } else {
-                                offerMuxerPacket(mp);
+                            boolean admitted = offerMuxerPacket(mp);
+                            if (awaitLiveMuxerKeyframe && admitted) {
+                                // Enqueue FIRST, then clear the gate — NO
+                                // muxerLock (pre-record/slow-SD fix): taking
+                                // muxerLock here parked the codec-drain loop
+                                // behind the writer's blocking writeSampleData
+                                // on slow SD cards. FIFO ordering makes the
+                                // lock unnecessary: any audio admitted after
+                                // this gate-clear lands BEHIND the IDR already
+                                // in the queue; audio racing the clear still
+                                // observes the gate and is dropped (same as
+                                // before).
+                                awaitLiveMuxerKeyframe = false;
                             }
                         }
                     }
@@ -4634,69 +5603,135 @@ public class HardwareEventRecorderGpu {
                         }
                     }
                 }
-                
-                // Release output buffer
-                encoder.releaseOutputBuffer(outputBufferIndex, false);
+                } finally {
+                    // ALWAYS release, even if the body threw or bailed via
+                    // continue. Wrapped so a concurrent encoder teardown
+                    // (IllegalStateException) doesn't mask the body's result;
+                    // the loop's next dequeue observes the dead codec and
+                    // exits.
+                    try {
+                        encoder.releaseOutputBuffer(outputBufferIndex, false);
+                    } catch (Exception releaseErr) {
+                        // Encoder released mid-iteration — nothing to return.
+                    }
+                }
             }
         }
         return framesDrained;
     }
 
     /**
-     * Rotates to a new segment file.
-     * 
-     * Closes current file and starts new segment WITHOUT flushing pre-record buffer
-     * (since we're continuing the same event, not starting a new one).
+     * Monotonic clock for the rotation arm/deadline timers. Package-private
+     * seam so unit tests can override it (the android.jar stub for
+     * SystemClock throws in the JVM harness). Production behavior is exactly
+     * {@code SystemClock.elapsedRealtime()}.
+     */
+    long rotationClockMs() {
+        return android.os.SystemClock.elapsedRealtime();
+    }
+
+    /**
+     * ARMS a rotation to a new segment file (writer-owned rotation). The
+     * actual close-old/open-new swap executes on the DISK WRITER when the
+     * splice frame's ROTATE ticket reaches the queue head; this method is
+     * non-blocking (volatile writes + one setParameters call — no I/O, no
+     * muxerLock) precisely so a storage stall can never park the calling
+     * thread (drainer tick / HTTP force path) behind rotation work.
+     *
+     * <p>The new segment continues the same event — the pre-record buffer is
+     * NOT flushed into it.
      */
     private void rotateSegment() {
         if (!isWritingToFile) {
             return;
         }
-        // Gate concurrent rotation attempts. The drainer tick and
-        // forceSegmentRotation can both reach here without sharing a lock;
-        // without this CAS, both pre-construct a new MediaMuxer off-lock,
-        // both enter the swap window, and the SECOND one's "old muxer"
-        // is the FIRST one's brand-new (empty) muxer → empty middle .mp4.
-        if (!rotationInFlight.compareAndSet(false, true)) {
-            logger.info("rotateSegment skipped — another rotation in flight");
+        if (savedFormat == null) {
+            // Can't build a new segment without the encoder's published
+            // format; the drainer's rotation-due branch owns log pacing
+            // for this state.
             return;
         }
+        // Gate concurrent arms (drainer tick vs forceSegmentRotation). Two
+        // live arms would produce two ROTATE tickets, and the second swap's
+        // "old muxer" would be the first's brand-new (empty) muxer → empty
+        // middle .mp4. NO finally-reset here: ownership rides with the arm →
+        // queued ticket → disk writer (see the ownership protocol at the
+        // rotation field docs).
+        if (!rotationInFlight.compareAndSet(false, true)) {
+            logger.debug("rotateSegment skipped — another rotation in flight");
+            return;
+        }
+        // MONOTONIC clock (elapsedRealtime), not wall time: a GPS/NTP clock
+        // correction stepping the wall clock backward must not postpone the
+        // splice deadline or the re-request cadence.
+        long now = rotationClockMs();
+        rotationArmedAtMs = now;
+        rotationLastSyncReqMs = now;
+        rotationAwaitingSplice = true;
+        logger.info("Rotation armed for segment " + segmentNumber
+            + " — waiting for splice keyframe");
+        // Non-blocking codec nudge (setParameters). The splice IDR both cuts
+        // the file at a decodable boundary and, written as the new muxer's
+        // first sample, seeds the new segment's PTS origin exactly at the cut.
+        requestSyncFrame();
+    }
+
+    /**
+     * Writer-owned rotation: executes the segment swap on the DISK WRITER
+     * thread when a {@link #TRACK_KIND_ROTATE} ticket (queued by the drainer
+     * at splice capture) reaches the queue head. FIFO ordering guarantees
+     * every old-segment packet was already written to the old muxer — no
+     * backlog drain, no seam drops. All rotation storage I/O (MediaMuxer fd
+     * open, start(), first-sample write) happens on the one thread that is
+     * ALLOWED to block; the drainer no longer touches muxerLock for rotation.
+     *
+     * <p>The ticket carries the splice frame's bytes; on success that frame
+     * becomes the new file's first sample, seeding the rebased PTS origin
+     * exactly at the cut. On any failure the OLD muxer stays (or is restored
+     * as) the active write target and the drainer tick re-arms after
+     * {@link #ROTATION_RETRY_BACKOFF_MS}.
+     *
+     * <p>Always consumes the ticket (payload back to the pool). Clears
+     * {@link #rotationInFlight} on every path except a stale-generation
+     * ticket, where the arm flags are left untouched because they belong to
+     * the successor recording (close already cleared the stale arm).
+     */
+    private void handleWriterRotatePacket(MuxerPacket ticket) {
         try {
-            rotateSegmentLocked();
-        } finally {
+            handleWriterRotatePacketInner(ticket);
+        } catch (Throwable t) {
+            // Containment: an unexpected throw must not bubble into the disk
+            // writer's consecutive-failure abort accounting (the loop already
+            // nulled its packet reference), and must never leave the rotation
+            // gate latched forever.
+            logger.error("Writer-side rotation failed unexpectedly: " + t.getMessage(), t);
             rotationInFlight.set(false);
+            try { releaseMuxerPacket(ticket); } catch (Throwable ignored) {}
         }
     }
 
-    private void rotateSegmentLocked() {
+    private void handleWriterRotatePacketInner(MuxerPacket ticket) {
+        // Stale ticket from a previous recording (close + retrigger while the
+        // writer was blocked with this ticket already dequeued): drop the
+        // payload and DO NOT touch the arm flags — any current arm state
+        // belongs to the successor recording.
+        if (ticket.rotateGeneration != recordingGeneration) {
+            logger.warn("Stale ROTATE ticket discarded (gen " + ticket.rotateGeneration
+                + " != live " + recordingGeneration + ")");
+            releaseMuxerPacket(ticket);
+            return;
+        }
+        if (!isWritingToFile) {
+            // Recording ended between splice capture and ticket processing.
+            // Same generation ⇒ this ticket's own arm is the one being
+            // abandoned, so clearing the gate is safe.
+            rotationInFlight.set(false);
+            releaseMuxerPacket(ticket);
+            return;
+        }
 
-        // SOTA RC6: hot-swap segment rotation.
-        //
-        // Old design: stop the disk writer, drain queue, muxer.stop() (slow,
-        // 50-200ms), open new muxer, restart writer. Total lock hold ≥100ms
-        // during which no packet writes flow → muxerWriteQueue grows →
-        // encoder eglSwap stalls → freeze+skip in the encoded MP4.
-        //
-        // New design: keep the disk writer running across the rotation. We:
-        //   1. Compute the new path / tempFile and pre-construct the new
-        //      MediaMuxer + addTrack on the SAME thread (the drainer thread
-        //      that calls rotateSegment) but BEFORE acquiring muxerLock. The
-        //      MediaMuxer constructor opens an fd; addTrack is metadata-only.
-        //      Both are O(1) and don't block on existing writes.
-        //   2. Briefly take muxerLock. Drain remaining queue into OLD muxer.
-        //      Stash old muxer reference into a local. Atomically replace
-        //      this.muxer with the new muxer; call new.start() inside the
-        //      lock so the writer's next iteration sees a started muxer.
-        //   3. Release muxerLock. Disk writer resumes immediately on the
-        //      new muxer.
-        //   4. Hand the old muxer + identity to a background worker thread
-        //      that runs stop+release+rename. The 50-200ms cost happens
-        //      OFF the disk-writer's critical path.
-        //
-        // Lock window: ~5-30ms (drain only) instead of 100-300ms. The disk
-        // writer never stops/restarts. Encoder backpressure window collapses.
-
-        logger.info("Rotating segment " + segmentNumber + " - hot-swap to new file");
+        logger.info("Rotating segment " + segmentNumber
+            + " — writer-side swap at splice frame");
 
         // Capture old segment identity for the background finalizer.
         final File oldTemp = tempFile;
@@ -4704,39 +5739,168 @@ public class HardwareEventRecorderGpu {
         final int oldSegmentNumber = segmentNumber;
 
         // === Step 1: pre-construct the new muxer OFF the lock ===
-        segmentNumber++;
+        // segmentNumber is bumped INSIDE the locked section below, only after
+        // the liveness/generation re-check passes — bumping here would
+        // corrupt a successor recording's counter if this rotation is
+        // abandoned (close + retrigger can land during the blocking muxer
+        // construction). nextSegmentPath reads segmentNumber only for the
+        // rare same-second disambiguation suffix; pre-bump value is fine.
+        //
+        // Geo stash/refresh + setLocation ALSO moved into the locked section:
+        // mutating closedStartGeo*/startGeo* before the swap is committed
+        // corrupted the CONTINUING segment's geo on every failed rotation,
+        // and could race a successor trigger's own location capture.
         String newPath = nextSegmentPath(segmentBasePath);
         File newTempFile = new File(newPath + ".tmp");
-        MediaMuxer newMuxer;
+        MediaMuxer newMuxer = null;
         int newTrackIndex = -1;
         int newAudioTrackIndex = -1;
-
-        // Stash the OUTGOING segment's start-geo before we overwrite the
-        // active fields with the new segment's GPS. The engine's segment
-        // listener (which fires AFTER this method returns, on the same
-        // finalizer thread) will read these via getClosedStartGeo*() to
-        // populate the closed segment's sidecar. Without this stash, the
-        // closed segment's geo.start would carry the new segment's GPS,
-        // misattributing location on every multi-segment recording.
-        closedStartGeoLat         = startGeoLat;
-        closedStartGeoLng         = startGeoLng;
-        closedStartGeoAccuracy    = startGeoAccuracy;
-        closedStartGeoAgeMs       = startGeoAgeMs;
-        closedStartGeoCapturedAtMs = startGeoCapturedAtMs;
-
-        // Refresh the start-location snapshot for the new segment so each
-        // rotated .mp4 carries a geo block matching the time it actually
-        // began (a 30-min trip can move several km between segment 1 and
-        // segment 15). Failures are non-fatal — the segment just won't have
-        // a geo block.
-        captureStartLocationSnapshot();
 
         try {
             newMuxer = new MediaMuxer(newTempFile.getAbsolutePath(),
                     MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-            // ISO 6709 geotag for the new segment (separate moov from the
-            // outgoing one). Same coordinate-clamping discipline as the
-            // start path — never let a malformed coord break rotation.
+            if (savedFormat != null) {
+                newTrackIndex = newMuxer.addTrack(savedFormat);
+                // Re-evaluate audio for the new segment so a mid-recording
+                // toggle flip OR a fresh CSD upload from the app takes
+                // effect at the rotation boundary.
+                newAudioTrackIndex = maybeAddAudioTrack(newMuxer);
+            } else {
+                logger.error("Cannot rotate: savedFormat is null (encoder hasn't published format)");
+                try { newMuxer.release(); } catch (Exception ignored) {}
+                abortRotationKeepOldSegment(ticket, newTempFile, true);
+                return;
+            }
+        } catch (Exception e) {
+            logger.error("Failed to pre-construct new segment muxer: " + e.getMessage(), e);
+            // Release a muxer whose CONSTRUCTOR succeeded but whose
+            // addTrack/audio wiring threw — otherwise its fd leaks until GC.
+            if (newMuxer != null) {
+                try { newMuxer.release(); } catch (Exception ignored) {}
+            }
+            abortRotationKeepOldSegment(ticket, newTempFile, true);
+            return;
+        }
+
+        // === Writer-side lock window: verify, stash, swap, first write ===
+        //
+        // No backlog drain here: this code runs on the DISK WRITER itself,
+        // and the ROTATE ticket's FIFO position guarantees every packet
+        // queued before the splice has already been written into the old
+        // muxer. Nothing is dropped at the seam.
+        final MediaMuxer oldMuxer;
+        final int oldRecordedFrames;
+        final long oldFirstPtsUs;
+        final long oldLastPtsUs;
+        final long listenerGenAtCommit;
+        final SegmentListener listenerAtCommit;
+        final com.overdrive.app.geo.GeoSnapshot closedGeoAtCommit;
+        final boolean spliceWasKeyframe = ticket.isKeyFrame();
+        synchronized (muxerLock) {
+            // COMMIT-POINT CAPTURE for the finalizer's callback fencing —
+            // taken BEFORE the liveness re-check below, deliberately. The
+            // ordering invariant that makes this safe: every close bumps
+            // recordingGeneration at ENTRY, strictly before it ever bumps
+            // listenerGeneration (wedge-abort or post-wait). So:
+            //   - capture BEFORE close's listener bump → the fence drops the
+            //     late callback (captured epoch < live epoch);
+            //   - capture AFTER close's listener bump → close entered before
+            //     it, so recordingGeneration is already bumped and the
+            //     re-check below abandons this rotation outright.
+            // Capturing AFTER the re-check (the previous layout) left a hole:
+            // a writer descheduled between re-check and capture for close's
+            // full join budget would capture the post-bump epoch with the
+            // re-check already passed — both fence sides poisoned alike.
+            final long lgAtCommit;
+            final SegmentListener slAtCommit;
+            synchronized (listenerEpochLock) {
+                lgAtCommit = listenerGeneration;
+                slAtCommit = segmentListener;
+            }
+            listenerGenAtCommit = lgAtCommit;
+            listenerAtCommit = slAtCommit;
+
+            // AUTHORITATIVE liveness re-check. closeEventRecording bumps
+            // recordingGeneration at ENTRY and holds muxerLock for its final
+            // flush + muxer stop; if close got ahead of us on either, this
+            // rotation must abandon — swapping a fresh muxer into a closed
+            // (or successor) recording would strand it with no owner.
+            // !diskWriterRunning covers the teardown window where the stop
+            // request has been issued but this thread is still draining its
+            // backlog: committing a swap then would spawn a finalizer close
+            // may no longer be waiting for.
+            if (!isWritingToFile || !muxerStarted || muxer == null
+                    || !diskWriterRunning
+                    || ticket.rotateGeneration != recordingGeneration) {
+                logger.warn("Rotation abandoned at swap — recording closed or"
+                    + " superseded (ticket gen " + ticket.rotateGeneration
+                    + ", live gen " + recordingGeneration + ")");
+                try { newMuxer.release(); } catch (Exception ignored) {}
+                if (newTempFile.exists()) newTempFile.delete();
+                // No segmentNumber back-out: the bump only happens below,
+                // after this re-check passes.
+                if (ticket.rotateGeneration == recordingGeneration) {
+                    // Same generation ⇒ this ticket's own arm is being
+                    // abandoned; a stale ticket's flags belong to a successor.
+                    rotationInFlight.set(false);
+                }
+                releaseMuxerPacket(ticket);
+                return;
+            }
+
+            // Stash the old muxer + its stats for the background finalizer,
+            // plus the full pre-swap PTS/identity/geo state so any failure
+            // below can ROLL BACK to the old muxer with nothing corrupted.
+            // Anything updated on `this.*` past this point belongs to the
+            // new segment.
+            oldMuxer = muxer;
+            oldRecordedFrames = recordedFrames;
+            oldFirstPtsUs = firstFramePtsUs;
+            oldLastPtsUs = lastFramePtsUs;
+            final int oldTrackIndexStash = trackIndex;
+            final int oldAudioTrackIndexStash = audioTrackIndex;
+            final long oldPtsOriginUs = ptsOriginUs;
+            final long oldLastSourcePtsUs = lastSourcePtsUs;
+            final long oldLastAudioPtsUs = lastAudioPtsUs;
+            final long oldSegmentStartTime = segmentStartTime;
+            final long oldLastDiskWrittenMs = lastDiskWrittenMs;
+            final double prevStartGeoLat = startGeoLat;
+            final double prevStartGeoLng = startGeoLng;
+            final float  prevStartGeoAccuracy = startGeoAccuracy;
+            final long   prevStartGeoAgeMs = startGeoAgeMs;
+            final long   prevStartGeoCapturedAtMs = startGeoCapturedAtMs;
+            final double prevClosedGeoLat = closedStartGeoLat;
+            final double prevClosedGeoLng = closedStartGeoLng;
+            final float  prevClosedGeoAccuracy = closedStartGeoAccuracy;
+            final long   prevClosedGeoAgeMs = closedStartGeoAgeMs;
+            final long   prevClosedGeoCapturedAtMs = closedStartGeoCapturedAtMs;
+
+            // Stash the OUTGOING segment's start-geo (read by the finalizer's
+            // scheduling-time snapshot and the engine's segment listener via
+            // getClosedStartGeo*()), then refresh the active fields for the
+            // NEW segment. Under muxerLock the re-check above guarantees the
+            // recording is live and close/trigger are excluded, so these
+            // writes can't race a successor's capture; the failure paths
+            // below restore both sets so an aborted rotation leaves the
+            // continuing segment's geo untouched.
+            closedStartGeoLat          = startGeoLat;
+            closedStartGeoLng          = startGeoLng;
+            closedStartGeoAccuracy     = startGeoAccuracy;
+            closedStartGeoAgeMs        = startGeoAgeMs;
+            closedStartGeoCapturedAtMs = startGeoCapturedAtMs;
+            captureStartLocationSnapshot();
+            // Immutable closed-segment geo for the finalizer, built at the
+            // commit point alongside the epoch/listener captures above.
+            closedGeoAtCommit = hasClosedStartGeo()
+                ? new com.overdrive.app.geo.GeoSnapshot(
+                        closedStartGeoLat, closedStartGeoLng,
+                        closedStartGeoAccuracy, closedStartGeoAgeMs,
+                        closedStartGeoCapturedAtMs, 0L)
+                : null;
+
+            // ISO 6709 geotag for the new segment (must precede start()).
+            // Same coordinate-clamping discipline as the trigger path —
+            // never let a malformed coord break rotation.
             try {
                 if (!Double.isNaN(startGeoLat) && !Double.isNaN(startGeoLng)) {
                     float lat = (float) Math.max(-90.0, Math.min(90.0, startGeoLat));
@@ -4746,173 +5910,185 @@ public class HardwareEventRecorderGpu {
             } catch (Throwable geoErr) {
                 logger.warn("Rotation MediaMuxer.setLocation failed: " + geoErr.getMessage());
             }
-            if (savedFormat != null) {
-                newTrackIndex = newMuxer.addTrack(savedFormat);
-                // Re-evaluate audio for the new segment so a mid-recording
-                // toggle flip OR a fresh CSD upload from the app takes
-                // effect at the rotation boundary.
-                newAudioTrackIndex = maybeAddAudioTrack(newMuxer);
-            } else {
-                logger.error("Cannot rotate: savedFormat is null (encoder hasn't published format)");
-                newMuxer.release();
-                segmentNumber--;  // back out the bump
-                return;
-            }
-        } catch (Exception e) {
-            logger.error("Failed to pre-construct new segment muxer: " + e.getMessage(), e);
-            if (newTempFile.exists()) newTempFile.delete();
-            segmentNumber--;  // back out the bump
-            return;
-        }
 
-        // === Step 2: brief lock window — drain, swap, start ===
-        final MediaMuxer oldMuxer;
-        final int oldTrackIndex;
-        final int oldRecordedFrames;
-        final long oldFirstPtsUs;
-        final long oldLastPtsUs;
-        boolean rotationOk = false;
-        synchronized (muxerLock) {
-            // Drain remaining queue into the OLD muxer. These packets have
-            // PTS values that belong to the old segment; writing them to the
-            // new muxer would break PTS monotonicity, so the queue MUST be
-            // empty before the hot-swap below.
-            //
-            // BOUNDED: writing the backlog is blocking disk I/O on the drainer
-            // thread, and under storage backpressure the queue can hold up to
-            // MUXER_WRITE_QUEUE_CAPACITY packets, each writeSampleData stalling
-            // on the slow drive. Draining all of it synchronously here starves
-            // the encoder drain → GL eglSwapBuffers blocks → the 3s GL watchdog
-            // kills the process (see ROTATE_DRAIN_BUDGET_MS). So we write only
-            // until the time budget is spent, then DROP (recycle without
-            // writing) the remaining old-segment packets. Dropping — rather
-            // than leaving them queued — is mandatory: any packet left in the
-            // queue would be picked up by the disk writer AFTER the swap and
-            // written, with its old PTS, into the NEW muxer, corrupting that
-            // segment. A sub-second seam gap beats a process restart.
-            final long drainDeadlineNs =
-                System.nanoTime() + ROTATE_DRAIN_BUDGET_MS * 1_000_000L;
-            MuxerPacket pkt;
-            int drained = 0;
-            int dropped = 0;
-            boolean stopWriting = false;  // latches once budget spent or a write fails
-            while ((pkt = muxerWriteQueue.poll()) != null) {
-                if (!stopWriting && muxerStarted && muxer != null
-                        && System.nanoTime() < drainDeadlineNs) {
-                    try {
-                        pkt.rewindForWrite();
-                        if (pkt.trackKind == TRACK_KIND_AUDIO) {
-                            if (audioTrackIndex >= 0) {
-                                writeRebasedAudio(muxer, audioTrackIndex,
-                                    pkt.data, pkt.info);
-                            }
-                        } else {
-                            writeRebased(muxer, trackIndex, pkt.data, pkt.info);
-                            // PTS tracking handled inside writeRebased; uses
-                            // the OLD segment's origin since muxer/ptsOriginUs
-                            // haven't been swapped yet.
-                            recordedFrames++;
-                            lastDiskWrittenMs = System.currentTimeMillis();
-                        }
-                        drained++;
-                    } catch (Exception e) {
-                        logger.warn("Rotation drain error: " + e.getMessage());
-                        writerAbortedCorrupt = true;
-                        // Drop (don't leave queued) the rest, so nothing leaks
-                        // into the new muxer after the swap.
-                        stopWriting = true;
-                        dropped++;
-                        releaseMuxerPacket(pkt);
-                        continue;
-                    }
-                } else {
-                    // Budget exhausted (or muxer gone): latch and drop the
-                    // remaining backlog instead of stalling the drainer.
-                    stopWriting = true;
-                    dropped++;
-                }
-                releaseMuxerPacket(pkt);
-            }
-            if (drained > 0 || dropped > 0) {
-                if (dropped > 0) {
-                    logger.warn("Rotation drained " + drained + " queued frames into old"
-                        + " segment, DROPPED " + dropped + " (drain budget "
-                        + ROTATE_DRAIN_BUDGET_MS + "ms exceeded — storage backpressure;"
-                        + " dropping seam frames to avoid a GL watchdog restart)");
-                } else {
-                    logger.debug("Rotation drained " + drained + " queued frames into old segment");
-                }
-            }
-
-            // Stash the old muxer + its stats so the background finalizer
-            // owns them. Anything we update on `this.*` from here on belongs
-            // to the new segment.
-            oldMuxer = muxer;
-            oldTrackIndex = trackIndex;
-            oldRecordedFrames = recordedFrames;
-            oldFirstPtsUs = firstFramePtsUs;
-            oldLastPtsUs = lastFramePtsUs;
-
-            // Hot-swap: this.muxer now points at the new muxer. The disk
-            // writer's next iteration will write to it.
             try {
                 newMuxer.start();
-                muxer = newMuxer;
-                trackIndex = newTrackIndex;
-                audioTrackIndex = newAudioTrackIndex;
-                muxerStarted = true;
-                tempFile = newTempFile;
-                outputPath = newPath;
-                // Reset per-segment counters AFTER capturing oldFirstPtsUs etc.
-                // for the finalizer. Reset ptsOriginUs too so the new
-                // segment's muxer captures its own origin from its first
-                // packet — without this the new muxer would inherit the old
-                // segment's origin and produce out-of-range PTSs.
-                recordedFrames = 0;
-                firstFramePtsUs = -1;
-                lastFramePtsUs = -1;
-                ptsOriginUs = -1;
-                lastSourcePtsUs = -1;
-                lastAudioPtsUs = -1L;
-                // Re-seed the disk-write clock on rotation so the new segment
-                // gets a fresh grace window (mirrors the trigger-open seed).
-                lastDiskWrittenMs = System.currentTimeMillis();
-                segmentStartTime = System.currentTimeMillis();
-                rotationOk = true;
             } catch (Exception e) {
                 logger.error("Failed to start new segment muxer: " + e.getMessage(), e);
-                // Restore the old muxer as the active one so the writer keeps
-                // writing to a still-valid target. The old segment continues
-                // until the next rotation attempt.
+                // Old muxer stays the active target; the old segment simply
+                // continues until the drainer re-arms after the backoff.
+                // Restore the geo sets mutated above.
+                startGeoLat = prevStartGeoLat;
+                startGeoLng = prevStartGeoLng;
+                startGeoAccuracy = prevStartGeoAccuracy;
+                startGeoAgeMs = prevStartGeoAgeMs;
+                startGeoCapturedAtMs = prevStartGeoCapturedAtMs;
+                closedStartGeoLat = prevClosedGeoLat;
+                closedStartGeoLng = prevClosedGeoLng;
+                closedStartGeoAccuracy = prevClosedGeoAccuracy;
+                closedStartGeoAgeMs = prevClosedGeoAgeMs;
+                closedStartGeoCapturedAtMs = prevClosedGeoCapturedAtMs;
                 try { newMuxer.release(); } catch (Exception ignored) {}
-                if (newTempFile.exists()) newTempFile.delete();
-                segmentNumber--;  // back out the bump
+                abortRotationKeepOldSegment(ticket, newTempFile, true);
+                return;
+            }
+
+            // Hot-swap: this.muxer now points at the new muxer. Reset the
+            // per-segment counters (captured above) — ptsOriginUs especially,
+            // so the carried splice frame written below seeds the new
+            // segment's own PTS=0 origin exactly at the cut.
+            muxer = newMuxer;
+            trackIndex = newTrackIndex;
+            audioTrackIndex = newAudioTrackIndex;
+            muxerStarted = true;
+            tempFile = newTempFile;
+            outputPath = newPath;
+            segmentNumber++;  // committed with the swap; rollback decrements
+            recordedFrames = 0;
+            firstFramePtsUs = -1;
+            lastFramePtsUs = -1;
+            ptsOriginUs = -1;
+            lastSourcePtsUs = -1;
+            lastAudioPtsUs = -1L;
+            // Re-seed the disk-write clock on rotation so the new segment
+            // gets a fresh grace window (mirrors the trigger-open seed).
+            lastDiskWrittenMs = System.currentTimeMillis();
+            segmentStartTime = System.currentTimeMillis();
+
+            // First write: the carried splice frame becomes the new file's
+            // first sample. writeRebased THROWS on failure — roll the entire
+            // swap back so the writer keeps a valid target (the old muxer,
+            // still un-stopped) and the old segment continues.
+            try {
+                ticket.rewindForWrite();
+                writeRebased(muxer, trackIndex, ticket.data, ticket.info);
+                recordedFrames = 1;
+                lastDiskWrittenMs = System.currentTimeMillis();
+            } catch (Exception e) {
+                logger.error("First write to new segment failed — rolling back"
+                    + " to old muxer: " + e.getMessage());
+                muxer = oldMuxer;
+                trackIndex = oldTrackIndexStash;
+                audioTrackIndex = oldAudioTrackIndexStash;
+                muxerStarted = true;
+                tempFile = oldTemp;
+                outputPath = oldOutputPath;
+                segmentNumber--;  // back out the swap-committed bump
+                recordedFrames = oldRecordedFrames;
+                firstFramePtsUs = oldFirstPtsUs;
+                lastFramePtsUs = oldLastPtsUs;
+                ptsOriginUs = oldPtsOriginUs;
+                lastSourcePtsUs = oldLastSourcePtsUs;
+                lastAudioPtsUs = oldLastAudioPtsUs;
+                segmentStartTime = oldSegmentStartTime;
+                lastDiskWrittenMs = oldLastDiskWrittenMs;
+                startGeoLat = prevStartGeoLat;
+                startGeoLng = prevStartGeoLng;
+                startGeoAccuracy = prevStartGeoAccuracy;
+                startGeoAgeMs = prevStartGeoAgeMs;
+                startGeoCapturedAtMs = prevStartGeoCapturedAtMs;
+                closedStartGeoLat = prevClosedGeoLat;
+                closedStartGeoLng = prevClosedGeoLng;
+                closedStartGeoAccuracy = prevClosedGeoAccuracy;
+                closedStartGeoAgeMs = prevClosedGeoAgeMs;
+                closedStartGeoCapturedAtMs = prevClosedGeoCapturedAtMs;
+                try { newMuxer.stop(); } catch (Exception ignored) {}
+                try { newMuxer.release(); } catch (Exception ignored) {}
+                abortRotationKeepOldSegment(ticket, newTempFile, true);
+                return;
             }
         }
 
-        if (!rotationOk) {
-            return;
-        }
+        // Swap committed. Release the gate BEFORE the housekeeping below so
+        // an exception in finalize/verify can never latch rotation shut.
+        rotationInFlight.set(false);
+        releaseMuxerPacket(ticket);
+        logger.info("Segment " + segmentNumber + " started: " + newTempFile.getName()
+            + (spliceWasKeyframe ? " (keyframe splice)"
+                                 : " (deadline splice — P-frame lead)"));
 
-        // === Step 3: writer is already on the new muxer. Request keyframe. ===
-        // Without this, the new segment would start with P-frames referencing
-        // an I-frame that lives in the old (now-stopped) file. Players would
-        // render garbage until the next ~2-second I-frame interval.
-        requestSyncFrame();
-        logger.info("Segment " + segmentNumber + " started: " + newTempFile.getName());
-
-        // === Step 4: hand the old muxer to a background finalizer ===
-        // stop() takes 50-200ms (writes the moov atom). rename() is fast but
-        // blocks on metadata. Both happen off the realtime-critical path.
+        // Hand the old muxer to the background finalizer. stop() takes
+        // 50-200 ms (writes the moov atom); rename blocks on metadata — both
+        // stay off the writer's per-packet path.
         //
-        // Snapshot writerAbortedCorrupt at rotation time. The live volatile
-        // is shared across all in-flight finalizers; without snapshotting,
-        // a transient SD-card hiccup that flips the flag during finalizer N's
-        // stop() would also poison finalizer N+1's perfectly-fine segment
-        // because both check the same live flag (audit Finding R2).
+        // Snapshot writerAbortedCorrupt at rotation time (audit Finding R2:
+        // the live volatile is shared across all in-flight finalizers; a
+        // later transient hiccup must not poison this fine segment).
         finalizeOldSegmentAsync(oldMuxer, oldTemp, oldOutputPath,
                 oldSegmentNumber, oldRecordedFrames, oldFirstPtsUs, oldLastPtsUs,
-                writerAbortedCorrupt, new File(newPath));
+                writerAbortedCorrupt, new File(newPath),
+                listenerAtCommit, closedGeoAtCommit, listenerGenAtCommit);
+
+        // forceSegmentRotation's audio verification, against POST-swap state
+        // (the old synchronous check right after rotateSegment() returned
+        // would read the OUTGOING segment's audioTrackIndex now that
+        // rotation is asynchronous).
+        if (pendingForceAudioVerify) {
+            pendingForceAudioVerify = false;
+            if (newAudioTrackIndex < 0 && hasAudioConfig()) {
+                logger.info("force-rotation verify: new segment has no audio track"
+                    + " — scheduling 1.5s follow-up rotation");
+                scheduleForceAudioFollowUp();
+            }
+        }
+    }
+
+    /**
+     * Common cleanup for a failed writer-side rotation where the OLD segment
+     * remains (or was restored as) the active write target. Deletes the
+     * orphan tmp, releases the ticket payload to the pool, clears the
+     * rotation gate, and (optionally) pushes the drainer's re-arm out by
+     * {@link #ROTATION_RETRY_BACKOFF_MS} — field logs showed rotation
+     * retries spinning at drainer-tick cadence during an SD stall without
+     * this. segmentNumber is NOT touched here: the bump commits with the
+     * swap, and only the first-write rollback (which restores the pre-swap
+     * state inline) backs it out.
+     */
+    private void abortRotationKeepOldSegment(MuxerPacket ticket, File newTempFile,
+                                             boolean applyBackoff) {
+        if (newTempFile != null && newTempFile.exists()) {
+            try { newTempFile.delete(); } catch (Throwable ignored) {}
+        }
+        if (applyBackoff) {
+            segmentStartTime = System.currentTimeMillis() - segmentDurationMs
+                + ROTATION_RETRY_BACKOFF_MS;
+        }
+        rotationInFlight.set(false);
+        releaseMuxerPacket(ticket);
+    }
+
+    /**
+     * Single-shot 1.5 s follow-up rotation for the force-rotation audio
+     * verification (scheduled by the disk writer post-swap when the new
+     * segment failed to pick up an audio track despite a live audio config).
+     * The delay lets the next AAC DATA packet trigger AacIngestServer's
+     * identity-changed replay so audio is wired up by the time the follow-up
+     * rotation's muxer is constructed. Re-checks everything at fire time
+     * under startStopLock; daemon thread so JVM shutdown never blocks on it.
+     */
+    private void scheduleForceAudioFollowUp() {
+        Thread followup = new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    Thread.sleep(1500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                synchronized (startStopLock) {
+                    if (!isWritingToFile) return;
+                    // Already wired up by the next natural rotation tick or
+                    // by another forceSegmentRotation call.
+                    if (audioTrackIndex >= 0) return;
+                    // Audio gone again — nothing to gain by rotating.
+                    if (!hasAudioConfig()) return;
+                    rotateSegment();
+                    logger.info("forceSegmentRotation follow-up fired");
+                }
+            }
+        }, "ForceRotateFollowup");
+        followup.setDaemon(true);
+        followup.start();
     }
 
     /**
@@ -4929,8 +6105,49 @@ public class HardwareEventRecorderGpu {
                                          final int oldSegmentNumber, final int oldRecordedFrames,
                                          final long oldFirstPtsUs, final long oldLastPtsUs,
                                          final boolean wasAbortedAtRotation,
-                                         final File newSegmentFile) {
-        // Increment BEFORE constructing the thread so a close() that arrives
+                                         final File newSegmentFile,
+                                         final SegmentListener listenerAtCommit,
+                                         final com.overdrive.app.geo.GeoSnapshot closedGeoAtCommit,
+                                         final long listenerGenerationAtCommit) {
+        // The listener, closed-segment geo, and callback-ownership epoch are
+        // COMMIT-POINT captures passed in by the rotation handler (taken
+        // under muxerLock right after its authoritative re-check, BEFORE the
+        // blocking muxer I/O). Capturing them here at scheduling time was a
+        // fence bypass: a writer wedged inside start()/first-write can be
+        // out-waited by a wedge-aborting close that bumps the epoch — a
+        // scheduling-time capture then reads the POST-bump epoch and the
+        // late callback sails through dispatchSegmentClosedFenced into a
+        // terminal (or successor) recording's engine state.
+        // Dispatch-order ticket. Callbacks must reach the engine in segment
+        // order, but native finalization must NOT be serialized (a wedged
+        // stop() on dead storage would head-of-line-block every later
+        // finalizer, leaking muxers and .tmp files across successor
+        // recordings). Per-rotation threads keep finalization isolated; the
+        // sequenced gate in deliverSegmentClosedInOrder orders ONLY the
+        // callback hand-off.
+        final long dispatchSeq;
+        synchronized (finalizerDispatchLock) {
+            dispatchSeq = ++finalizerSeqLast;
+            if (listenerGenerationAtCommit > finalizerLastScheduledGen) {
+                // Strictly ADVANCING generations only: a stale finalizer
+                // scheduling LATE (wedged writer, old epoch) must not
+                // re-trigger the supersede and wipe out a successor's
+                // pending range.
+                finalizerLastScheduledGen = listenerGenerationAtCommit;
+                // First finalizer of a new callback-ownership generation:
+                // the entire previous seq range belongs to a dead recording
+                // whose callbacks the fence will drop anyway. Supersede it
+                // NOW so this recording's callbacks never queue behind a
+                // dead recording's wedged stragglers (and so a doomed waiter
+                // wakes and drops immediately instead of colliding with
+                // close's finalizer budgets 5 s later).
+                if (finalizerDispatchedUpTo < dispatchSeq - 1) {
+                    finalizerDispatchedUpTo = dispatchSeq - 1;
+                    finalizerDispatchLock.notifyAll();
+                }
+            }
+        }
+        // Increment BEFORE starting the thread so a close() that arrives
         // immediately after this method returns sees the in-flight count.
         inFlightFinalizers.incrementAndGet();
         Thread t = new Thread(() -> {
@@ -4993,21 +6210,20 @@ public class HardwareEventRecorderGpu {
                         // SurveillanceEngineGpu's listener which writes
                         // the richer v3 sidecar. The CLOSED-segment geo
                         // is in closedStartGeo* (stashed at the top of
-                        // rotateSegmentLocked before we refreshed the
-                        // active fields for the new segment). Off-thread
-                        // executor inside LocationSidecarWriter.
+                        // the writer-side rotation handler before the
+                        // active fields were refreshed for the new
+                        // segment). Off-thread executor inside
+                        // LocationSidecarWriter.
                         try {
                             String flow = inferGeocodingFlow(finalFile.getName());
                             if (!"surveillance".equals(flow)) {
-                                com.overdrive.app.geo.GeoSnapshot startGeo;
-                                if (hasClosedStartGeo()) {
-                                    startGeo = new com.overdrive.app.geo.GeoSnapshot(
-                                            closedStartGeoLat, closedStartGeoLng,
-                                            closedStartGeoAccuracy, closedStartGeoAgeMs,
-                                            closedStartGeoCapturedAtMs, 0L);
-                                } else {
-                                    startGeo = com.overdrive.app.geo.GeoSnapshot.empty();
-                                }
+                                // Commit-point snapshot, NOT the live
+                                // closedStartGeo* fields — a later rotation
+                                // may have overwritten them by now.
+                                com.overdrive.app.geo.GeoSnapshot startGeo =
+                                    (closedGeoAtCommit != null)
+                                        ? closedGeoAtCommit
+                                        : com.overdrive.app.geo.GeoSnapshot.empty();
                                 com.overdrive.app.geo.LocationSidecarWriter
                                         .getInstance()
                                         .submit(finalFile, flow, startGeo);
@@ -5048,15 +6264,11 @@ public class HardwareEventRecorderGpu {
             }
 
             // Notify the engine after the rename so consumers can read the
-            // finalised file. Same listener as the synchronous path.
-            SegmentListener listener = segmentListener;
-            if (listener != null) {
-                try {
-                    listener.onSegmentClosed(finalisedSegment, newSegmentFile);
-                } catch (Throwable th) {
-                    logger.warn("SegmentListener error: " + th.getMessage());
-                }
-            }
+            // finalised file. COMMIT-POINT listener + OWNERSHIP FENCE +
+            // ORDER GATE — right object, right time, right order (see
+            // dispatchSegmentClosedFenced / deliverSegmentClosedInOrder).
+            deliverSegmentClosedInOrder(dispatchSeq, listenerAtCommit,
+                    listenerGenerationAtCommit, finalisedSegment, newSegmentFile);
           } finally {
             // Decrement and notify any close()/release() waiter. Must be in
             // finally so an exception inside the body still releases the
@@ -5075,12 +6287,260 @@ public class HardwareEventRecorderGpu {
         t.start();
     }
 
+    // ==================== finalizer callback ordering ====================
+    // Rotations can be as little as ~1–1.5 s apart (forceSegmentRotation +
+    // its audio follow-up), and finalizers run on independent per-rotation
+    // threads (deliberately: serializing native finalization on one worker
+    // would let a single wedged MediaMuxer.stop() on dead storage
+    // head-of-line-block every later finalizer, leaking muxers and .tmp
+    // files across successor recordings). So segment N+1's finalizer (tiny
+    // file, fast stop) can FINISH before segment N's (large file, slow
+    // stop) — and delivering their callbacks in completion order would roll
+    // the engine's currentEventFile/timeline state backward. The gate below
+    // orders ONLY the callback hand-off: each finalizer waits (bounded) for
+    // its predecessor's dispatch, then delivers under the gate's lock. A
+    // predecessor wedged past the bound is skipped; when its callback
+    // finally arrives it is dropped as superseded (delivering it late would
+    // recreate the rollback). Its FILE-side work still completes whenever
+    // its stop() unwedges — only the engine callback is sacrificed.
+    private final Object finalizerDispatchLock = new Object();
+    private long finalizerSeqLast = 0;          // guarded by finalizerDispatchLock
+    private long finalizerDispatchedUpTo = 0;   // guarded by finalizerDispatchLock
+    // Generation whose finalizers were last scheduled. Lets the FIRST
+    // finalizer of a new callback-ownership generation supersede the entire
+    // previous seq range at SCHEDULING time (writer thread, no lifecycle
+    // locks involved) — a healthy successor recording must never queue
+    // behind a dead recording's wedged stragglers.
+    private long finalizerLastScheduledGen = 0; // guarded by finalizerDispatchLock
+    // Seqs currently READY inside the order gate. On a wait expiry the gate
+    // bridges the cursor only up to the LOWEST ready waiter — not to the
+    // expirer's own seq — so a timeout burst drains ready callbacks in
+    // order instead of letting monitor-acquisition luck drop lower ready
+    // sequences as superseded.
+    private final java.util.TreeSet<Long> finalizerWaitingSeqs =
+        new java.util.TreeSet<>();
+    // Instance field (not a constant) so the unit harness can shrink it.
+    private long finalizerDispatchOrderWaitMs = 5_000L;
+
+    /** Monotonic millis for the dispatch gate's deadline arithmetic. Wall
+     *  time (currentTimeMillis) steps under GPS/NTP corrections — common on
+     *  this head unit — which would stretch or prematurely expire the order
+     *  bound. nanoTime is monotonic on both Android and the JVM test
+     *  harness (unlike SystemClock, whose stub throws in unit tests). */
+    private static long monotonicNowMs() {
+        return System.nanoTime() / 1_000_000L;
+    }
+
+    private void deliverSegmentClosedInOrder(long seq,
+                                             SegmentListener listenerAtSchedule,
+                                             long listenerGenerationAtSchedule,
+                                             File finalisedSegment,
+                                             File newSegmentFile) {
+        synchronized (finalizerDispatchLock) {
+          finalizerWaitingSeqs.add(seq);
+          try {
+            long lastObservedCursor = finalizerDispatchedUpTo;
+            long deadline = monotonicNowMs() + finalizerDispatchOrderWaitMs;
+            while (finalizerDispatchedUpTo < seq - 1) {
+                if (finalizerDispatchedUpTo != lastObservedCursor) {
+                    // Predecessor progress — grant a fresh window. The
+                    // deadline punishes STALLED gaps, not long ordered
+                    // chains that are actively draining.
+                    lastObservedCursor = finalizerDispatchedUpTo;
+                    deadline = monotonicNowMs() + finalizerDispatchOrderWaitMs;
+                }
+                long remaining = deadline - monotonicNowMs();
+                if (remaining <= 0) {
+                    // No predecessor progress for a full window: the gap
+                    // ahead is wedged (or gone). Bridge the cursor up to the
+                    // LOWEST ready waiter — possibly us — so ready callbacks
+                    // drain in order and only truly absent seqs are skipped.
+                    long lowestReady = finalizerWaitingSeqs.first();
+                    if (finalizerDispatchedUpTo < lowestReady - 1) {
+                        logger.warn("Finalizer dispatch order wait expired (seq "
+                            + seq + ", dispatched through "
+                            + finalizerDispatchedUpTo + ") — bridging wedged gap"
+                            + " to seq " + lowestReady + "; stragglers will be"
+                            + " dropped as superseded");
+                        finalizerDispatchedUpTo = lowestReady - 1;
+                        finalizerDispatchLock.notifyAll();
+                    }
+                    if (finalizerDispatchedUpTo >= seq - 1) {
+                        break;  // we were the lowest — our turn
+                    }
+                    // A lower READY waiter drains first. Yield the monitor
+                    // briefly; the progress check above grants a fresh
+                    // window the moment the cursor moves.
+                    try {
+                        finalizerDispatchLock.wait(50);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    continue;
+                }
+                try {
+                    finalizerDispatchLock.wait(remaining);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (finalizerDispatchedUpTo >= seq) {
+                // A successor already skipped past us: we wedged beyond the
+                // order bound, it delivered, and advanced the cursor.
+                // Delivering now would roll engine state backward.
+                logger.warn("Segment-closed callback dropped — superseded"
+                    + " (seq " + seq + ", dispatched through "
+                    + finalizerDispatchedUpTo + ")");
+            } else {
+                if (finalizerDispatchedUpTo < seq - 1) {
+                    logger.warn("Finalizer dispatch order interrupted/expired"
+                        + " ahead of seq " + seq + " (dispatched through "
+                        + finalizerDispatchedUpTo + ") — delivering past the"
+                        + " gap; stragglers will be dropped as superseded");
+                }
+                // Delivery INSIDE the gate: callbacks are engine Java code
+                // (bounded; "consumers should not block" per the interface
+                // contract), unlike native stop() which is what actually
+                // wedges — so serializing here cannot head-of-line-block on
+                // storage, only on listener code.
+                dispatchSegmentClosedFenced(listenerAtSchedule,
+                        listenerGenerationAtSchedule, finalisedSegment,
+                        newSegmentFile);
+                finalizerDispatchedUpTo = seq;
+            }
+            if (finalizerDispatchedUpTo < seq) {
+                finalizerDispatchedUpTo = seq;
+            }
+            finalizerDispatchLock.notifyAll();
+          } finally {
+            finalizerWaitingSeqs.remove(seq);
+          }
+        }
+    }
+
+    /**
+     * Reclaims the dangling muxer of a writer-aborted recording whose flags
+     * were already cleared by the drainer's abort branch — in that state
+     * neither the owner's stop nor the abort listener's quarantine ever ran
+     * (both short-circuit on the cleared flags), so the native MediaMuxer
+     * handle and the half-written .mp4.tmp would otherwise dangle until the
+     * next trigger silently overwrote the reference. Stops/releases the
+     * muxer (errors expected and contained on dead storage) and quarantines
+     * the tmp as .broken so the user never sees a corrupt file with a final
+     * .mp4 name. Caller holds startStopLock; muxer ops run under muxerLock.
+     */
+    private void quarantineAbortedMuxer() {
+        synchronized (muxerLock) {
+            // Purge stale queue residue FIRST, unconditionally. The aborted
+            // writer's one-time queue drain races the still-running
+            // drainer's in-flight pass, which can enqueue more old-recording
+            // packets right after it (the drainer only observes the abort at
+            // its NEXT pass's top). Nothing else drains them — the writer is
+            // dead — and the replacement writer would otherwise write them
+            // into the SUCCESSOR muxer once it starts, seeding the new
+            // segment's PTS origin from a dead recording's timestamp with a
+            // P-frame lead.
+            MuxerPacket stale;
+            int purged = 0;
+            while ((stale = muxerWriteQueue.poll()) != null) {
+                discardQueuedPacket(stale);
+                purged++;
+            }
+            if (purged > 0) {
+                logger.warn("Purged " + purged + " stale queued packet(s) from "
+                    + "the aborted recording before starting the successor");
+            }
+            if (muxer == null) {
+                return;
+            }
+            logger.warn("Trigger found a writer-aborted recording's dangling "
+                + "muxer — quarantining before starting the new recording");
+            try {
+                muxer.stop();
+            } catch (Exception e) {
+                logger.warn("Aborted-muxer stop error (expected on dead storage): "
+                    + e.getMessage());
+            }
+            try {
+                muxer.release();
+            } catch (Exception e) {
+                logger.warn("Aborted-muxer release error: " + e.getMessage());
+            }
+            muxer = null;
+            muxerStarted = false;
+            trackIndex = -1;
+            audioTrackIndex = -1;
+            if (tempFile != null && tempFile.exists()) {
+                File broken = new File(outputPath + ".broken");
+                if (tempFile.renameTo(broken)) {
+                    logger.warn("Quarantined writer-aborted segment: "
+                        + broken.getName());
+                } else {
+                    logger.warn("Quarantine rename failed; deleting aborted tmp: "
+                        + tempFile.getName());
+                    tempFile.delete();
+                }
+            }
+            tempFile = null;
+        }
+    }
+
     /**
      * Wait for any in-flight segment finalizers to complete. Bounded by
      * timeoutMs (returns false on timeout — caller must decide whether to
      * proceed anyway). Called from closeEventRecording and release() so a
      * rapid stop+restart can't race a still-running rename + onFileSaved.
      */
+    /**
+     * Generation-fenced segment-closed dispatch (finalizer tail). Close's
+     * finalizer waits are bounded (2 s at entry, 3 s post-worker-stop):
+     * after a long storage stall a finalizer blocked in {@code muxer.stop()}
+     * can outlive BOTH, close proceeds, a successor recording starts, and
+     * only then does this dispatch run. The scheduling-time listener capture
+     * prevents delivering to the WRONG listener object, but the engine's
+     * handlers mutate LIVE engine state (currentEventFile re-point,
+     * thumbnail drain, timeline restart) — running them for a dead recording
+     * corrupts the successor's event. If callback ownership
+     * ({@link #listenerGeneration} — NOT {@link #recordingGeneration}, which
+     * close bumps at entry for ticket invalidation and which must not
+     * suppress the closing recording's own valid callbacks) moved on, the
+     * callback is DROPPED; the closed segment's file-side work (rename,
+     * index seed, sidecar with the scheduling-time geo snapshot) has already
+     * completed above and remains valid.
+     *
+     * <p>Residual (accepted): the fence check and the callback are not one
+     * atomic step — a callback that passed the check can still be executing
+     * when a timed-out close proceeds to bump. That window exists only when
+     * a wait OVERRUNS its bound, and closing it would mean an unbounded
+     * close or a lock shared between close and arbitrary listener code
+     * (deadlock bait). The waits make the normal path race-free: an
+     * executing callback holds the in-flight count, and the bump happens
+     * after the wait drains it.
+     *
+     * <p>Package-private so the unit harness can exercise the fence
+     * deterministically.
+     */
+    void dispatchSegmentClosedFenced(SegmentListener listenerAtSchedule,
+                                     long listenerGenerationAtSchedule,
+                                     File finalisedSegment, File newSegmentFile) {
+        if (listenerAtSchedule == null) {
+            return;
+        }
+        if (listenerGeneration != listenerGenerationAtSchedule) {
+            logger.warn("Segment-closed callback dropped — callback ownership moved on ("
+                + listenerGenerationAtSchedule + " -> " + listenerGeneration
+                + "); late finalizer dispatch after close/retrigger");
+            return;
+        }
+        try {
+            listenerAtSchedule.onSegmentClosed(finalisedSegment, newSegmentFile);
+        } catch (Throwable th) {
+            logger.warn("SegmentListener error: " + th.getMessage());
+        }
+    }
+
     private boolean waitForFinalizers(long timeoutMs) {
         long deadline = System.currentTimeMillis() + timeoutMs;
         synchronized (finalizerJoinLock) {

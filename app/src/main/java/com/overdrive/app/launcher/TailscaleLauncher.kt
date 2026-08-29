@@ -2,6 +2,7 @@ package com.overdrive.app.launcher
 
 import android.content.Context
 import com.overdrive.app.logging.LogManager
+import com.overdrive.app.mqtt.ProxyHelper
 
 /**
  * Launches Tailscale tunnel processes via ADB shell for remote access.
@@ -29,7 +30,7 @@ class TailscaleLauncher(
 
         // Proxy settings for sing-box (socks5 for tailscale)
         private const val PROXY_HOST = "127.0.0.1"
-        private const val PROXY_PORT = "8119"
+        private const val PROXY_PORT = 8119
 
         // Remote-ADB opt-in sentinel + the adbd port we forward to. Same
         // sentinel-file pattern as TAILSCALE_PROXY_FILE so the UID-2000 shell
@@ -77,10 +78,9 @@ class TailscaleLauncher(
                 }
             } else {
                 checkAndInstallTailscale(callback) {
-                    isSingboxActive { active ->
-                        isProxyEnabled { enableProxy ->
-                            launchTailscaleDaemon(active, enableProxy, callback)
-                        }
+                    val useProxy = ProxyHelper.probePort(PROXY_PORT)
+                    isProxyEnabled { enableProxy ->
+                        launchTailscaleDaemon(useProxy, enableProxy, callback)
                     }
                 }
             }
@@ -553,21 +553,6 @@ class TailscaleLauncher(
     fun isTunnelRunning(callback: (Boolean) -> Unit) {
         adbShellExecutor.execute(
             command = "ps -A | grep tailscaled | grep -v grep",
-            callback = object : AdbShellExecutor.ShellCallback {
-                override fun onSuccess(output: String) {
-                    callback(output.trim().isNotEmpty())
-                }
-
-                override fun onError(error: String) {
-                    callback(false)
-                }
-            }
-        )
-    }
-
-    private fun isSingboxActive(callback: (Boolean) -> Unit) {
-        adbShellExecutor.execute(
-            command = "pgrep -f sing-box",
             callback = object : AdbShellExecutor.ShellCallback {
                 override fun onSuccess(output: String) {
                     callback(output.trim().isNotEmpty())

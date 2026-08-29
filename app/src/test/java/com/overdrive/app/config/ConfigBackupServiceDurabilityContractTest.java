@@ -234,6 +234,16 @@ public class ConfigBackupServiceDurabilityContractTest {
                 "stripEphemeral(unified)");
     }
 
+    @Test
+    public void backupCarriesEncryptedGenAiCredentialWithDeviceKey()
+            throws IOException {
+        String source = source();
+        assertTrue(source.contains(
+                "listOf(\"bydCloud\", \"navMap\", \"telegram\", \"genAi\")"));
+        assertTrue(source.contains(
+                "\"genAi\"    -> \"GenAI provider API key\""));
+    }
+
     private static void assertOrdered(String source, String... needles) {
         int previous = -1;
         for (String needle : needles) {

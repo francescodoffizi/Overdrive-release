@@ -24,6 +24,17 @@ public final class TelenavActions {
 
     private TelenavActions() {}
 
+    public static boolean isAvailable(Context ctx) {
+        return TelenavClient.isAvailable(ctx);
+    }
+
+    public static void validateCoordinates(double lat, double lng) {
+        if (Double.isNaN(lat) || Double.isInfinite(lat) || lat < -90.0 || lat > 90.0
+                || Double.isNaN(lng) || Double.isInfinite(lng) || lng < -180.0 || lng > 180.0) {
+            throw new IllegalArgumentException("invalid latitude/longitude");
+        }
+    }
+
     /**
      * Bring Telenav's map to the foreground. Verified live 2026-08-23: Telenav only
      * engages turn-by-turn guidance while it is the foreground app — {@code startNavigation}
@@ -54,17 +65,21 @@ public final class TelenavActions {
     public static Place buildPlace(
             String name, double lat, double lng, String favoriteType,
             String placeId, String formattedAddress) {
+        validateCoordinates(lat, lng);
+        String safeName = (name == null || name.trim().isEmpty()) ? "Shared location" : name.trim();
         String pid = (placeId == null || placeId.trim().isEmpty())
                 ? "OD-" + lat + "_" + lng : placeId.trim();
-        String addr = (formattedAddress == null || formattedAddress.isEmpty()) ? name : formattedAddress;
+        String addr = (formattedAddress == null || formattedAddress.trim().isEmpty())
+                ? safeName : formattedAddress.trim();
+        String type = FavoriteType.Normal.equals(favoriteType) ? favoriteType : FavoriteType.Normal;
 
         Place p = new Place();
         p.setPlaceId(pid);
         p.setSearchSourceType("ON_BOARD");
-        p.setPlaceName(name);
-        p.setPlaceDisplayLabel(name);
+        p.setPlaceName(safeName);
+        p.setPlaceDisplayLabel(safeName);
         p.setPlaceType("ADDRESS");
-        p.setFavoriteType(favoriteType);
+        p.setFavoriteType(type);
         p.setGeoLatitude(lat);
         p.setGeoLongitude(lng);
         p.setNavLatitude(lat);
@@ -79,7 +94,7 @@ public final class TelenavActions {
     /** Save a place to the favourites (default type Normal = the heart list). Blocking. */
     public static void addFavorite(Context ctx, String name, double lat, double lng, String favoriteType)
             throws Exception {
-        String type = (favoriteType == null || favoriteType.isEmpty()) ? FavoriteType.Normal : favoriteType;
+        String type = FavoriteType.Normal;
         TelenavClient.addFavorite(ctx, TIMEOUT_MS, type, buildPlace(name, lat, lng, type, null, null));
     }
 

@@ -603,7 +603,7 @@
     <string name="dashboard_no_tunnel">Nenhum túnel executando</string>
     <string name="dashboard_starting_zrok">Iniciando túnel Zrok…</string>
     <string name="dashboard_starting_cloudflared">Iniciando túnel Cloudflared…</string>
-    <string name="dashboard_starting_tailscale">Iniciando Túnel  Tailscale…</string>
+    <string name="dashboard_starting_tailscale">Iniciando túnel Tailscale…</string>
     <string name="dashboard_waiting_url">Esperando a URL do túnel…</string>
     <string name="dashboard_daemons_running">%1$d/%2$d em execução</string>
     <string name="tunnel_label_cloudflared">Cloudflared</string>
@@ -614,9 +614,9 @@
     <string name="daemon_name_surveillance">Daemon de Vigilância</string>
     <string name="daemon_name_acc_surveillance">Vigilância ACC</string>
     <string name="daemon_name_singbox">Proxy Sing-box</string>
-    <string name="daemon_name_cloudflared">Túnel Zrok</string>
-    <string name="daemon_name_zrok">Túnel Tailscale</string>
-    <string name="daemon_name_tailscale">Túnel Cloudflare</string>
+    <string name="daemon_name_cloudflared">Túnel Cloudflared</string>
+    <string name="daemon_name_zrok">Túnel Zrok</string>
+    <string name="daemon_name_tailscale">Túnel Tailscale</string>
     <string name="daemon_name_telegram">Bot do Telegram</string>
     <string name="clip_label_access_code">Código de Acesso</string>
     <string name="clip_label_url">URL</string>
@@ -631,7 +631,7 @@
     <string name="tailscale_failed_login_url">Não foi possível gerar a URL de login. O daemon está em execução?</string>
     <string name="tailscale_logged_in_relogin">Conectado. Clique para entrar em uma conta diferente</string>
     <string name="dialog_tailscale_proxy_enable_title">Ativar Proxy do Tailscale?</string>
-    <string name="dialog_tailscale_proxy_enable_message">Isso roteia o MQTT via Tailscale para que você possa alcançar um broker privado na sua tailnet sem redirecionamento de portas.\n\nEnquanto estiver ativado:\n• O MQTT para um broker da tailnet funciona (ex.: Mosquitto em um dispositivo na sua tailnet)\n• O MQTT para brokers públicos (HiveMQ, AWS IoT, etc.) falhará — o Tailscale roteia apenas para a sua tailnet\n• O daemon do Tailscale será reiniciado para aplicar a alteração\n• • O restante do tráfego de aplicativos e do dispositivo não é afetado\n\nVocê pode desativar isso a qualquer momento.</string>
+    <string name="dialog_tailscale_proxy_enable_message">Isso roteia o MQTT via Tailscale para que você possa alcançar um broker privado na sua tailnet sem redirecionamento de portas.\n\nEnquanto estiver ativado:\n• O MQTT para um broker da tailnet funciona (ex.: Mosquitto em um dispositivo na sua tailnet)\n• O MQTT para brokers públicos (HiveMQ, AWS IoT, etc.) falhará — o Tailscale roteia apenas para a sua tailnet\n• O daemon do Tailscale será reiniciado para aplicar a alteração\n• O restante do tráfego de aplicativos e do dispositivo não é afetado\n\nVocê pode desativar isso a qualquer momento.</string>
     <string name="dialog_zrok_reset_title">Redefinir Ambiente Zrok</string>
     <string name="dialog_zrok_reset_message">Isso irá:\n• Parar o túnel zrok se estiver em execução\n• Remover o ambiente zrok deste dispositivo\n• Excluir o token salvo\n\nVocê precisará reinserir o seu token e ativar novamente. Isto usa uma das 5 vagas de dispositivo em zrok.io.\n\nTem certeza?</string>
     <string name="toast_resetting_zrok">Redefinindo o ambiente zrok…</string>

@@ -31,8 +31,8 @@ import java.util.concurrent.atomic.AtomicLong
  * those keys are carried verbatim. The remaining hazards are write-path, not
  * data: see [applyBundle].
  *
- * SECRETS — the 3 device-bound encrypted credentials (bydCloud password,
- * navMap routing key, telegram bot token) are stored as their `ENC:` blobs and
+ * SECRETS — device-bound encrypted credentials (BYD Cloud, navigation,
+ * Telegram, and GenAI API keys) are stored as their `ENC:` blobs and
  * the bundle ALSO snapshots the device-id file (.byd_device_id) that
  * CredentialCipher derives its key from. Restoring the DID first lets the
  * blobs decrypt again even after a factory reset. TRADEOFF: the bundle then
@@ -89,7 +89,8 @@ object ConfigBackupService {
     // the user's CURRENTLY-WORKING credentials with blobs that can no longer
     // decrypt (key derives from the DID) — actively making things worse. In
     // that one case we skip them so the live credentials survive.
-    private val CREDENTIAL_SECTIONS = listOf("bydCloud", "navMap", "telegram")
+    private val CREDENTIAL_SECTIONS =
+        listOf("bydCloud", "navMap", "telegram", "genAi")
 
     // Recursion cap for [deepMergeInto] — guards against a pathological
     // hand-edited bundle with deeply nested objects. Real config nesting is
@@ -150,7 +151,8 @@ object ConfigBackupService {
      *  - Every unified-config section EXCEPT [EXCLUDED_SECTIONS] and the
      *    [EPHEMERAL_KEYS]. That includes credential sections whose secret
      *    fields are stored as `ENC:` blobs — bydCloud (username + login/sign
-     *    keys + password), navMap.routingApiKey, telegram.botToken. The
+     *    keys + password), navMap.routingApiKey, telegram.botToken, and
+     *    genAi.apiKey. The
      *    username/identity fields are NOT encrypted. This is acceptable ONLY
      *    because the feature is same-device and the export endpoints are
      *    LOCAL-mode + JWT gated; the UI warns the file holds credentials.
@@ -561,7 +563,7 @@ object ConfigBackupService {
 
     /** True if the named section in [unified] carries an `ENC:` credential blob.
      *  Lets the skip-warning name only the credentials the bundle ACTUALLY held,
-     *  rather than a blanket "3 tokens" message. */
+     *  rather than a blanket token-count message. */
     private fun sectionHasEncryptedSecret(unified: JSONObject, section: String): Boolean {
         val obj = unified.optJSONObject(section) ?: return false
         return obj.toString().contains("\"ENC:")
@@ -588,7 +590,7 @@ object ConfigBackupService {
     private fun bundleSecretsDecrypt(unified: JSONObject): Boolean {
         // Check EVERY ENC: blob across ALL credential sections, not just the
         // first — a bundle could carry a valid bydCloud blob and a tampered
-        // navMap/telegram one; an early return on the first success would let
+        // navMap/telegram/genAi one; an early return on the first success would let
         // the corrupt later blob through. Any blob that fails to yield real
         // plaintext fails the whole validation (→ skip credentials, keep live).
         for (section in CREDENTIAL_SECTIONS) {
@@ -631,6 +633,7 @@ object ConfigBackupService {
         "bydCloud" -> "BYD Cloud login"
         "navMap"   -> "navigation API key"
         "telegram" -> "Telegram bot token"
+        "genAi"    -> "GenAI provider API key"
         else        -> section
     }
 

@@ -487,7 +487,6 @@
     "close_all_windows_label": "关闭所有的窗户"
   },
   "automation": {
-    "wait_timeout": "超时(秒)",
     "control_automation": "控制自动化",
     "control_automation_description": "启用、禁用或切换另一个自动化-从规则中武装或解除常规。",
     "control_target": "自动化",
@@ -526,8 +525,6 @@
     "windows_all_description": "打开、关闭或停止所有窗口。",
     "tailgate": "锁定门",
     "tailgate_description": "打开、关闭或停止尾门/干燥。",
-    "save_seat_position": "保存座位位置",
-    "save_seat_position_description": "将当前司机座位存储到内存栏位中。",
     "child_lock": "子锁",
     "child_lock_description": "启用或禁用后门子锁。",
     "wireless_charging": "手机无线充电",
@@ -556,6 +553,12 @@
     "set_seat_climate_description": "设置座椅加热/制冷设置。",
     "set_drl": "设置 DRL 状态",
     "set_drl_description": "设置 日间行车灯 状态。车辆断电时此控制不起作用。",
+    "set_headlight_mode": "设置大灯模式",
+    "set_headlight_mode_description": "设置原厂外部灯光选择开关。仅在车辆安全驻车时才接受关闭。这是车辆本地控制，车辆断电时无法使用。",
+    "headlight_mode": "大灯模式",
+    "headlight_auto": "自动",
+    "parking_lights": "示宽灯",
+    "headlight_on_low_beam": "开启（近光灯）",
     "send_notification": "发送通知",
     "send_notification_description": "发送推送通知。这将向已安装且启用通知的应用发送推送通知。",
     "actions_description": "触发此自动化时要执行的操作。这些操作将按顺序执行，并可能略有延迟。",
@@ -683,8 +686,6 @@
     "set_headlight_level": "标题级别",
     "set_headlight_level_description": "设置耳光束高度/级别 (1-11)。",
     "headlight_level_value": "等级 (1-11)",
-    "set_seat_position": "控制座椅位置",
-    "set_seat_position_description": "加载一个座位内存位置。确保内存先从车上保存。 这种控制在车辆关闭时不可用。",
     "position_1": "位置 - 1",
     "position_2": "位置 - 2",
     "open_windows": "打开窗口",
@@ -1087,7 +1088,12 @@
     "mqtt_channel": "频道",
     "mqtt_value": "值",
     "wait_until_description": "暂停其余动作，直到选定的信号符合比较或超时。例如：等待到 Speed = 0 后关闭窗口。",
-    "wait_until_state_description": "暂停其余动作，直到选定的一个/关闭信号到达一个状态或超时。例如：等待直到Indicator=关闭才继续。"
+    "wait_until_state_description": "暂停其余动作，直到选定的一个/关闭信号到达一个状态或超时。例如：等待直到Indicator=关闭才继续。",
+      "wait_timeout": "超时(秒)",
+      "save_seat_position": "保存座位位置",
+      "save_seat_position_description": "将当前司机座位存储到内存栏位中。",
+      "set_seat_position": "控制座椅位置",
+      "set_seat_position_description": "加载一个座位内存位置。确保内存先从车上保存。 这种控制在车辆关闭时不可用。"
   },
   "messages": {
     "logged_out": "登录出来",

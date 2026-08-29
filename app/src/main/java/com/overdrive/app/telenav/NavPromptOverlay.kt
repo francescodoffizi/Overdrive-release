@@ -9,7 +9,6 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.util.Log
 import android.util.TypedValue
 import android.view.ContextThemeWrapper
@@ -25,6 +24,7 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.MaterialColors
 import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
+import com.overdrive.app.overlay.OverlayPermissionChecker
 import kotlin.math.abs
 
 /**
@@ -54,11 +54,11 @@ object NavPromptOverlay {
 
     @JvmStatic
     @SuppressLint("ClickableViewAccessibility")
-    fun show(context: Context, name: String, lat: Double, lng: Double) {
+    fun show(context: Context, name: String, lat: Double, lng: Double): Boolean {
         val app = context.applicationContext
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(app)) {
+        if (!OverlayPermissionChecker.isGranted(app)) {
             Log.w(TAG, "no draw-overlay permission — cannot show prompt")
-            return
+            return false
         }
         dismiss() // never stack two
 
@@ -212,9 +212,11 @@ object NavPromptOverlay {
             view = card
             main.postDelayed(dismissRunnable, AUTO_DISMISS_MS)
             Log.i(TAG, "prompt shown for '$name' (night=$nightYes)")
+            return true
         } catch (t: Throwable) {
             Log.w(TAG, "addView failed: ${t.message}")
             view = null
+            return false
         }
     }
 

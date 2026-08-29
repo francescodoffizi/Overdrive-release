@@ -75,6 +75,11 @@ public class SocHistoryDatabase {
     public static final double STOP_BOUNDARY_POWER_KW = -1.0;
     /** Rate was unavailable while charging remained admitted; this interval is incomplete. */
     public static final double MISSING_RATE_BOUNDARY_POWER_KW = -2.0;
+    /**
+     * SoC/thermal sample captured during an already-marked missing-rate interval. It remains
+     * non-positive so the energy integrator cannot bridge or price the unmeasured interval.
+     */
+    public static final double AUXILIARY_SAMPLE_POWER_KW = -3.0;
 
     // Retention periods (per-table — see cleanupOldData()).
     //
@@ -230,9 +235,9 @@ public class SocHistoryDatabase {
     private volatile double counterBaselineLatestKwh = Double.NaN;
     private volatile long counterBaselineLatestAtMs = 0L;
     /**
-     * Full scale for the external counter, kWh. Wider than the 16-bit capacity counter: a field capture
-     * recorded this accessor at 119.0, so 65.534 cannot be its modulus. Sized to the SDK's own envelope
-     * for the accessor, which is the only documented bound available.
+     * Full scale for the external counter, kWh. This is a separate, wider accessor than the dedicated
+     * capacity counter. Sized to the SDK envelope for the accessor, which is the only documented bound
+     * available.
      */
     private static final double EXTERNAL_COUNTER_FULL_SCALE_KWH = 500.0;
     /**
@@ -293,6 +298,8 @@ public class SocHistoryDatabase {
     // ACC-off parked charging), and preserved across a daemon-restart resume.
     private volatile int chargingStartOdometer = -1;
     private volatile int chargingGunState = -1;
+    /** Latched AC/DC verdict; estimated power may corroborate type but never enters accounting. */
+    private volatile int chargingTypeVerdict = ChargingTypeClassifier.UNKNOWN;
     // Latched estimated time-to-full (minutes). The BYD rest-time field is only
     // meaningful WHILE charging — at session end it reads ~0 / stale. We capture
     // the latest plausible value on each mid-session tick and persist that.
@@ -367,6 +374,7 @@ public class SocHistoryDatabase {
         int startRange = -1;
         int startOdometer = -1;
         int gun = -1;
+        int typeVerdict = ChargingTypeClassifier.UNKNOWN;
         int timeToFull = -1;
         double lat;
         double lng;
@@ -431,7 +439,7 @@ public class SocHistoryDatabase {
         this(new java.io.File(CHARGING_LIFECYCLE_JOURNAL_PATH));
     }
 
-    protected SocHistoryDatabase(java.io.File chargingLifecycleJournalFile) {
+    SocHistoryDatabase(java.io.File chargingLifecycleJournalFile) {
         this.chargingLifecycleJournalFile = chargingLifecycleJournalFile;
         // Load the H2 JDBC driver (pure Java - always works)
         try {
@@ -1225,7 +1233,10 @@ public class SocHistoryDatabase {
             // session tracker seeded peak_power at 7.0 → the session mis-classified
             // as "AC fast" (>=7 kW) when it was really a 6 kW AC slow charge. Pass 0
             // for estimated reads so peak/avg only ever reflect measured power.
-            double chargingPower = (chargingData != null && !chargingData.isEstimated)
+            double chargingPower = (chargingData != null && !chargingData.isEstimated
+                    && isFinite(chargingData.chargingPowerKW)
+                    && chargingData.chargingPowerKW > 0
+                    && chargingData.chargingPowerKW <= 500)
                 ? chargingData.chargingPowerKW : 0;
             double voltage = powerData != null ? powerData.voltageVolts : 0;
             int range = rangeData != null ? rangeData.elecRangeKm : 0;
@@ -1581,14 +1592,9 @@ public class SocHistoryDatabase {
                             // wrong UTC day.
                             long closeTime = strictlyAfterChargingStart(
                                     chargingStartTime, optOutBoundaryMs);
-                            // Time-weighted, like the other three close paths, so this row's average
-                            // agrees with its own energy and duration. The unweighted mean over
-                            // irregularly-spaced ticks remains only as the fallback when there is no
-                            // energy figure to divide.
-                            double avgPower = timeWeightedAvgKw(energyAdded, chargingStartTime, closeTime);
-                            if (avgPower < 0 && chargingPowerCount > 0) {
-                                avgPower = chargingPowerSum / chargingPowerCount;
-                            }
+                            double avgPower = resolveAveragePowerKw(
+                                    chargingStartTime, chargingPowerSum,
+                                    chargingPowerCount);
 
                             // Resolve the peak from BOTH series before the AC/DC verdict uses it, as
                             // the other three close paths do. The coarse 2-min running max can miss a
@@ -1599,7 +1605,7 @@ public class SocHistoryDatabase {
                             // Peak-guarded so a misread DC gun on a low-power charge isn't stored as DC.
                             int isDc = optOutCloseIsDc >= -1
                                     ? optOutCloseIsDc
-                                    : deriveIsDc(chargingGunState, chargingPeakPower);
+                                    : currentChargingTypeVerdict();
                             int rangeGained = rangeGainedFromEnergy(energyAdded);
                             // Price at the tariff for WHERE this charge happened,
                             // else the global DC/base rate (see priceSession).
@@ -1794,6 +1800,15 @@ public class SocHistoryDatabase {
                     double[] loc = snapshotLocation();
                     chargingStartLat = loc[0];
                     chargingStartLng = loc[1];
+                }
+                chargingTypeVerdict = deferredPhysicalStart
+                        ? deferredGeneration.typeVerdict
+                        : ChargingTypeClassifier.classify(
+                                chargingGunState, chargingPeakPower);
+                if (chargingTypeVerdict != ChargingTypeClassifier.AC
+                        && chargingTypeVerdict != ChargingTypeClassifier.DC) {
+                    chargingTypeVerdict = ChargingTypeClassifier.classify(
+                            chargingGunState, chargingPeakPower);
                 }
                 // Fresh accumulator for a genuinely new session, then capture the counter's
                 // baseline. A stale accumulator here would attribute a previous charge's energy to
@@ -1997,8 +2012,8 @@ public class SocHistoryDatabase {
                             && counterNowAtStart >= prevPersistedLast
                             && (counterNowAtStart - prevPersistedLast)
                                     <= LEGACY_CONTINUATION_MAX_GAP_KWH
-                            // A legacy row's endpoint came from a 16-bit register, so a value beyond
-                            // that ceiling cannot be one — it is the other counter.
+                            // A legacy row's endpoint came from the dedicated capacity counter, so a
+                            // value beyond that ceiling cannot belong to the same series.
                             && prevPersistedLast <= com.overdrive.app.charging
                                     .ChargeCounterAccumulator.COUNTER_FULL_SCALE_KWH
                             && counterNowAtStart <= com.overdrive.app.charging
@@ -2308,7 +2323,7 @@ public class SocHistoryDatabase {
                 // (a DC flag on a sub-DC-power charge is downgraded to unknown).
                 // gun: 2=AC 3=DC 4=AC_DC 5=V2L; AC_DC/V2L/unknown -> -1.
                 int isDc = pendingCloseIsDc >= -1
-                        ? pendingCloseIsDc : deriveIsDc(chargingGunState, chargingPeakPower);
+                        ? pendingCloseIsDc : currentChargingTypeVerdict();
 
                 // Range gained derived from energy × the car's efficiency — the
                 // elecRangeKm delta was unavailable during parked charging (always
@@ -2334,13 +2349,9 @@ public class SocHistoryDatabase {
                 // Use the value latched WHILE charging — re-reading now would
                 // get ~0 since charging just stopped.
                 int ttf = chargingTimeToFullMin;
-                // Time-weighted, so it always agrees with energy/duration. The old unweighted mean
-                // over irregularly-spaced ticks could disagree with the row's own energy and
-                // duration by a large factor on a tapering session.
-                double avgPower = timeWeightedAvgKw(energyAdded, chargingStartTime, now);
-                if (avgPower < 0 && chargingPowerCount > 0) {
-                    avgPower = chargingPowerSum / chargingPowerCount;   // no energy figure to divide
-                }
+                double avgPower = resolveAveragePowerKw(
+                        chargingStartTime, chargingPowerSum,
+                        chargingPowerCount);
 
                 final boolean sohCalibrationCandidate =
                         isFinite(socDelta)
@@ -2707,6 +2718,7 @@ public class SocHistoryDatabase {
         double powerSum;
         int powerCount;
         int gun = -1;
+        int typeVerdict = ChargingTypeClassifier.UNKNOWN;
         int startRange = -1;
         int startOdometer = -1;
         double lat;
@@ -2909,7 +2921,7 @@ public class SocHistoryDatabase {
                 }
 
                 try (PreparedStatement r = connection.prepareStatement(
-                        "SELECT end_time, peak_power_kw, gun_state, start_range_km,"
+                        "SELECT end_time, peak_power_kw, gun_state, is_dc, start_range_km,"
                         + " start_odometer_km, start_lat, start_lng FROM " + TABLE_CHARGING
                         + " WHERE start_time = ?;")) {
                     r.setLong(1, canonStart);
@@ -2920,8 +2932,15 @@ public class SocHistoryDatabase {
                         long canonEnd = rs.getLong("end_time");
                         if (!rs.wasNull() && canonEnd > 0) affectedDays.add(dayEpoch(canonEnd));
                         double peak = rs.getDouble("peak_power_kw");
-                        state.peak = rs.wasNull() ? 0 : peak;
+                        state.peak = !rs.wasNull()
+                                && isValidMeasuredChargingPower(peak) ? peak : 0;
                         state.gun = rs.getInt("gun_state");
+                        state.typeVerdict = rs.getInt("is_dc");
+                        if (state.typeVerdict != ChargingTypeClassifier.AC
+                                && state.typeVerdict != ChargingTypeClassifier.DC) {
+                            state.typeVerdict = ChargingTypeClassifier.classify(
+                                    state.gun, state.peak);
+                        }
                         state.startRange = rs.getInt("start_range_km");
                         state.startOdometer = rs.getInt("start_odometer_km");
                         state.lat = rs.getDouble("start_lat");
@@ -2943,16 +2962,23 @@ public class SocHistoryDatabase {
 
                 try (PreparedStatement sp = connection.prepareStatement(
                         "SELECT power_kw FROM " + TABLE_CPS
-                        + " WHERE session_start_time = ? AND power_kw > 0;")) {
+                        + " WHERE session_start_time = ?"
+                        + " AND power_kw > 0 AND power_kw <= 500;")) {
                     sp.setLong(1, canonStart);
                     try (ResultSet rs = sp.executeQuery()) {
                         while (rs.next()) {
                             double p = rs.getDouble(1);
+                            if (!isValidMeasuredChargingPower(p)) continue;
                             if (p > state.peak) state.peak = p;
                             state.powerSum += p;
                             state.powerCount++;
                         }
                     }
+                }
+                if (state.typeVerdict != ChargingTypeClassifier.AC
+                        && state.typeVerdict != ChargingTypeClassifier.DC) {
+                    state.typeVerdict = ChargingTypeClassifier.classify(
+                            state.gun, state.peak);
                 }
                 for (long day : affectedDays) rebuildChargingDailyDay(day);
             });
@@ -3027,6 +3053,7 @@ public class SocHistoryDatabase {
         chargingStartTime = attempt.canonicalStart;
         chargingStartSoc = attempt.canonicalStartSoc;
         chargingGunState = state.gun;
+        chargingTypeVerdict = state.typeVerdict;
         chargingStartRange = state.startRange;
         chargingStartOdometer = state.startOdometer;
         chargingStartLat = state.lat;
@@ -3134,7 +3161,7 @@ public class SocHistoryDatabase {
         // The close path itself must not take another live snapshot after a new physical charge starts.
         pendingCloseCounterCaptured = true;
         chargingPeakPower = resolvePeakKw(chargingStartTime, chargingPeakPower);
-        pendingCloseIsDc = deriveIsDc(chargingGunState, chargingPeakPower);
+        pendingCloseIsDc = currentChargingTypeVerdict();
         try {
             pendingClosePricing = priceSessionForClose(
                     pendingCloseIsDc, chargingStartLat, chargingStartLng);
@@ -3312,6 +3339,7 @@ public class SocHistoryDatabase {
         generation.startRange = chargingStartRange;
         generation.startOdometer = chargingStartOdometer;
         generation.gun = chargingGunState;
+        generation.typeVerdict = currentChargingTypeVerdict();
         generation.timeToFull = chargingTimeToFullMin;
         generation.lat = chargingStartLat;
         generation.lng = chargingStartLng;
@@ -3431,12 +3459,17 @@ public class SocHistoryDatabase {
         }
         try {
             ChargingStateData state = VehicleDataMonitor.getInstance().getChargingState();
-            if (state != null && !state.isEstimated && state.chargingPowerKW > 0) {
+            if (state != null && !state.isEstimated
+                    && isFinite(state.chargingPowerKW)
+                    && state.chargingPowerKW > 0
+                    && state.chargingPowerKW <= 500) {
                 generation.peakPower = state.chargingPowerKW;
                 generation.powerSum = state.chargingPowerKW;
                 generation.powerCount = 1;
             }
         } catch (Throwable ignored) {}
+        generation.typeVerdict = deriveIsDc(
+                generation.gun, generation.peakPower);
         deferredPhysicalGenerations.addLast(generation);
         sessionInputsFenced = true;
         lastAllocatedChargingStartMs =
@@ -3519,12 +3552,17 @@ public class SocHistoryDatabase {
         clearPreSessionProvisionalExternal();
         try {
             ChargingStateData state = VehicleDataMonitor.getInstance().getChargingState();
-            if (state != null && !state.isEstimated && state.chargingPowerKW > 0) {
+            if (state != null && !state.isEstimated
+                    && isFinite(state.chargingPowerKW)
+                    && state.chargingPowerKW > 0
+                    && state.chargingPowerKW <= 500) {
                 generation.peakPower = state.chargingPowerKW;
                 generation.powerSum = state.chargingPowerKW;
                 generation.powerCount = 1;
             }
         } catch (Throwable ignored) {}
+        generation.typeVerdict = deriveIsDc(
+                generation.gun, generation.peakPower);
         deferredPhysicalGenerations.addLast(generation);
         sessionInputsFenced = true;
         lastAllocatedChargingStartMs =
@@ -3583,7 +3621,7 @@ public class SocHistoryDatabase {
                 }
             } catch (Throwable ignored) {}
             generation.closeIsDc =
-                    deriveIsDc(generation.gun, generation.peakPower);
+                    deferredChargingTypeVerdict(generation);
             try {
                 generation.closePricing = priceSessionForClose(
                         generation.closeIsDc, generation.lat, generation.lng);
@@ -3718,7 +3756,8 @@ public class SocHistoryDatabase {
 
     public synchronized boolean recordDeferredChargingSample(
             long t, double powerKw, double soc, double temp, double tempHigh, double tempLow) {
-        if (!chargingAnalyticsEnabled || optOutClosePending || Double.isNaN(powerKw)) {
+        if (!chargingAnalyticsEnabled || optOutClosePending
+                || !isValidChargingSamplePower(powerKw)) {
             return false;
         }
         if (!reconcilePendingActiveChargingReplacement()) return false;
@@ -3746,6 +3785,7 @@ public class SocHistoryDatabase {
             generation.peakPower = Math.max(generation.peakPower, powerKw);
             generation.powerSum += powerKw;
             generation.powerCount++;
+            deferredChargingTypeVerdict(generation);
         }
         if (tempHigh > -999) generation.endTempHigh = tempHigh;
         if (tempLow > -999) generation.endTempLow = tempLow;
@@ -3976,6 +4016,7 @@ public class SocHistoryDatabase {
         active.put("startRange", chargingStartRange);
         active.put("startOdometer", chargingStartOdometer);
         active.put("gun", chargingGunState);
+        active.put("typeVerdict", currentChargingTypeVerdict());
         active.put("timeToFull", chargingTimeToFullMin);
         putFinite(active, "lat", chargingStartLat);
         putFinite(active, "lng", chargingStartLng);
@@ -4032,6 +4073,7 @@ public class SocHistoryDatabase {
         out.put("startRange", generation.startRange);
         out.put("startOdometer", generation.startOdometer);
         out.put("gun", generation.gun);
+        out.put("typeVerdict", deferredChargingTypeVerdict(generation));
         out.put("timeToFull", generation.timeToFull);
         putFinite(out, "lat", generation.lat);
         putFinite(out, "lng", generation.lng);
@@ -4118,6 +4160,7 @@ public class SocHistoryDatabase {
         out.put("startRange", state.startRange);
         out.put("startOdometer", state.startOdometer);
         out.put("gun", state.gun);
+        out.put("typeVerdict", state.typeVerdict);
         out.put("timeToFull", state.timeToFull);
         putFinite(out, "lat", state.lat);
         putFinite(out, "lng", state.lng);
@@ -4183,6 +4226,9 @@ public class SocHistoryDatabase {
         state.startRange = source.optInt("startRange", -1);
         state.startOdometer = source.optInt("startOdometer", -1);
         state.gun = source.optInt("gun", -1);
+        state.typeVerdict = source.optInt(
+                "typeVerdict",
+                ChargingTypeClassifier.classify(state.gun, 0.0));
         state.timeToFull = source.optInt("timeToFull", -1);
         state.lat = finiteOrZero(source, "lat");
         state.lng = finiteOrZero(source, "lng");
@@ -4399,6 +4445,9 @@ public class SocHistoryDatabase {
         requireJournalLong(active, "startRange", -1L, Integer.MAX_VALUE);
         requireJournalLong(active, "startOdometer", -1L, Integer.MAX_VALUE);
         requireJournalLong(active, "gun", -1L, Integer.MAX_VALUE);
+        if (active.has("typeVerdict")) {
+            requireJournalLong(active, "typeVerdict", -1L, 1L);
+        }
         requireJournalLong(active, "timeToFull", -1L, Integer.MAX_VALUE);
         requireOptionalJournalFinite(active, "lat", -90.0, 90.0);
         requireOptionalJournalFinite(active, "lng", -180.0, 180.0);
@@ -4495,6 +4544,9 @@ public class SocHistoryDatabase {
         requireJournalLong(
                 generation, "startOdometer", -1L, Integer.MAX_VALUE);
         requireJournalLong(generation, "gun", -1L, Integer.MAX_VALUE);
+        if (generation.has("typeVerdict")) {
+            requireJournalLong(generation, "typeVerdict", -1L, 1L);
+        }
         requireJournalLong(
                 generation, "timeToFull", -1L, Integer.MAX_VALUE);
         requireOptionalJournalFinite(generation, "lat", -90.0, 90.0);
@@ -4554,7 +4606,13 @@ public class SocHistoryDatabase {
                 throw invalidJournal(
                         "deferred sample lies after its session boundary");
             }
-            requireJournalFinite(sample, "power", -Double.MAX_VALUE, Double.MAX_VALUE);
+            double samplePower =
+                    requireJournalFinite(
+                            sample, "power", -Double.MAX_VALUE, Double.MAX_VALUE);
+            if (!isValidChargingSamplePower(samplePower)) {
+                throw invalidJournal(
+                        "deferred sample power is outside its domain");
+            }
             requireOptionalJournalFinite(
                     sample, "soc", 0.0, 100.0);
             requireOptionalJournalFinite(
@@ -4624,6 +4682,9 @@ public class SocHistoryDatabase {
         requireJournalLong(
                 replacement, "startOdometer", -1L, Integer.MAX_VALUE);
         requireJournalLong(replacement, "gun", -1L, Integer.MAX_VALUE);
+        if (replacement.has("typeVerdict")) {
+            requireJournalLong(replacement, "typeVerdict", -1L, 1L);
+        }
         requireJournalLong(
                 replacement, "timeToFull", -1L, Integer.MAX_VALUE);
         requireOptionalJournalFinite(replacement, "lat", -90.0, 90.0);
@@ -4954,6 +5015,10 @@ public class SocHistoryDatabase {
         chargingStartRange = active.optInt("startRange", -1);
         chargingStartOdometer = active.optInt("startOdometer", -1);
         chargingGunState = active.optInt("gun", -1);
+        chargingTypeVerdict = active.optInt(
+                "typeVerdict",
+                ChargingTypeClassifier.classify(
+                        chargingGunState, chargingPeakPower));
         chargingTimeToFullMin = active.optInt("timeToFull", -1);
         chargingStartLat = finiteOrZero(active, "lat");
         chargingStartLng = finiteOrZero(active, "lng");
@@ -5058,6 +5123,13 @@ public class SocHistoryDatabase {
         generation.integrationTruncated =
                 source.optBoolean("integrationTruncated", false);
         generation.closeIsDc = source.optInt("closeIsDc", -1);
+        generation.typeVerdict = source.optInt(
+                "typeVerdict",
+                generation.closeIsDc == ChargingTypeClassifier.AC
+                                || generation.closeIsDc == ChargingTypeClassifier.DC
+                        ? generation.closeIsDc
+                        : ChargingTypeClassifier.classify(
+                                generation.gun, generation.peakPower));
         generation.resumeBlocked = source.optBoolean("resumeBlocked", false);
         JSONObject continuation = source.optJSONObject("continuation");
         if (continuation != null) {
@@ -5118,6 +5190,7 @@ public class SocHistoryDatabase {
                     clearRecoveredActiveLifecycle();
                 } else {
                     mergeRecoveredActiveCounterWithDatabase();
+                    reconcileRecoveredActivePowerStatsWithDatabase();
                     reconcileRecoveredActivePowerGap();
                 }
             }
@@ -5132,6 +5205,7 @@ public class SocHistoryDatabase {
                     adoptDeferredGenerationAsRecoveredActive(generation);
                     iterator.remove();
                     mergeRecoveredActiveCounterWithDatabase();
+                    reconcileRecoveredActivePowerStatsWithDatabase();
                 } else if (!generation.isEnded()
                         && generation.counter.hasSeriesState()) {
                     generation.counter.beginGapReconciliation(
@@ -5171,6 +5245,16 @@ public class SocHistoryDatabase {
             chargingCounter.beginGapReconciliation(
                     outageGapEstimate(chargingStartSoc, chargingCounter.energyKwh()));
         }
+    }
+
+    /**
+     * Reconcile the journal's coarse peak with fine samples that committed after its last snapshot.
+     *
+     * <p>This runs once when an open session is restored or adopted. Steady-state outbound telemetry
+     * then reads the in-memory peak without issuing a database aggregate on every publication.
+     */
+    private void reconcileRecoveredActivePowerStatsWithDatabase() {
+        chargingPeakPower = resolvePeakKw(chargingStartTime, chargingPeakPower);
     }
 
     private void reconcileRecoveredActivePowerGap() throws Exception {
@@ -5288,6 +5372,7 @@ public class SocHistoryDatabase {
         long clearedStart = chargingStartTime;
         wasCharging = false;
         chargingStartTime = 0L;
+        chargingTypeVerdict = ChargingTypeClassifier.UNKNOWN;
         pendingCloseSessionStart = 0L;
         pendingCloseAtMs = 0L;
         pendingCloseSoc = Double.NaN;
@@ -5316,6 +5401,7 @@ public class SocHistoryDatabase {
         chargingStartRange = generation.startRange;
         chargingStartOdometer = generation.startOdometer;
         chargingGunState = generation.gun;
+        chargingTypeVerdict = generation.typeVerdict;
         chargingTimeToFullMin = generation.timeToFull;
         chargingStartLat = generation.lat;
         chargingStartLng = generation.lng;
@@ -5496,8 +5582,11 @@ public class SocHistoryDatabase {
                     : lastRecordedSoc >= 0 ? lastRecordedSoc : chargingStartSoc;
             ChargingStateData cs = monitor.getChargingState();
             // Same rule as the tick: an estimated/placeholder kW must not seed peak/avg.
-            double power = isCharging && cs != null && !cs.isEstimated ? cs.chargingPowerKW : 0;
-            if (Double.isNaN(power) || power < 0) power = 0;
+            double power = isCharging && cs != null && !cs.isEstimated
+                    && isFinite(cs.chargingPowerKW)
+                    && cs.chargingPowerKW > 0
+                    && cs.chargingPowerKW <= 500
+                    ? cs.chargingPowerKW : 0;
             long now = System.currentTimeMillis();
             if (!chargingAnalyticsEnabled && pendingCloseResumeBlocked && wasCharging) {
                 if (!trackWithAnalyticsTemporarilyEnabled(
@@ -5586,7 +5675,7 @@ public class SocHistoryDatabase {
      * @param counterKwh the admitted raw counter reading, kWh (0 is valid and is the ideal baseline)
      */
     public synchronized void onChargeCounterObserved(String source, double counterKwh) {
-        if (Double.isNaN(counterKwh) || counterKwh < 0) return;
+        if (!Double.isFinite(counterKwh) || counterKwh < 0) return;
         if (source == null) return;
         final double rawCounterValue = counterKwh;
         // APPLY THE SAME UNIT CALIBRATION THE RATE PATH APPLIES. ChargeRateResolver corrects a
@@ -5600,6 +5689,7 @@ public class SocHistoryDatabase {
             unitDiv = com.overdrive.app.monitor.ChargeRateResolver.counterUnitDivisor(source);
             if (unitDiv > 1.0) counterKwh = counterKwh / unitDiv;
         } catch (Throwable ignored) {}
+        if (!Double.isFinite(counterKwh) || counterKwh < 0) return;
         if (!chargingAnalyticsEnabled || optOutClosePending) return;
         // Deferred generations are owned by the atomic sidecar journal, not H2. Route their observations
         // before any JDBC/replacement gate so a failed A close and unavailable reconnect cannot discard
@@ -5926,10 +6016,15 @@ public class SocHistoryDatabase {
             }
             if (accountingBound < start) accountingBound = start;
             // Aggregate the recorded samples for this session.
-            long lastT = -1; double lastSoc = Double.NaN, lastTemp = -999;
+            long lastT = -1;
+            double lastSoc = Double.NaN;
+            double lastTemp = -999;
+            double lastTempHigh = -999;
+            double lastTempLow = -999;
             double peak = 0, sum = 0; int count = 0;
             double startSoc = 0;
             boolean rowFound = false;
+            boolean invalidPowerSample = false;
             try (PreparedStatement r = connection.prepareStatement(
                     "SELECT start_soc, peak_power_kw FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
                 r.setLong(1, start);
@@ -5937,7 +6032,9 @@ public class SocHistoryDatabase {
                     if (rs.next()) {
                         rowFound = true;
                         startSoc = rs.getDouble(1);
-                        double pk = rs.getDouble(2); peak = rs.wasNull() ? 0 : pk;
+                        double pk = rs.getDouble(2);
+                        peak = !rs.wasNull()
+                                && isValidMeasuredChargingPower(pk) ? pk : 0;
                     }
                 }
             }
@@ -5949,20 +6046,42 @@ public class SocHistoryDatabase {
                 return true;
             }
             try (PreparedStatement sp = connection.prepareStatement(
-                    "SELECT t, power_kw, soc, temp FROM " + TABLE_CPS +
-                    " WHERE session_start_time = ? AND power_kw >= 0 AND t < ? ORDER BY t ASC;")) {
+                    "SELECT t, power_kw, soc, temp, temp_high, temp_low FROM " + TABLE_CPS
+                    + " WHERE session_start_time = ?"
+                    + " AND (power_kw >= 0 OR power_kw = ? OR power_kw = ?)"
+                    + " AND t < ? ORDER BY t ASC;")) {
                 sp.setLong(1, start);
-                sp.setLong(2, accountingBound);
+                sp.setDouble(2, MISSING_RATE_BOUNDARY_POWER_KW);
+                sp.setDouble(3, AUXILIARY_SAMPLE_POWER_KW);
+                sp.setLong(4, accountingBound);
                 try (ResultSet rs = sp.executeQuery()) {
                     while (rs.next()) {
                         long t = rs.getLong(1);
                         double p = rs.getDouble(2);
                         double s = rs.getDouble(3);
+                        boolean socMissing = rs.wasNull();
                         double tp = rs.getDouble(4);
-                        if (p > 0) { if (p > peak) peak = p; sum += p; count++; }
+                        boolean tempMissing = rs.wasNull();
+                        double tpHigh = rs.getDouble(5);
+                        boolean tempHighMissing = rs.wasNull();
+                        double tpLow = rs.getDouble(6);
+                        boolean tempLowMissing = rs.wasNull();
+                        if (isValidMeasuredChargingPower(p)) {
+                            if (p > peak) peak = p;
+                            sum += p;
+                            count++;
+                        } else if (!Double.isFinite(p) || p > 0) {
+                            invalidPowerSample = true;
+                        }
                         lastT = t;
-                        if (!rs.wasNull()) lastSoc = s;  // last non-null soc
-                        if (tp > -999) lastTemp = tp;
+                        if (!socMissing && isFinite(s) && s >= 0 && s <= 100) lastSoc = s;
+                        if (!tempMissing && isFinite(tp) && tp > -999) lastTemp = tp;
+                        if (!tempHighMissing && isFinite(tpHigh) && tpHigh > -999) {
+                            lastTempHigh = tpHigh;
+                        }
+                        if (!tempLowMissing && isFinite(tpLow) && tpLow > -999) {
+                            lastTempLow = tpLow;
+                        }
                     }
                 }
             }
@@ -6029,6 +6148,7 @@ public class SocHistoryDatabase {
             } catch (Exception e) {
                 logger.debug("counter columns unavailable for stale session " + start + ": " + e.getMessage());
             }
+            rowIncomplete |= invalidPowerSample;
             // NOTE: the outage tail is NOT credited here. It is credited to the session that is
             // still LIVE, at SESSION START, by seeding that session's baseline from this row's
             // persisted counter_last_kwh when the counter shows it never reset (see the continuation
@@ -6043,8 +6163,8 @@ public class SocHistoryDatabase {
                 // Endpoints without an accumulated total: a pre-restore row. Resolve the ambiguity
                 // (did it wrap, or reset?) against the SOC estimate rather than assuming.
                 // The wrap candidate depends on the counter's MODULUS, so it must be that counter's.
-                // Using the 16-bit default for an external-counter row makes the wrapped candidate wrong
-                // by the difference between the two scales — hundreds of kWh.
+                // Using the dedicated-capacity default for an external-counter row makes the wrapped
+                // candidate wrong by the difference between the two scales, potentially hundreds of kWh.
                 double[] cands = com.overdrive.app.charging.ChargeCounterAccumulator
                         .gapCandidatesKwh(counterStart, counterLast,
                                 !Double.isNaN(rowCounterFullScale) ? rowCounterFullScale
@@ -6084,11 +6204,11 @@ public class SocHistoryDatabase {
                     start, energyAdded, staleRes.source,
                     Double.isNaN(counterEnergy) ? "n/a" : String.format("%.3f", counterEnergy),
                     Double.isNaN(socEstStale) ? "n/a" : String.format("%.3f", socEstStale)));
-            // Same peak/avg rules as the live close path, so a session reconstructed after a
+            // Same peak/average rules as the live close path, so a session reconstructed after a
             // restart is not reported differently from one we were present to finish.
             peak = resolvePeakKw(start, peak);
-            double avgPower = timeWeightedAvgKw(energyAdded, start, endTime);
-            if (avgPower < 0 && count > 0) avgPower = sum / count;
+            double avgPower = resolveAveragePowerKw(
+                    start, sum, count);
             int rangeGained = rangeGainedFromEnergy(energyAdded);
             // Determine AC/DC first — the DC tariff selection depends on it.
             // Read the charge LOCATION from the row too: this path runs after a
@@ -6115,6 +6235,8 @@ public class SocHistoryDatabase {
             double cost = pd.costFor(energyAdded);
             String curr = pd.currency;
             double tAvg = lastTemp > -999 ? lastTemp : -999;
+            double tHigh = lastTempHigh > -999 ? lastTempHigh : -999;
+            double tLow = lastTempLow > -999 ? lastTempLow : -999;
 
             final double persistedEndSoc = endSoc;
             final double persistedAvgPower = avgPower;
@@ -6123,7 +6245,8 @@ public class SocHistoryDatabase {
                 try (PreparedStatement upd = connection.prepareStatement(
                         "UPDATE " + TABLE_CHARGING + " SET end_time = ?, end_soc = ?, energy_added_kwh = ?, " +
                         "avg_power_kw = ?, peak_power_kw = ?, range_gained_km = ?, is_dc = ?, " +
-                        "electricity_rate = ?, currency = ?, session_cost = ?, hv_temp_avg = ?, " +
+                        "electricity_rate = ?, currency = ?, session_cost = ?, "
+                        + "hv_temp_high = ?, hv_temp_low = ?, hv_temp_avg = ?, " +
                         "tariff_id = ?, tariff_label = ?, " +
                         "energy_source = ?, energy_soc_kwh = ?, energy_incomplete = ?," +
                         " closed_by_sweep = 1, post_commit_tariff_applied = ?," +
@@ -6139,14 +6262,16 @@ public class SocHistoryDatabase {
                     upd.setDouble(8, rate);
                     upd.setString(9, curr);
                     upd.setDouble(10, cost);
-                    upd.setDouble(11, tAvg);
-                    upd.setString(12, pd.tariffId);
-                    upd.setString(13, pd.tariffLabel);
-                    upd.setString(14, staleRes.source);
+                    upd.setDouble(11, tHigh);
+                    upd.setDouble(12, tLow);
+                    upd.setDouble(13, tAvg);
+                    upd.setString(14, pd.tariffId);
+                    upd.setString(15, pd.tariffLabel);
+                    upd.setString(16, staleRes.source);
                     if (!Double.isNaN(staleRes.socEstimateKwh)) {
-                        upd.setDouble(15, staleRes.socEstimateKwh);
+                        upd.setDouble(17, staleRes.socEstimateKwh);
                     } else {
-                        upd.setNull(15, java.sql.Types.DOUBLE);
+                        upd.setNull(17, java.sql.Types.DOUBLE);
                     }
                     // ALWAYS incomplete. This path exists precisely because nobody observed the end of
                     // the charge: the daemon was down when it finished, so everything delivered between
@@ -6156,10 +6281,10 @@ public class SocHistoryDatabase {
                     // PRICED. Flagging it makes the UI show '~' rather than presenting a floor as exact.
                     // (The condition previously read `staleRes.incomplete || rowIncomplete`, which is a
                     // strictly weaker claim than this comment asserted.)
-                    upd.setInt(16, 1);
-                    upd.setInt(17, pd.tariffId.isEmpty() ? 1 : 0);
-                    upd.setInt(18, forceRecent ? 1 : 0);
-                    upd.setLong(19, start);
+                    upd.setInt(18, 1);
+                    upd.setInt(19, pd.tariffId.isEmpty() ? 1 : 0);
+                    upd.setInt(20, forceRecent ? 1 : 0);
+                    upd.setLong(21, start);
                     if (upd.executeUpdate() != 1) {
                         throw new java.sql.SQLException(
                                 "stale close found no matching open session");
@@ -6233,7 +6358,8 @@ public class SocHistoryDatabase {
                 + " COALESCE(SUM(CASE WHEN session_cost > 0 THEN session_cost ELSE 0 END), 0),"
                 + " COALESCE(SUM(CASE WHEN is_dc = 1 THEN 1 ELSE 0 END), 0),"
                 + " COALESCE(SUM(CASE WHEN is_dc = 0 THEN 1 ELSE 0 END), 0),"
-                + " COALESCE(MAX(CASE WHEN peak_power_kw > 0 THEN peak_power_kw ELSE 0 END), 0),"
+                + " COALESCE(MAX(CASE WHEN peak_power_kw > 0"
+                + " AND peak_power_kw <= 500 THEN peak_power_kw ELSE 0 END), 0),"
                 + " COALESCE(SUM(CASE WHEN range_gained_km > 0 THEN range_gained_km ELSE 0 END), 0),"
                 + " COALESCE(SUM(CASE WHEN energy_incomplete = 1 THEN 1 ELSE 0 END), 0)"
                 + " FROM " + TABLE_CHARGING
@@ -6350,7 +6476,7 @@ public class SocHistoryDatabase {
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         double energy = rs.getDouble(3);
-                        if (Double.isNaN(energy) || energy <= 0) continue;
+                        if (!Double.isFinite(energy) || energy <= 0) continue;
                         keys.add(new long[]{ rs.getLong(1), rs.getLong(2) });
                         vals.add(new double[]{ energy, rs.getDouble(4), rs.getDouble(5), rs.getDouble(6), rs.getDouble(12) });
                         flags.add(new int[]{ rs.getInt(7), rs.getInt(8) });
@@ -6416,7 +6542,7 @@ public class SocHistoryDatabase {
                     // A globally-priced session that a tariff now geofences may be
                     // adopted ONLY if it was never actually priced (no rate, no
                     // cost). Restating a real historical price is the I2 violation.
-                    if (owner.isEmpty() && (oldRate > 0 || oldCost > 0)) continue;
+                    if (owner.isEmpty() && (oldRate >= 0 || oldCost >= 0)) continue;
 
                     // Targeted mode: touch only sessions this tariff owned before,
                     // or that it owns now. Other tariffs' sessions are untouched.
@@ -6674,7 +6800,7 @@ public class SocHistoryDatabase {
                         return null;
                     }
                     double rate = rs.getDouble(2);
-                    if (Double.isNaN(rate) || rate <= 0) {
+                    if (!Double.isFinite(rate) || rate <= 0) {
                         noteReadOk();
                         return null;
                     }
@@ -6700,7 +6826,8 @@ public class SocHistoryDatabase {
                     out.put("tariffId", tId != null ? tId : "");
                     out.put("tariffLabel", tLabel != null ? tLabel : "");
                     int isDc = rs.getInt(6);
-                    out.put("isDc", isDc == 1);
+                    out.put("isDc", rs.wasNull() || (isDc != 0 && isDc != 1)
+                            ? JSONObject.NULL : Boolean.valueOf(isDc == 1));
                     noteReadOk();
                     return out;
                 }
@@ -6724,7 +6851,11 @@ public class SocHistoryDatabase {
         if (!isInitialized || connection == null) {
             throw new java.sql.SQLException("charging database unavailable during daily cost adjustment");
         }
-        if (delta == 0 || Double.isNaN(delta)) return;
+        if (!Double.isFinite(delta)) {
+            throw new java.sql.SQLException(
+                    "non-finite charging cost delta");
+        }
+        if (delta == 0) return;
         long day = (endTime / 86_400_000L) * 86_400_000L;
         try (PreparedStatement upd = connection.prepareStatement(
                 "UPDATE " + TABLE_CHARGING_DAILY +
@@ -6785,7 +6916,7 @@ public class SocHistoryDatabase {
      * Returns -1 when energy is unknown/non-positive.
      */
     private int rangeGainedFromEnergy(double energyKwh) {
-        if (Double.isNaN(energyKwh) || energyKwh <= 0) return -1;
+        if (!Double.isFinite(energyKwh) || energyKwh <= 0) return -1;
         double consumption = DEFAULT_CONSUMPTION_KWH_PER_100KM;
         try {
             com.overdrive.app.byd.BydDataCollector col = com.overdrive.app.byd.BydDataCollector.getInstance();
@@ -6867,8 +6998,11 @@ public class SocHistoryDatabase {
      * ~1.7 kW (≈7 kW peak) reported gun=3 → was labelled "DC fast". So a gun==3
      * (DC) verdict is only honoured when the session peak is DC-plausible; otherwise
      * we downgrade to unknown (-1) and let the power-based classifier bucket it as
-     * AC. gun==2 (AC) is trusted as-is. The 15 kW floor mirrors charging.js
-     * DC_MIN_PEAK_KW — comfortably above any AC wallbox, well below a real DC ramp.
+     * AC. gun==2 (AC) is trusted as-is. The shared 15 kW floor is above the observed
+     * false-DC AC profiles while retaining
+     * short or heavily tapered DC sessions that never reach the 25 kW power-only threshold.
+     * With no trustworthy gun verdict, a measured peak at or above 25 kW is sufficient
+     * evidence for DC because it is above the supported AC charging domain.
      *
      * <p>An UNMEASURED peak (0) deliberately lands on -1 too, i.e. base rate. It is
      * tempting to read 0 as "no evidence, so trust the gun" and return 1, but that is
@@ -6879,12 +7013,62 @@ public class SocHistoryDatabase {
      * measures anything, refusing to guess is I2. Overcharging permanently to fix a
      * seconds-long label transient is not a trade worth making.
      */
-    private static final double DC_MIN_PEAK_KW = 15.0;
-    private int deriveIsDc(int gunState, double peakKw) {
-        if (gunState == 3) {
-            return (peakKw >= DC_MIN_PEAK_KW) ? 1 : -1;  // DC flag needs DC-plausible power
+    static int deriveIsDc(int gunState, double peakKw) {
+        return ChargingTypeClassifier.classify(gunState, peakKw);
+    }
+
+    private int currentChargingTypeVerdict() {
+        if (chargingTypeVerdict != ChargingTypeClassifier.AC
+                && chargingTypeVerdict != ChargingTypeClassifier.DC) {
+            chargingTypeVerdict = deriveIsDc(
+                    chargingGunState, chargingPeakPower);
         }
-        return (gunState == 2) ? 0 : -1;
+        return chargingTypeVerdict;
+    }
+
+    private static int deferredChargingTypeVerdict(
+            DeferredChargingGeneration generation) {
+        if (generation.typeVerdict != ChargingTypeClassifier.AC
+                && generation.typeVerdict != ChargingTypeClassifier.DC) {
+            generation.typeVerdict = deriveIsDc(
+                    generation.gun, generation.peakPower);
+        }
+        return generation.typeVerdict;
+    }
+
+    /**
+     * Latch charger type from an inferred rate without admitting that rate to peak, average, energy,
+     * or cost accounting. Only an explicit DC gun plus a high corroborating rate can change it.
+     */
+    public synchronized boolean observeEstimatedChargingTypeEvidence(
+            double estimatedPowerKw) {
+        if (!Double.isFinite(estimatedPowerKw)
+                || estimatedPowerKw <= 0.0 || estimatedPowerKw > 500.0) {
+            return true;
+        }
+        DeferredChargingGeneration generation =
+                currentDeferredPhysicalGeneration();
+        if (generation != null && !generation.isEnded()) {
+            int verdict = ChargingTypeClassifier.classifyWithCorroboratingPower(
+                    generation.gun, generation.peakPower, estimatedPowerKw);
+            if (generation.typeVerdict == ChargingTypeClassifier.UNKNOWN
+                    && verdict != ChargingTypeClassifier.UNKNOWN) {
+                generation.typeVerdict = verdict;
+                return persistChargingLifecycleJournal();
+            }
+            return !chargingLifecycleJournalDirty
+                    || persistChargingLifecycleJournal();
+        }
+        if (!wasCharging || chargingStartTime <= 0L) return true;
+        int verdict = ChargingTypeClassifier.classifyWithCorroboratingPower(
+                chargingGunState, chargingPeakPower, estimatedPowerKw);
+        if (chargingTypeVerdict == ChargingTypeClassifier.UNKNOWN
+                && verdict != ChargingTypeClassifier.UNKNOWN) {
+            chargingTypeVerdict = verdict;
+            return persistChargingLifecycleJournal();
+        }
+        return !chargingLifecycleJournalDirty
+                || persistChargingLifecycleJournal();
     }
 
     /**
@@ -6905,8 +7089,12 @@ public class SocHistoryDatabase {
      */
     private String resolveCounterSource(com.overdrive.app.byd.BydVehicleData vd) {
         if (vd == null) return null;
-        boolean capAlive = !Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0;
-        boolean extAlive = !Double.isNaN(vd.externalChargingPowerKw)
+        boolean capAlive = Double.isFinite(vd.chargingCapacityKwh)
+                && vd.chargingCapacityKwh >= 0
+                && vd.chargingCapacityKwh
+                        <= com.overdrive.app.charging.ChargeCounterAccumulator
+                                .COUNTER_FULL_SCALE_KWH + 1.0;
+        boolean extAlive = Double.isFinite(vd.externalChargingPowerKw)
                 && vd.externalChargingPowerKw >= 0
                 && vd.externalChargingPowerKw <= EXTERNAL_COUNTER_FULL_SCALE_KWH
                 && com.overdrive.app.byd.ChargeSourceClassifier.isCounter(
@@ -6964,7 +7152,7 @@ public class SocHistoryDatabase {
     private double snapshotCounterForSource(com.overdrive.app.byd.BydVehicleData vd, String source) {
         if (vd == null || source == null) return Double.NaN;
         if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL.equals(source)) {
-            if (Double.isNaN(vd.externalChargingPowerKw) || vd.externalChargingPowerKw < 0
+            if (!Double.isFinite(vd.externalChargingPowerKw) || vd.externalChargingPowerKw < 0
                     || vd.externalChargingPowerKw > EXTERNAL_COUNTER_FULL_SCALE_KWH
                     || !com.overdrive.app.byd.ChargeSourceClassifier.isCounter(source)) {
                 return Double.NaN;
@@ -6977,7 +7165,11 @@ public class SocHistoryDatabase {
             return div > 1.0 ? vd.externalChargingPowerKw / div : vd.externalChargingPowerKw;
         }
         if (com.overdrive.app.byd.ChargeSourceClassifier.SRC_CAPACITY.equals(source)
-                && !Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0) {
+                && Double.isFinite(vd.chargingCapacityKwh)
+                && vd.chargingCapacityKwh >= 0
+                && vd.chargingCapacityKwh
+                        <= com.overdrive.app.charging.ChargeCounterAccumulator
+                                .COUNTER_FULL_SCALE_KWH + 1.0) {
             // Zero is the ideal post-reset baseline and is therefore valid.
             return vd.chargingCapacityKwh;
         }
@@ -6985,7 +7177,7 @@ public class SocHistoryDatabase {
     }
 
     private void rememberCounterBaselineCandidate(double counterKwh, long observedAt) {
-        if (Double.isNaN(counterKwh) || counterKwh < 0) return;
+        if (!Double.isFinite(counterKwh) || counterKwh < 0) return;
         if (Double.isNaN(counterBaselineCandidateKwh)
                 || counterKwh < counterBaselineCandidateKwh) {
             counterBaselineCandidateKwh = counterKwh;
@@ -7007,7 +7199,7 @@ public class SocHistoryDatabase {
 
     /** Admit one final counter snapshot without letting a stale previous-session value become energy. */
     private void observeFinalCounterForClose(double counterKwh, double endSoc, long observedAt) {
-        if (Double.isNaN(counterKwh) || counterKwh < 0) return;
+        if (!Double.isFinite(counterKwh) || counterKwh < 0) return;
         chargingCounter.setIndependentEstimate(socEstimateForOpenSession(endSoc));
         if (counterBaselinePending) {
             rememberCounterBaselineCandidate(counterKwh, observedAt);
@@ -7096,12 +7288,11 @@ public class SocHistoryDatabase {
      * Modulus to use for a persisted row's counter, kWh.
      *
      * <p>A row written before {@code counter_source} existed has no recorded owner. Defaulting such a
-     * row to the 16-bit scale is right for the capacity counter but wrong for the external one, and the
-     * accumulator cannot be re-scaled once a baseline exists — so the choice made here is final. When
-     * the source is unknown, infer it from the endpoints themselves: a value ABOVE the 16-bit ceiling
-     * cannot have come from a 16-bit register, so it is unambiguously the wider one. Below the ceiling
-     * both are possible and the default is correct, because the capacity counter is the common case and
-     * an external counter that never exceeded 65.534 wraps identically under either reading.
+     * row to the dedicated-capacity scale is right for the common case but wrong for the external one,
+     * and the accumulator cannot be re-scaled once a baseline exists, so the choice made here is final.
+     * When the source is unknown, infer it from the endpoints themselves: a value above the dedicated
+     * counter's ceiling can only belong to the wider accessor. Below that ceiling both are possible, so
+     * the dedicated capacity counter remains the conservative default.
      */
     /**
      * Decide which counter a restored legacy series belongs to, by seeing which one currently reads
@@ -7130,8 +7321,12 @@ public class SocHistoryDatabase {
             // endpoint. That rules a candidate in or out on physics rather than on proximity. Only when
             // both are still plausible does distance decide, and then the SMALLER advance is preferred
             // because the outage bounds how much could really have been delivered.
-            boolean capValid = !Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0;
-            boolean extValid = !Double.isNaN(vd.externalChargingPowerKw)
+            boolean capValid = Double.isFinite(vd.chargingCapacityKwh)
+                    && vd.chargingCapacityKwh >= 0
+                    && vd.chargingCapacityKwh
+                            <= com.overdrive.app.charging.ChargeCounterAccumulator
+                                    .COUNTER_FULL_SCALE_KWH + 1.0;
+            boolean extValid = Double.isFinite(vd.externalChargingPowerKw)
                     && vd.externalChargingPowerKw >= 0
                     && com.overdrive.app.byd.ChargeSourceClassifier.isCounter(
                             com.overdrive.app.byd.ChargeSourceClassifier.SRC_EXTERNAL);
@@ -7181,9 +7376,9 @@ public class SocHistoryDatabase {
      * arithmetic all key off the register's real modulus, and {@code counter_energy_kwh} round-trips
      * through the database in that frame, so correcting inside it would double-apply on every restore.
      *
-     * <p>Returns NaN while a fault is suspected but unproven, which makes the resolver fall through to
-     * the SOC estimate and flag the row. That is the recoverable direction: a withheld figure can be
-     * re-derived, whereas a factor-of-two energy total is billed and also calibrates SOH.
+     * <p>An unproven suspicion does not change the numeric frame here. The resolver receives the raw
+     * total together with the separate suspicion flag so it can compare that total with the measured
+     * integral and SOC estimate. Discarding it here erased the ratio that proves a half-scale fault.
      */
     private double meteredEnergyKwh() {
         if (!chargingCounter.hasBaseline()) return Double.NaN;
@@ -7194,9 +7389,6 @@ public class SocHistoryDatabase {
         try {
             double factor = com.overdrive.app.charging.CounterScaleCalibrator.factorFor(source);
             if (factor != 1.0) return raw * factor;
-            if (com.overdrive.app.charging.CounterScaleCalibrator.isScaleSuspect(source)) {
-                return Double.NaN;
-            }
         } catch (Throwable ignored) { /* uncalibrated: behave exactly as before */ }
         return raw;
     }
@@ -7227,9 +7419,6 @@ public class SocHistoryDatabase {
         try {
             double factor = com.overdrive.app.charging.CounterScaleCalibrator.factorFor(owner);
             if (factor != 1.0) return storedKwh * factor;
-            if (com.overdrive.app.charging.CounterScaleCalibrator.isScaleSuspect(owner)) {
-                return Double.NaN;
-            }
         } catch (Throwable ignored) { /* uncalibrated: behave exactly as before */ }
         return storedKwh;
     }
@@ -7697,12 +7886,16 @@ public class SocHistoryDatabase {
                 // most recent positive TTF into the persisted session row, so the guess would
                 // outlive the window that produced it. Estimated → no TTF; the caller falls back
                 // to the HAL's own charging-rest-time.
-                double powerKw = (cs != null && !cs.isEstimated) ? cs.chargingPowerKW : Double.NaN;
+                double powerKw = cs != null && !cs.isEstimated
+                        && isFinite(cs.chargingPowerKW)
+                        && cs.chargingPowerKW > 0
+                        && cs.chargingPowerKW <= 500
+                        ? cs.chargingPowerKW : Double.NaN;
                 double sohFrac = capacitySoh != null && capacitySoh.hasDisplaySoh()
                         ? capacitySoh.getDisplaySoh() / 100.0 : 1.0;
                 if (sohFrac <= 0) sohFrac = 1.0;
-                if (!Double.isNaN(soc) && soc >= 0 && soc < 100
-                        && !Double.isNaN(powerKw) && powerKw > 0.1) {
+                if (isFinite(soc) && soc >= 0 && soc < 100
+                        && isFinite(powerKw) && powerKw > 0.1) {
                     double remainingToFullKwh = ((100.0 - soc) / 100.0) * nominal * sohFrac;
                     if (remainingToFullKwh > 0) {
                         int mins = (int) Math.round(remainingToFullKwh / powerKw * 60.0);
@@ -8613,12 +8806,12 @@ public class SocHistoryDatabase {
     public synchronized boolean recordChargingSample(long sessionStartTime, long t, double powerKw,
                                       double soc, double temp, double tempHigh, double tempLow) {
         if (!isInitialized || connection == null || sessionStartTime <= 0) return false;
+        if (!isValidChargingSamplePower(powerKw)) return false;
         if (!reconcilePendingActiveChargingReplacement()) return false;
         if (!chargingAnalyticsEnabled || optOutClosePending) return false;
         // A clear/reset can atomically replace the active row while a sampler is waiting on this
         // monitor with the old start key. Reject that stale write instead of creating an orphan sample.
         if (wasCharging && sessionStartTime != chargingStartTime) return false;
-        if (Double.isNaN(powerKw)) return false;
         if (powerKw > 0 && !advancePendingCloseForAdmittedTaper(
                 sessionStartTime, t, soc, temp, tempHigh, tempLow)) {
             return false;
@@ -8654,12 +8847,14 @@ public class SocHistoryDatabase {
                     }
                 }
             });
+            noteDurableChargingSample(sessionStartTime, powerKw);
             noteWriteOk();
             return true;
         } catch (Exception e) {
             logger.debug("recordChargingSample failed: " + e.getMessage());
             if (isChargingSampleDurable(
                     sessionStartTime, t, powerKw, soc, temp, tempHigh, tempLow)) {
+                noteDurableChargingSample(sessionStartTime, powerKw);
                 noteWriteOk();
                 return true;
             }
@@ -8667,10 +8862,40 @@ public class SocHistoryDatabase {
             try { reconnect(); } catch (Exception ignored) {}
             if (isChargingSampleDurable(
                     sessionStartTime, t, powerKw, soc, temp, tempHigh, tempLow)) {
+                noteDurableChargingSample(sessionStartTime, powerKw);
                 noteWriteOk();
                 return true;
             }
             return false;
+        }
+    }
+
+    private static boolean isValidChargingSamplePower(double powerKw) {
+        if (!Double.isFinite(powerKw) || powerKw > 500.0) return false;
+        return powerKw >= 0.0
+                || powerKw == STOP_BOUNDARY_POWER_KW
+                || powerKw == MISSING_RATE_BOUNDARY_POWER_KW
+                || powerKw == AUXILIARY_SAMPLE_POWER_KW;
+    }
+
+    private static boolean isValidMeasuredChargingPower(double powerKw) {
+        return Double.isFinite(powerKw) && powerKw > 0.0 && powerKw <= 500.0;
+    }
+
+    /**
+     * Keep the open-session peak synchronized with the durable fine sample series.
+     *
+     * <p>Resume consolidation rebuilds this field from stored samples. Updating it after each
+     * confirmed write lets frequent outbound publications retain a proven AC/DC verdict without
+     * running a database aggregate on every MQTT/telemetry cycle.
+     */
+    private void noteDurableChargingSample(long sessionStartTime, double powerKw) {
+        if (powerKw > 0.0
+                && wasCharging
+                && sessionStartTime == chargingStartTime
+                && powerKw > chargingPeakPower) {
+            chargingPeakPower = powerKw;
+            currentChargingTypeVerdict();
         }
     }
 
@@ -8719,6 +8944,23 @@ public class SocHistoryDatabase {
     public synchronized long getOpenChargingSessionStart() {
         if (!reconcilePendingActiveChargingReplacement()) return -1L;
         return wasCharging ? chargingStartTime : -1;
+    }
+
+    /**
+     * Peak-guarded AC/DC verdict for the currently-open physical session.
+     *
+     * <p>{@code chargingPeakPower} is advanced by both coarse ticks and each durable 12-second
+     * sample, and is rebuilt from those samples on resume. A proven DC session therefore remains DC
+     * during its low-power taper without querying the database on every outbound telemetry cycle.
+     * Returns {@link ChargingTypeClassifier#UNKNOWN} when no session is open or the available
+     * evidence has not proved either charger type.
+     */
+    public synchronized int getOpenChargingSessionTypeVerdict() {
+        if (!reconcilePendingActiveChargingReplacement()
+                || !wasCharging || chargingStartTime <= 0L) {
+            return ChargingTypeClassifier.UNKNOWN;
+        }
+        return currentChargingTypeVerdict();
     }
 
     /** Durable H2 truth used by manager edge postcondition checks. */
@@ -8806,6 +9048,7 @@ public class SocHistoryDatabase {
         int startRange;
         int startOdometer;
         int gun;
+        int typeVerdict = ChargingTypeClassifier.UNKNOWN;
         int timeToFull;
         double lat;
         double lng;
@@ -8889,6 +9132,7 @@ public class SocHistoryDatabase {
         state.startRange = snapshotRangeKm();
         state.startOdometer = snapshotOdometerKm();
         state.gun = snapshotGunState();
+        state.typeVerdict = currentChargingTypeVerdict();
         state.timeToFull = snapshotTimeToFullMin();
         double[] location = snapshotLocation();
         state.lat = location[0];
@@ -8939,6 +9183,7 @@ public class SocHistoryDatabase {
         rebased.startRange = original.startRange;
         rebased.startOdometer = original.startOdometer;
         rebased.gun = original.gun;
+        rebased.typeVerdict = original.typeVerdict;
         rebased.timeToFull = original.timeToFull;
         rebased.lat = original.lat;
         rebased.lng = original.lng;
@@ -9064,6 +9309,7 @@ public class SocHistoryDatabase {
             ActiveChargingReplacement source, ActiveChargingReplacement target) {
         target.previousStartTime = source.previousStartTime;
         target.lifecycleHold = source.lifecycleHold;
+        target.typeVerdict = source.typeVerdict;
         target.pendingClose = source.pendingClose;
         target.closeAtMs = source.closeAtMs;
         target.closeSoc = source.closeSoc;
@@ -9251,6 +9497,12 @@ public class SocHistoryDatabase {
         chargingStartRange = state.startRange;
         chargingStartOdometer = state.startOdometer;
         chargingGunState = state.gun;
+        chargingTypeVerdict = state.typeVerdict;
+        if (chargingTypeVerdict != ChargingTypeClassifier.AC
+                && chargingTypeVerdict != ChargingTypeClassifier.DC) {
+            chargingTypeVerdict = ChargingTypeClassifier.classify(
+                    chargingGunState, 0.0);
+        }
         chargingTimeToFullMin = state.timeToFull;
         chargingStartLat = state.lat;
         chargingStartLng = state.lng;
@@ -9327,6 +9579,7 @@ public class SocHistoryDatabase {
         chargingStartRange = -1;
         chargingStartOdometer = -1;
         chargingGunState = -1;
+        chargingTypeVerdict = ChargingTypeClassifier.UNKNOWN;
         chargingTimeToFullMin = -1;
         chargingStartLat = 0;
         chargingStartLng = 0;
@@ -9371,15 +9624,47 @@ public class SocHistoryDatabase {
         return wasCharging ? chargingStartSoc : -1;
     }
 
+    /** Quality-preserving live energy snapshot for the currently open charging session. */
+    public static final class OpenChargingSessionEnergy {
+        public final double energyKwh;
+        public final String source;
+        public final boolean incomplete;
+        public final boolean estimated;
+
+        private OpenChargingSessionEnergy(
+                double energyKwh, String source,
+                boolean incomplete, boolean estimated) {
+            this.energyKwh = energyKwh;
+            this.source = source;
+            this.incomplete = incomplete;
+            this.estimated = estimated;
+        }
+
+        public boolean isUsable() {
+            return Double.isFinite(energyKwh)
+                    && energyKwh
+                    >= com.overdrive.app.charging.SessionEnergyResolver.MIN_SESSION_KWH;
+        }
+
+        private static OpenChargingSessionEnergy unavailable() {
+            return new OpenChargingSessionEnergy(
+                    -1.0,
+                    com.overdrive.app.charging.SessionEnergyResolver.SRC_NONE,
+                    false,
+                    false);
+        }
+    }
+
+    private static boolean isSessionEnergyEstimated(
+            String source, boolean incomplete) {
+        if (incomplete) return true;
+        return source == null
+                || source.isEmpty()
+                || !com.overdrive.app.charging.SessionEnergyResolver.SRC_METERED.equals(source);
+    }
+
     /**
-     * Energy (kWh) added so far in the currently-open session, or -1 if none.
-     * Integrates the recorded power samples (robust for slow charges where SOC
-     * hasn't moved a whole percent), falling back to the SOC-delta estimate.
-     * Single source of truth for the dashboard "Session" + stats "Added this
-     * session" metrics so they can't read 0 early in a slow charge.
-     */
-    /**
-     * Live energy for the open session, kWh, or -1.
+     * Live energy for the open session with its provenance and quality, or an unavailable snapshot.
      *
      * <p>{@code synchronized} because {@link com.overdrive.app.charging.ChargeCounterAccumulator} is
      * documented as not thread-safe and {@code restore()} briefly zeroes its state before
@@ -9387,8 +9672,10 @@ public class SocHistoryDatabase {
      * thread may be resuming a session, so an unsynchronised read could observe that window and
      * publish 0 for a session that has real energy.
      */
-    public synchronized double getOpenChargingSessionEnergyKwh() {
-        if (!wasCharging || chargingStartTime <= 0) return -1;
+    public synchronized OpenChargingSessionEnergy getOpenChargingSessionEnergy() {
+        if (!wasCharging || chargingStartTime <= 0) {
+            return OpenChargingSessionEnergy.unavailable();
+        }
         // SAME resolution as the session-close path, deliberately. This accessor feeds the live
         // in-progress card and /status, so using a different rule here made the card disagree with
         // the row it turns into the moment the charge ended.
@@ -9409,9 +9696,20 @@ public class SocHistoryDatabase {
                             integrateSessionEnergyKwh(chargingStartTime), socEstimate,
                             lastIntegrationTruncated,
                             counterScaleSuspect(counterOwner));
-            return r.isUsable() ? r.energyKwh : -1;
+            if (r.isUsable()) {
+                return new OpenChargingSessionEnergy(
+                        r.energyKwh,
+                        r.source,
+                        r.incomplete,
+                        isSessionEnergyEstimated(r.source, r.incomplete));
+            }
         } catch (Exception ignored) {}
-        return -1;
+        return OpenChargingSessionEnergy.unavailable();
+    }
+
+    /** Compatibility accessor for callers that only need the numeric value. */
+    public synchronized double getOpenChargingSessionEnergyKwh() {
+        return getOpenChargingSessionEnergy().energyKwh;
     }
 
 
@@ -9470,7 +9768,8 @@ public class SocHistoryDatabase {
                 "SELECT MIN(timestamp) as t, " +
                 "  AVG(soc_percent) as soc, " +
                 "  MAX(is_charging) as charging, " +
-                "  AVG(CASE WHEN charging_power_kw > 0 THEN charging_power_kw END) as power, " +
+                "  AVG(CASE WHEN charging_power_kw > 0"
+                    + " AND charging_power_kw <= 500 THEN charging_power_kw END) as power, " +
                 "  AVG(range_km) as range, " +
                 "  AVG(CASE WHEN remaining_kwh > 0 THEN remaining_kwh END) as kwh, " +
                 "  AVG(CASE WHEN voltage_v > 0 THEN voltage_v END) as volt, " +
@@ -9552,10 +9851,14 @@ public class SocHistoryDatabase {
         }
         
         try {
-            long startTime = System.currentTimeMillis() - (daysBack * 24 * 60 * 60 * 1000L);
+            long requestedDays = Math.max(1L, (long) daysBack);
+            long startTime = System.currentTimeMillis()
+                    - (requestedDays * 24L * 60L * 60L * 1000L);
             
             String sql = "SELECT start_time as startTime, end_time as endTime, start_soc as startSoc, " +
-                "end_soc as endSoc, energy_added_kwh as energyAdded, peak_power_kw as peakPower " +
+                "end_soc as endSoc, energy_added_kwh as energyAdded, peak_power_kw as peakPower, " +
+                "avg_power_kw as avgPower, gun_state as gunState, is_dc as isDc, " +
+                "energy_source as energySource, energy_incomplete as energyIncomplete " +
                 "FROM " + TABLE_CHARGING + " WHERE start_time >= ? ORDER BY start_time DESC;";
             
             try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -9568,10 +9871,41 @@ public class SocHistoryDatabase {
                         row.put("endTime", rs.getLong("endTime"));
                         // NaN-safe: put(String,double) throws on NaN, which would abort the whole
                         // response. A session opened before SoC ever resolved can hold NaN here.
-                        row.put("startSoc", jsonNum(rs.getDouble("startSoc")));
-                        row.put("endSoc", jsonNum(rs.getDouble("endSoc")));
-                        row.put("energyAdded", jsonNum(rs.getDouble("energyAdded")));
-                        row.put("peakPower", jsonNum(rs.getDouble("peakPower")));
+                        double startSoc = rs.getDouble("startSoc");
+                        row.put("startSoc", rs.wasNull()
+                                ? JSONObject.NULL : jsonSoc(startSoc));
+                        double endSoc = rs.getDouble("endSoc");
+                        row.put("endSoc", rs.wasNull()
+                                ? JSONObject.NULL : jsonSoc(endSoc));
+                        double energy = rs.getDouble("energyAdded");
+                        boolean hasEnergy = !rs.wasNull()
+                                && Double.isFinite(energy) && energy > 0;
+                        row.put("energyAdded", hasEnergy
+                                ? Double.valueOf(energy) : JSONObject.NULL);
+                        double peakPower = rs.getDouble("peakPower");
+                        row.put("peakPower", rs.wasNull()
+                                || !isValidMeasuredChargingPower(peakPower)
+                                ? JSONObject.NULL : peakPower);
+                        double avgPower = rs.getDouble("avgPower");
+                        row.put("avgPower", rs.wasNull()
+                                || !isValidMeasuredChargingPower(avgPower)
+                                ? JSONObject.NULL : avgPower);
+                        int gunState = rs.getInt("gunState");
+                        row.put("gunState", rs.wasNull() ? -1 : gunState);
+                        int isDc = rs.getInt("isDc");
+                        row.put("isDc", rs.wasNull() || (isDc != 0 && isDc != 1)
+                                ? JSONObject.NULL : Boolean.valueOf(isDc == 1));
+                        String energySource = rs.getString("energySource");
+                        boolean energyIncomplete =
+                                rs.getInt("energyIncomplete") == 1;
+                        row.put("energySource",
+                                energySource == null || energySource.isEmpty()
+                                        ? JSONObject.NULL : energySource);
+                        row.put("energyIncomplete",
+                                hasEnergy && energyIncomplete);
+                        row.put("energyEstimated",
+                                hasEnergy && isSessionEnergyEstimated(
+                                        energySource, energyIncomplete));
                         results.put(row);
                     }
                 }
@@ -9599,9 +9933,14 @@ public class SocHistoryDatabase {
         "tariff_id, tariff_label, energy_source, energy_soc_kwh, energy_incomplete, " +
         "counter_energy_kwh";
 
-    /** NaN -> JSON null. {@code JSONObject.put(String,double)} throws on NaN, failing whole responses. */
+    /** Non-finite -> JSON null; JSON numeric values must be finite. */
     private static Object jsonNum(double v) {
-        return Double.isNaN(v) ? JSONObject.NULL : (Object) Double.valueOf(v);
+        return Double.isFinite(v) ? Double.valueOf(v) : JSONObject.NULL;
+    }
+
+    private static Object jsonSoc(double v) {
+        return Double.isFinite(v) && v >= 0.0 && v <= 100.0
+                ? Double.valueOf(v) : JSONObject.NULL;
     }
 
     private JSONObject chargingRowToJson(ResultSet rs) throws Exception {
@@ -9616,48 +9955,75 @@ public class SocHistoryDatabase {
         o.put("chargingNow", inProgress
                 && wasCharging && start == chargingStartTime
                 && physicalChargingStateKnown && physicalChargingNow);
-        o.put("startSoc", jsonNum(rs.getDouble("start_soc")));
+        double startSoc = rs.getDouble("start_soc");
+        o.put("startSoc", rs.wasNull()
+                ? JSONObject.NULL : jsonSoc(startSoc));
         double endSoc = rs.getDouble("end_soc");
-        o.put("endSoc", rs.wasNull() ? JSONObject.NULL : endSoc);
+        o.put("endSoc", rs.wasNull() ? JSONObject.NULL : jsonSoc(endSoc));
         double energy = rs.getDouble("energy_added_kwh");
-        o.put("energyAdded", rs.wasNull() ? JSONObject.NULL : energy);
+        boolean hasStoredEnergy =
+                !rs.wasNull() && Double.isFinite(energy) && energy > 0;
+        o.put("energyAdded", hasStoredEnergy
+                ? Double.valueOf(energy) : JSONObject.NULL);
         double peak = rs.getDouble("peak_power_kw");
-        o.put("peakPower", rs.wasNull() ? JSONObject.NULL : peak);
+        o.put("peakPower", rs.wasNull()
+                || !isValidMeasuredChargingPower(peak)
+                ? JSONObject.NULL : Double.valueOf(peak));
         double avg = rs.getDouble("avg_power_kw");
-        o.put("avgPower", avg > -1 ? avg : JSONObject.NULL);
+        o.put("avgPower", rs.wasNull()
+                || !isValidMeasuredChargingPower(avg)
+                ? JSONObject.NULL : Double.valueOf(avg));
         int range = rs.getInt("range_gained_km");
-        o.put("rangeGained", range > -1 ? range : JSONObject.NULL);
+        o.put("rangeGained", !rs.wasNull() && range >= 0
+                ? Integer.valueOf(range) : JSONObject.NULL);
         int gunState = rs.getInt("gun_state");
         o.put("gunState", rs.wasNull() ? -1 : gunState);
         int isDc = rs.getInt("is_dc");
-        o.put("isDc", isDc == 1 ? Boolean.TRUE : isDc == 0 ? Boolean.FALSE : JSONObject.NULL);
+        o.put("isDc", rs.wasNull() || (isDc != 0 && isDc != 1)
+                ? JSONObject.NULL : Boolean.valueOf(isDc == 1));
         double rate = rs.getDouble("electricity_rate");
-        o.put("electricityRate", rate > 0 ? rate : JSONObject.NULL);
+        o.put("electricityRate", !rs.wasNull()
+                && Double.isFinite(rate) && rate > 0
+                ? Double.valueOf(rate) : JSONObject.NULL);
         double cost = rs.getDouble("session_cost");
-        o.put("cost", cost > -1 ? cost : JSONObject.NULL);
+        o.put("cost", !rs.wasNull()
+                && Double.isFinite(cost) && cost >= 0
+                ? Double.valueOf(cost) : JSONObject.NULL);
         String curr = rs.getString("currency");
         o.put("currency", curr != null ? curr : "");
         int ttf = rs.getInt("time_to_full_min");
-        o.put("timeToFullMin", ttf > -1 ? ttf : JSONObject.NULL);
+        o.put("timeToFullMin", !rs.wasNull() && ttf >= 0
+                ? Integer.valueOf(ttf) : JSONObject.NULL);
         double tHi = rs.getDouble("hv_temp_high");
+        boolean tHiMissing = rs.wasNull();
         double tLo = rs.getDouble("hv_temp_low");
+        boolean tLoMissing = rs.wasNull();
         double tAvg = rs.getDouble("hv_temp_avg");
-        o.put("tempHigh", tHi > -999 ? tHi : JSONObject.NULL);
-        o.put("tempLow", tLo > -999 ? tLo : JSONObject.NULL);
-        o.put("tempAvg", tAvg > -999 ? tAvg : JSONObject.NULL);
+        boolean tAvgMissing = rs.wasNull();
+        o.put("tempHigh", !tHiMissing && Double.isFinite(tHi) && tHi > -999
+                ? Double.valueOf(tHi) : JSONObject.NULL);
+        o.put("tempLow", !tLoMissing && Double.isFinite(tLo) && tLo > -999
+                ? Double.valueOf(tLo) : JSONObject.NULL);
+        o.put("tempAvg", !tAvgMissing && Double.isFinite(tAvg) && tAvg > -999
+                ? Double.valueOf(tAvg) : JSONObject.NULL);
         o.put("durationMinutes", (end > 0 && end > start) ? Math.round((end - start) / 60000.0) : JSONObject.NULL);
         // Location of the charge. lat/lng are 0/0 when no GPS fix; placeLabel is
         // filled async by the geocoder (may be empty on early reads).
         double lat = rs.getDouble("start_lat");
+        boolean latMissing = rs.wasNull();
         double lng = rs.getDouble("start_lng");
-        boolean hasLoc = !(lat == 0 && lng == 0);
+        boolean lngMissing = rs.wasNull();
+        boolean hasLoc = !latMissing && !lngMissing
+                && Double.isFinite(lat) && Double.isFinite(lng)
+                && !(lat == 0 && lng == 0);
         o.put("lat", hasLoc ? lat : JSONObject.NULL);
         o.put("lng", hasLoc ? lng : JSONObject.NULL);
         String place = rs.getString("place_label");
         o.put("placeLabel", (place != null && !place.isEmpty()) ? place : JSONObject.NULL);
         // Odometer at charge start (km). -1 sentinel → null so the UI shows "--".
         int odo = rs.getInt("start_odometer_km");
-        o.put("startOdometerKm", odo > -1 ? odo : JSONObject.NULL);
+        o.put("startOdometerKm", !rs.wasNull() && odo >= 0
+                ? Integer.valueOf(odo) : JSONObject.NULL);
         // Which tariff priced this session. Empty (every pre-v6 row, and any
         // charge at an unmapped location) → null, and the UI simply omits the
         // provenance chip. Read defensively: a session row written before the
@@ -9678,15 +10044,26 @@ public class SocHistoryDatabase {
             String esrc = rs.getString("energy_source");
             o.put("energySource", (esrc != null && !esrc.isEmpty()) ? esrc : JSONObject.NULL);
             double esoc = rs.getDouble("energy_soc_kwh");
-            o.put("energySocKwh", rs.wasNull() ? JSONObject.NULL : esoc);
+            o.put("energySocKwh", rs.wasNull()
+                    || !Double.isFinite(esoc) || esoc < 0
+                    ? JSONObject.NULL : Double.valueOf(esoc));
             double ectr = rs.getDouble("counter_energy_kwh");
-            o.put("energyCounterKwh", rs.wasNull() ? JSONObject.NULL : ectr);
-            o.put("energyIncomplete", rs.getInt("energy_incomplete") == 1);
+            o.put("energyCounterKwh", rs.wasNull()
+                    || !Double.isFinite(ectr) || ectr < 0
+                    ? JSONObject.NULL : Double.valueOf(ectr));
+            boolean energyIncomplete = rs.getInt("energy_incomplete") == 1;
+            o.put("energyIncomplete", energyIncomplete);
+            o.put("energyEstimated",
+                    hasStoredEnergy
+                            && ((esrc == null || esrc.isEmpty())
+                            || isSessionEnergyEstimated(
+                                    esrc, energyIncomplete)));
         } catch (Exception ignored) {
             o.put("energySource", JSONObject.NULL);
             o.put("energySocKwh", JSONObject.NULL);
             o.put("energyCounterKwh", JSONObject.NULL);
             o.put("energyIncomplete", false);
+            o.put("energyEstimated", hasStoredEnergy);
         }
 
         // ---- Live enrichment for the OPEN (in-progress) session ----
@@ -9710,11 +10087,18 @@ public class SocHistoryDatabase {
             // threshold. A live DC session in the 15..25 kW band was therefore
             // labelled "AC fast" while being PRICED at dcRate (pricing uses this same
             // deriveIsDc below), and the DC/AC tile counted it in the AC bucket.
-            // Publishing the verdict makes one authority — deriveIsDc — drive the
-            // label, the price and the tile. Same tri-state mapping as the column read
-            // above, so -1 still means "don't claim to know".
-            int liveIsDc = deriveIsDc(chargingGunState, chargingPeakPower);
+            // Resolve the same combined coarse + fine peak that the card receives
+            // before deriving the verdict. Otherwise a 12-second DC ramp peak can
+            // make the card show a DC-plausible number while classification and
+            // pricing still use the lower two-minute peak.
+            double livePeak = resolvePeakKw(start, chargingPeakPower);
+            if (livePeak > chargingPeakPower) chargingPeakPower = livePeak;
+            int liveIsDc = currentChargingTypeVerdict();
             o.put("isDc", liveIsDc == 1 ? Boolean.TRUE : liveIsDc == 0 ? Boolean.FALSE : JSONObject.NULL);
+            if (livePeak > 0) o.put("peakPower", livePeak);
+            double liveAverage = resolveAveragePowerKw(
+                    start, chargingPowerSum, chargingPowerCount);
+            if (liveAverage > 0) o.put("avgPower", liveAverage);
             try {
                 VehicleDataMonitor vm = VehicleDataMonitor.getInstance();
                 double liveSoc = Double.NaN;
@@ -9731,15 +10115,20 @@ public class SocHistoryDatabase {
                 // the session-close path. Previously this block ran its own integrate-then-
                 // SOC x capacity rule, so the in-progress card could show a different figure from
                 // the row it turned into the moment the charge ended.
-                double e = getOpenChargingSessionEnergyKwh();
-                if (e > 0) {
+                OpenChargingSessionEnergy liveEnergy =
+                        getOpenChargingSessionEnergy();
+                if (liveEnergy.isUsable()) {
+                    double e = liveEnergy.energyKwh;
                     o.put("energyAdded", e);
+                    o.put("energySource", liveEnergy.source);
+                    o.put("energyIncomplete", liveEnergy.incomplete);
+                    o.put("energyEstimated", liveEnergy.estimated);
                     // Same classifier + tariff resolution as the SESSION END path
                     // (location tariff first, then global DC/base), so this live
                     // card cost matches the value persisted when it closes — and
                     // the live card already names the tariff that will price it.
                     PricingDecision livePd = priceSession(
-                            deriveIsDc(chargingGunState, chargingPeakPower),
+                            liveIsDc,
                             chargingStartLat, chargingStartLng);
                     if (livePd.rate > 0) {
                         o.put("cost", e * livePd.rate);
@@ -9758,9 +10147,9 @@ public class SocHistoryDatabase {
                 if (chargingTimeToFullMin > 0) o.put("timeToFullMin", chargingTimeToFullMin);
                 BatteryThermalData th = vm != null ? vm.getBatteryThermal() : null;
                 if (th != null && th.hasData()) {
-                    if (!Double.isNaN(th.averageTempC)) o.put("tempAvg", th.averageTempC);
-                    if (!Double.isNaN(th.highestTempC)) o.put("tempHigh", th.highestTempC);
-                    if (!Double.isNaN(th.lowestTempC)) o.put("tempLow", th.lowestTempC);
+                    if (isFinite(th.averageTempC)) o.put("tempAvg", th.averageTempC);
+                    if (isFinite(th.highestTempC)) o.put("tempHigh", th.highestTempC);
+                    if (isFinite(th.lowestTempC)) o.put("tempLow", th.lowestTempC);
                 }
                 // Live MEASURED power for the card chip. The stored peak_power_kw
                 // may be a stale estimate (7.0 placeholder written before the
@@ -9772,12 +10161,12 @@ public class SocHistoryDatabase {
                     // session list / detail drill-in suppress a placeholder power
                     // reading the same way (index.html dashChargePower gates on it).
                     o.put("isEstimated", cs.isEstimated);
-                    if (!cs.isEstimated && cs.chargingPowerKW > 0) {
+                    if (!cs.isEstimated && isFinite(cs.chargingPowerKW)
+                            && cs.chargingPowerKW > 0
+                            && cs.chargingPowerKW <= 500) {
                         o.put("livePowerKw", cs.chargingPowerKW);
                     }
                 }
-                double samplePeak = peakSampleKw(start);
-                if (samplePeak > 0) o.put("peakPower", samplePeak);
             } catch (Exception ignored) {}
         }
         // Read-only evidence metadata. This is intentionally added after live
@@ -9814,35 +10203,67 @@ public class SocHistoryDatabase {
      */
     private double resolvePeakKw(long sessionStartTime, double coarsePeak) {
         double fine = peakSampleKw(sessionStartTime);
-        return Math.max(coarsePeak > 0 ? coarsePeak : 0, fine > 0 ? fine : 0);
+        return Math.max(
+                isValidMeasuredChargingPower(coarsePeak) ? coarsePeak : 0,
+                isValidMeasuredChargingPower(fine) ? fine : 0);
     }
 
     /**
-     * Session average (kW) as energy over elapsed time.
+     * Session average (kW) over the recorded positive charging-power points.
      *
-     * <p>Time-weighted by construction, unlike a mean of the tick values: those ticks are
-     * irregularly spaced (the SoC recorder skips a tick when nothing changed), so an unweighted
-     * mean over-weights whichever moments happened to fire and could disagree with
-     * energy/duration by a large factor on a session that tapered.
-     *
-     * @return kW, or -1 when it cannot be computed
+     * <p>The vehicle recorder's charging summary defines average power as the arithmetic mean of its
+     * stored power points; duration and charged energy are separate quantities. Using
+     * {@code energy / row lifetime} dilutes the result when a row spans a pause, an offline gap, or a
+     * resumed session. The fine sample series is preferred because it has a stable cadence. The
+     * coarse in-memory mean survives database gaps. With no measured point, active charging time is
+     * unknowable, so the average is left unavailable rather than dividing energy by row lifetime.
      */
-    private static double timeWeightedAvgKw(double energyKwh, long startMs, long endMs) {
-        if (energyKwh <= 0 || startMs <= 0 || endMs <= startMs) return -1;
-        double hours = (endMs - startMs) / 3_600_000.0;
-        if (hours <= 0) return -1;
-        double kw = energyKwh / hours;
-        return (kw > 0 && kw <= 500) ? kw : -1;
+    private double resolveAveragePowerKw(long sessionStartTime,
+                                         double coarsePowerSum,
+                                         int coarsePowerCount) {
+        double sampled = averageSamplePowerKw(sessionStartTime);
+        if (sampled > 0) return sampled;
+        if (coarsePowerCount > 0) {
+            double coarse = coarsePowerSum / coarsePowerCount;
+            if (coarse > 0 && coarse <= 500) return coarse;
+        }
+        return -1;
+    }
+
+    /** Arithmetic mean of measured positive samples, or -1 when none are available. */
+    private double averageSamplePowerKw(long sessionStartTime) {
+        if (!isInitialized || connection == null || sessionStartTime <= 0) return -1;
+        try (PreparedStatement p = connection.prepareStatement(
+                "SELECT AVG(power_kw) FROM " + TABLE_CPS
+                        + " WHERE session_start_time = ?"
+                        + " AND power_kw > 0 AND power_kw <= 500;")) {
+            p.setLong(1, sessionStartTime);
+            try (ResultSet rs = p.executeQuery()) {
+                if (!rs.next()) return -1;
+                double value = rs.getDouble(1);
+                return !rs.wasNull() && isValidMeasuredChargingPower(value)
+                        ? value : -1;
+            }
+        } catch (Exception e) {
+            logger.debug("averageSamplePowerKw failed: " + e.getMessage());
+            return -1;
+        }
     }
 
     /** Max measured power (kW) across a session's recorded samples, or 0. */
     private double peakSampleKw(long sessionStartTime) {
         if (!isInitialized || connection == null || sessionStartTime <= 0) return 0;
         try (PreparedStatement p = connection.prepareStatement(
-                "SELECT MAX(power_kw) FROM " + TABLE_CPS + " WHERE session_start_time = ? AND power_kw > 0;")) {
+                "SELECT MAX(power_kw) FROM " + TABLE_CPS
+                        + " WHERE session_start_time = ?"
+                        + " AND power_kw > 0 AND power_kw <= 500;")) {
             p.setLong(1, sessionStartTime);
             try (ResultSet rs = p.executeQuery()) {
-                if (rs.next()) { double v = rs.getDouble(1); return rs.wasNull() ? 0 : v; }
+                if (rs.next()) {
+                    double value = rs.getDouble(1);
+                    return !rs.wasNull()
+                            && isValidMeasuredChargingPower(value) ? value : 0;
+                }
             }
         } catch (Exception ignored) {}
         return 0;
@@ -9926,6 +10347,13 @@ public class SocHistoryDatabase {
                 while (rs.next()) {
                     long t = rs.getLong(1);
                     double p = rs.getDouble(2);
+                    if (!Double.isFinite(p) || p > 500.0) {
+                        // A corrupt/legacy out-of-domain row is an observation gap, not power.
+                        lastIntegrationTruncated = true;
+                        prevT = -1;
+                        prevP = 0;
+                        continue;
+                    }
                     if (p <= 0) {
                         // Charging-stopped boundary: break the trapezoid chain so
                         // the next live sample starts a fresh segment.
@@ -10083,26 +10511,37 @@ public class SocHistoryDatabase {
             }
             try (PreparedStatement pstmt = conn.prepareStatement(
                     "SELECT t, power_kw, soc, temp, temp_high, temp_low FROM " + TABLE_CPS +
-                    " WHERE session_start_time = ? AND power_kw >= 0 ORDER BY t ASC;")) {
+                    " WHERE session_start_time = ?"
+                            + " AND (power_kw >= 0 OR power_kw = ? OR power_kw = ?)"
+                            + " ORDER BY t ASC;")) {
                 pstmt.setLong(1, start);
+                pstmt.setDouble(2, MISSING_RATE_BOUNDARY_POWER_KW);
+                pstmt.setDouble(3, AUXILIARY_SAMPLE_POWER_KW);
                 try (ResultSet rs = pstmt.executeQuery()) {
                     while (rs.next()) {
                         JSONObject o = new JSONObject();
                         o.put("t", rs.getLong("t"));
-                        o.put("power", rs.getDouble("power_kw"));
+                        double samplePower = rs.getDouble("power_kw");
+                        o.put("power", (!rs.wasNull() && isFinite(samplePower)
+                                && samplePower > 0 && samplePower <= 500)
+                                ? samplePower : JSONObject.NULL);
                         // NaN-safe. The fast sampler stores whatever SoC it had, and NaN is reachable
                         // (a sentinel SoC read while the power accessor still answers). JSONObject.put
                         // THROWS on a NaN double, which aborted this loop mid-session and served a
                         // silently TRUNCATED curve — the chart just stopped, with no error anywhere.
                         double sampleSoc = rs.getDouble("soc");
-                        o.put("soc", (rs.wasNull() || Double.isNaN(sampleSoc))
+                        o.put("soc", (rs.wasNull() || !isFinite(sampleSoc)
+                                || sampleSoc < 0 || sampleSoc > 100)
                                 ? JSONObject.NULL : sampleSoc);
-                        double temp = rs.getDouble("temp");
-                        o.put("temp", temp > -999 ? temp : JSONObject.NULL);
-                        double tHi = rs.getDouble("temp_high");
-                        o.put("tempHigh", (!rs.wasNull() && tHi > -999) ? tHi : JSONObject.NULL);
-                        double tLo = rs.getDouble("temp_low");
-                        o.put("tempLow", (!rs.wasNull() && tLo > -999) ? tLo : JSONObject.NULL);
+                        double sampleTemp = rs.getDouble("temp");
+                        o.put("temp", (!rs.wasNull() && isFinite(sampleTemp)
+                                && sampleTemp > -999) ? sampleTemp : JSONObject.NULL);
+                        double sampleTempHigh = rs.getDouble("temp_high");
+                        o.put("tempHigh", (!rs.wasNull() && isFinite(sampleTempHigh)
+                                && sampleTempHigh > -999) ? sampleTempHigh : JSONObject.NULL);
+                        double sampleTempLow = rs.getDouble("temp_low");
+                        o.put("tempLow", (!rs.wasNull() && isFinite(sampleTempLow)
+                                && sampleTempLow > -999) ? sampleTempLow : JSONObject.NULL);
                         results.put(o);
                     }
                 }
@@ -10192,6 +10631,17 @@ public class SocHistoryDatabase {
         try {
             long sinceDay = (fromMs / 86_400_000L) * 86_400_000L;
             long untilDay = (toMs == Long.MAX_VALUE) ? Long.MAX_VALUE : (toMs / 86_400_000L) * 86_400_000L;
+            long untilExclusive = untilDay == Long.MAX_VALUE
+                    || untilDay > Long.MAX_VALUE - 86_400_000L
+                    ? Long.MAX_VALUE
+                    : untilDay + 86_400_000L;
+            java.util.Map<Long, Integer> estimatedByDay =
+                    estimatedEnergySessionsByDay(
+                            conn, sinceDay, untilExclusive);
+            int periodEstimated = 0;
+            for (Integer count : estimatedByDay.values()) {
+                if (count != null) periodEstimated += count.intValue();
+            }
 
             // Period aggregates from charging_daily.
             JSONArray daily = new JSONArray();
@@ -10213,6 +10663,10 @@ public class SocHistoryDatabase {
                         // How many of the day's sessions carried a floor rather than a measured total.
                         // Exposed so a consumer can qualify the figure instead of reading it as exact.
                         d.put("incomplete", rs.getInt("incomplete_count"));
+                        d.put("estimated",
+                                estimatedByDay.getOrDefault(
+                                        Long.valueOf(rs.getLong("day_epoch")),
+                                        Integer.valueOf(0)).intValue());
                         daily.put(d);
                         periodSessions += rs.getInt("session_count");
                         periodEnergy += rs.getDouble("energy_kwh");
@@ -10232,6 +10686,7 @@ public class SocHistoryDatabase {
             out.put("periodAcCount", periodAc);
             out.put("periodRangeGained", periodRange);
             out.put("periodIncompleteSessions", periodIncomplete);
+            out.put("periodEstimatedSessions", periodEstimated);
             out.put("avgCostPerKwh", periodEnergy > 0 && periodCost > 0 ? periodCost / periodEnergy : JSONObject.NULL);
 
             // Lifetime totals (entire charging_daily — survives the prune).
@@ -10246,6 +10701,9 @@ public class SocHistoryDatabase {
                     out.put("lifetimeIncompleteSessions", rs.getInt(4));
                 }
             }
+            out.put("lifetimeEstimatedSessions",
+                    countEstimatedEnergySessions(
+                            conn, 0L, Long.MAX_VALUE));
 
             // SOH-degradation trend from soc_daily.
             JSONArray sohTrend = new JSONArray();
@@ -10268,6 +10726,90 @@ public class SocHistoryDatabase {
             throw chargingHistoryReadException(
                     "build charging summary", e);
         }
+    }
+
+    /**
+     * Count completed sessions whose displayed energy is not a complete direct meter reading.
+     *
+     * <p>The daily rollup predates energy provenance and intentionally remains compact. Detailed
+     * charging rows are permanent, so deriving this quality count at read time avoids a schema
+     * migration while keeping aggregate energy/cost/range labels honest for integrated, SOC-derived,
+     * reconstructed, incomplete, and legacy unknown-source sessions.
+     */
+    private int countEstimatedEnergySessions(
+            Connection conn, long fromInclusive,
+            long toExclusive) throws java.sql.SQLException {
+        String sql = "SELECT COUNT(*) FROM " + TABLE_CHARGING
+                + " WHERE end_time IS NOT NULL"
+                + " AND end_time >= ?"
+                + (toExclusive == Long.MAX_VALUE
+                        ? ""
+                        : " AND end_time < ?")
+                + " AND energy_added_kwh > 0"
+                + " AND (energy_incomplete = 1"
+                + " OR energy_source IS NULL"
+                + " OR energy_source <> ?);";
+        try (PreparedStatement query =
+                     conn.prepareStatement(sql)) {
+            int parameter = 1;
+            query.setLong(parameter++, fromInclusive);
+            if (toExclusive != Long.MAX_VALUE) {
+                query.setLong(parameter++, toExclusive);
+            }
+            query.setString(
+                    parameter,
+                    com.overdrive.app.charging.SessionEnergyResolver
+                            .SRC_METERED);
+            try (ResultSet rs = query.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        }
+    }
+
+    private java.util.Map<Long, Integer>
+            estimatedEnergySessionsByDay(
+                    Connection conn, long fromInclusive,
+                    long toExclusive) throws java.sql.SQLException {
+        java.util.Map<Long, Integer> counts =
+                new java.util.HashMap<>();
+        String sql = "SELECT end_time FROM " + TABLE_CHARGING
+                + " WHERE end_time IS NOT NULL"
+                + " AND end_time >= ?"
+                + (toExclusive == Long.MAX_VALUE
+                        ? ""
+                        : " AND end_time < ?")
+                + " AND energy_added_kwh > 0"
+                + " AND (energy_incomplete = 1"
+                + " OR energy_source IS NULL"
+                + " OR energy_source <> ?);";
+        try (PreparedStatement query =
+                     conn.prepareStatement(sql)) {
+            int parameter = 1;
+            query.setLong(parameter++, fromInclusive);
+            if (toExclusive != Long.MAX_VALUE) {
+                query.setLong(parameter++, toExclusive);
+            }
+            query.setString(
+                    parameter,
+                    com.overdrive.app.charging.SessionEnergyResolver
+                            .SRC_METERED);
+            try (ResultSet rs = query.executeQuery()) {
+                while (rs.next()) {
+                    long endTime = rs.getLong(1);
+                    long day = (endTime / 86_400_000L)
+                            * 86_400_000L;
+                    Long key = Long.valueOf(day);
+                    counts.put(
+                            key,
+                            Integer.valueOf(
+                                    counts.getOrDefault(
+                                            key,
+                                            Integer.valueOf(0))
+                                            .intValue() + 1));
+                }
+            }
+        }
+        return counts;
     }
 
     /** Wipe only the charging-related tables (user "Clear charging history"). Returns rows deleted. */
@@ -10388,77 +10930,77 @@ public class SocHistoryDatabase {
     }
 
     /**
-     * Update the total cost of a single charging session, recalculate its
-     * rate (cost per kWh), clear any location-based tariff fields (as it's now a manual cost),
-     * and adjust the daily rollup so lifetime / monthly-cost totals stay consistent.
+     * Replace a completed session's total cost, derive its effective rate, and
+     * rebuild that day's authoritative rollup in the same transaction.
      */
     public synchronized boolean updateChargingSessionCost(long id, double newCost) {
-        if (!isInitialized || connection == null) return false;
-        boolean priorAutoCommit = false;
-        boolean committed = false;
-        try {
-            priorAutoCommit = connection.getAutoCommit();
-            connection.setAutoCommit(false);
+        if (!isInitialized || connection == null
+                || !Double.isFinite(newCost)
+                || !Float.isFinite((float) newCost)
+                || (newCost < 0 && newCost != -1)) {
+            return false;
+        }
 
-            long startTime = -1, endTime = 0;
-            double energyAdded = 0;
-            double oldCost = 0;
-            try (PreparedStatement sel = connection.prepareStatement(
-                    "SELECT start_time, end_time, energy_added_kwh, session_cost FROM " + TABLE_CHARGING + " WHERE id = ?;")) {
-                sel.setLong(1, id);
-                try (ResultSet rs = sel.executeQuery()) {
-                    if (rs.next()) {
+        final boolean[] updated = { false };
+        final double[] storedRate = { -1 };
+        try {
+            runInTransaction(() -> {
+                long startTime;
+                long endTime;
+                double energyAdded;
+                try (PreparedStatement select = connection.prepareStatement(
+                        "SELECT start_time, end_time, energy_added_kwh"
+                                + " FROM " + TABLE_CHARGING + " WHERE id = ?;")) {
+                    select.setLong(1, id);
+                    try (ResultSet rs = select.executeQuery()) {
+                        if (!rs.next()) return;
                         startTime = rs.getLong("start_time");
                         endTime = rs.getLong("end_time");
-                        if (endTime == 0 || endTime <= startTime) {
-                            logger.warn("updateChargingSessionCost: cannot edit cost of an in-progress session " + id);
-                            return false;
+                        if (rs.wasNull() || endTime <= startTime) {
+                            logger.warn("Refusing to edit cost of in-progress charging session "
+                                    + id);
+                            return;
                         }
-                        double energyRead = rs.getDouble("energy_added_kwh");
-                        energyAdded = (rs.wasNull() || energyRead < 0) ? 0 : energyRead;
-                        double costRead = rs.getDouble("session_cost");
-                        oldCost = (rs.wasNull() || costRead < 0) ? 0 : costRead;
-                    } else {
-                        return false;
+                        double storedEnergy = rs.getDouble("energy_added_kwh");
+                        energyAdded = rs.wasNull() || !Double.isFinite(storedEnergy)
+                                || storedEnergy < 0 ? 0 : storedEnergy;
                     }
                 }
-            }
 
-            double newRate = (newCost < 0) ? -1 : ((energyAdded > 0) ? (newCost / energyAdded) : 0);
-
-            try (PreparedStatement updSession = connection.prepareStatement(
-                    "UPDATE " + TABLE_CHARGING + " SET electricity_rate = ?, session_cost = ?, tariff_id = '', tariff_label = '' WHERE id = ?;")) {
-                updSession.setDouble(1, newRate);
-                updSession.setDouble(2, newCost);
-                updSession.setLong(3, id);
-                updSession.executeUpdate();
-            }
-
-            double delta = (newCost >= 0 ? newCost : 0) - (oldCost >= 0 ? oldCost : 0);
-            if (delta != 0 && endTime > 0) {
-                long day = (endTime / 86_400_000L) * 86_400_000L;
-                try (PreparedStatement updDaily = connection.prepareStatement(
-                        "UPDATE " + TABLE_CHARGING_DAILY + " SET cost = GREATEST(cost + ?, 0) WHERE day_epoch = ?;")) {
-                    updDaily.setDouble(1, delta);
-                    updDaily.setLong(2, day);
-                    updDaily.executeUpdate();
+                double rate = newCost < 0
+                        ? -1 : energyAdded > 0 ? newCost / energyAdded : 0;
+                if (!Double.isFinite(rate)
+                        || !Float.isFinite((float) rate)) {
+                    throw new java.sql.SQLException(
+                            "manual charging cost produced a non-finite rate");
                 }
-            }
+                try (PreparedStatement update = connection.prepareStatement(
+                        "UPDATE " + TABLE_CHARGING
+                                + " SET electricity_rate = ?, session_cost = ?,"
+                                + " tariff_id = '', tariff_label = '',"
+                                + " post_commit_tariff_applied = 1"
+                                + " WHERE id = ?;")) {
+                    update.setDouble(1, rate);
+                    update.setDouble(2, newCost);
+                    update.setLong(3, id);
+                    if (update.executeUpdate() != 1) {
+                        throw new java.sql.SQLException(
+                                "charging session disappeared before cost update: " + id);
+                    }
+                }
+                rebuildChargingDailyDay(dayEpoch(endTime));
+                storedRate[0] = rate;
+                updated[0] = true;
+            });
+            if (!updated[0]) return false;
 
-            connection.commit();
-            committed = true;
-            logger.info("Updated charging session " + id + " to cost " + newCost + ", calculated rate " + newRate);
+            replayPendingChargingPostCommitMetadata();
+            logger.info("Updated charging session " + id + " to cost " + newCost
+                    + ", calculated rate " + storedRate[0]);
             return true;
         } catch (Exception e) {
             logger.error("updateChargingSessionCost failed for " + id, e);
             return false;
-        } finally {
-            if (!committed && connection != null) {
-                try { connection.rollback(); } catch (Exception ignored) {}
-            }
-            if (connection != null) {
-                try { connection.setAutoCommit(priorAutoCommit); } catch (Exception ignored) {}
-            }
         }
     }
 
@@ -10558,8 +11100,16 @@ public class SocHistoryDatabase {
                 livePoint.put("charging", chargingData != null
                     && (chargingData.status == ChargingStateData.ChargingStatus.CHARGING
                         || chargingData.isTaperCharging));
-                double livePower = (chargingData != null) ? chargingData.chargingPowerKW : 0;
-                livePoint.put("power", Double.isNaN(livePower) ? 0 : livePower);
+                boolean livePowerEstimated = chargingData != null && chargingData.isEstimated;
+                double livePower = chargingData != null
+                        ? chargingData.chargingPowerKW : Double.NaN;
+                if (!livePowerEstimated && isFinite(livePower)
+                        && livePower > 0 && livePower <= 500) {
+                    livePoint.put("power", Math.round(livePower * 100) / 100.0);
+                } else {
+                    livePoint.put("power", JSONObject.NULL);
+                }
+                livePoint.put("powerEstimated", livePowerEstimated);
                 livePoint.put("range", rangeData != null ? rangeData.elecRangeKm : 0);
                 double liveKwh = monitor.getBatteryRemainPowerKwh();
                 if (liveKwh > 0) livePoint.put("kwh", Math.round(liveKwh * 10) / 10.0);
@@ -10606,7 +11156,9 @@ public class SocHistoryDatabase {
             
             report.put("history", history);
             report.put("stats", stats);
-            report.put("chargingSessions", getChargingSessions(hoursBack / 24));
+            int reportDays = Math.max(
+                    1, (int) Math.ceil(hoursBack / 24.0));
+            report.put("chargingSessions", getChargingSessions(reportDays));
             report.put("hoursBack", hoursBack);
             report.put("maxPoints", maxPoints);
             report.put("timestamp", System.currentTimeMillis());
@@ -10714,7 +11266,7 @@ public class SocHistoryDatabase {
                     }
                     optOutCounterCaptured = true;
                     chargingPeakPower = resolvePeakKw(chargingStartTime, chargingPeakPower);
-                    optOutCloseIsDc = deriveIsDc(chargingGunState, chargingPeakPower);
+                    optOutCloseIsDc = currentChargingTypeVerdict();
                     try {
                         optOutClosePricing = priceSessionForClose(
                                 optOutCloseIsDc, chargingStartLat, chargingStartLng);
@@ -11732,16 +12284,18 @@ public class SocHistoryDatabase {
      * hours. Returns null if none, if values are garbage, or if DB is closed.
      *
      * Returned JSON shape:
-     *  { startTime, endTime, durationMinutes, energyAddedKwh, startSoc, endSoc }
+     *  { startTime, endTime, durationMinutes, energyAddedKwh, startSoc, endSoc,
+     *    energySource, energyIncomplete, energyEstimated }
      */
     public synchronized JSONObject getMostRecentCompletedChargingSession(int hoursBack) {
         if (!isAvailable()) return null;
         if (hoursBack <= 0) return null;
         try {
             long cutoff = System.currentTimeMillis() - (hoursBack * 60L * 60L * 1000L);
-            String sql = "SELECT start_time, end_time, start_soc, end_soc, energy_added_kwh " +
+            String sql = "SELECT start_time, end_time, start_soc, end_soc, energy_added_kwh,"
+                + " energy_source, energy_incomplete " +
                 "FROM " + TABLE_CHARGING +
-                " WHERE end_time IS NOT NULL AND start_time >= ? " +
+                " WHERE end_time IS NOT NULL AND end_time >= ? " +
                 "ORDER BY end_time DESC LIMIT 1";
             try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
                 pstmt.setLong(1, cutoff);
@@ -11750,10 +12304,14 @@ public class SocHistoryDatabase {
                     long start = rs.getLong(1);
                     long end = rs.getLong(2);
                     double startSoc = rs.getDouble(3);
+                    boolean startSocMissing = rs.wasNull();
                     double endSoc = rs.getDouble(4);
+                    boolean endSocMissing = rs.wasNull();
                     double energy = rs.getDouble(5);
+                    String energySource = rs.getString(6);
+                    boolean energyIncomplete = rs.getInt(7) == 1;
                     if (end <= start) return null;
-                    if (Double.isNaN(energy) || energy <= 0 || energy > 500) return null;
+                    if (!Double.isFinite(energy) || energy <= 0 || energy > 500) return null;
                     long durationMin = (end - start) / 60_000L;
                     if (durationMin <= 0 || durationMin > 7 * 24 * 60) return null;
                     JSONObject out = new JSONObject();
@@ -11761,8 +12319,27 @@ public class SocHistoryDatabase {
                     out.put("endTime", end);
                     out.put("durationMinutes", durationMin);
                     out.put("energyAddedKwh", Math.round(energy * 10) / 10.0);
-                    out.put("startSoc", Math.round(startSoc * 10) / 10.0);
-                    out.put("endSoc", Math.round(endSoc * 10) / 10.0);
+                    out.put("energySource",
+                            energySource != null
+                                    && !energySource.isEmpty()
+                                    ? energySource
+                                    : JSONObject.NULL);
+                    out.put("energyIncomplete",
+                            energyIncomplete);
+                    out.put("energyEstimated",
+                            energySource == null
+                                    || energySource.isEmpty()
+                                    || isSessionEnergyEstimated(
+                                            energySource,
+                                            energyIncomplete));
+                    out.put("startSoc",
+                            startSocMissing
+                                    ? JSONObject.NULL
+                                    : jsonSoc(Math.round(startSoc * 10) / 10.0));
+                    out.put("endSoc",
+                            endSocMissing
+                                    ? JSONObject.NULL
+                                    : jsonSoc(Math.round(endSoc * 10) / 10.0));
                     return out;
                 }
             }

@@ -69,9 +69,23 @@ public final class SessionEnergyResolver {
      * possibly-degraded pack whose measurement is believed.
      */
     public static final double HALF_SCALE_MAX_RATIO = 0.55;
+    /**
+     * Wider counter/integral contradiction admitted only after an independent register has already
+     * identified the counter scale as suspect. This catches quantisation around an exact half while
+     * still requiring the measured integral to be materially larger than the faulty counter.
+     */
+    public static final double SUSPECT_COUNTER_INTEGRAL_MAX_RATIO = RATIO_LOW;
 
     /** Below this, a session is noise rather than a charge. */
     public static final double MIN_SESSION_KWH = 0.05;
+    /**
+     * Maximum physically admissible session total.
+     *
+     * <p>Matches the widest charging-energy register envelope used by this app. Keeping the bound
+     * here prevents finite framework sentinels such as 104857.5 from becoming billable energy when
+     * an older row or accessor bypasses a lower-level domain check.
+     */
+    public static final double MAX_SESSION_KWH = 500.0;
 
 
     /** Where a resolved figure came from. Persisted for support, so do not rename. */
@@ -117,7 +131,9 @@ public final class SessionEnergyResolver {
             this.socIndependentKwh = socIndependentKwh;
         }
 
-        public boolean isUsable() { return !Double.isNaN(energyKwh) && energyKwh >= MIN_SESSION_KWH; }
+        public boolean isUsable() {
+            return isUsableEnergy(energyKwh);
+        }
 
         /**
          * True when a SOC-independent figure exists and may safely calibrate SOH.
@@ -132,7 +148,7 @@ public final class SessionEnergyResolver {
          * figure is unfit, so re-checking a different source's health here only subtracts.
          */
         public boolean canCalibrateSoh() {
-            return !Double.isNaN(socIndependentKwh) && socIndependentKwh >= MIN_SESSION_KWH;
+            return isUsableEnergy(socIndependentKwh);
         }
     }
 
@@ -147,8 +163,8 @@ public final class SessionEnergyResolver {
      * @return kWh, or NaN when it cannot be computed
      */
     public static double socEstimateKwh(double socDeltaPercent, double nominalKwh, double sohPercent) {
-        if (Double.isNaN(socDeltaPercent) || socDeltaPercent <= 0) return Double.NaN;
-        if (Double.isNaN(nominalKwh) || nominalKwh <= 0) return Double.NaN;
+        if (!Double.isFinite(socDeltaPercent) || socDeltaPercent <= 0) return Double.NaN;
+        if (!Double.isFinite(nominalKwh) || nominalKwh <= 0) return Double.NaN;
         // A percent of SOC holds nominal x SOH/100, not nominal.
         //
         // A low-but-real SOH is FLOORED rather than discarded. Snapping an out-of-band value to 1.0
@@ -159,10 +175,16 @@ public final class SessionEnergyResolver {
         // the estimate continuous (no doubling as SOH crosses a threshold) and errs toward believing
         // the measurement. Only a value that is not a percentage at all falls back to 1.0.
         double sohFactor = 1.0;
-        if (!Double.isNaN(sohPercent) && sohPercent > 0 && sohPercent <= 100.0) {
+        if (Double.isFinite(sohPercent) && sohPercent > 0 && sohPercent <= 100.0) {
             sohFactor = Math.max(sohPercent, MIN_PLAUSIBLE_SOH_PERCENT) / 100.0;
         }
-        return (socDeltaPercent / 100.0) * nominalKwh * sohFactor;
+        double estimate = (socDeltaPercent / 100.0) * nominalKwh * sohFactor;
+        // Preserve sub-noise estimates for wrap/gap arbitration; only the final resolver applies
+        // MIN_SESSION_KWH when deciding whether a session total is displayable.
+        return Double.isFinite(estimate)
+                && estimate > 0.0
+                && estimate <= MAX_SESSION_KWH
+                ? estimate : Double.NaN;
     }
 
     /**
@@ -221,9 +243,9 @@ public final class SessionEnergyResolver {
                                  double integratedKwh, double socEstimate,
                                  boolean integratedTruncated,
                                  boolean counterScaleSuspect) {
-        boolean meteredUsable = !Double.isNaN(meteredKwh) && meteredKwh >= MIN_SESSION_KWH;
-        boolean socUsable = !Double.isNaN(socEstimate) && socEstimate >= MIN_SESSION_KWH;
-        boolean intUsable = !Double.isNaN(integratedKwh) && integratedKwh >= MIN_SESSION_KWH;
+        boolean meteredUsable = isUsableEnergy(meteredKwh);
+        boolean socUsable = isUsableEnergy(socEstimate);
+        boolean intUsable = isUsableEnergy(integratedKwh);
 
         // The best SOC-INDEPENDENT figure, computed once and carried on every Result regardless of
         // which figure wins the display. A gap-reconstructed metered value does NOT qualify: its
@@ -249,6 +271,54 @@ public final class SessionEnergyResolver {
                         && (integratedKwh / socEstimate) <= RATIO_HIGH));
         if (Double.isNaN(socIndependent) && integralLooksComplete) {
             socIndependent = integratedKwh;
+        }
+
+        // A complete measured-power integral is also an independent unit cross-check on the
+        // counter. Apply it even when SOC is available: SOC moves in whole-percent quanta, so its
+        // ratio can drift just above the narrow half-scale band and make the same faulty counter
+        // alternate between accepted and rejected as the gauge ticks. A counter at no more than
+        // roughly half of a continuous integral cannot be explained by ordinary AC/DC losses.
+        if (meteredUsable && !meteredIncomplete && intUsable && !integratedTruncated) {
+            double intRatio = meteredKwh / integratedKwh;
+            if (intRatio <= HALF_SCALE_MAX_RATIO) {
+                logger.warn(String.format(java.util.Locale.US,
+                        "Metered energy %.3f kWh is %.2fx the complete integrated %.3f kWh —"
+                        + " treating the counter as under-scale and using the integral",
+                        meteredKwh, intRatio, integratedKwh));
+                return new Result(integratedKwh, SRC_INTEGRATED, socEstimate, false,
+                        integralLooksComplete ? integratedKwh : Double.NaN);
+            }
+        }
+
+        // A behavioural scale verdict is stronger than agreement with the SOC estimate: the estimate
+        // inherits SOH and whole-percent gauge quantisation, while the calibrator compares this counter
+        // with a separate full-scale energy register. Keep the raw counter available here only so a
+        // continuous measured-power integral can disprove it; never accept the suspect counter as a
+        // confident total.
+        if (counterScaleSuspect && meteredUsable) {
+            boolean integralDisprovesCounter = intUsable && !integratedTruncated
+                    && meteredKwh / integratedKwh
+                            <= SUSPECT_COUNTER_INTEGRAL_MAX_RATIO;
+            if (integralDisprovesCounter) {
+                logger.warn(String.format(java.util.Locale.US,
+                        "Suspect metered energy %.3f kWh is materially below the complete integrated"
+                        + " %.3f kWh — using the measured-power integral",
+                        meteredKwh, integratedKwh));
+                return new Result(integratedKwh, SRC_INTEGRATED, socEstimate, false,
+                        integralLooksComplete ? integratedKwh : Double.NaN);
+            }
+            if (socUsable) {
+                logger.warn(String.format(java.util.Locale.US,
+                        "Metered energy %.3f kWh comes from a counter with an independently suspect"
+                        + " unit and no complete integral disproves it — using the SOC estimate",
+                        meteredKwh));
+                return new Result(socEstimate, SRC_SOC_FALLBACK, socEstimate, false,
+                        integralLooksComplete ? integratedKwh : Double.NaN);
+            }
+            // No independent total can replace it. Preserve the best lower bound, but make the
+            // uncertainty explicit and prevent SOH calibration.
+            return new Result(meteredKwh, meteredIsGap ? SRC_METERED_GAP : SRC_METERED,
+                    socEstimate, true, Double.NaN);
         }
 
         if (meteredUsable && !meteredIncomplete) {
@@ -278,17 +348,6 @@ public final class SessionEnergyResolver {
                                 integratedTruncated,
                                 integralLooksComplete ? integratedKwh : Double.NaN);
                     }
-                }
-                // A behaviourally-indicated scale fault still counts here, where no ratio test is
-                // possible at all: mark the row incomplete and withhold it from calibration rather
-                // than present a probably-halved total as a confident measurement.
-                if (counterScaleSuspect) {
-                    logger.warn(String.format(java.util.Locale.US,
-                            "Metered energy %.3f kWh comes from a counter whose scale is under"
-                            + " suspicion and there is no SOC cross-check — flagging the row"
-                            + " incomplete and withholding it from SOH calibration", meteredKwh));
-                    return new Result(meteredKwh, meteredIsGap ? SRC_METERED_GAP : SRC_METERED,
-                            socEstimate, true, Double.NaN);
                 }
                 // Otherwise the counter is still the best measurement we have, and refusing it here
                 // would discard a real reading in favour of nothing.
@@ -338,8 +397,7 @@ public final class SessionEnergyResolver {
             // That is a ratchet, so the band is now the FALLBACK and a behavioural verdict is
             // preferred: CounterScaleCalibrator compares the counter against a register the SOH does
             // not touch, so it cannot be walked out of range by its own consequences.
-            boolean looksHalfScale = ratio <= HALF_SCALE_MAX_RATIO
-                    || (!Double.isNaN(meteredKwh) && counterScaleSuspect);
+            boolean looksHalfScale = ratio <= HALF_SCALE_MAX_RATIO;
             if (looksHalfScale) {
                 logger.warn(String.format(java.util.Locale.US,
                         "Metered energy %.3f kWh is %.2fx the SOC estimate %.3f kWh — consistent with a"
@@ -389,5 +447,11 @@ public final class SessionEnergyResolver {
                     socEstimate, true, Double.NaN);
         }
         return new Result(Double.NaN, SRC_NONE, socEstimate, meteredIncomplete);
+    }
+
+    private static boolean isUsableEnergy(double energyKwh) {
+        return Double.isFinite(energyKwh)
+                && energyKwh >= MIN_SESSION_KWH
+                && energyKwh <= MAX_SESSION_KWH;
     }
 }

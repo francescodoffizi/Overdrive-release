@@ -60,6 +60,9 @@ data class DashboardChargingSnapshot(
     val powerEstimated: Boolean,
     val timeToFullMinutes: Int?,
     val sessionKwh: Double?,
+    val sessionEnergyIncomplete: Boolean,
+    val sessionEnergyEstimated: Boolean,
+    val sessionEnergySource: String?,
 )
 
 /**
@@ -228,6 +231,17 @@ object DashboardStatusParser {
             )?.takeIf { it > 0.0 && !nominalPlaceholder }
         val eta = optPositiveInt("timeToFullMin")
         val session = finiteDouble("sessionKwh")?.takeIf { it > 0.0 }
+        val sessionSource = optString("sessionEnergySource", "")
+            .trim()
+            .takeIf { session != null && it.isNotEmpty() && !it.equals("none", true) }
+        val sessionIncomplete = session != null
+            && optBoolean("sessionEnergyIncomplete", false)
+        val sessionEstimated = session != null && (
+            sessionIncomplete
+                || optBoolean("sessionEnergyEstimated", false)
+                || sessionSource == null
+                || !sessionSource.equals("metered_counter", true)
+            )
         val state = optString("stateName", "")
             .trim()
             .takeIf { it.isNotEmpty() && !it.equals("Unavailable", true) }
@@ -242,6 +256,9 @@ object DashboardStatusParser {
             powerEstimated = power != null && powerIsEstimated,
             timeToFullMinutes = eta,
             sessionKwh = session,
+            sessionEnergyIncomplete = sessionIncomplete,
+            sessionEnergyEstimated = sessionEstimated,
+            sessionEnergySource = sessionSource,
         )
     }
 

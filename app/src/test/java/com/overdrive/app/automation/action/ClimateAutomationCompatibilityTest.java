@@ -1,15 +1,25 @@
 package com.overdrive.app.automation.action;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 import com.overdrive.app.automation.AutomationAction;
+import com.overdrive.app.automation.AutomationCategories;
+import com.overdrive.app.automation.type.EnumType;
+import com.overdrive.app.byd.BydDataCollector;
+import com.overdrive.app.byd.routing.VehicleCommandRouter;
+import com.overdrive.app.mqtt.VehicleControlCatalog;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 
 import org.json.JSONObject;
 import org.junit.Test;
 
-/** Regression coverage for the numeric climate-zone schema migration. */
+/** Climate automation compatibility and OEM encoding checks. */
 public class ClimateAutomationCompatibilityTest {
 
     @Test
@@ -63,4 +73,60 @@ public class ClimateAutomationCompatibilityTest {
         assertNotNull(parsed);
         assertEquals("both", parsed.getVariables().get("zone"));
     }
+
+    @Test
+    public void acSyncUsesOemLinkedZoneEncodingAndIsExposed() throws Exception {
+        Action action = new Actions().getAction("acSync");
+        assertTrue(action instanceof ApiAction);
+        EnumType input = (EnumType) ((ApiAction) action).getVariables().get(0);
+        assertTrue(input.isValidValue("off"));
+        assertTrue(input.isValidValue("on"));
+        assertFalse(input.isValidValue("toggle"));
+        assertEquals(AutomationCategories.CLIMATE, AutomationCategories.forId("acSync"));
+
+        Constructor<BydDataCollector> constructor =
+                BydDataCollector.class.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        BydDataCollector collector = constructor.newInstance();
+        FakeAcDevice device = new FakeAcDevice();
+        Field acDevice = BydDataCollector.class.getDeclaredField("acDevice");
+        acDevice.setAccessible(true);
+        acDevice.set(collector, device);
+
+        assertTrue(collector.setAcTemperatureSync(true));
+        assertEquals(1, device.area);
+        assertEquals(0, device.mode);
+        assertTrue(collector.setAcTemperatureSync(false));
+        assertEquals(1, device.area);
+        assertEquals(1, device.mode);
+    }
+
+    @Test
+    public void snowRainModeUsesTheExistingDriveModeCommand() {
+        VehicleControlAction automation =
+                (VehicleControlAction) new Actions().getAction("drive_mode");
+        EnumType input = (EnumType) automation.getVariables().get(0);
+        assertTrue(input.isValidValue("snow"));
+
+        VehicleControlCatalog.ControlEntity entity = VehicleControlCatalog.get("drive_mode");
+        assertNotNull(entity);
+        assertEquals(java.util.Arrays.asList("normal", "eco", "sport", "snow"),
+                entity.options);
+        VehicleControlCatalog.ControlAction routed = entity.toAction(null, "snow", null);
+        assertNotNull(routed);
+        assertTrue(routed.command instanceof VehicleCommandRouter.OperationModeCommand);
+        assertEquals(4, ((VehicleCommandRouter.OperationModeCommand) routed.command).mode);
+    }
+
+    public static final class FakeAcDevice {
+        int area;
+        int mode;
+
+        public int setAcTemperatureControlMode(int area, int mode) {
+            this.area = area;
+            this.mode = mode;
+            return 0;
+        }
+    }
+
 }

@@ -227,7 +227,9 @@ public class DaemonLogger {
                         Log.e(tag, message);
                         break;
                 }
-            } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+                // Logging must not interrupt daemon work or local JVM tests.
+            }
         }
         
         // Print to stdout for daemon processes running via app_process.

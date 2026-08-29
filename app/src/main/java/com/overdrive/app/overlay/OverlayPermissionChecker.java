@@ -4,7 +4,8 @@ import android.app.AppOpsManager;
 import android.content.Context;
 import android.os.Build;
 import android.provider.Settings;
-import android.util.Log;
+
+import com.overdrive.app.logging.DaemonLogger;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -14,6 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class OverlayPermissionChecker {
 
     private static final String TAG = "OverlayPermission";
+    private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
     private static final AtomicBoolean mismatchLogged = new AtomicBoolean(false);
 
     private OverlayPermissionChecker() {}
@@ -29,7 +31,7 @@ public final class OverlayPermissionChecker {
         if (appOpsAllowed != null
                 && appOpsAllowed.booleanValue() != frameworkAllowed
                 && mismatchLogged.compareAndSet(false, true)) {
-            Log.w(TAG, "Permission APIs disagree: appOps=" + appOpsAllowed
+            logger.warn("Permission APIs disagree: appOps=" + appOpsAllowed
                     + ", framework=" + frameworkAllowed
                     + "; using AppOps");
         }
@@ -40,7 +42,7 @@ public final class OverlayPermissionChecker {
         try {
             return Settings.canDrawOverlays(context);
         } catch (Throwable error) {
-            Log.w(TAG, "Settings.canDrawOverlays failed: " + error.getMessage());
+            logger.warn("Settings.canDrawOverlays failed: " + error.getMessage());
             return false;
         }
     }
@@ -73,9 +75,9 @@ public final class OverlayPermissionChecker {
                     || mode == AppOpsManager.MODE_DEFAULT) {
                 return Boolean.FALSE;
             }
-            Log.w(TAG, "Unknown SYSTEM_ALERT_WINDOW AppOps mode: " + mode);
+            logger.warn("Unknown SYSTEM_ALERT_WINDOW AppOps mode: " + mode);
         } catch (Throwable error) {
-            Log.w(TAG, "SYSTEM_ALERT_WINDOW AppOps check failed: "
+            logger.warn("SYSTEM_ALERT_WINDOW AppOps check failed: "
                     + error.getMessage());
         }
         return null;

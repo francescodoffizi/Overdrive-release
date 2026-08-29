@@ -36,13 +36,14 @@ public class ChargeCounterAccumulatorTest {
     @Test
     public void renewedRiseClearsFalseSaturation() {
         ChargeCounterAccumulator accumulator = new ChargeCounterAccumulator();
-        accumulator.observe(65.1, 1_000L);
-        accumulator.observe(65.1, 2_000L);
-        accumulator.observe(65.1, 3_000L);
-        accumulator.observe(65.1, 4_000L);
+        double nearCeiling = ChargeCounterAccumulator.COUNTER_FULL_SCALE_KWH - 0.4;
+        accumulator.observe(nearCeiling, 1_000L);
+        accumulator.observe(nearCeiling, 2_000L);
+        accumulator.observe(nearCeiling, 3_000L);
+        accumulator.observe(nearCeiling, 4_000L);
         assertTrue(accumulator.isSaturated());
 
-        accumulator.observe(65.2, 5_000L);
+        accumulator.observe(nearCeiling + 0.1, 5_000L);
 
         assertFalse(accumulator.isSaturated());
         assertFalse(accumulator.isIncomplete());
@@ -173,5 +174,50 @@ public class ChargeCounterAccumulatorTest {
         assertEquals(1, accumulator.resetCount());
         assertEquals(10.0, accumulator.energyKwh(), 0.0);
         assertTrue(accumulator.isIncomplete());
+    }
+
+    @Test
+    public void nonFiniteCounterStateAndObservationsAreRejected() {
+        ChargeCounterAccumulator accumulator = new ChargeCounterAccumulator();
+        accumulator.setFullScaleKwh(Double.POSITIVE_INFINITY);
+        assertEquals(ChargeCounterAccumulator.COUNTER_FULL_SCALE_KWH,
+                accumulator.fullScaleKwh(), 0.0);
+
+        accumulator.observe(Double.POSITIVE_INFINITY, 1_000L);
+        assertFalse(accumulator.hasBaseline());
+        assertEquals(0.0, accumulator.energyKwh(), 0.0);
+
+        accumulator.restore(
+                Double.POSITIVE_INFINITY,
+                Double.POSITIVE_INFINITY,
+                Double.POSITIVE_INFINITY,
+                false,
+                Double.POSITIVE_INFINITY,
+                Double.POSITIVE_INFINITY);
+        assertFalse(accumulator.hasBaseline());
+        assertEquals(0.0, accumulator.energyKwh(), 0.0);
+        assertEquals(ChargeCounterAccumulator.COUNTER_FULL_SCALE_KWH,
+                accumulator.fullScaleKwh(), 0.0);
+
+        ChargeCounterAccumulator.State corrupt =
+                new ChargeCounterAccumulator.State();
+        corrupt.baseline = Double.POSITIVE_INFINITY;
+        corrupt.last = Double.POSITIVE_INFINITY;
+        corrupt.accumulated = Double.POSITIVE_INFINITY;
+        corrupt.abandonedKwh = Double.POSITIVE_INFINITY;
+        corrupt.gapEstimateKwh = Double.POSITIVE_INFINITY;
+        corrupt.recentRateKwhPerH = Double.POSITIVE_INFINITY;
+        corrupt.fullScaleKwh = Double.POSITIVE_INFINITY;
+        accumulator.restoreState(corrupt);
+
+        assertFalse(accumulator.hasBaseline());
+        assertEquals(0.0, accumulator.energyKwh(), 0.0);
+        assertEquals(0,
+                ChargeCounterAccumulator.gapCandidatesKwh(
+                        Double.POSITIVE_INFINITY, 1.0).length);
+        assertTrue(Double.isNaN(
+                ChargeCounterAccumulator.chooseCandidate(
+                        new double[] {Double.POSITIVE_INFINITY},
+                        1.0, 0.6, 1.3)));
     }
 }

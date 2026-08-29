@@ -487,7 +487,6 @@
     "close_all_windows_label": "Sluit alle ramen."
   },
   "automation": {
-    "wait_timeout": "Time-out (seconden)",
     "control_automation": "Controleren automatisering",
     "control_automation_description": "Schakel een andere automatisering in of uit of schakel deze in — arm of deactiveer een routine van een regel.",
     "control_target": "Automatisering",
@@ -526,8 +525,6 @@
     "windows_all_description": "Open, sluiten of stoppen met alle ramen.",
     "tailgate": "Afschuining",
     "tailgate_description": "Open, sluiten of stoppen met de taillegate/trui.",
-    "save_seat_position": "Bewaar zitpositie",
-    "save_seat_position_description": "Sla de huidige positie van de chauffeur op in een geheugenvak.",
     "child_lock": "Onderliggende vergrendeling",
     "child_lock_description": "Child op achterdeur in- of uitschakelen.",
     "wireless_charging": "Telefoon draadloze lader",
@@ -556,6 +553,12 @@
     "set_seat_climate_description": "Stel de instellingen voor stoelverwarming/-koeling in.",
     "set_drl": "DRL-status instellen",
     "set_drl_description": "Stel de status van de dagrijverlichting in. Deze bediening werkt niet terwijl het voertuig is uitgeschakeld.",
+    "set_headlight_mode": "Koplampstand instellen",
+    "set_headlight_mode_description": "Stelt de originele buitenlichtschakelaar in. Uit wordt alleen geaccepteerd wanneer het voertuig veilig geparkeerd staat. Dit is een lokale voertuigbediening en werkt niet wanneer het voertuig uit staat.",
+    "headlight_mode": "Koplampstand",
+    "headlight_auto": "Auto",
+    "parking_lights": "Stadslichten",
+    "headlight_on_low_beam": "Aan (dimlicht)",
     "send_notification": "Melding verzenden",
     "send_notification_description": "Pushmelding verzenden. Hiermee wordt een pushmelding verzonden naar geïnstalleerde apps waarvoor meldingen zijn ingeschakeld.",
     "actions_description": "Welke acties worden uitgevoerd wanneer deze automatisering wordt geactiveerd. Deze acties worden op volgorde uitgevoerd en kunnen enigszins vertraagd zijn.",
@@ -627,8 +630,6 @@
     "speed": "Snelheid",
     "set_ac_fan": "Snelheid AC ventilatoren instellen",
     "set_ac_fan_description": "De huidige ventilatorsnelheid voor de luchtconditie wijzigen. Deze controle werkt niet terwijl het voertuig is uitgeschakeld.",
-    "set_seat_position": "Bedien locatie positie",
-    "set_seat_position_description": "Laad een positie in het geheugen van een zitplaats. Zorg ervoor dat het geheugen eerst uit het voertuig is opgeslagen. Deze controle werkt niet terwijl het voertuig is uitgeschakeld.",
     "position_1": "Positie 1",
     "position_2": "Positie 2",
     "open_windows": "Vensters openen",
@@ -1087,7 +1088,12 @@
     "mqtt_channel": "Kanaal",
     "mqtt_value": "Waarde",
     "wait_until_description": "Onderbreek de resterende acties totdat een gekozen signaal een vergelijking weergeeft, of de timeout elapes. Voorbeeld: wacht tot Snelheid = 0 voordat u de vensters sluit.",
-    "wait_until_state_description": "Pauzeer de resterende acties totdat een gekozen aan/uit signaal een staat bereikt, of de timeout eloes. Voorbeeld: wacht tot Indicators = Uit voordat u verder gaat."
+    "wait_until_state_description": "Pauzeer de resterende acties totdat een gekozen aan/uit signaal een staat bereikt, of de timeout eloes. Voorbeeld: wacht tot Indicators = Uit voordat u verder gaat.",
+      "wait_timeout": "Time-out (seconden)",
+      "save_seat_position": "Bewaar zitpositie",
+      "save_seat_position_description": "Sla de huidige positie van de chauffeur op in een geheugenvak.",
+      "set_seat_position": "Bedien locatie positie",
+      "set_seat_position_description": "Laad een positie in het geheugen van een zitplaats. Zorg ervoor dat het geheugen eerst uit het voertuig is opgeslagen. Deze controle werkt niet terwijl het voertuig is uitgeschakeld."
   },
   "messages": {
     "logged_out": "Ik heb me uitgeschakeld .",

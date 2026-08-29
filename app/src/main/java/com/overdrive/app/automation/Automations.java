@@ -33,7 +33,9 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class Automations {
     private static final DaemonLogger logger = DaemonLogger.getInstance("Automations");
-    private static final File AUTOMATION_HOME = new File("/data/local/tmp/.automations");
+    static final String AUTOMATION_HOME_PROPERTY = "overdrive.automation.home";
+    private static final File AUTOMATION_HOME = new File(System.getProperty(
+            AUTOMATION_HOME_PROPERTY, "/data/local/tmp/.automations"));
     private static final File AUTOMATION_CONFIG = new File(AUTOMATION_HOME, "config.json");
     // Last-known-good backup + scratch file for the atomic write. loadFromFile falls back to .bak when
     // the live file is truncated/corrupt (e.g. daemon killed mid-write on ACC-off), so a torn write can
@@ -121,24 +123,6 @@ public class Automations {
             this.generation = generation;
             this.referenced = referenced;
         }
-    }
-
-    static {
-        runIsolatedStartupStep("saved automation load", Automations::loadFromFile);
-        runIsolatedStartupStep("action-group load", ActionGroups::loadFromFile);
-
-        // NOTE: btState / btDeviceName are NOT polled here. Bluetooth can't be read
-        // reliably from the daemon (UID 2000) — Bluetooth is only readable from a normal
-        // app process, not the shell-UID daemon. So
-        // the app-process BluetoothStateMonitor (started by KeepAliveAccessibilityService)
-        // watches ACL connect/disconnect and relays those events to the daemon via
-        // Automations.publishExternalEvent, exactly like callState.
-
-        // Door callbacks are event-driven and stay subscribed. Every periodic source below is
-        // configuration-driven: no enabled reference means no scheduled task and no parked
-        // thread waking just to discover that it has nothing to read.
-        pollersReady = true;
-        refreshConditionalPollers();
     }
 
     private static void refreshConditionalPollers() {
@@ -231,7 +215,8 @@ public class Automations {
         if (d == null) {
             synchronized (SCHEMA_LOCK) {
                 d = delay;
-                if (d == null) d = delay = new IntType(new Label("delay", Messages.get("automation.delay")), 0, 86400);
+                if (d == null) d = delay =
+                        new IntType(new Label("delay", "automation.delay"), 0, 86400);
             }
         }
         return d;
@@ -448,6 +433,25 @@ public class Automations {
     private static final ThreadLocal<Boolean> SILENT_SEED =
             ThreadLocal.withInitial(() -> false);
     private static final ThreadLocal<QueueActionCursor> QUEUE_ACTION_CURSOR = new ThreadLocal<>();
+    // ── Per-execution ownership token ──────────────────────────────────────────
+    // Identifies ONE automation execution across all of its attempts (a deferred
+    // wait suspends and resumes the same cursor, so the token must live on the
+    // cursor, not the thread). Ownership-aware endpoints (the camera-view
+    // show/hide pair) read it via currentExecutionToken() — ApiAction's
+    // automationApiRequest is a synchronous in-process call on this very thread,
+    // so the thread-local is visible to the handler. Explicit Run-now / key-mapping
+    // executions deliberately do NOT set a token: their API calls stay "ownerless",
+    // which the camview hide path maps to the legacy global-close behaviour.
+    private static final java.util.concurrent.atomic.AtomicLong EXECUTION_TOKEN_SEQ =
+            new java.util.concurrent.atomic.AtomicLong(0);
+    private static final ThreadLocal<Long> CURRENT_EXECUTION_TOKEN = new ThreadLocal<>();
+
+    /** The ownership token of the automation execution running on THIS thread, or
+     *  null when the caller is not inside an automation execution (manual API call,
+     *  key mapping, overlay tap, web UI). Never throws. */
+    public static Long currentExecutionToken() {
+        return CURRENT_EXECUTION_TOKEN.get();
+    }
     private static final ThreadLocal<java.util.IdentityHashMap<AutomationAction, Integer>>
             QUEUE_ACTION_OCCURRENCES = new ThreadLocal<>();
     private static final ThreadLocal<Automation> ACTIVE_QUEUED_DEFINITION = new ThreadLocal<>();
@@ -475,6 +479,51 @@ public class Automations {
 
     /** Whether the current chain has been aborted by a timed-out wait. */
     public static boolean chainAborted() { return CHAIN_ABORTED.get(); }
+
+    /**
+     * Yield a top-level queued action without parking the singleton automation worker.
+     * Nested flow actions keep their existing blocking semantics so loop/group replay
+     * and wall-clock caps remain unchanged.
+     */
+    public static boolean deferQueuedAction(
+            AutomationAction action, long delayMs, boolean actionCompleted) {
+        QueueActionCursor cursor = QUEUE_ACTION_CURSOR.get();
+        if (cursor == null || action == null || delayMs <= 0L || RUN_DEPTH.get() != 1) {
+            return false;
+        }
+        cursor.deferredAction = action;
+        cursor.deferredActionCompleted = actionCompleted;
+        cursor.resumeAtNanos = System.nanoTime()
+                + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(delayMs);
+        return true;
+    }
+
+    /**
+     * Return one stable timeout deadline for the current top-level queued wait.
+     * A non-queued or nested wait returns 0 and uses its legacy blocking path.
+     */
+    public static long queuedWaitDeadlineNanos(
+            AutomationAction action, long timeoutMs) {
+        QueueActionCursor cursor = QUEUE_ACTION_CURSOR.get();
+        if (cursor == null || action == null || timeoutMs <= 0L || RUN_DEPTH.get() != 1) {
+            return 0L;
+        }
+        if (cursor.pendingWaitAction != action) {
+            cursor.pendingWaitAction = action;
+            cursor.pendingWaitDeadlineNanos = System.nanoTime()
+                    + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        }
+        return cursor.pendingWaitDeadlineNanos;
+    }
+
+    /** Clear the persisted deadline after a queued wait succeeds or times out. */
+    public static void clearQueuedWait(AutomationAction action) {
+        QueueActionCursor cursor = QUEUE_ACTION_CURSOR.get();
+        if (cursor != null && cursor.pendingWaitAction == action) {
+            cursor.pendingWaitAction = null;
+            cursor.pendingWaitDeadlineNanos = 0L;
+        }
+    }
 
     /**
      * Run a live sampler as a baseline observation. Values are stored, but transitions observed
@@ -567,10 +616,13 @@ public class Automations {
                         && actionSucceeded
                         && ACTION_CHAIN_SUCCEEDED.get()
                         && !chainAborted()
+                        && (!queueCursor.hasDeferredAction()
+                                || queueCursor.deferredActionCompleted(automationAction))
                         && (!Thread.currentThread().isInterrupted() || !controlFlow)) {
                     queueCursor.completedOccurrences.merge(
                             automationAction, 1, Integer::sum);
                 }
+                if (queueCursor != null && queueCursor.hasDeferredAction()) break;
             }
         } finally {
             RUN_DEPTH.set(depth);
@@ -689,6 +741,13 @@ public class Automations {
     }
 
     /**
+     * The composite "either indicator" address (WaitUntilStateAction's sentinel). It is not a real
+     * signal id, so it resolves to no key — the reference scan special-cases it to TURN_LEFT and
+     * TURN_RIGHT, which is what it actually reads.
+     */
+    private static final String TURN_ANY_ID = "turnAny";
+
+    /**
      * Does any action in this list (or nested beneath it) name {@code key} as an operand?
      *
      * <p>An action's operands are plain variable values, so this asks each value whether it
@@ -699,21 +758,6 @@ public class Automations {
      * <p>Depth-bounded by the same constant the action runner uses, so a malformed/deep tree
      * can't make this walk unbounded on a scheduler thread.
      */
-    /**
-     * The action-variable ids that can name a signal: {@code event} is a flow action's
-     * left-hand address ({@code SignalAddressType}) and {@code value} its dynamic right-hand
-     * side, which may hold a {@code ${signal:…}} token. Any other variable is a plain operand
-     * and is deliberately not treated as an address.
-     */
-    private static final String[] ADDRESS_FIELDS = { "event", "value" };
-
-    /**
-     * The composite "either indicator" address (WaitUntilStateAction's sentinel). It is not a real
-     * signal id, so it resolves to no key — the reference scan special-cases it to TURN_LEFT and
-     * TURN_RIGHT, which is what it actually reads.
-     */
-    private static final String TURN_ANY_ID = "turnAny";
-
     private static boolean actionsReference(List<AutomationAction> actions, EventData key) {
         return actionsReference(actions, key, MAX_RUN_DEPTH);
     }
@@ -815,39 +859,20 @@ public class Automations {
         }
         for (AutomationAction a : actions) {
             if (a == null) continue;
-            // ONLY the two fields that can hold a signal address are considered: "event" (a
-            // flow action's LHS, a SignalAddressType) and "value" (the dynamic RHS, which may
-            // hold a ${signal:…} token). Scanning EVERY variable would be both wasteful and
-            // WRONG — a user variable or a free-text field could legitimately contain a word
-            // that happens to be a legacy signal id ("hazard", "drl"), which would then keep an
-            // unrelated signal's poller awake for no reason.
             Map<String, Object> vars = a.getVariables();
-            for (String field : ADDRESS_FIELDS) {
-                Object v = vars.get(field);
-                if (!(v instanceof String)) continue;
-                String s = (String) v;
-                // The "turnAny" sentinel is a COMPOSITE address: WaitUntilStateAction reads both
-                // TURN_LEFT and TURN_RIGHT for it, but the string resolves to neither, so the
-                // resolver below cannot see it. Both keys are FAST_POLL_OWNED, so missing this
-                // parks their only publisher and the wait reads null on both sides forever.
-                if (TURN_ANY_ID.equals(s.trim())
-                        && (com.overdrive.app.automation.condition.BydEvent.TURN_LEFT.equals(key)
-                            || com.overdrive.app.automation.condition.BydEvent.TURN_RIGHT.equals(key))) {
-                    return true;
-                }
-                // Cheap reject before allocating. This runs on the fast pollers (the dynamics
-                // poll calls isEventReferenced 3x every 250ms), and parsing an address builds a
-                // fresh EventData plus a HashMap for the attributed case — avoid that for the
-                // overwhelmingly common "this value can't name this key" case.
-                if (!mightAddress(s, key.getType())) continue;
-                if (key.equals(AutomationCondition.resolveSignalAddress(s))) return true;
-            }
+            if (vars == null) continue;
+            // Keep these two field checks explicit. A static String[] declared below the class
+            // initializer used to be null while refreshConditionalPollers() ran, so the enhanced
+            // for-loop threw "Attempt to get length of null array" and every fast poller failed
+            // to start after daemon boot.
+            if (actionFieldReferences(vars, "event", key)
+                    || actionFieldReferences(vars, "value", key)) return true;
             // FREE-TEXT fields (notification message, MQTT topic/payload, API body) are
             // interpolated by TextInterpolator, which resolves an EMBEDDED ${signal:…} token out
-            // of this same state map. Those field names aren't in ADDRESS_FIELDS, so without this
-            // an owned key referenced only from message text would keep its poller parked and
-            // interpolate to the literal placeholder. Unlike the bare-address case above this
-            // scans every variable — safe here because we match only the unambiguous
+            // of this same state map. Those fields are not the explicit event/value addresses, so
+            // without this an owned key referenced only from message text would keep its poller
+            // parked and interpolate to the literal placeholder. Unlike the bare-address case
+            // above this scans every variable — safe here because we match only the unambiguous
             // "${signal:" token, never a loose word that happens to be a legacy alias.
             if (anyValueEmbedsSignal(vars, key)) return true;
             // An actionGroup is call-by-reference: its body lives in ActionGroups, not in this
@@ -877,6 +902,33 @@ public class Automations {
             }
         }
         return false;
+    }
+
+    /**
+     * Whether one of the only two action fields that may hold a signal address references
+     * {@code key}. Keeping this as direct field access avoids static-initialization ordering
+     * entirely while preserving the allocation-free fast path.
+     */
+    private static boolean actionFieldReferences(
+            Map<String, Object> vars, String field, EventData key) {
+        Object v = vars.get(field);
+        if (!(v instanceof String)) return false;
+        String s = (String) v;
+        // The "turnAny" sentinel is a COMPOSITE address: WaitUntilStateAction reads both
+        // TURN_LEFT and TURN_RIGHT for it, but the string resolves to neither, so the
+        // resolver below cannot see it. Both keys are FAST_POLL_OWNED, so missing this
+        // parks their only publisher and the wait reads null on both sides forever.
+        if (TURN_ANY_ID.equals(s.trim())
+                && (com.overdrive.app.automation.condition.BydEvent.TURN_LEFT.equals(key)
+                    || com.overdrive.app.automation.condition.BydEvent.TURN_RIGHT.equals(key))) {
+            return true;
+        }
+        // Cheap reject before allocating. This runs on the fast pollers (the dynamics
+        // poll calls isEventReferenced 3x every 250ms), and parsing an address builds a
+        // fresh EventData plus a HashMap for the attributed case — avoid that for the
+        // overwhelmingly common "this value can't name this key" case.
+        return mightAddress(s, key.getType())
+                && key.equals(AutomationCondition.resolveSignalAddress(s));
     }
 
     /**
@@ -1129,6 +1181,14 @@ public class Automations {
         }
 
         return json;
+    }
+
+    /**
+     * Bounded, read-only rule definitions plus current condition values for an
+     * explicit assistant diagnosis. Action parameters are intentionally omitted.
+     */
+    public static JSONObject diagnosticContext(String query) {
+        return AutomationDiagnostics.build(automations, conditionState, query);
     }
 
     /**
@@ -1850,9 +1910,37 @@ public class Automations {
                 completedOccurrences = new java.util.IdentityHashMap<>();
         private int nextAction;
         private boolean recorded;
+        private AutomationAction deferredAction;
+        private boolean deferredActionCompleted;
+        private long resumeAtNanos;
+        private AutomationAction pendingWaitAction;
+        private long pendingWaitDeadlineNanos;
+        // Ownership token for this execution. Assigned once (first attempt) and
+        // restored into CURRENT_EXECUTION_TOKEN on every resumed attempt, so a
+        // show fired before a deferred wait and a hide fired after it carry the
+        // SAME token. 0 = not yet assigned.
+        private long executionToken;
 
         boolean hasStarted() {
             return actions != null;
+        }
+
+        void beginAttempt() {
+            deferredAction = null;
+            deferredActionCompleted = false;
+            resumeAtNanos = 0L;
+        }
+
+        boolean hasDeferredAction() {
+            return deferredAction != null && resumeAtNanos != 0L;
+        }
+
+        boolean deferredActionCompleted(AutomationAction action) {
+            return deferredAction == action && deferredActionCompleted;
+        }
+
+        long resumeAtNanos() {
+            return resumeAtNanos;
         }
     }
 
@@ -1989,7 +2077,14 @@ public class Automations {
             return true;
         }
 
+        cursor.beginAttempt();
         resetChain();
+        // Ownership token: assign once per execution, restore on every attempt so
+        // deferred-wait resumptions keep the same identity (see field comment).
+        if (cursor.executionToken == 0L) {
+            cursor.executionToken = EXECUTION_TOKEN_SEQ.incrementAndGet();
+        }
+        CURRENT_EXECUTION_TOKEN.set(cursor.executionToken);
         QUEUE_ACTION_CURSOR.set(cursor);
         QUEUE_ACTION_OCCURRENCES.set(new java.util.IdentityHashMap<>());
         ACTIVE_QUEUED_DEFINITION.set(cursor.automation);
@@ -2034,6 +2129,14 @@ public class Automations {
                     cursor.nextAction = cursor.actions.size();
                     break;
                 }
+                if (cursor.hasDeferredAction()) {
+                    if (actionBoundaryCompleted
+                            && !action.hasChildActions()
+                            && !"actionGroup".equals(automationAction.getType())) {
+                        cursor.nextAction++;
+                    }
+                    return false;
+                }
                 if (Thread.currentThread().isInterrupted()) {
                     // A control-flow action may have returned with an unvisited nested suffix.
                     // Re-enter it; runActionList will skip its completed child occurrences.
@@ -2076,6 +2179,7 @@ public class Automations {
             ACTIVE_QUEUED_DEFINITION.remove();
             QUEUE_ACTION_OCCURRENCES.remove();
             QUEUE_ACTION_CURSOR.remove();
+            CURRENT_EXECUTION_TOKEN.remove();
         }
         if (cursor.recorded
                 && (cursor.automation.getTriggerCount() % STATS_PERSIST_EVERY) == 0) {
@@ -2143,6 +2247,17 @@ public class Automations {
             if (recordStats) automation.recordTriggered(System.currentTimeMillis());
             boolean previousExplicit = EXPLICIT_RUN.get();
             if (explicit) EXPLICIT_RUN.set(true);
+            // Ownership token for the cursor-less automatic path (the resumable
+            // cursor path assigns its own on the cursor). One call here is one
+            // complete execution — no deferral survives it — so a fresh token per
+            // call is correct. Explicit Run-now/key-mapping runs stay ownerless
+            // (null) by design: their camview hide keeps global-close semantics.
+            // Save/restore rather than remove, so a nested trigger can't clobber
+            // an outer execution's token.
+            Long previousToken = CURRENT_EXECUTION_TOKEN.get();
+            if (!explicit) {
+                CURRENT_EXECUTION_TOKEN.set(EXECUTION_TOKEN_SEQ.incrementAndGet());
+            }
             try {
                 if (runElse) automation.triggerElseActions();
                 else automation.triggerActions();
@@ -2150,6 +2265,10 @@ public class Automations {
                 logger.error("Automation action threw while triggering: " + id);
             } finally {
                 EXPLICIT_RUN.set(previousExplicit);
+                if (!explicit) {
+                    if (previousToken != null) CURRENT_EXECUTION_TOKEN.set(previousToken);
+                    else CURRENT_EXECUTION_TOKEN.remove();
+                }
             }
             // Persist the bumped stats opportunistically: only every STATS_PERSIST_EVERY
             // fires (per automation) so a busy rule doesn't hammer the disk, while the
@@ -2165,4 +2284,47 @@ public class Automations {
     // would be a disk write per trigger on a hot rule). A restart loses at most N-1
     // increments of the display counter, which is acceptable for a cosmetic stat.
     private static final long STATS_PERSIST_EVERY = 10L;
+    private static final Object STARTUP_ORDER_SENTINEL = new Object();
+    private static final boolean startupSawInitializedStaticFields;
+
+    static boolean startupSawInitializedStaticFieldsForTest() {
+        return startupSawInitializedStaticFields;
+    }
+
+    /*
+     * Keep this as the final static field/initializer in the class.
+     *
+     * Saved automations are loaded during class initialization, and their reference walk touches
+     * helpers throughout this class. This initializer previously lived near the top, before later
+     * non-constant static fields had run. ADDRESS_FIELDS was therefore still null when the startup
+     * turn/gear reference checks executed, every conditional poller declined to start, and a
+     * disable/enable mutation appeared to fix the rules because it refreshed them after <clinit>.
+     *
+     * Running startup last makes the ordering guarantee structural: future static helper state
+     * declared above is initialized before any saved rule is scanned or any poller is scheduled.
+     */
+    static {
+        startupSawInitializedStaticFields = STARTUP_ORDER_SENTINEL != null
+                && RUN_DEPTH != null
+                && mqttChannelsSeen != null;
+        if (!startupSawInitializedStaticFields) {
+            throw new ExceptionInInitializerError(
+                    "Automation startup ran before static helper fields were initialized");
+        }
+
+        runIsolatedStartupStep("saved automation load", Automations::loadFromFile);
+        runIsolatedStartupStep("action-group load", ActionGroups::loadFromFile);
+
+        // NOTE: btState / btDeviceName are NOT polled here. Bluetooth can't be read
+        // reliably from the daemon (UID 2000) — Bluetooth is only readable from a normal
+        // app process, not the shell-UID daemon. The app-process BluetoothStateMonitor
+        // watches ACL connect/disconnect and relays those events to the daemon via
+        // Automations.publishExternalEvent, exactly like callState.
+
+        // Door callbacks are event-driven and stay subscribed. Every periodic source below is
+        // configuration-driven: no enabled reference means no scheduled task and no parked
+        // thread waking just to discover that it has nothing to read.
+        pollersReady = true;
+        refreshConditionalPollers();
+    }
 }

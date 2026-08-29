@@ -1,9 +1,19 @@
 package com.overdrive.app.byd.routing;
 
 import com.overdrive.app.byd.BydDataCollector;
-import com.overdrive.app.byd.BydVehicleData;
+import com.overdrive.app.config.UnifiedConfigManager;
 import com.overdrive.app.monitor.AccMonitor;
 import com.overdrive.app.monitor.GearMonitor;
+import com.overdrive.app.util.DaemonHttpClient;
+
+import android.os.SystemClock;
+
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Decides whether a motion-sensitive vehicle action is safe to run right now.
@@ -24,6 +34,26 @@ public final class DrivingSafetyGuard {
 
     private DrivingSafetyGuard() {}
 
+    public static final String GUARD_DOOR_LOCKS = "doorLocks";
+    public static final String GUARD_TRUNK = "trunk";
+    public static final String GUARD_MIRROR_FOLD = "mirrorFold";
+    public static final String GUARD_POSITIONING = "positioning";
+    public static final String GUARD_HEADLIGHT_OFF = "headlightOff";
+    public static final String GUARD_DISPLAY_BRIGHTNESS = "displayBrightness";
+    public static final String GUARD_DISPLAY_POWER = "displayPower";
+    public static final String GUARD_SCREEN_MEDIA = "screenMedia";
+
+    private static final String[] GUARD_KEYS = {
+            GUARD_DOOR_LOCKS,
+            GUARD_TRUNK,
+            GUARD_MIRROR_FOLD,
+            GUARD_POSITIONING,
+            GUARD_HEADLIGHT_OFF,
+            GUARD_DISPLAY_BRIGHTNESS,
+            GUARD_DISPLAY_POWER,
+            GUARD_SCREEN_MEDIA
+    };
+
     /**
      * Gear reads P but speed is still above this, we still treat it as moving
      * ("rolling in Park"). ~0.5 m/s (TripDetector's GPS threshold) converted to
@@ -31,12 +61,93 @@ public final class DrivingSafetyGuard {
      */
     private static final double PARKED_SPEED_THRESHOLD_KMH = 2.0;
 
-    /** How stale a GearMonitor snapshot can be before we stop trusting it and
-     *  fall back to the BydDataCollector snapshot instead. Matches GearMonitor's
-     *  own poll cadence. */
+    /** How stale a GearMonitor observation can be before we fail closed. */
     private static final long GEAR_FRESHNESS_MS = 1000L;
 
     enum GearReading { PARK, NOT_PARK, UNKNOWN }
+
+    public static boolean isKnownGuard(String key) {
+        if (key == null) return false;
+        for (String candidate : GUARD_KEYS) {
+            if (candidate.equals(key)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Per-action policy. Missing, malformed, and unknown settings all keep the
+     * guard enabled so an old/corrupt config cannot silently remove protection.
+     */
+    static boolean isGuardEnabled(JSONObject settings, String key) {
+        if (key == null || !isKnownGuard(key)) return true;
+        Object value = settings != null ? settings.opt(key) : null;
+        return !(value instanceof Boolean) || ((Boolean) value).booleanValue();
+    }
+
+    public static boolean isGuardEnabled(String key) {
+        try {
+            return isGuardEnabled(UnifiedConfigManager.getDrivingSafety(), key);
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    /** Complete settings snapshot for the API/UI, including default-on values. */
+    public static JSONObject getGuardSettings() {
+        JSONObject configured = null;
+        try {
+            configured = UnifiedConfigManager.getDrivingSafety();
+        } catch (Throwable ignored) {
+        }
+        JSONObject resolved = new JSONObject();
+        for (String key : GUARD_KEYS) {
+            try {
+                resolved.put(key, isGuardEnabled(configured, key));
+            } catch (Exception ignored) {
+            }
+        }
+        return resolved;
+    }
+
+    /** True only when this action's guard is enabled and the live vehicle state blocks it. */
+    public static boolean isActionBlocked(String key) {
+        return isGuardEnabled(key) && isMovementBlocked();
+    }
+
+    /**
+     * App-process final-boundary check against the daemon's authoritative vehicle state.
+     * Network/config failures fail closed.
+     */
+    public static boolean isActionBlockedViaDaemon(String key) {
+        if (!isKnownGuard(key)) return true;
+        HttpURLConnection connection = null;
+        try {
+            connection = DaemonHttpClient.open(
+                    "/api/vehicle/driving-safety/" + key, "GET", 750, 1000);
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) return true;
+            StringBuilder body = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                    connection.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) body.append(line);
+            }
+            JSONObject response = new JSONObject(body.toString());
+            return !isDaemonResponseUnblocked(response, key);
+        } catch (Throwable ignored) {
+            return true;
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    static boolean isDaemonResponseUnblocked(JSONObject response, String key) {
+        return response != null
+                && key != null
+                && Boolean.TRUE.equals(response.opt("success"))
+                && key.equals(response.opt("guard"))
+                && Boolean.FALSE.equals(response.opt("blocked"));
+    }
 
     /**
      * Pure policy — no Android, no singletons, no side effects. Package-visible
@@ -58,32 +169,25 @@ public final class DrivingSafetyGuard {
 
     /** Live wrapper — reads AccMonitor / GearMonitor / BydDataCollector singletons. */
     public static boolean isMovementBlocked() {
-        return isBlocked(resolveGear(), AccMonitor.isAccOn(), AccMonitor.isAccStateAuthoritative(), resolveSpeedKmh());
+        boolean accAuthoritative = AccMonitor.isAccStateAuthoritative();
+        if (!accAuthoritative) return true;
+        boolean accOn = AccMonitor.isAccOn();
+        if (!accOn) return false;
+        return isBlocked(resolveGear(), true, true, resolveSpeedKmh());
     }
 
     private static GearReading resolveGear() {
         GearMonitor gm = GearMonitor.getInstance();
-        if (gm.isRunning()) {
-            long age = System.currentTimeMillis() - gm.getLastUpdateTime();
-            if (age >= 0 && age < GEAR_FRESHNESS_MS) {
-                return gm.getCurrentGear() == GearMonitor.GEAR_P ? GearReading.PARK : GearReading.NOT_PARK;
-            }
-            // Poller running but the last read is stale — fall through to the
-            // collector snapshot rather than trusting a possibly-outdated value.
-        }
-        // Poller not running (normally ACC-off — already resolved by the
-        // accAuthoritative branch in isBlocked() before this is reached in that
-        // case) or a cold-boot race where GearMonitor hasn't started yet. Fall
-        // back to the last BYD data snapshot instead of assuming PARK.
-        BydVehicleData d = BydDataCollector.getInstance().getData();
-        if (d != null && d.gearMode != BydVehicleData.UNAVAILABLE) {
-            return d.gearMode == GearMonitor.GEAR_P ? GearReading.PARK : GearReading.NOT_PARK;
+        if (!gm.isRunning()) return GearReading.UNKNOWN;
+        long age = SystemClock.elapsedRealtime() - gm.getLastUpdateTime();
+        if (age >= 0 && age < GEAR_FRESHNESS_MS) {
+            return gm.getCurrentGear() == GearMonitor.GEAR_P
+                    ? GearReading.PARK : GearReading.NOT_PARK;
         }
         return GearReading.UNKNOWN;
     }
 
     private static double resolveSpeedKmh() {
-        BydVehicleData d = BydDataCollector.getInstance().getData();
-        return d != null ? d.speedKmh : Double.NaN;
+        return BydDataCollector.getInstance().readCurrentSpeedKmh();
     }
 }

@@ -30,8 +30,31 @@ public class AutomationPickerGroupingAssetTest {
         assertTrue(keyMapping.contains(
                 "var items = buckets[cats[i]].slice().sort"));
         assertTrue(keyMapping.contains("String(tr(a.i18n)).localeCompare("));
-        assertTrue(automationsPage.contains("automations.js?v=av62"));
-        assertTrue(keyMappingPage.contains("key-mapping.js?v=32"));
+        assertTrue(keyMapping.contains("BYD.i18n.onChange(refreshLocale)"));
+        assertTrue(keyMapping.contains(
+                "action.textContent = describeAction(b.action) || b.label || '';"));
+        assertTrue(automationsPage.contains("automations.js?v=av70"));
+        assertTrue(keyMappingPage.contains("key-mapping.js?v=34"));
+    }
+
+    @Test
+    public void operatingModeUsesPersistentHelpGuideInsteadOfTooltip() throws IOException {
+        String automations = readRepositoryFile(
+                "app/src/main/assets/web/shared/automations.js");
+        String english = readRepositoryFile(
+                "app/src/main/assets/web/i18n/en.json");
+
+        assertTrue(automations.contains(
+                "if (selected.description && value !== 'operatingMode')"));
+        assertTrue(automations.contains(
+                "'automation.operating_mode_help_intro'"));
+        assertTrue(automations.contains(
+                "'automation.operating_mode_help_on_only'"));
+        assertTrue(automations.contains(
+                "'automation.operating_mode_help_on_and_off'"));
+        assertTrue(english.contains("entire OverDrive daemon stack"));
+        assertTrue(english.contains("all OverDrive daemons shut down"));
+        assertTrue(english.contains("uses more parked battery"));
     }
 
     @Test

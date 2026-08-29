@@ -157,11 +157,21 @@
             android:id="@+id/segmentedSource"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            app:checkedButton="@id/segmentDashcam"
+            app:checkedButton="@id/segmentAll"
             app:singleSelection="true"
             app:selectionRequired="true">
 
-            <!-- Three weight-1 segments must share the card width with the
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/segmentAll"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="48dp"
+                android:text="@string/recordings_segment_all"
+                android:textAllCaps="false"
+                android:textSize="12sp" />
+
+            <!-- Four weight-1 segments must share the card width with the
                  runtime count labels ("Surveillance · 45"). Compact insets
                  (12dp vs the M3 default 24dp), 12sp single-line ellipsized
                  text keep the longest label from wrapping/clipping inside
@@ -177,7 +187,7 @@
                 android:textSize="12sp"
                 android:maxLines="1"
                 android:ellipsize="end"
-                android:paddingHorizontal="12dp"
+                android:paddingHorizontal="8dp"
                 app:icon="@drawable/ic_directions_car"
                 app:iconSize="18dp"
                 app:iconGravity="textStart"
@@ -194,7 +204,7 @@
                 android:textSize="12sp"
                 android:maxLines="1"
                 android:ellipsize="end"
-                android:paddingHorizontal="12dp"
+                android:paddingHorizontal="8dp"
                 app:icon="@drawable/ic_instant_replay"
                 app:iconSize="18dp"
                 app:iconGravity="textStart"
@@ -211,7 +221,7 @@
                 android:textSize="12sp"
                 android:maxLines="1"
                 android:ellipsize="end"
-                android:paddingHorizontal="12dp"
+                android:paddingHorizontal="8dp"
                 app:icon="@drawable/ic_sentry"
                 app:iconSize="18dp"
                 app:iconGravity="textStart"

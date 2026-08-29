@@ -190,5 +190,12 @@ public final class SidecarGeoUpdater {
                 try { tmp.delete(); } catch (Throwable ignored) {}
             }
         }
+        // Idle cleanup gate: this sidecar landed AFTER the mp4's save hook
+        // fired (async place resolve / backfill can be minutes later), so the
+        // bytes it added would otherwise stay invisible to the parked-tick
+        // skip until the hourly backstop. Best-effort, never fails the write.
+        try {
+            com.overdrive.app.storage.StorageManager.getInstance().markStorageDirty();
+        } catch (Throwable ignored) {}
     }
 }

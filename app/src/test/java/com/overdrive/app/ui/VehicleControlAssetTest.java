@@ -71,6 +71,16 @@ public class VehicleControlAssetTest {
         assertFalse(script.contains("corner.psi > 50"));
     }
 
+    @Test
+    public void tyrePressureLabelsUseConnectedSdkEncoding() throws IOException {
+        String script = readRepositoryFile("app/src/main/assets/web/shared/vehicle-control.js");
+
+        assertTrue(script.contains(
+                "corner.pressureState === 1) return BYD.i18n.t('vehicle.tyre_high')"));
+        assertTrue(script.contains(
+                "corner.pressureState === 2) return BYD.i18n.t('vehicle.tyre_low')"));
+    }
+
     /** The per-axle band must come from the server, not be re-hardcoded. */
     @Test
     public void tyreLimitsComeFromServerConfig() throws IOException {
@@ -115,6 +125,33 @@ public class VehicleControlAssetTest {
         assertTrue(script.contains("this.renderer.setPixelRatio(window.AndroidBridge"));
         assertTrue(script.contains("type: typeof WebAssembly === 'object' ? 'wasm' : 'js'"));
         assertTrue(script.contains("now - this._lastRenderFrame < 32"));
+    }
+
+    @Test
+    public void acChargingCurrentLimitStaysVisibleAndUsesFiveStateReadback() throws IOException {
+        String html = readRepositoryFile("app/src/main/assets/web/local/vehicle-control.html");
+        String script = readRepositoryFile("app/src/main/assets/web/shared/vehicle-control.js");
+
+        assertTrue(html.contains("id=\"acChargeCurrentSection\""));
+        assertFalse(html.contains("id=\"acChargeCurrentSection\" style=\"display:none;\""));
+        assertEquals(5, count(html, "class=\"vc-seg\" data-state="));
+        assertEquals(5, count(html, "data-state=\"1\" disabled")
+                + count(html, "data-state=\"2\" disabled")
+                + count(html, "data-state=\"3\" disabled")
+                + count(html, "data-state=\"4\" disabled")
+                + count(html, "data-state=\"5\" disabled"));
+        assertTrue(html.contains("vehicle-control.js?v=vclite7"));
+        assertTrue(script.contains("fetch('/api/vehicle/ac-charge-current-limit')"));
+        assertTrue(script.contains("self.apiPost('/api/vehicle/ac-charge-current-limit'"));
+        assertTrue(script.contains("startAcChargeCurrentSync: function()"));
+        assertTrue(script.contains("}, 15 * 1000);"));
+        assertTrue(script.contains("if (panelId === 'panelCharging')"));
+        assertTrue(script.contains("this.fetchAcChargeCurrentLimit();"));
+        assertFalse(script.contains(
+                "state.checked && state.supported !== false ? '' : 'none'"));
+        assertTrue(script.contains("state.available !== true"));
+        assertTrue(script.contains(
+                "self.vehicleState.acChargeCurrentLimit.available = false;"));
     }
 
     private static int count(String text, String needle) {

@@ -3551,10 +3551,7 @@ const TRIPS = {
             mapDiv.innerHTML = '';
             const map = L.map(mapDiv, { zoomControl: false, attributionControl: false });
             this.routeCompareMapInstance = map;
-            // Theme-aware CartoCDN tiles (Voyager light / dark_all dark).
-            // Helper handles the live re-swap when the theme picker flips.
-            // OSM's main tile servers reject the BYD head-unit's Android 7.1
-            // WebView UA, so we stay on CartoCDN end-to-end.
+            // Shared keyless OSM.de tiles follow the current day/night theme.
             BYD.theme.attachMapTiles(map);
 
             const bounds = L.latLngBounds();
@@ -4494,7 +4491,7 @@ const TRIPS = {
         const ctx = canvas.getContext('2d');
         ctx.scale(dpr, dpr);
 
-        const pad = { top: 10, right: 10, bottom: 25, left: 80 };
+        const pad = { top: 10, right: 40, bottom: 25, left: 80 };
         const cw = w - pad.left - pad.right;
         const ch = h - pad.top - pad.bottom;
 
@@ -4687,10 +4684,7 @@ const TRIPS = {
             this.leafletMap.setView([points[0].la, points[0].lo], 14);
         }
 
-        // Theme-aware CartoCDN tiles (Voyager light / dark_all dark).
-        // Helper handles the live re-swap when the theme picker flips.
-        // OSM's main tile servers reject the BYD head-unit's Android 7.1
-        // WebView UA, so we stay on CartoCDN end-to-end.
+        // Shared keyless OSM.de tiles follow the current day/night theme.
         BYD.theme.attachMapTiles(this.leafletMap);
 
         console.log('[Trips] Map created successfully, tiles added, bounds set');

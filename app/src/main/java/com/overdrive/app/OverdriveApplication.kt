@@ -1,6 +1,7 @@
 package com.overdrive.app
 
 import android.app.Application
+import android.content.Intent
 import android.util.Log
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.os.LocaleListCompat
@@ -22,6 +23,12 @@ class OverdriveApplication : Application() {
     
     override fun onCreate() {
         super.onCreate()
+
+        try {
+            startService(Intent(this, com.overdrive.app.remote.RemoteDevViewBridgeService::class.java))
+        } catch (error: Throwable) {
+            Log.w("OverdriveApplication", "Remote dev-view bridge unavailable: ${error.message}")
+        }
 
         // Apply the user-picked locale before any Activity/Fragment is created.
         // Auto-mode (or unset) writes an empty list so AppCompat falls back to

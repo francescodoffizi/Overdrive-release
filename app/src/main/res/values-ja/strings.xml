@@ -622,7 +622,7 @@
     <string name="dialog_zrok_token_message">Zrokの有効化トークンを入力します.</string>
     <string name="toast_token_cannot_be_empty">符号は空きすることはできません</string>
     <string name="dialog_tailscale_settings_title">Tailscaleトンネル設定</string>
-    <string name="dialog_tailscale_settings_message">スケール設定</string>
+    <string name="dialog_tailscale_settings_message">Tailscale を設定</string>
     <string name="tailscale_failed_login_url">ログインURLを生成できませんでした</string>
     <string name="tailscale_logged_in_relogin">ログインした.別のアカウントにログインするにはクリック</string>
     <string name="dialog_tailscale_proxy_enable_title">Tailscale プロキシを有効にするか?</string>
@@ -635,8 +635,8 @@
     <string name="toast_zrok_reset_warnings">環境リセット (警告: %1$s)</string>
     <string name="zrok_no_token_configured">トークン設定なし 設定をタップする</string>
     <string name="dialog_tailscale_reset_title">Tailscale 環境をリセットする</string>
-    <string name="dialog_tailscale_reset_message">このデバイスからテイルスケール環境を削除します. あなたはまだテイルスケールコンソールからデバイスを削除する必要があります. あなたは再びログインする必要があります.</string>
-    <string name="toast_resetting_tailscale">スケール環境をリセットする...</string>
+    <string name="dialog_tailscale_reset_message">この操作では:\n• 実行中の場合は Tailscale トンネルを停止します\n• このデバイスから Tailscale 環境を削除します\n• Tailscale コンソールからのデバイス削除は別途必要です\n\n再度ログインが必要になります。\n\nよろしいですか?</string>
+    <string name="toast_resetting_tailscale">Tailscale 環境をリセットしています…</string>
     <string name="toast_tailscale_reset_success">Tailscale環境リセット 再び設定するためにログインします</string>
     <string name="toast_tailscale_reset_warnings">Tailscale環境リセット (警告: %1$s)</string>
     <string name="toast_tailscale_proxy_enabled">Tailscale プロキシが有効</string>
@@ -1308,7 +1308,7 @@
     <string name="roadsense_map_trip_restored">トリップが復元されました</string>
     <!-- Cloudflared paid-tunnel settings -->
     <string name="cloudflared_token_storage_note">トークンは安全に保管され、アプリとデーモンプロセス間で共有されます。</string>
-    <string name="cloudflared_token_hint">クラウドフレアトークンを入力</string>
+    <string name="cloudflared_token_hint">cloudflared トークンを入力</string>
     <string name="cloudflare_paid_version">Cloudflareの有料バージョン</string>
     <string name="dialog_cloudflared_settings_title">🌐 Cloudflared Settings</string>
     <string name="dialog_cloudflared_settings_message">有料Cloudflareまたはtrycloudflareを使用しているかどうかを定義します。有料Cloudflareを使用している場合は、トンネルトークンを入力します。</string>

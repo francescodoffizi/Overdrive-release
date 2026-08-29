@@ -1451,7 +1451,7 @@
     "heatmap_threat_high": "很高",
     "heatmap_threat_critical": "關鍵的",
     "state_active": "活動",
-    "state_safe_zone": " 安全區",
+    "state_safe_zone": "安全區",
     "state_safe_zone_named": "安全區 ({name})",
     "size_used_dash": "-- 使用",
     "size_limit_dash": "-- 限制",
@@ -2161,13 +2161,13 @@
     "add_zone_failed": "沒有添加區域",
     "confirm_delete_zone": "這裡的安全區域?",
     "zone_deleted": "已取消區域",
-    "in_safe_zone": " 在安全區 ({zone},{meters}m)",
-    "outside_zone": "🔴 室外 ({meters}m至最近)",
+    "in_safe_zone": "在安全區 ({zone},{meters}m)",
+    "outside_zone": "室外 ({meters}m至最近)",
     "no_zones_yet": "目前沒有區域",
     "waiting_gps": "在等待GPS...",
-    "badge_on": "● 啟動",
-    "badge_off": "○ 關閉",
-    "you_are_here": " 你在這裡",
+    "badge_on": "啟動",
+    "badge_off": "關閉",
+    "you_are_here": "你在這裡",
     "popup_radius": "半徑的PH0__{name}</b><br>{meters}m"
   },
   "liveview": {
@@ -2268,7 +2268,6 @@
     "auto": "自動"
   },
   "about": {
-    "ack_chimes": "RoadSense 警告提示音 — 來自 Google 音效庫，授權許可為",
     "page_title": "關於 — OverDrive",
     "page_title_short": "關於",
     "contributors_title": "貢獻者",
@@ -2290,7 +2289,8 @@
       "kofi_value": "Ko-fi 上一杯咖啡,讓深夜提交不停歇。",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "在貢獻者和支持者的幫助下打造。"
+    "thanks_subtitle": "在貢獻者和支持者的幫助下打造。",
+      "ack_chimes": "RoadSense 警告提示音 — 來自 Google 音效庫，授權許可為"
   },
   "byd_cloud": {
     "page_title": "BYD 雲端",

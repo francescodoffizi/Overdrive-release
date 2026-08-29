@@ -128,7 +128,7 @@ public class GpuDownscaler {
         0f, 0f, 1f, 0f,
         0f, 0f, 0f, 1f,
     };
-    private volatile int cameraLayout = 0;  // 0=4-strip rearrange, 3=passthrough
+    private volatile int cameraLayout = 0;  // 0=4-strip, 1=full-frame, 3=2x2 remap
     
     // Vertex buffers
     private FloatBuffer vertexBuffer;
@@ -213,15 +213,58 @@ public class GpuDownscaler {
     
     /**
      * Initialize with main thread's EGL context.
+     *
+     * <p>FIX (EGL-leak audit follow-up): this used to post the GL bring-up
+     * and return immediately — a failed child-context creation was logged on
+     * the render thread and swallowed, so camera startup reported success
+     * with a dead probe path AND a live-but-useless HandlerThread. Now the
+     * call waits (bounded, 3s) for the on-thread init to complete. On
+     * failure or timeout it self-releases (quits/joins the thread, closes
+     * the reader, tears down partial EGL state) and returns false so the
+     * caller can explicitly enter degraded mode instead of discovering the
+     * dead lane later. If a timed-out init completes late, the queued
+     * release() cleanup is serialized behind it on the same handler, so the
+     * late context is destroyed, not leaked.
+     *
+     * @return true if the GL thread + child EGL context are up; false if the
+     *         downscaler is unusable (already cleaned up — do not use).
      */
-    public void init(EGLContext mainThreadContext) {
+    public boolean init(EGLContext mainThreadContext) {
         this.sharedContext = mainThreadContext;
         
         renderThread = new HandlerThread("GpuDownscalerThread");
         renderThread.start();
         renderHandler = new Handler(renderThread.getLooper());
         
-        renderHandler.post(this::initGlOnThread);
+        final java.util.concurrent.CountDownLatch ready =
+            new java.util.concurrent.CountDownLatch(1);
+        renderHandler.post(() -> {
+            try {
+                initGlOnThread();
+            } finally {
+                ready.countDown();
+            }
+        });
+
+        // Same interrupt discipline as release(): honour the full 3s deadline
+        // even if the caller is interrupted, so an interrupt is never misread
+        // as an init failure (which would put the run in a spurious degraded
+        // mode). Status restored in the finally.
+        final boolean[] interrupted = { Thread.interrupted() };
+        try {
+            boolean completed = awaitFullDeadline(ready, 3000, interrupted);
+            if (!completed || !initialized) {
+                logger.error("init: GL bring-up " + (completed ? "failed" : "timed out (3s)")
+                    + " — releasing and entering degraded mode (probe/thumbnail path disabled)");
+                release();
+                return false;
+            }
+            return true;
+        } finally {
+            if (interrupted[0]) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
     
     /**
@@ -233,13 +276,13 @@ public class GpuDownscaler {
      * If called from wrong thread, EGL14.eglGetCurrentContext() returns EGL_NO_CONTEXT
      * and texture sharing will silently fail.
      */
-    public void init() {
+    public boolean init() {
         EGLContext ctx = EGL14.eglGetCurrentContext();
         if (ctx == EGL14.EGL_NO_CONTEXT) {
             logger.error("init() called without EGL context! Must call from GL thread (onSurfaceCreated)");
             throw new IllegalStateException("GpuDownscaler.init() must be called from GL thread");
         }
-        init(ctx);
+        return init(ctx);
     }
     
     /**
@@ -247,8 +290,8 @@ public class GpuDownscaler {
      * 
      * ⚠️ WARNING: Must be called from GL thread!
      */
-    public void init(boolean grayscaleMode) {
-        init();
+    public boolean init(boolean grayscaleMode) {
+        return init();
     }
     
     private void initGlOnThread() {
@@ -282,7 +325,11 @@ public class GpuDownscaler {
             eglContext = EGL14.eglCreateContext(eglDisplay, configs[0], sharedContext, contextAttribs, 0);
             
             if (eglContext == EGL14.EGL_NO_CONTEXT) {
-                throw new RuntimeException("Failed to create shared EGL context");
+                // Capture the symbolic error — EGL_BAD_ALLOC here is the
+                // canonical signature of driver context-table exhaustion.
+                int eglError = EGL14.eglGetError();
+                throw new RuntimeException("Failed to create shared EGL context: "
+                    + com.overdrive.app.camera.EGLCore.eglErrorString(eglError));
             }
             
             // Create surface from ImageReader
@@ -301,6 +348,32 @@ public class GpuDownscaler {
             
         } catch (Exception e) {
             logger.error("Failed to init GL on thread: " + e.getMessage());
+            // Partial-state cleanup ON THIS THREAD: a failed bring-up must
+            // not strand a half-built context/surface current on a thread
+            // that init()'s failure path is about to quit. Same unbind-
+            // before-destroy ordering as release()'s cleanup.
+            try {
+                if (eglDisplay != null && eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                    EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+                    if (eglSurface != null && eglSurface != EGL14.EGL_NO_SURFACE) {
+                        EGL14.eglDestroySurface(eglDisplay, eglSurface);
+                        eglSurface = EGL14.EGL_NO_SURFACE;
+                    }
+                    if (eglContext != null && eglContext != EGL14.EGL_NO_CONTEXT) {
+                        EGL14.eglDestroyContext(eglDisplay, eglContext);
+                        eglContext = EGL14.EGL_NO_CONTEXT;
+                    }
+                    EGL14.eglReleaseThread();
+                    eglDisplay = EGL14.EGL_NO_DISPLAY;
+                }
+            } catch (Throwable cleanup) {
+                logger.warn("init failure cleanup errored: " + cleanup.getMessage());
+            }
+            if (imageReader != null) {
+                try { imageReader.close(); } catch (Throwable ignored) {}
+                imageReader = null;
+            }
         }
     }
     
@@ -352,6 +425,17 @@ public class GpuDownscaler {
         if (imageReader == null) return null;
         return imageReader.acquireLatestImage();
     }
+
+    /**
+     * True once the private probe thread + child EGL context are up; false
+     * before init, after a failed init (self-released), and after release().
+     * Callers that interpret a null {@link #readPixels} result as "black
+     * frame" MUST check this first — a dead probe path says nothing about
+     * frame content.
+     */
+    public boolean isInitialized() {
+        return initialized;
+    }
     
     private void drawFrame(int textureId) {
         if (!initialized) return;
@@ -374,7 +458,7 @@ public class GpuDownscaler {
         }
         if (uApplyManualYFlipLocation >= 0) {
             GLES20.glUniform1f(uApplyManualYFlipLocation,
-                cameraLayout == 3 ? 0.0f : 1.0f);
+                (cameraLayout == 1 || cameraLayout == 3) ? 0.0f : 1.0f);
         }
         if (uProducerForFrontLocation >= 0) {
             float[] m = new float[8];
@@ -611,7 +695,7 @@ public class GpuDownscaler {
         }
         if (directUApplyManualYFlip >= 0) {
             GLES20.glUniform1f(directUApplyManualYFlip,
-                cameraLayout == 3 ? 0.0f : 1.0f);
+                (cameraLayout == 1 || cameraLayout == 3) ? 0.0f : 1.0f);
         }
         if (directUProducerForFront >= 0) {
             float[] m = new float[8];
@@ -874,7 +958,7 @@ public class GpuDownscaler {
             }
             if (directUApplyManualYFlip >= 0) {
                 GLES20.glUniform1f(directUApplyManualYFlip,
-                    cameraLayout == 3 ? 0.0f : 1.0f);
+                    (cameraLayout == 1 || cameraLayout == 3) ? 0.0f : 1.0f);
             }
             if (directUProducerForFront >= 0) {
                 float[] m = new float[8];
@@ -1045,7 +1129,8 @@ public class GpuDownscaler {
     /**
      * Selects between layouts:
      *   0 = legacy 4-strip → 2x2 rearrangement (Seal/Atto)
-     *   3 = oem-parity passthrough (HAL emits final framing natively)
+     *   1 = full-frame APA passthrough
+     *   3 = DiLink 4 four-corner remap
      * Other values fall through to layout 0 in the shader.
      */
     public void setCameraLayout(int layout) { this.cameraLayout = layout; }
@@ -1191,39 +1276,189 @@ public class GpuDownscaler {
      * These belong to the downscaler's private EGL context, NOT the AI-lane
      * context, so they must be deleted from {@link #renderHandler}.
      *
-     * <p>This is what stays on {@link #release}'s posted runnable; the
+     * <p>This is what stays on {@link #release}'s cleanup runnable; the
      * direct-path cleanup migrated out via
      * {@link #releaseDirectResources()}.
+     *
+     * <p>FIX (EGL-leak audit): this used to fire-and-forget a runnable that
+     * destroyed the surface/context in the wrong order (context destroyed
+     * before the program delete, never unbound via eglMakeCurrent(NO_CONTEXT),
+     * never eglReleaseThread'd) and then quitSafely'd without joining. Because
+     * the context stayed CURRENT on the render thread, eglDestroyContext only
+     * deferred the destruction — and a later eglTerminate by the camera's
+     * EGLCore couldn't reclaim it either (EGL defers deletion of anything
+     * current on a live thread). Each stop/start cycle then pinned one full
+     * context + window surface + ImageReader until the Adreno driver refused
+     * new contexts. Now the cleanup is SYNCHRONOUS (bounded wait), unbinds
+     * before destroying, releases the thread's driver-side EGL state, and
+     * joins the HandlerThread. Idempotent: a second call sees null fields and
+     * no-ops. Does NOT eglTerminate — the display is shared with the camera's
+     * EGLCore, which owns it.
      */
     public void release() {
         initialized = false;
 
-        if (renderHandler != null) {
-            renderHandler.post(() -> {
-                if (eglSurface != null && eglSurface != EGL14.EGL_NO_SURFACE) {
-                    EGL14.eglDestroySurface(eglDisplay, eglSurface);
+        final HandlerThread thread = renderThread;
+        final Handler handler = renderHandler;
+        renderThread = null;
+        renderHandler = null;
+
+        // FIX (audit follow-up): capture-and-CLEAR the caller's interrupt
+        // status before any timed wait. A caller arriving interrupted made
+        // both the latch await and the join throw instantly — cleanupComplete
+        // and threadExited then read a HEALTHY teardown as wedged and
+        // triggered a false trip-safe process restart. All waits below run to
+        // their real deadlines regardless of interrupts; the status is
+        // restored in the finally so the caller's own interrupt semantics
+        // are preserved.
+        final boolean[] interrupted = { Thread.interrupted() };
+        try {
+        if (handler != null && thread != null && thread.isAlive()) {
+            final Runnable glCleanup = () -> {
+                try {
+                    // 1. Delete GL objects while the context is still current.
+                    if (programId != 0) {
+                        GLES20.glDeleteProgram(programId);
+                        programId = 0;
+                    }
+                    // 2. Unbind. This is what lets the deferred destruction of
+                    //    the context/surface actually complete — destroying a
+                    //    CURRENT context only marks it for deletion.
+                    if (eglDisplay != null && eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                        EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE,
+                            EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+                        if (eglSurface != null && eglSurface != EGL14.EGL_NO_SURFACE) {
+                            EGL14.eglDestroySurface(eglDisplay, eglSurface);
+                            eglSurface = EGL14.EGL_NO_SURFACE;
+                        }
+                        if (eglContext != null && eglContext != EGL14.EGL_NO_CONTEXT) {
+                            EGL14.eglDestroyContext(eglDisplay, eglContext);
+                            eglContext = EGL14.EGL_NO_CONTEXT;
+                        }
+                        // 3. Drop this thread's driver-side EGL state so the
+                        //    KGSL context table entry is truly reclaimed.
+                        //    NEVER eglTerminate here — shared display.
+                        EGL14.eglReleaseThread();
+                        eglDisplay = EGL14.EGL_NO_DISPLAY;
+                    }
+                } catch (Throwable t) {
+                    logger.warn("release: GL-thread cleanup error: " + t.getMessage());
                 }
-                if (eglContext != null && eglContext != EGL14.EGL_NO_CONTEXT) {
-                    EGL14.eglDestroyContext(eglDisplay, eglContext);
+            };
+
+            boolean cleanupComplete;
+            if (Thread.currentThread() == thread) {
+                // Defensive: called from the render thread itself — run inline
+                // (a latch wait here would self-deadlock).
+                glCleanup.run();
+                cleanupComplete = true;
+            } else {
+                final java.util.concurrent.CountDownLatch done =
+                    new java.util.concurrent.CountDownLatch(1);
+                boolean posted = handler.post(() -> {
+                    try {
+                        glCleanup.run();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+                cleanupComplete = false;
+                if (posted) {
+                    // Full 2s deadline even across interrupts — see awaitFullDeadline.
+                    cleanupComplete = awaitFullDeadline(done, 2000, interrupted);
+                    if (!cleanupComplete) {
+                        logger.warn("release: GL cleanup did not complete within its "
+                            + "real 2s deadline");
+                    }
+                } else {
+                    logger.warn("release: Handler.post failed (looper already quitting?)");
                 }
-                if (programId != 0) {
-                    GLES20.glDeleteProgram(programId);
+            }
+
+            thread.quitSafely();
+            boolean threadExited = true;
+            if (Thread.currentThread() != thread) {
+                // Full 1s deadline even across interrupts.
+                threadExited = com.overdrive.app.util.ThreadJoins
+                    .joinFullDeadline(thread, 1000, interrupted);
+            }
+
+            // FIX (audit follow-up, finding 4): an unreleased context CURRENT
+            // on a wedged render thread cannot be reclaimed in-process — the
+            // caller is about to drop the reference and eglTerminate the
+            // parent display, which recreates exactly the leak this release
+            // exists to fix. Escalate to a trip-safe process restart (same
+            // recovery path the GL stall watchdog and the EGLCore exhaustion
+            // breaker use); a process exit is the only thing that frees the
+            // pinned KGSL context.
+            if (!cleanupComplete || !threadExited) {
+                String reason = !cleanupComplete
+                    ? "EGL cleanup did not execute (render thread wedged or post failed)"
+                    : "render thread did not exit within 1s of quitSafely";
+                logger.error("release: " + reason + " — the downscaler's EGL context "
+                    + "stays pinned; requesting trip-safe daemon process restart");
+                try {
+                    com.overdrive.app.daemon.CameraDaemon.requestProcessRestartPreservingTrip(
+                        "GpuDownscaler release wedged: " + reason);
+                } catch (Throwable t) {
+                    logger.error("release: process-restart request failed: " + t.getMessage());
                 }
-            });
+                if (imageReader != null) {
+                    try { imageReader.close(); } catch (Throwable ignored) {}
+                    imageReader = null;
+                }
+                logger.warn("AsyncGpuDownscaler release INCOMPLETE (process recovery requested)");
+                return;
+            }
         }
-        
-        if (renderThread != null) {
-            renderThread.quitSafely();
-            renderThread = null;
-        }
-        
+
         if (imageReader != null) {
             imageReader.close();
             imageReader = null;
         }
-        
+
         logger.info("AsyncGpuDownscaler released");
+        } finally {
+            // Restore the caller's interrupt status (both the flag captured at
+            // entry and any interrupt swallowed by the deadline waits).
+            if (interrupted[0]) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
+
+    /**
+     * Latch await that honours the FULL timeout even if the calling thread is
+     * (or arrives) interrupted. An interrupt during teardown must not be
+     * misread as a wedged render thread — that misdiagnosis triggered a false
+     * trip-safe process restart. Swallowed interrupts are recorded in
+     * {@code interruptedHolder[0]} so the caller can restore the thread's
+     * interrupt status after teardown completes.
+     *
+     * @return true if the latch opened within the real deadline.
+     */
+    private static boolean awaitFullDeadline(java.util.concurrent.CountDownLatch latch,
+            long timeoutMs, boolean[] interruptedHolder) {
+        final long deadlineNanos = System.nanoTime() + timeoutMs * 1_000_000L;
+        while (true) {
+            long remaining = deadlineNanos - System.nanoTime();
+            if (remaining <= 0) {
+                return latch.getCount() == 0;
+            }
+            try {
+                return latch.await(remaining, java.util.concurrent.TimeUnit.NANOSECONDS);
+            } catch (InterruptedException ie) {
+                interruptedHolder[0] = true;
+                // Keep waiting out the REAL deadline.
+            }
+        }
+    }
+
+    // Thread join that honours the FULL timeout across interrupts lives in
+    // com.overdrive.app.util.ThreadJoins.joinFullDeadline — shared with the
+    // other GL/codec-owning teardown paths (PanoramicCameraGpu, the encoder
+    // drainer). awaitFullDeadline above stays private: it has no caller
+    // outside this class.
 
     private static float[] normalizeOffsets(float[] quadrantStripOffsetX) {
         if (quadrantStripOffsetX == null || quadrantStripOffsetX.length != 4) {
@@ -1249,7 +1484,8 @@ public class GpuDownscaler {
         // hardcoded quadrant-index assumption (Q0=Front, Q1=Right, Q2=Rear,
         // Q3=Left at fixed grid positions) holds and the FoveatedCropper
         // sees a coherent canonical frame.
-        // Legacy (uApaMode <= 0.5) → 4-strip → 2x2 rearrangement, unchanged.
+        // Layout 1 → full-frame passthrough. Legacy (uApaMode <= 0.5) →
+        // 4-strip → 2x2 rearrangement, unchanged.
         return String.format(Locale.US,
             "#extension GL_OES_EGL_image_external : require\n" +
             "precision mediump float;\n" +
@@ -1287,6 +1523,8 @@ public class GpuDownscaler {
             "        if (flip.y > 0.5) sampledLocal.y = 0.5 - sampledLocal.y;\n" +
             "        samplePos = producerCorner + sampledLocal;\n" +
             com.overdrive.app.camera.GlUtil.APA_CENTER_INSET_GLSL +
+            "    } else if (uApaMode > 0.5) {\n" +
+            "        samplePos = vTexCoord;\n" +
             "    } else {\n" +
             "        vec2 gridPos = step(0.5, vTexCoord);\n" +
             "        float frontOffset = %.5f;\n" +

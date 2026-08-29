@@ -1451,8 +1451,8 @@
     "heatmap_threat_high": "Yüksek",
     "heatmap_threat_critical": "Kritik",
     "state_active": "Etkin",
-    "state_safe_zone": " Güvenli Bölge",
-    "state_safe_zone_named": " Güvenli Bölge ({name})",
+    "state_safe_zone": "Güvenli Bölge",
+    "state_safe_zone_named": "Güvenli Bölge ({name})",
     "size_used_dash": "-- kullanılır",
     "size_limit_dash": "-- sınırı",
     "limit_min_default": "100 MB",
@@ -2161,12 +2161,12 @@
     "add_zone_failed": "Bölge eklemedi",
     "confirm_delete_zone": "Bu güvenli bölgeyi silmek mi?",
     "zone_deleted": "Bölge kaldırıldı",
-    "in_safe_zone": " Güvenli Bölgede ({zone}, {meters}m)",
-    "outside_zone": "🔴 Dışarıda ({meters}m en yakın)",
+    "in_safe_zone": "Güvenli Bölgede ({zone}, {meters}m)",
+    "outside_zone": "Dışarıda ({meters}m en yakın)",
     "no_zones_yet": "Henüz bölge yok.",
     "waiting_gps": "GPS'i bekliyorum...",
-    "badge_on": "● AÇIK",
-    "badge_off": "○ Kapatılmış",
+    "badge_on": "AÇIK",
+    "badge_off": "Kapatılmış",
     "you_are_here": "Sen buradasın.",
     "popup_radius": "<b>{name}</b><br>{meters}m radyosu"
   },
@@ -2268,7 +2268,6 @@
     "auto": "Otomatik"
   },
   "about": {
-    "ack_chimes": "RoadSense uyarı sesleri — Google Sound Library'den sesler, şu lisans altında:",
     "page_title": "Hakkında — OverDrive",
     "page_title_short": "Hakkında",
     "contributors_title": "Katkıda bulunanlar",
@@ -2290,7 +2289,8 @@
       "kofi_value": "Ko-fi'da bir kahve gece commitlerini sürdürür.",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "Katkıda bulunanların ve destekçilerin yardımıyla kuruldu."
+    "thanks_subtitle": "Katkıda bulunanların ve destekçilerin yardımıyla kuruldu.",
+      "ack_chimes": "RoadSense uyarı sesleri — Google Sound Library'den sesler, şu lisans altında:"
   },
   "byd_cloud": {
     "page_title": "BYD Bulut",

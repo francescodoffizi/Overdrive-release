@@ -40,6 +40,7 @@
 # typed-listener subclasses we construct in BydDeviceHelper.
 -keepclassmembers class * extends android.hardware.bydauto.instrument.AbsBYDAutoInstrumentListener { *; }
 -keepclassmembers class * extends android.hardware.bydauto.charging.AbsBYDAutoChargingListener { *; }
+-keepclassmembers class * extends android.hardware.bydauto.energy.AbsBYDAutoEnergyListener { *; }
 
 # ==================== Daemon Entry Points (app_process) ====================
 # ONLY keep class names and main() - everything else gets obfuscated
@@ -61,6 +62,12 @@
     public static void main(java.lang.String[]);
 }
 -keep class com.overdrive.app.byd.BydEventDaemon {
+    public static void main(java.lang.String[]);
+}
+-keep class com.overdrive.app.byd.BydModeCommand {
+    public static void main(java.lang.String[]);
+}
+-keep class com.overdrive.app.launcher.ZrokRuntimeProbe {
     public static void main(java.lang.String[]);
 }
 

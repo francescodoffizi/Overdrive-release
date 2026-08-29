@@ -15,7 +15,7 @@ import java.net.Socket;
  * READ-ONLY spike endpoint for Telenav's exported user-data AIDL. The daemon
  * (uid-2000, synthetic ActivityThread) cannot {@code bindService}, so this handler
  * forwards to {@link TelenavIpcServer} in the app process over
- * {@code 127.0.0.1:19878}, which does the bind and returns the JSON.
+ * {@code 127.0.0.1:19882}, which does the bind and returns the JSON.
  *
  * <p>{@code GET /api/debug/telenav/favorites} — read all favourite buckets + recent.
  */
@@ -54,7 +54,7 @@ public final class TelenavDebugApiHandler {
             String op = p.endsWith("/navigate") ? "navigate" : "addFavorite";
             req = new JSONObject()
                     .put("op", op)
-                    .put("favoriteType", in.optString("favoriteType", "Normal"))
+                    .put("favoriteType", "Normal")
                     .put("name", in.optString("name", ""))
                     .put("lat", in.getDouble("lat"))
                     .put("lng", in.getDouble("lng"))
@@ -77,12 +77,17 @@ public final class TelenavDebugApiHandler {
                 // the target; DeferredNavManager offers it as a prompt on the next ACC-on.
                 double qlat = req.optDouble("lat", Double.NaN);
                 double qlng = req.optDouble("lng", Double.NaN);
-                if (Double.isNaN(qlat) || Double.isNaN(qlng)) {
-                    HttpResponse.sendError(out, 400, "lat/lng required");
+                try {
+                    com.overdrive.app.telenav.TelenavActions.validateCoordinates(qlat, qlng);
+                } catch (IllegalArgumentException invalid) {
+                    HttpResponse.sendError(out, 400, invalid.getMessage());
                     return true;
                 }
-                com.overdrive.app.telenav.DeferredNavManager.storePending(
-                        req.optString("name", ""), qlat, qlng);
+                if (!com.overdrive.app.telenav.DeferredNavManager.storePending(
+                        req.optString("name", ""), qlat, qlng)) {
+                    HttpResponse.sendError(out, 503, "Unable to persist deferred navigation");
+                    return true;
+                }
                 JSONObject queued = new JSONObject();
                 queued.put("success", true);
                 queued.put("queued", true);

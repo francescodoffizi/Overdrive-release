@@ -10,7 +10,7 @@
     <script src="../shared/theme.js?v=5"></script>
     <script src="../shared/app-shell.js?v=5"></script>
     <link rel="stylesheet" href="../shared/styles.css?v=23">
-    <link rel="stylesheet" href="../shared/communicate.css?v=3">
+    <link rel="stylesheet" href="../shared/communicate.css?v=4">
 </head>
 <body class="communicate-page">
     <div class="app-layout">
@@ -57,10 +57,24 @@
                     <section class="communicate-tool talk-tool is-mobile-active" id="talkPanel" aria-labelledby="talkHeading">
                         <div class="communicate-tool-header">
                             <h2 id="talkHeading" data-i18n="communicate.talk">Talk</h2>
-                            <span class="talk-live-badge" id="liveBadge">
-                                <span class="talk-live-dot"></span>
-                                <span>LIVE</span>
-                            </span>
+                            <div class="talk-header-actions">
+                                <button type="button"
+                                        class="cabin-listener-toggle"
+                                        id="cabinListenerToggle"
+                                        aria-pressed="false"
+                                        disabled>
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                                        <path d="M11 5 6 9H2v6h4l5 4V5Z"/>
+                                        <path d="M15.5 8.5a5 5 0 0 1 0 7"/>
+                                        <path d="M18.5 5.5a9 9 0 0 1 0 13"/>
+                                    </svg>
+                                    <span data-i18n="communicate.listen">Listen</span>
+                                </button>
+                                <span class="talk-live-badge" id="liveBadge">
+                                    <span class="talk-live-dot"></span>
+                                    <span>LIVE</span>
+                                </span>
+                            </div>
                         </div>
 
                         <div class="talk-stage">
@@ -196,7 +210,8 @@
 
     <script src="../shared/auth.js"></script>
     <script src="../shared/core.js?v=20"></script>
-    <script src="../shared/communicate.js?v=3"></script>
+    <script src="../shared/cabin-audio.js?v=1"></script>
+    <script src="../shared/communicate.js?v=10"></script>
     <script>
         function toggleSidebar() {
             var sidebar = document.getElementById('sidebar');

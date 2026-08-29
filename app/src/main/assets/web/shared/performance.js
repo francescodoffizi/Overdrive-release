@@ -542,32 +542,62 @@ BYD.performance = {
         let dataIndex;
         
         if (chartType === 'soc') {
-            // SOC chart uses time-based positioning
+            // SOC chart uses time-based positioning. renderSocChart draws with
+            // its own padding (left:45/right:15), not the shared 40/10 above,
+            // so recompute the x mapping against the real plot area — same
+            // pattern as the dataUsage special case below.
             const history = this.socData.history;
             if (!history || history.length < 2) return;
-            
+            const socPadLeft = 45, socPadRight = 15;
+            const socChartW = width - socPadLeft - socPadRight;
+            if (mouseX < socPadLeft || mouseX > width - socPadRight) {
+                this.tooltip.visible = false; this.renderChartByType(chartType); return;
+            }
             const timeStart = history[0].t;
             const timeEnd = history[history.length - 1].t;
-            const timeRange = timeEnd - timeStart;
-            const targetTime = timeStart + (relativeX / chartWidth) * timeRange;
-            
-            // Find closest data point
+            const targetTime = timeStart
+                + ((mouseX - socPadLeft) / socChartW) * (timeEnd - timeStart);
             dataIndex = this.findClosestTimeIndex(history, targetTime);
         } else if (chartType === 'voltage') {
             const d = this.batteryHealthData;
             if (!d || !d.voltageHistory || d.voltageHistory.length < 2) return;
-            const history = d.voltageHistory;
+            // Mirror renderVoltageChart EXACTLY. It draws only the points inside
+            // the user-selected batteryTimeRange window (the shared fetch can
+            // hold a longer series when healthTimeRange is larger) and pads
+            // left:50/right:20. Hover must index the SAME filtered array with
+            // the SAME x mapping: drawVoltageCrosshair applies this index to
+            // the filtered array, so a full-array index snapped the crosshair
+            // to a point k entries newer than the cursor (or drew nothing).
+            const history = d.voltageHistory.filter(
+                p => p.t >= Date.now() - this.batteryTimeRange * 3600 * 1000);
+            if (history.length < 2) return;
+            const vPadLeft = 50, vPadRight = 20;
+            const vChartW = width - vPadLeft - vPadRight;
+            if (mouseX < vPadLeft || mouseX > width - vPadRight) {
+                this.tooltip.visible = false; this.renderChartByType(chartType); return;
+            }
             const timeStart = history[0].t;
             const timeEnd = history[history.length - 1].t;
-            const targetTime = timeStart + (relativeX / chartWidth) * (timeEnd - timeStart);
+            const targetTime = timeStart
+                + ((mouseX - vPadLeft) / vChartW) * (timeEnd - timeStart);
             dataIndex = this.findClosestTimeIndex(history, targetTime);
         } else if (chartType === 'thermal') {
+            // Same contract as the voltage branch: renderThermalChart filters
+            // by healthTimeRange and pads left:50/right:20.
             const d = this.batteryHealthData;
             if (!d || !d.thermalHistory || d.thermalHistory.length < 2) return;
-            const history = d.thermalHistory;
+            const history = d.thermalHistory.filter(
+                p => p.t >= Date.now() - this.healthTimeRange * 3600 * 1000);
+            if (history.length < 2) return;
+            const tPadLeft = 50, tPadRight = 20;
+            const tChartW = width - tPadLeft - tPadRight;
+            if (mouseX < tPadLeft || mouseX > width - tPadRight) {
+                this.tooltip.visible = false; this.renderChartByType(chartType); return;
+            }
             const timeStart = history[0].t;
             const timeEnd = history[history.length - 1].t;
-            const targetTime = timeStart + (relativeX / chartWidth) * (timeEnd - timeStart);
+            const targetTime = timeStart
+                + ((mouseX - tPadLeft) / tChartW) * (timeEnd - timeStart);
             dataIndex = this.findClosestTimeIndex(history, targetTime);
         } else if (chartType === 'dataUsage') {
             // Discrete daily BARS (not a time-series line). The bar chart uses its

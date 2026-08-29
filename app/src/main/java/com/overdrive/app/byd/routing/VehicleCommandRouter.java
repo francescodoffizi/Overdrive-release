@@ -361,15 +361,16 @@ public final class VehicleCommandRouter {
 
         /**
          * Whether the router should refuse this command while the vehicle is
-         * moving (see {@link DrivingSafetyGuard}). Default is UNRESTRICTED: only a
-         * small, explicit blocklist of physical body actuators (door lock/unlock and
-         * the trunk/tailgate) is gated in motion — see the BLOCK_WHILE_MOVING
-         * overrides on those commands. NOTE: because the default is now permissive, a
-         * newly added command ships UNRESTRICTED unless it explicitly opts into
-         * BLOCK_WHILE_MOVING; add the override when introducing another actuator that
-         * must not fire while the car is moving.
+         * moving (see {@link DrivingSafetyGuard}). Default is UNRESTRICTED; only
+         * commands with an explicit BLOCK_WHILE_MOVING override are gated.
          */
         public MotionSafety motionSafety() { return MotionSafety.UNRESTRICTED; }
+
+        /**
+         * User-configurable guard key. Null keeps BLOCK_WHILE_MOVING enabled with no
+         * UI override, which is the safe default for future guarded commands.
+         */
+        public String motionSafetyGuardKey() { return null; }
 
         // ── Execution legs (override the ones you support) ──────────────
 
@@ -430,6 +431,7 @@ public final class VehicleCommandRouter {
         public CloudCapabilities.Feature cloudFeature() { return CloudCapabilities.Feature.LOCK; }
         public boolean requiresKnownCloudFeature() { return true; }
         public MotionSafety motionSafety() { return MotionSafety.BLOCK_WHILE_MOVING; }
+        public String motionSafetyGuardKey() { return DrivingSafetyGuard.GUARD_DOOR_LOCKS; }
     }
 
     public static final class UnlockCommand extends VehicleCommand {
@@ -443,6 +445,7 @@ public final class VehicleCommandRouter {
         public CloudCapabilities.Feature cloudFeature() { return CloudCapabilities.Feature.UNLOCK; }
         public boolean requiresKnownCloudFeature() { return true; }
         public MotionSafety motionSafety() { return MotionSafety.BLOCK_WHILE_MOVING; }
+        public String motionSafetyGuardKey() { return DrivingSafetyGuard.GUARD_DOOR_LOCKS; }
     }
 
     /** Horn + lights — BYD cloud only (no SDK FINDCAR primitive on this gen). */
@@ -675,6 +678,7 @@ public final class VehicleCommandRouter {
         }
         public CloudCapabilities.Feature cloudFeature() { return CloudCapabilities.Feature.TRUNK_OPEN; }
         public MotionSafety motionSafety() { return MotionSafety.BLOCK_WHILE_MOVING; }
+        public String motionSafetyGuardKey() { return DrivingSafetyGuard.GUARD_TRUNK; }
         public boolean allowCloudFallbackFromMqtt() { return true; }
     }
 
@@ -689,6 +693,7 @@ public final class VehicleCommandRouter {
         public boolean executeViaSdk(BydDataCollector c) { return c.closeTailgate(); }
         public CloudCapabilities.Feature cloudFeature() { return CloudCapabilities.Feature.TRUNK_CLOSE; }
         public MotionSafety motionSafety() { return MotionSafety.BLOCK_WHILE_MOVING; }
+        public String motionSafetyGuardKey() { return DrivingSafetyGuard.GUARD_TRUNK; }
         public boolean allowCloudFallbackFromMqtt() { return true; }
     }
 
@@ -706,6 +711,7 @@ public final class VehicleCommandRouter {
                     && c.openTailgate();
         }
         public MotionSafety motionSafety() { return MotionSafety.BLOCK_WHILE_MOVING; }
+        public String motionSafetyGuardKey() { return DrivingSafetyGuard.GUARD_TRUNK; }
     }
 
     // ── Tier 2: local body comfort (reuse verified SDK setters) ─────────
@@ -771,6 +777,7 @@ public final class VehicleCommandRouter {
         public MotionSafety motionSafety() {
             return fold ? MotionSafety.BLOCK_WHILE_MOVING : MotionSafety.UNRESTRICTED;
         }
+        public String motionSafetyGuardKey() { return DrivingSafetyGuard.GUARD_MIRROR_FOLD; }
         public boolean executeViaSdk(BydDataCollector c) {
             return c.setMirrorsFolded(fold);
         }
@@ -1056,6 +1063,7 @@ public final class VehicleCommandRouter {
         public MotionSafety motionSafety() {
             return save ? MotionSafety.UNRESTRICTED : MotionSafety.BLOCK_WHILE_MOVING;
         }
+        public String motionSafetyGuardKey() { return DrivingSafetyGuard.GUARD_POSITIONING; }
         public boolean executeViaSdk(BydDataCollector c) {
             return save ? c.setSeatMemorySave(position) : c.setSeatMemoryPosition(position);
         }
@@ -1068,6 +1076,31 @@ public final class VehicleCommandRouter {
         public Capability sdkCapability() { return Capability.REQUIRED; }
         public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
         public boolean executeViaSdk(BydDataCollector c) { return c.setDayTimeLight(drlOn); }
+    }
+
+    /**
+     * OEM four-position exterior-light selector. Local SDK only: the persistent headlight
+     * selector has no BYD Cloud equivalent (cloud flash/find-car commands are momentary).
+     *
+     * <p>Only OFF is Park-gated. AUTO, parking lights and low beam restore or increase
+     * visibility, so blocking those modes while moving would prevent recovery from an
+     * accidental or stale selector state.
+     */
+    public static final class HeadlightModeCommand extends VehicleCommand {
+        public final int mode;
+        public HeadlightModeCommand(int mode) { this.mode = mode; }
+        public String name() { return "headlight-mode"; }
+        public Capability sdkCapability() { return Capability.REQUIRED; }
+        public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
+        public MotionSafety motionSafety() {
+            return mode == BydDataCollector.HEADLIGHT_MODE_OFF
+                    ? MotionSafety.BLOCK_WHILE_MOVING
+                    : MotionSafety.UNRESTRICTED;
+        }
+        public String motionSafetyGuardKey() { return DrivingSafetyGuard.GUARD_HEADLIGHT_OFF; }
+        public boolean executeViaSdk(BydDataCollector c) {
+            return c.setHeadlightMode(mode);
+        }
     }
 
     /**
@@ -1108,6 +1141,16 @@ public final class VehicleCommandRouter {
         public Capability sdkCapability() { return Capability.REQUIRED; }
         public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
         public boolean executeViaSdk(BydDataCollector c) { return c.setAcAutoMode(on); }
+    }
+
+    /** Link or separate the driver/passenger AC temperature zones. SDK-only. */
+    public static final class AcTemperatureSyncCommand extends VehicleCommand {
+        public final boolean synced;
+        public AcTemperatureSyncCommand(boolean synced) { this.synced = synced; }
+        public String name() { return "ac-temperature-sync"; }
+        public Capability sdkCapability() { return Capability.REQUIRED; }
+        public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
+        public boolean executeViaSdk(BydDataCollector c) { return c.setAcTemperatureSync(synced); }
     }
 
     /** Air intake: recirculate cabin air vs draw fresh outside air (feature-id
@@ -1512,6 +1555,18 @@ public final class VehicleCommandRouter {
         public boolean executeViaSdk(BydDataCollector c) { return c.setChargeCapEnabled(enabled); }
     }
 
+    /** OEM five-position AC inlet current limit: 1=6A, 2=8A, 3=10A, 4=16A, 5=max. */
+    public static final class AcChargeCurrentLimitCommand extends VehicleCommand {
+        public final int state;
+        public AcChargeCurrentLimitCommand(int state) { this.state = state; }
+        public String name() { return "ac-charge-current-limit"; }
+        public Capability sdkCapability() { return Capability.REQUIRED; }
+        public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
+        public boolean executeViaSdk(BydDataCollector c) {
+            return c.setAcChargingCurrentLimitState(state);
+        }
+    }
+
     /**
      * PHEV battery-hold preset: one command that writes BOTH legs of the SOC-hold pair in the
      * OEM's order (target, then switch), replicating the OEM's two DM-i presets.
@@ -1534,9 +1589,8 @@ public final class VehicleCommandRouter {
     }
 
     /**
-     * Turn a SOC hold on/off without touching the target. {@code true} re-applies the
-     * hold-at-current preset (the only sane "on", since a bare switch-on would hold at whatever
-     * stale target was last written); {@code false} clears the switch and leaves the target.
+     * Turn SOC hold on/off without changing the configured target. Enabling first verifies that
+     * the vehicle reports a valid saved target; disabling leaves that target untouched.
      */
     public static final class SocHoldToggleCommand extends VehicleCommand {
         public final boolean enabled;
@@ -1545,7 +1599,19 @@ public final class VehicleCommandRouter {
         public Capability sdkCapability() { return Capability.REQUIRED; }
         public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
         public boolean executeViaSdk(BydDataCollector c) {
-            return enabled ? c.applySocHoldAtCurrent() : c.clearSocHold();
+            return enabled ? c.enableSocHoldAtSavedTarget() : c.clearSocHold();
+        }
+    }
+
+    /** PHEV driving SOC target via BYDAutoSettingDevice.setSOCTarget (15..70%). */
+    public static final class SocTargetPercentCommand extends VehicleCommand {
+        public final int percent;
+        public SocTargetPercentCommand(int percent) { this.percent = percent; }
+        public String name() { return "soc-target-percent"; }
+        public Capability sdkCapability() { return Capability.REQUIRED; }
+        public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
+        public boolean executeViaSdk(BydDataCollector c) {
+            return c.setSocTargetPercent(percent);
         }
     }
 
@@ -1604,8 +1670,8 @@ public final class VehicleCommandRouter {
     }
 
     /** Drive mode on OverDrive's config axis: 1=NORMAL, 2=ECO, 3=SPORT, 4=SNOW.
-     *  Routed via {@link BydDataCollector#setDriveConfigMode(int)}, which maps onto the
-     *  connected unit's energy operation-mode enum before legacy setting-device fallbacks. */
+     *  Routed via {@link BydDataCollector#setDriveConfigMode(int)}, which selects the OEM
+     *  Energy, road-surface, or setting-device axis for that mode. */
     public static final class OperationModeCommand extends VehicleCommand {
         public final int mode;
         public OperationModeCommand(int mode) { this.mode = mode; }
@@ -1781,7 +1847,7 @@ public final class VehicleCommandRouter {
         logger.warn("'" + cmd.name() + "' local write failed while awake/occupied — NOT falling "
                 + "back to the cloud remote command (it acts on the remote session, which ends "
                 + "with the vehicle powering down)");
-        return CommandResult.failed(Path.SDK, msg("not_supported"), elapsed, leg.error);
+        return CommandResult.failed(Path.SDK, msg("local_failed"), elapsed, leg.error);
     }
 
     /**
@@ -1890,7 +1956,7 @@ public final class VehicleCommandRouter {
         long elapsed = System.currentTimeMillis() - start;
         if (leg.blocked) return CommandResult.blocked(msg("blocked_driving"));
         if (leg.success) return CommandResult.success(Path.SDK, msg("local_sent"), elapsed);
-        return CommandResult.failed(Path.SDK, msg("not_supported"), elapsed, leg.error);
+        return CommandResult.failed(Path.SDK, msg("local_failed"), elapsed, leg.error);
     }
 
     /**
@@ -2408,25 +2474,32 @@ public final class VehicleCommandRouter {
     /**
      * A VENTILATIONHEATING payload always includes steering-wheel heat. Preserve
      * a reported value when available. If capability discovery positively says
-     * this trim has no wheel heater, use pyBYD's wire-off default (3); only a
-     * supported-but-unreported wheel remains unsafe to overwrite.
+     * this trim has no wheel heater, use pyBYD's wire-off default (3). When the
+     * cloud omits a supported wheel, use an exact live HAL readback; only block
+     * when neither source can preserve its current state.
      */
     private int prepareSeatCloudSteeringWheelWireState(
             SeatClimateCommand command, CloudCapabilities capabilities) {
         int explicit = command.explicitSteeringWheelHeatWireState();
         VehicleCloudSnapshot cloud = freshCloudSeatSnapshot();
         int reported = cloud != null ? cloud.steeringWheelHeatWireState() : -1;
-        return resolveSeatCloudSteeringWheelWireState(explicit, reported, capabilities);
+        int resolved = resolveSeatCloudSteeringWheelWireState(
+                explicit, reported, BydVehicleData.UNAVAILABLE, capabilities);
+        if (resolved >= 0) return resolved;
+        int local = BydDataCollector.getInstance().getSteeringWheelHeatingState();
+        return resolveSeatCloudSteeringWheelWireState(explicit, reported, local, capabilities);
     }
 
     static int resolveSeatCloudSteeringWheelWireState(
-            int explicit, int reported, CloudCapabilities capabilities) {
+            int explicit, int reported, int local, CloudCapabilities capabilities) {
         if (explicit == 1 || explicit == 3) return explicit;
         if (reported == 1 || reported == 3) return reported;
         if (capabilities != null
                 && !capabilities.supports(CloudCapabilities.Feature.SEAT_STEERING_WHEEL)) {
             return 3;
         }
+        if (local == 2) return 1;
+        if (local == 1) return 3;
         return -1;
     }
 
@@ -2670,6 +2743,9 @@ public final class VehicleCommandRouter {
         BydCloudClient.CloudCommandResult r =
                 client.executeRemoteCommandWithCode(vin, commandType, extra, true);
         if (r.success) return CloudOutcome.success();
+        if (BydCloudClient.DRIVING_SAFETY_BLOCKED_CODE.equals(r.code)) {
+            return CloudOutcome.blockedDriving();
+        }
         if (CLOUD_CODE_RATE_LIMITED.equals(r.code)) return CloudOutcome.rateLimited();
         return CloudOutcome.failed();
     }
@@ -2683,7 +2759,7 @@ public final class VehicleCommandRouter {
         if (cmd.motionSafety() != VehicleCommand.MotionSafety.BLOCK_WHILE_MOVING) {
             return false;
         }
-        if (!DrivingSafetyGuard.isMovementBlocked()) return false;
+        if (!DrivingSafetyGuard.isActionBlocked(cmd.motionSafetyGuardKey())) return false;
         logger.warn("Blocked cloud dispatch for '" + cmd.name() + "' — vehicle in motion");
         return true;
     }
@@ -2757,7 +2833,7 @@ public final class VehicleCommandRouter {
      */
     private CommandResult checkDrivingSafety(VehicleCommand cmd) {
         if (cmd.motionSafety() != VehicleCommand.MotionSafety.BLOCK_WHILE_MOVING) return null;
-        if (!DrivingSafetyGuard.isMovementBlocked()) return null;
+        if (!DrivingSafetyGuard.isActionBlocked(cmd.motionSafetyGuardKey())) return null;
         logger.warn("Blocked '" + cmd.name() + "' — vehicle in motion");
         return CommandResult.blocked(msg("blocked_driving"));
     }

@@ -1451,8 +1451,8 @@
     "heatmap_threat_high": "높은",
     "heatmap_threat_critical": "비평적",
     "state_active": "활동",
-    "state_safe_zone": " 안전 구역",
-    "state_safe_zone_named": " 안전 구역 ({name})",
+    "state_safe_zone": "안전 구역",
+    "state_safe_zone_named": "안전 구역 ({name})",
     "size_used_dash": "-- 사용",
     "size_limit_dash": "-- 제한",
     "limit_min_default": "100 MB",
@@ -2161,13 +2161,13 @@
     "add_zone_failed": "영역을 추가하지 못함",
     "confirm_delete_zone": "안전 구역을 지우고?",
     "zone_deleted": "삭제된 구역",
-    "in_safe_zone": " 안전 구역 ({zone}, {meters}m)",
-    "outside_zone": "🔴 외부 ({meters}m에서 가장 가까운 곳)",
+    "in_safe_zone": "안전 구역 ({zone}, {meters}m)",
+    "outside_zone": "외부 ({meters}m에서 가장 가까운 곳)",
     "no_zones_yet": "아직 구역은 없습니다",
     "waiting_gps": "GPS를 기다리고 있어",
-    "badge_on": "● 켜짐",
-    "badge_off": "○ ",
-    "you_are_here": " 당신은 여기 있습니다",
+    "badge_on": "켜짐",
+    "badge_off": "",
+    "you_are_here": "당신은 여기 있습니다",
     "popup_radius": "지름: <b>{name}</b><br>{meters}m"
   },
   "liveview": {
@@ -2268,7 +2268,6 @@
     "auto": "자동"
   },
   "about": {
-    "ack_chimes": "RoadSense 경고음 — Google Sound Library에서 제공하는 사운드, 라이선스:",
     "page_title": "정보 — OverDrive",
     "page_title_short": "정보",
     "contributors_title": "기여자",
@@ -2290,7 +2289,8 @@
       "kofi_value": "Ko-fi 의 커피 한 잔이 늦은 밤 커밋을 이어갑니다.",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "기여자와 후원자의 도움으로 만들어졌습니다."
+    "thanks_subtitle": "기여자와 후원자의 도움으로 만들어졌습니다.",
+      "ack_chimes": "RoadSense 경고음 — Google Sound Library에서 제공하는 사운드, 라이선스:"
   },
   "byd_cloud": {
     "page_title": "BYD 클라우드",

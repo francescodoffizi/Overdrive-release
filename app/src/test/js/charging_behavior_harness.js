@@ -449,6 +449,12 @@ test('failed current live pair clears live fields and later success recovers', a
     assert.strictEqual(charging.summaryCache.live.charging, false);
     assert.strictEqual(charging.summaryCache.live.powerKw, 0);
     assert.strictEqual(charging.summaryCache.live.sessionKwh, null);
+    assert.strictEqual(
+        charging.summaryCache.live.sessionEnergyEstimated,
+        false);
+    assert.strictEqual(
+        charging.summaryCache.live.sessionEnergyIncomplete,
+        false);
     assert.strictEqual(charging.sessions.length, 2);
     assert.strictEqual(charging.sessions[0].chargingNow, false);
     assert.strictEqual(charging.sessions[0].livePowerKw, null);
@@ -740,6 +746,299 @@ test('open historical row is not rendered as charging now when live verdict is f
     charging.sessions[0].chargingNow = true;
     charging._renderSessionCards();
     assert.ok(grid.children[0].innerHTML.indexOf('Charging now') >= 0);
+});
+
+test('active session power matches live dashboard power while history keeps peak', function () {
+    const env = createEnvironment();
+    const charging = env.charging;
+    const grid = env.document.getElementById('sessionList');
+    charging.sessions = [{
+        id: 1,
+        inProgress: true,
+        chargingNow: true,
+        startTime: 1000,
+        livePowerKw: 6.3,
+        peakPower: 0,
+        isEstimated: true,
+        energyAdded: 1.2,
+        energyEstimated: true
+    }];
+
+    charging._renderSessionCards();
+    assert.ok(grid.children[0].innerHTML.indexOf('≈6.3 kW') >= 0);
+    assert.ok(grid.children[0].innerHTML.indexOf('Power &amp; energy estimated') >= 0);
+
+    grid.children = [];
+    charging.sessions[0].energyEstimated = false;
+    charging.sessions[0].energyIncomplete = false;
+    charging.sessions[0].energySource = 'metered_counter';
+    charging._renderSessionCards();
+    assert.ok(grid.children[0].innerHTML.indexOf('Power estimated') >= 0);
+
+    charging.currentSessionId = 1;
+    charging._fillDetailHeader({
+        id: 1,
+        inProgress: true,
+        startTime: 1000,
+        energyAdded: 1.2,
+        energyEstimated: true
+    }, 1);
+    assert.strictEqual(
+        env.document.getElementById('detailAvgPowerLabel').textContent,
+        'Current power');
+    assert.strictEqual(
+        env.document.getElementById('detailAvgPower').textContent,
+        '≈6.3 kW');
+    assert.strictEqual(
+        env.document.getElementById('detailPeakPower').textContent,
+        'Not measured');
+    assert.strictEqual(
+        env.document.getElementById('detailEstimateDisclosure').style.display,
+        '');
+
+    grid.children = [];
+    charging.sessions[0].inProgress = false;
+    charging.sessions[0].chargingNow = false;
+    charging.sessions[0].isEstimated = false;
+    charging.sessions[0].energyEstimated = false;
+    charging.sessions[0].energySource = 'metered_counter';
+    charging.sessions[0].peakPower = 6.6;
+    charging._renderSessionCards();
+    assert.ok(grid.children[0].innerHTML.indexOf('6.6 kW') >= 0);
+    assert.ok(grid.children[0].innerHTML.indexOf('Estimated') < 0);
+});
+
+test('charger tier honors an explicit backend verdict before power fallback', function () {
+    const charging = createEnvironment().charging;
+
+    assert.strictEqual(charging._typeKind({ isDc: false, peakPower: 359.4 }), 'fast');
+    assert.strictEqual(charging._typeKind({ isDc: true, peakPower: 15 }), 'dc');
+    assert.strictEqual(charging._typeKind({ isDc: null, peakPower: 25 }), 'dc');
+    assert.strictEqual(charging._typeKind({ isDc: null, peakPower: 7.2 }), 'fast');
+    assert.strictEqual(charging._typeKind({ isDc: null, peakPower: 6.1 }), 'slow');
+    assert.strictEqual(charging._typeKind({
+        gunState: 1, isDc: null, peakPower: 100
+    }), 'unk');
+    assert.strictEqual(charging._typeKind({
+        gunState: 5, isDc: true, peakPower: 100
+    }), 'unk');
+});
+
+test('estimated or incomplete energy is never rendered as exact', function () {
+    const env = createEnvironment();
+    const charging = env.charging;
+
+    assert.strictEqual(charging._energyIsApproximate({
+        energySource: 'metered_counter'
+    }), false);
+    assert.strictEqual(charging._energyIsApproximate({
+        energySource: 'integrated_rate'
+    }), true);
+    assert.strictEqual(charging._energyIsApproximate({
+        sessionEnergyIncomplete: true,
+        sessionEnergySource: 'metered_counter'
+    }), true);
+    assert.strictEqual(charging._energyIsApproximate({
+        sessionKwh: 2.0
+    }), true);
+
+    charging.renderCircleGauge = function () {};
+    charging._renderSummaryCharts = function () {};
+    charging._energyBars = function () { return []; };
+    charging.sessions = [];
+    charging._applySummary({
+        live: {
+            charging: true,
+            sessionKwh: 1.6,
+            sessionEnergyEstimated: true
+        }
+    }, 'days=7', true);
+    assert.strictEqual(
+        env.document.getElementById('kwhHeroValue').textContent,
+        '--');
+    assert.strictEqual(
+        env.document.getElementById('statsEstimateDisclosure').style.display,
+        '');
+    assert.strictEqual(
+        env.document.getElementById('summaryEstimateDisclosure').style.display,
+        '');
+
+    charging._applySummary({
+        periodEnergyKwh: 5.0,
+        periodCost: 2.5,
+        periodRangeGained: 30,
+        periodEstimatedSessions: 1,
+        lifetimeEnergyKwh: 20,
+        lifetimeCost: 10,
+        lifetimeEstimatedSessions: 1,
+        live: { charging: false }
+    }, 'days=7', true);
+    assert.strictEqual(
+        env.document.getElementById('kwhHeroValue').textContent,
+        '--');
+    assert.strictEqual(
+        env.document.getElementById('summaryEnergy').textContent,
+        '~5.0 kWh');
+    assert.strictEqual(
+        env.document.getElementById('summaryRangeGained').textContent,
+        '~30 km');
+    assert.strictEqual(
+        env.document.getElementById('lifetimeEnergy').textContent,
+        '~20 kWh');
+
+    const barCharging = createEnvironment().charging;
+    const bars = plain(barCharging._energyBars([{
+        startTime: 1,
+        energyAdded: 3.6,
+        energySource: 'integrated_rate',
+        isDc: null,
+        inProgress: false
+    }, {
+        startTime: 2,
+        energyAdded: 1.2,
+        energySource: 'metered_counter',
+        isDc: false,
+        peakPower: 7.4,
+        inProgress: false
+    }]));
+    assert.strictEqual(bars[0].approximate, false);
+    assert.strictEqual(bars[1].approximate, true);
+    assert.strictEqual(bars[0].chargerKind, 'fast');
+    assert.strictEqual(bars[1].chargerKind, 'unk');
+});
+
+test('legacy SOC keeps the endpoint that was actually recorded', function () {
+    const charging = createEnvironment().charging;
+
+    assert.strictEqual(
+        charging._socRangeText({ startSoc: 32, endSoc: null }),
+        '32% → --');
+    assert.strictEqual(
+        charging._socRangeText({ startSoc: null, endSoc: 81 }),
+        '-- → 81%');
+    assert.strictEqual(
+        charging._socRangeText({ startSoc: 32.4, endSoc: 81.4 }),
+        '32% → 81%');
+    assert.strictEqual(
+        charging._socRangeText({ startSoc: -1, endSoc: 255 }),
+        '--');
+});
+
+test('recent SOC history fills live-card gaps without reviving stale SOC', function () {
+    const charging = createEnvironment().charging;
+    const now = Date.now();
+    charging.socHistoryCache = [
+        { t: now - 3 * 60 * 60 * 1000, soc: 42, range: 180, soh: 97 },
+        { t: now - 10 * 60 * 1000, soc: 88, range: 260 }
+    ];
+    charging.summaryCache = {
+        sohTrend: [{ soh: 96 }]
+    };
+
+    assert.deepStrictEqual(
+        plain(charging._latestBatterySnapshot()),
+        { soc: 88, range: 260, soh: 97 });
+
+    charging.socHistoryCache = [
+        { t: now - 3 * 60 * 60 * 1000, soc: 42, range: 180, soh: 97 }
+    ];
+    assert.deepStrictEqual(
+        plain(charging._latestBatterySnapshot()),
+        { soc: null, range: null, soh: 97 });
+});
+
+test('SOC arrival repaints the hero from the shared summary', function () {
+    const env = createEnvironment();
+    const charging = env.charging;
+    let repaint = null;
+    charging.summaryCache = { live: {} };
+    charging._summaryPeriodKey = 'days=7';
+    charging.renderSocOverTime = function () {};
+    charging._applySummary = function (summary, period, force) {
+        repaint = { summary: summary, period: period, force: force };
+    };
+
+    charging._applySoc([{ t: Date.now(), soc: 88, soh: 97 }], 168);
+
+    assert.strictEqual(repaint.summary, charging.summaryCache);
+    assert.strictEqual(repaint.period, 'days=7');
+    assert.strictEqual(repaint.force, true);
+});
+
+test('average-power card never upgrades estimates to measured data', function () {
+    const charging = createEnvironment().charging;
+    charging.sessions = [{
+        inProgress: false,
+        energyAdded: 7,
+        durationMinutes: 60,
+        energySource: 'metered_counter'
+    }, {
+        inProgress: false,
+        energyAdded: 4,
+        durationMinutes: 60,
+        energySource: 'integrated_rate'
+    }];
+
+    assert.deepStrictEqual(
+        plain(charging._periodAveragePower({
+            charging: true,
+            powerKw: 5.5,
+            isEstimated: true
+        })),
+        { value: 7, live: false });
+    assert.deepStrictEqual(
+        plain(charging._periodAveragePower({
+            charging: true,
+            powerKw: 6.2,
+            isEstimated: false
+        })),
+        { value: 6.2, live: true });
+});
+
+test('completion card covers full waiting and active charging', function () {
+    const charging = createEnvironment().charging;
+
+    assert.strictEqual(
+        charging._chargingCompletion({ full: true }).primary,
+        'Complete');
+    assert.strictEqual(
+        charging._chargingCompletion({
+            plugged: true,
+            charging: false
+        }).primary,
+        'Waiting');
+    assert.strictEqual(
+        charging._chargingCompletion({
+            charging: true,
+            timeToFullMin: 65
+        }).primary,
+        '1h 5m');
+    assert.strictEqual(
+        charging._chargingCompletion({
+            charging: false,
+            timeToFullMin: 65
+        }),
+        null);
+});
+
+test('zero and negative charging power remain explicit graph gaps', function () {
+    const charging = createEnvironment().charging;
+    const points = plain(charging._powerCurvePoints([
+        { t: 1, power: 6.1, soc: 40 },
+        { t: 2, power: 0, soc: null },
+        { t: 3, power: -2, soc: 41 },
+        { t: 4, power: null, soc: null },
+        { t: 5, power: 6.0, soc: 42 }
+    ]));
+
+    assert.deepStrictEqual(points, [
+        { t: 1, power: 6.1, soc: 40 },
+        { t: 2, power: null, soc: null },
+        { t: 3, power: null, soc: 41 },
+        { t: 4, power: null, soc: null },
+        { t: 5, power: 6, soc: 42 }
+    ]);
+    assert.strictEqual(charging._powerCurveValueCount(points), 3);
 });
 
 (async function run() {

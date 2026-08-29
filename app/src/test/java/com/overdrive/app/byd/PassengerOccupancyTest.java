@@ -44,14 +44,6 @@ public class PassengerOccupancyTest {
     }
 
     @Test
-    public void typedPassengerBeltCallbackOverridesEmptySeatGetterDefault() {
-        assertEquals(0, BydDataCollector.selectPassengerSeatbeltState(1, 0));
-        assertEquals(1, BydDataCollector.selectPassengerSeatbeltState(0, 1));
-        assertEquals(1, BydDataCollector.selectPassengerSeatbeltState(
-                1, BydVehicleData.UNAVAILABLE));
-    }
-
-    @Test
     public void preservesDirectPassengerSensorBeforeApplyingEstimate() {
         assertEquals(0, BydDataCollector.resolvePassengerOccupancy(0, true, 1, true));
         assertEquals(1, BydDataCollector.resolvePassengerOccupancy(1, false, 0, false));

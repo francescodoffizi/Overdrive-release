@@ -121,6 +121,17 @@ public class RecordingModernizationContractTest {
     }
 
     @Test
+    public void landscapeLibraryRowReservesTheFilenameLine()
+            throws IOException {
+        String row = read(
+                "app/src/main/res/layout/item_recording_landscape.xml");
+
+        assertTrue(row.contains("android:layout_height=\"136dp\""));
+        assertTrue(openingTagForId(row, "tvFilename")
+                .contains("android:maxLines=\"1\""));
+    }
+
+    @Test
     public void daemonMediaUrlsStayQualifiedToTheIndexedVolume() throws IOException {
         String index = read(
                 "app/src/main/java/com/overdrive/app/server/RecordingsIndex.java");
@@ -129,11 +140,17 @@ public class RecordingModernizationContractTest {
         String client = read(
                 "app/src/main/java/com/overdrive/app/ui/util/RecordingsApiClient.kt");
 
+        assertTrue(index.contains(
+                "rec.put(\"videoUrl\", \"/video/id/\" + recordingId);"));
+        assertTrue(index.contains(
+                "rec.put(\"thumbnailUrl\", \"/thumb/id/\" + recordingId);"));
+        assertTrue(index.contains(
+                "rec.put(\"eventUrl\", \"/api/events/id/\" + recordingId);"));
         assertTrue(index.contains("String mediaQuery = mediaPathQuery(absPath);"));
         assertTrue(index.contains(
-                "rec.put(\"videoUrl\", \"/video/\" + name + mediaQuery);"));
+                "rec.put(\"legacyVideoUrl\", \"/video/\" + name + mediaQuery);"));
         assertTrue(index.contains(
-                "rec.put(\"thumbnailUrl\", \"/thumb/\" + name + mediaQuery);"));
+                "rec.put(\"legacyThumbnailUrl\", \"/thumb/\" + name + mediaQuery);"));
         assertTrue(handler.contains(
                 "serveThumbnail(out, filename, mediaRequestedPath(path));"));
         assertTrue(handler.contains(
@@ -194,6 +211,34 @@ public class RecordingModernizationContractTest {
                 "fullscreenBackCallback.isEnabled = playerFullscreen"));
         assertTrue(host.contains(
                 "player.onFullscreenToggle = { wantFullscreen ->"));
+    }
+
+    @Test
+    public void inlinePlayerKeepsUsableSpaceAndAutoHidingControls()
+            throws IOException {
+        String landscape = read("app/src/main/res/layout-land/fragment_recordings.xml");
+        String player = read(
+                "app/src/main/java/com/overdrive/app/ui/fragment/VideoPlayerFragment.kt");
+        String host = read(
+                "app/src/main/java/com/overdrive/app/ui/fragment/RecordingsFragment.kt");
+
+        assertTrue(openingTagForId(landscape, "libraryContainer")
+                .contains("android:layout_weight=\"11\""));
+        assertTrue(openingTagForId(landscape, "previewCard")
+                .contains("android:layout_weight=\"9\""));
+        assertTrue(openingTagForId(landscape, "previewInsightsToggle")
+                .contains("android:layout_height=\"48dp\""));
+        assertTrue(openingTagForId(landscape, "previewInsights")
+                .contains("android:visibility=\"gone\""));
+        assertTrue(host.contains("setPreviewDetailsExpanded(root, false)"));
+        assertTrue(host.contains("setPreviewDetailsExpanded(root, !expanded)"));
+        assertTrue(host.contains(
+                "previewInsightsToggle?.visibility = if (fullscreen) View.GONE else View.VISIBLE"));
+        assertTrue(host.contains("params.weight = if (fullscreen) 0f else 11f"));
+        assertTrue(player.contains(
+                "val chrome = listOfNotNull(topBar, quadrantBar, bottomControls)"));
+        assertTrue(player.contains(
+                "handler.postDelayed(hideOverlayRunnable, OVERLAY_HIDE_DELAY)"));
     }
 
     private static String openingTagForId(String xml, String id) {

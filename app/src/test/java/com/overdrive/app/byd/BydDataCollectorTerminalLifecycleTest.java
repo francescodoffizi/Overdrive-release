@@ -21,8 +21,10 @@ public class BydDataCollectorTerminalLifecycleTest {
 
     @Test
     public void terminalCounterUsesNewestValidObservationEvenWhenLower() {
+        double nearCapacityCeiling =
+                BydDataCollector.CHARGING_CAPACITY_MAX_KWH - 0.1;
         assertEquals(0.25, BydDataCollector.reconcileTerminalCounterObservation(
-                ChargeSourceClassifier.SRC_CAPACITY, 65.4, 0.25), 0.0);
+                ChargeSourceClassifier.SRC_CAPACITY, nearCapacityCeiling, 0.25), 0.0);
         assertEquals(0.0, BydDataCollector.reconcileTerminalCounterObservation(
                 ChargeSourceClassifier.SRC_CAPACITY, 4.25, 0.0), 0.0);
         assertEquals(3.0, BydDataCollector.reconcileTerminalCounterObservation(
@@ -32,7 +34,8 @@ public class BydDataCollectorTerminalLifecycleTest {
     @Test
     public void invalidTerminalCounterCannotReplaceExistingValue() {
         assertEquals(4.25, BydDataCollector.reconcileTerminalCounterObservation(
-                ChargeSourceClassifier.SRC_CAPACITY, 4.25, 70.0), 0.0);
+                ChargeSourceClassifier.SRC_CAPACITY, 4.25,
+                BydDataCollector.CHARGING_CAPACITY_MAX_KWH + 0.001), 0.0);
         assertEquals(4.25, BydDataCollector.reconcileTerminalCounterObservation(
                 ChargeSourceClassifier.SRC_CAPACITY, 4.25, Double.NaN), 0.0);
     }
@@ -52,7 +55,8 @@ public class BydDataCollectorTerminalLifecycleTest {
                 "settleCounterCallbacks", long.class, long.class, boolean.class);
         settle.setAccessible(true);
 
-        reserve.invoke(order, 7L, ChargeSourceClassifier.SRC_CAPACITY, 65.5);
+        reserve.invoke(order, 7L, ChargeSourceClassifier.SRC_CAPACITY,
+                BydDataCollector.CHARGING_CAPACITY_MAX_KWH - 0.1);
         reserve.invoke(order, 7L, ChargeSourceClassifier.SRC_CAPACITY, 0.25);
         Object batch = settle.invoke(order, Long.MAX_VALUE, 7L, true);
 

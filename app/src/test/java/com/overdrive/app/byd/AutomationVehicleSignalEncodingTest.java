@@ -1,11 +1,24 @@
 package com.overdrive.app.byd;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
 /** Locks automation-facing BYD enum mappings to the connected-unit SDK contracts. */
 public class AutomationVehicleSignalEncodingTest {
+
+    @Test
+    public void tyrePressureStatesUseConnectedSdkEncoding() {
+        assertEquals(0, BydVehicleData.TYRE_PRESSURE_STATE_NORMAL);
+        assertEquals(1, BydVehicleData.TYRE_PRESSURE_STATE_OVERPRESSURE);
+        assertEquals(2, BydVehicleData.TYRE_PRESSURE_STATE_UNDERPRESSURE);
+        assertTrue(BydVehicleData.isTyreOverpressureState(1));
+        assertFalse(BydVehicleData.isTyreOverpressureState(2));
+        assertTrue(BydVehicleData.isTyreUnderpressureState(2));
+        assertFalse(BydVehicleData.isTyreUnderpressureState(1));
+    }
 
     @Test
     public void drlAndAutoHeadlightRejectUnavailableValues() {
@@ -48,12 +61,14 @@ public class AutomationVehicleSignalEncodingTest {
     }
 
     @Test
-    public void sunroofAndSunshadeCommandsUseReferencePercentageEncoding() {
-        assertEquals(100, BydDataCollector.sunWindowPositionForCommand(1));
-        assertEquals(0, BydDataCollector.sunWindowPositionForCommand(2));
-        assertEquals(254, BydDataCollector.sunWindowPositionForCommand(3));
-        assertEquals(-1, BydDataCollector.sunWindowPositionForCommand(4));
-        assertEquals(-1, BydDataCollector.sunWindowPositionForCommand(5));
+    public void sunroofAndSunshadeCommandsUseSdkMotionEncoding() {
+        assertEquals(1, BydDataCollector.sunWindowVoiceCommand(1));
+        assertEquals(2, BydDataCollector.sunWindowVoiceCommand(2));
+        assertEquals(4, BydDataCollector.sunWindowVoiceCommand(3));
+        assertEquals(3, BydDataCollector.sunWindowVoiceCommand(4));
+        assertEquals(5, BydDataCollector.sunWindowVoiceCommand(5));
+        assertEquals(-1, BydDataCollector.sunWindowVoiceCommand(0));
+        assertEquals(-1, BydDataCollector.sunWindowVoiceCommand(6));
     }
 
     @Test

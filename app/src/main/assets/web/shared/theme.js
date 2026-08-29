@@ -512,56 +512,43 @@
     };
 
     // ─── Step 7: Leaflet tile-layer theming ─────────────────────────────
-    // Live View map + Trips route maps + best/worst comparison map all use
-    // CartoCDN raster tiles. CartoCDN exposes a matching dark-grey style at
-    // the same endpoint shape, so theming is a URL swap on data-theme flips.
-    // Both styles share the abcd subdomain set, maxZoom 20, and retina
-    // ({r}) hints — the only difference is the style segment.
-    //   dark : dark_all        — flat dark-grey basemap (Google-Maps-dark
-    //                            lookalike) for in-app dark theme
-    //   light: rastertiles/voyager — colourful Google-Maps-light lookalike
-    //                            (the long-standing default)
-    var TILE_DARK  = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
-    var TILE_LIGHT = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png';
-    function tileUrlForTheme() {
-        var v = document.documentElement.getAttribute('data-theme');
-        return v === 'light' ? TILE_LIGHT : TILE_DARK;
+    // Every embedded map uses the same keyless OSM.de raster tiles. Filtering
+    // the layer gives day/night styling without fetching a second tile set.
+    var TILE_URL = 'https://tile.openstreetmap.de/{z}/{x}/{y}.png';
+    var TILE_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>';
+    function tileFilterForTheme() {
+        return document.documentElement.getAttribute('data-theme') === 'light'
+            ? 'saturate(.62) brightness(1.04) contrast(.93)'
+            : 'invert(.91) hue-rotate(180deg) brightness(.66) contrast(.92) saturate(.68)';
+    }
+    function applyTileTheme(layer) {
+        var container = layer && layer.getContainer && layer.getContainer();
+        if (!container) return;
+        var filter = tileFilterForTheme();
+        container.style.filter = filter;
+        container.style.webkitFilter = filter;
     }
     /**
-     * Attach a CartoCDN tile layer to a Leaflet map and keep it in sync with
-     * the current theme. Caller still owns the map; this just handles the
-     * layer's lifecycle. Returns the initial layer in case the caller needs
-     * to introspect it.
-     *
-     * Re-swap path: a single MutationObserver on <html data-theme> removes
-     * the old layer and adds a new one. The map keeps the same zoom/centre
-     * because we never touch the view — only the tile pyramid changes.
-     *
-     * Bound to the map's `remove` event so the observer stops firing once
-     * the map is destroyed (Trips tears down + recreates the route map on
-     * every trip-detail drill-in).
+     * Attach the shared OSM.de layer and keep its filter in sync with the
+     * current theme. The caller still owns the map and layer lifecycle.
      */
     window.BYD.theme.attachMapTiles = function (map) {
         if (!map || typeof L === 'undefined') return null;
-        var currentUrl = tileUrlForTheme();
-        var layer = L.tileLayer(currentUrl, { maxZoom: 20, subdomains: 'abcd' });
+        if (!map.attributionControl) {
+            map.attributionControl = L.control.attribution({
+                position: 'bottomright',
+                prefix: false
+            }).addTo(map);
+        }
+        var layer = L.tileLayer(TILE_URL, {
+            maxZoom: 19,
+            attribution: TILE_ATTRIBUTION
+        });
         layer.addTo(map);
-        // Gate the swap on URL change. The Android WebView's onPageFinished
-        // re-stamps `data-theme` to the same value the bootstrap already set
-        // (belt-and-suspenders — see theme.js step 1 + WebViewFragment.kt
-        // INJECT_JS), which fires this observer redundantly. Without the
-        // short-circuit every Live View / Trips page-load drops the freshly-
-        // mounted tile layer and re-fetches identical tiles, producing a
-        // brief grid flash on the head unit's slow mobile data.
+        applyTileTheme(layer);
         var obs = new MutationObserver(function () {
-            var next = tileUrlForTheme();
-            if (next === currentUrl) return;
-            currentUrl = next;
-            try {
-                if (map.hasLayer(layer)) map.removeLayer(layer);
-                layer = L.tileLayer(next, { maxZoom: 20, subdomains: 'abcd' });
-                layer.addTo(map);
-            } catch (e) { /* map may be mid-teardown — ignore */ }
+            try { applyTileTheme(layer); }
+            catch (e) { /* map may be mid-teardown — ignore */ }
         });
         obs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
         map.on('remove', function () { obs.disconnect(); });

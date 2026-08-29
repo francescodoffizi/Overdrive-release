@@ -183,25 +183,40 @@ public class StreamingApiHandler {
      */
     // ── Camera-view arm retry ────────────────────────────────────────────────────
     // Bounded, self-converging retry for a /api/camview/show that arrived before the
-    // lane could be armed. Mirrors BlindSpotControl.armWithRetry's discipline:
-    //   * a monotonic generation token so a newer show/hide supersedes an older loop
-    //     (no two loops fighting, and a hide is never undone by a stale arm);
-    //   * a hard deadline so it always terminates;
-    //   * re-reads the persisted intent each pass and bails the moment camview.enabled
-    //     goes false, so a user cancel wins immediately.
-    private static final java.util.concurrent.atomic.AtomicInteger camViewArmGen =
-        new java.util.concurrent.atomic.AtomicInteger(0);
+    // lane could be armed. Validity is SESSION-scoped, not generation-scoped: the
+    // loop serves exactly one user request (its showSession) and exits the moment
+    // that session is superseded. Every cancel path — hide, newer show, auto-hide
+    // timeout, real teardown, blind-spot takeover — bumps the session
+    // (noteCamViewShowRequest / hideCamView / endCamViewSessionLocked), so no
+    // separate cancellation token exists to disagree with it. The old global
+    // generation was exactly such a disagreement: it recorded CALL order while the
+    // session records INTENT order, so a STALE show handler starting its retry
+    // late bumped the generation and killed the NEWER show's valid loop — the
+    // stale loop then failed session validation and NEITHER armed. Concurrent
+    // loops are harmless now: a stale loop exits on its first session check
+    // without driving the pano cold start, and ensurePanoStartedNonBlocking is
+    // deduped anyway.
     // 30s, matching BlindSpotControl.REARM_DEADLINE_MS: the retry has to outlast a full
     // pano cold start (AvcHalWarmup + camera open), not just a brief in-flight lane build.
     private static final long CAMVIEW_ARM_DEADLINE_MS = 30_000L;
     private static final long CAMVIEW_ARM_BACKOFF_MAX_MS = 1_500L;
 
-    /** Bump the arm generation, invalidating any in-flight retry loop. Called by the hide
-     *  path so an explicit cancel can't be undone by a pending arm, and by the pipeline's
-     *  own teardown paths (disableCamView / stop) so an ACC-off or blind-spot takeover
-     *  likewise can't be undone. Public + static so the surveillance package can call it
-     *  without a compile-time dependency back into the server package's internals. */
-    public static void cancelCamViewArmRetry() { camViewArmGen.incrementAndGet(); }
+    // Serializes a show's WHOLE mutation transaction: session mint + geometry
+    // persist + intent write + override install are one atomic unit with respect
+    // to other shows. Without it, session order and config-write order could
+    // TEAR: an older show's handler, resuming after a newer show completed,
+    // wrote ITS geometry/override into the config the newer session's transition
+    // tick then resolved — the new view rendered at the old request's position.
+    // The arm (enableCamView) stays OUTSIDE this monitor (it can block seconds
+    // on a lane build); the session check under bsLifecycleLock covers it.
+    // Lock order: camViewShowMutationLock → bsLifecycleLock (noteCamViewShowRequest
+    // takes the lane lock briefly); nothing acquires them in reverse — the
+    // pipeline never calls back into this handler on camview paths.
+    // The hide route deliberately does NOT take this monitor (its teardown can
+    // block ~2s on a GL quiesce); a hide interleaving a show transaction leaves
+    // only the documented safe-direction config drift (enabled=true persisted,
+    // nothing shows — no path re-shows from config).
+    private static final Object camViewShowMutationLock = new Object();
 
     /** Current value of the pipeline's sticky auto-hide latch, or false when there is no
      *  pipeline. Snapshotted at retry start so the loop can tell "MY session timed out"
@@ -216,25 +231,30 @@ public class StreamingApiHandler {
     }
 
     /**
-     * Is the deferred camera-view arm captured by generation {@code gen} still wanted?
-     * Every bail condition in one cheap, side-effect-free predicate, so the retry loop can
+     * Is the deferred camera-view arm for {@code showSession} still wanted? Every bail
+     * condition in one cheap, side-effect-free predicate, so the retry loop can
      * re-check it immediately before arming as well as at the top of a pass.
      *
-     * <p>Deliberately does NO config file I/O. An earlier version called
-     * {@code forceReload()} every pass, which (a) bought nothing — {@code camview.enabled}
-     * is only ever written by this same process — and (b) took the global config monitor,
-     * and on a self-heal branch blocked on the cross-process file lock WHILE holding it,
-     * stalling the 250ms blind-spot arbiter tick behind a peer daemon's write.
+     * <p>Cancellation is the SESSION, nothing else. Every cancel path bumps it
+     * (hide, newer show, auto-hide timeout, teardown, blind-spot takeover), and the
+     * arm itself re-validates it under bsLifecycleLock — this unlocked read is only
+     * the early exit. Two former gates are deliberately GONE: the global generation
+     * (recorded call order, not intent order — a stale show's late retry start
+     * killed a newer show's valid loop) and the persisted camview.enabled re-read
+     * (the show route ignores a FALSE return from the intent write, so a failed
+     * persist left enabled=false and this gate killed the retry on pass 1 —
+     * silently dropping the key press the retry exists to rescue; every real
+     * cancel that clears enabled also bumps the session, so the session gate
+     * already covers user intent without the config dependency).
+     *
+     * <p>Deliberately does NO config file I/O (an earlier version's forceReload
+     * blocked the 250ms blind-spot arbiter tick behind a peer daemon's write).
      */
-    private static boolean camViewArmStillWanted(int gen, boolean autoHideAtStart) {
-        // Superseded by a newer show, or cancelled by a hide / real teardown.
-        if (camViewArmGen.get() != gen) return false;
-        try {
-            // In-memory read (no forceReload — see above): an explicit hide clears this.
-            if (!com.overdrive.app.config.UnifiedConfigManager.isCamViewEnabled()) return false;
-        } catch (Throwable ignored) {}
-        GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
+    private static boolean camViewArmStillWanted(GpuSurveillancePipeline p,
+            long showSession, boolean autoHideAtStart) {
         if (p == null) return false;
+        // Superseded by a newer show, or cancelled by a hide / real teardown.
+        if (p.getCamViewSessionId() != showSession) return false;
         if (p.isCamViewActive()) return false;          // already armed by someone else
         // Auto-hide: bail only when the flag flipped DURING this loop. It is a sticky
         // process-wide latch cleared only inside enableCamView, so an absolute test would
@@ -267,8 +287,29 @@ public class StreamingApiHandler {
         return true;
     }
 
-    private static void startCamViewArmRetry(int mode, String target, int autoHide) {
-        final int gen = camViewArmGen.incrementAndGet();
+    /**
+     * Bounded background retry converging a deferred camera-view show.
+     *
+     * <p>{@code showSession} is the session the API show route minted for the USER
+     * request this retry serves. Every arm pass MUST reuse it via the
+     * session-validated {@code enableCamView(mode, target, autoHide, session)}
+     * entry point — the arm side re-checks it under bsLifecycleLock, so a hide (or
+     * newer show) landing at ANY point, including between this loop's unlocked
+     * still-wanted check and the arm itself, invalidates the session and the arm
+     * rejects itself. The old shape (self-minting 3-arg entry) re-MINTED a session
+     * on each pass: a hide racing the final check was post-dated by the fresh
+     * session and the dismissed view re-armed — the hide race. A false return
+     * means superseded: stop retrying, the request is cancelled.
+     */
+    private static void startCamViewArmRetry(int mode, String target, int autoHide,
+            long showSession) {
+        // Don't spawn a loop for a request that is ALREADY superseded (a stale
+        // handler reaching this line late). Best-effort — the loop's own session
+        // checks are the authoritative gate.
+        {
+            GpuSurveillancePipeline pl = CameraDaemon.getGpuPipeline();
+            if (pl == null || pl.getCamViewSessionId() != showSession) return;
+        }
         // Snapshot the sticky auto-hide latch AT START. The loop then bails only if it
         // flips during our wait — an absolute test would inherit a previous session's
         // timeout (the latch is cleared only inside enableCamView, which the pano
@@ -285,9 +326,8 @@ public class StreamingApiHandler {
                 try { Thread.sleep(delay); }
                 catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
                 delay = Math.min(delay * 2, CAMVIEW_ARM_BACKOFF_MAX_MS);
-                if (!camViewArmStillWanted(gen, autoHideAtStart)) return;
                 GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
-                if (p == null) return;
+                if (!camViewArmStillWanted(p, showSession, autoHideAtStart)) return;
                 // Keep driving the pano cold start ONLY while it is legitimately coming up.
                 // ensurePanoStartedNonBlocking is async + deduped, so re-calling is cheap;
                 // without it the loop would spin against a pipeline nobody is starting.
@@ -296,11 +336,18 @@ public class StreamingApiHandler {
                 // from the arm by ensurePanoStartedNonBlocking, and a hide/newer-show
                 // landing in that window would otherwise be overridden — resurrecting a
                 // view the user just dismissed, or arming the PREVIOUS camera. Cheap
-                // (atomic + volatile reads), so re-checking costs nothing.
-                if (!camViewArmStillWanted(gen, autoHideAtStart)) return;
+                // (volatile reads), so re-checking costs nothing.
+                if (!camViewArmStillWanted(p, showSession, autoHideAtStart)) return;
                 try {
-                    p.enableCamView(mode, target, autoHide);
-                    CameraDaemon.log("camview arm retry: armed after deferral");
+                    // Session-validated arm — the ONLY safe entry point here. The
+                    // unlocked still-wanted check above is best-effort; the session
+                    // check inside (under bsLifecycleLock) is the authoritative gate.
+                    if (p.enableCamView(mode, target, autoHide, showSession)) {
+                        CameraDaemon.log("camview arm retry: armed after deferral");
+                    } else {
+                        CameraDaemon.log("camview arm retry: superseded by a hide or"
+                            + " newer show — cancelled");
+                    }
                     return;
                 } catch (GpuSurveillancePipeline.BlindSpotNotReadyException nr) {
                     // still not ready — keep trying until the deadline
@@ -529,13 +576,26 @@ public class StreamingApiHandler {
             return true;
         }
         if (clean.equals("/api/camview/hide")) {
-            // Invalidate any in-flight arm retry FIRST, so a pending deferred arm can
-            // never resurrect the view the user just dismissed.
-            cancelCamViewArmRetry();
-            pipeline.disableCamView();
-            // Persist enabled=false so a daemon restart doesn't re-show it.
-            try { com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(
-                java.util.Collections.singletonMap("enabled", false)); } catch (Throwable ignored) {}
+            // v40 contract: every hide source closes the current camera view.
+            // hideCamView (NOT the lenient disableCamView) — it invalidates the show
+            // SESSION even when the view never armed, so a straight-through show still
+            // in flight outside the mutation lock rejects itself instead of arming
+            // after this hide and reopening the camera behind the success we report.
+            // The session bump is ALSO what stops any deferred-arm retry loop: retry
+            // validity is session-scoped (see startCamViewArmRetry) — there is no
+            // separate cancellation token to race with.
+            pipeline.hideCamView();
+            // Same false-return contract as the geometry persist: a failed write here
+            // means a daemon restart re-shows the view the user just dismissed. The
+            // hide itself already happened (session invalidated), so log — don't fail
+            // the hide — but leave a trace for exactly that re-appearance report.
+            try {
+                if (!com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(
+                        java.util.Collections.singletonMap("enabled", false))) {
+                    CameraDaemon.log("camview hide: enabled=false persist returned false"
+                        + " — a daemon restart may re-show the view");
+                }
+            } catch (Throwable ignored) {}
             JSONObject r = new JSONObject(); r.put("success", true); r.put("active", false);
             HttpResponse.sendJson(out, r.toString());
             return true;
@@ -544,41 +604,84 @@ public class StreamingApiHandler {
             java.util.Map<String, String> p = parseQuery(query);
             int mode = parseCamMode(p.get("cam"));
             String target = "cluster".equals(p.get("target")) ? "cluster" : "head_unit";
-            // Fall back to the PERSISTED autoHideSec when the caller doesn't pass one.
-            // The automation action and every key-mapping binding build their URL without
-            // an autoHide param, so an explicit-query-only read meant the user's configured
-            // auto-hide was ignored on exactly the paths that matter and the view stayed up
-            // forever. 0 (either source) still means "until explicitly hidden".
+            // Mint the session FIRST — before ANY config I/O. Everything below the
+            // mint (autoHide config read, geometry persist, intent write) can block
+            // on the cross-process config file lock for hundreds of ms; with the mint
+            // BELOW those writes, a hide completing in that window was post-dated by
+            // this (older) request's fresh session and the view REOPENED behind the
+            // hide's reported success. Minting at entry pins this request's authority
+            // to its arrival order: any hide (or newer show) landing after this line
+            // bumps the session and every arm attempt for THIS request self-rejects
+            // under bsLifecycleLock. The residual is confined to config drift in the
+            // safe direction (enabled=true persisted while nothing shows — no boot
+            // path re-shows from config; its only reader is the retry's intent gate).
+            // The retry must never re-mint (a fresh session would post-date the hide
+            // and defeat its invalidation), which is also why the pipeline has no
+            // self-minting enableCamView convenience wrapper. The mint itself is what
+            // cancels any older show's retry loop (retry validity is session-scoped).
+            //
+            // The WHOLE mutation transaction — mint + autoHide read + geometry
+            // persist + intent write + override install — is serialized against
+            // other shows (camViewShowMutationLock): with unserialized writes, an
+            // OLDER show's handler resuming after a newer show completed would
+            // overwrite the config/override the newer session's transition tick
+            // resolves, rendering the new view at the old request's position.
+            // Inside the monitor, session order == config-write order == override
+            // order, so the LAST transaction owns all three consistently.
+            final long showSession;
             int autoHide = 0;
-            try { autoHide = com.overdrive.app.config.UnifiedConfigManager.getCamViewAutoHideSec(); }
-            catch (Throwable ignored) {}
-            try { if (p.containsKey("autoHide")) autoHide = Integer.parseInt(p.get("autoHide")); }
-            catch (NumberFormatException ignored) {}
-            // Persist geometry (preset or absolute) + selection BEFORE enabling so
-            // resolveCamViewGeometry reads it. Per-target geometry key.
-            persistCamViewGeometry(p, target);
-            try {
-                java.util.Map<String, Object> cvVals = new java.util.HashMap<>();
-                cvVals.put("enabled", true);
-                cvVals.put("mode", mode);
-                cvVals.put("target", target);
-                if (autoHide > 0) cvVals.put("autoHideSec", autoHide);
-                com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(cvVals);
-            } catch (Throwable ignored) {}
-            // EVERY show supersedes any pending retry — including one that goes on to
-            // succeed immediately. A success used to leave an older loop valid, so after a
-            // later blind-spot takeover cleared camViewActive that loop could re-arm the
-            // PREVIOUS camera (or target), resurrecting a view the user had replaced.
-            // startCamViewArmRetry bumps the generation itself, so the deferral paths below
-            // are already covered; this handles the straight-through success path.
-            cancelCamViewArmRetry();
+            JSONObject failedGeo = null;
+            synchronized (camViewShowMutationLock) {
+                showSession = pipeline.noteCamViewShowRequest(null);
+                // Fall back to the PERSISTED autoHideSec when the caller doesn't pass
+                // one. The automation action and every key-mapping binding build their
+                // URL without an autoHide param, so an explicit-query-only read meant
+                // the user's configured auto-hide was ignored on exactly the paths
+                // that matter and the view stayed up forever. 0 (either source) still
+                // means "until explicitly hidden".
+                try { autoHide = com.overdrive.app.config.UnifiedConfigManager.getCamViewAutoHideSec(); }
+                catch (Throwable ignored) {}
+                try { if (p.containsKey("autoHide")) autoHide = Integer.parseInt(p.get("autoHide")); }
+                catch (NumberFormatException ignored) {}
+                // v40 contract: persist the requested rect first, then resolve it from
+                // the same config path the live lane has always used. A non-null return
+                // means the persist FAILED — the requested geometry must then ride this
+                // session as the fail-open override (installed below), or the view
+                // renders at the stale persisted position while this API reports success.
+                failedGeo = persistCamViewGeometry(p, target);
+                try {
+                    java.util.Map<String, Object> cvVals = new java.util.HashMap<>();
+                    cvVals.put("enabled", true);
+                    cvVals.put("mode", mode);
+                    cvVals.put("target", target);
+                    if (autoHide > 0) cvVals.put("autoHideSec", autoHide);
+                    // False-return contract (updateValues): a failed intent persist no
+                    // longer kills the deferred retry (its validity is session-scoped,
+                    // not config-scoped), but leave a trace — the persisted state is
+                    // stale until the next successful show/hide write.
+                    if (!com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(cvVals)) {
+                        CameraDaemon.log("camview show: intent persist returned false"
+                            + " — proceeding (retry is session-scoped), config stale");
+                    }
+                } catch (Throwable ignored) {}
+                // Fail-open contract: when the atomic geometry persist failed, install
+                // the REQUESTED geometry as this session's override so the resolver
+                // renders where the caller asked. Otherwise clear any stale override so
+                // the resolver reads the (fresh) persisted config. The override is
+                // session-scoped — endCamViewSessionLocked clears it on hide/takeover.
+                if (failedGeo != null) {
+                    pipeline.setCamViewGeometryOverride(target, failedGeo);
+                } else {
+                    pipeline.clearCamViewGeometryOverride();
+                }
+            }
             // Cold-start pano if needed (same async dedup as BS). Moved BELOW the intent
             // persist and wired to the SAME retry as the deferral case below: this branch
             // used to return "pano_starting" with the identical never-honoured re-poll
             // contract, so a key press during a cold start was the very same silent
             // no-op. Now the request converges once the pipeline comes up.
             if (!ensurePanoStartedNonBlocking(pipeline)) {
-                startCamViewArmRetry(mode, target, autoHide);
+                startCamViewArmRetry(mode, target, autoHide, showSession);
                 JSONObject pending = new JSONObject();
                 pending.put("success", false); pending.put("starting", true);
                 pending.put("error", "Pipeline starting — retrying");
@@ -587,8 +690,9 @@ public class StreamingApiHandler {
                 HttpResponse.sendJson(out, pending.toString());
                 return true;
             }
+            boolean armed;
             try {
-                pipeline.enableCamView(mode, target, autoHide);
+                armed = pipeline.enableCamView(mode, target, autoHide, showSession);
             } catch (GpuSurveillancePipeline.BlindSpotNotReadyException nr) {
                 // The lane isn't armable YET (pano still cold-starting, or another
                 // program's build is in flight). The contract was "caller must re-poll",
@@ -597,7 +701,7 @@ public class StreamingApiHandler {
                 // nothing at all — silently, with no view, no ✕ and no toast. Since the
                 // request is already persisted above, converge it here on a bounded
                 // background retry so a single fire-and-forget call still lands.
-                startCamViewArmRetry(mode, target, autoHide);
+                startCamViewArmRetry(mode, target, autoHide, showSession);
                 JSONObject pending = new JSONObject();
                 pending.put("success", false); pending.put("starting", true);
                 pending.put("error", "Camera-view lane arming — retrying");
@@ -605,6 +709,18 @@ public class StreamingApiHandler {
                 // Tell callers a retry is already running so they don't need to poll.
                 pending.put("retrying", true);
                 HttpResponse.sendJson(out, pending.toString());
+                return true;
+            }
+            if (!armed) {
+                // This request's session was superseded between the mint above and the
+                // arm (a hide or a newer show won). Report it as CANCELLED — reading
+                // isCamViewActive() here would attribute the NEWER session's state to
+                // this request.
+                JSONObject sup = new JSONObject();
+                sup.put("success", false);
+                sup.put("superseded", true);
+                sup.put("error", "Request superseded by a newer show or hide");
+                HttpResponse.sendJson(out, sup.toString());
                 return true;
             }
             JSONObject r = new JSONObject();
@@ -616,6 +732,13 @@ public class StreamingApiHandler {
             // a valid deferred request from a failed request without polling first.
             r.put("rendering", pipeline.isCamViewRendering());
             r.put("maskedByBlindSpot", pipeline.isCamViewMaskedByBlindSpot());
+            // Honest persistence report: when a geometry was requested but the UCM
+            // write failed, THIS session still renders it (fail-open override), but
+            // the saved position is stale — the next boot/daemon restart resolves the
+            // old rect. Callers that care (settings UI) can re-issue or surface it.
+            if (p.containsKey("preset") || p.containsKey("geometry")) {
+                r.put("geometryPersisted", failedGeo == null);
+            }
             HttpResponse.sendJson(out, r.toString());
             return true;
         }
@@ -775,11 +898,18 @@ public class StreamingApiHandler {
     }
 
     /** Persist camview geometry from the query (preset=sizePct/corner OR
-     *  geometry=x/y/w/h) into the per-target geometry key. No-op if neither given. */
-    private static void persistCamViewGeometry(java.util.Map<String, String> p, String target) {
+     *  geometry=x/y/w/h) into the per-target geometry key. No-op if neither given.
+     *
+     *  @return the requested geometry object when it could NOT be persisted — the
+     *          caller must install it as the session's fail-open override
+     *          ({@code setCamViewGeometryOverride}), or the session silently renders
+     *          the STALE persisted position while the API reports success. Null when
+     *          no geometry was requested, the request was unparseable, or the
+     *          persist succeeded (the resolver then reads the fresh config). */
+    private static JSONObject persistCamViewGeometry(java.util.Map<String, String> p, String target) {
+        String geomKey = "cluster".equals(target) ? "geometryCluster" : "geometry";
+        JSONObject geo = null;
         try {
-            String geomKey = "cluster".equals(target) ? "geometryCluster" : "geometry";
-            JSONObject geo = null;
             if (p.containsKey("preset")) {
                 String[] parts = p.get("preset").split("/");
                 if (parts.length >= 1) {
@@ -826,12 +956,26 @@ public class StreamingApiHandler {
                     if (kept != null) geo.put("corner", kept);
                 }
             }
-            if (geo != null) {
-                com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(
-                    java.util.Collections.singletonMap(geomKey, (Object) geo));
-            }
         } catch (Throwable t) {
-            CameraDaemon.log("persistCamViewGeometry: " + t.getMessage());
+            // Unparseable request — nothing valid to persist OR to fail-open on.
+            CameraDaemon.log("persistCamViewGeometry: parse: " + t.getMessage());
+            return null;
+        }
+        if (geo == null) return null;
+        try {
+            // setCamViewValues reports failure by RETURNING FALSE (updateValues), not
+            // by throwing — a catch-only guard silently swallowed every real persist
+            // failure and the fail-open contract never engaged.
+            boolean ok = com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(
+                java.util.Collections.singletonMap(geomKey, (Object) geo));
+            if (ok) return null;   // persisted — the resolver reads the fresh config
+            CameraDaemon.log("persistCamViewGeometry: persist returned false"
+                + " — caller must fail-open on the requested geometry");
+            return geo;
+        } catch (Throwable t) {
+            CameraDaemon.log("persistCamViewGeometry: persist FAILED (" + t.getMessage()
+                + ") — caller must fail-open on the requested geometry");
+            return geo;
         }
     }
 

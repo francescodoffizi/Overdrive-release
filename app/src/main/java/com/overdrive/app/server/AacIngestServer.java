@@ -13,8 +13,10 @@ import java.net.Socket;
 import java.net.SocketException;
 
 /**
- * Receives AAC frames from the app process (UID 10067) which captures from
- * the cabin mic and AAC-encodes inside StatusOverlayService. The daemon
+ * Receives cabin audio from the app process, which owns AudioRecord because
+ * the daemon cannot. Recording sessions send AAC for muxing; an authenticated
+ * live listener receives bounded PCM fan-out from the same capture.
+ * The daemon
  * (UID 2000 / shell) cannot open AudioRecord directly because BYD's
  * AudioPolicy denies non-app UIDs — see /api/audio/probe-mic-spoof
  * verification — so capture lives app-side and the encoded bitstream is
@@ -46,6 +48,13 @@ import java.net.SocketException;
  *   [N bytes]     AAC AU bytes (no ADTS)
  * </pre>
  *
+ * <h4>msgType=3 (PCM)</h4>
+ * Mono 48 kHz PCM_16LE for the active remote listener.
+ *
+ * <h4>msgType=4 (LISTENER_ONLY)</h4>
+ * Empty marker sent by a listener-only capture. It clears stale recording
+ * audio config from a client this connection replaced.
+ *
  * <h3>Lifecycle</h3>
  * Single-client. A new connection terminates the previous one. The accept
  * loop runs on the thread spawned by CameraDaemon; the per-client read
@@ -73,6 +82,9 @@ public class AacIngestServer implements Runnable {
 
     private static final int MSG_CONFIG = 1;
     private static final int MSG_DATA = 2;
+    private static final int MSG_PCM = 3;
+    private static final int MSG_LISTENER_ONLY = 4;
+    private static final int MAX_PCM_FRAME_BYTES = 8 * 1024;
 
     // Hard cap so a runaway / corrupt client can't allocate 2 GB.
     // 64 KB is far above any reasonable AAC frame at 64 kbps mono.
@@ -359,6 +371,22 @@ public class AacIngestServer implements Runnable {
                     // else: no recording active — drop the packet, the app
                     // should also be checking before encoding, but this is
                     // the canonical gate.
+                } else if (msgType == MSG_PCM) {
+                    if (payloadLength <= 0
+                            || payloadLength > MAX_PCM_FRAME_BYTES
+                            || (payloadLength & 1) != 0) {
+                        logger.warn("Malformed PCM frame — closing");
+                        break;
+                    }
+                    CabinAudioWebSocket.offerPcm(
+                            payloadBuf, 0, payloadLength);
+                } else if (msgType == MSG_LISTENER_ONLY) {
+                    if (payloadLength != 0) {
+                        logger.warn("Malformed LISTENER_ONLY marker — closing");
+                        break;
+                    }
+                    configReceived = false;
+                    clearRecordingConfig();
                 } else {
                     logger.warn("Unknown msgType=" + msgType + " — skipping");
                 }
@@ -377,19 +405,7 @@ public class AacIngestServer implements Runnable {
             // client. If a newer client has already taken over, its
             // CONFIG is live and we must not undo it.
             if (activeClient == myClient) {
-                HardwareEventRecorderGpu enc = currentEncoder();
-                if (enc != null) enc.disableAudioMuxing();
-                // Drop the cached CONFIG on disconnect so the next client
-                // is forced through parseConfig (which sets the cache
-                // fresh). Also reset lastConfiguredEncoder so the new
-                // client's first DATA packet re-applies even if the
-                // encoder identity hasn't changed.
-                cachedCsd0 = null;
-                cachedSampleRate = 0;
-                cachedChannelCount = 0;
-                cachedBitrate = 0;
-                configCachedButNotApplied = false;
-                lastConfiguredEncoder = null;
+                clearRecordingConfig();
                 logger.info("Client disconnected; audio muxing disabled, cache cleared");
             } else {
                 logger.info("Client disconnected; newer client active, leaving muxing alone");
@@ -435,6 +451,17 @@ public class AacIngestServer implements Runnable {
         this.configCachedButNotApplied = false;
         this.lastConfiguredEncoder = enc;
         return true;
+    }
+
+    private void clearRecordingConfig() {
+        HardwareEventRecorderGpu enc = currentEncoder();
+        if (enc != null) enc.disableAudioMuxing();
+        cachedCsd0 = null;
+        cachedSampleRate = 0;
+        cachedChannelCount = 0;
+        cachedBitrate = 0;
+        configCachedButNotApplied = false;
+        lastConfiguredEncoder = null;
     }
 
     private static HardwareEventRecorderGpu currentEncoder() {

@@ -29,7 +29,7 @@ public final class RemoteVoiceBridge implements Closeable {
     }
 
     private static final int ACCEPT_TIMEOUT_MS = 4_500;
-    private static final int HANDSHAKE_TIMEOUT_MS = 2_000;
+    private static final int HANDSHAKE_TIMEOUT_MS = 5_000;
     private static final long SAFETY_REFRESH_MS = 100L;
 
     private final Listener listener;
@@ -40,7 +40,7 @@ public final class RemoteVoiceBridge implements Closeable {
     private DataInputStream controlInput;
     private DataOutputStream audioOutput;
     private Thread controlThread;
-    private long lastSafetyCheckMs;
+    private Thread safetyThread;
     private Boolean lastOverlaySafe;
 
     private RemoteVoiceBridge(ServerSocket serverSocket, Listener listener) {
@@ -96,6 +96,7 @@ public final class RemoteVoiceBridge implements Closeable {
         }
         receiver.setSoTimeout(0);
         sendOverlaySafety(true);
+        startSafetyWatcher();
         startControlReader();
     }
 
@@ -120,33 +121,62 @@ public final class RemoteVoiceBridge implements Closeable {
         if (closed.get()) throw new IOException("Remote voice bridge is closed");
         synchronized (writeLock) {
             RemoteVoiceProtocol.writePcm(audioOutput, pcm);
-            sendOverlaySafety(false);
         }
     }
 
+    private void startSafetyWatcher() {
+        safetyThread = new Thread(() -> {
+            while (!closed.get()) {
+                try {
+                    sendOverlaySafety(false);
+                    Thread.sleep(SAFETY_REFRESH_MS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (IOException error) {
+                    if (!closed.get() && listener != null) {
+                        listener.onReceiverLost(
+                                "The car audio receiver disconnected");
+                    }
+                    break;
+                }
+            }
+        }, "RemoteVoiceSafety");
+        safetyThread.setDaemon(true);
+        safetyThread.start();
+    }
+
     private void sendOverlaySafety(boolean force) throws IOException {
-        long now = System.currentTimeMillis();
-        if (!force && now - lastSafetyCheckMs < SAFETY_REFRESH_MS) return;
-        lastSafetyCheckMs = now;
         boolean safe = VehicleCommunicationSafety.isRemoteVoiceOverlaySafe();
-        if (force || lastOverlaySafe == null || lastOverlaySafe != safe) {
-            RemoteVoiceProtocol.writeOverlaySafe(audioOutput, safe);
-            lastOverlaySafe = safe;
+        synchronized (writeLock) {
+            if (closed.get()) return;
+            if (force || lastOverlaySafe == null || lastOverlaySafe != safe) {
+                RemoteVoiceProtocol.writeOverlaySafe(audioOutput, safe);
+                lastOverlaySafe = safe;
+            }
         }
     }
 
     @Override public void close() {
+        close(false);
+    }
+
+    public void close(boolean drain) {
         if (!closed.compareAndSet(false, true)) return;
         synchronized (writeLock) {
             try {
-                if (audioOutput != null) RemoteVoiceProtocol.writeEnd(audioOutput);
+                if (audioOutput != null) {
+                    RemoteVoiceProtocol.writeEnd(audioOutput, drain);
+                }
             } catch (Throwable ignored) {}
             try { if (receiver != null) receiver.close(); } catch (Throwable ignored) {}
             try { serverSocket.close(); } catch (Throwable ignored) {}
         }
-        RemoteVoiceController.stop();
         if (controlThread != null && controlThread != Thread.currentThread()) {
             controlThread.interrupt();
+        }
+        if (safetyThread != null && safetyThread != Thread.currentThread()) {
+            safetyThread.interrupt();
         }
     }
 }

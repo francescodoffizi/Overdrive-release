@@ -127,7 +127,7 @@ public final class RecordingsIndex {
     //            dedicated Replays tab instead of mixed with dashcam loops.
     //            Migration is a data UPDATE, not a column change — see
     //            createSchema().
-    private static final int SCHEMA_VERSION = 3;
+    private static final int SCHEMA_VERSION = RecordingsIndexSchema.VERSION;
 
     // Singleton — one index per daemon process.
     private static volatile RecordingsIndex INSTANCE;
@@ -198,9 +198,9 @@ public final class RecordingsIndex {
     // playback 404s, and queryStats() counts the dead clip's bytes (inflating
     // the storage card) until the next reconcile, up to an HOUR later.
     //
-    // Fix: remove() records the filename against a monotonically increasing
+    // Fix: remove() records the recording identity against a monotonically increasing
     // sequence. upsert() samples the sequence BEFORE parsing; upsertRow() then
-    // refuses the MERGE if that filename was removed after the sample. Costs one
+    // refuses the MERGE if that identity was removed after the sample. Costs one
     // map lookup under the monitor — no extra stat()/FUSE I/O, which is the
     // whole point of not re-checking File.isFile() here.
     //
@@ -208,9 +208,9 @@ public final class RecordingsIndex {
     // dangerous interleaving is precisely the one where the in-flight upsert
     // hasn't MERGEd yet, so there is no row to delete at that moment.
     //
-    // A tombstone is NOT a permanent block on the filename. The gate is a
+    // A tombstone is NOT a permanent block on the identity. The gate is a
     // strict `removedAt > seqSampled`, so it only rejects parses that STARTED
-    // BEFORE the removal. A genuine later re-add of the same name (manual replay
+    // BEFORE the removal. A genuine later re-add of the same path (manual replay
     // re-record, a restored file, reconcile finding it back on disk) samples a
     // sequence at or after the tombstone and proceeds normally. That is why this
     // is a sequence comparison and not a "was it ever deleted" set.
@@ -233,20 +233,20 @@ public final class RecordingsIndex {
         return removalSeq;
     }
 
-    /** Record that {@code filename} was removed, and prune old entries. */
-    private void noteRemoval(String filename) {
-        removalTombstones.put(filename, ++removalSeq);
+    /** Record that {@code recordingId} was removed, and prune old entries. */
+    private void noteRemoval(String recordingId) {
+        removalTombstones.put(recordingId, ++removalSeq);
         if (removalTombstones.size() > TOMBSTONE_SOFT_CAP) {
             long cutoff = removalSeq - TOMBSTONE_KEEP;
             removalTombstones.entrySet().removeIf(e -> e.getValue() <= cutoff);
         }
     }
 
-    /** True when {@code filename} was removed after {@code seqSampled}, i.e. a
+    /** True when {@code recordingId} was removed after {@code seqSampled}, i.e. a
      *  delete landed while the caller was parsing and its Row is now stale. */
-    private boolean removedSince(String filename, long seqSampled) {
+    private boolean removedSince(String recordingId, long seqSampled) {
         if (seqSampled == NO_REMOVAL_GATE) return false;
-        Long removedAt = removalTombstones.get(filename);
+        Long removedAt = removalTombstones.get(recordingId);
         return removedAt != null && removedAt > seqSampled;
     }
 
@@ -758,101 +758,8 @@ public final class RecordingsIndex {
     }
 
     private void createSchema() throws Exception {
-        try (Statement stmt = connection.createStatement()) {
-            stmt.execute(
-                "CREATE TABLE IF NOT EXISTS recordings (" +
-                "  filename        VARCHAR(256) PRIMARY KEY," +
-                "  abs_path        VARCHAR(512) NOT NULL," +
-                "  type            VARCHAR(16) NOT NULL," +
-                "  camera_id       INT DEFAULT 0," +
-                "  ts_ms           BIGINT NOT NULL," +
-                "  size_bytes      BIGINT NOT NULL DEFAULT 0," +
-                "  mp4_mtime       BIGINT NOT NULL DEFAULT 0," +
-                "  sidecar_mtime   BIGINT NOT NULL DEFAULT 0," +
-                "  schema_version  INT DEFAULT 0," +
-                // Sidecar denorm — filterable columns
-                "  peak_severity   VARCHAR(16)," +
-                "  peak_proximity  VARCHAR(16)," +
-                "  person_count    INT DEFAULT 0," +
-                "  vehicle_count   INT DEFAULT 0," +
-                "  bike_count      INT DEFAULT 0," +
-                "  animal_count    INT DEFAULT 0," +
-                "  hero_thumb      VARCHAR(256)," +
-                "  actor_classes   VARCHAR(256)," +   // CSV lowercase
-                "  place_short     VARCHAR(128)," +
-                "  place_medium    VARCHAR(192)," +
-                "  place_display   VARCHAR(256)," +
-                "  place_country   VARCHAR(8)," +
-                "  place_source    VARCHAR(32)," +
-                "  start_lat       DOUBLE," +
-                "  start_lng       DOUBLE," +
-                // Date-bucket helpers, populated at insert time so the
-                // /api/recordings/dates and /api/recordings GROUP-BY
-                // queries can hit a covering index instead of recomputing
-                // the date string per row.
-                "  ymd             VARCHAR(10)," +    // "yyyy-MM-dd" local
-                // Physical volume the clip lives on: "INTERNAL" / "SD_CARD" /
-                // "USB", classified from abs_path at index time. NULL on rows
-                // written before v2 (the storage filter treats NULL via the
-                // path-derivation fallback in rowToJson). Appended LAST so the
-                // upsert MERGE's positional VALUES list stays append-only.
-                "  storage         VARCHAR(16)" +
-                ")"
-            );
-
-            // v1 → v2 migration for DBs created before the `storage` column
-            // existed. ADD COLUMN IF NOT EXISTS is a no-op on a fresh v2 table
-            // (the CREATE above already has it) and additive on an old v1 file,
-            // so this is safe to run unconditionally on every open. Existing
-            // rows get storage=NULL and are backfilled lazily by reconcile()/
-            // upsert as files are re-touched; rowToJson also derives the tag
-            // from the path when the column is NULL, so the UI never shows a
-            // blank badge for a legacy row.
-            stmt.execute("ALTER TABLE recordings ADD COLUMN IF NOT EXISTS storage VARCHAR(16)");
-
-            // v2 → v3 migration: retype existing replay_* rows from 'normal'
-            // to 'replay'. Idempotent (the predicate excludes already-migrated
-            // rows) and cheap at the ~1000-row scale, so it runs on every
-            // open like the ADD COLUMN above. ESCAPE pins the underscore as a
-            // literal — without it '_' is the single-char wildcard and a
-            // hypothetical 'replayX...' name would be swept in too.
-            stmt.execute("UPDATE recordings SET type = 'replay'"
-                    + " WHERE type <> 'replay'"
-                    + " AND filename LIKE 'replay\\_%' ESCAPE '\\'");
-            // Rows moved between type buckets — drop any queryStats() memo
-            // carried across a reopen (this runs on every open, including the
-            // mid-session reconnect path).
-            invalidateStatsCache();
-
-            // Indexes — covering most common access patterns.
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_rec_ts ON recordings(ts_ms DESC)");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_rec_type_ts ON recordings(type, ts_ms DESC)");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_rec_ymd ON recordings(ymd)");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_rec_place ON recordings(place_short)");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_rec_country ON recordings(place_country)");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_rec_severity ON recordings(peak_severity)");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_rec_storage ON recordings(storage)");
-
-            // Schema version table — for future migrations.
-            //
-            // Column is `meta_key`, not `key`. H2 2.2.x (build 224) promoted
-            // KEY to a reserved word — it's now part of MERGE's `KEY(...)`
-            // grammar — and rejects bare `key` as a column identifier with
-            // "expected identifier" at parse time. The whole index init
-            // bails on this CREATE, the ctor returns false, and the
-            // recordings API silently falls back to direct-FS scanning
-            // (no thumbnails, no place chips, no warming counters). Use a
-            // non-reserved name and a quoted constraint identifier to
-            // avoid the same trap with KEY in MERGE.
-            stmt.execute(
-                "CREATE TABLE IF NOT EXISTS recordings_meta (" +
-                "  meta_key VARCHAR(64) PRIMARY KEY," +
-                "  meta_value VARCHAR(256)" +
-                ")"
-            );
-            stmt.execute("MERGE INTO recordings_meta KEY(meta_key) VALUES('schema_version', '"
-                    + SCHEMA_VERSION + "')");
-        }
+        RecordingsIndexSchema.ensure(connection);
+        invalidateStatsCache();
     }
 
     // =================================================================
@@ -928,7 +835,7 @@ public final class RecordingsIndex {
         // A delete landed while the caller was parsing: the file is already gone
         // from disk, so MERGEing this Row would create a ghost row that 404s on
         // playback and inflates the storage card until the next reconcile.
-        if (removedSince(row.filename, seqSampled)) {
+        if (removedSince(row.recordingId, seqSampled)) {
             logger.debug("upsertRow: dropping stale row for removed " + row.filename);
             return false;
         }
@@ -939,35 +846,47 @@ public final class RecordingsIndex {
         final Row r = row;
         return withRetry("upsertRow(" + row.filename + ")", Boolean.FALSE, () -> {
             String sql =
-                "MERGE INTO recordings KEY(filename) VALUES (" +
-                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "MERGE INTO recordings (recording_id, filename, abs_path, root_id, volume_id,"
+                + " relative_path, root_rank, is_available, type, camera_id, ts_ms, size_bytes,"
+                + " mp4_mtime, sidecar_mtime, schema_version, peak_severity, peak_proximity,"
+                + " person_count, vehicle_count, bike_count, animal_count, hero_thumb,"
+                + " actor_classes, place_short, place_medium, place_display, place_country,"
+                + " place_source, start_lat, start_lng, ymd, storage) KEY(recording_id) VALUES ("
+                + "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                + " ?, ?, ?, ?, ?, ?, ?, ?)";
             try (PreparedStatement ps = connection.prepareStatement(sql)) {
-                ps.setString(1, r.filename);
-                ps.setString(2, r.absPath);
-                ps.setString(3, r.type);
-                ps.setInt(4, r.cameraId);
-                ps.setLong(5, r.tsMs);
-                ps.setLong(6, r.sizeBytes);
-                ps.setLong(7, r.mp4Mtime);
-                ps.setLong(8, r.sidecarMtime);
-                ps.setInt(9, r.schemaVersion);
-                setNullableString(ps, 10, r.peakSeverity);
-                setNullableString(ps, 11, r.peakProximity);
-                ps.setInt(12, r.personCount);
-                ps.setInt(13, r.vehicleCount);
-                ps.setInt(14, r.bikeCount);
-                ps.setInt(15, r.animalCount);
-                setNullableString(ps, 16, r.heroThumb);
-                setNullableString(ps, 17, r.actorClasses);
-                setNullableString(ps, 18, r.placeShort);
-                setNullableString(ps, 19, r.placeMedium);
-                setNullableString(ps, 20, r.placeDisplay);
-                setNullableString(ps, 21, r.placeCountry);
-                setNullableString(ps, 22, r.placeSource);
-                setNullableDouble(ps, 23, r.startLat);
-                setNullableDouble(ps, 24, r.startLng);
-                ps.setString(25, r.ymd);
-                setNullableString(ps, 26, r.storage);
+                ps.setString(1, r.recordingId);
+                ps.setString(2, r.filename);
+                ps.setString(3, r.absPath);
+                ps.setString(4, r.rootId);
+                ps.setString(5, r.volumeId);
+                ps.setString(6, r.relativePath);
+                ps.setInt(7, r.rootRank);
+                ps.setBoolean(8, true);
+                ps.setString(9, r.type);
+                ps.setInt(10, r.cameraId);
+                ps.setLong(11, r.tsMs);
+                ps.setLong(12, r.sizeBytes);
+                ps.setLong(13, r.mp4Mtime);
+                ps.setLong(14, r.sidecarMtime);
+                ps.setInt(15, r.schemaVersion);
+                setNullableString(ps, 16, r.peakSeverity);
+                setNullableString(ps, 17, r.peakProximity);
+                ps.setInt(18, r.personCount);
+                ps.setInt(19, r.vehicleCount);
+                ps.setInt(20, r.bikeCount);
+                ps.setInt(21, r.animalCount);
+                setNullableString(ps, 22, r.heroThumb);
+                setNullableString(ps, 23, r.actorClasses);
+                setNullableString(ps, 24, r.placeShort);
+                setNullableString(ps, 25, r.placeMedium);
+                setNullableString(ps, 26, r.placeDisplay);
+                setNullableString(ps, 27, r.placeCountry);
+                setNullableString(ps, 28, r.placeSource);
+                setNullableDouble(ps, 29, r.startLat);
+                setNullableDouble(ps, 30, r.startLng);
+                ps.setString(31, r.ymd);
+                setNullableString(ps, 32, r.storage);
                 ps.executeUpdate();
                 invalidateStatsCache();   // row counts/bytes changed
                 return Boolean.TRUE;
@@ -1051,20 +970,33 @@ public final class RecordingsIndex {
      */
     public synchronized boolean remove(String filename) {
         if (filename == null || filename.isEmpty()) return false;
-        // Tombstone FIRST, and unconditionally — before the DELETE and
-        // regardless of how many rows it affects. An upsert() that is mid-parse
-        // for this file hasn't MERGEd yet, so the DELETE below will report 0
-        // rows; recording the removal is what stops that in-flight upsert from
-        // resurrecting the row once it wakes. See the tombstone block above.
-        noteRemoval(filename);
-        // Same reconnect+retry rationale as upsertRow: a dropped DELETE
-        // leaves a ghost row pointing at a file the cleaner already removed,
-        // and playback then 404s.
         final String name = filename;
-        return withRetry("remove(" + filename + ")", Boolean.FALSE, () -> {
+        String recordingId = withRetry("resolve legacy remove(" + filename + ")", null, () -> {
             try (PreparedStatement ps = connection.prepareStatement(
-                    "DELETE FROM recordings WHERE filename = ?")) {
+                    "SELECT recording_id FROM recordings WHERE filename = ?"
+                            + " ORDER BY is_available DESC, root_rank ASC, ts_ms DESC LIMIT 1")) {
                 ps.setString(1, name);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getString(1) : null;
+                }
+            }
+        });
+        return recordingId != null && removeById(recordingId);
+    }
+
+    public boolean removeByPath(String absolutePath) {
+        if (absolutePath == null || absolutePath.isEmpty()) return false;
+        return removeById(RecordingIdentity.fromPath(absolutePath).recordingId);
+    }
+
+    public synchronized boolean removeById(String recordingId) {
+        if (recordingId == null || recordingId.isEmpty()) return false;
+        noteRemoval(recordingId);
+        final String id = recordingId;
+        return withRetry("removeById(" + recordingId + ")", Boolean.FALSE, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "DELETE FROM recordings WHERE recording_id = ?")) {
+                ps.setString(1, id);
                 boolean deleted = ps.executeUpdate() > 0;
                 if (deleted) invalidateStatsCache();
                 return deleted;
@@ -1092,11 +1024,13 @@ public final class RecordingsIndex {
     public synchronized int countRowsUnderRoots(List<String> roots) {
         if (roots == null || roots.isEmpty()) return -1;
         if (!isAvailable()) return -1;
-        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM recordings WHERE ");
+        StringBuilder sql = new StringBuilder(
+                "SELECT COUNT(*) FROM recordings WHERE is_available = TRUE AND (");
         for (int i = 0; i < roots.size(); i++) {
             if (i > 0) sql.append(" OR ");
             sql.append("abs_path LIKE ?");
         }
+        sql.append(')');
         final String query = sql.toString();
         final List<String> params = roots;
         Integer count = withRetry("countRowsUnderRoots", null, () -> {
@@ -1129,6 +1063,77 @@ public final class RecordingsIndex {
                 }
             }
         });
+    }
+
+    public synchronized boolean containsPath(String absolutePath) {
+        if (absolutePath == null) return false;
+        final String id = RecordingIdentity.fromPath(absolutePath).recordingId;
+        return withRetry("containsPath", Boolean.FALSE, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT 1 FROM recordings WHERE recording_id = ? LIMIT 1")) {
+                ps.setString(1, id);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next();
+                }
+            }
+        });
+    }
+
+    public static final class RecordingRef {
+        public final String id;
+        public final String filename;
+        public final String absolutePath;
+        public final String heroThumbnail;
+
+        RecordingRef(String id, String filename, String absolutePath, String heroThumbnail) {
+            this.id = id;
+            this.filename = filename;
+            this.absolutePath = absolutePath;
+            this.heroThumbnail = heroThumbnail;
+        }
+
+        public File file() {
+            return new File(absolutePath);
+        }
+    }
+
+    public synchronized RecordingRef resolveById(String recordingId) {
+        if (recordingId == null || recordingId.isEmpty()) return null;
+        final String id = recordingId;
+        return withRetry("resolveById", null, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT recording_id, filename, abs_path, hero_thumb FROM recordings"
+                            + " WHERE recording_id = ? AND is_available = TRUE LIMIT 1")) {
+                ps.setString(1, id);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? recordingRef(rs) : null;
+                }
+            }
+        });
+    }
+
+    public synchronized RecordingRef resolveByFilename(String filename) {
+        if (filename == null || filename.isEmpty()) return null;
+        final String name = filename;
+        return withRetry("resolveByFilename", null, () -> {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT recording_id, filename, abs_path, hero_thumb FROM recordings"
+                            + " WHERE filename = ? AND is_available = TRUE"
+                            + " ORDER BY root_rank ASC, ts_ms DESC LIMIT 1")) {
+                ps.setString(1, name);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? recordingRef(rs) : null;
+                }
+            }
+        });
+    }
+
+    private static RecordingRef recordingRef(ResultSet rs) throws Exception {
+        return new RecordingRef(
+                rs.getString("recording_id"),
+                rs.getString("filename"),
+                rs.getString("abs_path"),
+                rs.getString("hero_thumb"));
     }
 
     // =================================================================
@@ -1220,7 +1225,7 @@ public final class RecordingsIndex {
     private synchronized int countIndexedRows() {
         return withRetry("countIndexedRows", -1, () -> {
             try (PreparedStatement ps = connection.prepareStatement(
-                    "SELECT COUNT(*) FROM recordings");
+                    "SELECT COUNT(*) FROM recordings WHERE is_available = TRUE");
                  ResultSet rs = ps.executeQuery()) {
                 return rs.next() ? rs.getInt(1) : 0;
             }
@@ -1230,15 +1235,16 @@ public final class RecordingsIndex {
     /**
      * Cheap on-disk file count across all recordings/surveillance/proximity
      * dirs. Uses {@link StorageManager#listMp4Files} (FUSE shell-fallback
-     * compatible). Names are deduped so mirror dirs don't double-count.
+     * compatible). Recording identities are deduped so path aliases don't
+     * double-count.
      */
     private int countDiskFiles() {
         StorageManager sm = StorageManager.getInstance();
-        Set<String> names = new HashSet<>();
-        scanDirNames(names, sm.getAllRecordingsDirs());
-        scanDirNames(names, sm.getAllSurveillanceDirs());
-        scanDirNames(names, sm.getAllProximityDirs());
-        return names.size();
+        Set<String> ids = new HashSet<>();
+        scanDirNames(ids, sm.getAllRecordingsDirs());
+        scanDirNames(ids, sm.getAllSurveillanceDirs());
+        scanDirNames(ids, sm.getAllProximityDirs());
+        return ids.size();
     }
 
     private synchronized void persistWarmupComplete() {
@@ -1291,11 +1297,12 @@ public final class RecordingsIndex {
         addDirFiles(entries, sm.getAllSurveillanceDirs(), null);
         addDirFiles(entries, sm.getAllProximityDirs(), null);
 
-        // Dedup by filename (mirror dirs hold the same .mp4).
+        // Dedup by row identity. Equal filenames on different volumes remain
+        // distinct; repeated references to the same root/path collapse.
         Set<String> seen = new HashSet<>(entries.size() * 2);
         List<File> unique = new ArrayList<>(entries.size());
         for (DirEntry e : entries) {
-            if (seen.add(e.file.getName())) unique.add(e.file);
+            if (seen.add(RecordingIdentity.fromFile(e.file).recordingId)) unique.add(e.file);
         }
 
         warmupTotal.set(unique.size());
@@ -1475,7 +1482,7 @@ public final class RecordingsIndex {
         long t0 = System.currentTimeMillis();
         StorageManager sm = StorageManager.getInstance();
 
-          // Three-phase walk: index snapshot → drop missing → upsert new/changed.
+        // Three-phase walk: index snapshot -> drop missing -> upsert new/changed.
         // The SELECT enumerate is synchronized so the snapshot is
         // consistent. The per-row remove()/upsert() calls re-acquire the
           // monitor themselves; filesystem fingerprinting stays outside that
@@ -1505,12 +1512,14 @@ public final class RecordingsIndex {
             indexFiles = withRetry("reconcile: index enumerate", null, () -> {
                 Map<String, IndexedFileState> rows = new HashMap<>();
                 try (PreparedStatement ps = connection.prepareStatement(
-                        "SELECT filename, abs_path, size_bytes, mp4_mtime, sidecar_mtime"
+                        "SELECT recording_id, root_id, abs_path, size_bytes,"
+                            + " mp4_mtime, sidecar_mtime"
                                 + " FROM recordings");
                      ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         rows.put(rs.getString(1), new IndexedFileState(
-                                rs.getString(2), rs.getLong(3), rs.getLong(4), rs.getLong(5)));
+                            rs.getString(2), rs.getString(3), rs.getLong(4),
+                            rs.getLong(5), rs.getLong(6)));
                     }
                 }
                 return rows;
@@ -1524,57 +1533,30 @@ public final class RecordingsIndex {
             return;
         }
 
-        // Disk scan. authoritativeRoots collects the directories whose
-        // enumeration provably completed (Java listFiles() non-null, or shell
-        // ls drained fully with exit 0) — only THOSE directories' contents are
-        // ground truth for Phase 2's removals. A dir that is missing (volume
-        // unmounted), listed partially (shell timeout), or failed to list
-        // never lands in the set, so its rows are retained. This is both the
-        // partial-listing safety fix and the offline-volume model: an
-        // unmounted SD/USB volume's dirs drop out of getAll*Dirs() (or fail
-        // exists()), its rows survive reconcile, and they rejoin the live set
-        // when the volume remounts — instead of being mass-pruned on the
-        // first reconcile that runs while the card is offline.
+        List<RootScan> rootScans = scanRoots(sm);
         Map<String, RecordingFileFingerprint> diskFiles = new LinkedHashMap<>();
-        Set<String> authoritativeRoots = new HashSet<>();
-        Set<String> observedNames = new HashSet<>();
-        scanDirFiles(diskFiles, sm.getAllRecordingsDirs(), authoritativeRoots, observedNames);
-        scanDirFiles(diskFiles, sm.getAllSurveillanceDirs(), authoritativeRoots, observedNames);
-        scanDirFiles(diskFiles, sm.getAllProximityDirs(), authoritativeRoots, observedNames);
+        for (RootScan root : rootScans) {
+            diskFiles.putAll(root.files);
+        }
 
-        // Phase 2: drop rows whose file is gone. remove() takes the
-        // monitor per call; that's fine — we want short critical sections
-        // here so query threads can interleave.
-        //
-        // A row is prunable ONLY when its absence is PROVEN: its abs_path
-        // places it under a directory whose listing this pass was
-        // authoritative, AND no complete listing anywhere observed its
-        // filename (observedNames is raw listing output — see scanDirFiles
-        // for why pruning must not depend on the post-listing isFile()/size
-        // syscalls that feed diskFiles). Rows with a missing/empty abs_path
-        // can't be attributed to any scanned directory, so they are never
-        // pruned here (a later upsert repairs abs_path when the file is seen
-        // again).
-        int retainedUnverifiable = 0;
-        for (Map.Entry<String, IndexedFileState> e : indexFiles.entrySet()) {
-            if (diskFiles.containsKey(e.getKey())) continue;
-            if (observedNames.contains(e.getKey())) continue;  // listing saw it — not prunable
-            if (!isUnderAuthoritativeRoot(e.getValue().absolutePath, authoritativeRoots)) {
-                retainedUnverifiable++;
-                continue;
+        applyRootAvailability(rootScans);
+
+        Map<String, RootScan> scansByRoot = new HashMap<>();
+        for (RootScan scan : rootScans) scansByRoot.put(scan.rootId, scan);
+
+        // Phase 2: delete only after a complete scan of an available root.
+        // A raw directory entry counts as discovered even if a follow-up stat
+        // fails because the volume disappears mid-scan.
+        for (Map.Entry<String, IndexedFileState> indexedEntry : indexFiles.entrySet()) {
+            RootScan root = scansByRoot.get(indexedEntry.getValue().rootId);
+            if (root != null && RecordingReconcilePolicy.shouldDeleteMissingRow(
+                    root.available, root.complete,
+                    root.observedIds.contains(indexedEntry.getKey()))) {
+                if (removeById(indexedEntry.getKey())) removed++;
             }
-            if (remove(e.getKey())) removed++;
-        }
-        if (retainedUnverifiable > 0) {
-            logger.info("Reconcile: retained " + retainedUnverifiable
-                    + " row(s) not covered by an authoritative directory listing"
-                    + " (offline volume, partial/failed listing, or missing abs_path)"
-                    + " — not pruning");
         }
 
-        // Phase 3: parse only new or fingerprint-changed files. Active-first
-        // map insertion also repairs abs_path when the same filename moved
-        // between roots or volumes.
+        // Phase 3: parse only new or fingerprint-changed files.
         for (Map.Entry<String, RecordingFileFingerprint> entry : diskFiles.entrySet()) {
             RecordingFileFingerprint fingerprint = entry.getValue();
             IndexedFileState indexed = indexFiles.get(entry.getKey());
@@ -1605,13 +1587,15 @@ public final class RecordingsIndex {
     }
 
     private static final class IndexedFileState {
+        final String rootId;
         final String absolutePath;
         final long sizeBytes;
         final long mp4Mtime;
         final long sidecarMtime;
 
-        IndexedFileState(String absolutePath, long sizeBytes,
+        IndexedFileState(String rootId, String absolutePath, long sizeBytes,
                          long mp4Mtime, long sidecarMtime) {
+            this.rootId = rootId;
             this.absolutePath = absolutePath;
             this.sizeBytes = sizeBytes;
             this.mp4Mtime = mp4Mtime;
@@ -1619,60 +1603,71 @@ public final class RecordingsIndex {
         }
     }
 
-    /**
-     * Scan {@code dirs} into {@code out}, recording in
-     * {@code authoritativeRoots} the absolute path of every directory whose
-     * enumeration was COMPLETE (see {@link StorageManager.DirListing}), and
-     * in {@code observedNames} every filename such a complete listing
-     * CONTAINED — recorded straight off the listing, BEFORE the per-file
-     * isFile()/size filters below.
-     *
-     * <p>That ordering is the point (audit finding: destructive mid-scan
-     * pruning): the per-file checks are separate syscalls made AFTER the
-     * listing. If the volume drops between the two, every isFile() fails and
-     * {@code out} ends up empty while the root is already marked
-     * authoritative — and Phase 2 would prune every row under it. Pruning
-     * therefore keys off {@code observedNames} (pure listing output, no
-     * post-listing syscalls): a file the listing SAW is never prunable this
-     * pass, however its follow-up stat calls fared. The fingerprints in
-     * {@code out} are used only for the additive upsert path, where acting
-     * on a filtered/partial view merely under-adds and self-corrects.
-     *
-     * <p>The files of an incomplete listing are still collected into
-     * {@code out} for the same additive reason — but the directory is not
-     * authoritative, so Phase 2 will not prune its rows.
-     */
-    private void scanDirFiles(Map<String, RecordingFileFingerprint> out, List<File> dirs,
-                              Set<String> authoritativeRoots, Set<String> observedNames) {
-        StorageManager sm = StorageManager.getInstance();
-        for (File dir : dirs) {
-            if (dir == null) continue;
-            StorageManager.DirListing listing = sm.listMp4FilesChecked(dir);
-            if (listing.complete) {
-                authoritativeRoots.add(dir.getAbsolutePath());
-                for (File file : listing.files) {
-                    observedNames.add(file.getName());
-                }
-            }
-            for (File file : listing.files) {
-                if (!file.isFile() || out.containsKey(file.getName())) continue;
-                RecordingFileFingerprint fingerprint = RecordingFileFingerprint.from(file);
-                if (fingerprint.sizeBytes > 0) out.put(file.getName(), fingerprint);
-            }
+    private static final class RootScan {
+        final String rootId;
+        final int rank;
+        final boolean available;
+        final boolean complete;
+        final Set<String> observedIds = new HashSet<>();
+        final Map<String, RecordingFileFingerprint> files = new LinkedHashMap<>();
+
+        RootScan(String rootId, int rank, boolean available, boolean complete) {
+            this.rootId = rootId;
+            this.rank = rank;
+            this.available = available;
+            this.complete = complete;
         }
     }
 
-    /**
-     * True when {@code absPath} sits directly under one of the directories
-     * whose listing this reconcile pass was authoritative. Null/empty
-     * abs_path is never covered (non-prunable by construction).
-     */
-    private static boolean isUnderAuthoritativeRoot(String absPath, Set<String> roots) {
-        if (absPath == null || absPath.isEmpty()) return false;
-        for (String root : roots) {
-            if (absPath.startsWith(root + "/")) return true;
+    private List<RootScan> scanRoots(StorageManager sm) {
+        List<File> roots = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (List<File> category : java.util.Arrays.asList(
+                sm.getAllRecordingsDirs(), sm.getAllSurveillanceDirs(), sm.getAllProximityDirs())) {
+            for (File root : category) {
+                if (root != null && seen.add(root.getAbsolutePath())) roots.add(root);
+            }
         }
-        return false;
+
+        List<RootScan> scans = new ArrayList<>(roots.size());
+        for (int rank = 0; rank < roots.size(); rank++) {
+            File root = roots.get(rank);
+            StorageManager.Mp4Listing listing = sm.listMp4FilesWithStatus(root);
+            RootScan scan = new RootScan(
+                    RecordingIdentity.rootIdFor(root), rank, listing.available, listing.complete);
+            for (File file : listing.files) {
+                RecordingIdentity identity = RecordingIdentity.fromFile(file);
+                scan.observedIds.add(identity.recordingId);
+                if (!file.isFile()) continue;
+                RecordingFileFingerprint fingerprint = RecordingFileFingerprint.from(file);
+                if (fingerprint.sizeBytes > 0) {
+                    scan.files.put(fingerprint.recordingId, fingerprint);
+                }
+            }
+            scans.add(scan);
+        }
+        return scans;
+    }
+
+    private synchronized void applyRootAvailability(List<RootScan> scans) {
+        withRetry("reconcile: root availability", Boolean.FALSE, () -> {
+            try (PreparedStatement offline = connection.prepareStatement(
+                    "UPDATE recordings SET is_available = FALSE")) {
+                offline.executeUpdate();
+            }
+            try (PreparedStatement online = connection.prepareStatement(
+                    "UPDATE recordings SET is_available = TRUE, root_rank = ? WHERE root_id = ?")) {
+                for (RootScan scan : scans) {
+                    if (!scan.available) continue;
+                    online.setInt(1, scan.rank);
+                    online.setString(2, scan.rootId);
+                    online.addBatch();
+                }
+                online.executeBatch();
+            }
+            invalidateStatsCache();
+            return Boolean.TRUE;
+        });
     }
 
     private void scanDirNames(Set<String> out, List<File> dirs) {
@@ -1683,7 +1678,9 @@ public final class RecordingsIndex {
             // shell ls when listFiles() returns null on SD-card mounts.
             File[] files = sm.listMp4Files(dir);
             for (File f : files) {
-                if (f.isFile() && f.length() > 0) out.add(f.getName());
+                if (f.isFile() && f.length() > 0) {
+                    out.add(RecordingIdentity.fromFile(f).recordingId);
+                }
             }
         }
     }
@@ -1766,7 +1763,7 @@ public final class RecordingsIndex {
 
         String sql = "SELECT * FROM recordings"
                 + (where.length() > 0 ? " WHERE " + where : "")
-                + " ORDER BY ts_ms DESC"
+            + " ORDER BY ts_ms DESC, root_rank ASC"
                 + " LIMIT ? OFFSET ?";
 
         // The result list is built INSIDE the body so a reconnect-retry
@@ -1855,7 +1852,7 @@ public final class RecordingsIndex {
         String sql =
             "SELECT ymd, COUNT(*) AS c, "
             + " MAX(CASE WHEN type = 'sentry' THEN 1 ELSE 0 END) AS hasSentry"
-            + " FROM recordings WHERE ymd IS NOT NULL GROUP BY ymd";
+            + " FROM recordings WHERE is_available = TRUE AND ymd IS NOT NULL GROUP BY ymd";
         return withRetry("queryDates", new ArrayList<DateBucket>(), () -> {
             List<DateBucket> out = new ArrayList<>();
             try (PreparedStatement ps = connection.prepareStatement(sql);
@@ -1872,9 +1869,39 @@ public final class RecordingsIndex {
         });
     }
 
+    // Package-visible for RecordingsIndexStatsDedupTest.
+    //
+    // DEDUP (audit finding): the table stores one row PER PHYSICAL COPY — a
+    // clip mirrored on internal + SD has two rows (root_rank disambiguates,
+    // see resolveByFilename) — but retention deduplicates by FILENAME
+    // (StorageManager.getDirectoriesTotalSize's seen-set), so a raw physical
+    // SUM here over-reports usage vs what the reaper actually enforces and
+    // the storage card lies whenever a clip is mirrored. Count each available
+    // filename ONCE, preferring the lowest root_rank (ties broken by
+    // recording_id for determinism) — the same representative
+    // resolveByFilename serves. The NOT EXISTS anti-join probes are served by
+    // idx_rec_filename_rank (filename, is_available, root_rank, ...), and the
+    // result is memoized by cachedStats, so the scan cost is paid once per
+    // table mutation, not once per poll.
+    static final String STATS_SQL =
+        "SELECT type,"
+        + "  COUNT(*) AS c,"
+        + "  COALESCE(SUM(size_bytes), 0) AS bytes,"
+        + "  SUM(CASE WHEN ts_ms >= ? THEN 1 ELSE 0 END) AS todayC"
+        + " FROM recordings r WHERE is_available = TRUE"
+        + " AND NOT EXISTS ("
+        + "   SELECT 1 FROM recordings d"
+        + "   WHERE d.filename = r.filename AND d.is_available = TRUE"
+        + "     AND (d.root_rank < r.root_rank"
+        + "          OR (d.root_rank = r.root_rank AND d.recording_id < r.recording_id))"
+        + " )"
+        + " GROUP BY type";
+
     /**
      * Per-type aggregate stats: count, total bytes, count-from-today.
      * Used by /api/recordings/stats and the native fragment header.
+     * Mirrored clips (same filename on multiple volumes) count once — see
+     * {@link #STATS_SQL}.
      */
     public synchronized Stats queryStats() {
         long todayStart = startOfTodayMillis();
@@ -1884,12 +1911,7 @@ public final class RecordingsIndex {
         if (cachedStats != null && cachedStatsTodayStart == todayStart) {
             return cachedStats.copy();
         }
-        String sql =
-            "SELECT type,"
-            + "  COUNT(*) AS c,"
-            + "  COALESCE(SUM(size_bytes), 0) AS bytes,"
-            + "  SUM(CASE WHEN ts_ms >= ? THEN 1 ELSE 0 END) AS todayC"
-            + " FROM recordings GROUP BY type";
+        String sql = STATS_SQL;
         // Stats is accumulated with += for the normal/oemDashcam fold, so a
         // fresh instance MUST be allocated inside the body — reusing one
         // across a reconnect-retry would double-count the dashcam bucket.
@@ -1938,6 +1960,7 @@ public final class RecordingsIndex {
     // =================================================================
 
     private static void buildWhere(Filter f, StringBuilder where, List<Object> args) {
+        appendAnd(where, "is_available = TRUE");
         if (f == null) return;
         if (f.types != null && !f.types.isEmpty()) {
             // Multi-type path: literal IN(...) — caller is explicit about
@@ -2106,6 +2129,12 @@ public final class RecordingsIndex {
     private static Row parse(File mp4) {
         String name = mp4.getName();
         Row r = new Row();
+        RecordingIdentity identity = RecordingIdentity.fromFile(mp4);
+        r.recordingId = identity.recordingId;
+        r.rootId = identity.rootId;
+        r.volumeId = identity.volumeId;
+        r.relativePath = identity.relativePath;
+        r.rootRank = 100;
         r.filename = name;
         r.absPath = mp4.getAbsolutePath();
         r.sizeBytes = mp4.length();
@@ -2116,8 +2145,10 @@ public final class RecordingsIndex {
         // failure leaves storage NULL and rowToJson falls back to deriving the
         // tag from the path at read time, so the row is never dropped.
         try {
-            r.storage = com.overdrive.app.storage.StorageManager
-                    .getInstance().classifyStorageForPath(r.absPath);
+            com.overdrive.app.storage.StorageManager storageManager =
+                    com.overdrive.app.storage.StorageManager.getInstance();
+            r.storage = storageManager.classifyStorageForPath(r.absPath);
+            r.rootRank = storageManager.getRecordingRootRank(mp4);
         } catch (Throwable ignored) {
             r.storage = null;
         }
@@ -2305,11 +2336,15 @@ public final class RecordingsIndex {
      */
     private static JSONObject rowToJson(ResultSet rs) throws Exception {
         JSONObject rec = new JSONObject();
+        rec.put("id", rs.getString("recording_id"));
         String name = rs.getString("filename");
         long ts = rs.getLong("ts_ms");
         rec.put("filename", name);
         String absPath = rs.getString("abs_path");
         rec.put("path", absPath);
+        rec.put("available", rs.getBoolean("is_available"));
+        rec.put("volumeId", rs.getString("volume_id"));
+        rec.put("rootId", rs.getString("root_id"));
         // Per-clip storage tag (INTERNAL / SD_CARD / USB). Makes the silent
         // SD→internal fallback (SD bridged behind USB power) visible at the
         // file level, and backs the storage filter. Prefer the indexed column
@@ -2341,9 +2376,14 @@ public final class RecordingsIndex {
         rec.put("dateFormatted", FMT_DATE_DISPLAY.get().format(d));
         rec.put("timeFormatted", FMT_TIME_DISPLAY.get().format(d));
 
+        String recordingId = rs.getString("recording_id");
+        rec.put("videoUrl", "/video/id/" + recordingId);
+        rec.put("thumbnailUrl", "/thumb/id/" + recordingId);
+        rec.put("deleteUrl", "/api/recordings/id/" + recordingId);
+        rec.put("eventUrl", "/api/events/id/" + recordingId);
         String mediaQuery = mediaPathQuery(absPath);
-        rec.put("videoUrl", "/video/" + name + mediaQuery);
-        rec.put("thumbnailUrl", "/thumb/" + name + mediaQuery);
+        rec.put("legacyVideoUrl", "/video/" + name + mediaQuery);
+        rec.put("legacyThumbnailUrl", "/thumb/" + name + mediaQuery);
 
         int sv = rs.getInt("schema_version");
         if (sv > 0) rec.put("schemaVersion", sv);
@@ -2364,9 +2404,8 @@ public final class RecordingsIndex {
 
         String hero = rs.getString("hero_thumb");
         if (hero != null) {
-            File parent = new File(absPath).getParentFile();
-            String heroPath = parent == null ? hero : new File(parent, hero).getAbsolutePath();
-            rec.put("heroThumbnailUrl", "/thumb/" + hero + mediaPathQuery(heroPath));
+            rec.put("heroThumbnailName", hero);
+            rec.put("heroThumbnailUrl", "/thumb/id/" + recordingId);
         }
 
         String classes = rs.getString("actor_classes");
@@ -2469,6 +2508,11 @@ public final class RecordingsIndex {
 
     /** Internal row representation — pre-DB and post-DB share the shape. */
     private static final class Row {
+        String recordingId;
+        String rootId;
+        String volumeId;
+        String relativePath;
+        int rootRank;
         String filename;
         String absPath;
         String type;

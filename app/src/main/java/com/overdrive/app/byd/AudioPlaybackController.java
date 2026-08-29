@@ -63,6 +63,13 @@ public final class AudioPlaybackController {
     /** Broadcast the audio service + video activity both stop on. */
     private static final String ACTION_STOP = "com.overdrive.app.action.STOP_MEDIA";
     private static final String PKG = "com.overdrive.app";
+    /** FIFO bridge so rapid Play/Stop edges cannot overtake each other in separate `am` processes. */
+    private static final java.util.concurrent.ExecutorService MEDIA_COMMANDS =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "OverDriveMediaCommands");
+                t.setDaemon(true);
+                return t;
+            });
 
     private AudioPlaybackController() {}
 
@@ -169,8 +176,8 @@ public final class AudioPlaybackController {
     public static void stop() {
         // Stop user-started automation/keymap audio and video. RoadSense warning chimes
         // are isolated safety cues and intentionally do not share this cancellation path.
-        exec("am stopservice -n " + AUDIO_SERVICE);
-        exec("am broadcast -a " + ACTION_STOP + " -p " + PKG);
+        exec("am stopservice -n " + AUDIO_SERVICE
+                + "; am broadcast -a " + ACTION_STOP + " -p " + PKG);
         logger.info("stop: dispatched automation audio stop + video stop broadcast");
     }
 
@@ -266,14 +273,33 @@ public final class AudioPlaybackController {
     }
 
     /**
-     * Fire-and-forget `am` exec, exactly like the RoadSense sidecar launch — no
-     * waitFor, so a slow/hung `am` never stalls the HTTP-worker / keymap-fire thread.
-     * The OS reaps the short-lived child; a failed launch is harmless.
+     * Queue media bridge commands on one daemon worker. The worker waits with a hard bound so
+     * Play/Stop requests stay FIFO without blocking the automation or HTTP caller.
      */
     private static void exec(String cmd) {
         try {
-            Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd});
+            MEDIA_COMMANDS.execute(() -> runQuietCommand(cmd));
         } catch (Throwable t) {
+            logger.warn("could not queue media command [" + cmd + "]: " + t.getMessage());
+        }
+    }
+
+    private static void runQuietCommand(String cmd) {
+        Process p = null;
+        try {
+            p = Runtime.getRuntime().exec(
+                    new String[]{"sh", "-c", "(" + cmd + ") >/dev/null 2>&1"});
+            if (!p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                p.destroyForcibly();
+                logger.warn("media command timed out [" + cmd + "]");
+            } else if (p.exitValue() != 0) {
+                logger.warn("media command failed (exit=" + p.exitValue() + ") [" + cmd + "]");
+            }
+        } catch (InterruptedException e) {
+            if (p != null) p.destroyForcibly();
+            Thread.currentThread().interrupt();
+        } catch (Throwable t) {
+            if (p != null) { try { p.destroyForcibly(); } catch (Throwable ignored) {} }
             logger.warn("exec failed [" + cmd + "]: " + t.getMessage());
         }
     }

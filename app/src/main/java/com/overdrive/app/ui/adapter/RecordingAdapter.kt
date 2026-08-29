@@ -10,12 +10,15 @@ import android.view.ViewGroup
 import android.widget.CheckBox
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.card.MaterialCardView
 import com.overdrive.app.ui.model.RecordingFile
 import com.overdrive.app.R
+import com.overdrive.app.ui.util.RecordingUiText
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -34,7 +37,8 @@ class RecordingAdapter(
     private val onPlay: (RecordingFile) -> Unit,
     private val onDelete: (RecordingFile) -> Unit,
     private val onSelectionChanged: ((Int) -> Unit)? = null,
-    private val onShare: ((RecordingFile) -> Unit)? = null
+    private val onShare: ((RecordingFile) -> Unit)? = null,
+    private val landscapeRows: Boolean = false
 ) : ListAdapter<RecordingFile, RecordingAdapter.RecordingViewHolder>(RecordingDiffCallback()) {
     
     // Cache for thumbnails — size-bounded LRU. The cap is set in BYTES so a
@@ -54,6 +58,19 @@ class RecordingAdapter(
     var selectMode = false
         private set
     private val selectedItems = mutableSetOf<String>() // paths
+    private var activeRecordingPath: String? = null
+
+    fun setActiveRecording(path: String?) {
+        if (activeRecordingPath == path) return
+        val previous = activeRecordingPath
+        activeRecordingPath = path
+        currentList.indexOfFirst { it.path == previous }
+            .takeIf { it >= 0 }
+            ?.let(::notifyItemChanged)
+        currentList.indexOfFirst { it.path == path }
+            .takeIf { it >= 0 }
+            ?.let(::notifyItemChanged)
+    }
     
     fun enterSelectMode() {
         selectMode = true
@@ -114,8 +131,13 @@ class RecordingAdapter(
     val selectedCount: Int get() = selectedItems.size
     
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecordingViewHolder {
+        val layout = if (landscapeRows) {
+            R.layout.item_recording_landscape
+        } else {
+            R.layout.item_recording
+        }
         val view = LayoutInflater.from(parent.context)
-            .inflate(R.layout.item_recording, parent, false)
+            .inflate(layout, parent, false)
         return RecordingViewHolder(view)
     }
     
@@ -129,15 +151,19 @@ class RecordingAdapter(
     }
     
     inner class RecordingViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+        private val card: MaterialCardView? = itemView as? MaterialCardView
+        private val activeIndicator: View? = itemView.findViewById(R.id.activeIndicator)
         private val ivThumbnail: ImageView = itemView.findViewById(R.id.ivThumbnail)
         private val tvCameraId: TextView = itemView.findViewById(R.id.tvCameraId)
         private val tvRecordingTime: TextView = itemView.findViewById(R.id.tvRecordingTime)
         private val tvDuration: TextView = itemView.findViewById(R.id.tvDuration)
         private val tvSize: TextView = itemView.findViewById(R.id.tvSize)
-        private val btnDelete: ImageButton = itemView.findViewById(R.id.btnDelete)
+        private val btnDelete: ImageButton? = itemView.findViewById(R.id.btnDelete)
         private val btnShare: ImageButton? = itemView.findViewById(R.id.btnShare)
+        private val btnMore: ImageButton? = itemView.findViewById(R.id.btnMore)
         private val cbSelect: CheckBox = itemView.findViewById(R.id.cbSelect)
         private val tvFilename: TextView? = itemView.findViewById(R.id.tvFilename)
+        private val tvEventTitle: TextView? = itemView.findViewById(R.id.tvEventTitle)
         private val tvSeverity: TextView? = itemView.findViewById(R.id.tvSeverity)
         private val tvTypeBadge: TextView? = itemView.findViewById(R.id.tvTypeBadge)
         private val tvStorageBadge: TextView? = itemView.findViewById(R.id.tvStorageBadge)
@@ -153,11 +179,16 @@ class RecordingAdapter(
             if (recording.durationMs > 0) {
                 tvDuration.text = recording.formattedDuration
                 tvDuration.visibility = View.VISIBLE
+            } else if (landscapeRows) {
+                tvDuration.text = "--:--"
+                tvDuration.visibility = View.VISIBLE
             } else {
                 tvDuration.visibility = View.GONE
             }
             tvSize.text = recording.formattedSize
             tvFilename?.text = recording.file.name
+            tvEventTitle?.text = RecordingUiText.headline(itemView.context, recording)
+            renderActiveState(recording)
 
             // Type badge — short prefix label corresponding to the on-disk
             // filename group. Always visible so the user can map a tile back
@@ -233,22 +264,10 @@ class RecordingAdapter(
             // Actor + proximity summary (v3 only). Mid-dot prefix reads cleanly
             // without leaning on emoji glyphs that don't render at SOTA quality
             // on the head-unit font stack.
-            val parts = mutableListOf<String>()
-            if (recording.personCount > 0)  parts += "${recording.personCount} person"
-            if (recording.vehicleCount > 0) parts += "${recording.vehicleCount} vehicle"
-            if (recording.bikeCount > 0)    parts += "${recording.bikeCount} bike"
-            if (recording.animalCount > 0)  parts += "${recording.animalCount} animal"
-            val proxLabel = when (recording.peakProximity?.uppercase()) {
-                "VERY_CLOSE" -> "very close"
-                "CLOSE" -> "close"
-                "MID" -> "mid"
-                "FAR" -> "far"
-                else -> null
-            }
-            if (proxLabel != null) parts += proxLabel
-            if (parts.isNotEmpty()) {
+            val actorSummary = RecordingUiText.actorAndDistance(itemView.context, recording)
+            if (actorSummary != null) {
                 tvActorSummary?.visibility = View.VISIBLE
-                tvActorSummary?.text = parts.joinToString(" · ")
+                tvActorSummary?.text = actorSummary
             } else {
                 tvActorSummary?.visibility = View.INVISIBLE
             }
@@ -272,8 +291,9 @@ class RecordingAdapter(
                 cbSelect.visibility = View.VISIBLE
                 cbSelect.setOnCheckedChangeListener(null)
                 cbSelect.isChecked = recording.path in selectedItems
-                btnDelete.visibility = View.GONE
+                btnDelete?.visibility = View.GONE
                 btnShare?.visibility = View.GONE
+                btnMore?.visibility = View.GONE
                 updateSelectionAccessibility(recording, placeText, cbSelect.isChecked)
 
                 cbSelect.setOnCheckedChangeListener { _, isChecked ->
@@ -294,7 +314,8 @@ class RecordingAdapter(
                 cbSelect.setOnCheckedChangeListener(null)
                 cbSelect.visibility = View.GONE
                 cbSelect.contentDescription = null
-                btnDelete.visibility = View.VISIBLE
+                btnDelete?.visibility = View.VISIBLE
+                btnMore?.visibility = View.VISIBLE
                 itemView.contentDescription = itemView.context.getString(
                     R.string.recording_item_description,
                     recording.formattedTime,
@@ -302,7 +323,7 @@ class RecordingAdapter(
                     recording.formattedSize
                 )
 
-                btnDelete.setOnClickListener { onDelete(recording) }
+                btnDelete?.setOnClickListener { onDelete(recording) }
                 // Per-tile share — only wired when the host fragment opted
                 // into the share callback. Hidden otherwise so the tile
                 // footer doesn't show a dead button.
@@ -313,9 +334,13 @@ class RecordingAdapter(
                     btnShare?.visibility = View.GONE
                     btnShare?.setOnClickListener(null)
                 }
+                btnMore?.setOnClickListener { showMoreMenu(it, recording) }
                 // Tile body opens the player. Long-press = enter multi-select.
-                itemView.setOnClickListener { onPlay(recording) }
-                itemView.isActivated = false
+                itemView.setOnClickListener {
+                    setActiveRecording(recording.path)
+                    onPlay(recording)
+                }
+                itemView.isActivated = recording.path == activeRecordingPath
                 itemView.setOnLongClickListener {
                     enterSelectMode()
                     selectedItems.add(recording.path)
@@ -323,6 +348,35 @@ class RecordingAdapter(
                     onSelectionChanged?.invoke(selectedItems.size)
                     true
                 }
+            }
+        }
+
+        private fun renderActiveState(recording: RecordingFile) {
+            val active = !selectMode && recording.path == activeRecordingPath
+            activeIndicator?.visibility = if (active) View.VISIBLE else View.GONE
+            card?.isSelected = active
+        }
+
+        private fun showMoreMenu(anchor: View, recording: RecordingFile) {
+            val shareTitle = anchor.context.getString(R.string.action_share)
+            val deleteTitle = anchor.context.getString(R.string.action_delete)
+            PopupMenu(anchor.context, anchor).apply {
+                if (onShare != null) menu.add(shareTitle)
+                menu.add(deleteTitle)
+                setOnMenuItemClickListener { item ->
+                    when (item.title?.toString()) {
+                        shareTitle -> {
+                            onShare?.invoke(recording)
+                            true
+                        }
+                        deleteTitle -> {
+                            onDelete(recording)
+                            true
+                        }
+                        else -> false
+                    }
+                }
+                show()
             }
         }
 

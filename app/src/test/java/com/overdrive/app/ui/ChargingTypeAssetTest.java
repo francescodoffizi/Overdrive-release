@@ -43,7 +43,7 @@ public class ChargingTypeAssetTest {
         assertFalse(displayPeak.contains("livePowerKw"));
         assertFalse(displayPeak.contains("avgPower"));
         assertFalse(displayPeak.contains("summaryCache"));
-        assertTrue(script.contains("var chipKw = self._displayPeakKw(s);"));
+        assertTrue(script.contains("self._displayPeakKw(s);"));
         assertTrue(script.contains("var displayedPeak = this._displayPeakKw(s);"));
     }
 

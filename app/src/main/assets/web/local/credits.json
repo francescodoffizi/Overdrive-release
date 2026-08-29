@@ -67,6 +67,10 @@
       "tier": "diamond"
     },
     {
+      "name": "Huijuan Xie",
+      "tier": "diamond"
+    },
+    {
       "name": "MCox",
       "tier": "platinum",
       "count": 2
@@ -239,6 +243,18 @@
     },
     {
       "name": "Muhammad Azham Abu Rahman",
+      "tier": "bronze"
+    },
+    {
+      "name": "Freddy Liaw",
+      "tier": "bronze"
+    },
+    {
+      "name": "Davide Borghetti",
+      "tier": "bronze"
+    },
+    {
+      "name": "Bartlomiej Jedrzejczyk",
       "tier": "bronze"
     }
   ]

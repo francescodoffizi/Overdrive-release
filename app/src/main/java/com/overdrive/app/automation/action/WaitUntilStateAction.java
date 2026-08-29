@@ -110,22 +110,35 @@ public class WaitUntilStateAction extends BaseAction {
             return;
         }
 
-        long deadline = System.currentTimeMillis() + timeoutS * 1000L;
+        long queuedDeadline = Automations.queuedWaitDeadlineNanos(
+                automationAction, timeoutS * 1000L);
+        boolean queuedWait = queuedDeadline != 0L;
+        long deadline = queuedWait ? queuedDeadline : System.nanoTime()
+                + java.util.concurrent.TimeUnit.SECONDS.toNanos(timeoutS);
         while (true) {
             if (stateMet(eventId, target)) {
+                Automations.clearQueuedWait(automationAction);
                 logger.info("WaitUntilStateAction: satisfied (" + eventId + " = " + target + ")");
                 return;
             }
-            if (System.currentTimeMillis() >= deadline) {
-                // Same contract as WaitUntilAction: an unmet wait is a failed precondition, so
-                // the rest of the chain is skipped rather than running as if the state arrived.
+            if (System.nanoTime() >= deadline) {
+                // An unmet wait is a failed precondition, so skip the remaining actions.
+                Automations.clearQueuedWait(automationAction);
                 logger.info("WaitUntilStateAction: timed out after " + timeoutS + "s waiting for "
-                        + eventId + " = " + target + " — stopping the remaining actions");
+                        + eventId + " = " + target + " - stopping the remaining actions");
                 Automations.abortChain();
                 return;
             }
+            long remainingNanos = Math.max(1L, deadline - System.nanoTime());
+            long pollMs = Math.max(1L, Math.min(POLL_MS,
+                    java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+            if (queuedWait) {
+                if (Automations.deferQueuedAction(automationAction, pollMs, false)) return;
+                Automations.clearQueuedWait(automationAction);
+                queuedWait = false;
+            }
             try {
-                Thread.sleep(POLL_MS);
+                Thread.sleep(pollMs);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 return;

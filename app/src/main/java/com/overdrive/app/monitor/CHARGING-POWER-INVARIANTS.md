@@ -22,68 +22,16 @@ plus device logs `log_X5RRX996` (Sealion/Tang-class DM-i PHEV, 21.5 kWh nominal,
 
 ## Invariants
 
-- **I1 — BEV path is frozen.** BEV resolves via `chargePowerKw` (`getChargePower`,
-  battery-side, matches OEM app/cloud). Any change must leave BEV bit-identical.
-  Mechanically: BEV passes `socScaleKwh = NaN` into C4, so `socRing` stays empty and
-  every coarse-ring rule (`minPoints`, `SOC_MAX_SPAN_MS`, the refused baseline
-  fallback) is unreachable on BEV. The fine-grained callers pass `minPoints = 0`,
-  which is *provably* the old eviction rule (`size() > 0` ≡ `!isEmpty()`); verified by
-  brute force over 300k random ring states, 0 divergences.
-  **Sanctioned exception — the C4 staleness expiry is drivetrain-agnostic.**
-  `estimatePowerKw()`'s `STALE_ESTIMATE_MS` check is a property of the OUTPUT, not of
-  `socRing`, so it also applies when `derived` came from `remain`/`cap` — i.e. on BEV.
-  A BEV whose getters are all dead under uid-2000 and whose `remainKwh` freezes will,
-  after the expiry, fall from `estimator(ring)` to the 7.0 kW `nominalPlaceholder`
-  (`isEstimated = true`, therefore excluded from the CPS curve and cost). This is
-  deliberate: a value frozen that long IS a sentinel by I4, and I2 forbids publishing
-  it as measured.
-  **Second sanctioned exception — the BEV `enginePowerKw` branch is flagged `isEstimated`.**
-  `abs(enginePowerKw)` is an inference, not a charger-side reading, so I3 requires the flag; the
-  PHEV copy of the identical branch already had it. Leaving BEV unflagged put a placeholder
-  ENGINE_POWER value (the `-1.0` filter is exact-match, so `-1.5`/`-2.0` walk in) straight into
-  the CPS curve and the session price. Where I1 and I3 conflict, I3 wins: an unflagged inference
-  is wrong in currency, a blank display is only unhelpful.
-  **Third sanctioned exception — on BEV the ring estimator outranks the `enginePowerKw`
-  inference.** The estimator branch sits ABOVE `enginePowerKw` in the C3 cascade, mirroring the
-  PHEV ordering. Reachable on exactly one input class: BEV, fused-CHARGING, `chargePowerKw` +
-  `externalChargingPowerKw` + `chargingPowerKw` all dead, estimator warm, AND
-  `enginePowerKw < -0.3`. Any BEV with a live charger getter still resolves from it first and is
-  bit-identical. Motivated by a real 79 kW DC charge (`log_6492FTH5`) where the whole charger
-  surface was NaN: `enginePowerKw` won, and because it is correctly flagged per I3 — and
-  `isEstimated` doubles as "do not persist" — `ChargingSessionManager` skipped every CPS sample,
-  so `peak_power_kw` stayed 0, `deriveIsDc`'s peak guard revoked the DC flag (base rate instead
-  of `dcRate`), and both charging graphs rendered empty. Ordering the UNFLAGGED
-  measured-from-counter value first is what restores persistence; re-flagging or reordering it
-  back reopens all three symptoms.
-  **Fourth sanctioned exception — the C3 SCALE gate is PHEV-contained.** `isEstimated` doubles as
-  "do not persist", so any gate that sets it on a BEV reopens the exception above through a second
-  door. The scale gate was the only one of the four unit-ambiguity gates without a `phev` term —
-  `contradictedByCounter`, `shouldWithholdUnverifiedDirectRate` and
-  `shouldDeferExternalToGroundedEstimate` all have one, and `contradictedByCounter` states the
-  reason: a BEV DC session has no observation comparable to the documented EVSE-rated behaviour.
-  Its promise that "the flag clears once a yardstick exists" cannot hold on BEV, because the
-  pack-flow reference runs through `hasComparablePhevPackFlow`, which opens `return phev && ...`;
-  on a trim whose `getChargingCapacity` counter reads a flat 0.000 there is no second yardstick
-  either. A real ~100 kW DC charge (`log_5HVWKT2M`, 59→100%) therefore published a correct 91–104 kW
-  to the card while flagging all 38 ticks estimated, and reproduced the same triple: `peak_power_kw`
-  0, `deriveIsDc` → -1 (`?`, base rate instead of `dcRate`), empty curve. Do NOT re-verify by
-  feeding the ring estimator to `isScaleVerified`: it is a smoothed-window slope, so it lags a
-  stepping rate and 8 of 37 ticks fell outside `DIRECT_SCALE_CORROBORATION_FACTOR` (1.35) at the
-  taper knees, holing the curve and resetting the trapezoid chain at each one. That factor is the
-  bar for LATCHING a divisor; loosening it weakens divisor latching everywhere.
-  **Fifth sanctioned exception — confirmed AC cross-validates BEV counters.** On the Atto 3,
-  `remainKwh` is not remaining pack energy: it cycles backwards and jumped 1.5→6.6 kWh in one
-  poll while `chargingCapacityKwh` rose smoothly at the granny charger's rate. The old
-  remain-first rule turned that jump into 155.5 kW, then persisted 41.6 false kWh and classified
-  an explicit AC session as DC. When gun==2, C4 now waits briefly for both present counters,
-  rejects slopes above the physical AC ceiling, and latches capacity only when remain is more
-  than 4x the simultaneous capacity slope. The 4x guard deliberately preserves the known
-  half-scale capacity counter on the Seal (2:1 still selects remain). DC/unknown connector
-  states retain the old remain-first order. A transient gun==1 with fused charging publishes
-  no estimate until the connector byte catches up, so pre-comparison samples cannot poison the
-  session curve.
-  Those FIVE are the only knowingly BEV-visible changes; anything else touching BEV is a
-  regression.
+- **I1 — Dedicated charging-device kW is primary on every drivetrain.**
+  `chargingPowerKw` comes from the charging device's `getChargingPower()` property, whose SDK
+  contract is already-normalized signed kW. It must outrank cluster, external, instrument,
+  counter-slope, and inferred sources for BEV and PHEV alike. The older `getChargePower()` method
+  on that same device is only a compatibility alias when the primary method is absent; the
+  instrument device's similarly named field remains a guarded fallback with different semantics.
+  The dedicated value does not require unit learning, motion, or a changing waveform before it can
+  be persisted. If it is unavailable, the existing cascade and all of its scale/quality gates still
+  apply. `enginePowerKw` and nominal/SOC-derived figures remain estimates and must stay behind every
+  measured charger-side source.
 - **I2 — Never publish a confidently-wrong measured-looking value.** An honest
   estimate flagged `isEstimated` beats a precise-looking wrong number. A *stuck*
   value is not a measurement.
@@ -98,8 +46,9 @@ plus device logs `log_X5RRX996` (Sealion/Tang-class DM-i PHEV, 21.5 kWh nominal,
   `chargingPowerKW` without that check reopens this.
 - **I4 — Sentinels never become values.** Known BYD sentinels: `-10011`,
   `-2147482645`, `-2147482648`, `65535`, `104857.5`, and observed idle junk
-  `~359.x`. A value that never changes across a long window is also a sentinel,
-  regardless of magnitude.
+  `~359.x` on ambiguous instrument fields. A flat value is suspicious only for those ambiguous
+  fields; a steady dedicated AC charging rate is valid measured power and must not be rejected for
+  lack of movement.
 - **I5 — Cost/energy rows are immutable snapshots.** Fixing power improves FUTURE
   sessions only. Never retroactively reprice global-rate-priced history.
 - **I6 — No circularity in the C1 gate.** The `clusterChargePowerKw` publish gate
@@ -121,6 +70,18 @@ plus device logs `log_X5RRX996` (Sealion/Tang-class DM-i PHEV, 21.5 kWh nominal,
   feed. **Withholding is the safe direction:** while a fault is suspected but unproven, publish
   nothing rather than a probably-wrong figure — the cascade falls to another source or a flagged
   estimate, both recoverable, whereas a factor error is billed.
+
+- **I9 — Confirmed AC cross-validates battery counters.** On the Atto 3, `remainKwh`
+  cycles and jumped 1.5→6.6 kWh in one poll while `chargingCapacityKwh` rose smoothly
+  at the granny charger's rate. The old remain-first rule produced a false 155.5 kW
+  peak, persisted 41.6 false kWh, and classified an explicit AC session as DC. When
+  gun state is AC (`2`), C4 waits briefly for both present counters, rejects slopes
+  above the physical AC ceiling, and selects capacity only when remain is more than
+  4× the simultaneous capacity slope. The 4× guard preserves the known half-scale
+  capacity counter on the Seal, where 2:1 still selects remain. DC and unknown gun
+  states retain remain-first selection. A transient disconnected state (`1`) with
+  fused charging publishes no estimate until the connector byte catches up, so an
+  unvalidated pre-connection sample cannot poison the session curve.
 
 ## Load-bearing asymmetries (do NOT "simplify")
 

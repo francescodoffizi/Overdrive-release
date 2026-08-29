@@ -7,8 +7,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Publishes the radar blind-spot / lane-change / cross-traffic ALERT state into
- * the automation state, per side, as a stable on/off edge.
+ * Publishes blind-spot, rear-cross-traffic, and door-open warning families as
+ * distinct per-side automation states.
  *
  * <p><b>What this is not.</b> This is the OEM's radar warning — "is there a
  * vehicle beside me right now" — not the side-camera blind-spot overlay. The two
@@ -60,10 +60,18 @@ public final class BlindSpotEvent {
     // Per-side clock of the last observed alert. 0 = never alerted.
     private static final AtomicLong lastLeftAlertMs = new AtomicLong(0);
     private static final AtomicLong lastRightAlertMs = new AtomicLong(0);
+    private static final AtomicLong lastRctaLeftAlertMs = new AtomicLong(0);
+    private static final AtomicLong lastRctaRightAlertMs = new AtomicLong(0);
+    private static final AtomicLong lastDowLeftAlertMs = new AtomicLong(0);
+    private static final AtomicLong lastDowRightAlertMs = new AtomicLong(0);
     // Whether each side is currently published as "on", so the hold expiry only
     // publishes the "off" edge once instead of every tick.
     private static final AtomicBoolean leftOn = new AtomicBoolean(false);
     private static final AtomicBoolean rightOn = new AtomicBoolean(false);
+    private static final AtomicBoolean rctaLeftOn = new AtomicBoolean(false);
+    private static final AtomicBoolean rctaRightOn = new AtomicBoolean(false);
+    private static final AtomicBoolean dowLeftOn = new AtomicBoolean(false);
+    private static final AtomicBoolean dowRightOn = new AtomicBoolean(false);
     // Whether a readable value has ever been seen. Until then nothing is
     // published: an unreadable sensor must not assert "clear", and the automation
     // layer ignores the first transition out of an unseeded state, so seeding an
@@ -74,7 +82,11 @@ public final class BlindSpotEvent {
 
     private static boolean referenced() {
         return Automations.isEventReferenced(BydEvent.BLIND_SPOT_LEFT)
-                || Automations.isEventReferenced(BydEvent.BLIND_SPOT_RIGHT);
+                || Automations.isEventReferenced(BydEvent.BLIND_SPOT_RIGHT)
+                || Automations.isEventReferenced(BydEvent.REAR_CROSS_TRAFFIC_LEFT)
+                || Automations.isEventReferenced(BydEvent.REAR_CROSS_TRAFFIC_RIGHT)
+                || Automations.isEventReferenced(BydEvent.DOOR_OPEN_WARNING_LEFT)
+                || Automations.isEventReferenced(BydEvent.DOOR_OPEN_WARNING_RIGHT);
     }
 
     public static void refresh() {
@@ -87,23 +99,60 @@ public final class BlindSpotEvent {
      * publishes "on" — no SDK read, no scheduling.
      */
     public static void onAlert(boolean left) {
+        onAlert(left
+                ? com.overdrive.app.byd.BydDataCollector.BS_LEFT_BIT
+                : com.overdrive.app.byd.BydDataCollector.BS_RIGHT_BIT);
+    }
+
+    public static void onAlert(int warningBit) {
         try {
-            EventData key = left ? BydEvent.BLIND_SPOT_LEFT : BydEvent.BLIND_SPOT_RIGHT;
+            EventData key;
+            AtomicLong lastAlert;
+            AtomicBoolean on;
+            switch (warningBit) {
+                case com.overdrive.app.byd.BydDataCollector.BS_LEFT_BIT:
+                    key = BydEvent.BLIND_SPOT_LEFT;
+                    lastAlert = lastLeftAlertMs;
+                    on = leftOn;
+                    break;
+                case com.overdrive.app.byd.BydDataCollector.BS_RIGHT_BIT:
+                    key = BydEvent.BLIND_SPOT_RIGHT;
+                    lastAlert = lastRightAlertMs;
+                    on = rightOn;
+                    break;
+                case com.overdrive.app.byd.BydDataCollector.RCTA_LEFT_BIT:
+                    key = BydEvent.REAR_CROSS_TRAFFIC_LEFT;
+                    lastAlert = lastRctaLeftAlertMs;
+                    on = rctaLeftOn;
+                    break;
+                case com.overdrive.app.byd.BydDataCollector.RCTA_RIGHT_BIT:
+                    key = BydEvent.REAR_CROSS_TRAFFIC_RIGHT;
+                    lastAlert = lastRctaRightAlertMs;
+                    on = rctaRightOn;
+                    break;
+                case com.overdrive.app.byd.BydDataCollector.DOW_LEFT_BIT:
+                    key = BydEvent.DOOR_OPEN_WARNING_LEFT;
+                    lastAlert = lastDowLeftAlertMs;
+                    on = dowLeftOn;
+                    break;
+                case com.overdrive.app.byd.BydDataCollector.DOW_RIGHT_BIT:
+                    key = BydEvent.DOOR_OPEN_WARNING_RIGHT;
+                    lastAlert = lastDowRightAlertMs;
+                    on = dowRightOn;
+                    break;
+                default:
+                    return;
+            }
             if (!Automations.isEventReferenced(key)) return;
             long now = System.currentTimeMillis();
             // publish() seeds the baseline itself, which matters when an alert beats
             // the poll to it: the automation layer ignores a transition out of an
             // unseeded state, so publishing "on" with nothing stored would silently
             // swallow the very first alert — the event that matters most.
-            if (left) {
-                lastLeftAlertMs.set(now);
-                publish(BydEvent.BLIND_SPOT_LEFT, leftOn, true);
-            } else {
-                lastRightAlertMs.set(now);
-                publish(BydEvent.BLIND_SPOT_RIGHT, rightOn, true);
-            }
+            lastAlert.set(now);
+            publish(key, on, true);
         } catch (Throwable t) {
-            logger.error("Failed to handle blind-spot alert", t);
+            logger.error("Failed to handle ADAS warning alert", t);
         }
     }
 
@@ -129,6 +178,10 @@ public final class BlindSpotEvent {
             // in-memory map, so the brief hold is not a stall risk.
             Automations.update(BydEvent.BLIND_SPOT_LEFT, "off");
             Automations.update(BydEvent.BLIND_SPOT_RIGHT, "off");
+            Automations.update(BydEvent.REAR_CROSS_TRAFFIC_LEFT, "off");
+            Automations.update(BydEvent.REAR_CROSS_TRAFFIC_RIGHT, "off");
+            Automations.update(BydEvent.DOOR_OPEN_WARNING_LEFT, "off");
+            Automations.update(BydEvent.DOOR_OPEN_WARNING_RIGHT, "off");
         }
     }
 
@@ -138,10 +191,22 @@ public final class BlindSpotEvent {
      * on a timer for the clear edge.
      */
     private static void expireHolds() {
-        if (!leftOn.get() && !rightOn.get()) return;
+        if (!leftOn.get() && !rightOn.get()
+                && !rctaLeftOn.get() && !rctaRightOn.get()
+                && !dowLeftOn.get() && !dowRightOn.get()) {
+            return;
+        }
         long now = System.currentTimeMillis();
         reconcile(BydEvent.BLIND_SPOT_LEFT, false, lastLeftAlertMs, leftOn, now);
         reconcile(BydEvent.BLIND_SPOT_RIGHT, false, lastRightAlertMs, rightOn, now);
+        reconcile(BydEvent.REAR_CROSS_TRAFFIC_LEFT, false,
+                lastRctaLeftAlertMs, rctaLeftOn, now);
+        reconcile(BydEvent.REAR_CROSS_TRAFFIC_RIGHT, false,
+                lastRctaRightAlertMs, rctaRightOn, now);
+        reconcile(BydEvent.DOOR_OPEN_WARNING_LEFT, false,
+                lastDowLeftAlertMs, dowLeftOn, now);
+        reconcile(BydEvent.DOOR_OPEN_WARNING_RIGHT, false,
+                lastDowRightAlertMs, dowRightOn, now);
     }
 
     /**
@@ -166,7 +231,7 @@ public final class BlindSpotEvent {
         if (Automations.isDisabled() && !Automations.editorSeedActive()) return;
         int packed;
         try {
-            packed = com.overdrive.app.byd.BydDataCollector.getInstance().readBlindSpotNow();
+            packed = com.overdrive.app.byd.BydDataCollector.getInstance().readAdasWarningsNow();
         } catch (Throwable t) {
             // ADAS device unreachable this tick. Do NOT just return: if a side is
             // currently held "on", nothing else would ever release it and the
@@ -190,6 +255,18 @@ public final class BlindSpotEvent {
         reconcile(BydEvent.BLIND_SPOT_RIGHT,
                 (packed & com.overdrive.app.byd.BydDataCollector.BS_RIGHT_BIT) != 0,
                 lastRightAlertMs, rightOn, now);
+        reconcile(BydEvent.REAR_CROSS_TRAFFIC_LEFT,
+                (packed & com.overdrive.app.byd.BydDataCollector.RCTA_LEFT_BIT) != 0,
+                lastRctaLeftAlertMs, rctaLeftOn, now);
+        reconcile(BydEvent.REAR_CROSS_TRAFFIC_RIGHT,
+                (packed & com.overdrive.app.byd.BydDataCollector.RCTA_RIGHT_BIT) != 0,
+                lastRctaRightAlertMs, rctaRightOn, now);
+        reconcile(BydEvent.DOOR_OPEN_WARNING_LEFT,
+                (packed & com.overdrive.app.byd.BydDataCollector.DOW_LEFT_BIT) != 0,
+                lastDowLeftAlertMs, dowLeftOn, now);
+        reconcile(BydEvent.DOOR_OPEN_WARNING_RIGHT,
+                (packed & com.overdrive.app.byd.BydDataCollector.DOW_RIGHT_BIT) != 0,
+                lastDowRightAlertMs, dowRightOn, now);
     }
 
     /**
@@ -252,7 +329,15 @@ public final class BlindSpotEvent {
         seeded.set(false);
         leftOn.set(false);
         rightOn.set(false);
+        rctaLeftOn.set(false);
+        rctaRightOn.set(false);
+        dowLeftOn.set(false);
+        dowRightOn.set(false);
         lastLeftAlertMs.set(0);
         lastRightAlertMs.set(0);
+        lastRctaLeftAlertMs.set(0);
+        lastRctaRightAlertMs.set(0);
+        lastDowLeftAlertMs.set(0);
+        lastDowRightAlertMs.set(0);
     }
 }

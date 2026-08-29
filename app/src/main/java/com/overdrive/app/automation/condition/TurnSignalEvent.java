@@ -40,4 +40,8 @@ public final class TurnSignalEvent {
     public static void refresh() {
         poller.refresh();
     }
+
+    static boolean isScheduledForTest() {
+        return poller.isScheduledForTest();
+    }
 }

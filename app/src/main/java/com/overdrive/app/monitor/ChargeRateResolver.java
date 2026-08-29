@@ -79,7 +79,7 @@ public final class ChargeRateResolver {
     private static final double PHEV_LARGE_SIGNATURE_HIGH = 1321.0;
     /**
      * Domain of a value acceptable as the kWh scale reference. Wide enough for the external counter's
-     * register (observed at 119.0) as well as the 16-bit capacity counter's 65.534 ceiling.
+     * register as well as the dedicated capacity counter's 131.07 kWh ceiling.
      */
     private static final double COUNTER_REF_MAX_KWH = 500.0;
     /**
@@ -347,6 +347,11 @@ public final class ChargeRateResolver {
     }
 
     private static double meteredReferenceKw(long maxAgeMs) {
+        String owner = scaleRefOwner;
+        if (owner != null
+                && com.overdrive.app.charging.CounterScaleCalibrator.isScaleSuspect(owner)) {
+            return Double.NaN;
+        }
         Slope s = slopes.get(SCALE_REF_KEY);
         if (s == null) return Double.NaN;
         synchronized (s) {
@@ -368,7 +373,7 @@ public final class ChargeRateResolver {
      * <p>Called on every admitted counter observation regardless of what the classifier has decided,
      * so the yardstick exists from the second reading of the first charge onward.
      *
-     * @param kwh raw counter value, kWh (the SDK-documented domain is [0, 65.534])
+     * @param kwh raw counter value, kWh (the SDK-documented domain is [0, 131.07])
      */
     public static void observeCounterForScale(double kwh) {
         // Legacy entry point: the capacity counter's unit is the documented one, so no normalisation.
@@ -452,6 +457,12 @@ public final class ChargeRateResolver {
         // unconditionally so a stale persisted classifier verdict can never publish the total as kW.
         if (ChargeSourceClassifier.SRC_CAPACITY.equals(source)) {
             return calibratedCounterSlope(source);
+        }
+        // BYDAutoChargingDevice.getChargingPower() is already a framework-defined signed kW rate
+        // over [-500, 500]. Applying behavioral classification or unit calibration to this source
+        // withholds normal AC plateaus and can turn a genuine 300 kW DC reading into 3 kW.
+        if (ChargeSourceClassifier.SRC_DEVICE.equals(source)) {
+            return raw > 0.1 && raw <= MAX_RATE_KW ? raw : Double.NaN;
         }
         ChargeSourceClassifier.Kind kind = ChargeSourceClassifier.kindOf(source);
         double packFlowRef = validReference(independentPackFlowKw)
@@ -628,6 +639,9 @@ public final class ChargeRateResolver {
         if (source == null || Double.isNaN(raw) || !(raw > 0)
                 || raw > MAX_RATE_KW * UNIT_FACTOR) {
             return Double.NaN;
+        }
+        if (ChargeSourceClassifier.SRC_DEVICE.equals(source)) {
+            return raw <= MAX_RATE_KW ? raw : Double.NaN;
         }
         if (validReference(referenceKw)) {
             double resolved = resolveRateValueAgainstReference(raw, referenceKw);
@@ -822,6 +836,9 @@ public final class ChargeRateResolver {
     public static boolean isScaleVerified(String source, double publishedKw,
                                           double independentPackFlowKw) {
         if (Double.isNaN(publishedKw)) return false;
+        if (ChargeSourceClassifier.SRC_DEVICE.equals(source)) {
+            return publishedKw > 0.1 && publishedKw <= MAX_RATE_KW;
+        }
         if (publishedKw <= UNVERIFIED_FULLY_SAFE_KW) return true;
         // The charged-energy counter's unit is documented — but a field capture proved a trim whose
         // register advances at half the delivered energy, so "documented" is not the same as verified.
@@ -846,6 +863,7 @@ public final class ChargeRateResolver {
      */
     static boolean hasProvenUnitScale(String source) {
         if (source == null) return false;
+        if (ChargeSourceClassifier.SRC_DEVICE.equals(source)) return true;
         if (ChargeSourceClassifier.SRC_CAPACITY.equals(source)) return true;
         if (currentSessionRateDivisor(source) != null) return true;
         return ChargeSourceClassifier.isCounter(source) && latchedDivisors.containsKey(source);

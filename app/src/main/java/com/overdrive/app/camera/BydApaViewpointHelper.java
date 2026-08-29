@@ -15,14 +15,16 @@ import java.util.concurrent.CopyOnWriteArraySet;
 /**
  * Reflective port of oem's il.C6498a (BYDApaHelper).
  *
- * Purpose: on byd_apa / apa firmware variants the AVMCamera HAL boots in
- * single-camera (dashcam) mode. Even with a correct addTexture(st, 0)
- * attach, the HAL keeps streaming the dashcam feed unless we tell the
- * BYDAutoManager Panorama device to switch to mosaic-output viewpoint.
+ * Purpose: control the BYDAutoManager Panorama output on byd_apa / apa
+ * firmware variants that require an explicit output selection.
  *
  * The handshake is a single setIntArray write to device 1031 with the
  * five PANO_VIEWPOINT_SET_FEATURES feature IDs and the magic args
  * {7, 0, 1, 0, 0}. Args 0 = reset (used on close).
+ *
+ * On DiLink 4 variants where output 7 enters the red automatic-calibration
+ * screen, camera.dilink4PassiveApaMode skips this helper completely and lets
+ * AVMCamera preview port 0 expose the firmware's native output unchanged.
  *
  * No public BYDAutoManager method signature is in the SDK stub
  * (android/hardware/BYDAutoManager.java only declares get/set Int/Double/Buffer).
@@ -209,6 +211,12 @@ public final class BydApaViewpointHelper {
      *  is fine. {@code release} must be called with the same token. */
     public static void acquire(Object token) {
         if (token == null) return;
+        if (isPassiveApaModeEnabled()) {
+            lastAcquireRc = Integer.MIN_VALUE;
+            mosaicViewpointConfirmed = false;
+            logger.info("DiLink 4 passive APA mode enabled — panorama output left untouched");
+            return;
+        }
         synchronized (LOCK) {
             try {
                 Object mgr = ensureAutoManager();
@@ -626,6 +634,14 @@ public final class BydApaViewpointHelper {
         }
     }
 
+    static boolean isPassiveApaModeEnabled() {
+        try {
+            return CameraConfigResolver.isPassiveApaModeEnabled();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private static Object ensureAutoManager() {
         if (autoManagerInstance != null) return autoManagerInstance;
         Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
@@ -751,6 +767,12 @@ public final class BydApaViewpointHelper {
 
     private static int invokeSetIntArray(Object mgr, int device, int[] features, int[] values)
             throws Exception {
+        if (values != null && values.length > 0 && values[0] == 7
+                && isPassiveApaModeEnabled()) {
+            mosaicViewpointConfirmed = false;
+            logger.info("Passive APA: blocked panorama output 7 command");
+            return -1;
+        }
         Method m = mgr.getClass().getMethod("setIntArray", int.class, int[].class, int[].class);
         Object rc = m.invoke(mgr, device, features, values);
         return (rc instanceof Integer) ? (Integer) rc : -1;

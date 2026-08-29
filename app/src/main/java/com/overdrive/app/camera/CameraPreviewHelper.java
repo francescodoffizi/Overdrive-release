@@ -138,15 +138,16 @@ public final class CameraPreviewHelper {
      */
     public static byte[] capturePanoramicSliceJpeg(PanoramicSlice slice) {
         if (slice == null) return null;
-        // Preferred: direct GL render of the requested slice at full
-        // per-camera resolution (Seal 1280×960, Tang 1280×720). No mosaic
-        // round-trip, no quality loss from sub-sampling.
+        // Preferred: direct GL render at full output resolution. Passive
+        // mode returns the whole native frame because no four-camera map is
+        // assumed; mapped layouts return the requested camera tile.
         byte[] hiRes = highResSliceJpeg(slice);
         if (hiRes != null && hiRes.length > 0) return hiRes;
         // Fallback: crop the engine's pre-encoded 640×480 mosaic. Smaller
         // and lower-quality but free when the engine is publishing.
         byte[] mosaicJpeg = engineMosaicJpeg();
         if (mosaicJpeg == null || mosaicJpeg.length == 0) return null;
+        if (CameraConfigResolver.isPassiveApaModeEnabled()) return mosaicJpeg;
         return cropMosaicJpegToSlice(mosaicJpeg, slice);
     }
 
@@ -160,7 +161,7 @@ public final class CameraPreviewHelper {
             if (p == null) return null;
             com.overdrive.app.camera.PanoramicCameraGpu cam = p.getCamera();
             if (cam == null) return null;
-            if (cam.isUsingOemSurfaceTexturePath()) {
+            if (cam.getCameraLayoutMode() == 3) {
                 // 2x2-native HAL on DiLink 4. Slice → role → Variant A
                 // corner+flip mapping. Reads Dilink4Constants so this stays in
                 // lockstep with recorder / stream / blind-spot / AI-downscaler /
@@ -195,6 +196,9 @@ public final class CameraPreviewHelper {
                 }
                 return cam.samplePerQuadrantJpeg(
                     slice.getStripOffsetX(), cx, cy, fx, fy);
+            }
+            if (cam.getCameraLayoutMode() == 1) {
+                return cam.sampleFullResMosaicJpeg();
             }
             return cam.samplePerQuadrantJpeg(slice.getStripOffsetX());
         } catch (Throwable t) {

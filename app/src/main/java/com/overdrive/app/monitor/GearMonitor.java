@@ -44,7 +44,8 @@ public class GearMonitor {
     private Thread pollThread;
     private volatile boolean isRunning = false;
     private volatile int currentGear = GEAR_P;
-    private long lastUpdateTime = 0;
+    /** Elapsed-realtime timestamp of the last valid gear observation. */
+    private volatile long lastUpdateTime = 0;
 
     /** Whether the 200ms poll thread is active — i.e. getCurrentGear() is fresh
      *  to within ~POLL_INTERVAL_MS rather than a cold initial value. */
@@ -127,7 +128,7 @@ public class GearMonitor {
                 return;
             }
             currentGear = initialGearRead;
-            lastUpdateTime = System.currentTimeMillis();
+            lastUpdateTime = SystemClock.elapsedRealtime();
             logger.info("Initial gear: " + gearToString(currentGear));
             
             isRunning = true;
@@ -144,6 +145,7 @@ public class GearMonitor {
                         if (!isRunning) break;
 
                         int gear;
+                        long gearObservedAtElapsedRealtimeMs;
                         // Prefer TelemetryDataCollector's cached snapshot to avoid
                         // duplicate CAN bus reads when the overlay poller is running
                         com.overdrive.app.telemetry.TelemetryDataCollector src = telemetrySource;
@@ -162,6 +164,8 @@ public class GearMonitor {
                                         < CACHED_GEAR_MAX_AGE_MS) {
                             // Only a recent successful gear read is cacheable.
                             gear = snap.gearMode;
+                            gearObservedAtElapsedRealtimeMs =
+                                    snap.gearReadElapsedRealtimeMs;
                         } else {
                             // Snapshot the reflection refs to locals: stop() is
                             // synchronized and nullifies these mid-iteration. Without
@@ -172,6 +176,8 @@ public class GearMonitor {
                             Object device = gearboxDevice;
                             if (getter == null || device == null) break;
                             gear = (int) getter.invoke(device);
+                            gearObservedAtElapsedRealtimeMs =
+                                    SystemClock.elapsedRealtime();
                         }
 
                         if (!isValidGearMode(gear)) {
@@ -179,10 +185,12 @@ public class GearMonitor {
                                     + gear);
                             continue;
                         }
-                        if (gear != currentGear) {
-                            logger.info("Gear changed: " + gearToString(currentGear) + " -> " + gearToString(gear));
-                            currentGear = gear;
-                            lastUpdateTime = System.currentTimeMillis();
+                        int previousGear = currentGear;
+                        currentGear = gear;
+                        lastUpdateTime =
+                                gearObservedAtElapsedRealtimeMs;
+                        if (gear != previousGear) {
+                            logger.info("Gear changed: " + gearToString(previousGear) + " -> " + gearToString(gear));
                             CameraDaemon.onGearChanged(gear);
                         }
                     } catch (InterruptedException e) {

@@ -10,8 +10,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Daemon-side bridge that ALSO dispatches mirror-fold / HUD / powertrain mode to the app-process
- * {@code VehicleActuatorService}, so the write is attempted from a real foreground-app
+ * Daemon-side bridge that dispatches mirror-fold / HUD to {@code VehicleActuatorService} and
+ * powertrain mode to its isolated {@code EnergyModeActuatorService}, so each write uses a real app
  * Context (UID 10xxx) — the environment where the OEM {@code setMirrorFoldState} /
  * {@code setHUDBrightness} calls (and the HUD-switch feature-id write) actually actuate.
  * The daemon's own mirror/HUD attempts (see {@link BydDataCollector#setMirrorsFolded}
@@ -28,8 +28,11 @@ public final class VehicleActuatorBridge {
 
     private static final String SERVICE =
             "com.overdrive.app/.services.VehicleActuatorService";
+    private static final String ENERGY_SERVICE =
+            "com.overdrive.app/.services.EnergyModeActuatorService";
     private static final EnergyGenerationGate ENERGY_GENERATIONS = new EnergyGenerationGate();
     private static final long ENERGY_LAUNCH_TIMEOUT_MS = 1500L;
+    private static final long ENERGY_STANDALONE_TIMEOUT_MS = 6000L;
     private static final long ENERGY_PROCESS_TERMINATION_GRACE_MS = 500L;
     private static final long ENERGY_DIRECT_START_TIMEOUT_MS = 750L;
     private static final long ENERGY_STATE_IO_TIMEOUT_MS = 500L;
@@ -120,6 +123,25 @@ public final class VehicleActuatorBridge {
     }
 
     /**
+     * Retry the five-position AC inlet current setting from the normal app process.
+     *
+     * <p>The daemon remains responsible for reading the authoritative state after this launch. The
+     * service only performs the same idempotent setting write from a real application Context, which
+     * covers firmware that accepts Setting-device calls from UID 2000 without actuating them.
+     */
+    public static void dispatchAcChargeCurrentLimit(int state) {
+        if (state < BydDataCollector.AC_CHARGE_CURRENT_6A
+                || state > BydDataCollector.AC_CHARGE_CURRENT_MAX) {
+            return;
+        }
+        exec("am start-foreground-service -n " + SERVICE
+                + " --es action ac_charge_current_limit"
+                + " --es state " + state);
+        logger.info("ac_charge_current_limit state=" + state
+                + " also dispatched to app-process VehicleActuatorService");
+    }
+
+    /**
      * Deliver the app-process powertrain write and wait for ActivityManager to accept the service
      * launch. Energy launches use one process-wide worker with one latest-pending slot, so an
      * uninterruptible process spawn cannot leak threads and a newer request is retained as the
@@ -162,6 +184,55 @@ public final class VehicleActuatorBridge {
         logger.info("energy_mode=" + mode + " generation=" + generation
                 + " direct app-process start " + (direct ? "accepted" : "failed"));
         return direct;
+    }
+
+    static boolean dispatchStandaloneEnergyMode(
+            android.content.Context context, int mode, long generation) {
+        return dispatchStandaloneMode(
+                context,
+                buildStandaloneEnergyCommand(mode, generation),
+                "energy_mode=" + mode + " generation=" + generation,
+                true);
+    }
+
+    static boolean dispatchStandaloneDriveMode(android.content.Context context, int mode) {
+        return dispatchStandaloneMode(
+                context, buildStandaloneDriveCommand(mode), "drive_mode=" + mode, false);
+    }
+
+    private static boolean dispatchStandaloneMode(
+            android.content.Context context, String command, String tag, boolean fenced) {
+        if (command == null || context == null) return false;
+        String classpath;
+        try {
+            classpath = context.getApplicationInfo().sourceDir;
+        } catch (Throwable unavailable) {
+            classpath = System.getenv("CLASSPATH");
+        }
+        if (classpath == null || classpath.trim().isEmpty()) return false;
+        LaunchOutcome outcome = execLoggedBlocking(
+                command,
+                tag + " standalone",
+                ENERGY_STANDALONE_TIMEOUT_MS,
+                null,
+                fenced,
+                classpath);
+        return outcome == LaunchOutcome.SUCCESS;
+    }
+
+    static String buildStandaloneEnergyCommand(int mode, long generation) {
+        if (!isUserWritableEnergyMode(mode) || generation <= 0L) return null;
+        return buildStandaloneModeCommand("energy", mode) + " " + generation;
+    }
+
+    static String buildStandaloneDriveCommand(int mode) {
+        if (mode < 1 || mode > 4) return null;
+        return buildStandaloneModeCommand("drive", mode);
+    }
+
+    private static String buildStandaloneModeCommand(String type, int mode) {
+        return "/system/bin/app_process /system/bin --nice-name=overdrive_byd_mode "
+                + BydModeCommand.class.getName() + " " + type + " " + mode;
     }
 
     interface EnergyCommandLauncher {
@@ -232,7 +303,7 @@ public final class VehicleActuatorBridge {
     static String buildEnergyCommand(EnergyDispatch request) {
         // This firmware's `am` rejects --ei/--el and aborts the command. Keep numeric values as
         // strings; the service parses both extras explicitly.
-        return "am start-foreground-service -n " + SERVICE
+        return "am start-foreground-service -n " + ENERGY_SERVICE
                 + " --es action energy_mode"
                 + " --es mode " + request.mode
                 + " --es request_generation " + request.generation;
@@ -331,7 +402,6 @@ public final class VehicleActuatorBridge {
             cancelPublishedEnergyRequest(context, reserved.generation);
             return null;
         }
-        dispatchEnergyControl(context, "energy_mode_fence", reserved.generation);
         return reserved;
     }
 
@@ -548,6 +618,22 @@ public final class VehicleActuatorBridge {
         }
         return result instanceof PublishedEnergyRead
                 ? (PublishedEnergyRead) result : PublishedEnergyRead.unreadable();
+    }
+
+    static boolean isPublishedEnergyRequestCurrent(
+            android.content.Context context, int mode, long generation) {
+        PublishedEnergyRead read = readPublishedEnergyState(context);
+        return read.status == EnergyReadStatus.VALID
+                && matchesPublishedEnergyRequest(read.request, mode, generation);
+    }
+
+    static boolean matchesPublishedEnergyRequest(
+            PublishedEnergyRequest marker, int mode, long generation) {
+        return marker != null
+                && !marker.cancelled
+                && !marker.pending
+                && marker.mode == mode
+                && marker.generation == generation;
     }
 
     /** Compatibility view for callers that only consume a valid marker. */
@@ -965,8 +1051,7 @@ public final class VehicleActuatorBridge {
                 return marker.asCancelled();
             case BEGIN:
                 if (marker.cancelled || marker.pending || marker.mode != mode) return null;
-                if (marker.actuationStarted
-                        && marker.rollbackOwner != actuatorOwner) {
+                if (!isEnergyActuatorOwnershipAvailable(marker, actuatorOwner)) {
                     // One process class must own every setter that can outlive this generation.
                     // Otherwise the recorded owner can finish rollback while the other process
                     // still has a blocked setter that later restores the cancelled mode.
@@ -1888,6 +1973,60 @@ public final class VehicleActuatorBridge {
         return mode == 1 || mode == 3;
     }
 
+    /** Map the public EV/HEV command to the OEM selector used by the vehicle's own UI. */
+    public static int mandatoryElectricStateForEnergyMode(int mode) {
+        if (mode == 1) return 2; // EV -> mandatory electric
+        if (mode == 3) return 1; // HEV -> intelligent
+        return -1;
+    }
+
+    /** Convert the OEM selector readback to the public EV/HEV command domain. */
+    public static int energyModeForMandatoryElectricState(int state) {
+        if (state == 2) return 1;
+        if (state == 1) return 3;
+        return -1;
+    }
+
+    /**
+     * Read the OEM EV/HEV selector. Feature IDs are device-scoped: on the Energy device,
+     * 2665/2667 are the mandatory-electric read/write pair.
+     */
+    public static int readMandatoryElectricState(Object energyDevice) {
+        if (energyDevice == null) return -1;
+        try {
+            Object value = energyDevice.getClass()
+                    .getMethod("getMandatoryElectricState")
+                    .invoke(energyDevice);
+            if (value instanceof Number) {
+                int state = ((Number) value).intValue();
+                if (state == 1 || state == 2) return state;
+            }
+        } catch (Throwable unavailable) {
+            // Older runtime wrappers expose this selector only through generic feature IDs.
+        }
+        Object value = BydDeviceHelper.callGet(energyDevice, 2665, Integer.TYPE);
+        int state = BydDeviceHelper.getIntValue(value);
+        return state == 1 || state == 2 ? state : -1;
+    }
+
+    /** Write the OEM selector through both supported SDK surfaces; readback remains authoritative. */
+    public static int writeMandatoryElectricState(Object energyDevice, int state) {
+        if (energyDevice == null || state < 1 || state > 2) return Integer.MIN_VALUE;
+        int namedResult = Integer.MIN_VALUE;
+        try {
+            Object result = energyDevice.getClass()
+                    .getMethod("setMandatoryElectricState", int.class)
+                    .invoke(energyDevice, state);
+            namedResult = result instanceof Number
+                    ? ((Number) result).intValue()
+                    : result instanceof Boolean && !((Boolean) result) ? -1 : 0;
+        } catch (Throwable unavailable) {
+            // The generic Energy feature is the actual path on older runtime wrappers.
+        }
+        int genericResult = BydDeviceHelper.sendSetCommandRaw(energyDevice, 2667, state);
+        return genericResult != Integer.MIN_VALUE ? genericResult : namedResult;
+    }
+
     static boolean isPlausibleEnergyGeneration(long generation, long nowNanos) {
         if (generation <= 0L || nowNanos <= 0L) return false;
         long oldest = nowNanos > ENERGY_MARKER_MAX_AGE_NANOS
@@ -2075,6 +2214,13 @@ public final class VehicleActuatorBridge {
 
     private static boolean bootTokensMatch(String expected, String actual) {
         return expected.equals(actual);
+    }
+
+    static boolean isEnergyActuatorOwnershipAvailable(
+            PublishedEnergyRequest marker, int actuatorOwner) {
+        return marker != null
+                && isValidActuatorOwner(actuatorOwner)
+                && (!marker.actuationStarted || marker.rollbackOwner == actuatorOwner);
     }
 
     private static boolean parseFlag(String value) {
@@ -2512,7 +2658,7 @@ public final class VehicleActuatorBridge {
 
     private static void dispatchEnergyControl(
             android.content.Context context, String action, long generation) {
-        final String shellCommand = "am start-foreground-service -n " + SERVICE
+        final String shellCommand = "am start-foreground-service -n " + ENERGY_SERVICE
                 + " --es action " + action
                 + " --es request_generation " + generation;
         ENERGY_CONTROL_SHELL_LANE.submit(action, generation, shellCommand);
@@ -2526,7 +2672,7 @@ public final class VehicleActuatorBridge {
                 android.content.Intent intent = new android.content.Intent();
                 intent.setComponent(new android.content.ComponentName(
                         "com.overdrive.app",
-                        "com.overdrive.app.services.VehicleActuatorService"));
+                        "com.overdrive.app.services.EnergyModeActuatorService"));
                 intent.putExtra("action", action);
                 intent.putExtra("request_generation", Long.toString(generation));
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
@@ -2561,7 +2707,21 @@ public final class VehicleActuatorBridge {
 
     private static LaunchOutcome execLoggedBlocking(
             String cmd, String tag, long timeoutMs, Runnable onInterrupted) {
-        LaunchTask task = ENERGY_LAUNCH_LANE.submit(cmd, tag, timeoutMs);
+        return execLoggedBlocking(
+                cmd, tag, timeoutMs, onInterrupted, true, null);
+    }
+
+    private static LaunchOutcome execLoggedBlocking(
+            String cmd,
+            String tag,
+            long timeoutMs,
+            Runnable onInterrupted,
+            boolean fenced,
+            String classpath) {
+        LaunchTask task = ENERGY_LAUNCH_LANE.submit(
+                cmd, tag, timeoutMs,
+                fenced ? () -> isEnergyLaunchCommandCurrent(cmd) : null,
+                classpath);
         try {
             if (!task.done.await(timeoutMs, TimeUnit.MILLISECONDS)) {
                 logger.warn(tag + ": am launch still running at caller deadline");
@@ -2597,6 +2757,9 @@ public final class VehicleActuatorBridge {
             // leaving a child behind when only an intermediate `sh -c` process is killed.
             String[] argv = task.command.trim().split("\\s+");
             ProcessBuilder builder = new ProcessBuilder(argv);
+            if (task.classpath != null) {
+                builder.environment().put("CLASSPATH", task.classpath);
+            }
             builder.redirectErrorStream(true);
             process = task.start(builder);
             if (process == null) return LaunchOutcome.INTERRUPTED;
@@ -2619,7 +2782,7 @@ public final class VehicleActuatorBridge {
             drainAvailableProcessOutput(stream, output);
             String text = output.toString().trim();
             int exitCode = process.exitValue();
-            if (exitCode != 0 || text.contains("Error")) {
+            if (exitCode != 0 || task.classpath == null && text.contains("Error")) {
                 logger.warn(task.tag + ": am FAILED (exit=" + exitCode + ") " + text);
                 return LaunchOutcome.FAILURE;
             } else if (!text.isEmpty()) {
@@ -2708,11 +2871,26 @@ public final class VehicleActuatorBridge {
         private boolean poisoned;
 
         synchronized LaunchTask submit(String command, String tag, long timeoutMs) {
+            return submit(
+                    command,
+                    tag,
+                    timeoutMs,
+                    () -> isEnergyLaunchCommandCurrent(command),
+                    null);
+        }
+
+        synchronized LaunchTask submit(
+                String command,
+                String tag,
+                long timeoutMs,
+                LaunchAuthority authority,
+                String classpath) {
             LaunchTask task = new LaunchTask(
                     command,
                     tag,
                     timeoutMs,
-                    () -> isEnergyLaunchCommandCurrent(command));
+                    authority,
+                    classpath);
             if (poisoned) {
                 task.cancel();
                 task.complete(LaunchOutcome.FAILURE);
@@ -2781,6 +2959,7 @@ public final class VehicleActuatorBridge {
         final String command;
         final String tag;
         final long timeoutMs;
+        final String classpath;
         final CountDownLatch done = new CountDownLatch(1);
         volatile boolean cancelled;
         volatile boolean unreapedProcess;
@@ -2791,7 +2970,7 @@ public final class VehicleActuatorBridge {
         private boolean invocationStarted;
 
         LaunchTask(String command, String tag, long timeoutMs) {
-            this(command, tag, timeoutMs, null);
+            this(command, tag, timeoutMs, null, null);
         }
 
         LaunchTask(
@@ -2799,10 +2978,20 @@ public final class VehicleActuatorBridge {
                 String tag,
                 long timeoutMs,
                 LaunchAuthority authority) {
+            this(command, tag, timeoutMs, authority, null);
+        }
+
+        LaunchTask(
+                String command,
+                String tag,
+                long timeoutMs,
+                LaunchAuthority authority,
+                String classpath) {
             this.command = command;
             this.tag = tag;
             this.timeoutMs = timeoutMs;
             this.authority = authority;
+            this.classpath = classpath;
         }
 
         Process start(ProcessBuilder builder) throws java.io.IOException {
@@ -2852,6 +3041,10 @@ public final class VehicleActuatorBridge {
         long generation = parseNumericCommandArgument(
                 command, "request_generation");
         long modeValue = parseNumericCommandArgument(command, "mode");
+        if (generation <= 0L || modeValue < 1L || modeValue > 5L) {
+            modeValue = parseStandaloneEnergyCommandArgument(command, 2);
+            generation = parseStandaloneEnergyCommandArgument(command, 3);
+        }
         if (generation <= 0L || modeValue < 1L || modeValue > 5L) return false;
         String boot = energyBootToken;
         if (boot == null) return false;
@@ -2868,6 +3061,23 @@ public final class VehicleActuatorBridge {
                 && !marker.pending
                 && marker.generation == generation
                 && marker.mode == (int) modeValue;
+    }
+
+    private static long parseStandaloneEnergyCommandArgument(
+            String command, int argumentOffset) {
+        if (command == null) return -1L;
+        String[] words = command.trim().split("\\s+");
+        for (int index = 0; index + 3 < words.length; index++) {
+            if (BydModeCommand.class.getName().equals(words[index])
+                    && "energy".equals(words[index + 1])) {
+                try {
+                    return Long.parseLong(words[index + argumentOffset]);
+                } catch (NumberFormatException ignored) {
+                    return -1L;
+                }
+            }
+        }
+        return -1L;
     }
 
     private static long parseNumericCommandArgument(String command, String name) {
@@ -2912,7 +3122,7 @@ public final class VehicleActuatorBridge {
             android.content.Intent intent = new android.content.Intent();
             intent.setComponent(new android.content.ComponentName(
                     "com.overdrive.app",
-                    "com.overdrive.app.services.VehicleActuatorService"));
+                    "com.overdrive.app.services.EnergyModeActuatorService"));
             intent.putExtra("action", "energy_mode");
             intent.putExtra("mode", Integer.toString(task.mode));
             intent.putExtra("request_generation", Long.toString(task.generation));

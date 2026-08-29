@@ -879,6 +879,13 @@
     padding-top: 8px;
 }
 
+.vc-inline-control-label {
+    color: var(--vc-text-secondary);
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
 /* Charge-cap slider — fixed width so it sits next to the toggle tile and
    readout as a compact cluster, not stretched across the panel. */
 .vc-soc-slider {

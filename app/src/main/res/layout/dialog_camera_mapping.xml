@@ -352,10 +352,8 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
-        <!-- DiLink 4 quadrant tweaks card. Two toggles for variant-specific
-             fixes that only take effect when DiLink 4 mode is selected
-             above. Saves via /api/surveillance/config {dilink4RotateQuads,
-             dilink4SwapRightRear} and triggers a daemon restart. -->
+        <!-- DiLink 4 compatibility options. Both only take effect when the
+             DiLink 4 camera path is selected above. -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -387,12 +385,24 @@
                     android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="?attr/colorOnSurfaceVariant" />
 
-                <!-- Red calibration-overlay mitigations. The HAL paints a red
-                     "calibration failed" overlay onto frames when
-                     persist.vendor.camera.autostudy.avm is missing or
-                     malformed. Two independent options here so the operator
-                     can pick whichever (or both) actually clears it on their
-                     trim. Both gated on cameraMode = dilink4. -->
+                <!-- DiLink 4-only root workaround plus a cosmetic fallback. -->
+                <com.google.android.material.materialswitch.MaterialSwitch
+                    android:id="@+id/swCameraDilink4PassiveApaMode"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="@string/camera_dilink4_passive_apa_label"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textColor="?attr/colorOnSurface" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="@string/camera_dilink4_passive_apa_subtitle"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+
                 <com.google.android.material.materialswitch.MaterialSwitch
                     android:id="@+id/swCameraDilink4RedMask"
                     android:layout_width="match_parent"

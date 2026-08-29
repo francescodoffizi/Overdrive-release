@@ -22,7 +22,7 @@ import java.net.Socket
  * (the same `sys.accanim.status` signal the surveillance side and the automation
  * engine watch) so it is fully isolated from the surveillance ACC state machine.
  * Gear comes from the daemon's [GearMonitor]; the overlay itself lives in the APP
- * process (Telenav bind + SYSTEM_ALERT_WINDOW), reached over 127.0.0.1:19878.
+ * process (Telenav bind + SYSTEM_ALERT_WINDOW), reached over 127.0.0.1:19882.
  */
 object DeferredNavManager {
 
@@ -50,12 +50,18 @@ object DeferredNavManager {
 
     /** Store the latest target received while the car is off. Called by the endpoint. */
     @JvmStatic
-    fun storePending(name: String?, lat: Double, lng: Double) {
-        try {
-            UnifiedConfigManager.setPendingNav(name ?: "", lat, lng, System.currentTimeMillis())
-            Log.i(TAG, "queued pending navigate: '$name' ($lat,$lng)")
+    fun storePending(name: String?, lat: Double, lng: Double): Boolean {
+        return try {
+            TelenavActions.validateCoordinates(lat, lng)
+            val stored = UnifiedConfigManager.setPendingNav(
+                name ?: "", lat, lng, System.currentTimeMillis(),
+            )
+            if (stored) Log.i(TAG, "queued pending navigate: '$name' ($lat,$lng)")
+            else Log.w(TAG, "failed to persist pending navigate")
+            stored
         } catch (t: Throwable) {
             Log.w(TAG, "storePending failed: ${t.message}")
+            false
         }
     }
 
@@ -86,23 +92,27 @@ object DeferredNavManager {
                     waited += REVERSE_POLL_MS
                 }
                 if (GearMonitor.getInstance().currentGear == GearMonitor.GEAR_R) {
-                    Log.i(TAG, "still in reverse after ${REVERSE_WAIT_MAX_MS / 1000}s — skipping, clearing")
-                    UnifiedConfigManager.clearPendingNav()
+                    Log.i(TAG, "still in reverse after ${REVERSE_WAIT_MAX_MS / 1000}s — keeping pending")
                     return@Thread
                 }
 
                 val name = d.optString("name", "Shared location")
                 val lat = d.optDouble("lat", Double.NaN)
                 val lng = d.optDouble("lng", Double.NaN)
-                if (lat.isNaN() || lng.isNaN()) {
+                try {
+                    TelenavActions.validateCoordinates(lat, lng)
+                } catch (invalid: IllegalArgumentException) {
                     UnifiedConfigManager.clearPendingNav()
                     return@Thread
                 }
 
                 val shown = sendShowPrompt(name, lat, lng)
-                // One-shot: clear once handed to the app (offered on the next start, not every start).
-                UnifiedConfigManager.clearPendingNav()
-                Log.i(TAG, "ACC-on: prompt ${if (shown) "shown" else "send-failed"}; pending cleared")
+                if (shown) {
+                    UnifiedConfigManager.clearPendingNav()
+                    Log.i(TAG, "ACC-on: prompt shown; pending cleared")
+                } else {
+                    Log.w(TAG, "ACC-on: prompt unavailable; keeping pending")
+                }
             } catch (ie: InterruptedException) {
                 Thread.currentThread().interrupt()
             } catch (t: Throwable) {

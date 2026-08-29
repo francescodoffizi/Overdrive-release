@@ -26,7 +26,10 @@ class DashboardStatusParserTest {
                 "fault": false,
                 "powerKw": 6.8,
                 "timeToFullMin": 102,
-                "sessionKwh": 12.6
+                "sessionKwh": 12.6,
+                "sessionEnergyIncomplete": false,
+                "sessionEnergyEstimated": false,
+                "sessionEnergySource": "metered_counter"
               }
             }
             """.trimIndent()
@@ -42,6 +45,12 @@ class DashboardStatusParserTest {
         assertFalse(snapshot.charging?.powerEstimated!!)
         assertEquals(102, snapshot.charging?.timeToFullMinutes)
         assertEquals(12.6, snapshot.charging?.sessionKwh!!, 0.0)
+        assertFalse(snapshot.charging?.sessionEnergyIncomplete!!)
+        assertFalse(snapshot.charging?.sessionEnergyEstimated!!)
+        assertEquals(
+            "metered_counter",
+            snapshot.charging?.sessionEnergySource,
+        )
     }
 
     @Test
@@ -363,6 +372,55 @@ class DashboardStatusParserTest {
         val charging = result.snapshot.charging!!
         assertEquals(6.4, charging.powerKw!!, 0.0)
         assertTrue(charging.powerEstimated)
+    }
+
+    @Test
+    fun reconstructedSessionEnergyIsPresentedAsApproximate() {
+        val result = DashboardStatusParser.parse(
+            """
+            {
+              "status": "ok",
+              "vehicleDataReady": true,
+              "soc": {"percent": 43},
+              "charging": {
+                "charging": true,
+                "plugged": true,
+                "sessionKwh": 3.6,
+                "sessionEnergyIncomplete": false,
+                "sessionEnergyEstimated": false,
+                "sessionEnergySource": "integrated_rate"
+              }
+            }
+            """.trimIndent()
+        ) as DashboardStatusResult.Available
+
+        val charging = result.snapshot.charging!!
+        assertEquals(3.6, charging.sessionKwh!!, 0.0)
+        assertFalse(charging.sessionEnergyIncomplete)
+        assertTrue(charging.sessionEnergyEstimated)
+        assertEquals("integrated_rate", charging.sessionEnergySource)
+    }
+
+    @Test
+    fun sessionEnergyWithoutProvenanceIsConservativelyApproximate() {
+        val result = DashboardStatusParser.parse(
+            """
+            {
+              "status": "ok",
+              "vehicleDataReady": true,
+              "charging": {
+                "charging": true,
+                "plugged": true,
+                "sessionKwh": 2.1
+              }
+            }
+            """.trimIndent()
+        ) as DashboardStatusResult.Available
+
+        val charging = result.snapshot.charging!!
+        assertEquals(2.1, charging.sessionKwh!!, 0.0)
+        assertTrue(charging.sessionEnergyEstimated)
+        assertNull(charging.sessionEnergySource)
     }
 
     @Test

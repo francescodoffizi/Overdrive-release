@@ -89,6 +89,10 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
     private long pendingBoundarySessionStart = -1L;
     private long pendingBoundaryAtMs = 0L;
     private double pendingBoundaryPowerKw = SocHistoryDatabase.STOP_BOUNDARY_POWER_KW;
+    private double pendingBoundarySoc = Double.NaN;
+    private double pendingBoundaryTemp = -999;
+    private double pendingBoundaryTempHigh = -999;
+    private double pendingBoundaryTempLow = -999;
     /** DB edge that did not reach its postcondition yet; null when persistence is reconciled. */
     private Boolean pendingDatabaseEdge = null;
     private ScheduledFuture<?> databaseEdgeRetryTask;
@@ -908,24 +912,53 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
             long atMs = System.currentTimeMillis();
             if (!persistBoundaryLocked(
                     sessionStart, atMs, SocHistoryDatabase.STOP_BOUNDARY_POWER_KW)) {
-                pendingBoundarySessionStart = sessionStart;
-                pendingBoundaryAtMs = atMs;
-                pendingBoundaryPowerKw = SocHistoryDatabase.STOP_BOUNDARY_POWER_KW;
+                rememberPendingBoundaryLocked(
+                        sessionStart, atMs, SocHistoryDatabase.STOP_BOUNDARY_POWER_KW,
+                        Double.NaN, -999, -999, -999);
             }
             lastTickHadPower = false;
         }
     }
 
     private boolean persistBoundaryLocked(long sessionStart, long atMs, double boundaryPowerKw) {
+        return persistBoundaryLocked(
+                sessionStart, atMs, boundaryPowerKw, Double.NaN, -999, -999, -999);
+    }
+
+    private boolean persistBoundaryLocked(
+            long sessionStart, long atMs, double boundaryPowerKw,
+            double soc, double temp, double tempHigh, double tempLow) {
         if (socDb == null || sessionStart <= 0) return false;
         for (int attempt = 0; attempt < BOUNDARY_WRITE_ATTEMPTS; attempt++) {
             if (socDb.recordChargingSample(sessionStart, atMs,
-                    boundaryPowerKw, Double.NaN, -999, -999, -999)) {
+                    boundaryPowerKw, soc, temp, tempHigh, tempLow)) {
                 return true;
             }
         }
         logger.warn("Charging gap boundary remains pending for session " + sessionStart);
         return false;
+    }
+
+    private void rememberPendingBoundaryLocked(
+            long sessionStart, long atMs, double boundaryPowerKw,
+            double soc, double temp, double tempHigh, double tempLow) {
+        pendingBoundarySessionStart = sessionStart;
+        pendingBoundaryAtMs = atMs;
+        pendingBoundaryPowerKw = boundaryPowerKw;
+        pendingBoundarySoc = soc;
+        pendingBoundaryTemp = temp;
+        pendingBoundaryTempHigh = tempHigh;
+        pendingBoundaryTempLow = tempLow;
+    }
+
+    private void clearPendingBoundaryLocked() {
+        pendingBoundarySessionStart = -1L;
+        pendingBoundaryAtMs = 0L;
+        pendingBoundaryPowerKw = SocHistoryDatabase.STOP_BOUNDARY_POWER_KW;
+        pendingBoundarySoc = Double.NaN;
+        pendingBoundaryTemp = -999;
+        pendingBoundaryTempHigh = -999;
+        pendingBoundaryTempLow = -999;
     }
 
     private boolean retryPendingBoundary() {
@@ -936,19 +969,16 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
             if (openSessionStart != pendingBoundarySessionStart) {
                 // Closing or atomically replacing the row is itself a hard integration boundary.
                 // Retrying the obsolete key would otherwise block every sample of the new row.
-                pendingBoundarySessionStart = -1L;
-                pendingBoundaryAtMs = 0L;
-                pendingBoundaryPowerKw = SocHistoryDatabase.STOP_BOUNDARY_POWER_KW;
+                clearPendingBoundaryLocked();
                 return true;
             }
             if (!persistBoundaryLocked(
                     pendingBoundarySessionStart, pendingBoundaryAtMs,
-                    pendingBoundaryPowerKw)) {
+                    pendingBoundaryPowerKw, pendingBoundarySoc, pendingBoundaryTemp,
+                    pendingBoundaryTempHigh, pendingBoundaryTempLow)) {
                 return false;
             }
-            pendingBoundarySessionStart = -1L;
-            pendingBoundaryAtMs = 0L;
-            pendingBoundaryPowerKw = SocHistoryDatabase.STOP_BOUNDARY_POWER_KW;
+            clearPendingBoundaryLocked();
             return true;
         }
     }
@@ -1208,59 +1238,6 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
             // first and decline this tick if persistence is still unavailable.
             if (!deferredTarget && !retryPendingBoundary()) return;
             double power = cs != null ? cs.chargingPowerKW : Double.NaN;
-            // No usable MEASURED rate this tick. Two cases, both skipped for the curve:
-            //   - NaN/<=0: ACC-off or every source refused (including a source still UNKNOWN).
-            //   - isEstimated: a nominal placeholder or an inference, which must never enter a
-            //     curve that is integrated into energy and then priced.
-            //
-            // MARK THE GAP rather than returning silently. The energy integrator resets its
-            // trapezoid chain on any power_kw <= 0 row, so writing an explicit boundary is what
-            // stops the next live sample being bridged back to the last one across a hole that
-            // delivered nothing. Returning without a row left the integrator unable to see the gap
-            // at all, and it then credited the whole interval at the last known rate.
-            if (Double.isNaN(power) || power <= 0 || cs.isEstimated) {
-                // One -2 marker per contiguous missing-rate interval. This includes a session that
-                // begins without a usable rate; waiting for a positive-to-missing falling edge made
-                // that opening interval disappear without setting energy_incomplete.
-                if (!missingRateIntervalMarked) {
-                    try {
-                        // SAME generation fence and lock as the positive path. Without it a tick that
-                        // was cancelled mid-flight could append its -1 boundary AFTER charging resumed
-                        // and a new positive sample had landed, severing the trapezoid chain inside a
-                        // live charge and under-counting its energy — the mirror image of the race the
-                        // positive path already guards.
-                        synchronized (sampleWriteLock) {
-                            if (generation != samplerGeneration) return;
-                            long atMs = System.currentTimeMillis();
-                            boolean persisted = deferredTarget
-                                    ? socDb.recordDeferredChargingSample(
-                                            atMs, SocHistoryDatabase.MISSING_RATE_BOUNDARY_POWER_KW,
-                                            Double.NaN, -999, -999, -999)
-                                    : persistBoundaryLocked(
-                                            sessionStart, atMs,
-                                            SocHistoryDatabase.MISSING_RATE_BOUNDARY_POWER_KW);
-                            if (persisted) {
-                                lastTickHadPower = false;
-                                missingRateIntervalMarked = true;
-                            } else if (!deferredTarget) {
-                                pendingBoundarySessionStart = sessionStart;
-                                pendingBoundaryAtMs = atMs;
-                                pendingBoundaryPowerKw =
-                                        SocHistoryDatabase.MISSING_RATE_BOUNDARY_POWER_KW;
-                                lastTickHadPower = false;
-                                missingRateIntervalMarked = true;
-                            } else {
-                                // The deferred generation already contains the marker in memory;
-                                // its next successful journal write will make both it and later
-                                // samples durable.
-                                lastTickHadPower = false;
-                                missingRateIntervalMarked = true;
-                            }
-                        }
-                    } catch (Exception ignored) {}
-                }
-                return;
-            }
 
             BatterySocData soc = vm.getBatterySoc();
             double socPct = soc != null ? soc.socPercent : Double.NaN;
@@ -1275,6 +1252,53 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
                 }
             } catch (Exception ignored) {}
 
+            // No usable MEASURED rate this tick. Two cases, both excluded from the power series:
+            //   - NaN/<=0: ACC-off or every source refused (including a source still UNKNOWN).
+            //   - isEstimated: a nominal placeholder or an inference, which must never enter a
+            //     curve that is integrated into energy and then priced.
+            //
+            // MARK THE GAP rather than returning silently. The energy integrator resets its
+            // trapezoid chain on any power_kw <= 0 row, so writing an explicit boundary is what
+            // stops the next live sample being bridged back to the last one across a hole that
+            // delivered nothing. Returning without a row left the integrator unable to see the gap
+            // at all, and it then credited the whole interval at the last known rate.
+            if (!Double.isFinite(power) || power <= 0 || power > 500.0 || cs.isEstimated) {
+                try {
+                    // The first row marks the accounting gap. Later rows retain measured SoC and
+                    // thermal channels without repeatedly mutating the session-level incomplete flag.
+                    // Both sentinels remain non-positive, so every row keeps the integration chain
+                    // broken until a measured rate returns.
+                    double sentinel = missingRateIntervalMarked
+                            ? SocHistoryDatabase.AUXILIARY_SAMPLE_POWER_KW
+                            : SocHistoryDatabase.MISSING_RATE_BOUNDARY_POWER_KW;
+                    synchronized (sampleWriteLock) {
+                        if (generation != samplerGeneration) return;
+                        if (cs != null && cs.isEstimated
+                                && Double.isFinite(power)
+                                && power > 0.0 && power <= 500.0) {
+                            socDb.observeEstimatedChargingTypeEvidence(power);
+                        }
+                        long atMs = System.currentTimeMillis();
+                        boolean persisted = deferredTarget
+                                ? socDb.recordDeferredChargingSample(
+                                        atMs, sentinel, socPct, temp, tempHigh, tempLow)
+                                : persistBoundaryLocked(
+                                        sessionStart, atMs, sentinel,
+                                        socPct, temp, tempHigh, tempLow);
+                        if (!persisted && !deferredTarget) {
+                            rememberPendingBoundaryLocked(
+                                    sessionStart, atMs, sentinel,
+                                    socPct, temp, tempHigh, tempLow);
+                        }
+                        // A failed deferred journal append has already accepted the row into the
+                        // in-memory generation; a later journal write will make it durable.
+                        lastTickHadPower = false;
+                        missingRateIntervalMarked = true;
+                    }
+                } catch (Exception ignored) {}
+                return;
+            }
+
             // Check-and-write ATOMICALLY. A bare check before the write leaves a TOCTOU window: the
             // tick passes the check, OFF then increments the generation and writes the -1 boundary, and
             // the tick's positive sample lands after it — re-arming the trapezoid chain across a real
@@ -1286,12 +1310,11 @@ public class ChargingSessionManager implements ChargingDetector.FusedStateListen
                 if (pendingBoundarySessionStart > 0
                         && !persistBoundaryLocked(
                                 pendingBoundarySessionStart, pendingBoundaryAtMs,
-                                pendingBoundaryPowerKw)) {
+                                pendingBoundaryPowerKw, pendingBoundarySoc, pendingBoundaryTemp,
+                                pendingBoundaryTempHigh, pendingBoundaryTempLow)) {
                     return;
                 }
-                pendingBoundarySessionStart = -1L;
-                pendingBoundaryAtMs = 0L;
-                pendingBoundaryPowerKw = SocHistoryDatabase.STOP_BOUNDARY_POWER_KW;
+                clearPendingBoundaryLocked();
                 boolean persisted = deferredTarget
                         ? socDb.recordDeferredChargingSample(
                                 System.currentTimeMillis(), power, socPct,

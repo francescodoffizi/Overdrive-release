@@ -56,6 +56,7 @@ public final class SignalMqttMap {
         // NOTE the deliberate cross-over: signal `power` is ignition (off/acc/on).
         MQTT.put("power", "power_level");
         MQTT.put("batteryLevel", "soc");
+        MQTT.put("targetSoc", "target_soc");
         MQTT.put("estimatedRange", "ev_range_km");
         MQTT.put("gear", "gear");
         MQTT.put("speed", "speed");

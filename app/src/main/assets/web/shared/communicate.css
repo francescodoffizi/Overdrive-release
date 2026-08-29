@@ -4,6 +4,7 @@
 
 .communicate-page .main-content {
     height: 100vh;
+    height: calc(var(--vh, 1vh) * 100);
     overflow: auto;
 }
 
@@ -89,6 +90,50 @@
     font-size: 17px;
     line-height: 1.2;
     font-weight: 650;
+}
+
+.talk-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.cabin-listener-toggle {
+    height: 34px;
+    padding: 0 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: var(--surface-container-low);
+    color: var(--text-secondary);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 650;
+    cursor: pointer;
+}
+
+.cabin-listener-toggle svg {
+    width: 16px;
+    height: 16px;
+}
+
+.cabin-listener-toggle.is-active {
+    border-color: var(--primary);
+    background: var(--primary-container);
+    color: var(--primary);
+}
+
+.cabin-listener-toggle.is-connecting,
+.cabin-listener-toggle.is-paused {
+    border-color: var(--status-warning);
+    color: var(--status-warning);
+}
+
+.cabin-listener-toggle:disabled {
+    cursor: default;
+    opacity: 0.5;
 }
 
 .talk-live-badge {
@@ -602,11 +647,17 @@
 
 @media (max-width: 700px) {
     .communicate-page .main-content {
+        min-height: 0;
         overflow: hidden;
     }
 
+    .communicate-page .mobile-header {
+        flex: 0 0 auto;
+    }
+
     .communicate-mobile-tabs {
-        height: 52px;
+        min-height: 52px;
+        flex: 0 0 52px;
         padding: 6px 12px;
         border-bottom: 1px solid var(--border-subtle);
         background: var(--bg-base);
@@ -641,9 +692,10 @@
 
     .communicate-body {
         box-sizing: border-box;
-        height: calc(100vh - 116px);
+        height: auto;
+        flex: 1 1 auto;
         min-height: 0;
-        padding: 10px 12px 12px;
+        padding: 10px 12px calc(12px + env(safe-area-inset-bottom, 0px));
         overflow: hidden;
     }
 

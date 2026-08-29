@@ -31,9 +31,8 @@ import java.util.concurrent.TimeUnit;
  * </ul>
  *
  * <p>This notifier is purely a downstream consumer — it never mutates
- * {@code chargingState} or {@code chargingPowerKw}. ABRP, MQTT, and the
- * SOC-history graph all read the snapshot directly via {@code getData()}
- * and are unaffected by this code path.
+ * {@code chargingState} or {@code chargingPowerKw}. It consumes the same resolved
+ * {@code VehicleDataMonitor} publication as ABRP, MQTT, and charging history.
  */
 public final class ChargingEventNotifier {
 
@@ -290,7 +289,9 @@ public final class ChargingEventNotifier {
             // this the notification announces the nominal placeholder — "Charging started, 7.0 kW" on
             // a 2 kW charge — as if it were the real rate. Omitting the figure is the honest option.
             if (cs != null && !cs.isEstimated
-                    && !Double.isNaN(cs.chargingPowerKW) && cs.chargingPowerKW > 0) {
+                    && Double.isFinite(cs.chargingPowerKW)
+                    && cs.chargingPowerKW > 0
+                    && cs.chargingPowerKW <= 500) {
                 powerKw = cs.chargingPowerKW;
             }
         } catch (Throwable ignored) { /* leave NaN — the body simply omits the rate */ }
@@ -359,8 +360,8 @@ public final class ChargingEventNotifier {
         publish(new NotificationEvent(
                 "vehicle.charging.full",
                 NotificationEvent.Severity.WARN,
-                Messages.get("notifications.charging_complete"),
-                Messages.get("notifications.battery_ready_to_unplug",
+                Messages.get("notifications.charging_nearly_complete"),
+                Messages.get("notifications.battery_nearly_full",
                         (int) Math.round(socPercent)),
                 "charging-full",
                 null,

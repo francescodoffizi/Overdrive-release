@@ -7,6 +7,7 @@ package com.overdrive.app.monitor;
  * Includes error detection for breakdown states and discharging detection.
  */
 public class ChargingStateData {
+    public static final double MAX_ABSOLUTE_POWER_KW = 500.0;
     
     // Charging state constants from BYDAutoChargingDevice
     public static final int CHARGING_BATTERY_STATE_READY = 0;
@@ -95,6 +96,11 @@ public class ChargingStateData {
      * @param powerKW The charging power in kilowatts
      */
     public void updateChargingPower(double powerKW) {
+        if (!Double.isFinite(powerKW)
+                || Math.abs(powerKW) > MAX_ABSOLUTE_POWER_KW) {
+            clearChargingPower();
+            return;
+        }
         this.chargingPowerKW = powerKW;
         updateDischargingFlag();
     }
@@ -103,6 +109,11 @@ public class ChargingStateData {
     public void updateChargingPower(double powerKW, String source,
                                     long observedAtMs, PowerQuality quality,
                                     double confidence) {
+        if (!Double.isFinite(powerKW)
+                || Math.abs(powerKW) > MAX_ABSOLUTE_POWER_KW) {
+            clearChargingPower();
+            return;
+        }
         updateChargingPower(powerKW);
         this.powerSource = source != null && !source.isEmpty() ? source : "none";
         this.powerObservedAtMs = Math.max(0L, observedAtMs);
@@ -111,7 +122,9 @@ public class ChargingStateData {
 
     public void updatePowerQuality(PowerQuality quality, double confidence) {
         this.powerQuality = quality != null ? quality : PowerQuality.UNKNOWN;
-        this.powerConfidence = Math.max(0.0, Math.min(1.0, confidence));
+        this.powerConfidence = Double.isFinite(confidence)
+                ? Math.max(0.0, Math.min(1.0, confidence))
+                : 0.0;
     }
 
     /** Clear a value and all provenance when charging is no longer active. */

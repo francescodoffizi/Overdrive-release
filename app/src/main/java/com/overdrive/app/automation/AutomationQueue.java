@@ -21,7 +21,7 @@ public class AutomationQueue {
     private static class DelayedAutomation implements Delayed {
         private final String id;
         private final String queueKey;
-        private final long startTime;
+        private long startTime;
         private final long sequence;
         private final Automations.QueueActionCursor actionCursor;
         private final java.util.List<StatefulCompensation> compensations;
@@ -1567,10 +1567,13 @@ public class AutomationQueue {
         synchronized (lock) {
             java.util.ArrayList<DelayedAutomation> removedItems =
                     new java.util.ArrayList<>();
+            // A yielded pause/wait has already started. Condition changes may cancel only
+            // pending work, not the continuation of an in-progress action chain.
             boolean removed =
                     automationQueue.removeIf(
                             delayedAutomation -> {
                                 boolean match = delayedAutomation.isAutomationWork()
+                                        && !delayedAutomation.hasStartedCursor()
                                         && id.equals(delayedAutomation.getId());
                                 if (match) removedItems.add(delayedAutomation);
                                 return match;
@@ -1578,6 +1581,7 @@ public class AutomationQueue {
             removed |= urgentReadyQueue.removeIf(
                     delayedAutomation -> {
                         boolean match = delayedAutomation.isAutomationWork()
+                                && !delayedAutomation.hasStartedCursor()
                                 && id.equals(delayedAutomation.getId());
                         if (match) removedItems.add(delayedAutomation);
                         return match;
@@ -1586,16 +1590,16 @@ public class AutomationQueue {
                 removed |= generation.pending.removeIf(
                         delayedAutomation -> {
                             boolean match = delayedAutomation.isAutomationWork()
+                                    && !delayedAutomation.hasStartedCursor()
                                     && id.equals(delayedAutomation.getId());
                             if (match) removedItems.add(delayedAutomation);
                             return match;
                         });
             }
-            if (!removed && !queueItems.contains(id)) return;
+            if (!removed) return;
             for (DelayedAutomation removedItem : removedItems) {
                 queueItems.remove(removedItem.getQueueKey());
             }
-            queueItems.remove(id);
             replay = enqueueReadyReplacementReplaysLocked();
             lock.notifyAll();
         }
@@ -2631,6 +2635,11 @@ public class AutomationQueue {
             retainLatestStateReconciliationLocked(item);
             queueItems.remove(item.getQueueKey());
             return;
+        }
+        long resumeAtNanos = item.actionCursor == null
+                ? 0L : item.actionCursor.resumeAtNanos();
+        if (resumeAtNanos != 0L) {
+            item.startTime = Math.max(System.nanoTime(), resumeAtNanos);
         }
         // A newer trigger for the same automation supersedes this failed claim.
         if (queueItems.add(item.getQueueKey())) {

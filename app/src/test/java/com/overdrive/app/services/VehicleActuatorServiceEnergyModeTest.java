@@ -9,12 +9,69 @@ import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 public class VehicleActuatorServiceEnergyModeTest {
+
+    @Test
+    public void energyProcessDoesNotMoveExistingActuators() throws Exception {
+        String manifest = new String(
+                Files.readAllBytes(Paths.get("src/main/AndroidManifest.xml")),
+                StandardCharsets.UTF_8);
+        int existingService = manifest.indexOf(
+                "android:name=\"com.overdrive.app.services.VehicleActuatorService\"");
+        int existingServiceEnd = manifest.indexOf("</service>", existingService);
+        int energyService = manifest.indexOf(
+                "android:name=\"com.overdrive.app.services.EnergyModeActuatorService\"");
+        int energyServiceEnd = manifest.indexOf("</service>", energyService);
+
+        assertTrue(existingService >= 0);
+        assertTrue(existingServiceEnd > existingService);
+        assertFalse(manifest.substring(existingService, existingServiceEnd)
+                .contains("android:process="));
+        assertTrue(energyService >= 0);
+        assertTrue(energyServiceEnd > energyService);
+        assertTrue(manifest.substring(energyService, energyServiceEnd)
+                .contains("android:process=\"com.byd.warning\""));
+    }
+
+    @Test
+    public void energySettersUseTheRequiredPackageContexts() throws Exception {
+        String service = new String(
+                Files.readAllBytes(Paths.get(
+                        "src/main/java/com/overdrive/app/services/VehicleActuatorService.java")),
+                StandardCharsets.UTF_8);
+        int writeStart = service.indexOf(
+                "private static EnergyWriteResult writeEnergyModeDirect");
+        int writeEnd = service.indexOf(
+                "private static boolean isEnergyHalTaskCurrent", writeStart);
+        String energyWrite = service.substring(writeStart, writeEnd);
+        assertTrue(energyWrite.contains(
+                "BydDeviceHelper.withBydPermissionBypass(task.appContext)"));
+        assertTrue(energyWrite.contains("ENERGY_DEVICE, bydContext"));
+        assertTrue(energyWrite.contains("enableDevice(\n                    bydContext"));
+        assertTrue(service.contains(".readMandatoryElectricState(device)"));
+        assertTrue(service.contains(".writeMandatoryElectricState(target, value)"));
+
+        String standalone = new String(
+                Files.readAllBytes(Paths.get(
+                        "src/main/java/com/overdrive/app/byd/BydModeCommand.java")),
+                StandardCharsets.UTF_8);
+        assertTrue(standalone.contains(
+                "BydDeviceHelper.withBydPermissionBypass(createAppContext());"));
+        assertTrue(standalone.contains("if (energyCommand) prepareEnergyDevice(energy);"));
+        assertTrue(standalone.contains("readInt(energy, \"getEnergyMode\")"));
+        assertTrue(standalone.contains("readInt(energy, \"getOperationMode\")"));
+        assertTrue(standalone.contains("readMandatoryElectricState(energy)"));
+        assertTrue(standalone.contains("writeMandatoryElectricState("));
+        assertTrue(standalone.contains("BydDeviceHelper.registerListener(energy"));
+    }
 
     @Test
     public void parsesStringExtraUsedByAmBridge() {
@@ -102,6 +159,15 @@ public class VehicleActuatorServiceEnergyModeTest {
         assertFalse(VehicleActuatorService.isUserWritableEnergyMode(2));
         assertFalse(VehicleActuatorService.isUserWritableEnergyMode(4));
         assertFalse(VehicleActuatorService.isUserWritableEnergyMode(5));
+    }
+
+    @Test
+    public void stopCanBeAReadbackButIsNeverACommandOrRollbackTarget() {
+        assertTrue(VehicleActuatorService.isReadableEnergySourceMode(0));
+        assertFalse(VehicleActuatorService.isUserWritableEnergyMode(0));
+        assertFalse(VehicleActuatorService.isSafeEnergyRollbackMode(0));
+        assertTrue(VehicleActuatorService.isSafeEnergyRollbackMode(1));
+        assertTrue(VehicleActuatorService.isSafeEnergyRollbackMode(5));
     }
 
     @Test

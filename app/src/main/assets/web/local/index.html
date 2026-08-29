@@ -10,7 +10,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#00876C">
-    <script src="../shared/theme.js?v=5"></script>
+    <script src="../shared/theme.js?v=6"></script>
     <script src="../shared/app-shell.js?v=5"></script>
     <link rel="stylesheet" href="../shared/leaflet.css">
     <script src="../shared/leaflet.js"></script>
@@ -189,6 +189,31 @@
                         </div>
                     </div>
                 </section>
+
+                <button class="dash-ai-insight" id="dashAiInsight" type="button"
+                        aria-expanded="false" aria-live="polite" hidden>
+                    <span class="dash-ai-insight-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                             stroke-width="1.8" stroke-linecap="round"
+                             stroke-linejoin="round">
+                            <rect x="4" y="6" width="16" height="13" rx="3"/>
+                            <path d="M9 3v3M8 12h.01M16 12h.01M9 16h6"/>
+                        </svg>
+                    </span>
+                    <span class="dash-ai-insight-copy">
+                        <span class="dash-ai-insight-kicker"
+                              data-i18n="dashboard.ai_insight_kicker">AI insight</span>
+                        <strong id="dashAiInsightTitle"
+                                data-i18n="dashboard.ai_insight_default_title">Vehicle brief</strong>
+                        <span id="dashAiInsightText" class="dash-ai-insight-text"></span>
+                        <small id="dashAiInsightMeta"></small>
+                    </span>
+                    <svg class="dash-ai-insight-arrow" viewBox="0 0 24 24"
+                         fill="none" stroke="currentColor" stroke-width="2"
+                         aria-hidden="true">
+                        <path d="m6 9 6 6 6-6"/>
+                    </svg>
+                </button>
 
                 <!-- Reorderable card grid. Dashboard + vehicle now live in
                      the unified hero above; the remaining cards carry
@@ -413,6 +438,140 @@
             margin-top: 8px;
             color: var(--text-secondary);
             font-size: 15px;
+        }
+
+        .dash-ai-insight {
+            position: relative;
+            display: grid;
+            grid-template-columns: 44px minmax(0, 1fr) 24px;
+            align-items: center;
+            gap: 14px;
+            width: 100%;
+            margin-top: 16px;
+            padding: 16px 18px;
+            color: inherit;
+            font: inherit;
+            text-align: left;
+            border: 1px solid var(--border-subtle);
+            overflow: hidden;
+            border-radius: var(--radius-lg, 16px);
+            background:
+                linear-gradient(110deg, rgba(0, 135, 108, 0.13), transparent 55%),
+                var(--bg-surface);
+            cursor: pointer;
+            transition: border-color 0.15s ease, transform 0.15s ease,
+                box-shadow 0.15s ease;
+        }
+        .dash-ai-insight::before {
+            content: "";
+            position: absolute;
+            inset: 0 auto 0 0;
+            width: 3px;
+            background: linear-gradient(
+                180deg, var(--brand-primary), var(--tertiary));
+        }
+        [dir="rtl"] .dash-ai-insight::before {
+            inset: 0 0 0 auto;
+        }
+        [dir="rtl"] .dash-ai-insight { text-align: right; }
+        .dash-ai-insight[hidden] { display: none; }
+        .dash-ai-insight:hover {
+            border-color: var(--brand-primary);
+            transform: translateY(-1px);
+            box-shadow: 0 10px 28px rgba(0, 0, 0, .16);
+        }
+        .dash-ai-insight:focus-visible {
+            outline: 2px solid var(--brand-primary);
+            outline-offset: 3px;
+        }
+        .dash-ai-insight:active {
+            transform: translateY(0);
+        }
+        .dash-ai-insight-icon {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            color: var(--brand-primary);
+            background: var(--brand-primary-container);
+            border: 1px solid rgba(0, 135, 108, .2);
+        }
+        .dash-ai-insight-icon svg { width: 23px; height: 23px; }
+        .dash-ai-insight-copy {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        .dash-ai-insight-kicker {
+            color: var(--brand-primary);
+            font-size: 10px;
+            font-weight: 750;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        .dash-ai-insight-copy strong {
+            margin-top: 2px;
+            color: var(--text-primary);
+            font-size: 16px;
+            overflow-wrap: anywhere;
+        }
+        .dash-ai-insight-text {
+            display: -webkit-box;
+            margin-top: 5px;
+            overflow: hidden;
+            color: var(--text-secondary);
+            font-size: 13px;
+            line-height: 1.45;
+            white-space: pre-line;
+            overflow-wrap: anywhere;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 3;
+        }
+        .dash-ai-insight.is-expanded .dash-ai-insight-text {
+            display: block;
+            overflow: visible;
+            white-space: pre-wrap;
+            -webkit-line-clamp: unset;
+        }
+        .dash-ai-insight.is-expanded { align-items: start; }
+        .dash-ai-insight.is-expanded .dash-ai-insight-icon,
+        .dash-ai-insight.is-expanded .dash-ai-insight-arrow {
+            margin-top: 4px;
+        }
+        .dash-ai-insight-copy small {
+            margin-top: 6px;
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+        .dash-ai-insight-arrow {
+            width: 20px;
+            height: 20px;
+            color: var(--text-muted);
+            transition: transform 0.16s ease;
+        }
+        .dash-ai-insight.is-expanded .dash-ai-insight-arrow {
+            transform: rotate(180deg);
+        }
+        @media (max-width: 900px) {
+            .dash-ai-insight {
+                grid-template-columns: 40px minmax(0, 1fr) 20px;
+                gap: 12px;
+                margin-top: 12px;
+                padding: 14px;
+            }
+            .dash-ai-insight-icon {
+                width: 40px;
+                height: 40px;
+                border-radius: 11px;
+            }
+            .dash-ai-insight-copy strong { font-size: 15px; }
+            .dash-ai-insight-text { -webkit-line-clamp: 4; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .dash-ai-insight,
+            .dash-ai-insight-arrow { transition: none; }
         }
 
         /* Hero-level drive state. This is a status band, not another card:
@@ -1261,6 +1420,12 @@
             text-overflow: ellipsis;
         }
 
+        /* The 260px sidebar leaves the 638px hero grid enough room only
+           from a 984px viewport upward. */
+        @media (max-width: 983px) {
+            .dash-hero { grid-template-columns: 1fr; }
+        }
+
         @media (max-width: 980px) {
             .dash-grid,
             .dash-metric-grid,
@@ -1277,7 +1442,6 @@
                 padding-bottom: calc(96px + var(--safe-bottom));
             }
             .dash-hero {
-                grid-template-columns: 1fr;
                 padding: 18px;
             }
             .dash-hero h1 { font-size: 27px; }
@@ -1360,8 +1524,158 @@
             vehicleStateRefreshQueued: false,
             vehicleStateFailureCount: 0,
             vehicleStatePollTimer: null,
+            aiInsightTimer: null,
+            aiInsightEnabled: false,
             VEHICLE_STATE_STALE_AFTER_FAILURES: 2,
             VEHICLE_STATE_POLL_MS: 6000,
+            AI_INSIGHT_POLL_MS: 300000,
+            initAiInsight: function() {
+                var self = this;
+                var card = document.getElementById('dashAiInsight');
+                if (card) {
+                    card.addEventListener('click', function() {
+                        self.toggleAiInsight();
+                    });
+                }
+                if (window.BYD && BYD.i18n
+                        && typeof BYD.i18n.onChange === 'function') {
+                    BYD.i18n.onChange(function() {
+                        if (self.aiInsightEnabled) {
+                            self.refreshAiInsight();
+                        }
+                    });
+                }
+                document.addEventListener('visibilitychange', function() {
+                    if (document.hidden) {
+                        self.stopAiInsightPolling();
+                    } else if (self.aiInsightEnabled) {
+                        self.refreshAiInsight();
+                    }
+                });
+            },
+            stopAiInsightPolling: function() {
+                if (!this.aiInsightTimer) return;
+                clearTimeout(this.aiInsightTimer);
+                this.aiInsightTimer = null;
+            },
+            setAiInsightEnabled: function(enabled) {
+                enabled = !!enabled;
+                if (this.aiInsightEnabled === enabled) return;
+                this.aiInsightEnabled = enabled;
+                if (!enabled) {
+                    this.stopAiInsightPolling();
+                    this.renderAiInsight(null);
+                    return;
+                }
+                this.refreshAiInsight();
+            },
+            refreshAiInsight: function() {
+                var self = this;
+                this.stopAiInsightPolling();
+                if (document.hidden || !this.aiInsightEnabled) return;
+                var language = window.BYD && BYD.i18n
+                    ? BYD.i18n.getLang() : 'en';
+                fetch('/api/genai/insights/dashboard?lang='
+                        + encodeURIComponent(language), { cache: 'no-store' })
+                    .then(function(response) {
+                        if (!response.ok) throw new Error('HTTP ' + response.status);
+                        return response.json();
+                    })
+                    .then(function(data) {
+                        if (window.BYD && BYD.i18n
+                                && BYD.i18n.getLang() !== language) {
+                            return;
+                        }
+                        var enabled = !!(data && data.enabled);
+                        self.renderAiInsight(enabled ? data.item : null);
+                        // Disabled means no recurring GenAI dashboard work.
+                        if (enabled && self.aiInsightEnabled) {
+                            self.aiInsightTimer = setTimeout(function() {
+                                self.refreshAiInsight();
+                            }, self.AI_INSIGHT_POLL_MS);
+                        }
+                    })
+                    .catch(function() {
+                        self.renderAiInsight(null);
+                    });
+            },
+            renderAiInsight: function(item) {
+                var card = document.getElementById('dashAiInsight');
+                if (!card) return;
+                var createdAt = item ? Number(item.createdAt) : 0;
+                var text = item && typeof item.text === 'string'
+                    ? item.text.trim() : '';
+                var age = Date.now() - createdAt;
+                if (!text || !isFinite(createdAt) || createdAt <= 0
+                        || age > 30 * 24 * 60 * 60 * 1000) {
+                    card.hidden = true;
+                    this.setAiInsightExpanded(false);
+                    return;
+                }
+                var insightId = String(item.id || createdAt);
+                if (card.getAttribute('data-insight-id') !== insightId) {
+                    card.setAttribute('data-insight-id', insightId);
+                    this.setAiInsightExpanded(false);
+                }
+                var title = item && typeof item.title === 'string'
+                    ? item.title.trim() : '';
+                var model = item && typeof item.model === 'string'
+                    ? item.model.trim() : '';
+                document.getElementById('dashAiInsightTitle').textContent =
+                    title || BYD.i18n.t('dashboard.ai_insight_default_title')
+                    || 'Vehicle brief';
+                document.getElementById('dashAiInsightText').textContent = text;
+                document.getElementById('dashAiInsightMeta').textContent =
+                    this.aiInsightAge(createdAt) + (model ? ' · ' + model : '');
+                card.hidden = false;
+            },
+            toggleAiInsight: function() {
+                var card = document.getElementById('dashAiInsight');
+                if (!card || card.hidden) return;
+                this.setAiInsightExpanded(
+                    !card.classList.contains('is-expanded'));
+            },
+            setAiInsightExpanded: function(expanded) {
+                var card = document.getElementById('dashAiInsight');
+                if (!card) return;
+                card.classList.toggle('is-expanded', !!expanded);
+                card.setAttribute(
+                    'aria-expanded', expanded ? 'true' : 'false');
+                var key = expanded
+                    ? 'dashboard.ai_insight_collapse'
+                    : 'dashboard.ai_insight_show_full';
+                var fallback = expanded
+                    ? 'Collapse AI insight' : 'Show full AI insight';
+                card.setAttribute(
+                    'aria-label',
+                    window.BYD && BYD.i18n
+                        ? (BYD.i18n.t(key) || fallback) : fallback);
+            },
+            aiInsightAge: function(timestamp) {
+                var seconds = Math.max(
+                    0, Math.floor((Date.now() - timestamp) / 1000));
+                if (seconds < 60) {
+                    return BYD.i18n.t(
+                        'dashboard.time_seconds_ago', { n: seconds })
+                        || (seconds + 's ago');
+                }
+                var minutes = Math.floor(seconds / 60);
+                if (minutes < 60) {
+                    return BYD.i18n.t(
+                        'dashboard.time_minutes_ago', { n: minutes })
+                        || (minutes + 'm ago');
+                }
+                var hours = Math.floor(minutes / 60);
+                if (hours < 24) {
+                    return BYD.i18n.t(
+                        'dashboard.time_hours_ago', { n: hours })
+                        || (hours + 'h ago');
+                }
+                var days = Math.floor(hours / 24);
+                return BYD.i18n.t(
+                    'dashboard.time_days_ago', { n: days })
+                    || (days + 'd ago');
+            },
             command: function(btn, url, payload) {
                 if (!btn || btn.classList.contains('pending')) return;
                 btn.classList.add('pending');
@@ -1659,20 +1973,23 @@
                             if (psiEl) {
                                 // Corner labels honour the pressure display
                                 // unit (BYD.units.pressureMode, fed from
-                                // /status.pressureUnit). PSI stays a whole
-                                // number here — the schematic corners are too
-                                // small for decimals — while kPa is integral
-                                // anyway and bar keeps its 2 decimals to stay
-                                // meaningful (whole bar would always read "2").
+                                // /status.pressureUnit). Every unit renders
+                                // through the shared BYD.units.pressureVal
+                                // formatter, so PSI shows one decimal here —
+                                // matching the Vehicle Control page and the
+                                // server's own psi field (integer PSI
+                                // collapses the ±3 kPa steps the BYD TPMS
+                                // reports, hiding real change; bar already
+                                // rendered 4 chars in these corners, so
+                                // "36.5" fits just as well). The toFixed(1)
+                                // fallback covers a stale cached core.js
+                                // that predates the pressure helpers.
                                 var pv = '--';
                                 if (corner.available && typeof corner.psi === 'number') {
                                     var UU = (window.BYD && BYD.units && BYD.units.pressureVal)
                                         ? BYD.units : null;
-                                    if (!UU || UU.pressureMode === 'psi') {
-                                        pv = corner.psi.toFixed(0);
-                                    } else {
-                                        pv = UU.pressureVal(corner.kPa || 0);
-                                    }
+                                    pv = UU ? UU.pressureVal(corner.kPa)
+                                            : corner.psi.toFixed(1);
                                 }
                                 psiEl.textContent = pv;
                                 psiEl.setAttribute('class', 'dash-car-psi'
@@ -1750,7 +2067,13 @@
                         var ttf = Math.floor(c.timeToFullMin / 60) + 'h ' + (c.timeToFullMin % 60) + 'm';
                         bits.push(BYD.i18n.t('dashboard.glance_time_to_full', { t: ttf }) || (ttf + ' to full'));
                     }
-                    if (c.sessionKwh && c.sessionKwh > 0) bits.push('+' + c.sessionKwh.toFixed(1) + ' kWh');
+                    if (c.sessionKwh && c.sessionKwh > 0) {
+                        var sessionEnergyApproximate = c.sessionEnergyIncomplete === true
+                            || c.sessionEnergyEstimated === true
+                            || c.sessionEnergySource !== 'metered_counter';
+                        bits.push((sessionEnergyApproximate ? '~' : '+')
+                            + c.sessionKwh.toFixed(1) + ' kWh');
+                    }
                     if (!bits.length) bits.push(BYD.i18n.t('charge.state_charging') || 'Charging');
                     var textEl = document.getElementById('dashGlanceChargeText');
                     if (textEl) textEl.textContent = bits.join(' · ');
@@ -2128,6 +2451,8 @@
             updateFromStatus: function(status) {
                 if (!status) return;
                 this.lastStatus = status;
+                this.setAiInsightEnabled(
+                    status.genAiDashboardEnabled === true);
 
                 function setText(id, value) {
                     var el = document.getElementById(id);
@@ -2286,7 +2611,13 @@
                         ? (c.isEstimated ? '~' : '') + dashboardPower.toFixed(1) + ' kW'
                         : '--';
                     setText('dashChargePower', dashboardPowerText);
-                    setText('dashChargeKwh', (c.sessionKwh && c.sessionKwh > 0) ? c.sessionKwh.toFixed(1) + ' kWh' : '--');
+                    var dashboardEnergyApproximate = c.sessionEnergyIncomplete === true
+                        || c.sessionEnergyEstimated === true
+                        || c.sessionEnergySource !== 'metered_counter';
+                    setText('dashChargeKwh', (c.sessionKwh && c.sessionKwh > 0)
+                        ? (dashboardEnergyApproximate ? '~' : '')
+                            + c.sessionKwh.toFixed(1) + ' kWh'
+                        : '--');
                     if (c.charging && c.timeToFullMin && c.timeToFullMin > 0) {
                         setText('dashChargeTtf', Math.floor(c.timeToFullMin / 60) + 'h ' + (c.timeToFullMin % 60) + 'm');
                     } else {
@@ -2343,6 +2674,7 @@
             BYD.core.init();
             if (BYD.map) BYD.map.init();
             BYD.dashboard.initVehicleStatePolling();
+            BYD.dashboard.initAiInsight();
             BYD.dashboard.refreshSecurityDigest();
             setInterval(function() { BYD.dashboard.refreshSecurityDigest(); }, 60000);
             // Once, after i18n: the labels are user-authored so they need no translation,

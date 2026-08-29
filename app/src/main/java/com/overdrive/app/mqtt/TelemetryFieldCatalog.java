@@ -79,6 +79,7 @@ public final class TelemetryFieldCatalog {
         // `power` is the IGNITION level (off/acc/on), published here as `power_level` —
         // two unrelated facts that both read as "power". See SignalMqttMap.
         add("power",      "Motor Power",     SENSOR, "power",       MEAS, "kW",   "mdi:flash",              false, 0.1);
+        add("target_soc", "Target SOC",      SENSOR, "battery",     MEAS, "%",    "mdi:battery-sync",       false, 1);
         add("charge_power","Charge Power",   SENSOR, "power",       MEAS, "kW",   "mdi:battery-charging",   false, 0.1);
         add("speed",      "Speed",           SENSOR, "speed",       MEAS, "km/h", "mdi:speedometer",        false, 0.1);
         add("lat",        "Latitude",        SENSOR, null,          MEAS, "°",    "mdi:latitude",           true,  0.00001);
@@ -96,6 +97,9 @@ public final class TelemetryFieldCatalog {
         add("charging_eta_hours",   "Charging ETA (h)",    SENSOR, "duration",         null, "h",  "mdi:timer-sand",     false, 0);
         add("charging_eta_minutes", "Charging ETA (min)",  SENSOR, "duration",         null, "min","mdi:timer-sand",     false, 0);
         add("charging_capacity_kwh","Charging Capacity",   SENSOR, "energy",           TOTI, "kWh","mdi:battery-charging-high", false, 0.1);
+        add("charging_capacity_incomplete", "Charging Energy Incomplete", BINARY, null, null, null, "mdi:alert-circle-outline", true, 0);
+        add("charging_capacity_estimated",  "Charging Energy Estimated",  BINARY, null, null, null, "mdi:approximately-equal", true, 0);
+        add("charging_capacity_source",     "Charging Energy Source",     SENSOR, "enum", null, null, "mdi:source-branch", true, 0);
         add("charging_v2l",         "V2L Active",          BINARY, null,               null, null, "mdi:home-lightning-bolt", false, 0);
         // Published for the controllable charge-limit entities' state topics;
         // do not also create duplicate read-only sensor entities.

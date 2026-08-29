@@ -105,6 +105,8 @@ window.KM = (function () {
           payloads: [ { v: 'on', i18n: 'keymap.recirculate' }, { v: 'off', i18n: 'keymap.fresh_air' } ] },
         { id: 'drl',             i18n: 'keymap.act_drl',             kind: 'catalog', key: 'drl',
           payloads: [ { v: 'on', i18n: 'keymap.on' }, { v: 'off', i18n: 'keymap.off' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
+        { id: 'headlight_mode',  i18n: 'keymap.act_headlight_mode',  kind: 'catalog', key: 'headlight_mode',
+          payloads: [ { v: 'off', i18n: 'keymap.off' }, { v: 'auto', i18n: 'keymap.headlight_auto' }, { v: 'parking', i18n: 'keymap.parking_lights' }, { v: 'low_beam', i18n: 'keymap.headlight_on_low_beam' } ] },
         // Welcome / reading / ambient-music lights on/off. ${v} carries true|false into
         // the /api/vehicle/lights enable field (target fixed per action).
         { id: 'welcome_light',   i18n: 'keymap.act_welcome_light',    kind: 'api',
@@ -523,7 +525,7 @@ window.KM = (function () {
         ac_auto: 'climate', fan_only: 'climate', steering_heat: 'climate', recirculation: 'climate',
         defrost_front: 'climate', defrost_rear: 'climate',
         seat_heat_driver: 'climate', seat_heat_passenger: 'climate',
-        drl: 'lighting', hazard: 'lighting',
+        drl: 'lighting', headlight_mode: 'lighting', hazard: 'lighting',
         welcome_light: 'lighting', reading_light: 'lighting',
         ambient_music: 'lighting', headlight_level: 'lighting',
         esp_control: 'adas_safety', itac: 'adas_safety', adas_slw: 'adas_safety',
@@ -642,6 +644,7 @@ window.KM = (function () {
     // every onCuratedChange so a late fetch response for a since-changed action is
     // discarded instead of clobbering the current action's payload options.
     var payloadReqSeq = 0;
+    var localeChangeBound = false;
 
     function $(id) { return document.getElementById(id); }
     function tr(key, vars) { return (window.BYD && BYD.i18n) ? (BYD.i18n.t(key, vars) || key) : key; }
@@ -801,14 +804,7 @@ window.KM = (function () {
         }
         onKindChange();
 
-        var badge = $('kmStatusBadge');
-        if (state.enabled) {
-            badge.textContent = tr('keymap.badge_on');
-            badge.className = 'status-badge active';
-        } else {
-            badge.textContent = tr('keymap.badge_off');
-            badge.className = 'status-badge inactive';
-        }
+        paintStatusBadge();
 
         // Show the a11y nudge only while mapping is enabled but key filtering isn't live yet
         // (see a11yReady — bound, not merely the OS precondition).
@@ -816,6 +812,20 @@ window.KM = (function () {
         paintRestartWarning();
 
         renderList();
+    }
+
+    function paintStatusBadge() {
+        var badge = $('kmStatusBadge');
+        if (!badge) return;
+        if (state.enabled) {
+            badge.setAttribute('data-i18n', 'keymap.badge_on');
+            badge.textContent = tr('keymap.badge_on');
+            badge.className = 'status-badge active';
+        } else {
+            badge.setAttribute('data-i18n', 'keymap.badge_off');
+            badge.textContent = tr('keymap.badge_off');
+            badge.className = 'status-badge inactive';
+        }
     }
 
     function paintRestartWarning() {
@@ -851,7 +861,10 @@ window.KM = (function () {
         meta.className = 'km-meta';
         var action = document.createElement('div');
         action.className = 'km-action';
-        action.textContent = b.label || describeAction(b.action);
+        // `label` is a persisted display snapshot and may have been saved in another
+        // locale. Rebuild known action summaries from their locale-neutral payload so
+        // a live language switch cannot leave an old Portuguese label in the list.
+        action.textContent = describeAction(b.action) || b.label || '';
         var sub = document.createElement('div');
         sub.className = 'km-sub';
         // For a double binding that blocks the native single, note it on the sub-line so
@@ -1116,13 +1129,21 @@ window.KM = (function () {
         capturing = !capturing;
         var box = $('kmCaptureBox');
         var label = $('kmCaptureBtnLabel');
+        var hint = $('kmCapHint');
         if (capturing) {
             box.classList.add('armed');
-            $('kmCapHint').textContent = tr('keymap.capture_press');
+            hint.setAttribute('data-i18n', 'keymap.capture_press');
+            hint.textContent = tr('keymap.capture_press');
+            label.setAttribute('data-i18n', 'keymap.capture_stop');
             label.textContent = tr('keymap.capture_stop');
         } else {
             box.classList.remove('armed');
+            label.setAttribute('data-i18n', 'keymap.capture');
             label.textContent = tr('keymap.capture');
+            if (!captured) {
+                hint.setAttribute('data-i18n', 'keymap.capture_idle');
+                hint.textContent = tr('keymap.capture_idle');
+            }
         }
         // Tell the native side to route hardware keys to us while armed. Hardware
         // buttons hit the native AccessibilityService (onKeyEvent), NOT the WebView
@@ -1142,6 +1163,7 @@ window.KM = (function () {
         if (!code) return;
         captured = code;
         $('kmCapKeycode').textContent = code;
+        $('kmCapHint').setAttribute('data-i18n', 'keymap.captured');
         $('kmCapHint').textContent = tr('keymap.captured');
         $('kmManualKeycode').value = code;
         // If the captured code is a known long-variant (302/303/306/312), narrow
@@ -1389,7 +1411,7 @@ window.KM = (function () {
         return { beforeSeconds: before, afterSeconds: after };
     }
 
-    function buildCuratedOptions() {
+    function buildCuratedOptions(payloadPreselect) {
         var sel = $('kmCuratedAction');
         var selected = sel.value;
         sel.innerHTML = '';
@@ -1431,7 +1453,7 @@ window.KM = (function () {
                 && !(state.fuelCapableHybrid === false && HYBRID_ONLY_CURATED[selected])) {
             sel.value = selected;
         }
-        onCuratedChange();
+        onCuratedChange(payloadPreselect);
     }
 
     // Cached installed-app list [{package,label}] for the openApp picker.
@@ -2155,8 +2177,16 @@ window.KM = (function () {
     function setFormMode(editing) {
         var title = $('kmAddTitle');
         var btn = $('kmAddBtnLabel');
-        if (title) title.textContent = tr(editing ? 'keymap.edit_title' : 'keymap.add_title');
-        if (btn) btn.textContent = tr(editing ? 'keymap.save_changes' : 'keymap.add_binding');
+        var titleKey = editing ? 'keymap.edit_title' : 'keymap.add_title';
+        var buttonKey = editing ? 'keymap.save_changes' : 'keymap.add_binding';
+        if (title) {
+            title.setAttribute('data-i18n', titleKey);
+            title.textContent = tr(titleKey);
+        }
+        if (btn) {
+            btn.setAttribute('data-i18n', buttonKey);
+            btn.textContent = tr(buttonKey);
+        }
     }
 
     // Populate the action inputs (kind + curated action + payload / shell / app)
@@ -2358,6 +2388,7 @@ window.KM = (function () {
         editIndex = -1;
         $('kmManualKeycode').value = '';
         $('kmCapKeycode').textContent = '—';
+        $('kmCapHint').setAttribute('data-i18n', 'keymap.capture_idle');
         $('kmCapHint').textContent = tr('keymap.capture_idle');
         $('kmShellCmd').value = '';
         var bn = $('kmBlockNativeSingle'); if (bn) bn.checked = false;
@@ -2385,11 +2416,46 @@ window.KM = (function () {
 
     // ───────────────────────── Init ─────────────────────────
 
+    function refreshLocale() {
+        // Keep every in-progress form value while rebuilding only the controls whose
+        // labels were created imperatively and therefore cannot be fixed by hydrate().
+        var wasDirty = formDirty;
+        var payload = $('kmPayload') ? $('kmPayload').value : '';
+        var known = $('kmKnownButton') ? $('kmKnownButton').value : '';
+        var press = $('kmPressType') ? $('kmPressType').value : '';
+
+        buildCuratedOptions(payload || undefined);
+        buildKnownButtonOptions();
+        if ($('kmKnownButton')) $('kmKnownButton').value = known;
+
+        var pressSel = $('kmPressType');
+        if (pressSel) {
+            for (var i = 0; i < pressSel.options.length; i++) {
+                pressSel.options[i].textContent = pressLabel(pressSel.options[i].value);
+            }
+            if (press) pressSel.value = press;
+        }
+
+        if ($('kmActionKind') && $('kmActionKind').value === 'openApp') buildAppOptions();
+        paintStatusBadge();
+        updateClipWindowLabels();
+        renderList();
+        renderQuickControls();
+        renderSteps();
+        setFormMode(editIndex >= 0);
+        formDirty = wasDirty;
+    }
+
     function init() {
         buildCuratedOptions();
         buildKnownButtonOptions();
         onKnownButtonChange(); // set initial custom-wrap visibility (placeholder → hidden)
         onKindChange();
+        if (!localeChangeBound && window.BYD && BYD.i18n
+                && typeof BYD.i18n.onChange === 'function') {
+            localeChangeBound = true;
+            BYD.i18n.onChange(refreshLocale);
+        }
         document.addEventListener('keydown', onKeydown, true);
         // Reset a stale edit session when the user switches to the Add tab by any
         // means other than the edit pencil (see onTabChanged) — closes the edit trap.

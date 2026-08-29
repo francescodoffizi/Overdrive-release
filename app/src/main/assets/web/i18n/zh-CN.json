@@ -2431,12 +2431,12 @@
     "add_zone_failed": "没有添加区域",
     "confirm_delete_zone": "删除这个安全区?",
     "zone_deleted": "已删除区域",
-    "in_safe_zone": " 在安全区 ({zone},{meters}m)",
-    "outside_zone": "🔴 外面 ({meters}m至最近)",
+    "in_safe_zone": "在安全区 ({zone},{meters}m)",
+    "outside_zone": "外面 ({meters}m至最近)",
     "no_zones_yet": "目前没有区域",
     "waiting_gps": "在等待GPS...",
-    "badge_on": "● 啟動",
-    "badge_off": "○ 关闭",
+    "badge_on": "啟動",
+    "badge_off": "关闭",
     "you_are_here": "你在这里",
     "popup_radius": "半径:<b>{name}</b><br>{meters}m"
   },
@@ -2566,7 +2566,6 @@
     "restore_failed": "还原失败。"
   },
   "about": {
-    "ack_chimes": "RoadSense 警告提示音 — 來自 Google 音效庫，授權許可為",
     "page_title": "关于 — OverDrive",
     "page_title_short": "关于",
     "contributors_title": "贡献者",
@@ -2588,7 +2587,8 @@
       "kofi_value": "Ko-fi 上一杯咖啡,让深夜提交不停歇。",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "在贡献者和支持者的帮助下打造。"
+    "thanks_subtitle": "在贡献者和支持者的帮助下打造。",
+      "ack_chimes": "RoadSense 警告提示音 — 來自 Google 音效庫，授權許可為"
   },
   "byd_cloud": {
     "page_title": "BYD 云",

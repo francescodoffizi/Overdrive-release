@@ -41,7 +41,7 @@ public class BydEvent {
     public static final EventData AMBIENT_STATE = new EventData("ambient", Map.of());
     public static final EventData SLW = new EventData("slw");
     public static final EventData CPD = new EventData("cpd");
-    // Drive mode (normal/eco/sport/snow) on the SETTING drive-config axis, and the
+    // Drive mode (normal/eco/sport/snow) normalized from the live Energy/Setting axes, and the
     // EV/HEV powertrain mode — both already on every telemetry snapshot (collectEnergy)
     // and MQTT-published (op_mode / energy_mode). Published as words so a trigger can
     // fire "when drive mode → sport" and a condition can gate "only if in eco".
@@ -105,12 +105,18 @@ public class BydEvent {
     // firmware. Published on/off per side (see updateTurnSignals).
     public static final EventData TURN_LEFT = new EventData("turnSignal", Map.of("side", "left"));
     public static final EventData TURN_RIGHT = new EventData("turnSignal", Map.of("side", "right"));
-    // Radar blind-spot / lane-change / cross-traffic ALERT, per side. Distinct
-    // from the blind-spot camera overlay: this is the OEM radar warning. Driven by
-    // BlindSpotEvent (instant ADAS event + fast poll), with an alert hold so a
-    // momentary pulse becomes a stable on/off edge.
+    // OEM radar warning families, kept distinct so rear cross traffic or door-open
+    // warnings cannot fire a saved blind-spot automation.
     public static final EventData BLIND_SPOT_LEFT = new EventData("blindSpot", Map.of("side", "left"));
     public static final EventData BLIND_SPOT_RIGHT = new EventData("blindSpot", Map.of("side", "right"));
+    public static final EventData REAR_CROSS_TRAFFIC_LEFT =
+            new EventData("rearCrossTraffic", Map.of("side", "left"));
+    public static final EventData REAR_CROSS_TRAFFIC_RIGHT =
+            new EventData("rearCrossTraffic", Map.of("side", "right"));
+    public static final EventData DOOR_OPEN_WARNING_LEFT =
+            new EventData("doorOpenWarning", Map.of("side", "left"));
+    public static final EventData DOOR_OPEN_WARNING_RIGHT =
+            new EventData("doorOpenWarning", Map.of("side", "right"));
     // Pushed once a minute by TimeEvent (not from a vehicle-data snapshot).
     public static final EventData TIME = new EventData("time");
     public static final EventData DAY = new EventData("day");
@@ -1001,6 +1007,22 @@ public class BydEvent {
     }
 
     /**
+     * Publish a typed front-passenger belt callback as an observed edge.
+     *
+     * <p>Unlike the getter poll, the callback witnessed an actual state transition. Routing it
+     * through {@link Automations#updateObservedEdge} ensures the first callback after daemon
+     * startup fires instead of becoming a silent sampled seed. The normal delivered-value dedup
+     * suppresses a racing poll or duplicate callback of the same state.
+     */
+    public static void publishPassengerSeatbeltEdge(int state) {
+        if (state == 1) {
+            Automations.updateObservedEdge(SEATBELT_PASSENGER, "on");
+        } else if (state == 0) {
+            Automations.updateObservedEdge(SEATBELT_PASSENGER, "off");
+        }
+    }
+
+    /**
      * Sample + publish per-seat seatbelt state NOW (called by the fast {@link
      * com.overdrive.app.automation.condition.SeatbeltEvent} poll). Reads the live
      * {@code getSafetyBeltStatus(area)} getter directly and publishes each seat via the
@@ -1229,7 +1251,7 @@ public class BydEvent {
      * accident or emergency event.
      */
     private static void updateSafetyEvents(BydVehicleData data) {
-        // Tyre pressure: worst state across the four wheels (0=normal,1=under,2=over).
+        // Tyre pressure: worst state across the four wheels (0=normal,1=over,2=under).
         // Publishing the worst gives a single "tyre pressure" trigger that fires on any
         // wheel going abnormal; the UI condition offers normal/under/over.
         String pressure = worstTyrePressure(data.tyrePressureState);
@@ -1248,8 +1270,8 @@ public class BydEvent {
         for (int s : states) {
             if (s < 0) continue; // unavailable slot
             any = true;
-            if (s == 2) over = true;
-            else if (s == 1) under = true;
+            if (BydVehicleData.isTyreOverpressureState(s)) over = true;
+            else if (BydVehicleData.isTyreUnderpressureState(s)) under = true;
         }
         if (!any) return null;
         return over ? "over" : under ? "under" : "normal";

@@ -1760,8 +1760,8 @@
     "heatmap_threat_high": "高い",
     "heatmap_threat_critical": "批判的",
     "state_active": "アクティブ",
-    "state_safe_zone": " 安全地帯",
-    "state_safe_zone_named": " 安全地帯 ({name})",
+    "state_safe_zone": "安全地帯",
+    "state_safe_zone_named": "安全地帯 ({name})",
     "size_used_dash": "-- 使用する",
     "size_limit_dash": "-- 制限",
     "limit_min_default": "100MB",
@@ -2439,13 +2439,13 @@
     "add_zone_failed": "ゾーンを追加できませんでした",
     "confirm_delete_zone": "安全地帯を削除する?",
     "zone_deleted": "削除されたゾーン",
-    "in_safe_zone": " 安全地帯 ({zone}, {meters}m)",
-    "outside_zone": "🔴 外 ({meters}mから最も近い)",
+    "in_safe_zone": "安全地帯 ({zone}, {meters}m)",
+    "outside_zone": "外 ({meters}mから最も近い)",
     "no_zones_yet": "ゾーンはない",
     "waiting_gps": "GPSを待ってる",
-    "badge_on": "● オン",
-    "badge_off": "○ オフ",
-    "you_are_here": " あなたはここにいます",
+    "badge_on": "オン",
+    "badge_off": "オフ",
+    "you_are_here": "あなたはここにいます",
     "popup_radius": "<b>{name}</b><br>{meters}m半径"
   },
   "liveview": {
@@ -2574,7 +2574,6 @@
     "restore_failed": "復元に失敗しました。"
   },
   "about": {
-    "ack_chimes": "RoadSense警告チャイム — Google Sound Libraryの下でライセンスされている音",
     "page_title": "このアプリについて — OverDrive",
     "page_title_short": "このアプリについて",
     "contributors_title": "コントリビューター",
@@ -2596,7 +2595,8 @@
       "kofi_value": "Ko-fi のコーヒー一杯が深夜のコミットを支えます。",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "コントリビューターとサポーターの皆さんのおかげで成り立っています。"
+    "thanks_subtitle": "コントリビューターとサポーターの皆さんのおかげで成り立っています。",
+      "ack_chimes": "RoadSense警告チャイム — Google Sound Libraryの下でライセンスされている音"
   },
   "byd_cloud": {
     "page_title": "BYD クラウド",

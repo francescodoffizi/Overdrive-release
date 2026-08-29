@@ -362,7 +362,9 @@ public final class LauncherApiHandler {
             try {
                 com.overdrive.app.monitor.ChargingStateData cs =
                         com.overdrive.app.monitor.VehicleDataMonitor.getInstance().getChargingState();
-                if (cs != null && !Double.isNaN(cs.chargingPowerKW)) {
+                if (cs != null && Double.isFinite(cs.chargingPowerKW)
+                        && cs.chargingPowerKW >= 0
+                        && cs.chargingPowerKW <= 500) {
                     if (cs.isEstimated) {
                         kwEstimated = true;
                     } else {
@@ -790,11 +792,23 @@ public final class LauncherApiHandler {
                     j.put("startSoc", s.opt("startSoc"));
                     j.put("endSoc", s.opt("endSoc"));
                     j.put("kwh", s.opt("energyAdded"));
+                    j.put("energyIncomplete",
+                            s.optBoolean(
+                                    "energyIncomplete",
+                                    false));
+                    j.put("energyEstimated",
+                            s.optBoolean(
+                                    "energyEstimated",
+                                    !s.has("energySource")
+                                            || s.isNull("energySource")));
+                    j.put("energySource",
+                            s.opt("energySource"));
                     j.put("kw", s.opt("avgPower"));
                     j.put("cost", s.opt("cost"));
                     j.put("currency", s.opt("currency"));
                     j.put("durationMin", s.opt("durationMinutes"));
-                    j.put("dc", s.optBoolean("isDc", false));
+                    j.put("dc", s.has("isDc")
+                            ? s.opt("isDc") : JSONObject.NULL);
                     charging.put(j);
                 }
             }

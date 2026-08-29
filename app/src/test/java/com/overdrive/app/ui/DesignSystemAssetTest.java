@@ -99,6 +99,25 @@ public class DesignSystemAssetTest {
     }
 
     @Test
+    public void webMapsUseKeylessThemeAwareOsmTiles() throws IOException {
+        String theme = readRepositoryFile("app/src/main/assets/web/shared/theme.js");
+        String safeLocations =
+                readRepositoryFile("app/src/main/assets/web/shared/safe-locations.js");
+        String webView = readRepositoryFile(
+                "app/src/main/java/com/overdrive/app/ui/fragment/WebViewFragment.kt");
+
+        assertTrue(theme.contains("https://tile.openstreetmap.de/{z}/{x}/{y}.png"));
+        assertTrue(theme.contains("saturate(.62) brightness(1.04) contrast(.93)"));
+        assertTrue(theme.contains(
+                "invert(.91) hue-rotate(180deg) brightness(.66) contrast(.92) saturate(.68)"));
+        assertTrue(theme.contains("OpenStreetMap contributors"));
+        assertFalse(theme.contains("basemaps.cartocdn.com"));
+        assertTrue(safeLocations.contains("BYD.theme.attachMapTiles(this.map);"));
+        assertTrue(webView.contains("url.contains(\"tile.openstreetmap.de\")"));
+        assertFalse(webView.contains("basemaps.cartocdn.com"));
+    }
+
+    @Test
     public void directionalUiVectorsMirrorInRtl() throws IOException {
         for (String vector : new String[]{"ic_back.xml", "ic_chevron_left.xml",
                 "ic_chevron_right.xml"}) {

@@ -28,9 +28,11 @@ public class NavigationRailLayoutParityTest {
         assertEquals(portrait, landscape);
         assertTrue(portrait.containsAll(Arrays.asList(
                 "railDestDashboard",
+                "railDestAssistant",
                 "railDestLive",
                 "railDestRecordings",
                 "railDestVehicle",
+                "railDestSeatPositions",
                 "railDestProjection",
                 "railDestTrips",
                 "railDestCharging",

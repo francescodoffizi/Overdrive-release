@@ -98,6 +98,29 @@ public final class BydFeatureIds {
     public static final int SET_PASSENGER_SEAT_VENTILATING_STATE = resolveOrFallback("Setting.SET_PASSENGER_SEAT_VENTILATING_STATE", 1335885840);
     public static final int SETTING_CPD_SWITCH_STATUS  = resolveOrFallback("Setting.SETTING_CPD_SWITCH_STATUS", 376438818);
     public static final int SETTING_CPD_SWITCH_STATUS_SET  = resolveOrFallback("Setting.SETTING_CPD_SWITCH_STATUS_SET", 1324617778);
+    /**
+     * AC inlet current-limit controls used by the OEM ElectricLimit screen.
+     *
+     * <p>The runtime framework remains authoritative when it publishes these fields. Older DiLink 3
+     * frameworks expose the same setting-device contract without exporting the field names, so the
+     * connected-platform IDs are retained as fallbacks. Callers MUST prove the read side first
+     * (config state 2 or a current state in 1..5) before sending the write ID; numeric resolution
+     * alone is never capability evidence.
+     */
+    public static final int SETTING_AC_CHARGING_CURRENT_LIMIT_CONFIG_STATUS =
+            resolveOrFallback("Setting.SETTING_AC_CHARGING_CURRENT_LIMIT_CONFIG_STATUS",
+                    0x18500843);
+    public static final int SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS =
+            resolveOrFallback("Setting.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS",
+                    0x18500845);
+    public static final int SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS_SET =
+            resolveOrFallback("Setting.SETTING_AC_CHARGING_CURRENT_LIMIT_STATUS_SET",
+                    0x4EF06044);
+
+    // ==================== ENERGY ====================
+    /** Live road-surface selector: 1=common, 2=snow on the connected DiCar profile. */
+    public static final int ENERGY_ROAD_SURFACE_MODE =
+            resolveOrFallback("Energy.ENERGY_ROAD_SURFACE_MODE", 0x24000033);
 
     // ==================== BODY ====================
     public static final int BODY_ATMOSPHERE_LIGHT_SWITCH = resolveOrFallback("Body.ATMOSPHERE_LIGHT_SWITCH_EXECUTE", 489701406);
@@ -140,6 +163,12 @@ public final class BydFeatureIds {
     // ==================== INSTRUMENT ====================
     public static final int INSTRUMENT_DD_MAIN_SAFETYBELT_STATE = resolveOrFallback("Instrument.INSTRUMENT_DD_MAIN_SAFETYBELT_STATE", 692060184);
     public static final int INSTRUMENT_DD_DEPUTY_SAFETYBELT_STATE = resolveOrFallback("Instrument.INSTRUMENT_DD_DEPUTY_SAFETYBELT_STATE", 638582811);
+    /** OEM four-position exterior-light selector feedback: 1=off, 2=auto, 3=parking, 4=low beam. */
+    public static final int INSTRUMENT_HEADLIGHT_CONTROL_FEEDBACK = resolveOrFallback(
+        "Instrument.INSTRUMENT_HEADLIGHT_CONTROL_FEEDBACK", 1011875880);
+    /** OEM four-position exterior-light selector command: 1=off, 2=auto, 3=parking, 4=low beam. */
+    public static final int INSTRUMENT_HEADLIGHT_CONTROL_SET = resolveOrFallback(
+        "Instrument.INSTRUMENT_HEADLIGHT_CONTROL_SET", 1276153912);
     public static final int INSTRUMENT_MUSIC_STATE_SET = resolveOrFallback("Instrument.MUSIC_STATE_SET", 1138753546);
     public static final int INSTRUMENT_MUSIC_SOURCE_SET = resolveOrFallback("Instrument.MUSIC_SOURCE_SET", 871366704);
     public static final int INSTRUMENT_MUSIC_PLAYBACK_PROGRESS_SET = resolveOrFallback("Instrument.MUSIC_PLAYBACK_PROGRESS_SET", 1138753552);
@@ -189,9 +218,8 @@ public final class BydFeatureIds {
      * while a charge is delivering and resets when a new session starts; the BMS keeps it across
      * a head-unit power cycle, so it is not tied to daemon uptime.
      *
-     * <p>Read as a DOUBLE (the HAL's float accessor width). Domain is the SDK's
-     * {@code CHARGING_CAPACITY_MIN/MAX} = [0.0, 65.534] kWh — 0xFFFE/1000, i.e. a 16-bit
-     * counter at 1 Wh resolution.
+     * <p>Read as a DOUBLE (the HAL's float accessor width). The connected SDK declares
+     * {@code CHARGING_CAPACITY_MIN/MAX} = [0.0, 131.07] kWh.
      */
     public static final int CHARGING_CHARGE_CAPACITY = resolveOrFallback("Charging.CHARGING_CHARGE_CAPACITY", 666894360);
 

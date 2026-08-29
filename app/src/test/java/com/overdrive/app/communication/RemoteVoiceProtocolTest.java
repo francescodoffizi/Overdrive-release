@@ -24,6 +24,7 @@ public class RemoteVoiceProtocolTest {
         RemoteVoiceProtocol.writePcm(output, pcm);
         RemoteVoiceProtocol.writeOverlaySafe(output, false);
         RemoteVoiceProtocol.writeEnd(output);
+        RemoteVoiceProtocol.writeEnd(output, true);
 
         DataInputStream input = new DataInputStream(
                 new ByteArrayInputStream(bytes.toByteArray()));
@@ -38,6 +39,11 @@ public class RemoteVoiceProtocolTest {
         RemoteVoiceProtocol.Packet end = RemoteVoiceProtocol.read(input);
         assertEquals(RemoteVoiceProtocol.TYPE_END, end.type);
         assertEquals(0, end.payload.length);
+
+        RemoteVoiceProtocol.Packet gracefulEnd =
+                RemoteVoiceProtocol.read(input);
+        assertEquals(RemoteVoiceProtocol.TYPE_END, gracefulEnd.type);
+        assertArrayEquals(new byte[]{1}, gracefulEnd.payload);
         assertNull(RemoteVoiceProtocol.read(input));
     }
 

@@ -15,6 +15,8 @@ import android.util.TypedValue
 import androidx.annotation.AttrRes
 import androidx.annotation.WorkerThread
 import com.overdrive.app.R
+import com.overdrive.app.genai.GenAiConfig
+import com.overdrive.app.server.LocaleManager
 import com.overdrive.app.ui.util.RecordingsApiClient
 import com.overdrive.app.util.DaemonHttpClient
 import org.json.JSONObject
@@ -30,6 +32,13 @@ import java.net.HttpURLConnection
 data class DashboardInsight(
     val text: CharSequence,
     val priority: Int = 0
+)
+
+data class DashboardAiInsight(
+    val title: String,
+    val text: String,
+    val createdAt: Long,
+    val model: String
 )
 
 /**
@@ -94,6 +103,35 @@ class DashboardInsightProvider(appContext: Context) {
     }
 
     // ============== Individual insight builders ==============
+
+    /** Latest stored AI card; this path never generates or contacts a provider. */
+    @WorkerThread
+    fun latestAiInsight(): DashboardAiInsight? {
+        if (!GenAiConfig.isDashboardPresentationEnabled()) return null
+        val root = fetchDaemonJson(
+            "/api/genai/insights/dashboard?lang=${LocaleManager.get()}"
+        )
+            ?: return null
+        if (!root.optBoolean("enabled", false)) return null
+        val item = root.optJSONObject("item") ?: return null
+        val createdAt = item.optLong("createdAt", 0L)
+        if (createdAt <= 0L ||
+            System.currentTimeMillis() - createdAt > 30L * DateUtils.DAY_IN_MILLIS
+        ) return null
+        val text = item.optString("text", "").trim()
+        if (text.isEmpty()) return null
+        return DashboardAiInsight(
+            title = item.optString(
+                "title",
+                ctx.getString(R.string.dashboard_ai_insight_default_title)
+            ).trim().ifEmpty {
+                ctx.getString(R.string.dashboard_ai_insight_default_title)
+            },
+            text = text,
+            createdAt = createdAt,
+            model = item.optString("model", "").trim()
+        )
+    }
 
     /** First-launch welcome. priority highest so it wins on visit #0. */
     private fun welcomeInsight(visitCountBefore: Int): DashboardInsight? {
@@ -188,9 +226,16 @@ class DashboardInsightProvider(appContext: Context) {
         val mins = json.optLong("durationMinutes", 0L)
         if (kwh.isNaN() || kwh <= 0.05 || kwh > 500) return null
         if (mins <= 0L || mins > 7 * 24 * 60) return null
+        val energyApproximate = json.optBoolean("energyIncomplete", false)
+            || if (json.has("energyEstimated")) {
+                json.optBoolean("energyEstimated", true)
+            } else {
+                true
+            }
+        val formattedKwh = (if (energyApproximate) "~" else "") + formatKwh(kwh)
         val template = ctx.getString(
             R.string.dashboard_insight_last_charge,
-            formatKwh(kwh),
+            formattedKwh,
             formatDurationMinutes(mins)
         )
         return DashboardInsight(

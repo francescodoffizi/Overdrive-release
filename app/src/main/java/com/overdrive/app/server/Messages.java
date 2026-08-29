@@ -27,13 +27,18 @@ public final class Messages {
     // disk is stale or absent. Separate cache so neither source can shadow the other.
     private static final Map<String, JSONObject> ASSET_CATALOGS = new HashMap<>();
     private static final java.util.Set<String> ASSET_MISSES = new java.util.HashSet<>();
+    // Some HTTP surfaces have their own browser-local locale (the external tunnel) and must
+    // not mutate the app/daemon locale just to serialize one response. Thread-local keeps that
+    // request override isolated from concurrent API calls and from background daemon work.
+    private static final ThreadLocal<String> REQUEST_LOCALE = new ThreadLocal<>();
 
     private Messages() {}
 
     public static String get(String key) { return get(key, (Object[]) null); }
 
     public static String get(String key, Object... args) {
-        String lang = LocaleManager.get();
+        String lang = REQUEST_LOCALE.get();
+        if (lang == null) lang = LocaleManager.get();
         String raw = lookup(lang, key);
         if (raw == null && !lang.equals("en")) raw = lookup("en", key);
         // Last resort: the catalog COMPILED INTO the running APK. The lookups above read the
@@ -52,6 +57,26 @@ public final class Messages {
         // reads as a quoted literal — dropping the apostrophe and, when it comes
         // before a placeholder, suppressing the substitution entirely.
         return MessageFormatSafe.format(raw, Locale.forLanguageTag(lang), args);
+    }
+
+    /**
+     * Run one serialization using {@code lang} without changing the persisted app locale.
+     *
+     * <p>This is intended for request-scoped responses whose client owns a separate locale,
+     * such as the external web tunnel. Nested calls restore the previous override, and the
+     * thread-local is always cleared in {@code finally} so pooled HTTP threads cannot leak a
+     * language into the next request.
+     */
+    public static <T> T withLocale(String lang, java.util.function.Supplier<T> operation) {
+        if (!LocaleManager.isSupported(lang)) return operation.get();
+        String previous = REQUEST_LOCALE.get();
+        REQUEST_LOCALE.set(lang);
+        try {
+            return operation.get();
+        } finally {
+            if (previous == null) REQUEST_LOCALE.remove();
+            else REQUEST_LOCALE.set(previous);
+        }
     }
 
     private static synchronized String lookup(String lang, String key) {
@@ -86,6 +111,11 @@ public final class Messages {
         JSONObject cat = ASSET_CATALOGS.get(lang);
         if (cat == null) {
             if (ASSET_MISSES.contains(lang)) return null; // don't re-open a known-absent asset
+            // Only a real Context can tell us the asset is absent. Before DaemonBootstrap has
+            // one, return without recording a miss — latching here would disable this fallback
+            // for the whole process, which is what let raw keys leak in the first place.
+            android.content.Context ctx = com.overdrive.app.daemon.DaemonBootstrap.getContext();
+            if (ctx == null || ctx.getAssets() == null) return null;
             cat = loadAsset(lang);
             if (cat == null) {
                 ASSET_MISSES.add(lang);

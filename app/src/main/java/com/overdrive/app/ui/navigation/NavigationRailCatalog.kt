@@ -15,6 +15,7 @@ data class NavigationRailOption(
  * persisted because they can change between builds.
  */
 object NavigationRailCatalog {
+    const val ASSISTANT = "assistant"
     const val LIVE = "live"
     const val RECORDINGS = "recordings"
     const val VEHICLE = "vehicle"
@@ -31,6 +32,7 @@ object NavigationRailCatalog {
     const val DIAGNOSTICS = "diagnostics"
 
     val customizableOptions: List<NavigationRailOption> = listOf(
+        NavigationRailOption(ASSISTANT, R.string.rail_assistant, R.drawable.ic_smart_toy),
         NavigationRailOption(LIVE, R.string.rail_live, R.drawable.ic_live),
         NavigationRailOption(RECORDINGS, R.string.rail_recordings, R.drawable.ic_recording),
         NavigationRailOption(VEHICLE, R.string.rail_vehicle, R.drawable.ic_vehicle_control),

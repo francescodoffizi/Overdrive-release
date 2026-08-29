@@ -1,11 +1,13 @@
 /*
  * Seat positions page. Only what this page adds — cards, buttons, chips, badges and
  * form controls all come from shared/styles.css.
+ *
+ * The head-unit WebView is Chrome 58, so flex spacing uses sibling margins instead
+ * of `gap` (flex gap arrived in Chrome 84).
  */
 
 /* ── Seat glyph ───────────────────────────────────────────────────────────────
- * The car's own side render (CarSetting.apk res/drawable-xhdpi-v4/
- * seat_adjust_main_normal.png), duotoned to the OverDrive palette. It is drawn
+ * The car's side-profile seat render, drawn
  * TWICE and clipped along the crease at the recliner, so the backrest half can
  * rotate against the cushion. One flat image would be a static picture; two
  * halves make the glyph actually show the geometry it is labelling, and the wedge
@@ -57,8 +59,9 @@
 
 .seat-frame {
     flex: none;
-    display: grid;
-    place-items: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     background: var(--surface-container-high);
     border: 1px solid var(--outline-variant);
     border-radius: var(--radius-sm);
@@ -67,9 +70,12 @@
 .seat-frame.hero-size { width: 116px; height: 116px; align-self: center; }
 
 /* ── Current position hero ───────────────────────────────────────────────────── */
-.sp-hero { display: flex; align-items: stretch; gap: 18px; }
-.sp-hero-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
-.sp-hero-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.sp-hero { display: flex; align-items: stretch; }
+.sp-hero > * + * { margin-left: 18px; }
+.sp-hero-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.sp-hero-main > * + * { margin-top: 10px; }
+.sp-hero-top { display: flex; align-items: flex-start; justify-content: space-between; }
+.sp-hero-top > * + * { margin-left: 12px; }
 .sp-eyebrow {
     font-size: 10.5px;
     font-weight: 700;
@@ -81,8 +87,10 @@
 .sp-match em { font-style: normal; color: var(--primary); }
 
 /* ── Axis readout ────────────────────────────────────────────────────────────── */
-.sp-axes { display: flex; flex-direction: column; gap: 5px; }
-.sp-axis-line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.sp-axes { display: flex; flex-direction: column; }
+.sp-axes > * + * { margin-top: 5px; }
+.sp-axis-line { display: flex; align-items: baseline; flex-wrap: wrap; }
+.sp-axis-line > * + * { margin-left: 8px; }
 .sp-axis-group {
     font-size: 10px;
     font-weight: 700;
@@ -104,11 +112,11 @@
 .sp-axis + .sp-axis::before { content: '\00b7'; color: var(--outline-variant); margin: 0 6px 0 2px; }
 
 /* Two-batch apply progress, mirroring what applyFull actually does. */
-.sp-batches { display: flex; gap: 8px; align-items: center; }
+.sp-batches { display: flex; align-items: center; }
+.sp-batches > * + * { margin-left: 8px; }
 .sp-batch {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
     font-family: var(--family-mono);
     font-size: 11px;
     padding: 2px 8px;
@@ -116,14 +124,15 @@
     border: 1px solid var(--outline-variant);
     color: var(--outline);
 }
-.sp-batch .led { width: 6px; height: 6px; border-radius: 50%; background: var(--outline); }
+.sp-batch .led { width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--outline); }
 .sp-batch.run .led { background: var(--status-warning); animation: sp-pulse 700ms ease-in-out infinite; }
 .sp-batch.done { color: var(--status-success); border-color: var(--outline-variant); }
 .sp-batch.done .led { background: var(--status-success); }
 @keyframes sp-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
 /* ── List ────────────────────────────────────────────────────────────────────── */
-.sp-group-head { display: flex; align-items: center; gap: 10px; padding: 16px 2px 4px; }
+.sp-group-head { display: flex; align-items: center; padding: 16px 2px 4px; }
+.sp-group-head > * + * { margin-left: 10px; }
 .sp-group-title { font-size: 13px; font-weight: 650; }
 .sp-group-meta { font-size: 12px; color: var(--outline); }
 .sp-group-rule { flex: 1; height: 1px; background: var(--outline-variant); }
@@ -131,7 +140,6 @@
 .sp-row {
     display: flex;
     align-items: center;
-    gap: 14px;
     padding: 12px 16px;
     border-radius: var(--radius-md);
     background: var(--surface-container);
@@ -139,6 +147,7 @@
     transition: background var(--duration-short) var(--easing-standard),
                 border-color var(--duration-short) var(--easing-standard);
 }
+.sp-row > * + * { margin-left: 14px; }
 .sp-row + .sp-row { margin-top: 8px; }
 .sp-row:hover { background: var(--surface-container-high); }
 .sp-row.is-applied { border-color: var(--primary); }
@@ -183,14 +192,14 @@
     cursor: pointer;
     display: inline-flex;
     align-items: center;
-    gap: 5px;
     color: var(--on-surface-variant);
     background: transparent;
 }
-.sp-chip.used-by svg { width: 12px; height: 12px; }
+.sp-chip.used-by svg { width: 12px; height: 12px; margin-right: 5px; }
 .sp-chip.used-by:hover { background: var(--surface-container-highest); color: var(--on-surface); }
 
-.sp-row-actions { flex: none; display: flex; align-items: center; gap: 6px; }
+.sp-row-actions { flex: none; display: flex; align-items: center; }
+.sp-row-actions > * + * { margin-left: 6px; }
 
 /* ── Overflow menu ───────────────────────────────────────────────────────────── */
 .sp-menu-wrap { position: relative; }
@@ -206,9 +215,9 @@
     padding: 6px;
     display: none;
     flex-direction: column;
-    gap: 2px;
     z-index: 15;
 }
+.sp-menu > * + * { margin-top: 2px; }
 .sp-menu.open { display: flex; }
 .sp-menu button {
     appearance: none;
@@ -223,25 +232,25 @@
     cursor: pointer;
     display: flex;
     align-items: center;
-    gap: 10px;
     white-space: nowrap;
 }
-.sp-menu button svg { width: 15px; height: 15px; flex: none; opacity: 0.8; }
+.sp-menu button svg { width: 15px; height: 15px; margin-right: 10px; flex: none; opacity: 0.8; }
 .sp-menu button:hover { background: var(--surface-container-highest); }
 .sp-menu button.danger { color: var(--status-danger); }
 .sp-menu-sep { height: 1px; background: var(--outline-variant); margin: 4px 6px; }
 
 /* ── Used-by dialog list ─────────────────────────────────────────────────────── */
-.sp-uses { display: flex; flex-direction: column; gap: 8px; }
+.sp-uses { display: flex; flex-direction: column; }
+.sp-uses > * + * { margin-top: 8px; }
 .sp-use {
     display: flex;
     align-items: baseline;
-    gap: 10px;
     padding: 9px 12px;
     border-radius: var(--radius-sm);
     background: var(--surface-container-low);
     border: 1px solid var(--outline-variant);
 }
+.sp-use > * + * { margin-left: 10px; }
 .sp-use-name { font-weight: 600; font-size: 13.5px; }
 .sp-use-trigger { font-size: 12px; color: var(--outline); }
 
@@ -263,11 +272,10 @@
 .sp-parts-summary {
     display: flex;
     align-items: center;
-    gap: 6px;
     font-size: 12px;
     color: var(--tertiary);
 }
-.sp-dot { opacity: 0.5; }
+.sp-dot { margin: 0 6px; opacity: 0.5; }
 .sp-swatch {
     display: inline-block;
     width: 10px;
@@ -278,19 +286,21 @@
 }
 
 /* ── save-parts chooser ─────────────────────────────────────────────────────── */
-.sp-parts { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.sp-parts { display: flex; flex-direction: column; margin-top: 4px; }
+.sp-parts > * + * { margin-top: 4px; }
 .sp-part {
     display: flex;
     align-items: flex-start;
-    gap: 10px;
     padding: 10px 12px;
     border: 1px solid var(--outline-variant);
     border-radius: 10px;
     cursor: pointer;
 }
+.sp-part > * + * { margin-left: 10px; }
 .sp-part:hover { background: var(--surface-container-high); }
 .sp-part input { margin-top: 2px; flex: none; }
-.sp-part-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sp-part-text { display: flex; flex-direction: column; min-width: 0; }
+.sp-part-text > * + * { margin-top: 2px; }
 .sp-part-label { font-weight: 600; font-size: 14px; }
 .sp-part-hint { font-size: 12px; color: var(--tertiary); }
 
@@ -299,7 +309,8 @@
    trim and only the 30-colour hex ramp is known here, so swatches cannot be drawn for
    a larger palette — but a gradient can, and it matches the continuous-looking control
    the car's own screen uses. The slider still picks a discrete index. */
-.sp-colour-pick { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+.sp-colour-pick { display: flex; flex-direction: column; margin-top: 4px; }
+.sp-colour-pick > * + * { margin-top: 10px; }
 .sp-colour-range {
     -webkit-appearance: none;
     appearance: none;
@@ -333,9 +344,69 @@
 .sp-colour-meta {
     display: flex;
     align-items: baseline;
-    gap: 4px;
     font-family: var(--family-mono);
     font-size: 12px;
     color: var(--on-surface-variant);
 }
+.sp-colour-meta > * + * { margin-left: 4px; }
 .sp-colour-of { color: var(--outline); }
+
+.sp-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+}
+.sp-dialog-actions > * + * { margin-left: 8px; }
+
+[dir="rtl"] .sp-hero > * + * { margin-left: 0; margin-right: 18px; }
+[dir="rtl"] .sp-hero-top > * + * { margin-left: 0; margin-right: 12px; }
+[dir="rtl"] .sp-axis-line > * + *,
+[dir="rtl"] .sp-batches > * + *,
+[dir="rtl"] .sp-name-line > * + *,
+[dir="rtl"] .sp-dialog-actions > * + * { margin-left: 0; margin-right: 8px; }
+[dir="rtl"] .sp-group-head > * + *,
+[dir="rtl"] .sp-use > * + *,
+[dir="rtl"] .sp-part > * + * { margin-left: 0; margin-right: 10px; }
+[dir="rtl"] .sp-row > * + * { margin-left: 0; margin-right: 14px; }
+[dir="rtl"] .sp-row-actions > * + * { margin-left: 0; margin-right: 6px; }
+[dir="rtl"] .sp-colour-meta > * + * { margin-left: 0; margin-right: 4px; }
+[dir="rtl"] .sp-batch .led,
+[dir="rtl"] .sp-chip.used-by svg,
+[dir="rtl"] .sp-menu button svg {
+    margin-right: 0;
+}
+[dir="rtl"] .sp-batch .led { margin-left: 6px; }
+[dir="rtl"] .sp-chip.used-by svg { margin-left: 5px; }
+[dir="rtl"] .sp-menu button svg { margin-left: 10px; }
+
+@media (max-width: 768px) {
+    .sp-row {
+        align-items: flex-start;
+        flex-wrap: wrap;
+    }
+    .sp-row-actions {
+        width: 100%;
+        margin-top: 12px;
+        margin-left: 0;
+    }
+    .sp-row-actions > .btn:not(.icon-btn) { flex: 1; }
+    [dir="rtl"] .sp-row-actions {
+        margin-right: 0;
+    }
+}
+
+@media (max-width: 480px) {
+    .sp-hero {
+        flex-direction: column;
+    }
+    .sp-hero > * + * {
+        margin-top: 16px;
+        margin-left: 0;
+    }
+    .sp-hero-top .btn {
+        flex: none;
+        white-space: nowrap;
+    }
+    [dir="rtl"] .sp-hero > * + * {
+        margin-right: 0;
+    }
+}

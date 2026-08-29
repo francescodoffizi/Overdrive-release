@@ -922,7 +922,17 @@ object UnifiedConfigManager {
             // two pipelines don't collide. 30s into the pano cycle.
             oemDashcam.put("segmentRotateOffsetMs", 30_000)
         }
-        
+
+        // OS package policy (NOT feature gates). Each key is a `pm` state that a
+        // firmware OTA silently undoes, so it is re-asserted on daemon boot —
+        // see TrafficMonitorPolicy.enforceStickyDisableIfRequested.
+        val systemApps = config.optJSONObject("systemApps") ?: JSONObject().also {
+            config.put("systemApps", it)
+        }
+        if (!systemApps.has("disableTrafficMonitor")) {
+            systemApps.put("disableTrafficMonitor", false)
+        }
+
         // Trip Analytics defaults
         val tripAnalytics = config.optJSONObject("tripAnalytics") ?: JSONObject().also {
             config.put("tripAnalytics", it)
@@ -987,6 +997,12 @@ object UnifiedConfigManager {
         if (!remoteCommunication.has("outputLevelOverrideEnabled")) {
             remoteCommunication.put("outputLevelOverrideEnabled", false)
         }
+        if (!remoteCommunication.has("audioChannel")) {
+            remoteCommunication.put("audioChannel", "media")
+        }
+        if (!remoteCommunication.has("listenerEnabled")) {
+            remoteCommunication.put("listenerEnabled", false)
+        }
         if (!remoteCommunication.has("messagesEnabled")) {
             remoteCommunication.put("messagesEnabled", true)
         }
@@ -999,6 +1015,27 @@ object UnifiedConfigManager {
             config.put("bydCloud", it)
         }
         if (!bydCloud.has("enabled")) bydCloud.put("enabled", false)
+
+        // GenAI BYOK. Disabled by default; no provider client, worker, timer,
+        // or network request exists until the user explicitly enables and
+        // invokes it. The apiKey field is intentionally not seeded here —
+        // GenAiConfig owns encrypted credential persistence.
+        val genAi = config.optJSONObject("genAi") ?: JSONObject().also {
+            config.put("genAi", it)
+        }
+        if (!genAi.has("enabled")) genAi.put("enabled", false)
+        if (!genAi.has("provider")) genAi.put("provider", "openai")
+        if (!genAi.has("baseUrl")) genAi.put("baseUrl", "https://api.openai.com")
+        if (!genAi.has("model")) genAi.put("model", "")
+        if (!genAi.has("realtimeModel")) genAi.put("realtimeModel", "")
+        if (!genAi.has("maxOutputTokens")) genAi.put("maxOutputTokens", 1200)
+        if (!genAi.has("insightSchedule")) genAi.put("insightSchedule", "off")
+        if (!genAi.has("insightHour")) genAi.put("insightHour", 20)
+        if (!genAi.has("insightMinute")) genAi.put("insightMinute", 0)
+        if (!genAi.has("insightDay")) genAi.put("insightDay", 7)
+        if (!genAi.has("insightMode")) genAi.put("insightMode", "overview")
+        if (!genAi.has("insightDashboard")) genAi.put("insightDashboard", false)
+        if (!genAi.has("insightNotifications")) genAi.put("insightNotifications", false)
 
         // Cloudflared defaults
         val cloudflared = config.optJSONObject("cloudflared") ?: JSONObject().also {
@@ -2294,6 +2331,11 @@ object UnifiedConfigManager {
     @JvmStatic
     fun getAutomation(): JSONObject = loadConfig().optJSONObject("automation") ?: JSONObject()
 
+    /** Per-action driving-safety guards. Missing keys default ON in DrivingSafetyGuard. */
+    @JvmStatic
+    fun getDrivingSafety(): JSONObject =
+        loadConfig().optJSONObject("drivingSafety") ?: JSONObject()
+
     /** Gate for the automation ShellAction — DISTINCT from [isKeymapAdvancedAllowed].
      *  Automations fire autonomously on vehicle events (not a deliberate button
      *  press), so arming shell there is a separate, stricter opt-in: enabling the
@@ -2310,25 +2352,40 @@ object UnifiedConfigManager {
     fun setAutomationShellAllowed(allow: Boolean): Boolean =
         updateValues("automation", mapOf("allowShell" to allow))
 
-    /** Whether the user has explicitly disabled OverDrive's WiFi keep-alive via the
-     *  Background services setting or turned WiFi OFF via an automation / key-mapping
-     *  radio action. The WiFi keep-alive watchdog (AccSentryDaemon.ensureWifiEnabled,
-     *  SentryDaemon.enableWifi, ServiceLauncher.ensureWifiEnabled) checks this BEFORE
-     *  running `svc wifi enable`, so a deliberate "WiFi off" rule is not immediately
-     *  auto-re-enabled. Defaults FALSE — with no such rule the keep-alive behaves
-     *  normally (keeps the head unit connected for streaming / cloud). Fail-open on any
-     *  read error (returns false → keep-alive resumes) so a transient config glitch can
-     *  never strand WiFi off. Lives in a dedicated "radio" section. */
+    /** Whether OverDrive's WiFi keep-alive must stand down. User/automation intent and
+     *  the hotspot's temporary single-radio guard are independent: changing either one
+     *  must never clear the other. Defaults FALSE and fails open on read errors. */
     @JvmStatic
-    fun isWifiKeepAliveSuppressed(): Boolean =
-        try { (loadConfig().optJSONObject("radio")?.optBoolean("wifiUserOff", false)) ?: false }
-        catch (t: Throwable) { false }
+    fun isWifiKeepAliveSuppressed(): Boolean = try {
+        val config = loadConfig()
+        val userOff =
+            config.optJSONObject("radio")?.optBoolean("wifiUserOff", false) ?: false
+        val hotspotOwnsSuppression =
+            config.optJSONObject("hotspot")
+                ?.optBoolean("suppressedByHotspot", false) ?: false
+        userOff || hotspotOwnsSuppression
+    } catch (t: Throwable) {
+        false
+    }
 
-    /** Persist the WiFi keep-alive suppression flag. Set true by the Background services
-     *  setting or when a radio action turns WiFi off (so keep-alive stands down), and
-     *  cleared to false when the setting is enabled or WiFi is turned back on.
-     *  Single-key merge on the "radio" section, off the main looper (updateValues
-     *  routes an app-process write to the daemon). */
+    /** Positive user-facing form of the persisted WiFi user/automation intent.
+     *  Deliberately ignores the hotspot's temporary suppression marker. */
+    @JvmStatic
+    fun isWifiAutoEnableEnabled(): Boolean =
+        try {
+            !(loadConfig().optJSONObject("radio")
+                ?.optBoolean("wifiUserOff", false) ?: false)
+        } catch (t: Throwable) {
+            true
+        }
+
+    @JvmStatic
+    fun setWifiAutoEnableEnabled(enabled: Boolean): Boolean =
+        setWifiKeepAliveSuppressed(!enabled)
+
+    /** Persist user/automation WiFi-off intent only. The hotspot owns its separate
+     *  suppressedByHotspot marker. Single-key merge on the "radio" section, off the
+     *  main looper (updateValues routes an app-process write to the daemon). */
     @JvmStatic
     fun setWifiKeepAliveSuppressed(suppressed: Boolean): Boolean =
         updateValues("radio", mapOf("wifiUserOff" to suppressed))
@@ -2376,10 +2433,9 @@ object UnifiedConfigManager {
     @JvmStatic
     fun updateHotspot(values: Map<String, Any>): Boolean = updateValues("hotspot", values)
 
-    /** Whether the hotspot itself set [setWifiKeepAliveSuppressed]. SoftAP and
-     *  WiFi-STA share one radio, so enabling the hotspot must suppress the WiFi
-     *  keep-alive watchdog — but only the hotspot may clear a flag it set, or a
-     *  deliberate user "WiFi off" would be undone on hotspot teardown. */
+    /** Whether the hotspot temporarily suppresses WiFi keep-alive. SoftAP and WiFi-STA
+     *  share one radio, so this marker is combined with (but never overwrites) the
+     *  user's independent WiFi auto-enable preference. */
     @JvmStatic
     fun didHotspotSuppressWifiKeepAlive(): Boolean =
         try { getHotspot().optBoolean("suppressedByHotspot", false) } catch (t: Throwable) { false }
@@ -2706,6 +2762,19 @@ object UnifiedConfigManager {
     }
 
     /**
+     * OS-level package policy the user opted into. These are NOT feature gates —
+     * each key records a `pm` state we must re-assert on daemon boot because a
+     * firmware OTA re-scans the system partition and undoes it. Read fields:
+     * disableTrafficMonitor. Owner: TrafficMonitorPolicy.
+     */
+    @JvmStatic
+    fun getSystemApps(): JSONObject {
+        return loadConfig().optJSONObject("systemApps") ?: JSONObject().apply {
+            put("disableTrafficMonitor", false)
+        }
+    }
+
+    /**
      * True iff either OEM Dashcam mode is non-Off. Pipeline lifecycle is
      * OR-gated. Streaming alone does NOT activate recording — that's gated
      * separately by the daemon-side stream router, mirroring how pano
@@ -2974,6 +3043,8 @@ object UnifiedConfigManager {
             put("voiceEnabled", true)
             put("outputLevel", 70)
             put("outputLevelOverrideEnabled", false)
+            put("audioChannel", "media")
+            put("listenerEnabled", false)
             put("messagesEnabled", true)
             put("emergencyDisabled", false)
         }
@@ -4022,6 +4093,7 @@ object UnifiedConfigManager {
         config.put("tripAnalytics", JSONObject())
         config.put("oemDashcam", JSONObject())
         config.put("bydCloud", JSONObject())
+        config.put("genAi", JSONObject())
         config.put("geocoding", JSONObject())
         config.put("version", 1)
         config.put("lastModified", System.currentTimeMillis())

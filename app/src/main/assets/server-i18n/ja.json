@@ -486,7 +486,6 @@
     "close_all_windows_label": "すべての窓を閉じる"
   },
   "automation": {
-    "wait_timeout": "タイムアウト (秒)",
     "lock": "車両をロック",
     "lock_description": "車両のドアをロックします。",
     "unlock": "Desbloquear Veículo",
@@ -499,8 +498,6 @@
     "windows_all_description": "すべてのウィンドウを開く、閉じる、または停止します。",
     "tailgate": "テールゲート",
     "tailgate_description": "テールゲート/トランクを開く、閉じる、または停止します。",
-    "save_seat_position": "座席の位置を保存",
-    "save_seat_position_description": "現在のドライバーシートの位置をメモロットに保存します。",
     "child_lock": "子のロック",
     "child_lock_description": "後部子ロックを有効または無効にします。",
     "wireless_charging": "電話無線充電",
@@ -529,6 +526,12 @@
     "set_seat_climate_description": "シートの加熱／冷却の設定を行います。",
     "set_drl": "DRL の状態を設定",
     "set_drl_description": "昼間走行灯 の状態を設定します。この操作は車両の電源がオフのときは動作しません。",
+    "set_headlight_mode": "ヘッドライトモードを設定",
+    "set_headlight_mode_description": "純正の外部ライトセレクターを設定します。オフは車両が安全に駐車されている場合にのみ受け付けられます。これは車両側のローカル制御で、車両の電源が切れている場合は動作しません。",
+    "headlight_mode": "ヘッドライトモード",
+    "headlight_auto": "オート",
+    "parking_lights": "車幅灯",
+    "headlight_on_low_beam": "オン（ロービーム）",
     "send_notification": "通知を送信",
     "send_notification_description": "プッシュ通知を送信します。通知が有効になっているインストール済みのアプリにプッシュ通知が送信されます。",
     "actions_description": "このオートメーションがトリガーされたときに実行するアクションです。これらのアクションは順番に実行され、多少遅れることがあります。",
@@ -611,8 +614,6 @@
     "speed": "速度",
     "set_ac_fan": "ACファン速度を設定",
     "set_ac_fan_description": "エアコンの現在のファン速度を変更します。車両の電源が切れている間はこのコントロールは動作しません。",
-    "set_seat_position": "座席の位置",
-    "set_seat_position_description": "シートメモリの位置をロードします。最初に車両からメモリが保存されていることを確認してください。 このコントロールは、車両の電源が切れている間は動作しません。",
     "position_1": "ポジション 1",
     "position_2": "ポジション 2",
     "open_windows": "Windowsを開く",
@@ -1086,7 +1087,12 @@
     "mqtt_channel": "チャンネル",
     "mqtt_value": "値",
     "wait_until_description": "選択された信号が比較を満たすまで、またはタイムアウトが経過するまで、残りのアクションを一時停止します。例: ウィンドウを閉じる前にスピード = 0 まで待機します。",
-    "wait_until_state_description": "選択したオン/オフ信号が状態に達するまで、またはタイムアウトが経過するまで、残りのアクションを一時停止します。例: 続行する前にインジケーターがオフになるまで待機します。"
+    "wait_until_state_description": "選択したオン/オフ信号が状態に達するまで、またはタイムアウトが経過するまで、残りのアクションを一時停止します。例: 続行する前にインジケーターがオフになるまで待機します。",
+      "wait_timeout": "タイムアウト (秒)",
+      "save_seat_position": "座席の位置を保存",
+      "save_seat_position_description": "現在のドライバーシートの位置をメモロットに保存します。",
+      "set_seat_position": "座席の位置",
+      "set_seat_position_description": "シートメモリの位置をロードします。最初に車両からメモリが保存されていることを確認してください。 このコントロールは、車両の電源が切れている間は動作しません。"
   },
   "messages": {
     "logged_out": "ログアウト",

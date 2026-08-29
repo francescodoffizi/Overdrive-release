@@ -48,8 +48,7 @@ enum class DaemonType(
  * to terminate the whole daemon stack and KEEP it down while parked (zero compute).
  *
  * Deliberately DISTINCT from [DaemonType.sentinelPath] (the user `.disabled` sentinel):
- *  - `.disabled` is wiped by DaemonStartupManager.clearStaleSentinels() on every
- *    boot/launch — reusing it would let the stack rebuild mid-park.
+ *  - `.disabled` persists until the user manually starts that daemon.
  *  - `.disabled` also means "the USER stopped this" — reusing it would make a parked
  *    car look permanently user-disabled.
  * This marker is NOT in CORE_DAEMONS, so clearStaleSentinels never touches it; it is

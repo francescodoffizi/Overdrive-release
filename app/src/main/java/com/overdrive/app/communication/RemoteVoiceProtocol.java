@@ -49,6 +49,11 @@ public final class RemoteVoiceProtocol {
         write(out, TYPE_END, new byte[0]);
     }
 
+    public static void writeEnd(DataOutputStream out, boolean drain)
+            throws IOException {
+        write(out, TYPE_END, new byte[]{(byte) (drain ? 1 : 0)});
+    }
+
     private static void write(DataOutputStream out, int type, byte[] payload)
             throws IOException {
         out.writeInt(1 + payload.length);

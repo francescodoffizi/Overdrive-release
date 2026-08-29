@@ -59,6 +59,7 @@ public class Actions {
      */
     public Actions() {
         addAction(new NotificationAction(new Label("notification", "automation.send_notification"), "automation.send_notification_description"));
+        addAction(new GenAiInsightAction());
         // ── Composite vehicle commands (parity with key mapping) ──────────
         // lock / unlock / flash / find-car route through the dedicated
         // /api/vehicle/<action> endpoints (cloud-first on this generation). These
@@ -117,6 +118,17 @@ public class Actions {
         addAction(new VehicleControlAction(
                 new Label("drl", "automation.set_drl"), "automation.set_drl_description",
                 new EnumType(new Label("payload", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
+        // OEM four-position exterior-light selector. The label id MUST equal the shared
+        // catalog key so automations and key mappings execute the identical routed command.
+        addAction(new VehicleControlAction(
+                new Label("headlight_mode", "automation.set_headlight_mode"),
+                "automation.set_headlight_mode_description",
+                new EnumType(
+                        new Label("payload", "automation.headlight_mode"),
+                        new Label("off", "automation.off"),
+                        new Label("auto", "automation.headlight_auto"),
+                        new Label("parking", "automation.parking_lights"),
+                        new Label("low_beam", "automation.headlight_on_low_beam"))));
         // Hazard (double-flash) lights on/off — catalog key "hazard". The SET is
         // unconfirmed on this platform (see VehicleControlCatalog/HazardCommand); the
         // action reports failure honestly if the HAL refuses the write.
@@ -167,7 +179,7 @@ public class Actions {
         addAction(new VehicleControlAction(
                 new Label("adas_aeb", "automation.set_aeb"), "automation.set_aeb_description",
                 new EnumType(new Label("payload", "automation.action"), new Label("on", "automation.on"))));
-        // ── Climate breadth: AC auto / fan-only / steering-wheel heater ──
+        // ── Climate breadth: AC auto / sync / fan-only / steering-wheel heater ──
         // Each maps the on/off enum into a distinct /api/vehicle/climate action string.
         addAction(new ApiAction(
                 new Label("acAuto", "automation.set_ac_auto"),
@@ -175,6 +187,13 @@ public class Actions {
                 "POST",
                 "/api/vehicle/climate",
                 "{\"action\":\"auto_${action}\"}",
+                new EnumType(new Label("action", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
+        addAction(new ApiAction(
+                new Label("acSync", "automation.set_ac_sync"),
+                "automation.set_ac_sync_description",
+                "POST",
+                "/api/vehicle/climate",
+                "{\"action\":\"sync_${action}\"}",
                 new EnumType(new Label("action", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
         // A standalone "switch the AC off in N minutes" step, so a window can be armed (or
         // cancelled, with "0") without also re-issuing a power command — e.g. extend the window
@@ -814,15 +833,12 @@ public class Actions {
         // VehicleControlAction.trigger resolves it.
         addAction(new VehicleControlAction(
                 new Label("drive_mode", "automation.set_drive_mode"), "automation.set_drive_mode_description",
-                // Drive mode routes through the energy-device operation setter, whose public
-                // enum supports NORMAL/ECO/SPORT. OverDrive exposes those on its stable
-                // config axis (NORMAL=1, ECO=2, SPORT=3, SNOW=4).
-                // SNOW is left out of the picker (it interacts with a road-surface axis
-                // and is rarely a user automation), but the payload mapping accepts it.
+                // Stable config axis: NORMAL=1, ECO=2, SPORT=3, SNOW/RAIN=4.
                 new EnumType(new Label("payload", "automation.mode"),
                         new Label("normal", "automation.mode_normal"),
                         new Label("eco", "automation.mode_eco"),
-                        new Label("sport", "automation.mode_sport"))));
+                        new Label("sport", "automation.mode_sport"),
+                        new Label("snow", "automation.mode_snow"))));
         // Only field-validated energy writes are offered. Conditions still decode the complete SDK
         // enum so modes already reported by the vehicle remain observable.
         addAction(new VehicleControlAction(
@@ -850,8 +866,15 @@ public class Actions {
                 "automation.battery_hold_description",
                 new EnumType(new Label("payload", "automation.mode"),
                         new Label("at_current", "automation.battery_hold_at_current"),
+                        new Label("at_target", "automation.battery_hold_at_target"),
                         new Label("at_floor", "automation.battery_hold_at_floor"),
                         new Label("off", "automation.off"))));
+        addAction(new VehicleControlAction(
+                new Label("target_soc", "automation.set_target_soc"),
+                "automation.set_target_soc_description",
+                new IntType(new Label("payload", "automation.percent"),
+                        com.overdrive.app.byd.BydDataCollector.SOC_TARGET_MIN,
+                        com.overdrive.app.byd.BydDataCollector.SOC_TARGET_MAX)));
         addAction(new VehicleControlAction(
                 new Label("charge_cap_percent", "automation.soc_hold_percent"),
                 "automation.soc_hold_percent_description",
@@ -862,6 +885,18 @@ public class Actions {
                 new EnumType(new Label("payload", "automation.action"),
                         new Label("1", "automation.on"),
                         new Label("0", "automation.off"))));
+        addAction(new ApiAction(
+                new Label("acChargeCurrentLimit", "automation.ac_charge_current_limit"),
+                "automation.ac_charge_current_limit_description",
+                "POST",
+                "/api/vehicle/ac-charge-current-limit",
+                "{\"state\":${state}}",
+                new EnumType(new Label("state", "automation.ac_charge_current"),
+                        new Label("1", "automation.ac_charge_current_6a"),
+                        new Label("2", "automation.ac_charge_current_8a"),
+                        new Label("3", "automation.ac_charge_current_10a"),
+                        new Label("4", "automation.ac_charge_current_16a"),
+                        new Label("5", "automation.ac_charge_current_max"))));
         // Smart-charge controls have no local SDK primitive and therefore deliberately use the
         // capability-gated cloud endpoints. The master toggle remains separate from a schedule
         // save so a rule can pause/resume the existing OEM schedule without overwriting it.
@@ -918,6 +953,16 @@ public class Actions {
                         new Label("action", "automation.action"),
                         new Label("disable", "automation.off"),
                         new Label("enable", "automation.on"))));
+        addAction(new ApiAction(
+                new Label("operatingMode", "automation.set_operating_mode"),
+                "automation.set_operating_mode_description",
+                "POST",
+                "/api/surveillance/config",
+                "{\"operatingMode\":\"${mode}\",\"applyCurrentAccState\":true}",
+                new EnumType(
+                        new Label("mode", "automation.mode"),
+                        new Label("onOnly", "automation.operating_mode_on_only"),
+                        new Label("onAndOff", "automation.operating_mode_on_and_off"))));
         addAction(new ApiAction(
                 new Label("recording", "automation.set_recording"),
                 "automation.set_recording_description",

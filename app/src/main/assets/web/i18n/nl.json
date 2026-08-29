@@ -1763,8 +1763,8 @@
     "heatmap_threat_high": "HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET HET",
     "heatmap_threat_critical": "CRIETICK",
     "state_active": "Actief",
-    "state_safe_zone": " Veilig gebied",
-    "state_safe_zone_named": " Veilig gebied ({name})",
+    "state_safe_zone": "Veilig gebied",
+    "state_safe_zone_named": "Veilig gebied ({name})",
     "size_used_dash": "-- gebruikt",
     "size_limit_dash": "- limiet",
     "limit_min_default": "100 MB",
@@ -2442,13 +2442,13 @@
     "add_zone_failed": "Zone niet toegevoegd",
     "confirm_delete_zone": "Deze veilige zone verwijderen?",
     "zone_deleted": "Zone verwijderd",
-    "in_safe_zone": " In de veilige zone ({zone}, {meters}m)",
-    "outside_zone": "🔴 Buiten ({meters}m tot dichtstbijzijnde)",
+    "in_safe_zone": "In de veilige zone ({zone}, {meters}m)",
+    "outside_zone": "Buiten ({meters}m tot dichtstbijzijnde)",
     "no_zones_yet": "Nog geen zones",
     "waiting_gps": "Wachtend op GPS...",
-    "badge_on": "● ON",
-    "badge_off": "○ OFF",
-    "you_are_here": " Je bent hier",
+    "badge_on": "ON",
+    "badge_off": "OFF",
+    "you_are_here": "Je bent hier",
     "popup_radius": "<b>{name}</b><br>{meters}m"
   },
   "liveview": {
@@ -2577,7 +2577,6 @@
     "restore_failed": "Herstellen mislukt."
   },
   "about": {
-    "ack_chimes": "RoadSense waarschuwing chimes - geluiden van de Google Sound Library, gelicentieerd onder",
     "page_title": "Over — OverDrive",
     "page_title_short": "Over",
     "contributors_title": "Bijdragers",
@@ -2599,7 +2598,8 @@
       "kofi_value": "Een koffie op Ko-fi houdt de late commits gaande.",
       "kofi_url": "https://ko-fi.com/E1E71XALHX"
     },
-    "thanks_subtitle": "Gebouwd met hulp van bijdragers en ondersteuners."
+    "thanks_subtitle": "Gebouwd met hulp van bijdragers en ondersteuners.",
+      "ack_chimes": "RoadSense waarschuwing chimes - geluiden van de Google Sound Library, gelicentieerd onder"
   },
   "byd_cloud": {
     "page_title": "BYD Wolk",
