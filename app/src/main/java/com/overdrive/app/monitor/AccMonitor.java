@@ -577,7 +577,7 @@ public class AccMonitor {
         }
     }
 
-    private static String execShell(String command) {
+    public static String execShell(String command) {
         StringBuilder output = new StringBuilder();
         try {
             Process process = Runtime.getRuntime().exec(new String[]{"sh", "-c", command});

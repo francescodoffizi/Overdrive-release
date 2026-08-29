@@ -5385,6 +5385,39 @@ public class BydDataCollector {
         // snapshot into a fresh observation on every poll.
         b.chargingPowerKw(Double.NaN);
         if (chargingDevice == null) {
+            if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+                try {
+                    String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
+                        "dumpsys car_service 2>/dev/null | grep -E '0x21403c00|0x2140461c' | grep 'lastEvent'");
+                    if (!propDump.isEmpty()) {
+                        long gunObs = chargingObservationOrder.begin();
+                        if (propDump.contains("Property:0x21403c00") && propDump.contains("int32Values: [1]")) {
+                            chargingObservationOrder.recordGunPoll(gunObs);
+                            b.chargingGunState(2); // Gun Connected
+                            evidence.connectionObserved = true;
+                            evidence.gunObservation = gunObs;
+                        }
+                        if (propDump.contains("Property:0x2140461c")) {
+                            if (propDump.contains("int32Values: [4]")) {
+                                observedChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_SCHEDULE; // 9 = SCHEDULED
+                            } else if (propDump.contains("int32Values: [1]")) {
+                                observedChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_CHARGING; // 1 = CHARGING
+                                evidence.powerIsCharging = Boolean.TRUE;
+                            } else if (propDump.contains("int32Values: [2]")) {
+                                observedChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_CHARG_FINISH; // 2 = FINISHED
+                            }
+                        }
+                        if (observedChargingState != BydVehicleData.UNAVAILABLE) {
+                            b.chargingState(observedChargingState);
+                        }
+                        b.chargingType(1); // AC charging
+                        b.vtolCharging(false);
+                        return evidence;
+                    }
+                } catch (Throwable t) {
+                    logger.debug("DiLink5 charging probe error: " + t.getMessage());
+                }
+            }
             b.chargingState(BydVehicleData.UNAVAILABLE)
                     .chargingGunState(BydVehicleData.UNAVAILABLE)
                     .chargingType(BydVehicleData.UNAVAILABLE)
