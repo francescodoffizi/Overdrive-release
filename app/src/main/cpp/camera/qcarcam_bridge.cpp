@@ -44,32 +44,27 @@ pthread_t g_streamThread = 0;
 ANativeWindow* g_nativeWindow = nullptr;
 std::mutex g_winMutex;
 
-// Convert UYVY to RGBA8888 for Surface posting (vertical flip for upright orientation)
+// Convert UYVY to RGBA8888 for Surface posting (normal upright orientation and full-range BT.601 colors)
 void convert_uyvy_to_rgba(const uint8_t* uyvy, int width, int height, uint32_t* dst_rgba, int dst_stride) {
     int stride = (dst_stride > 0 ? dst_stride : width);
     for (int y = 0; y < height; ++y) {
-        // Flip vertically: map y to (height - 1 - y)
-        const uint8_t* src_row = uyvy + (height - 1 - y) * width * 2;
+        const uint8_t* src_row = uyvy + y * width * 2;
         uint32_t* dst_row = dst_rgba + y * stride;
         for (int x = 0; x < width; x += 2) {
-            uint8_t u  = src_row[0];
-            uint8_t y0 = src_row[1];
-            uint8_t v  = src_row[2];
-            uint8_t y1 = src_row[3];
+            int u  = (int)src_row[0] - 128;
+            int y0 = (int)src_row[1];
+            int v  = (int)src_row[2] - 128;
+            int y1 = (int)src_row[3];
             src_row += 4;
 
-            int c0 = (int)y0 - 16;
-            int c1 = (int)y1 - 16;
-            int d = (int)u - 128;
-            int e = (int)v - 128;
+            // Full Range BT.601 YUV -> RGB (accurate colors, uncrushed blacks)
+            int r0 = y0 + ((1436 * v + 512) >> 10);
+            int g0 = y0 - ((352 * u + 731 * v + 512) >> 10);
+            int b0 = y0 + ((1815 * u + 512) >> 10);
 
-            int r0 = (298 * c0 + 409 * e + 128) >> 8;
-            int g0 = (298 * c0 - 100 * d - 208 * e + 128) >> 8;
-            int b0 = (298 * c0 + 516 * d + 128) >> 8;
-
-            int r1 = (298 * c1 + 409 * e + 128) >> 8;
-            int g1 = (298 * c1 - 100 * d - 208 * e + 128) >> 8;
-            int b1 = (298 * c1 + 516 * d + 128) >> 8;
+            int r1 = y1 + ((1436 * v + 512) >> 10);
+            int g1 = y1 - ((352 * u + 731 * v + 512) >> 10);
+            int b1 = y1 + ((1815 * u + 512) >> 10);
 
             r0 = r0 < 0 ? 0 : (r0 > 255 ? 255 : r0);
             g0 = g0 < 0 ? 0 : (g0 > 255 ? 255 : g0);
@@ -91,7 +86,7 @@ void convert_nv12_to_rgba(const uint8_t* nv12, int width, int height, uint32_t* 
     const uint8_t* uv_plane = nv12 + (width * height);
 
     for (int y = 0; y < height; y++) {
-        int src_y = height - 1 - y;
+        int src_y = y;
         uint32_t* row = dst_rgba + y * stride;
         for (int x = 0; x < width; x++) {
             int y_val = y_plane[src_y * width + x];
