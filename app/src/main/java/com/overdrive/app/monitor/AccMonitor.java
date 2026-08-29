@@ -331,48 +331,49 @@ public class AccMonitor {
                     }
                 }
 
-                // 1. Check Automotive PowerMode (Standby=4, Sleep=8, Str=5, Off=0 vs StartUp=2, Pre StartUp=1, DisPlay on=10)
-                String carServicePower = getSystemProperty("sys.byd.power_mode", "");
-                if (carServicePower.isEmpty()) {
-                    carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 2 | grep 'current' | head -1");
-                }
-                if (!carServicePower.isEmpty()) {
-                    if (carServicePower.contains("Standby") || carServicePower.contains("Sleep") ||
-                        carServicePower.contains("Str") || carServicePower.contains("PowerMode Off") ||
-                        carServicePower.contains("4=") || carServicePower.contains("8=") || carServicePower.contains("5=") ||
-                        carServicePower.contains("0=") || carServicePower.contains("9=")) {
-                        accOn = false;
-                        inSentryMode = true;
-                        lastProbeTrustworthy = true;
-                        accOnAuthoritative = true;
-                        notifyAccEdge(false);
-                        CameraDaemon.log("AccMonitor [DiLink5]: car_service PowerMode is STANDBY/SLEEP (" + carServicePower.trim() + ") -> accOn=false, sentryMode=true");
-                        return true;
-                    } else if (carServicePower.contains("StartUp") || carServicePower.contains("Pre StartUp") ||
-                               carServicePower.contains("DisPlay on") || carServicePower.contains("Degraded") ||
-                               carServicePower.contains("1=") || carServicePower.contains("2=") ||
-                               carServicePower.contains("10=") || carServicePower.contains("3=")) {
+                // 1. Check Automotive PowerMode via CarPowerManagement CpmsState
+                String cpms = execShell("dumpsys car_service 2>/dev/null | grep 'CpmsState=' | head -1");
+                if (!cpms.isEmpty()) {
+                    if (cpms.contains("CpmsState=ON") || cpms.contains("CpmsState=1")) {
                         accOn = true;
                         inSentryMode = false;
                         lastProbeTrustworthy = true;
                         accOnAuthoritative = true;
                         notifyAccEdge(true);
-                        CameraDaemon.log("AccMonitor [DiLink5]: car_service PowerMode is ON/ACTIVE (" + carServicePower.trim() + ") -> accOn=true, sentryMode=false");
+                        CameraDaemon.log("AccMonitor [DiLink5]: CarPowerManagement is ON (" + cpms.trim() + ") -> accOn=true, sentryMode=false");
                         return false;
-                    }
-                }
-
-                // 2. Check Display Interactive State on DiLink 5 (Primary Indicator of Sleep/Parked)
-                if (context != null) {
-                    android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(android.content.Context.POWER_SERVICE);
-                    if (pm != null && !pm.isInteractive()) {
+                    } else if (cpms.contains("SUSPEND") || cpms.contains("SHUTDOWN") || cpms.contains("PREPARE") || cpms.contains("WAIT_FOR_VHAL")) {
                         accOn = false;
                         inSentryMode = true;
                         lastProbeTrustworthy = true;
                         accOnAuthoritative = true;
                         notifyAccEdge(false);
-                        CameraDaemon.log("AccMonitor [DiLink5]: Display is OFF (isInteractive=false) -> accOn=false, sentryMode=true");
+                        CameraDaemon.log("AccMonitor [DiLink5]: CarPowerManagement is SLEEP (" + cpms.trim() + ") -> accOn=false, sentryMode=true");
                         return true;
+                    }
+                }
+
+                // 2. Check Display Interactive State on DiLink 5 (Primary Indicator of Driving vs Parked)
+                if (context != null) {
+                    android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(android.content.Context.POWER_SERVICE);
+                    if (pm != null) {
+                        if (!pm.isInteractive()) {
+                            accOn = false;
+                            inSentryMode = true;
+                            lastProbeTrustworthy = true;
+                            accOnAuthoritative = true;
+                            notifyAccEdge(false);
+                            CameraDaemon.log("AccMonitor [DiLink5]: Display is OFF (isInteractive=false) -> accOn=false, sentryMode=true");
+                            return true;
+                        } else {
+                            accOn = true;
+                            inSentryMode = false;
+                            lastProbeTrustworthy = true;
+                            accOnAuthoritative = true;
+                            notifyAccEdge(true);
+                            CameraDaemon.log("AccMonitor [DiLink5]: Display is ON (isInteractive=true) -> accOn=true, sentryMode=false");
+                            return false;
+                        }
                     }
                 }
 

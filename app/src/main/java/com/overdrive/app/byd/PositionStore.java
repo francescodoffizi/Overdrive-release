@@ -503,7 +503,7 @@ public final class PositionStore {
      * after an explicit acknowledgement rather than blocked, because a feature that refuses to run
      * anywhere it has not already been proven can never be proven anywhere new.
      */
-    private static final String[] CONFIRMED_MODELS = { "seal" };
+    private static final String[] CONFIRMED_MODELS = { "seal", "sealion7" };
 
     /** Whether the axis map is confirmed for this model id. Null/unknown is NOT confirmed. */
     public static boolean isModelConfirmed(String modelId) {
