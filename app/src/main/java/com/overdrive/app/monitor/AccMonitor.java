@@ -305,21 +305,61 @@ public class AccMonitor {
         // We probe dumpsys car_service PowerMode, Android PowerManager/Display power state and doorLockStatus.
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             try {
-                // 1. Check Automotive PowerMode (Standby=4, Sleep=8, Str=5, Off=0)
+                // 0. Check Vehicle Active Telemetry (Speed > 0 or in Gear = definitely ACC ON / Driving)
+                com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+                if (collector != null) {
+                    com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                    if (vd != null) {
+                        if (vd.speedKmh > 0 && vd.speedKmh != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) {
+                            accOn = true;
+                            inSentryMode = false;
+                            lastProbeTrustworthy = true;
+                            accOnAuthoritative = true;
+                            notifyAccEdge(true);
+                            CameraDaemon.log("AccMonitor [DiLink5]: Vehicle is MOVING (speed=" + vd.speedKmh + " km/h) -> accOn=true, sentryMode=false");
+                            return false;
+                        }
+                        if (vd.gearMode > com.overdrive.app.monitor.GearMonitor.GEAR_P && vd.gearMode <= com.overdrive.app.monitor.GearMonitor.GEAR_S) {
+                            accOn = true;
+                            inSentryMode = false;
+                            lastProbeTrustworthy = true;
+                            accOnAuthoritative = true;
+                            notifyAccEdge(true);
+                            CameraDaemon.log("AccMonitor [DiLink5]: Vehicle is IN GEAR (" + vd.gearMode + ") -> accOn=true, sentryMode=false");
+                            return false;
+                        }
+                    }
+                }
+
+                // 1. Check Automotive PowerMode (Standby=4, Sleep=8, Str=5, Off=0 vs StartUp=2, Pre StartUp=1, DisPlay on=10)
                 String carServicePower = getSystemProperty("sys.byd.power_mode", "");
                 if (carServicePower.isEmpty()) {
-                    carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 4");
+                    carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 2 | grep 'current' | head -1");
                 }
-                if (carServicePower.contains("Standby") || carServicePower.contains("Sleep") ||
-                    carServicePower.contains("Str") || carServicePower.contains("PowerMode Off") ||
-                    carServicePower.contains("4=") || carServicePower.contains("8=") || carServicePower.contains("5=")) {
-                    accOn = false;
-                    inSentryMode = true;
-                    lastProbeTrustworthy = true;
-                    accOnAuthoritative = true;
-                    notifyAccEdge(false);
-                    CameraDaemon.log("AccMonitor [DiLink5]: car_service PowerMode is STANDBY/SLEEP (" + carServicePower.trim() + ") -> accOn=false, sentryMode=true");
-                    return true;
+                if (!carServicePower.isEmpty()) {
+                    if (carServicePower.contains("Standby") || carServicePower.contains("Sleep") ||
+                        carServicePower.contains("Str") || carServicePower.contains("PowerMode Off") ||
+                        carServicePower.contains("4=") || carServicePower.contains("8=") || carServicePower.contains("5=") ||
+                        carServicePower.contains("0=") || carServicePower.contains("9=")) {
+                        accOn = false;
+                        inSentryMode = true;
+                        lastProbeTrustworthy = true;
+                        accOnAuthoritative = true;
+                        notifyAccEdge(false);
+                        CameraDaemon.log("AccMonitor [DiLink5]: car_service PowerMode is STANDBY/SLEEP (" + carServicePower.trim() + ") -> accOn=false, sentryMode=true");
+                        return true;
+                    } else if (carServicePower.contains("StartUp") || carServicePower.contains("Pre StartUp") ||
+                               carServicePower.contains("DisPlay on") || carServicePower.contains("Degraded") ||
+                               carServicePower.contains("1=") || carServicePower.contains("2=") ||
+                               carServicePower.contains("10=") || carServicePower.contains("3=")) {
+                        accOn = true;
+                        inSentryMode = false;
+                        lastProbeTrustworthy = true;
+                        accOnAuthoritative = true;
+                        notifyAccEdge(true);
+                        CameraDaemon.log("AccMonitor [DiLink5]: car_service PowerMode is ON/ACTIVE (" + carServicePower.trim() + ") -> accOn=true, sentryMode=false");
+                        return false;
+                    }
                 }
 
                 // 2. Check Display Interactive State on DiLink 5 (Primary Indicator of Sleep/Parked)
@@ -336,8 +376,7 @@ public class AccMonitor {
                     }
                 }
 
-                // 2. Check Lock State (Vehicle Locked = ACC OFF)
-                com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+                // 3. Check Lock State (Vehicle Locked = ACC OFF)
                 if (collector != null) {
                     com.overdrive.app.byd.BydVehicleData vd = collector.getData();
                     if (vd != null && vd.doorLockStatus != null && vd.doorLockStatus.length > 0) {
@@ -354,7 +393,7 @@ public class AccMonitor {
                     }
                 }
 
-                // 3. Fallback: check sys.accanim.status if explicitly set to "1" (OFF)
+                // 4. Fallback: check sys.accanim.status if explicitly set to "1" (OFF)
                 String accAnim = getSystemProperty("sys.accanim.status", "");
                 if ("1".equals(accAnim)) {
                     accOn = false;
@@ -370,6 +409,7 @@ public class AccMonitor {
                     lastProbeTrustworthy = true;
                     accOnAuthoritative = true;
                     notifyAccEdge(true);
+                    CameraDaemon.log("AccMonitor [DiLink5]: sys.accanim.status=0 -> accOn=true, sentryMode=false");
                     return false;
                 }
             } catch (Throwable t) {

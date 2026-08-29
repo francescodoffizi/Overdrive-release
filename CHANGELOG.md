@@ -4,6 +4,13 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Risoluzione Rilevamento Stato ACC su DiLink 5.0 (Sealion 7) & Sicurezza Screen Deterrent in Guida**:
+  - `AccMonitor.java`: Risolto il bug di parsing su `dumpsys car_service PowerMode` che matchava la stringa statica `All items` (contenente sempre i termini `Standby`/`Sleep`/`4=`), causando un perenne falso positivo `accOn=false / sentryMode=true` durante la marcia. Il comando ora isola la riga specifica `current` (riconoscendo correttamente `Pre StartUp`, `StartUp`, `DisPlay on`).
+  - **Fail-Safe Telemetrico di Marcia**: Aggiunto in `AccMonitor.java` il controllo proattivo su velocità veicolo (`speed.kmh > 0`) e marcia inserita (`gearMode` in D/R/N/M/S) per forzare immediatamente lo stato `accOn=true / inSentryMode=false`.
+  - **Protezione Anti-Blocco Schermo (Screen Deterrent)**:
+    - `ScreenDeterrent.java`: Integrato il controllo `isVehicleActive()` in `onMotionDetected()`, `fire()` e `shouldStop()` per impedire l'attivazione o interrompere all'istante l'overlay se il veicolo è in marcia o attivo.
+    - `DeterrentActivity.java`: Aggiunto il controllo in `onCreate()` e `shouldFinishNow()` per auto-chiudere immediatamente l'Activity a tutto schermo qualora il veicolo sia acceso o in movimento, ripristinando all'istante l'uso del touchscreen del pad.
+
 - **Modalità Sentinella Autonoma (`armMode: power`) & Periodo di Grazia (15s)**:
   - **Sganciamento Totale da Dipendenze Cloud / Stato Serrature**: Configurato il default di `armMode` su `"power"` in `UnifiedConfigManager.kt` e nella configurazione on-device. Su DiLink 5.0 (Snapdragon SA8155P), l'armamento della Sentinella avviene direttamente e localmente sul segnale hardware `dumpsys car_service` `PowerMode STANDBY/SLEEP`, senza dipendere dalla ricezione del blocco porte via Cloud API/MQTT (che in garage interrati o con segnale 4G debole impediva l'attivazione).
   - **Periodo di Grazia (15 secondi)**: Introdotto in `CameraDaemon.java` un timer di grazia (`PowerArmGraceThread`) di 15 secondi dopo lo spegnimento/standby del veicolo (`ACC OFF`). Questo consente a conducente e passeggeri di scendere e chiudere le porte prima che la Sentinella armi i deterrenti visivi e la rilevazione di movimento basata su AI.

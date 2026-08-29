@@ -83,6 +83,10 @@ public class DeterrentActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+            finish();
+            return;
+        }
         createdAtMs = System.currentTimeMillis();
         deterrentStartedAtMs = createdAtMs;
 
@@ -164,6 +168,17 @@ public class DeterrentActivity extends Activity {
     @Override public boolean dispatchTouchEvent(MotionEvent ev) { return true; }
 
     private boolean shouldFinishNow() {
+        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) return true;
+        try {
+            com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (collector != null) {
+                com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                if (vd != null) {
+                    if (vd.speedKmh > 0 && vd.speedKmh != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) return true;
+                    if (vd.gearMode > com.overdrive.app.monitor.GearMonitor.GEAR_P && vd.gearMode <= com.overdrive.app.monitor.GearMonitor.GEAR_S) return true;
+                }
+            }
+        } catch (Throwable ignored) {}
         long now = System.currentTimeMillis();
         if (now - deterrentStartedAtMs > ABSOLUTE_MAX_MS) return true;
         try {

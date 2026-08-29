@@ -226,8 +226,8 @@ public final class ScreenDeterrent {
         // the ACC-on disarm watchdog's HAL probe which also refreshes this
         // flag; this guard closes the common + steady-state cases that had NO
         // guard at all. Fail-safe: if ACC is on, do not arm or render.
-        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-            logger.warn("Screen deterrent suppressed — ACC is ON (must never cover the screen while driving)");
+        if (isVehicleActive()) {
+            logger.warn("Screen deterrent suppressed — ACC is ON / Vehicle is active (must never cover the screen while driving)");
             return;
         }
 
@@ -333,8 +333,8 @@ public final class ScreenDeterrent {
         // moment — this is the last line before the z=MAX SurfaceControl layer
         // is created. Zero the deadline so cleanup()'s sustained-motion
         // re-enqueue loop can't keep re-firing into a driving window.
-        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-            logger.warn("Screen deterrent fire() aborted — ACC turned ON before render");
+        if (isVehicleActive()) {
+            logger.warn("Screen deterrent fire() aborted — ACC is ON / Vehicle is active before render");
             extendDeadlineMs.set(0);
             return;
         }
@@ -481,8 +481,8 @@ public final class ScreenDeterrent {
         // OFF→ON edge by AccSentryDaemon; if that daemon is dead/stalled at the
         // transition, forceStop never flips and the loop would otherwise run to
         // its deadline (up to 30s) over the live driving screen. A direct
-        // isAccOn() read here bounds that to one render tick (≤200ms).
-        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) return true;
+        // isVehicleActive() read here bounds that to one render tick (≤200ms).
+        if (isVehicleActive()) return true;
         long now = System.currentTimeMillis();
         long localDeadline = extendDeadlineMs.get();
         if (now >= localDeadline) return true;
@@ -1120,5 +1120,20 @@ public final class ScreenDeterrent {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    private static boolean isVehicleActive() {
+        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) return true;
+        try {
+            com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (collector != null) {
+                com.overdrive.app.byd.BydVehicleData vd = collector.getData();
+                if (vd != null) {
+                    if (vd.speedKmh > 0 && vd.speedKmh != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) return true;
+                    if (vd.gearMode > com.overdrive.app.monitor.GearMonitor.GEAR_P && vd.gearMode <= com.overdrive.app.monitor.GearMonitor.GEAR_S) return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
     }
 }
