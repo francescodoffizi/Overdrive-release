@@ -735,18 +735,21 @@ public class ChargingApiHandler {
                 continue;
             }
 
-            boolean isCloudCharging = cloudSnap != null && cloudSnap.chargingState > 0;
-            boolean isCloudPlugged = isCloudCharging || (cloudSnap != null && (cloudSnap.remainingHours > 0 || cloudSnap.remainingMinutes > 0));
+            boolean isCloudCharging = cloudSnap != null && cloudSnap.getChargingStateAsSdk() == 1;
+            boolean isCloudPlugged = isCloudCharging || (cloudSnap != null && cloudSnap.chargingState == 15);
+
+            boolean hasLocalDetector = after != null;
+            boolean effectiveCharging = hasLocalDetector ? after.charging : isCloudCharging;
 
             ChargingStateData.ChargingStatus status = state != null
-                    ? state.status : (isCloudCharging ? ChargingStateData.ChargingStatus.CHARGING : ChargingStateData.ChargingStatus.UNKNOWN);
+                    ? state.status : (effectiveCharging ? ChargingStateData.ChargingStatus.CHARGING : ChargingStateData.ChargingStatus.UNKNOWN);
             LiveStateFlags flags = normalizeLiveState(
-                    (after != null && after.charging) || isCloudCharging,
+                    effectiveCharging,
                     status,
                     state != null && state.isTaperCharging,
                     gunState,
                     vtolCharging);
-            if (isCloudCharging || isCloudPlugged) {
+            if (!hasLocalDetector && (isCloudCharging || isCloudPlugged)) {
                 flags = new LiveStateFlags(
                     flags.charging || isCloudCharging,
                     flags.plugged || isCloudPlugged,
@@ -755,7 +758,7 @@ public class ChargingApiHandler {
             }
             PowerPublication power =
                     normalizePowerPublication(flags.charging, state);
-            if (!flags.charging && !isCloudCharging) {
+            if (!flags.charging) {
                 // An open row may remain during the bounded final-counter drain. It is persistence
                 // state, not proof that power is still flowing.
                 sessionKwh = -1.0;

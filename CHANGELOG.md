@@ -4,6 +4,10 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Correzione Falso Rilevamento Ricarica ("Charging in progress") da Cloud BYD**:
+  - `ChargingApiHandler.java`: Risolto il bug in cui `cloudSnap.chargingState > 0` interpretava il valore sentinella/inattivo `15` (`CONNECTED`) di BYD Cloud come ricarica attiva (`charging = true`), mostrando erroneamente *"Charging in progress"* sulla dashboard a cavo scollegato e potenza 0 kW.
+  - La condizione verifica ora esclusivamente lo stato effettivo di ricarica (`cloudSnap.getChargingStateAsSdk() == 1`) e assegna sempre priorità autoritativa alle letture del `ChargingDetector` locale del veicolo.
+
 - **Risoluzione Rilevamento Stato ACC su DiLink 5.0 (Sealion 7) & Sicurezza Screen Deterrent in Guida**:
   - `AccMonitor.java`: Risolto il bug di parsing su `dumpsys car_service PowerMode` che matchava la stringa statica `All items` (contenente sempre i termini `Standby`/`Sleep`/`4=`), causando un perenne falso positivo `accOn=false / sentryMode=true` durante la marcia. Il comando ora isola la riga specifica `current` (riconoscendo correttamente `Pre StartUp`, `StartUp`, `DisPlay on`).
   - **Fail-Safe Telemetrico di Marcia**: Aggiunto in `AccMonitor.java` il controllo proattivo su velocità veicolo (`speed.kmh > 0`) e marcia inserita (`gearMode` in D/R/N/M/S) per forzare immediatamente lo stato `accOn=true / inSentryMode=false`.
