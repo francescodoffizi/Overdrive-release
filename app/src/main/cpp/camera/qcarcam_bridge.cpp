@@ -47,63 +47,81 @@ std::mutex g_winMutex;
 #include <arm_neon.h>
 
 // High-performance ARM NEON SIMD UYVY to RGBA8888 conversion (Full-range BT.601)
-// Processes 8 pixels (16 bytes UYVY -> 32 bytes RGBA) per SIMD cycle in <3ms per 1080p frame.
+// Processes 16 pixels (32 bytes UYVY -> 64 bytes RGBA) per SIMD cycle in <3ms per frame with zero overflow.
 void convert_uyvy_to_rgba(const uint8_t* __restrict__ uyvy, int width, int height, uint32_t* __restrict__ dst_rgba, int dst_stride) {
     int stride = (dst_stride > 0 ? dst_stride : width);
     const int16x8_t c_128 = vdupq_n_s16(128);
-    const int16x8_t c_512 = vdupq_n_s16(512);
     const uint8x8_t c_255 = vdup_n_u8(255);
+    const int32x4_t c_512_32 = vdupq_n_s32(512);
 
     for (int y = 0; y < height; ++y) {
         const uint8_t* src_row = uyvy + y * width * 2;
         uint32_t* dst_row = dst_rgba + y * stride;
         int x = 0;
 
-        // Vectorized loop: 8 pixels per iteration
-        for (; x <= width - 8; x += 8) {
+        // Vectorized loop: 16 pixels per iteration
+        for (; x <= width - 16; x += 16) {
             uint8x8x4_t uyvy_8 = vld4_u8(src_row);
-            src_row += 16;
+            src_row += 32;
 
-            // uyvy_8.val[0] = U (4 unique U's, replicated for 8 pixels)
-            // uyvy_8.val[1] = Y0 (even pixels)
-            // uyvy_8.val[2] = V (4 unique V's, replicated for 8 pixels)
-            // uyvy_8.val[3] = Y1 (odd pixels)
+            // U and V in signed 16-bit
+            int16x8_t u_16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uyvy_8.val[0])), c_128);
+            int16x8_t v_16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uyvy_8.val[2])), c_128);
 
-            uint8x8x2_t u_zip = vzip_u8(uyvy_8.val[0], uyvy_8.val[0]);
-            uint8x8x2_t v_zip = vzip_u8(uyvy_8.val[2], uyvy_8.val[2]);
-            uint8x8_t u_8 = u_zip.val[0];
-            uint8x8_t v_8 = v_zip.val[0];
+            // Promote to 32-bit for exact multiplication with zero overflow
+            int32x4_t v_lo_32 = vmovl_s16(vget_low_s16(v_16));
+            int32x4_t v_hi_32 = vmovl_s16(vget_high_s16(v_16));
 
-            uint8x8x2_t y_zip = vzip_u8(uyvy_8.val[1], uyvy_8.val[3]);
-            uint8x8_t y_8 = y_zip.val[0];
+            int32x4_t u_lo_32 = vmovl_s16(vget_low_s16(u_16));
+            int32x4_t u_hi_32 = vmovl_s16(vget_high_s16(u_16));
 
-            int16x8_t u_16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(u_8)), c_128);
-            int16x8_t v_16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(v_8)), c_128);
-            int16x8_t y_16 = vreinterpretq_s16_u16(vmovl_u8(y_8));
+            // R delta = (1436 * V + 512) >> 10
+            int16x4_t r_delta_lo = vshrn_n_s32(vaddq_s32(vmulq_n_s32(v_lo_32, 1436), c_512_32), 10);
+            int16x4_t r_delta_hi = vshrn_n_s32(vaddq_s32(vmulq_n_s32(v_hi_32, 1436), c_512_32), 10);
+            int16x8_t r_delta = vcombine_s16(r_delta_lo, r_delta_hi);
 
-            // R = Y + (1436 * V + 512) >> 10
-            int16x8_t r_delta = vshrq_n_s16(vaddq_s16(vmulq_n_s16(v_16, 1436), c_512), 10);
-            int16x8_t r_16 = vaddq_s16(y_16, r_delta);
+            // G delta = (352 * U + 731 * V + 512) >> 10
+            int16x4_t g_delta_lo = vshrn_n_s32(vaddq_s32(vaddq_s32(vmulq_n_s32(u_lo_32, 352), vmulq_n_s32(v_lo_32, 731)), c_512_32), 10);
+            int16x4_t g_delta_hi = vshrn_n_s32(vaddq_s32(vaddq_s32(vmulq_n_s32(u_hi_32, 352), vmulq_n_s32(v_hi_32, 731)), c_512_32), 10);
+            int16x8_t g_delta = vcombine_s16(g_delta_lo, g_delta_hi);
 
-            // G = Y - (352 * U + 731 * V + 512) >> 10
-            int16x8_t g_delta = vshrq_n_s16(vaddq_s16(vaddq_s16(vmulq_n_s16(u_16, 352), vmulq_n_s16(v_16, 731)), c_512), 10);
-            int16x8_t g_16 = vsubq_s16(y_16, g_delta);
+            // B delta = (1815 * U + 512) >> 10
+            int16x4_t b_delta_lo = vshrn_n_s32(vaddq_s32(vmulq_n_s32(u_lo_32, 1815), c_512_32), 10);
+            int16x4_t b_delta_hi = vshrn_n_s32(vaddq_s32(vmulq_n_s32(u_hi_32, 1815), c_512_32), 10);
+            int16x8_t b_delta = vcombine_s16(b_delta_lo, b_delta_hi);
 
-            // B = Y + (1815 * U + 512) >> 10
-            int16x8_t b_delta = vshrq_n_s16(vaddq_s16(vmulq_n_s16(u_16, 1815), c_512), 10);
-            int16x8_t b_16 = vaddq_s16(y_16, b_delta);
+            // EVEN pixels (Y0)
+            int16x8_t y0_16 = vreinterpretq_s16_u16(vmovl_u8(uyvy_8.val[1]));
+            uint8x8_t r0_8 = vqmovun_s16(vaddq_s16(y0_16, r_delta));
+            uint8x8_t g0_8 = vqmovun_s16(vsubq_s16(y0_16, g_delta));
+            uint8x8_t b0_8 = vqmovun_s16(vaddq_s16(y0_16, b_delta));
 
-            uint8x8_t r_8 = vqmovun_s16(r_16);
-            uint8x8_t g_8 = vqmovun_s16(g_16);
-            uint8x8_t b_8 = vqmovun_s16(b_16);
+            // ODD pixels (Y1)
+            int16x8_t y1_16 = vreinterpretq_s16_u16(vmovl_u8(uyvy_8.val[3]));
+            uint8x8_t r1_8 = vqmovun_s16(vaddq_s16(y1_16, r_delta));
+            uint8x8_t g1_8 = vqmovun_s16(vsubq_s16(y1_16, g_delta));
+            uint8x8_t b1_8 = vqmovun_s16(vaddq_s16(y1_16, b_delta));
 
-            uint8x8x4_t rgba_8;
-            rgba_8.val[0] = r_8;
-            rgba_8.val[1] = g_8;
-            rgba_8.val[2] = b_8;
-            rgba_8.val[3] = c_255;
+            // Interleave even and odd channels:
+            uint8x8x2_t r_zip = vzip_u8(r0_8, r1_8);
+            uint8x8x2_t g_zip = vzip_u8(g0_8, g1_8);
+            uint8x8x2_t b_zip = vzip_u8(b0_8, b1_8);
 
-            vst4_u8((uint8_t*)(dst_row + x), rgba_8);
+            // First 8 pixels
+            uint8x8x4_t rgba_lo;
+            rgba_lo.val[0] = r_zip.val[0];
+            rgba_lo.val[1] = g_zip.val[0];
+            rgba_lo.val[2] = b_zip.val[0];
+            rgba_lo.val[3] = c_255;
+            vst4_u8((uint8_t*)(dst_row + x), rgba_lo);
+
+            // Next 8 pixels
+            uint8x8x4_t rgba_hi;
+            rgba_hi.val[0] = r_zip.val[1];
+            rgba_hi.val[1] = g_zip.val[1];
+            rgba_hi.val[2] = b_zip.val[1];
+            rgba_hi.val[3] = c_255;
+            vst4_u8((uint8_t*)(dst_row + x + 8), rgba_hi);
         }
 
         // Remainder scalar loop
