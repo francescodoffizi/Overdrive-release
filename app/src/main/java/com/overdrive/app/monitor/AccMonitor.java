@@ -332,7 +332,7 @@ public class AccMonitor {
                 }
 
                 // 1. Check Automotive BYD PowerMode enum (Standby=4, Sleep=8, Str=5, Off=0 vs StartUp=2, Pre StartUp=1)
-                String carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 2 | grep 'current' | head -1");
+                String carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 3 | grep 'current' | head -1");
                 if (!carServicePower.isEmpty()) {
                     if (carServicePower.contains("4=PowerMode Standby") || carServicePower.contains("8=PowerMode Sleep") ||
                         carServicePower.contains("5=PowerMode Str") || carServicePower.contains("0=PowerMode Off") ||
