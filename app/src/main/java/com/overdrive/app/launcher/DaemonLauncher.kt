@@ -260,7 +260,9 @@ class DaemonLauncher(
                 "    exit 0",
                 "  fi",
                 "",
-                "  echo \"[\$(date)] Starting Daemon...\" >> \"\$LOG_FILE\"",
+                "  RESOLVED_APK=\$(pm path com.overdrive.app 2>/dev/null | grep '/base.apk\$' | head -n 1 | sed 's/^package://')",
+                "  if [ -n \"\$RESOLVED_APK\" ] && [ -f \"\$RESOLVED_APK\" ]; then APK_PATH=\"\$RESOLVED_APK\"; fi",
+                "  echo \"[\$(date)] Starting Daemon from \$APK_PATH...\" >> \"\$LOG_FILE\"",
                 // Backgrounded so the log poller can supervise it while it runs.
                 "  CLASSPATH=\"\$APK_PATH\" app_process \$PROXY_ARGS /system/bin --nice-name=\"\$PROCESS_NAME\" \"\$CLS\" >> \"\$LOG_FILE\" 2>&1 &",
                 "  DAEMON_PID=\$!",

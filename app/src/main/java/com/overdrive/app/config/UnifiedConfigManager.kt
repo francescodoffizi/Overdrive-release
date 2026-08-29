@@ -612,9 +612,9 @@ object UnifiedConfigManager {
         //   "power" — arm immediately on ACC-off, disarm on ACC-on. No lock gate.
         //             Deterministic; works on every trim.
         // Branched in CameraDaemon's ACC-off dispatch + door-lock gate. Both modes
-        // still honor the safe-zone and schedule suppression gates. Default "lock"
-        // to preserve the owner-privacy behaviour of the prior single-mode build.
-        if (!surveillance.has("armMode")) surveillance.put("armMode", "lock")
+        // still honor the safe-zone and schedule suppression gates. Default "power"
+        // for autonomous zero-cloud sentry activation.
+        if (!surveillance.has("armMode")) surveillance.put("armMode", "power")
         // Keep ONLY the USB/data rail powered after ACC OFF (e.g. to charge a phone
         // while parked). DEFAULT TRUE so out-of-box behaviour is unchanged; user
         // opt-out (Surveillance → General) lets just that rail sleep on the next
@@ -3962,8 +3962,8 @@ object UnifiedConfigManager {
      */
     @JvmStatic
     fun getSurveillanceArmMode(): String {
-        val mode = getSurveillance().optString("armMode", "lock")
-        return if (mode == "power") "power" else "lock"
+        val mode = getSurveillance().optString("armMode", "power")
+        return if (mode == "lock") "lock" else "power"
     }
 
     /**

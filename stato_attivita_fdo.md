@@ -34,13 +34,15 @@
 
 ### D. Integrazione Modello Sealion 7, ACC & Telemetria DiLink 5.0
 - **Modello Sealion 7 Ufficiale**: Aggiunto nel catalogo `manifest.json` dei modelli con Blade Battery LFP da 82.5 kWh nominali e agganciato al modello 3D fastback.
-- **Rilevamento ACC DiLink 5.0**: Implementato in `AccMonitor.java` tramite polling `sys.accanim.status`, stato blocco portiere e `PowerManager.isInteractive()`.
+- **Rilevamento Standby Hardware & Sentinella Autonoma (`armMode: power`)**:
+  - Implementato in `AccMonitor.java` tramite lettura diretta dello stato di alimentazione Android Automotive (`dumpsys car_service` `PowerMode STANDBY/SLEEP`).
+  - Modalità Sentinella autonoma e sganciata dal Cloud: armamento immediato all'ingresso in standby senza dipendere dallo stato di blocco porte remoto.
+  - Periodo di grazia di 15 secondi (`PowerArmGraceThread`) all'uscita dal veicolo prima di avviare il monitoraggio AI e i deterrenti.
+- **Bridge Telemetria Hardware & TPMS Diretto**:
+  - `BydDataCollector` opera in `DaemonKeepaliveService` dentro il processo registrato `com.overdrive.app`, agganciandosi con successo a `CarAdapterService` (`com.ts.appservice.caradapter`).
+  - Scrittura e lettura persistente dello snapshot telemetrico (`byd_telemetry_snap.json`): TPMS 4 ruote (270-285 kPa / 39.2-41.3 psi), contachilometri (10072 km), SoC batteria (87%), autonomia (420 km) e VIN reale.
 - **Risoluzione Stato di Ricarica**: `BydDataCollector` promuove `chargingState` a `CHARGING (1)` quando il cloud conferma la ricarica con cavo inserito anche se l'hardware DiLink 5 restituisce `0 (READY)`.
 - **Gating Hotspot DVR Telecamere**: Disabilitato automaticamente su DiLink 5.0 per non mostrare hotspot DVR su veicoli europei privi di dashcam OEM.
-- **Telemetria & VHAL DiLink 5.0 Live**:
-  - `CarPropertyBridge`: Supporto fallback binder diretto via `ServiceManager` (`car_service`).
-  - `BydDataCollector`: Gestito `0.0` unpopulated su `StatisticDevice` permettendo il merge di SOC reale, autonomia e stato di ricarica.
-  - `VehicleControlApiHandler`: Overlay a strati (SDK -> VHAL -> Cloud Snapshot) per finestrini, porte, serrature, clima e batteria.
 ### E. Risoluzione Schermo Verde Telecamere, AVAS & Telemetria Istantanea
 - **Cattura Hardware 4 Telecamere a 30 FPS**:
   - Risolto il problema della schermata verde modificando il supervisore in `DiLink5QCarCamBackend` per caricare ed eseguire `4cam.xml` (tutti e 4 i sensori contemporaneamente).
@@ -57,7 +59,39 @@
   - `CameraProfile.java` & `CameraProfiles.java`: Introdotto il supporto per risoluzione encoder esplicita (1920x1080 @ 30 FPS).
   - `GpuMosaicRecorder.java`: Implementato il center-crop 16:9 del sensore raw 1920x1300 verso canvas 1920x1080 nello shader OpenGL, preservando le proporzioni fisheye senza deformazioni.
 - **Motore di Streaming Hardware DMA a 30.0 FPS (`hook_qcarcam.cpp`)**:
-  - Sostituito l'aggancio a `clock_gettime` con un thread di streaming dedicato a 30.00 FPS con temporizzazione nanometrica su `CLOCK_MONOTONIC`.
+### G. Integrazione Telemetria Hardware Diretta & Iniezione Runtime SDK DiLink 5.0
+- **Architettura Compile-Only Stubs**:
+  - Rimossi tutti i file stub mock `android.hardware.bydauto.*` da `app/src/main/java` e riposizionati in un task Gradle `compileOnly` separato. In questo modo il DEX finale dell'APK Overdrive non oscura più le classi OEM reali di sistema.
+- **Iniezione Runtime DEX (`Dilink5SdkInjector.java`)**:
+  - Implementata l'iniezione dinamica di `/system/app/BydDataCollect/BydDataCollect.apk` in tutti i ClassLoader pertinenti (`PathClassLoader`, `ContextClassLoader`, `SystemClassLoader`).
+- **Bridge di Telemetria in Processo App & Sincronizzazione Multi-Path (`DaemonKeepaliveService` / `BydDataCollector`)**:
+  - Su Android 11 Automotive (DiLink 5), l'accesso all'HAL BYD richiede il binding del servizio di sistema `com.ts.appservice.caradapter.CarAdapterService`. Questo binding viene eseguito con successo nel processo applicativo registrato `com.overdrive.app`.
+  - `BydDataCollector` viene inizializzato ed eseguito in `DaemonKeepaliveService.kt`, interroga i 24 driver HAL locali (pressione TPMS pneumatici, contachilometri, tensione 12V, ecc.) e scrive atomicamente lo snapshot nei percorsi condivisi (`/storage/emulated/0/Android/data/com.overdrive.app/files/byd_telemetry_snap.json` e `/data/local/tmp/`).
+  - Il daemon `byd_cam_daemon` (UID 2000) legge e unisce all'istante lo snapshot telemetrico restituendolo attraverso `/api/vehicle/state` alla UI web, Home Assistant, MQTT e ABRP.
+- **Verifica Valori Live Rilevati**:
+  - Pressione Pneumatici TPMS Hardware: `FL: 285 kPa (41.3 psi)`, `FR: 285 kPa (41.3 psi)`, `RL: 285 kPa (41.3 psi)`, `RR: 285 kPa (41.3 psi)` (`available: true`).
+  - Batteria & Autonomia: `SoC: 87%`, `Range: 420 km`, `12V: 13.0V`.
+  - Contachilometri & VIN: `10072 km`, `LGXCH4CD2S2151430`.
+
+---
+
+## 🚀 3. Istruzioni Operative per Deploy & Verifica
+- **Build APK**:
+  ```bash
+  JAVA_HOME="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home" ./gradlew assembleDebug
+  ```
+- **Installazione su Sealion 7**:
+  ```bash
+  adb -s 100.119.76.84:5555 install -r -d app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
+  ```
+- **Riavvio Daemon**:
+  ```bash
+  adb -s 100.119.76.84:5555 shell "pkill -f byd_cam_daemon; nohup /data/local/tmp/start_cam_daemon.sh > /dev/null 2>&1 &"
+  ```
+- **Verifica Telemetria**:
+  ```bash
+  curl -s http://100.119.76.84:8080/api/vehicle/state | jq .
+  ```
   - Azzerati i frame drop, il tearing e i duplicati orizzontali.
 - **Wakeup & Sincronizzazione Sentinella ad Auto Spenta (`TsAvmCoordinator.java`)**:
   - Integrata l'attivazione preventivo `startAvm()` di `com.ts.avm.AvmAndroidService` all'apertura del driver di cattura per mantenere accese le telecamere anche ad auto bloccata/spenta.

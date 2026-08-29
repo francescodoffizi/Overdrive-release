@@ -3,6 +3,7 @@ package com.overdrive.app.byd;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.pm.PackageManager;
+import android.os.Looper;
 
 import com.overdrive.app.logging.DaemonLogger;
 
@@ -26,9 +27,39 @@ public final class BydDeviceHelper {
      */
     public static Object getDevice(String className, Context context) {
         try {
-            Class<?> cls = Class.forName(className);
+            if (Looper.myLooper() == null) {
+                try {
+                    Looper.prepare();
+                } catch (Throwable ignored) {}
+            }
+            com.overdrive.app.byd.dilink5.Dilink5SdkInjector.ensure(context);
+            Class<?> cls = null;
+            try {
+                cls = Class.forName(className, true, com.overdrive.app.byd.dilink5.Dilink5SdkInjector.class.getClassLoader());
+            } catch (ClassNotFoundException e) {
+                if (context != null && context.getClassLoader() != null) {
+                    cls = Class.forName(className, true, context.getClassLoader());
+                } else {
+                    throw e;
+                }
+            }
             Method getInstance = cls.getMethod("getInstance", Context.class);
-            Object device = getInstance.invoke(null, context);
+            Context effectiveContext = withBydPermissionBypass(context);
+            Object device = null;
+            try {
+                device = getInstance.invoke(null, effectiveContext);
+            } catch (Throwable t) {
+                if (effectiveContext != context) {
+                    device = getInstance.invoke(null, context);
+                } else {
+                    throw t;
+                }
+            }
+            if (device == null && effectiveContext != context) {
+                try {
+                    device = getInstance.invoke(null, context);
+                } catch (Throwable ignored) {}
+            }
             if (device != null) {
                 logger.info("Device OK: " + cls.getSimpleName());
             } else {
@@ -36,11 +67,11 @@ public final class BydDeviceHelper {
             }
             return device;
         } catch (ClassNotFoundException e) {
-            logger.debug("Device class not found: " + className);
-        } catch (Exception e) {
+            logger.info("Device class not found: " + className);
+        } catch (Throwable e) {
             Throwable cause = e instanceof InvocationTargetException && e.getCause() != null
                     ? e.getCause() : e;
-            logger.debug("Device init failed: " + className + " — "
+            logger.info("Device init failed: " + className + " — "
                     + cause.getClass().getSimpleName() + ": " + cause.getMessage());
         }
         return null;
@@ -48,18 +79,102 @@ public final class BydDeviceHelper {
 
     /**
      * Wrap an app context so BYD's SDK-side permission checks see the BYD permissions as granted.
-     *
-     * <p>Some OEM SDK clients use a custom {@code Application}: BYD device
-     * {@code getInstance(Context)} methods enforce signature permissions directly on the supplied
-     * Context before they create their singleton. OverDrive is not platform-signed, so a raw app
-     * context fails before any Binder/HAL call is attempted. The wrapper is opt-in and grants only
-     * {@code android.permission.BYD*}; every unrelated Android permission still delegates to the
-     * real context. Returning the wrapper from {@link Context#getApplicationContext()} prevents
-     * the SDK from normalizing back to the unwrapped context before a later permission check.
      */
     public static Context withBydPermissionBypass(Context context) {
-        if (context == null || context instanceof BydPermissionContext) return context;
+        if (context == null) return null;
+        fixContextImplForUid2000(context);
+        preinstallSettingsProviderForUid2000(context);
+        if (context instanceof BydPermissionContext) return context;
         return new BydPermissionContext(context);
+    }
+
+    public static void fixContextImplForUid2000(Context context) {
+        if (android.os.Process.myUid() != 2000) return;
+        try {
+            Context target = context;
+            while (target instanceof ContextWrapper) {
+                target = ((ContextWrapper) target).getBaseContext();
+            }
+            if (target != null && target.getClass().getName().equals("android.app.ContextImpl")) {
+                try {
+                    Field pkgField = target.getClass().getDeclaredField("mPackageName");
+                    pkgField.setAccessible(true);
+                    pkgField.set(target, "com.android.shell");
+                } catch (Throwable ignored) {}
+
+                try {
+                    Field opPkgField = target.getClass().getDeclaredField("mOpPackageName");
+                    opPkgField.setAccessible(true);
+                    opPkgField.set(target, "com.android.shell");
+                } catch (Throwable ignored) {}
+
+                try {
+                    Field basePkgField = target.getClass().getDeclaredField("mBasePackageName");
+                    basePkgField.setAccessible(true);
+                    basePkgField.set(target, "com.android.shell");
+                } catch (Throwable ignored) {}
+
+                try {
+                    Field attrField = target.getClass().getDeclaredField("mAttributionSource");
+                    attrField.setAccessible(true);
+                    attrField.set(target, null);
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            logger.debug("fixContextImplForUid2000 failed: " + t.getMessage());
+        }
+        preinstallSettingsProviderForUid2000(context);
+    }
+
+    private static volatile boolean sSettingsProviderInstalled = false;
+
+    public static void preinstallSettingsProviderForUid2000(Context context) {
+        if (sSettingsProviderInstalled || android.os.Process.myUid() != 2000) return;
+        try {
+            Class<?> atCls = Class.forName("android.app.ActivityThread");
+            Method currentAtMethod = atCls.getMethod("currentActivityThread");
+            Object at = currentAtMethod.invoke(null);
+            if (at == null) return;
+
+            Class<?> amClass = Class.forName("android.app.ActivityManager");
+            Method getService = amClass.getMethod("getService");
+            Object am = getService.invoke(null);
+            if (am == null) return;
+
+            Object holder = null;
+            for (Method m : am.getClass().getMethods()) {
+                if (m.getName().equals("getContentProviderExternal")) {
+                    int pc = m.getParameterTypes().length;
+                    if (pc == 3) {
+                        holder = m.invoke(am, "settings", 0, null);
+                    } else if (pc == 4) {
+                        holder = m.invoke(am, "settings", 0, null, null);
+                    }
+                    break;
+                }
+            }
+
+            if (holder != null) {
+                Field infoField = holder.getClass().getDeclaredField("info");
+                infoField.setAccessible(true);
+                Object info = infoField.get(holder);
+
+                for (Method m : atCls.getDeclaredMethods()) {
+                    if (m.getName().equals("installProvider")) {
+                        m.setAccessible(true);
+                        Class<?>[] pts = m.getParameterTypes();
+                        if (pts.length == 6) {
+                            m.invoke(at, context, holder, info, true, true, true);
+                            sSettingsProviderInstalled = true;
+                            logger.info("Successfully pre-installed settings provider in ActivityThread for UID 2000");
+                            return;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            logger.debug("preinstallSettingsProviderForUid2000 failed: " + t.getMessage());
+        }
     }
 
     static boolean isBydPermissionName(String permission) {
@@ -72,59 +187,55 @@ public final class BydDeviceHelper {
         }
 
         @Override
+        public String getPackageName() {
+            if (android.os.Process.myUid() == 2000 || "android".equals(super.getPackageName())) {
+                return "com.android.shell";
+            }
+            return super.getPackageName();
+        }
+
+        @Override
+        public String getOpPackageName() {
+            if (android.os.Process.myUid() == 2000 || "android".equals(super.getOpPackageName())) {
+                return "com.android.shell";
+            }
+            return super.getOpPackageName();
+        }
+
+        @Override
         public Context getApplicationContext() {
             return this;
         }
 
         @Override
         public int checkPermission(String permission, int pid, int uid) {
-            return isBydPermissionName(permission)
-                    ? PackageManager.PERMISSION_GRANTED
-                    : super.checkPermission(permission, pid, uid);
+            return PackageManager.PERMISSION_GRANTED;
         }
 
         @Override
         public int checkCallingPermission(String permission) {
-            return isBydPermissionName(permission)
-                    ? PackageManager.PERMISSION_GRANTED
-                    : super.checkCallingPermission(permission);
+            return PackageManager.PERMISSION_GRANTED;
         }
 
         @Override
         public int checkCallingOrSelfPermission(String permission) {
-            return isBydPermissionName(permission)
-                    ? PackageManager.PERMISSION_GRANTED
-                    : super.checkCallingOrSelfPermission(permission);
+            return PackageManager.PERMISSION_GRANTED;
         }
 
         @Override
         public int checkSelfPermission(String permission) {
-            return isBydPermissionName(permission)
-                    ? PackageManager.PERMISSION_GRANTED
-                    : super.checkSelfPermission(permission);
+            return PackageManager.PERMISSION_GRANTED;
         }
 
         @Override
         public void enforcePermission(
-                String permission, int pid, int uid, String message) {
-            if (!isBydPermissionName(permission)) {
-                super.enforcePermission(permission, pid, uid, message);
-            }
-        }
+                String permission, int pid, int uid, String message) {}
 
         @Override
-        public void enforceCallingPermission(String permission, String message) {
-            if (!isBydPermissionName(permission)) {
-                super.enforceCallingPermission(permission, message);
-            }
-        }
+        public void enforceCallingPermission(String permission, String message) {}
 
         @Override
-        public void enforceCallingOrSelfPermission(String permission, String message) {
-            if (!isBydPermissionName(permission)) {
-                super.enforceCallingOrSelfPermission(permission, message);
-            }
-        }
+        public void enforceCallingOrSelfPermission(String permission, String message) {}
     }
 
     /**
@@ -715,6 +826,14 @@ public final class BydDeviceHelper {
                     public void onIndirectTyreSystemStateChanged(int state) {
                         invokeCallback(callback, "onIndirectTyreSystemStateChanged", new Object[]{state});
                     }
+                    @Override
+                    public void onTyreTemperatureValueChanged(int wheel, int value) {
+                        invokeCallback(callback, "onTyreTemperatureValueChanged", new Object[]{wheel, value});
+                    }
+                    @Override
+                    public void onTyrePressureValueByTypeChanged(int wheel, float value) {
+                        invokeCallback(callback, "onTyrePressureValueByTypeChanged", new Object[]{wheel, value});
+                    }
                     // Generic feature-ID event channel. When the listener is
                     // registered via the 2-arg overload with an int[] filter,
                     // the HAL fires this for each subscribed feature ID
@@ -1161,8 +1280,44 @@ public final class BydDeviceHelper {
                         invokeCallback(callback, "onElecPercentageChanged", new Object[]{percentage});
                     }
                     @Override
+                    public void onSOCBatteryPercentageChanged(int percentage) {
+                        invokeCallback(callback, "onSOCBatteryPercentageChanged", new Object[]{percentage});
+                    }
+                    @Override
+                    public void onTotalMileageValueChanged(float mileage) {
+                        invokeCallback(callback, "onTotalMileageValueChanged", new Object[]{mileage});
+                    }
+                    @Override
+                    public void onEVMileageValueChanged(int mileage) {
+                        invokeCallback(callback, "onEVMileageValueChanged", new Object[]{mileage});
+                    }
+                    @Override
+                    public void onElecDrivingRangeChanged(int range) {
+                        invokeCallback(callback, "onElecDrivingRangeChanged", new Object[]{range});
+                    }
+                    @Override
+                    public void onFuelDrivingRangeChanged(int range) {
+                        invokeCallback(callback, "onFuelDrivingRangeChanged", new Object[]{range});
+                    }
+                    @Override
+                    public void onDrivingRangeValueChanged(int range) {
+                        invokeCallback(callback, "onDrivingRangeValueChanged", new Object[]{range});
+                    }
+                    @Override
                     public void onFuelPercentageChanged(int percentage) {
                         invokeCallback(callback, "onFuelPercentageChanged", new Object[]{percentage});
+                    }
+                    @Override
+                    public void onEVRemainingBatteryPowerChanged(float power) {
+                        invokeCallback(callback, "onEVRemainingBatteryPowerChanged", new Object[]{power});
+                    }
+                    @Override
+                    public void onRemainingBatteryPowerChanged(float power) {
+                        invokeCallback(callback, "onRemainingBatteryPowerChanged", new Object[]{power});
+                    }
+                    @Override
+                    public void onTotalElecConChanged(double con) {
+                        invokeCallback(callback, "onTotalElecConChanged", new Object[]{con});
                     }
                 };
 
@@ -1194,6 +1349,58 @@ public final class BydDeviceHelper {
             logger.debug("registerStatisticListener: class not available on this firmware");
         } catch (Exception e) {
             logger.debug("registerStatisticListener failed: " + e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * Register a typed collectdata listener (HV Voltage/Current + Motor RPM).
+     */
+    public static boolean registerCollectDataListener(Object device, ListenerCallback callback) {
+        if (device == null) return false;
+        try {
+            android.hardware.bydauto.collectdata.AbsBYDAutoCollectDataListener listener =
+                new android.hardware.bydauto.collectdata.AbsBYDAutoCollectDataListener() {
+                    @Override
+                    public void onMotorMCUGeneratrixVolt(int a, int b) {
+                        invokeCallback(callback, "onMotorMCUGeneratrixVolt", new Object[]{a, b});
+                    }
+                    @Override
+                    public void onMotorMCUGeneratrixCurrent(int a, int b) {
+                        invokeCallback(callback, "onMotorMCUGeneratrixCurrent", new Object[]{a, b});
+                    }
+                    @Override
+                    public void onDriverMotorSpeed(int a, int b) {
+                        invokeCallback(callback, "onDriverMotorSpeed", new Object[]{a, b});
+                    }
+                    @Override
+                    public void onDriverMotorTemperature(int a, int b) {
+                        invokeCallback(callback, "onDriverMotorTemperature", new Object[]{a, b});
+                    }
+                    @Override
+                    public void onDriverMotorTorque(int a, int b) {
+                        invokeCallback(callback, "onDriverMotorTorque", new Object[]{a, b});
+                    }
+                };
+
+            Method register = findRegisterMethod(device.getClass(),
+                android.hardware.bydauto.collectdata.AbsBYDAutoCollectDataListener.class);
+            if (register != null) {
+                register.invoke(device, listener);
+                return true;
+            }
+            Method registerWithIds = findRegisterMethodWithIds(device.getClass(),
+                android.hardware.bydauto.collectdata.AbsBYDAutoCollectDataListener.class);
+            if (registerWithIds != null) {
+                registerWithIds.invoke(device, listener, new int[0]);
+                return true;
+            }
+            logger.debug("registerCollectDataListener: no registerListener method on "
+                + device.getClass().getName());
+        } catch (NoClassDefFoundError e) {
+            logger.debug("registerCollectDataListener: class not available on this firmware");
+        } catch (Exception e) {
+            logger.debug("registerCollectDataListener failed: " + e.getMessage());
         }
         return false;
     }

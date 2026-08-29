@@ -143,6 +143,7 @@ public class BydDataCollector {
     private Object lightDevice;
     private Object wiperDevice;
     private Object adasDevice;
+    private Object collectDataDevice;
     private Object radarDevice;
     private Object powerDevice;
     private Object settingDevice;
@@ -279,9 +280,73 @@ public class BydDataCollector {
         return instance;
     }
 
+    public static final String[] SNAPSHOT_FILE_PATHS = new String[] {
+            "/storage/emulated/0/Android/data/com.overdrive.app/files/byd_telemetry_snap.json",
+            "/storage/emulated/0/Overdrive/byd_telemetry_snap.json",
+            "/data/local/tmp/byd_telemetry_snap.json"
+    };
+
+    public static void writeSnapshotDiskFile(BydVehicleData data) {
+        if (data == null) return;
+        byte[] bytes = data.toJson().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        for (String path : SNAPSHOT_FILE_PATHS) {
+            try {
+                java.io.File file = new java.io.File(path);
+                java.io.File parent = file.getParentFile();
+                if (parent != null && !parent.exists()) parent.mkdirs();
+                java.io.File tmp = new java.io.File(path + ".tmp");
+                try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp)) {
+                    fos.write(bytes);
+                    fos.flush();
+                }
+                tmp.renameTo(file);
+                file.setReadable(true, false);
+                file.setWritable(true, false);
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    public static BydVehicleData readSnapshotDiskFile() {
+        for (String path : SNAPSHOT_FILE_PATHS) {
+            try {
+                java.io.File file = new java.io.File(path);
+                if (file.exists() && (System.currentTimeMillis() - file.lastModified()) <= 60_000) {
+                    byte[] bytes = new byte[(int) file.length()];
+                    try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                        fis.read(bytes);
+                    }
+                    String jsonStr = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                    BydVehicleData parsed = BydVehicleData.fromJson(new org.json.JSONObject(jsonStr));
+                    if (parsed != null) return parsed;
+                }
+            } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
     /** Get the latest vehicle data snapshot. Thread-safe. */
     public BydVehicleData getData() {
-        return snapshot.get();
+        BydVehicleData current = snapshot.get();
+        if (current == null || current.tyrePressure == null) {
+            BydVehicleData fromDisk = readSnapshotDiskFile();
+            if (fromDisk != null) {
+                if (current == null) {
+                    snapshot.set(fromDisk);
+                    return fromDisk;
+                }
+                BydVehicleData.Builder b = current.toBuilder();
+                if (current.tyrePressure == null && fromDisk.tyrePressure != null) {
+                    b.tyrePressure(fromDisk.tyrePressure);
+                    b.tyrePressureState(fromDisk.tyrePressureState);
+                    b.tyreTemperature(fromDisk.tyreTemperature);
+                    b.tyreSystemState(fromDisk.tyreSystemState);
+                }
+                BydVehicleData merged = b.build();
+                snapshot.set(merged);
+                return merged;
+            }
+        }
+        return current;
     }
 
     static BydVehicleData preserveNewerChargingEdge(BydVehicleData collected,
@@ -721,6 +786,7 @@ public class BydDataCollector {
                 }
             }
             publishAutomationSnapshot(published);
+            writeSnapshotDiskFile(published);
             return published;
         }
     }
@@ -817,6 +883,7 @@ public class BydDataCollector {
         pollSchedulerGeneration.incrementAndGet();
         cancelPersistedDaemonEnergyReconciliation(false);
         this.context = context;
+        com.overdrive.app.byd.dilink5.Dilink5SdkInjector.ensure(context);
         logger.info("=== BYD Data Collector Initializing ===");
         long start = System.currentTimeMillis();
 
@@ -908,6 +975,7 @@ public class BydDataCollector {
         energyDevice = initDevice("android.hardware.bydauto.energy.BYDAutoEnergyDevice", "Energy");
         radarDevice = initDevice("android.hardware.bydauto.radar.BYDAutoRadarDevice", "Radar");
         settingDevice = initDevice("android.hardware.bydauto.setting.BYDAutoSettingDevice", "Setting");
+        collectDataDevice = initDevice("android.hardware.bydauto.collectdata.BYDAutoCollectDataDevice", "CollectData");
         multimediaDevice = initMultimediaDevice();
         // Multimedia resolves through its own multi-strategy path (4 separate accept sites), so it
         // bypasses initDevice() and would otherwise be the ONE device never activated or type-learned
@@ -5531,6 +5599,16 @@ public class BydDataCollector {
                 int t = ((Number) extTemp).intValue();
                 if (isPlausibleOutsideTempC(t)) b.outsideTempC(t);
             }
+            if (Double.isNaN(b.outsideTempC) && acDevice != null) {
+                try {
+                    java.lang.reflect.Method m = acDevice.getClass().getMethod("getTemprature", int.class);
+                    Object tempVal = m.invoke(acDevice, 4);
+                    if (tempVal instanceof Number) {
+                        int t = ((Number) tempVal).intValue();
+                        if (isPlausibleOutsideTempC(t)) b.outsideTempC(t);
+                    }
+                } catch (Exception ignored) {}
+            }
 
             // External charging power. STORED RAW — no scaling, on either the listener or the polled
             // path. The old "above 50 means hectowatts, divide" heuristic is deleted: it rested on
@@ -5927,9 +6005,17 @@ public class BydDataCollector {
         if (otaDevice == null) return;
         try {
             Object voltage = BydDeviceHelper.callGetter(otaDevice, "getBatteryPowerVoltage");
-            if (voltage instanceof Number) {
-                double v = ((Number) voltage).doubleValue();
-                if (v > 0 && v < 20) b.voltage12v(v);
+            if (voltage instanceof Number && ((Number) voltage).doubleValue() > 0 && ((Number) voltage).doubleValue() < 20) {
+                b.voltage12v(((Number) voltage).doubleValue());
+            } else {
+                try {
+                    java.lang.reflect.Method m = otaDevice.getClass().getMethod("getBatteryVoltage", int.class);
+                    Object v5 = m.invoke(otaDevice, 0);
+                    if (v5 instanceof Number) {
+                        double v = ((Number) v5).doubleValue();
+                        if (v > 0 && v < 20) b.voltage12v(v);
+                    }
+                } catch (Exception ignored) {}
             }
         } catch (Exception e) {
             logger.debug("collectOta error: " + e.getMessage());
@@ -8120,6 +8206,41 @@ public class BydDataCollector {
     private void onTyreCallback(String method, Object[] args) {
         if (args == null) return;
         try {
+            if ("onTyreTemperatureValueChanged".equals(method) && args.length >= 2) {
+                int wheel = ((Number) args[0]).intValue();
+                int value = ((Number) args[1]).intValue();
+                int idx = wheel;
+                if (idx >= 1 && idx <= 4) idx = idx - 1; // 1-based to 0-based
+                if (idx >= 0 && idx < 4 && value >= -40 && value <= 125) {
+                    synchronized (tyreTemperatureCache) {
+                        tyreTemperatureCache[idx] = value;
+                    }
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .tyreTemperature(snapshotTyreTemperatures()).build());
+                    }
+                }
+                return;
+            }
+            if ("onTyrePressureValueByTypeChanged".equals(method) && args.length >= 2) {
+                int wheel = ((Number) args[0]).intValue();
+                float value = ((Number) args[1]).floatValue();
+                int idx = wheel;
+                if (idx >= 1 && idx <= 4) idx = idx - 1;
+                if (idx >= 0 && idx < 4 && value >= 0f && value <= 5000f) {
+                    int kpa = value < 10.0f ? (int) Math.round(value * 100.0) : (int) Math.round(value);
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        int[] pressures = current.tyrePressure != null ? current.tyrePressure.clone() : new int[]{-1, -1, -1, -1};
+                        pressures[idx] = kpa;
+                        publishNonChargingSnapshot(current.toBuilder()
+                                .tyrePressure(pressures).build());
+                    }
+                }
+                return;
+            }
+
             // Generic feature-ID event from the 2-arg listener registration.
             // Per-wheel temperature on this firmware family arrives here keyed
             // on the LF/RF/LB/RB Instrument feature IDs. We accept either
@@ -9369,6 +9490,10 @@ public class BydDataCollector {
             logger.info("  Power listener registered");
             count++;
         }
+        if (noteRegisterOk(collectDataDevice, BydDeviceHelper.registerCollectDataListener(collectDataDevice, this::onCollectDataCallback))) {
+            logger.info("  CollectData listener registered (HV Voltage/Current + Motor RPM)");
+            count++;
+        }
 
         // Record which handles are now attached, so a re-init skips exactly these and retries the
         // rest. A handle whose registration FAILED is deliberately not recorded — it must be
@@ -9398,6 +9523,7 @@ public class BydDataCollector {
         markRegistered(this.powerDevice, powerDevice);
         markRegistered(this.settingDevice, settingDevice);
         markRegistered(this.safetyBeltDevice, safetyBeltDevice);
+        markRegistered(this.collectDataDevice, collectDataDevice);
         logger.info("Listeners registered: " + count
                 + " (tracked handles: " + registeredHandles.size() + ")");
     }
@@ -9607,6 +9733,54 @@ public class BydDataCollector {
             } catch (Exception e) { /* ignore */ }
             return;
         }
+        if ("onSOCBatteryPercentageChanged".equals(method) && args != null && args.length > 0) {
+            try {
+                int soc = ((Number) args[0]).intValue();
+                if (soc >= 0 && soc <= 100) {
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder().socPercent((double) soc).build());
+                    }
+                }
+            } catch (Exception e) { /* ignore */ }
+            return;
+        }
+        if ("onTotalMileageValueChanged".equals(method) && args != null && args.length > 0) {
+            try {
+                float mileage = ((Number) args[0]).floatValue();
+                if (mileage > 0) {
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder().totalMileageKm((int) Math.round(mileage * distanceToKmFactor)).build());
+                    }
+                }
+            } catch (Exception e) { /* ignore */ }
+            return;
+        }
+        if (("onElecDrivingRangeChanged".equals(method) || "onDrivingRangeValueChanged".equals(method)) && args != null && args.length > 0) {
+            try {
+                int range = ((Number) args[0]).intValue();
+                if (range >= 0) {
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder().elecRangeKm((int) Math.round(range * distanceToKmFactor)).build());
+                    }
+                }
+            } catch (Exception e) { /* ignore */ }
+            return;
+        }
+        if (("onEVRemainingBatteryPowerChanged".equals(method) || "onRemainingBatteryPowerChanged".equals(method)) && args != null && args.length > 0) {
+            try {
+                float kwh = ((Number) args[0]).floatValue();
+                if (kwh >= 0) {
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder().remainKwh((double) kwh).build());
+                    }
+                }
+            } catch (Exception e) { /* ignore */ }
+            return;
+        }
         if ("onFuelPercentageChanged".equals(method) && args != null && args.length > 0) {
             try {
                 int fuel = ((Number) args[0]).intValue();
@@ -9748,6 +9922,57 @@ public class BydDataCollector {
     // Device-type argument for the STATISTIC family's get(deviceType, featureId) overload.
     // 1014 per the OEM app's own SOH read (its second-tier attempt).
     private static final int STATISTIC_DEVICE_TYPE = 1014;
+
+    private int lastHvVolt = 0;
+    private Integer lastHvCurrent = null;
+
+    private void onCollectDataCallback(String method, Object[] args) {
+        if (args == null) return;
+        try {
+            if ("onMotorMCUGeneratrixVolt".equals(method) && args.length >= 2) {
+                int b = ((Number) args[1]).intValue();
+                if (b >= 100 && b <= 1000) {
+                    lastHvVolt = b;
+                    updateLiveHvPower();
+                }
+                return;
+            }
+            if ("onMotorMCUGeneratrixCurrent".equals(method) && args.length >= 2) {
+                int b = ((Number) args[1]).intValue();
+                if (b >= -2000 && b <= 2000) {
+                    lastHvCurrent = b;
+                    updateLiveHvPower();
+                }
+                return;
+            }
+            if ("onDriverMotorSpeed".equals(method) && args.length >= 2) {
+                int a = ((Number) args[0]).intValue();
+                int b = ((Number) args[1]).intValue();
+                int rpm = -1;
+                if (b >= 0 && b <= 30000) rpm = b;
+                else if (a >= 0 && a <= 30000) rpm = a;
+                if (rpm >= 0) {
+                    BydVehicleData current = snapshot.get();
+                    if (current != null) {
+                        publishNonChargingSnapshot(current.toBuilder().rearMotorSpeed(rpm).build());
+                    }
+                }
+                return;
+            }
+        } catch (Exception e) {
+            logger.debug("onCollectDataCallback error: " + e.getMessage());
+        }
+    }
+
+    private void updateLiveHvPower() {
+        if (lastHvVolt > 0 && lastHvCurrent != null) {
+            double powerKw = (lastHvVolt * (double) lastHvCurrent) / 1000.0;
+            BydVehicleData current = snapshot.get();
+            if (current != null) {
+                publishNonChargingSnapshot(current.toBuilder().enginePowerKw(powerKw).build());
+            }
+        }
+    }
 
     /**
      * Publish every gun edge through the same lock/version protocol used by BMS edges and deliver it

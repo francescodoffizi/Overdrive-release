@@ -411,6 +411,21 @@ android {
  * 3. getInstance() is called via reflection on the real class
  */
 
+// ── DiLink BYD Auto compile stubs (built from SOURCE, not bundled into APK) ──────────
+val bydautoStubsClasses = layout.buildDirectory.dir("bydauto-stubs/classes")
+val compileBydautoStubs = tasks.register<JavaCompile>("compileBydautoStubs") {
+    source(fileTree(rootProject.file("stubs-bydauto")) { include("android/**/*.java") })
+    classpath = files(android.bootClasspath)
+    options.release.set(17)
+    destinationDirectory.set(bydautoStubsClasses)
+}
+val bydautoStubsJar = tasks.register<Jar>("bydautoStubsJar") {
+    dependsOn(compileBydautoStubs)
+    from(bydautoStubsClasses)
+    archiveFileName.set("bydauto-stubs.jar")
+    destinationDirectory.set(layout.buildDirectory.dir("bydauto-stubs"))
+}
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
@@ -498,4 +513,9 @@ dependencies {
     testImplementation("org.json:json:20231013")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+
+    // Compile against BYD Auto stubs without bundling dummy mocks into APK classes.dex
+    compileOnly(files(bydautoStubsJar.flatMap { it.archiveFile }))
+    testImplementation(files(bydautoStubsJar.flatMap { it.archiveFile }))
 }
+

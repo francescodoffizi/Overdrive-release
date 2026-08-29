@@ -6245,6 +6245,11 @@ public class AccSentryDaemon {
     private static int readPowerLevel() {
         if (appContext == null) return -1;
         try {
+            if (!com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                return POWER_LEVEL_OFF;
+            }
+        } catch (Throwable ignored) {}
+        try {
             Class<?> deviceClass = Class.forName(
                 "android.hardware.bydauto.bodywork.BYDAutoBodyworkDevice");
             Method getInstance = deviceClass.getMethod("getInstance", Context.class);
