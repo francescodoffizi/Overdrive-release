@@ -4,7 +4,10 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
-### Aggiunte e Correzioni (Added & Fixed)
+- **Risoluzione Aggiornamento Stato Batteria (SoC %) & Autonomia a Veicolo Spento / in Ricarica**:
+  - `BydDataCollector.java`: Introdotto il tracciamento puntuale del successo di lettura HAL nel ciclo di polling (`socHalSucceeded`, `rangeHalSucceeded`, `fuelHalSucceeded`).
+  - Risolto il problema del congelamento del SoC (es. bloccato al 67% durante la ricarica notturna): a veicolo spento / in sosta (ACC OFF) o quando l'HAL locale DiLink 5 restituisce `0.0` (unpopulated), i fallback e il merge dei dati da BYD Cloud/MQTT (`cs.socPercent`, `cs.elecRangeKm`, `cs.fuelPercent`, `cs.fuelRangeKm`) vengono ora applicati tempestivamente invece di essere bloccati dallo snapshot ereditato da `toBuilder()`.
+  - `BydCloudDataMergeSocTest.java`: Aggiunta suite di test unitari a copertura del merge di SoC, autonomia elettrica e carburante (PHEV) in sosta e in marcia.
 - **Risoluzione Risoluzione Video & Aspect Ratio su DiLink 5.0 (Full HD 1080p / 16:9 Standard)**:
   - `CameraProfile.java` & `CameraProfiles.java`: Introdotto il supporto per dimensioni encoder personalizzate. Impostata la risoluzione encoder di `dilink5_sealion7` a **1920×1080 @ 30 FPS** nativa (eliminando il calcolo legacy 4-strip che causava l'anomalo 960×2600 e lo stiramento verticale 2.7:1).
   - `GpuSurveillancePipeline.java`: Il costruttore e il supervisore della pipeline acquisiscono direttamente la risoluzione encoder risolta dal profilo (1920×1080 su DiLink 5).

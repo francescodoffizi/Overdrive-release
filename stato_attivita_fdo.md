@@ -62,6 +62,14 @@
 - **Wakeup & Sincronizzazione Sentinella ad Auto Spenta (`TsAvmCoordinator.java`)**:
   - Integrata l'attivazione preventivo `startAvm()` di `com.ts.avm.AvmAndroidService` all'apertura del driver di cattura per mantenere accese le telecamere anche ad auto bloccata/spenta.
 
+### G. Risoluzione Aggiornamento Stato Batteria (SoC %) & Autonomia in Ricarica / Sosta
+- **Tracciamento Successo HAL Puntuale (`BydDataCollector.java`)**:
+  - Aggiunto `StatisticHalResult` che traccia se la lettura locale di SoC, autonomia elettrica e carburante ha avuto successo nel ciclo di polling corrente.
+  - A veicolo spento / in ricarica notturna (ACC OFF) o quando `StatisticDevice` restituisce `0.0` unpopulated, i valori aggiornati in tempo reale da BYD Cloud/MQTT (`cs.socPercent`, `cs.elecRangeKm`, `cs.fuelPercent`, `cs.fuelRangeKm`) vengono applicati tempestivamente invece di rimanere bloccati dal valore ereditato da `snapshot.toBuilder()`.
+  - Risolto il blocco della percentuale batteria (es. 67%) mentre il veicolo si ricarica.
+- **Suite di Test Unitari (`BydCloudDataMergeSocTest.java`)**:
+  - Convalidata la logica di fallback e priorità (HAL primario durante la guida, Cloud primario a veicolo spento o con HAL non popolato).
+
 ---
 
 ## 🛠️ 3. File Chiave del Modulo DiLink 5.0
