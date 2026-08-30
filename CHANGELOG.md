@@ -4,9 +4,12 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
-- **Correzione Hardware Property ID Ricarica & Pistola DiLink 5.0 (`BydDataCollector.java`)**:
-  - Risolto il bug critico in cui la routine di polling per DiLink 5.0 interrogava la proprietà `0x21403c00` (`CHARGING_PORT_R_27C`, sportellino di ricarica, che restituiva sempre `1`) mappandola erroneamente su `gunState = 2` (pistola collegata).
-  - Mappata la proprietà corretta di Android Automotive **`0x21403407` (`CHARGING_GUN_STATER`)**: `0 = Gun Disconnected (1)`, `1/2 = Gun Connected (2)`, e `0x2140461c: 0 = IDLE (15)`, ripristinando la perfetta coerenza di stato (veicolo non in carica / *Vehicle Powered Down*) sia in sosta che a vettura spenta.
+- **Correzione Mappatura Hardware Stato Blocco Porte (`VehicleControlApiHandler.java`, `LauncherApiHandler.java`, `AccMonitor.java`)**:
+  - Risolta l'inversione dello stato delle portiere tra la convenzione BYD SDK (`1 = UNLOCKED, 2 = LOCKED`) e l'API/Frontend Web (`1 = LOCKED, 2 = UNLOCKED`).
+  - Mappati correttamente i valori telemetrici hardware tramite `cloudLockToApi()`, ripristinando la visualizzazione immediata di vettura **Bloccata** (`overall = 1`) con lucchetto chiuso.
+
+- **Risoluzione Falso Blocco "Veicolo in movimento" sui Comandi Rapidi (`DrivingSafetyGuard.java`)**:
+  - Aggiunto il fallback sul canale telemetrico `BydVehicleData.gearMode` in `resolveGear()` nel caso in cui `GearMonitor` sia inattivo o in sosta prolungata, impedendo che lo stato marcia sconosciuto blocchi erroneamente i comandi di controllo con l'avviso *"Questa azione non è disponibile mentre il veicolo è in movimento"*.
 
 - **Prevenzione Falsi Stati di Ricarica al Boot & Sanity Check Dashboard (`ChargingApiHandler.java`, `index.html`)**:
   - `ChargingApiHandler.java`: `effectiveCharging` richiede ora un campionamento live validato nel ciclo di vita corrente del processo (`after.observedAtMs > 0`), impedendo che vecchi stati di carica salvati nella cache SQLite o su disco prima del riavvio/crash dei servizi vengano serviti come attivi.
