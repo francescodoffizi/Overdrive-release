@@ -4,6 +4,10 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Fix Crash Loop TelegramBotDaemon & Risoluzione Dinamica APK nel Watchdog (`DaemonLauncher.kt`, `TelegramDaemonLauncher.java`)**:
+  - **Risoluzione Dinamica APK ad ogni Ciclo Watchdog**: Aggiornato `buildTelegramWatchdogScript` in `DaemonLauncher.kt` introducendo la query a runtime `pm path com.overdrive.app` ad ogni iterazione del loop di supervisione (`start_telegram.sh`). In questo modo, a seguito di aggiornamenti o reinstallazioni dell'applicazione (che generano un nuovo hash casuale per la cartella dell'APK in Android 11), il watchdog individua istantaneamente il file `base.apk` valido eliminando alla radice il crash fatale `ClassNotFoundException` / `SIGABRT`.
+  - **Watchdog PID Tracking & Prevenzione Processi Orfani Multipli**: Aggiunto il tracciamento PID del watchdog in `/data/local/tmp/telegram_watchdog.pid` e rafforzato il controllo `isRunning()` in `TelegramDaemonLauncher.java` per verificare sia il processo demone (`telegram_bot_daemon`) sia il rispettivo script di supervisione (`start_telegram.sh`), impedendo lo spawn concorrente di istanze watchdog duplicate.
+
 - **Fix Rilevamento Marcia (D/R), Dashcam Automatica a 30 FPS & Dashboard di Guida in Tempo Reale (`GearMonitor.java`, `RecordingModeManager.java`, `DashboardStatusParser.kt`, `DashboardFragment.kt`, `DiLink5QCarCamBackend.java`)**:
   - **Bypass Sicurezza Android 11 per `GearMonitor`**: Corretta l'istanziazione di `BYDAutoGearboxDevice` tramite `BydDeviceHelper.getDevice(...)` e `callGetter(...)`, risolvendo il `SecurityException` (UID 2000 mismatch) su DiLink 5.0 e consentendo la lettura istantanea delle marce `D`, `R`, `P`, `N`.
   - **Promozione Automatica Dashcam su Movimento GPS**: Integrato in `RecordingModeManager` il fallback di movimento (`speed >= 3 km/h` o `isMoving = true`), garantendo l'attivazione immediata della registrazione continua a 30 FPS ad alta risoluzione anche durante la marcia.
