@@ -5388,14 +5388,21 @@ public class BydDataCollector {
             if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
                 try {
                     String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
-                        "dumpsys car_service 2>/dev/null | grep -E '0x21403c00|0x2140461c' | grep 'lastEvent'");
+                        "dumpsys car_service 2>/dev/null | grep -E '0x21403407|0x2140461c' | grep 'lastEvent'");
                     if (!propDump.isEmpty()) {
                         long gunObs = chargingObservationOrder.begin();
-                        if (propDump.contains("Property:0x21403c00") && propDump.contains("int32Values: [1]")) {
-                            chargingObservationOrder.recordGunPoll(gunObs);
-                            b.chargingGunState(2); // Gun Connected
-                            evidence.connectionObserved = true;
-                            evidence.gunObservation = gunObs;
+                        if (propDump.contains("Property:0x21403407")) {
+                            if (propDump.contains("Property:0x21403407,status: 0") && (propDump.contains("int32Values: [1]") || propDump.contains("int32Values: [2]"))) {
+                                chargingObservationOrder.recordGunPoll(gunObs);
+                                b.chargingGunState(2); // Gun Connected
+                                evidence.connectionObserved = true;
+                                evidence.gunObservation = gunObs;
+                            } else if (propDump.contains("int32Values: [0]")) {
+                                chargingObservationOrder.recordGunPoll(gunObs);
+                                b.chargingGunState(1); // Gun Disconnected
+                                evidence.connectionObserved = true;
+                                evidence.gunObservation = gunObs;
+                            }
                         }
                         if (propDump.contains("Property:0x2140461c")) {
                             if (propDump.contains("int32Values: [4]")) {
@@ -5405,10 +5412,14 @@ public class BydDataCollector {
                                 evidence.powerIsCharging = Boolean.TRUE;
                             } else if (propDump.contains("int32Values: [2]")) {
                                 observedChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_CHARG_FINISH; // 2 = FINISHED
+                            } else if (propDump.contains("int32Values: [0]")) {
+                                observedChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_IDLE; // 15 = IDLE
                             }
                         }
                         if (observedChargingState != BydVehicleData.UNAVAILABLE) {
                             b.chargingState(observedChargingState);
+                        } else if (b.chargingGunState == 1) {
+                            b.chargingState(com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_IDLE);
                         }
                         b.chargingType(1); // AC charging
                         b.vtolCharging(false);
