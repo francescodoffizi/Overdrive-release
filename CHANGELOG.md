@@ -4,6 +4,10 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Sentry Keep-Awake h24 & Supporto `WifiLock` per DiLink 5.0 / Android 11 (`AccSentryDaemon.java`)**:
+  - Implementata la reflection per il metodo a 3 argomenti `PowerManager.userActivity(long when, int event, int flags)` di Android 11+ con flag `USER_ACTIVITY_FLAG_NO_CHANGE_LIGHTS = 1`, consentendo il reset del timer di inattività hardware dell'headunit mantenendo il display totalmente spento.
+  - Integrato `WifiLock` (`WIFI_MODE_FULL_HIGH_PERF`) coordinato con il `PARTIAL_WAKE_LOCK` di sistema in `AccSentryDaemon`, prevenendo la disattivazione della scheda Wi-Fi/4G e garantendo la raggiungibilità h24 del tunnel Cloudflare, dei bot Telegram e della Dashboard Web a veicolo spento.
+
 - **Risoluzione Crash Loop `acc_sentry_daemon` & Stabilizzazione Connessione Veicolo (`AccSentryDaemon.java`)**:
   - Risolto il crash fatale ricorrente (`FATAL EXCEPTION: BodyworkRegistration-1` causato da `NoClassDefFoundError: AbsBYDAutoBodyworkListener` / `AbsBYDAutoPowerListener`) sui sistemi DiLink dove le classi listener dell'SDK non sono esposte nel classpath shell.
   - Implementato il controllo runtime preventivo `isBodyworkSupported()` / `isPowerListenerSupported()` e l'isolamento dell'istanziazione dei listener in registrar dedicati (`BodyworkListenerRegistrar` / `PowerListenerRegistrar`), con gestione sicura di `LinkageError` / `Throwable`.

@@ -207,6 +207,7 @@ public class AccSentryDaemon {
     // concurrently on independent binder threads — an unsynchronized check-then-act
     // here would let both create + acquire a non-ref-counted lock and orphan one.
     private static volatile PowerManager.WakeLock wakeLock;
+    private static volatile android.net.wifi.WifiManager.WifiLock wifiLock;
 
     // Original screen timeout (saved before sentry mode)
     private static String originalScreenTimeout = "60000";
@@ -1660,19 +1661,21 @@ public class AccSentryDaemon {
     // ==================== WAKELOCK MANAGEMENT ====================
 
     private static synchronized void acquireWakeLock() {
-        if (wakeLock != null && wakeLock.isHeld()) return;
         if (appContext == null) return;
 
-        try {
-            Context permissiveContext = new PermissionBypassContext(appContext);
-            PowerManager pm = (PowerManager) permissiveContext.getSystemService(Context.POWER_SERVICE);
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AccSentry:Core");
-            wakeLock.setReferenceCounted(false);
-            wakeLock.acquire();
-            log("WakeLock Acquired");
-        } catch (Exception e) {
-            log("WakeLock Error: " + e.getMessage());
+        if (wakeLock == null || !wakeLock.isHeld()) {
+            try {
+                Context permissiveContext = new PermissionBypassContext(appContext);
+                PowerManager pm = (PowerManager) permissiveContext.getSystemService(Context.POWER_SERVICE);
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AccSentry:Core");
+                wakeLock.setReferenceCounted(false);
+                wakeLock.acquire();
+                log("WakeLock Acquired");
+            } catch (Throwable e) {
+                log("WakeLock Error: " + e.getMessage());
+            }
         }
+        acquireWifiLock();
     }
 
     private static synchronized void releaseWakeLock() {
@@ -1680,9 +1683,40 @@ public class AccSentryDaemon {
             try {
                 wakeLock.release();
                 log("WakeLock Released");
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 // Ignore
             }
+        }
+        releaseWifiLock();
+    }
+
+    private static synchronized void acquireWifiLock() {
+        if (wifiLock != null && wifiLock.isHeld()) return;
+        if (appContext == null) return;
+
+        try {
+            Context permissiveContext = new PermissionBypassContext(appContext);
+            android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
+                    permissiveContext.getSystemService(Context.WIFI_SERVICE);
+            if (wm != null) {
+                wifiLock = wm.createWifiLock(
+                        android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                        "AccSentry:Wifi");
+                wifiLock.setReferenceCounted(false);
+                wifiLock.acquire();
+                log("WifiLock Acquired");
+            }
+        } catch (Throwable e) {
+            log("WifiLock Error: " + e.getMessage());
+        }
+    }
+
+    private static synchronized void releaseWifiLock() {
+        if (wifiLock != null && wifiLock.isHeld()) {
+            try {
+                wifiLock.release();
+                log("WifiLock Released");
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -5399,6 +5433,10 @@ public class AccSentryDaemon {
     private static volatile boolean pmUserActivity2ArgResolved = false;
     private static volatile boolean pmUserActivity2ArgFailed = false;
 
+    private static volatile Method pmUserActivity3ArgMethod;
+    private static volatile boolean pmUserActivity3ArgResolved = false;
+    private static volatile boolean pmUserActivity3ArgFailed = false;
+
     private static void resolvePmGetPowerScreenStatus() {
         if (pmGetPowerScreenStatusResolved || pmGetPowerScreenStatusFailed) return;
         try {
@@ -5432,6 +5470,18 @@ public class AccSentryDaemon {
             pmUserActivity2ArgFailed = true;
         } catch (Exception e) {
             pmUserActivity2ArgFailed = true;
+        }
+    }
+
+    private static void resolvePmUserActivity3Arg() {
+        if (pmUserActivity3ArgResolved || pmUserActivity3ArgFailed) return;
+        try {
+            pmUserActivity3ArgMethod = PowerManager.class.getMethod("userActivity", long.class, int.class, int.class);
+            pmUserActivity3ArgResolved = true;
+        } catch (NoSuchMethodException e) {
+            pmUserActivity3ArgFailed = true;
+        } catch (Throwable e) {
+            pmUserActivity3ArgFailed = true;
         }
     }
 
@@ -5584,22 +5634,44 @@ public class AccSentryDaemon {
             Context permissiveContext = new PermissionBypassContext(appContext);
             PowerManager pm = (PowerManager) permissiveContext.getSystemService(Context.POWER_SERVICE);
 
-            // CRITICAL: Check screen status FIRST ( pattern)
-            // On some BYD firmware, calling userActivity() when screen is OFF fails
+            // Android 11+ / DiLink 5 (Snapdragon SA8155P) stealth userActivity
+            // Signature: userActivity(long when, int event, int flags)
+            // event=0 (USER_ACTIVITY_EVENT_OTHER), flags=1 (USER_ACTIVITY_FLAG_NO_CHANGE_LIGHTS)
+            resolvePmUserActivity3Arg();
+            if (pmUserActivity3ArgResolved) {
+                if (!isKeepAliveGenerationCurrent(transitionGeneration)) {
+                    return true;
+                }
+                pmUserActivity3ArgMethod.invoke(
+                    pm, android.os.SystemClock.uptimeMillis(), 0, 1);
+                log("userActivity(long, 0, NO_CHANGE_LIGHTS) called [Android 11 stealth]");
+                return true;
+            }
+
+            // CRITICAL: Check screen status for legacy 1-arg method
+            // On legacy 1-arg PowerManager, userActivity() turns on the screen,
+            // so we skip 1-arg if screen is OFF.
             resolvePmGetPowerScreenStatus();
             if (pmGetPowerScreenStatusResolved) {
                 try {
                     int screenStatus = (Integer) pmGetPowerScreenStatusMethod.invoke(pm);
-                    if (screenStatus == 0) {
-                        // Screen is OFF - userActivity may fail or be ignored
-                        // Skip it - the wakeUp call in performSystemWakeUp() handles keeping CPU alive
-                        log("Screen OFF - skipping userActivity");
+                    if (screenStatus == 0 && !isDilink4CameraMode()) {
+                        // For legacy 1-arg fallback, try 2-arg stealth before giving up
+                        resolvePmUserActivity2Arg();
+                        if (pmUserActivity2ArgResolved) {
+                            if (!isKeepAliveGenerationCurrent(transitionGeneration)) {
+                                return true;
+                            }
+                            pmUserActivity2ArgMethod.invoke(pm, android.os.SystemClock.uptimeMillis(), true);
+                            log("userActivity(long, boolean) called [stealth fallback]");
+                            return true;
+                        }
+                        log("Screen OFF - skipping legacy 1-arg userActivity");
                         return true;
                     }
                 } catch (Exception e) {
                     // Per-call invocation failure (transient binder/access issue);
-                    // do NOT mark resolution failed — proceed anyway, matching
-                    // the original try/catch semantics.
+                    // do NOT mark resolution failed — proceed anyway.
                 }
             }
 
@@ -5609,21 +5681,6 @@ public class AccSentryDaemon {
             // loop's own comment has always claimed it used, but the 1-arg
             // branch below returns first, so on any firmware that exposes
             // 1-arg (i.e. all of them) the noChangeLights call was unreachable.
-            //
-            // Why it matters on dilink4: this pump is the reason the parked panel
-            // came back on. The 1-arg call resets the display's dim/off state
-            // machine — i.e. it actively fights the backlight-off we just
-            // performed. (The byd_apa reference app sidesteps this entirely: it
-            // never calls userActivity at all, holding the AP awake with
-            // PowerManager.wakeUp on a 60 s cadence instead. We keep the pump
-            // because our USB-VBUS-follows-wakefulness requirement depends on
-            // it, and just stop it from touching the lights.)
-            //
-            // Strictly gated: legacy pano_h/pano_l units keep the original
-            // 1-arg-first order byte-for-byte. There the pump self-skips once
-            // getPowerScreenStatus()==0 anyway, and that path is long-proven on
-            // the fleet — no reason to re-sequence it. Falls through to the
-            // 1-arg path below if this firmware has no 2-arg overload.
             if (isDilink4CameraMode()) {
                 resolvePmUserActivity2Arg();
                 if (pmUserActivity2ArgResolved) {
@@ -5652,11 +5709,7 @@ public class AccSentryDaemon {
                 log("userActivity(long) called");
                 return true;
             } else {
-                // Preserved verbatim from the original ordering: on firmware with
-                // no 1-arg overload this line fired BEFORE the 2-arg fallback was
-                // attempted. Keeping it here (rather than folding it into an else
-                // on the 2-arg branch) keeps the legacy log stream identical.
-                log("userActivity: no compatible method found");
+                log("userActivity 1-arg not found, trying 2-arg fallback");
             }
 
             // Fallback: Try 2-arg version (stealth mode - doesn't turn on screen)
