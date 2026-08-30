@@ -104,44 +104,47 @@ public class GearMonitor {
         try {
             logger.info("Starting gear monitor...");
             
-            // Get gearbox device instance via BydDeviceHelper (with DiLink 5.0 / Android 11 bypass)
-            gearboxDevice = com.overdrive.app.byd.BydDeviceHelper.getDevice("android.hardware.bydauto.gearbox.BYDAutoGearboxDevice", context);
-            if (gearboxDevice == null) {
-                try {
+            // 1. Try BYDAutoGearboxDevice via BydDeviceHelper
+            try {
+                gearboxDevice = com.overdrive.app.byd.BydDeviceHelper.getDevice("android.hardware.bydauto.gearbox.BYDAutoGearboxDevice", context);
+                if (gearboxDevice == null) {
                     Class<?> gearboxClass = Class.forName("android.hardware.bydauto.gearbox.BYDAutoGearboxDevice");
                     Method getInstance = gearboxClass.getMethod("getInstance", Context.class);
                     gearboxDevice = getInstance.invoke(null, context);
+                }
+                if (gearboxDevice != null) {
+                    getGearMethod = gearboxDevice.getClass().getMethod("getGearboxAutoModeType");
+                }
+            } catch (Throwable t) {
+                logger.info("BYDAutoGearboxDevice reflection skipped: " + t.getMessage());
+            }
+
+            int initialGearRead = -1;
+            if (getGearMethod != null && gearboxDevice != null) {
+                try {
+                    Object initialReadObj = getGearMethod.invoke(gearboxDevice);
+                    if (initialReadObj instanceof Number) {
+                        initialGearRead = ((Number) initialReadObj).intValue();
+                    }
                 } catch (Throwable ignored) {}
             }
-            
-            if (gearboxDevice == null) {
-                logger.error("BYDAutoGearboxDevice.getInstance() returned null");
-                return;
-            }
-            
-            // Cache the getter method
-            getGearMethod = gearboxDevice.getClass().getMethod("getGearboxAutoModeType");
-            
-            // Get initial gear state
-            Object initialReadObj = getGearMethod.invoke(gearboxDevice);
-            int initialGearRead = (initialReadObj instanceof Integer) ? (Integer) initialReadObj : -1;
+
             if (!isValidGearMode(initialGearRead)) {
-                logger.error("Invalid initial gear read: "
-                        + initialGearRead);
-                gearboxDevice = null;
-                getGearMethod = null;
-                return;
+                initialGearRead = readFromCarAdapter();
             }
+            if (!isValidGearMode(initialGearRead)) {
+                initialGearRead = readFromBydDataCollector();
+            }
+            if (!isValidGearMode(initialGearRead)) {
+                initialGearRead = GEAR_P; // Safe fallback
+            }
+
             currentGear = initialGearRead;
             lastUpdateTime = SystemClock.elapsedRealtime();
-            logger.info("Initial gear: " + gearToString(currentGear));
+            logger.info("Initial gear: " + gearToString(currentGear) + (gearboxDevice != null ? " (HAL)" : " (Multi-source fallback)"));
             
             isRunning = true;
             
-            // Build the poller first, but publish the hardware state before it
-            // can run. Starting the thread first allowed a fast P -> D shift to
-            // update currentGear before this initial callback, permanently
-            // collapsing the P edge during async trip-manager startup.
             final int initialGear = currentGear;
             pollThread = new Thread(() -> {
                 while (isRunning) {
@@ -149,10 +152,10 @@ public class GearMonitor {
                         Thread.sleep(POLL_INTERVAL_MS);
                         if (!isRunning) break;
 
-                        int gear;
-                        long gearObservedAtElapsedRealtimeMs;
-                        // Prefer TelemetryDataCollector's cached snapshot to avoid
-                        // duplicate CAN bus reads when the overlay poller is running
+                        int gear = -1;
+                        long gearObservedAtElapsedRealtimeMs = SystemClock.elapsedRealtime();
+
+                        // 1. Prefer TelemetryDataCollector's cached snapshot
                         com.overdrive.app.telemetry.TelemetryDataCollector src = telemetrySource;
                         com.overdrive.app.telemetry.TelemetrySnapshot snap =
                             (src != null) ? src.getLatestSnapshot() : null;
@@ -165,29 +168,40 @@ public class GearMonitor {
                                 && snap.gearValid
                                 && isValidGearMode(snap.gearMode)
                                 && gearAgeMs >= 0L
-                                && gearAgeMs
-                                        < CACHED_GEAR_MAX_AGE_MS) {
-                            // Only a recent successful gear read is cacheable.
+                                && gearAgeMs < CACHED_GEAR_MAX_AGE_MS) {
                             gear = snap.gearMode;
                             gearObservedAtElapsedRealtimeMs =
                                     snap.gearReadElapsedRealtimeMs;
-                        } else {
-                            // Snapshot the reflection refs to locals: stop() is
-                            // synchronized and nullifies these mid-iteration. Without
-                            // local snapshot, getGearMethod.invoke would NPE and
-                            // produce a bogus "Gear poll error: null" log on every
-                            // race. Cleanly exit the loop on null instead.
+                        }
+
+                        // 2. Try BYDAutoGearboxDevice getter if available
+                        if (!isValidGearMode(gear)) {
                             Method getter = getGearMethod;
                             Object device = gearboxDevice;
-                            if (getter == null || device == null) break;
-                            gear = (int) getter.invoke(device);
-                            gearObservedAtElapsedRealtimeMs =
-                                    SystemClock.elapsedRealtime();
+                            if (getter != null && device != null) {
+                                try {
+                                    Object res = getter.invoke(device);
+                                    if (res instanceof Number) {
+                                        int g = ((Number) res).intValue();
+                                        if (isValidGearMode(g)) gear = g;
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                        }
+
+                        // 3. Try CarAdapterManager / CarCabinAdapterManager (DiLink 5.0 / TS framework)
+                        if (!isValidGearMode(gear)) {
+                            int g = readFromCarAdapter();
+                            if (isValidGearMode(g)) gear = g;
+                        }
+
+                        // 4. Try BydDataCollector fast dynamics / CAN poll
+                        if (!isValidGearMode(gear)) {
+                            int g = readFromBydDataCollector();
+                            if (isValidGearMode(g)) gear = g;
                         }
 
                         if (!isValidGearMode(gear)) {
-                            logger.debug("Ignoring invalid gear read: "
-                                    + gear);
                             continue;
                         }
                         int previousGear = currentGear;
@@ -201,14 +215,13 @@ public class GearMonitor {
                     } catch (InterruptedException e) {
                         break;
                     } catch (Exception e) {
-                        // Don't crash the poll thread — just log and retry
                         logger.debug("Gear poll error: " + e.getMessage());
                         try { Thread.sleep(1000); } catch (InterruptedException ie) { break; }
                     }
                 }
+                logger.info("Gear poll thread stopped");
             }, "GearPoll");
             pollThread.setDaemon(true);
-            // Notify initial state
             CameraDaemon.onGearChanged(initialGear);
             pollThread.start();
             
@@ -218,6 +231,48 @@ public class GearMonitor {
             logger.error("Failed to start gear monitor: " + e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    private int readFromCarAdapter() {
+        try {
+            Class<?> camCls = Class.forName("com.ts.lib.caradapter.CarAdapterManager");
+            Method getInst = camCls.getMethod("getInstance", Context.class);
+            Object cam = getInst.invoke(null, context);
+            if (cam != null) {
+                Method getMgr = camCls.getMethod("getCarAdapterManager", String.class);
+                Object cabinMgr = getMgr.invoke(cam, "cabin");
+                if (cabinMgr != null) {
+                    try {
+                        Method m = cabinMgr.getClass().getMethod("getGearboxAutoModeType");
+                        Object res = m.invoke(cabinMgr);
+                        if (res instanceof Number) {
+                            int g = ((Number) res).intValue();
+                            if (isValidGearMode(g)) return g;
+                        }
+                    } catch (Throwable ignored) {}
+                    try {
+                        Method m = cabinMgr.getClass().getMethod("getGear");
+                        Object res = m.invoke(cabinMgr);
+                        if (res instanceof Number) {
+                            int g = ((Number) res).intValue();
+                            if (isValidGearMode(g)) return g;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    private int readFromBydDataCollector() {
+        try {
+            com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (collector != null) {
+                int g = collector.readGearNow();
+                if (isValidGearMode(g)) return g;
+            }
+        } catch (Throwable ignored) {}
+        return -1;
     }
     
     /**
