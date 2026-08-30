@@ -4,6 +4,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Risoluzione Crash Loop `acc_sentry_daemon` & Stabilizzazione Connessione Veicolo (`AccSentryDaemon.java`)**:
+  - Risolto il crash fatale ricorrente (`FATAL EXCEPTION: BodyworkRegistration-1` causato da `NoClassDefFoundError: AbsBYDAutoBodyworkListener` / `AbsBYDAutoPowerListener`) sui sistemi DiLink dove le classi listener dell'SDK non sono esposte nel classpath shell.
+  - Implementato il controllo runtime preventivo `isBodyworkSupported()` / `isPowerListenerSupported()` e l'isolamento dell'istanziazione dei listener in registrar dedicati (`BodyworkListenerRegistrar` / `PowerListenerRegistrar`), con gestione sicura di `LinkageError` / `Throwable`.
+  - Abilitato il fallback immediato sull'heartbeat ACC per garantire il mantenimento ininterrotto dei WakeLock e del monitoraggio energetico, impedendo il deep-sleep non controllato dell'headunit e le conseguenti disconnessioni dell'interfaccia Wi-Fi / ADB (`device offline`).
+
 - **Correzione Mappatura Hardware Stato Blocco Porte (`VehicleControlApiHandler.java`, `LauncherApiHandler.java`, `AccMonitor.java`)**:
   - Risolta l'inversione dello stato delle portiere tra la convenzione BYD SDK (`1 = UNLOCKED, 2 = LOCKED`) e l'API/Frontend Web (`1 = LOCKED, 2 = UNLOCKED`).
   - Mappati correttamente i valori telemetrici hardware tramite `cloudLockToApi()`, ripristinando la visualizzazione immediata di vettura **Bloccata** (`overall = 1`) con lucchetto chiuso.

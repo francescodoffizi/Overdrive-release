@@ -1879,6 +1879,26 @@ public class AccSentryDaemon {
 
     // ==================== ACC STATE DETECTION ====================
 
+    private static boolean isBodyworkSupported() {
+        try {
+            Class.forName("android.hardware.bydauto.bodywork.BYDAutoBodyworkDevice");
+            Class.forName("android.hardware.bydauto.bodywork.AbsBYDAutoBodyworkListener");
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static boolean isPowerListenerSupported() {
+        try {
+            Class.forName("android.hardware.bydauto.power.BYDAutoPowerDevice");
+            Class.forName("android.hardware.bydauto.power.AbsBYDAutoPowerListener");
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private static boolean registerBodyworkListener(
             Context context, AccListener listener) {
         if (context == null) return false;
@@ -1912,7 +1932,7 @@ public class AccSentryDaemon {
 
             return true;
 
-        } catch (Exception e) {
+        } catch (Throwable e) {
             log("Bodywork registration failed: " + e.getMessage());
             return false;
         }
@@ -1921,6 +1941,14 @@ public class AccSentryDaemon {
     private static void startBodyworkListenerRegistrationSupervisor(
             Context context) {
         if (context == null) {
+            return;
+        }
+        if (!isBodyworkSupported()) {
+            log("BYD bodywork SDK classes (AbsBYDAutoBodyworkListener) not available on this ROM — skipping bodywork listener and enabling ACC fallback heartbeat");
+            synchronized (bodyworkRegistrationLock) {
+                bodyworkRegistered = true;
+            }
+            startAccStateHeartbeat();
             return;
         }
         synchronized (bodyworkRegistrationLock) {
@@ -1954,13 +1982,19 @@ public class AccSentryDaemon {
         try {
             while (isBodyworkLifecycleCurrent(
                     lifecycleGeneration)) {
+                if (!isBodyworkSupported()) {
+                    log("Bodywork SDK no longer available — stopping bodywork supervisor");
+                    synchronized (bodyworkRegistrationLock) {
+                        bodyworkRegistered = true;
+                    }
+                    startAccStateHeartbeat();
+                    return;
+                }
                 final long attemptGeneration;
                 synchronized (bodyworkRegistrationLock) {
                     attemptGeneration =
                             ++bodyworkAttemptGeneration;
                 }
-                AccListener listener = new AccListener(
-                        lifecycleGeneration, attemptGeneration);
                 ShellOwnership ownership = () ->
                         isBodyworkAttemptCurrent(
                                 lifecycleGeneration,
@@ -1970,8 +2004,10 @@ public class AccSentryDaemon {
                                 "register attempt " + attemptGeneration,
                                 5000L,
                                 ownership,
-                                () -> registerBodyworkListener(
-                                        context, listener),
+                                () -> BodyworkListenerRegistrar.register(
+                                        context,
+                                        lifecycleGeneration,
+                                        attemptGeneration),
                                 null);
                 if (!result.completed
                         && result.failure == null
@@ -2010,6 +2046,8 @@ public class AccSentryDaemon {
                 retryDelayMs = Math.min(
                         retryDelayMs * 2L, 60_000L);
             }
+        } catch (Throwable t) {
+            log("Bodywork registration supervisor encountered fatal error: " + t.getMessage());
         } finally {
             synchronized (bodyworkRegistrationLock) {
                 if (bodyworkRegistrationThread
@@ -2162,7 +2200,7 @@ public class AccSentryDaemon {
         } catch (ClassNotFoundException cnf) {
             log("BYDAutoPowerDevice classes not on this ROM: " + cnf.getMessage());
             return false;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             log("registerPowerListener failed: " + e.getMessage());
             return false;
         }
@@ -2171,6 +2209,10 @@ public class AccSentryDaemon {
     private static void startPowerListenerRegistrationSupervisor(
             Context context) {
         if (context == null) {
+            return;
+        }
+        if (!isPowerListenerSupported()) {
+            log("BYD power SDK classes (AbsBYDAutoPowerListener) not available on this ROM — skipping power listener");
             return;
         }
         synchronized (powerListenerRegistrationLock) {
@@ -2237,6 +2279,10 @@ public class AccSentryDaemon {
         try {
             while (isPowerListenerLifecycleCurrent(
                     lifecycleGeneration)) {
+                if (!isPowerListenerSupported()) {
+                    log("Power SDK no longer available — stopping power supervisor");
+                    return;
+                }
                 final long attemptGeneration;
                 synchronized (powerListenerRegistrationLock) {
                     if (!running
@@ -2249,10 +2295,6 @@ public class AccSentryDaemon {
                             ++powerListenerAttemptGeneration;
                 }
 
-                OemStylePowerListener listener =
-                        new OemStylePowerListener(
-                                lifecycleGeneration,
-                                attemptGeneration);
                 ShellOwnership ownership = () ->
                         isPowerListenerAttemptCurrent(
                                 lifecycleGeneration,
@@ -2263,8 +2305,10 @@ public class AccSentryDaemon {
                                         + attemptGeneration,
                                 5000L,
                                 ownership,
-                                () -> registerPowerListener(
-                                        context, listener),
+                                () -> PowerListenerRegistrar.register(
+                                        context,
+                                        lifecycleGeneration,
+                                        attemptGeneration),
                                 null);
                 if (!result.completed
                         && result.failure == null
@@ -2306,6 +2350,8 @@ public class AccSentryDaemon {
                 retryDelayMs = Math.min(
                         retryDelayMs * 2L, 60_000L);
             }
+        } catch (Throwable t) {
+            log("Power-listener registration supervisor encountered fatal error: " + t.getMessage());
         } finally {
             boolean restart = false;
             synchronized (powerListenerRegistrationLock) {
@@ -2393,6 +2439,20 @@ public class AccSentryDaemon {
         }
         if (worker != null && worker != Thread.currentThread()) {
             worker.interrupt();
+        }
+    }
+
+    private static final class PowerListenerRegistrar {
+        static boolean register(Context context, long lifecycleGeneration, long attemptGeneration) {
+            OemStylePowerListener listener = new OemStylePowerListener(lifecycleGeneration, attemptGeneration);
+            return registerPowerListener(context, listener);
+        }
+    }
+
+    private static final class BodyworkListenerRegistrar {
+        static boolean register(Context context, long lifecycleGeneration, long attemptGeneration) {
+            AccListener listener = new AccListener(lifecycleGeneration, attemptGeneration);
+            return registerBodyworkListener(context, listener);
         }
     }
 
