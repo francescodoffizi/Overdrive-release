@@ -331,11 +331,12 @@ public class AccMonitor {
                     }
                 }
 
-                // 1. Check Automotive BYD PowerMode enum (Standby=4, Sleep=8, Str=5, Off=0 vs StartUp=2, Pre StartUp=1)
+                // 1. Check Automotive BYD PowerMode enum (Standby=4, Sleep=8, Str=5, Off=0, Pre StartUp=1 vs StartUp=2, DisPlay on=10)
                 String carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 3 | grep 'current' | head -1");
                 if (!carServicePower.isEmpty()) {
                     if (carServicePower.contains("4=PowerMode Standby") || carServicePower.contains("8=PowerMode Sleep") ||
                         carServicePower.contains("5=PowerMode Str") || carServicePower.contains("0=PowerMode Off") ||
+                        carServicePower.contains("1=PowerMode Pre StartUp") || carServicePower.contains("12=PowerMode Tod") ||
                         carServicePower.contains("9=PowerMode Str Suspending")) {
                         accOn = false;
                         inSentryMode = true;
@@ -344,7 +345,7 @@ public class AccMonitor {
                         notifyAccEdge(false);
                         CameraDaemon.log("AccMonitor [DiLink5]: Vehicle PowerMode is STANDBY/OFF (" + carServicePower.trim() + ") -> accOn=false, sentryMode=true");
                         return true;
-                    } else if (carServicePower.contains("2=PowerMode StartUp") || carServicePower.contains("1=PowerMode Pre StartUp") ||
+                    } else if (carServicePower.contains("2=PowerMode StartUp") ||
                                carServicePower.contains("10=PowerMode DisPlay on") || carServicePower.contains("3=PowerMode Degraded")) {
                         accOn = true;
                         inSentryMode = false;
