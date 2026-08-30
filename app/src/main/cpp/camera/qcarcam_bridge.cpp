@@ -56,7 +56,7 @@ void convert_uyvy_to_rgba(const uint8_t* __restrict__ uyvy, int width, int heigh
 
     for (int y = 0; y < height; ++y) {
         const uint8_t* src_row = uyvy + y * width * 2;
-        uint32_t* dst_row = dst_rgba + y * stride;
+        uint32_t* dst_row = dst_rgba + (height - 1 - y) * stride;
         int x = 0;
 
         // Vectorized loop: 16 pixels per iteration
@@ -161,7 +161,7 @@ void convert_nv12_to_rgba(const uint8_t* nv12, int width, int height, uint32_t* 
 
     for (int y = 0; y < height; y++) {
         int src_y = y;
-        uint32_t* row = dst_rgba + y * stride;
+        uint32_t* row = dst_rgba + (height - 1 - y) * stride;
         for (int x = 0; x < width; x++) {
             int y_val = y_plane[src_y * width + x];
             int uv_idx = (src_y / 2) * width + (x & ~1);
