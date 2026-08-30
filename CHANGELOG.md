@@ -4,6 +4,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Hardening Persistenza ADB Wireless & Self-Healing h24 dei Demoni (`AccSentryDaemon.java`, `AdbShellExecutor.kt`, `BootReceiver.kt`)**:
+  - **Auto-Enforcement Periodico Impostazioni Globali**: Implementato in `AccSentryDaemon` (UID 2000 shell) l'aggiornamento forzato e continuo ogni 60 secondi di `adb_enabled = 1`, `adb_wifi_enabled = 1`, `adb_allowed_connection_time = 0`, `development_settings_enabled = 1` e `stay_on_while_plugged_in = 7` tramite `SettingsProvider`, impedendo a BYD di disattivare il debug wireless durante i cicli di standby o le soste prolungate.
+  - **Self-Healing Nativo dei Demoni Compagni**: `AccSentryDaemon` monitora costantemente i processi `CameraDaemon` (`byd_cam_daemon`) e `TelegramBotDaemon`; in caso di morte inattesa o crash, ne esegue il respawn automatico tramite gli script watchdog in `/data/local/tmp/` senza richiedere alcun comando ADB esterno o riapertura dell'app.
+  - **Auto-Recovery in Avvio & Boot**: Integrato l'auto-ripristino preventivo delle chiavi di debug in `BootReceiver` e in `AdbShellExecutor` su tentativi di connessione locale a `127.0.0.1:5555`, eliminando la necessità di riattivare manualmente ADB tramite la procedura degli 8 tap.
+
 - **Risoluzione Blocco "Connecting" Telecamere & Estrazione Nativa Multi-Livello `libhook_qcarcam.so` su DiLink 5.0 (`DiLink5QCarCamBackend.java`, `UnifiedConfigManager.kt`)**:
   - **Risoluzione Bug Ricerca APK in `app_process`**: Sostituita la lettura di `System.getProperty("java.class.path")` con `System.getenv("CLASSPATH")`, garantendo che il demone autonomo individui sempre `base.apk` per estrarre la libreria nativa `libhook_qcarcam.so` in `/data/local/tmp/`.
   - **Supporto Struttura Cartelle Android 11 (`~~hash/`)**: Implementata la scansione ricorsiva di `/data/app` fino a 3 livelli e il fallback su `pm path com.overdrive.app` e `Context.getPackageCodePath()`, superando le directory con hash casuali tipiche di Android 11 Automotive (`msmnile`).

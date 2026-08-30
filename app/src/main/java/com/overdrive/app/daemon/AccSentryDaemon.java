@@ -9136,6 +9136,9 @@ public class AccSentryDaemon {
                         logMemoryStatus();
                     }
                     
+                    // Enforce persistent ADB over Wi-Fi and self-heal companion daemons
+                    enforceAdbAndDaemonHealth();
+
                     log("===================");
                     
                 } catch (Exception e) {
@@ -9152,6 +9155,57 @@ public class AccSentryDaemon {
         // Start first check after 60 seconds
         statusHandler.postDelayed(statusCheck, 60000);
         log("Status monitoring started (60s interval)");
+    }
+
+    /**
+     * Periodically enforce persistent ADB over Wi-Fi and self-heal companion daemons.
+     * Runs every 60s as shell UID 2000.
+     */
+    private static void enforceAdbAndDaemonHealth() {
+        try {
+            // 1. Enforce global ADB settings via SettingsProvider (authorized for shell UID 2000)
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "adb_enabled", "1"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "adb_wifi_enabled", "1"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "adb_allowed_connection_time", "0"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "development_settings_enabled", "1"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "stay_on_while_plugged_in", "7"});
+
+            // 2. Self-heal CameraDaemon if unexpectedly dead and not explicitly disabled
+            java.io.File camDisabled = new java.io.File("/data/local/tmp/camera_daemon.disabled");
+            java.io.File camScript = new java.io.File("/data/local/tmp/start_cam_daemon.sh");
+            if (!camDisabled.exists() && camScript.exists()) {
+                if (!isProcessRunning("byd_cam_daemon") && !isProcessRunning("CameraDaemon")) {
+                    log("Self-healing: CameraDaemon is dead, respawning watchdog via start_cam_daemon.sh...");
+                    Runtime.getRuntime().exec(new String[]{"sh", "-c", "nohup sh /data/local/tmp/start_cam_daemon.sh > /dev/null 2>&1 &"});
+                }
+            }
+
+            // 3. Self-heal TelegramBotDaemon if unexpectedly dead and not explicitly disabled
+            java.io.File tgDisabled = new java.io.File("/data/local/tmp/telegram_bot_daemon.disabled");
+            java.io.File tgScript = new java.io.File("/data/local/tmp/start_telegram.sh");
+            if (!tgDisabled.exists() && tgScript.exists()) {
+                if (!isProcessRunning("TelegramBotDaemon")) {
+                    log("Self-healing: TelegramBotDaemon is dead, respawning watchdog via start_telegram.sh...");
+                    Runtime.getRuntime().exec(new String[]{"sh", "-c", "nohup sh /data/local/tmp/start_telegram.sh > /dev/null 2>&1 &"});
+                }
+            }
+        } catch (Throwable t) {
+            log("enforceAdbAndDaemonHealth error: " + t.getMessage());
+        }
+    }
+
+    private static boolean isProcessRunning(String processName) {
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", processName});
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
+                String line = r.readLine();
+                return line != null && !line.trim().isEmpty();
+            } finally {
+                p.waitFor();
+            }
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
     
     /**
