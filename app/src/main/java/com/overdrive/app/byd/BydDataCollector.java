@@ -1883,15 +1883,50 @@ public class BydDataCollector {
     // call at a fast cadence. Each returns UNAVAILABLE on a miss so the caller skips the
     // publish rather than manufacturing a spurious edge.
 
+    private int readGearFromCarAdapter() {
+        try {
+            Class<?> camCls = Class.forName("com.ts.lib.caradapter.CarAdapterManager");
+            Method getInst = camCls.getMethod("getInstance", Context.class);
+            Object cam = getInst.invoke(null, context);
+            if (cam != null) {
+                Method getMgr = camCls.getMethod("getCarAdapterManager", String.class);
+                Object bodyMgr = getMgr.invoke(cam, "body");
+                if (bodyMgr != null) {
+                    Method m = bodyMgr.getClass().getMethod("getShiftMode");
+                    Object res = m.invoke(bodyMgr);
+                    if (res instanceof Number) {
+                        int shift = ((Number) res).intValue();
+                        switch (shift) {
+                            case 0:
+                            case 1: return 1; // GEAR_P
+                            case 2: return 2; // GEAR_R
+                            case 3: return 3; // GEAR_N
+                            case 4: return 4; // GEAR_D
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return BydVehicleData.UNAVAILABLE;
+    }
+
     /** Live gearbox mode (raw SDK enum for {@link com.overdrive.app.monitor.GearMonitor}),
      *  or UNAVAILABLE on a miss. Uses the same getter the 5s poll (collectGearbox) and the
      *  fast-dynamics poll already call — NOT the learningEPB() listener path. */
     public int readGearNow() {
-        if (gearboxDevice == null) return BydVehicleData.UNAVAILABLE;
-        try {
-            Object g = BydDeviceHelper.callGetter(gearboxDevice, "getGearboxAutoModeType");
-            if (g instanceof Number) return ((Number) g).intValue();
-        } catch (Throwable t) { logger.debug("readGearNow error: " + t.getMessage()); }
+        if (gearboxDevice != null) {
+            try {
+                Object g = BydDeviceHelper.callGetter(gearboxDevice, "getGearboxAutoModeType");
+                if (g instanceof Number) {
+                    int val = ((Number) g).intValue();
+                    if (val >= 1 && val <= 7) return val;
+                }
+            } catch (Throwable t) { logger.debug("readGearNow error: " + t.getMessage()); }
+        }
+        int carAdapterGear = readGearFromCarAdapter();
+        if (carAdapterGear != BydVehicleData.UNAVAILABLE) {
+            return carAdapterGear;
+        }
         return BydVehicleData.UNAVAILABLE;
     }
 
@@ -6213,12 +6248,9 @@ public class BydDataCollector {
     }
 
     private void collectGearbox(BydVehicleData.Builder b) {
-        if (gearboxDevice == null) return;
-        try {
-            Object gear = BydDeviceHelper.callGetter(gearboxDevice, "getGearboxAutoModeType");
-            if (gear instanceof Number) b.gearMode(((Number) gear).intValue());
-        } catch (Exception e) {
-            logger.debug("collectGearbox error: " + e.getMessage());
+        int g = readGearNow();
+        if (g != BydVehicleData.UNAVAILABLE) {
+            b.gearMode(g);
         }
     }
 
