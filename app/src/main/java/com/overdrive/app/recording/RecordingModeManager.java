@@ -528,6 +528,16 @@ public class RecordingModeManager {
                 // GearMonitor unavailable — keep our current value
             }
 
+            // Fallback: If ACC is ON and GPS speed >= 3 km/h or moving, promote gear to D
+            if (hwAcc && (hwGear == com.overdrive.app.monitor.GearMonitor.GEAR_P || hwGear == com.overdrive.app.monitor.GearMonitor.GEAR_N)) {
+                try {
+                    com.overdrive.app.monitor.GpsMonitor gps = com.overdrive.app.monitor.GpsMonitor.getInstance();
+                    if (gps != null && (gps.getSpeed() * 3.6f >= 3.0f || gps.isMoving())) {
+                        hwGear = com.overdrive.app.monitor.GearMonitor.GEAR_D;
+                    }
+                } catch (Throwable ignored) {}
+            }
+
             accChanged = hwAcc != accIsOn;
             gearChanged = hwGear != currentGear;
             // Steady-state quiet logging: at 30s ticker interval, an info log

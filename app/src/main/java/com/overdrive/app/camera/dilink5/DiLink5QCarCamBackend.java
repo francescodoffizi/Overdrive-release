@@ -269,8 +269,16 @@ public class DiLink5QCarCamBackend {
         try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(zipFile)) {
             java.util.zip.ZipEntry entry = zf.getEntry(entryPath);
             if (entry != null) {
+                // If destination already exists with the exact same non-zero size, no need to re-write
+                if (dst.exists() && dst.length() == entry.getSize() && entry.getSize() > 0) {
+                    dst.setReadable(true, false);
+                    dst.setExecutable(true, false);
+                    return true;
+                }
+                // Overwrite stale/mismatched file
+                java.io.File tmpDst = new java.io.File(dst.getParentFile(), dst.getName() + ".tmp." + System.currentTimeMillis());
                 try (java.io.InputStream in = zf.getInputStream(entry);
-                     java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
+                     java.io.OutputStream out = new java.io.FileOutputStream(tmpDst)) {
                     byte[] buf = new byte[8192];
                     int len;
                     while ((len = in.read(buf)) > 0) {
@@ -278,21 +286,40 @@ public class DiLink5QCarCamBackend {
                     }
                     out.flush();
                 }
-                return dst.exists() && dst.length() > 0;
+                if (tmpDst.exists() && tmpDst.length() > 0) {
+                    if (dst.exists()) dst.delete();
+                    tmpDst.renameTo(dst);
+                    dst.setReadable(true, false);
+                    dst.setExecutable(true, false);
+                    logger.info("Extracted and deployed " + dst.getName() + " (" + dst.length() + " bytes, mode 755)");
+                    return true;
+                }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            logger.warn("extractFromZip failed for " + entryPath + ": " + t.getMessage());
+        }
         return false;
     }
 
     private static void copyFile(java.io.File src, java.io.File dst) {
-        try (java.io.InputStream in = new java.io.FileInputStream(src);
-             java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
-            byte[] buf = new byte[8192];
-            int len;
-            while ((len = in.read(buf)) > 0) {
-                out.write(buf, 0, len);
+        try {
+            if (dst.exists() && dst.length() == src.length() && src.length() > 0) {
+                dst.setReadable(true, false);
+                dst.setExecutable(true, false);
+                return;
             }
-            out.flush();
+            try (java.io.InputStream in = new java.io.FileInputStream(src);
+                 java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
+                byte[] buf = new byte[8192];
+                int len;
+                while ((len = in.read(buf)) > 0) {
+                    out.write(buf, 0, len);
+                }
+                out.flush();
+            }
+            dst.setReadable(true, false);
+            dst.setExecutable(true, false);
+            logger.info("Copied and deployed " + dst.getName() + " (" + dst.length() + " bytes, mode 755)");
         } catch (Throwable ignored) {}
     }
 

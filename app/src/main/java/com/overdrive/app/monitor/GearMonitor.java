@@ -104,10 +104,15 @@ public class GearMonitor {
         try {
             logger.info("Starting gear monitor...");
             
-            // Get gearbox device instance via reflection
-            Class<?> gearboxClass = Class.forName("android.hardware.bydauto.gearbox.BYDAutoGearboxDevice");
-            Method getInstance = gearboxClass.getMethod("getInstance", Context.class);
-            gearboxDevice = getInstance.invoke(null, context);
+            // Get gearbox device instance via BydDeviceHelper (with DiLink 5.0 / Android 11 bypass)
+            gearboxDevice = com.overdrive.app.byd.BydDeviceHelper.getDevice("android.hardware.bydauto.gearbox.BYDAutoGearboxDevice", context);
+            if (gearboxDevice == null) {
+                try {
+                    Class<?> gearboxClass = Class.forName("android.hardware.bydauto.gearbox.BYDAutoGearboxDevice");
+                    Method getInstance = gearboxClass.getMethod("getInstance", Context.class);
+                    gearboxDevice = getInstance.invoke(null, context);
+                } catch (Throwable ignored) {}
+            }
             
             if (gearboxDevice == null) {
                 logger.error("BYDAutoGearboxDevice.getInstance() returned null");
@@ -115,11 +120,11 @@ public class GearMonitor {
             }
             
             // Cache the getter method
-            getGearMethod = gearboxClass.getMethod("getGearboxAutoModeType");
+            getGearMethod = gearboxDevice.getClass().getMethod("getGearboxAutoModeType");
             
             // Get initial gear state
-            int initialGearRead =
-                    (int) getGearMethod.invoke(gearboxDevice);
+            Object initialReadObj = getGearMethod.invoke(gearboxDevice);
+            int initialGearRead = (initialReadObj instanceof Integer) ? (Integer) initialReadObj : -1;
             if (!isValidGearMode(initialGearRead)) {
                 logger.error("Invalid initial gear read: "
                         + initialGearRead);

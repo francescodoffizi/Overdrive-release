@@ -4,6 +4,12 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Fix Rilevamento Marcia (D/R), Dashcam Automatica a 30 FPS & Dashboard di Guida in Tempo Reale (`GearMonitor.java`, `RecordingModeManager.java`, `DashboardStatusParser.kt`, `DashboardFragment.kt`, `DiLink5QCarCamBackend.java`)**:
+  - **Bypass Sicurezza Android 11 per `GearMonitor`**: Corretta l'istanziazione di `BYDAutoGearboxDevice` tramite `BydDeviceHelper.getDevice(...)` e `callGetter(...)`, risolvendo il `SecurityException` (UID 2000 mismatch) su DiLink 5.0 e consentendo la lettura istantanea delle marce `D`, `R`, `P`, `N`.
+  - **Promozione Automatica Dashcam su Movimento GPS**: Integrato in `RecordingModeManager` il fallback di movimento (`speed >= 3 km/h` o `isMoving = true`), garantendo l'attivazione immediata della registrazione continua a 30 FPS ad alta risoluzione anche durante la marcia.
+  - **Auto-Sovrascrittura Automatica Librerie Native**: `DiLink5QCarCamBackend` verifica la corrispondenza di dimensione/versione e sovrascrive automaticamente file obsoleti o corrotti in `/data/local/tmp/libhook_qcarcam.so` impostando permessi `755`, eliminando la necessità di interventi manuali via ADB per i tester.
+  - **Dashboard Dinamica in Tempo Reale**: Aggiornato `DashboardFragment` e `DashboardStatusParser` per mostrare sul display centrale lo stato reale del veicolo (`In Guida (D) · XX km/h (REC)`, `In Retromarcia (R)`, `Pronta / Parcheggiata (P)`, `In Ricarica (X.X kW)`, `Sentinella Attiva`).
+
 - **Hardening Persistenza ADB Wireless & Self-Healing h24 dei Demoni (`AccSentryDaemon.java`, `AdbShellExecutor.kt`, `BootReceiver.kt`)**:
   - **Auto-Enforcement Periodico Impostazioni Globali**: Implementato in `AccSentryDaemon` (UID 2000 shell) l'aggiornamento forzato e continuo ogni 60 secondi di `adb_enabled = 1`, `adb_wifi_enabled = 1`, `adb_allowed_connection_time = 0`, `development_settings_enabled = 1` e `stay_on_while_plugged_in = 7` tramite `SettingsProvider`, impedendo a BYD di disattivare il debug wireless durante i cicli di standby o le soste prolungate.
   - **Self-Healing Nativo dei Demoni Compagni**: `AccSentryDaemon` monitora costantemente i processi `CameraDaemon` (`byd_cam_daemon`) e `TelegramBotDaemon`; in caso di morte inattesa o crash, ne esegue il respawn automatico tramite gli script watchdog in `/data/local/tmp/` senza richiedere alcun comando ADB esterno o riapertura dell'app.
