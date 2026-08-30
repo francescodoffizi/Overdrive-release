@@ -178,21 +178,12 @@ public final class DrivingSafetyGuard {
 
     private static GearReading resolveGear() {
         GearMonitor gm = GearMonitor.getInstance();
-        if (gm != null && gm.isRunning()) {
-            long age = SystemClock.elapsedRealtime() - gm.getLastUpdateTime();
-            if (age >= 0 && age < GEAR_FRESHNESS_MS) {
-                return gm.getCurrentGear() == GearMonitor.GEAR_P
-                        ? GearReading.PARK : GearReading.NOT_PARK;
-            }
-        }
-        com.overdrive.app.byd.BydDataCollector collector = com.overdrive.app.byd.BydDataCollector.getInstance();
-        if (collector != null) {
-            com.overdrive.app.byd.BydVehicleData vd = collector.getData();
-            if (vd != null && vd.gearMode != com.overdrive.app.byd.BydVehicleData.UNAVAILABLE) {
-                return vd.gearMode == GearMonitor.GEAR_P ? GearReading.PARK : GearReading.NOT_PARK;
-            }
-        }
-        return GearReading.UNKNOWN;
+        if (gm == null) return GearReading.UNKNOWN;
+        if (!gm.isRunning()) return GearReading.UNKNOWN;
+        long age = SystemClock.elapsedRealtime() - gm.getLastUpdateTime();
+        if (age < 0 || age >= GEAR_FRESHNESS_MS) return GearReading.UNKNOWN;
+        return gm.getCurrentGear() == GearMonitor.GEAR_P
+                ? GearReading.PARK : GearReading.NOT_PARK;
     }
 
     private static double resolveSpeedKmh() {

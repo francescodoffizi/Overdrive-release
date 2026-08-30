@@ -4,6 +4,12 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Risoluzione Blocco "Connecting" Telecamere & Estrazione Nativa Multi-Livello `libhook_qcarcam.so` su DiLink 5.0 (`DiLink5QCarCamBackend.java`, `UnifiedConfigManager.kt`)**:
+  - **Risoluzione Bug Ricerca APK in `app_process`**: Sostituita la lettura di `System.getProperty("java.class.path")` con `System.getenv("CLASSPATH")`, garantendo che il demone autonomo individui sempre `base.apk` per estrarre la libreria nativa `libhook_qcarcam.so` in `/data/local/tmp/`.
+  - **Supporto Struttura Cartelle Android 11 (`~~hash/`)**: Implementata la scansione ricorsiva di `/data/app` fino a 3 livelli e il fallback su `pm path com.overdrive.app` e `Context.getPackageCodePath()`, superando le directory con hash casuali tipiche di Android 11 Automotive (`msmnile`).
+  - **Prevenzione Deadlock Pipe Processo Hardware (`qcarcam-test-drainer`)**: Aggiunto un thread di background per consumare e registrare in tempo reale lo stream combinato di `stdout/stderr` di `/vendor/bin/qcarcam_test`, evitando il riempimento del buffer di pipe (64 KB) e il conseguente stallo del demone.
+  - **Auto-Rilevamento Modello `sealion7` su Piattaforme DiLink 5.0**: Configurato il default del modello veicolo in `UnifiedConfigManager.kt` su `"sealion7"` (invece del generico `"seal"`) quando viene rilevata la presenza dell'architettura hardware DiLink 5.0 (`DiLink5QCarCamBackend.isSupported()`).
+
 - **Ottimizzazione Failover Rete 4G / LTE & Instradamento Proxy `sing-box` (`TelegramBotDaemon.java`)**:
   - Integrato il rilevamento automatico del proxy `sing-box` (porta 8119) e `Tailscale` (porta 8539) tramite `ProxyHelper` in `TelegramBotDaemon`, instradando tutto il traffico Telegram e gli alert attraverso il tunnel VLESS quando la connettività 4G del veicolo è attiva a display spento.
   - Abilitato `retryOnConnectionFailure(true)` su tutti i client HTTP e ridotti i timeout di connessione (15s connect) per accelerare il failover da Wi-Fi locale a rete cellulare 4G.

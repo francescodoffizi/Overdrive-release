@@ -119,6 +119,20 @@ public class DiLink5QCarCamBackend {
             );
             pb.redirectErrorStream(true);
             sHardwareProcess = pb.start();
+
+            // Asynchronously drain stdout/stderr to prevent pipe buffer saturation (64KB deadlock)
+            final Process proc = sHardwareProcess;
+            Thread drainer = new Thread(() -> {
+                try (java.io.BufferedReader streamReader = new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream()))) {
+                    String drainLine;
+                    while ((drainLine = streamReader.readLine()) != null) {
+                        logger.info("[QCarCamProc] " + drainLine);
+                    }
+                } catch (Throwable ignored) {}
+            }, "qcarcam-test-drainer");
+            drainer.setDaemon(true);
+            drainer.start();
+
             logger.info("Qualcomm QCarCam hardware pipeline started successfully via supervisor.");
         } catch (Throwable t) {
             logger.error("Failed to start Qualcomm QCarCam hardware supervisor: " + t.getMessage(), t);
@@ -127,36 +141,98 @@ public class DiLink5QCarCamBackend {
 
     private static void ensureHookLibraryExtracted(java.io.File dst) {
         try {
-            // 1. Search in /data/app native lib directories
-            java.io.File dataApp = new java.io.File("/data/app");
-            if (dataApp.exists() && dataApp.isDirectory()) {
-                java.io.File[] dirs = dataApp.listFiles();
-                if (dirs != null) {
-                    for (java.io.File d : dirs) {
-                        if (!d.getName().contains("com.overdrive.app")) continue;
-                        java.io.File libDir = new java.io.File(d, "lib/arm64");
-                        java.io.File candidate = new java.io.File(libDir, "libhook_qcarcam.so");
-                        if (candidate.exists() && candidate.length() > 0) {
-                            copyFile(candidate, dst);
-                            if (dst.exists() && dst.length() > 0) return;
-                        }
-                        // 2. Search and extract directly from base.apk
-                        java.io.File baseApk = new java.io.File(d, "base.apk");
-                        if (baseApk.exists()) {
-                            extractFromZip(baseApk, "lib/arm64-v8a/libhook_qcarcam.so", dst);
-                            if (dst.exists() && dst.length() > 0) return;
+            // 1. Search via environment CLASSPATH (app_process daemon primary mechanism)
+            String envClasspath = System.getenv("CLASSPATH");
+            if (envClasspath != null && !envClasspath.isEmpty()) {
+                for (String cpEntry : envClasspath.split(":")) {
+                    if (cpEntry.endsWith(".apk") && (cpEntry.contains("com.overdrive.app") || new java.io.File(cpEntry).exists())) {
+                        java.io.File apkFile = new java.io.File(cpEntry);
+                        if (apkFile.exists() && apkFile.canRead()) {
+                            if (extractFromZip(apkFile, "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
+                                extractFromZip(apkFile, "lib/arm64/libhook_qcarcam.so", dst)) {
+                                logger.info("Extracted libhook_qcarcam.so from CLASSPATH APK: " + cpEntry);
+                                return;
+                            }
                         }
                     }
                 }
             }
 
-            // 3. Fallback: check CLASSPATH property
-            String classpath = System.getProperty("java.class.path");
-            if (classpath != null) {
-                for (String cpEntry : classpath.split(":")) {
+            // 2. Check Context package code path / native library dir
+            try {
+                android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+                if (ctx != null) {
+                    if (ctx.getApplicationInfo() != null && ctx.getApplicationInfo().nativeLibraryDir != null) {
+                        java.io.File candidate = new java.io.File(ctx.getApplicationInfo().nativeLibraryDir, "libhook_qcarcam.so");
+                        if (candidate.exists() && candidate.length() > 0) {
+                            copyFile(candidate, dst);
+                            if (dst.exists() && dst.length() > 0) {
+                                logger.info("Copied libhook_qcarcam.so from nativeLibraryDir: " + candidate.getAbsolutePath());
+                                return;
+                            }
+                        }
+                    }
+                    String pkgCodePath = ctx.getPackageCodePath();
+                    if (pkgCodePath != null) {
+                        java.io.File apkFile = new java.io.File(pkgCodePath);
+                        if (apkFile.exists() && apkFile.canRead()) {
+                            if (extractFromZip(apkFile, "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
+                                extractFromZip(apkFile, "lib/arm64/libhook_qcarcam.so", dst)) {
+                                logger.info("Extracted libhook_qcarcam.so from Context package code path: " + pkgCodePath);
+                                return;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                logger.warn("Context package code path check skipped: " + t.getMessage());
+            }
+
+            // 3. Fallback: Query package manager path via shell
+            try {
+                Process pmProc = Runtime.getRuntime().exec(new String[]{"pm", "path", "com.overdrive.app"});
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.InputStreamReader(pmProc.getInputStream()))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        line = line.trim();
+                        if (line.startsWith("package:")) {
+                            String apkPath = line.substring("package:".length()).trim();
+                            java.io.File apkFile = new java.io.File(apkPath);
+                            if (apkFile.exists() && apkFile.canRead()) {
+                                if (extractFromZip(apkFile, "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
+                                    extractFromZip(apkFile, "lib/arm64/libhook_qcarcam.so", dst)) {
+                                    logger.info("Extracted libhook_qcarcam.so from pm path: " + apkPath);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                pmProc.waitFor();
+            } catch (Throwable t) {
+                logger.warn("pm path fallback skipped: " + t.getMessage());
+            }
+
+            // 4. Recursive scan in /data/app (handling Android 11+ ~~hash/ subdirectories)
+            java.io.File dataApp = new java.io.File("/data/app");
+            if (dataApp.exists() && dataApp.isDirectory()) {
+                findAndExtractInDir(dataApp, dst, 0, 3);
+                if (dst.exists() && dst.length() > 0) {
+                    logger.info("Extracted libhook_qcarcam.so via /data/app recursive scan");
+                    return;
+                }
+            }
+
+            // 5. Fallback: check java.class.path JVM property
+            String propClasspath = System.getProperty("java.class.path");
+            if (propClasspath != null && !propClasspath.isEmpty()) {
+                for (String cpEntry : propClasspath.split(":")) {
                     if (cpEntry.endsWith(".apk") && new java.io.File(cpEntry).exists()) {
-                        extractFromZip(new java.io.File(cpEntry), "lib/arm64-v8a/libhook_qcarcam.so", dst);
-                        if (dst.exists() && dst.length() > 0) return;
+                        if (extractFromZip(new java.io.File(cpEntry), "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
+                            extractFromZip(new java.io.File(cpEntry), "lib/arm64/libhook_qcarcam.so", dst)) {
+                            logger.info("Extracted libhook_qcarcam.so from java.class.path: " + cpEntry);
+                            return;
+                        }
                     }
                 }
             }
@@ -165,7 +241,31 @@ public class DiLink5QCarCamBackend {
         }
     }
 
-    private static void extractFromZip(java.io.File zipFile, String entryPath, java.io.File dst) {
+    private static boolean findAndExtractInDir(java.io.File dir, java.io.File dst, int depth, int maxDepth) {
+        if (dir == null || !dir.exists() || !dir.isDirectory() || depth > maxDepth) return false;
+        java.io.File[] files = dir.listFiles();
+        if (files == null) return false;
+        for (java.io.File f : files) {
+            if (f.isDirectory()) {
+                if (f.getName().equals("lib") || f.getName().equals("arm64") || f.getName().equals("arm64-v8a")) {
+                    java.io.File candidate = new java.io.File(f, "libhook_qcarcam.so");
+                    if (candidate.exists() && candidate.length() > 0) {
+                        copyFile(candidate, dst);
+                        if (dst.exists() && dst.length() > 0) return true;
+                    }
+                }
+                if (findAndExtractInDir(f, dst, depth + 1, maxDepth)) return true;
+            } else if (f.getName().endsWith(".apk") && f.getAbsolutePath().contains("com.overdrive.app")) {
+                if (extractFromZip(f, "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
+                    extractFromZip(f, "lib/arm64/libhook_qcarcam.so", dst)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean extractFromZip(java.io.File zipFile, String entryPath, java.io.File dst) {
         try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(zipFile)) {
             java.util.zip.ZipEntry entry = zf.getEntry(entryPath);
             if (entry != null) {
@@ -178,8 +278,10 @@ public class DiLink5QCarCamBackend {
                     }
                     out.flush();
                 }
+                return dst.exists() && dst.length() > 0;
             }
         } catch (Throwable ignored) {}
+        return false;
     }
 
     private static void copyFile(java.io.File src, java.io.File dst) {

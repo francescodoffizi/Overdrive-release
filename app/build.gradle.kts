@@ -201,6 +201,7 @@ android {
     }
     namespace = "com.overdrive.app"
     compileSdk = 36
+    buildToolsVersion = "36.0.0"
     ndkVersion = "26.1.10909125"
 
     defaultConfig {
