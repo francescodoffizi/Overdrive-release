@@ -221,7 +221,7 @@ android {
         // value (e.g. `-PoverdriveVersionName=27.4 -PoverdriveVersionCode=12`)
         // without a source edit per release; the defaults track the current
         // rolling head so a plain local build is still accurate.
-        versionCode = (project.findProperty("overdriveVersionCode") as? String)?.toIntOrNull() ?: 66
+        versionCode = (project.findProperty("overdriveVersionCode") as? String)?.toIntOrNull() ?: 102
         versionName = (project.findProperty("overdriveVersionName") as? String) ?: "50.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         

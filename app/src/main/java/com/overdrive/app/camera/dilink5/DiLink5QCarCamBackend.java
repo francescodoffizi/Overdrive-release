@@ -97,14 +97,15 @@ public class DiLink5QCarCamBackend {
                 writer.close();
             }
 
-            // Path to libhook_qcarcam.so
+            // Ensure libhook_qcarcam.so exists in /data/local/tmp for LD_PRELOAD
             String hookPath = "/data/local/tmp/libhook_qcarcam.so";
             java.io.File hookFile = new java.io.File(hookPath);
-            if (!hookFile.exists()) {
-                java.io.File appHook = new java.io.File("/data/app", "libhook_qcarcam.so");
-                if (appHook.exists()) {
-                    copyFile(appHook, hookFile);
-                }
+            if (!hookFile.exists() || hookFile.length() == 0) {
+                ensureHookLibraryExtracted(hookFile);
+            }
+            if (hookFile.exists()) {
+                hookFile.setReadable(true, false);
+                hookFile.setExecutable(true, false);
             }
 
             String qcarcamBin = "/data/local/tmp/qcarcam_test";
@@ -124,6 +125,63 @@ public class DiLink5QCarCamBackend {
         }
     }
 
+    private static void ensureHookLibraryExtracted(java.io.File dst) {
+        try {
+            // 1. Search in /data/app native lib directories
+            java.io.File dataApp = new java.io.File("/data/app");
+            if (dataApp.exists() && dataApp.isDirectory()) {
+                java.io.File[] dirs = dataApp.listFiles();
+                if (dirs != null) {
+                    for (java.io.File d : dirs) {
+                        if (!d.getName().contains("com.overdrive.app")) continue;
+                        java.io.File libDir = new java.io.File(d, "lib/arm64");
+                        java.io.File candidate = new java.io.File(libDir, "libhook_qcarcam.so");
+                        if (candidate.exists() && candidate.length() > 0) {
+                            copyFile(candidate, dst);
+                            if (dst.exists() && dst.length() > 0) return;
+                        }
+                        // 2. Search and extract directly from base.apk
+                        java.io.File baseApk = new java.io.File(d, "base.apk");
+                        if (baseApk.exists()) {
+                            extractFromZip(baseApk, "lib/arm64-v8a/libhook_qcarcam.so", dst);
+                            if (dst.exists() && dst.length() > 0) return;
+                        }
+                    }
+                }
+            }
+
+            // 3. Fallback: check CLASSPATH property
+            String classpath = System.getProperty("java.class.path");
+            if (classpath != null) {
+                for (String cpEntry : classpath.split(":")) {
+                    if (cpEntry.endsWith(".apk") && new java.io.File(cpEntry).exists()) {
+                        extractFromZip(new java.io.File(cpEntry), "lib/arm64-v8a/libhook_qcarcam.so", dst);
+                        if (dst.exists() && dst.length() > 0) return;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            logger.warn("ensureHookLibraryExtracted failed: " + t.getMessage());
+        }
+    }
+
+    private static void extractFromZip(java.io.File zipFile, String entryPath, java.io.File dst) {
+        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(zipFile)) {
+            java.util.zip.ZipEntry entry = zf.getEntry(entryPath);
+            if (entry != null) {
+                try (java.io.InputStream in = zf.getInputStream(entry);
+                     java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
+                    byte[] buf = new byte[8192];
+                    int len;
+                    while ((len = in.read(buf)) > 0) {
+                        out.write(buf, 0, len);
+                    }
+                    out.flush();
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
     private static void copyFile(java.io.File src, java.io.File dst) {
         try (java.io.InputStream in = new java.io.FileInputStream(src);
              java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
@@ -132,6 +190,7 @@ public class DiLink5QCarCamBackend {
             while ((len = in.read(buf)) > 0) {
                 out.write(buf, 0, len);
             }
+            out.flush();
         } catch (Throwable ignored) {}
     }
 
