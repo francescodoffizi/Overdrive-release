@@ -1530,6 +1530,10 @@ public class AccSentryDaemon {
                 
                 // Start periodic status monitoring
                 startStatusMonitoring();
+
+                // Prevent Wi-Fi sleep policy from disconnecting when display is darkened
+                execShell("settings put global wifi_sleep_policy 2");
+                execShell("settings put global wifi_suspend_optimizations_enabled 0");
                 
                 // BYD traffic monitor: user-opt-in only. TrafficMonitorPolicy owns the
                 // toggle, and CameraDaemon re-applies it on boot when the user opted in.
@@ -4403,30 +4407,32 @@ public class AccSentryDaemon {
             }
         }
 
-        // Fallback: Settings brightness
+        // Fallback: Settings brightness & StealthPanel
         int brightness = on ? 128 : 0;
         ShellResult brightnessResult = execShellResult(
                 "settings put system screen_brightness " + brightness,
                 DEFAULT_SHELL_TIMEOUT_MS, ownership);
-        ShellResult keyResult;
         if (!brightnessResult.success) {
             return false;
         }
         if (on) {
-            keyResult = execShellResult(
+            ShellResult keyResult = execShellResult(
                     "input keyevent 224",
                     DEFAULT_SHELL_TIMEOUT_MS, ownership);
+            if (!keyResult.success) {
+                log("Backlight shell fallback failed: keyevent=" + keyResult.describeFailure());
+            }
+            return keyResult.success;
         } else {
-            keyResult = execShellResult(
-                    "input keyevent 223",
-                    DEFAULT_SHELL_TIMEOUT_MS, ownership);
+            // CRITICAL: Do NOT send "input keyevent 223" (KEYCODE_SLEEP).
+            // KEYCODE_SLEEP forces mWakefulness to Asleep, which triggers mHalAutoSuspendModeEnabled
+            // and kernel suspend-to-RAM, freezing CPU, Wi-Fi, and LTE.
+            // Brightness 0 + turnBacklightOff keeps mWakefulness Awake while display is fully dark.
+            try {
+                com.overdrive.app.power.StealthPanel.turnOff(appContext);
+            } catch (Throwable ignored) {}
+            return true;
         }
-        if (!brightnessResult.success || !keyResult.success) {
-            log("Backlight shell fallback failed: brightness="
-                    + brightnessResult.describeFailure()
-                    + ", keyevent=" + keyResult.describeFailure());
-        }
-        return brightnessResult.success && keyResult.success;
     }
 
     /**
@@ -4457,34 +4463,12 @@ public class AccSentryDaemon {
         // state"), so the next person to wire it up gets the verified path
         // instead of an unverified one. Legacy pano_h/pano_l units are
         // unaffected and keep the original goToSleep behaviour.
-        if (isDilink4CameraMode()) {
-            try {
-                com.overdrive.app.power.StealthPanel.turnOff(appContext);
-                log("enforceSmartSleep: used verified backlight-off path (dilink4)");
-            } catch (Throwable t) {
-                log("enforceSmartSleep backlight-off failed: " + t.getMessage());
-            }
-            return;
-        }
-
         try {
-            Context permissiveContext = new PermissionBypassContext(appContext);
-            PowerManager pm = (PowerManager) permissiveContext.getSystemService(Context.POWER_SERVICE);
-
-            // Method signature: goToSleep(long time, int reason, int flags)
-            Method method = PowerManager.class.getMethod("goToSleep", Long.TYPE, Integer.TYPE, Integer.TYPE);
-
-            // Dynamically retrieve the system-specific reason code (Compatibility Mode)
-            // This ensures the command is accepted by the Body Control Module
-            int reasonID = getSystemSleepReasonCode();
-
-            // Execute with Flag 1 (GO_TO_SLEEP_FLAG_NO_DOZE)
-            // Flag 1 is the critical component: Screen OFF, but CPU/Radio remain ACTIVE.
-            method.invoke(pm, android.os.SystemClock.uptimeMillis(), reasonID, 1);
-
-        } catch (Exception e) {
-            log("Smart sleep state enforcement failed: " + e.getMessage());
-            // Graceful fallback to basic backlight control if reflection fails
+            com.overdrive.app.power.StealthPanel.turnOff(appContext);
+            setBacklightState(false);
+            log("enforceSmartSleep: display darkened without triggering Asleep state");
+        } catch (Throwable t) {
+            log("enforceSmartSleep failed: " + t.getMessage());
             setBacklightState(false);
         }
     }

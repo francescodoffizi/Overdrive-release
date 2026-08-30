@@ -4,8 +4,15 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Ottimizzazione Failover Rete 4G / LTE & Instradamento Proxy `sing-box` (`TelegramBotDaemon.java`)**:
+  - Integrato il rilevamento automatico del proxy `sing-box` (porta 8119) e `Tailscale` (porta 8539) tramite `ProxyHelper` in `TelegramBotDaemon`, instradando tutto il traffico Telegram e gli alert attraverso il tunnel VLESS quando la connettività 4G del veicolo è attiva a display spento.
+  - Abilitato `retryOnConnectionFailure(true)` su tutti i client HTTP e ridotti i timeout di connessione (15s connect) per accelerare il failover da Wi-Fi locale a rete cellulare 4G.
+  - Implementata l'eviction automatica e immediata del connection pool (`httpClient.connectionPool().evictAll()`) al primo errore di socket/rete, eliminando le socket orfane dell'interfaccia Wi-Fi spenta e consentendo al bot Telegram di riaprire istantaneamente le connessioni sul modem 4G LTE permanente del veicolo.
+
 - **Sentry Keep-Awake h24 & Supporto `WifiLock` per DiLink 5.0 / Android 11 (`AccSentryDaemon.java`)**:
-  - Implementata la reflection per il metodo a 3 argomenti `PowerManager.userActivity(long when, int event, int flags)` di Android 11+ con flag `USER_ACTIVITY_FLAG_NO_CHANGE_LIGHTS = 1`, consentendo il reset del timer di inattività hardware dell'headunit mantenendo il display totalmente spento.
+  - Eliminato l'invio di `KEYCODE_SLEEP` (223) e `goToSleep` nello spegnimento dello schermo in Sentry Mode, prevenendo la transizione di `mWakefulness` ad `Asleep` e la conseguente attivazione di `mHalAutoSuspendModeEnabled`.
+  - Implementato lo spegnimento display via Backlight-Off puro (`screen_brightness 0` / `StealthPanel.turnOff()`) con mantenimento dei `Suspend Blockers` del kernel (`mWakefulness=Awake`).
+  - Implementata la reflection per il metodo a 3 argomenti `PowerManager.userActivity(long when, int event, int flags)` di Android 11+ con flag `USER_ACTIVITY_FLAG_NO_CHANGE_LIGHTS = 1`, azzerando il timer di inattività a schermo spento.
   - Integrato `WifiLock` (`WIFI_MODE_FULL_HIGH_PERF`) coordinato con il `PARTIAL_WAKE_LOCK` di sistema in `AccSentryDaemon`, prevenendo la disattivazione della scheda Wi-Fi/4G e garantendo la raggiungibilità h24 del tunnel Cloudflare, dei bot Telegram e della Dashboard Web a veicolo spento.
 
 - **Risoluzione Crash Loop `acc_sentry_daemon` & Stabilizzazione Connessione Veicolo (`AccSentryDaemon.java`)**:
