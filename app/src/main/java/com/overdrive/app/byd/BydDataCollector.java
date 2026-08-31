@@ -1914,6 +1914,10 @@ public class BydDataCollector {
      *  or UNAVAILABLE on a miss. Uses the same getter the 5s poll (collectGearbox) and the
      *  fast-dynamics poll already call — NOT the learningEPB() listener path. */
     public int readGearNow() {
+        int carAdapterGear = readGearFromCarAdapter();
+        if (carAdapterGear != BydVehicleData.UNAVAILABLE && carAdapterGear >= 1 && carAdapterGear <= 7) {
+            return carAdapterGear;
+        }
         if (gearboxDevice != null) {
             try {
                 Object g = BydDeviceHelper.callGetter(gearboxDevice, "getGearboxAutoModeType");
@@ -1922,10 +1926,6 @@ public class BydDataCollector {
                     if (val >= 1 && val <= 7) return val;
                 }
             } catch (Throwable t) { logger.debug("readGearNow error: " + t.getMessage()); }
-        }
-        int carAdapterGear = readGearFromCarAdapter();
-        if (carAdapterGear != BydVehicleData.UNAVAILABLE) {
-            return carAdapterGear;
         }
         return BydVehicleData.UNAVAILABLE;
     }
@@ -7680,7 +7680,13 @@ public class BydDataCollector {
             int[] signalStates = new int[4];
             for (int i = 0; i < 4; i++) {
                 Object p = BydDeviceHelper.callGetter(tyreDevice, "getTyrePressureValue", i + 1);
-                pressures[i] = (p instanceof Number) ? ((Number) p).intValue() : -1;
+                int rawP = (p instanceof Number) ? ((Number) p).intValue() : -1;
+                // Sentinel filter: 4095 (0xFFF), 2047, 255, <= 0 or >= 1000 kPa are invalid / sleeping TPMS readings
+                if (rawP <= 0 || rawP >= 1000 || rawP == 4095 || rawP == 2047 || rawP == 255) {
+                    pressures[i] = BydVehicleData.UNAVAILABLE;
+                } else {
+                    pressures[i] = rawP;
+                }
                 Object s = BydDeviceHelper.callGetter(tyreDevice, "getTyrePressureState", i + 1);
                 pressureStates[i] = (s instanceof Number) ? ((Number) s).intValue() : -1;
                 Object leak = BydDeviceHelper.callGetter(tyreDevice, "getTyreAirLeakState", i + 1);

@@ -5710,7 +5710,7 @@ var VC = {
         var lim = this._tyreLimits;
         var low = isFront ? lim.frontLow : lim.rearLow;
         var high = isFront ? lim.frontHigh : lim.rearHigh;
-        if (typeof corner.kPa === 'number' && corner.kPa > 0) {
+        if (typeof corner.kPa === 'number' && corner.kPa > 0 && corner.kPa < 1000 && corner.kPa !== 4095 && corner.kPa !== 2047 && corner.kPa !== 255) {
             if (corner.kPa <= lim.criticalLow) return 'alert';
             if (corner.kPa < low || corner.kPa > high) return 'warn';
         }

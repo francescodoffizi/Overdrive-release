@@ -155,26 +155,41 @@ public class GearMonitor {
                         int gear = -1;
                         long gearObservedAtElapsedRealtimeMs = SystemClock.elapsedRealtime();
 
-                        // 1. Prefer TelemetryDataCollector's cached snapshot
-                        com.overdrive.app.telemetry.TelemetryDataCollector src = telemetrySource;
-                        com.overdrive.app.telemetry.TelemetrySnapshot snap =
-                            (src != null) ? src.getLatestSnapshot() : null;
-                        long gearAgeMs = snap != null
-                                && snap.gearReadElapsedRealtimeMs >= 0L
-                                ? SystemClock.elapsedRealtime()
-                                        - snap.gearReadElapsedRealtimeMs
-                                : Long.MAX_VALUE;
-                        if (snap != null
-                                && snap.gearValid
-                                && isValidGearMode(snap.gearMode)
-                                && gearAgeMs >= 0L
-                                && gearAgeMs < CACHED_GEAR_MAX_AGE_MS) {
-                            gear = snap.gearMode;
-                            gearObservedAtElapsedRealtimeMs =
-                                    snap.gearReadElapsedRealtimeMs;
+                        // 1. Try CarAdapterManager / CarBodyManager (DiLink 5.0 / TS framework)
+                        int carAdapterGear = readFromCarAdapter();
+                        if (isValidGearMode(carAdapterGear)) {
+                            gear = carAdapterGear;
+                            gearObservedAtElapsedRealtimeMs = SystemClock.elapsedRealtime();
                         }
 
-                        // 2. Try BYDAutoGearboxDevice getter if available
+                        // 2. Prefer TelemetryDataCollector's cached snapshot
+                        if (!isValidGearMode(gear)) {
+                            com.overdrive.app.telemetry.TelemetryDataCollector src = telemetrySource;
+                            com.overdrive.app.telemetry.TelemetrySnapshot snap =
+                                (src != null) ? src.getLatestSnapshot() : null;
+                            long gearAgeMs = snap != null
+                                    && snap.gearReadElapsedRealtimeMs >= 0L
+                                    ? SystemClock.elapsedRealtime()
+                                            - snap.gearReadElapsedRealtimeMs
+                                    : Long.MAX_VALUE;
+                            if (snap != null
+                                    && snap.gearValid
+                                    && isValidGearMode(snap.gearMode)
+                                    && gearAgeMs >= 0L
+                                    && gearAgeMs < CACHED_GEAR_MAX_AGE_MS) {
+                                gear = snap.gearMode;
+                                gearObservedAtElapsedRealtimeMs =
+                                        snap.gearReadElapsedRealtimeMs;
+                            }
+                        }
+
+                        // 3. Try BydDataCollector fast dynamics / CAN poll
+                        if (!isValidGearMode(gear)) {
+                            int g = readFromBydDataCollector();
+                            if (isValidGearMode(g)) gear = g;
+                        }
+
+                        // 4. Try BYDAutoGearboxDevice getter if available
                         if (!isValidGearMode(gear)) {
                             Method getter = getGearMethod;
                             Object device = gearboxDevice;
@@ -187,18 +202,6 @@ public class GearMonitor {
                                     }
                                 } catch (Throwable ignored) {}
                             }
-                        }
-
-                        // 3. Try CarAdapterManager / CarCabinAdapterManager (DiLink 5.0 / TS framework)
-                        if (!isValidGearMode(gear)) {
-                            int g = readFromCarAdapter();
-                            if (isValidGearMode(g)) gear = g;
-                        }
-
-                        // 4. Try BydDataCollector fast dynamics / CAN poll
-                        if (!isValidGearMode(gear)) {
-                            int g = readFromBydDataCollector();
-                            if (isValidGearMode(g)) gear = g;
                         }
 
                         if (!isValidGearMode(gear)) {

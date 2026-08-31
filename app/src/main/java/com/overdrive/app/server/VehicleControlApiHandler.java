@@ -975,7 +975,7 @@ public class VehicleControlApiHandler {
                 JSONObject t = new JSONObject();
                 int kPa = (data.tyrePressure != null && i < data.tyrePressure.length)
                         ? data.tyrePressure[i] : BydVehicleData.UNAVAILABLE;
-                if (kPa != BydVehicleData.UNAVAILABLE && kPa > 0) {
+                if (kPa != BydVehicleData.UNAVAILABLE && kPa > 0 && kPa < 1000 && kPa != 4095 && kPa != 2047 && kPa != 255) {
                     t.put("kPa", kPa);
                     // PSI = kPa * 0.1450377 (matches the OEM vehicle-control app
                     // UnitFormatter conversion). One decimal place is
