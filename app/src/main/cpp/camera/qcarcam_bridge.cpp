@@ -39,7 +39,7 @@ struct FrameHeader {
 namespace {
 
 std::atomic<bool> g_streaming{false};
-std::atomic<int> g_active_camera{0};
+std::atomic<int> g_active_camera{4}; // Default: 4 = 2x2 Mosaic (All cameras)
 pthread_t g_streamThread = 0;
 ANativeWindow* g_nativeWindow = nullptr;
 std::mutex g_winMutex;
@@ -318,7 +318,7 @@ extern "C" {
 JNIEXPORT jboolean JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeIsSupported(
     JNIEnv* env, jclass clazz) {
-    return (access("/vendor/lib64/libais_client.so", F_OK) == 0) ? JNI_TRUE : JNI_FALSE;
+    return (access("/vendor/bin/qcarcam_test", F_OK) == 0 || access("/data/local/tmp/qcarcam_test", F_OK) == 0) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jlong JNICALL

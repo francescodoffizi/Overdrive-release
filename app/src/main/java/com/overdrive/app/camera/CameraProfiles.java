@@ -94,7 +94,7 @@ public final class CameraProfiles {
                 0,
                 1920,
                 1300,
-                0,
+                1,
                 1920,
                 1080,
                 dilink5Mappings,
