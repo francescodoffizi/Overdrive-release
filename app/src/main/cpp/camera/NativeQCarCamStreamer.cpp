@@ -59,7 +59,28 @@ struct QCarCamSymbols {
 
     bool load() {
         if (libHandle) return true;
-        libHandle = dlopen("/vendor/lib64/libais_client.so", RTLD_NOW);
+
+        // 1. Try SPHAL loader first (bypasses Android Bionic classloader-namespace restrictions on vendor HAL libraries)
+        void* vndk = dlopen("libvndksupport.so", RTLD_NOW);
+        if (vndk) {
+            typedef void* (*pfn_android_load_sphal_library)(const char* name, int flag);
+            pfn_android_load_sphal_library load_sphal = 
+                (pfn_android_load_sphal_library)dlsym(vndk, "android_load_sphal_library");
+            if (load_sphal) {
+                libHandle = load_sphal("libais_client.so", RTLD_NOW);
+                if (!libHandle) {
+                    libHandle = load_sphal("/vendor/lib64/libais_client.so", RTLD_NOW);
+                }
+                if (libHandle) {
+                    LOGI("Successfully loaded libais_client.so via android_load_sphal_library");
+                }
+            }
+        }
+
+        // 2. Direct fallback
+        if (!libHandle) {
+            libHandle = dlopen("/vendor/lib64/libais_client.so", RTLD_NOW);
+        }
         if (!libHandle) {
             libHandle = dlopen("libais_client.so", RTLD_NOW);
         }
