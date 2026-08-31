@@ -9184,7 +9184,7 @@ public class AccSentryDaemon {
             java.io.File tgDisabled = new java.io.File("/data/local/tmp/telegram_bot_daemon.disabled");
             java.io.File tgScript = new java.io.File("/data/local/tmp/start_telegram.sh");
             if (!tgDisabled.exists() && tgScript.exists()) {
-                if (!isProcessRunning("TelegramBotDaemon")) {
+                if (!isProcessRunning("telegram_bot_daemon") && !isProcessRunning("start_telegram.sh")) {
                     log("Self-healing: TelegramBotDaemon is dead, respawning watchdog via start_telegram.sh...");
                     Runtime.getRuntime().exec(new String[]{"sh", "-c", "nohup sh /data/local/tmp/start_telegram.sh > /dev/null 2>&1 &"});
                 }

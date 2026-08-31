@@ -237,28 +237,67 @@ public class GearMonitor {
         try {
             Class<?> camCls = Class.forName("com.ts.lib.caradapter.CarAdapterManager");
             Method getInst = camCls.getMethod("getInstance", Context.class);
-            Object cam = getInst.invoke(null, context);
+            Object cam = getInst.invoke(null, context != null ? context : CameraDaemon.getAppContext());
             if (cam != null) {
+                // Check if car service is bound
+                try {
+                    Method isBound = camCls.getMethod("isCarServiceBound");
+                    Object boundObj = isBound.invoke(cam);
+                    if (boundObj instanceof Boolean && !((Boolean) boundObj)) {
+                        // Reconnect / reset singleton if unbound
+                        try {
+                            Method connect = camCls.getMethod("connect");
+                            connect.invoke(cam);
+                        } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable ignored) {}
+
                 Method getMgr = camCls.getMethod("getCarAdapterManager", String.class);
-                Object cabinMgr = getMgr.invoke(cam, "cabin");
-                if (cabinMgr != null) {
-                    try {
-                        Method m = cabinMgr.getClass().getMethod("getGearboxAutoModeType");
-                        Object res = m.invoke(cabinMgr);
-                        if (res instanceof Number) {
-                            int g = ((Number) res).intValue();
-                            if (isValidGearMode(g)) return g;
-                        }
-                    } catch (Throwable ignored) {}
-                    try {
-                        Method m = cabinMgr.getClass().getMethod("getGear");
-                        Object res = m.invoke(cabinMgr);
-                        if (res instanceof Number) {
-                            int g = ((Number) res).intValue();
-                            if (isValidGearMode(g)) return g;
-                        }
-                    } catch (Throwable ignored) {}
-                }
+                
+                // 1. DiLink 5.0 / SL7: CarBodyManager ("body") -> getShiftMode()
+                try {
+                    Object bodyMgr = getMgr.invoke(cam, "body");
+                    if (bodyMgr != null) {
+                        try {
+                            Method m = bodyMgr.getClass().getMethod("getShiftMode");
+                            Object res = m.invoke(bodyMgr);
+                            if (res instanceof Number) {
+                                int shift = ((Number) res).intValue();
+                                // Shift values: 0=parked/charging, 1=P, 2=R, 3=N, 4=D
+                                switch (shift) {
+                                    case 0:
+                                    case 1: return GEAR_P;
+                                    case 2: return GEAR_R;
+                                    case 3: return GEAR_N;
+                                    case 4: return GEAR_D;
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable ignored) {}
+
+                // 2. Legacy DiLink / Cabin adapter fallback
+                try {
+                    Object cabinMgr = getMgr.invoke(cam, "cabin");
+                    if (cabinMgr != null) {
+                        try {
+                            Method m = cabinMgr.getClass().getMethod("getGearboxAutoModeType");
+                            Object res = m.invoke(cabinMgr);
+                            if (res instanceof Number) {
+                                int g = ((Number) res).intValue();
+                                if (isValidGearMode(g)) return g;
+                            }
+                        } catch (Throwable ignored) {}
+                        try {
+                            Method m = cabinMgr.getClass().getMethod("getGear");
+                            Object res = m.invoke(cabinMgr);
+                            if (res instanceof Number) {
+                                int g = ((Number) res).intValue();
+                                if (isValidGearMode(g)) return g;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable ignored) {}
             }
         } catch (Throwable ignored) {}
         return -1;
