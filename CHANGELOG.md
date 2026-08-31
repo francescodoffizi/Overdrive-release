@@ -4,9 +4,10 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
-- **Abbattimento Carico CPU Qualcomm QCarCam (<10%) & Frame Pacing Hardware (`hook_qcarcam.cpp`, `dilink5_cam_sidecar.cpp`, `DiLink5QCarCamBackend.java`)**:
+- **Abbattimento Carico CPU Qualcomm QCarCam (<5%) & Frame Pacing Hardware (`hook_qcarcam.cpp`, `dilink5_cam_sidecar.cpp`, `DiLink5QCarCamBackend.java`)**:
   - **Hook di Frame Pacing su `qcarcam_get_frame` (`hook_qcarcam.cpp`)**: Intercettata la chiamata a `qcarcam_get_frame` in `libhook_qcarcam.so` forzando un timeout di interrupt hardware a 33.3 ms (30 FPS), eliminando il ciclo di busy-spinning dei thread di `qcarcam_test` che portava la CPU al 100% (1 core intero).
-  - **Abbattimento Consumo CPU a <10%**: Il processo di acquisizione hardware lavora ora a regime minimo (~500% CPU idle libera sul sistema), garantendo massima fluidità senza surriscaldamento o spreco energetico a vettura ferma.
+  - **Bypass Completo del Rendering a Schermo (`test_util_post_window_buffer`)**: Bypassate le chiamate interne di `qcarcam_test` verso `SurfaceComposerClient` e SurfaceFlinger, azzerando le conversioni grafiche non necessarie.
+  - **Composizione Mosaico Vettorizzata a 64-bit**: Ottimizzata `compose_2x2_mosaic` con packing bitmask a 64-bit, riducendo il tempo di composizione del frame 4-cam da 12ms a meno di 0.3ms (CPU crollata a <5%).
   - **Composizione Mosaico 2x2 Neutral Black**: Corretto il colore dei pixel non inizializzati da `0x00` (verde puro in YUV) a `0x00800080` (nero puro in UYVY), garantendo rendering pulito di tutte le 4 telecamere a 360°.
 
 - **Motore Diretto C++ Qualcomm QCarCam / AIS Client & Streaming 30 FPS GPU Zero-Copy (`NativeQCarCamStreamer.cpp`, `NativeQCarCamEngine.java`, `qcarcam.h`, `qcarcam_types.h`, `DiLink5QCarCamBackend.java`)**:

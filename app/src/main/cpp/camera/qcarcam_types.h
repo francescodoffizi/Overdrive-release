@@ -58,16 +58,17 @@ typedef struct {
 } qcarcam_plane_t;
 
 typedef struct {
-    uint32_t flags;
     qcarcam_plane_t planes[QCARCAM_MAX_NUM_PLANES];
     uint32_t num_planes;
+    uint32_t flags;
 } qcarcam_buffer_t;
 
 typedef struct {
     qcarcam_color_fmt_t color_fmt;
-    uint32_t num_buffers;
-    qcarcam_buffer_t* buffers;
     uint32_t flags;
+    qcarcam_buffer_t* buffers;
+    uint32_t num_buffers;
+    uint32_t padding;
 } qcarcam_buffers_t;
 
 typedef struct {

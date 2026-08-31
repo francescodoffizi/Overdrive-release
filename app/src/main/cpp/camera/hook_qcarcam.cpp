@@ -65,7 +65,7 @@ static void* get_cam_vaddr(int cam_idx, int buf_idx) {
     return *(void**)(desc + 0x10);
 }
 
-// 2x2 grid compositor in UYVY (4 cameras combined into 1920x1300 at 30 FPS)
+// High-speed 64-bit packed 2x2 grid compositor in UYVY (4 cameras combined into 1920x1300 at 30 FPS)
 static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const uint8_t* cam2, const uint8_t* cam3) {
     const int W = FRAME_WIDTH;  // 1920
     const int H = FRAME_HEIGHT; // 1300
@@ -75,81 +75,57 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
 
     // Top half: Cam 0 (Front) on Left, Cam 1 (Right) on Right
     for (int y = 0; y < HALF_H; y++) {
-        const uint8_t* src0 = cam0 ? (cam0 + (y * 2) * W * 2) : NULL;
-        const uint8_t* src1 = cam1 ? (cam1 + (y * 2) * W * 2) : NULL;
-        uint8_t* dst_row = g_mosaic_buf + y * W * 2;
+        const uint64_t* src0_64 = cam0 ? (const uint64_t*)(cam0 + (y * 2) * W * 2) : NULL;
+        const uint64_t* src1_64 = cam1 ? (const uint64_t*)(cam1 + (y * 2) * W * 2) : NULL;
+        uint32_t* dst_left_32 = (uint32_t*)(g_mosaic_buf + y * W * 2);
+        uint32_t* dst_right_32 = dst_left_32 + (HALF_W / 2);
 
         // Top-Left: Cam 0
-        if (src0) {
-            for (int x = 0; x < HALF_W; x += 2) {
-                int s = (x * 2) * 2;
-                dst_row[x * 2]     = src0[s];
-                dst_row[x * 2 + 1] = src0[s + 1];
-                dst_row[x * 2 + 2] = src0[s + 2];
-                dst_row[x * 2 + 3] = src0[s + 5];
+        if (src0_64) {
+            for (int x = 0; x < HALF_W / 2; x++) {
+                uint64_t s = src0_64[x * 2]; // 8 bytes: U0 Y0 V0 Y1 U1 Y2 V1 Y3
+                dst_left_32[x] = (uint32_t)(s & 0x00FFFFFFULL) | (uint32_t)((s >> 16) & 0xFF000000ULL);
             }
         } else {
-            uint32_t* dst32 = (uint32_t*)dst_row;
-            for (int x = 0; x < HALF_W / 2; x++) {
-                dst32[x] = UYVY_BLACK;
-            }
+            for (int x = 0; x < HALF_W / 2; x++) dst_left_32[x] = UYVY_BLACK;
         }
 
         // Top-Right: Cam 1
-        uint8_t* dst_right = dst_row + HALF_W * 2;
-        if (src1) {
-            for (int x = 0; x < HALF_W; x += 2) {
-                int s = (x * 2) * 2;
-                dst_right[x * 2]     = src1[s];
-                dst_right[x * 2 + 1] = src1[s + 1];
-                dst_right[x * 2 + 2] = src1[s + 2];
-                dst_right[x * 2 + 3] = src1[s + 5];
+        if (src1_64) {
+            for (int x = 0; x < HALF_W / 2; x++) {
+                uint64_t s = src1_64[x * 2];
+                dst_right_32[x] = (uint32_t)(s & 0x00FFFFFFULL) | (uint32_t)((s >> 16) & 0xFF000000ULL);
             }
         } else {
-            uint32_t* dst32 = (uint32_t*)dst_right;
-            for (int x = 0; x < HALF_W / 2; x++) {
-                dst32[x] = UYVY_BLACK;
-            }
+            for (int x = 0; x < HALF_W / 2; x++) dst_right_32[x] = UYVY_BLACK;
         }
     }
 
     // Bottom half: Cam 3 (Left) on Left, Cam 2 (Rear) on Right
     for (int y = 0; y < HALF_H; y++) {
-        const uint8_t* src3 = cam3 ? (cam3 + (y * 2) * W * 2) : NULL;
-        const uint8_t* src2 = cam2 ? (cam2 + (y * 2) * W * 2) : NULL;
-        uint8_t* dst_row = g_mosaic_buf + (y + HALF_H) * W * 2;
+        const uint64_t* src3_64 = cam3 ? (const uint64_t*)(cam3 + (y * 2) * W * 2) : NULL;
+        const uint64_t* src2_64 = cam2 ? (const uint64_t*)(cam2 + (y * 2) * W * 2) : NULL;
+        uint32_t* dst_left_32 = (uint32_t*)(g_mosaic_buf + (y + HALF_H) * W * 2);
+        uint32_t* dst_right_32 = dst_left_32 + (HALF_W / 2);
 
         // Bottom-Left: Cam 3
-        if (src3) {
-            for (int x = 0; x < HALF_W; x += 2) {
-                int s = (x * 2) * 2;
-                dst_row[x * 2]     = src3[s];
-                dst_row[x * 2 + 1] = src3[s + 1];
-                dst_row[x * 2 + 2] = src3[s + 2];
-                dst_row[x * 2 + 3] = src3[s + 5];
+        if (src3_64) {
+            for (int x = 0; x < HALF_W / 2; x++) {
+                uint64_t s = src3_64[x * 2];
+                dst_left_32[x] = (uint32_t)(s & 0x00FFFFFFULL) | (uint32_t)((s >> 16) & 0xFF000000ULL);
             }
         } else {
-            uint32_t* dst32 = (uint32_t*)dst_row;
-            for (int x = 0; x < HALF_W / 2; x++) {
-                dst32[x] = UYVY_BLACK;
-            }
+            for (int x = 0; x < HALF_W / 2; x++) dst_left_32[x] = UYVY_BLACK;
         }
 
         // Bottom-Right: Cam 2
-        uint8_t* dst_right = dst_row + HALF_W * 2;
-        if (src2) {
-            for (int x = 0; x < HALF_W; x += 2) {
-                int s = (x * 2) * 2;
-                dst_right[x * 2]     = src2[s];
-                dst_right[x * 2 + 1] = src2[s + 1];
-                dst_right[x * 2 + 2] = src2[s + 2];
-                dst_right[x * 2 + 3] = src2[s + 5];
+        if (src2_64) {
+            for (int x = 0; x < HALF_W / 2; x++) {
+                uint64_t s = src2_64[x * 2];
+                dst_right_32[x] = (uint32_t)(s & 0x00FFFFFFULL) | (uint32_t)((s >> 16) & 0xFF000000ULL);
             }
         } else {
-            uint32_t* dst32 = (uint32_t*)dst_right;
-            for (int x = 0; x < HALF_W / 2; x++) {
-                dst32[x] = UYVY_BLACK;
-            }
+            for (int x = 0; x < HALF_W / 2; x++) dst_right_32[x] = UYVY_BLACK;
         }
     }
 }
@@ -316,6 +292,56 @@ extern "C" int _Z21test_util_init_windowP16test_util_ctxt_tPP18test_util_window_
         }
         pthread_mutex_unlock(&g_mutex);
     }
+    return res;
+}
+
+// Bypass display posting in qcarcam_test to eliminate 100% of GPU/SurfaceFlinger rendering overhead
+extern "C" int _Z28test_util_post_window_bufferP16test_util_ctxt_tP18test_util_window_tjPNSt3__14listIjNS3_9allocatorIjEEEE15qcarcam_field_t(
+    void* ctxt, void* window, uint32_t buf_idx, void* p_list, int field_t) {
+    return 0; // Skip display blitting completely!
+}
+
+// Hook qcarcam_open
+typedef void* (*open_fn)(uint32_t);
+static open_fn real_open = NULL;
+extern "C" void* qcarcam_open(uint32_t input_id) {
+    if (!real_open) real_open = (open_fn)dlsym(RTLD_NEXT, "qcarcam_open");
+    void* res = real_open ? real_open(input_id) : NULL;
+    printf("[Hook] qcarcam_open(input_id=%u) -> %p\n", input_id, res);
+    return res;
+}
+
+// Hook qcarcam_s_param
+typedef int (*s_param_fn)(void*, uint32_t, const void*);
+static s_param_fn real_s_param = NULL;
+extern "C" int qcarcam_s_param(void* hndl, uint32_t param, const void* p_val) {
+    if (!real_s_param) real_s_param = (s_param_fn)dlsym(RTLD_NEXT, "qcarcam_s_param");
+    uint32_t val0 = p_val ? *(const uint32_t*)p_val : 0;
+    uint32_t val1 = p_val ? *((const uint32_t*)p_val + 1) : 0;
+    uint32_t val2 = p_val ? *((const uint32_t*)p_val + 2) : 0;
+    int res = real_s_param ? real_s_param(hndl, param, p_val) : -1;
+    printf("[Hook] qcarcam_s_param(hndl=%p, param=%u, val=[0x%x, 0x%x, 0x%x]) -> %d\n", hndl, param, val0, val1, val2, res);
+    return res;
+}
+
+// Hook qcarcam_s_buffers
+typedef int (*s_buffers_fn)(void*, const void*);
+static s_buffers_fn real_s_buffers = NULL;
+extern "C" int qcarcam_s_buffers(void* hndl, const void* p_bufs) {
+    if (!real_s_buffers) real_s_buffers = (s_buffers_fn)dlsym(RTLD_NEXT, "qcarcam_s_buffers");
+    const uint32_t* u32 = (const uint32_t*)p_bufs;
+    if (u32) {
+        printf("[Hook] qcarcam_s_buffers(hndl=%p, color_fmt=0x%x, num_buffers=%u, buffers_ptr=%p, flags=0x%x)\n",
+               hndl, u32[0], u32[1], *(void**)(u32 + 2), u32[4]);
+        const uint8_t* p_raw = (const uint8_t*)(*(void**)(u32 + 2));
+        if (p_raw) {
+            printf("[Hook]   buf0 raw 64 bytes: ");
+            for (int k = 0; k < 64; k++) printf("%02x ", p_raw[k]);
+            printf("\n");
+        }
+    }
+    int res = real_s_buffers ? real_s_buffers(hndl, p_bufs) : -1;
+    printf("[Hook] qcarcam_s_buffers -> %d\n", res);
     return res;
 }
 
