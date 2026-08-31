@@ -197,12 +197,21 @@ void* streamClientLoop(void* arg) {
 
     uint8_t* frameBuffer = (uint8_t*)malloc(MAX_RAW_FRAME_SIZE);
 
+    uint64_t last_fps_log_ns = 0;
+    int client_frames_recv = 0;
+
     while (g_streaming.load()) {
         int sock = socket(AF_UNIX, SOCK_STREAM, 0);
         if (sock < 0) {
             usleep(500000);
             continue;
         }
+
+        int rcv_buf_size = 8 * 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcv_buf_size, sizeof(rcv_buf_size));
+
+        struct timeval tv = { 1, 0 }; // 1s receive timeout
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         struct sockaddr_un serv_addr;
         memset(&serv_addr, 0, sizeof(serv_addr));
@@ -218,6 +227,10 @@ void* streamClientLoop(void* arg) {
         }
 
         int curCam = -1;
+        struct timespec ts_now;
+        clock_gettime(CLOCK_MONOTONIC, &ts_now);
+        last_fps_log_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL + (uint64_t)ts_now.tv_nsec;
+
         while (g_streaming.load()) {
             int reqCam = g_active_camera.load();
             if (reqCam != curCam && reqCam >= 0) {
@@ -263,6 +276,17 @@ void* streamClientLoop(void* arg) {
             if (read_all(sock, frameBuffer, header.data_size) != (ssize_t)header.data_size) {
                 LOGW("Sidecar disconnected (payload read failed)");
                 break;
+            }
+
+            client_frames_recv++;
+            clock_gettime(CLOCK_MONOTONIC, &ts_now);
+            uint64_t cur_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL + (uint64_t)ts_now.tv_nsec;
+            if (cur_ns - last_fps_log_ns >= 3000000000ULL) {
+                double secs = (double)(cur_ns - last_fps_log_ns) / 1000000000.0;
+                double fps = (double)client_frames_recv / secs;
+                LOGI("DiLink5 QCarCam Ingestion: %.1f FPS (received %d frames in %.1fs)", fps, client_frames_recv, secs);
+                client_frames_recv = 0;
+                last_fps_log_ns = cur_ns;
             }
 
             std::lock_guard<std::mutex> lock(g_winMutex);

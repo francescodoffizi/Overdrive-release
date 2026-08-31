@@ -83,7 +83,7 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
         // Top-Left: Cam 0
         if (src0_64) {
             for (int x = 0; x < HALF_W / 2; x++) {
-                uint64_t s = src0_64[x * 2]; // 8 bytes: U0 Y0 V0 Y1 U1 Y2 V1 Y3
+                uint64_t s = src0_64[x]; // 8 bytes (4 pixels) -> downsampled to 4 bytes (2 pixels)
                 dst_left_32[x] = (uint32_t)(s & 0x00FFFFFFULL) | (uint32_t)((s >> 16) & 0xFF000000ULL);
             }
         } else {
@@ -93,7 +93,7 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
         // Top-Right: Cam 1
         if (src1_64) {
             for (int x = 0; x < HALF_W / 2; x++) {
-                uint64_t s = src1_64[x * 2];
+                uint64_t s = src1_64[x];
                 dst_right_32[x] = (uint32_t)(s & 0x00FFFFFFULL) | (uint32_t)((s >> 16) & 0xFF000000ULL);
             }
         } else {
@@ -111,7 +111,7 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
         // Bottom-Left: Cam 3
         if (src3_64) {
             for (int x = 0; x < HALF_W / 2; x++) {
-                uint64_t s = src3_64[x * 2];
+                uint64_t s = src3_64[x];
                 dst_left_32[x] = (uint32_t)(s & 0x00FFFFFFULL) | (uint32_t)((s >> 16) & 0xFF000000ULL);
             }
         } else {
@@ -121,7 +121,7 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
         // Bottom-Right: Cam 2
         if (src2_64) {
             for (int x = 0; x < HALF_W / 2; x++) {
-                uint64_t s = src2_64[x * 2];
+                uint64_t s = src2_64[x];
                 dst_right_32[x] = (uint32_t)(s & 0x00FFFFFFULL) | (uint32_t)((s >> 16) & 0xFF000000ULL);
             }
         } else {
@@ -131,10 +131,11 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
 }
 
 static void* dma_streamer_thread(void* arg) {
-    printf("[Hook] Dedicated 30.0 FPS DMA Streaming engine started.\n");
-
-    const uint64_t target_frame_period_ns = 33333333ULL; // 30.00 FPS (~33.33 ms)
-    uint32_t s_idx = 0;
+    printf("[Hook] DMA streamer thread started (30 FPS target)\n");
+    const uint64_t target_frame_period_ns = 33333333ULL; // 30.0 FPS
+    int s_idx = 0;
+    uint64_t last_fps_log_ns = get_monotonic_time_ns();
+    int frames_sent_count = 0;
 
     while (g_running.load()) {
         uint64_t frame_start_ns = get_monotonic_time_ns();
@@ -196,12 +197,24 @@ static void* dma_streamer_thread(void* arg) {
                         !write_all(cfd, send_payload, header.data_size)) {
                         close(cfd);
                         g_clients[i] = -1;
+                        printf("[Hook] Client [%d] closed due to socket write error/timeout\n", i);
+                    } else {
+                        frames_sent_count++;
                     }
                 }
             }
         }
 
         pthread_mutex_unlock(&g_mutex);
+
+        // Real-time FPS logger
+        if (frame_start_ns - last_fps_log_ns >= 3000000000ULL) {
+            double secs = (double)(frame_start_ns - last_fps_log_ns) / 1000000000.0;
+            double fps = (double)frames_sent_count / secs;
+            printf("[Hook] Emitting Real-Time Stream: %.1f FPS (sent %d frames in %.1fs)\n", fps, frames_sent_count, secs);
+            frames_sent_count = 0;
+            last_fps_log_ns = frame_start_ns;
+        }
 
         // Precise sleep to maintain stable 30.0 FPS
         uint64_t elapsed_ns = get_monotonic_time_ns() - frame_start_ns;
@@ -224,6 +237,10 @@ static void* socket_server_thread(void* arg) {
     g_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_server_fd < 0) return NULL;
 
+    int buf_size = 8 * 1024 * 1024; // 8 MB socket buffer
+    setsockopt(g_server_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    setsockopt(g_server_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -245,13 +262,21 @@ static void* socket_server_thread(void* arg) {
     while (g_running.load()) {
         int client = accept(g_server_fd, NULL, NULL);
         if (client >= 0) {
+            // Configure client socket with 8MB buffer and non-blocking timeout
+            int c_buf_size = 8 * 1024 * 1024;
+            setsockopt(client, SOL_SOCKET, SO_SNDBUF, &c_buf_size, sizeof(c_buf_size));
+            setsockopt(client, SOL_SOCKET, SO_RCVBUF, &c_buf_size, sizeof(c_buf_size));
+
+            struct timeval tv = { 0, 50000 }; // 50ms send timeout max
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
             pthread_mutex_lock(&g_mutex);
             bool added = false;
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (g_clients[i] < 0) {
                     g_clients[i] = client;
                     g_client_cam[i] = 4; // Default: 2x2 Mosaic
-                    printf("[Hook] Client connected in slot [%d] (fd=%d)\n", i, client);
+                    printf("[Hook] Client connected in slot [%d] (fd=%d, buf=8MB)\n", i, client);
                     added = true;
                     break;
                 }
