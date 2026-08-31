@@ -57,6 +57,8 @@ set(SURVEILLANCE_SOURCES
     camera/HardwareBufferTextureBinder.cpp
     # DiLink 5 Qualcomm QCarCam / AIS Client hardware stream backend
     camera/qcarcam_bridge.cpp
+    # DiLink 5 Direct Native Qualcomm QCarCam C++ Driver (Zero-Copy 30 FPS)
+    camera/NativeQCarCamStreamer.cpp
 )
 
 add_library(surveillance SHARED ${SURVEILLANCE_SOURCES})

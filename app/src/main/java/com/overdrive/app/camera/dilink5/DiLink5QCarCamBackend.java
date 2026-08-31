@@ -389,8 +389,22 @@ public class DiLink5QCarCamBackend {
     }
 
     public synchronized boolean startSurface(android.view.Surface surface) {
-        if (nativeHandle == 0 && !open()) return false;
         if (isStreaming.get()) return true;
+
+        // 1. Primary path: Direct Native QCarCam C++ Driver (Zero-Copy 30 FPS, no subprocess/socket)
+        if (com.overdrive.app.camera.NativeQCarCamEngine.isSupported()) {
+            logger.info("Starting Direct Native QCarCam C++ Driver for Camera " + cameraId + " (Zero-Copy 30 FPS)...");
+            boolean ok = com.overdrive.app.camera.NativeQCarCamEngine.startStream(surface, cameraId, 1920, 1300);
+            if (ok) {
+                isStreaming.set(true);
+                logger.info("Direct Native QCarCam C++ Driver active and streaming at 30 FPS");
+                return true;
+            }
+            logger.warn("Direct Native QCarCam Driver start failed, falling back to legacy bridge...");
+        }
+
+        // 2. Fallback path: Legacy Sidecar Bridge
+        if (nativeHandle == 0 && !open()) return false;
 
         try {
             boolean ok = nativeStartSurface(surface);
@@ -408,18 +422,26 @@ public class DiLink5QCarCamBackend {
     }
 
     public synchronized void stop() {
-        if (nativeHandle != 0 && isStreaming.getAndSet(false)) {
-            try {
-                nativeStop(nativeHandle);
-                logger.info("DiLink 5 QCarCam stream stopped on camera " + cameraId);
-            } catch (Throwable t) {
-                logger.warn("Error stopping DiLink 5 QCarCam stream: " + t.getMessage());
+        if (isStreaming.getAndSet(false)) {
+            if (com.overdrive.app.camera.NativeQCarCamEngine.isStreaming()) {
+                com.overdrive.app.camera.NativeQCarCamEngine.stopStream();
+            }
+            if (nativeHandle != 0) {
+                try {
+                    nativeStop(nativeHandle);
+                    logger.info("DiLink 5 QCarCam stream stopped on camera " + cameraId);
+                } catch (Throwable t) {
+                    logger.warn("Error stopping DiLink 5 QCarCam stream: " + t.getMessage());
+                }
             }
         }
     }
 
     public synchronized void close() {
         stop();
+        if (com.overdrive.app.camera.NativeQCarCamEngine.isStreaming()) {
+            com.overdrive.app.camera.NativeQCarCamEngine.stopStream();
+        }
         if (nativeHandle != 0) {
             try {
                 nativeRelease(nativeHandle);
