@@ -71,6 +71,7 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
     const int H = FRAME_HEIGHT; // 1300
     const int HALF_W = W / 2;   // 960
     const int HALF_H = H / 2;   // 650
+    const uint32_t UYVY_BLACK = 0x00800080; // U=128, Y0=0, V=128, Y1=0 (Pure neutral black)
 
     // Top half: Cam 0 (Front) on Left, Cam 1 (Right) on Right
     for (int y = 0; y < HALF_H; y++) {
@@ -79,28 +80,35 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
         uint8_t* dst_row = g_mosaic_buf + y * W * 2;
 
         // Top-Left: Cam 0
-        for (int x = 0; x < HALF_W; x += 2) {
-            if (src0) {
+        if (src0) {
+            for (int x = 0; x < HALF_W; x += 2) {
                 int s = (x * 2) * 2;
                 dst_row[x * 2]     = src0[s];
                 dst_row[x * 2 + 1] = src0[s + 1];
                 dst_row[x * 2 + 2] = src0[s + 2];
                 dst_row[x * 2 + 3] = src0[s + 5];
-            } else {
-                memset(dst_row + x * 2, 0, 4);
+            }
+        } else {
+            uint32_t* dst32 = (uint32_t*)dst_row;
+            for (int x = 0; x < HALF_W / 2; x++) {
+                dst32[x] = UYVY_BLACK;
             }
         }
+
         // Top-Right: Cam 1
         uint8_t* dst_right = dst_row + HALF_W * 2;
-        for (int x = 0; x < HALF_W; x += 2) {
-            if (src1) {
+        if (src1) {
+            for (int x = 0; x < HALF_W; x += 2) {
                 int s = (x * 2) * 2;
                 dst_right[x * 2]     = src1[s];
                 dst_right[x * 2 + 1] = src1[s + 1];
                 dst_right[x * 2 + 2] = src1[s + 2];
                 dst_right[x * 2 + 3] = src1[s + 5];
-            } else {
-                memset(dst_right + x * 2, 0, 4);
+            }
+        } else {
+            uint32_t* dst32 = (uint32_t*)dst_right;
+            for (int x = 0; x < HALF_W / 2; x++) {
+                dst32[x] = UYVY_BLACK;
             }
         }
     }
@@ -112,28 +120,35 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
         uint8_t* dst_row = g_mosaic_buf + (y + HALF_H) * W * 2;
 
         // Bottom-Left: Cam 3
-        for (int x = 0; x < HALF_W; x += 2) {
-            if (src3) {
+        if (src3) {
+            for (int x = 0; x < HALF_W; x += 2) {
                 int s = (x * 2) * 2;
                 dst_row[x * 2]     = src3[s];
                 dst_row[x * 2 + 1] = src3[s + 1];
                 dst_row[x * 2 + 2] = src3[s + 2];
                 dst_row[x * 2 + 3] = src3[s + 5];
-            } else {
-                memset(dst_row + x * 2, 0, 4);
+            }
+        } else {
+            uint32_t* dst32 = (uint32_t*)dst_row;
+            for (int x = 0; x < HALF_W / 2; x++) {
+                dst32[x] = UYVY_BLACK;
             }
         }
+
         // Bottom-Right: Cam 2
         uint8_t* dst_right = dst_row + HALF_W * 2;
-        for (int x = 0; x < HALF_W; x += 2) {
-            if (src2) {
+        if (src2) {
+            for (int x = 0; x < HALF_W; x += 2) {
                 int s = (x * 2) * 2;
                 dst_right[x * 2]     = src2[s];
                 dst_right[x * 2 + 1] = src2[s + 1];
                 dst_right[x * 2 + 2] = src2[s + 2];
                 dst_right[x * 2 + 3] = src2[s + 5];
-            } else {
-                memset(dst_right + x * 2, 0, 4);
+            }
+        } else {
+            uint32_t* dst32 = (uint32_t*)dst_right;
+            for (int x = 0; x < HALF_W / 2; x++) {
+                dst32[x] = UYVY_BLACK;
             }
         }
     }
@@ -302,4 +317,19 @@ extern "C" int _Z21test_util_init_windowP16test_util_ctxt_tPP18test_util_window_
         pthread_mutex_unlock(&g_mutex);
     }
     return res;
+}
+
+// Hook qcarcam_get_frame: enforce proper hardware interrupt wait timeout (33ms = 30 FPS)
+// to prevent qcarcam_test worker threads from busy-spinning at 100% CPU.
+typedef int (*get_frame_fn)(void* hndl, void* p_info, uint64_t timeout, uint32_t flags);
+static get_frame_fn real_get_frame = NULL;
+
+extern "C" int qcarcam_get_frame(void* hndl, void* p_info, uint64_t timeout, uint32_t flags) {
+    if (!real_get_frame) {
+        real_get_frame = (get_frame_fn)dlsym(RTLD_NEXT, "qcarcam_get_frame");
+    }
+    if (timeout < 25000000ULL) {
+        timeout = 33333333ULL; // 33.3ms (30 FPS)
+    }
+    return real_get_frame ? real_get_frame(hndl, p_info, timeout, flags) : -1;
 }

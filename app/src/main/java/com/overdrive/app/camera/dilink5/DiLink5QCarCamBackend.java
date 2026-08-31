@@ -54,45 +54,6 @@ public class DiLink5QCarCamBackend {
 
     private static synchronized void ensureHardwareProcess() {
         try {
-            // 1. Check if dilink5_cam_sidecar is already running
-            Process checkSidecar = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", "dilink5_cam_sidecar"});
-            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(checkSidecar.getInputStream()))) {
-                String line = reader.readLine();
-                checkSidecar.waitFor();
-                if (line != null && !line.trim().isEmpty()) {
-                    logger.info("Native QCarCam hardware sidecar already running (PID: " + line.trim() + ")");
-                    return;
-                }
-            }
-
-            // 2. Try launching our clean standalone native C++ streamer (/data/local/tmp/dilink5_cam_sidecar)
-            java.io.File sidecarBin = new java.io.File("/data/local/tmp/dilink5_cam_sidecar");
-            if (!sidecarBin.exists() || sidecarBin.length() == 0) {
-                ensureHookLibraryExtracted(sidecarBin);
-            }
-            if (sidecarBin.exists()) {
-                sidecarBin.setReadable(true, false);
-                sidecarBin.setExecutable(true, false);
-                logger.info("Launching Direct Native QCarCam Sidecar (/data/local/tmp/dilink5_cam_sidecar)...");
-                ProcessBuilder pb = new ProcessBuilder("/data/local/tmp/dilink5_cam_sidecar");
-                pb.redirectErrorStream(true);
-                sHardwareProcess = pb.start();
-
-                final Process proc = sHardwareProcess;
-                Thread drainer = new Thread(() -> {
-                    try (java.io.BufferedReader streamReader = new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream()))) {
-                        String drainLine;
-                        while ((drainLine = streamReader.readLine()) != null) {
-                            logger.info("[SidecarNative] " + drainLine);
-                        }
-                    } catch (Throwable ignored) {}
-                }, "qcarcam-sidecar-drainer");
-                drainer.setDaemon(true);
-                drainer.start();
-                return;
-            }
-
-            // 3. Fallback: vendor qcarcam_test diagnostic tool
             // Check if qcarcam_test is already running
             Process checkPgrep = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", "qcarcam_test"});
             try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(checkPgrep.getInputStream()))) {
@@ -104,7 +65,7 @@ public class DiLink5QCarCamBackend {
                 }
             }
 
-            logger.info("Starting Qualcomm QCarCam hardware capture supervisor (fallback)...");
+            logger.info("Starting Qualcomm QCarCam hardware capture supervisor...");
 
             // Ensure 4cam.xml exists in /data/local/tmp
             java.io.File cfgFile = new java.io.File("/data/local/tmp/4cam.xml");
@@ -153,10 +114,7 @@ public class DiLink5QCarCamBackend {
                 qcarcamBin = "/vendor/bin/qcarcam_test";
             }
 
-            String configFile = "/data/local/tmp/1cam.xml";
-            if (!new java.io.File(configFile).exists()) {
-                configFile = "/data/local/tmp/4cam.xml";
-            }
+            String configFile = "/data/local/tmp/4cam.xml";
 
             ProcessBuilder pb = new ProcessBuilder(
                     "/system/bin/sh", "-c",

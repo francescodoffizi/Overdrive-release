@@ -85,11 +85,13 @@ static bool write_all(int fd, const void* buf, size_t count) {
     return true;
 }
 
+typedef int (*pfn_test_util_parse_xml_config_file)(const char* filename, void* p_xml_inputs, uint32_t max_inputs);
 typedef int (*pfn_test_util_init)(void** pp_ctxt, void* p_params);
 typedef int (*pfn_test_util_init_window)(void* ctxt, void** pp_window);
 typedef int (*pfn_test_util_init_window_buffers)(void* ctxt, void* window, qcarcam_buffers_t* p_buffers);
 typedef int (*pfn_test_util_get_buf_ptr)(void* window, void* p_buf_ptr);
 
+static pfn_test_util_parse_xml_config_file g_test_util_parse_xml = nullptr;
 static pfn_test_util_init                g_test_util_init = nullptr;
 static pfn_test_util_init_window         g_test_util_init_window = nullptr;
 static pfn_test_util_init_window_buffers g_test_util_init_window_buffers = nullptr;
@@ -109,6 +111,7 @@ static bool load_qcarcam_symbols() {
     if (!util_lib) util_lib = dlopen("libais_test_util_proprietary.so", RTLD_NOW);
 
     if (util_lib) {
+        g_test_util_parse_xml = (pfn_test_util_parse_xml_config_file)dlsym(util_lib, "_Z31test_util_parse_xml_config_filePKcP21test_util_xml_input_tj");
         g_test_util_init = (pfn_test_util_init)dlsym(util_lib, "_Z14test_util_initPP16test_util_ctxt_tP23test_util_ctxt_params_t");
         g_test_util_init_window = (pfn_test_util_init_window)dlsym(util_lib, "_Z21test_util_init_windowP16test_util_ctxt_tPP18test_util_window_t");
         g_test_util_init_window_buffers = (pfn_test_util_init_window_buffers)dlsym(util_lib, "_Z29test_util_init_window_buffersP16test_util_ctxt_tP18test_util_window_tP17qcarcam_buffers_t");
@@ -131,7 +134,7 @@ static bool load_qcarcam_symbols() {
         return false;
     }
 
-    printf("[+] Successfully loaded Qualcomm QCarCam API & Test Util\n");
+    printf("[+] Successfully loaded Qualcomm QCarCam API\n");
     return true;
 }
 
@@ -160,29 +163,48 @@ static bool init_camera(int cam_id) {
     bufs.num_buffers = NUM_BUFFERS;
     bufs.buffers = g_buffers[cam_id];
 
-    if (g_test_util_init_window_buffers && g_test_util_init_window && g_test_util_init) {
-        if (!g_test_util_ctxt) {
-            g_test_util_init(&g_test_util_ctxt, nullptr);
+    // Allocate memory for buffers
+    for (int i = 0; i < NUM_BUFFERS; ++i) {
+        if (!g_buffer_ptrs[cam_id][i]) {
+            posix_memalign(&g_buffer_ptrs[cam_id][i], 4096, FRAME_SIZE);
+            memset(g_buffer_ptrs[cam_id][i], 0, FRAME_SIZE);
         }
-        if (!g_test_util_window[cam_id]) {
+        g_buffers[cam_id][i].num_planes = 1;
+        g_buffers[cam_id][i].planes[0].width = FRAME_WIDTH;
+        g_buffers[cam_id][i].planes[0].height = FRAME_HEIGHT;
+        g_buffers[cam_id][i].planes[0].stride = FRAME_WIDTH * 2;
+        g_buffers[cam_id][i].planes[0].size = FRAME_SIZE;
+        g_buffers[cam_id][i].planes[0].p_buf = g_buffer_ptrs[cam_id][i];
+    }
+
+    // Try test_util buffer registration if available, otherwise direct pointer registration
+    if (g_test_util_parse_xml && g_test_util_init && g_test_util_init_window && g_test_util_init_window_buffers) {
+        uint8_t xml_inputs_raw[4096];
+        memset(xml_inputs_raw, 0, sizeof(xml_inputs_raw));
+        int num_parsed = g_test_util_parse_xml("/data/local/tmp/4cam.xml", xml_inputs_raw, 4);
+        printf("[+] Parsed XML inputs: %d\n", num_parsed);
+
+        uint8_t ctxt_params[1024];
+        memset(ctxt_params, 0, sizeof(ctxt_params));
+        if (!g_test_util_ctxt) {
+            g_test_util_init(&g_test_util_ctxt, ctxt_params);
+        }
+        if (g_test_util_ctxt && !g_test_util_window[cam_id]) {
             g_test_util_init_window(g_test_util_ctxt, &g_test_util_window[cam_id]);
         }
-        g_test_util_init_window_buffers(g_test_util_ctxt, g_test_util_window[cam_id], &bufs);
-        printf("[+] Allocated hardware ION buffers via test_util\n");
-    } else {
-        for (int i = 0; i < NUM_BUFFERS; ++i) {
-            if (!g_buffer_ptrs[cam_id][i]) {
-                posix_memalign(&g_buffer_ptrs[cam_id][i], 4096, FRAME_SIZE);
-                memset(g_buffer_ptrs[cam_id][i], 0, FRAME_SIZE);
-            }
-            g_buffers[cam_id][i].num_planes = 1;
-            g_buffers[cam_id][i].planes[0].width = FRAME_WIDTH;
-            g_buffers[cam_id][i].planes[0].height = FRAME_HEIGHT;
-            g_buffers[cam_id][i].planes[0].stride = FRAME_WIDTH * 2;
-            g_buffers[cam_id][i].planes[0].size = FRAME_SIZE;
-            g_buffers[cam_id][i].planes[0].p_buf = g_buffer_ptrs[cam_id][i];
+        if (g_test_util_ctxt && g_test_util_window[cam_id]) {
+            g_test_util_init_window_buffers(g_test_util_ctxt, g_test_util_window[cam_id], &bufs);
+            printf("[+] Registered window buffers via test_util\n");
         }
     }
+
+    printf("[+] Debug bufs: color_fmt=0x%x, num_buffers=%d, flags=0x%x, planes[0]=(w=%d, h=%d, stride=%d, size=%d, ptr=%p)\n",
+           bufs.color_fmt, bufs.num_buffers, bufs.flags,
+           bufs.buffers ? bufs.buffers[0].planes[0].width : 0,
+           bufs.buffers ? bufs.buffers[0].planes[0].height : 0,
+           bufs.buffers ? bufs.buffers[0].planes[0].stride : 0,
+           bufs.buffers ? bufs.buffers[0].planes[0].size : 0,
+           bufs.buffers ? bufs.buffers[0].planes[0].p_buf : nullptr);
 
     qcarcam_ret_t ret = g_qcarcam_s_buffers(hndl, &bufs);
     if (ret != QCARCAM_RET_OK) {
