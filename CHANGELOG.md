@@ -4,6 +4,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+### Fixed
+- **DiLink 5.0 (Sealion 7) QCarCam 2x2 Mosaic Subsampling**: Risolto bug di stride orizzontale in `compose_2x2_mosaic` (`src_64[x]` anziché `src_64[x*2]`) che causava una duplicazione orizzontale dei frame (8 riquadri visibili anziché 4 quadranti 1080p).
+- **Abbattimento CPU `qcarcam_test` (<5%)**: Bypass completo delle chiamate a `SurfaceComposerClient` (`_Z28test_util_post_window_buffer`) e ottimizzazione vettorializzata bitmask a 64-bit del compositing.
+- **Throughput IPC Socket 8MB**: Inseriti buffer di ricezione e trasmissione a 8MB (`SO_SNDBUF`/`SO_RCVBUF`) e timeout di trasmissione non-bloccanti su `@dilink5_cam` per supportare 30 FPS continui.
+
 - **Abbattimento Carico CPU Qualcomm QCarCam (<5%) & Frame Pacing Hardware (`hook_qcarcam.cpp`, `dilink5_cam_sidecar.cpp`, `DiLink5QCarCamBackend.java`)**:
   - **Hook di Frame Pacing su `qcarcam_get_frame` (`hook_qcarcam.cpp`)**: Intercettata la chiamata a `qcarcam_get_frame` in `libhook_qcarcam.so` forzando un timeout di interrupt hardware a 33.3 ms (30 FPS), eliminando il ciclo di busy-spinning dei thread di `qcarcam_test` che portava la CPU al 100% (1 core intero).
   - **Bypass Completo del Rendering a Schermo (`test_util_post_window_buffer`)**: Bypassate le chiamate interne di `qcarcam_test` verso `SurfaceComposerClient` e SurfaceFlinger, azzerando le conversioni grafiche non necessarie.
