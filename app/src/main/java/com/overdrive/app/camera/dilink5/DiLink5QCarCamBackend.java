@@ -118,7 +118,7 @@ public class DiLink5QCarCamBackend {
 
             ProcessBuilder pb = new ProcessBuilder(
                     "/system/bin/sh", "-c",
-                    "LD_PRELOAD=" + hookPath + " " + qcarcamBin + " -config=" + configFile
+                    "LD_PRELOAD=" + hookPath + " " + qcarcamBin + " -config=" + configFile + " -noDisplay"
             );
             pb.redirectErrorStream(true);
             sHardwareProcess = pb.start();

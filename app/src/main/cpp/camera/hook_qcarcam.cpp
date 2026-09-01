@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <stdint.h>
 #include <atomic>
@@ -16,6 +17,8 @@
 #define MAGIC_HEADER 0x44494C35
 #define MAX_CLIENTS 8
 #define MAX_CAMERAS 4
+#define QCARCAM_MAX_NUM_PLANES 3
+#define QCARCAM_MAX_NUM_BUFFERS 12
 
 struct FrameHeader {
     uint32_t magic;
@@ -26,9 +29,57 @@ struct FrameHeader {
     uint64_t timestamp;
 };
 
-static void* g_windows[MAX_CAMERAS] = { NULL, NULL, NULL, NULL };
-static void* g_handles[MAX_CAMERAS] = { NULL, NULL, NULL, NULL };
-static std::atomic<int> g_latest_buf_idx[MAX_CAMERAS]{0, 0, 0, 0};
+// =========================================================================
+// qcarcam_frame_info_t layout (from qcarcam_types.h)
+// =========================================================================
+struct qcarcam_frame_info_t {
+    int      idx;
+    uint32_t seq_no;
+    uint64_t timestamp;
+    uint64_t timestamp_system;
+    uint64_t sof_qtimestamp;
+    uint32_t field_type;
+    uint32_t flags;
+};
+
+// =========================================================================
+// qcarcam_plane_t and buffer tracking (from qcarcam_types.h)
+// =========================================================================
+struct qcarcam_plane_t {
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t size;
+    void*    p_buf;   // virtual address of this plane
+};
+
+struct qcarcam_buffer_t {
+    qcarcam_plane_t planes[QCARCAM_MAX_NUM_PLANES];
+    uint32_t        num_planes;
+    uint32_t        flags;
+};
+
+struct qcarcam_buffers_t {
+    uint32_t          color_fmt; // qcarcam_color_fmt_t (enum = 4 bytes)
+    uint32_t          flags;
+    qcarcam_buffer_t* buffers;   // pointer to buffer array (8 bytes on aarch64)
+    uint32_t          num_buffers;
+    uint32_t          padding;
+};
+
+// Per-camera buffer tracking: ION fd and mmap'd vaddr for up to 12 buffers
+struct CamBufferInfo {
+    int      buf_ion_fd[QCARCAM_MAX_NUM_BUFFERS]; // ION fd from plane[0].p_buf
+    void*    buf_vaddr[QCARCAM_MAX_NUM_BUFFERS];  // mmap'd virtual address
+    size_t   buf_size[QCARCAM_MAX_NUM_BUFFERS];   // size from plane[0].size
+    uint32_t num_buffers;
+    uint32_t color_fmt;
+};
+
+static void* g_windows[MAX_CAMERAS]  = { NULL, NULL, NULL, NULL };
+static void* g_handles[MAX_CAMERAS]{nullptr, nullptr, nullptr, nullptr};
+static CamBufferInfo g_cam_buffers[MAX_CAMERAS];
+static std::atomic<int>      g_latest_buf_idx[MAX_CAMERAS]{-1, -1, -1, -1};
 static std::atomic<uint64_t> g_frame_counter[MAX_CAMERAS]{0, 0, 0, 0};
 static int g_num_windows = 0;
 
@@ -60,8 +111,25 @@ static bool write_all(int fd, const void* buf, size_t count) {
     return true;
 }
 
+// =========================================================================
+// Helper: get camera virtual address for buf_idx
+// Tries the g_cam_buffers table first (populated by our s_buffers hook).
+// Falls back to the legacy window-struct pointer arithmetic for -display mode.
+// =========================================================================
 static void* get_cam_vaddr(int cam_idx, int buf_idx) {
-    if (cam_idx < 0 || cam_idx >= g_num_windows) return NULL;
+    if (cam_idx < 0 || cam_idx >= MAX_CAMERAS) return NULL;
+
+    // Fast path: direct buffer table (populated once by qcarcam_s_buffers at startup).
+    // Read without mutex: g_cam_buffers is written only during s_buffers init, before
+    // any frames arrive, so it is stable by the time dma_streamer_thread calls us.
+    // Taking g_mutex here would deadlock because dma_streamer_thread already holds it.
+    const CamBufferInfo& ci = g_cam_buffers[cam_idx];
+    if (ci.num_buffers > 0 && buf_idx >= 0 && buf_idx < (int)ci.num_buffers) {
+        return ci.buf_vaddr[buf_idx];
+    }
+
+    // Fallback: legacy window struct traversal (display mode)
+    if (cam_idx >= g_num_windows) return NULL;
     void* win = g_windows[cam_idx];
     if (!win) return NULL;
     uint8_t* p_win = (uint8_t*)win;
@@ -153,7 +221,7 @@ static void* dma_streamer_thread(void* arg) {
             if (g_clients[i] >= 0) active_clients++;
         }
 
-        if (active_clients > 0 && g_num_windows > 0) {
+        if (active_clients > 0) {
             bool mosaic_built = false;
 
             for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -208,7 +276,7 @@ static void* dma_streamer_thread(void* arg) {
                 }
             }
         }
-
+        
         pthread_mutex_unlock(&g_mutex);
 
         // Real-time FPS logger
@@ -300,6 +368,10 @@ static void* socket_server_thread(void* arg) {
 __attribute__((constructor))
 void hook_init() {
     printf("[Hook] libhook_qcarcam.so 4-Camera driver initialized!\n");
+    memset(g_cam_buffers, 0, sizeof(g_cam_buffers));
+
+    // This hook is always loaded via LD_PRELOAD into qcarcam_test — always spawn threads.
+    printf("[Hook] Spawning streamer and socket threads.\n");
     pthread_t th_server, th_stream;
     pthread_create(&th_server, NULL, socket_server_thread, NULL);
     pthread_detach(th_server);
@@ -320,52 +392,35 @@ extern "C" int _Z21test_util_init_windowP16test_util_ctxt_tPP18test_util_window_
         if (g_num_windows < MAX_CAMERAS) {
             g_windows[g_num_windows] = *pp_window;
             printf("[Hook] Captured Camera [%d] test_util window pointer: %p\n", g_num_windows, *pp_window);
-            g_num_windows++;
         }
         pthread_mutex_unlock(&g_mutex);
     }
     return res;
 }
 
-// Bypass display posting in qcarcam_test to eliminate 100% of GPU/SurfaceFlinger rendering overhead,
-// while properly releasing the ISP buffer back to QCarCam to prevent frame starvation / freezing.
+// Bypass display posting in qcarcam_test to eliminate 100% of GPU/SurfaceFlinger rendering overhead.
 extern "C" int _Z28test_util_post_window_bufferP16test_util_ctxt_tP18test_util_window_tjPNSt3__14listIjNS3_9allocatorIjEEEE15qcarcam_field_t(
     void* ctxt, void* window, uint32_t buf_idx, void* p_list, int field_t) {
 
-    if (!real_release_frame) {
-        real_release_frame = (release_frame_fn)dlsym(RTLD_NEXT, "qcarcam_release_frame");
-        if (!real_release_frame) {
-            void* ais_lib = dlopen("libais_client.so", RTLD_NOW);
-            if (!ais_lib) ais_lib = dlopen("/vendor/lib64/libais_client.so", RTLD_NOW);
-            if (ais_lib) real_release_frame = (release_frame_fn)dlsym(ais_lib, "qcarcam_release_frame");
-        }
-    }
-
-    void* hndl = NULL;
     int cam_idx = -1;
     pthread_mutex_lock(&g_mutex);
     for (int c = 0; c < MAX_CAMERAS; c++) {
         if (g_windows[c] == window) {
-            hndl = g_handles[c];
             cam_idx = c;
             break;
         }
     }
     pthread_mutex_unlock(&g_mutex);
 
-    if (cam_idx >= 0) {
-        g_latest_buf_idx[cam_idx].store((int)buf_idx, std::memory_order_relaxed);
-        g_frame_counter[cam_idx].fetch_add(1, std::memory_order_relaxed);
-    }
-
-    if (hndl && real_release_frame) {
-        real_release_frame(hndl, buf_idx);
-    }
+    // We do NOT store g_latest_buf_idx here anymore. We do it in get_frame.
+    // We also completely skip inserting into p_list to avoid libc++ ABI issues.
 
     return 0; // Skip display blitting completely!
 }
 
-// Hook qcarcam_open
+// =========================================================================
+// Hook qcarcam_open: capture handle → cam_idx mapping
+// =========================================================================
 typedef void* (*open_fn)(uint32_t);
 static open_fn real_open = NULL;
 extern "C" void* qcarcam_open(uint32_t input_id) {
@@ -380,7 +435,9 @@ extern "C" void* qcarcam_open(uint32_t input_id) {
     return res;
 }
 
-// Hook qcarcam_s_param
+// =========================================================================
+// Hook qcarcam_s_param: log frame-rate and other params
+// =========================================================================
 typedef int (*s_param_fn)(void*, uint32_t, const void*);
 static s_param_fn real_s_param = NULL;
 extern "C" int qcarcam_s_param(void* hndl, uint32_t param, const void* p_val) {
@@ -393,29 +450,99 @@ extern "C" int qcarcam_s_param(void* hndl, uint32_t param, const void* p_val) {
     return res;
 }
 
-// Hook qcarcam_s_buffers
+// =========================================================================
+// Hook qcarcam_start: pass-through, no param override.
+// Forcing QCARCAM_PARAM_FRAME_RATE (param 7) via s_param after start returns
+// error 20 on this AIS version and triggers an async session reset ~10s later.
+// =========================================================================
+typedef int (*start_fn)(void*);
+static start_fn real_start = NULL;
+extern "C" int qcarcam_start(void* hndl) {
+    if (!real_start) real_start = (start_fn)dlsym(RTLD_NEXT, "qcarcam_start");
+    int res = real_start ? real_start(hndl) : -1;
+    printf("[Hook] qcarcam_start(hndl=%p) -> %d\n", hndl, res);
+    return res;
+}
+
+// =========================================================================
+// Hook qcarcam_s_buffers: capture virtual buffer addresses per camera
+// This is the KEY hook for -noDisplay mode: we record plane[0].p_buf for
+// each buffer so that qcarcam_get_frame can look them up by frame_info.idx.
+// =========================================================================
 typedef int (*s_buffers_fn)(void*, const void*);
 static s_buffers_fn real_s_buffers = NULL;
 extern "C" int qcarcam_s_buffers(void* hndl, const void* p_bufs) {
     if (!real_s_buffers) real_s_buffers = (s_buffers_fn)dlsym(RTLD_NEXT, "qcarcam_s_buffers");
-    const uint32_t* u32 = (const uint32_t*)p_bufs;
-    if (u32) {
-        printf("[Hook] qcarcam_s_buffers(hndl=%p, color_fmt=0x%x, num_buffers=%u, buffers_ptr=%p, flags=0x%x)\n",
-               hndl, u32[0], u32[1], *(void**)(u32 + 2), u32[4]);
-        const uint8_t* p_raw = (const uint8_t*)(*(void**)(u32 + 2));
-        if (p_raw) {
-            printf("[Hook]   buf0 raw 64 bytes: ");
-            for (int k = 0; k < 64; k++) printf("%02x ", p_raw[k]);
-            printf("\n");
-        }
-    }
+
+    // Call real implementation first so buffers get registered with ISP
     int res = real_s_buffers ? real_s_buffers(hndl, p_bufs) : -1;
-    printf("[Hook] qcarcam_s_buffers -> %d\n", res);
+
+    if (p_bufs) {
+        const qcarcam_buffers_t* bufs = (const qcarcam_buffers_t*)p_bufs;
+        uint32_t num = bufs->num_buffers;
+        uint32_t fmt = bufs->color_fmt;
+        qcarcam_buffer_t* buf_arr = bufs->buffers;
+
+        printf("[Hook] qcarcam_s_buffers(hndl=%p, color_fmt=0x%x, num_buffers=%u, buffers=%p) -> %d\n",
+               hndl, fmt, num, buf_arr, res);
+
+        // Find cam_idx for this handle
+        int cam_idx = -1;
+        pthread_mutex_lock(&g_mutex);
+        for (int c = 0; c < MAX_CAMERAS; c++) {
+            if (g_handles[c] == hndl) {
+                cam_idx = c;
+                break;
+            }
+        }
+
+        if (cam_idx >= 0 && buf_arr && num > 0 && num <= QCARCAM_MAX_NUM_BUFFERS) {
+            CamBufferInfo& ci = g_cam_buffers[cam_idx];
+            ci.num_buffers = num;
+            ci.color_fmt   = fmt;
+            for (uint32_t b = 0; b < num; b++) {
+                // p_buf is an ION fd (small integer), not a virtual address
+                int ion_fd = (int)(intptr_t)buf_arr[b].planes[0].p_buf;
+                size_t sz  = buf_arr[b].planes[0].size;
+                ci.buf_ion_fd[b] = ion_fd;
+                ci.buf_size[b]   = sz;
+                // mmap the ION buffer into our address space
+                void* va = (sz > 0 && ion_fd > 2) ?
+                    mmap(NULL, sz, PROT_READ, MAP_SHARED, ion_fd, 0) : NULL;
+                if (va == MAP_FAILED) va = NULL;
+                ci.buf_vaddr[b] = va;
+                printf("[Hook]   cam[%d] buf[%u] ion_fd=%d vaddr=%p stride=%u size=%zu\n",
+                       cam_idx, b, ion_fd, va,
+                       buf_arr[b].planes[0].stride, sz);
+            }
+        }
+        pthread_mutex_unlock(&g_mutex);
+    }
+
     return res;
 }
 
-// Hook qcarcam_get_frame: enforce proper hardware interrupt wait timeout (33ms = 30 FPS)
-// to prevent qcarcam_test worker threads from busy-spinning at 100% CPU.
+// =========================================================================
+// Hook qcarcam_release_frame: pass-through, but we expose the real fn for
+// internal use by qcarcam_get_frame to release buffers back to the ISP.
+// =========================================================================
+typedef int (*release_frame_hook_fn)(void* hndl, uint32_t idx);
+static release_frame_hook_fn real_release_frame_hook = NULL;
+
+extern "C" int qcarcam_release_frame(void* hndl, uint32_t idx) {
+    if (!real_release_frame_hook) {
+        real_release_frame_hook = (release_frame_hook_fn)dlsym(RTLD_NEXT, "qcarcam_release_frame");
+    }
+    return real_release_frame_hook ? real_release_frame_hook(hndl, idx) : -1;
+}
+
+// =========================================================================
+// Hook qcarcam_get_frame: the MAIN acquisition path in -noDisplay mode.
+// After a successful frame:
+//   1. Update g_latest_buf_idx so the DMA streamer picks up the frame.
+//   2. Immediately release the previous frame buffer back to the ISP so the
+//      hardware can continue writing new frames (avoids ring buffer starvation).
+// =========================================================================
 typedef int (*get_frame_fn)(void* hndl, void* p_info, uint64_t timeout, uint32_t flags);
 static get_frame_fn real_get_frame = NULL;
 
@@ -423,20 +550,33 @@ extern "C" int qcarcam_get_frame(void* hndl, void* p_info, uint64_t timeout, uin
     if (!real_get_frame) {
         real_get_frame = (get_frame_fn)dlsym(RTLD_NEXT, "qcarcam_get_frame");
     }
-    if (timeout < 25000000ULL) {
-        timeout = 33333333ULL; // 33.3ms (30 FPS)
-    }
-    int res = real_get_frame ? real_get_frame(hndl, p_info, timeout, flags) : -1;
-    if (res == 0 && p_info) {
-        uint32_t* p_u32 = (uint32_t*)p_info;
-        uint32_t buf_idx = p_u32[0]; // idx is first field in qcarcam_frame_info_t
+    int ret = real_get_frame ? real_get_frame(hndl, p_info, timeout, flags) : -1;
+
+    // QCARCAM_RET_OK == 0
+    if (ret == 0 && p_info) {
+        qcarcam_frame_info_t* fi = (qcarcam_frame_info_t*)p_info;
+        int new_buf_idx = fi->idx;
+
+        // Find cam_idx for this handle (lock-free scan)
+        int cam_idx = -1;
         for (int c = 0; c < MAX_CAMERAS; c++) {
             if (g_handles[c] == hndl) {
-                g_latest_buf_idx[c].store((int)buf_idx, std::memory_order_relaxed);
+                cam_idx = c;
                 break;
             }
         }
+
+        if (cam_idx >= 0 && new_buf_idx >= 0) {
+            // Atomically publish the new buffer index for the DMA streamer to read.
+            // NOTE: We do NOT call qcarcam_release_frame here directly, because it can
+            // cause a futex deadlock with qcarcam_test's internal locking or re-entrancy issues.
+            // Instead, the dma_streamer_thread will call release_frame on the PREVIOUS
+            // buffer once it sees a new buffer index published here.
+            g_latest_buf_idx[cam_idx].store(new_buf_idx, std::memory_order_release);
+            g_frame_counter[cam_idx].fetch_add(1, std::memory_order_relaxed);
+        }
     }
-    return res;
+
+    return ret;
 }
 
