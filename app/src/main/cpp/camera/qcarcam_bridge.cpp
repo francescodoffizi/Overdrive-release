@@ -1,6 +1,6 @@
 // qcarcam_bridge.cpp — BYD DiLink 5.0 (Snapdragon SA8155P) Sidecar Bridge.
 // Connects to the native dilink5_cam_sidecar daemon via high-speed abstract UNIX socket (@dilink5_cam),
-// receives hardware frames, and posts them to Android's ANativeWindow / Surface.
+// receives hardware frames via shared memory, and posts them to Android's ANativeWindow / Surface.
 
 #include <jni.h>
 #include <android/log.h>
@@ -11,8 +11,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/mman.h>
 #include <atomic>
 #include <mutex>
 
@@ -25,8 +27,23 @@
 #define FRAME_WIDTH 1920
 #define FRAME_HEIGHT 1300
 #define MAX_RAW_FRAME_SIZE (FRAME_WIDTH * FRAME_HEIGHT * 2)
-#define MAGIC_HEADER 0x44494C35
 
+// Shared memory transport
+#define SHM_PATH        "/data/local/tmp/dilink5_shm"
+#define SHM_NUM_SLOTS   5
+#define SHM_SLOT_SIZE   MAX_RAW_FRAME_SIZE
+#define SHM_TOTAL_SIZE  ((size_t)SHM_NUM_SLOTS * SHM_SLOT_SIZE)
+#define SHM_NOTIF_MAGIC 0x44494C36U
+
+struct ShmNotif {
+    uint32_t magic;
+    uint8_t  cam_idx;
+    uint8_t  buf_slot;
+    uint16_t seq;
+};
+
+// Legacy header for fallback path (hook without shm support)
+#define MAGIC_HEADER 0x44494C35
 struct FrameHeader {
     uint32_t magic;
     uint32_t width;
@@ -43,6 +60,10 @@ std::atomic<int> g_active_camera{4}; // Default: 4 = 2x2 Mosaic (All cameras)
 pthread_t g_streamThread = 0;
 ANativeWindow* g_nativeWindow = nullptr;
 std::mutex g_winMutex;
+
+// Shared memory (mapped once, kept for process lifetime)
+uint8_t* g_shm_base = nullptr;
+int      g_shm_fd   = -1;
 
 #include <arm_neon.h>
 
@@ -195,6 +216,7 @@ ssize_t read_all(int fd, void* buf, size_t count) {
 void* streamClientLoop(void* arg) {
     LOGI("DiLink 5 UNIX Socket Client thread started.");
 
+    // Legacy fallback buffer (used only when shm is unavailable)
     uint8_t* frameBuffer = (uint8_t*)malloc(MAX_RAW_FRAME_SIZE);
 
     uint64_t last_fps_log_ns = 0;
@@ -207,7 +229,7 @@ void* streamClientLoop(void* arg) {
             continue;
         }
 
-        int rcv_buf_size = 8 * 1024 * 1024;
+        int rcv_buf_size = 256 * 1024; // small: notifications are only 8 bytes
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcv_buf_size, sizeof(rcv_buf_size));
 
         struct timeval tv = { 1, 0 }; // 1s receive timeout
@@ -222,8 +244,24 @@ void* streamClientLoop(void* arg) {
 
         if (connect(sock, (struct sockaddr*)&serv_addr, addr_len) < 0) {
             close(sock);
-            usleep(300000); // retry connect
+            usleep(300000);
             continue;
+        }
+
+        // Map shared memory on first successful connection
+        if (g_shm_base == nullptr) {
+            int fd = open(SHM_PATH, O_RDONLY);
+            if (fd >= 0) {
+                void* m = mmap(NULL, SHM_TOTAL_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+                if (m != MAP_FAILED) {
+                    g_shm_base = (uint8_t*)m;
+                    g_shm_fd   = fd;
+                    LOGI("Shared memory mapped for reading: %s (~%zu MB)", SHM_PATH, SHM_TOTAL_SIZE >> 20);
+                } else {
+                    close(fd);
+                    LOGW("shm mmap failed — falling back to legacy socket mode");
+                }
+            }
         }
 
         int curCam = -1;
@@ -239,66 +277,99 @@ void* streamClientLoop(void* arg) {
                 curCam = reqCam;
             }
 
-            FrameHeader header;
-            if (read_all(sock, &header, sizeof(header)) != sizeof(header)) {
-                LOGW("Sidecar disconnected (header read failed)");
-                break;
-            }
-
-            if (header.magic != MAGIC_HEADER) {
-                // Resynchronization: byte-scan until MAGIC_HEADER is found
-                uint32_t magic_window = header.magic;
-                bool synced = false;
-                while (g_streaming.load()) {
-                    uint8_t next_b = 0;
-                    if (recv(sock, &next_b, 1, 0) <= 0) break;
-                    magic_window = (magic_window >> 8) | ((uint32_t)next_b << 24);
-                    if (magic_window == MAGIC_HEADER) {
-                        // Read rest of header
-                        if (read_all(sock, ((uint8_t*)&header) + 4, sizeof(header) - 4) == (ssize_t)(sizeof(header) - 4)) {
-                            header.magic = MAGIC_HEADER;
-                            synced = true;
-                        }
-                        break;
-                    }
-                }
-                if (!synced) {
-                    LOGW("Sidecar resync failed / socket closed");
+            if (g_shm_base) {
+                // ── Shared memory path: read 8-byte notification ──────────────
+                ShmNotif notif;
+                if (read_all(sock, &notif, sizeof(notif)) != (ssize_t)sizeof(notif)) {
+                    LOGW("Sidecar disconnected (header read failed)");
                     break;
                 }
-            }
+                if (notif.magic != SHM_NOTIF_MAGIC) {
+                    LOGW("Sidecar: unexpected magic 0x%08x (shm path)", notif.magic);
+                    break;
+                }
 
-            if (header.data_size > MAX_RAW_FRAME_SIZE) {
-                LOGE("Invalid frame data size: %u", header.data_size);
-                break;
-            }
+                int slot = (notif.cam_idx <= 3) ? (int)notif.cam_idx : 4;
+                const uint8_t* frame_ptr = g_shm_base + (size_t)slot * SHM_SLOT_SIZE;
 
-            if (read_all(sock, frameBuffer, header.data_size) != (ssize_t)header.data_size) {
-                LOGW("Sidecar disconnected (payload read failed)");
-                break;
-            }
+                client_frames_recv++;
+                clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                uint64_t cur_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL + (uint64_t)ts_now.tv_nsec;
+                if (cur_ns - last_fps_log_ns >= 3000000000ULL) {
+                    double secs = (double)(cur_ns - last_fps_log_ns) / 1000000000.0;
+                    LOGI("DiLink5 QCarCam Ingestion (shm): %.1f FPS (%d frames in %.1fs)",
+                         (double)client_frames_recv / secs, client_frames_recv, secs);
+                    client_frames_recv = 0;
+                    last_fps_log_ns = cur_ns;
+                }
 
-            client_frames_recv++;
-            clock_gettime(CLOCK_MONOTONIC, &ts_now);
-            uint64_t cur_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL + (uint64_t)ts_now.tv_nsec;
-            if (cur_ns - last_fps_log_ns >= 3000000000ULL) {
-                double secs = (double)(cur_ns - last_fps_log_ns) / 1000000000.0;
-                double fps = (double)client_frames_recv / secs;
-                LOGI("DiLink5 QCarCam Ingestion: %.1f FPS (received %d frames in %.1fs)", fps, client_frames_recv, secs);
-                client_frames_recv = 0;
-                last_fps_log_ns = cur_ns;
-            }
-
-            std::lock_guard<std::mutex> lock(g_winMutex);
-            if (g_nativeWindow) {
-                ANativeWindow_Buffer winBuffer;
-                if (ANativeWindow_lock(g_nativeWindow, &winBuffer, nullptr) == 0) {
-                    if (header.format == 1) {
-                        convert_uyvy_to_rgba(frameBuffer, header.width, header.height, (uint32_t*)winBuffer.bits, winBuffer.stride);
-                    } else {
-                        convert_nv12_to_rgba(frameBuffer, header.width, header.height, (uint32_t*)winBuffer.bits, winBuffer.stride);
+                std::lock_guard<std::mutex> lock(g_winMutex);
+                if (g_nativeWindow) {
+                    ANativeWindow_Buffer winBuffer;
+                    if (ANativeWindow_lock(g_nativeWindow, &winBuffer, nullptr) == 0) {
+                        convert_uyvy_to_rgba(frame_ptr, FRAME_WIDTH, FRAME_HEIGHT,
+                                             (uint32_t*)winBuffer.bits, winBuffer.stride);
+                        ANativeWindow_unlockAndPost(g_nativeWindow);
                     }
-                    ANativeWindow_unlockAndPost(g_nativeWindow);
+                }
+            } else {
+                // ── Legacy path: read FrameHeader + raw payload from socket ───
+                FrameHeader header;
+                if (read_all(sock, &header, sizeof(header)) != sizeof(header)) {
+                    LOGW("Sidecar disconnected (header read failed)");
+                    break;
+                }
+                if (header.magic != MAGIC_HEADER) {
+                    // Resync: byte-scan for magic
+                    uint32_t w = header.magic;
+                    bool synced = false;
+                    while (g_streaming.load()) {
+                        uint8_t b = 0;
+                        if (recv(sock, &b, 1, 0) <= 0) break;
+                        w = (w >> 8) | ((uint32_t)b << 24);
+                        if (w == MAGIC_HEADER) {
+                            if (read_all(sock, ((uint8_t*)&header) + 4, sizeof(header) - 4)
+                                    == (ssize_t)(sizeof(header) - 4)) {
+                                header.magic = MAGIC_HEADER;
+                                synced = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (!synced) { LOGW("Sidecar resync failed"); break; }
+                }
+                if (header.data_size > MAX_RAW_FRAME_SIZE) {
+                    LOGE("Invalid frame data size: %u", header.data_size);
+                    break;
+                }
+                if (read_all(sock, frameBuffer, header.data_size) != (ssize_t)header.data_size) {
+                    LOGW("Sidecar disconnected (payload read failed)");
+                    break;
+                }
+
+                client_frames_recv++;
+                clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                uint64_t cur_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL + (uint64_t)ts_now.tv_nsec;
+                if (cur_ns - last_fps_log_ns >= 3000000000ULL) {
+                    double secs = (double)(cur_ns - last_fps_log_ns) / 1000000000.0;
+                    LOGI("DiLink5 QCarCam Ingestion (socket): %.1f FPS (%d frames in %.1fs)",
+                         (double)client_frames_recv / secs, client_frames_recv, secs);
+                    client_frames_recv = 0;
+                    last_fps_log_ns = cur_ns;
+                }
+
+                std::lock_guard<std::mutex> lock(g_winMutex);
+                if (g_nativeWindow) {
+                    ANativeWindow_Buffer winBuffer;
+                    if (ANativeWindow_lock(g_nativeWindow, &winBuffer, nullptr) == 0) {
+                        if (header.format == 1)
+                            convert_uyvy_to_rgba(frameBuffer, header.width, header.height,
+                                                 (uint32_t*)winBuffer.bits, winBuffer.stride);
+                        else
+                            convert_nv12_to_rgba(frameBuffer, header.width, header.height,
+                                                 (uint32_t*)winBuffer.bits, winBuffer.stride);
+                        ANativeWindow_unlockAndPost(g_nativeWindow);
+                    }
                 }
             }
         }

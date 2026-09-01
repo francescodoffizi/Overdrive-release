@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <time.h>
 #include <stdint.h>
 #include <atomic>
@@ -20,6 +21,22 @@
 #define QCARCAM_MAX_NUM_PLANES 3
 #define QCARCAM_MAX_NUM_BUFFERS 12
 
+// Shared memory transport (replaces raw 4.77 MB socket writes)
+#define SHM_PATH        "/data/local/tmp/dilink5_shm"
+#define SHM_NUM_SLOTS   5          // slots 0-3: single cams, slot 4: mosaic
+#define SHM_SLOT_SIZE   UYVY_SIZE  // 4,992,000 bytes per slot
+#define SHM_TOTAL_SIZE  ((size_t)SHM_NUM_SLOTS * SHM_SLOT_SIZE)  // ~24 MB
+#define SHM_NOTIF_MAGIC 0x44494C36U
+
+// 8-byte notification sent over socket instead of the full frame payload
+struct ShmNotif {
+    uint32_t magic;    // SHM_NOTIF_MAGIC
+    uint8_t  cam_idx;  // 0-3 single cam, 4 = mosaic
+    uint8_t  buf_slot; // same as cam_idx (1:1 mapping)
+    uint16_t seq;      // wrapping frame counter
+};
+
+// Legacy header kept for fallback path (when shm init fails)
 struct FrameHeader {
     uint32_t magic;
     uint32_t width;
@@ -93,6 +110,11 @@ static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static std::atomic<bool> g_running{true};
 
 static uint8_t g_mosaic_buf[UYVY_SIZE];
+
+// Shared memory transport
+static uint8_t*  g_shm_base = nullptr;
+static int       g_shm_fd   = -1;
+static uint16_t  g_shm_seq  = 0;
 
 static inline uint64_t get_monotonic_time_ns() {
     struct timespec ts;
@@ -257,21 +279,43 @@ static void* dma_streamer_thread(void* arg) {
                 }
 
                 if (send_payload) {
-                    FrameHeader header;
-                    header.magic = MAGIC_HEADER;
-                    header.width = FRAME_WIDTH;
-                    header.height = FRAME_HEIGHT;
-                    header.format = 1; // UYVY
-                    header.data_size = UYVY_SIZE;
-                    header.timestamp = frame_start_ns;
+                    if (g_shm_base) {
+                        // Shared memory path: write frame, fence, send 8-byte notification
+                        int slot = (target_mode <= 3) ? target_mode : 4;
+                        memcpy(g_shm_base + (size_t)slot * SHM_SLOT_SIZE, send_payload, SHM_SLOT_SIZE);
+                        __sync_synchronize();
 
-                    if (!write_all(cfd, &header, sizeof(header)) ||
-                        !write_all(cfd, send_payload, header.data_size)) {
-                        close(cfd);
-                        g_clients[i] = -1;
-                        printf("[Hook] Client [%d] closed due to socket write error/timeout\n", i);
+                        ShmNotif notif;
+                        notif.magic    = SHM_NOTIF_MAGIC;
+                        notif.cam_idx  = (uint8_t)target_mode;
+                        notif.buf_slot = (uint8_t)slot;
+                        notif.seq      = g_shm_seq++;
+
+                        if (!write_all(cfd, &notif, sizeof(notif))) {
+                            close(cfd);
+                            g_clients[i] = -1;
+                            printf("[Hook] Client [%d] closed (shm notif write error)\n", i);
+                        } else {
+                            frames_sent_count++;
+                        }
                     } else {
-                        frames_sent_count++;
+                        // Legacy fallback: send full raw frame over socket
+                        FrameHeader header;
+                        header.magic     = MAGIC_HEADER;
+                        header.width     = FRAME_WIDTH;
+                        header.height    = FRAME_HEIGHT;
+                        header.format    = 1;
+                        header.data_size = UYVY_SIZE;
+                        header.timestamp = frame_start_ns;
+
+                        if (!write_all(cfd, &header, sizeof(header)) ||
+                            !write_all(cfd, send_payload, header.data_size)) {
+                            close(cfd);
+                            g_clients[i] = -1;
+                            printf("[Hook] Client [%d] closed due to socket write error/timeout\n", i);
+                        } else {
+                            frames_sent_count++;
+                        }
                     }
                 }
             }
@@ -369,6 +413,22 @@ __attribute__((constructor))
 void hook_init() {
     printf("[Hook] libhook_qcarcam.so 4-Camera driver initialized!\n");
     memset(g_cam_buffers, 0, sizeof(g_cam_buffers));
+
+    // Create shared memory frame store (~24 MB file-backed mmap)
+    g_shm_fd = open(SHM_PATH, O_CREAT | O_RDWR, 0666);
+    if (g_shm_fd >= 0 && ftruncate(g_shm_fd, (off_t)SHM_TOTAL_SIZE) == 0) {
+        void* m = mmap(NULL, SHM_TOTAL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
+        if (m != MAP_FAILED) {
+            g_shm_base = (uint8_t*)m;
+            printf("[Hook] Shared memory ready: %s (%zu MB)\n", SHM_PATH, SHM_TOTAL_SIZE >> 20);
+        } else {
+            printf("[Hook] WARN: shm mmap failed, falling back to legacy socket mode\n");
+            close(g_shm_fd); g_shm_fd = -1;
+        }
+    } else {
+        printf("[Hook] WARN: shm open/truncate failed, falling back to legacy socket mode\n");
+        if (g_shm_fd >= 0) { close(g_shm_fd); g_shm_fd = -1; }
+    }
 
     // This hook is always loaded via LD_PRELOAD into qcarcam_test — always spawn threads.
     printf("[Hook] Spawning streamer and socket threads.\n");
